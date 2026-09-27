@@ -170,34 +170,49 @@ if (showToc && html) {
     // Render any ```mermaid blocks (rewritten to <pre class="mermaid">).
     // mermaid is bundled (a marketing dep) and code-split: this dynamic import
     // only loads its chunk on doc pages that actually contain a diagram.
-    if (document.querySelector('pre.mermaid')) {
+    // The theme is the site's own (data-theme on <html>, set by the header
+    // toggle), not the OS setting, and the diagrams re-render when it flips.
+    const diagrams = Array.from(document.querySelectorAll<HTMLElement>('pre.mermaid'));
+    if (diagrams.length) {
       const mermaid = (await import('mermaid')).default;
-      const dark = window.matchMedia?.('(prefers-color-scheme: dark)').matches;
-      // useMaxWidth:false lets the rendered SVG scale up to fill its container
-      // (matches the in-product viewer) instead of locking to the tiny intrinsic
-      // width — the CSS in docs.css then caps it at a readable max-width.
-      mermaid.initialize({
-        startOnLoad: false,
-        theme: dark ? 'dark' : 'default',
-        flowchart: { useMaxWidth: false },
-        sequence: { useMaxWidth: false },
-      });
-      await mermaid.run({ querySelector: 'pre.mermaid' });
-      // Tighten each SVG's viewBox to the actual drawn content. Mermaid's
-      // default viewBox is often 2–3× larger than the graph, which renders the
-      // diagram as a tiny island in a huge empty box. (Same fix the in-product
-      // docs viewer applies.)
-      document.querySelectorAll<SVGSVGElement>('pre.mermaid svg').forEach((svg) => {
-        try {
-          const bbox = svg.getBBox();
-          const pad = 8;
-          svg.setAttribute(
-            'viewBox',
-            `${bbox.x - pad} ${bbox.y - pad} ${bbox.width + pad * 2} ${bbox.height + pad * 2}`
-          );
-          svg.removeAttribute('height');
-        } catch { /* getBBox throws if detached; ignore */ }
-      });
+      diagrams.forEach((pre) => { pre.dataset.src = pre.textContent ?? ''; });
+      const render = async () => {
+        const dark = document.documentElement.dataset.theme !== 'light';
+        // useMaxWidth:false lets the rendered SVG scale up to fill its container
+        // (matches the in-product viewer) instead of locking to the tiny intrinsic
+        // width — the CSS in docs.css then caps it at a readable max-width.
+        mermaid.initialize({
+          startOnLoad: false,
+          theme: dark ? 'dark' : 'default',
+          flowchart: { useMaxWidth: false },
+          sequence: { useMaxWidth: false },
+        });
+        diagrams.forEach((pre) => {
+          pre.removeAttribute('data-processed');
+          pre.textContent = pre.dataset.src ?? '';
+        });
+        await mermaid.run({ nodes: diagrams });
+        // Tighten each SVG's viewBox to the actual drawn content. Mermaid's
+        // default viewBox is often 2–3× larger than the graph, which renders the
+        // diagram as a tiny island in a huge empty box. (Same fix the in-product
+        // docs viewer applies.)
+        diagrams.forEach((pre) => {
+          const svg = pre.querySelector('svg');
+          if (!svg) return;
+          try {
+            const bbox = svg.getBBox();
+            const pad = 8;
+            svg.setAttribute(
+              'viewBox',
+              `${bbox.x - pad} ${bbox.y - pad} ${bbox.width + pad * 2} ${bbox.height + pad * 2}`
+            );
+            svg.removeAttribute('height');
+          } catch { /* getBBox throws if detached; ignore */ }
+        });
+      };
+      await render();
+      new MutationObserver(() => { void render(); })
+        .observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
     }
   </script>
 )}
