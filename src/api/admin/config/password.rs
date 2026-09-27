@@ -227,6 +227,7 @@ pub async fn recover_db(
         &headers,
         connect_info.as_ref().map(|ci| ci.0.ip()),
         "bootstrap",
+        true,
         "recover_db",
     )
     .await

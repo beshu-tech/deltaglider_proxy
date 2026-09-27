@@ -534,6 +534,7 @@ pub async fn login(
         &req_headers,
         connect_info.as_ref().map(|ci| ci.0.ip()),
         "bootstrap",
+        true,
         "admin",
     )
     .await
@@ -881,16 +882,19 @@ pub async fn login_as(
     // bucket, a botnet rotating IPs could target a specific admin's
     // access_key_id without any rate limit. The account dimension is
     // the AKID being attempted.
+    let iam_state = state.iam_state.load();
+    let known =
+        matches!(&**iam_state, IamState::Iam(index) if index.get(&body.access_key_id).is_some());
     let guard = crate::rate_limiter::RateLimitGuard::enter_with_account(
         &state.rate_limiter,
         &req_headers,
         connect_info.as_ref().map(|ci| ci.0.ip()),
         &body.access_key_id,
+        known,
         "login_as",
     )
     .await?;
 
-    let iam_state = state.iam_state.load();
     let user = match &**iam_state {
         IamState::Iam(index) => index.get(&body.access_key_id),
         _ => None,

@@ -764,6 +764,8 @@ pub struct RateLimitGuard<'a> {
     /// The account-dimension key — empty when the caller didn't
     /// supply one. Currently set by callers via `enter_with_account`.
     subject: String,
+    /// How log lines name `subject` ([`account_log_label`]).
+    subject_log: String,
     event_prefix: &'static str,
 }
 
@@ -777,7 +779,7 @@ impl<'a> RateLimitGuard<'a> {
         peer_ip: Option<IpAddr>,
         event_prefix: &'static str,
     ) -> Result<Self, Blocked> {
-        Self::enter_with_account(rl, headers, peer_ip, "", event_prefix).await
+        Self::enter_with_account(rl, headers, peer_ip, "", true, event_prefix).await
     }
 
     /// Like [`enter`], but also consults the per-account bucket. If
@@ -785,13 +787,18 @@ impl<'a> RateLimitGuard<'a> {
     /// guard returns `Err(Blocked)`. `subject` is the account key —
     /// `"bootstrap"` for the bootstrap password, the access-key-id
     /// for `login_as`, etc. Empty string degrades to per-IP only.
+    /// `subject_known`: whether the subject names a real account; an
+    /// unknown one may be a pasted secret and is logged only as a label
+    /// ([`account_log_label`]).
     pub async fn enter_with_account(
         rl: &'a RateLimiter,
         headers: &axum::http::HeaderMap,
         peer_ip: Option<IpAddr>,
         subject: &str,
+        subject_known: bool,
         event_prefix: &'static str,
     ) -> Result<Self, Blocked> {
+        let subject_log = account_log_label(subject, subject_known);
         let unspecified = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
         let ip = extract_client_ip_with_peer(headers, peer_ip).unwrap_or(unspecified);
         if let Some(retry_after) = rl.lockout_remaining(&ip) {
@@ -815,7 +822,7 @@ impl<'a> RateLimitGuard<'a> {
             tracing::warn!(
                 "SECURITY | event={}_brute_force_blocked | scope=account | subject={} | ip={}",
                 event_prefix,
-                sanitize_for_log(subject),
+                subject_log,
                 ip
             );
             return Err(Blocked {
@@ -832,6 +839,7 @@ impl<'a> RateLimitGuard<'a> {
             rl,
             ip,
             subject: subject.to_string(),
+            subject_log,
             event_prefix,
         })
     }
@@ -876,11 +884,22 @@ impl<'a> RateLimitGuard<'a> {
                 tracing::warn!(
                     "SECURITY | event={}_brute_force_lockout | scope=account | subject={} | ip={}",
                     self.event_prefix,
-                    sanitize_for_log(&self.subject),
+                    self.subject_log,
                     self.ip
                 );
             }
         }
+    }
+}
+
+/// How a log line names an account subject: a known one as written
+/// (control characters replaced), an unknown one as
+/// `security::unknown_access_key_label` (it may be a pasted secret).
+pub fn account_log_label(subject: &str, known: bool) -> String {
+    if known {
+        sanitize_for_log(subject)
+    } else {
+        crate::security::unknown_access_key_label(subject)
     }
 }
 
@@ -982,6 +1001,7 @@ mod tests {
                     &headers,
                     Some(ip.parse().unwrap()),
                     "bootstrap",
+                    true,
                     "t",
                 )
                 .await
@@ -1552,6 +1572,16 @@ mod tests {
     }
 
     #[test]
+    fn account_log_label_hides_an_unknown_subject() {
+        assert_eq!(account_log_label("bootstrap", true), "bootstrap");
+        assert_eq!(account_log_label("AK\nX", true), "AK?X");
+        let pasted = "wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY";
+        let label = account_log_label(pasted, false);
+        assert!(label.starts_with("unknown-key:"), "{label}");
+        assert!(!label.contains("wJalr"), "{label}");
+    }
+
+    #[test]
     fn trust_without_cidrs_is_a_boot_error() {
         let msg = proxy_trust_config_error(true, &[]).expect("error");
         assert!(msg.contains("DGP_TRUSTED_PROXY_CIDRS"), "{msg}");
@@ -1574,14 +1604,14 @@ mod tests {
         let rl = RateLimiter::new(100, Duration::from_secs(60), Duration::from_secs(60))
             .with_account_policy(3, Duration::from_secs(60), Duration::from_secs(60));
         let op = hdrs(&[("x-forwarded-for", "203.0.113.10")]);
-        RateLimitGuard::enter_with_account(&rl, &op, Some(ip("10.0.0.1")), "bootstrap", "t")
+        RateLimitGuard::enter_with_account(&rl, &op, Some(ip("10.0.0.1")), "bootstrap", true, "t")
             .await
             .unwrap()
             .record_success();
         for i in 1..=3 {
             let a = format!("198.51.100.{i}");
             let h = hdrs(&[("x-forwarded-for", a.as_str())]);
-            RateLimitGuard::enter_with_account(&rl, &h, Some(ip(&a)), "bootstrap", "t")
+            RateLimitGuard::enter_with_account(&rl, &h, Some(ip(&a)), "bootstrap", true, "t")
                 .await
                 .unwrap()
                 .record_failure();
@@ -1592,6 +1622,7 @@ mod tests {
             &forged,
             Some(ip("198.51.100.66")),
             "bootstrap",
+            true,
             "t",
         )
         .await;
