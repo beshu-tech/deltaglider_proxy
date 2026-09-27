@@ -143,3 +143,23 @@ test('a browser without remove() still gets the error', async () => {
   deps.picker = async () => h;
   await assert.rejects(downloadZip('/zip', 'a.zip', deps), /ZIP download failed \(502\)/);
 });
+
+// review4 frontend-6: createWritable() can throw after a 2xx (permission
+// revoked, file locked). The response body must be cancelled and a new
+// empty file deleted, like the other failure paths.
+test('createWritable throws after a 2xx: the body is cancelled, the new file is deleted', async () => {
+  const { calls, deps } = fakes(200);
+  let cancelled = false;
+  deps.fetch = (async () => new Response(new ReadableStream<Uint8Array>({
+    pull: (c) => c.enqueue(new Uint8Array([0x50, 0x4b])),
+    cancel: () => { cancelled = true; },
+  }), { status: 200 })) as typeof fetch;
+  const picker = deps.picker!;
+  deps.picker = async (opts) => {
+    const h = await picker(opts);
+    return { ...h, createWritable: async () => { throw new DOMException('locked', 'NoModificationAllowedError'); } };
+  };
+  await assert.rejects(downloadZip('/zip', 'a.zip', deps), /locked/);
+  assert.equal(cancelled, true, 'the response body is cancelled');
+  assert.equal(calls.removed, 1, 'the empty file is deleted');
+});

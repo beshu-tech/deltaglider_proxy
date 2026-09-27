@@ -135,7 +135,16 @@ export async function downloadZip(
     await discard();
     throw new Error('ZIP download failed: the server sent no data.');
   }
-  const writable = await handle.createWritable();
+  let writable: WritableStream<Uint8Array>;
+  try {
+    writable = await handle.createWritable();
+  } catch (e) {
+    // Permission revoked or file locked after a 2xx: release the connection
+    // and the empty file, like every other failure here.
+    await res.body.cancel().catch(() => {});
+    await discard();
+    throw e;
+  }
   // pipeTo closes the writable on success and aborts it when the connection
   // breaks: an aborted writable discards what it wrote and leaves the file's
   // previous content. A file that was new is deleted, like above.
