@@ -43,7 +43,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use super::super::AdminState;
+use super::super::{AdminError, AdminState};
 use super::write::{
     self, Built, ConfigWrite, EnvRefs, Mode, Outcome, Rejection, ScrubEnv, Stage, Surface,
     WriteResult,
@@ -169,7 +169,8 @@ pub async fn get_section(
         SectionName::Access => emit_section(section, sectioned.access, yaml_format),
         SectionName::Storage => emit_section(section, sectioned.storage, yaml_format),
         SectionName::Advanced => emit_section(section, sectioned.advanced, yaml_format),
-    };
+    }
+    .unwrap_or_else(IntoResponse::into_response);
     // The version a PUT sends back in `If-Match` (optimistic concurrency).
     resp.headers_mut()
         .insert(axum::http::header::ETAG, super::version::etag(&version));
@@ -183,7 +184,7 @@ fn emit_section<T: serde::Serialize>(
     section: SectionName,
     value: T,
     yaml_format: bool,
-) -> axum::response::Response {
+) -> Result<Response, AdminError> {
     if yaml_format {
         // Emit `<name>:\n  ...fields...` — matches the shape this same
         // block would take inside the full canonical YAML. The empty-
@@ -191,36 +192,24 @@ fn emit_section<T: serde::Serialize>(
         // and not an error; the client renders an editor seeded with
         // the section's defaults.
         let mut map = serde_yaml::Mapping::new();
-        let value_yaml = match serde_yaml::to_value(&value) {
-            Ok(v) => v,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to serialize section to YAML: {}", e),
-                )
-                    .into_response();
-            }
+        let yaml_err = |e: serde_yaml::Error| {
+            AdminError::internal(format!("failed to serialize section to YAML: {}", e))
         };
+        let value_yaml = serde_yaml::to_value(&value).map_err(yaml_err)?;
         map.insert(
             serde_yaml::Value::String(section.as_str().to_string()),
             value_yaml,
         );
         let doc = serde_yaml::Value::Mapping(map);
-        match serde_yaml::to_string(&doc) {
-            Ok(s) => (
-                StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, "application/yaml")],
-                s,
-            )
-                .into_response(),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to serialize section to YAML: {}", e),
-            )
-                .into_response(),
-        }
+        let s = serde_yaml::to_string(&doc).map_err(yaml_err)?;
+        Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/yaml")],
+            s,
+        )
+            .into_response())
     } else {
-        (StatusCode::OK, Json(value)).into_response()
+        Ok((StatusCode::OK, Json(value)).into_response())
     }
 }
 
