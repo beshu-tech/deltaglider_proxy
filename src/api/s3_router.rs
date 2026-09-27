@@ -26,6 +26,20 @@ fn is_acl_request(uri: &axum::http::Uri) -> bool {
     crate::api::request_target::RequestTarget::from_uri(uri).is_ok_and(|t| t.has_query("acl"))
 }
 
+/// Whether a response is a HEAD answer for a byte range. s3s applies
+/// `S3Response.status` only to custom routes, so HeadObject with `Range`
+/// left the adapter as 200 with a `Content-Range`; S3 answers 206
+/// (s3surface-6). GetObject gets its 206 from s3s itself.
+fn head_range_is_partial(
+    method: &axum::http::Method,
+    status: axum::http::StatusCode,
+    headers: &axum::http::HeaderMap,
+) -> bool {
+    method == axum::http::Method::HEAD
+        && status == axum::http::StatusCode::OK
+        && headers.contains_key(axum::http::header::CONTENT_RANGE)
+}
+
 /// Build the S3-compatible router with all routes and middleware layers.
 ///
 /// Backed by the `s3s` crate, which translates wire-level S3 protocol
@@ -115,7 +129,11 @@ where
         next: axum::middleware::Next,
     ) -> axum::response::Response {
         let is_acl_request = is_acl_request(request.uri());
+        let method = request.method().clone();
         let mut response = next.run(request).await;
+        if head_range_is_partial(&method, response.status(), response.headers()) {
+            *response.status_mut() = axum::http::StatusCode::PARTIAL_CONTENT;
+        }
         let request_id = response
             .headers()
             .get("x-amz-request-id")
@@ -413,7 +431,35 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::is_acl_request;
+    use super::{head_range_is_partial, is_acl_request};
+
+    #[test]
+    fn only_a_head_with_content_range_becomes_206() {
+        use axum::http::{header::CONTENT_RANGE, HeaderMap, Method, StatusCode};
+        let mut ranged = HeaderMap::new();
+        ranged.insert(CONTENT_RANGE, "bytes 1-3/4".parse().unwrap());
+        let plain = HeaderMap::new();
+        assert!(head_range_is_partial(
+            &Method::HEAD,
+            StatusCode::OK,
+            &ranged
+        ));
+        assert!(!head_range_is_partial(
+            &Method::HEAD,
+            StatusCode::OK,
+            &plain
+        ));
+        assert!(!head_range_is_partial(
+            &Method::GET,
+            StatusCode::OK,
+            &ranged
+        ));
+        assert!(!head_range_is_partial(
+            &Method::HEAD,
+            StatusCode::NOT_MODIFIED,
+            &ranged
+        ));
+    }
 
     #[test]
     fn acl_query_is_decoded_like_s3s() {

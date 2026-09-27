@@ -165,6 +165,19 @@ proxy installed the new engine before the refusal, so the new limit
 served requests while the config still showed the old one. Now every
 check runs first, and the new engine goes live as the last step.
 
+### Fixed — Conditional and range requests answer as S3 does
+
+A date condition compared the object's time to the nanosecond with an HTTP
+date, which has whole seconds only. So a client that sent back the exact
+`Last-Modified` it received got 200 for `If-Modified-Since` (never 304), and
+412 for `If-Unmodified-Since` and for a conditional copy. Now every date
+condition compares whole seconds. A 304 now carries `ETag` and
+`Last-Modified`, and no XML body headers. `If-Range` was ignored, so a resumed
+download of a changed object got new bytes after old ones; now a validator
+that does not match serves the whole object with 200. A suffix range on an
+empty object is 416 (it was a 206 that promised one byte and sent none), and
+a HEAD with `Range` answers 206 (it answered 200).
+
 ### Changed — A migrate to a filesystem backend is about twice as fast
 
 A migrate made every copy durable on its own before the next one (one

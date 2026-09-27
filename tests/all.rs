@@ -158,6 +158,8 @@ mod s3_backend_test;
 mod s3_compat_test;
 #[path = "s3_correctness_test.rs"]
 mod s3_correctness_test;
+#[path = "s3_edge_semantics_test.rs"]
+mod s3_edge_semantics_test;
 #[path = "s3_integration_test.rs"]
 mod s3_integration_test;
 #[path = "savings_test.rs"]

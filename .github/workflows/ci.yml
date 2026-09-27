@@ -348,6 +348,7 @@ jobs:
             s3_api_test:: \
             s3_backend_test:: \
             s3_compat_test:: \
+            s3_edge_semantics_test:: \
             s3_integration_test:: \
             status_endpoints_test:: \
             storage_resilience_test:: \

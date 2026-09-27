@@ -98,9 +98,6 @@ pub enum S3Error {
     #[error("InvalidRange: The requested range is not satisfiable.")]
     InvalidRange,
 
-    #[error("NotModified")]
-    NotModified { etag: String, last_modified: String },
-
     #[error("PreconditionFailed: At least one of the pre-conditions you specified did not hold.")]
     PreconditionFailed,
 
@@ -137,7 +134,6 @@ impl S3Error {
             S3Error::RequestTimeTooSkewed => "RequestTimeTooSkewed",
             S3Error::InvalidBucketName(_) => "InvalidBucketName",
             S3Error::InvalidRange => "InvalidRange",
-            S3Error::NotModified { .. } => "NotModified",
             S3Error::PreconditionFailed => "PreconditionFailed",
             S3Error::ServiceUnavailable(_) => "ServiceUnavailable",
         }
@@ -171,7 +167,6 @@ impl S3Error {
             S3Error::RequestTimeTooSkewed => StatusCode::FORBIDDEN,
             S3Error::InvalidBucketName(_) => StatusCode::BAD_REQUEST,
             S3Error::InvalidRange => StatusCode::RANGE_NOT_SATISFIABLE,
-            S3Error::NotModified { .. } => StatusCode::NOT_MODIFIED,
             S3Error::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
             S3Error::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
@@ -205,25 +200,6 @@ impl IntoResponse for S3Error {
     fn into_response(self) -> Response {
         let status = self.status_code();
         let request_id = uuid::Uuid::new_v4().to_string();
-
-        // NotModified has no body per HTTP spec, but MUST include ETag and Last-Modified (RFC 7232)
-        if let S3Error::NotModified {
-            ref etag,
-            ref last_modified,
-        } = self
-        {
-            let mut headers = axum::http::HeaderMap::new();
-            headers.insert(
-                "x-amz-request-id",
-                axum::http::HeaderValue::from_str(&request_id).unwrap(),
-            );
-            headers.insert("ETag", axum::http::HeaderValue::from_str(etag).unwrap());
-            headers.insert(
-                "Last-Modified",
-                axum::http::HeaderValue::from_str(last_modified).unwrap(),
-            );
-            return (status, headers).into_response();
-        }
 
         let body = self.to_xml(&request_id);
 

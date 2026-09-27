@@ -171,6 +171,7 @@ impl s3s::S3 for DeltaGliderS3Service {
         req: s3s::S3Request<s3s::dto::HeadObjectInput>,
     ) -> s3s::S3Result<s3s::S3Response<s3s::dto::HeadObjectOutput>> {
         let reader = Reader::of(&req.extensions);
+        let if_range = req.headers.get(axum::http::header::IF_RANGE).cloned();
         let input = req.input;
         let meta = self
             .state
@@ -188,11 +189,7 @@ impl s3s::S3 for DeltaGliderS3Service {
         )?;
 
         let mut output = head_object_output_from_metadata(&meta, reader)?;
-        let mut status = None;
-        if let Some(range) = input.range.as_ref() {
-            let checked = range
-                .check(meta.file_size)
-                .map_err(|_| s3s::s3_error!(InvalidRange))?;
+        if let Some(checked) = served_range(input.range.as_ref(), if_range.as_ref(), &meta)? {
             let range_len = checked.end.saturating_sub(checked.start);
             output.content_length = Some(i64::try_from(range_len).unwrap_or(i64::MAX));
             output.content_range = Some(format!(
@@ -201,11 +198,12 @@ impl s3s::S3 for DeltaGliderS3Service {
                 checked.end.saturating_sub(1),
                 meta.file_size
             ));
-            status = Some(axum::http::StatusCode::PARTIAL_CONTENT);
         }
 
+        // No `resp.status` here: s3s applies it only to custom routes. The
+        // router turns a HEAD with `Content-Range` into 206
+        // (`s3_router::head_range_is_partial`).
         let mut resp = s3s::S3Response::new(output);
-        resp.status = status;
         add_storage_debug_headers(&mut resp.headers, &meta);
         Ok(resp)
     }
@@ -219,6 +217,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             .extensions
             .get::<AuthenticatedUser>()
             .is_some_and(|u| u.is_anonymous());
+        let if_range = req.headers.get(axum::http::header::IF_RANGE).cloned();
         let input = req.input;
         check_response_overrides_allowed(&input, anonymous_principal)?;
         let engine = self.state.engine.load();
@@ -234,10 +233,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             input.if_unmodified_since.as_ref(),
         )?;
 
-        if let Some(range) = input.range.as_ref() {
-            let checked = range
-                .check(head.file_size)
-                .map_err(|_| s3s::s3_error!(InvalidRange))?;
+        if let Some(checked) = served_range(input.range.as_ref(), if_range.as_ref(), &head)? {
             let start = checked.start;
             let end_inclusive = checked.end.saturating_sub(1);
             let content_range = format!("bytes {start}-{end_inclusive}/{}", head.file_size);
@@ -252,8 +248,8 @@ impl s3s::S3 for DeltaGliderS3Service {
                 output.content_length = Some(i64::try_from(content_length).unwrap_or(i64::MAX));
                 output.content_range = Some(content_range);
                 apply_get_response_overrides(&input, &mut output);
-                let mut resp =
-                    s3s::S3Response::with_status(output, axum::http::StatusCode::PARTIAL_CONTENT);
+                // s3s answers 206 because `content_range` is set.
+                let mut resp = s3s::S3Response::new(output);
                 add_storage_debug_headers(&mut resp.headers, &metadata);
                 add_get_object_security_headers(&mut resp);
                 return Ok(resp);
@@ -282,8 +278,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             output.content_length = Some(i64::try_from(range_len).unwrap_or(i64::MAX));
             output.content_range = Some(content_range);
             apply_get_response_overrides(&input, &mut output);
-            let mut resp =
-                s3s::S3Response::with_status(output, axum::http::StatusCode::PARTIAL_CONTENT);
+            let mut resp = s3s::S3Response::new(output);
             add_storage_debug_headers(&mut resp.headers, &metadata);
             add_get_object_security_headers(&mut resp);
             return Ok(resp);
@@ -1996,7 +1991,7 @@ fn evaluate_copy_source_conditionals_s3s(
     if_unmodified_since: Option<&s3s::dto::Timestamp>,
 ) -> s3s::S3Result<()> {
     let current = parse_s3s_etag(&source_meta.etag())?;
-    let last_modified: s3s::dto::Timestamp = SystemTime::from(source_meta.created_at).into();
+    let last_modified = http_last_modified(source_meta);
 
     if let Some(cond) = if_match {
         let matches = cond.is_any()
@@ -2080,6 +2075,89 @@ fn query_flag(uri: &axum::http::Uri, key: &str, expected: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The byte range a GET or HEAD serves; `None` serves the whole object.
+///
+/// - s3s's `Range::check` accepts a suffix range on an empty object as `0..0`.
+///   S3 answers 416, and serving it sent `Content-Length: 1` with no body
+///   (s3surface-3). An empty range is `InvalidRange`.
+/// - s3s does not model `If-Range`. When it does not match the object, the
+///   client holds bytes of another version: a partial answer would splice new
+///   bytes onto old ones, so the whole object is served (RFC 9110 §13.1.5,
+///   s3surface-4). An entity tag matches only by strong comparison; a date
+///   matches only when it equals `Last-Modified`.
+fn served_range(
+    range: Option<&s3s::dto::Range>,
+    if_range: Option<&axum::http::HeaderValue>,
+    meta: &FileMetadata,
+) -> s3s::S3Result<Option<std::ops::Range<u64>>> {
+    let Some(range) = range else {
+        return Ok(None);
+    };
+    if let Some(validator) = if_range {
+        if !if_range_matches(validator, meta)? {
+            return Ok(None);
+        }
+    }
+    match range.check(meta.file_size) {
+        Ok(checked) if !checked.is_empty() => Ok(Some(checked)),
+        _ => Err(s3s::s3_error!(InvalidRange)),
+    }
+}
+
+/// Whether an `If-Range` validator names this object version. A value that
+/// is neither an entity tag nor an HTTP date matches nothing.
+fn if_range_matches(
+    validator: &axum::http::HeaderValue,
+    meta: &FileMetadata,
+) -> s3s::S3Result<bool> {
+    let raw = validator.as_bytes().trim_ascii();
+    if raw.starts_with(b"\"") || raw.starts_with(b"W/") {
+        let current = parse_s3s_etag(&meta.etag())?;
+        return Ok(s3s::dto::ETag::parse_http_header(raw)
+            .is_ok_and(|candidate| candidate.strong_cmp(&current)));
+    }
+    let Ok(text) = std::str::from_utf8(raw) else {
+        return Ok(false);
+    };
+    Ok(
+        s3s::dto::Timestamp::parse(s3s::dto::TimestampFormat::HttpDate, text)
+            .is_ok_and(|date| date == http_last_modified(meta)),
+    )
+}
+
+/// A 304 with the validators S3 sends (`ETag`, `Last-Modified`; RFC 9110
+/// §15.4.5). s3s writes an error's own headers IN PLACE of its XML ones, so
+/// the 304 also loses the `Content-Type`/`Content-Length` of a body that is
+/// never sent (s3surface-7).
+fn not_modified(etag: &s3s::dto::ETag, last_modified: &s3s::dto::Timestamp) -> s3s::S3Error {
+    let mut headers = axum::http::HeaderMap::new();
+    if let Ok(value) = etag.to_http_header() {
+        headers.insert(axum::http::header::ETAG, value);
+    }
+    let mut date = Vec::new();
+    if last_modified
+        .format(s3s::dto::TimestampFormat::HttpDate, &mut date)
+        .is_ok()
+    {
+        if let Ok(value) = axum::http::HeaderValue::from_bytes(&date) {
+            headers.insert(axum::http::header::LAST_MODIFIED, value);
+        }
+    }
+    let mut err = s3s::s3_error!(NotModified);
+    err.set_headers(headers);
+    err
+}
+
+/// `Last-Modified` at the precision the wire carries: whole seconds. An HTTP
+/// date has no sub-second part, so a date conditional that compared the
+/// nanosecond `created_at` failed for a client that sent back the exact
+/// `Last-Modified` it received (s3surface-1). Every date check uses this.
+fn http_last_modified(meta: &FileMetadata) -> s3s::dto::Timestamp {
+    let whole =
+        chrono::DateTime::from_timestamp(meta.created_at.timestamp(), 0).unwrap_or(meta.created_at);
+    SystemTime::from(whole).into()
+}
+
 fn evaluate_read_conditionals_s3s(
     meta: &FileMetadata,
     if_match: Option<&s3s::dto::ETagCondition>,
@@ -2088,7 +2166,7 @@ fn evaluate_read_conditionals_s3s(
     if_unmodified_since: Option<&s3s::dto::Timestamp>,
 ) -> s3s::S3Result<()> {
     let current = parse_s3s_etag(&meta.etag())?;
-    let last_modified: s3s::dto::Timestamp = SystemTime::from(meta.created_at).into();
+    let last_modified = http_last_modified(meta);
 
     if let Some(cond) = if_match {
         let matches = cond.is_any()
@@ -2111,12 +2189,12 @@ fn evaluate_read_conditionals_s3s(
                 .as_etag()
                 .is_some_and(|candidate| candidate.weak_cmp(&current));
         if matches {
-            return Err(s3s::s3_error!(NotModified));
+            return Err(not_modified(&current, &last_modified));
         }
         // AWS/S3: a passing If-None-Match wins over If-Modified-Since.
     } else if let Some(since) = if_modified_since {
         if last_modified <= *since {
-            return Err(s3s::s3_error!(NotModified));
+            return Err(not_modified(&current, &last_modified));
         }
     }
 
@@ -2555,7 +2633,7 @@ fn head_object_output_from_metadata(
     reader: Reader,
 ) -> s3s::S3Result<s3s::dto::HeadObjectOutput> {
     let e_tag = parse_s3s_etag(&meta.etag())?;
-    let last_modified: s3s::dto::Timestamp = SystemTime::from(meta.created_at).into();
+    let last_modified = http_last_modified(meta);
     let content_length = i64::try_from(meta.file_size).unwrap_or(i64::MAX);
     // Treat a blank content-type the same as absent: some backends return
     // the `content-type` header present-but-empty for objects stored without
@@ -3307,6 +3385,165 @@ mod tests {
                 .code(),
             &s3s::S3ErrorCode::BadDigest
         );
+    }
+
+    /// An object stored at 12:00:05.700, and an HTTP date `delta` whole
+    /// seconds from its `Last-Modified` (12:00:05).
+    fn meta_at_subsecond() -> FileMetadata {
+        let mut meta = FileMetadata::new_passthrough(
+            "k".to_string(),
+            "sha".to_string(),
+            "0123456789abcdef0123456789abcdef".to_string(),
+            3,
+            None,
+        );
+        meta.created_at = chrono::DateTime::from_timestamp(1_700_000_005, 700_000_000).unwrap();
+        meta
+    }
+
+    fn http_date(delta: i64) -> s3s::dto::Timestamp {
+        SystemTime::from(chrono::DateTime::from_timestamp(1_700_000_005 + delta, 0).unwrap()).into()
+    }
+
+    #[test]
+    fn date_conditionals_compare_at_http_date_precision() {
+        let meta = meta_at_subsecond();
+        let code = |r: s3s::S3Result<()>| r.err().map(|e| e.code().as_str().to_string());
+        // (delta, If-Modified-Since result, If-Unmodified-Since result)
+        let read_cases: &[(i64, Option<&str>, Option<&str>)] = &[
+            (-1, None, Some("PreconditionFailed")),
+            (0, Some("NotModified"), None),
+            (1, Some("NotModified"), None),
+        ];
+        for &(delta, ims, ius) in read_cases {
+            let d = http_date(delta);
+            let got = code(evaluate_read_conditionals_s3s(
+                &meta,
+                None,
+                None,
+                Some(&d),
+                None,
+            ));
+            assert_eq!(got.as_deref(), ims, "read If-Modified-Since, delta {delta}");
+            let got = code(evaluate_read_conditionals_s3s(
+                &meta,
+                None,
+                None,
+                None,
+                Some(&d),
+            ));
+            assert_eq!(
+                got.as_deref(),
+                ius,
+                "read If-Unmodified-Since, delta {delta}"
+            );
+        }
+        let copy_cases: &[(i64, Option<&str>, Option<&str>)] = &[
+            (-1, None, Some("PreconditionFailed")),
+            (0, Some("PreconditionFailed"), None),
+            (1, Some("PreconditionFailed"), None),
+        ];
+        for &(delta, ims, ius) in copy_cases {
+            let d = http_date(delta);
+            let got = code(evaluate_copy_source_conditionals_s3s(
+                &meta,
+                None,
+                None,
+                Some(&d),
+                None,
+            ));
+            assert_eq!(got.as_deref(), ims, "copy if-modified-since, delta {delta}");
+            let got = code(evaluate_copy_source_conditionals_s3s(
+                &meta,
+                None,
+                None,
+                None,
+                Some(&d),
+            ));
+            assert_eq!(
+                got.as_deref(),
+                ius,
+                "copy if-unmodified-since, delta {delta}"
+            );
+        }
+    }
+
+    #[test]
+    fn served_range_truth_table() {
+        let object = |size: u64| {
+            let mut meta = meta_at_subsecond();
+            meta.file_size = size;
+            meta
+        };
+        let range = |h: &str| s3s::dto::Range::parse(h).unwrap();
+        let hv = |v: &str| axum::http::HeaderValue::from_str(v).unwrap();
+        let four = object(4);
+        let etag = four.etag();
+        let lm = "Tue, 14 Nov 2023 22:13:25 GMT"; // 1_700_000_005, whole seconds
+        assert_eq!(http_last_modified(&four), http_date(0));
+        type Case<'a> = (
+            u64,
+            Option<&'a str>,
+            Option<String>,
+            Result<Option<(u64, u64)>, &'a str>,
+        );
+        let cases: &[Case] = &[
+            (4, None, None, Ok(None)),
+            (4, Some("bytes=1-"), None, Ok(Some((1, 4)))),
+            (4, Some("bytes=-2"), None, Ok(Some((2, 4)))),
+            (4, Some("bytes=9-"), None, Err("InvalidRange")),
+            // Empty object: no byte can be served.
+            (0, Some("bytes=-5"), None, Err("InvalidRange")),
+            (0, Some("bytes=0-"), None, Err("InvalidRange")),
+            // If-Range that names this version keeps the range.
+            (4, Some("bytes=1-"), Some(etag.clone()), Ok(Some((1, 4)))),
+            (4, Some("bytes=1-"), Some(lm.to_string()), Ok(Some((1, 4)))),
+            // Any other validator serves the whole object.
+            (4, Some("bytes=1-"), Some("\"deadbeef\"".into()), Ok(None)),
+            (4, Some("bytes=1-"), Some(format!("W/{etag}")), Ok(None)),
+            (
+                4,
+                Some("bytes=1-"),
+                Some("Tue, 14 Nov 2023 22:13:24 GMT".into()),
+                Ok(None),
+            ),
+            (
+                4,
+                Some("bytes=1-"),
+                Some("Tue, 14 Nov 2023 22:13:26 GMT".into()),
+                Ok(None),
+            ),
+            (4, Some("bytes=1-"), Some("garbage".into()), Ok(None)),
+            // If-Range without Range is ignored.
+            (4, None, Some("\"deadbeef\"".into()), Ok(None)),
+            // A stale validator on an empty object: full (empty) body, no 416.
+            (0, Some("bytes=-5"), Some("\"deadbeef\"".into()), Ok(None)),
+        ];
+        for (size, r, ir, want) in cases {
+            let meta = object(*size);
+            let r = r.map(range);
+            let ir = ir.as_deref().map(hv);
+            let got = served_range(r.as_ref(), ir.as_ref(), &meta)
+                .map(|o| o.map(|x| (x.start, x.end)))
+                .map_err(|e| e.code().as_str().to_string());
+            let want = want.map_err(str::to_string);
+            assert_eq!(got, want, "size {size}, range {r:?}, if-range {ir:?}");
+        }
+    }
+
+    #[test]
+    fn not_modified_carries_the_validators() {
+        let meta = meta_at_subsecond();
+        let d = http_date(0);
+        let err = evaluate_read_conditionals_s3s(&meta, None, None, Some(&d), None).unwrap_err();
+        assert_eq!(err.code().as_str(), "NotModified");
+        let headers = err.headers().expect("304 headers");
+        assert_eq!(headers.get("etag").unwrap(), meta.etag().as_str());
+        assert_eq!(
+            headers.get("last-modified").unwrap(),
+            "Tue, 14 Nov 2023 22:13:25 GMT"
+        );
+        assert!(headers.get("content-type").is_none());
     }
 
     #[test]
