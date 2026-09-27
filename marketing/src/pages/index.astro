@@ -196,8 +196,7 @@ import {
 
       <div class="term">
         <div class="term-bar" aria-hidden="true">
-          <span class="term-dots"><i></i><i></i><i></i></span>
-          <span class="term-title">terminal</span>
+          <span class="term-title">shell</span>
         </div>
         <pre class="term-pre"><code><span class="term-prompt">$</span> docker run --rm -it -p 9000:9000 -v dgp-data:/data \
     -e DGP_AUTHENTICATION=none \
@@ -212,11 +211,11 @@ import {
         locks it down</a>.
       </p>
 
-      <p style="margin-top: 1.5rem;">
+      <div class="hero-ctas">
         <a href="/docs/tutorials/first-delta-savings" class="btn btn-brand">Full tutorial</a>
-        <a href="/trial" class="btn" style="margin-left: 0.4rem;">30-day support trial</a>
-        <a href="https://github.com/beshu-tech/deltaglider_proxy" class="btn" style="margin-left: 0.4rem;">GitHub</a>
-      </p>
+        <a href="/trial" class="btn">30-day support trial</a>
+        <a href="https://github.com/beshu-tech/deltaglider_proxy" class="btn btn-ghost">GitHub</a>
+      </div>
     </div>
   </section>
 </BaseLayout>
@@ -316,10 +315,9 @@ import {
   .term {
     max-width: var(--measure-wide);
     border: 1px solid var(--rule-strong);
-    border-radius: 14px;
+    border-radius: var(--r-md);
     overflow: hidden;
     background: var(--panel-dark-bg);
-    box-shadow: var(--shadow-lg), 0 0 24px var(--brand-tint);
     margin: 1.75rem 0;
   }
 
@@ -327,22 +325,14 @@ import {
     display: flex;
     align-items: center;
     gap: 0.85rem;
-    padding: 0.7rem 1.1rem;
-    background: linear-gradient(180deg, rgba(30, 41, 59, 0.9), rgba(15, 23, 42, 0.9));
+    padding: 0.75rem 1.25rem;
     border-bottom: 1px solid var(--rule);
   }
-
-  .term-dots { display: inline-flex; gap: 7px; }
-  .term-dots i { width: 12px; height: 12px; border-radius: 50%; }
-  .term-dots i:nth-child(1) { background: #ff5f57; }
-  .term-dots i:nth-child(2) { background: #febc2e; }
-  .term-dots i:nth-child(3) { background: #28c840; }
 
   .term-title {
     font-family: var(--font-mono);
     font-size: 0.8rem;
     color: var(--panel-dark-ink-dim);
-    letter-spacing: 0.04em;
   }
 
   .term-pre {
