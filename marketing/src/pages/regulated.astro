@@ -1,4 +1,5 @@
 ---
+import Glyph from '../components/Glyph.astro';
 // /regulated — v5 plan §4.3.
 // Encryption + key custody story for regulated buyers (banks,
 // gov, research). Beshu customer-segment block above the fold,
@@ -44,8 +45,9 @@ const description =
           <a href="https://beshu.tech">Beshu Tech</a> built DeltaGlider.
           We are the team behind
           <a href="https://readonlyrest.com">ReadonlyREST</a>
-          (Elasticsearch security) since 2017. Customer references are in
-          the sidebar.
+          (Elasticsearch security) since 2017. On a wide screen, the
+          customer references are in the <a href="#references">sidebar</a>.
+          On a phone, they are at the <a href="#references">end of the page</a>.
         </p>
       </div>
 
@@ -53,11 +55,11 @@ const description =
         <div class="enc-pane enc-pane--yours">
           <span class="enc-tag">Your runtime</span>
           <div class="enc-file">
-            <span class="enc-file-icon">▤</span>
+            <Glyph name="file" bare size={20} />
             acme-db-20260611.dump · 2.1 GB
           </div>
           <div class="enc-keyrow">
-            <span class="enc-key-chip">⚿ AES-256 key</span>
+            <span class="enc-key-chip"><Glyph name="key" bare size={18} /> AES-256 key</span>
             <span class="enc-key-note">lives here and is never uploaded.</span>
           </div>
         </div>
@@ -204,7 +206,7 @@ de 60 3b f5 9a 04 c2 77 18 8d eb 56 a3 0f c4 29</pre>
       </section>
     </div>
 
-    <aside class="social-proof-sidebar">
+    <aside class="social-proof-sidebar" id="references">
       <div class="sidebar-sticky compact-social">
         <CustomerSegmentBlock />
         <TestimonialsBlock />
@@ -283,7 +285,6 @@ de 60 3b f5 9a 04 c2 77 18 8d eb 56 a3 0f c4 29</pre>
     white-space: nowrap;
     overflow: hidden;
   }
-  .enc-file-icon { color: var(--brand); font-size: 1.25rem; }
 
   .enc-keyrow {
     display: flex;
@@ -295,11 +296,14 @@ de 60 3b f5 9a 04 c2 77 18 8d eb 56 a3 0f c4 29</pre>
     font-family: var(--font-mono);
     font-size: 0.95rem;
     font-weight: 700;
-    color: var(--amber-ink);
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    color: var(--brand);
     padding: 0.45rem 0.8rem;
-    border: 1px solid var(--amber-line);
-    border-radius: 999px;
-    background: var(--amber-wash);
+    border: 1px solid var(--brand-line);
+    border-radius: var(--r-pill);
+    background: var(--brand-tint);
   }
   .enc-key-note { color: var(--ink-soft); font-size: 0.95rem; }
 
@@ -318,7 +322,7 @@ de 60 3b f5 9a 04 c2 77 18 8d eb 56 a3 0f c4 29</pre>
   .enc-arrow-line {
     flex: 1;
     height: 2px;
-    background: linear-gradient(90deg, var(--brand-glow), var(--rule));
+    background: var(--ink-faint);
     position: relative;
   }
   .enc-arrow-line::after {
