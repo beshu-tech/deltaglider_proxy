@@ -249,6 +249,14 @@ that does not match serves the whole object with 200. A suffix range on an
 empty object is 416 (it was a 206 that promised one byte and sent none), and
 a HEAD with `Range` answers 206 (it answered 200).
 
+### Fixed — An edit typed just after an apply is kept
+
+After an apply, a config panel read its section again and replaced the
+form with the result. An edit typed while that read was in flight was
+lost, and the panel showed no unsaved changes. Now the read replaces the
+form only when it has no new edits. Otherwise the edits stay, and the
+panel shows them as unsaved. The read also no longer hides the form.
+
 ### Changed — A migrate to a filesystem backend is about twice as fast
 
 A migrate made every copy durable on its own before the next one (one

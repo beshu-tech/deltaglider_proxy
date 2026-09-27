@@ -183,10 +183,15 @@ interface UseDirtySectionResult<T> {
   setValue: (next: T | ((prev: T) => T)) => void;
   /** Revert to the snapshot. */
   discard: () => void;
-  /** Reset the snapshot to `value` — call after a successful Apply. */
-  markApplied: () => void;
+  /** Reset the snapshot to `applied` (default: the current value) — call
+   *  after a successful Apply with the value that was actually sent. */
+  markApplied: (applied?: T) => void;
   /** Replace the snapshot outright (e.g. when the server resends new state). */
   resetWith: (next: T) => void;
+  /** Replace the snapshot with fresh server state, but replace the value
+   *  only when it is still clean: an edit made meanwhile survives and reads
+   *  dirty against the new snapshot. */
+  rebase: (next: T) => void;
 }
 
 /**
@@ -280,16 +285,22 @@ export function useDirtySection<T>(
     []
   );
   const discard = useCallback(() => setValueState(snapshotRef.current), []);
-  const markApplied = useCallback(() => {
-    snapshotRef.current = valueRef.current;
+  const markApplied = useCallback((applied?: T) => {
+    snapshotRef.current = applied === undefined ? valueRef.current : applied;
     forceRender(); // recompute isDirty
   }, []);
   const resetWith = useCallback((next: T) => {
     snapshotRef.current = next;
     setValueState(next);
   }, []);
+  const rebase = useCallback((next: T) => {
+    const before = snapshotRef.current;
+    snapshotRef.current = next;
+    setValueState((cur) => (jsonEq(cur, before) ? next : cur));
+    forceRender(); // the value may stay put while the snapshot moved
+  }, []);
 
-  return { value, isDirty, setValue, discard, markApplied, resetWith };
+  return { value, isDirty, setValue, discard, markApplied, resetWith, rebase };
 }
 
 /**

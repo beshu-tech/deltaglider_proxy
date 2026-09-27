@@ -8,7 +8,7 @@
  *   * fetch `getSection(section)` on mount → `resetWith()`
  *   * `useDirtySection` for snapshot/dirty/apply/discard
  *   * Apply flow: `validateSection` → open `ApplyDialog` → on confirm
- *     `putSection` → `markApplied` → refresh
+ *     `putSection` → `markApplied` → re-read without clobbering new edits
  *   * Snapshot the body at validate time (§F5 fix) so the diff and
  *     the subsequent PUT refer to the same payload even if the user
  *     keeps editing under the dialog
@@ -149,7 +149,7 @@ export function useSectionEditor<Wire, Local = Wire>(
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const queryClient = useQueryClient();
-  const { value, isDirty, setValue, discard, markApplied, resetWith } =
+  const { value, isDirty, setValue, discard, markApplied, resetWith, rebase } =
     useDirtySection<Local>(dirtyKey, initial);
 
   // `initial` / `pick` / `resetWith` are *expected* stable across renders, but
@@ -172,6 +172,9 @@ export function useSectionEditor<Wire, Local = Wire>(
   const [applyOpen, setApplyOpen] = useState(false);
   const [applyResponse, setApplyResponse] = useState<SectionApplyResponse | null>(null);
   const [pendingBody, setPendingBody] = useState<Wire | null>(null);
+  // The local value `pendingBody` was built from: after the PUT it becomes
+  // the snapshot, so an edit made under the dialog stays dirty.
+  const pendingLocalRef = useRef<Local | null>(null);
   const [applying, setApplying] = useState(false);
   // The version (ETag) of the section this editor's value is based on.
   const versionRef = useRef<string | null>(null);
@@ -183,24 +186,25 @@ export function useSectionEditor<Wire, Local = Wire>(
     [section]
   );
 
+  const toLocal = useCallback((body: Wire): Local => {
+    const currentPick = pickRef.current;
+    // Caller converts wire → local outright (subset OR shape-change).
+    if (currentPick) return currentPick(body);
+    // Full-body edit path: local === wire. Merge incoming into the initial
+    // so absent fields keep their form defaults (a bare `{}` on a fresh
+    // install).
+    return {
+      ...(initialRef.current as unknown as object),
+      ...(body as unknown as object),
+    } as Local;
+  }, []);
+
   const refresh = useCallback(async () => {
     try {
       setLoading(true);
       const { body, version } = await getSectionVersioned<Wire>(section);
       versionRef.current = version;
-      const currentPick = pickRef.current;
-      if (currentPick) {
-        // Caller converts wire → local outright (subset OR shape-change).
-        resetWithRef.current(currentPick(body));
-      } else {
-        // Full-body edit path: local === wire. Merge incoming into
-        // the initial so absent fields keep their form defaults
-        // (e.g. a bare `{}` on a fresh install).
-        resetWithRef.current({
-          ...(initialRef.current as unknown as object),
-          ...(body as unknown as object),
-        } as Local);
-      }
+      resetWithRef.current(toLocal(body));
       setError(null);
     } catch (e) {
       if (isSessionExpired(e)) {
@@ -214,7 +218,25 @@ export function useSectionEditor<Wire, Local = Wire>(
     // `initial` / `resetWith` / `pick` are read via refs (see above) so they
     // stay current without forcing a refetch on every render — hence they're
     // legitimately absent from the dep list.
-  }, [section, onSessionExpired, noun]);
+  }, [section, onSessionExpired, noun, toLocal]);
+
+  // Re-read server truth after our own apply WITHOUT the refresh() reset:
+  // the form stays mounted (no `loading` flip) and an edit typed while the
+  // GET is in flight survives as dirty against the new snapshot.
+  const rebaseAfterApply = useCallback(async () => {
+    const expected = versionRef.current;
+    try {
+      const { body, version } = await getSectionVersioned<Wire>(section);
+      // A sibling editor applied during the GET: this body may predate it,
+      // so keep the snapshot and version we already have.
+      if (versionRef.current !== expected) return;
+      versionRef.current = version;
+      rebase(toLocal(body));
+    } catch (e) {
+      // The apply itself succeeded; the snapshot is already the sent value.
+      if (isSessionExpired(e)) onSessionExpired?.();
+    }
+  }, [section, onSessionExpired, rebase, toLocal]);
 
   useEffect(() => {
     void refresh();
@@ -232,6 +254,7 @@ export function useSectionEditor<Wire, Local = Wire>(
     try {
       const resp = await validateSection<Wire>(section, snapshot);
       setApplyResponse(resp);
+      pendingLocalRef.current = value;
       setPendingBody(snapshot);
       setApplyOpen(true);
     } catch (e) {
@@ -309,7 +332,7 @@ export function useSectionEditor<Wire, Local = Wire>(
       message.success(
         resp.persisted_path ? `Applied + persisted to ${resp.persisted_path}` : 'Applied'
       );
-      markApplied();
+      markApplied(pendingLocalRef.current ?? undefined);
       setApplyOpen(false);
       setPendingBody(null);
       // Other panels read the full config via the cached `qk.config()`
@@ -317,7 +340,7 @@ export function useSectionEditor<Wire, Local = Wire>(
       // Groups banners, the section overviews, etc.). A section PUT changed
       // server truth, so invalidate that cache to refetch.
       void queryClient.invalidateQueries({ queryKey: qk.config() });
-      void refresh();
+      void rebaseAfterApply();
       return true;
     } catch (e) {
       if (e instanceof ConfigConflictError) {
@@ -338,7 +361,7 @@ export function useSectionEditor<Wire, Local = Wire>(
     } finally {
       setApplying(false);
     }
-  }, [section, pendingBody, markApplied, refresh, queryClient, openConflict]);
+  }, [section, pendingBody, markApplied, rebaseAfterApply, queryClient, openConflict]);
 
   // ⌘S wiring: when dirty, ⌘S opens the validate → ApplyDialog sequence.
   // Registered under dirtyKey so ⌘S reaches the active panel, not all

@@ -130,9 +130,11 @@ describe('dirty → validate → apply', () => {
     expect(result.current.pendingBody).toBeNull();
     expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.config() });
     expect(await screen.findByText('Applied + persisted to /etc/dgp.yaml')).toBeInTheDocument();
-    // markApplied + refresh: the section is re-read and the panel is clean.
+    // The section is re-read; the 999 typed under the dialog was not sent,
+    // so it stays in the form and reads dirty.
     await waitFor(() => expect(http.callsTo('GET', SECTION)).toHaveLength(2));
-    await waitFor(() => expect(result.current.isDirty).toBe(false));
+    expect(result.current.value.cache_size_mb).toBe(999);
+    expect(result.current.isDirty).toBe(true);
   });
 
   test('toPayload shapes the validated and PUT body', async () => {
