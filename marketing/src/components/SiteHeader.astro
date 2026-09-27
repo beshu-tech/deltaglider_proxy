@@ -237,7 +237,28 @@ import { NAV_LINKS } from '../lib/nav';
   }
 
   @media (max-width: 879px) {
+    .site-nav {
+      padding-top: 0.6rem;
+      padding-bottom: 0.6rem;
+      gap: 0.5rem;
+    }
+
+    /* Thumb-sized targets (44 px) for the brand link and both buttons. */
+    .brand {
+      min-height: 44px;
+    }
+
+    .theme-toggle,
+    .nav-toggle {
+      width: 44px;
+      height: 44px;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+    }
+
     .theme-toggle {
+      display: inline-flex;
       margin-left: auto;
     }
 
@@ -270,7 +291,7 @@ import { NAV_LINKS } from '../lib/nav';
 
     .site-nav-links a {
       display: block;
-      padding: 0.7rem 0.25rem;
+      padding: 0.8rem 0.25rem;
       border-bottom: 1px solid var(--rule);
     }
 
