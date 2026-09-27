@@ -187,15 +187,18 @@ pub fn lint(file: &str) -> i32 {
         return EXIT_REJECTED;
     }
 
-    // The flat shape ignores unknown root keys (no deny_unknown_fields, for
-    // old files): name them, a typo keeps the default silently otherwise.
-    let mut warnings = warnings;
+    // The flat shape ignores unknown root keys at load (no
+    // deny_unknown_fields, so old files still boot). Lint refuses them, as
+    // the sectioned shape refuses an unknown field: a typo keeps the
+    // default silently otherwise.
     if let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
-        warnings.extend(
-            crate::config::unknown_flat_root_keys(&doc)
-                .into_iter()
-                .map(|k| format!("unknown root key '{k}' is ignored")),
-        );
+        let unknown = crate::config::unknown_flat_root_keys(&doc);
+        if !unknown.is_empty() {
+            for k in &unknown {
+                eprintln!("error: unknown root key '{k}' (the proxy ignores it at load)");
+            }
+            return EXIT_PARSE;
+        }
     }
 
     for w in &warnings {
@@ -698,6 +701,19 @@ storage:
         .unwrap();
         let code = lint(path.to_str().unwrap());
         assert_eq!(code, EXIT_PARSE);
+    }
+
+    /// The flat shape loads with an unknown root key (old files must
+    /// boot), but lint refuses it, as the sectioned shape refuses an
+    /// unknown field: a typo keeps the default silently otherwise.
+    #[test]
+    fn lint_refuses_an_unknown_flat_root_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.yaml");
+        std::fs::write(&path, "listen_addr: \"0.0.0.0:9000\"\ncache_size_mbb: 64\n").unwrap();
+        assert_eq!(lint(path.to_str().unwrap()), EXIT_PARSE);
+        std::fs::write(&path, "listen_addr: \"0.0.0.0:9000\"\ncache_size_mb: 64\n").unwrap();
+        assert_eq!(lint(path.to_str().unwrap()), EXIT_OK);
     }
 
     #[test]

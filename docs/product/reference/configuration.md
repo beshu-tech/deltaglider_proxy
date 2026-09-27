@@ -61,7 +61,7 @@ advanced:    # process-level tunables
 
 Every section is optional. Fields equal to their default are omitted from canonical exports (`GET /api/admin/config/export`), keeping GitOps diffs minimal.
 
-The flat (pre-Phase-3) shape — root-level `listen_addr:`, `backend:`, etc. — still loads unchanged. Mixing the two shapes in one document is a hard parse error naming the conflicting keys. The sectioned shape refuses an unknown key. The flat shape ignores an unknown root key, so a typo such as `cache_size_mbb` keeps the default value. For this reason, the proxy logs a warning that names every unknown root key of a flat document, and `config lint` reports the key as a warning.
+The flat (pre-Phase-3) shape — root-level `listen_addr:`, `backend:`, etc. — still loads unchanged. Mixing the two shapes in one document is a hard parse error naming the conflicting keys. The sectioned shape refuses an unknown key. The flat shape ignores an unknown root key, so a typo such as `cache_size_mbb` keeps the default value. For this reason, the proxy logs a warning that names every unknown root key of a flat document, and `config lint` refuses the document with exit code `4`.
 
 The same document is editable from the admin UI. The form keeps section ownership visible and surfaces each field's YAML path on hover; environment-driven fields note their `DGP_*` variable inline in the help text.
 

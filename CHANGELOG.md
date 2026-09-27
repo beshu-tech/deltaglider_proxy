@@ -297,8 +297,10 @@ answers `400` with the reason, and nothing changes.
 
 A flat-shape config file ignored a root key that it did not know, so a
 typo such as `cache_size_mbb: 5` loaded as the default, with no message.
-Now the proxy logs a warning that names the key, and `config lint`
-reports it. The file still loads, so an existing file keeps working.
+Now the proxy logs a warning that names the key, and `config lint` refuses
+the file with exit code 4, the same answer as for an unknown key in the
+sectioned shape. The proxy still loads the file, so an existing file keeps
+working.
 
 ### Docs — Every environment variable is in the configuration reference
 
