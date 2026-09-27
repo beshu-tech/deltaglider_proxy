@@ -902,9 +902,9 @@ body.shell-wide { --shell: 1240px; }
 /* Touch screens have no hover: the code Copy button must always show, and
    the language tag (which it would cover) steps aside. */
 @media (hover: none) {
-  .docs-copy-btn { opacity: 1; transform: none; top: 6px; right: 6px; padding: 7px 12px; }
+  .docs-copy-btn { opacity: 1; transform: none; top: 6px; right: 6px; min-height: 44px; padding: 0 14px; }
   /* The always-visible button gets its own strip, so it never covers code. */
-  .docs-prose pre.has-copy { padding-top: 46px; }
+  .docs-prose pre.has-copy { padding-top: 56px; }
   .docs-prose .shiki-wrap[data-lang]::after { display: none; }
   .docs-search-kbd { display: none; }
   /* "Press ⌘K to search" means nothing without a keyboard. */
