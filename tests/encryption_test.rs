@@ -343,38 +343,45 @@ async fn test_sse_s3_roundtrip_through_s3_backend() {
     let got = get_object(&server, "sse-s3-target.txt").await;
     assert_eq!(got, plaintext);
 
-    // Verify the dg-encrypted-native marker was stamped (via HEAD).
-    let client = server.s3_client().await;
-    let head = client
-        .head_object()
+    // The proxy never shows its own `dg-*` metadata to clients, so read the
+    // stored object from MinIO directly: it must carry the native marker,
+    // MinIO's own SSE-S3 header, and no proxy-encryption marker.
+    let minio = common::minio_client().await;
+    let listed = minio
+        .list_objects_v2()
         .bucket(BUCKET)
-        .key("sse-s3-target.txt")
         .send()
         .await
-        .expect("HEAD should succeed");
-    // AWS SDK surfaces user-metadata as a lowercase-keyed map.
-    let dg_native = head
-        .metadata
-        .as_ref()
-        .and_then(|m| m.get("dg-encrypted-native"))
-        .map(|s| s.as_str());
+        .expect("list the backend bucket");
+    let stored_key = listed
+        .contents()
+        .iter()
+        .filter_map(|o| o.key())
+        .find(|k| k.ends_with("sse-s3-target.txt"))
+        .expect("the object is stored in the backend bucket")
+        .to_string();
+    let head = minio
+        .head_object()
+        .bucket(BUCKET)
+        .key(&stored_key)
+        .send()
+        .await
+        .expect("HEAD on the backend should succeed");
     assert_eq!(
-        dg_native,
-        Some("sse-s3"),
-        "SSE-S3 writes must stamp `dg-encrypted-native: sse-s3` in user-metadata, \
-         got metadata: {:?}",
-        head.metadata
+        head.server_side_encryption(),
+        Some(&aws_sdk_s3::types::ServerSideEncryption::Aes256),
+        "MinIO stored the object with SSE-S3"
     );
-
-    // Proxy-side encryption markers must NOT be set — native and
-    // proxy encryption are mutually exclusive on a given backend.
-    let dg_enc = head
-        .metadata
-        .as_ref()
-        .and_then(|m| m.get("dg-encrypted"))
-        .map(|s| s.as_str());
+    let meta = |k: &str| head.metadata().and_then(|m| m.get(k)).map(|s| s.as_str());
     assert_eq!(
-        dg_enc, None,
+        meta("dg-encrypted-native"),
+        Some("sse-s3"),
+        "SSE-S3 writes must stamp `dg-encrypted-native: sse-s3`, got metadata: {:?}",
+        head.metadata()
+    );
+    assert_eq!(
+        meta("dg-encrypted"),
+        None,
         "native-SSE objects must NOT carry the proxy `dg-encrypted` marker"
     );
 }
