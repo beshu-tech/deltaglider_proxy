@@ -21,13 +21,18 @@ import { rewriteDocLink, rewriteAssetSrc } from './docs';
 import { highlightCode } from './highlight';
 export { extractTitle, extractSummary } from './docText';
 
-/** GitHub-style heading slug: lower, strip punctuation, spaces→dashes. */
-function slugifyHeading(text: string): string {
+/**
+ * GitHub-compatible heading slug (the github-slugger rule that rehype-slug
+ * applies in the product viewer): lower-case, drop punctuation, and turn EACH
+ * space into a dash. Runs of spaces are NOT collapsed: "Server / Advanced"
+ * is "server--advanced", which is the anchor the markdown links use.
+ */
+export function slugifyHeading(text: string): string {
   return text
     .toLowerCase()
     .replace(/[^\w\s-]/g, '')
     .trim()
-    .replace(/\s+/g, '-');
+    .replace(/\s/g, '-');
 }
 
 /** Collect the visible text of a hast element (for heading ids). */
@@ -170,6 +175,9 @@ export interface TocEntry {
   depth: 2 | 3;
   id: string;
   text: string;
+  /** The label as HTML: plain text with the heading's `<code>` spans kept, so
+   *  a TOC entry like `--init` renders in the mono face, not as a dash. */
+  html: string;
 }
 
 /**
@@ -194,8 +202,12 @@ export function extractToc(html: string): TocEntry[] {
     // the version (+ title) spans directly — stripping all tags would mash
     // the adjacent spans into "v1.4.32026-06-18". `clVerTitle` returns null
     // for ordinary headings, so they fall through to plain stripTags.
-    const text = clVerTitle(inner) ?? stripTags(inner).trim();
-    if (text) out.push({ depth, id: idMatch[1], text });
+    const cl = clVerTitle(inner);
+    const text = cl ?? stripTags(inner).trim();
+    const html = cl
+      ? escapeHtml(cl)
+      : inner.replace(/<(?!\/?code\b)[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+    if (text) out.push({ depth, id: idMatch[1], text, html });
   }
   return out;
 }
@@ -211,6 +223,10 @@ function clVerTitle(headingInner: string): string | null {
   if (!ver) return null;
   const title = span('cl-title');
   return [stripTags(ver[1]).trim(), title && stripTags(title[1]).trim()].filter(Boolean).join(' — ');
+}
+
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 /** Strip inline tags + decode the entities that appear in heading text,

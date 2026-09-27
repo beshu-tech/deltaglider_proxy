@@ -4,7 +4,7 @@
 // can't silently break the changelog page's hover-date / ToC logic.
 
 import { describe, it, expect } from 'vitest';
-import { VERSION_HEADING_RE } from './renderDoc';
+import { VERSION_HEADING_RE, slugifyHeading } from './renderDoc';
 
 const parse = (h: string) => {
   const m = h.match(VERSION_HEADING_RE);
@@ -31,5 +31,17 @@ describe('VERSION_HEADING_RE', () => {
                        'Changed (breaking) — IAM permission templates are now `${iam:...}`']) {
       expect(parse(neg)).toBeNull();
     }
+  });
+});
+
+describe('slugifyHeading', () => {
+  it('matches the GitHub anchors the markdown links use', () => {
+    // Each space becomes a dash; a removed "/" or "—" leaves a double dash.
+    expect(slugifyHeading('Server / Advanced')).toBe('server--advanced');
+    expect(slugifyHeading('Access — authentication')).toBe('access--authentication');
+    expect(slugifyHeading('Jobs — one surface for everything background')).toBe('jobs--one-surface-for-everything-background');
+    expect(slugifyHeading('502 Bad Gateway / 504 Gateway Timeout on large uploads'))
+      .toBe('502-bad-gateway--504-gateway-timeout-on-large-uploads');
+    expect(slugifyHeading('The `legacy_key` shim')).toBe('the-legacy_key-shim');
   });
 });

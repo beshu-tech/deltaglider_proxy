@@ -50,7 +50,7 @@ let html: string | null = null;
 let groupDocs: { url: string; title: string }[] = [];
 
 // Doc-only reading affordances (server-rendered).
-let toc: { depth: 2 | 3; id: string; text: string }[] = [];
+let toc: { depth: 2 | 3; id: string; text: string; html: string }[] = [];
 let docTitle = '';
 let groupId = '';
 let editUrl = '';
@@ -146,7 +146,7 @@ const showToc = props.kind === 'doc' && toc.length >= 2;
         <ul>
           {toc.map((h) => (
             <li class={h.depth === 3 ? 'docs-toc-sub' : undefined}>
-              <a href={`#${h.id}`} data-toc-link={h.id}>{h.text}</a>
+              <a href={`#${h.id}`} data-toc-link={h.id} set:html={h.html} />
             </li>
           ))}
         </ul>
