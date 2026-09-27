@@ -1,0 +1,294 @@
+{
+  "doc_apply_400": {
+    "body": {
+      "applied": false,
+      "error": "YAML parse error: Parse error: did not find expected ',' or ']' at line 2 column 1, while parsing a flow sequence at line 1 column 11",
+      "persisted": false,
+      "requires_restart": false
+    },
+    "etag": true,
+    "status": 400
+  },
+  "doc_apply_403": {
+    "body": {
+      "applied": false,
+      "error": "bootstrap_password_hash cannot be changed via /config/apply; use PUT /api/admin/password (verifies the current password)",
+      "persisted": false,
+      "requires_restart": false
+    },
+    "etag": true,
+    "status": 403
+  },
+  "doc_apply_409": {
+    "body": {
+      "applied": false,
+      "current_version": "<normalised>",
+      "error": "config_conflict: the config changed after you loaded it (another tab, another admin, or a GitOps apply). Export it again and re-apply your edits.",
+      "persisted": false,
+      "requires_restart": false
+    },
+    "etag": true,
+    "status": 409
+  },
+  "doc_apply_422": {
+    "body": {
+      "applied": false,
+      "error": "Config transition refused (no state changed): removing the bootstrap SigV4 pair would leave the proxy without authentication: create an IAM admin user first, or set `authentication: none` explicitly",
+      "persisted": false,
+      "requires_restart": false,
+      "warnings": [
+        "proxy-level credentials are asymmetric in the applied YAML (access_key_id set, secret_access_key missing) — not cross-wiring the runtime secret; authentication will fail until both are supplied"
+      ]
+    },
+    "etag": true,
+    "status": 422
+  },
+  "doc_apply_empty": {
+    "body": {
+      "applied": false,
+      "error": "empty YAML body: apply requires a full canonical config document. Refusing to reset every field to its default.",
+      "persisted": false,
+      "requires_restart": false
+    },
+    "etag": true,
+    "status": 400
+  },
+  "doc_apply_lifecycle_400": {
+    "body": {
+      "applied": false,
+      "error": "lifecycle rule 'expire-old' delete action requires expire_after",
+      "persisted": false,
+      "requires_restart": false,
+      "warnings": [
+        "lifecycle rule 'expire-old' delete action requires expire_after"
+      ]
+    },
+    "etag": true,
+    "status": 400
+  },
+  "doc_apply_ok": {
+    "body": {
+      "applied": true,
+      "persisted": true,
+      "persisted_path": "<normalised>",
+      "requires_restart": false
+    },
+    "etag": true,
+    "status": 200
+  },
+  "doc_validate_400": {
+    "body": {
+      "error": "invalid log_level filter 'not==valid': expected a tracing-subscriber EnvFilter (e.g. 'info', 'deltaglider_proxy=debug')",
+      "ok": false
+    },
+    "etag": false,
+    "status": 400
+  },
+  "doc_validate_lifecycle_400": {
+    "body": {
+      "error": "lifecycle rule 'expire-old' delete action requires expire_after",
+      "ok": false
+    },
+    "etag": false,
+    "status": 400
+  },
+  "doc_validate_ok": {
+    "body": {
+      "ok": true
+    },
+    "etag": false,
+    "status": 200
+  },
+  "patch_409": {
+    "body": {
+      "current_version": "<normalised>",
+      "error": "config_conflict: the config changed after you loaded it (another tab, another admin, or a GitOps apply). Reload it and apply your edits again.",
+      "ok": false
+    },
+    "etag": true,
+    "status": 409
+  },
+  "patch_bad_bucket": {
+    "body": {
+      "error": "bucket `b1`: `public: true` and `public_prefixes: [\"x/\"]` cannot both be set on the same bucket — they are two syntaxes for the same concept. Use one: `public: true` for the entire bucket, or `public_prefixes: [...]` for specific key prefixes.",
+      "success": false
+    },
+    "etag": false,
+    "status": 400
+  },
+  "patch_ok": {
+    "body": {
+      "requires_restart": false,
+      "success": true,
+      "warnings": []
+    },
+    "etag": false,
+    "status": 200
+  },
+  "patch_transition_refused": {
+    "body": {
+      "requires_restart": false,
+      "success": true,
+      "warnings": [
+        "Failed to apply config patch: removing the bootstrap SigV4 pair would leave the proxy without authentication: create an IAM admin user first, or set `authentication: none` explicitly. Pre-patch config restored."
+      ]
+    },
+    "etag": false,
+    "status": 200
+  },
+  "patch_warnings_restart": {
+    "body": {
+      "requires_restart": true,
+      "success": true,
+      "warnings": [
+        "Invalid log_level 'not==valid': error parsing level filter: expected one of \"off\", \"error\", \"warn\", \"info\", \"debug\", \"trace\", or a number 0-5 — keeping current value",
+        "cache_size_mb changed to 999 — restart required"
+      ]
+    },
+    "etag": false,
+    "status": 200
+  },
+  "section_400": {
+    "body": {
+      "error": "invalid advanced section body at `max_delta_ratio`: invalid type: string \"not a number\", expected f32",
+      "ok": false,
+      "requires_restart": false
+    },
+    "etag": false,
+    "status": 400
+  },
+  "section_403": {
+    "body": {
+      "error": "bootstrap_password_hash cannot be changed via /config/section; use PUT /api/admin/password (verifies the current password)",
+      "ok": false,
+      "requires_restart": false
+    },
+    "etag": false,
+    "status": 403
+  },
+  "section_404": {
+    "body": {
+      "error": "unknown section 'nope'; valid names: admission, access, storage, advanced",
+      "ok": false,
+      "requires_restart": false
+    },
+    "etag": false,
+    "status": 404
+  },
+  "section_409": {
+    "body": {
+      "current_version": "<normalised>",
+      "error": "config_conflict: the 'advanced' section changed after you loaded it (another tab, another admin, or a GitOps apply). Reload it and apply your edits again.",
+      "ok": false
+    },
+    "etag": true,
+    "status": 409
+  },
+  "section_key_only": {
+    "body": {
+      "diff": {
+        "access": {
+          "access_key_id": {
+            "after": "HALFKEY",
+            "before": "GOLDKEY1"
+          }
+        }
+      },
+      "ok": true,
+      "persisted_path": "<normalised>",
+      "requires_restart": false
+    },
+    "etag": true,
+    "status": 200
+  },
+  "section_lifecycle_400": {
+    "body": {
+      "error": "lifecycle rule 'expire-old' delete action requires expire_after",
+      "ok": false,
+      "requires_restart": false
+    },
+    "etag": false,
+    "status": 400
+  },
+  "section_local_webhook": {
+    "body": {
+      "diff": {
+        "advanced": {
+          "event_delivery": {
+            "after": {
+              "batch_size": 50,
+              "delivered_max_rows": 10000,
+              "delivered_retention": "24h",
+              "enabled": true,
+              "format": "raw",
+              "max_attempts": 8,
+              "prune_batch": 100,
+              "request_timeout": "5s",
+              "retry_base": "5s",
+              "retry_max": "5m",
+              "slack_notify_kinds": [
+                "ObjectCreated"
+              ],
+              "stale_claim_after": "60s",
+              "tick_interval": "10s",
+              "webhook_urls": [
+                "http://127.0.0.1:5056/x"
+              ]
+            },
+            "before": null
+          }
+        }
+      },
+      "error": "Failed to apply section 'advanced' (no state changed): config refused: event_delivery.webhook_urls \"http://127.0.0.1:5056/x\" is refused by the outbound-URL policy: URL scheme 'http' is not allowed (use https://). Set event_delivery.allow_local: true for a receiver on http:// or a private address (cloud-metadata addresses are never allowed)",
+      "ok": false,
+      "requires_restart": false,
+      "warnings": [
+        "event_delivery.webhook_urls \"http://127.0.0.1:5056/x\" will be refused when events are delivered: URL scheme 'http' is not allowed (use https://). Set event_delivery.allow_local: true for a receiver on http:// or a private address"
+      ]
+    },
+    "etag": false,
+    "status": 422
+  },
+  "section_ok": {
+    "body": {
+      "diff": {
+        "advanced": {
+          "max_delta_ratio": {
+            "after": 0.41999998688697815,
+            "before": 0.5
+          }
+        }
+      },
+      "ok": true,
+      "persisted_path": "<normalised>",
+      "requires_restart": false
+    },
+    "etag": true,
+    "status": 200
+  },
+  "section_validate_400": {
+    "body": {
+      "error": "duplicate admission block name `dup` — block names must be unique across the chain",
+      "ok": false,
+      "requires_restart": false
+    },
+    "etag": false,
+    "status": 400
+  },
+  "section_validate_ok": {
+    "body": {
+      "diff": {
+        "advanced": {
+          "cache_size_mb": {
+            "after": 2048,
+            "before": 999
+          }
+        }
+      },
+      "ok": true,
+      "requires_restart": true
+    },
+    "etag": false,
+    "status": 200
+  }
+}

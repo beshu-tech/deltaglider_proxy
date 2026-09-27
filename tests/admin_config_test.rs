@@ -1684,3 +1684,185 @@ async fn enabling_config_sync_without_the_db_key_is_refused() {
         "the refused bucket must not be applied: {cfg}"
     );
 }
+
+// ═══════════════════════════════════════════════════
+// Write-surface contract (characterisation)
+// ═══════════════════════════════════════════════════
+
+/// Characterisation test for the three config write surfaces (field PATCH,
+/// section PUT/validate, document apply/validate): status, ETag presence and
+/// the full JSON body of every main arm, compared with a golden file. It
+/// pins what clients see while the write pipeline moves under them.
+#[tokio::test]
+async fn config_write_surfaces_answer_as_the_golden_file() {
+    let server = TestServer::builder()
+        .auth("GOLDKEY1", "GOLDSECRET1")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let url = |p: &str| format!("{}/_/api/admin/config{p}", server.endpoint());
+    let stale = "\"0000000000000000\"";
+    let bootstrap = common::TEST_BOOTSTRAP_PASSWORD_HASH;
+
+    let mut out = serde_json::Map::new();
+    async fn record(
+        out: &mut serde_json::Map<String, serde_json::Value>,
+        name: &str,
+        resp: reqwest::Response,
+    ) {
+        let status = resp.status().as_u16();
+        let etag = resp.headers().contains_key("etag");
+        let text = resp.text().await.unwrap();
+        let body = serde_json::from_str::<serde_json::Value>(&text)
+            .unwrap_or(serde_json::Value::String(text));
+        out.insert(
+            name.to_string(),
+            json!({ "status": status, "etag": etag, "body": normalise(body) }),
+        );
+    }
+    fn normalise(v: serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(m) => m
+                .into_iter()
+                .map(|(k, v)| match k.as_str() {
+                    "persisted_path" | "current_version" if !v.is_null() => {
+                        (k, json!("<normalised>"))
+                    }
+                    _ => (k, normalise(v)),
+                })
+                .collect(),
+            serde_json::Value::Array(a) => a.into_iter().map(normalise).collect(),
+            other => other,
+        }
+    }
+
+    // ── Field-level PATCH ──
+    let r = admin.put(url("")).json(&json!({ "max_delta_ratio": 0.5 }));
+    record(&mut out, "patch_ok", r.send().await.unwrap()).await;
+    let r = admin
+        .put(url(""))
+        .header("if-match", stale)
+        .json(&json!({ "max_delta_ratio": 0.4 }));
+    record(&mut out, "patch_409", r.send().await.unwrap()).await;
+    let r = admin
+        .put(url(""))
+        .json(&json!({ "access_key_id": "", "secret_access_key": "" }));
+    record(&mut out, "patch_transition_refused", r.send().await.unwrap()).await;
+    let r = admin.put(url("")).json(&json!({
+        "bucket_policies": { "b1": { "public": true, "public_prefixes": ["x/"] } }
+    }));
+    record(&mut out, "patch_bad_bucket", r.send().await.unwrap()).await;
+    let r = admin
+        .put(url(""))
+        .json(&json!({ "log_level": "not==valid", "cache_size_mb": 999 }));
+    record(&mut out, "patch_warnings_restart", r.send().await.unwrap()).await;
+
+    // ── Section PUT / validate ──
+    let adv = "/section/advanced";
+    let r = admin.put(url(adv)).json(&json!({ "max_delta_ratio": 0.42 }));
+    record(&mut out, "section_ok", r.send().await.unwrap()).await;
+    let r = admin
+        .put(url(adv))
+        .header("if-match", stale)
+        .json(&json!({ "max_delta_ratio": 0.41 }));
+    record(&mut out, "section_409", r.send().await.unwrap()).await;
+    let r = admin.put(url("/section/nope")).json(&json!({}));
+    record(&mut out, "section_404", r.send().await.unwrap()).await;
+    let r = admin
+        .put(url(adv))
+        .json(&json!({ "max_delta_ratio": "not a number" }));
+    record(&mut out, "section_400", r.send().await.unwrap()).await;
+    let r = admin
+        .put(url(adv))
+        .json(&json!({ "bootstrap_password_hash": "$2b$12$abcdefghijklmnopqrstuv" }));
+    record(&mut out, "section_403", r.send().await.unwrap()).await;
+    let r = admin
+        .put(url("/section/access"))
+        .json(&json!({ "access_key_id": "HALFKEY" }));
+    record(&mut out, "section_key_only", r.send().await.unwrap()).await;
+    let r = admin.put(url(adv)).json(&json!({
+        "event_delivery": { "enabled": true, "webhook_urls": ["http://127.0.0.1:5056/x"] }
+    }));
+    record(&mut out, "section_local_webhook", r.send().await.unwrap()).await;
+    let lifecycle = json!({ "lifecycle": { "enabled": true, "tick_interval": "1h", "rules": [{
+        "name": "expire-old", "enabled": true, "bucket": "b", "prefix": "",
+        "batch_size": 100, "include_globs": ["old/**"], "exclude_globs": []
+    }] } });
+    let r = admin.put(url("/section/storage")).json(&lifecycle);
+    record(&mut out, "section_lifecycle_400", r.send().await.unwrap()).await;
+    let r = admin
+        .post(url(&format!("{adv}/validate")))
+        .header("if-match", stale)
+        .json(&json!({ "cache_size_mb": 2048 }));
+    record(&mut out, "section_validate_ok", r.send().await.unwrap()).await;
+    let r = admin
+        .post(url("/section/admission/validate"))
+        .json(&json!({ "blocks": [
+            { "name": "dup", "match": {}, "action": "deny" },
+            { "name": "dup", "match": {}, "action": "deny" }
+        ] }));
+    record(&mut out, "section_validate_400", r.send().await.unwrap()).await;
+
+    // ── Document apply / validate ──
+    let exported = admin.get(url("/export")).send().await.unwrap();
+    let yaml = exported.text().await.unwrap();
+    let r = admin.post(url("/apply")).json(&json!({ "yaml": yaml }));
+    record(&mut out, "doc_apply_ok", r.send().await.unwrap()).await;
+    let r = admin
+        .post(url("/apply"))
+        .header("if-match", stale)
+        .json(&json!({ "yaml": yaml }));
+    record(&mut out, "doc_apply_409", r.send().await.unwrap()).await;
+    let r = admin
+        .post(url("/apply"))
+        .json(&json!({ "yaml": "advanced: [unclosed" }));
+    record(&mut out, "doc_apply_400", r.send().await.unwrap()).await;
+    let r = admin.post(url("/apply")).json(&json!({ "yaml": "  \n" }));
+    record(&mut out, "doc_apply_empty", r.send().await.unwrap()).await;
+    let changed_hash = yaml.replace(bootstrap, "$2b$12$abcdefghijklmnopqrstuv");
+    let with_hash = if changed_hash == yaml {
+        format!("{yaml}\n")
+            .replace("advanced:\n", "advanced:\n  bootstrap_password_hash: \"$2b$12$abcdefghijklmnopqrstuv\"\n")
+    } else {
+        changed_hash
+    };
+    let r = admin.post(url("/apply")).json(&json!({ "yaml": with_hash }));
+    record(&mut out, "doc_apply_403", r.send().await.unwrap()).await;
+    let r = admin.post(url("/validate")).json(&json!({ "yaml": yaml }));
+    record(&mut out, "doc_validate_ok", r.send().await.unwrap()).await;
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    doc["storage"]["lifecycle"] = serde_yaml::to_value(&lifecycle["lifecycle"]).unwrap();
+    let lc_yaml = serde_yaml::to_string(&doc).unwrap();
+    for (name, path) in [("doc_apply_lifecycle_400", "/apply"), ("doc_validate_lifecycle_400", "/validate")] {
+        let r = admin.post(url(path)).json(&json!({ "yaml": lc_yaml }));
+        record(&mut out, name, r.send().await.unwrap()).await;
+    }
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    doc["access"]["access_key_id"] = "OTHERKEY".into();
+    if let Some(m) = doc["access"].as_mapping_mut() {
+        m.remove("secret_access_key");
+    }
+    let half = serde_yaml::to_string(&doc).unwrap();
+    let r = admin.post(url("/apply")).json(&json!({ "yaml": half }));
+    record(&mut out, "doc_apply_422", r.send().await.unwrap()).await;
+    let r = admin
+        .post(url("/validate"))
+        .json(&json!({ "yaml": "advanced:\n  log_level: \"not==valid\"\n" }));
+    record(&mut out, "doc_validate_400", r.send().await.unwrap()).await;
+
+    let got = serde_json::to_string_pretty(&serde_json::Value::Object(out)).unwrap();
+    let golden_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/admin_config_write_contract.json"
+    );
+    let Ok(golden) = std::fs::read_to_string(golden_path) else {
+        // First run: record the golden file, then fail so it is reviewed.
+        std::fs::write(golden_path, format!("{got}\n")).unwrap();
+        panic!("golden file written to {golden_path}: review and commit it");
+    };
+    assert_eq!(
+        golden.trim(),
+        got.trim(),
+        "the config write responses changed; if on purpose, update {golden_path}"
+    );
+}
