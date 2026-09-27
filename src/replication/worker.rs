@@ -1545,7 +1545,6 @@ mod tests {
     /// detached heartbeat. A normal exit leaves the release to the caller.
     #[tokio::test]
     async fn dropped_run_releases_its_lease() {
-        use futures::FutureExt;
         let data = tempfile::tempdir().unwrap();
         let config = crate::config::Config::default();
         let backend: Box<dyn crate::storage::StorageBackend> = Box::new(
@@ -1597,17 +1596,38 @@ mod tests {
         let db = Arc::new(Mutex::new(ConfigDb::in_memory("t").unwrap()));
         run(db).await.unwrap();
         assert_eq!(released(), 0);
-        // Poll once (the run stops at its first storage I/O), then drop.
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("t").unwrap()));
-        assert!(run(db).now_or_never().is_none(), "the run must yield");
-        // The release runs in a spawned task that may wait on blocking DB
-        // work, so a fixed number of yields is not enough under load: poll
-        // with a real-time deadline.
+        // Abnormal exit: dropping the run's guard (a panic or a dropped run
+        // future) releases the lease. Tested on the guard itself: whether a
+        // single poll of `run_rule` gets past the guard depends on which
+        // storage I/O answers Pending first, which made a run-level version
+        // of this test flaky.
+        let keeper = spawn_lease_keeper(
+            "r",
+            Some(RunLease {
+                owner: "w".into(),
+                ttl_secs: 300,
+                heartbeat_secs: 60,
+            }),
+            lease.clone(),
+        );
+        let guard = RunLeaseGuard {
+            keeper,
+            release: Some((lease.clone(), "r".into(), "w".into())),
+        };
+        drop(guard);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         while released() == 0 && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            tokio::task::yield_now().await;
         }
-        assert_eq!(released(), 1, "the dropped run must release its lease");
+        assert_eq!(released(), 1, "the dropped guard must release its lease");
+        // finish() is the normal exit: the caller releases, the guard does not.
+        RunLeaseGuard {
+            keeper: None,
+            release: Some((lease.clone(), "r".into(), "w".into())),
+        }
+        .finish();
+        tokio::task::yield_now().await;
+        assert_eq!(released(), 1, "finish() must not release");
     }
 
     /// jobs-4 drift: the replication heartbeat read ANY renew error (one S3
