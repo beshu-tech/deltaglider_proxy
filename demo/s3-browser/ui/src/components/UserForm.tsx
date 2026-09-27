@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useId } from 'react';
 import { Input, Switch, Button, Alert, Space, Divider, Typography } from 'antd';
 import { ThunderboltOutlined, CheckCircleFilled, MinusCircleFilled, CrownFilled } from '@ant-design/icons';
 import type { IamUser, CreateUserRequest, UpdateUserRequest } from '../adminApi';
@@ -56,6 +56,7 @@ interface UserFormProps {
 }
 
 export default function UserForm({ user, readOnly = false, onSaved, onDeleted, onCancel, onCreated, onSavingChange, onNavigateToGroup }: UserFormProps) {
+  const uid = useId();
   const isEdit = user !== null;
   const { inputRadius } = useCardStyles();
   const colors = useColors();
@@ -242,9 +243,10 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
       </div>
 
       <div style={{ marginBottom: 16 }}>
-        <FormLabel text="Access Key ID" hint={isEdit ? undefined : '(auto-generated if empty)'} />
+        <FormLabel text="Access Key ID" hint={isEdit ? undefined : '(auto-generated if empty)'} htmlFor={`${uid}-akid`} />
         <Space.Compact style={{ width: '100%' }}>
           <Input
+            id={`${uid}-akid`}
             value={accessKeyId}
             onChange={e => setAccessKeyId(e.target.value)}
             placeholder={isEdit ? user?.access_key_id : 'e.g. user@company.com'}
@@ -259,9 +261,10 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
 
       {!readOnly && (
         <div style={{ marginBottom: 16 }}>
-          <FormLabel text="Secret Access Key" hint={isEdit ? undefined : '(auto-generated if empty)'} />
+          <FormLabel text="Secret Access Key" hint={isEdit ? undefined : '(auto-generated if empty)'} htmlFor={`${uid}-secret`} />
           <Space.Compact style={{ width: '100%' }}>
             <MaskedSecretInput
+              id={`${uid}-secret`}
               mode={isEdit ? 'blank-keeps' : 'new'}
               value={secretKey}
               onChange={setSecretKey}
@@ -274,8 +277,8 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
       )}
 
       <div style={{ marginBottom: 20, display: 'flex', alignItems: 'center', gap: 12 }}>
-        <FormLabel text="Enabled" />
-        <Switch checked={enabled} onChange={setEnabled} size="small" disabled={readOnly} />
+        <FormLabel text="Enabled" htmlFor={`${uid}-enabled`} />
+        <Switch id={`${uid}-enabled`} checked={enabled} onChange={setEnabled} size="small" disabled={readOnly} />
       </div>
 
       <Divider style={{ margin: '20px 0 12px' }}>Permissions</Divider>

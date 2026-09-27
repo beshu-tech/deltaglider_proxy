@@ -24,9 +24,12 @@ interface Props {
   rows?: number;
   placeholder?: string;
   style?: React.CSSProperties;
+  /** Forwarded to the textarea, so a FormField label names it. */
+  id?: string;
+  'aria-labelledby'?: string;
 }
 
-export default function GlobListTextArea({ value, onChange, rows = 3, placeholder, style }: Props) {
+export default function GlobListTextArea({ value, onChange, rows = 3, placeholder, style, id, 'aria-labelledby': labelledBy }: Props) {
   const [text, setText] = useState<string>(() => lines(value));
   // The last array we emitted, as a stable key, to tell our own echo apart from
   // a real external prop change.
@@ -53,6 +56,8 @@ export default function GlobListTextArea({ value, onChange, rows = 3, placeholde
 
   return (
     <Input.TextArea
+      id={id}
+      aria-labelledby={labelledBy}
       value={text}
       onChange={(e) => setText(e.target.value)}
       onBlur={commit}

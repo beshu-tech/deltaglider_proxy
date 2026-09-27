@@ -138,6 +138,7 @@ export function SectionYamlModal({ section, open, onClose }: SectionYamlModalPro
           />
         )}
         <Input.TextArea
+          aria-label="Section YAML"
           value={yaml}
           readOnly
           rows={accessEmptyExplainer ? 24 : 18}

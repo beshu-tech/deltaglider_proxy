@@ -385,9 +385,10 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
         background: colors.BG_CARD, border: `1px solid ${colors.BORDER}`, borderRadius: 8,
         padding: 16, marginBottom: 24,
       }}>
-        <div style={{ ...label, marginBottom: 8 }}>Preview</div>
+        <label htmlFor="mapping-preview-email" style={{ ...label, display: 'block', marginBottom: 8 }}>Preview</label>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <Input
+            id="mapping-preview-email"
             prefix={<SearchOutlined style={{ color: colors.TEXT_MUTED }} />}
             placeholder="Test email address..."
             value={previewEmail}

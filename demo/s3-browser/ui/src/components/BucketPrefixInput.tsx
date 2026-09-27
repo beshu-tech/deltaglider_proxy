@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, useId } from 'react';
 import { Button, Typography } from 'antd';
 import { listCommonPrefixes } from '../s3client';
 import { normalizePrefix } from '../storagePath';
@@ -35,6 +35,7 @@ export default function BucketPrefixInput({
   showHelp = true,
   style,
 }: BucketPrefixInputProps) {
+  const uid = useId();
   const colors = useColors();
   const [prefixOptions, setPrefixOptions] = useState<string[]>([]);
   const normalized = useMemo(() => normalizePrefix(value.prefix), [value.prefix]);
@@ -72,10 +73,11 @@ export default function BucketPrefixInput({
     <div style={{ ...style }}>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 10 }}>
       <div>
-        <Text type="secondary" style={{ display: 'block', fontSize: 11, fontWeight: 600, marginBottom: 4 }}>
+        <Text id={`${uid}-bucket`} type="secondary" style={{ display: 'block', fontSize: 11, fontWeight: 600, marginBottom: 4 }}>
           {bucketLabel}
         </Text>
         <SimpleAutoComplete
+          aria-labelledby={`${uid}-bucket`}
           value={value.bucket}
           onChange={(bucket) => onChange({ ...value, bucket })}
           options={buckets}
@@ -88,10 +90,11 @@ export default function BucketPrefixInput({
         </Text>
       </div>
       <div>
-        <Text type="secondary" style={{ display: 'block', fontSize: 11, fontWeight: 600, marginBottom: 4 }}>
+        <Text id={`${uid}-prefix`} type="secondary" style={{ display: 'block', fontSize: 11, fontWeight: 600, marginBottom: 4 }}>
           {prefixLabel}
         </Text>
         <SimpleAutoComplete
+          aria-labelledby={`${uid}-prefix`}
           value={value.prefix}
           onChange={(prefix) => onChange({ ...value, prefix })}
           onBlur={() => onChange({ ...value, prefix: normalized })}

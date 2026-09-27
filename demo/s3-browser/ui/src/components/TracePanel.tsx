@@ -179,9 +179,10 @@ export default function TracePanel({ onSessionExpired }: Props) {
           <FormField
             label="Authenticated"
             helpText="Whether the sample request is signed with credentials."
+            controlId="trace-authenticated"
           >
             <Space>
-              <Switch checked={authenticated} onChange={setAuthenticated} />
+              <Switch id="trace-authenticated" checked={authenticated} onChange={setAuthenticated} />
               <Text type="secondary" style={{ fontSize: 12 }}>
                 {authenticated
                   ? 'Signed (authenticated user).'

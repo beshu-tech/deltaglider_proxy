@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from 'react';
+import { useState, useEffect, useMemo, useCallback, useId } from 'react';
 import { Button, Typography, Alert, Input, Divider, Checkbox, message } from 'antd';
 import { FolderOutlined, CopyOutlined } from '@ant-design/icons';
 import type { IamGroup, IamUser } from '../adminApi';
@@ -289,6 +289,7 @@ interface GroupFormProps {
 }
 
 function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCancel, onSavingChange }: GroupFormProps) {
+  const uid = useId();
   const isEdit = group !== null;
   const { inputRadius } = useCardStyles();
 
@@ -425,8 +426,8 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
       </div>
 
       <div style={{ marginBottom: 16 }}>
-        <FormLabel text="Description" />
-        <Input value={description} onChange={e => setDescription(e.target.value)} placeholder="e.g. Development team access" disabled={readOnly} style={{ ...inputRadius }} />
+        <FormLabel text="Description" htmlFor={`${uid}-description`} />
+        <Input id={`${uid}-description`} value={description} onChange={e => setDescription(e.target.value)} placeholder="e.g. Development team access" disabled={readOnly} style={{ ...inputRadius }} />
       </div>
 
       <Divider style={{ margin: '16px 0 12px' }}>Permissions</Divider>
@@ -467,9 +468,9 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
               }}
               onClick={() => { if (!readOnly) toggleMember(user.id); }}
             >
-              <Checkbox checked={memberIds.has(user.id)} disabled={readOnly} />
+              <Checkbox checked={memberIds.has(user.id)} disabled={readOnly} aria-labelledby={`${uid}-member-${user.id}`} />
               <div style={{ flex: 1 }}>
-                <Text style={{ fontSize: 13 }}>{user.name}</Text>
+                <Text id={`${uid}-member-${user.id}`} style={{ fontSize: 13 }}>{user.name}</Text>
                 <Text type="secondary" style={{ fontSize: 11, marginLeft: 8, fontFamily: 'var(--font-mono)' }}>
                   {user.access_key_id}
                 </Text>

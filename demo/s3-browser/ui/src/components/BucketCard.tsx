@@ -21,7 +21,7 @@
  * for pre-provisioning drafts).
  */
 import { bucketNameError } from '../bucketName';
-import { useState } from 'react';
+import { useState, useId } from 'react';
 import { CAPABILITY_DOC_URL, docsUrlToInAppHref } from '../linkifyDocUrl';
 import { Button, Collapse, Input, InputNumber, Modal, Progress, Radio, Select, Typography } from 'antd';
 import { DownOutlined, RightOutlined, SyncOutlined } from '@ant-design/icons';
@@ -120,6 +120,7 @@ export default function BucketCard({
   maintenanceJob = null,
   onReencrypt,
 }: CardProps) {
+  const uid = useId();
   const colors = useColors();
   const [migrateOpen, setMigrateOpen] = useState(false);
 
@@ -311,6 +312,7 @@ export default function BucketCard({
         {onDraftNameChange ? (
           <span onClick={(e) => e.stopPropagation()} style={{ flex: 1, minWidth: 160 }}>
             <SimpleAutoComplete
+              aria-label="Bucket name"
               value={name}
               onChange={(v) => onDraftNameChange(v)}
               options={availableBuckets}
@@ -484,9 +486,10 @@ export default function BucketCard({
           {/* Placement — backend routing + the honest move. */}
           {backends.length > 0 && (
             <div style={{ marginTop: 14 }}>
-              <Text style={{ ...groupLabel, color: colors.TEXT_MUTED }}>Backend</Text>
+              <Text id={`${uid}-backend`} style={{ ...groupLabel, color: colors.TEXT_MUTED }}>Backend</Text>
               <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
                 <Select
+                  aria-labelledby={`${uid}-backend`}
                   value={eff.backend}
                   onChange={handleBackendChange}
                   size="small"
@@ -552,10 +555,11 @@ export default function BucketCard({
                 children: (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
                     <div style={formRow(8, { flexWrap: 'wrap' })}>
-                      <Text style={{ fontSize: 12, fontFamily: 'var(--font-ui)', color: colors.TEXT_MUTED, width: 150 }}>
+                      <Text id={`${uid}-compression`} style={{ fontSize: 12, fontFamily: 'var(--font-ui)', color: colors.TEXT_MUTED, width: 150 }}>
                         Compression
                       </Text>
                       <Select
+                        aria-labelledby={`${uid}-compression`}
                         size="small"
                         style={{ minWidth: 220, ...inputRadius }}
                         value={eff.compression === null ? 'inherit' : eff.compression ? 'on' : 'off'}
@@ -575,10 +579,11 @@ export default function BucketCard({
                     </div>
                     {eff.compression !== false && (
                       <div style={formRow(8, { flexWrap: 'wrap' })}>
-                        <Text style={{ fontSize: 12, color: colors.TEXT_MUTED, width: 150 }} title="A delta is kept only when delta-size / original-size is below this cutoff; otherwise the file is stored as-is.">
+                        <Text id={`${uid}-ratio`} style={{ fontSize: 12, color: colors.TEXT_MUTED, width: 150 }} title="A delta is kept only when delta-size / original-size is below this cutoff; otherwise the file is stored as-is.">
                           Delta size cutoff
                         </Text>
                         <InputNumber
+                          aria-labelledby={`${uid}-ratio`}
                           value={eff.max_delta_ratio ?? undefined}
                           onChange={(v) => onPatch({ max_delta_ratio: v ?? null })}
                           min={0}
@@ -591,10 +596,11 @@ export default function BucketCard({
                       </div>
                     )}
                     <div style={formRow(8, { flexWrap: 'wrap' })}>
-                      <Text style={{ fontSize: 12, color: colors.TEXT_MUTED, width: 150 }} title="Store this bucket under a different real name on the backend.">
+                      <Text id={`${uid}-alias`} style={{ fontSize: 12, color: colors.TEXT_MUTED, width: 150 }} title="Store this bucket under a different real name on the backend.">
                         Real name on backend
                       </Text>
                       <Input
+                        aria-labelledby={`${uid}-alias`}
                         value={eff.alias}
                         onChange={(e) => onPatch({ alias: e.target.value })}
                         placeholder={`same as name${name ? ` (${name})` : ''}`}
@@ -603,10 +609,11 @@ export default function BucketCard({
                       />
                     </div>
                     <div style={formRow(8, { flexWrap: 'wrap' })}>
-                      <Text style={{ fontSize: 12, color: colors.TEXT_MUTED, width: 150 }}>
+                      <Text id={`${uid}-quota`} style={{ fontSize: 12, color: colors.TEXT_MUTED, width: 150 }}>
                         Quota
                       </Text>
                       <InputNumber
+                        aria-labelledby={`${uid}-quota`}
                         value={eff.quota_bytes != null ? gibFromBytes(eff.quota_bytes) : undefined}
                         onChange={(v) => onPatch({ quota_bytes: v != null ? bytesFromGib(v) : null })}
                         min={0}

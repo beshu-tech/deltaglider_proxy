@@ -79,6 +79,11 @@ interface FormFieldProps {
   overrideColour?: string;
   /** The input element itself. */
   children: ReactNode;
+  /**
+   * The id of the control when it is not the single direct child (e.g. a
+   * Switch next to a status text): the label then points at it.
+   */
+  controlId?: string;
   /** Optional override for the outer container style. */
   style?: CSSProperties;
 }
@@ -126,6 +131,7 @@ export default function FormField({
   overrideColour,
   children,
   style,
+  controlId: explicitControlId,
 }: FormFieldProps) {
   const { TEXT_PRIMARY: TEXT, TEXT_MUTED, TEXT_FAINT, BG_CARD, BORDER, ACCENT_AMBER } = useColors();
   // THE env rule: a field that a `DGP_*` variable controls shows the
@@ -139,7 +145,7 @@ export default function FormField({
       : undefined;
   const baseId = useId();
   const labelId = `${baseId}-label`;
-  const controlId = controlIdOf(children, `${baseId}-control`);
+  const controlId = explicitControlId ?? controlIdOf(children, `${baseId}-control`);
   const barColour = overrideColour || ACCENT_AMBER; // amber — matches §2.6 "override" indicator
   // Tight groups, air between: the label→input→help unit hugs together; the
   // BIG gap lives at the bottom of the group so each field reads as one chunk.
@@ -237,7 +243,7 @@ export default function FormField({
           {envOverrideText(envOverride)}
         </div>
       ) : (
-        <div>{labelChild(children, controlId, labelId)}</div>
+        <div>{explicitControlId ? children : labelChild(children, controlId, labelId)}</div>
       )}
       {/* Help text — clearly subordinate: smaller, fainter, tight line-height.
           Example chips share this row. */}

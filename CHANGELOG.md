@@ -276,9 +276,8 @@ the wizard shows the error, and **Next** stays disabled.
 
 The admin forms showed each field's label as plain text that was not
 linked to its input. A screen reader announced most inputs and switches
-as "edit text" or "switch" with no name. Now every field in the shared
-field layout, and every field of the OIDC provider form, is named by its
-visible label.
+as "edit text" or "switch" with no name. Now every admin form control has
+a name: its visible label where it has one, else a short description.
 
 ### Fixed — A cleared provider display name is saved
 

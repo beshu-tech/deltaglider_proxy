@@ -15,7 +15,7 @@
  * testable in isolation and prevents it from accidentally stomping
  * sibling config.
  */
-import { useState } from 'react';
+import { useState, useId } from 'react';
 import { Alert, Button, Checkbox, Input, Select, Space, Typography } from 'antd';
 import {
   LockOutlined,
@@ -81,6 +81,7 @@ interface Props {
 }
 
 export default function BackendEncryptionEditor({ backendName, current, onApply, readOnly, onClearLegacy }: Props) {
+  const uid = useId();
   const colors = useColors();
   const { cardStyle, inputRadius } = useCardStyles();
 
@@ -317,10 +318,11 @@ export default function BackendEncryptionEditor({ backendName, current, onApply,
                 title="If you lose this key, encrypted objects on this backend are unrecoverable."
                 description="DeltaGlider does not back up your encryption key. Copy it to a password manager / secrets vault BEFORE clicking Apply."
               />
-              <span style={{ fontSize: 11, color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
+              <label htmlFor={`${uid}-key`} style={{ fontSize: 11, color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
                 Generated key (64 hex chars, shown ONCE)
-              </span>
+              </label>
               <Input.TextArea
+                id={`${uid}-key`}
                 value={pendingKey}
                 readOnly
                 autoSize={{ minRows: 2, maxRows: 2 }}
@@ -376,10 +378,11 @@ export default function BackendEncryptionEditor({ backendName, current, onApply,
 
           {pending.mode === 'sse-kms' && (
             <>
-              <span style={{ fontSize: 11, color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
+              <label htmlFor={`${uid}-kms`} style={{ fontSize: 11, color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
                 KMS key ARN or alias
-              </span>
+              </label>
               <Input
+                id={`${uid}-kms`}
                 value={pending.kms_key_id ?? ''}
                 onChange={(e) =>
                   setPending({ ...pending, kms_key_id: e.target.value })

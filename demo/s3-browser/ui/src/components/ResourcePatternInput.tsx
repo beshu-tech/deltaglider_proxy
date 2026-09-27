@@ -262,6 +262,7 @@ export default function ResourcePatternInput({ value, onChange, buckets = [], st
           <div key={row.id} style={{ display: 'flex', gap: 6, alignItems: 'center', width: '100%' }}>
             <div style={{ flex: 1, minWidth: 0 }} onFocusCapture={() => { setFocusedId(row.id); setLastFocusedId(row.id); }}>
               <SimpleAutoComplete
+                aria-label="Resource pattern"
                 value={row.text}
                 filterText={row.text}
                 autoComplete={`dgp-resource-${row.id}`}

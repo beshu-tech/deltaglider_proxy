@@ -380,6 +380,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
 
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
         <Input
+          aria-label="Search loaded rows"
           placeholder="Search loaded rows..."
           prefix={<SearchOutlined style={{ color: colors.TEXT_MUTED }} />}
           value={filter}
@@ -388,6 +389,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
           allowClear
         />
         <Select
+          aria-label="Status filter"
           value={status}
           onChange={(value) => {
             setStatus(value);
@@ -425,8 +427,8 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
           Purge failed ({counts.failed})
         </Button>
         <Space size={6}>
-          <Switch size="small" checked={autoRefresh} onChange={setAutoRefresh} />
-          <Text style={{ fontSize: 12, color: colors.TEXT_MUTED }}>Auto-refresh (3s)</Text>
+          <Switch id="outbox-auto-refresh" size="small" checked={autoRefresh} onChange={setAutoRefresh} />
+          <label htmlFor="outbox-auto-refresh" style={{ fontSize: 12, color: colors.TEXT_MUTED }}>Auto-refresh (3s)</label>
         </Space>
         <Text type="secondary" style={{ fontSize: 12 }}>
           {filtered.length} shown on this page · {total} total

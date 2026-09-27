@@ -105,10 +105,11 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
       />
       {bucket === null && (
         <div style={{ marginBottom: 12 }}>
-          <Text strong style={{ fontSize: 13, display: 'block', marginBottom: 6 }}>
+          <Text id="migrate-bucket-label" strong style={{ fontSize: 13, display: 'block', marginBottom: 6 }}>
             Bucket
           </Text>
           <Select
+            aria-labelledby="migrate-bucket-label"
             style={{ width: '100%' }}
             placeholder="Pick a bucket"
             value={pickedBucket}
@@ -121,10 +122,11 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
         </div>
       )}
       <div style={{ marginBottom: 12 }}>
-        <Text strong style={{ fontSize: 13, display: 'block', marginBottom: 6 }}>
+        <Text id="migrate-target-label" strong style={{ fontSize: 13, display: 'block', marginBottom: 6 }}>
           Target backend
         </Text>
         <Select
+          aria-labelledby="migrate-target-label"
           style={{ width: '100%' }}
           placeholder={
             targets.length === 0 ? 'No other backend available' : 'Pick the destination backend'

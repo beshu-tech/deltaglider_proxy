@@ -298,6 +298,7 @@ export default function CommandPalette({
     >
       <div style={{ padding: '14px 16px', borderBottom: `1px solid ${colors.BORDER}` }}>
         <Input
+          aria-label="Search pages and actions"
           ref={inputRef}
           size="large"
           placeholder="Type to filter pages or actions..."

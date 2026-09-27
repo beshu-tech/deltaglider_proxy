@@ -47,6 +47,10 @@ interface Props {
   style?: React.CSSProperties;
   /** Override browser autofill name (reduces “ghost” inline predictions on technical fields). */
   autoComplete?: string;
+  /** Forwarded to the input so a label can name it. */
+  id?: string;
+  'aria-label'?: string;
+  'aria-labelledby'?: string;
 }
 
 function normalizeGroups(options: string[] | undefined, optionGroups: AutoCompleteGroup[] | undefined): AutoCompleteGroup[] {
@@ -88,6 +92,9 @@ export default function SimpleAutoComplete({
   inputTitle,
   style,
   autoComplete = 'off',
+  id,
+  'aria-label': ariaLabel,
+  'aria-labelledby': ariaLabelledBy,
 }: Props) {
   const listId = useId();
   const colors = useColors();
@@ -154,6 +161,9 @@ export default function SimpleAutoComplete({
           autoCapitalize="off"
           autoCorrect="off"
           role="combobox"
+          id={id}
+          aria-label={ariaLabel}
+          aria-labelledby={ariaLabelledBy}
           aria-expanded={showDrop}
           aria-controls={showDrop ? listId : undefined}
           aria-activedescendant={

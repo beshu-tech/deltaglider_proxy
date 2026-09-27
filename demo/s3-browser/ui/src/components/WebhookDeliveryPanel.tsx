@@ -466,6 +466,7 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
                   renderRow={(row, update, remove) => (
                     <Space.Compact style={{ width: '100%' }}>
                       <Input
+                        aria-label="Endpoint URL"
                         value={row.url}
                         onChange={(e) => update({ url: e.target.value })}
                         placeholder="https://hooks.example.com/deltaglider"
@@ -517,12 +518,14 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
                   renderRow={(row, update, remove) => (
                     <Space.Compact style={{ width: '100%' }}>
                       <Input
+                        aria-label="Header name"
                         value={row.name}
                         onChange={(e) => update({ name: e.target.value })}
                         placeholder="Authorization"
                         style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 14, width: '40%' }}
                       />
                       <MaskedSecretInput
+                        aria-label="Header value"
                         mode="sentinel"
                         reveal
                         value={row.value}

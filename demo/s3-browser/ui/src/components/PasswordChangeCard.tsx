@@ -62,6 +62,7 @@ export default function PasswordChangeCard() {
 
         <input type="text" autoComplete="username" defaultValue="admin" aria-hidden="true" style={{ display: 'none' }} />
         <Input.Password
+          aria-label="Current admin password"
           placeholder="Current admin password"
           value={currentPassword}
           onChange={(e) => setCurrentPassword(e.target.value)}
@@ -69,6 +70,7 @@ export default function PasswordChangeCard() {
           style={inputRadius}
         />
         <Input.Password
+          aria-label="New admin password"
           placeholder="New admin password"
           value={newPassword}
           onChange={(e) => setNewPassword(e.target.value)}

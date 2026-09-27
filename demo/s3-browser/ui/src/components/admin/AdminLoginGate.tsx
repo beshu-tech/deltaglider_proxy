@@ -98,6 +98,7 @@ export function AdminLoginGate({ externalProviders, s3BrowserSessionOnly, initia
         )}
         {loginError && <Alert type="error" title={loginError} showIcon style={{ marginBottom: 16, borderRadius: 8 }} />}
         <Input.Password
+          aria-label="Admin password"
           placeholder="Admin password"
           value={password}
           onChange={e => setPassword(e.target.value)}

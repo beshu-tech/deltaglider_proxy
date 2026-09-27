@@ -51,3 +51,34 @@ test("a child's own aria-label wins over the FormField label", () => {
   );
   expect(screen.getByRole('switch')).toHaveAccessibleName('Serve HTTPS');
 });
+
+// The sweep behind controlsHaveLabels: spot-check that the names reach the
+// rendered DOM, for a visible-label link and for a Switch next to its text.
+test('a FormField with controlId names a Switch that is not its direct child', () => {
+  renderWithQuery(
+    <FormField label="Authenticated" controlId="sw">
+      <span>
+        <Switch id="sw" checked={false} onChange={() => {}} />
+        <span>Anonymous</span>
+      </span>
+    </FormField>,
+  );
+  expect(screen.getByRole('switch')).toHaveAccessibleName('Authenticated');
+});
+
+test('a mapping rule row names every control', async () => {
+  const { default: MappingRuleRow } = await import('../components/MappingRuleRow');
+  const colors = new Proxy({}, { get: () => '#000' }) as never;
+  renderWithQuery(
+    <MappingRuleRow
+      rule={{ id: 1, provider_id: null, priority: 0, match_type: 'claim_value', match_field: 'hd', match_value: 'acme', group_id: 2, created_at: '' }}
+      providers={[]}
+      groups={[{ id: 2, name: 'Engineering' } as never]}
+      colors={colors}
+      onUpdate={() => {}}
+      onDelete={() => {}}
+    />,
+  );
+  for (const name of ['Claim field', 'Match value']) expect(screen.getByRole('textbox', { name })).toBeInTheDocument();
+  for (const name of ['Match type', 'Assign to group', 'Provider']) expect(screen.getByRole('combobox', { name })).toBeInTheDocument();
+});

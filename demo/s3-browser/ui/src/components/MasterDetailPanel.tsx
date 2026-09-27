@@ -141,6 +141,7 @@ export default function MasterDetailPanel<T>({
               )}
             </div>
             <Input
+              aria-label={searchPlaceholder || 'Search'}
               prefix={<SearchOutlined style={{ color: colors.TEXT_MUTED }} />}
               placeholder={searchPlaceholder}
               value={search}

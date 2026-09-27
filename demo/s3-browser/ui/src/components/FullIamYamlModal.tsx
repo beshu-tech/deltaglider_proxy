@@ -223,6 +223,7 @@ export function FullIamYamlModal({ open, mode, onClose, onApplied }: Props) {
           </Paragraph>
           {error && <Alert type="error" title={error} showIcon />}
           <Input.TextArea
+            aria-label="Exported IAM YAML"
             value={yaml}
             readOnly
             rows={18}
@@ -259,6 +260,7 @@ export function FullIamYamlModal({ open, mode, onClose, onApplied }: Props) {
           </Paragraph>
 
           <Input.TextArea
+            aria-label="IAM YAML to import"
             value={yaml}
             onChange={(e) => {
               setYaml(e.target.value);

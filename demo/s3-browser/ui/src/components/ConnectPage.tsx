@@ -391,16 +391,16 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                 </div>
                 <div style={{ background: 'color-mix(in srgb, var(--input-bg) 78%, var(--glass-bg) 22%)', borderRadius: 12, padding: 16 }}>
                   <div style={{ marginBottom: 12 }}>
-                    <label style={{ fontSize: 11, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>Hash</label>
+                    <label htmlFor="recovered-hash" style={{ fontSize: 11, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>Hash</label>
                     <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
-                      <Input value={recoveredHash.hash} readOnly style={{ ...recoveryInputStyle, flex: 1, fontSize: 11 }} />
+                      <Input id="recovered-hash" value={recoveredHash.hash} readOnly style={{ ...recoveryInputStyle, flex: 1, fontSize: 11 }} />
                       <Button icon={<CopyOutlined />} onClick={() => copyToClipboard(recoveredHash.hash, 'Hash')} />
                     </div>
                   </div>
                   <div>
-                    <label style={{ fontSize: 11, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>Base64 (for Docker / env vars)</label>
+                    <label htmlFor="recovered-hash-base64" style={{ fontSize: 11, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>Base64 (for Docker / env vars)</label>
                     <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
-                      <Input value={recoveredHash.base64} readOnly style={{ ...recoveryInputStyle, flex: 1, fontSize: 11 }} />
+                      <Input id="recovered-hash-base64" value={recoveredHash.base64} readOnly style={{ ...recoveryInputStyle, flex: 1, fontSize: 11 }} />
                       <Button icon={<CopyOutlined />} onClick={() => copyToClipboard(recoveredHash.base64, 'Base64 hash')} />
                     </div>
                   </div>
@@ -444,10 +444,11 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                 </div>
                 {recoveryError && <Alert type="error" title={recoveryError} showIcon />}
                 <div>
-                  <label style={{ fontSize: 13, fontWeight: 600, color: TEXT_SECONDARY, fontFamily: "var(--font-ui)", marginBottom: 6, display: 'block' }}>
+                  <label htmlFor="recovery-key" style={{ fontSize: 13, fontWeight: 600, color: TEXT_SECONDARY, fontFamily: "var(--font-ui)", marginBottom: 6, display: 'block' }}>
                     Config DB Key or Legacy Password Hash
                   </label>
                   <Input.TextArea
+                    id="recovery-key"
                     value={recoveryPassword}
                     onChange={(e) => setRecoveryPassword(e.target.value)}
                     placeholder="config DB key, or $2b$12$... / base64-encoded hash"
@@ -563,8 +564,9 @@ export default function ConnectPage({ onConnect, showError }: Props) {
               {isBootstrap ? (
                 /* Bootstrap mode: password only */
                 <div>
-                  <label className="dg-login-label">Admin password</label>
+                  <label htmlFor="connect-admin-password" className="dg-login-label">Admin password</label>
                   <Input.Password
+                    id="connect-admin-password"
                     value={adminPassword}
                     onChange={(e) => setAdminPassword(e.target.value)}
                     onPressEnter={handleConnect}
@@ -581,8 +583,9 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                 /* IAM mode: access key + secret key */
                 <div className="dg-login-fields">
                   <div>
-                    <label className="dg-login-label">Access key ID</label>
+                    <label htmlFor="connect-access-key" className="dg-login-label">Access key ID</label>
                     <Input
+                      id="connect-access-key"
                       value={accessKey}
                       onChange={(e) => setAccessKey(e.target.value)}
                       placeholder="Access Key ID"
@@ -593,8 +596,9 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                   </div>
 
                   <div>
-                    <label className="dg-login-label">Secret access key</label>
+                    <label htmlFor="connect-secret-key" className="dg-login-label">Secret access key</label>
                     <Input.Password
+                      id="connect-secret-key"
                       value={secretKey}
                       onChange={(e) => setSecretKey(e.target.value)}
                       onPressEnter={handleConnect}

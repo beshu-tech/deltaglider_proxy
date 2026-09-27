@@ -232,6 +232,7 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
       {/* Toolbar */}
       <Space size="middle" style={{ flexWrap: 'wrap' }}>
         <Input
+          aria-label="Filter audit entries"
           size="middle"
           placeholder="Filter (action / user / ip / bucket / path)..."
           prefix={<SearchOutlined style={{ color: colors.TEXT_MUTED }} />}

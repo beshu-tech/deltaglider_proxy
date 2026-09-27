@@ -216,6 +216,7 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
 
       <Space wrap style={{ marginBottom: 16 }}>
         <Select
+          aria-label="Bucket"
           style={{ minWidth: 280 }}
           placeholder="Select bucket"
           value={bucket}
@@ -225,8 +226,9 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
         />
         <HoverHint hint="Skip folders with fewer than this many compressed files. Smaller folders don't have enough signal to draw a verdict from.">
           <span>
-            min deltas:{' '}
+            <label htmlFor="delta-efficiency-min-deltas">min deltas:</label>{' '}
             <InputNumber
+              id="delta-efficiency-min-deltas"
               size="small"
               min={1}
               max={1000}

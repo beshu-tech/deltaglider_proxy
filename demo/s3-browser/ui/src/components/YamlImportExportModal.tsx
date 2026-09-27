@@ -170,6 +170,7 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
           </Paragraph>
           {error && <Alert type="error" title={error} showIcon />}
           <Input.TextArea
+            aria-label="Exported YAML"
             value={yaml}
             readOnly
             rows={18}
@@ -210,6 +211,7 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
           </Paragraph>
 
           <Input.TextArea
+            aria-label="YAML to import"
             value={yaml}
             onChange={(e) => {
               setYaml(e.target.value);

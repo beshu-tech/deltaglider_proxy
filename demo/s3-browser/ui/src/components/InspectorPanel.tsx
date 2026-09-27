@@ -817,6 +817,7 @@ export default function InspectorPanel({
                     Expires in {SHARE_DURATIONS.find(d => d.seconds === shareDuration)?.label ?? 'unknown'}
                   </div>
                   <Input.TextArea
+                    aria-label="Share URL"
                     value={modalState.url}
                     readOnly
                     autoSize={{ minRows: 2, maxRows: 4 }}

@@ -44,6 +44,7 @@ export default function PrefixListEditor({
       renderRow={(prefix, update, remove) => (
         <div style={formRow(4)}>
           <Input
+            aria-label="Public prefix"
             value={prefix.value}
             onChange={(e) => update({ value: e.target.value })}
             onBlur={(e) => {

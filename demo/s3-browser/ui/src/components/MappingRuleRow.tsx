@@ -38,6 +38,7 @@ export default function MappingRuleRow({ rule, providers, groups, colors, onUpda
     }}>
       <Text style={{ fontSize: 12, color: colors.TEXT_MUTED, whiteSpace: 'nowrap' }}>When</Text>
       <Select
+        aria-label="Match type"
         size="small"
         disabled={disabled}
         value={rule.match_type}
@@ -49,6 +50,7 @@ export default function MappingRuleRow({ rule, providers, groups, colors, onUpda
         <>
           <Text style={{ fontSize: 12, color: colors.TEXT_MUTED }}>field</Text>
           <Input
+            aria-label="Claim field"
             size="small"
             disabled={disabled}
             value={rule.match_field}
@@ -59,6 +61,7 @@ export default function MappingRuleRow({ rule, providers, groups, colors, onUpda
       )}
       <Text style={{ fontSize: 12, color: colors.TEXT_MUTED }}>matches</Text>
       <Input
+        aria-label="Match value"
         size="small"
         disabled={disabled}
         value={rule.match_value}
@@ -73,6 +76,7 @@ export default function MappingRuleRow({ rule, providers, groups, colors, onUpda
       />
       <Text style={{ fontSize: 12, color: colors.TEXT_MUTED, whiteSpace: 'nowrap' }}>assign to</Text>
       <Select
+        aria-label="Assign to group"
         size="small"
         showSearch={{ optionFilterProp: 'label' }}
         disabled={disabled}
@@ -82,6 +86,7 @@ export default function MappingRuleRow({ rule, providers, groups, colors, onUpda
         style={{ width: 140 }}
       />
       <Select
+        aria-label="Provider"
         size="small"
         showSearch={{ optionFilterProp: 'label' }}
         disabled={disabled}

@@ -645,8 +645,8 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                   </FormField>
                   <div style={{ marginBottom: 20 }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <Switch checked={formForcePathStyle} onChange={setFormForcePathStyle} size="small" />
-                      <Text style={{ fontSize: 13, fontFamily: 'var(--font-ui)' }}>Force path-style URLs</Text>
+                      <Switch id="backend-force-path-style" checked={formForcePathStyle} onChange={setFormForcePathStyle} size="small" />
+                      <label htmlFor="backend-force-path-style" style={{ fontSize: 13, fontFamily: 'var(--font-ui)' }}>Force path-style URLs</label>
                     </div>
                     <Text type="secondary" style={{ fontSize: 11, display: 'block', marginTop: 4 }}>
                       Keep ON for S3-compatibles (MinIO, Hetzner, Ceph). Turn OFF for AWS S3.
@@ -669,8 +669,8 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
               )}
             </div>
             <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 8 }}>
-              <Switch checked={formSetDefault} onChange={setFormSetDefault} size="small" />
-              <Text style={{ fontSize: 13, fontFamily: 'var(--font-ui)' }}>Set as default backend</Text>
+              <Switch id="backend-set-default" checked={formSetDefault} onChange={setFormSetDefault} size="small" />
+              <label htmlFor="backend-set-default" style={{ fontSize: 13, fontFamily: 'var(--font-ui)' }}>Set as default backend</label>
             </div>
             {formError && (
               <Alert type="error" showIcon title={formError} style={{ marginTop: 16, borderRadius: 8 }} />

@@ -450,9 +450,10 @@ function WebhookModeFields({
               No webhook URL yet. Add the one Slack gave you.
             </Text>
           )}
-          {form.urlRows.map((row: WebhookUrlRow) => (
+          {form.urlRows.map((row: WebhookUrlRow, i: number) => (
             <Space.Compact key={row.id} style={{ width: '100%' }}>
               <Input
+                aria-label={`Incoming Webhook URL ${i + 1}`}
                 value={row.url}
                 onChange={(e) => updateUrl(row.id, e.target.value)}
                 placeholder="https://hooks.slack.com/services/T000/B000/xxxx"
@@ -574,9 +575,10 @@ function GlobRowsField({
             None.
           </Text>
         )}
-        {rows.map((row) => (
+        {rows.map((row, i) => (
           <Space.Compact key={row.id} style={{ width: '100%', maxWidth: 480 }}>
             <Input
+              aria-label={`${label} ${i + 1}`}
               value={row.glob}
               onChange={(e) => onUpdate(row.id, e.target.value)}
               placeholder={placeholder}
@@ -817,6 +819,7 @@ function LivePreview({
           </Text>
           <Space.Compact style={{ width: '100%', marginBottom: 12 }}>
             <Input
+              aria-label="Sample bucket"
               value={sampleBucket}
               onChange={(e) => onBucket(e.target.value)}
               placeholder="bucket"
@@ -824,6 +827,7 @@ function LivePreview({
               title="Sample bucket"
             />
             <Input
+              aria-label="Sample object key"
               value={sampleKey}
               onChange={(e) => onKey(e.target.value)}
               placeholder="path/to/key.zip"

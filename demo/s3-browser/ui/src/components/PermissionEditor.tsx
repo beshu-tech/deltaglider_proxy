@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useId } from 'react';
 import { Input, Button, Typography, Segmented, Alert } from 'antd';
 import { PlusOutlined, DeleteOutlined, FilterOutlined } from '@ant-design/icons';
 import { useCardStyles, usePermissionStyles } from './shared-styles';
@@ -36,6 +36,7 @@ interface PermissionEditorProps {
 }
 
 export default function PermissionEditor({ permissions, onChange }: PermissionEditorProps) {
+  const uid = useId();
   const { inputRadius } = useCardStyles();
   const { condLabelStyle, monoTextStyle } = usePermissionStyles();
   const colors = useColors();
@@ -375,13 +376,14 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
 
                   {/* aws:SourceIp condition */}
                   <div>
-                    <div style={condLabelStyle}>
+                    <label htmlFor={`${uid}-ip-${id}`} style={{ ...condLabelStyle, display: 'block' }}>
                       IP restriction
                       <span style={{ fontWeight: 400, textTransform: 'none', marginLeft: 6, opacity: 0.6 }}>
                         IpAddress on aws:SourceIp
                       </span>
-                    </div>
+                    </label>
                     <Input
+                      id={`${uid}-ip-${id}`}
                       value={ipVal}
                       onChange={e => updateRow(id, {
                         conditions: setConditionValue(row.conditions, 'IpAddress', 'aws:SourceIp', e.target.value),

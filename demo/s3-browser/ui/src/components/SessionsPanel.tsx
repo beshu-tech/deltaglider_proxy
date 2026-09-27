@@ -137,6 +137,7 @@ export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?:
       <Table rowKey="id" size="small" columns={columns} dataSource={rows} loading={loading} pagination={false} />
       <Space.Compact style={{ maxWidth: 480 }}>
         <Input
+          aria-label="Identity to force-logout"
           placeholder="identity to force-logout: access_key_id, or provider:user-id for external users"
           value={revokeKey}
           onChange={(e) => setRevokeKey(e.target.value)}

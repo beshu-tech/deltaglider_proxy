@@ -148,6 +148,7 @@ export default function LogsPanel({ onSessionExpired }: Props) {
       <Space wrap style={{ flexShrink: 0 }}>
         <FileTextOutlined style={{ color: c.TEXT_MUTED }} />
         <Select
+          aria-label="Minimum level"
           value={level ?? 'all'}
           onChange={(v) => setLevel(v === 'all' ? undefined : v)}
           style={{ width: 110 }}
@@ -160,6 +161,7 @@ export default function LogsPanel({ onSessionExpired }: Props) {
           ]}
         />
         <Input
+          aria-label="Target (module)"
           placeholder="target (module)…"
           value={target}
           onChange={(e) => setTarget(e.target.value)}
@@ -167,6 +169,7 @@ export default function LogsPanel({ onSessionExpired }: Props) {
           allowClear
         />
         <Input
+          aria-label="Search message and fields"
           prefix={<SearchOutlined />}
           placeholder="search message + fields…"
           value={q}
@@ -178,8 +181,8 @@ export default function LogsPanel({ onSessionExpired }: Props) {
           Refresh
         </Button>
         <Space size={4}>
-          <Switch checked={follow} onChange={setFollow} />
-          <Text type="secondary">Follow</Text>
+          <Switch id="logs-follow" checked={follow} onChange={setFollow} />
+          <label htmlFor="logs-follow"><Text type="secondary">Follow</Text></label>
         </Space>
         <Text type="secondary">{entries.length} lines</Text>
       </Space>

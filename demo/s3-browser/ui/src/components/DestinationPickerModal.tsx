@@ -27,9 +27,9 @@ function getModalTitle(mode: 'copy' | 'move', itemCount: number): string {
 }
 
 /** Uppercase field caption shared by the bucket/path inputs. */
-function SectionLabel({ color, children }: { color: string; children: React.ReactNode }) {
+function SectionLabel({ color, children, id }: { color: string; children: React.ReactNode; id?: string }) {
   return (
-    <Text style={{ fontSize: 12, fontWeight: 600, color, textTransform: 'uppercase', letterSpacing: 0.5, display: 'block', marginBottom: 6 }}>
+    <Text id={id} style={{ fontSize: 12, fontWeight: 600, color, textTransform: 'uppercase', letterSpacing: 0.5, display: 'block', marginBottom: 6 }}>
       {children}
     </Text>
   );
@@ -73,8 +73,9 @@ export default function DestinationPickerModal({ open, mode, itemCount, onConfir
       mask={{ closable: !loading }}
     >
       <div style={{ marginBottom: 16 }}>
-        <SectionLabel color={colors.TEXT_MUTED}>Destination Bucket</SectionLabel>
+        <SectionLabel id="dest-picker-bucket" color={colors.TEXT_MUTED}>Destination Bucket</SectionLabel>
         <Select
+          aria-labelledby="dest-picker-bucket"
           value={destBucket}
           onChange={setDestBucket}
           options={buckets.map(b => ({ value: b, label: b }))}
@@ -85,8 +86,9 @@ export default function DestinationPickerModal({ open, mode, itemCount, onConfir
       </div>
 
       <div style={{ marginBottom: 16 }}>
-        <SectionLabel color={colors.TEXT_MUTED}>Destination Path</SectionLabel>
+        <SectionLabel id="dest-picker-path" color={colors.TEXT_MUTED}>Destination Path</SectionLabel>
         <Input
+          aria-labelledby="dest-picker-path"
           value={destPrefix}
           onChange={e => setDestPrefix(e.target.value)}
           placeholder="/ (bucket root)"

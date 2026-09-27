@@ -97,6 +97,7 @@ export default function DocSearch({ docs, onSelect }: Props) {
   return (
     <div style={{ padding: '12px 12px 8px' }}>
       <Input
+        aria-label="Search the docs"
         ref={inputRef as never}
         prefix={<SearchOutlined style={{ color: colors.TEXT_FAINT, fontSize: 12 }} />}
         suffix={isActive ? (

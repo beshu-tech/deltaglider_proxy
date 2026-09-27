@@ -1,5 +1,5 @@
 import type { CSSProperties } from 'react';
-import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo, useId } from 'react';
 import { Table, Typography, Alert, Progress, Checkbox, theme, Button, Select } from 'antd';
 import { FolderOutlined, FileOutlined, LoadingOutlined, CalculatorOutlined, CloseCircleOutlined, WarningOutlined } from '@ant-design/icons';
 import type { S3Object } from '../types';
@@ -187,6 +187,7 @@ export default function ObjectTable({
   onCursorChange,
   onRowOrderChange,
 }: Props) {
+  const uid = useId();
   const { token } = theme.useToken();
   const { TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED, ACCENT_BLUE, ACCENT_AMBER, ACCENT_PURPLE, STORAGE_TYPE_COLORS, STORAGE_TYPE_DEFAULT } = useColors();
 
@@ -608,8 +609,9 @@ export default function ObjectTable({
             flexShrink: 0,
           }}
         >
-          <span>Rows per page</span>
+          <span id={`${uid}-rows`}>Rows per page</span>
           <Select
+            aria-labelledby={`${uid}-rows`}
             size="small"
             value={String(pageSize)}
             onChange={(v) => {
