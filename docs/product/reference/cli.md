@@ -24,7 +24,7 @@ Offline validation — the same pipeline as the admin API's `/config/validate`: 
 
 ## `config schema [--out <OUTPUT>]`
 
-Emits the JSON Schema for the canonical `Config` shape (generated from the schemars derives, so it tracks the struct automatically). Consumed by CI and YAML LSP autocompletion.
+Emits the JSON Schema for the canonical sectioned document, with the `admission`, `access`, `storage` and `advanced` sections at the root. This is the shape that `config export` and every admin save write. The schema comes from the schemars derives, so it follows the code automatically. CI and YAML LSP autocompletion consume it.
 
 ## `config defaults [--out <OUTPUT>]`
 

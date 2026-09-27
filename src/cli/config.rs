@@ -27,7 +27,7 @@ pub const EXIT_PARTIAL: i32 = 10;
 
 /// `config schema [--out <path>]`
 ///
-/// Emit the JSON Schema for the canonical Config shape. Produced from
+/// Emit the JSON Schema for the canonical sectioned shape. Produced from
 /// `schemars` derives at build time, so the schema tracks the struct
 /// automatically. Used by CI to publish `schema/deltaglider.schema.json` and
 /// by YAML LSP / editor autocomplete.
@@ -38,19 +38,26 @@ pub fn schema(output: Option<&str>) -> i32 {
 /// Produce the JSON Schema as a String (used by tests and callers that want
 /// the schema without spawning the process).
 pub fn schema_string() -> Result<String, ConfigError> {
-    let schema = schemars::schema_for!(Config);
+    let schema = canonical_schema();
     serde_json::to_string_pretty(&schema).map_err(|e| ConfigError::Parse(e.to_string()))
 }
 
+/// JSON Schema of the canonical document: the SECTIONED shape that export,
+/// persist and every doc example write. The flat runtime `Config` is only a
+/// legacy input shape; a YAML LSP fed its schema flags every canonical file.
+pub fn canonical_schema() -> schemars::schema::RootSchema {
+    schemars::schema_for!(crate::config_sections::SectionedConfig)
+}
+
 /// Shared emitter for `config schema` and `config defaults`. Both
-/// subcommands serialize `schemars::schema_for!(Config)` and write
+/// subcommands serialize [`canonical_schema`] and write
 /// the bytes to stdout or a file; the `label` parameter disambiguates
 /// the operator-facing stderr message ("wrote schema to ..." vs
 /// "wrote defaults to ..."). Splitting by label rather than cloning
 /// the whole function body keeps future schema-specific enhancements
 /// (e.g. `--resolve`, `--version`) trivial to add.
 fn emit_schema_json(output: Option<&str>, label: &str) -> i32 {
-    let schema = schemars::schema_for!(Config);
+    let schema = canonical_schema();
     let pretty = match serde_json::to_string_pretty(&schema) {
         Ok(s) => s,
         Err(e) => {
@@ -210,7 +217,7 @@ pub fn lint(file: &str) -> i32 {
 
 /// `config defaults [--out <path>]`
 ///
-/// Emit the JSON Schema for the current `Config` shape, which includes
+/// Emit the JSON Schema for the canonical sectioned shape, which includes
 /// every default value and the doc-comment description for every
 /// field (produced by schemars' `title` + `description` on schema
 /// properties). This is the CLI counterpart to the admin API's
@@ -627,6 +634,19 @@ mod tests {
         assert!(!is_cleartext_to_remote("not-a-url")); // ditto
     }
 
+    /// Review 4 config-4: the schema describes the SECTIONED document (the
+    /// canonical export, the persisted file and every doc example), not the
+    /// flat runtime struct.
+    #[test]
+    fn schema_root_is_the_sectioned_shape() {
+        let schema: serde_json::Value = serde_json::from_str(&schema_string().unwrap()).unwrap();
+        let props = schema["properties"].as_object().unwrap();
+        for section in ["admission", "access", "storage", "advanced"] {
+            assert!(props.contains_key(section), "schema lacks `{section}`");
+        }
+        assert!(!props.contains_key("listen_addr"), "flat key at the root");
+    }
+
     // ── Phase 4: lint + defaults ───────────────────────────────────────
 
     #[test]
@@ -730,14 +750,13 @@ storage:
         let content = std::fs::read_to_string(&path).unwrap();
         // Must be valid JSON and carry at least one known field.
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
-        let has_max_delta_ratio = parsed["properties"]["max_delta_ratio"].is_object()
-            || parsed["$defs"]
-                .as_object()
-                .map(|d| {
-                    d.values()
-                        .any(|v| v["properties"]["max_delta_ratio"].is_object())
-                })
-                .unwrap_or(false);
+        // Sectioned root: the field lives in a section definition.
+        let has_max_delta_ratio = ["$defs", "definitions"].iter().any(|k| {
+            parsed[k].as_object().is_some_and(|d| {
+                d.values()
+                    .any(|v| v["properties"]["max_delta_ratio"].is_object())
+            })
+        });
         assert!(
             has_max_delta_ratio,
             "defaults output must include max_delta_ratio, got:\n{content}"

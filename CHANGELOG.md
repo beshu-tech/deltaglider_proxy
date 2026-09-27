@@ -80,6 +80,14 @@ release has no generation and keeps the old rule. During a rolling upgrade,
 an instance on the older release does not merge copies from upgraded
 instances until it is upgraded too, as with every schema change.
 
+### Fixed — `config schema` describes the sectioned config file
+
+`config schema`, `config defaults` and `GET /_/api/admin/config/defaults`
+described the old flat shape, with keys such as `listen_addr` at the
+root. The export, the saved file and every doc example use the
+sectioned shape, so a YAML editor fed this schema flagged every
+canonical file. Now the schema has the four sections at the root.
+
 ### Fixed — Every file that `--init` writes starts the proxy
 
 The default answer to "Enable SigV4 authentication?" (no) wrote a file

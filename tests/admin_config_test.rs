@@ -376,12 +376,13 @@ async fn test_config_defaults_returns_schema() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let schema: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(schema["title"], "Config");
-    assert!(schema["properties"].is_object());
+    // The canonical (sectioned) document, like the export.
+    assert_eq!(schema["title"], "SectionedConfig");
     assert!(
-        schema["properties"]["max_delta_ratio"].is_object(),
-        "schema must describe max_delta_ratio field"
+        schema["properties"]["advanced"].is_object(),
+        "schema must describe the advanced section"
     );
+    assert!(schema["properties"]["listen_addr"].is_null(), "flat root key");
 }
 
 #[tokio::test]

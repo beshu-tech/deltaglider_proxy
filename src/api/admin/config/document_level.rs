@@ -200,8 +200,8 @@ pub async fn export_config(
 /// `GET /api/admin/config/defaults[?section=<name>]` — JSON Schema for
 /// the Config type, optionally scoped to one section.
 ///
-/// Default (no `section=`) returns the full Config schema (the legacy
-/// behaviour). With `?section=admission|access|storage|advanced`, the
+/// Default (no `section=`) returns the schema of the whole canonical
+/// (sectioned) document. With `?section=admission|access|storage|advanced`, the
 /// response is the JSON Schema for just that section's type — exactly
 /// what `monaco-yaml` needs when the UI's Monaco editor is bound to
 /// one section's scope. Wave 2 of the admin UI plan reads this for
@@ -210,7 +210,7 @@ pub async fn config_defaults(
     AdminQuery(query): AdminQuery<SectionFilterQuery>,
 ) -> impl IntoResponse {
     let schema = match query.section.as_deref() {
-        None => serde_json::to_value(schemars::schema_for!(crate::config::Config)),
+        None => serde_json::to_value(crate::cli::config::canonical_schema()),
         Some(name) => match SectionName::parse(name) {
             Some(SectionName::Admission) => serde_json::to_value(schemars::schema_for!(
                 crate::config_sections::AdmissionSection
