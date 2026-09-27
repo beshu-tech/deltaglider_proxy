@@ -109,6 +109,41 @@
   --font-sans: 'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, 'Menlo', 'Monaco', monospace;
 
+  /* Media overlays: text and veils drawn over a video or a lightbox, which
+     are dark in both themes. */
+  --media-ink: #ffffff;
+  --media-ink-on-brand: #081018;
+  --media-veil: rgba(8, 13, 24, 0.46);
+  --media-veil-strong: rgba(8, 13, 24, 0.58);
+  --media-button-bg: rgba(8, 13, 24, 0.55);
+  --media-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+  --overlay-bg: rgba(8, 12, 18, 0.5);
+  --overlay-shadow: 0 24px 60px rgba(8, 12, 18, 0.35);
+  --lightbox-bg: rgba(11, 15, 25, 0.85);
+
+  /* Docs (docs.css) */
+  /* Code panel: lighter than the page (--bg var(--bg)) so the "this is a
+     copyable command" surface reads as a distinct panel, not a void. Must stay
+     a step above --bg — if it ever drops below it the boundary disappears
+     (the old #070a12-on-#0b0f19 was ~1.03:1, invisible). Keep in lockstep with
+     the shiki theme bg in lib/highlight.ts (shiki writes it inline). */
+  --doc-code-bg: #1d2336;
+  --doc-code-border: #323c54;
+
+  /* A softer, desaturated blue used as an ACCENT on small eyebrow text —
+     replaces raw brand cyan (var(--brand)), which vibrates on near-black at small
+     sizes. Syntax-token colours (shiki) are untouched; this is chrome only. */
+  --doc-accent-blue: #7dd3fc;
+
+  /* In-prose link colour. Deliberately a CORNFLOWER BLUE, not cyan/teal — the
+     inline-code chips are cyan (--brand-dark var(--brand-dark)), so links get a clearly
+     different hue (blue, not green-blue) to stay unconfusable while still
+     reading as "this is a link" via colour, not just the underline. */
+  --doc-link: #8ab4ff;
+  --doc-link-hover: #b3ccff;
+  --doc-link-line: rgba(138, 180, 255, 0.45);
+  --doc-link-line-strong: rgba(138, 180, 255, 0.6);
+
   /* Type scale (1.25 ratio from 16 px). Sentence case everywhere. */
   --fs-display: clamp(2.5rem, 4.6vw, 3.75rem);
   --fs-h2: clamp(1.75rem, 3vw, 2.25rem);
@@ -216,4 +251,11 @@
   --panel-dark-ink: #cbd5e1;
   --panel-dark-ink-dim: #7c8aa0;
   --panel-dark-accent: #22d3ee;
+
+  /* Docs (docs.css) */
+  --doc-accent-blue: #155e75;
+  --doc-link: #2451b2;
+  --doc-link-hover: #16327a;
+  --doc-link-line: rgba(36, 81, 178, 0.45);
+  --doc-link-line-strong: rgba(36, 81, 178, 0.6);
 }

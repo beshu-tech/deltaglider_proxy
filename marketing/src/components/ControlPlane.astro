@@ -275,7 +275,7 @@ import Glyph from './Glyph.astro';
     overflow: visible;
   }
   .lightbox::backdrop {
-    background: rgba(11, 15, 25, 0.85);
+    background: var(--lightbox-bg);
     backdrop-filter: blur(12px);
     -webkit-backdrop-filter: blur(12px);
   }
@@ -284,7 +284,7 @@ import Glyph from './Glyph.astro';
     max-width: 100%;
     max-height: 90vh;
     border-radius: 8px;
-    box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+    box-shadow: var(--shadow-lg);
     object-fit: contain;
   }
   .lightbox-close-wrapper {

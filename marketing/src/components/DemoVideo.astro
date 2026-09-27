@@ -108,9 +108,9 @@
     /* A soft dark veil so the play icon reads over any poster frame. */
     background:
       radial-gradient(circle at center,
-        rgba(8, 13, 24, 0.30) 0%,
-        rgba(8, 13, 24, 0.46) 55%,
-        rgba(8, 13, 24, 0.58) 100%);
+        transparent 0%,
+        var(--media-veil) 55%,
+        var(--media-veil-strong) 100%);
     transition: opacity 0.25s ease, visibility 0.25s ease;
   }
   .demo-video-frame[data-state='playing'] .demo-video-play {
@@ -127,9 +127,9 @@
     width: 92px;
     height: 92px;
     border-radius: 50%;
-    background: rgba(8, 13, 24, 0.55);
-    border: 3px solid #fff;
-    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+    background: var(--media-button-bg);
+    border: 3px solid var(--media-ink);
+    box-shadow: var(--media-shadow);
     transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease;
   }
   /* CSS triangle play glyph (right-pointing), nudged right to optically
@@ -140,7 +140,7 @@
     margin-left: 6px;
     border-style: solid;
     border-width: 16px 0 16px 26px;
-    border-color: transparent transparent transparent #fff;
+    border-color: transparent transparent transparent var(--media-ink);
     transition: border-color 0.2s ease;
   }
   .demo-video-play:hover .demo-video-play__circle {
@@ -148,7 +148,7 @@
     border-color: var(--brand, var(--brand));
   }
   .demo-video-play:hover .demo-video-play__tri {
-    border-left-color: #081018;
+    border-left-color: var(--media-ink-on-brand);
   }
   .demo-video-play:focus-visible {
     outline: 3px solid var(--brand, var(--brand));
