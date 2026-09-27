@@ -587,15 +587,15 @@ hr {
 }
 
 .btn-brand {
-  background: var(--brand);
-  border-color: var(--brand);
+  background: var(--brand-fill);
+  border-color: var(--brand-fill);
   color: var(--bg);
   box-shadow: var(--shadow-glow);
 }
 
 .btn-brand:hover {
-  background: var(--brand-dark);
-  border-color: var(--brand-dark);
+  background: var(--brand-fill-hover);
+  border-color: var(--brand-fill-hover);
   color: var(--bg);
   transform: translateY(-2px) scale(1.02);
 }

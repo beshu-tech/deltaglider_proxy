@@ -22,6 +22,9 @@
   --brand-dark: #67e8f9;
   --brand-bright: #7dd3fc;
   --brand-soft: rgba(34, 211, 238, 0.1);
+  /* Solid brand fill behind text (primary button, selected chip). */
+  --brand-fill: var(--brand);
+  --brand-fill-hover: var(--brand-dark);
   /* Brand alpha tiers — the ONLY place translucent brand colour is
      spelled out. tint < wash < line-soft < line < glow. */
   --brand-tint: rgba(34, 211, 238, 0.07);
@@ -108,10 +111,15 @@
 :root[data-theme='light'] {
   color-scheme: light;
 
-  /* Brand — darker cyan so text and lines keep contrast on white */
-  --brand: #0891b2;
-  --brand-dark: #0e7490;
+  /* Brand — darker cyan so text and lines keep contrast on white.
+     #0891b2 was 3.4:1 as text on the page; #0e7490 is 5:1. */
+  --brand: #0e7490;
+  /* #0e7490 was 4.48:1 on the alt sections; #0d6f8a is 4.8:1. */
+  --brand-dark: #0d6f8a;
   --brand-bright: #155e75;
+  /* Page-white text on --brand (#0891b2) was 3.4:1; on --brand-dark 5.3:1. */
+  --brand-fill: var(--brand-dark);
+  --brand-fill-hover: var(--brand-bright);
   --brand-soft: rgba(8, 145, 178, 0.1);
   --brand-tint: rgba(8, 145, 178, 0.07);
   --brand-wash: rgba(8, 145, 178, 0.13);

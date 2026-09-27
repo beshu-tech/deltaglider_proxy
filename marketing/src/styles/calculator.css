@@ -107,7 +107,7 @@
   margin-top: 0.4rem;
   margin-bottom: 0;
   font-size: 0.8rem;
-  color: var(--ink-faint);
+  color: var(--ink-soft);
   line-height: 1.4;
   max-width: none;
 }
@@ -139,8 +139,8 @@
 }
 
 .region-buttons .btn-active {
-  background: var(--brand);
-  border-color: var(--brand);
+  background: var(--brand-fill);
+  border-color: var(--brand-fill);
   color: var(--bg);
   box-shadow: var(--shadow-glow);
 }
@@ -311,7 +311,7 @@
   font-size: 0.75rem;
   text-transform: uppercase;
   letter-spacing: 0.08em;
-  color: var(--ink-faint);
+  color: var(--ink-soft);
   font-family: var(--font-sans);
   border-bottom: 2px solid var(--rule-strong);
 }
@@ -474,8 +474,8 @@
 }
 
 .provider-chips .btn-active {
-  background: var(--brand);
-  border-color: var(--brand);
+  background: var(--brand-fill);
+  border-color: var(--brand-fill);
   color: var(--bg);
   box-shadow: var(--shadow-glow);
 }
@@ -623,7 +623,7 @@
 }
 
 .provider-bar-dgp {
-  background: var(--brand);
+  background: var(--brand-fill);
   color: var(--bg);
 }
 
