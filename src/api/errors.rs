@@ -56,9 +56,6 @@ pub enum S3Error {
     #[error("InvalidRequest: {0}")]
     InvalidRequest(String),
 
-    #[error("MalformedXML: The XML you provided was not well-formed.")]
-    MalformedXML,
-
     #[error("NoSuchUpload: The specified multipart upload does not exist.")]
     NoSuchUpload(String),
 
@@ -70,9 +67,6 @@ pub enum S3Error {
 
     #[error("BadDigest: The Content-MD5 you specified did not match what we received.")]
     BadDigest,
-
-    #[error("InvalidDigest: The Content-MD5 you specified is not valid.")]
-    InvalidDigest,
 
     #[error("NotImplemented: {0}")]
     NotImplemented(String),
@@ -125,12 +119,10 @@ impl S3Error {
             S3Error::KeyTooLong(_) => "KeyTooLongError",
             S3Error::MetadataTooLarge(_) => "MetadataTooLarge",
             S3Error::InvalidRequest(_) => "InvalidRequest",
-            S3Error::MalformedXML => "MalformedXML",
             S3Error::NoSuchUpload(_) => "NoSuchUpload",
             S3Error::InvalidPart(_) => "InvalidPart",
             S3Error::InvalidPartOrder => "InvalidPartOrder",
             S3Error::BadDigest => "BadDigest",
-            S3Error::InvalidDigest => "InvalidDigest",
             S3Error::NotImplemented(_) => "NotImplemented",
             S3Error::AccessDenied => "AccessDenied",
             S3Error::AccessDeniedReason(_) => "AccessDenied",
@@ -159,12 +151,10 @@ impl S3Error {
             S3Error::KeyTooLong(_) => StatusCode::BAD_REQUEST,
             S3Error::MetadataTooLarge(_) => StatusCode::BAD_REQUEST,
             S3Error::InvalidRequest(_) => StatusCode::BAD_REQUEST,
-            S3Error::MalformedXML => StatusCode::BAD_REQUEST,
             S3Error::NoSuchUpload(_) => StatusCode::NOT_FOUND,
             S3Error::InvalidPart(_) => StatusCode::BAD_REQUEST,
             S3Error::InvalidPartOrder => StatusCode::BAD_REQUEST,
             S3Error::BadDigest => StatusCode::BAD_REQUEST,
-            S3Error::InvalidDigest => StatusCode::BAD_REQUEST,
             S3Error::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             S3Error::AccessDenied => StatusCode::FORBIDDEN,
             S3Error::AccessDeniedReason(_) => StatusCode::FORBIDDEN,
@@ -215,6 +205,88 @@ impl IntoResponse for S3Error {
             axum::http::HeaderValue::from_str(&request_id).unwrap(),
         );
         response
+    }
+}
+
+/// THE mapping from the proxy's error vocabulary to the s3s wire error.
+/// Exhaustive on purpose: a new variant cannot fall into a silent 500.
+impl From<S3Error> for s3s::S3Error {
+    fn from(err: S3Error) -> Self {
+        match err {
+            S3Error::NoSuchKey(_) => s3s::s3_error!(NoSuchKey),
+            S3Error::NoSuchBucket(_) => s3s::s3_error!(NoSuchBucket),
+            S3Error::BucketAlreadyExists(_) => s3s::s3_error!(BucketAlreadyExists),
+            S3Error::BucketNotEmpty(_) => s3s::s3_error!(BucketNotEmpty),
+            S3Error::EntityTooLarge { .. } => s3s::s3_error!(EntityTooLarge),
+            S3Error::EntityTooLargeReason(msg) => s3s::s3_error!(EntityTooLarge, "{}", msg),
+            S3Error::InvalidArgument(msg) => s3s::s3_error!(InvalidArgument, "{}", msg),
+            S3Error::KeyTooLong(msg) => s3s::s3_error!(KeyTooLongError, "{}", msg),
+            S3Error::MetadataTooLarge(msg) => s3s::s3_error!(MetadataTooLarge, "{}", msg),
+            S3Error::InvalidRequest(msg) => s3s::s3_error!(InvalidRequest, "{}", msg),
+            S3Error::NoSuchUpload(id) => {
+                // Multipart upload state is in-memory and PER-INSTANCE. Behind a
+                // non-sticky load balancer, an UploadPart/Complete that lands on a
+                // different node than CreateMultipartUpload sees no such upload —
+                // indistinguishable, to the client, from a genuinely-missing id. The
+                // proxy can't tell the two apart, so we don't warn (would spam
+                // single-instance logs on legitimate retries-after-abort), but we DO
+                // enrich the client-visible message so an operator behind an LB has a
+                // pointer instead of a bare NoSuchUpload. debug-level for diagnosis.
+                tracing::debug!(
+                    "NoSuchUpload for upload_id={id} (multipart state is per-instance)"
+                );
+                s3s::s3_error!(
+                    NoSuchUpload,
+                    "the upload id is unknown to this instance; multipart upload state is \
+                     per-instance — behind a load balancer, pin multipart requests to one \
+                     node (sticky sessions)"
+                )
+            }
+            S3Error::InvalidPart(msg) => s3s::s3_error!(InvalidPart, "{}", msg),
+            S3Error::InvalidPartOrder => s3s::s3_error!(InvalidPartOrder),
+            S3Error::InvalidBucketName(msg) => s3s::s3_error!(InvalidBucketName, "{}", msg),
+            S3Error::AccessDenied => s3s::s3_error!(AccessDenied),
+            S3Error::AccessDeniedReason(msg) => s3s::s3_error!(AccessDenied, "{}", msg),
+            S3Error::PreconditionFailed => s3s::s3_error!(PreconditionFailed),
+            S3Error::NotImplemented(msg) => s3s::s3_error!(NotImplemented, "{}", msg),
+            S3Error::InvalidRange => s3s::s3_error!(InvalidRange),
+            S3Error::BadDigest => s3s::s3_error!(BadDigest),
+            S3Error::SignatureDoesNotMatch => s3s::s3_error!(SignatureDoesNotMatch),
+            S3Error::RequestTimeTooSkewed => s3s::s3_error!(RequestTimeTooSkewed),
+            // 503 SlowDown must reach the wire as SlowDown — AWS SDKs back off on
+            // it; a 500 InternalError is treated as permanent instead.
+            S3Error::SlowDown(msg) => s3s::s3_error!(SlowDown, "{}", msg),
+            // A backend that did not answer: 503 (retryable), naming the backend.
+            S3Error::ServiceUnavailable(msg) => s3s::s3_error!(ServiceUnavailable, "{}", msg),
+            other @ S3Error::InternalError(_) => {
+                // The wire error carries only the code, so without this the
+                // cause (upstream timeout, a storage I/O failure) is lost and
+                // prod 500s are undebuggable. Logged once: a sanitised 500
+                // was logged where it was made.
+                if !other.cause_is_logged() {
+                    tracing::error!(error = %other, code = other.code(), "mapping engine error to 500 InternalError");
+                }
+                s3s::s3_error!(InternalError, "{}", other.code())
+            }
+        }
+    }
+}
+
+impl From<crate::deltaglider::EngineError> for s3s::S3Error {
+    fn from(err: crate::deltaglider::EngineError) -> Self {
+        S3Error::from(err).into()
+    }
+}
+
+impl From<crate::storage::StorageError> for s3s::S3Error {
+    fn from(err: crate::storage::StorageError) -> Self {
+        S3Error::from(err).into()
+    }
+}
+
+impl From<crate::deltaglider::ConditionalError> for s3s::S3Error {
+    fn from(err: crate::deltaglider::ConditionalError) -> Self {
+        S3Error::from(err).into()
     }
 }
 
@@ -345,6 +417,105 @@ mod tests {
             offenders.is_empty(),
             "a log target outside the crate (the default filter drops it):\n{}",
             offenders.join("\n")
+        );
+    }
+
+    /// Every variant reaches the s3s wire with its own S3 code: the bridge
+    /// is exhaustive, so no variant falls into a catch-all 500.
+    #[test]
+    fn every_variant_reaches_s3s_with_its_own_code() {
+        let all = vec![
+            S3Error::NoSuchKey("k".into()),
+            S3Error::NoSuchBucket("b".into()),
+            S3Error::BucketNotEmpty("b".into()),
+            S3Error::BucketAlreadyExists("b".into()),
+            S3Error::EntityTooLarge { size: 2, max: 1 },
+            S3Error::EntityTooLargeReason("r".into()),
+            S3Error::InternalError("x".into()),
+            S3Error::InvalidArgument("x".into()),
+            S3Error::KeyTooLong("x".into()),
+            S3Error::MetadataTooLarge("x".into()),
+            S3Error::InvalidRequest("x".into()),
+            S3Error::NoSuchUpload("u".into()),
+            S3Error::InvalidPart("x".into()),
+            S3Error::InvalidPartOrder,
+            S3Error::BadDigest,
+            S3Error::NotImplemented("x".into()),
+            S3Error::AccessDenied,
+            S3Error::AccessDeniedReason("x".into()),
+            S3Error::SignatureDoesNotMatch,
+            S3Error::SlowDown("x".into()),
+            S3Error::RequestTimeTooSkewed,
+            S3Error::InvalidBucketName("x".into()),
+            S3Error::InvalidRange,
+            S3Error::PreconditionFailed,
+            S3Error::ServiceUnavailable("x".into()),
+        ];
+        assert_eq!(
+            all.len(),
+            s3_error_variants().len(),
+            "a variant is missing here"
+        );
+        for e in all {
+            let code = e.code();
+            assert_eq!(s3s::S3Error::from(e).code().as_str(), code);
+        }
+    }
+
+    /// The variant names of `S3Error`, read from this file.
+    fn s3_error_variants() -> Vec<String> {
+        let text = include_str!("errors.rs");
+        let body = text
+            .split_once("pub enum S3Error {")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .expect("enum S3Error");
+        body.lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with(|c: char| c.is_ascii_uppercase()))
+            .map(|l| {
+                l.split(|c: char| !c.is_ascii_alphanumeric())
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Every variant has a producer in production code: a variant that
+    /// nothing constructs is dead vocabulary (review 4, theme 4). A use in
+    /// a match pattern (before `=>`, or in `matches!`) does not count.
+    #[test]
+    fn every_variant_is_constructed_somewhere() {
+        use crate::source_scan::{prod_lines, prod_sources};
+        let sources = prod_sources("src");
+        let mut dead = Vec::new();
+        for name in s3_error_variants() {
+            let needle = format!("S3Error::{name}");
+            let produced = sources.iter().any(|(_, text)| {
+                prod_lines(text).into_iter().any(|(_, line)| {
+                    let line = line.trim();
+                    if line.contains("matches!(") {
+                        return false;
+                    }
+                    let tail = match line.split_once("=>") {
+                        Some((_, after)) => after,
+                        None => line,
+                    };
+                    tail.match_indices(needle.as_str()).any(|(at, _)| {
+                        let next = tail[at + needle.len()..].chars().next();
+                        !next.is_some_and(|c| c.is_ascii_alphanumeric())
+                            && !tail[at + needle.len()..].trim_start().starts_with('|')
+                    })
+                })
+            });
+            if !produced {
+                dead.push(name);
+            }
+        }
+        assert!(
+            dead.is_empty(),
+            "S3Error variants nothing constructs: {dead:?}"
         );
     }
 

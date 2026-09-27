@@ -182,7 +182,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             Ok(meta) => meta,
             Err(e) => {
                 return Err(
-                    no_such_key_or_bucket(&engine, &input.bucket, engine_error_to_s3s(e)).await,
+                    no_such_key_or_bucket(&engine, &input.bucket, s3s::S3Error::from(e)).await,
                 )
             }
         };
@@ -231,7 +231,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             Ok(meta) => meta,
             Err(e) => {
                 return Err(
-                    no_such_key_or_bucket(&engine, &input.bucket, engine_error_to_s3s(e)).await,
+                    no_such_key_or_bucket(&engine, &input.bucket, s3s::S3Error::from(e)).await,
                 )
             }
         };
@@ -250,8 +250,7 @@ impl s3s::S3 for DeltaGliderS3Service {
 
             if let Some((stream, content_length, metadata)) = engine
                 .retrieve_stream_range(&input.bucket, &input.key, start, end_inclusive, None)
-                .await
-                .map_err(engine_error_to_s3s)?
+                .await?
             {
                 let body = s3s::dto::StreamingBlob::new(SyncStorageStream::new(stream));
                 let mut output = get_object_output_from_metadata(&metadata, body, reader)?;
@@ -265,10 +264,7 @@ impl s3s::S3 for DeltaGliderS3Service {
                 return Ok(resp);
             }
 
-            let (data, metadata) = engine
-                .retrieve(&input.bucket, &input.key)
-                .await
-                .map_err(engine_error_to_s3s)?;
+            let (data, metadata) = engine.retrieve(&input.bucket, &input.key).await?;
             // `checked` was validated against the HEAD `file_size`, but we
             // slice into the freshly-reconstructed `data`. If stored
             // `file_size` metadata is stale / larger than the actual bytes
@@ -299,8 +295,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             .engine
             .load()
             .retrieve_stream(&input.bucket, &input.key)
-            .await
-            .map_err(engine_error_to_s3s)?;
+            .await?;
         let (body, metadata) = match response {
             RetrieveResponse::Streamed {
                 stream, metadata, ..
@@ -444,10 +439,7 @@ impl s3s::S3 for DeltaGliderS3Service {
         let auth_user = req.extensions.get::<AuthenticatedUser>().cloned();
         let input = req.input;
         let engine = self.state.engine.load();
-        let mut buckets = engine
-            .list_buckets_with_dates()
-            .await
-            .map_err(engine_error_to_s3s)?;
+        let mut buckets = engine.list_buckets_with_dates().await?;
         // The coordination bucket is not a client bucket (see
         // `reserved_bucket_refusal`).
         let registry = engine.bucket_policy_registry();
@@ -536,8 +528,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             .engine
             .load()
             .head(&input.bucket, &input.key)
-            .await
-            .map_err(engine_error_to_s3s)?;
+            .await?;
         Ok(s3s::S3Response::new(s3s::dto::GetObjectAclOutput {
             owner: Some(default_acl_owner()),
             grants: Some(vec![default_full_control_grant()]),
@@ -554,8 +545,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             .engine
             .load()
             .head(&input.bucket, &input.key)
-            .await
-            .map_err(engine_error_to_s3s)?;
+            .await?;
         Err(s3s::s3_error!(
             NotImplemented,
             "Object ACL mutation is not supported by this proxy"
@@ -571,8 +561,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             .engine
             .load()
             .head(&input.bucket, &input.key)
-            .await
-            .map_err(engine_error_to_s3s)?;
+            .await?;
         Err(s3s::s3_error!(
             NotImplemented,
             "Object tagging is not supported by this proxy"
@@ -588,8 +577,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             .engine
             .load()
             .head(&input.bucket, &input.key)
-            .await
-            .map_err(engine_error_to_s3s)?;
+            .await?;
         Err(s3s::s3_error!(
             NotImplemented,
             "Object tagging is not supported by this proxy"
@@ -605,8 +593,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             .engine
             .load()
             .head(&input.bucket, &input.key)
-            .await
-            .map_err(engine_error_to_s3s)?;
+            .await?;
         Err(s3s::s3_error!(
             NotImplemented,
             "Object tagging is not supported by this proxy"
@@ -623,12 +610,7 @@ impl s3s::S3 for DeltaGliderS3Service {
         // creatable (that's how a replication target is bootstrapped). The
         // marker gates OBJECT writes and bucket DELETION; a bare CreateBucket
         // corrupts nothing (an existing bucket returns BucketAlreadyOwnedByYou).
-        self.state
-            .engine
-            .load()
-            .create_bucket(&bucket)
-            .await
-            .map_err(engine_error_to_s3s)?;
+        self.state.engine.load().create_bucket(&bucket).await?;
         Ok(s3s::S3Response::new(s3s::dto::CreateBucketOutput {
             location: Some(format!("/{bucket}")),
         }))
@@ -641,14 +623,11 @@ impl s3s::S3 for DeltaGliderS3Service {
         let bucket = req.input.bucket;
         // A client must not delete a replication mirror (an object-empty or
         // freshly-marked destination would otherwise be destructible).
-        crate::api::handlers::object_helpers::check_client_write_allowed(&self.state, &bucket)
-            .map_err(engine_error_to_s3s)?;
+        crate::api::handlers::object_helpers::check_client_write_allowed(&self.state, &bucket)?;
         let engine = self.state.engine.load();
 
         // Check object emptiness first: only visible objects are hard blockers.
-        let first_object = first_visible_key(engine.as_ref(), &bucket)
-            .await
-            .map_err(engine_error_to_s3s)?;
+        let first_object = first_visible_key(engine.as_ref(), &bucket).await?;
 
         let mpu_count = self.state.multipart.count_uploads_for_bucket(&bucket);
         if let Some(sample) = first_object {
@@ -685,10 +664,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             }
         }
 
-        engine
-            .delete_bucket(&bucket)
-            .await
-            .map_err(engine_error_to_s3s)?;
+        engine.delete_bucket(&bucket).await?;
         Ok(s3s::S3Response::new(s3s::dto::DeleteBucketOutput::default()))
     }
 
@@ -700,8 +676,7 @@ impl s3s::S3 for DeltaGliderS3Service {
         crate::api::handlers::object_helpers::check_client_write_allowed(
             &self.state,
             &input.bucket,
-        )
-        .map_err(engine_error_to_s3s)?;
+        )?;
         // `DELETE photos/` deletes the folder marker `photos/` only, as on S3
         // (review D3). Folder deletes list and batch-delete the keys.
         match self
@@ -727,7 +702,7 @@ impl s3s::S3 for DeltaGliderS3Service {
                 ensure_bucket_exists_s3s(&self.state, &input.bucket).await?;
                 Ok(s3s::S3Response::new(s3s::dto::DeleteObjectOutput::default()))
             }
-            Err(e) => Err(engine_error_to_s3s(e)),
+            Err(e) => Err(s3s::S3Error::from(e)),
         }
     }
 
@@ -740,8 +715,7 @@ impl s3s::S3 for DeltaGliderS3Service {
         crate::api::handlers::object_helpers::check_client_write_allowed(
             &self.state,
             &input.bucket,
-        )
-        .map_err(engine_error_to_s3s)?;
+        )?;
         validate_delete_objects_count(input.delete.objects.len())?;
         // Per-key misses are successes, so a missing bucket is asked here.
         ensure_bucket_exists_s3s(&self.state, &input.bucket).await?;
@@ -865,14 +839,9 @@ impl s3s::S3 for DeltaGliderS3Service {
         crate::api::handlers::object_helpers::check_client_write_allowed(
             &self.state,
             &input.bucket,
-        )
-        .map_err(engine_error_to_s3s)?;
+        )?;
         check_user_metadata_size_s3s(input.metadata.as_ref())?;
-        if !engine
-            .head_bucket(&input.bucket)
-            .await
-            .map_err(engine_error_to_s3s)?
-        {
+        if !engine.head_bucket(&input.bucket).await? {
             return Err(s3s::s3_error!(NoSuchBucket));
         }
 
@@ -900,8 +869,7 @@ impl s3s::S3 for DeltaGliderS3Service {
                 },
             },
         )
-        .await
-        .map_err(engine_error_to_s3s)?;
+        .await?;
         let mut resp = s3s::S3Response::new(s3s::dto::PutObjectOutput {
             e_tag: Some(parse_s3s_etag(&result.metadata.etag())?),
             ..Default::default()
@@ -933,8 +901,7 @@ impl s3s::S3 for DeltaGliderS3Service {
         crate::api::handlers::object_helpers::check_client_write_allowed(
             &self.state,
             &input.bucket,
-        )
-        .map_err(engine_error_to_s3s)?;
+        )?;
         let directive = input
             .metadata_directive
             .as_ref()
@@ -960,10 +927,7 @@ impl s3s::S3 for DeltaGliderS3Service {
         ensure_bucket_exists_s3s(&self.state, &source_bucket).await?;
         ensure_bucket_exists_s3s(&self.state, &input.bucket).await?;
         let engine = self.state.engine.load();
-        let source_meta = engine
-            .head(&source_bucket, &source_key)
-            .await
-            .map_err(engine_error_to_s3s)?;
+        let source_meta = engine.head(&source_bucket, &source_key).await?;
         evaluate_copy_source_conditionals_s3s(
             &source_meta,
             input.copy_source_if_match.as_ref(),
@@ -974,10 +938,7 @@ impl s3s::S3 for DeltaGliderS3Service {
         if source_meta.file_size > engine.max_object_size() {
             return Err(s3s::s3_error!(EntityTooLarge));
         }
-        let (data, source_meta) = engine
-            .retrieve(&source_bucket, &source_key)
-            .await
-            .map_err(engine_error_to_s3s)?;
+        let (data, source_meta) = engine.retrieve(&source_bucket, &source_key).await?;
         if data.len() as u64 > engine.max_object_size() {
             return Err(s3s::s3_error!(EntityTooLarge));
         }
@@ -1014,8 +975,7 @@ impl s3s::S3 for DeltaGliderS3Service {
                 precondition: &crate::deltaglider::Precondition::none(),
             },
         )
-        .await
-        .map_err(engine_error_to_s3s)?;
+        .await?;
         Ok(s3s::S3Response::new(s3s::dto::CopyObjectOutput {
             copy_object_result: Some(s3s::dto::CopyObjectResult {
                 e_tag: Some(parse_s3s_etag(&result.metadata.etag())?),
@@ -1036,26 +996,21 @@ impl s3s::S3 for DeltaGliderS3Service {
         crate::api::handlers::object_helpers::check_client_write_allowed(
             &self.state,
             &input.bucket,
-        )
-        .map_err(engine_error_to_s3s)?;
+        )?;
         check_user_metadata_size_s3s(input.metadata.as_ref())?;
         ensure_bucket_exists_s3s(&self.state, &input.bucket).await?;
         let delta_limit = crate::config::env_parse_with_default(
             "DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES",
             64 * 1024 * 1024,
         );
-        let upload_id = self
-            .state
-            .multipart
-            .create_with_relay_policy(
-                &input.bucket,
-                &input.key,
-                input.content_type.clone(),
-                input.metadata.unwrap_or_default(),
-                Some(delta_limit),
-                false,
-            )
-            .map_err(engine_error_to_s3s)?;
+        let upload_id = self.state.multipart.create_with_relay_policy(
+            &input.bucket,
+            &input.key,
+            input.content_type.clone(),
+            input.metadata.unwrap_or_default(),
+            Some(delta_limit),
+            false,
+        )?;
         Ok(s3s::S3Response::new(
             s3s::dto::CreateMultipartUploadOutput {
                 bucket: Some(input.bucket),
@@ -1079,17 +1034,13 @@ impl s3s::S3 for DeltaGliderS3Service {
         let data =
             collect_blob_limited(input.body, max_object_size, chunked_headers.as_ref()).await?;
         validate_content_md5_s3s(input.content_md5.as_deref(), &data)?;
-        let etag = self
-            .state
-            .multipart
-            .upload_part(
-                &input.upload_id,
-                &input.bucket,
-                &input.key,
-                input.part_number as u32,
-                data,
-            )
-            .map_err(engine_error_to_s3s)?;
+        let etag = self.state.multipart.upload_part(
+            &input.upload_id,
+            &input.bucket,
+            &input.key,
+            input.part_number as u32,
+            data,
+        )?;
         Ok(s3s::S3Response::new(s3s::dto::UploadPartOutput {
             e_tag: Some(parse_s3s_etag(&etag)?),
             ..Default::default()
@@ -1103,8 +1054,7 @@ impl s3s::S3 for DeltaGliderS3Service {
         let input = req.input;
         self.state
             .multipart
-            .abort(&input.upload_id, &input.bucket, &input.key)
-            .map_err(engine_error_to_s3s)?;
+            .abort(&input.upload_id, &input.bucket, &input.key)?;
         Ok(s3s::S3Response::new(
             s3s::dto::AbortMultipartUploadOutput::default(),
         ))
@@ -1117,17 +1067,13 @@ impl s3s::S3 for DeltaGliderS3Service {
         let input = req.input;
         let max_parts = input.max_parts.unwrap_or(1000).clamp(1, 1000) as u32;
         let marker = input.part_number_marker.unwrap_or(0) as u32;
-        let (parts, is_truncated, next_marker) = self
-            .state
-            .multipart
-            .list_parts_paginated(
-                &input.upload_id,
-                &input.bucket,
-                &input.key,
-                marker,
-                max_parts,
-            )
-            .map_err(engine_error_to_s3s)?;
+        let (parts, is_truncated, next_marker) = self.state.multipart.list_parts_paginated(
+            &input.upload_id,
+            &input.bucket,
+            &input.key,
+            marker,
+            max_parts,
+        )?;
         let parts = parts
             .into_iter()
             .map(|p| s3s::dto::Part {
@@ -1161,8 +1107,7 @@ impl s3s::S3 for DeltaGliderS3Service {
         crate::api::handlers::object_helpers::check_client_write_allowed(
             &self.state,
             &input.bucket,
-        )
-        .map_err(engine_error_to_s3s)?;
+        )?;
         ensure_bucket_exists_s3s(&self.state, &input.bucket).await?;
         let requested_parts = completed_parts_to_request(input.multipart_upload.as_ref())?;
         self.state
@@ -1172,16 +1117,12 @@ impl s3s::S3 for DeltaGliderS3Service {
         // Completion registry: exactly one request runs the store pipeline, on a
         // DETACHED task (a client disconnect must not cancel a half-done store);
         // identical retries join the in-flight outcome or hit the tombstone.
-        let begin = self
-            .state
-            .multipart
-            .begin_complete(
-                &input.upload_id,
-                &input.bucket,
-                &input.key,
-                &requested_parts,
-            )
-            .map_err(engine_error_to_s3s)?;
+        let begin = self.state.multipart.begin_complete(
+            &input.upload_id,
+            &input.bucket,
+            &input.key,
+            &requested_parts,
+        )?;
         let complete_response = |etag: &str,
                                  meta: Option<&crate::types::FileMetadata>|
          -> s3s::S3Result<
@@ -1223,8 +1164,7 @@ impl s3s::S3 for DeltaGliderS3Service {
                     &self.state,
                     &input.bucket,
                     total_parts_size,
-                )
-                .map_err(engine_error_to_s3s)?;
+                )?;
                 // Same conditional write as PutObject (If-None-Match: * is
                 // create-only), under the same per-key lock, held until the
                 // store ends. Only the owner checks: a retry that joins or
@@ -1241,8 +1181,7 @@ impl s3s::S3 for DeltaGliderS3Service {
                             if_none_match: input.if_none_match.clone(),
                         },
                     )
-                    .await
-                    .map_err(engine_error_to_s3s)?;
+                    .await?;
                 let delta_limit = crate::config::env_parse_with_default(
                     "DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES",
                     64 * 1024 * 1024,
@@ -1268,7 +1207,7 @@ impl s3s::S3 for DeltaGliderS3Service {
                         force_chunked_passthrough,
                     )
                     .await
-                    .map_err(engine_error_to_s3s);
+                    .map_err(s3s::S3Error::from);
                     match &result {
                         Ok((etag, _)) => publisher.publish(Ok(etag.clone())),
                         Err(e) => {
@@ -1280,7 +1219,7 @@ impl s3s::S3 for DeltaGliderS3Service {
                 match handle.await {
                     Ok(Ok((etag, meta))) => complete_response(&etag, meta.as_ref()),
                     Ok(Err(e)) => Err(e),
-                    Err(join_err) => Err(engine_error_to_s3s(
+                    Err(join_err) => Err(s3s::S3Error::from(
                         crate::api::errors::S3Error::InternalError(format!(
                             "completion task failed: {join_err}"
                         )),
@@ -1354,15 +1293,11 @@ impl s3s::S3 for DeltaGliderS3Service {
         crate::api::handlers::object_helpers::check_client_write_allowed(
             &self.state,
             &input.bucket,
-        )
-        .map_err(engine_error_to_s3s)?;
+        )?;
         ensure_bucket_exists_s3s(&self.state, &source_bucket).await?;
         ensure_bucket_exists_s3s(&self.state, &input.bucket).await?;
         let engine = self.state.engine.load();
-        let source_meta = engine
-            .head(&source_bucket, &source_key)
-            .await
-            .map_err(engine_error_to_s3s)?;
+        let source_meta = engine.head(&source_bucket, &source_key).await?;
         evaluate_copy_source_conditionals_s3s(
             &source_meta,
             input.copy_source_if_match.as_ref(),
@@ -1392,8 +1327,7 @@ impl s3s::S3 for DeltaGliderS3Service {
                         end as u64,
                         Some(&source_meta),
                     )
-                    .await
-                    .map_err(engine_error_to_s3s)?
+                    .await?
             }
             None => None,
         };
@@ -1408,10 +1342,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             if source_meta.file_size > engine.max_object_size() {
                 return Err(s3s::s3_error!(EntityTooLarge));
             }
-            let (data, _) = engine
-                .retrieve(&source_bucket, &source_key)
-                .await
-                .map_err(engine_error_to_s3s)?;
+            let (data, _) = engine.retrieve(&source_bucket, &source_key).await?;
             if data.len() as u64 > engine.max_object_size() {
                 return Err(s3s::s3_error!(EntityTooLarge));
             }
@@ -1422,17 +1353,13 @@ impl s3s::S3 for DeltaGliderS3Service {
                 bytes::Bytes::from(data)
             }
         };
-        let etag = self
-            .state
-            .multipart
-            .upload_part(
-                &input.upload_id,
-                &input.bucket,
-                &input.key,
-                input.part_number as u32,
-                part,
-            )
-            .map_err(engine_error_to_s3s)?;
+        let etag = self.state.multipart.upload_part(
+            &input.upload_id,
+            &input.bucket,
+            &input.key,
+            input.part_number as u32,
+            part,
+        )?;
         Ok(s3s::S3Response::new(s3s::dto::UploadPartCopyOutput {
             copy_part_result: Some(s3s::dto::CopyPartResult {
                 e_tag: Some(parse_s3s_etag(&etag)?),
@@ -1689,11 +1616,7 @@ async fn ensure_bucket_on(
     engine: &crate::deltaglider::DynEngine,
     bucket: &str,
 ) -> s3s::S3Result<()> {
-    if engine
-        .head_bucket(bucket)
-        .await
-        .map_err(engine_error_to_s3s)?
-    {
+    if engine.head_bucket(bucket).await? {
         Ok(())
     } else {
         Err(s3s::s3_error!(NoSuchBucket))
@@ -1754,7 +1677,7 @@ async fn client_list_page(
             InvalidRequest,
             "no visible key within the listing scan budget; use a narrower prefix"
         ),
-        crate::iam::listing::ListingError::Engine(e) => engine_error_to_s3s(e),
+        crate::iam::listing::ListingError::Engine(e) => s3s::S3Error::from(e),
     })?;
     if page.objects.is_empty() && page.common_prefixes.is_empty() {
         ensure_bucket_on(engine, bucket).await?;
@@ -1894,7 +1817,7 @@ async fn collect_exact(
 ) -> s3s::S3Result<bytes::Bytes> {
     let mut buf = bytes::BytesMut::with_capacity(usize::try_from(len).unwrap_or(0));
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(engine_error_to_s3s)?;
+        let chunk = chunk?;
         if (buf.len() + chunk.len()) as u64 > len {
             return Err(s3s::s3_error!(
                 InternalError,
@@ -2188,17 +2111,8 @@ fn verify_signed_payload_hash_s3s(
         return Ok(());
     };
     // Delegate to the canonical verifier so axum + s3s can never desync
-    // on the H1 integrity contract. Translate the typed S3Error into
-    // s3s's error vocabulary; only BadDigest and NotImplemented are
-    // reachable per `verify_against_body`'s contract.
-    match claimed.verify_against_body(body) {
-        Ok(()) => Ok(()),
-        Err(crate::api::S3Error::NotImplemented(msg)) => {
-            Err(s3s::s3_error!(NotImplemented, "{}", msg))
-        }
-        Err(crate::api::S3Error::BadDigest) => Err(s3s::s3_error!(BadDigest)),
-        Err(other) => Err(engine_error_to_s3s(other)),
-    }
+    // on the H1 integrity contract (BadDigest / NotImplemented).
+    Ok(claimed.verify_against_body(body)?)
 }
 
 /// Await a joined completion's outcome (initial watch value is None).
@@ -2321,68 +2235,6 @@ async fn run_multipart_completion(
         .await;
     }
     Ok((etag, store_meta))
-}
-
-fn engine_error_to_s3s(err: impl Into<crate::api::S3Error>) -> s3s::S3Error {
-    match err.into() {
-        crate::api::S3Error::NoSuchKey(_) => s3s::s3_error!(NoSuchKey),
-        crate::api::S3Error::NoSuchBucket(_) => s3s::s3_error!(NoSuchBucket),
-        crate::api::S3Error::BucketAlreadyExists(_) => s3s::s3_error!(BucketAlreadyExists),
-        crate::api::S3Error::BucketNotEmpty(_) => s3s::s3_error!(BucketNotEmpty),
-        crate::api::S3Error::EntityTooLarge { .. } => s3s::s3_error!(EntityTooLarge),
-        crate::api::S3Error::EntityTooLargeReason(msg) => {
-            s3s::s3_error!(EntityTooLarge, "{}", msg)
-        }
-        crate::api::S3Error::InvalidArgument(msg) => s3s::s3_error!(InvalidArgument, "{}", msg),
-        crate::api::S3Error::KeyTooLong(msg) => s3s::s3_error!(KeyTooLongError, "{}", msg),
-        crate::api::S3Error::MetadataTooLarge(msg) => s3s::s3_error!(MetadataTooLarge, "{}", msg),
-        crate::api::S3Error::InvalidRequest(msg) => s3s::s3_error!(InvalidRequest, "{}", msg),
-        crate::api::S3Error::NoSuchUpload(id) => {
-            // Multipart upload state is in-memory and PER-INSTANCE. Behind a
-            // non-sticky load balancer, an UploadPart/Complete that lands on a
-            // different node than CreateMultipartUpload sees no such upload —
-            // indistinguishable, to the client, from a genuinely-missing id. The
-            // proxy can't tell the two apart, so we don't warn (would spam
-            // single-instance logs on legitimate retries-after-abort), but we DO
-            // enrich the client-visible message so an operator behind an LB has a
-            // pointer instead of a bare NoSuchUpload. debug-level for diagnosis.
-            tracing::debug!("NoSuchUpload for upload_id={id} (multipart state is per-instance)");
-            s3s::s3_error!(
-                NoSuchUpload,
-                "the upload id is unknown to this instance; multipart upload state is \
-                 per-instance — behind a load balancer, pin multipart requests to one \
-                 node (sticky sessions)"
-            )
-        }
-        crate::api::S3Error::InvalidPart(msg) => s3s::s3_error!(InvalidPart, "{}", msg),
-        crate::api::S3Error::InvalidPartOrder => s3s::s3_error!(InvalidPartOrder),
-        crate::api::S3Error::InvalidBucketName(msg) => {
-            s3s::s3_error!(InvalidBucketName, "{}", msg)
-        }
-        crate::api::S3Error::AccessDenied => s3s::s3_error!(AccessDenied),
-        crate::api::S3Error::AccessDeniedReason(msg) => s3s::s3_error!(AccessDenied, "{}", msg),
-        crate::api::S3Error::PreconditionFailed => s3s::s3_error!(PreconditionFailed),
-        crate::api::S3Error::NotImplemented(msg) => s3s::s3_error!(NotImplemented, "{}", msg),
-        crate::api::S3Error::InvalidRange => s3s::s3_error!(InvalidRange),
-        // 503 SlowDown must reach the wire as SlowDown — AWS SDKs back off on
-        // it; a catch-all 500 InternalError is treated as permanent instead.
-        crate::api::S3Error::SlowDown(msg) => s3s::s3_error!(SlowDown, "{}", msg),
-        // A backend that did not answer: 503 (retryable), naming the backend.
-        crate::api::S3Error::ServiceUnavailable(msg) => {
-            s3s::s3_error!(ServiceUnavailable, "{}", msg)
-        }
-        other => {
-            // Catch-all → 500. The S3 wire error only carries the error *code*
-            // (a category), so without this the actual cause (upstream S3
-            // timeout/throttle, a storage I/O failure, etc.) is lost and prod
-            // 500s are undebuggable. Log the full Display (which includes the
-            // underlying error chain) at ERROR before mapping.
-            if !other.cause_is_logged() {
-                tracing::error!(error = %other, code = other.code(), "mapping engine error to 500 InternalError");
-            }
-            s3s::s3_error!(InternalError, "{}", other.code())
-        }
-    }
 }
 
 fn completed_parts_to_request(
@@ -3126,30 +2978,24 @@ mod tests {
         // The mappings the wire tests used to prove end-to-end (missing
         // key/bucket → the right S3 error code the client sees).
         assert_eq!(
-            engine_error_to_s3s(S3Error::NoSuchKey("k".into())).code(),
+            s3s::S3Error::from(S3Error::NoSuchKey("k".into())).code(),
             &s3s::S3ErrorCode::NoSuchKey
         );
         assert_eq!(
-            engine_error_to_s3s(S3Error::NoSuchBucket("b".into())).code(),
-            &s3s::S3ErrorCode::NoSuchBucket
-        );
-        assert_eq!(
-            engine_error_to_s3s(S3Error::PreconditionFailed).code(),
-            &s3s::S3ErrorCode::PreconditionFailed
+            s3s::S3Error::from(crate::deltaglider::EngineError::NotFound("k".into())).code(),
+            &s3s::S3ErrorCode::NoSuchKey
         );
         // A backend that did not answer is a 503 the client retries, and the
         // message names it.
-        let e = engine_error_to_s3s(crate::storage::StorageError::Unavailable(
+        let e = s3s::S3Error::from(crate::storage::StorageError::Unavailable(
             "backend 'hetzner-fsn1': head_object timed out".into(),
         ));
         assert_eq!(e.code(), &s3s::S3ErrorCode::ServiceUnavailable);
         assert!(e.message().unwrap_or("").contains("hetzner-fsn1"));
-        // Catch-all: an unmapped engine error becomes a 500 InternalError
-        // rather than leaking an unrelated code.
-        assert_eq!(
-            engine_error_to_s3s(S3Error::MalformedXML).code(),
-            &s3s::S3ErrorCode::InternalError
-        );
+        // A 500 carries only its code, never the cause.
+        let e = s3s::S3Error::from(S3Error::InternalError("/secret/path".into()));
+        assert_eq!(e.code(), &s3s::S3ErrorCode::InternalError);
+        assert_eq!(e.message(), Some("InternalError"));
     }
 
     #[tokio::test]
