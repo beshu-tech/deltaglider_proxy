@@ -46,11 +46,15 @@ services:
       # The config template, mounted read-only. The proxy expands its ${env:...}
       # placeholders in memory at load — the file on disk stays secret-free.
       - ./deltaglider_proxy.yaml:/etc/deltaglider_proxy/deltaglider_proxy.yaml:ro
-      # Writable dir for the encrypted config DB (deltaglider_config.db lands in
-      # DGP_CONFIG's parent dir). PERSIST + back this up — it holds your IAM data.
+      # Writable dir for the encrypted config DB and its key file
+      # (deltaglider_config.db + deltaglider_config.db.key land in DGP_CONFIG's
+      # parent dir). PERSIST + back up both together — they hold your IAM data.
       - dgp-config:/etc/deltaglider_proxy
-      # Local scratch for delta reconstruction + caches. Object data lives in the
-      # S3 backend, not here, but reconstruction buffers to disk.
+      # The working directory. It holds the generated bootstrap password hash
+      # (.deltaglider_bootstrap_hash) when DGP_BOOTSTRAP_PASSWORD_HASH is unset,
+      # and the object data if you use a `filesystem: /data` backend. Object data
+      # of the S3 backend is not here. Delta scratch files go to the spool
+      # (DGP_SPOOL_DIR, default /tmp/dgp-spool), not to this volume.
       - dgp-data:/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/_/health"]
@@ -61,5 +65,5 @@ services:
     restart: unless-stopped
 
 volumes:
-  dgp-config:   # encrypted config DB — back this up
-  dgp-data:     # delta/reconstruction scratch + caches
+  dgp-config:   # encrypted config DB + its key file — back this up
+  dgp-data:     # working dir: bootstrap hash file, filesystem-backend data
