@@ -11,7 +11,9 @@
 //!
 //! The version is content-derived, so every mutation path (GUI, GitOps
 //! apply, a background migrate flip, a restore) changes it without any
-//! bookkeeping. The hash covers secrets too (a rotated key is a change), so
+//! bookkeeping. The bootstrap password hash is left out: no config editor
+//! can change it, and a password change must not 409 open tabs. The hash
+//! covers the other secrets (a rotated key is a change), so
 //! it is a MAC keyed with a key derived from the config DB key: the ETag
 //! reveals nothing about the secrets, and it is stable across restarts.
 
@@ -58,7 +60,14 @@ fn version_key() -> &'static [u8; 32] {
 
 /// The version of `section` of `cfg`, or of the whole document (`None`).
 pub(super) fn config_version(cfg: &Config, section: Option<SectionName>) -> String {
-    let sectioned = SectionedConfig::from_flat(cfg);
+    // The bootstrap hash is not an editable config field (apply and section
+    // PUT refuse a change; `PUT /password` owns it), so a password change is
+    // not a conflict for an open editor.
+    let versioned = Config {
+        bootstrap_password_hash: None,
+        ..cfg.clone()
+    };
+    let sectioned = SectionedConfig::from_flat(&versioned);
     // `to_value` first: its maps are sorted, so the bytes are canonical.
     let value = match section {
         None => serde_json::to_value(&sectioned),
@@ -170,5 +179,22 @@ mod tests {
             "another section's edit is not a conflict"
         );
         assert_ne!(config_version(&a, None), config_version(&b, None));
+    }
+
+    /// Review 4: `PUT /password` changes only the bootstrap hash, which no
+    /// config editor can edit (apply and section PUT refuse a change). It
+    /// must not turn every open tab's next apply into a 409.
+    #[test]
+    fn a_password_change_is_not_a_config_change() {
+        let a = Config::default();
+        let b = Config {
+            bootstrap_password_hash: Some("$2b$04$new".into()),
+            ..a.clone()
+        };
+        assert_eq!(config_version(&a, None), config_version(&b, None));
+        assert_eq!(
+            config_version(&a, Some(SectionName::Advanced)),
+            config_version(&b, Some(SectionName::Advanced))
+        );
     }
 }

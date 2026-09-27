@@ -80,6 +80,13 @@ release has no generation and keeps the old rule. During a rolling upgrade,
 an instance on the older release does not merge copies from upgraded
 instances until it is upgraded too, as with every schema change.
 
+### Fixed — A password change no longer makes open config editors conflict
+
+The version of the config document included the bootstrap password
+hash. After a password change, the next apply from every open browser
+tab answered `409 Conflict`, although no config field changed. Now the
+version leaves the hash out.
+
 ### Fixed — The field-level config PUT refuses a bucket policy that the loader refuses
 
 `PUT /_/api/admin/config` stored a bucket policy that could not be
