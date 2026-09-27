@@ -125,6 +125,12 @@ de 60 3b f5 9a 04 c2 77 18 8d eb 56 a3 0f c4 29</pre>
           </li>
           <li>In proxy-AES mode, the encryption key never leaves the proxy process.</li>
           <li>Backend credentials never leave the proxy process.</li>
+          <li>
+            The users, groups, and SSO settings live in a SQLCipher database
+            with its own key (<code>DGP_CONFIG_DB_KEY</code>, or a generated
+            key file), separate from the admin password. A synced copy in a
+            bucket is encrypted with the same key.
+          </li>
           <li>The proxy does not phone home, sends no telemetry, and has no SaaS dependency.</li>
           <li>The source code is public (BUSL-1.1), so your security team can read every line.</li>
         </ul>
