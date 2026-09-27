@@ -12,6 +12,8 @@
 //!
 //! The grant covers exactly the request that matched, read-class only:
 //! GET/HEAD of that object, or a LIST of that bucket with that prefix.
+//! An object key with `*` or `?` gets no grant (a pattern cannot name it
+//! exactly).
 //! A write never gets a grant. Synthesised `public-prefix:` blocks keep
 //! their grant: the bucket's public prefixes.
 
@@ -52,6 +54,9 @@ pub fn anonymous_grant(decision: &Decision, req: &RequestInfo<'_>) -> Option<Ano
         }
     }
     Some(match req.key.filter(|k| !k.is_empty()) {
+        // A resource pattern reads `*` / `?` as wildcards and has no escape,
+        // so a grant for such a key would cover other keys too: none.
+        Some(key) if key.contains(['*', '?']) => return None,
         Some(key) => AnonymousGrant::Read {
             bucket,
             key: key.to_string(),
@@ -174,6 +179,34 @@ mod tests {
         let mut root = req("GET", None, None);
         root.bucket = "";
         assert_eq!(anonymous_grant(&allow(), &root), None);
+    }
+
+    /// A resource pattern treats `*` and `?` as wildcards, and iam-rs has
+    /// no escape for them, so a Read grant for `a*.zip` also allowed
+    /// `abc.zip`. Such a key gets no grant: exactly one object, or none.
+    #[test]
+    fn a_key_with_wildcard_characters_gets_no_read_grant() {
+        for key in ["a*.zip", "a?.zip", "*"] {
+            assert_eq!(
+                anonymous_grant(&allow(), &req("GET", Some(key), None)),
+                None,
+                "{key}"
+            );
+        }
+        // Why: the permission such a grant would carry matches other keys.
+        let wide = AnonymousGrant::Read {
+            bucket: "releases".into(),
+            key: "a*.zip".into(),
+        }
+        .permission()
+        .unwrap();
+        let mut anon = crate::api::auth::build_anonymous_user("releases", &[]);
+        anon.iam_policies
+            .push(crate::iam::permissions::permission_to_iam_policy(&wide));
+        anon.permissions.push(wide);
+        assert!(anon.can(crate::iam::S3Action::Read, "releases", "abc.zip"));
+        // Other characters are literal in a pattern: the grant stays.
+        assert!(anonymous_grant(&allow(), &req("GET", Some("a[1]+b.zip"), None)).is_some());
     }
 
     #[test]

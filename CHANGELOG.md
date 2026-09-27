@@ -354,6 +354,13 @@ So the total covered only the objects after the cursor, and the progress
 bar reached 99 % long before the end. Now the resumed count starts from
 the count that was saved with the cursor.
 
+### Fixed — An `allow-anonymous` grant never covers more than one object
+
+The grant for a `GET` of a key with `*` or `?` was a permission pattern,
+which also matched other keys. The principal lives for one request, so no
+other key was served, but the grant was wider than the object. Now such a
+key gets no grant, and the anonymous request is refused with `403`.
+
 ### Fixed — Pending OAuth logins are bounded
 
 Every `GET /_/api/admin/oauth/authorize/<provider>` stored a pending login
