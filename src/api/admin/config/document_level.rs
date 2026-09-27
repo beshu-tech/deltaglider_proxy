@@ -26,7 +26,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use super::super::{audit_log, AdminState};
-use super::{active_config_path, apply_config_transition, unknown_section_error, SectionName};
+use super::{
+    active_config_path, apply_config_transition, unknown_section_error, SectionName, TransitionCtx,
+};
 
 //
 // These endpoints serve the GitOps persona and the GUI "Copy as YAML" flow.
@@ -794,10 +796,10 @@ async fn apply_config_pipeline(
     //    mirrors the field-level PATCH path in `update_config` — both
     //    paths compose their responses from the same single source of
     //    transition truth.
-    let old_cfg = cfg.clone();
+    let ctx = TransitionCtx::Admin { state, headers };
     let (transition_warnings, requires_restart) =
-        match apply_config_transition(state, &old_cfg, &incoming, headers).await {
-            Ok(r) => r,
+        match apply_config_transition(ctx, &mut cfg, incoming).await {
+            Ok(r) => (r.warnings, r.requires_restart),
             Err(e) => {
                 return (
                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -821,8 +823,7 @@ async fn apply_config_pipeline(
             }
         };
 
-    // 6. Atomic in-memory swap (still inside the write lock).
-    *cfg = incoming;
+    // 6. The transition swapped the config in (still inside the write lock).
 
     // 7. Persist to the active config file, preserving its on-disk extension.
     //    `persist_to_file` is atomic (write-to-tempfile + rename) so the

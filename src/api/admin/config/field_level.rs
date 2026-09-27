@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use super::super::AdminState;
-use super::{active_config_path, apply_config_transition};
+use super::{active_config_path, apply_config_transition, TransitionCtx};
 
 #[derive(Serialize)]
 pub struct ConfigResponse {
@@ -758,9 +758,16 @@ pub async fn update_config(
         }
     }
 
-    match apply_config_transition(&state, &old_cfg, &cfg, &headers).await {
-        Ok((transition_warnings, requires_restart)) => {
-            warnings.extend(transition_warnings);
+    // The transition swaps the patch in itself: put the running config back.
+    let new_cfg = std::mem::replace(&mut *cfg, old_cfg);
+    let ctx = TransitionCtx::Admin {
+        state: &state,
+        headers: &headers,
+    };
+    match apply_config_transition(ctx, &mut cfg, new_cfg).await {
+        Ok(report) => {
+            warnings.extend(report.warnings);
+            let requires_restart = report.requires_restart;
 
             // Persist AFTER side effects succeed. Persist failure is a
             // warning, not a rollback — the runtime state is correct;
@@ -781,11 +788,8 @@ pub async fn update_config(
             .into_response()
         }
         Err(engine_err) => {
-            // Roll back the in-memory mutation so the next read sees the
-            // pre-patch state. The helper changes no runtime state on Err
-            // (every fallible step precedes its first publish), so only
-            // `*cfg` needs restoring.
-            *cfg = old_cfg;
+            // The helper changes no runtime state on Err (every fallible step
+            // precedes its first publish), and `*cfg` is the pre-patch config.
             warnings.push(format!(
                 "Failed to apply config patch: {}. Pre-patch config restored.",
                 engine_err

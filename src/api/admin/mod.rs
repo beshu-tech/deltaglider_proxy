@@ -71,6 +71,7 @@ pub use config::{
     PasswordChangeRequest, PasswordChangeResponse, SectionApplyResponse, SyncNowResponse,
     TestS3Request, TestS3Response, TraceRequest, TraceResolved, TraceResponse,
 };
+pub(crate) use config::{apply_config_transition, TransitionCtx};
 pub use delta_efficiency::{
     classify_deltaspace, get_delta_efficiency, post_delta_efficiency_scan, verify_delta_efficiency,
     DeltaEfficiencyScanner, Efficiency,

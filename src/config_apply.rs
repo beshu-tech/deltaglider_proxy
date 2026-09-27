@@ -12,12 +12,11 @@
 //! resolved once in main and shared, never re-derived, so a worker can't
 //! write to a different file than the operator's apply does).
 //!
-//! NOTE: `mutate_and_apply` deliberately does NOT rebuild the
-//! bucket-derived snapshots (public-prefix / admission). That matches the
-//! synchronous migrate flow it replaces; `__dgmigrate_*` transient
-//! policies carry no public prefixes or admission rules, and the final
-//! flip only changes `backend` routing — none of which feed those
-//! snapshots.
+//! The mutation runs through the SAME transition as every admin write
+//! ([`crate::api::admin::config::apply_config_transition`]) in its
+//! background scope: the gates and the engine rebuild run, the steps that
+//! need admin-side state are skipped, and a change that needs one of them
+//! is refused (see `TransitionCtx::Background`).
 
 use std::sync::Arc;
 
@@ -68,9 +67,9 @@ pub struct ConfigMutator {
 impl ConfigMutator {
     /// Write-lock the config, apply `mutate`, rebuild the engine, persist.
     ///
-    /// Rollback contract: the pre-mutation config is cloned first; if the
-    /// engine rebuild fails, the clone is restored (no rebuild needed —
-    /// the OLD engine was never swapped out) and the error returned.
+    /// Rollback contract: the mutation is built on a clone; if the
+    /// transition refuses it (a gate, the engine build, a change only the
+    /// admin API may make), nothing is swapped and the error is returned.
     /// A persist failure after a successful rebuild is warn-only: the
     /// running state is correct and a later persist (any admin apply)
     /// writes the same content.
@@ -105,25 +104,34 @@ impl ConfigMutator {
         mutate: impl FnOnce(&mut Config),
         persist_required: bool,
     ) -> Result<(), String> {
+        use crate::api::admin::{apply_config_transition, TransitionCtx};
+        let ctx = || TransitionCtx::Background {
+            app: &self.app,
+            context,
+        };
         let mut cfg = self.config.write().await;
         let rollback = cfg.clone();
-        mutate(&mut cfg);
-        if let Err(e) = rebuild_engine_only(&self.app, &cfg, context).await {
-            *cfg = rollback;
-            return Err(format!("engine rebuild failed ({context}): {e}"));
-        }
+        let mut new_cfg = rollback.clone();
+        mutate(&mut new_cfg);
+        // On Err nothing changed: the old config and engine keep serving.
+        apply_config_transition(ctx(), &mut cfg, new_cfg)
+            .await
+            .map_err(|e| format!("engine rebuild failed ({context}): {e}"))?;
         if let Err(e) = cfg.persist_to_file(&self.persist_path) {
             if persist_required {
-                // Unwind fully: restore the old config AND swap the old
-                // engine back so memory and file agree again.
-                let restore_err = rebuild_engine_only(
-                    &self.app,
-                    &rollback,
-                    &format!("rollback after failed persist ({context})"),
-                )
-                .await
-                .err();
-                *cfg = rollback;
+                // Unwind fully: transition back to the old config AND engine
+                // so memory and file agree again.
+                let back = TransitionCtx::Background {
+                    app: &self.app,
+                    context: "rollback after failed persist",
+                };
+                let restore_err = apply_config_transition(back, &mut cfg, rollback.clone())
+                    .await
+                    .err();
+                if restore_err.is_some() {
+                    // The file still holds the old config: memory follows it.
+                    *cfg = rollback;
+                }
                 return Err(format!(
                     "config persist to '{}' failed ({context}): {e}{}",
                     self.persist_path,

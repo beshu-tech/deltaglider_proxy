@@ -1549,8 +1549,8 @@ async fn apply_secrets(
     // immediately. A mismatch between Config and the running engine
     // would cause every subsequent S3 op to use stale credentials
     // until restart.
-    if let Err(e) =
-        crate::api::admin::config::apply_config_transition(state, &old_cfg, &new_cfg, headers).await
+    let ctx = crate::api::admin::config::TransitionCtx::Admin { state, headers };
+    if let Err(e) = crate::api::admin::config::apply_config_transition(ctx, &mut cfg, new_cfg).await
     {
         tracing::error!("Full-backup import: apply_config_transition failed: {}", e);
         return Err(BackupSecretApplyError::new(
@@ -1558,7 +1558,6 @@ async fn apply_secrets(
             "failed to rebuild engine after applying backup secrets",
         ));
     }
-    *cfg = new_cfg;
 
     // Persist the merged config so storage/access creds survive a
     // restart. Without this, the operator would see the restore "work"
