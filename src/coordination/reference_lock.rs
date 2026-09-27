@@ -216,6 +216,25 @@ pub fn lock_object_key(bucket: &str, deltaspace: &str) -> String {
     format!("_dgp/locks/reference/{}.json", hex::encode(h.finalize()))
 }
 
+/// The lock objects of a deltaspace, in the order to take them. This
+/// release changes the identity of a routed bucket without an alias; while
+/// the previous identity differs, both lock objects are taken so that a
+/// node of the previous release (old key only) and a node of the next one
+/// (new key only) are both excluded. The old key comes first on every node,
+/// so two nodes of this release cannot deadlock (each waits for the old key
+/// before it holds anything). Release in reverse order.
+pub fn reference_lock_keys(
+    identity: &str,
+    previous: Option<&str>,
+    deltaspace: &str,
+) -> Vec<String> {
+    let new = lock_object_key(identity, deltaspace);
+    match previous.map(|p| lock_object_key(p, deltaspace)) {
+        Some(old) if old != new => vec![old, new],
+        _ => vec![new],
+    }
+}
+
 /// The concrete lock over a CAS-capable coordination bucket.
 pub struct S3ReferenceLock {
     client: Client,
@@ -405,6 +424,25 @@ mod tests {
             expires_at: expires,
             ttl_secs: None,
         }
+    }
+
+    #[test]
+    fn reference_lock_keys_take_the_old_key_first() {
+        let old = lock_object_key("releases", "v1");
+        let new = lock_object_key("hetzner-fsn1\u{0}releases", "v1");
+        assert_eq!(
+            reference_lock_keys("hetzner-fsn1\u{0}releases", Some("releases"), "v1"),
+            vec![old, new.clone()]
+        );
+        assert_eq!(
+            reference_lock_keys("hetzner-fsn1\u{0}releases", None, "v1"),
+            vec![new]
+        );
+        let same = lock_object_key("db-archive", "v1");
+        assert_eq!(
+            reference_lock_keys("db-archive", Some("db-archive"), "v1"),
+            vec![same]
+        );
     }
 
     /// The body stays readable both ways for one release: the previous

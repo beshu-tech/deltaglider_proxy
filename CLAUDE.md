@@ -316,6 +316,10 @@ single-instance planes below are addressed.
   clock skew does not matter; `expires_at` is still written for the previous
   release's readers, and a body without `ttl_secs` is judged by it. MinIO tests
   therefore wait real time (TTL 2 s), a simulated `now` no longer expires a lock.
+  Lock key = `lock_object_key(storage_identity, deltaspace)`; a routed bucket's identity is
+  `backend\0real_bucket` (before this release a route without an alias used the bare name), so
+  this release takes BOTH lock objects while they differ, old first, released in reverse
+  (`reference_lock_keys`, `previous_storage_identity`); the next release drops the old key.
   Every engine write of reference.bin (and of a delta) goes through a guard method:
   the backend write takes a `RefWriteProof` that only the guard's
   `reference_writes` module in `engine/locking.rs` makes, incl. delete-reclaim, sweep-reclaim,

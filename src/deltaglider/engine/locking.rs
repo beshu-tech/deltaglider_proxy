@@ -7,11 +7,13 @@ use super::*;
 
 /// RAII guard for the optional cross-instance reference lock. Held for the
 /// duration of a reference read-modify-write, inside the in-process prefix
-/// mutex. While held, a heartbeat task renews the lock every
-/// `renew_interval`; [`Self::ensure_held`] runs before each commit so a holder
-/// whose lock lapsed (a long streaming encode, a coordination-bucket outage)
-/// stops before it writes. On drop it stops the heartbeat and spawns a
-/// best-effort async release (Drop cannot be async); the lock's TTL backstops
+/// mutex. It holds one lock object, or two while a bucket's lock key changes
+/// (`reference_lock_keys`: old key first). While held, a heartbeat task per
+/// lock object renews it every `renew_interval`; [`Self::ensure_held`] runs
+/// before each commit and checks every object, so a holder whose lock lapsed
+/// (a long streaming encode, a coordination-bucket outage) stops before it
+/// writes. On drop it stops the heartbeats and spawns a best-effort async
+/// release in reverse order (Drop cannot be async); the lock's TTL backstops
 /// a release that never completes. Inert (`hold: None`) single-instance.
 ///
 /// Every engine write of reference.bin (bytes or metadata) goes through a
@@ -24,15 +26,21 @@ pub(crate) struct ReferenceLockGuard {
 
 struct CrossNodeHold {
     lock: Arc<dyn crate::coordination::ReferenceLock>,
-    key: String,
     owner: String,
-    state: Arc<HoldState>,
-    heartbeat: tokio::task::JoinHandle<()>,
+    /// The lock objects held, in acquisition order. Released in reverse.
+    keys: Vec<HeldKey>,
     /// reference.bin as this hold saw it right after the acquire; every
     /// reference write of the hold is conditional on it (and moves it on).
     /// A writer whose lock lapsed while a peer wrote cannot overwrite the
     /// peer's baseline: its condition fails instead.
     fence: parking_lot::Mutex<crate::storage::RefFence>,
+}
+
+/// One held lock object and its heartbeat.
+struct HeldKey {
+    key: String,
+    state: Arc<HoldState>,
+    heartbeat: tokio::task::JoinHandle<()>,
 }
 
 /// Shared between the guard and its heartbeat task.
@@ -77,12 +85,24 @@ impl ReferenceLockGuard {
         Self { hold: None }
     }
 
-    fn held(
-        lock: Arc<dyn crate::coordination::ReferenceLock>,
-        key: String,
-        owner: String,
-        fence: crate::storage::RefFence,
-    ) -> Self {
+    /// A cross-instance hold with no lock object yet: [`Self::push_key`]
+    /// adds each one when it is acquired, so a drop releases what is held.
+    fn holding(lock: Arc<dyn crate::coordination::ReferenceLock>, owner: String) -> Self {
+        Self {
+            hold: Some(CrossNodeHold {
+                lock,
+                owner,
+                keys: Vec::new(),
+                fence: parking_lot::Mutex::new(crate::storage::RefFence::Unfenced),
+            }),
+        }
+    }
+
+    /// Record an acquired lock object and start its heartbeat.
+    fn push_key(&mut self, key: String) {
+        let Some(h) = &mut self.hold else {
+            return;
+        };
         let state = Arc::new(HoldState {
             lost: std::sync::atomic::AtomicBool::new(false),
             confirmed_at: parking_lot::Mutex::new(std::time::Instant::now()),
@@ -90,21 +110,16 @@ impl ReferenceLockGuard {
             stop: tokio::sync::Notify::new(),
         });
         let heartbeat = tokio::spawn(Self::heartbeat(
-            lock.clone(),
+            h.lock.clone(),
             key.clone(),
-            owner.clone(),
+            h.owner.clone(),
             state.clone(),
         ));
-        Self {
-            hold: Some(CrossNodeHold {
-                lock,
-                key,
-                owner,
-                state,
-                heartbeat,
-                fence: parking_lot::Mutex::new(fence),
-            }),
-        }
+        h.keys.push(HeldKey {
+            key,
+            state,
+            heartbeat,
+        });
     }
 
     /// Whether reference.bin existed when the lock was taken: `Some` for a
@@ -160,23 +175,31 @@ impl ReferenceLockGuard {
         }
     }
 
-    /// Refuse the caller's next write unless the lock is still ours.
+    /// Refuse the caller's next write unless every lock object of the hold
+    /// is still ours.
     pub(crate) async fn ensure_held(&self) -> Result<(), EngineError> {
-        use std::sync::atomic::Ordering;
         let Some(h) = &self.hold else {
             return Ok(());
         };
+        for k in &h.keys {
+            Self::ensure_key_held(h, k).await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_key_held(h: &CrossNodeHold, k: &HeldKey) -> Result<(), EngineError> {
+        use std::sync::atomic::Ordering;
         let lost_err = || {
             EngineError::Storage(StorageError::Other(format!(
                 "reference lock {} lapsed before the write; refusing to write reference.bin \
                  or its delta (another instance may own the deltaspace now)",
-                h.key
+                k.key
             )))
         };
         let check = || {
             hold_check(
-                h.state.lost.load(Ordering::SeqCst),
-                h.state.confirmed_at.lock().elapsed(),
+                k.state.lost.load(Ordering::SeqCst),
+                k.state.confirmed_at.lock().elapsed(),
                 h.lock.renew_interval(),
             )
         };
@@ -185,7 +208,7 @@ impl ReferenceLockGuard {
         }
         // Wait out a heartbeat renew in flight, then decide again: it may
         // have just confirmed the lock, or seen it lost.
-        let _one = h.state.renewing.lock().await;
+        let _one = k.state.renewing.lock().await;
         match check() {
             HoldCheck::Trust => Ok(()),
             HoldCheck::Lost => Err(lost_err()),
@@ -194,23 +217,23 @@ impl ReferenceLockGuard {
                 match h
                     .lock
                     .renew(
-                        &h.key,
+                        &k.key,
                         &h.owner,
                         crate::event_outbox::current_unix_seconds(),
                     )
                     .await
                 {
                     Ok(()) => {
-                        *h.state.confirmed_at.lock() = started;
+                        *k.state.confirmed_at.lock() = started;
                         Ok(())
                     }
                     Err(crate::coordination::LeaseError::Lost) => {
-                        h.state.lost.store(true, Ordering::SeqCst);
+                        k.state.lost.store(true, Ordering::SeqCst);
                         Err(lost_err())
                     }
                     Err(e) => Err(EngineError::Storage(StorageError::Other(format!(
                         "reference lock {} could not be confirmed before the write: {e}",
-                        h.key
+                        k.key
                     )))),
                 }
             }
@@ -396,22 +419,32 @@ pub use reference_writes::RefWriteProof;
 impl Drop for ReferenceLockGuard {
     fn drop(&mut self) {
         if let Some(h) = self.hold.take() {
+            if h.keys.is_empty() {
+                return;
+            }
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                // Stop the heartbeat and let a renew in flight finish BEFORE
+                // Stop the heartbeats and let a renew in flight finish BEFORE
                 // the release: a renew PUT that lands between the release's
                 // read and its If-Match DELETE made the DELETE fail, and the
                 // lock blocked the deltaspace for a whole TTL.
-                h.state.stop.notify_one();
-                let (lock, key, owner, heartbeat) = (h.lock, h.key, h.owner, h.heartbeat);
+                for k in &h.keys {
+                    k.state.stop.notify_one();
+                }
+                let (lock, owner, keys) = (h.lock, h.owner, h.keys);
                 handle.spawn(async move {
-                    let _ = heartbeat.await;
-                    if let Err(e) = lock.release(&key, &owner).await {
-                        tracing::warn!("reference lock release failed for {key}: {e}");
+                    // Reverse of the acquire order: the old key goes last.
+                    for k in keys.into_iter().rev() {
+                        let _ = k.heartbeat.await;
+                        if let Err(e) = lock.release(&k.key, &owner).await {
+                            tracing::warn!("reference lock release failed for {}: {e}", k.key);
+                        }
                     }
                 });
             } else {
                 // No runtime available (dropped during shutdown) → rely on the TTL.
-                h.heartbeat.abort();
+                for k in &h.keys {
+                    k.heartbeat.abort();
+                }
             }
         }
     }
@@ -498,42 +531,49 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let Some(lock) = self.reference_lock.clone() else {
             return Ok(ReferenceLockGuard::inert());
         };
-        let key = crate::coordination::reference_lock::lock_object_key(
+        // Old key first while it differs (see `reference_lock_keys`).
+        let keys = crate::coordination::reference_lock::reference_lock_keys(
             &self.storage.storage_identity(bucket),
+            self.storage.previous_storage_identity(bucket).as_deref(),
             deltaspace,
         );
         let owner = format!("ref-{}", uuid::Uuid::new_v4());
         let deadline = std::time::Instant::now() + lock.acquire_timeout();
         let now_fn = || crate::event_outbox::current_unix_seconds();
-        match crate::coordination::reference_lock::acquire_blocking(
-            lock.as_ref(),
-            &key,
-            &owner,
-            deadline,
-            &now_fn,
-        )
-        .await
-        {
-            Ok(true) => {
-                // Observe reference.bin under the lock: the fence of every
-                // reference write this hold makes. On an error the guard is
-                // built first so that its drop releases the lock.
-                let guard =
-                    ReferenceLockGuard::held(lock, key, owner, crate::storage::RefFence::Unfenced);
-                let fence = self.storage.reference_fence(bucket, deltaspace).await?;
-                if let Some(h) = &guard.hold {
-                    *h.fence.lock() = fence;
+        // Built before the first acquire: on any error below, its drop
+        // releases the lock objects that it holds so far.
+        let mut guard = ReferenceLockGuard::holding(lock.clone(), owner.clone());
+        for key in keys {
+            match crate::coordination::reference_lock::acquire_blocking(
+                lock.as_ref(),
+                &key,
+                &owner,
+                deadline,
+                &now_fn,
+            )
+            .await
+            {
+                Ok(true) => guard.push_key(key),
+                Ok(false) => {
+                    return Err(EngineError::Storage(StorageError::Other(format!(
+                        "reference lock for deltaspace '{bucket}/{deltaspace}' held by another \
+                         instance; write timed out to avoid corrupting reference.bin"
+                    ))))
                 }
-                Ok(guard)
+                Err(e) => {
+                    return Err(EngineError::Storage(StorageError::Other(format!(
+                        "reference lock acquire failed for deltaspace '{bucket}/{deltaspace}': {e}"
+                    ))))
+                }
             }
-            Ok(false) => Err(EngineError::Storage(StorageError::Other(format!(
-                "reference lock for deltaspace '{bucket}/{deltaspace}' held by another instance; \
-                 write timed out to avoid corrupting reference.bin"
-            )))),
-            Err(e) => Err(EngineError::Storage(StorageError::Other(format!(
-                "reference lock acquire failed for deltaspace '{bucket}/{deltaspace}': {e}"
-            )))),
         }
+        // Observe reference.bin under the lock: the fence of every reference
+        // write this hold makes.
+        let fence = self.storage.reference_fence(bucket, deltaspace).await?;
+        if let Some(h) = &guard.hold {
+            *h.fence.lock() = fence;
+        }
+        Ok(guard)
     }
 
     /// Prune prefix lock entries that are no longer actively held.

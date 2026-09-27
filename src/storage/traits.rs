@@ -819,10 +819,19 @@ pub trait StorageBackend: Send + Sync {
 
     /// A name for the STORAGE behind `bucket`: two bucket names that store
     /// into the same real bucket (policy aliases) get the same identity, so
-    /// the engine's deltaspace locks serialise them. An unaliased bucket is
-    /// its own name (the lock keys of existing deployments stay the same).
+    /// the engine's deltaspace locks serialise them. An unrouted bucket is
+    /// its own name.
     fn storage_identity(&self, bucket: &str) -> String {
         bucket.to_string()
+    }
+
+    /// The identity that the previous release used for `bucket`, when it
+    /// differs from [`Self::storage_identity`]. The reference lock takes the
+    /// lock object of both during this release, so a node of the previous
+    /// release and a node of this one exclude each other in a rolling
+    /// upgrade. Remove in the next release (CHANGELOG).
+    fn previous_storage_identity(&self, _bucket: &str) -> Option<String> {
+        None
     }
 
     // === Scanning operations ===
@@ -1419,6 +1428,9 @@ macro_rules! impl_storage_backend_for_box {
             }
             fn storage_identity(&self, bucket: &str) -> String {
                 (**self).storage_identity(bucket)
+            }
+            fn previous_storage_identity(&self, bucket: &str) -> Option<String> {
+                (**self).previous_storage_identity(bucket)
             }
 
             async fn scan_deltaspace(

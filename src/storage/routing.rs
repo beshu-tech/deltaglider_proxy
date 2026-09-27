@@ -32,6 +32,20 @@ struct BucketRoute {
     real_bucket: Option<String>,
 }
 
+/// Pure: the storage identity of a routed bucket, `backend \0 real bucket`
+/// (the real bucket is the bucket name itself without an alias). A route
+/// to a backend is never the same storage as the same name on another one.
+fn route_identity(bucket: &str, route: &BucketRoute) -> String {
+    let real = route.real_bucket.as_deref().unwrap_or(bucket);
+    format!("{}\u{0}{real}", route.backend_name)
+}
+
+/// Pure: the identity of the previous release, when it differs. It was the
+/// bare bucket name for a route without an alias.
+fn previous_route_identity(bucket: &str, route: &BucketRoute) -> Option<String> {
+    route.real_bucket.is_none().then(|| bucket.to_string())
+}
+
 /// Multi-backend routing storage backend.
 ///
 /// Dispatches each storage operation to the correct underlying backend
@@ -1212,12 +1226,14 @@ impl StorageBackend for RoutingBackend {
 
     fn storage_identity(&self, bucket: &str) -> String {
         match self.routes.get(bucket) {
-            Some(BucketRoute {
-                backend_name,
-                real_bucket: Some(real),
-            }) => format!("{backend_name}\u{0}{real}"),
-            _ => bucket.to_string(),
+            Some(route) => route_identity(bucket, route),
+            None => bucket.to_string(),
         }
+    }
+
+    fn previous_storage_identity(&self, bucket: &str) -> Option<String> {
+        let route = self.routes.get(bucket)?;
+        previous_route_identity(bucket, route)
     }
 
     fn resolved_backend_name(&self, bucket: &str) -> Option<String> {
@@ -1791,6 +1807,46 @@ mod tests {
         let by_name: HashMap<_, _> = origins.iter().map(|b| (b.name.as_str(), b)).collect();
         assert_eq!(by_name["shared"].backend_name.as_deref(), Some("primary"));
         assert_eq!(by_name["leftover"].backend_name.as_deref(), Some("archive"));
+    }
+
+    /// Review 4 coordination-6: a route without an alias had the bare
+    /// bucket name as its identity, so its alias twin (`backend \0 name`)
+    /// took another deltaspace lock for the same storage. Every route now
+    /// has `backend \0 real bucket`; the old identity is named while it
+    /// differs, for the two-key reference lock of this release.
+    #[test]
+    fn every_route_has_a_backend_scoped_identity() {
+        let mk = |b: &str| {
+            Arc::new(Box::new(TestBackend::with_buckets(&[b])) as Box<dyn StorageBackend>)
+        };
+        let backends = HashMap::from([
+            ("local-disk".to_string(), mk("x")),
+            ("hetzner-fsn1".to_string(), mk("releases")),
+        ]);
+        let routes = HashMap::from([
+            ("releases".to_string(), ("hetzner-fsn1".to_string(), None)),
+            (
+                "downloads".to_string(),
+                ("hetzner-fsn1".to_string(), Some("releases".to_string())),
+            ),
+        ]);
+        let routing = RoutingBackend::new(backends, routes, "local-disk".to_string()).unwrap();
+        assert_eq!(
+            routing.storage_identity("releases"),
+            "hetzner-fsn1\u{0}releases"
+        );
+        assert_eq!(
+            routing.storage_identity("downloads"),
+            routing.storage_identity("releases"),
+            "an alias and its target are one storage"
+        );
+        assert_eq!(
+            routing.previous_storage_identity("releases").as_deref(),
+            Some("releases")
+        );
+        assert_eq!(routing.previous_storage_identity("downloads"), None);
+        assert_eq!(routing.storage_identity("db-archive"), "db-archive");
+        assert_eq!(routing.previous_storage_identity("db-archive"), None);
     }
 
     /// Tier 4: every op on an unrouted bucket sent a head_bucket to each

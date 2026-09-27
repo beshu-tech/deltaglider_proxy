@@ -96,6 +96,22 @@ job rows: it stays armed while a job is active, and it opens when the job
 settles, when a migrate passes its flip, or when a migrate unwinds before
 its flip.
 
+### Fixed — A routed bucket and its alias share one deltaspace lock
+
+The per-deltaspace lock (in one process and across instances) was keyed by
+the bare bucket name for a bucket that routes to a backend without a
+`real_bucket` alias, but by `backend` and real bucket name for an alias.
+So a bucket and an alias of it, which store into the same real bucket,
+took two different locks for one `reference.bin`. Now every routed bucket
+is keyed by its backend and its real bucket name.
+
+This changes the name of the cross-instance lock object of such a bucket.
+So that the nodes of the previous release and the nodes of this release
+exclude each other during a rolling upgrade, this release takes both lock
+objects, the old one first, and releases them in reverse order. The next
+release takes only the new lock object. Upgrade every node to this release
+before you upgrade any node to the next one.
+
 ### Changed — ListObjectsV2 continuation tokens are opaque
 
 `NextContinuationToken` was the raw key of the last entry. With

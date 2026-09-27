@@ -858,3 +858,218 @@ async fn fenced_writes_pass_without_a_race() {
         .await
         .unwrap());
 }
+
+// ── M1: the lock key change of a routed bucket (rolling upgrade) ─────
+
+/// A lock per key, like the lock objects in the coordination bucket.
+/// Records the order of every acquire and release.
+#[derive(Default)]
+struct KeyedLock {
+    held: parking_lot::Mutex<HashMap<String, String>>, // key -> owner
+    lost: parking_lot::Mutex<std::collections::HashSet<String>>,
+    log: parking_lot::Mutex<Vec<(&'static str, String)>>,
+}
+
+#[async_trait]
+impl crate::coordination::ReferenceLock for KeyedLock {
+    async fn try_acquire(&self, key: &str, owner: &str, _: i64) -> Result<bool, LeaseError> {
+        let mut held = self.held.lock();
+        if held.contains_key(key) {
+            return Ok(false);
+        }
+        held.insert(key.to_string(), owner.to_string());
+        self.log.lock().push(("acquire", key.to_string()));
+        Ok(true)
+    }
+    async fn release(&self, key: &str, owner: &str) -> Result<(), LeaseError> {
+        let mut held = self.held.lock();
+        if held.get(key).map(String::as_str) == Some(owner) {
+            held.remove(key);
+            self.log.lock().push(("release", key.to_string()));
+        }
+        Ok(())
+    }
+    async fn renew(&self, key: &str, owner: &str, _: i64) -> Result<(), LeaseError> {
+        let ours = self.held.lock().get(key).map(String::as_str) == Some(owner);
+        if !ours || self.lost.lock().contains(key) {
+            return Err(LeaseError::Lost);
+        }
+        Ok(())
+    }
+    fn ttl_secs(&self) -> i64 {
+        120
+    }
+    fn renew_interval(&self) -> Duration {
+        Duration::ZERO // every commit re-confirms every key
+    }
+    fn acquire_timeout(&self) -> Duration {
+        Duration::from_millis(100)
+    }
+}
+
+const OLD_KEY_BUCKET: &str = "releases";
+const NEW_KEY_BUCKET: &str = "hetzner-fsn1\u{0}releases";
+
+fn old_key() -> String {
+    crate::coordination::reference_lock::lock_object_key(OLD_KEY_BUCKET, "v1")
+}
+fn new_key() -> String {
+    crate::coordination::reference_lock::lock_object_key(NEW_KEY_BUCKET, "v1")
+}
+
+/// A routing engine: `releases` routes to `hetzner-fsn1` with no alias,
+/// the bucket whose lock key changes in this release.
+async fn routed_engine(lock: Arc<KeyedLock>) -> (tempfile::TempDir, DynEngine) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut backends: HashMap<String, Arc<Box<dyn StorageBackend>>> = HashMap::new();
+    for name in ["local-disk", "hetzner-fsn1"] {
+        let dir = tmp.path().join(name);
+        let fs = FilesystemBackend::new(dir).await.unwrap();
+        backends.insert(name.to_string(), Arc::new(Box::new(fs)));
+    }
+    let routes = HashMap::from([("releases".to_string(), ("hetzner-fsn1".to_string(), None))]);
+    let routing =
+        crate::storage::RoutingBackend::new(backends, routes, "local-disk".to_string()).unwrap();
+    let backend: Box<dyn StorageBackend> = Box::new(routing);
+    backend.create_bucket("releases").await.unwrap();
+    let engine = DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None)
+        .with_reference_lock(Some(lock));
+    (tmp, engine)
+}
+
+/// This release takes the old lock object AND the new one, old first, and
+/// releases them in reverse. So a node of the previous release (old key
+/// only) and a node of the next release (new key only) both exclude it.
+#[tokio::test]
+async fn m1_a_changed_key_takes_both_lock_objects_old_first() {
+    let lock = Arc::new(KeyedLock::default());
+    let (_tmp, engine) = routed_engine(lock.clone()).await;
+    let guard = engine
+        .acquire_reference_lock("releases", "v1")
+        .await
+        .unwrap();
+    guard.ensure_held().await.unwrap();
+    drop(guard);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !lock.held.lock().is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        *lock.log.lock(),
+        vec![
+            ("acquire", old_key()),
+            ("acquire", new_key()),
+            ("release", new_key()),
+            ("release", old_key()),
+        ]
+    );
+}
+
+/// A peer on either key blocks the write, and the key that this node did
+/// take is not left behind.
+#[tokio::test]
+async fn m1_a_peer_on_either_key_blocks_and_nothing_stays_held() {
+    for peer_key in [old_key(), new_key()] {
+        let lock = Arc::new(KeyedLock::default());
+        lock.held.lock().insert(peer_key.clone(), "peer".into());
+        let (_tmp, engine) = routed_engine(lock.clone()).await;
+        let err = engine
+            .store("releases", "v1/app.zip", &[7u8; 4096], None, HashMap::new())
+            .await
+            .expect_err("a peer holding a key must block the write");
+        assert!(
+            err.to_string().contains("held by another instance"),
+            "{err}"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while lock.held.lock().len() > 1 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            lock.held.lock().keys().cloned().collect::<Vec<_>>(),
+            vec![peer_key],
+            "only the peer's key may stay held"
+        );
+    }
+}
+
+/// A commit checks every key: losing either one refuses the write.
+#[tokio::test]
+async fn m1_losing_either_key_refuses_the_commit() {
+    for lost in [old_key(), new_key()] {
+        let lock = Arc::new(KeyedLock::default());
+        let (_tmp, engine) = routed_engine(lock.clone()).await;
+        let guard = engine
+            .acquire_reference_lock("releases", "v1")
+            .await
+            .unwrap();
+        lock.lost.lock().insert(lost.clone());
+        let err = guard
+            .ensure_held()
+            .await
+            .expect_err("a lost key must refuse");
+        assert!(err.to_string().contains("lapsed"), "{err}");
+    }
+}
+
+/// Race: many writers on two "nodes" (two engines sharing the lock
+/// objects), plus a previous-release node that takes only the old key.
+/// At most one holds the deltaspace at a time, and every writer finishes
+/// (the fixed key order means no deadlock).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m1_old_and_new_nodes_exclude_each_other_without_deadlock() {
+    use std::sync::atomic::AtomicI64;
+    let lock = Arc::new(KeyedLock::default());
+    let (_t1, a) = routed_engine(lock.clone()).await;
+    let (_t2, b) = routed_engine(lock.clone()).await;
+    let (a, b) = (Arc::new(a), Arc::new(b));
+    let inside = Arc::new(AtomicI64::new(0));
+    let peak = Arc::new(AtomicI64::new(0));
+    let enter = |inside: &AtomicI64, peak: &AtomicI64| {
+        let n = inside.fetch_add(1, Ordering::SeqCst) + 1;
+        peak.fetch_max(n, Ordering::SeqCst);
+    };
+    let mut tasks = Vec::new();
+    for i in 0..24 {
+        let engine = if i % 2 == 0 { a.clone() } else { b.clone() };
+        let (inside, peak) = (inside.clone(), peak.clone());
+        tasks.push(tokio::spawn(async move {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                match engine.acquire_reference_lock("releases", "v1").await {
+                    Ok(guard) => {
+                        enter(&inside, &peak);
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                        inside.fetch_sub(1, Ordering::SeqCst);
+                        drop(guard);
+                        return;
+                    }
+                    Err(_) if std::time::Instant::now() < deadline => continue,
+                    Err(e) => panic!("writer starved (deadlock?): {e}"),
+                }
+            }
+        }));
+    }
+    // The previous-release node: only the old key, straight on the lock.
+    for n in 0..12 {
+        let (lock, inside, peak) = (lock.clone(), inside.clone(), peak.clone());
+        tasks.push(tokio::spawn(async move {
+            use crate::coordination::ReferenceLock as _;
+            let owner = format!("old-node-{n}");
+            while !lock.try_acquire(&old_key(), &owner, 0).await.unwrap() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            enter(&inside, &peak);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            inside.fetch_sub(1, Ordering::SeqCst);
+            lock.release(&old_key(), &owner).await.unwrap();
+        }));
+    }
+    for t in tasks {
+        tokio::time::timeout(Duration::from_secs(30), t)
+            .await
+            .expect("no deadlock")
+            .unwrap();
+    }
+    assert_eq!(peak.load(Ordering::SeqCst), 1, "two holders at once");
+}
