@@ -15,17 +15,21 @@ storage:
         - public/
 ```
 
-Or in the UI: **Settings → Storage → Buckets** → expand the `downloads` row → **Anonymous read access** → pick **Specific prefixes** and add `public/`:
+Or in the UI: **Settings → Storage → Buckets** → expand the `downloads` row → **Public access** → pick **Specific prefixes public** and add `public/`:
 
 ![Bucket policies with the public-access tri-state](/_/screenshots/bucket-policies.jpg)
 
-The tri-state maps directly to the YAML: **None** (no anonymous access), **Specific prefixes** (`public_prefixes: [...]`), **Entire bucket** (`public: true`).
+The tri-state maps directly to the YAML: **Private (default)** (no anonymous access), **Specific prefixes public** (`public_prefixes: [...]`), **Entire bucket public** (`public: true`).
 
 Apply the change — it hot-reloads; the proxy creates a read-only request rule named `public-prefix:downloads` from it.
 
+The proxy refuses to make the coordination bucket (`config_sync_bucket`) public, because S3 clients can never reach that bucket.
+
 ## 2. Know what anonymous callers get
 
-Anonymous requests can GET, HEAD, and LIST under the prefix (LIST results never escape it), run as an audited `$anonymous` user, and can never write — full semantics in the [authentication reference](../reference/authentication.md#public-prefixes).
+Anonymous requests can GET, HEAD, and LIST under the prefix (LIST results never escape it), run as the built-in `$anonymous` user, and can never write. The full semantics are in the [authentication reference](../reference/authentication.md#public-prefixes).
+
+A response to an anonymous request carries no `x-amz-meta-dg-tool` header, because that metadata names the proxy version. The failed-sign-in lockout does not block public reads: a client address that the proxy locked out still gets the objects under a public prefix.
 
 ## Mind the trailing slash
 
@@ -70,7 +74,7 @@ env -i curl -sw "%{http_code}\n" -o /dev/null -X PUT \
 # 403 — anonymous writes are always denied
 ```
 
-Anonymous fetches appear in **Settings → Observability → Audit** as `user=$anonymous`.
+Each anonymous request writes a line with `action=public_read` and `user=$anonymous` to the proxy log. These lines do not appear in the admin GUI's audit log.
 
 ## Lock writes down
 

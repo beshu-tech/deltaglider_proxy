@@ -32,14 +32,16 @@ A request with no matching Allow is implicitly denied.
 
 | Action | S3 operations |
 |--------|---------------|
-| `read` | GetObject, HeadObject |
+| `read` | GetObject, HeadObject, ListParts |
 | `write` | PutObject, CopyObject, CreateMultipartUpload, UploadPart, CompleteMultipartUpload |
-| `delete` | DeleteObject, DeleteObjects |
-| `list` | ListBuckets, ListObjectsV2, ListMultipartUploads, ListParts |
-| `admin` | CreateBucket, DeleteBucket |
+| `delete` | DeleteObject, DeleteObjects, AbortMultipartUpload |
+| `list` | ListBuckets, ListObjectsV2, ListMultipartUploads, HeadBucket |
+| `admin` | CreateBucket, DeleteBucket, and every other bucket-level `PUT` or `DELETE` |
 | `*` | All actions |
 
-A user is an **admin** (admin GUI access, config changes) when at least one Allow rule has actions containing `*` or `admin` AND resources containing `*`.
+The proxy derives the action from the method and the path: a `GET` or `HEAD` of a key is `read`, and a `GET` or `HEAD` of a bucket is `list`. ListParts is a `GET` of the upload's key, so it needs `read`.
+
+A user is an **admin** (admin GUI access, config changes) when at least one Allow rule has actions containing `*` or `admin` AND resources containing `*`. A Deny rule of the same shape (actions `*` or `admin`, resources `*`) removes the admin status. Direct rules and group rules count together.
 
 ### Resources
 
@@ -150,14 +152,14 @@ A PUT to a non-existent bucket returns `404 NoSuchBucket` on every backend — i
 
 ## Canned policy templates
 
-The admin GUI (**Access → Users → Apply template**) offers four starting-point policies. Generated permissions are editable before saving.
+The user form (**Settings → Access → Users**) shows four preset buttons above the permission editor. A click replaces the permissions in the form, after a confirmation when the form already has permissions. You can edit them before you save. A new user starts with `read` and `list` on every resource.
 
-| Template | Permissions |
+| Preset | Permissions |
 |----------|-------------|
-| Read-only | `read`, `list` on every resource |
-| Developer | `read`, `write`, `list` on every resource |
-| Admin | All actions on every resource |
-| Bucket owner | All actions on one named bucket (selected on apply) |
+| Read Only | `read`, `list` on every resource |
+| Read/Write (no delete) | `read`, `write`, `list` on every resource |
+| Read/Write/Delete | `read`, `write`, `delete`, `list` on every resource |
+| Full Access (admin) | All actions on every resource |
 
 ## Group resolution
 
@@ -165,7 +167,7 @@ The admin GUI (**Access → Users → Apply template**) offers four starting-poi
 - Group permissions are merged into each member at IAM index build time; identity templates expand after this merge.
 - Deny precedence applies across the union: a Deny in any source — direct or inherited — overrides Allows from all sources.
 - OAuth group mapping rules add group memberships on each login; memberships are merged, never replaced, so manual assignments persist.
-- The built-in Administrators group carries `{ "effect": "Allow", "actions": ["*"], "resources": ["*"] }`.
+- The proxy creates no group by itself. When the first IAM user is created in `gui` mode, the bootstrap pair becomes the user `legacy-admin` with the direct rule `{ "effect": "Allow", "actions": ["*"], "resources": ["*"] }`.
 
 ## Related
 

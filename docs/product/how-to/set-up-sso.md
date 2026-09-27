@@ -44,21 +44,22 @@ If you use any other OIDC provider: it works as long as it serves `.well-known/o
 
 ## 2. Add the provider in the admin UI
 
-Go to **Settings → Access → External authentication** → **+ Add provider**.
+Go to **Settings → Access → External authentication** → **Add provider**.
 
 The proxy has one provider type, `oidc`. Google, Okta, and Azure AD have no type of their own: each one is an OpenID Connect issuer, so you add it as an `oidc` provider with its issuer URL. The proxy reads the issuer's `.well-known/openid-configuration` document and takes the authorization, token, and key endpoints from it. The form sets the type to `oidc` for you. In the admin API and in declarative YAML, `provider_type` must be `oidc`. The proxy refuses a provider of any other type when you save it (`422` in the admin API, a refused apply in declarative mode), because it has no sign-in flow for another type.
 
 | Field | Value |
 |---|---|
-| Name | lower-case ASCII id — appears in the sign-in button (`Sign in with okta`) |
-| Display name | human-readable label shown on the login page |
+| Provider name | a unique identifier, for example `okta` |
+| Display name | the label of the sign-in button (`Sign in with Okta`). When it is empty, the button shows the provider name. |
 | Issuer URL | the issuer URL from step 1 |
 | Client ID / Client secret | from step 1 |
 | Scopes | `openid email profile` minimum; add `groups` per your provider |
 | Enabled | ✓ |
-| Priority | lower number = shown first on the login page |
 
-Save, then use the provider row's **Test** action: the proxy fetches the issuer's `.well-known/openid-configuration` and reports DNS, TLS, or connectivity problems before any human tries to log in. The error names the underlying cause, for example `invalid peer certificate: UnknownIssuer` for a certificate from a CA that the proxy does not trust.
+The form has no priority field. In the admin API and in YAML, `priority` sets the order of the buttons on the login page: a provider with a higher number is shown first.
+
+Click **Test Connection**, before or after you save. The proxy tests the values that are in the form at that moment and saves nothing. A blank client secret keeps the saved secret for the test. The proxy fetches the issuer's `.well-known/openid-configuration` and reports DNS, TLS, or connectivity problems before any human tries to log in. The error names the underlying cause, for example `invalid peer certificate: UnknownIssuer` for a certificate from a CA that the proxy does not trust. Test Connection also works in declarative IAM mode, because it changes nothing. In the admin API, `POST /_/api/admin/ext-auth/providers/:id/test` tests a saved provider, and an optional JSON body with the form fields replaces the saved values for that test only. `POST /_/api/admin/ext-auth/providers/test` tests a provider that is not saved yet. A test that fails answers `200` with `success: false` and the reason in `error`.
 
 The proxy checks the issuer URL when you save the provider. By default the issuer must use `https://` and a public address, because the proxy refuses requests to private, loopback, and cloud-metadata addresses. A provider that breaks this rule is refused with `422` and a message that names the rule. The client secret is never returned in a response: the API shows `****` in its place.
 
@@ -93,22 +94,29 @@ The proxy does not use the operating system's certificate store for identity pro
 
 ## 3. Map IdP groups to IAM groups
 
-Mapping rules decide which IAM groups a fresh identity lands in, based on its claims. Acme maps the Okta `engineering` group to the `Engineering` IAM group.
+Mapping rules decide which IAM groups an identity joins, based on its claims. Acme maps the Okta `engineering` group to the `Engineering` IAM group.
 
-Go to **Settings → Access → External authentication** → **Mapping rules** → **+ Add rule**.
+Go to **Settings → Access → External authentication** → **Allowed Users & Group Assignment** → **Add Rule**, fill in the new row, and click **Save Rules**.
 
 ![OAuth provider and group mapping settings](/_/screenshots/oauth_group_mapping.jpg)
 
 | Field | Value |
 |---|---|
-| Name | `okta-engineering` |
-| Priority | rules evaluate in ascending priority; first match wins |
-| Match | claim path `groups`, value `engineering` (exact match; globs `*`/`?` supported) |
-| Target groups | `Engineering` |
+| Match type | **Claim value** |
+| Claim field | `groups` |
+| Match value | `engineering` |
+| Assign to group | `Engineering` |
+| Provider | the provider of step 2, or **All providers** |
 
-Common claim paths: Google `hd` (hosted domain) or `email` (`*@acme.example`); Okta `groups`; Azure AD `groups` (UUIDs) or `roles` for app roles.
+The match types are **Email pattern** (`*` matches any characters, for example `*@acme.example`), **Email domain**, **Email exact**, **Email regex**, and **Claim value**. A claim-value rule matches when the claim is a string equal to the value, or a list that contains the value, without regard to case. It does not support wildcards. Rules that read the email match only when the provider marks the email as verified.
 
-Use the **Preview** button before relying on a rule: paste an email or claim set and the UI shows which groups that identity would receive — cheaper than logging in as them. Group memberships are merged on each login, never replaced, so manual assignments survive SSO.
+The proxy checks every rule at each login, and the identity joins the group of every rule that matches. Rule order does not change the result.
+
+Common claim fields: Google `hd` (hosted domain); Okta `groups`; Azure AD `groups` (UUIDs) or `roles` for app roles. For an email match, use one of the email match types.
+
+Use the **Preview** box before you rely on a rule: type an email address and click **Check**, and the UI shows which groups that address would receive. Preview checks only the email: it cannot show the result of a claim-value rule. Group memberships are merged on each login, never replaced, so manual assignments survive SSO.
+
+A login needs no matching rule. The proxy creates the user on the first login in any case, and a user that no rule matches has no group memberships and no permissions.
 
 ## 4. First login
 
@@ -118,19 +126,21 @@ Open the login page in a private window. A "Sign in with Okta" button now appear
 
 Have `dana` click it. She authenticates at the provider, consents, and is redirected back. On success:
 
-- A row appears in **Settings → Access → External authentication → Identities**, linking the provider's subject ID to a DeltaGlider user.
+- A row appears under **Login Activity** on the **External authentication** page, linking the provider's subject ID to a DeltaGlider user.
 - Matching mapping rules fire — `dana` is now a member of `Engineering`.
-- She gets a session cookie and lands in the admin UI.
+- She gets a session cookie and lands in the file browser. Only a user with admin permissions (direct or through a group) gets an admin session. Every other user gets a browser-only session, which opens the file browser with the user's own S3 permissions and refuses the admin API with `403`. The bulk copy, move, delete, and ZIP actions of the file browser work in that session, under the same permissions.
 
-Every successful OAuth login shows as `external_login` in **Settings → Observability → Audit**; rejections show as `access_denied`.
+Every successful OAuth login shows as `external_login` in **Settings → Observability → Audit log**. A failed login shows an error page in the browser and a line in the proxy log.
 
 ## If the login fails
 
 Three failure modes are provider-side, not proxy-side:
 
-1. **`invalid_redirect_uri` at the provider.** The registered URI doesn't byte-for-byte match `https://s3.acme.example/_/api/admin/oauth/callback` — watch trailing slashes and `http` vs `https`. If a reverse proxy fronts DeltaGlider, also confirm it forwards the same `Host` header the user sees. The proxy builds the callback URL from the `Host` header. It uses `X-Forwarded-Host` and `X-Forwarded-Proto` only when `DGP_TRUST_PROXY_HEADERS=true`, because otherwise any client could choose the host that receives the authorization code.
+1. **`invalid_redirect_uri` at the provider.** The registered URI doesn't byte-for-byte match `https://s3.acme.example/_/api/admin/oauth/callback` — watch trailing slashes and `http` vs `https`. If a reverse proxy fronts DeltaGlider, also confirm it forwards the same `Host` header the user sees. The proxy builds the callback URL from the `Host` header. It uses `X-Forwarded-Host` and `X-Forwarded-Proto` only when `DGP_TRUST_PROXY_HEADERS=true` and the request comes from a network in `DGP_TRUSTED_PROXY_CIDRS`, because otherwise any client could choose the host that receives the authorization code.
 2. **Azure `groups` claim missing.** Azure AD omits groups by default; in the app registration go to Token configuration → Add groups claim, then retry the flow.
-3. **"Token exchange failed" in the audit log, or a failed Test.** The proxy couldn't reach the provider. Read the error first: it names the cause (DNS, a refused connection, a refused private address, or a TLS error such as `UnknownIssuer`). A `curl` from the proxy container is not a reliable check. `curl` trusts the operating system's certificate store and connects to private addresses, but the proxy does neither unless you set `ca_cert_path` and `allow_local` (see [An identity provider in a private network](#an-identity-provider-in-a-private-network)). So `curl` can succeed while the proxy fails. If `curl` fails too, fix DNS, the network, or the certificate first; it isn't an OAuth problem.
+3. **"Code exchange failed" on the error page, or a failed Test Connection.** The proxy couldn't reach the provider. Read the error first: it names the cause (DNS, a refused connection, a refused private address, or a TLS error such as `UnknownIssuer`). A `curl` from the proxy container is not a reliable check. `curl` trusts the operating system's certificate store and connects to private addresses, but the proxy does neither unless you set `ca_cert_path` and `allow_local` (see [An identity provider in a private network](#an-identity-provider-in-a-private-network)). So `curl` can succeed while the proxy fails. If `curl` fails too, fix DNS, the network, or the certificate first; it isn't an OAuth problem.
+
+Two refusals come from the proxy itself. First, the proxy refuses a login whose email the provider does not mark as verified (an ID token without the `email_verified` claim counts as unverified), and the error page says so. To accept such logins, set `require_email_verified: false` in the provider's `extra_config`; email-based mapping rules still do not match such an identity. Second, after too many failed sign-ins from one address, the proxy locks that address out for a while. The authorize and callback pages then answer `429` with a `Retry-After` header, and the error page names the wait, for example "Try again in 10 min.".
 
 If login succeeds but the user has no permissions, no mapping rule matched — check with the Preview tool, and verify the auto-created user row in **Settings → Access → Users**. If you rotate the client secret at the provider, update it in the provider form; it takes effect on save, no restart.
 

@@ -89,9 +89,11 @@ Per entity type (users, groups, providers, mapping rules), by NAME:
 | present | missing | CREATE |
 | missing | present | DELETE (cascades via FKs) |
 
+A user that an OAuth login created (`auth_source: external`) is never written in YAML, so its absence alone does not delete it. The reconciler deletes such a user only when the OAuth flow can create it again: no direct permissions, and exactly the groups that the mapping rules give it. A user with permissions or groups that an admin added keeps its row. A YAML user with the name of an OAuth-created user and a different access key fails the apply, because the name would otherwise give that YAML user's credentials to the holder of the identity-provider account. Rename one of the two.
+
 Mapping rules are wipe-and-rebuild (no stable per-row identity beyond the tuple of fields; replacing is identical in observable effect).
 
-**Validation is separate from side effects.** Every YAML-only error (duplicate names, duplicate access keys, unknown group refs, invalid permissions, `$`-prefixed reserved names, an OIDC `issuer_url` that the provider's `extra_config.allow_local` setting does not permit) surfaces before any DB write. A single error means zero state change.
+**Validation is separate from side effects.** Every YAML-only error (duplicate names, duplicate access keys, unknown group refs, invalid permissions, `$`-prefixed reserved names, a new or changed provider whose `provider_type` is not `oidc`, an OIDC `issuer_url` that the provider's `extra_config.allow_local` setting does not permit) surfaces before any DB write. A single error means zero state change. A provider of another type that the database already holds unchanged still loads at boot, with a warning in the log, but no user can sign in with it.
 
 **Permission templates.** `resources` and string condition values may contain `${iam:username}` and `${iam:access_key_id}` (the `iam:` prefix is required — it distinguishes these request-time identity substitutions from `${env:NAME}` load-time config expansion). The reconciler stores those templates literally in the DB; runtime IAM index rebuild expands them per user after group permissions are merged. Identity values are inserted as they are, and a value that contains `/`, `*`, `?`, `$`, `{`, `}` or `%` is refused at expansion (that user then gets no permissions), so user names and access keys cannot inject a path level or a wildcard. Unknown `${...}` variables (including a bare, unprefixed `${username}`) fail validation before any reconcile write.
 
@@ -109,7 +111,7 @@ The reconciler's contract for the main config / config-apply surface:
 - `external_identities` are preserved through user UPDATEs (same DB id → same bindings).
 - `external_identities` are cascade-deleted when a YAML-authoritative delete removes the user or provider they reference — the user is gone, so the binding is meaningless.
 
-If an OAuth callback is in-flight when a reconcile fires, the callback inserts the external identity into a user row that the reconcile may then delete (if YAML doesn't list that user). The callback flow fails; the next login creates a fresh external user (if auto-provisioning is enabled and matching mapping rules exist).
+If an OAuth callback is in-flight when a reconcile fires, the callback inserts the external identity into a user row that the reconcile may then delete (if YAML doesn't list that user). The callback flow fails; the next login creates a fresh external user.
 
 ### Full-IAM round-trip
 
@@ -152,7 +154,7 @@ The gate fires only on the `gui→declarative` transition. Declarative-to-declar
 
 ## Audit trail
 
-Every mutation the reconciler performs emits an audit ring entry tagged `declarative`:
+Every mutation the reconciler performs emits an audit ring entry tagged `declarative`. Each entry carries the user agent and the client IP of the admin request that started the apply:
 
 - `iam_reconcile_user_create` / `_update` / `_delete`
 - `iam_reconcile_group_create` / `_update` / `_delete`

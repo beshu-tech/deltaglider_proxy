@@ -56,8 +56,8 @@ storage:
         - public/
 ```
 
-- Trace `GET /downloads/public/tool.zip`, unauthenticated → **allow-anonymous**, matched rule `public-prefix:downloads/public/` — the public-access rule that the proxy creates from the bucket setting. It allows reading and listing only.
-- Trace `PUT /downloads/public/tool.zip`, unauthenticated → **denied**. The public-access rule matches only read methods, so the PUT falls through to authentication, which an anonymous request fails.
+- Trace `GET /downloads/public/tool.zip`, unauthenticated → **allow-anonymous**, matched rule `public-prefix:downloads` — the public-access rule that the proxy creates from the bucket setting. It allows reading and listing only.
+- Trace `PUT /downloads/public/tool.zip`, unauthenticated → **continue**, with no matched rule. The public-access rule matches only read methods, so the PUT goes on to authentication, which refuses an anonymous PUT with `403`.
 
 Same prefix, opposite outcomes — and the trace names the exact rule responsible for each.
 
@@ -66,7 +66,7 @@ Same prefix, opposite outcomes — and the trace names the exact rule responsibl
 For per-request visibility on real traffic, set `DGP_DEBUG_HEADERS=true` and read the response headers:
 
 - `x-amz-storage-type` — how the object is stored: `delta`, `passthrough`, or `reference`.
-- `x-deltaglider-cache: hit|miss` — on every delta-reconstructed GET; tells you whether the reference baseline came from the cache.
+- `x-deltaglider-stored-size`: on the responses to object requests, the number of bytes that the object takes on the backend, which is smaller than the object size for a delta.
 - `x-deltaglider-listing-facts-misses` — on every LIST; the number of entries on the page that show their stored size instead of their original size, because the proxy found no listing facts for them (see [how delta compression works](../explanation/delta-compression.md)).
 
 Leave this **off** in production once you're done — it reveals storage internals to anyone who can send a request.
@@ -76,7 +76,7 @@ Leave this **off** in production once you're done — it reveals storage interna
 ```bash
 # Trace agrees with reality: this should print an allow-anonymous decision...
 DGP_BOOTSTRAP_PASSWORD=... deltaglider_proxy admission trace \
-  --method GET --path /downloads/public/tool.zip --server https://s3.acme.example | jq .decision
+  --method GET --path /downloads/public/tool.zip --server https://s3.acme.example | jq .admission.decision
 
 # ...and the real request behaves the same way
 curl -s -o /dev/null -w "%{http_code}\n" https://s3.acme.example/downloads/public/tool.zip

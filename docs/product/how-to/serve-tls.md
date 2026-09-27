@@ -24,7 +24,7 @@ When the proxy faces the internet directly, keep `DGP_TRUST_PROXY_HEADERS=false`
 
 ## Option B: terminate TLS at a reverse proxy
 
-If you terminate TLS at Traefik, nginx, or Caddy, bind the proxy to `127.0.0.1:9000` and forward over the loopback.
+If you terminate TLS at nginx or Caddy on the same host, bind the proxy to `127.0.0.1:9000` and forward over the loopback. If Traefik runs in Docker, it reaches the proxy container over the Docker network instead.
 
 **Traefik** (Docker Compose labels):
 
@@ -33,7 +33,7 @@ deltaglider_proxy:
   image: beshultd/deltaglider_proxy:latest
   environment:
     DGP_TRUST_PROXY_HEADERS: "true"
-    DGP_TRUSTED_PROXY_CIDRS: "127.0.0.1/32"   # Traefik connects over the loopback
+    DGP_TRUSTED_PROXY_CIDRS: "172.16.0.0/12"  # the Docker networks: Traefik connects from its container address
   labels:
     traefik.enable: "true"
     traefik.http.routers.dgp.rule: "Host(`s3.acme.example`)"
@@ -74,9 +74,9 @@ Set three env vars on the proxy when a reverse proxy is in front:
 
 | Variable | Value | Why |
 |---|---|---|
-| `DGP_TRUST_PROXY_HEADERS` | `true` | Accept `X-Forwarded-For` / `X-Real-IP` for rate limiting and IAM IP conditions. Flip it **only** when a reverse proxy is genuinely in front — otherwise clients can spoof IPs. |
+| `DGP_TRUST_PROXY_HEADERS` | `true` | Accept `X-Forwarded-For` / `X-Real-IP` for rate limiting, the IP binding of admin sessions, and IAM IP conditions. Also accept `X-Forwarded-Host` and `X-Forwarded-Proto` for the same-origin check of admin requests, the OAuth callback address, and the `Secure` cookie flag. Flip it **only** when a reverse proxy is genuinely in front — otherwise clients can spoof IPs. |
 | `DGP_TRUSTED_PROXY_CIDRS` | the reverse proxy's address, for example `127.0.0.1/32` | The proxy reads those headers only on a connection from these networks. It is required with `DGP_TRUST_PROXY_HEADERS=true`: without it, the proxy refuses to start. |
-| `DGP_SECURE_COOKIES` | `true` | The listener is plain HTTP behind the reverse proxy, so the proxy cannot see the TLS itself. It sets the `Secure` flag on its own only when a trusted `X-Forwarded-Proto: https` header arrives. Setting this variable to `true` makes the admin session cookies HTTPS-only for every request. |
+| `DGP_SECURE_COOKIES` | `true` | The listener is plain HTTP behind the reverse proxy, so the proxy cannot see the TLS itself. It sets the `Secure` flag on its own only when a trusted `X-Forwarded-Proto: https` header arrives. Setting this variable to `true` makes the admin session cookies HTTPS-only for every request, and `false` never sets the flag. Unset means automatic. |
 
 ## Raise the reverse-proxy read timeout — mandatory for large uploads
 

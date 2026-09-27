@@ -17,14 +17,14 @@ Or via env vars: `DGP_ACCESS_KEY_ID` + `DGP_SECRET_ACCESS_KEY`. For the guided z
 
 ## 2. Create the user
 
-Go to **Settings → Access → Users** → **+ Add user**.
+Go to **Settings → Access → Users** → **New**.
 
 ![IAM users panel](/_/screenshots/iam.jpg)
 
 1. Name: `ci-uploader`.
 2. Leave **Access key ID** and **Secret access key** blank to auto-generate them.
-3. Add permissions (next step) or pick a group.
-4. Save. The secret is shown **once**, on the "Created" toast — copy it now. If it's lost, rotate the keys (step 4).
+3. Set the permissions (next step). A new user starts with `read` and `list` on every resource. To give the user a group, add the user on the group's page (step 5).
+4. Save. The secret is shown **once**, in the "User created: save these credentials" dialog — copy it now. If it's lost, rotate the keys (step 4).
 
 If you script it instead, `POST /_/api/admin/users` needs `name`; `access_key_id` and `secret_access_key` are auto-generated when omitted, `enabled` defaults to `true`, and `permissions` defaults to empty. Group membership is a separate call: `POST /_/api/admin/groups/:id/members`. All admin routes require a session cookie from `POST /_/api/admin/login` — see the [admin API reference](../reference/admin-api.md).
 
@@ -56,7 +56,7 @@ Each permission is an ABAC rule: effect, actions, resources, optional conditions
 ]
 ```
 
-Deny is absolute: if any Deny rule matches — direct or group-inherited — the request fails regardless of Allows. For the full grammar (action-to-S3-operation mapping, glob rules, `${iam:username}` identity templates) and the canned starting-point templates in **Settings → Access → Users → Apply template**, see the [IAM permissions reference](../reference/iam-permissions.md).
+Deny is absolute: if any Deny rule matches — direct or group-inherited — the request fails regardless of Allows. For the full grammar (action-to-S3-operation mapping, glob rules, `${iam:username}` identity templates) and the preset buttons above the permission editor in the user form, see the [IAM permissions reference](../reference/iam-permissions.md).
 
 ## 4. Rotate keys without downtime
 
@@ -64,7 +64,7 @@ Deny is absolute: if any Deny rule matches — direct or group-inherited — the
 
 To rotate with zero downtime, overlap two credentials:
 
-1. Clone the user: per-user row menu → **Clone**, or `POST /_/api/admin/users/:id/clone`. The clone gets fresh keys and a copy of the permissions.
+1. Clone the user: the **Duplicate user with fresh credentials** button on the user's row, or `POST /_/api/admin/users/:id/clone`. The clone gets fresh keys and a copy of the permissions.
 2. Roll the new credentials out to every client.
 3. Delete the original user once nothing signs with it (check the audit log at `/_/admin/diagnostics/audit`).
 
@@ -74,7 +74,7 @@ If you only need to suspend a user, untick **Enabled** instead of deleting — t
 
 Don't copy the same rules onto ten users. Acme's `Engineering` group carries read access to `releases` and `downloads`:
 
-1. **Settings → Access → Groups** → **+ Add group**, name it `Engineering`.
+1. **Settings → Access → Groups** → **New**, name it `Engineering`.
 2. Add permissions on the group (same JSON schema as user permissions):
 
 ```json
@@ -84,7 +84,7 @@ Don't copy the same rules onto ten users. Acme's `Engineering` group carries rea
 ]
 ```
 
-3. Add members: **Settings → Access → Users** → edit `dana` → **Groups** → tick `Engineering`.
+3. Add members: in the group form, tick `dana` under **Members**, then save the group. The user form of `dana` then lists `Engineering` under **Groups & Inherited Access**.
 
 Members get the group's rules in addition to their direct rules; a Deny from either source wins. If you use SSO, mapping rules can add people to `Engineering` automatically on login — see [How to set up OAuth/OIDC single sign-on](set-up-sso.md).
 
@@ -134,7 +134,7 @@ aws --profile acme-proxy s3 cp s3://db-archive/nightly/dump.sql.gz .
 # fatal error: An error occurred (AccessDenied)
 ```
 
-Every denial lands in the audit log (**Settings → Observability → Audit**) with user, action, bucket, and path.
+Every denial lands in the audit log (**Settings → Observability → Audit log**) with user, action, bucket, and path.
 
 ## Related
 

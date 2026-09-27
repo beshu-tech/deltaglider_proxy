@@ -39,19 +39,22 @@ docker run --rm -it -p 9000:9000 -v dgp-data:/data \
 
 Notice there's no password box in the logs this time — the proxy found our hash on the volume and used it.
 
-Now prove the password works. Open [http://localhost:9000/_/admin](http://localhost:9000/_/admin). You should see a login gate that says **Enter the bootstrap password to continue.** Type `acme-rocks-mauve-42` (or whatever you chose) and sign in — the Settings area opens, with a navigation sidebar on the left. Stay here; the next two steps live in these screens.
+Now prove the password works. Open [http://localhost:9000/_/admin](http://localhost:9000/_/admin). You should see an **Admin Login** gate that says **Enter the admin password to continue.** Type `acme-rocks-mauve-42` (or whatever you chose) and sign in — the Settings area opens, with a navigation sidebar on the left.
 
 ## Step 2: require S3 authentication
 
-Time to close the open door. In Settings, go to **Access → Credentials & mode**.
+Time to close the open door. The proxy is still in open mode because we started it with `DGP_AUTHENTICATION=none`. An environment variable wins over the settings, so the **S3 authentication mode** choice on **Access → Credentials & mode** is read-only right now, with a note that names the variable. Take a look, then restart the proxy without that variable and with a bootstrap credential pair instead.
 
-1. Under **S3 authentication mode**, select **Auto-detect (recommended)** — authentication is required whenever credentials are set.
-2. Under the bootstrap credentials, fill in:
-   - **Access key ID**: `acme-admin`
-   - **Secret access key**: `correct-horse-battery-staple-acme-1`
-3. An **Unsaved changes** bar appears at the bottom of the page — click **Apply**, then **Apply and Persist** in the confirmation dialog.
+Stop the running proxy (`Ctrl+C`), and start it again:
 
-The change is live immediately, no restart. Let's prove it from the second terminal, where the `dummy` credentials from tutorial 1 are still exported:
+```bash
+docker run --rm -it -p 9000:9000 -v dgp-data:/data \
+  -e DGP_ACCESS_KEY_ID=acme-admin \
+  -e DGP_SECRET_ACCESS_KEY=correct-horse-battery-staple-acme-1 \
+  beshultd/deltaglider_proxy
+```
+
+Sign in to [http://localhost:9000/_/admin](http://localhost:9000/_/admin) again with your password, because a restart ends every session. **Access → Credentials & mode** now shows **Auto-detect (recommended)**, and the access key ID `acme-admin` with a badge that says it comes from the environment. Let's prove it from the second terminal, where the `dummy` credentials from tutorial 1 are still exported:
 
 ```bash
 aws --endpoint-url http://localhost:9000 s3 ls
@@ -80,7 +83,7 @@ Same proxy, same bucket — but now only signed requests with the right key get 
 
 One shared credential is better than none, but Acme's CI pipeline shouldn't hold the keys to everything. Let's give it its own identity, scoped to the firmware folder.
 
-In Settings, go to **Access → Users**. Because no IAM users exist yet, you'll see a **Set Up IAM** button — notice the note next to it: your current credentials will be migrated automatically as an admin user, so nothing you just set up breaks. Click it.
+In Settings, go to **Access → Users**. Because no IAM users exist yet, the page says **Create the first user**. Notice the note under it: your current credentials are kept as an admin user, so nothing you just set up breaks. Click **New** above the user list.
 
 ![IAM users panel](/_/screenshots/iam.jpg)
 
@@ -91,7 +94,7 @@ In the user form:
 3. Edit the pre-filled permission rule: keep **Effect** on `Allow`, set **Actions** to `read`, `write`, `list`, and **Resources** to `releases/firmware/*`.
 4. Click **Create User**.
 
-You should see a green notice: **User created — save these credentials**, showing the generated access key and secret. Copy both now — the secret is shown only this once.
+You should see a dialog titled **User created: save these credentials**, showing the generated access key and secret. Copy both now — the secret is shown only this once.
 
 Notice the user list: `ci-uploader` shows **1 rule**, and a second row, `legacy-admin`, shows **Full admin** — that's your `acme-admin` credential pair, carried over as a proper IAM user.
 

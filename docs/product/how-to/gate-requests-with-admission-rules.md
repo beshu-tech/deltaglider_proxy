@@ -28,9 +28,9 @@ admission:
       action: deny
 ```
 
-A request matches a rule only when it matches every condition of the rule. A rule with an empty `match: {}` matches every request. The [configuration reference](../reference/configuration.md#admission-chain) lists all conditions (`method`, `source_ip` or `source_ip_list` with CIDR networks, `bucket`, `path_glob`, `authenticated`) and all actions (`deny`, `allow-anonymous`, `continue`, and `reject` with a custom status and message).
+A request matches a rule only when it matches every condition of the rule. A rule with an empty `match: {}` matches every request. The proxy checks the rules for every request, so the list holds at most 1000 of your rules. A config with more rules is refused, on load and on every apply, with an error that names the count and the limit. The [configuration reference](../reference/configuration.md#admission-chain) lists all conditions (`method`, `source_ip` or `source_ip_list` with CIDR networks, `bucket`, `path_glob`, `authenticated`) and all actions (`deny`, `allow-anonymous`, `continue`, and `reject` with a custom status and message).
 
-An `allow-anonymous` rule lets the matched request through without credentials only when that request is a read: a `GET` or `HEAD` of an object, or a listing with the requested prefix. The rule grants exactly that request and nothing wider. A write that matches an `allow-anonymous` rule is refused with `403`, because the proxy never grants a write to an anonymous caller.
+An `allow-anonymous` rule lets the matched request through without credentials only when that request is a read: a `GET` or `HEAD` of an object, or a listing with the requested prefix. The rule grants exactly that request and nothing wider. A `GET` or `HEAD` of a key that contains `*` or `?` gets no grant and is refused with `403`, because the proxy cannot write a permission that names only that key. A write that matches an `allow-anonymous` rule is refused with `403`, because the proxy never grants a write to an anonymous caller.
 
 ## 2. Put the rules in order
 
@@ -56,7 +56,7 @@ deltaglider_proxy admission trace --method PUT --path /downloads/public/installe
 
 The result is a `deny` decision that names the rule `deny-anonymous-writes-downloads`. Run the command again with `--authenticated`. This time the rule does not match, because its `authenticated: false` condition is not true, and the request continues to SigV4 authentication.
 
-The same tool is in the admin UI at **Settings → Observability → Request rule tester**. It shows the decision, the rule that matched, and ready-made example requests, and it has a Copy-as-JSON button:
+The same tool is in the admin UI at **Settings → Observability → Request rule tester**. It shows the decision, the rule that matched, and ready-made example requests, and it has a Copy-as-JSON button. For every `allow-anonymous` decision it also shows an **Anonymous access** box, which names what the anonymous caller may do: the one object that it may read, the bucket and prefix that it may list, or the public prefixes of the bucket. For a write, the box says that nothing is granted. The CLI result carries the same information in the `anonymous_grant` field:
 
 ![Request trace diagnostics](/_/screenshots/request-trace.jpg)
 

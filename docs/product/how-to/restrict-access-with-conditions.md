@@ -55,7 +55,7 @@ Give `dana` her own prefix in `db-archive`, and deny any LIST that isn't scoped 
 
 A LIST with `prefix=home/dana/reports/` passes (the Deny's condition doesn't match); a LIST with `prefix=home/` or no prefix at all is denied. To make the rule reusable across users, write `"home/${iam:username}/*"` — it expands per user at index-build time. Template rules live in the [IAM permissions reference](../reference/iam-permissions.md#permission-templates).
 
-If you want to hide dot-prefixed keys from everyone, add a bucket-wide Deny:
+To refuse every LIST whose `prefix` starts with a dot (for example `prefix=.config/`), add a bucket-wide Deny:
 
 ```json
 {
@@ -67,6 +67,8 @@ If you want to hide dot-prefixed keys from everyone, add a bucket-wide Deny:
   }
 }
 ```
+
+This rule refuses the request with `AccessDenied`. It does not hide dot-prefixed keys from a LIST with a wider prefix, because the `s3:prefix` condition compares the requested prefix, not the keys. To hide keys from a listing, write a Deny on `list` whose `resources` pattern matches those keys. The proxy then leaves each matching key out of the result.
 
 ## 3. Combine conditions
 
@@ -128,7 +130,7 @@ Exercise both sides of every condition:
 
 1. Run an allowed request from a matching IP / prefix — expect success.
 2. Run the same request from a non-matching IP (or a wider LIST prefix) — expect `AccessDenied`.
-3. Check **Settings → Observability → Audit**: the denial appears with the user, action, and path.
+3. Check **Settings → Observability → Audit log**: the denial appears with the user, action, and path.
 
 ## Related
 

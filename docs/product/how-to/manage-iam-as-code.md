@@ -55,7 +55,7 @@ In the admin UI the ApplyDialog surfaces the same line under Warnings, so you se
 
 If you flip from `gui` to `declarative` with no `iam_users`/`iam_groups` in the YAML, the preview warns that the live apply will **refuse** — the empty-YAML gate exists so a careless toggle can't wipe a populated DB. That warning is the system working; add your IAM state to the YAML and re-validate.
 
-Validation is all-or-nothing: duplicate access keys, unknown group references, or invalid permissions fail the whole apply with zero state change.
+Validation is all-or-nothing: duplicate access keys, unknown group references, invalid permissions, or a provider whose `provider_type` is not `oidc` fail the whole apply with zero state change.
 
 ## 3. Apply
 
@@ -83,7 +83,7 @@ Use `${env:NAME}` references in the committed file:
       secret_access_key: "${env:CI_UPLOADER_SECRET}"
 ```
 
-`config apply` expands `${env:NAME}` against the *operator's* environment before sending; the server expands the config file from disk at startup and expands document bodies POSTed to `/config/apply` against the *server's* environment. `config lint` fails loudly on an unset variable with no default — run it in CI to catch missing secrets before the apply. One caveat: raw section PUTs (the GUI's per-section editor) are **not** expanded — a literal `${env:...}` typed into a form field stays literal.
+`config apply` expands `${env:NAME}` against the *operator's* environment before sending, so the server receives the values. The server expands the config file from disk against its own environment at startup. A document that arrives over the admin API (a body POSTed to `/config/apply`, or a section PUT from the GUI) is admin input, so the server resolves a reference in it only when the config file loaded at startup already uses that name, or when the name is listed in `DGP_CONFIG_ENV_ALLOWLIST`. Any other reference takes its `:-default`, or the request fails. In a section PUT, only a field whose whole value is one `${env:NAME}` reference is resolved; a reference in the middle of a string stays literal. `config lint` fails loudly on an unset variable with no default — run it in CI to catch missing secrets before the apply.
 
 **The references round-trip.** The proxy records which values came from `${env:NAME}` refs. When a GUI change persists the config to disk, and when you download `GET /config/export`, those values are re-emitted as `${env:NAME}` — not as materialized secrets, and not redacted away. The intended loop: provision a secret-free template → tweak in the GUI as needed → export → commit the export straight back into IaC. Secrets that never came from a ref behave as before (kept on disk, redacted in exports). A ref that expanded into a *non-string* field (a number, a boolean) does not round-trip — it persists as its literal value.
 
