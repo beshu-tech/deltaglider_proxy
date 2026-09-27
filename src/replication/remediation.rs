@@ -114,6 +114,85 @@ fn policy_permits_copy_over_existing(policy: ConflictPolicy) -> bool {
     !matches!(policy, ConflictPolicy::SkipIfDestExists)
 }
 
+/// Pure: does a STORED failure text read as transient? The object-failure
+/// ledger keeps the text only (no class column), so this advisory verdict
+/// reads the words that the typed errors put in their Display (and that
+/// older releases wrote). Nothing retries on it: every retry decision uses
+/// the typed `transfer::CopyClass`.
+fn stored_error_looks_transient(message: &str, names: &[&str]) -> bool {
+    let m = error_signal(message, names).to_ascii_lowercase();
+    [
+        "source changed during copy",
+        "failed to read response body",
+        "streaming error",
+        "connection reset",
+        "connection closed",
+        "connection aborted",
+        "timed out",
+        "timeout",
+        "temporary failure",
+        "service unavailable",
+        "slowdown",
+        "internalerror",
+        "broken pipe",
+        "throttled",
+        "status=500",
+        "status=502",
+        "status=503",
+        "status=504",
+        "bad gateway",
+        "gateway timeout",
+        "service overloaded",
+    ]
+    .iter()
+    .any(|needle| m.contains(needle))
+}
+
+/// Pure: the error text with every user-supplied name (key, bucket) removed,
+/// so [`stored_error_looks_transient`] sees only the backend's words: a key
+/// such as `logs/timeout.txt` must not decide the verdict. Only
+/// WHOLE occurrences are removed (delimited by start/end, whitespace, `/`,
+/// quotes, brackets, `:`/`,`/`;`), longest name first: a short key such as
+/// `a` must not cut letters out of `status=503`.
+fn error_signal(err: &str, names: &[&str]) -> String {
+    let is_delim = |c: Option<char>| {
+        c.is_none_or(|c| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '/' | '"' | '\'' | '(' | ')' | '[' | ']' | ':' | ',' | ';'
+                )
+        })
+    };
+    let mut names: Vec<&str> = names.iter().copied().filter(|n| !n.is_empty()).collect();
+    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    let mut out = err.to_string();
+    for name in names {
+        let mut result = String::with_capacity(out.len());
+        let mut rest = out.as_str();
+        while let Some(i) = rest.find(name) {
+            let before = rest[..i].chars().next_back();
+            let after = rest[i + name.len()..].chars().next();
+            // `before` of the first match in `rest` is the last char we copied.
+            let before = if i == 0 {
+                result.chars().next_back()
+            } else {
+                before
+            };
+            result.push_str(&rest[..i]);
+            if is_delim(before) && is_delim(after) {
+                result.push_str("<name>");
+            } else {
+                result.push_str(name);
+            }
+            rest = &rest[i + name.len()..];
+        }
+        result.push_str(rest);
+        out = result;
+    }
+    out
+}
+
 /// A copy that keeps failing — ledger overrides policy: the bytes never land,
 /// so no policy reasoning matters until the underlying error is fixed.
 ///
@@ -126,10 +205,7 @@ fn policy_permits_copy_over_existing(policy: ConflictPolicy) -> bool {
 fn copy_failing(ledger: &ObjectFailure, error_names: &[&str]) -> Remediation {
     // Classify the backend's words only: a key like `logs/timeout.txt` must
     // not make a permanent error look transient.
-    let transient = crate::transfer::is_transient_copy_error(&crate::transfer::error_signal(
-        &ledger.last_error,
-        error_names,
-    ));
+    let transient = stored_error_looks_transient(&ledger.last_error, error_names);
     let reason_detail = format!(
         "copy has failed {} time(s); last error: {}",
         ledger.consecutive_failures, ledger.last_error
@@ -541,6 +617,44 @@ mod tests {
                 why: NoReason::CopyKeepsFailing
             }
         );
+    }
+
+    #[test]
+    fn error_signal_removes_whole_names_only() {
+        assert_eq!(
+            error_signal("Not found: reports/quota.pdf", &["reports/quota.pdf"]),
+            "Not found: <name>"
+        );
+        // A short key never cuts into the backend's words.
+        assert_eq!(
+            error_signal("put a failed (status=503): SlowDown", &["a"]),
+            "put <name> failed (status=503): SlowDown"
+        );
+        // A key that only LOOKS transient does not decide the verdict.
+        let msg = "source head failed: Not found: logs/timeout.txt";
+        assert!(stored_error_looks_transient(msg, &[]));
+        assert!(!stored_error_looks_transient(msg, &["logs/timeout.txt"]));
+    }
+
+    /// The texts the typed transient errors write read as transient.
+    #[test]
+    fn stored_transient_texts_read_as_transient() {
+        for t in [
+            "source retrieve failed: S3 error: get_object failed (status=500): service error",
+            "source retrieve failed: S3 error: Failed to read response body: x",
+            "source retrieve failed: Storage error: Backend throttled: x (status=503)",
+            "source retrieve failed: Service overloaded: all delta codec slots busy",
+            "source changed during copy: b/k was overwritten after HEAD",
+            "object copy timed out after 5s",
+        ] {
+            assert!(stored_error_looks_transient(t, &[]), "{t}");
+        }
+        for p in [
+            "destination store failed: Storage error: Bucket not found: b",
+            "S3 error: put_object failed (status=403): AccessDenied",
+        ] {
+            assert!(!stored_error_looks_transient(p, &[]), "{p}");
+        }
     }
 
     // ─────────────── Orphan (4 rows) ───────────────

@@ -477,10 +477,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         if let (Some(expected), Some(actual)) = (expected_source, metadata.as_ref()) {
             if !Self::same_generation(expected, actual) {
-                return Err(EngineError::Storage(StorageError::Other(format!(
-                    "source changed during copy: {}/{} (size {} -> {})",
-                    bucket, key, expected.file_size, actual.file_size
-                ))));
+                return Err(EngineError::Storage(StorageError::PreconditionFailed(
+                    format!(
+                        "source changed during copy: {}/{} (size {} -> {})",
+                        bucket, key, expected.file_size, actual.file_size
+                    ),
+                )));
             }
         }
 

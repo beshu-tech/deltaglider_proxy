@@ -164,52 +164,39 @@ impl ObjectTransferOutcome {
 pub(crate) async fn copy_object_with_retries(
     engine: &Arc<DynEngine>,
     request: ObjectTransferRequest<'_>,
-) -> Result<ObjectTransferOutcome, Box<dyn std::error::Error + Send + Sync>> {
-    let mut last_err: Option<String> = None;
-    for attempt in 1..=DEFAULT_COPY_MAX_ATTEMPTS {
+) -> Result<ObjectTransferOutcome, CopyError> {
+    let mut attempt = 1;
+    loop {
         let attempt_result = match request.keep_created_at {
             true => keep_source_created_at(engine, request).await,
             false => copy_object_once(engine, request).await,
         };
-        match attempt_result {
+        let err = match attempt_result {
             Ok(outcome) => return Ok(outcome),
-            Err(err) => {
-                let msg = err.to_string();
-                let signal = error_signal(
-                    &msg,
-                    &[
-                        request.source_key,
-                        request.destination_key,
-                        request.source_bucket,
-                        request.destination_bucket,
-                    ],
-                );
-                if !is_transient_copy_error(&signal) || attempt == DEFAULT_COPY_MAX_ATTEMPTS {
-                    return Err(if attempt > 1 {
-                        format!("{} (after {} attempts)", msg, attempt).into()
-                    } else {
-                        msg.into()
-                    });
-                }
-                warn!(
-                    "{} transient copy failure attempt {}/{} src={}/{} dst={}/{}: {}",
-                    request.operation,
-                    attempt,
-                    DEFAULT_COPY_MAX_ATTEMPTS,
-                    request.source_bucket,
-                    request.source_key,
-                    request.destination_bucket,
-                    request.destination_key,
-                    msg
-                );
-                last_err = Some(msg);
-                tokio::time::sleep(std::time::Duration::from_millis(250 * attempt as u64)).await;
-            }
+            Err(err) => err,
+        };
+        if !err.class.retryable() || attempt == DEFAULT_COPY_MAX_ATTEMPTS {
+            return Err(if attempt > 1 {
+                let class = err.class;
+                CopyError::new(class, format!("{err} (after {attempt} attempts)"))
+            } else {
+                err
+            });
         }
+        warn!(
+            "{} transient copy failure attempt {}/{} src={}/{} dst={}/{}: {}",
+            request.operation,
+            attempt,
+            DEFAULT_COPY_MAX_ATTEMPTS,
+            request.source_bucket,
+            request.source_key,
+            request.destination_bucket,
+            request.destination_key,
+            err
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250 * attempt as u64)).await;
+        attempt += 1;
     }
-    Err(last_err
-        .unwrap_or_else(|| "copy failed without error detail".to_string())
-        .into())
 }
 
 /// [`copy_object_once`] with the destination stamped the source's
@@ -217,13 +204,11 @@ pub(crate) async fn copy_object_with_retries(
 async fn keep_source_created_at(
     engine: &Arc<DynEngine>,
     request: ObjectTransferRequest<'_>,
-) -> Result<ObjectTransferOutcome, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ObjectTransferOutcome, CopyError> {
     let at = engine
         .head(request.source_bucket, request.source_key)
         .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("source head failed: {}", e).into()
-        })?
+        .map_err(|e| CopyError::engine("source head failed", e))?
         .created_at;
     crate::types::with_created_at(at, copy_object_once(engine, request)).await
 }
@@ -231,14 +216,12 @@ async fn keep_source_created_at(
 async fn copy_object_once(
     engine: &Arc<DynEngine>,
     request: ObjectTransferRequest<'_>,
-) -> Result<ObjectTransferOutcome, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ObjectTransferOutcome, CopyError> {
     // HEAD first so callers get a crisp source-disappeared failure row.
     let source_head = engine
         .head(request.source_bucket, request.source_key)
         .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("source head failed: {}", e).into()
-        })?;
+        .map_err(|e| CopyError::engine("source head failed", e))?;
 
     // Large passthrough on a native-multipart destination → stream via
     // multipart with per-part range-resume (bounded memory). Delta /
@@ -279,9 +262,7 @@ async fn copy_object_once(
     let (data, meta) = engine
         .retrieve(request.source_bucket, request.source_key)
         .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("source retrieve failed: {}", e).into()
-        })?;
+        .map_err(|e| CopyError::engine("source retrieve failed", e))?;
 
     let content_type = meta.content_type.clone();
     let mut user_metadata = meta.user_metadata.clone();
@@ -317,9 +298,7 @@ async fn copy_object_once(
                 mp_etag,
             )
             .await
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("destination store failed: {}", e).into()
-            })?;
+            .map_err(|e| CopyError::engine("destination store failed", e))?;
     } else {
         engine
             .store(
@@ -330,9 +309,7 @@ async fn copy_object_once(
                 user_metadata,
             )
             .await
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("destination store failed: {}", e).into()
-            })?;
+            .map_err(|e| CopyError::engine("destination store failed", e))?;
     }
 
     verify_destination(
@@ -378,7 +355,7 @@ async fn stream_copy_passthrough(
     engine: &Arc<DynEngine>,
     request: ObjectTransferRequest<'_>,
     source_head: &crate::types::FileMetadata,
-) -> Result<ObjectTransferOutcome, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ObjectTransferOutcome, CopyError> {
     let total = source_head.file_size;
     let part_size = transfer_plan::multipart_part_size();
     let concurrency = request
@@ -411,9 +388,7 @@ async fn stream_copy_passthrough(
             user_metadata,
         )
         .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("multipart create failed: {}", e).into()
-        })?;
+        .map_err(|e| CopyError::engine("multipart create failed", e))?;
     let native = handle.native();
     let handle = Arc::new(handle);
     // Abort the upload if THIS future is dropped (killed) before complete/abort.
@@ -440,7 +415,7 @@ async fn stream_copy_passthrough(
     let src_key = request.source_key.to_string();
     let pinned_head = source_head.clone();
     let metrics = engine.metrics().cloned();
-    let results: Result<Vec<PartUploadResult>, String> =
+    let results: Result<Vec<PartUploadResult>, CopyError> =
         futures::stream::iter(spans.iter().copied())
             .map(|span| {
                 let engine = engine.clone();
@@ -463,7 +438,7 @@ async fn stream_copy_passthrough(
                         metrics.as_ref(),
                     )
                     .await
-                    .map_err(|e| format!("part {} fetch failed: {}", span.number, e))?;
+                    .map_err(|e| e.context(format_args!("part {} fetch failed", span.number)))?;
                     let len = bytes.len() as u64;
                     if let Some(g) = guard.as_mut() {
                         g.resident(len);
@@ -476,12 +451,14 @@ async fn stream_copy_passthrough(
                     let part = engine
                         .upload_passthrough_part(&handle, span.number, bytes)
                         .await
-                        .map_err(|e| format!("upload_part {} failed: {}", span.number, e))?;
+                        .map_err(|e| {
+                            CopyError::engine(&format!("upload_part {} failed", span.number), e)
+                        })?;
                     if let Some(m) = metrics.as_ref() {
                         m.replication_multipart_parts_total.inc();
                         m.replication_bytes_streamed_total.inc_by(len);
                     }
-                    Ok::<PartUploadResult, String>((part, retained))
+                    Ok::<PartUploadResult, CopyError>((part, retained))
                 }
             })
             .buffer_unordered(concurrency)
@@ -495,7 +472,7 @@ async fn stream_copy_passthrough(
             // Arc strong count; disarm so the guard's Drop doesn't double-abort.
             engine.abort_passthrough_multipart_ref(&handle).await;
             drop(abort_guard.disarm());
-            return Err(e.into());
+            return Err(e);
         }
     };
 
@@ -524,15 +501,16 @@ async fn stream_copy_passthrough(
             // Should be sole-owned here; if not, ABORT the upload before
             // erroring — the guard is already disarmed, so nobody else will.
             engine.abort_passthrough_multipart_ref(&shared).await;
-            return Err("internal: multipart handle still shared at finish".into());
+            return Err(CopyError::new(
+                CopyClass::Permanent,
+                "internal: multipart handle still shared at finish",
+            ));
         }
     };
     let result = engine
         .finish_passthrough_multipart(handle, parts, assembled, sha256, md5, multipart_etag)
         .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("multipart complete failed: {}", e).into()
-        })?;
+        .map_err(|e| CopyError::engine("multipart complete failed", e))?;
 
     let bytes = result.metadata.file_size as usize;
     verify_destination(
@@ -597,53 +575,46 @@ async fn fetch_part_with_resume(
     span: &PartSpan,
     source_head: &crate::types::FileMetadata,
     metrics: Option<&Arc<Metrics>>,
-) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Bytes, CopyError> {
     const MAX_PART_ATTEMPTS: u32 = 4;
-    let mut last_err: Option<String> = None;
-    for attempt in 1..=MAX_PART_ATTEMPTS {
-        match fetch_part_once(engine, bucket, key, span, source_head).await {
+    let mut attempt = 1;
+    loop {
+        let err = match fetch_part_once(engine, bucket, key, span, source_head).await {
             Ok(bytes) => return Ok(bytes),
-            Err(msg) => {
-                // A generation-pin failure can never heal at the PART level
-                // (the pin is fixed) — abort now; the whole-copy retry
-                // re-HEADs and copies the NEW generation cleanly.
-                if msg.contains(SOURCE_CHANGED_TOKEN) {
-                    return Err(msg.into());
-                }
-                if !is_transient_copy_error(&error_signal(&msg, &[key, bucket]))
-                    || attempt == MAX_PART_ATTEMPTS
-                {
-                    return Err(msg.into());
-                }
-                if let Some(m) = metrics {
-                    m.replication_part_retries_total.inc();
-                }
-                warn!(
-                    "transient part {} fetch failure attempt {}/{} ({}-{}): {}",
-                    span.number, attempt, MAX_PART_ATTEMPTS, span.start, span.end_inclusive, msg
-                );
-                last_err = Some(msg);
-                tokio::time::sleep(std::time::Duration::from_millis(200 * attempt as u64)).await;
-            }
+            Err(err) => err,
+        };
+        // A generation-pin failure can never heal at the PART level (the pin
+        // is fixed): `retryable` says yes for the whole copy, which re-HEADs
+        // and copies the NEW generation cleanly.
+        if err.class == CopyClass::SourceChanged
+            || !err.class.retryable()
+            || attempt == MAX_PART_ATTEMPTS
+        {
+            return Err(err);
         }
+        if let Some(m) = metrics {
+            m.replication_part_retries_total.inc();
+        }
+        warn!(
+            "transient part {} fetch failure attempt {}/{} ({}-{}): {}",
+            span.number, attempt, MAX_PART_ATTEMPTS, span.start, span.end_inclusive, err
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200 * attempt as u64)).await;
+        attempt += 1;
     }
-    Err(last_err
-        .unwrap_or_else(|| "part fetch failed".to_string())
-        .into())
 }
 
-/// One ranged GET → collect into a single `Bytes` (≤ part_size). Errors are
-/// stringified so `is_transient_copy_error` can classify them.
+/// One ranged GET → collect into a single `Bytes` (≤ part_size).
 async fn fetch_part_once(
     engine: &Arc<DynEngine>,
     bucket: &str,
     key: &str,
     span: &PartSpan,
     source_head: &crate::types::FileMetadata,
-) -> Result<Bytes, String> {
+) -> Result<Bytes, CopyError> {
     // Test-only fault injection (inert without the env var): fire a
-    // transient-classified error exactly once for the named part so the
-    // resume loop retries + range-resumes it.
+    // transient error exactly once for the named part so the resume loop
+    // retries + range-resumes it.
     if let Some(e) = maybe_inject_part_failure(span.number) {
         return Err(e);
     }
@@ -659,28 +630,34 @@ async fn fetch_part_once(
             Some(source_head),
         )
         .await
-        .map_err(|e| format!("ranged retrieve failed: {}", e))?;
+        .map_err(|e| CopyError::engine("ranged retrieve failed", e))?;
     let (stream, content_length, _meta) = ranged.ok_or_else(|| {
         // None means the object isn't natively range-able (delta/unmanaged).
         // The caller only enters the streaming path for passthrough objects,
         // so this is a genuine error (concurrent strategy flip).
-        "ranged retrieve unavailable for object".to_string()
+        CopyError::new(
+            CopyClass::Permanent,
+            "ranged retrieve unavailable for object",
+        )
     })?;
 
     let expected = span.len();
     let mut buf = BytesMut::with_capacity(expected.min(64 * 1024 * 1024) as usize);
     let mut stream = stream;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("part body stream error: {}", e))?;
+        let chunk = chunk.map_err(|e| CopyError::storage("part body stream error", e))?;
         buf.extend_from_slice(&chunk);
     }
     let got = buf.len() as u64;
     // content_length==0 signals "full stream, not range" — a backend that
     // didn't honour the Range. Validate we got exactly the span length.
     if got != expected {
-        return Err(format!(
-            "part {} short read: expected {} bytes, got {} (content_length={})",
-            span.number, expected, got, content_length
+        return Err(CopyError::new(
+            CopyClass::Permanent,
+            format!(
+                "part {} short read: expected {} bytes, got {} (content_length={})",
+                span.number, expected, got, content_length
+            ),
         ));
     }
     Ok(buf.freeze())
@@ -691,7 +668,7 @@ async fn verify_destination(
     request: ObjectTransferRequest<'_>,
     expected_bytes: usize,
     expected_multipart_etag: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), CopyError> {
     verify_destination_sized(
         engine,
         request,
@@ -727,13 +704,11 @@ async fn verify_destination_sized(
     expected_bytes: usize,
     stored_delta_size: Option<u64>,
     expected_multipart_etag: Option<&str>,
-) -> Result<VerifyAccepted, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<VerifyAccepted, CopyError> {
     let dest = engine
         .head(request.destination_bucket, request.destination_key)
         .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("destination verify head failed: {}", e).into()
-        })?;
+        .map_err(|e| CopyError::engine("destination verify head failed", e))?;
     match verify_size_verdict(
         dest.file_size,
         expected_bytes as u64,
@@ -745,16 +720,17 @@ async fn verify_destination_sized(
         // redundant HEAD: logical size → intact; stored-delta size → stripped.
         Ok(()) if dest.file_size == expected_bytes as u64 => Ok(VerifyAccepted::Intact),
         Ok(()) => Ok(VerifyAccepted::StrippedDelta),
-        Err(VerifyReject::Size { found }) => Err(format!(
-            "destination verify failed: expected {} bytes, found {}",
-            expected_bytes, found
-        )
-        .into()),
-        Err(VerifyReject::Etag { found }) => Err(format!(
-            "destination verify failed: expected multipart etag {:?}, found {:?}",
-            expected_multipart_etag, found
-        )
-        .into()),
+        Err(VerifyReject::Size { found }) => Err(CopyError::new(
+            CopyClass::Permanent,
+            format!("destination verify failed: expected {expected_bytes} bytes, found {found}"),
+        )),
+        Err(VerifyReject::Etag { found }) => Err(CopyError::new(
+            CopyClass::Permanent,
+            format!(
+                "destination verify failed: expected multipart etag {:?}, found {:?}",
+                expected_multipart_etag, found
+            ),
+        )),
     }
 }
 
@@ -794,9 +770,9 @@ fn verify_size_verdict(
 }
 
 /// Test seam: when `DGP_TEST_FAIL_PART_ONCE=<part#>` is set, return a
-/// transient-classified error the FIRST time that part is fetched (once per
-/// process via `compare_exchange`). Inert in prod (env unset → None).
-fn maybe_inject_part_failure(part_number: i32) -> Option<String> {
+/// transient error the FIRST time that part is fetched (once per process
+/// via `compare_exchange`). Inert in prod (env unset → None).
+fn maybe_inject_part_failure(part_number: i32) -> Option<CopyError> {
     use std::sync::atomic::{AtomicI32, Ordering};
     static FIRED: AtomicI32 = AtomicI32::new(-1);
     let target: i32 = crate::config::env_parse_with_default("DGP_TEST_FAIL_PART_ONCE", -1);
@@ -808,7 +784,10 @@ fn maybe_inject_part_failure(part_number: i32) -> Option<String> {
         .compare_exchange(-1, part_number, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
     {
-        return Some("connection reset (injected)".to_string());
+        return Some(CopyError::new(
+            CopyClass::Transient,
+            "connection reset (injected)",
+        ));
     }
     None
 }
@@ -824,88 +803,145 @@ async fn maybe_part_barrier() {
     }
 }
 
-/// Pure: the error text with every user-supplied name (key, bucket) removed,
-/// so the substring classifiers (`is_transient_copy_error`, the replication
-/// dest-fatal / throttle checks) see only the backend's words: a key such as
-/// `quota-report.pdf` or `SlowDown-q3.pdf` must not decide the verdict. Only
-/// WHOLE occurrences are removed (delimited by start/end, whitespace, `/`,
-/// quotes, brackets, `:`/`,`/`;`), longest name first: a short key such as
-/// `a` must not cut letters out of `status=503`.
-pub(crate) fn error_signal(err: &str, names: &[&str]) -> String {
-    let is_delim = |c: Option<char>| {
-        c.is_none_or(|c| {
-            c.is_whitespace()
-                || matches!(
-                    c,
-                    '/' | '"' | '\'' | '(' | ')' | '[' | ']' | ':' | ',' | ';'
-                )
-        })
-    };
-    let mut names: Vec<&str> = names.iter().copied().filter(|n| !n.is_empty()).collect();
-    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
-    let mut out = err.to_string();
-    for name in names {
-        let mut result = String::with_capacity(out.len());
-        let mut rest = out.as_str();
-        while let Some(i) = rest.find(name) {
-            let before = rest[..i].chars().next_back();
-            let after = rest[i + name.len()..].chars().next();
-            // `before` of the first match in `rest` is the last char we copied.
-            let before = if i == 0 {
-                result.chars().next_back()
-            } else {
-                before
-            };
-            result.push_str(&rest[..i]);
-            if is_delim(before) && is_delim(after) {
-                result.push_str("<name>");
-            } else {
-                result.push_str(name);
-            }
-            rest = &rest[i + name.len()..];
-        }
-        result.push_str(rest);
-        out = result;
-    }
-    out
+/// The first words of a generation-pin failure: the source changed after
+/// the copy's HEAD. Kept as text so the failure rows read as before.
+const SOURCE_CHANGED: &str = "source changed during copy";
+
+/// What a failed copy means for the caller. Set from the typed error where
+/// the failure happens, never read back out of the message text: a key
+/// such as `SlowDown-q3.pdf` or `quota-report.pdf` cannot change it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyClass {
+    /// A retry can succeed: the backend was slow, broke off, or answered
+    /// a 5xx; a peer held a lock; the proxy was out of codec or spool room.
+    Transient,
+    /// The backend throttles (503 SlowDown, 429). Retryable, and the
+    /// replication run counts it apart (a throttle is not about the object).
+    Throttled,
+    /// The source changed under the copy's generation pin. Fatal for one
+    /// part (the pin is fixed); the whole-copy retry re-HEADs.
+    SourceChanged,
+    /// No object can land: the bucket is gone, access is refused, or a
+    /// storage cap is used up.
+    DestinationFatal,
+    /// Anything else: about this object, and a retry does not help.
+    Permanent,
 }
 
-/// Marker for a generation-pin failure (see retrieve_stream_range): fatal at
-/// the part level, transient at the whole-copy level (retry re-HEADs).
-pub(crate) const SOURCE_CHANGED_TOKEN: &str = "source changed during copy";
+impl CopyClass {
+    /// May the whole-copy retry loop try again?
+    pub(crate) fn retryable(self) -> bool {
+        matches!(
+            self,
+            CopyClass::Transient | CopyClass::Throttled | CopyClass::SourceChanged
+        )
+    }
 
-pub(crate) fn is_transient_copy_error(message: &str) -> bool {
-    let m = message.to_ascii_lowercase();
-    [
-        SOURCE_CHANGED_TOKEN,
-        "failed to read response body",
-        "streaming error",
-        "connection reset",
-        "connection closed",
-        "connection aborted",
-        "timed out",
-        "timeout",
-        "temporary failure",
-        "service unavailable",
-        "slowdown",
-        "internalerror",
-        "broken pipe",
-        // Transient source-backend 5xx. Hetzner phrases 503 as "throttled" and
-        // 502/504 as "failed (status=50x)" — none match the words above, so
-        // they were landing in the failure ring instead of being retried.
-        "throttled",
-        "status=502",
-        "status=503",
-        "status=504",
-        "bad gateway",
-        "gateway timeout",
-        // Spool budget exhaustion under concurrent large copies is a CONTENTION
-        // signal, not a permanent failure — retry (with backoff) rather than
-        // poisoning the object into the failure ring (finding #14).
-        "spool budget exhausted",
-    ]
-    .iter()
-    .any(|needle| m.contains(needle))
+    pub(crate) fn of_storage(e: &crate::storage::StorageError) -> Self {
+        use crate::storage::StorageError as S;
+        match e {
+            S::Throttled(_) => CopyClass::Throttled,
+            S::Unavailable(_) | S::Transient(_) | S::Contended(_) => CopyClass::Transient,
+            S::PreconditionFailed(_) => CopyClass::SourceChanged,
+            S::BucketNotFound(_) | S::AccessDenied(_) | S::QuotaExceeded(_) | S::DiskFull => {
+                CopyClass::DestinationFatal
+            }
+            S::Io(io) => Self::of_io(io),
+            _ => CopyClass::Permanent,
+        }
+    }
+
+    pub(crate) fn of_engine(e: &crate::deltaglider::EngineError) -> Self {
+        use crate::deltaglider::{CodecError, EngineError as E};
+        match e {
+            E::Storage(s) => Self::of_storage(s),
+            // Out of codec slots or spool budget: contention, not a fault of
+            // the object (finding #14).
+            E::Overloaded(_) | E::Codec(CodecError::TimedOut(_)) => CopyClass::Transient,
+            E::Codec(CodecError::Io(io)) => Self::of_io(io),
+            _ => CopyClass::Permanent,
+        }
+    }
+
+    fn of_io(e: &std::io::Error) -> Self {
+        use std::io::ErrorKind as K;
+        match e.kind() {
+            K::ConnectionReset
+            | K::ConnectionAborted
+            | K::BrokenPipe
+            | K::TimedOut
+            | K::UnexpectedEof
+            | K::Interrupted => CopyClass::Transient,
+            K::StorageFull | K::QuotaExceeded => CopyClass::DestinationFatal,
+            _ => CopyClass::Permanent,
+        }
+    }
+}
+
+/// A failed copy: the class the caller acts on, and the text the failure
+/// rows show (the same text as before the class existed).
+#[derive(Debug)]
+pub(crate) struct CopyError {
+    pub class: CopyClass,
+    message: String,
+}
+
+impl std::fmt::Display for CopyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CopyError {}
+
+impl CopyError {
+    pub(crate) fn new(class: CopyClass, message: impl Into<String>) -> Self {
+        Self {
+            class,
+            message: message.into(),
+        }
+    }
+
+    /// `"{context}: {e}"`, classed by the engine error.
+    pub(crate) fn engine(context: &str, e: crate::deltaglider::EngineError) -> Self {
+        Self::new(CopyClass::of_engine(&e), format!("{context}: {e}"))
+    }
+
+    /// `"{context}: {e}"`, classed by the storage error.
+    pub(crate) fn storage(context: &str, e: crate::storage::StorageError) -> Self {
+        Self::new(CopyClass::of_storage(&e), format!("{context}: {e}"))
+    }
+
+    /// The source is not the generation the copy's HEAD saw.
+    fn source_changed(what: std::fmt::Arguments<'_>) -> Self {
+        Self::new(
+            CopyClass::SourceChanged,
+            format!("{SOURCE_CHANGED}: {what}"),
+        )
+    }
+
+    /// The same class, the message behind `context`.
+    fn context(self, context: std::fmt::Arguments<'_>) -> Self {
+        Self::new(self.class, format!("{context}: {}", self.message))
+    }
+}
+
+impl From<crate::deltaglider::EngineError> for CopyError {
+    fn from(e: crate::deltaglider::EngineError) -> Self {
+        Self::new(CopyClass::of_engine(&e), e.to_string())
+    }
+}
+
+impl From<crate::storage::StorageError> for CopyError {
+    fn from(e: crate::storage::StorageError) -> Self {
+        Self::new(CopyClass::of_storage(&e), e.to_string())
+    }
+}
+
+impl From<std::io::Error> for CopyError {
+    fn from(e: std::io::Error) -> Self {
+        Self::new(CopyClass::of_io(&e), e.to_string())
+    }
 }
 
 // ── Delta-passthrough fast path ──────────────────────────────────────
@@ -1088,7 +1124,7 @@ async fn delta_passthrough_copy(
     engine: &Arc<DynEngine>,
     request: ObjectTransferRequest<'_>,
     source_head: &crate::types::FileMetadata,
-) -> Result<Option<ObjectTransferOutcome>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Option<ObjectTransferOutcome>, CopyError> {
     use crate::types::{ObjectKey, StorageInfo};
 
     // Source delta facts. `ref_sha256` comes from the HEAD; recover it via
@@ -1196,7 +1232,7 @@ async fn delta_passthrough_copy(
         .await;
     // `Some(ref_bytes)` = shipped (ref_bytes = bytes of a reference we SEEDED on
     // this copy, 0 if the dest already had one); `None` = fell back.
-    let shipped: Result<Option<u64>, Box<dyn std::error::Error + Send + Sync>> = engine
+    let shipped: Result<Option<u64>, CopyError> = engine
         .with_dest_prefix_lock(&counter_dest_bucket, &dest_prefix, || async move {
             // Re-read the dest reference UNDER the lock and re-run the SAME pure
             // gate — identical sha + enc precedence to the first read.
@@ -1244,11 +1280,9 @@ async fn delta_passthrough_copy(
                 .await
                 .ok();
             if !same_delta_generation(&meta_generation, fresh.as_ref(), delta_bytes.len()) {
-                return Err(format!(
-                    "{SOURCE_CHANGED_TOKEN}: {src_bucket}/{src_prefix2}/{src_filename2} was \
-                     overwritten after HEAD"
-                )
-                .into());
+                return Err(CopyError::source_changed(format_args!(
+                    "{src_bucket}/{src_prefix2}/{src_filename2} was overwritten after HEAD"
+                )));
             }
             engine2
                 .put_delta_raw(
@@ -1382,16 +1416,14 @@ async fn spooled_copy(
     request: &ObjectTransferRequest<'_>,
     source_head: &crate::types::FileMetadata,
     source_size: u64,
-) -> Result<Option<ObjectTransferOutcome>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Option<ObjectTransferOutcome>, CopyError> {
     use tokio::io::AsyncWriteExt;
 
     // Stream the (reconstructed) source to a spool file — bounded memory.
     let resp = engine
         .retrieve_stream(request.source_bucket, request.source_key)
         .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("source retrieve_stream failed: {e}").into()
-        })?;
+        .map_err(|e| CopyError::engine("source retrieve_stream failed", e))?;
     let (mut stream, meta) = match resp {
         crate::deltaglider::RetrieveResponse::Streamed {
             stream, metadata, ..
@@ -1401,12 +1433,11 @@ async fn spooled_copy(
     };
 
     // Same generation as the HEAD? (The size below is the HEAD's.)
-    let changed = || -> Box<dyn std::error::Error + Send + Sync> {
-        format!(
-            "{SOURCE_CHANGED_TOKEN}: {}/{} was overwritten after HEAD",
+    let changed = || {
+        CopyError::source_changed(format_args!(
+            "{}/{} was overwritten after HEAD",
             request.source_bucket, request.source_key
-        )
-        .into()
+        ))
     };
     if !source_head.file_sha256.is_empty()
         && !meta.file_sha256.is_empty()
@@ -1425,9 +1456,7 @@ async fn spooled_copy(
         let mut written: u64 = 0;
         let mut file = tokio::fs::File::create(spool.path()).await?;
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("source stream error: {e}").into()
-            })?;
+            let chunk = chunk.map_err(|e| CopyError::storage("source stream error", e))?;
             written += chunk.len() as u64;
             if written > source_size {
                 return Err(changed());
@@ -1472,9 +1501,7 @@ async fn spooled_copy(
             meta.multipart_etag.clone(),
         )
         .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("destination spooled store failed: {e}").into()
-        })?;
+        .map_err(|e| CopyError::engine("destination spooled store failed", e))?;
     // Same post-store check as the buffered path.
     verify_destination(
         engine,
@@ -1549,8 +1576,9 @@ mod tests {
             keep_created_at: false,
         };
         match spooled_copy(&engine, &request, &stale, stale.file_size).await {
-            Err(e) => assert!(
-                is_transient_copy_error(&e.to_string()),
+            Err(e) => assert_eq!(
+                e.class,
+                CopyClass::SourceChanged,
                 "a changed source must be retryable: {e}"
             ),
             Ok(None) => {}
@@ -1562,26 +1590,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn error_signal_removes_whole_names_only() {
-        assert_eq!(
-            error_signal("Not found: reports/quota.pdf", &["reports/quota.pdf"]),
-            "Not found: <name>"
-        );
-        // A short key never cuts into the backend's words.
-        assert_eq!(
-            error_signal("put a failed (status=503): SlowDown", &["a"]),
-            "put <name> failed (status=503): SlowDown"
-        );
-        // The retry classifier ignores a key that only LOOKS transient.
-        let msg = "source head failed: Not found: logs/timeout.txt";
-        assert!(is_transient_copy_error(msg));
-        assert!(!is_transient_copy_error(&error_signal(
-            msg,
-            &["logs/timeout.txt"]
-        )));
     }
 
     #[test]
@@ -1712,8 +1720,9 @@ mod tests {
         };
         let result = delta_passthrough_copy(&engine, request, &stale_head).await;
         match result {
-            Err(e) => assert!(
-                is_transient_copy_error(&e.to_string()),
+            Err(e) => assert_eq!(
+                e.class,
+                CopyClass::SourceChanged,
                 "a changed source must be a retryable error, got: {e}"
             ),
             Ok(outcome) => {
@@ -1792,44 +1801,71 @@ mod tests {
         );
     }
 
+    /// The copy retry, the replication run and the event consumer act on the
+    /// class, and the class comes from the error variant: the text (which
+    /// names the key) plays no part.
     #[test]
-    fn transient_copy_error_classification_is_narrow() {
-        assert!(is_transient_copy_error(
-            "source retrieve failed: Storage error: S3 error: Failed to read response body: streaming error"
-        ));
-        assert!(is_transient_copy_error("connection reset by peer"));
-        assert!(is_transient_copy_error("503 SlowDown"));
-
-        // Exact source-backend (Hetzner) transient strings from the failure ring.
-        assert!(is_transient_copy_error(
-            "source retrieve failed: Storage error: Backend throttled: head_object throttled (status=503): service error"
-        ));
-        assert!(is_transient_copy_error(
-            "source retrieve failed: Storage error: S3 error: head_object failed (status=502): service error"
-        ));
-        assert!(is_transient_copy_error(
-            "source retrieve failed: Storage error: S3 error: get_object failed (status=504): service error"
-        ));
-
-        assert!(!is_transient_copy_error(
-            "destination store failed: Storage error: Bucket not found: test-bucket"
-        ));
-        assert!(!is_transient_copy_error("AccessDenied"));
-        assert!(!is_transient_copy_error("NoSuchKey"));
-
-        // Spool budget exhaustion is contention, not permanent (finding #14):
-        // the Overloaded Display string must classify transient so the copy
-        // retries instead of poisoning the object into the failure ring.
-        assert!(is_transient_copy_error(
-            "source retrieve failed: Service overloaded: spool budget exhausted; retry shortly"
-        ));
-
-        // A generation-pin change is FATAL at the part level (part loop returns
-        // it immediately) but the whole-copy retry re-HEADs → transient here.
-        assert!(is_transient_copy_error(&format!(
-            "{}: b/k (size 10 -> 11)",
-            SOURCE_CHANGED_TOKEN
-        )));
+    fn copy_class_follows_the_error_variant() {
+        use crate::deltaglider::{CodecError, EngineError as E};
+        use crate::storage::StorageError as S;
+        use CopyClass::*;
+        let io = |k: std::io::ErrorKind| S::Io(std::io::Error::new(k, "x"));
+        let cases: Vec<(E, CopyClass)> = vec![
+            (E::Storage(S::Throttled("SlowDown".into())), Throttled),
+            (E::Storage(S::Unavailable("timed out".into())), Transient),
+            (E::Storage(S::Transient("status=502".into())), Transient),
+            (E::Storage(S::Contended("reference lock".into())), Transient),
+            (E::Overloaded("spool budget exhausted".into()), Transient),
+            (
+                E::Overloaded("all delta codec slots busy".into()),
+                Transient,
+            ),
+            (E::Codec(CodecError::TimedOut("xdelta3".into())), Transient),
+            (
+                E::Storage(io(std::io::ErrorKind::ConnectionReset)),
+                Transient,
+            ),
+            (E::Storage(io(std::io::ErrorKind::BrokenPipe)), Transient),
+            (
+                E::Storage(S::PreconditionFailed("gen".into())),
+                SourceChanged,
+            ),
+            (E::Storage(S::BucketNotFound("b".into())), DestinationFatal),
+            (E::Storage(S::AccessDenied("403".into())), DestinationFatal),
+            (E::Storage(S::QuotaExceeded("cap".into())), DestinationFatal),
+            (E::Storage(S::DiskFull), DestinationFatal),
+            (
+                E::Storage(io(std::io::ErrorKind::StorageFull)),
+                DestinationFatal,
+            ),
+            // Marker words in a key never change the class.
+            (E::NotFound("SlowDown-q3.pdf".into()), Permanent),
+            (
+                E::Storage(S::NotFound("logs/timeout.txt".into())),
+                Permanent,
+            ),
+            (
+                E::Storage(S::S3("quota-report.pdf status=503".into())),
+                Permanent,
+            ),
+            (E::Storage(S::Other("connection reset".into())), Permanent),
+            (E::Codec(CodecError::DecodeFailed("bad".into())), Permanent),
+            (E::InvalidArgument("x".into()), Permanent),
+        ];
+        for (e, want) in cases {
+            let msg = e.to_string();
+            let err = CopyError::engine("source retrieve failed", e);
+            assert_eq!(err.class, want, "{msg}");
+            assert_eq!(err.to_string(), format!("source retrieve failed: {msg}"));
+        }
+        assert!(Transient.retryable() && Throttled.retryable() && SourceChanged.retryable());
+        assert!(!DestinationFatal.retryable() && !Permanent.retryable());
+        // The generation-pin text reads as before.
+        let changed = CopyError::source_changed(format_args!("b/k was overwritten after HEAD"));
+        assert_eq!(
+            changed.to_string(),
+            "source changed during copy: b/k was overwritten after HEAD"
+        );
     }
 
     #[test]

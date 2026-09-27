@@ -102,7 +102,7 @@ fn wait_with_timeout(
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait(); // reap zombie
-                    return Err(CodecError::EncodeFailed(format!(
+                    return Err(CodecError::TimedOut(format!(
                         "xdelta3 subprocess timed out after {}s",
                         timeout.as_secs()
                     )));
@@ -122,6 +122,11 @@ pub enum CodecError {
 
     #[error("Delta decoding failed: {0}")]
     DecodeFailed(String),
+
+    /// xdelta3 ran past its timeout and was killed. A retry can succeed on
+    /// a less busy host. Same Display as `EncodeFailed`.
+    #[error("Delta encoding failed: {0}")]
+    TimedOut(String),
 
     #[error("Data too large: {size} bytes (max: {max} bytes)")]
     TooLarge { size: usize, max: usize },

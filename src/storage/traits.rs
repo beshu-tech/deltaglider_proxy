@@ -112,7 +112,8 @@ pub enum StorageError {
     #[error("S3 error: {0}")]
     S3(String),
 
-    /// The backend refused an object-level request (403). Classified where
+    /// The backend refused an object-level request (403), or sends every
+    /// request to another endpoint (301 PermanentRedirect). Classified where
     /// the status is known (`S3Backend::classify_s3_error`), so no caller
     /// reads the status out of the text. Same Display and the same wire
     /// answer as `S3` (500, sanitised): only the classification is new.
@@ -155,11 +156,34 @@ pub enum StorageError {
     MetadataTooLarge(String),
 
     /// The backend did not answer: the request timed out, or the
-    /// connection failed. Maps to 503 ServiceUnavailable. The Display text
-    /// says "timed out or unreachable" on purpose: the string-based
-    /// transient classifiers (`transfer::is_transient_copy_error`) match it.
+    /// connection failed. Maps to 503 ServiceUnavailable.
     #[error("Backend unavailable (timed out or unreachable): {0}")]
     Unavailable(String),
+
+    /// The backend answered with a fault that a retry can clear: a 5xx
+    /// other than 503 (500, 502, 504), or the response body broke off
+    /// while it was read. Same Display and wire answer (500) as `S3`:
+    /// only the classification is new.
+    #[error("S3 error: {0}")]
+    Transient(String),
+
+    /// Another writer holds the resource past the wait (the cross-instance
+    /// reference lock). A retry can succeed. Same Display and wire answer
+    /// (500) as `Other`.
+    #[error("Storage error: {0}")]
+    Contended(String),
+
+    /// The object is not the generation the caller pinned: it changed
+    /// after the caller's HEAD (a copy source overwritten during the copy).
+    /// Same Display and wire answer (500) as `Other`.
+    #[error("Storage error: {0}")]
+    PreconditionFailed(String),
+
+    /// The backend refuses writes because a storage cap or quota is used
+    /// up (507, `QuotaExceeded`, B2 `cap_exceeded`). Same Display and wire
+    /// answer (500) as `S3`.
+    #[error("S3 error: {0}")]
+    QuotaExceeded(String),
 
     /// The requested byte range starts past the object's end (the caller
     /// resolved it against a stale size). Maps to 416 InvalidRange.

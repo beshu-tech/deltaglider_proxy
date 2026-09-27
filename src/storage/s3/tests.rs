@@ -743,9 +743,9 @@ mod classify_tests {
         }
     }
 
-    /// A 500 from a bucket-level op is NOT a bucket-not-found signal.
-    /// Should stay S3 with status visible so the caller can see the
-    /// upstream failure.
+    /// A 500 from a bucket-level op is NOT a bucket-not-found signal. It
+    /// is a transient fault, with the status visible so the caller can see
+    /// the upstream failure.
     #[test]
     fn classify_s3_error_preserves_bucket_level_500() {
         let inner = aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error::generic(
@@ -756,11 +756,10 @@ mod classify_tests {
         let err: SdkError<_> = SdkError::service_error(inner, http_response(500, Some("req-5")));
         let classified = S3Backend::classify_s3_error("bucket", &err, S3Op::ListObjects);
         match classified {
-            StorageError::S3(msg) => {
+            StorageError::Transient(msg) => {
                 assert!(msg.contains("500"), "status must be in message: {msg}");
-                assert!(!msg.is_empty(), "S3 error message must not be empty");
             }
-            other => panic!("expected S3, got {:?}", other),
+            other => panic!("expected Transient, got {:?}", other),
         }
     }
 
@@ -830,7 +829,7 @@ mod classify_tests {
                 "SlowDown-q3.pdf",
                 500,
                 S3Op::PutObject,
-                "S3",
+                "Transient",
             ),
             (
                 "SlowDown",
@@ -851,6 +850,7 @@ mod classify_tests {
             let err = err_with(code, msg, status);
             let got = match S3Backend::classify_s3_error("bucket", &err, op) {
                 StorageError::S3(_) => "S3",
+                StorageError::Transient(_) => "Transient",
                 StorageError::AccessDenied(_) => "AccessDenied",
                 StorageError::Throttled(_) => "Throttled",
                 StorageError::BucketNotFound(_) => "BucketNotFound",
@@ -858,6 +858,48 @@ mod classify_tests {
                 other => panic!("unexpected {other:?}"),
             };
             assert_eq!(got, want, "code={code} msg={msg} status={status} op={op}");
+        }
+    }
+
+    /// The copy retry and the replication run decide on the variant, so the
+    /// classifier must set it: a 5xx that a retry can clear is `Transient`,
+    /// a used-up cap is `QuotaExceeded`, a wrong-endpoint bucket refuses
+    /// every request. The Display text stays the old `S3` text.
+    #[test]
+    fn classify_s3_error_types_retryable_and_fatal_answers() {
+        let err_with = |code: &str, status: u16| {
+            let inner = GetObjectError::generic(
+                aws_smithy_types::error::ErrorMetadata::builder()
+                    .code(code)
+                    .build(),
+            );
+            SdkError::service_error(inner, http_response(status, Some("req-r1")))
+        };
+        let cases: [(&str, u16, &str); 8] = [
+            ("InternalError", 500, "Transient"),
+            ("BadGateway", 502, "Transient"),
+            ("GatewayTimeout", 504, "Transient"),
+            ("InsufficientStorage", 507, "QuotaExceeded"),
+            ("QuotaExceeded", 403, "QuotaExceeded"),
+            ("XMinioAdminBucketQuotaExceeded", 400, "QuotaExceeded"),
+            ("PermanentRedirect", 301, "AccessDenied"),
+            ("InvalidRequest", 400, "S3"),
+        ];
+        for (code, status, want) in cases {
+            let e = S3Backend::classify_s3_error("b", &err_with(code, status), S3Op::PutObject);
+            let got = match &e {
+                StorageError::S3(_) => "S3",
+                StorageError::Transient(_) => "Transient",
+                StorageError::QuotaExceeded(_) => "QuotaExceeded",
+                StorageError::AccessDenied(_) => "AccessDenied",
+                other => panic!("unexpected {other:?}"),
+            };
+            assert_eq!(got, want, "code={code} status={status}");
+            assert!(
+                e.to_string()
+                    .starts_with(&format!("S3 error: put_object failed (status={status})")),
+                "Display text changed: {e}"
+            );
         }
     }
 

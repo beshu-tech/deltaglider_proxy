@@ -44,7 +44,7 @@ use crate::event_outbox::{
     current_unix_seconds, EventKind, EventOutboxRecord, EventSource, NewEvent,
 };
 use crate::transfer::{
-    copy_object_with_retries, ObjectTransferRequest, TransferProvenance,
+    copy_object_with_retries, CopyClass, ObjectTransferRequest, TransferProvenance,
     REPLICATION_RULE_METADATA_KEY,
 };
 
@@ -935,11 +935,7 @@ async fn drain_rule_rows(
                     // quota, throttle, 5xx, timeout) is not about THIS key:
                     // it never counts toward giving up, or a short outage
                     // gave up on every key and dropped its events.
-                    let signal = crate::transfer::error_signal(
-                        &err.to_string(),
-                        &[key, bucket, &rule.destination.bucket],
-                    );
-                    if !failure_counts_toward_give_up(&signal) {
+                    if !failure_counts_toward_give_up(failure_class(err.as_ref())) {
                         hold();
                         continue;
                     }
@@ -967,14 +963,24 @@ async fn drain_rule_rows(
     std::ops::ControlFlow::Continue(())
 }
 
-/// Pure: may this failure (its text with user names removed) count toward
-/// giving up on the key? Only a key-specific fault may. Destination-wide and
-/// transient faults hold the key until they clear.
-fn failure_counts_toward_give_up(signal: &str) -> bool {
-    !(super::worker::is_destination_fatal(signal)
-        || super::worker::is_backend_throttled(signal)
-        || crate::transfer::is_transient_copy_error(signal)
-        || signal.to_ascii_lowercase().contains("overloaded"))
+/// The class of an `apply_action` failure: a copy carries its own, an
+/// engine error (HEAD, delete) is classed by its variant, anything else
+/// (a bad rule glob, a key the rewrite refuses) is about this key.
+fn failure_class(err: &(dyn std::error::Error + Send + Sync + 'static)) -> CopyClass {
+    if let Some(e) = err.downcast_ref::<crate::transfer::CopyError>() {
+        e.class
+    } else if let Some(e) = err.downcast_ref::<crate::deltaglider::EngineError>() {
+        CopyClass::of_engine(e)
+    } else {
+        CopyClass::Permanent
+    }
+}
+
+/// Pure: may this failure count toward giving up on the key? Only a
+/// key-specific fault may. Destination-wide and transient faults hold the
+/// key until they clear.
+fn failure_counts_toward_give_up(class: CopyClass) -> bool {
+    class == CopyClass::Permanent
 }
 
 /// Pure: has a key used up its attempts?
@@ -1909,23 +1915,38 @@ mod per_rule_cursor_tests {
 
     #[test]
     fn only_key_specific_failures_count_toward_give_up() {
+        use crate::deltaglider::EngineError;
+        use crate::storage::StorageError as S;
+        use crate::transfer::CopyError;
+        let boxed = |e: Box<dyn std::error::Error + Send + Sync>| failure_class(e.as_ref());
         for wide in [
-            "Storage error: Bucket not found: <name>",
-            "NoSuchBucket",
-            "QuotaExceeded",
-            "Backend throttled: SlowDown",
-            "S3 error: service unavailable (status=503)",
-            "operation timed out",
-            "Service overloaded: all delta codec slots busy",
+            EngineError::Storage(S::BucketNotFound("b".into())),
+            EngineError::Storage(S::QuotaExceeded("cap".into())),
+            EngineError::Storage(S::Throttled("SlowDown".into())),
+            EngineError::Storage(S::Transient("status=502".into())),
+            EngineError::Storage(S::Unavailable("timed out".into())),
+            EngineError::Overloaded("all delta codec slots busy".into()),
         ] {
-            assert!(!failure_counts_toward_give_up(wide), "{wide}");
+            let msg = wide.to_string();
+            assert!(
+                !failure_counts_toward_give_up(boxed(Box::new(wide))),
+                "{msg}"
+            );
         }
+        let timeout = CopyError::new(CopyClass::Transient, "object copy timed out after 5s");
+        assert!(!failure_counts_toward_give_up(boxed(Box::new(timeout))));
+        // A key that LOOKS like a throttle does not make a key fault wide.
         for key_fault in [
-            "Missing reference for deltaspace: x",
-            "Checksum mismatch for <name>: expected a, got b",
+            EngineError::MissingReference("SlowDown-q3.pdf".into()),
+            EngineError::NotFound("quota-report.pdf".into()),
         ] {
-            assert!(failure_counts_toward_give_up(key_fault), "{key_fault}");
+            let msg = key_fault.to_string();
+            assert!(
+                failure_counts_toward_give_up(boxed(Box::new(key_fault))),
+                "{msg}"
+            );
         }
+        assert!(failure_counts_toward_give_up(boxed("bad glob".into())));
     }
 
     #[test]

@@ -503,7 +503,7 @@ impl S3Backend {
                 Ok(Some(chunk)) => Some((Ok(chunk), body)),
                 Ok(None) => None,
                 Err(e) => Some((
-                    Err(StorageError::S3(format!(
+                    Err(StorageError::Transient(format!(
                         "Failed to read response body: {}",
                         e
                     ))),
@@ -532,7 +532,7 @@ impl S3Backend {
             .body
             .collect()
             .await
-            .map_err(|e| StorageError::S3(format!("Failed to read response body: {}", e)))?
+            .map_err(|e| StorageError::Transient(format!("Failed to read response body: {}", e)))?
             .into_bytes()
             .to_vec();
 

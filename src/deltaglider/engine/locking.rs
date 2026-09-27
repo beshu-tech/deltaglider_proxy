@@ -555,7 +555,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             {
                 Ok(true) => guard.push_key(key),
                 Ok(false) => {
-                    return Err(EngineError::Storage(StorageError::Other(format!(
+                    return Err(EngineError::Storage(StorageError::Contended(format!(
                         "reference lock for deltaspace '{bucket}/{deltaspace}' held by another \
                          instance; write timed out to avoid corrupting reference.bin"
                     ))))

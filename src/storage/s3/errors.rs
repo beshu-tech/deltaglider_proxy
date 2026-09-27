@@ -200,11 +200,30 @@ impl S3Backend {
             if s == 503 || s == 429 || code == "SlowDown" {
                 return StorageError::Throttled(format!("{} throttled (status={}): {}", op, s, e));
             }
+            if s == 507 || code_is_quota(code) {
+                return StorageError::QuotaExceeded(format!("{op} failed (status={s}): {e}"));
+            }
             if s == 403 {
                 return StorageError::AccessDenied(format!("{op} failed (status=403): {e}"));
             }
+            // The bucket lives behind another endpoint: every request fails
+            // the same way, as a refused one does.
+            if s == 301 || code == "PermanentRedirect" {
+                return StorageError::AccessDenied(format!("{op} failed (status={s}): {e}"));
+            }
+            // A server-side fault a retry can clear (500 InternalError, 502,
+            // 504). 503 is `Throttled` above.
+            if matches!(s, 500 | 502 | 504) {
+                return StorageError::Transient(format!("{op} failed (status={s}): {e}"));
+            }
         } else if code == "SlowDown" {
             return StorageError::Throttled(format!("{} throttled: {}", op, e));
+        } else if code_is_quota(code) {
+            return StorageError::QuotaExceeded(format!("{op} failed (status=0): {e}"));
+        }
+        // The response came back but broke off or could not be read.
+        if matches!(e, SdkError::ResponseError(_)) {
+            return StorageError::Transient(format!("{op} failed (status=0): {e}"));
         }
         StorageError::S3(format!(
             "{} failed (status={}): {}",
@@ -230,6 +249,14 @@ impl S3Backend {
         }
         Self::classify_s3_error(bucket, e, S3Op::GetObject)
     }
+}
+
+/// Pure: an S3 error code that means "storage cap or quota used up".
+fn code_is_quota(code: &str) -> bool {
+    matches!(
+        code,
+        "QuotaExceeded" | "XMinioAdminBucketQuotaExceeded" | "InsufficientStorage" | "cap_exceeded"
+    )
 }
 
 /// How a failed fenced write reads.

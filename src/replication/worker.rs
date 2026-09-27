@@ -717,9 +717,10 @@ async fn copy_one_object(
     let copy_result = match object_timeout {
         Some(timeout) => match tokio::time::timeout(timeout, copy_fut).await {
             Ok(r) => r,
-            Err(_elapsed) => {
-                Err(format!("object copy timed out after {}s", timeout.as_secs()).into())
-            }
+            Err(_elapsed) => Err(crate::transfer::CopyError::new(
+                crate::transfer::CopyClass::Transient,
+                format!("object copy timed out after {}s", timeout.as_secs()),
+            )),
         },
         None => copy_fut.await,
     };
@@ -764,17 +765,15 @@ async fn copy_one_object(
             out.errors = 1;
             out.had_error = true;
             let err_msg = format!("{}", e);
-            // Classify on the message WITHOUT the names in it: the key and the
-            // buckets are user text (`quota-report.pdf`, `SlowDown-q3.pdf`).
-            let signal = crate::transfer::error_signal(
-                &err_msg,
-                &[src_key, dest_key, src_bucket, dst_bucket],
-            );
             // A backend THROTTLE is not an object-specific fault — the driver
             // must not count it toward the poison-skip ledger, or a throttling
             // backend would mass-poison healthy objects into permanent skip.
-            out.throttled = is_backend_throttled(&signal);
-            out.dest_fatal = is_destination_fatal(&signal);
+            out.throttled = e.class == crate::transfer::CopyClass::Throttled;
+            // A dead destination (bucket gone, access refused, cap used up)
+            // fails every object; the page-level zero-success gate aborts the
+            // run instead of grinding through the rest (the prod B2-over-cap
+            // case).
+            out.dest_fatal = e.class == crate::transfer::CopyClass::DestinationFatal;
             debug!(
                 "replication rule '{}' object failure src={:?} dst={:?}: {}",
                 rule_name, src_key, dest_key, e
@@ -783,59 +782,6 @@ async fn copy_one_object(
         }
     }
     out
-}
-
-/// True iff a copy error means the DESTINATION is fundamentally unusable for the
-/// whole run — the dest bucket doesn't exist, the account is suspended, or the
-/// backend is out of storage/quota. These are NOT per-object hiccups: no object
-/// will ever land, so the run must FAIL FAST instead of retrying every object
-/// against a dead destination (the prod case: a Backblaze bucket over quota was
-/// surfacing `NoSuchBucket`/quota errors per-object and grinding through ~93K
-/// objects every tick). Pure so the truth table is unit-tested.
-///
-/// This answers "COULD this error mean a dead dest" — some tokens (quota,
-/// access denied) can also be per-object. The caller's page-level zero-success
-/// gate makes that safe: a dead dest fails every object, so the abort only fires
-/// when nothing copied. (A fuller fix would classify on the typed StorageError
-/// variant before the retry loop — deferred; substring + the page gate closes
-/// the prod incident without re-plumbing the engine error type.)
-pub(crate) fn is_destination_fatal(err: &str) -> bool {
-    let e = err.to_ascii_lowercase();
-    // Dest bucket missing / account suspended (StorageError::BucketNotFound's
-    // Display is "Bucket not found: …"; Backblaze returns NoSuchBucket).
-    e.contains("bucket not found")
-        || e.contains("nosuchbucket")
-        // Storage cap / quota exhaustion — provider-agnostic signatures.
-        || e.contains("quota")
-        || e.contains("insufficient storage")
-        || e.contains("cap exceeded")
-        || e.contains("storage limit")
-        // Real Backblaze B2 over-cap shapes (machine code + human text + the
-        // 403-disabled message). The page-level zero-success gate in the fold
-        // makes these safe to match even though they CAN appear per-object.
-        || e.contains("cap_exceeded")
-        || e.contains("exceed account cap")
-        || e.contains("account cap")
-        || e.contains("all access to this object has been disabled")
-        // Dead/wrong destination credentials or endpoint — no object will land.
-        || e.contains("accessdenied")
-        || e.contains("access denied")
-        || e.contains("signaturedoesnotmatch")
-        || e.contains("permanentredirect")
-}
-
-/// True iff a copy error is a backend THROTTLE signal (Ceph/AWS `503
-/// SlowDown`, generic 429). Like `is_destination_fatal` this answers "COULD
-/// this be a throttle" — the caller's page-level gate (several throttled
-/// objects AND zero successes) keeps a stray token from aborting a healthy
-/// run. Pure so the truth table is unit-tested.
-pub(crate) fn is_backend_throttled(err: &str) -> bool {
-    let e = err.to_ascii_lowercase();
-    e.contains("slowdown")
-        || e.contains("throttl") // "throttled"/"throttling" (StorageError::Throttled Display)
-        || e.contains("too many requests")
-        || e.contains("status=503")
-        || e.contains("(503")
 }
 
 /// Pure: should the run abort this page as backend-throttled? True with ZERO
@@ -1324,86 +1270,6 @@ mod tests {
             ..base
         });
         assert_eq!((d.status, d.clear_cursor), ("stopped", false));
-    }
-
-    #[test]
-    fn destination_fatal_truth_table() {
-        // Fatal: dest bucket gone / account suspended / over quota.
-        for f in [
-            "Bucket not found: beshu-b2",
-            "S3 error: NoSuchBucket",
-            "storage error: quota exceeded",
-            "Insufficient storage",
-            "B2 cap exceeded for account",
-            "monthly storage limit reached",
-            // Real Backblaze B2 over-cap + dead-creds shapes (C2).
-            "S3 error: put_object failed (status=403): cap_exceeded",
-            "Cannot upload, would exceed account cap",
-            "all access to this object has been disabled",
-            "S3 error: AccessDenied",
-            "SignatureDoesNotMatch: the request signature we calculated",
-            "PermanentRedirect: the bucket is in a different region",
-        ] {
-            assert!(is_destination_fatal(f), "expected fatal: {f}");
-        }
-        // Per-object hiccups: NOT fatal — keep going. (Note: tokens like a bare
-        // "quota" or "access denied" CAN be per-object, but the fold's
-        // page-level zero-success gate stops one such object aborting a healthy
-        // page — this fn only answers "could this be a dead dest".)
-        for ok in [
-            "object copy timed out after 1800s",
-            "S3 error: put_object failed (status=503): SlowDown",
-            "connection reset by peer",
-            "NoSuchKey",
-        ] {
-            assert!(!is_destination_fatal(ok), "expected non-fatal: {ok}");
-        }
-    }
-
-    /// The error text names the object. A key such as `quota-report.pdf` or
-    /// `SlowDown-q3.pdf` must not turn a plain per-object error into a
-    /// dead-destination or throttle verdict.
-    #[test]
-    fn key_text_does_not_classify_the_error() {
-        let keys = ["reports/quota-report.pdf", "SlowDown-q3.pdf"];
-        for key in keys {
-            let msg = format!("source retrieve failed: Not found: {key}");
-            let sig = crate::transfer::error_signal(&msg, &[key, key, "src", "dst"]);
-            assert!(!is_destination_fatal(&sig), "{msg}");
-            assert!(!is_backend_throttled(&sig), "{msg}");
-        }
-        // A real signal next to the key still counts.
-        let msg = "put reports/quota-report.pdf failed: S3 error: NoSuchBucket";
-        assert!(is_destination_fatal(&crate::transfer::error_signal(
-            msg,
-            &["reports/quota-report.pdf"]
-        )));
-    }
-
-    #[test]
-    fn backend_throttled_truth_table() {
-        // Throttle signals: Ceph/AWS SlowDown, StorageError::Throttled
-        // Display, generic 429, bare 503 statuses.
-        for t in [
-            "S3 error: put_object failed (status=503): SlowDown",
-            "Backend throttled: get_object throttled (status=503): service error",
-            "429 Too Many Requests",
-            "head_object failed (status=503)",
-            "service error (503 Service Unavailable)",
-        ] {
-            assert!(is_backend_throttled(t), "expected throttled: {t}");
-        }
-        // Everything else: not a throttle — per-object handling continues.
-        for ok in [
-            "Bucket not found: beshu-b2",
-            "object copy timed out after 1800s",
-            "connection reset by peer",
-            "NoSuchKey",
-            "S3 error: AccessDenied",
-            "storage error: quota exceeded",
-        ] {
-            assert!(!is_backend_throttled(ok), "expected non-throttle: {ok}");
-        }
     }
 
     fn mk_rule() -> ReplicationRule {

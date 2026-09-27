@@ -136,6 +136,16 @@ delta-eligible objects; other files are limited by
 `max_passthrough_object_size`. A failed download no longer leaves a truncated
 file, and `s3 verify` hashes the object while it reads it.
 
+### Changed — Copies decide retries on the error type, not its text
+
+Replication, lifecycle transitions, migrate, re-encrypt and the admin bulk
+copy decided whether to retry a failed object copy by searching the error
+text for words such as `timeout` or `status=503`. Now the backend error
+carries its class from where it happens, so a key such as `SlowDown-q3.pdf`
+cannot change the decision. One answer is now retried that was not before:
+a proxy that has no free delta codec slot. The failure rows show the same
+text as before.
+
 ### Changed — `config lint` refuses an empty file
 
 `config lint` now runs the same validation step as

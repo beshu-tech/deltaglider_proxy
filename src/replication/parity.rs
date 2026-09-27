@@ -1237,9 +1237,7 @@ async fn scan_prefix(
                         let msg = e.to_string();
                         attempt += 1;
                         if attempt >= LIST_MAX_ATTEMPTS
-                            || !crate::transfer::is_transient_copy_error(
-                                &crate::transfer::error_signal(&msg, &[bucket, prefix]),
-                            )
+                            || !crate::transfer::CopyClass::of_engine(&e).retryable()
                         {
                             return Err(format!("list {bucket}/{prefix} page failed: {msg}"));
                         }

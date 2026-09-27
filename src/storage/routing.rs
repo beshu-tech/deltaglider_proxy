@@ -302,7 +302,7 @@ impl RoutingBackend {
                         let secs = (deadline - now).as_secs();
                         cooling.push((
                             name.clone(),
-                            Err(StorageError::S3(format!(
+                            Err(StorageError::Transient(format!(
                                 "backend in failure cooldown ({secs}s remaining): {last_err}"
                             ))),
                         ));
@@ -335,7 +335,7 @@ impl RoutingBackend {
                 let outcome =
                     match tokio::time::timeout(timeout, backend.list_buckets_with_dates()).await {
                         Ok(res) => res,
-                        Err(_) => Err(StorageError::S3(format!(
+                        Err(_) => Err(StorageError::Transient(format!(
                             "listing timed out after {}s",
                             timeout.as_secs()
                         ))),
