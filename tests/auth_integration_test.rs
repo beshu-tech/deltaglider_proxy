@@ -3185,20 +3185,19 @@ async fn production_defaults_sdk_retry_after_a_5xx_succeeds() {
         .expect("filesystem backend")
         .join(server.bucket())
         .join("deltaspaces");
+    // A symlink to itself: every path through it fails with ELOOP, a plain
+    // I/O error (500), and unlike a read-only directory it also stops a
+    // proxy that runs as root (the CI runner).
     let blocker = blocker.join("blocked");
-    std::fs::create_dir_all(&blocker).unwrap();
-    let set_mode = |path: &std::path::Path, mode: u32| {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
-    };
-    set_mode(&blocker, 0o555);
+    std::fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&blocker, &blocker).unwrap();
     let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let unblock = blocker.clone();
     let client = retrying_client(
         &server,
         OnRetry {
             attempts: attempts.clone(),
-            before_retry: Box::new(move || set_mode(&unblock, 0o755)),
+            before_retry: Box::new(move || std::fs::remove_file(&unblock).unwrap()),
         },
     );
 
