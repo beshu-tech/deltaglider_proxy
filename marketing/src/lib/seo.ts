@@ -39,7 +39,7 @@ export const BESHU = {
   /** Sister product URLs for sameAs / brand. */
   sisterProducts: {
     readonlyrest: 'https://readonlyrest.com',
-    anaphora: 'https://anaphora.beshu.tech',
+    anaphora: 'https://anaphora.it',
   },
 } as const;
 

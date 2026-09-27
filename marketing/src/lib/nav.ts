@@ -49,7 +49,7 @@ export const FOOTER_COLUMNS: readonly FooterColumn[] = [
     links: [
       { label: 'beshu.tech', href: 'https://beshu.tech' },
       { label: 'ReadonlyREST', href: 'https://readonlyrest.com' },
-      { label: 'Anaphora', href: 'https://anaphora.beshu.tech' },
+      { label: 'Anaphora', href: 'https://anaphora.it' },
     ],
   },
 ];
