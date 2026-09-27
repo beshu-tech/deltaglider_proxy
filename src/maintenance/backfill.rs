@@ -142,24 +142,19 @@ pub async fn hash_object_content<S: crate::storage::StorageBackend>(
     ))
 }
 
-/// The backfill phase machine: `counting` → `objects`. Mirrors the
-/// reencrypt executor (page-granular resume, per-object failures recorded
-/// and skipped over, cancellation checked per page). No `references`
-/// phase — references either carry intact metadata or are healed by the
-/// write path's `heal_reference_if_corrupt`.
+/// The backfill phase machine: `counting` → `objects`, on the shared
+/// driver (page-granular resume, per-object failures recorded and skipped
+/// over, cancellation checked per page). No `references` phase —
+/// references either carry intact metadata or are healed by the write
+/// path's `heal_reference_if_corrupt`.
 pub(crate) async fn execute_backfill_phases(
     db: &std::sync::Arc<tokio::sync::Mutex<crate::config_db::ConfigDb>>,
     state: &std::sync::Arc<crate::api::handlers::AppState>,
     instance_id: &str,
     job: &super::store::MaintenanceJob,
 ) -> Result<(), String> {
-    use super::worker::{
-        check_cancel, counting_phase, drain_inflight_writes, heartbeat, persist, record_failure,
-        stop_if_shutting_down, PAGE_SIZE,
-    };
-    use crate::job_loop::Pager;
+    use super::worker::{drain_inflight_writes, run_count_then_walk};
 
-    let bucket = &job.bucket;
     let params = job
         .params
         .as_deref()
@@ -168,144 +163,61 @@ pub(crate) async fn execute_backfill_phases(
         .unwrap_or_default();
 
     // ── Drain in-flight writes admitted before the gate armed. ──
-    drain_inflight_writes(state, bucket).await?;
+    drain_inflight_writes(state, &job.bucket).await?;
 
-    let mut phase = job.phase.clone();
-    let resume_token = job.continuation_token.clone();
-    let mut total = job.objects_total;
-    let mut done = job.objects_done;
-    let mut skipped = job.objects_skipped;
-    let mut failed = job.objects_failed;
-    let mut bytes = job.bytes_done;
-
-    // ── Phase: counting ──
-    if phase == "counting" {
-        let count = counting_phase(db, state, instance_id, job, resume_token.clone()).await?;
-        total = Some(count);
-        phase = "objects".to_string();
-        (done, skipped, failed, bytes) = (0, 0, 0, 0);
-        persist(db, job, &phase, total, 0, 0, 0, 0, None).await;
-    }
-
-    // ── Phase: objects ──
-    if phase == "objects" {
-        // Resume only when the job was persisted IN this phase (a fresh
-        // transition from counting starts at page 0).
-        let mut pager = Pager::resuming(if job.phase == "objects" {
-            resume_token.clone()
-        } else {
-            None
-        });
-        while pager.begin_page().is_some() {
-            check_cancel(db, job.id).await?;
-            let engine = state.engine.load().clone();
-            let page = match engine
-                .list_objects(bucket, "", None, PAGE_SIZE, pager.token(), false)
-                .await
-            {
-                Ok(p) => p,
-                Err(e) if pager.poisoned_resume_token() => {
-                    // Restart the phase from page 0: needs_metadata_backfill
-                    // makes the re-scan idempotent (already-stamped objects
-                    // skip). Counters are NOT reset — display drift only.
-                    tracing::warn!(
-                        "maintenance: job #{} objects resume token rejected ({e}); restarting phase fresh",
-                        job.id
-                    );
-                    pager.restart_fresh();
-                    persist(
-                        db, job, "objects", total, done, skipped, failed, bytes, None,
-                    )
-                    .await;
-                    continue;
-                }
-                Err(e) => return Err(format!("object list failed: {e}")),
-            };
-
-            for (key, _) in page.objects.iter().filter(|(k, _)| !k.ends_with('/')) {
-                stop_if_shutting_down()?;
-                let meta = match engine.head(bucket, key).await {
-                    Ok(m) => m,
-                    Err(e) => {
-                        record_failure(
-                            db,
-                            job.id,
-                            key,
-                            &format!("could not read object metadata: {e}"),
-                        )
-                        .await?;
-                        failed += 1;
-                        continue;
-                    }
-                };
-                if !needs_metadata_backfill(&meta) {
-                    skipped += 1;
-                    continue;
-                }
-                // The one bytes-read of the job: hash the logical content.
-                let (sha256, md5, size) =
-                    match hash_object_content(engine.as_ref(), bucket, key).await {
-                        Ok(h) => h,
-                        Err(e) => {
-                            record_failure(db, job.id, key, &e).await?;
-                            failed += 1;
-                            continue;
-                        }
-                    };
-                let new_meta = backfilled_metadata(
-                    &meta,
-                    sha256,
-                    md5,
-                    size,
-                    params.refresh_last_modified,
-                    chrono::Utc::now(),
-                );
-                let (prefix, filename) = split_key(key);
-                if let Err(e) = engine
-                    .storage()
-                    .put_passthrough_metadata(bucket, prefix, filename, &new_meta)
-                    .await
-                {
-                    record_failure(db, job.id, key, &format!("metadata write failed: {e}")).await?;
-                    failed += 1;
-                    continue;
-                }
-                // The 10-minute metadata cache would otherwise keep serving
-                // the pre-backfill fallback shape on LIST.
-                engine.invalidate_metadata_cache(bucket, key);
-                done += 1;
-                bytes += size as i64;
-            }
-
-            let more = pager.advance(page.is_truncated, page.next_continuation_token);
-            persist(
-                db,
-                job,
-                "objects",
-                total,
-                done,
-                skipped,
-                failed,
-                bytes,
-                pager.token(),
-            )
-            .await;
-            heartbeat(db, job.id, instance_id).await?;
-            if !more {
-                break;
-            }
-        }
-        if pager.truncated_by_page_budget() {
-            // Falling through would report `completed` with the tail still
-            // unstamped — silent truncation.
-            return Err("backfill stopped at the page budget with more pages \
-                 pending — bucket too large for one pass; job left resumable \
-                 in phase 'objects' (cursor persisted)"
-                .to_string());
-        }
-    }
-
+    let mut visitor = Backfill {
+        bucket: &job.bucket,
+        refresh_last_modified: params.refresh_last_modified,
+    };
+    run_count_then_walk(db, state, instance_id, job, "backfill", &mut visitor).await?;
     Ok(())
+}
+
+/// The backfill per-object step: hash the content once, stamp the
+/// canonical metadata in place.
+struct Backfill<'a> {
+    bucket: &'a str,
+    refresh_last_modified: bool,
+}
+
+impl super::worker::ObjectVisitor for Backfill<'_> {
+    async fn visit(
+        &mut self,
+        engine: &std::sync::Arc<crate::deltaglider::DynEngine>,
+        key: &str,
+        meta: &FileMetadata,
+    ) -> Result<super::worker::Visit, String> {
+        use super::worker::Visit;
+        if !needs_metadata_backfill(meta) {
+            return Ok(Visit::Skipped);
+        }
+        // The one bytes-read of the job: hash the logical content.
+        let (sha256, md5, size) = match hash_object_content(engine.as_ref(), self.bucket, key).await
+        {
+            Ok(h) => h,
+            Err(e) => return Ok(Visit::Failed(e)),
+        };
+        let new_meta = backfilled_metadata(
+            meta,
+            sha256,
+            md5,
+            size,
+            self.refresh_last_modified,
+            chrono::Utc::now(),
+        );
+        let (prefix, filename) = split_key(key);
+        if let Err(e) = engine
+            .storage()
+            .put_passthrough_metadata(self.bucket, prefix, filename, &new_meta)
+            .await
+        {
+            return Ok(Visit::Failed(format!("metadata write failed: {e}")));
+        }
+        // The 10-minute metadata cache would otherwise keep serving the
+        // pre-backfill fallback shape on LIST.
+        engine.invalidate_metadata_cache(self.bucket, key);
+        Ok(Visit::Done { bytes: size as i64 })
+    }
 }
 
 #[cfg(test)]

@@ -281,138 +281,20 @@ async fn execute_phases(
     // ── Drain in-flight writes admitted before the gate armed. ──
     drain_inflight_writes(state, bucket).await?;
 
+    let mut visitor = Reencrypt {
+        config,
+        bucket,
+        desired: None,
+    };
+    let Counters {
+        total,
+        done,
+        skipped,
+        mut failed,
+        bytes,
+    } = run_count_then_walk(db, state, instance_id, job, "rewrite", &mut visitor).await?;
     let mut phase = job.phase.clone();
-    let resume_token = job.continuation_token.clone();
-    let mut total = job.objects_total;
-    let mut done = job.objects_done;
-    let mut skipped = job.objects_skipped;
-    let mut failed = job.objects_failed;
-    let mut bytes = job.bytes_done;
-
-    // ── Phase: counting ──
-    if phase == "counting" {
-        let count = counting_phase(db, state, instance_id, job, resume_token.clone()).await?;
-        total = Some(count);
-        phase = "objects".to_string();
-        (done, skipped, failed, bytes) = (0, 0, 0, 0);
-        persist(db, job, &phase, total, 0, 0, 0, 0, None).await;
-    }
-
-    // ── Phase: objects ──
-    if phase == "objects" {
-        // Resume only when the job was persisted IN this phase (a fresh
-        // transition from counting starts at page 0).
-        let mut pager = Pager::resuming(if job.phase == "objects" {
-            resume_token.clone()
-        } else {
-            None
-        });
-        while pager.begin_page().is_some() {
-            check_cancel(db, job.id).await?;
-            // Re-resolve the desired state every page: a config apply
-            // mid-run swaps the engine; the job must follow (or abort if
-            // the mode became unsupported).
-            let desired = {
-                let cfg = config.read().await;
-                resolve_desired(&cfg, bucket).map_err(|e| format!("config changed mid-run: {e}"))?
-            };
-            let engine = state.engine.load().clone();
-            let page = match engine
-                .list_objects(bucket, "", None, PAGE_SIZE, pager.token(), false)
-                .await
-            {
-                Ok(p) => p,
-                Err(e) if pager.poisoned_resume_token() => {
-                    // Restart the phase from page 0: needs_rewrite makes the
-                    // re-scan idempotent (already-rewritten objects skip).
-                    // Counters are NOT reset, so re-encountered objects tally
-                    // as `skipped` again — display drift only, never a
-                    // re-rewrite.
-                    warn!(
-                        "maintenance: job #{} objects resume token rejected ({e}); restarting phase fresh",
-                        job.id
-                    );
-                    pager.restart_fresh();
-                    persist(
-                        db, job, "objects", total, done, skipped, failed, bytes, None,
-                    )
-                    .await;
-                    continue;
-                }
-                Err(e) => return Err(format!("object list failed: {e}")),
-            };
-
-            for (key, _) in page.objects.iter().filter(|(k, _)| !k.ends_with('/')) {
-                stop_if_shutting_down()?;
-                let meta = match engine.head(bucket, key).await {
-                    Ok(m) => m,
-                    Err(e) => {
-                        record_failure(
-                            db,
-                            job.id,
-                            key,
-                            &format!("could not read object metadata: {e}"),
-                        )
-                        .await?;
-                        failed += 1;
-                        continue;
-                    }
-                };
-                if !needs_rewrite(&meta.user_metadata, &desired) {
-                    skipped += 1;
-                    continue;
-                }
-                let req = ObjectTransferRequest {
-                    source_bucket: bucket,
-                    source_key: key,
-                    destination_bucket: bucket,
-                    destination_key: key,
-                    provenance: None,
-                    // Shed stale markers; the encrypting wrapper re-stamps
-                    // fresh ones when the destination mode encrypts.
-                    strip_user_metadata_keys: &[ENCRYPTION_MARKER_KEY, ENCRYPTION_KEY_ID_KEY],
-                    operation: "maintenance-reencrypt",
-                    upload_concurrency: None,
-                    keep_created_at: true,
-                };
-                match copy_object_with_retries(&engine, req).await {
-                    Ok(outcome) => {
-                        done += 1;
-                        bytes += outcome.bytes_copied as i64;
-                    }
-                    Err(e) => {
-                        record_failure(db, job.id, key, &e.to_string()).await?;
-                        failed += 1;
-                    }
-                }
-            }
-
-            let more = pager.advance(page.is_truncated, page.next_continuation_token);
-            persist(
-                db,
-                job,
-                "objects",
-                total,
-                done,
-                skipped,
-                failed,
-                bytes,
-                pager.token(),
-            )
-            .await;
-            heartbeat(db, job.id, instance_id).await?;
-            if !more {
-                break;
-            }
-        }
-        if pager.truncated_by_page_budget() {
-            // Falling through would report `completed` with the tail still
-            // in the OLD encryption state — silent truncation.
-            return Err("rewrite stopped at the page budget with more pages \
-                 pending — bucket too large for one pass; job left resumable \
-                 in phase 'objects' (cursor persisted)"
-                .to_string());
-        }
+    if phase == "counting" || phase == "objects" {
         phase = "references".to_string();
         persist(db, job, &phase, total, done, skipped, failed, bytes, None).await;
     }
@@ -461,6 +343,221 @@ async fn execute_phases(
     Ok(())
 }
 
+/// The reencrypt per-object step: rewrite an object whose at-rest state
+/// does not match the backend's current mode.
+struct Reencrypt<'a> {
+    config: &'a SharedConfig,
+    bucket: &'a str,
+    desired: Option<DesiredEncryption>,
+}
+
+impl ObjectVisitor for Reencrypt<'_> {
+    async fn begin_page(&mut self) -> Result<(), String> {
+        // Re-resolve the desired state every page: a config apply mid-run
+        // swaps the engine; the job must follow (or abort if the mode
+        // became unsupported).
+        let cfg = self.config.read().await;
+        self.desired = Some(
+            resolve_desired(&cfg, self.bucket)
+                .map_err(|e| format!("config changed mid-run: {e}"))?,
+        );
+        Ok(())
+    }
+
+    async fn visit(
+        &mut self,
+        engine: &Arc<crate::deltaglider::DynEngine>,
+        key: &str,
+        meta: &crate::types::FileMetadata,
+    ) -> Result<Visit, String> {
+        let desired = self.desired.as_ref().expect("begin_page runs first");
+        if !needs_rewrite(&meta.user_metadata, desired) {
+            return Ok(Visit::Skipped);
+        }
+        let req = ObjectTransferRequest {
+            source_bucket: self.bucket,
+            source_key: key,
+            destination_bucket: self.bucket,
+            destination_key: key,
+            provenance: None,
+            // Shed stale markers; the encrypting wrapper re-stamps
+            // fresh ones when the destination mode encrypts.
+            strip_user_metadata_keys: &[ENCRYPTION_MARKER_KEY, ENCRYPTION_KEY_ID_KEY],
+            operation: "maintenance-reencrypt",
+            upload_concurrency: None,
+            keep_created_at: true,
+        };
+        Ok(match copy_object_with_retries(engine, req).await {
+            Ok(outcome) => Visit::Done {
+                bytes: outcome.bytes_copied as i64,
+            },
+            Err(e) => Visit::Failed(e.to_string()),
+        })
+    }
+}
+
+/// What one object of an `objects` phase ended in.
+pub(crate) enum Visit {
+    Done {
+        bytes: i64,
+    },
+    Skipped,
+    /// Recorded in the failure ring and counted; the phase goes on.
+    Failed(String),
+}
+
+/// The per-object work of a count-then-walk job kind (reencrypt,
+/// backfill-metadata). [`run_count_then_walk`] owns the rest.
+pub(crate) trait ObjectVisitor {
+    /// Runs before each listing page.
+    async fn begin_page(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    /// One user object, with the metadata the driver read for it.
+    async fn visit(
+        &mut self,
+        engine: &Arc<crate::deltaglider::DynEngine>,
+        key: &str,
+        meta: &crate::types::FileMetadata,
+    ) -> Result<Visit, String>;
+}
+
+/// A job's counters, as its row stores them.
+pub(crate) struct Counters {
+    pub total: Option<i64>,
+    pub done: i64,
+    pub skipped: i64,
+    pub failed: i64,
+    pub bytes: i64,
+}
+
+/// The `counting` → `objects` phases that the reencrypt and backfill kinds
+/// share: page-granular resume, the poison-token restart, per-object
+/// failures recorded and skipped over, cancel per page, shutdown per
+/// object. Returns the counters at the end of `objects`; a job persisted in
+/// a later phase gets its row's counters back untouched. `what` names the
+/// job in the page-budget error.
+pub(crate) async fn run_count_then_walk<V: ObjectVisitor>(
+    db: &Arc<Mutex<ConfigDb>>,
+    state: &Arc<AppState>,
+    instance_id: &str,
+    job: &MaintenanceJob,
+    what: &str,
+    visitor: &mut V,
+) -> Result<Counters, String> {
+    let bucket = &job.bucket;
+    let mut phase = job.phase.clone();
+    let resume_token = job.continuation_token.clone();
+    let mut c = Counters {
+        total: job.objects_total,
+        done: job.objects_done,
+        skipped: job.objects_skipped,
+        failed: job.objects_failed,
+        bytes: job.bytes_done,
+    };
+
+    // ── Phase: counting ──
+    if phase == "counting" {
+        let count = counting_phase(db, state, instance_id, job, resume_token.clone()).await?;
+        c = Counters {
+            total: Some(count),
+            done: 0,
+            skipped: 0,
+            failed: 0,
+            bytes: 0,
+        };
+        phase = "objects".to_string();
+        persist(db, job, &phase, c.total, 0, 0, 0, 0, None).await;
+    }
+
+    // ── Phase: objects ──
+    if phase != "objects" {
+        return Ok(c);
+    }
+    // Resume only when the job was persisted IN this phase (a fresh
+    // transition from counting starts at page 0).
+    let mut pager = Pager::resuming(if job.phase == "objects" {
+        resume_token
+    } else {
+        None
+    });
+    while pager.begin_page().is_some() {
+        check_cancel(db, job.id).await?;
+        visitor.begin_page().await?;
+        let engine = state.engine.load().clone();
+        let page = match engine
+            .list_objects(bucket, "", None, PAGE_SIZE, pager.token(), false)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) if pager.poisoned_resume_token() => {
+                // Restart the phase from page 0: the visitor skips objects
+                // already done, so the re-scan is idempotent. Counters are
+                // NOT reset: re-encountered objects tally as `skipped`
+                // again — display drift only, never a second rewrite.
+                warn!(
+                    "maintenance: job #{} objects resume token rejected ({e}); restarting phase fresh",
+                    job.id
+                );
+                pager.restart_fresh();
+                persist(
+                    db, job, "objects", c.total, c.done, c.skipped, c.failed, c.bytes, None,
+                )
+                .await;
+                continue;
+            }
+            Err(e) => return Err(format!("object list failed: {e}")),
+        };
+
+        for (key, _) in page.objects.iter().filter(|(k, _)| !k.ends_with('/')) {
+            stop_if_shutting_down()?;
+            let visit = match engine.head(bucket, key).await {
+                Ok(meta) => visitor.visit(&engine, key, &meta).await?,
+                Err(e) => Visit::Failed(format!("could not read object metadata: {e}")),
+            };
+            match visit {
+                Visit::Done { bytes } => {
+                    c.done += 1;
+                    c.bytes += bytes;
+                }
+                Visit::Skipped => c.skipped += 1,
+                Visit::Failed(reason) => {
+                    record_failure(db, job.id, key, &reason).await?;
+                    c.failed += 1;
+                }
+            }
+        }
+
+        let more = pager.advance(page.is_truncated, page.next_continuation_token);
+        persist(
+            db,
+            job,
+            "objects",
+            c.total,
+            c.done,
+            c.skipped,
+            c.failed,
+            c.bytes,
+            pager.token(),
+        )
+        .await;
+        heartbeat(db, job.id, instance_id).await?;
+        if !more {
+            break;
+        }
+    }
+    if pager.truncated_by_page_budget() {
+        // Falling through would report `completed` with the tail still
+        // unprocessed — silent truncation.
+        return Err(format!(
+            "{what} stopped at the page budget with more pages pending — bucket \
+             too large for one pass; job left resumable in phase 'objects' \
+             (cursor persisted)"
+        ));
+    }
+    Ok(c)
+}
+
 /// The shared `counting` phase: one LIST sweep for the exact object total
 /// (the write gate freezes the write set, so the total cannot drift and
 /// the progress bar is honest). Persists progress + cursor per page; used
@@ -473,7 +570,12 @@ pub(crate) async fn counting_phase(
     resume_token: Option<String>,
 ) -> Result<i64, String> {
     let bucket = &job.bucket;
-    let mut count: i64 = 0;
+    // A resumed count keeps the pages before its cursor: the row's total
+    // is the count up to that cursor (persisted with it, page by page).
+    let mut count: i64 = match (&resume_token, job.phase.as_str()) {
+        (Some(_), "counting") => job.objects_total.unwrap_or(0),
+        _ => 0,
+    };
     let mut pager = Pager::resuming(resume_token);
     while pager.begin_page().is_some() {
         check_cancel(db, job.id).await?;
@@ -920,6 +1022,68 @@ mod tests {
             Err(crate::config_db::ConfigDbError::Other("x".into()))
         )
         .is_empty());
+    }
+
+    /// A `counting` phase resumed from a persisted cursor keeps the count
+    /// of the pages before the cursor, so `objects_total` is the whole
+    /// bucket (it restarted at 0, and the bar reached 99 % early).
+    #[tokio::test]
+    async fn a_counting_resume_keeps_the_count_so_far() {
+        let data = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::default();
+        let backend: Box<dyn crate::storage::StorageBackend> = Box::new(
+            crate::storage::FilesystemBackend::new(data.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let engine = crate::deltaglider::DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &config,
+            None,
+        );
+        engine.create_bucket("b").await.unwrap();
+        for k in ["a.txt", "b.txt", "c.txt"] {
+            engine
+                .store("b", k, b"x", None, Default::default())
+                .await
+                .unwrap();
+        }
+        let state = Arc::new(AppState {
+            engine: arc_swap::ArcSwap::from_pointee(engine),
+            multipart: Arc::new(crate::multipart::MultipartStore::new(
+                config.max_object_size,
+            )),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+            usage_scanner: Arc::new(crate::usage_scanner::UsageScanner::new()),
+            bucket_usage: None,
+            reference_lock: None,
+            config_db: None,
+            maintenance_gate: Arc::new(crate::maintenance::gate::MaintenanceGate::new()),
+            maintenance_notify: Arc::new(tokio::sync::Notify::new()),
+            backend_capabilities: Default::default(),
+            backend_health: Default::default(),
+        });
+        let db = ConfigDb::in_memory("testpass").unwrap();
+        let id = db
+            .maintenance_create_job("reencrypt", "b", "counting", None, "admin", 1)
+            .unwrap()
+            .unwrap();
+        db.maintenance_claim_next_job("inst", current_unix_seconds(), 60)
+            .unwrap()
+            .unwrap();
+        // The previous process counted a and b and persisted the filesystem
+        // cursor "b.txt" (the token is the last key) before it died.
+        db.maintenance_update_progress(id, "counting", Some(2), 0, 0, 0, 0, Some("b.txt"))
+            .unwrap();
+        let job = db.maintenance_job_by_id(id).unwrap().unwrap();
+        let db = Arc::new(Mutex::new(db));
+        let count = counting_phase(&db, &state, "inst", &job, job.continuation_token.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 3,
+            "the resumed count includes the objects before the cursor"
+        );
     }
 
     #[test]

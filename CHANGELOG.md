@@ -336,6 +336,14 @@ before that removal, and then fail to create its file, so the client got
 is gone, and tries again. The reference write also no longer re-creates a
 bucket that a concurrent request deleted.
 
+### Fixed — A resumed re-encrypt or backfill counts the whole bucket
+
+A re-encrypt or metadata-backfill job that restarts during its `counting`
+phase resumes from its saved cursor, but it started its count at 0 again.
+So the total covered only the objects after the cursor, and the progress
+bar reached 99 % long before the end. Now the resumed count starts from
+the count that was saved with the cursor.
+
 ### Changed — A migrate to a filesystem backend is about twice as fast
 
 A migrate made every copy durable on its own before the next one (one
