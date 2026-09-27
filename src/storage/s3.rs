@@ -1206,14 +1206,7 @@ impl S3Backend {
             headers.insert("dg-encrypted-native".to_string(), marker.to_string());
         }
 
-        // S3 has a 2KB limit on total user metadata size. Warn if we're close.
-        let total_meta_size: usize = headers.iter().map(|(k, v)| k.len() + v.len()).sum();
-        if total_meta_size > 2048 {
-            return Err(StorageError::Other(format!(
-                "DG metadata exceeds S3's 2KB limit ({} bytes) for {}/{}",
-                total_meta_size, bucket, key
-            )));
-        }
+        check_metadata_size(&headers, bucket, &key)?;
 
         let backoff_ms = [100, 200, 400];
 
@@ -1392,13 +1385,7 @@ impl S3Backend {
         if let Some(marker) = self.native_encryption.marker() {
             headers.insert("dg-encrypted-native".to_string(), marker.to_string());
         }
-        let total_meta_size: usize = headers.iter().map(|(k, v)| k.len() + v.len()).sum();
-        if total_meta_size > 2048 {
-            return Err(StorageError::Other(format!(
-                "DG metadata exceeds S3's 2KB limit ({} bytes) for {}/{}",
-                total_meta_size, bucket, key
-            )));
-        }
+        check_metadata_size(&headers, bucket, &key)?;
 
         // The stored size for the listing-size cache: what this PUT sends.
         let stored_size = tokio::fs::metadata(source_path).await.ok().map(|m| m.len());
@@ -2904,13 +2891,7 @@ impl StorageBackend for S3Backend {
         if let Some(marker) = self.native_encryption.marker() {
             headers.insert("dg-encrypted-native".to_string(), marker.to_string());
         }
-        let total_meta_size: usize = headers.iter().map(|(k, v)| k.len() + v.len()).sum();
-        if total_meta_size > 2048 {
-            return Err(StorageError::Other(format!(
-                "DG metadata exceeds S3's 2KB limit ({} bytes) for {}/{}",
-                total_meta_size, bucket, key
-            )));
-        }
+        check_metadata_size(&headers, bucket, &key)?;
 
         let mut request = self
             .client
@@ -3972,9 +3953,44 @@ mod endpoint_guard_source_test {
     }
 }
 
+/// S3's limit on the user metadata of one object, in bytes (keys + values).
+const S3_USER_METADATA_MAX_BYTES: usize = 2048;
+
+/// Pure: whether the headers of a write (the proxy's own `dg-*` metadata
+/// plus the client's) fit S3's 2 KB limit. Over it is `MetadataTooLarge`
+/// (400): the client's metadata can pass the adapter's 2 KB gate while the
+/// proxy's own fields push the total over, and that is not a server fault.
+fn check_metadata_size(
+    headers: &HashMap<String, String>,
+    bucket: &str,
+    key: &str,
+) -> Result<(), StorageError> {
+    let total: usize = headers.iter().map(|(k, v)| k.len() + v.len()).sum();
+    if total > S3_USER_METADATA_MAX_BYTES {
+        return Err(StorageError::MetadataTooLarge(format!(
+            "the metadata of {bucket}/{key} is {total} bytes with the proxy's own fields; \
+             an S3 backend stores at most {S3_USER_METADATA_MAX_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// storage-4: DG fields + user metadata over 2 KB was `Other` (500).
+    #[test]
+    fn metadata_over_the_s3_limit_is_metadata_too_large() {
+        let mut h = HashMap::new();
+        h.insert("dg-x".to_string(), "v".repeat(2000));
+        assert!(check_metadata_size(&h, "b", "k").is_ok());
+        h.insert("user".to_string(), "v".repeat(100));
+        assert!(matches!(
+            check_metadata_size(&h, "b", "k"),
+            Err(StorageError::MetadataTooLarge(_))
+        ));
+    }
 
     #[test]
     fn fenced_write_verdict_truth_table() {

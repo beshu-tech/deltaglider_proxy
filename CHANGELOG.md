@@ -295,6 +295,13 @@ lost, and the panel showed no unsaved changes. Now the read replaces the
 form only when it has no new edits. Otherwise the edits stay, and the
 panel shows them as unsaved. The read also no longer hides the form.
 
+### Fixed — Too much metadata on an S3 backend answers 400, not 500
+
+On an S3 backend, the proxy stores its own metadata fields next to the
+client's user metadata, and S3 allows 2 KB for both together. A PUT whose
+user metadata was within 2 KB but over the limit with the proxy's fields
+got `500 InternalError`. Now it gets `400 MetadataTooLarge`.
+
 ### Fixed — A configuration change no longer leaves an old background task running
 
 Each S3 backend starts a background task that removes stale listing index
