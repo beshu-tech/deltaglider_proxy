@@ -519,3 +519,150 @@ fn external_identity_matches(
         None => false,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::config_db::ConfigDb;
+    use crate::iam::{reconcile_declarative_iam_at_boot, DeclarativeIam};
+
+    fn snapshot(yaml: &str) -> DeclarativeIam {
+        #[derive(serde::Deserialize)]
+        struct Doc {
+            #[serde(default)]
+            users: Vec<crate::iam::DeclarativeUser>,
+            #[serde(default)]
+            groups: Vec<crate::iam::DeclarativeGroup>,
+            #[serde(default)]
+            auth_providers: Vec<crate::iam::DeclarativeAuthProvider>,
+            #[serde(default)]
+            mapping_rules: Vec<crate::iam::DeclarativeMappingRule>,
+            #[serde(default)]
+            external_identities: Vec<crate::iam::DeclarativeExternalIdentity>,
+        }
+        let d: Doc = serde_yaml::from_str(yaml).unwrap();
+        DeclarativeIam {
+            users: d.users,
+            groups: d.groups,
+            auth_providers: d.auth_providers,
+            mapping_rules: d.mapping_rules,
+            external_identities: d.external_identities,
+        }
+    }
+
+    fn names<T>(rows: Vec<T>, name: impl Fn(&T) -> String) -> Vec<String> {
+        let mut v: Vec<String> = rows.iter().map(name).collect();
+        v.sort();
+        v
+    }
+
+    /// Every step of the reconcile, in two applies: the first creates
+    /// groups, a provider, users with memberships, a mapping rule and an
+    /// OAuth binding; the second updates, deletes and creates, and
+    /// replaces the rules. Pins the DB state and the stats.
+    #[test]
+    fn apply_iam_reconcile_runs_every_step() {
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let first = snapshot(
+            r#"
+groups:
+  - { name: Engineering, description: eng, permissions: [{ actions: [read], resources: ["releases/*"] }] }
+  - { name: Old }
+auth_providers:
+  - { name: corp, provider_type: oidc, issuer_url: "https://idp.example.com", client_id: cid, client_secret: cs }
+users:
+  - { name: dana, access_key_id: AKDANA, secret_access_key: s1, groups: [Engineering] }
+  - { name: ci-uploader, access_key_id: AKCI, secret_access_key: s2, permissions: [{ actions: [write], resources: ["releases/*"] }] }
+mapping_rules:
+  - { provider: corp, match_type: email_domain, match_value: example.com, group: Engineering }
+external_identities:
+  - { user: dana, provider: corp, subject: sub-dana, email: dana@example.com }
+"#,
+        );
+        let s = reconcile_declarative_iam_at_boot(&db, &first).unwrap();
+        assert_eq!(s.groups_created, ["Engineering", "Old"]);
+        assert_eq!(s.providers_created, ["corp"]);
+        assert_eq!(s.users_created, ["dana", "ci-uploader"]);
+        assert_eq!(s.mapping_rules_replaced, 1);
+        assert_eq!(s.external_identities_applied, 1);
+        assert_eq!(
+            (s.users_total, s.groups_total, s.providers_total),
+            (2, 2, 1)
+        );
+        let users = db.load_users().unwrap();
+        let dana = users.iter().find(|u| u.name == "dana").unwrap();
+        let groups = db.load_groups().unwrap();
+        let eng = groups.iter().find(|g| g.name == "Engineering").unwrap();
+        assert_eq!(eng.member_ids, [dana.id]);
+        assert_eq!(eng.permissions.len(), 1);
+        let rules = db.load_group_mapping_rules().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].group_id, eng.id);
+        let ids = db.list_external_identities().unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].user_id, dana.id);
+
+        // Re-applying the same snapshot changes nothing.
+        let again = reconcile_declarative_iam_at_boot(&db, &first).unwrap();
+        assert!(again.users_created.is_empty() && again.users_updated.is_empty());
+        assert_eq!(again.external_identities_applied, 0);
+
+        let second = snapshot(
+            r#"
+groups:
+  - { name: Engineering, description: engineering }
+auth_providers:
+  - { name: corp, provider_type: oidc, issuer_url: "https://idp.example.com", client_id: cid2, client_secret: cs }
+users:
+  - { name: dana, access_key_id: AKDANA, secret_access_key: s1, enabled: false, groups: [Engineering] }
+  - { name: backup-bot, access_key_id: AKBOT, secret_access_key: s3 }
+mapping_rules:
+  - { provider: corp, match_type: email_domain, match_value: example.org, group: Engineering }
+  - { match_type: email_exact, match_value: dana@example.com, group: Engineering }
+"#,
+        );
+        let s = reconcile_declarative_iam_at_boot(&db, &second).unwrap();
+        assert_eq!(s.users_deleted, ["ci-uploader"]);
+        assert_eq!(s.groups_deleted, ["Old"]);
+        assert!(s.providers_deleted.is_empty());
+        assert_eq!(s.groups_updated, ["Engineering"]);
+        assert_eq!(s.providers_updated, ["corp"]);
+        assert_eq!(s.users_updated, ["dana"]);
+        assert_eq!(s.users_created, ["backup-bot"]);
+        assert_eq!(s.mapping_rules_replaced, 2);
+        assert_eq!(
+            (s.users_total, s.groups_total, s.providers_total),
+            (2, 1, 1)
+        );
+        assert_eq!(
+            names(db.load_users().unwrap(), |u| u.name.clone()),
+            ["backup-bot", "dana"]
+        );
+        let groups = db.load_groups().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].description, "engineering");
+        assert!(groups[0].permissions.is_empty(), "permissions replaced");
+        let rules = db.load_group_mapping_rules().unwrap();
+        assert_eq!(
+            names(rules, |r| r.match_value.clone()),
+            ["dana@example.com", "example.org"]
+        );
+        // A binding absent from the YAML is left alone.
+        assert_eq!(db.list_external_identities().unwrap().len(), 1);
+
+        // An empty rule set clears the table and counts what it cleared.
+        let third = snapshot(
+            r#"
+groups:
+  - { name: Engineering, description: engineering }
+auth_providers:
+  - { name: corp, provider_type: oidc, issuer_url: "https://idp.example.com", client_id: cid2, client_secret: cs }
+users:
+  - { name: dana, access_key_id: AKDANA, secret_access_key: s1, enabled: false, groups: [Engineering] }
+  - { name: backup-bot, access_key_id: AKBOT, secret_access_key: s3 }
+"#,
+        );
+        let s = reconcile_declarative_iam_at_boot(&db, &third).unwrap();
+        assert_eq!(s.mapping_rules_replaced, 2);
+        assert!(db.load_group_mapping_rules().unwrap().is_empty());
+    }
+}

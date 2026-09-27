@@ -1589,3 +1589,189 @@ async fn a_provider_type_other_than_oidc_is_refused() {
     assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert!(body.to_string().contains("'oidc'"), "{body}");
 }
+
+// ── Error body shapes ───────────────────────────────────────────────────
+
+/// What a client reads from an admin error: the SPA shows the JSON
+/// `error`, else the text body, else a hint for the bare status.
+#[derive(Debug, PartialEq)]
+enum ErrorBody {
+    /// Status only: no body and no content type.
+    Empty,
+    /// `text/plain` with this text.
+    Text(String),
+    /// `application/json` with this value.
+    Json(Value),
+}
+
+async fn error_body(resp: reqwest::Response) -> (StatusCode, ErrorBody) {
+    let status = resp.status();
+    let ct = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .map(|v| v.to_str().unwrap().to_string());
+    let text = resp.text().await.unwrap();
+    let body = match ct.as_deref() {
+        None => {
+            assert!(text.is_empty(), "a body without a content type: {text:?}");
+            ErrorBody::Empty
+        }
+        Some(ct) if ct.starts_with("text/plain") => ErrorBody::Text(text),
+        Some(ct) if ct.starts_with("application/json") => {
+            ErrorBody::Json(serde_json::from_str(&text).unwrap())
+        }
+        Some(ct) => panic!("unexpected content type {ct}: {text}"),
+    };
+    (status, body)
+}
+
+/// One error of each admin module, pinned by status, content type and
+/// body: a change to a handler's error type must not change what a client
+/// reads.
+#[tokio::test]
+async fn admin_error_bodies_keep_their_shape() {
+    let server = TestServer::filesystem().await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let api = |p: &str| format!("{ep}/_/api/admin{p}");
+    let text = |s: &str| ErrorBody::Text(s.to_string());
+
+    // Set-up for the conflict cases.
+    for _ in 0..2 {
+        admin
+            .post(api("/groups"))
+            .json(&json!({ "name": "shape-dup" }))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let cases: Vec<(&str, reqwest::RequestBuilder, StatusCode, ErrorBody)> = vec![
+        // groups / users: bare status.
+        (
+            "group duplicate",
+            admin
+                .post(api("/groups"))
+                .json(&json!({ "name": "shape-dup" })),
+            StatusCode::CONFLICT,
+            ErrorBody::Empty,
+        ),
+        (
+            "group blank name",
+            admin.post(api("/groups")).json(&json!({ "name": "" })),
+            StatusCode::BAD_REQUEST,
+            ErrorBody::Empty,
+        ),
+        (
+            "user missing",
+            admin
+                .put(api("/users/999999"))
+                .json(&json!({ "name": "x" })),
+            StatusCode::NOT_FOUND,
+            ErrorBody::Empty,
+        ),
+        (
+            "user reserved name",
+            admin
+                .post(api("/users"))
+                .json(&json!({ "name": "$x", "permissions": [] })),
+            StatusCode::BAD_REQUEST,
+            ErrorBody::Empty,
+        ),
+        // external auth: bare status, 422 JSON for a bad provider.
+        (
+            "mapping missing",
+            admin.delete(api("/ext-auth/mappings/999999")),
+            StatusCode::NOT_FOUND,
+            ErrorBody::Empty,
+        ),
+        (
+            "provider test missing",
+            admin.post(api("/ext-auth/providers/999999/test")),
+            StatusCode::NOT_FOUND,
+            ErrorBody::Empty,
+        ),
+        // event outbox: text.
+        (
+            "outbox bad status",
+            admin.get(api("/event-outbox?status=bogus")),
+            StatusCode::BAD_REQUEST,
+            text("unknown outbox status: bogus"),
+        ),
+        (
+            "outbox requeue missing",
+            admin.post(api("/event-outbox/999999/requeue")),
+            StatusCode::CONFLICT,
+            text("event is not failed or does not exist"),
+        ),
+        // jobs / replication / lifecycle / maintenance: text.
+        (
+            "job id unknown",
+            admin.post(api("/jobs/nope:x/pause")),
+            StatusCode::NOT_FOUND,
+            text("job not found"),
+        ),
+        (
+            "job action unknown",
+            admin.post(api("/jobs/replication:x/bogus")),
+            StatusCode::NOT_FOUND,
+            text("unknown action 'bogus'"),
+        ),
+        (
+            "replication rule missing",
+            admin.post(api("/jobs/replication:missing/pause")),
+            StatusCode::NOT_FOUND,
+            text("rule not found"),
+        ),
+        (
+            "lifecycle rule missing",
+            admin.post(api("/jobs/lifecycle:missing/run-now")),
+            StatusCode::NOT_FOUND,
+            text("rule not found"),
+        ),
+        (
+            "maintenance runs of a bad id",
+            admin.get(api("/jobs/maintenance:abc/runs")),
+            StatusCode::NOT_FOUND,
+            text("job not found"),
+        ),
+        (
+            "reencrypt without buckets",
+            admin
+                .post(api("/jobs/reencrypt"))
+                .json(&json!({ "buckets": [] })),
+            StatusCode::BAD_REQUEST,
+            text("no buckets given"),
+        ),
+        // backends / objects: text.
+        (
+            "backend missing",
+            admin.post(api("/backends/nope/probe")),
+            StatusCode::NOT_FOUND,
+            text("no backend named 'nope'"),
+        ),
+        (
+            "copy without items",
+            admin.post(api("/objects/copy")).json(&json!({
+                "source_bucket": "src", "dest_bucket": "dst", "items": []
+            })),
+            StatusCode::BAD_REQUEST,
+            text("no items to copy"),
+        ),
+        // sessions: JSON.
+        (
+            "session missing",
+            admin.delete(api("/sessions/nope")),
+            StatusCode::NOT_FOUND,
+            ErrorBody::Json(json!({ "error": "no such session" })),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (what, req, status, body) in cases {
+        let got = error_body(req.send().await.unwrap()).await;
+        if got != (status, body) {
+            wrong.push(format!("{what}: got {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
