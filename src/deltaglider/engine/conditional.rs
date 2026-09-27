@@ -171,6 +171,22 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .await?)
     }
 
+    /// The metadata a GET judges its conditionals on: the metadata that
+    /// `retrieve_stream` then serves (the metadata cache, else a fresh
+    /// resolve that fills it), so a GET pays no extra uncached HEAD. An
+    /// object without proxy metadata gets its passthrough metadata, as on
+    /// HEAD. HEAD itself stays uncached ([`Self::head`]).
+    pub async fn read_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<FileMetadata, EngineError> {
+        if let Some(cached) = self.metadata_cache.get(bucket, key) {
+            return Ok(cached);
+        }
+        self.head(bucket, key).await
+    }
+
     /// Store a client body that is already in memory. A large delta-eligible
     /// body goes through the streaming spool store, so the delta encode and
     /// the ratio decision run with bounded memory; the others are stored
@@ -264,6 +280,58 @@ mod tests {
                 "exists {exists}, If-Match {im:?}, If-None-Match {inm:?}"
             );
         }
+    }
+
+    /// A GET judges the cached metadata that it then serves: no storage
+    /// request when the cache holds the key (HEAD still asks storage).
+    #[tokio::test]
+    async fn read_metadata_serves_the_cache_without_a_storage_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Box<dyn StorageBackend> = Box::new(
+            crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let engine: crate::deltaglider::DynEngine = DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &crate::config::Config::default(),
+            None,
+        );
+        engine.create_bucket("b").await.unwrap();
+        let stored = engine
+            .store("b", "a.png", b"x", None, Default::default())
+            .await
+            .unwrap();
+        // Remove the object behind the engine's back: only the cache knows it.
+        let bucket_dir = dir.path().join("b");
+        for entry in walkdir(&bucket_dir) {
+            if entry.file_name().is_some_and(|n| n == "a.png") {
+                std::fs::remove_file(&entry).unwrap();
+            }
+        }
+        let cached = engine.read_metadata("b", "a.png").await.unwrap();
+        assert_eq!(cached.etag(), stored.metadata.etag());
+        assert!(engine.head("b", "a.png").await.unwrap_err().is_not_found());
+        // A miss resolves from storage, like HEAD.
+        engine.invalidate_metadata_cache("b", "a.png");
+        assert!(engine
+            .read_metadata("b", "a.png")
+            .await
+            .unwrap_err()
+            .is_not_found());
+    }
+
+    fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                out.extend(walkdir(&path));
+            } else {
+                out.push(path);
+            }
+        }
+        out
     }
 
     #[test]

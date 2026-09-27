@@ -227,7 +227,9 @@ impl s3s::S3 for DeltaGliderS3Service {
         let input = req.input;
         check_response_overrides_allowed(&input, anonymous_principal)?;
         let engine = self.state.engine.load();
-        let head = match engine.head(&input.bucket, &input.key).await {
+        // Judged on the metadata the body is then served from (no separate
+        // uncached HEAD per GET).
+        let head = match engine.read_metadata(&input.bucket, &input.key).await {
             Ok(meta) => meta,
             Err(e) => {
                 return Err(
