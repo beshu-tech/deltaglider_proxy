@@ -152,22 +152,6 @@ impl<B: ErrorBody> From<StorageError> for AdminError<B> {
     }
 }
 
-/// A helper that still answers a bare status (e.g. a shared rebuild step)
-/// feeds a [`Bare`] handler through `?`.
-impl From<StatusCode> for AdminError<Bare> {
-    fn from(status: StatusCode) -> Self {
-        Self::status(status, String::new())
-    }
-}
-
-/// A helper that still answers `(StatusCode, String)` feeds a [`Text`]
-/// handler through `?`.
-impl From<(StatusCode, String)> for AdminError<Text> {
-    fn from((status, message): (StatusCode, String)) -> Self {
-        Self::status(status, message)
-    }
-}
-
 /// Pure: the HTTP status of a config-DB error. A missing row is the
 /// caller's 404 (also a FOREIGN KEY failure: the request names a user or
 /// group that does not exist), a UNIQUE violation its 409; only the rest
