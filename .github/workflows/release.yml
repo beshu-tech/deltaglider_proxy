@@ -570,9 +570,15 @@ jobs:
             artifacts/SHA256SUMS.txt
             artifacts/sbom-spdx.json
 
+      # The body lists every CHANGELOG entry of this version (commits land on
+      # main without PRs, so the generated notes alone carry nothing).
+      - name: Build release notes from CHANGELOG.md
+        run: scripts/release-notes.sh "${GITHUB_REF_NAME#v}" > release-notes.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
         with:
+          body_path: release-notes.md
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |

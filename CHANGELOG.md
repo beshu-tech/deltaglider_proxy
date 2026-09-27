@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Upgrade steps for 2.0.0 (read before you upgrade)
+
+2.0.0 is a major release because some changes stop a setup that worked on
+1.19. Do these steps before you start the new version:
+
+1. **Back up** `deltaglider_config.db` together with `deltaglider_config.db.key`.
+   The config DB schema moves from v24 to v29 on the first start, and a
+   downgrade to 1.19 is not supported.
+2. **Reverse proxies:** if you set `DGP_TRUST_PROXY_HEADERS=true`, also set
+   `DGP_TRUSTED_PROXY_CIDRS` to the networks of your proxies or load balancers.
+   Without it, the proxy refuses to start.
+3. **Several instances with `config_sync_bucket`:** set the same
+   `DGP_CONFIG_DB_KEY` on every instance, and follow the rollout steps in
+   "The IAM database has its own encryption key" below. Every S3 backend that
+   holds client-writable buckets must support conditional writes, or the
+   proxy refuses to start. A bucket migrate is refused (`409`) while a sync
+   bucket is set.
+4. **Kubernetes operator:** apply the new `deploy/crd.yaml` before you
+   upgrade the operator to 0.3.0.
+5. **Scripts and monitoring:** check the "Changed" entries below. The ones
+   that most often need an edit:
+   - A missing config DB answers `503` (was `404`) on every admin endpoint.
+   - `POST /config/validate` refuses what `/config/apply` refuses.
+   - `config lint` exits non-zero on an empty file and on an unknown key.
+   - The default log level is `info` (was `debug`).
+   - ListObjectsV2 continuation tokens are opaque (`dg1.` prefix).
+   - Delta objects larger than 16 MiB use the spool directory, so
+     `DGP_SPOOL_DIR` must be writable.
+
 ### Fixed — A refused `/config/validate` keeps the warnings of `/config/apply`
 
 When the secret preservation, the config check, or a lifecycle/replication
