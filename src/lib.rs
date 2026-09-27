@@ -619,6 +619,34 @@ mod source_guards {
         out_of_line_test_modules, prod_mask, rel as rel_path, root, rust_files, test_module_lines,
     };
 
+    /// The release image compiles with the toolchain that rust-toolchain.toml
+    /// pins. v2.0.0's image build failed because the Dockerfile still pinned
+    /// rust:1.92 while the AWS SDK needed 1.94.1 and the repo used 1.98.
+    #[test]
+    fn dockerfile_rust_matches_the_pinned_toolchain() {
+        let toolchain = crate::source_scan::read("rust-toolchain.toml");
+        let channel = toolchain
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("channel = "))
+            .expect("rust-toolchain.toml has a channel")
+            .trim_matches('"')
+            .to_string();
+        let minor = channel.rsplitn(2, '.').last().unwrap().to_string();
+        let dockerfile = crate::source_scan::read("Dockerfile");
+        let pins: Vec<&str> = dockerfile
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("FROM rust:"))
+            .collect();
+        assert!(!pins.is_empty(), "Dockerfile has no FROM rust: stage");
+        for pin in pins {
+            let version = pin.split('-').next().unwrap();
+            assert!(
+                version == channel || version == minor,
+                "Dockerfile pins rust:{pin}, rust-toolchain.toml pins {channel}: bump them together"
+            );
+        }
+    }
+
     /// Every object HEAD the server sends is counted in
     /// `deltaglider_backend_head_requests_total`, so the counter can prove
     /// that a path (a client LIST, the folder-size scan) sends none. The CLI

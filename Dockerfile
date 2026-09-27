@@ -25,7 +25,7 @@ RUN npm run build
 # image build on every recent Rust. A plain single-stage build is correct and
 # robust; dependency compilation is cached by buildx's GHA layer cache across
 # release runs, so the lost cargo-chef dep-layer is not a meaningful regression.
-FROM rust:1.92-bookworm AS rust-build
+FROM rust:1.98-bookworm AS rust-build
 RUN apt-get -o Acquire::Retries=3 update && apt-get install -y --no-install-recommends \
     pkg-config xdelta3=3.0.11-dfsg-1.2 \
     && rm -rf /var/lib/apt/lists/* \
