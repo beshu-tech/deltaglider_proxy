@@ -29,6 +29,16 @@ pub struct PassthroughMultipartHandle {
     _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
+/// A body spool with the hashes that the streaming PUT computed from it
+/// (and checked against the declared size), so no later step reads the
+/// body again to hash it.
+#[derive(Clone, Copy)]
+struct HashedSpool<'a> {
+    spool: &'a crate::deltaglider::spool::Spool,
+    sha256: &'a str,
+    md5: &'a str,
+}
+
 impl PassthroughMultipartHandle {
     /// Whether the backend writes parts durably & incrementally (S3) — the
     /// caller may drop part bytes after each `upload_passthrough_part`.
@@ -454,7 +464,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     bucket,
                     key,
                     body.path(),
-                    Some(body),
+                    Some(HashedSpool {
+                        spool: body,
+                        sha256: &sha256,
+                        md5: &md5,
+                    }),
                     size,
                     content_type.clone(),
                     user_metadata.clone(),
@@ -546,7 +560,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // — reserve it at the reference's actual size so the byte-budget isn't
         // under-accounted under concurrency (→ ENOSPC). Falls back to `size` for
         // a freshly-created baseline (no reference metadata yet).
-        let ref_size = existing_ref_meta.map(|m| m.file_size).unwrap_or(size);
+        // A fresh baseline is the body itself (storage-9): the encode reads
+        // it from the body spool, so the ref spool stays empty.
+        let ref_size = existing_ref_meta.map_or(1, |m| m.file_size);
         // Clamped beside the body spool this op already holds (else body +
         // pair > budget waited on itself for the whole acquire timeout).
         let pair = self.spool_acquire_pair_beside(body, ref_size, size).await?;
@@ -561,7 +577,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 .store_spooled_body_as_passthrough(
                     bucket,
                     key,
-                    body,
+                    HashedSpool {
+                        spool: body,
+                        sha256: &sha256,
+                        md5: &md5,
+                    },
                     size,
                     content_type,
                     user_metadata,
@@ -570,15 +590,21 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 .await
                 .map(|r| r.with_accounting(prior_for_counter, reference_created_bytes));
         };
-        self.storage
-            .get_reference_to_file(bucket, &deltaspace_id, ref_spool.path())
-            .await?;
+        // The reference just written from the body has the body's bytes:
+        // reading it back cost a second transfer of the object on S3.
+        let ref_path = if has_existing_reference {
+            self.storage
+                .get_reference_to_file(bucket, &deltaspace_id, ref_spool.path())
+                .await?;
+            ref_spool.path().to_path_buf()
+        } else {
+            body.path().to_path_buf()
+        };
 
         let effective_ratio = self.bucket_policies.max_delta_ratio(bucket);
         let cap = ((size as f64) * (effective_ratio as f64)).ceil() as u64;
         let _permit = self.try_acquire_codec()?;
         let codec = self.codec.clone();
-        let ref_path = ref_spool.path().to_path_buf();
         let body_path = body.path().to_path_buf();
         let delta_path = delta_spool.path().to_path_buf();
         let encode_start = Instant::now();
@@ -654,7 +680,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     .store_spooled_body_as_passthrough(
                         bucket,
                         key,
-                        body,
+                        HashedSpool {
+                            spool: body,
+                            sha256: &sha256,
+                            md5: &md5,
+                        },
                         size,
                         content_type.clone(),
                         user_metadata.clone(),
@@ -714,7 +744,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         &self,
         bucket: &str,
         key: &str,
-        body: &crate::deltaglider::spool::Spool,
+        body: HashedSpool<'_>,
         size: u64,
         content_type: Option<String>,
         user_metadata: std::collections::HashMap<String, String>,
@@ -724,7 +754,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .store_passthrough_file_inner(
                 bucket,
                 key,
-                body.path(),
+                body.spool.path(),
                 Some(body),
                 size,
                 content_type,
@@ -1384,7 +1414,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         bucket: &str,
         key: &str,
         source_path: &Path,
-        held: Option<&crate::deltaglider::spool::Spool>,
+        // The body spool this op holds, hashed and size-checked already.
+        held: Option<HashedSpool<'_>>,
         total_size: u64,
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
@@ -1395,30 +1426,21 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.metadata_cache.invalidate(bucket, key);
         let (obj_key, deltaspace_id) = self.validated_key_ingest(bucket, key)?;
 
-        let mut file = tokio::fs::File::open(source_path)
-            .await
-            .map_err(StorageError::from)?;
-        let mut buf = vec![0u8; 1024 * 1024];
-        let mut sha256_hasher = Sha256::new();
-        let mut md5_hasher = Md5::new();
-        let mut observed = 0u64;
-        loop {
-            let n = file.read(&mut buf).await.map_err(StorageError::from)?;
-            if n == 0 {
-                break;
+        let (sha256, md5) = match &held {
+            // storage-9: the streaming PUT hashed its body already.
+            Some(h) => (h.sha256.to_string(), h.md5.to_string()),
+            None => {
+                let (sha256, md5, observed) = Self::hash_spool_file(source_path).await?;
+                if observed != total_size {
+                    return Err(EngineError::Storage(StorageError::Other(format!(
+                        "Multipart relay size mismatch: expected {}, observed {}",
+                        total_size, observed
+                    ))));
+                }
+                (sha256, md5)
             }
-            observed = observed.saturating_add(n as u64);
-            sha256_hasher.update(&buf[..n]);
-            md5_hasher.update(&buf[..n]);
-        }
-        if observed != total_size {
-            return Err(EngineError::Storage(StorageError::Other(format!(
-                "Multipart relay size mismatch: expected {}, observed {}",
-                total_size, observed
-            ))));
-        }
-        let sha256 = hex::encode(sha256_hasher.finalize());
-        let md5 = hex::encode(md5_hasher.finalize());
+        };
+        let held = held.map(|h| h.spool);
         let reserved = self
             .reserve_storage_spool(
                 bucket,
