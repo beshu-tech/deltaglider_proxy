@@ -251,205 +251,15 @@ hr {
   position: relative;
   padding: 6rem 0 5rem 0;
   background:
-    radial-gradient(40% 40% at 80% 20%, var(--brand-wash), transparent 100%),
-    radial-gradient(35% 35% at 10% 80%, var(--accent-wash), transparent 100%),
+    radial-gradient(40% 40% at 80% 20%, var(--brand-tint), transparent 100%),
     var(--bg);
   border-bottom: 1px solid var(--rule);
   overflow: hidden;
 }
 
-.hero::after {
-  content: "";
-  position: absolute;
-  top: 0; left: 0; right: 0; bottom: 0;
-  background: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)' opacity='0.03'/%3E%3C/svg%3E");
-  pointer-events: none;
-  z-index: 0;
-}
-
 .hero .shell {
   position: relative;
 }
-
-/* Gradient text on the hero headline */
-.hero-copy h1 {
-  background: linear-gradient(135deg, var(--ink-900) 0%, var(--brand) 50%, var(--ink-900) 100%);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-}
-
-/* ============================================================
-   Split full-bleed hero: the copy column is pinned to a fixed margin
-   from the LEFT viewport edge; the dashboard slideshow occupies the
-   right portion and bleeds off the RIGHT viewport edge. Below the
-   breakpoint the screenshot is dropped entirely (text-only hero).
-   ============================================================ */
-.hero--full {
-  position: relative;
-  padding: 0;
-  display: flex;
-  align-items: center;
-  min-height: clamp(560px, 82vh, 900px);
-  overflow: hidden;
-  background: var(--bg);
-}
-
-/* Right-side image plate: starts ~52% across the viewport and runs to
-   the right edge. The image inside covers this plate. Starting later
-   keeps the bright dashboard clear of the headline's right end. */
-.hero-plate {
-  position: absolute;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  left: 52%;
-  z-index: 0;
-  pointer-events: none; /* clicks fall through to the copy/CTAs */
-}
-/* The framed walkthrough wants more horizontal room than the bleeding
-   screenshot did — start the plate earlier and let it run to the edge. */
-.hero--walkthrough .hero-plate { left: 50%; }
-@media (max-width: 1200px) {
-  .hero--walkthrough .hero-plate { left: 54%; }}
-/* The copy column is width:100% at z-index 2, so its transparent right half
-   covers the frame and would eat its clicks. Make the column pass-through and
-   re-enable only the actual copy (text + CTAs). */
-.hero--walkthrough .hero-full-inner { pointer-events: none; }
-.hero--walkthrough .hero-full-inner .hero-copy { pointer-events: auto; }
-/* Left fade: a strong dark veil over the plate's left third so the copy
-   column ALWAYS has contrast where text can reach (the headline extends
-   past the plate's left edge). Holds near-opaque, then clears so the
-   dashboard reads on the right. */
-.hero-plate-fade {
-  position: absolute;
-  inset: 0;
-  z-index: 1;
-  pointer-events: none;
-  background: linear-gradient(90deg,
-    var(--bg) 0%,
-    var(--fade-90) 10%,
-    var(--fade-70) 30%,
-    var(--fade-0) 56%);
-}
-
-/* Copy column: fixed distance from the LEFT viewport edge, capped width
-   so the text never drifts under the screenshot. */
-.hero-full-inner {
-  position: relative;
-  z-index: 2;
-  width: 100%;
-  padding-left: clamp(1.25rem, 6vw, 7rem);
-  padding-right: 1.25rem;
-}
-.hero-full-inner .hero-copy {
-  max-width: 40rem;
-  padding: 4.5rem 0;
-}
-/* On the dark hero the eyebrow needs a lighter treatment than the
-   light-bg default. */
-.hero--full .hero-eyebrow {
-  background: var(--brand-wash);
-  border-color: var(--brand-line);
-  color: var(--brand-bright);
-}
-.hero--full .hero-lede { color: var(--ink-soft); }
-.hero--full .hero-trust { color: var(--ink-faint); }
-
-/* Animated walkthrough — a device-framed viewport floating in the plate.
-   The 16:9 composition is CONTAIN-fit (never cropped) and maximized to the
-   column at every width. A teal ambient glow blends it into the dark hero. */
-.hero-walkthrough {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;         /* portrait frame sits centred in the right column */
-  padding: clamp(1.75rem, 3.5vh, 3.5rem) clamp(1.5rem, 3vw, 3rem);
-}
-
-/* Walkthrough hero: veil only the thin strip where the headline overlaps the
-   plate's left edge, clearing fast so the framed screen to the right is never
-   dimmed. (The headline reaches just a little into the plate.) */
-.hero--walkthrough .hero-plate-fade {
-  background: linear-gradient(90deg,
-    var(--bg) 0%,
-    var(--fade-50) 8%,
-    var(--fade-0) 22%);
-}
-
-/* Soft teal halo behind the frame, bleeding into the dark background. */
-.hero-walkthrough__glow {
-  position: absolute;
-  inset: 8%;
-  z-index: 0;
-  pointer-events: none;
-  background:
-    radial-gradient(60% 55% at 60% 45%, var(--brand-line-soft), transparent 70%),
-    radial-gradient(50% 60% at 40% 72%, var(--accent-wash), transparent 72%);
-  filter: blur(44px);
-}
-
-/* The "screen": rounded bezel, fine border, floating shadow. Straight-on (no
-   3D tilt) — the tilt fought the canvas's own scale transform and made the
-   rounded corner flicker. The clip lives here; nothing inside re-transforms it. */
-.hero-walkthrough__frame {
-  position: relative;
-  z-index: 1;
-  overflow: hidden;
-  border-radius: 16px;
-  background: #ecf3f4;
-  border: 1px solid rgba(14, 42, 50, 0.5);
-  box-shadow:
-    0 0 0 1px var(--surface-tint-strong),
-    0 40px 80px -28px var(--scrim-strong),
-    0 18px 50px -24px var(--brand-glow);
-  isolation: isolate;
-  /* The frame is clear of the copy column (verified gap), so make it
-     interactive — its children (scene dots, play/pause) become clickable while
-     the rest of the plate stays pass-through for the CTAs underneath. */
-  pointer-events: auto;
-}
-/* Scene content itself shouldn't grab the pointer — only the controls. */
-.hero-walkthrough__canvas { pointer-events: none; }
-
-.hero-walkthrough__canvas {
-  position: absolute;
-  top: 0;
-  left: 0;
-  /* width/height (1920×1080) + zoom (contain-fit) set inline by the component */
-}
-
-.hero-walkthrough__toggle {
-  position: absolute;
-  z-index: 2;
-  left: 14px;
-  bottom: 14px;
-  width: 30px;
-  height: 30px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-  border-radius: 8px;
-  border: 1px solid rgba(14, 42, 50, 0.16);
-  background: rgba(251, 253, 253, 0.7);
-  color: #0e2a32;
-  cursor: pointer;
-  pointer-events: auto;            /* plate is pointer-events:none — opt back in */
-  backdrop-filter: blur(6px);
-  transition: background 120ms ease, opacity 120ms ease;
-  opacity: 0;                      /* reveal on frame hover — keep the screen clean */
-}
-.hero-walkthrough:hover .hero-walkthrough__toggle { opacity: 0.7; }
-.hero-walkthrough__toggle:hover { background: rgba(251, 253, 253, 0.96); opacity: 1; }
-
-
-/* Narrow screens: drop the screenshot entirely, text-only hero. */
-@media (max-width: 900px) {
-  .hero--full { min-height: auto; }
-  .hero-plate { display: none; }
-  .hero-full-inner .hero-copy { padding: 3rem 0; max-width: none; }}
 
 /* Two-column hero: punchy copy left, screenshot slideshow right. Stacks on
    narrow screens (slideshow drops below the copy). */
@@ -460,35 +270,23 @@ hr {
   align-items: center;
 }
 @media (min-width: 1000px) {
-  .hero-grid {
+  .hero-grid:not(.hero-grid--home) {
     grid-template-columns: minmax(0, 1.02fr) minmax(0, 1fr);
     gap: 3.5rem;
   }}
 .hero-copy { min-width: 0; }
 .hero-visual { min-width: 0; }
-
-/* Full-bleed hero visual (homepage): the slideshow grows past the shell,
-   runs to the right viewport edge, and slides under the copy column with
-   its left edge fading out. Opt-in via modifier classes so the saas hero
-   (which reuses .hero-grid) keeps its contained layout. */
-@media (min-width: 1000px) {
-  .hero-grid--bleed {
-    grid-template-columns: minmax(0, 0.92fr) minmax(0, 1.08fr);
-    gap: 0;
-  }
-  .hero-grid--bleed .hero-copy { position: relative; z-index: 2; }
-  .hero-visual--bleed {
-    position: relative;
-    z-index: 1;
-    margin-right: calc(50% - 50vw);
-    margin-left: -6rem;
-  }}
+/* Home: the diagram column. Below 900 px it stacks under the copy. */
+.hero-grid--home { gap: 3rem; }
+@media (min-width: 900px) {
+  .hero-grid--home { grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr); gap: 3.5rem; }
+}
 
 .hero h1 {
   max-width: 15ch;
-  font-size: clamp(2.6rem, 5.6vw, 4.1rem);
-  line-height: 1.02;
-  letter-spacing: -0.035em;
+  font-size: var(--fs-display);
+  line-height: 1.05;
+  letter-spacing: -0.03em;
   font-weight: 800;
 }
 

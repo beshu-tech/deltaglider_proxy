@@ -1,0 +1,191 @@
+---
+// HeroDiagram.astro — the home page's one message graphic: DeltaGlider is
+// one proxy between your clients and any S3 backend, and it adds four
+// capabilities there. Static, no motion. It follows the site's diagram
+// grammar (docs/plan/site-design-audit-2026-09.md §2.7): neutral outlined
+// boxes for clients and buckets, the proxy is the only brand-bordered box,
+// flows are thin lines with a mono label. Every word here is already on
+// the page (hero bullets), so the diagram adds no claim.
+import BrandMark from './BrandMark.astro';
+import Glyph from './Glyph.astro';
+
+const CAPABILITIES = [
+  { glyph: 'binary', label: 'Delta compression' },
+  { glyph: 'lock', label: 'AES-256 encryption' },
+  { glyph: 'shield-key', label: 'IAM, SSO and audit' },
+  { glyph: 'replicate', label: 'Cross-cloud replication' },
+] as const;
+
+const BACKENDS = ['AWS', 'Hetzner', 'Wasabi', 'MinIO'];
+---
+
+<figure
+  class="hd"
+  role="img"
+  aria-label="Your clients talk the S3 API to the DeltaGlider proxy. The proxy adds delta compression, AES-256 encryption, IAM, SSO and audit, and cross-cloud replication, then talks the same S3 API to AWS, Hetzner, Wasabi or MinIO."
+>
+  <div class="hd-node hd-clients" aria-hidden="true">
+    <span class="hd-node-title">Your clients</span>
+    <span class="hd-mono">SDKs · aws CLI · CI</span>
+  </div>
+
+  <div class="hd-flow" aria-hidden="true"><span class="hd-mono">S3 API</span></div>
+
+  <div class="hd-proxy" aria-hidden="true">
+    <div class="hd-proxy-head">
+      <BrandMark />
+      <span>DeltaGlider Proxy</span>
+    </div>
+    <ul class="hd-caps">
+      {CAPABILITIES.map((c) => (
+        <li><Glyph name={c.glyph} bare size={20} /> {c.label}</li>
+      ))}
+    </ul>
+  </div>
+
+  <div class="hd-flow" aria-hidden="true"><span class="hd-mono">the same S3 API</span></div>
+
+  <ul class="hd-backends" aria-hidden="true">
+    {BACKENDS.map((b) => (
+      <li class="hd-bucket"><span class="hd-mono">{b}</span></li>
+    ))}
+  </ul>
+</figure>
+
+<style>
+  .hd {
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    width: 100%;
+    max-width: 30rem;
+    justify-self: center;
+  }
+
+  .hd-mono {
+    font-family: var(--font-mono);
+    font-size: var(--fs-label);
+    color: var(--ink-faint);
+  }
+
+  /* Neutral node: a client. */
+  .hd-node {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.2rem;
+    padding: 0.85rem 1rem;
+    border: 1px solid var(--rule-strong);
+    border-radius: var(--r-sm);
+    background: var(--bg-card);
+    text-align: center;
+  }
+  .hd-node-title { font-weight: 700; color: var(--ink-strong); }
+
+  /* A flow: a thin vertical line with an arrowhead and its label beside it. */
+  .hd-flow {
+    position: relative;
+    height: 3.25rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .hd-flow::before {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: 0;
+    bottom: 6px;
+    width: 1.5px;
+    transform: translateX(-50%);
+    background: var(--ink-faint);
+  }
+  .hd-flow::after {
+    content: '';
+    position: absolute;
+    left: 50%;
+    bottom: 0;
+    transform: translateX(-50%);
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 7px solid var(--ink-faint);
+  }
+  .hd-flow .hd-mono {
+    position: absolute;
+    left: calc(50% + 0.75rem);
+    top: 50%;
+    transform: translateY(-50%);
+    white-space: nowrap;
+  }
+
+  /* The proxy: the only brand-bordered box on the page. */
+  .hd-proxy {
+    border: 1.5px solid var(--brand);
+    border-radius: var(--r-md);
+    background: var(--brand-tint);
+    padding: 1rem 1.25rem 1.1rem;
+  }
+  .hd-proxy-head {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    font-weight: 800;
+    font-size: 1.1rem;
+    color: var(--ink-strong);
+    padding-bottom: 0.8rem;
+    margin-bottom: 0.8rem;
+    border-bottom: 1px solid var(--brand-line-soft);
+  }
+  .hd-caps {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.7rem 1rem;
+  }
+  .hd-caps li {
+    margin: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: var(--fs-small);
+    font-weight: 600;
+    color: var(--ink);
+    line-height: 1.3;
+  }
+
+  /* Backends: buckets, drawn with a lid line across the top. */
+  .hd-backends {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 0.6rem;
+  }
+  .hd-bucket {
+    margin: 0;
+    position: relative;
+    padding: 1rem 0.4rem 0.7rem;
+    border: 1px solid var(--rule-strong);
+    border-radius: var(--r-sm) var(--r-sm) var(--r-md) var(--r-md);
+    background: var(--bg-card);
+    text-align: center;
+  }
+  .hd-bucket::before {
+    content: '';
+    position: absolute;
+    left: 0.5rem;
+    right: 0.5rem;
+    top: 0.45rem;
+    height: 1px;
+    background: var(--rule-strong);
+  }
+  .hd-bucket .hd-mono { color: var(--ink-soft); }
+
+  @media (max-width: 420px) {
+    .hd-caps { grid-template-columns: 1fr; }
+  }
+</style>

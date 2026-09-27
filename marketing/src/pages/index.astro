@@ -18,8 +18,7 @@ import BaseLayout from '../layouts/BaseLayout.astro';
 import JsonLd from '../components/JsonLd.astro';
 import TestimonialsBlock from '../components/TestimonialsBlock.astro';
 import WorkloadFitTable from '../components/WorkloadFitTable.astro';
-import HeroWalkthrough from '../components/HeroWalkthrough.tsx';
-import HeroOrbit from '../components/HeroOrbit.astro';
+import HeroDiagram from '../components/HeroDiagram.astro';
 import DemoVideo from '../components/DemoVideo.astro';
 import StorageScale from '../components/StorageScale.astro';
 import DropIn from '../components/DropIn.astro';
@@ -42,19 +41,10 @@ import {
   </Fragment>
 
   {/* ============================== HERO ============================== */}
-  {/* Split full-bleed: copy column pinned to a fixed left margin; the
-      dashboard slideshow occupies the right half and bleeds to the right
-      viewport edge. On narrow screens the screenshot is dropped entirely
-      (text-only hero). */}
-  <section class="hero hero--full hero--walkthrough">
-    {/* Right column holds the device-framed product walkthrough (always plays).
-        Hidden below the breakpoint (CSS). */}
-    <div class="hero-plate" aria-hidden="false">
-      <HeroWalkthrough client:load />
-      <div class="hero-plate-fade" aria-hidden="true"></div>
-    </div>
-
-    <div class="hero-full-inner">
+  {/* Copy on the left, the control-plane diagram on the right. Below
+      900 px the diagram stacks under the copy, so phones get it too. */}
+  <section class="hero">
+    <div class="shell hero-grid hero-grid--home">
       <div class="hero-copy">
         <span class="hero-eyebrow">
           <span class="hero-eyebrow-dot"></span>
@@ -62,8 +52,6 @@ import {
         </span>
 
         <h1>The object storage control&nbsp;plane</h1>
-
-        <HeroOrbit />
 
         <p class="hero-lede">
           An S3 proxy in front of your bucket, with the same API and no
@@ -93,6 +81,7 @@ import {
           <a href="https://github.com/beshu-tech/deltaglider_proxy/commits/main">commit trailers</a>.
         </p>
       </div>
+      <HeroDiagram />
     </div>
   </section>
 
