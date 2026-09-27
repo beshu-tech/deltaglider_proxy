@@ -477,10 +477,7 @@ pub async fn list_jobs(
             });
         }
 
-        for j in db
-            .maintenance_list_jobs(50)
-            .map_err(|e| AdminError::internal(e.to_string()))?
-        {
+        for j in db.maintenance_list_jobs(50)? {
             jobs.push(maintenance_job_view(&j));
         }
 
@@ -597,8 +594,7 @@ pub async fn job_runs(
         .await;
     let runs: Vec<JobRunEntry> = match sub {
         JobSubsystem::Replication => db
-            .replication_recent_runs(key, limit)
-            .map_err(internal)?
+            .replication_recent_runs(key, limit)?
             .into_iter()
             .map(|r| JobRunEntry {
                 id: r.id,
@@ -619,8 +615,7 @@ pub async fn job_runs(
             })
             .collect(),
         JobSubsystem::Lifecycle => db
-            .lifecycle_recent_runs(key, limit)
-            .map_err(internal)?
+            .lifecycle_recent_runs(key, limit)?
             .into_iter()
             .map(|r| JobRunEntry {
                 id: r.id,
@@ -642,10 +637,7 @@ pub async fn job_runs(
             .collect(),
         JobSubsystem::Maintenance => {
             let job_id: i64 = key.parse().map_err(|_| not_found())?;
-            let job = db
-                .maintenance_job_by_id(job_id)
-                .map_err(internal)?
-                .ok_or(not_found())?;
+            let job = db.maintenance_job_by_id(job_id)?.ok_or(not_found())?;
             vec![JobRunEntry {
                 id: job.id,
                 triggered_by: job.triggered_by.clone().unwrap_or_else(|| "admin".into()),
@@ -684,8 +676,7 @@ pub async fn job_failures(
         .await;
     let failures: Vec<JobFailureEntry> = match sub {
         JobSubsystem::Replication => db
-            .replication_recent_failures(key, limit)
-            .map_err(internal)?
+            .replication_recent_failures(key, limit)?
             .into_iter()
             .map(|f| JobFailureEntry {
                 id: f.id,
@@ -699,8 +690,7 @@ pub async fn job_failures(
             })
             .collect(),
         JobSubsystem::Lifecycle => db
-            .lifecycle_recent_failures(key, limit)
-            .map_err(internal)?
+            .lifecycle_recent_failures(key, limit)?
             .into_iter()
             .map(|f| JobFailureEntry {
                 id: f.id,
@@ -715,8 +705,7 @@ pub async fn job_failures(
             .collect(),
         JobSubsystem::Maintenance => {
             let job_id: i64 = key.parse().map_err(|_| not_found())?;
-            db.maintenance_list_failures(job_id, limit as usize)
-                .map_err(internal)?
+            db.maintenance_list_failures(job_id, limit as usize)?
                 .into_iter()
                 .map(|f| JobFailureEntry {
                     id: f.id,
@@ -810,7 +799,7 @@ pub async fn job_action(
                 .ok_or_else(AdminError::no_config_db)?;
             let flipped = {
                 let db = db.lock().await;
-                db.replication_request_run_cancel(&name).map_err(internal)?
+                db.replication_request_run_cancel(&name)?
             };
             if !flipped {
                 return Err(AdminError::conflict("no running run to kill"));
