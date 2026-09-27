@@ -541,6 +541,17 @@ fn date_conditionals_compare_at_http_date_precision() {
     }
 }
 
+/// A condition header takes a fresh HEAD; a plain range reads the cache; a
+/// plain GET reads no metadata before `retrieve_stream`.
+#[test]
+fn get_metadata_source_truth_table() {
+    use object::{get_metadata_source, GetMetadata};
+    assert_eq!(get_metadata_source(true, false), GetMetadata::Fresh);
+    assert_eq!(get_metadata_source(true, true), GetMetadata::Fresh);
+    assert_eq!(get_metadata_source(false, true), GetMetadata::Cached);
+    assert_eq!(get_metadata_source(false, false), GetMetadata::None);
+}
+
 #[test]
 fn served_range_truth_table() {
     let object = |size: u64| {

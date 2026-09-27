@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Changed — Only a conditional GET reads fresh metadata
+
+A GET request with `If-Match`, `If-None-Match`, `If-Modified-Since` or
+`If-Unmodified-Since` judges the condition on metadata that the proxy reads
+from storage, so a condition never passes on stale metadata that another
+instance changed. A GET request without one of these headers no longer sends
+a metadata request to storage before it reads the object: it uses the
+metadata cache, so on a multi-instance deployment it can show metadata that
+is up to ten minutes old.
+
 ### Changed — Delta objects larger than 16 MiB use the spool by default
 
 `DGP_SPOOL_THRESHOLD_BYTES` defaulted to `max_object_size` (100 MiB). No

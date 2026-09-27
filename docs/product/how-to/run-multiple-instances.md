@@ -143,7 +143,11 @@ correctness, but both change behaviour compared to a single instance:
   reach the same instance, so that instance's cache is coherent for its own prefixes
   and the staleness window almost never shows. It can surface right after the hash
   ring moves (a scale event), when a prefix's new owner may serve up to ten minutes
-  of stale metadata for objects the old owner changed.
+  of stale metadata for objects the old owner changed. A HEAD request, and a GET
+  request that carries `If-Match`, `If-None-Match`, `If-Modified-Since` or
+  `If-Unmodified-Since`, reads the metadata from storage and not from the cache, so
+  the answer to such a conditional request is never stale. A GET request without
+  one of these headers uses the cache.
 - **Rate limits.** The login rate limiter counts per instance, so with N instances the
   effective limit is up to N times the configured value. Size the configured limit
   accordingly, and remember that the admin GUI's source-IP stickiness concentrates

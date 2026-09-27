@@ -171,11 +171,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .await?)
     }
 
-    /// The metadata a GET judges its conditionals on: the metadata that
-    /// `retrieve_stream` then serves (the metadata cache, else a fresh
-    /// resolve that fills it), so a GET pays no extra uncached HEAD. An
-    /// object without proxy metadata gets its passthrough metadata, as on
-    /// HEAD. HEAD itself stays uncached ([`Self::head`]).
+    /// The metadata a ranged GET without a condition header sizes its range
+    /// with: the metadata cache, else a resolve that fills it (the metadata
+    /// the body is then served from). An object without proxy metadata gets
+    /// its passthrough metadata, as on HEAD. A GET with a condition header
+    /// judges it on a fresh [`Self::head`] instead.
     pub async fn read_metadata(
         &self,
         bucket: &str,

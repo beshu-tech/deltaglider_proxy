@@ -60,26 +60,40 @@ pub(super) async fn get_object(
     let input = req.input;
     check_response_overrides_allowed(&input, anonymous_principal)?;
     let engine = svc.state.engine.load();
-    // Judged on the metadata the body is then served from (no separate
-    // uncached HEAD per GET).
-    let head = match engine.read_metadata(&input.bucket, &input.key).await {
-        Ok(meta) => meta,
+    let conditional = input.if_match.is_some()
+        || input.if_none_match.is_some()
+        || input.if_modified_since.is_some()
+        || input.if_unmodified_since.is_some();
+    let read = match get_metadata_source(conditional, input.range.is_some()) {
+        GetMetadata::Fresh => Some(engine.head(&input.bucket, &input.key).await),
+        GetMetadata::Cached => Some(engine.read_metadata(&input.bucket, &input.key).await),
+        GetMetadata::None => None,
+    };
+    let head = match read.transpose() {
+        Ok(head) => head,
         Err(e) => {
             return Err(no_such_key_or_bucket(&engine, &input.bucket, s3s::S3Error::from(e)).await)
         }
     };
-    evaluate_read_conditionals_s3s(
-        &head,
-        input.if_match.as_ref(),
-        input.if_none_match.as_ref(),
-        input.if_modified_since.as_ref(),
-        input.if_unmodified_since.as_ref(),
-    )?;
+    if let Some(head) = &head {
+        evaluate_read_conditionals_s3s(
+            head,
+            input.if_match.as_ref(),
+            input.if_none_match.as_ref(),
+            input.if_modified_since.as_ref(),
+            input.if_unmodified_since.as_ref(),
+        )?;
+    }
+    let checked = match &head {
+        Some(head) => served_range(input.range.as_ref(), if_range.as_ref(), head)?
+            .map(|checked| (checked, head.file_size)),
+        None => None,
+    };
 
-    if let Some(checked) = served_range(input.range.as_ref(), if_range.as_ref(), &head)? {
+    if let Some((checked, file_size)) = checked {
         let start = checked.start;
         let end_inclusive = checked.end.saturating_sub(1);
-        let content_range = format!("bytes {start}-{end_inclusive}/{}", head.file_size);
+        let content_range = format!("bytes {start}-{end_inclusive}/{file_size}");
 
         if let Some((stream, content_length, metadata)) = engine
             .retrieve_stream_range(&input.bucket, &input.key, start, end_inclusive, None)
@@ -123,12 +137,12 @@ pub(super) async fn get_object(
         return Ok(resp);
     }
 
-    let response = svc
-        .state
-        .engine
-        .load()
-        .retrieve_stream(&input.bucket, &input.key)
-        .await?;
+    let response = match engine.retrieve_stream(&input.bucket, &input.key).await {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(no_such_key_or_bucket(&engine, &input.bucket, s3s::S3Error::from(e)).await)
+        }
+    };
     let (body, metadata) = match response {
         RetrieveResponse::Streamed {
             stream, metadata, ..
@@ -147,6 +161,29 @@ pub(super) async fn get_object(
     add_storage_debug_headers(&mut resp.headers, &metadata);
     add_get_object_security_headers(&mut resp);
     Ok(resp)
+}
+
+/// Where a GET reads the metadata it judges before the body.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(super) enum GetMetadata {
+    /// A fresh HEAD of storage: a condition must not pass on a stale cache
+    /// (another node may have written the key).
+    Fresh,
+    /// The metadata cache (else storage): a range needs the object size.
+    Cached,
+    /// No lookup: `retrieve_stream` resolves the metadata it serves.
+    None,
+}
+
+/// Pure: the metadata source of a GET with or without a condition header
+/// (`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`)
+/// and a `Range`.
+pub(super) fn get_metadata_source(conditional: bool, ranged: bool) -> GetMetadata {
+    match (conditional, ranged) {
+        (true, _) => GetMetadata::Fresh,
+        (false, true) => GetMetadata::Cached,
+        (false, false) => GetMetadata::None,
+    }
 }
 
 pub(super) async fn get_object_acl(

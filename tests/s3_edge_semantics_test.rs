@@ -460,3 +460,79 @@ async fn ranged_part_copy_reads_only_the_range() {
     want.extend(vec![b'c'; 10]);
     assert_eq!(got.as_ref(), want.as_slice());
 }
+
+/// A GET with a condition header judges it on a fresh HEAD of storage; a GET
+/// without one takes no HEAD (it serves the metadata cache). Two proxies
+/// share one filesystem directory, so a PUT through node A leaves node B's
+/// metadata cache stale.
+#[tokio::test]
+async fn conditional_get_judges_fresh_storage_and_plain_get_takes_no_head() {
+    const KEY_ID: &str = "CONDKEY";
+    const SECRET: &str = "CONDSECRET";
+    let shared = tempfile::TempDir::new().unwrap();
+    let node = || async {
+        let doc = format!(
+            "access:\n  access_key_id: {KEY_ID}\n  secret_access_key: {SECRET}\n\
+             storage:\n  filesystem: {}\n\
+             advanced:\n  listen_addr: {}\n  bootstrap_password_hash: \"{}\"\n",
+            shared.path().display(),
+            common::LISTEN_ADDR_PLACEHOLDER,
+            common::TEST_BOOTSTRAP_PASSWORD_HASH
+        );
+        let data = tempfile::TempDir::new().unwrap();
+        common::TestServer::from_config_document(&doc, data, (KEY_ID, SECRET), "releases", vec![])
+            .await
+    };
+    let (a, b) = (node().await, node().await);
+    let (ha, hb) = (a.http(), b.http());
+    let url_b = format!("{}/releases/app.png", b.endpoint());
+    let endpoint_a = a.endpoint();
+    let put = |body: &[u8]| {
+        put_object(
+            &ha,
+            &endpoint_a,
+            "releases",
+            "app.png",
+            body.to_vec(),
+            "image/png",
+        )
+    };
+
+    put(b"v1").await;
+    // B caches the first version.
+    let first = hb.head(&url_b).send().await.unwrap();
+    let etag1 = header(&first, "etag").unwrap();
+    put(b"v2").await;
+
+    // No condition: served from B's cache, so no HEAD read the new version.
+    let plain = hb.get(&url_b).send().await.unwrap();
+    assert_eq!(plain.status(), 200);
+    assert_eq!(
+        header(&plain, "etag").as_ref(),
+        Some(&etag1),
+        "a plain GET takes no HEAD"
+    );
+
+    // If-Match the stale ETag: storage holds another version → 412.
+    let stale = hb
+        .get(&url_b)
+        .header("if-match", &etag1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        stale.status(),
+        412,
+        "the condition is judged on fresh storage state"
+    );
+    // If-None-Match the stale ETag: the object changed → 200 with the new body.
+    let changed = hb
+        .get(&url_b)
+        .header("if-none-match", &etag1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(changed.status(), 200);
+    assert_ne!(header(&changed, "etag").as_ref(), Some(&etag1));
+    assert_eq!(&changed.bytes().await.unwrap()[..], b"v2");
+}
