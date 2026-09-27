@@ -41,6 +41,14 @@ warned that secrets are "saved to the config file as the reference", and the
 apply does not give these warnings. Now the validate refuses a hash change
 with the same 403, and it gives only the warnings that the apply gives.
 
+### Fixed — The multipart `ObjectCreated` event carries the object size
+
+The `ObjectCreated` event of a CompleteMultipartUpload had no
+`content_length`, which the event of a PutObject has. Now both events come
+from one builder and carry the same fields (`content_length`,
+`storage_type`, `etag`). The quota gate and the write lock of a multipart
+completion now use the same helper as the other client writes.
+
 ### Fixed — The streaming PUT removes a baseline that no delta uses
 
 A delta-eligible PUT above the spool threshold (and every replication,

@@ -11,6 +11,8 @@
 //!
 //! * [`store_client_write`] — THE client write of a whole body: quota
 //!   gate, conditional store under the object's write lock, event.
+//! * [`store_client_multipart_admit`] / [`store_client_multipart_commit`]
+//!   — the same quota gate, write lock and event for a multipart completion.
 //! * [`check_quota`] — pre-write quota gate.
 //! * [`enqueue_object_event`] / [`enqueue_object_events`] — best-
 //!   effort event-outbox append for notification dispatch.
@@ -97,21 +99,66 @@ pub(crate) async fn store_client_write(
         .await?;
     enqueue_object_event(
         state,
-        NewEvent::new(
-            crate::event_outbox::EventKind::ObjectCreated,
-            write.bucket,
-            write.key,
-            crate::event_outbox::EventSource::S3Api,
-            crate::replication::current_unix_seconds(),
-            serde_json::json!({
-                "content_length": write.data.len(),
-                "storage_type": result.metadata.storage_info.label(),
-                "etag": result.metadata.etag(),
-            }),
-        ),
+        object_created_event(write.bucket, write.key, write.data.len() as u64, &result),
     )
     .await;
     Ok(result)
+}
+
+/// The admission of a client multipart completion, the multipart half of
+/// [`store_client_write`]: the quota gate, then the object's write lock
+/// with the preconditions (`If-None-Match: *` is create-only). The caller
+/// holds the lock until the store ends, then calls
+/// [`store_client_multipart_commit`].
+pub(crate) async fn store_client_multipart_admit(
+    state: &Arc<AppState>,
+    bucket: &str,
+    key: &str,
+    total_size: u64,
+    precondition: &crate::deltaglider::Precondition,
+) -> Result<crate::deltaglider::ObjectWriteGuard, S3Error> {
+    check_quota(state, bucket, total_size)?;
+    Ok(state
+        .engine
+        .load()
+        .lock_and_check(bucket, key, precondition)
+        .await?)
+}
+
+/// After a client multipart completion stored: the `ObjectCreated` event,
+/// with the same payload as [`store_client_write`].
+pub(crate) async fn store_client_multipart_commit(
+    state: &Arc<AppState>,
+    bucket: &str,
+    key: &str,
+    result: &crate::types::StoreResult,
+) {
+    enqueue_object_event(
+        state,
+        object_created_event(bucket, key, result.metadata.file_size, result),
+    )
+    .await;
+}
+
+/// THE `ObjectCreated` event of a client write (whole body or multipart).
+fn object_created_event(
+    bucket: &str,
+    key: &str,
+    content_length: u64,
+    result: &crate::types::StoreResult,
+) -> NewEvent {
+    NewEvent::new(
+        crate::event_outbox::EventKind::ObjectCreated,
+        bucket,
+        key,
+        crate::event_outbox::EventSource::S3Api,
+        crate::replication::current_unix_seconds(),
+        serde_json::json!({
+            "content_length": content_length,
+            "storage_type": result.metadata.storage_info.label(),
+            "etag": result.metadata.etag(),
+        }),
+    )
 }
 
 /// Client-write boundary gate. A bucket marked `replication_target_only`

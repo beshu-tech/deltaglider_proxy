@@ -1374,6 +1374,79 @@ async fn outbox(admin: &reqwest::Client, ep: &str, query: &str) -> (StatusCode, 
     .await
 }
 
+/// A CompleteMultipartUpload records the same `ObjectCreated` payload as a
+/// PutObject: size, storage type and ETag. The multipart event had no
+/// `content_length`.
+#[tokio::test]
+async fn object_created_payload_is_the_same_for_put_and_multipart() {
+    use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+    let server = TestServer::builder().build().await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let s3 = server.s3_client().await;
+    let bucket = server.bucket();
+    let body = vec![7u8; 1234];
+    let put = s3
+        .put_object()
+        .bucket(bucket)
+        .key("ev/put.bin")
+        .body(body.clone().into())
+        .send()
+        .await
+        .unwrap();
+    let up = s3
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key("ev/mpu.bin")
+        .send()
+        .await
+        .unwrap();
+    let id = up.upload_id().unwrap();
+    let part = s3
+        .upload_part()
+        .bucket(bucket)
+        .key("ev/mpu.bin")
+        .upload_id(id)
+        .part_number(1)
+        .body(body.clone().into())
+        .send()
+        .await
+        .unwrap();
+    let done = s3
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key("ev/mpu.bin")
+        .upload_id(id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(part.e_tag().unwrap())
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let (_, v) = outbox(&admin, &ep, "limit=100").await;
+    let rows = v["rows"].as_array().expect("outbox rows");
+    for (key, etag) in [
+        ("ev/put.bin", put.e_tag().unwrap()),
+        ("ev/mpu.bin", done.e_tag().unwrap()),
+    ] {
+        let row = rows
+            .iter()
+            .find(|r| r["kind"] == "ObjectCreated" && r["key"] == key)
+            .unwrap_or_else(|| panic!("no ObjectCreated for {key}: {v}"));
+        let p = &row["payload"];
+        assert_eq!(p["content_length"], 1234, "{key}: {p}");
+        assert_eq!(p["etag"], etag, "{key}: {p}");
+        assert_eq!(p["storage_type"], "passthrough", "{key}: {p}");
+    }
+}
+
 /// Two webhook endpoints that fail at once (one refused by the SSRF guard,
 /// one unresolvable), one attempt each: every event ends `failed` with a
 /// per-endpoint view, is requeued, fails again, and is purged.

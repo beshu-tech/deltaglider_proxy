@@ -169,28 +169,21 @@ pub(super) async fn complete_multipart_upload(
                 .iter()
                 .filter_map(|(num, _)| svc.state.multipart.get_part_size(&input.upload_id, *num))
                 .sum();
-            crate::api::handlers::object_helpers::check_quota(
+            // The quota gate, then the same conditional write as PutObject
+            // (If-None-Match: * is create-only), under the same per-key lock,
+            // held until the store ends. Only the owner checks: a retry that
+            // joins or hits the tombstone sees its OWN object and must not 412.
+            let write_lock = crate::api::handlers::object_helpers::store_client_multipart_admit(
                 &svc.state,
                 &input.bucket,
+                &input.key,
                 total_parts_size,
-            )?;
-            // Same conditional write as PutObject (If-None-Match: * is
-            // create-only), under the same per-key lock, held until the
-            // store ends. Only the owner checks: a retry that joins or
-            // hits the tombstone sees its OWN object and must not 412.
-            let write_lock = svc
-                .state
-                .engine
-                .load()
-                .lock_and_check(
-                    &input.bucket,
-                    &input.key,
-                    &crate::deltaglider::Precondition {
-                        if_match: input.if_match.clone(),
-                        if_none_match: input.if_none_match.clone(),
-                    },
-                )
-                .await?;
+                &crate::deltaglider::Precondition {
+                    if_match: input.if_match.clone(),
+                    if_none_match: input.if_none_match.clone(),
+                },
+            )
+            .await?;
             let delta_limit = crate::config::env_parse_with_default(
                 "DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES",
                 64 * 1024 * 1024,
@@ -309,7 +302,7 @@ pub(super) async fn run_multipart_completion(
         tokio::time::sleep(std::time::Duration::from_millis(stall_ms)).await;
     }
     let engine = state.engine.load();
-    let (etag, store_meta) = if force_chunked_passthrough {
+    let (etag, result) = if force_chunked_passthrough {
         let completed =
             state
                 .multipart
@@ -348,7 +341,7 @@ pub(super) async fn run_multipart_completion(
             }
         };
         match store_result {
-            Ok(result) => (etag, Some(result.metadata)),
+            Ok(result) => (etag, result),
             Err(e) => {
                 state.multipart.rollback_upload(&upload_id);
                 return Err(e.into());
@@ -370,7 +363,7 @@ pub(super) async fn run_multipart_completion(
             )
             .await
         {
-            Ok(result) => (etag, Some(result.metadata)),
+            Ok(result) => (etag, result),
             Err(e) => {
                 state.multipart.rollback_upload(&upload_id);
                 return Err(e.into());
@@ -378,24 +371,11 @@ pub(super) async fn run_multipart_completion(
         }
     };
     state.multipart.finish_upload(&upload_id);
-    if crate::replication::event_consumer::is_user_object_key(&key) {
-        crate::api::handlers::object_helpers::enqueue_object_event(
-            &state,
-            crate::event_outbox::NewEvent::new(
-                crate::event_outbox::EventKind::ObjectCreated,
-                &bucket,
-                &key,
-                crate::event_outbox::EventSource::S3Api,
-                crate::replication::current_unix_seconds(),
-                serde_json::json!({
-                    "etag": etag,
-                    "storage_type": store_meta.as_ref().map(|m| m.storage_info.label()),
-                }),
-            ),
-        )
-        .await;
-    }
-    Ok((etag, store_meta))
+    crate::api::handlers::object_helpers::store_client_multipart_commit(
+        &state, &bucket, &key, &result,
+    )
+    .await;
+    Ok((etag, Some(result.metadata)))
 }
 
 pub(super) fn completed_parts_to_request(
