@@ -173,6 +173,13 @@ export default function BackendEncryptionEditor({ backendName, current, onApply,
     }
   };
 
+  // A key change retires the current proxy key into the legacy slot. While
+  // that slot holds another key, the server refuses it (section_level.rs,
+  // "the legacy slot still holds key id ..."), so do not offer it.
+  const keyChangeBlocked = current.mode === 'aes256-gcm-proxy' && current.shim_active;
+  const keyChangeBlockedReason =
+    'The legacy key slot still holds an older key. Clear the legacy key before you change the key or the mode.';
+
   // Header row: current status + top-level action.
   const modeLabel =
     current.mode === 'aes256-gcm-proxy'
@@ -227,6 +234,8 @@ export default function BackendEncryptionEditor({ backendName, current, onApply,
                 size="small"
                 icon={<ReloadOutlined />}
                 onClick={() => startEdit('aes256-gcm-proxy')}
+                disabled={keyChangeBlocked}
+                title={keyChangeBlocked ? keyChangeBlockedReason : undefined}
               >
                 Rotate key
               </Button>
@@ -237,6 +246,8 @@ export default function BackendEncryptionEditor({ backendName, current, onApply,
                 value={current.mode}
                 onChange={(v) => startEdit(v as BackendEncryptionMode)}
                 options={modeOptions}
+                disabled={keyChangeBlocked}
+                title={keyChangeBlocked ? keyChangeBlockedReason : undefined}
                 size="small"
                 style={{ width: 220, maxWidth: '100%' }}
               />
@@ -248,6 +259,11 @@ export default function BackendEncryptionEditor({ backendName, current, onApply,
       {/* Shim banner. Info-level: the shim is an intentional
          transition state, not an error. Points the operator at the
          follow-up action (clear legacy_key when objects are gone). */}
+      {keyChangeBlocked && !pending && !readOnly && (
+        <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 6 }}>
+          {keyChangeBlockedReason}
+        </Text>
+      )}
       {current.shim_active && !pending && (
         <LegacyShimBanner backendName={backendName} readOnly={readOnly} onClearLegacy={onClearLegacy} />
       )}

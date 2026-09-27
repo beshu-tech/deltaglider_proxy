@@ -249,6 +249,16 @@ that does not match serves the whole object with 200. A suffix range on an
 empty object is 416 (it was a 206 that promised one byte and sent none), and
 a HEAD with `Range` answers 206 (it answered 200).
 
+### Fixed — Backends does not offer a key change that the server refuses
+
+While a backend's legacy (decrypt-only) key slot held an older key, the
+Backends page offered **Rotate key** and a mode change. The server refuses
+both, because the current key has no free slot to move to. The operator
+saw the refusal only after generating and storing a new key. Now both
+controls are disabled, and the page says to clear the legacy key first. A
+conflict with another tab or admin on these changes now says so, instead
+of "Re-encryption proposal failed".
+
 ### Fixed — The setup wizard shows a failed connection test
 
 When the setup wizard's **Test connection** request failed with a network
