@@ -298,15 +298,19 @@ function ProviderComparison({ sourceGb, storedGb, selectedId, onSelect }: Provid
               {p.currency === 'EUR' && <span className="provider-eur">€</span>}
               {p.archive && <span className="provider-archive">archive</span>}
             </button>
+            {/* Values sit beside the bar end, never inside the bar. The
+                longest bar takes 82% of the track, so its value still fits. */}
             <div className="provider-bars">
-              <div className="provider-bar provider-bar-today" style={{ width: `${(today / max) * 100}%` }}>
-                <span>{fmt(today)}</span>
+              <div className="provider-bar-line">
+                <div className="provider-bar provider-bar-today" style={{ width: `${(today / max) * 82}%` }} />
+                <span className="provider-val">{fmt(today)}</span>
               </div>
-              <div
-                className="provider-bar provider-bar-dgp"
-                style={{ width: `${Math.max((dgp / max) * 100, 1.5)}%` }}
-              >
-                <span>{fmt(dgp)}</span>
+              <div className="provider-bar-line">
+                <div
+                  className="provider-bar provider-bar-dgp"
+                  style={{ width: `${Math.max((dgp / max) * 82, 0.5)}%` }}
+                />
+                <span className="provider-val provider-val-dgp">{fmt(dgp)}</span>
               </div>
             </div>
           </li>

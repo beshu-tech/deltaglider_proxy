@@ -491,9 +491,9 @@
 .provider-compare {
   margin-top: 1.25rem;
   padding: 1.1rem 1.25rem 1rem;
-  background: var(--scrim);
+  background: var(--surface-sunk);
   border: 1px solid var(--rule);
-  border-radius: 10px;
+  border-radius: var(--r-md);
 }
 
 .provider-compare-head {
@@ -502,9 +502,8 @@
   align-items: baseline;
   gap: 0.75rem;
   flex-wrap: wrap;
-  font-family: var(--font-mono);
-  font-size: 0.78rem;
-  letter-spacing: 0.02em;
+  font-size: var(--fs-label);
+  font-weight: 700;
   color: var(--ink-soft);
   margin-bottom: 0.9rem;
 }
@@ -513,7 +512,8 @@
   display: inline-flex;
   align-items: center;
   gap: 0.35rem;
-  font-size: 0.72rem;
+  font-size: var(--fs-label);
+  font-weight: 500;
   color: var(--ink-soft);
 }
 
@@ -525,7 +525,7 @@
 }
 
 .provider-compare-legend .dot-today {
-  background: var(--rule-strong);
+  background: var(--neutral-data);
 }
 
 .provider-compare-legend .dot-dgp {
@@ -548,7 +548,7 @@
   align-items: center;
   gap: 0.75rem;
   padding: 0.35rem 0.5rem;
-  border-radius: 6px;
+  border-radius: var(--r-sm);
   transition: background 0.15s ease;
 }
 
@@ -599,33 +599,33 @@
   min-width: 0;
 }
 
-.provider-bar {
-  height: 17px;
-  border-radius: 3px;
+.provider-bar-line {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
-  padding-right: 6px;
-  min-width: fit-content;
-  box-sizing: border-box;
+  gap: 6px;
+  min-width: 0;
 }
 
-.provider-bar span {
+/* Filled bars, one colour per role (site-design-audit §2.8): neutral =
+   today's full copies, brand = with DeltaGlider. */
+.provider-bar {
+  flex: 0 0 auto;
+  height: 14px;
+  min-width: 2px;
+  border-radius: 4px;
+}
+
+.provider-bar-today { background: var(--neutral-data); }
+.provider-bar-dgp { background: var(--brand); }
+
+.provider-val {
   font-family: var(--font-mono);
-  font-size: 0.68rem;
+  font-size: 0.75rem;
   font-weight: 600;
+  color: var(--ink-soft);
   white-space: nowrap;
 }
-
-.provider-bar-today {
-  background: var(--rule-strong);
-  color: var(--ink-strong);
-}
-
-.provider-bar-dgp {
-  background: var(--brand-fill);
-  color: var(--bg);
-}
+.provider-val-dgp { color: var(--brand); }
 
 .provider-compare-note {
   margin: 0.9rem 0 0;
@@ -744,11 +744,11 @@
   }
 
   .provider-bar {
-    height: 20px;
+    height: 16px;
   }
 
-  .provider-bar span {
-    font-size: 0.75rem;
+  .provider-val {
+    font-size: 0.8125rem;
   }
 
   .provider-compare-note {
