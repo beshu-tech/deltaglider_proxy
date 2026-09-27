@@ -58,6 +58,16 @@ value, so the two variables had no effect on a replication run:
 `DGP_REPLICATION_TRANSFERS` had no effect at all. Now each variable overrides
 its field, as every other `DGP_*` variable overrides the file.
 
+### Added — The docs are easy to give to an LLM
+
+The documentation website publishes `/llms.txt` (an index of every page in the
+llmstxt.org format) and `/llms-full.txt` (all pages in one file). Every page is
+also plain markdown at its URL plus `.md`, for example
+`/docs/reference/configuration.md`. Each page has a "Copy page" button that
+copies its markdown, and "Open in ChatGPT" and "Open in Claude" links. The docs
+inside the product also have a "Copy page" button; they do not link to outside
+services.
+
 ### Fixed — A refused `/config/validate` keeps the warnings of `/config/apply`
 
 When the secret preservation, the config check, or a lifecycle/replication
