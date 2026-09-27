@@ -258,6 +258,10 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
         secret_access_key: state.s3SecretKey || undefined,
       });
       setTestResult(result);
+    } catch (e) {
+      // A thrown test (network error, 5xx) is a failed test: show it, and
+      // keep Next blocked.
+      setTestResult({ success: false, error: normalizeUiError(e, 'Connection test failed') });
     } finally {
       setTesting(false);
     }

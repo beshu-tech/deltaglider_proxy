@@ -249,6 +249,12 @@ that does not match serves the whole object with 200. A suffix range on an
 empty object is 416 (it was a 206 that promised one byte and sent none), and
 a HEAD with `Range` answers 206 (it answered 200).
 
+### Fixed — The setup wizard shows a failed connection test
+
+When the setup wizard's **Test connection** request failed with a network
+error or a server error, the spinner stopped and no message showed. Now
+the wizard shows the error, and **Next** stays disabled.
+
 ### Fixed — Screen readers name the admin form fields
 
 The admin forms showed each field's label as plain text that was not
