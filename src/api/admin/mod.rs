@@ -10,6 +10,7 @@ mod bucket_scan;
 mod config;
 pub mod csrf;
 mod delta_efficiency;
+mod error;
 mod event_outbox;
 pub mod external_auth;
 mod extract;
@@ -39,6 +40,8 @@ use crate::iam::SharedIamState;
 use crate::rate_limiter::RateLimiter;
 use crate::session::SessionStore;
 use crate::usage_scanner::UsageScanner;
+
+pub use error::{AdminError, Bare, ErrorBody, JsonError, Text};
 
 // Re-export everything so external code doesn't need import changes.
 pub use audit::get_audit;
@@ -289,29 +292,7 @@ where
     })
 }
 
-/// Pure: the HTTP status of a config-DB error. A missing row is the
-/// caller's 404 (also a FOREIGN KEY failure: the request names a user or
-/// group that does not exist), a UNIQUE violation its 409; only the rest
-/// is a 500. Every admin handler maps DB errors through it (source guard
-/// `admin_db_errors_map_through_db_error_status`).
-pub(crate) fn db_error_status(e: &crate::config_db::ConfigDbError) -> axum::http::StatusCode {
-    use crate::config_db::{classify_sqlite_error, ConfigDbError, SqliteErrorClass};
-    use axum::http::StatusCode;
-    match e {
-        ConfigDbError::NotFound(_) => StatusCode::NOT_FOUND,
-        ConfigDbError::Sqlite(rusqlite::Error::SqliteFailure(f, _))
-            if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY =>
-        {
-            StatusCode::NOT_FOUND
-        }
-        ConfigDbError::Sqlite(se) => match classify_sqlite_error(se) {
-            SqliteErrorClass::NotFound => StatusCode::NOT_FOUND,
-            SqliteErrorClass::Conflict => StatusCode::CONFLICT,
-            SqliteErrorClass::Other => StatusCode::INTERNAL_SERVER_ERROR,
-        },
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    }
-}
+pub(crate) use error::db_error_status;
 
 /// [`db_error_status`] with the error text, for handlers that answer
 /// `(StatusCode, String)`.
@@ -407,50 +388,5 @@ mod tests {
         ];
 
         assert_eq!(next_copy_name("reader", existing), "reader (copy3)");
-    }
-}
-
-#[cfg(test)]
-mod db_error_status_tests {
-    use super::db_error_status;
-    use crate::config_db::ConfigDbError;
-    use axum::http::StatusCode;
-
-    #[test]
-    fn db_error_status_truth_table() {
-        assert_eq!(
-            db_error_status(&ConfigDbError::NotFound("provider 9".into())),
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(
-            db_error_status(&ConfigDbError::Sqlite(rusqlite::Error::QueryReturnedNoRows)),
-            StatusCode::NOT_FOUND
-        );
-        let unique = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ErrorCode::ConstraintViolation,
-                extended_code: rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE,
-            },
-            Some("UNIQUE constraint failed: auth_providers.name".into()),
-        );
-        assert_eq!(
-            db_error_status(&ConfigDbError::Sqlite(unique)),
-            StatusCode::CONFLICT
-        );
-        let fk = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ErrorCode::ConstraintViolation,
-                extended_code: rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY,
-            },
-            Some("FOREIGN KEY constraint failed".into()),
-        );
-        assert_eq!(
-            db_error_status(&ConfigDbError::Sqlite(fk)),
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(
-            db_error_status(&ConfigDbError::Other("broken".into())),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
     }
 }

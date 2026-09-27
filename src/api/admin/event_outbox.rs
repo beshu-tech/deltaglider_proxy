@@ -2,7 +2,7 @@
 
 //! Admin diagnostics for the durable object-event outbox.
 
-use super::AdminState;
+use super::{AdminError, AdminState};
 use crate::api::admin::extract::{AdminJson, AdminQuery};
 use crate::event_delivery::known_status;
 use crate::event_outbox::{
@@ -10,7 +10,6 @@ use crate::event_outbox::{
     EventOutboxSort, EventOutboxSortOrder, EventOutboxStatusCounts,
 };
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -77,16 +76,15 @@ pub struct RequeueEventOutboxResponse {
 pub async fn list(
     AdminQuery(q): AdminQuery<EventOutboxQuery>,
     State(state): State<Arc<AdminState>>,
-) -> Result<Json<EventOutboxResponse>, (StatusCode, String)> {
+) -> Result<Json<EventOutboxResponse>, AdminError> {
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
     let offset = q.offset.unwrap_or(0);
     let status = q.status.map(|s| s.trim().to_ascii_lowercase());
     if let Some(status) = status.as_deref() {
         if !known_status(status) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("unknown outbox status: {status}"),
-            ));
+            return Err(AdminError::invalid(format!(
+                "unknown outbox status: {status}"
+            )));
         }
     }
     let sort_raw = q
@@ -95,56 +93,37 @@ pub async fn list(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("occurred_at");
-    let sort = EventOutboxSort::parse(sort_raw).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("unknown outbox sort field: {sort_raw}"),
-        )
-    })?;
+    let sort = EventOutboxSort::parse(sort_raw)
+        .ok_or_else(|| AdminError::invalid(format!("unknown outbox sort field: {sort_raw}")))?;
     let order_raw = q
         .order
         .as_deref()
         .map(str::trim)
         .map(str::to_ascii_lowercase)
         .unwrap_or_else(|| "desc".to_string());
-    let order = EventOutboxSortOrder::parse(&order_raw).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("unknown outbox sort order: {order_raw}"),
-        )
-    })?;
+    let order = EventOutboxSortOrder::parse(&order_raw)
+        .ok_or_else(|| AdminError::invalid(format!("unknown outbox sort order: {order_raw}")))?;
 
     let delivery = { state.config.read().await.event_delivery.clone() };
     let last = crate::event_delivery::last_outcome();
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "config DB not available".to_string(),
-            )
-        })?
+        .ok_or_else(AdminError::no_config_db)?
         .lock()
         .await;
 
-    let counts = db
-        .event_outbox_status_counts()
-        .map_err(super::db_error_reply)?;
-    let page = db
-        .event_outbox_list(DbEventOutboxListQuery {
-            status: status.as_deref(),
-            limit,
-            offset,
-            sort,
-            order,
-        })
-        .map_err(super::db_error_reply)?;
+    let counts = db.event_outbox_status_counts()?;
+    let page = db.event_outbox_list(DbEventOutboxListQuery {
+        status: status.as_deref(),
+        limit,
+        offset,
+        sort,
+        order,
+    })?;
 
     let ids: Vec<i64> = page.rows.iter().map(|r| r.id).collect();
-    let mut deliveries = db
-        .event_deliveries_for_many(&ids)
-        .map_err(super::db_error_reply)?;
+    let mut deliveries = db.event_deliveries_for_many(&ids)?;
     let labels = crate::event_delivery::endpoint_labels(&delivery);
     let rows = page
         .rows
@@ -186,29 +165,21 @@ pub async fn list(
 pub async fn requeue_one(
     Path(id): Path<i64>,
     State(state): State<Arc<AdminState>>,
-) -> Result<Json<RequeueEventOutboxResponse>, (StatusCode, String)> {
+) -> Result<Json<RequeueEventOutboxResponse>, AdminError> {
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "config DB not available".to_string(),
-            )
-        })?
+        .ok_or_else(AdminError::no_config_db)?
         .lock()
         .await;
 
     // Preserve `attempts` as delivery history. Requeue only moves a dead row
     // back to pending and makes it immediately claimable by the dispatcher.
-    let requeued = db
-        .event_outbox_requeue_failed(id, current_unix_seconds())
-        .map_err(super::db_error_reply)?;
+    let requeued = db.event_outbox_requeue_failed(id, current_unix_seconds())?;
 
     if !requeued {
-        return Err((
-            StatusCode::CONFLICT,
-            "event is not failed or does not exist".to_string(),
+        return Err(AdminError::conflict(
+            "event is not failed or does not exist",
         ));
     }
 
@@ -218,32 +189,24 @@ pub async fn requeue_one(
 pub async fn requeue_many(
     State(state): State<Arc<AdminState>>,
     AdminJson(req): AdminJson<RequeueEventOutboxRequest>,
-) -> Result<Json<RequeueEventOutboxResponse>, (StatusCode, String)> {
+) -> Result<Json<RequeueEventOutboxResponse>, AdminError> {
     if req.ids.is_empty() {
         return Ok(Json(RequeueEventOutboxResponse { requeued: 0 }));
     }
     if req.ids.len() > 500 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "cannot requeue more than 500 events at once".to_string(),
+        return Err(AdminError::invalid(
+            "cannot requeue more than 500 events at once",
         ));
     }
 
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "config DB not available".to_string(),
-            )
-        })?
+        .ok_or_else(AdminError::no_config_db)?
         .lock()
         .await;
 
-    let requeued = db
-        .event_outbox_requeue_failed_many(&req.ids, current_unix_seconds())
-        .map_err(super::db_error_reply)?;
+    let requeued = db.event_outbox_requeue_failed_many(&req.ids, current_unix_seconds())?;
 
     Ok(Json(RequeueEventOutboxResponse { requeued }))
 }
@@ -256,16 +219,11 @@ pub async fn requeue_many(
 pub async fn purge_failed(
     State(state): State<Arc<AdminState>>,
     headers: axum::http::HeaderMap,
-) -> Result<Json<PurgeFailedResponse>, (StatusCode, String)> {
+) -> Result<Json<PurgeFailedResponse>, AdminError> {
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "config DB not available".to_string(),
-            )
-        })?
+        .ok_or_else(AdminError::no_config_db)?
         .lock()
         .await;
 
@@ -292,23 +250,16 @@ pub async fn purge_failed(
             .unwrap_or(i64::MAX)
     };
 
-    let above = db
-        .event_outbox_failed_above_floor(min_keep_id)
-        .map_err(super::db_error_reply)?;
+    let above = db.event_outbox_failed_above_floor(min_keep_id)?;
     if above > 0 {
-        return Err((
-            StatusCode::CONFLICT,
-            format!(
-                "{above} failed event(s) are above the active replication cursor and \
+        return Err(AdminError::conflict(format!(
+            "{above} failed event(s) are above the active replication cursor and \
                  may still be consumed — requeue them or wait for replication to drain, \
                  then purge. Refusing to drop unconsumed events."
-            ),
-        ));
+        )));
     }
 
-    let purged = db
-        .event_outbox_purge_failed(min_keep_id)
-        .map_err(super::db_error_reply)?;
+    let purged = db.event_outbox_purge_failed(min_keep_id)?;
 
     crate::audit::audit_log("event_outbox_purge_failed", "admin", "", &headers, "", "");
     Ok(Json(PurgeFailedResponse { purged }))
