@@ -22,6 +22,7 @@
 //!       - `bootstrap_password_hash`
 //!       - `storage.access_key_id` / `storage.secret_access_key`
 //!       - `oauth_client_secrets[provider_name]`
+//!       - `iam_user_secrets[user_name]` (declarative `access.iam_users`)
 //!
 //! Operators commit the first two to git; `secrets.json` + any zip
 //! that contains it is a keystore.
@@ -345,6 +346,12 @@ struct BackupSecrets {
     /// Same, per named backend, keyed by backend name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     backend_encryption_named: BTreeMap<String, SecretsEncryption>,
+    /// Declarative IAM (`access.iam_users`): each user's secret access key,
+    /// keyed by user name. config.yaml has them redacted, so without these a
+    /// restore onto a fresh instance refuses the users. (iam.json already
+    /// carries the same keys.)
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    iam_user_secrets: BTreeMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
@@ -546,13 +553,7 @@ async fn export_zip(
             tracing::error!("Full-backup: config file view failed: {}", e);
             AdminError::internal(e.to_string())
         })?;
-        // OAuth client secrets (indexed by provider name, not id, so
-        // restore is robust across id reshuffles).
-        for p in &iam.auth_providers {
-            if let Some(cs) = &p.client_secret {
-                s.oauth_client_secrets.insert(p.name.clone(), cs.clone());
-            }
-        }
+        harvest_iam_secrets(&cfg, iam, &mut s);
         s
     };
 
@@ -852,6 +853,7 @@ fn harvest_config_secrets(
         storage_backends: Default::default(),
         oauth_client_secrets: Default::default(),
         event_delivery: None,
+        iam_user_secrets: Default::default(),
         backend_encryption: SecretsEncryption::harvest(&cfg.backend_encryption),
         backend_encryption_named: cfg
             .backends
@@ -914,6 +916,39 @@ fn harvest_config_secrets(
         });
     }
     Ok(s)
+}
+
+/// Add the IAM secrets that config.yaml redacts to `s`.
+///
+/// OAuth client secrets come from the IAM DB, keyed by provider name (not
+/// id), so a restore is robust across id reshuffles. Declarative users
+/// (`access.iam_users`) get their secret keyed by user name: the YAML value
+/// when it has one, else the DB's (a declarative apply with a blank secret
+/// keeps the DB's key, so the DB can be its only home). A `${env:NAME}` ref
+/// stays in config.yaml, so it needs no copy here.
+fn harvest_iam_secrets(cfg: &Config, iam: &IamBackup, s: &mut BackupSecrets) {
+    for p in &iam.auth_providers {
+        if let Some(cs) = &p.client_secret {
+            s.oauth_client_secrets.insert(p.name.clone(), cs.clone());
+        }
+    }
+    // No env var sets an IAM user, so the running config is the file view.
+    for u in &cfg.with_env_refs_reinserted().iam_users {
+        if crate::config::is_env_ref(&u.secret_access_key) {
+            continue;
+        }
+        let secret = Some(u.secret_access_key.as_str())
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                iam.users
+                    .iter()
+                    .find(|d| d.name == u.name)
+                    .map(|d| d.secret_access_key.as_str())
+            });
+        if let Some(sk) = secret.filter(|v| !v.is_empty()) {
+            s.iam_user_secrets.insert(u.name.clone(), sk.to_string());
+        }
+    }
 }
 
 /// Write the harvested secrets onto `cfg` (the restore half).
@@ -1005,6 +1040,22 @@ fn hydrate_config_with_backup_secrets(cfg: &mut Config, secrets: &BackupSecrets)
     for named in &mut cfg.backends {
         if let Some(e) = secrets.backend_encryption_named.get(&named.name) {
             e.hydrate(&mut named.encryption);
+        }
+    }
+
+    // Declarative IAM: fill only the slots the redacted export left empty.
+    for u in &mut cfg.iam_users {
+        if u.secret_access_key.is_empty() {
+            if let Some(sk) = secrets.iam_user_secrets.get(&u.name) {
+                u.secret_access_key.clone_from(sk);
+            }
+        }
+    }
+    for p in &mut cfg.auth_providers {
+        if p.client_secret.as_deref().unwrap_or("").is_empty() {
+            if let Some(cs) = secrets.oauth_client_secrets.get(&p.name) {
+                p.client_secret = Some(cs.clone());
+            }
         }
     }
 
@@ -1857,6 +1908,71 @@ mod tests {
         // Old secrets.json (no key fields) still parses.
         let old: BackupSecrets = serde_json::from_str("{}").unwrap();
         assert!(config_yaml_hydrated_for_restore(&exported, Some(&old)).is_ok());
+    }
+
+    /// N7: a full backup of a declarative-IAM config carries the users' and
+    /// the OIDC providers' secrets in secrets.json, and a restore fills them
+    /// into the redacted config.yaml. A `${env:NAME}` ref stays a ref, and
+    /// its value stays out of secrets.json.
+    #[test]
+    fn full_backup_round_trips_declarative_iam_secrets() {
+        const USER_SK: &str = "user-secret-literal-0001";
+        const REF_SK: &str = "user-secret-from-env-0002";
+        const CLIENT_SECRET: &str = "oidc-client-secret-0003";
+        const DB_ONLY_SK: &str = "dana-secret-in-db-only-0004";
+        let yaml = format!(
+            "access:\n  iam_mode: declarative\n  iam_users:\n    - name: ci-uploader\n      access_key_id: AKCIUPLOADER\n      secret_access_key: \"{USER_SK}\"\n    - name: backup-bot\n      access_key_id: AKBACKUPBOT\n      secret_access_key: \"{REF_SK}\"\n    - name: dana\n      access_key_id: AKDANA\n  auth_providers:\n    - name: corp-oidc\n      provider_type: oidc\n      client_id: dgp\n      client_secret: \"{CLIENT_SECRET}\"\n      issuer_url: https://id.example.com\n"
+        );
+        let mut cfg = crate::config::Config::from_yaml_str(&yaml).unwrap();
+        // backup-bot's key came from `${env:BACKUP_BOT_SK}` at load.
+        cfg.env_refs
+            .insert("BACKUP_BOT_SK".to_string(), REF_SK.to_string());
+        // The DB after the reconcile; dana's YAML secret is blank (a
+        // declarative apply with a blank secret keeps the DB's key).
+        let iam: IamBackup = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "users": [
+                {"name":"ci-uploader","access_key_id":"AKCIUPLOADER","secret_access_key":USER_SK,"enabled":true,"permissions":[],"group_ids":[]},
+                {"name":"backup-bot","access_key_id":"AKBACKUPBOT","secret_access_key":REF_SK,"enabled":true,"permissions":[],"group_ids":[]},
+                {"name":"dana","access_key_id":"AKDANA","secret_access_key":DB_ONLY_SK,"enabled":true,"permissions":[],"group_ids":[]}
+            ],
+            "groups": [],
+            "auth_providers": [
+                {"id":1,"name":"corp-oidc","provider_type":"oidc","enabled":true,"priority":0,"client_secret":CLIENT_SECRET,"created_at":"","updated_at":""}
+            ]
+        }))
+        .unwrap();
+        let mut secrets = harvest_config_secrets(&cfg).unwrap();
+        harvest_iam_secrets(&cfg, &iam, &mut secrets);
+        let json = serde_json::to_string(&secrets).unwrap();
+        assert!(json.contains(USER_SK), "{json}");
+        assert!(json.contains(CLIENT_SECRET), "{json}");
+        assert!(json.contains(DB_ONLY_SK), "{json}");
+        assert!(
+            !json.contains(REF_SK),
+            "an env value in secrets.json: {json}"
+        );
+
+        let exported = cfg.redact_all_secrets().to_canonical_yaml().unwrap();
+        assert!(!exported.contains(USER_SK) && !exported.contains(CLIENT_SECRET));
+        let restored = config_yaml_hydrated_for_restore(&exported, Some(&secrets)).unwrap();
+        let back = crate::config::Config::from_yaml_str(&restored).unwrap();
+        let sk = |n: &str| {
+            back.iam_users
+                .iter()
+                .find(|u| u.name == n)
+                .unwrap()
+                .secret_access_key
+                .clone()
+        };
+        assert_eq!(sk("ci-uploader"), USER_SK, "{restored}");
+        assert_eq!(sk("backup-bot"), "${env:BACKUP_BOT_SK}", "{restored}");
+        assert_eq!(sk("dana"), DB_ONLY_SK, "{restored}");
+        assert_eq!(
+            back.auth_providers[0].client_secret.as_deref(),
+            Some(CLIENT_SECRET),
+            "{restored}"
+        );
     }
 
     /// S16: a legacy backup (no `users[].id`) where Alice is in no group and

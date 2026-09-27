@@ -38,6 +38,15 @@ now ignores these variables, so a variable that an operator sets by mistake
 cannot slow down or break a production proxy. The startup warning still names
 every such variable that is set.
 
+### Fixed — A full backup of a declarative-IAM instance restores onto a fresh one
+
+The backup's `config.yaml` has the secret access keys of the users in
+`access.iam_users` redacted, and `secrets.json` did not hold them. So a restore
+onto a fresh instance failed with "user … has an empty secret_access_key". Now
+`secrets.json` holds these keys (and the client secrets of declarative OIDC
+providers), and the restore puts them back into the configuration. A key that
+is a `${env:NAME}` reference stays a reference.
+
 ### Fixed — A ZIP download stops reading when the client goes away
 
 The admin ZIP download noticed a closed connection only when it sent the next

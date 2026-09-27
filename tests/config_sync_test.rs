@@ -413,17 +413,9 @@ async fn failed_iam_phase_rolls_back_config_and_password() {
     );
 }
 
-/// H14c: a backup whose config is in declarative IAM mode reconciles the
-/// IAM DB to its YAML during the config phase. When the IAM phase then
-/// fails, the rollback also puts the GUI-mode DB back.
-#[tokio::test]
-async fn failed_restore_of_a_declarative_config_puts_the_iam_db_back() {
-    let source = TestServer::builder()
-        .auth("BKSRC3", "BKSRC3SECRET")
-        .build()
-        .await;
-    let sep = source.endpoint();
-    let src_admin = admin_http_client(&sep).await;
+/// Create `ci-uploader` in GUI mode, then flip the instance to declarative
+/// IAM (its live IAM becomes the YAML). Returns the user's key pair.
+async fn declarative_user(src_admin: &reqwest::Client, sep: &str) -> (String, String) {
     let resp = src_admin
         .post(format!("{sep}/_/api/admin/users"))
         .json(&json!({
@@ -435,6 +427,7 @@ async fn failed_restore_of_a_declarative_config_puts_the_iam_db_back() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 201);
     let created: serde_json::Value = resp.json().await.unwrap();
+    let key = created["access_key_id"].as_str().unwrap().to_string();
     let secret = created["secret_access_key"].as_str().unwrap().to_string();
     // Flip the source to declarative: its live IAM becomes the YAML.
     let exported = src_admin
@@ -478,6 +471,83 @@ async fn failed_restore_of_a_declarative_config_puts_the_iam_db_back() {
         "{}",
         resp.text().await.unwrap()
     );
+    (key, secret)
+}
+
+/// N7: a full backup of a declarative-IAM instance restores onto a fresh
+/// instance as it is. config.yaml has the users' secrets redacted, so
+/// secrets.json carries them and the restore fills them back.
+#[tokio::test]
+async fn full_backup_of_a_declarative_instance_restores_onto_a_fresh_one() {
+    let source = TestServer::builder()
+        .auth("BKSRC4", "BKSRC4SECRET")
+        .build()
+        .await;
+    let sep = source.endpoint();
+    let src_admin = admin_http_client(&sep).await;
+    let (key, secret) = declarative_user(&src_admin, &sep).await;
+    let zip = src_admin
+        .get(format!("{sep}/_/api/admin/backup"))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    // The redacted config.yaml keeps the secret out; secrets.json holds it.
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip.to_vec())).unwrap();
+    let mut read = |name: &str| {
+        use std::io::Read;
+        let mut s = String::new();
+        archive
+            .by_name(name)
+            .unwrap()
+            .read_to_string(&mut s)
+            .unwrap();
+        s
+    };
+    assert!(!read("config.yaml").contains(&secret));
+    assert!(read("secrets.json").contains(&secret));
+
+    let target = TestServer::builder()
+        .auth("BKDST4", "BKDST4SECRET")
+        .build()
+        .await;
+    let ep = target.endpoint();
+    let resp = admin_http_client(&ep)
+        .await
+        .post(format!("{ep}/_/api/admin/backup"))
+        .header("content-type", "application/zip")
+        .body(zip)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert!(status.is_success(), "{status} {body}");
+
+    let client = target.s3_client_with_creds(&key, &secret).await;
+    client
+        .list_buckets()
+        .send()
+        .await
+        .expect("the restored declarative user must authenticate");
+    let on_disk = std::fs::read_to_string(target.config_path()).unwrap();
+    assert!(on_disk.contains("iam_mode: declarative"), "{on_disk}");
+}
+
+/// H14c: a backup whose config is in declarative IAM mode reconciles the
+/// IAM DB to its YAML during the config phase. When the IAM phase then
+/// fails, the rollback also puts the GUI-mode DB back.
+#[tokio::test]
+async fn failed_restore_of_a_declarative_config_puts_the_iam_db_back() {
+    let source = TestServer::builder()
+        .auth("BKSRC3", "BKSRC3SECRET")
+        .build()
+        .await;
+    let sep = source.endpoint();
+    let src_admin = admin_http_client(&sep).await;
+    declarative_user(&src_admin, &sep).await;
     let zip = src_admin
         .get(format!("{sep}/_/api/admin/backup"))
         .send()
@@ -491,18 +561,6 @@ async fn failed_restore_of_a_declarative_config_puts_the_iam_db_back() {
             { "id": 1, "name": "dup", "permissions": [], "member_ids": [] },
             { "id": 2, "name": "dup", "permissions": [], "member_ids": [] }
         ]);
-    });
-    // The export redacts the declarative user's secret; put it in, so the
-    // config phase reconciles the target DB.
-    let zip = zip_edit(&zip, |files| {
-        let (_, yaml) = files.iter_mut().find(|(n, _)| n == "config.yaml").unwrap();
-        let mut doc: serde_yaml::Value = serde_yaml::from_slice(yaml).unwrap();
-        for u in doc["access"]["iam_users"].as_sequence_mut().unwrap() {
-            if u["name"] == "ci-uploader" {
-                u["secret_access_key"] = secret.clone().into();
-            }
-        }
-        *yaml = serde_yaml::to_string(&doc).unwrap().into_bytes();
     });
 
     let target = TestServer::builder()
