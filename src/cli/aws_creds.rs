@@ -491,4 +491,203 @@ region = us-east-2
             other => panic!("expected ProfileNotFound, got {other:?}"),
         }
     }
+
+    // ── Precedence pins ────────────────────────────────────────────
+    // Characterisation tests: they pin the chain as it is, per field.
+
+    fn write_creds_file(dir: &tempfile::TempDir, body: &str) -> PathBuf {
+        let path = dir.path().join("creds");
+        std::fs::write(&path, body).unwrap();
+        std::env::set_var("AWS_SHARED_CREDENTIALS_FILE", &path);
+        path
+    }
+
+    #[test]
+    fn resolve_fills_each_field_on_its_own() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::capture_and_clear();
+        let dir = tempfile::tempdir().unwrap();
+        write_creds_file(
+            &dir,
+            "[default]\naws_access_key_id = file-ak\naws_secret_access_key = file-sk\n\
+             aws_session_token = file-tok\nregion = file-region\n",
+        );
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "env-sk");
+
+        let r = resolve(CredsInputs {
+            access_key_flag: Some("flag-ak"),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(r.access_key_id, "flag-ak");
+        assert_eq!(r.secret_access_key, "env-sk");
+        assert_eq!(r.session_token.as_deref(), Some("file-tok"));
+        assert_eq!(r.region.as_deref(), Some("file-region"));
+        assert_eq!(r.source, CredsSource::Mixed);
+    }
+
+    #[test]
+    fn resolve_env_beats_file_and_file_fills_the_region() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::capture_and_clear();
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_creds_file(
+            &dir,
+            "[default]\naws_access_key_id = file-ak\naws_secret_access_key = file-sk\n\
+             region = file-region\n",
+        );
+        std::env::set_var("AWS_ACCESS_KEY_ID", "env-ak");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "env-sk");
+
+        let r = resolve(CredsInputs::default()).unwrap();
+        assert_eq!(r.access_key_id, "env-ak");
+        assert_eq!(r.secret_access_key, "env-sk");
+        assert_eq!(r.region.as_deref(), Some("file-region"));
+        // Both keys from env, but the file was read (for the region):
+        // the tag says ProfileFile only when NO key came from a flag.
+        assert_eq!(
+            r.source,
+            CredsSource::ProfileFile {
+                path,
+                profile: "default".into()
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_skips_the_file_when_keys_and_region_are_set() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::capture_and_clear();
+        let dir = tempfile::tempdir().unwrap();
+        // A profile that does not exist would be an error if the file
+        // were read.
+        write_creds_file(&dir, "[default]\naws_access_key_id = file-ak\n");
+        std::env::set_var("AWS_ACCESS_KEY_ID", "env-ak");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "env-sk");
+
+        let r = resolve(CredsInputs {
+            profile_flag: Some("absent"),
+            region_flag: Some("flag-region"),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(r.region.as_deref(), Some("flag-region"));
+        assert_eq!(r.source, CredsSource::Env);
+    }
+
+    #[test]
+    fn resolve_region_flag_then_aws_region_then_aws_default_region() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::capture_and_clear();
+        std::env::set_var("AWS_ACCESS_KEY_ID", "ak");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "sk");
+        std::env::set_var("AWS_REGION", "r-region");
+        std::env::set_var("AWS_DEFAULT_REGION", "r-default");
+
+        let flag = resolve(CredsInputs {
+            region_flag: Some("r-flag"),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(flag.region.as_deref(), Some("r-flag"));
+
+        let env = resolve(CredsInputs::default()).unwrap();
+        assert_eq!(env.region.as_deref(), Some("r-region"));
+
+        std::env::remove_var("AWS_REGION");
+        let dflt = resolve(CredsInputs::default()).unwrap();
+        assert_eq!(dflt.region.as_deref(), Some("r-default"));
+    }
+
+    #[test]
+    fn resolve_profile_flag_then_aws_profile_then_default() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::capture_and_clear();
+        let dir = tempfile::tempdir().unwrap();
+        write_creds_file(
+            &dir,
+            "[default]\naws_access_key_id = d-ak\naws_secret_access_key = d-sk\n\
+             [envp]\naws_access_key_id = e-ak\naws_secret_access_key = e-sk\n\
+             [flagp]\naws_access_key_id = f-ak\naws_secret_access_key = f-sk\n",
+        );
+
+        let d = resolve(CredsInputs::default()).unwrap();
+        assert_eq!(d.access_key_id, "d-ak");
+
+        std::env::set_var("AWS_PROFILE", "envp");
+        let e = resolve(CredsInputs::default()).unwrap();
+        assert_eq!(e.access_key_id, "e-ak");
+
+        let f = resolve(CredsInputs {
+            profile_flag: Some("flagp"),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(f.access_key_id, "f-ak");
+        assert_eq!(f.secret_access_key, "f-sk");
+    }
+
+    #[test]
+    fn resolve_ignores_empty_flags_and_empty_env() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::capture_and_clear();
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_creds_file(
+            &dir,
+            "[default]\naws_access_key_id = file-ak\naws_secret_access_key = file-sk\n",
+        );
+        std::env::set_var("AWS_ACCESS_KEY_ID", "");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "env-sk");
+
+        let r = resolve(CredsInputs {
+            access_key_flag: Some(""),
+            secret_key_flag: Some(""),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(r.access_key_id, "file-ak");
+        assert_eq!(r.secret_access_key, "env-sk");
+        // Keys from env and file, none from a flag: tagged as the file.
+        assert_eq!(
+            r.source,
+            CredsSource::ProfileFile {
+                path,
+                profile: "default".into()
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_takes_the_env_session_token_with_flag_keys() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::capture_and_clear();
+        let dir = tempfile::tempdir().unwrap();
+        write_creds_file(&dir, "[default]\naws_session_token = file-tok\n");
+        std::env::set_var("AWS_SESSION_TOKEN", "env-tok");
+
+        let r = resolve(CredsInputs {
+            access_key_flag: Some("ak"),
+            secret_key_flag: Some("sk"),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(r.session_token.as_deref(), Some("env-tok"));
+        assert_eq!(r.source, CredsSource::Flag);
+    }
+
+    #[test]
+    fn resolve_without_a_file_falls_through_to_missing_secret() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::capture_and_clear();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("AWS_SHARED_CREDENTIALS_FILE", dir.path().join("none"));
+
+        let err = resolve(CredsInputs {
+            access_key_flag: Some("ak"),
+            profile_flag: Some("anything"),
+            ..Default::default()
+        })
+        .expect_err("must fail");
+        assert_eq!(err, CredsError::MissingSecretKey);
+    }
 }
