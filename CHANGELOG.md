@@ -354,6 +354,12 @@ So the total covered only the objects after the cursor, and the progress
 bar reached 99 % long before the end. Now the resumed count starts from
 the count that was saved with the cursor.
 
+### Changed — operator 0.3.0
+
+The `DeltaGliderProxy` CRD gains `spec.router.trustedProxyCidrs`, so the
+operator is now 0.3.0 (`deploy/operator.yaml` pins that image). Apply the
+new `deploy/crd.yaml` before you upgrade the operator.
+
 ### Fixed — The bucket busy banner is shown only to users who may list the bucket
 
 `GET /_/api/admin/jobs/bucket/:bucket` answered any browser session for
