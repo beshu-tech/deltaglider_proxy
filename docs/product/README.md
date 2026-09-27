@@ -28,7 +28,7 @@ Three hands-on tutorials, each a complete session from nothing to a working resu
 
 Task-shaped guides, grouped by what you're touching:
 
-- **Deploy and operate** — [go to production](how-to/go-to-production.md), [deploy with Docker Compose](how-to/deploy-with-docker-compose.md), [deploy on Kubernetes](how-to/deploy-on-kubernetes.md), [troubleshooting](how-to/troubleshooting.md). Also: TLS, upgrades, backups, HA, Prometheus, request tracing.
+- **Deploy and operate** — [go to production](how-to/go-to-production.md), [deploy with Docker Compose](how-to/deploy-with-docker-compose.md), [deploy on Kubernetes](how-to/deploy-on-kubernetes.md), [troubleshooting](how-to/troubleshooting.md), [upgrade to 2.0](how-to/upgrade-to-2-0.md). Also: TLS, other upgrades, backups, HA, Prometheus, request tracing.
 - **Storage** — [route a bucket to a backend](how-to/route-a-bucket-to-a-backend.md), [migrate existing data into the proxy](how-to/migrate-existing-data-into-the-proxy.md), [encrypt data at rest](how-to/encrypt-data-at-rest.md), [replicate a bucket](how-to/replicate-a-bucket.md). Also: quotas and compression policy, bucket migration, lifecycle, key rotation, event notifications.
 - **Access** — [create IAM users](how-to/create-iam-users.md), [set up SSO](how-to/set-up-sso.md), [restrict access with conditions](how-to/restrict-access-with-conditions.md), [publish a public folder](how-to/publish-a-public-folder.md). Also: IAM as code, admission rules.
 
