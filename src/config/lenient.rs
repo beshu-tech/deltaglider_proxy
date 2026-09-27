@@ -385,11 +385,7 @@ mod tests {
     fn bool_fields_of_tagged_enums_accept_env_strings() {
         let mut offenders = Vec::new();
         for file in ["src/config/mod.rs", "src/config_sections.rs"] {
-            let text = std::fs::read_to_string(
-                concat!(env!("CARGO_MANIFEST_DIR"), "/").to_string() + file,
-            )
-            .unwrap();
-            let text = crate::source_scan::prod_text(&text);
+            let text = crate::source_scan::prod_text(&crate::source_scan::read(file));
             let text = text.as_str();
             for part in text
                 .split("#[serde(tag")

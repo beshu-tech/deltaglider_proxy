@@ -63,20 +63,31 @@ pub(crate) mod source_scan {
 
     /// Every `.rs` file under `dir` (relative to the crate root), sorted.
     pub(crate) fn rust_files(dir: &str) -> Vec<PathBuf> {
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        files(dir, "rs")
+    }
+
+    /// Every file with extension `ext` under `dir` (relative to the crate
+    /// root), sorted. THE walker: no guard keeps its own.
+    pub(crate) fn files(dir: &str, ext: &str) -> Vec<PathBuf> {
+        fn walk(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
             for entry in std::fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();
                 if path.is_dir() {
-                    walk(&path, out);
-                } else if path.extension().is_some_and(|e| e == "rs") {
+                    walk(&path, ext, out);
+                } else if path.extension().is_some_and(|e| e == ext) {
                     out.push(path);
                 }
             }
         }
         let mut out = Vec::new();
-        walk(&root().join(dir), &mut out);
+        walk(&root().join(dir), ext, &mut out);
         out.sort();
         out
+    }
+
+    /// The text of `path` (relative to the crate root).
+    pub(crate) fn read(path: &str) -> String {
+        std::fs::read_to_string(root().join(path)).unwrap_or_else(|e| panic!("{path}: {e}"))
     }
 
     /// `path` relative to the crate root, with `/` separators.
@@ -373,20 +384,8 @@ mod schema_conformance {
     /// `# validate` blocks of `docs/product` (what `check-docs-yaml-examples.sh`
     /// lints), as `(file:line, yaml)`.
     fn docs_validate_blocks() -> Vec<(String, String)> {
-        fn md_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            for e in std::fs::read_dir(dir).unwrap() {
-                let p = e.unwrap().path();
-                if p.is_dir() {
-                    md_files(&p, out);
-                } else if p.extension().is_some_and(|x| x == "md") {
-                    out.push(p);
-                }
-            }
-        }
-        let mut files = Vec::new();
-        md_files(&crate::source_scan::root().join("docs/product"), &mut files);
         let mut out = Vec::new();
-        for f in files {
+        for f in crate::source_scan::files("docs/product", "md") {
             let text = std::fs::read_to_string(&f).unwrap();
             let lines: Vec<&str> = text.lines().collect();
             let mut i = 0;
@@ -949,6 +948,36 @@ mod source_guards {
         assert!(
             missing.is_empty(),
             "fields missing from deltaglider_proxy.example.yaml: {missing:?}"
+        );
+    }
+
+    /// Every integration-test spawn of the proxy binary sets `current_dir`.
+    /// The proxy writes state files (`.deltaglider_bootstrap_hash`, and the
+    /// config DB and its key file when `DGP_CONFIG` is unset) relative to
+    /// its cwd. A spawn that inherits the test process's cwd writes them
+    /// into the repo root, where a later dev run of the binary picks them up.
+    #[test]
+    fn integration_test_spawns_set_current_dir() {
+        // Built at runtime so this file does not match itself.
+        let bin_needle = format!("Command::new(env!(\"{}", "CARGO_BIN_EXE");
+        let files = rust_files("tests");
+        assert!(files.len() > 50, "scan found tests/ ({})", files.len());
+        let mut offenders = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let spawns =
+                text.matches(&bin_needle).count() + text.matches("Command::new(BIN)").count();
+            let cwds = text.matches(".current_dir(").count();
+            if spawns > cwds {
+                offenders.push(format!(
+                    "{}: {spawns} spawn(s), {cwds} current_dir",
+                    rel_path(&file)
+                ));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "spawn the proxy with .current_dir(<temp dir>): {offenders:?}"
         );
     }
 

@@ -2245,21 +2245,7 @@ mod transition_lock_guard {
     /// on that shape.
     #[test]
     fn every_transition_caller_holds_the_config_write_lock() {
-        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            for e in std::fs::read_dir(dir).unwrap().flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().is_some_and(|x| x == "rs") {
-                    out.push(p);
-                }
-            }
-        }
-        let mut files = Vec::new();
-        walk(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut files,
-        );
+        let files = crate::source_scan::rust_files("src");
         let call = concat!("apply_config_transition", "(");
         let mut bad = Vec::new();
         let mut calls = 0;

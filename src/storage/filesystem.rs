@@ -3005,8 +3005,7 @@ mod tests {
     /// backend root (`new`) and `create_bucket` may call it.
     #[test]
     fn only_new_and_create_bucket_call_create_dir_all() {
-        let src = include_str!("filesystem.rs");
-        let prod = src.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        let prod = crate::source_scan::prod_text(include_str!("filesystem.rs"));
         let calls = prod
             .lines()
             .filter(|l| !l.trim_start().starts_with("//") && l.contains("create_dir_all("))

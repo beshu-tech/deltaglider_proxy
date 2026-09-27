@@ -164,8 +164,6 @@ mod s3_edge_semantics_test;
 mod s3_integration_test;
 #[path = "savings_test.rs"]
 mod savings_test;
-#[path = "spawn_cwd_guard_test.rs"]
-mod spawn_cwd_guard_test;
 #[path = "status_endpoints_test.rs"]
 mod status_endpoints_test;
 #[path = "storage_resilience_test.rs"]
