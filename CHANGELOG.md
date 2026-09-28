@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed — The replication rule's Enabled help names the real switch
+
+The help of a replication rule's **Enabled** switch said that "the global
+scheduler" must also be on, but no control in the admin UI sets it. The help
+now says that the rule runs on its own only while
+`storage.replication.enabled` is on, that it is on by default, and that only
+YAML sets it.
+
 ### Fixed — IAM hints point at the real backup button
 
 The section YAML preview of **Access** and the banner on the IAM pages sent

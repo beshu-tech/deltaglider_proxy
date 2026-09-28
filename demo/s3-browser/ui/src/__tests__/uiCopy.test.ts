@@ -26,3 +26,11 @@ test('texts that point at the backup name System → System', () => {
   }
   expect(src('components/RecoveryPanel.tsx')).toContain('Download backup');
 });
+
+// No admin control sets storage.replication.enabled (default true), so the
+// rule's help must not send the operator to a "global scheduler" switch.
+test('replication Enabled help names the YAML-only switch', () => {
+  const s = src('components/ReplicationRuleFields.tsx');
+  expect(s).not.toContain('The global scheduler must also be enabled');
+  expect(s).toContain('storage.replication.enabled');
+});

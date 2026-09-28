@@ -42,7 +42,7 @@ export default function ReplicationRuleFields({
         <FormField
           label="Enabled"
           yamlPath="storage.replication.rules[].enabled"
-          helpText="Per-rule toggle. The global scheduler must also be enabled for this rule to run automatically."
+          helpText="Per-rule switch. The rule runs on its own only while replication is on for the proxy: storage.replication.enabled, which is on by default and is set only in YAML."
         >
           <Switch checked={rule.enabled} onChange={(enabled) => onChange({ enabled })} />
         </FormField>
