@@ -439,7 +439,7 @@ export const ACCESS_SHOTS: Shot[] = [
   {
     id: 'admission-trace-deny',
     route: '/_/admin/diagnostics/trace',
-    alt: 'The rule tester shows that an anonymous PUT of downloads/public/installer.zip is denied; the box marks the decision and the rule deny-anonymous-writes-downloads that made it.',
+    alt: 'The request rule tester shows that an anonymous PUT of downloads/public/installer.zip is denied; the box marks the decision and the rule deny-anonymous-writes-downloads that made it.',
     setup: async (page) => {
       await page.locator('label.ant-radio-button-wrapper', { hasText: /^PUT$/ }).click();
       await page.getByPlaceholder('/my-bucket/some/key').fill('/downloads/public/installer.zip');

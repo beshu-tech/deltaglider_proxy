@@ -9,7 +9,7 @@ export const OBSERVABILITY_SHOTS: Shot[] = [
   {
     id: 'rule-tester',
     route: '/_/admin/diagnostics/trace',
-    alt: 'The rule tester shows that an anonymous GET of downloads/public/installer.sh is allowed; the box marks the decision and the rule that made it.',
+    alt: 'The request rule tester shows that an anonymous GET of downloads/public/installer.sh is allowed; the box marks the decision and the rule that made it.',
     setup: async (page) => {
       await page.getByPlaceholder('/my-bucket/some/key').fill('/downloads/public/installer.sh');
       await page.getByRole('button', { name: 'Test request' }).click();

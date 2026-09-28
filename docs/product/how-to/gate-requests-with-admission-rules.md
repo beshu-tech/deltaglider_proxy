@@ -87,7 +87,7 @@ The same tool is in the admin UI:
 1. In the sidebar, open **Observability → Request rule tester** (`/_/admin/diagnostics/trace`).
 2. Select `PUT` in **Method**, type `/downloads/public/installer.zip` in **Path**, leave **Authenticated** off, and click **Test request**. **Decision** shows `deny` by the rule `deny-anonymous-writes-downloads`.
 
-   ![The rule tester shows that an anonymous PUT of downloads/public/installer.zip is denied; the box marks the decision and the rule deny-anonymous-writes-downloads that made it.](/_/screenshots/admission-trace-deny.webp)
+   ![The request rule tester shows that an anonymous PUT of downloads/public/installer.zip is denied; the box marks the decision and the rule deny-anonymous-writes-downloads that made it.](/_/screenshots/admission-trace-deny.webp)
 
 The result also shows the **Reason path**, the **Resolved request**, and a **Copy as JSON** button. For every `allow-anonymous` decision it also shows an **Anonymous access** box, which names what the anonymous caller may do: the one object that it may read, the bucket and prefix that it may list, or the public prefixes of the bucket. For a write, the box says that nothing is granted. The CLI result carries the same information in the `anonymous_grant` field.
 

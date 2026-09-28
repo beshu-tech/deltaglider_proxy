@@ -24,7 +24,7 @@ Three front doors lead to the same evaluator, and none of them touches real data
 
 **Admin UI:** open **Observability → Request rule tester** (`/_/admin/diagnostics/trace`). Fill in **Method**, **Path**, and optionally **Query string** and **Source IP**, set **Authenticated**, and click **Test request**. The panel shows the decision and the reason path, and **Copy as JSON** copies the whole result.
 
-![The rule tester shows that an anonymous GET of downloads/public/installer.sh is allowed; the box marks the decision and the rule that made it.](/_/screenshots/rule-tester.webp)
+![The request rule tester shows that an anonymous GET of downloads/public/installer.sh is allowed; the box marks the decision and the rule that made it.](/_/screenshots/rule-tester.webp)
 
 **CLI:**
 

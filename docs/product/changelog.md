@@ -984,7 +984,7 @@ When the proxy refuses the provider with `422` (for example, an issuer URL
 on a private address without `allow_local`), the form shows the reason
 inline instead of in a short-lived toast.
 
-### Added — The rule tester shows what an anonymous caller may do
+### Added — The request rule tester shows what an anonymous caller may do
 
 The trace response carries `anonymous_grant`, but the admin UI showed only
 the decision. So `allow-anonymous` on a `PUT` looked like an allowed upload,
