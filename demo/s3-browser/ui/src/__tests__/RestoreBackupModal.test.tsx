@@ -39,11 +39,11 @@ describe('RestoreBackupModal', () => {
   // Batch-D audit: the help said a full restore "fails if the backup's admin
   // password does not match"; the server ADOPTS the backup's hash
   // (backup.rs plan_bootstrap_restore), and Config only restores it too
-  // (ImportMode::restores_bootstrap = Full | ConfigOnly).
+  // Only "full" restores it (ImportMode::restores_bootstrap = Full).
   test('the help says which modes restore the admin password', () => {
     renderWithQuery(<RestoreBackupModal file={file} onCancel={() => {}} onRestore={() => {}} />);
     expect(screen.queryByText(/does not match/)).not.toBeInTheDocument();
     expect(screen.getByText(/Everything in the backup\. This instance takes the backup's admin password/)).toBeInTheDocument();
-    expect(screen.getByText(/Config, backends, bucket policies and the admin password/)).toBeInTheDocument();
+    expect(screen.getByText(/Config, backends and bucket policies\. Users, groups, OIDC providers and the admin password stay as they are\./)).toBeInTheDocument();
   });
 });

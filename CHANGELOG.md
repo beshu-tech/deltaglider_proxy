@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Changed — A "Config only" restore keeps the admin password
+
+A backup restore with `mode=config-only` also replaced the admin password of
+the instance with the one in the backup. That did not match the name of the
+mode, and "Everything, including the admin password" (`mode=full`) exists for
+that purpose. A config-only restore now keeps the admin password of this
+instance. Only `mode=full` restores the admin password.
+
 ### Fixed — A read-only config file is visible in the admin GUI
 
 Docker Compose (`:ro`), the Helm chart and the operator mount the config file

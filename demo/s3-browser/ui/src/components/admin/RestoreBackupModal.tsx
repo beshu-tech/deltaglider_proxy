@@ -23,7 +23,7 @@ const MODES: { mode: ImportBackupMode; label: string; help: string; iam: boolean
   {
     mode: 'config-only',
     label: 'Config only',
-    help: "Config, backends, bucket policies and the admin password. Users, groups and OIDC providers stay as they are.",
+    help: 'Config, backends and bucket policies. Users, groups, OIDC providers and the admin password stay as they are.',
     iam: false,
   },
   {

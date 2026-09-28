@@ -131,6 +131,7 @@ enum ImportMode {
     PreserveBootstrap,
     /// Restore IAM/OAuth only; leave config and secrets untouched.
     IamOnly,
+    /// Restore config + secrets, not IAM; keep local bootstrap_password_hash.
     ConfigOnly,
 }
 
@@ -150,7 +151,7 @@ impl ImportMode {
     }
 
     fn restores_bootstrap(self) -> bool {
-        matches!(self, ImportMode::Full | ImportMode::ConfigOnly)
+        matches!(self, ImportMode::Full)
     }
 }
 
@@ -2087,6 +2088,12 @@ mod tests {
         assert!(!ImportMode::IamOnly.restores_config());
         assert!(ImportMode::IamOnly.restores_iam());
         assert!(!ImportMode::IamOnly.restores_bootstrap());
+
+        // "Config only" keeps this instance's admin password: only "full"
+        // (Everything, including the admin password) restores it.
+        assert!(ImportMode::ConfigOnly.restores_config());
+        assert!(!ImportMode::ConfigOnly.restores_iam());
+        assert!(!ImportMode::ConfigOnly.restores_bootstrap());
     }
 
     #[test]
