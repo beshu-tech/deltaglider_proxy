@@ -53,7 +53,7 @@ export default function ApplyDialog({
 
   if (!response) return null;
 
-  const { ok, warnings = [], existing_warnings: existingWarnings = [], requires_restart, error, diff } = response;
+  const { ok, warnings = [], existing_warnings: existingWarnings = [], requires_restart, restart_reasons: restartReasons = [], error, diff } = response;
   const sectionDiff = (diff && diff[section]) || {};
   const diffRows = Object.entries(sectionDiff);
   // A diff that the server computed and found empty: nothing to apply.
@@ -187,7 +187,12 @@ export default function ApplyDialog({
           showIcon
           icon={<SyncOutlined />}
           title="Restart required"
-          description="One or more changed fields (listen_addr, cache_size_mb) require a server restart to take effect. The apply will persist to disk — restart the proxy when the window is safe."
+          description={
+            <>
+              These changes take effect only after a restart of the proxy. Restart it when the window is safe.
+              {restartReasons.length > 0 && <WarningList items={restartReasons} />}
+            </>
+          }
           style={{ marginBottom: 0 }}
         />
       )}

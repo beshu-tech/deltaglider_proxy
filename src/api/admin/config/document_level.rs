@@ -472,7 +472,7 @@ fn shape_apply(outcome: Outcome) -> (StatusCode, ConfigApplyResponse) {
         }
         Outcome::Applied {
             warnings: w,
-            requires_restart,
+            restart,
             persist,
             ..
         } => {
@@ -494,7 +494,7 @@ fn shape_apply(outcome: Outcome) -> (StatusCode, ConfigApplyResponse) {
             let resp = ConfigApplyResponse {
                 applied: true,
                 persisted: persisted_path.is_some(),
-                requires_restart,
+                requires_restart: !restart.is_empty(),
                 warnings: [w.check_new, w.preserve, w.env, w.transition]
                     .concat()
                     .into_iter()

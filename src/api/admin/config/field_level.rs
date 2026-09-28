@@ -649,7 +649,7 @@ fn shape_patch(result: WriteResult) -> axum::response::Response {
         }
         Outcome::Applied {
             warnings: w,
-            requires_restart,
+            restart,
             persist,
             ..
         } => {
@@ -663,7 +663,7 @@ fn shape_patch(result: WriteResult) -> axum::response::Response {
                 .into_iter()
                 .chain(persist_warning)
                 .collect();
-            reply(warnings, requires_restart)
+            reply(warnings, !restart.is_empty())
         }
         Outcome::Validated { .. } => {
             reply(vec!["internal: a PATCH ran as a dry run".into()], false)

@@ -90,6 +90,10 @@ pub struct SectionApplyResponse {
     /// as a banner in the Apply dialog so operators don't ship a
     /// restart-requiring change during a busy window without noticing.
     pub requires_restart: bool,
+    /// What `requires_restart` is about: one line per changed
+    /// restart-required field, so the Apply dialog can name them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub restart_reasons: Vec<String>,
     /// Only set on PUT success — path the persisted YAML was written to.
     /// Absent for dry-run (validate) responses.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -127,6 +131,7 @@ fn reject(status: StatusCode, error: impl Into<String>) -> Response {
             existing_warnings: Vec::new(),
             warnings: vec![],
             requires_restart: false,
+            restart_reasons: Vec::new(),
             persisted_path: None,
             error: Some(error.into()),
             diff: None,
@@ -314,6 +319,7 @@ fn shape_section(section: SectionName, result: WriteResult) -> Response {
                 warnings,
                 existing_warnings: existing,
                 requires_restart: false,
+                restart_reasons: Vec::new(),
                 persisted_path: None,
                 error: Some(error),
                 diff,
@@ -322,14 +328,15 @@ fn shape_section(section: SectionName, result: WriteResult) -> Response {
         }
         Outcome::Validated {
             warnings: w,
-            requires_restart,
+            restart,
             diff,
         } => {
             let body = SectionApplyResponse {
                 ok: true,
                 warnings: [w.preserve, w.env, w.check_new, w.preview].concat(),
                 existing_warnings: w.existing,
-                requires_restart,
+                requires_restart: !restart.is_empty(),
+                restart_reasons: restart,
                 persisted_path: None,
                 error: None,
                 diff,
@@ -338,7 +345,7 @@ fn shape_section(section: SectionName, result: WriteResult) -> Response {
         }
         Outcome::Applied {
             warnings: w,
-            requires_restart,
+            restart,
             diff,
             persist,
             version,
@@ -367,7 +374,8 @@ fn shape_section(section: SectionName, result: WriteResult) -> Response {
                     .chain(persist_warning)
                     .collect(),
                 existing_warnings: w.existing,
-                requires_restart,
+                requires_restart: !restart.is_empty(),
+                restart_reasons: restart,
                 persisted_path,
                 error: None,
                 diff,

@@ -91,7 +91,6 @@ impl TransitionCtx<'_> {
 /// What a successful transition reports.
 pub(crate) struct TransitionReport {
     pub warnings: Vec<String>,
-    pub requires_restart: bool,
 }
 
 /// Decision on whether two `Config` snapshots require the storage engine to
@@ -190,8 +189,6 @@ pub(crate) async fn apply_config_transition(
         }
         None => Vec::new(),
     };
-    let mut requires_restart = false;
-
     // Nothing below returns Err.
 
     // Log-level hot reload. An invalid filter is a warning: the old filter
@@ -265,10 +262,7 @@ pub(crate) async fn apply_config_transition(
     // Restart-required fields: applied in memory, live only after a restart.
     // `requires_restart_warnings` is the single source (the section dry-run
     // uses it too).
-    for w in requires_restart_warnings(old_cfg, &new_cfg) {
-        requires_restart = true;
-        warnings.push(w);
-    }
+    warnings.extend(requires_restart_warnings(old_cfg, &new_cfg));
 
     // The engine store and the config swap are the LAST steps: every check
     // above passed, and the write guard is held across both.
@@ -281,10 +275,7 @@ pub(crate) async fn apply_config_transition(
     }
     **cfg = new_cfg;
 
-    Ok(TransitionReport {
-        warnings,
-        requires_restart,
-    })
+    Ok(TransitionReport { warnings })
 }
 
 /// The pre-commit gates of [`apply_config_transition`] that need no plan

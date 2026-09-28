@@ -201,13 +201,15 @@ pub(super) enum Outcome {
     /// Dry run passed.
     Validated {
         warnings: Warnings,
-        requires_restart: bool,
+        /// One line per changed restart-required field; empty = none.
+        restart: Vec<String>,
         diff: Option<serde_json::Value>,
     },
     /// Applied in memory; `persist` is the file write.
     Applied {
         warnings: Warnings,
-        requires_restart: bool,
+        /// One line per changed restart-required field; empty = none.
+        restart: Vec<String>,
         diff: Option<serde_json::Value>,
         persist: Result<String, (String, String)>,
         /// The version after the write (of the section, for a section PUT).
@@ -226,7 +228,7 @@ pub(super) struct WriteResult {
 pub(super) struct Prepared {
     pub new_cfg: Config,
     pub warnings: Warnings,
-    pub requires_restart: bool,
+    pub restart: Vec<String>,
     pub diff: Option<serde_json::Value>,
 }
 
@@ -248,7 +250,7 @@ pub(super) async fn run(
                 }
                 Outcome::Validated {
                     warnings: p.warnings,
-                    requires_restart: p.requires_restart,
+                    restart: p.restart,
                     diff: p.diff,
                 }
             }
@@ -318,7 +320,7 @@ async fn apply_locked(
         new_cfg,
         mut warnings,
         diff,
-        requires_restart: _,
+        restart,
     } = prepared;
 
     let no_headers = HeaderMap::new();
@@ -341,7 +343,8 @@ async fn apply_locked(
     let version = super::version::config_version(cfg, section);
     Outcome::Applied {
         warnings,
-        requires_restart: report.requires_restart,
+        // The transition computes the same list from the same two configs.
+        restart,
         diff,
         persist: persist(state, cfg),
         version,
@@ -523,11 +526,11 @@ pub(super) fn prepare(
         .surface
         .section()
         .map(|s| super::section_level::compute_section_diff(s, old, &incoming));
-    let requires_restart = !super::requires_restart_warnings(old, &incoming).is_empty();
+    let restart = super::requires_restart_warnings(old, &incoming);
     Ok(Prepared {
         new_cfg: incoming,
         warnings: w,
-        requires_restart,
+        restart,
         diff,
     })
 }
@@ -970,7 +973,13 @@ mod tests {
             Mode::DryRun,
         );
         let p = prepare(&old, built(new), &w).unwrap();
-        assert!(p.requires_restart);
+        assert_eq!(
+            p.restart,
+            [format!(
+                "cache_size_mb changed to {} — restart required",
+                old.cache_size_mb + 1
+            )]
+        );
         let diff = p.diff.unwrap();
         assert!(diff["advanced"]["cache_size_mb"].is_object(), "{diff}");
     }

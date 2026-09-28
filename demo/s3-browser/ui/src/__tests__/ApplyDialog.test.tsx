@@ -135,3 +135,16 @@ test('no restart banner without requires_restart', () => {
   renderDialog({ ok: true, diff: {} });
   expect(screen.queryByText('Restart required')).not.toBeInTheDocument();
 });
+
+// Batch-D audit: the banner hard-coded "(listen_addr, cache_size_mb)", but TLS
+// and the sync bucket also need a restart. It now lists what the server says.
+test('the restart banner lists the server restart reasons, not a fixed field list', () => {
+  renderDialog({
+    ok: true,
+    diff: {},
+    requires_restart: true,
+    restart_reasons: ['tls config changed — restart required to (re)bind the listener'],
+  });
+  expect(screen.getByText(/tls config changed — restart required/)).toBeInTheDocument();
+  expect(screen.queryByText(/listen_addr, cache_size_mb/)).not.toBeInTheDocument();
+});

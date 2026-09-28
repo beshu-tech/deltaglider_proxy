@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed — The Apply dialog names the fields that need a restart
+
+The "Restart required" banner always named `listen_addr` and `cache_size_mb`,
+but a change to TLS or to the sync bucket also needs a restart. The section
+validate and apply responses now carry `restart_reasons`, one line for each
+changed field that needs a restart, and the banner lists them.
+
 ### Fixed — The TLS and backup-restore help texts match what the proxy does
 
 The help of **Enable TLS** said that TLS needs a certificate path and a key

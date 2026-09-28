@@ -297,7 +297,10 @@
         }
       },
       "ok": true,
-      "requires_restart": true
+      "requires_restart": true,
+      "restart_reasons": [
+        "cache_size_mb changed to 2048 — restart required"
+      ]
     },
     "etag": false,
     "status": 200

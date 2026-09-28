@@ -577,6 +577,8 @@ export interface SectionApplyResponse {
   /** Warnings the current config already produces, unchanged by this apply. */
   existing_warnings?: string[];
   requires_restart?: boolean;
+  /** One line per changed restart-required field (what `requires_restart` is about). */
+  restart_reasons?: string[];
   persisted_path?: string;
   error?: string;
   /**
