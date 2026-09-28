@@ -194,8 +194,9 @@ pub struct AccessSection {
 #[serde(rename_all = "kebab-case")]
 pub enum IamMode {
     /// DB is the source of truth. Runtime IAM CRUD through the GUI /
-    /// admin API mutates the DB; YAML `access.users`/`groups`/`providers`
-    /// are applied as seeds only when the DB is empty at startup.
+    /// admin API mutates the DB. YAML `access.iam_users` / `iam_groups` /
+    /// `auth_providers` / `group_mapping_rules` are validated but never
+    /// applied in this mode, not even to an empty DB.
     #[default]
     Gui,
     /// YAML is the source of truth. The reconciler rebuilds the DB to
