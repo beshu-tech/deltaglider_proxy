@@ -187,13 +187,14 @@ export const ENCRYPTION_SHOTS: Shot[] = [
   {
     id: 'rotate-clear-legacy',
     route: '/_/admin/storage/backends',
-    alt: 'The hetzner-fsn1 backend shows the legacy key banner, which reports that no object uses the legacy key id hetzner-2026-06; the arrow points at Clear legacy key.',
+    alt: 'The hetzner-fsn1 backend shows the legacy key banner, which reports that no object uses the legacy key id hetzner-2026-06; a box marks Clear legacy key.',
     setup: async (page) => {
       await hetznerIsAes(page, true);
       const btn = page.getByRole('button', { name: 'Clear legacy key' });
       await btn.waitFor();
       await btn.scrollIntoViewIfNeeded();
     },
-    annotations: [{ target: { role: 'button', name: 'Clear legacy key' }, kind: 'arrow', side: 'right' }],
+    // A box: an arrow from the side crosses the banner text.
+    annotations: [{ target: { role: 'button', name: 'Clear legacy key' }, kind: 'box' }],
   },
 ];

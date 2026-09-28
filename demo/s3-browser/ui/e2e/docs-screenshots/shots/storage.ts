@@ -337,7 +337,7 @@ const BUCKET_POLICY_SHOTS: Shot[] = [
   {
     id: 'backend-health-test-connection',
     route: '/_/admin/storage/backends',
-    alt: 'The hetzner-fsn1 backend card after a probe; one box marks its Connected badge, the arrow points at its Test connection button, and a second box marks the probe result.',
+    alt: 'The hetzner-fsn1 backend card after a probe; boxes mark its Connected badge, its Test connection button and the probe result.',
     setup: async (page) => {
       await page.getByRole('button', { name: /Test connection$/ }).and(page.locator('[data-backend-card="hetzner-fsn1"] button')).click();
       await page.locator('[data-backend-card="hetzner-fsn1"] .ant-alert').first().waitFor();
@@ -347,7 +347,8 @@ const BUCKET_POLICY_SHOTS: Shot[] = [
       // The badge comes first in the card; the probe result repeats the word.
       { target: { text: 'Connected', exact: true, within: card('hetzner-fsn1'), nth: 0 }, kind: 'box' },
       { target: { css: '[data-backend-card="hetzner-fsn1"] .ant-alert-success' }, kind: 'box' },
-      { target: { role: 'button', name: /Test connection$/, within: card('hetzner-fsn1') }, kind: 'arrow', side: 'top' },
+      // A box, not an arrow: every side of the button has text within an arrow's length.
+      { target: { role: 'button', name: /Test connection$/, within: card('hetzner-fsn1') }, kind: 'box' },
     ],
   },
 ];

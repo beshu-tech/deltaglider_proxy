@@ -37,7 +37,7 @@ In the admin UI:
 7. Back on **Storage → Backends**, the card of `hetzner-fsn1` shows the banner **Decrypt-only shim active**. The banner counts the objects and delta references that still carry the legacy key id, because the proxy checks the metadata of every object on the backend. Click **Check again** after the jobs finish.
 8. When the check finds no such object, click **Clear legacy key**, and then click **Clear** in the dialog **Clear the legacy key?**.
 
-   ![The hetzner-fsn1 backend shows the legacy key banner, which reports that no object uses the legacy key id hetzner-2026-06; the arrow points at Clear legacy key.](/_/screenshots/rotate-clear-legacy.webp)
+   ![The hetzner-fsn1 backend shows the legacy key banner, which reports that no object uses the legacy key id hetzner-2026-06; a box marks Clear legacy key.](/_/screenshots/rotate-clear-legacy.webp)
 
    The button is enabled only when the check read every object and found none under the legacy key id. On a backend with more than 10000 objects, the check stops early, and the button stays disabled. In that case, send `GET /_/api/admin/backends/hetzner-fsn1/legacy-key-usage?limit=N` with a higher limit ([admin API](../reference/admin-api.md#backends)), and clear the key with a section update that sets `legacy_key: null` and `legacy_key_id: null`. After the clear, you can destroy the old key.
 
