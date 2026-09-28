@@ -38,9 +38,9 @@ code".
 
 ### Fixed — A running job's progress is readable in the Jobs table
 
-The Status column of the Jobs table could shrink so far that a running
-migration showed only "run…". The column now keeps room for the progress
-meter and its label, for example "running · 12 copied".
+In the Jobs table, the progress meter of a running migration took no width
+in its Status cell, so it showed only "run…". The meter now fills the
+column and shows its track and its label, for example "running · 12 copied".
 
 ### Fixed — A replication rule made in the admin UI gets the server defaults
 
