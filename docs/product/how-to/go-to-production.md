@@ -85,13 +85,13 @@ Decide per backend, before real data lands: `none`, proxy-side AES-256-GCM, SSE-
 
 ### 8. Size the caches
 
-Raise the reference cache (the LRU of reference baselines) to 1024 MB or more, because hot-read workloads benefit most from it. Raise the metadata cache to 200 MB or more if you list large prefixes repeatedly. The startup log warns with a `[cache]` prefix if you forgot. The reference cache size is read only at startup, so a change takes effect after a restart. The metadata cache size applies at once.
+Raise the reference cache (the LRU of reference baselines) to 1024 MB or more, because hot-read workloads benefit most from it. Raise the metadata cache to 200 MB or more if you list large prefixes repeatedly. The startup log warns with a `[cache]` prefix if you forgot. Both sizes apply at once, because the proxy rebuilds its caches when you apply a new size. The rebuilt caches start empty.
 
 In the admin UI:
 
 1. In the sidebar, open **System → System** (`/_/admin/system`), and scroll to the **Caches** card.
 2. Type `1024` in **Reference cache size (MB)** and `200` in **Metadata cache size (MB)**.
-3. Click **Review & apply** in the bar above the card, check the diff, and click **Apply and Persist**. Then restart the proxy for the reference cache.
+3. Click **Review & apply** in the bar above the card, check the diff, and click **Apply and Persist**.
 
    ![The Caches card of the System page holds a reference cache of 1024 MB and a metadata cache of 200 MB; callout 1 marks the two cache fields and callout 2 marks Review & apply.](/_/screenshots/production-caches.webp)
 
@@ -122,7 +122,7 @@ advanced:
   metadata_cache_mb: 200
 ```
 
-Apply the file with a restart, because TLS and the reference cache size are read only at startup. When the config file is mounted read-only, as on Docker Compose with `:ro`, the Helm chart and the Kubernetes operator, a change in the admin UI lasts only until the next restart, and the restart-only settings of items 3 and 8 never take effect from the UI. On those platforms, make these changes in the YAML of your deployment.
+Apply the file with a restart, because the TLS settings are read only at startup. When the config file is mounted read-only, as on Docker Compose with `:ro`, the Helm chart and the Kubernetes operator, a change in the admin UI lasts only until the next restart, and the TLS settings of item 3 never take effect from the UI. On those platforms, make these changes in the YAML of your deployment.
 
 ## Verify
 

@@ -962,7 +962,7 @@ mod tests {
     fn section_diff_and_restart_flag_come_from_prepare() {
         let old = running();
         let mut new = old.clone();
-        new.cache_size_mb += 1;
+        new.blocking_threads = Some(64);
         let body = serde_json::json!({});
         let section = SectionName::Advanced;
         let w = write(
@@ -973,15 +973,9 @@ mod tests {
             Mode::DryRun,
         );
         let p = prepare(&old, built(new), &w).unwrap();
-        assert_eq!(
-            p.restart,
-            [format!(
-                "cache_size_mb changed to {} — restart required",
-                old.cache_size_mb + 1
-            )]
-        );
+        assert_eq!(p.restart, ["blocking_threads changed — restart required"]);
         let diff = p.diff.unwrap();
-        assert!(diff["advanced"]["cache_size_mb"].is_object(), "{diff}");
+        assert!(diff["advanced"]["blocking_threads"].is_object(), "{diff}");
     }
 
     /// R10: an internal write (bootstrap removal, backup secrets restore)

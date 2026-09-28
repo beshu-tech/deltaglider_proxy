@@ -220,6 +220,35 @@ async fn test_config_update_restart_required() {
     assert!(!body["warnings"].as_array().unwrap().is_empty());
 }
 
+/// The engine is rebuilt on a cache_size_mb change, so the new reference
+/// cache is live at once and the apply must not ask for a restart.
+#[tokio::test]
+async fn test_cache_size_change_is_live_without_restart() {
+    let server = TestServer::builder()
+        .auth("CFGKEY5", "CFGSECRET5")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    let resp = admin
+        .put(format!("{}/_/api/admin/config", server.endpoint()))
+        .json(&json!({ "cache_size_mb": 321 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["requires_restart"], false, "{body}");
+
+    let health: serde_json::Value = reqwest::get(format!("{}/_/health", server.endpoint()))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health["cache_max_bytes"], 321u64 * 1024 * 1024, "{health}");
+}
+
 // ═══════════════════════════════════════════════════
 // Backend CRUD
 // ═══════════════════════════════════════════════════
@@ -1810,7 +1839,7 @@ async fn config_write_surfaces_answer_as_the_golden_file() {
     record(&mut out, "patch_bad_bucket", r.send().await.unwrap()).await;
     let r = admin
         .put(url(""))
-        .json(&json!({ "log_level": "not==valid", "cache_size_mb": 999 }));
+        .json(&json!({ "log_level": "not==valid", "listen_addr": "0.0.0.0:9999" }));
     record(&mut out, "patch_warnings_restart", r.send().await.unwrap()).await;
 
     // ── Section PUT / validate ──
@@ -1851,7 +1880,7 @@ async fn config_write_surfaces_answer_as_the_golden_file() {
     let r = admin
         .post(url(&format!("{adv}/validate")))
         .header("if-match", stale)
-        .json(&json!({ "cache_size_mb": 2048 }));
+        .json(&json!({ "blocking_threads": 64 }));
     record(&mut out, "section_validate_ok", r.send().await.unwrap()).await;
     let r = admin
         .post(url("/section/admission/validate"))

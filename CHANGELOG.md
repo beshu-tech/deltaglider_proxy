@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed — "Restart required" names the settings that need a restart
+
+The server and the admin UI did not agree about which settings need a
+restart. A change of the reference cache size answered "restart required",
+but the proxy rebuilds its caches at once when you apply a new size. The UI
+also marked **Codec concurrency** as restart-only, but it applies at once as
+well. A change of `blocking_threads` needs a restart, because the proxy sizes
+that thread pool at startup, but the server did not say so. Now the server and
+the UI mark the same four settings: `listen_addr`, the TLS settings,
+`blocking_threads` and `config_sync_bucket`.
+
 ### Fixed — The review dialog is no longer under the unsaved-changes bar
 
 The unsaved-changes bar sits over the Jobs drawer, so that a rule that you edit

@@ -514,14 +514,24 @@ async fn declarative_iam_precommit_gate(
         .map_err(|e| format!("declarative IAM reconcile failed (no state changed): {e}"))
 }
 
+/// The YAML paths that the proxy reads only at startup. The GUI marks exactly
+/// these with a "Restart required" chip (source test below). Everything else
+/// is hot: engine-affecting fields rebuild the engine, which also re-sizes
+/// the reference cache and the codec permits.
+pub(crate) const RESTART_ONLY_YAML_PATHS: &[&str] = &[
+    "advanced.listen_addr",
+    "advanced.tls",
+    "advanced.blocking_threads",
+    "advanced.config_sync_bucket",
+];
+
 /// Return one warning per restart-required field that changed between
 /// `old` and `new`. Empty vec = no restart required.
 ///
-/// Single source of truth for the restart-required fieldset:
-/// [`apply_config_transition`] uses this to emit warnings + set its
-/// `requires_restart` flag, and the write pipeline's dry run uses the same
-/// predicate. Adding a fifth restart-required field means editing exactly
-/// this function.
+/// Single source of truth for the restart-required fieldset
+/// ([`RESTART_ONLY_YAML_PATHS`]): [`apply_config_transition`] uses this to
+/// emit warnings + set its `requires_restart` flag, and the write pipeline's
+/// dry run uses the same predicate.
 pub(super) fn requires_restart_warnings(
     old: &crate::config::Config,
     new: &crate::config::Config,
@@ -533,11 +543,9 @@ pub(super) fn requires_restart_warnings(
             new.listen_addr
         ));
     }
-    if old.cache_size_mb != new.cache_size_mb {
-        out.push(format!(
-            "cache_size_mb changed to {} — restart required",
-            new.cache_size_mb
-        ));
+    // main.rs sizes the tokio blocking pool before the runtime exists.
+    if old.blocking_threads != new.blocking_threads {
+        out.push("blocking_threads changed — restart required".to_string());
     }
     // TLS is bound once at startup (tls.rs) and config_sync_bucket launches its
     // poller once at startup — neither is re-read on hot-apply, so a change here
@@ -554,6 +562,58 @@ pub(super) fn requires_restart_warnings(
         );
     }
     out
+}
+
+/// The GUI's "Restart required" chips and [`RESTART_ONLY_YAML_PATHS`] name the
+/// same fields: a chip on a hot field tells the operator to restart for
+/// nothing, a missing chip hides a change that has no effect yet.
+#[cfg(test)]
+mod restart_chip_parity_tests {
+    use super::RESTART_ONLY_YAML_PATHS;
+
+    fn is_restart_only(path: &str) -> bool {
+        RESTART_ONLY_YAML_PATHS
+            .iter()
+            .any(|p| path == *p || path.starts_with(&format!("{p}.")))
+    }
+
+    #[test]
+    fn gui_restart_chips_match_the_server_list() {
+        let src = include_str!("../../../../demo/s3-browser/ui/src/components/advancedPanels.tsx");
+        // Each FormField: its label (with or without a chip) precedes its yamlPath.
+        let mut chipped = Vec::new();
+        let mut plain = Vec::new();
+        for field in src.split("<FormField").skip(1) {
+            let Some(i) = field.find("yamlPath=\"") else {
+                continue;
+            };
+            let rest = &field[i + 10..];
+            let path = &rest[..rest.find('"').unwrap()];
+            if field[..i].contains("<RestartChip") {
+                chipped.push(path.to_string());
+            } else {
+                plain.push(path.to_string());
+            }
+        }
+        assert!(!chipped.is_empty(), "the parser found no chip");
+        for p in &chipped {
+            assert!(
+                is_restart_only(p),
+                "{p} has a Restart required chip but applies live"
+            );
+        }
+        for p in &plain {
+            assert!(!is_restart_only(p), "{p} needs a restart but has no chip");
+        }
+        for p in RESTART_ONLY_YAML_PATHS {
+            assert!(
+                chipped
+                    .iter()
+                    .any(|c| is_restart_only(c) && c.starts_with(p)),
+                "{p} has no chip in the GUI"
+            );
+        }
+    }
 }
 
 /// Review 4 config-1: `apply_config_transition` returns `Err` only before its

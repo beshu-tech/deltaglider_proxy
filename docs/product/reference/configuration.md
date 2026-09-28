@@ -281,7 +281,7 @@ In-memory reference cache size in MB. Use 1024 MB or more in production. A cache
 | **Env var** | `DGP_CACHE_MB` |
 | **YAML** | `advanced.cache_size_mb` |
 | **Default** | `100` |
-| **Hot-reload** | No |
+| **Hot-reload** | Yes (triggers engine rebuild; the new cache starts empty) |
 
 ### `metadata_cache_mb`
 
@@ -292,7 +292,7 @@ In-memory `FileMetadata` cache size in MB. Set it to `0` to disable the cache. 5
 | **Env var** | `DGP_METADATA_CACHE_MB` |
 | **YAML** | `advanced.metadata_cache_mb` |
 | **Default** | `50` |
-| **Hot-reload** | No |
+| **Hot-reload** | Yes (triggers engine rebuild; the new cache starts empty) |
 
 ### `filtered_list_max_engine_pages`
 

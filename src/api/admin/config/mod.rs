@@ -1140,6 +1140,25 @@ mod preserve_tests {
         assert!(requires_restart_warnings(&base, &base).is_empty());
     }
 
+    /// The tokio blocking pool is sized once in main.rs; the reference cache
+    /// and the codec permits are rebuilt with the engine, so they apply live.
+    #[test]
+    fn restart_warnings_match_what_is_read_only_at_startup() {
+        let base = crate::config::Config::default();
+        let mut bt = base.clone();
+        bt.blocking_threads = Some(64);
+        assert!(
+            requires_restart_warnings(&base, &bt)
+                .iter()
+                .any(|w| w.contains("blocking_threads")),
+            "a blocking_threads change must emit a restart-required warning"
+        );
+        let mut live = base.clone();
+        live.cache_size_mb = base.cache_size_mb + 1;
+        live.codec_concurrency = Some(base.effective_codec_concurrency() + 1);
+        assert!(requires_restart_warnings(&base, &live).is_empty());
+    }
+
     #[test]
     fn webhook_urls_index_restore_only_when_lengths_match() {
         // Same length → in-place restore by index (the safe round-trip case).

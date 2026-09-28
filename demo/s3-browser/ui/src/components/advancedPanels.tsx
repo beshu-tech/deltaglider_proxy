@@ -296,7 +296,12 @@ export function ListenerTlsPanel({ onSessionExpired }: PanelProps) {
         />
         <div>
           <FormField
-            label="Enable TLS"
+            label={
+              <>
+                Enable TLS
+                <RestartChip reason="The listener binds TLS once, at startup." />
+              </>
+            }
             yamlPath="advanced.tls.enabled"
             helpText="Serve HTTPS directly. Set both paths below to use your certificate, or leave both empty and the proxy makes a self-signed one at startup. Leave off to speak plain HTTP behind a TLS-terminating reverse proxy."
           >
@@ -371,12 +376,7 @@ export function CachesPanel({ onSessionExpired }: PanelProps) {
         />
         <div>
           <FormField
-            label={
-              <>
-                Reference cache size (MB)
-                <RestartChip reason="cache_size_mb is set at engine construction. Moka caches cannot be resized live." />
-              </>
-            }
+            label="Reference cache size (MB)"
             yamlPath="advanced.cache_size_mb"
             helpText="LRU cache for delta-reconstruction reference files. Recommend ≥1024 MB for production."
             defaultPlaceholder="100"
@@ -412,12 +412,7 @@ export function CachesPanel({ onSessionExpired }: PanelProps) {
           </FormField>
 
           <FormField
-            label={
-              <>
-                Codec concurrency
-                <RestartChip reason="xdelta3 subprocess permits are fixed at startup." />
-              </>
-            }
+            label="Codec concurrency"
             yamlPath="advanced.codec_concurrency"
             helpText="Maximum concurrent xdelta3 subprocesses. Leave empty to auto-detect from CPU count."
             examples={[16, 40]}

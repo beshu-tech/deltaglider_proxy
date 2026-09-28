@@ -20,7 +20,7 @@ When you edit the file instead, the running proxy does not notice the edit by it
 
 The apply endpoint and the GUI use the same validation and the same write path. An apply that fails validation changes nothing. An apply that succeeds is persisted to the config file in the same way as a GUI change.
 
-Most settings take effect at once. Four settings are read only at startup: `listen_addr`, `cache_size_mb`, the TLS settings, and `config_sync_bucket`. When an apply changes one of them, the proxy stores the new value, and the dialog or the API response says that a restart is required.
+Most settings take effect at once. Four settings are read only at startup: `listen_addr`, the TLS settings, `blocking_threads` and `config_sync_bucket`. When an apply changes one of them, the proxy stores the new value, and the dialog or the API response says that a restart is required.
 
 ## Environment variables sit on top
 
@@ -52,7 +52,7 @@ At startup, the proxy reads the configuration in this order:
 2. It applies the `DGP_*` environment variables on top of the file.
 3. It opens the encrypted config database, `deltaglider_config.db`, which sits next to the config file and holds the IAM state.
 
-A GUI change that the proxy persisted is in the file, so a restart keeps it. A GUI change that the proxy could not persist is lost at the restart. This happens when the config file is read-only. The Docker Compose example mounts the file with `:ro`, and the Helm chart and the Kubernetes operator both mount it read-only from a ConfigMap. On those platforms, a GUI change lives only until the container or the pod restarts. The four settings that the proxy reads only at startup (`listen_addr`, `cache_size_mb`, TLS and `config_sync_bucket`) never take effect from the GUI there, because the restart that they need also discards them.
+A GUI change that the proxy persisted is in the file, so a restart keeps it. A GUI change that the proxy could not persist is lost at the restart. This happens when the config file is read-only. The Docker Compose example mounts the file with `:ro`, and the Helm chart and the Kubernetes operator both mount it read-only from a ConfigMap. On those platforms, a GUI change lives only until the container or the pod restarts. The four settings that the proxy reads only at startup (`listen_addr`, TLS, `blocking_threads` and `config_sync_bucket`) never take effect from the GUI there, because the restart that they need also discards them.
 
 The proxy says so in three places. `GET /_/api/admin/config` reports `config_file_path` and `config_file_writable`, and when the file is not writable, the admin GUI shows a warning banner above every settings page: the file is read-only, changes work until the next restart, and settings that need a restart never take effect. After an apply, the response carries `persist_error`, and the GUI says that the change applies to the running proxy but is lost at the next restart. A backup restore that includes the config is refused before it changes anything, with `409 config_file_read_only`, because a restored config that reverts at the next restart is worse than no restore. On such a platform, change the YAML of the deployment instead, and use the GUI only to try a change before you commit it.
 
