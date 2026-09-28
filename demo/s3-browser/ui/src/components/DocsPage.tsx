@@ -4,7 +4,7 @@ import mermaid from 'mermaid';
 import { Button, Drawer, Spin } from 'antd';
 import { CheckOutlined, CopyOutlined, MenuOutlined } from '@ant-design/icons';
 import { findDocByFilename, type DocEntry } from '../docsBundle';
-import { DOC_REHYPE_PLUGINS, DOC_REMARK_PLUGINS, classifyDocHref, splitMermaid } from '../docsMarkdown';
+import { DOC_REHYPE_PLUGINS, DOC_REMARK_PLUGINS, classifyDocHref, splitMermaid, themedShotSrc } from '../docsMarkdown';
 import { useCopyToClipboard } from '../useCopyToClipboard';
 import { useIsNarrow } from '../useIsNarrow';
 import { useDocs } from '../queries/docs';
@@ -339,6 +339,7 @@ export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }
     setNavOpen(false);
     navigate(`docs/${id}`);
   }, [navigate]);
+  const { isDark } = useTheme();
   const [activeHeading, setActiveHeading] = useState('');
   const [headings, setHeadings] = useState<TocItem[]>([]);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -493,10 +494,11 @@ export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }
         {inlineToc}
       </>
     ),
-    // Wrap images in Lightbox — alt text becomes caption
+    // Wrap images in Lightbox — alt text becomes caption. A pipeline
+    // screenshot shows its light or dark variant (themedShotSrc).
     img: ({ alt, src, node: _node, ...props }) => (
       <Lightbox caption={alt}>
-        <img {...props} alt={alt} src={src} style={{ width: '100%', display: 'block' }} />
+        <img {...props} alt={alt} src={themedShotSrc(typeof src === 'string' ? src : undefined, isDark)} loading="lazy" style={{ width: '100%', display: 'block' }} />
       </Lightbox>
     ),
     // Changelog version headings ("vX.Y.Z — DATE"): show the
@@ -522,7 +524,7 @@ export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }
       }
       return <p {...props}>{children}</p>;
     },
-  }), [handleDocLink, scrollToHeading, inlineToc]);
+  }), [handleDocLink, scrollToHeading, inlineToc, isDark]);
 
   return (
     // .docs-page pins the page to the viewport height, so the sidebar, header

@@ -14,6 +14,20 @@ import rehypeSlug from 'rehype-slug';
 export const DOC_REMARK_PLUGINS = [remarkGfm];
 export const DOC_REHYPE_PLUGINS = [rehypeHighlight, rehypeSlug];
 
+/**
+ * A pipeline screenshot is referenced once, theme-neutral:
+ * `/_/screenshots/<name>.webp`. The files on disk are `<name>.light.webp`
+ * and `<name>.dark.webp` (scripts/docs-screenshots.sh). Pick the variant
+ * for the active theme; any other image (a legacy .jpg, an explicit
+ * variant, an external URL) passes through unchanged.
+ */
+export function themedShotSrc(src: string | undefined, isDark: boolean): string | undefined {
+  if (!src) return src;
+  const m = /^(\/_\/screenshots\/[A-Za-z0-9_-]+)\.webp$/.exec(src);
+  if (!m) return src;
+  return `${m[1]}.${isDark ? 'dark' : 'light'}.webp`;
+}
+
 export interface DocSegment {
   type: 'text' | 'mermaid';
   content: string;
