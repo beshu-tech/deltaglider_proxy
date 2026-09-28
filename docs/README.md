@@ -6,8 +6,8 @@ This tree splits into two audiences, enforced by CI so it can't drift:
 - **[dev/](dev/)** — contributor-facing, **never** bundled. Build from source, release workflow, CI infrastructure, historical design docs.
 
 `screenshots/` is shared — the same images ship in the binary (via the UI build/static asset pipeline) and render on GitHub. The marketing site also copies from this directory at build time and fails if the required product screenshots are missing or smaller than 900×700:
-`filebrowser.jpg`, `analytics.jpg`, `iam.jpg`, `advanced_security.jpg`,
-`bucket-policies.jpg`, and `object-replication.jpg`.
+`filebrowser.jpg`, `analytics.jpg`, `iam.jpg`, `advanced_security.jpg`
+and `object-replication.jpg`.
 
 ## Product docs index
 
