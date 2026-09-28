@@ -23,7 +23,7 @@ In the admin UI:
 
    ![The Definition tab of the releases-to-dr replication rule; callout 4 marks Rule name, callout 5 marks Enabled, callout 6 marks Source, set to releases, and callout 7 marks Destination, set to releases-dr.](/_/screenshots/replicate-rule-fields.webp)
 
-8. Click **Advanced rule behavior**. In **Interval**, type `1h`. In **Exclude globs**, replace the text with `.deltaglider/**`. Leave **Conflict policy** at **Newer wins — safest default**, and leave **Delete replication** off. Sections 3 to 5 explain these choices.
+8. Click **Advanced rule behavior**. In **Interval**, type `1h`. Leave **Exclude globs** at `.deltaglider/**`. Leave **Conflict policy** at **Newer wins — safest default**, and leave **Delete replication** off. Sections 3 to 5 explain these choices.
 
    ![The Advanced rule behavior part of the releases-to-dr rule is open; the box marks the Conflict policy choices, and the arrow points at the Delete replication switch.](/_/screenshots/replicate-rule-advanced.webp)
 
@@ -38,7 +38,7 @@ Every copy goes through the engine, so each side applies its own encryption and 
 ## 3. Scope what replicates
 
 - If only part of the bucket matters, give **Source** a prefix, for example `firmware/`. To narrow the scope further, add a pattern to **Include globs**, for example `firmware/widget-3000/**`. When include globs are set, only the matching keys replicate.
-- If some keys must never leave the source (scratch files, temporary uploads), add them to **Exclude globs**. An exclude wins over an include. Keep `.deltaglider/**` in the list, because it protects the config-sync prefix when the bucket also holds user data. A new rule that you create in the admin UI starts with the pattern `.dg/*` in this field, so replace that pattern with `.deltaglider/**`.
+- If some keys must never leave the source (scratch files, temporary uploads), add them to **Exclude globs**. An exclude wins over an include. Keep `.deltaglider/**` in the list, because it protects the config-sync prefix when the bucket also holds user data. A new rule that you create in the admin UI starts with `.deltaglider/**` in this field.
 - If the destination must use a different layout, give **Destination** a prefix. The rule then places the source keys under that prefix.
 
 Directory markers and storage-layer delta artifacts never replicate, because the engine listing filters them out before the planning ([full list](../reference/replication.md#what-doesnt-replicate)).

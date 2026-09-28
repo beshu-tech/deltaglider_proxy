@@ -3442,3 +3442,53 @@ mod tests {
         );
     }
 }
+
+/// The GUI builds a new replication or lifecycle rule from its own constants
+/// (`replicationPayload.ts`, `lifecyclePayload.ts`) and sends every field, so
+/// a drifted constant becomes the saved value. They must be the serde
+/// defaults above.
+#[cfg(test)]
+mod ui_rule_default_parity_tests {
+    use super::*;
+
+    fn quoted(v: &str) -> String {
+        format!("'{v}'")
+    }
+
+    #[test]
+    fn gui_replication_defaults_are_the_server_defaults() {
+        let src = include_str!("../demo/s3-browser/ui/src/components/replicationPayload.ts");
+        for (field, value) in [
+            ("tick_interval", default_tick_interval()),
+            ("lease_ttl", default_lease_ttl()),
+            ("heartbeat_interval", default_heartbeat_interval()),
+            ("interval", default_reconcile_interval()),
+        ] {
+            let want = format!("  {field}: {},", quoted(&value));
+            assert!(src.contains(&want), "replicationPayload.ts lacks `{want}`");
+        }
+        let globs = default_exclude_globs()
+            .iter()
+            .map(|g| quoted(g))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(
+            src.contains(&format!("exclude_globs: [{globs}],")),
+            "replicationPayload.ts: exclude_globs must default to [{globs}]"
+        );
+        assert!(!src.contains("'.dg/*'"), "a stale '.dg/*' default is left");
+    }
+
+    #[test]
+    fn gui_lifecycle_defaults_are_the_server_defaults() {
+        let src = include_str!("../demo/s3-browser/ui/src/components/lifecyclePayload.ts");
+        let want = format!("  tick_interval: {},", quoted(&default_lifecycle_tick_interval()));
+        assert!(src.contains(&want), "lifecyclePayload.ts lacks `{want}`");
+        let globs = default_lifecycle_exclude_globs()
+            .iter()
+            .map(|g| quoted(g))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(src.contains(&format!("exclude_globs: [{globs}],")));
+    }
+}

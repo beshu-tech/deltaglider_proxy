@@ -18,11 +18,12 @@ import type {
 import { normalizePrefix } from '../storagePath';
 import { nextUniqueRuleName } from './ruleNames';
 
+// Serde defaults of src/config_sections.rs (parity test there).
 export const DEFAULT_REPLICATION: ReplicationConfig = {
   enabled: true,
   tick_interval: '30s',
-  lease_ttl: '60s',
-  heartbeat_interval: '20s',
+  lease_ttl: '300s',
+  heartbeat_interval: '60s',
   max_failures_retained: 100,
   rules: [],
 };
@@ -33,12 +34,12 @@ export function emptyRule(existing: ReplicationRuleConfig[]): ReplicationRuleCon
     enabled: true,
     source: { bucket: '', prefix: '' },
     destination: { bucket: '', prefix: '' },
-    interval: '15m',
+    interval: '24h',
     batch_size: 100,
     replicate_deletes: false,
     conflict: 'newer-wins',
     include_globs: [],
-    exclude_globs: ['.dg/*'],
+    exclude_globs: ['.deltaglider/**'],
   };
 }
 
@@ -57,7 +58,7 @@ export function normalizeReplication(
         prefix: r.destination?.prefix || '',
       },
       include_globs: r.include_globs || [],
-      exclude_globs: r.exclude_globs || ['.dg/*'],
+      exclude_globs: r.exclude_globs || ['.deltaglider/**'],
     })),
   };
 }

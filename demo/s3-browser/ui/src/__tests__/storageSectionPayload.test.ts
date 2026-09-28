@@ -377,12 +377,12 @@ function emptyReplRule(name: string): ReplicationRuleConfig {
     enabled: true,
     source: { bucket: 'src', prefix: '' },
     destination: { bucket: 'dst', prefix: '' },
-    interval: '15m',
+    interval: '24h',
     batch_size: 100,
     replicate_deletes: false,
     conflict: 'newer-wins',
     include_globs: [],
-    exclude_globs: ['.dg/*'],
+    exclude_globs: ['.deltaglider/**'],
   };
 }
 
@@ -395,12 +395,12 @@ test('a valid rule normalises source/destination prefixes; body matches', () => 
         enabled: true,
         source: { bucket: 'src', prefix: 'a' },
         destination: { bucket: 'dst', prefix: 'b' },
-        interval: '15m',
+        interval: '24h',
         batch_size: 100,
         replicate_deletes: false,
         conflict: 'newer-wins',
         include_globs: [],
-        exclude_globs: ['.dg/*'],
+        exclude_globs: ['.deltaglider/**'],
       },
     ],
   };
@@ -437,6 +437,6 @@ test('normalizeReplication backfills defaults + nested source/destination', () =
   const r = norm.rules[0];
   assert.deepEqual(r.source, { bucket: '', prefix: '' });
   assert.deepEqual(r.destination, { bucket: '', prefix: '' });
-  assert.deepEqual(r.exclude_globs, ['.dg/*']);
+  assert.deepEqual(r.exclude_globs, ['.deltaglider/**']);
   assert.equal(r.conflict, 'newer-wins');
 });

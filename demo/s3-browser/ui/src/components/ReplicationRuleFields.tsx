@@ -79,7 +79,7 @@ export default function ReplicationRuleFields({
           <FormField
             label="Interval"
             yamlPath="storage.replication.rules[].interval"
-            helpText="How often the scheduler runs this rule. Humantime duration, e.g. 5m, 1h, 24h."
+            helpText="How often the full reconcile sweep runs for this rule. Events replicate changes as they happen; the sweep catches anything an event missed. Humantime duration, e.g. 6h or 24h (the default). Minimum 30s."
           >
             <Input
               value={rule.interval}
@@ -154,7 +154,7 @@ export default function ReplicationRuleFields({
               value={rule.exclude_globs}
               onChange={(v) => onChange({ exclude_globs: v })}
               rows={3}
-              placeholder=".dg/*"
+              placeholder=".deltaglider/**"
               style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
             />
           </FormField>

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed — A replication rule made in the admin UI gets the server defaults
+
+A new replication rule in the admin UI started with the exclude glob `.dg/*`
+and an interval of 15 minutes. A rule written in YAML gets `.deltaglider/**`
+and 24 hours. So a rule made in the UI did not exclude the config-sync prefix.
+The UI now starts a rule with the same defaults as YAML. The defaults of the
+replication scheduler lease (`lease_ttl` 300s, `heartbeat_interval` 60s) are
+also the server defaults now.
+
 ### Fixed — The key panel says where a generated AES key is stored
 
 When the admin UI generates a proxy-side AES key, the proxy writes it in plain
