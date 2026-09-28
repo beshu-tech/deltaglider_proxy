@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed — The permission editor shows every condition of a rule
+
+The permission editor has inputs only for a list prefix (`StringLike` on
+`s3:prefix`) and an IP restriction (`IpAddress` on `aws:SourceIp`). A rule
+with other conditions, such as `StringNotLike` or `NotIpAddress` from the API
+or YAML, showed empty filters, so you could not see what the rule does. The
+editor now lists those conditions read-only under **Other conditions**, and an
+edit of the rule keeps them.
+
 ### Fixed — The IAM mode card says why it cannot switch to declarative
 
 On **Access → Credentials & mode**, the **Declarative** option asked for

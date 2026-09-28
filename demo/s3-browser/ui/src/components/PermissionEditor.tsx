@@ -13,6 +13,7 @@ import {
   getConditionArray,
   setConditionArray,
   hasConditions,
+  otherConditions,
 } from './permissionConditions';
 import { unknownBucketWarnings, invalidPatternWarnings } from './permissionWarnings';
 import ActionChips from './ActionChips';
@@ -158,6 +159,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
         const conditionsVisible = (row._uiId ? expandedConditions.has(row._uiId) : false) || hasCond;
         const prefixVal = getConditionArray(row.conditions, 'StringLike', 's3:prefix');
         const ipVal = getConditionValue(row.conditions, 'IpAddress', 'aws:SourceIp');
+        const readOnlyConds = otherConditions(row.conditions);
         const bucketWarnings = unknownBucketWarnings(row.resources, bucketNames);
         const patternErrors = invalidPatternWarnings(row.resources);
         // A rule is incomplete (and silently dropped on save by rowsToPermissions)
@@ -202,7 +204,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                   icon={<FilterOutlined />}
                   title={
                     hasCond
-                      ? 'Conditions are expanded while prefix or IP filters are set — clear those fields below to collapse.'
+                      ? 'Conditions stay expanded while this rule has a condition. Clear the prefix and IP fields below to collapse them.'
                       : 'Show optional conditions: prefix restriction and IP filtering'
                   }
                   disabled={hasCond}
@@ -395,6 +397,24 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                       CIDR notation. Only requests from matching IPs will trigger this rule.
                     </div>
                   </div>
+
+                  {/* Conditions with no input here stay visible, and edits keep them. */}
+                  {readOnlyConds.length > 0 && (
+                    <div>
+                      <div style={condLabelStyle}>
+                        Other conditions
+                        <span style={{ fontWeight: 400, textTransform: 'none', marginLeft: 6, opacity: 0.6 }}>
+                          set by the API or YAML, read-only here
+                        </span>
+                      </div>
+                      {readOnlyConds.map((c) => (
+                        <div key={`${c.operator}:${c.key}`} style={{ fontSize: 12, marginTop: 2 }}>
+                          <span style={monoTextStyle}>{c.operator}</span> on <span style={monoTextStyle}>{c.key}</span>:{' '}
+                          <span style={monoTextStyle}>{c.values.join(', ')}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
             )}

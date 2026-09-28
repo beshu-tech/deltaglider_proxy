@@ -132,3 +132,27 @@ export function hasConditions(conditions?: Conditions): boolean {
     typeof v === 'string' ? v.trim() !== '' : v.length > 0
   ));
 }
+
+/** The operator/key pairs that PermissionEditor renders as inputs. */
+const EDITABLE: ReadonlyArray<readonly [string, string]> = [
+  ['StringLike', 's3:prefix'],
+  ['IpAddress', 'aws:SourceIp'],
+];
+
+/**
+ * Every condition the editor has no input for (set through the API or YAML),
+ * in map order, so the editor can show it read-only instead of hiding it.
+ */
+export function otherConditions(
+  conditions?: Conditions,
+): { operator: string; key: string; values: string[] }[] {
+  if (!conditions) return [];
+  const out: { operator: string; key: string; values: string[] }[] = [];
+  for (const [operator, block] of Object.entries(conditions)) {
+    for (const [key, v] of Object.entries(block)) {
+      if (EDITABLE.some(([op, k]) => op === operator && k === key)) continue;
+      out.push({ operator, key, values: Array.isArray(v) ? [...v] : [v] });
+    }
+  }
+  return out;
+}
