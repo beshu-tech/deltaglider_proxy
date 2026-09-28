@@ -2,7 +2,7 @@
 
 This guide shows you how to serve a bucket from a specific storage backend, and how to map the bucket name that clients use onto a different real bucket upstream. Routing is pure configuration, so you can do it in the admin UI or in the YAML file. For how multi-backend routing works internally, see [the multi-backend architecture](../explanation/multi-backend-architecture.md).
 
-The example registers three backends: `hetzner-fsn1` (S3-compatible storage at Hetzner, the default), `local-disk` (a directory on the proxy host) and `aws-dr` (AWS). It then routes `downloads` to `local-disk`, and it keeps `db-archive` on `hetzner-fsn1` under the real bucket name `acme-db-archive-prod`.
+The example registers three backends: `hetzner-fsn1` (S3-compatible storage at Hetzner, the default), `local-disk` (a directory on the proxy host) and `aws-dr` (AWS). It then routes `downloads` to `local-disk`, and it keeps `releases` on `hetzner-fsn1` under the real bucket name `acme-releases-prod`.
 
 ## 1. Declare the backends
 
@@ -54,20 +54,20 @@ If the bucket does not exist yet, open the menu next to **Create bucket** and se
 
 If the real bucket on the backend has a different name from the one that clients should see, give the bucket an alias. In the admin UI:
 
-1. On **Storage → Buckets**, click the `db-archive` row to open it.
+1. On **Storage → Buckets**, click the `releases` row to open it.
 2. Click **Advanced** inside the row.
-3. Type `acme-db-archive-prod` in **Real name on backend**.
+3. Type `acme-releases-prod` in **Real name on backend**.
 
-   ![The open db-archive row with callout 1 at the row, callout 2 at the Advanced disclosure, and callout 3 at the Real name on backend field, which holds acme-db-archive-prod.](/_/screenshots/route-bucket-alias.webp)
+   ![The open releases row with callout 1 at the row, callout 2 at the Advanced disclosure, and callout 3 at the Real name on backend field, which holds acme-releases-prod.](/_/screenshots/route-bucket-alias.webp)
 
 4. Click **Review & apply**, and then click **Apply and Persist**, as in the previous section.
 
-Clients send requests to `s3://db-archive/nightly/2026-06-11.dump`, and the proxy translates them to `s3://acme-db-archive-prod/nightly/2026-06-11.dump` on Hetzner.
+Clients send requests to `s3://releases/firmware/widget-3000/fw-1.4.3.tar`, and the proxy translates them to `s3://acme-releases-prod/firmware/widget-3000/fw-1.4.3.tar` on Hetzner.
 
 Aliasing is useful when:
 
 - You're moving buckets between backends without updating clients.
-- The upstream name carries a prefix you don't want to expose (`acme-db-archive-prod` vs `db-archive`).
+- The upstream name carries a prefix you don't want to expose (`acme-releases-prod` vs `releases`).
 - You want two logical namespaces in one physical bucket (two aliases that point at the same real bucket). Avoid this unless you also scope access by prefix with IAM.
 
 ## The same change in YAML
@@ -93,9 +93,9 @@ storage:
   buckets:
     downloads:
       backend: local-disk              # local filesystem
-    db-archive:                        # name clients use
+    releases:                          # name clients use
       backend: hetzner-fsn1
-      alias: acme-db-archive-prod      # real bucket on the backend
+      alias: acme-releases-prod        # real bucket on the backend
     # every other bucket goes to default_backend
 ```
 
@@ -136,15 +136,15 @@ Routing never moves data. When you point an existing bucket at a new backend, th
 3. Check that a round-trip works through the alias:
 
    ```bash
-   aws --endpoint-url https://s3.acme.example s3 cp test.txt s3://db-archive/test.txt
-   aws --endpoint-url https://s3.acme.example s3 cp s3://db-archive/test.txt -
+   aws --endpoint-url https://s3.acme.example s3 cp test.txt s3://releases/test.txt
+   aws --endpoint-url https://s3.acme.example s3 cp s3://releases/test.txt -
    ```
 
 4. Check that the object landed on the right backend. For a filesystem backend, check the path directly. For S3, list the real (aliased) bucket on the provider:
 
    ```bash
    ls /var/lib/dgp-local/downloads/                # filesystem backend
-   aws s3 ls s3://acme-db-archive-prod/ --profile hetzner   # S3 backend, raw
+   aws s3 ls s3://acme-releases-prod/ --profile hetzner     # S3 backend, raw
    ```
 
 If an object goes to the wrong backend, see [Troubleshooting](troubleshooting.md).

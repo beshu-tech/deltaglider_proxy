@@ -131,14 +131,14 @@ export const STORAGE_SHOTS: Shot[] = [
   {
     id: 'route-bucket-alias',
     route: '/_/admin/storage/buckets',
-    alt: 'The db-archive bucket is open with its Advanced settings; callout 1 marks the bucket row, callout 2 marks Advanced, and callout 3 marks Real name on backend, set to acme-db-archive-prod.',
+    alt: 'The releases bucket is open with its Advanced settings; callout 1 marks the bucket row, callout 2 marks Advanced, and callout 3 marks Real name on backend, set to acme-releases-prod.',
     setup: async (page) => {
-      await openBucket(page, 'db-archive');
+      await openBucket(page, 'releases');
       await page.getByText(/^Advanced/).click();
-      await page.getByRole('textbox', { name: 'Real name on backend' }).fill('acme-db-archive-prod');
+      await page.getByRole('textbox', { name: 'Real name on backend' }).fill('acme-releases-prod');
     },
     annotations: [
-      { target: bucketRow('db-archive'), kind: 'callout', label: '1' },
+      { target: bucketRow('releases'), kind: 'callout', label: '1' },
       { target: { text: /^Advanced/ }, kind: 'callout', label: '2', side: 'right' },
       { target: { role: 'textbox', name: 'Real name on backend' }, kind: 'box', label: '3', side: 'right' },
     ],
