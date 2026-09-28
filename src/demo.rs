@@ -190,15 +190,20 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             get(admin::export_declarative_iam),
         )
         // Full-IAM YAML import: dry-run validate (no state change) + apply
-        // (atomic reconcile). Counterpart to declarative-iam-export; works in
-        // any iam_mode (the reconciler is mode-agnostic) as a GUI round-trip.
+        // (atomic reconcile). Counterpart to declarative-iam-export. The dry
+        // run works in any iam_mode; the apply is an IAM mutation, so it has
+        // the declarative gate: there the YAML config owns IAM, and an import
+        // would drift the DB until the next config apply undoes it.
         .route(
             "/_/api/admin/config/declarative-iam-validate",
             post(admin::validate_declarative_iam),
         )
         .route(
             "/_/api/admin/config/declarative-iam-apply",
-            post(admin::apply_declarative_iam),
+            post(admin::apply_declarative_iam).layer(middleware::from_fn_with_state(
+                admin_state.clone(),
+                admin::require_not_declarative,
+            )),
         )
         .route("/_/api/admin/config/defaults", get(admin::config_defaults))
         .route(

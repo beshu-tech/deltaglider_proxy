@@ -151,6 +151,67 @@ async fn test_declarative_mode_returns_403_on_user_create() {
     );
 }
 
+/// In declarative mode the YAML config owns IAM. The full-IAM YAML import
+/// (`declarative-iam-apply`) reconciles the DB from an uploaded file, so it
+/// must refuse like every other IAM mutation: else the DB drifts from the
+/// config file until the next config apply silently undoes the import. The
+/// dry run (`declarative-iam-validate`) changes nothing and stays open.
+#[tokio::test]
+async fn test_declarative_mode_refuses_full_iam_import() {
+    let server = TestServer::builder().auth("IAMMK9", "IAMMS9").build().await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    set_iam_mode(&admin, &server.endpoint(), "declarative").await;
+
+    let users_before: serde_json::Value = admin
+        .get(format!("{}/_/api/admin/users", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let yaml = "access:\n  iam_users:\n    - name: dana\n      access_key_id: AKDANAIMPORT\n      \
+                secret_access_key: SECRETDANAIMPORT\n      permissions:\n        - actions: [read]\n          \
+                resources: [\"releases/*\"]\n";
+
+    let resp = admin
+        .post(format!(
+            "{}/_/api/admin/config/declarative-iam-validate",
+            server.endpoint()
+        ))
+        .json(&json!({ "yaml": yaml }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "the dry run stays open");
+
+    let resp = admin
+        .post(format!(
+            "{}/_/api/admin/config/declarative-iam-apply",
+            server.endpoint()
+        ))
+        .json(&json!({ "yaml": yaml }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "iam_declarative");
+
+    let users_after: serde_json::Value = admin
+        .get(format!("{}/_/api/admin/users", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        users_before, users_after,
+        "the refused import changes nothing"
+    );
+}
+
 #[tokio::test]
 async fn test_declarative_mode_allows_user_list() {
     let server = TestServer::builder().auth("IAMMK2", "IAMMS2").build().await;

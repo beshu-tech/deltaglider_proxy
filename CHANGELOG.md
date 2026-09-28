@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed — The full-IAM YAML import is refused in declarative mode
+
+In `access.iam_mode: declarative` the YAML config owns IAM, but
+`POST /_/api/admin/config/declarative-iam-apply` still reconciled the database
+from an uploaded file. The database then differed from the config file until
+the next config apply undid the import without a word. The import now gets
+`403 iam_declarative`, like the other IAM changes, and the account menu item
+"Import full IAM (YAML)" is disabled with a title that says why. The dry run
+(`declarative-iam-validate`) stays open.
+
 ### Fixed — Quota and object size units say GiB and MiB
 
 The bucket Quota field said "GB", but it converts with 1024³ bytes, which is a

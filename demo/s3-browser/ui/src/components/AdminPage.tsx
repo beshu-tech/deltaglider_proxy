@@ -28,6 +28,7 @@ import { FullIamYamlModal } from './FullIamYamlModal';
 import { useDirtyGlobalIndicators, requestApplyFirst } from '../useDirtySection';
 import type { SectionName } from '../adminApi';
 import type { AccountMenuConfigProps } from './AccountMenu';
+import { useAdminConfig } from '../queries/config';
 import { normalizeUiError } from '../errorHandling';
 import { AdminRouteContent, type AdminRouteContext } from './admin/adminRoutes';
 import { AdminAccessDenied, AdminLoginGate } from './admin/AdminLoginGate';
@@ -57,6 +58,9 @@ interface AdminPageProps {
   /** Running proxy version from whoami (App owns identity). */
   proxyVersion?: string;
 }
+
+const DECLARATIVE_IMPORT_BLOCKED =
+  'IAM is declarative (access.iam_mode: declarative): the YAML config owns users and groups. Edit the YAML config and apply it instead.';
 
 export default function AdminPage({ onBack, onSessionExpired, subPath, search, accountMenu, canAdmin = false, onShowShortcuts, proxyVersion }: AdminPageProps) {
   const colors = useColors();
@@ -141,6 +145,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
   const [yamlModalMode, setYamlModalMode] = useState<'import' | 'export' | null>(null);
   const [iamYamlMode, setIamYamlMode] = useState<'import' | 'export' | null>(null);
   const backup = useBackupImportExport();
+  const adminConfig = useAdminConfig({ enabled: authed && canAdmin });
 
   // Back-button close for modals (Tier 1.6). When a modal opens we push a
   // history entry with ?modal=… so Back closes the modal instead of leaving
@@ -400,6 +405,8 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
         onImportFullConfigYaml: () => openYamlModal('import'),
         onExportFullIam: () => openIamYamlModal('export'),
         onImportFullIam: () => openIamYamlModal('import'),
+        // The server refuses the import in declarative mode (403 iam_declarative).
+        importFullIamBlocked: adminConfig.data?.iam_mode === 'declarative' ? DECLARATIVE_IMPORT_BLOCKED : undefined,
       })
     : accountMenu;
 

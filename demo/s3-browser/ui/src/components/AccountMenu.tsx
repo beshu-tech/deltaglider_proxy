@@ -27,6 +27,8 @@ export interface AccountMenuConfigProps {
   onImportFullConfigYaml?: () => void;
   onExportFullIam?: () => void;
   onImportFullIam?: () => void;
+  /** Why the full-IAM import is refused (declarative mode); the item is then disabled. */
+  importFullIamBlocked?: string;
 }
 
 interface Props extends AccountMenuConfigProps {
@@ -68,6 +70,7 @@ export default function AccountMenu({
   onImportFullConfigYaml,
   onExportFullIam,
   onImportFullIam,
+  importFullIamBlocked,
 }: Props) {
   const { isDark, toggleTheme } = useTheme();
   const [open, setOpen] = useState(false);
@@ -307,7 +310,8 @@ export default function AccountMenu({
                   type="button"
                   className="account-menu-item"
                   role="menuitem"
-                  title={iamHelp}
+                  title={importFullIamBlocked ?? iamHelp}
+                  disabled={importFullIamBlocked !== undefined}
                   onClick={() => {
                     close();
                     onImportFullIam();
