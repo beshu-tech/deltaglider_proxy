@@ -298,7 +298,7 @@ export function ListenerTlsPanel({ onSessionExpired }: PanelProps) {
           <FormField
             label="Enable TLS"
             yamlPath="advanced.tls.enabled"
-            helpText="Serve HTTPS directly. Requires a cert + key path below. Leave off to speak plain HTTP behind a TLS-terminating reverse proxy."
+            helpText="Serve HTTPS directly. Set both paths below to use your certificate, or leave both empty and the proxy makes a self-signed one at startup. Leave off to speak plain HTTP behind a TLS-terminating reverse proxy."
           >
             <Switch
               checked={tlsEnabled}

@@ -23,7 +23,7 @@ const MODES: { mode: ImportBackupMode; label: string; help: string; iam: boolean
   {
     mode: 'config-only',
     label: 'Config only',
-    help: 'Config, backends and bucket policies. Users, groups and OIDC providers stay as they are.',
+    help: "Config, backends, bucket policies and the admin password. Users, groups and OIDC providers stay as they are.",
     iam: false,
   },
   {
@@ -35,7 +35,7 @@ const MODES: { mode: ImportBackupMode; label: string; help: string; iam: boolean
   {
     mode: 'full',
     label: 'Everything, including the admin password',
-    help: "Fails if the backup's admin password does not match the one this instance was set up with.",
+    help: "Everything in the backup. This instance takes the backup's admin password, unless DGP_BOOTSTRAP_PASSWORD_HASH sets it.",
     iam: true,
   },
 ];

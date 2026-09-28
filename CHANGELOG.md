@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed — The TLS and backup-restore help texts match what the proxy does
+
+The help of **Enable TLS** said that TLS needs a certificate path and a key
+path. When both paths are empty, the proxy makes a self-signed certificate at
+startup, and the help now says so. In the **Restore backup** dialog, the help
+of "Everything, including the admin password" said that the restore fails
+when the admin password of the backup does not match. The restore takes the
+admin password of the backup instead, unless `DGP_BOOTSTRAP_PASSWORD_HASH`
+sets it. The help of "Config only" now says that it also restores the admin
+password.
+
 ### Fixed — The full-IAM YAML import is refused in declarative mode
 
 In `access.iam_mode: declarative` the YAML config owns IAM, but
