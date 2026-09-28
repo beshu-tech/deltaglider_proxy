@@ -76,7 +76,10 @@ for f in "$SHOTS"/*; do
     continue
   fi
   stem="${name%.*.webp}"
-  if ! git -C "$ROOT" grep -q -F "$stem" -- docs/product README.md marketing/src demo/s3-browser/ui/src ':!demo/s3-browser/ui/src/__tests__'; then
+  # Plain grep, not git grep: CI runs in a container where git refuses the
+  # checkout ("dubious ownership"), which made every shot look unused.
+  if ! grep -rqF --exclude-dir=__tests__ --exclude-dir=node_modules --exclude-dir=dist "$stem" \
+      "$ROOT/docs/product" "$ROOT/README.md" "$ROOT/marketing/src" "$ROOT/demo/s3-browser/ui/src"; then
     echo "UNUSED SCREENSHOT: docs/screenshots/$name (no page references $stem; delete the pair and its shot)" >&2
     fail=1
   fi
