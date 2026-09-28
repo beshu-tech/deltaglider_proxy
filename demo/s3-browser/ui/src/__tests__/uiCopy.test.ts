@@ -42,3 +42,11 @@ test('encryption alert names the re-encrypt job for old objects', () => {
   expect(s).toMatch(/Applies to newly written objects only[\s\S]{0,800}re-encrypt job/);
   expect(s).toContain('Re-encrypt existing objects');
 });
+
+// config/mod.rs persist writes a GUI-set AES key into the config file in
+// plain text (0600 for a new file; a rewrite keeps mode & 0o660).
+test('the generated-key panel says the key goes into the config file', () => {
+  const s = src('components/BackendEncryptionEditor.tsx');
+  expect(s).toMatch(/plain text[\s\S]{0,300}config file/);
+  expect(s).toContain('encryptionKeyEnvVar(backendName)');
+});

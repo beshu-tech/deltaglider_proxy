@@ -1,7 +1,7 @@
 /** src/backendEncryptionPayload.ts */
 import assert from 'node:assert/strict';
 import { test } from 'vitest';
-import { aesKeyPatch, buildClearLegacySectionBody, buildEncryptionSectionBody } from '../backendEncryptionPayload';
+import { aesKeyPatch, buildClearLegacySectionBody, buildEncryptionSectionBody, encryptionKeyEnvVar } from '../backendEncryptionPayload';
 
 // One entry per backend variant, as the storage section GET returns it
 // (secrets redacted, so absent). Every field must survive an encryption
@@ -128,4 +128,12 @@ test('clearing the legacy key on a named backend keeps its key_id and every sibl
     assert.deepEqual(body.backends.find((b) => b.name === v.name), v);
   }
   assert.throws(() => buildClearLegacySectionBody('gone', { backends: variants }), /Reload the page/);
+});
+
+// Mirrors backend_encryption_env_names (src/config/mod.rs): "default" uses the
+// short name, others upper-case the name with '-' and '.' mapped to '_'.
+test('encryptionKeyEnvVar matches the server env-var names', () => {
+  assert.equal(encryptionKeyEnvVar('default'), 'DGP_ENCRYPTION_KEY');
+  assert.equal(encryptionKeyEnvVar('hetzner-fsn1'), 'DGP_BACKEND_HETZNER_FSN1_ENCRYPTION_KEY');
+  assert.equal(encryptionKeyEnvVar('aws.dr'), 'DGP_BACKEND_AWS_DR_ENCRYPTION_KEY');
 });

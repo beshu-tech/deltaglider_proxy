@@ -29,7 +29,7 @@ import { useColors } from '../ThemeContext';
 import { useCardStyles } from './shared-styles';
 import { generateAesKeyHex } from '../aesKeyGen';
 import { useCopyToClipboard } from '../useCopyToClipboard';
-import { aesKeyPatch } from '../backendEncryptionPayload';
+import { aesKeyPatch, encryptionKeyEnvVar } from '../backendEncryptionPayload';
 import { useLegacyKeyUsage } from '../queries/backends';
 import { confirmDialog } from '../confirmDialog';
 import { normalizeUiError } from '../errorHandling';
@@ -323,6 +323,12 @@ export default function BackendEncryptionEditor({ backendName, current, onApply,
                 title="If you lose this key, encrypted objects on this backend are unrecoverable."
                 description="DeltaGlider does not back up your encryption key. Copy it to a password manager / secrets vault BEFORE clicking Apply."
               />
+              <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
+                When you apply, the proxy writes this key in plain text into the config file. A new
+                config file is readable only by its owner; a rewritten file keeps the owner and group
+                read bits of the old one. To keep the key out of the file, set it in the environment
+                variable <code>{encryptionKeyEnvVar(backendName)}</code> instead.
+              </Text>
               <label htmlFor={`${uid}-key`} style={{ fontSize: 11, color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
                 Generated key (64 hex chars, shown ONCE)
               </label>

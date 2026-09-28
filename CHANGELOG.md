@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed — The key panel says where a generated AES key is stored
+
+When the admin UI generates a proxy-side AES key, the proxy writes it in plain
+text into the config file. The panel did not say so. It now says it, and it
+names the environment variable (for example
+`DGP_BACKEND_HETZNER_FSN1_ENCRYPTION_KEY`) that keeps the key out of the file.
+
 ### Fixed — The encryption editor names the re-encrypt job
 
 When you turn on proxy-side AES encryption, the editor said that old objects

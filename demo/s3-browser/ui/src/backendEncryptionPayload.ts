@@ -120,3 +120,13 @@ export function buildClearLegacySectionBody(
     ),
   };
 }
+
+/**
+ * The env var that supplies a backend's proxy-AES key, as
+ * `backend_encryption_env_names` in src/config/mod.rs names it.
+ */
+export function encryptionKeyEnvVar(backendName: string): string {
+  if (backendName === 'default') return 'DGP_ENCRYPTION_KEY';
+  const suffix = backendName.replace(/[-.]/g, '_').toUpperCase();
+  return `DGP_BACKEND_${suffix}_ENCRYPTION_KEY`;
+}
