@@ -19,7 +19,7 @@ When the badge is not **Connected**, the card also shows an alert with the cause
 
 Click **Test connection** on the backend card. The server runs the probe with its own credentials, endpoint and network, and the card shows the result below the buttons. A green result means that the proxy itself can serve from this backend, which proves more than a browser that can reach the endpoint. The same probe is `POST /_/api/admin/backends/<name>/probe`.
 
-![The hetzner-fsn1 backend card after a probe; boxes mark its Connected badge, its Test connection button and the probe result.](/_/screenshots/backend-health-test-connection.webp)
+![The hetzner-fsn1 backend card after a probe; a numbered mark sits above its Connected badge, and boxes mark its Test connection button and the probe result.](/_/screenshots/backend-health-test-connection.webp)
 
 Buckets that an unhealthy verdict blocks reopen by themselves within about 30 seconds of the recovery, and **Test connection** reopens them at once.
 

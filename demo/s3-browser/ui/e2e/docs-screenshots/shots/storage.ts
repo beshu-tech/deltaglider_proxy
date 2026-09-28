@@ -337,7 +337,7 @@ const BUCKET_POLICY_SHOTS: Shot[] = [
   {
     id: 'backend-health-test-connection',
     route: '/_/admin/storage/backends',
-    alt: 'The hetzner-fsn1 backend card after a probe; boxes mark its Connected badge, its Test connection button and the probe result.',
+    alt: 'The hetzner-fsn1 backend card after a probe; a numbered mark sits above its Connected badge, and boxes mark its Test connection button and the probe result.',
     setup: async (page) => {
       await page.getByRole('button', { name: /Test connection$/ }).and(page.locator('[data-backend-card="hetzner-fsn1"] button')).click();
       await page.locator('[data-backend-card="hetzner-fsn1"] .ant-alert').first().waitFor();
@@ -345,7 +345,8 @@ const BUCKET_POLICY_SHOTS: Shot[] = [
     },
     annotations: [
       // The badge comes first in the card; the probe result repeats the word.
-      { target: { text: 'Connected', exact: true, within: card('hetzner-fsn1'), nth: 0 }, kind: 'box' },
+      // A callout above it: a box frame would cross the endpoint line below.
+      { target: { text: 'Connected', exact: true, within: card('hetzner-fsn1'), nth: 0 }, kind: 'callout', label: '1', side: 'top' },
       { target: { css: '[data-backend-card="hetzner-fsn1"] .ant-alert-success' }, kind: 'box' },
       // A box, not an arrow: every side of the button has text within an arrow's length.
       { target: { role: 'button', name: /Test connection$/, within: card('hetzner-fsn1') }, kind: 'box' },
