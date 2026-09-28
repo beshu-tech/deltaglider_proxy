@@ -58,6 +58,8 @@ If you type the name of a bucket that the proxy already lists, the row does not 
 
 3. Optional: give the existing objects the metadata of the proxy (a content hash and the creation time), so that the admin UI shows their checksum and the proxy can verify them. In the sidebar, open **Storage → Jobs** (`/_/admin/jobs`), click **New job**, and select **Backfill metadata… — for objects written without the proxy**. In the dialog **Backfill object metadata**, select `releases`, and then click **Start now (1 bucket)**. The job reads each object once and rewrites only its metadata. It keeps the Last-Modified time of each object, unless you select **Show backfilled objects as modified now**. While the job runs, uploads and deletes in the bucket get `503 SlowDown`, and S3 clients retry them. The details are in the [jobs reference](../reference/jobs.md#metadata-backfill).
 
+   ![The dialog Backfill object metadata with the releases bucket selected; the arrow points at Start now.](/_/screenshots/adopt-bucket-backfill.webp)
+
 **The limit of this route:** objects that entered the bucket before the proxy never get compressed later. The proxy delta-encodes an object only when it writes it. An object stored as-is stays as-is, unless something writes it again through the proxy. If historical savings matter, use route 2.
 
 ### The same change in YAML
