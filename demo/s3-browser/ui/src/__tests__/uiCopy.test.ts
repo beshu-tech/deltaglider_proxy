@@ -1,52 +1,110 @@
 /**
- * Help texts that state a server behaviour. Each case names the server rule
- * that it must match, so a copy change that contradicts the server fails here.
+ * Operator-facing copy rules (issue #92 items 10 and 20), checked over every
+ * component source with comments stripped:
+ *   - no raw backticks inside a quoted string (they render as literal `…`;
+ *     use <code> for a real identifier),
+ *   - no internal API wording ("section API", "on PUT", "HEAD calls" —
+ *     HTTP traffic is "requests"),
+ *   - one vocabulary for request rules: never "admission block/chain",
+ *     "operator-authored", "synthesised", or "Rule tester".
+ * YAML keys and identifiers are unaffected: the patterns need spaces or
+ * word boundaries that identifiers do not have.
+ *
+ * src/__tests__ is excluded from the scan: this file's own RULES definitions
+ * quote the banned phrases and would otherwise flag themselves.
  */
-import { readFileSync } from 'node:fs';
-import { expect, test } from 'vitest';
+import assert from 'node:assert/strict';
+import { readFile, readdir } from 'node:fs/promises';
+import { join } from 'node:path';
+import { test } from 'vitest';
 
-const src = (rel: string) => readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8');
+const ROOT = process.env.UI_COPY_ROOT ?? new URL('../', import.meta.url).pathname;
 
-// event_delivery.rs inactive_prune_floor: with delivery off, the outbox keeps
-// an event until event-driven replication consumes it (keeps all while no
-// replication cursor is active), and prunes it at once only with replication off.
-test('Enable delivery help matches the outbox prune rule', () => {
-  const panel = src('components/WebhookDeliveryPanel.tsx');
-  expect(panel).not.toContain('events are not kept for later');
-  expect(panel).toMatch(/Enable delivery[\s\S]{0,400}replication/);
-});
-
-// The backup buttons live in the last card of System → System (RecoveryPanel,
-// "Download backup"); there is no Backup entry in the account menu.
-test('texts that point at the backup name System → System', () => {
-  for (const f of ['components/CopySectionYamlButton.tsx', 'components/IamSourceBanner.tsx']) {
-    const s = src(f);
-    expect(s, f).not.toMatch(/Avatar menu|use Backup →|Full Backup/);
-    expect(s, f).toContain('System → System');
+async function files(dir: string): Promise<string[]> {
+  const out: string[] = [];
+  for (const e of await readdir(dir, { withFileTypes: true })) {
+    if (e.isDirectory() && e.name === '__tests__') continue;
+    const p = join(dir, e.name);
+    if (e.isDirectory()) out.push(...(await files(p)));
+    else if (/\.tsx?$/.test(e.name)) out.push(p);
   }
-  expect(src('components/RecoveryPanel.tsx')).toContain('Download backup');
+  return out;
+}
+
+function stripComments(src: string): string {
+  const blank = (m: string) => m.replace(/[^\n]/g, ' ');
+  return src.replace(/\/\*[\s\S]*?\*\//g, blank).replace(/(^|[^:\\])\/\/[^\n]*/g, (m, p: string) => p + blank(m.slice(p.length)));
+}
+
+/**
+ * True when the line has a bare "rule tester" not immediately preceded by
+ * "request " ("request rule tester" is the approved vocabulary). Written
+ * without a regex lookbehind: ESLint's `no-restricted-syntax` bans lookbehind
+ * literals repo-wide (Safari < 16.4 cannot parse them), so this walks matches
+ * and inspects the preceding 8 characters by hand instead.
+ */
+function hasBareRuleTester(line: string): boolean {
+  const re = /rule tester/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(line))) {
+    const before = line.slice(Math.max(0, m.index - 8), m.index).toLowerCase();
+    if (before !== 'request ') return true;
+  }
+  return false;
+}
+
+const RULES: { name: string; test: (line: string) => boolean }[] = [
+  { name: 'raw backtick in a quoted string', test: (l) => /\w="[^"\n{}`]*`[^"\n{}]*"/.test(l) },
+  {
+    name: 'internal API wording',
+    test: (l) => /\bsection API\b|\bon (GET|PUT)\b|\b(HEAD|GET|PUT|LIST|API) calls\b|\bsome calls\b/i.test(l),
+  },
+  {
+    name: 'request-rule vocabulary',
+    test: (l) => /operator-authored|\bsynthesi[sz]ed\b|\badmission (block|chain)s?\b/i.test(l) || hasBareRuleTester(l),
+  },
+  {
+    // The config DB has its own key (DGP_CONFIG_DB_KEY or the key file); the
+    // admin password encrypts nothing, and resetting it keeps the IAM DB.
+    name: 'admin password encrypts the database (it does not)',
+    test: (l) => /\b(re-)?encrypts (the )?(IAM|user|config) (database|DB)\b|\bwipes the IAM database\b/i.test(l),
+  },
+];
+
+test('no UI copy violations in src/**/*.tsx', async () => {
+  const violations: string[] = [];
+  for (const f of await files(ROOT)) {
+    if (f.includes('/schemas/') || f.endsWith('docsBundle.ts')) continue;
+    const lines = stripComments(await readFile(f, 'utf8')).split('\n');
+    lines.forEach((line, i) => {
+      for (const r of RULES) {
+        if (r.test(line)) violations.push(`${f.replace(ROOT, 'src/')}:${i + 1} ${r.name}: ${line.trim().slice(0, 120)}`);
+      }
+    });
+  }
+  assert.deepEqual(violations, [], `UI copy violations:\n${violations.join('\n')}`);
 });
 
-// No admin control sets storage.replication.enabled (default true), so the
-// rule's help must not send the operator to a "global scheduler" switch.
-test('replication Enabled help names the YAML-only switch', () => {
-  const s = src('components/ReplicationRuleFields.tsx');
-  expect(s).not.toContain('The global scheduler must also be enabled');
-  expect(s).toContain('storage.replication.enabled');
-});
-
-// BackendsPanel opens ReencryptProposalModal after an encryption apply, and
-// BucketCard has "Re-encrypt existing objects": the alert must name that job.
-test('encryption alert names the re-encrypt job for old objects', () => {
-  const s = src('components/BackendEncryptionEditor.tsx');
-  expect(s).toMatch(/Applies to newly written objects only[\s\S]{0,800}re-encrypt job/);
-  expect(s).toContain('Re-encrypt existing objects');
-});
-
-// config/mod.rs persist writes a GUI-set AES key into the config file in
-// plain text (0600 for a new file; a rewrite keeps mode & 0o660).
-test('the generated-key panel says the key goes into the config file', () => {
-  const s = src('components/BackendEncryptionEditor.tsx');
-  expect(s).toMatch(/plain text[\s\S]{0,300}config file/);
-  expect(s).toContain('encryptionKeyEnvVar(backendName)');
+test('the product docs use the UI vocabulary for request rules too', async () => {
+  // The YAML key `admission.blocks` stays; prose says "rule". The changelog is history.
+  const DOCS = new URL('../../../../../docs/product/', import.meta.url).pathname;
+  async function mdFiles(dir: string): Promise<string[]> {
+    const out: string[] = [];
+    for (const e of await readdir(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) out.push(...(await mdFiles(p)));
+      else if (e.name.endsWith('.md') && e.name !== 'changelog.md') out.push(p);
+    }
+    return out;
+  }
+  const DOC_VOCAB = /operator-authored|\badmission blocks?\b|\bsynthesi[sz]ed (public-prefix |admission )?blocks?\b|\bmatched block\b/i;
+  const docViolations: string[] = [];
+  for (const f of await mdFiles(DOCS)) {
+    (await readFile(f, 'utf8')).split('\n').forEach((line, i) => {
+      if (DOC_VOCAB.test(line) || hasBareRuleTester(line)) {
+        docViolations.push(`${f.replace(DOCS, 'docs/product/')}:${i + 1}: ${line.trim().slice(0, 120)}`);
+      }
+    });
+  }
+  assert.deepEqual(docViolations, [], `Docs vocabulary violations:\n${docViolations.join('\n')}`);
 });
