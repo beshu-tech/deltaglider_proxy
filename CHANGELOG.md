@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed — The review dialog is no longer under the unsaved-changes bar
+
+The unsaved-changes bar sits over the Jobs drawer, so that a rule that you edit
+in the drawer stays easy to apply. It also sat over the "Review & apply"
+dialog, and it hid the bottom of that dialog. Dialogs now sit over the bar.
+
 ### Fixed — The Jobs row says why a lifecycle rule cannot run now
 
 The proxy refuses "Run now" on a lifecycle rule that is disabled or paused, and

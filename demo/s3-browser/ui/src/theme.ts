@@ -1,5 +1,15 @@
 import { theme } from 'antd';
 
+/**
+ * Stacking: the unsaved-changes bar (StickyDirtyBar) sits over a top-level
+ * Drawer (AntD zIndexPopupBase, 1000) so a rule edited in the Jobs drawer can
+ * be applied, and every Modal sits over the bar, because its Review & apply
+ * button opens the review modal.
+ */
+export const Z_DIRTY_BAR = 1001;
+const Z_MODAL = 1010;
+const COMPONENTS = { Modal: { zIndexPopupBase: Z_MODAL } };
+
 const DG_BRAND = {
   colorPrimary: '#2dd4bf',
   fontFamily: "'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
@@ -27,6 +37,7 @@ export const darkTheme = {
     borderRadius: 8,
     fontFamilyCode: "'JetBrains Mono', 'Fira Code', monospace",
   },
+  components: COMPONENTS,
 };
 
 export const lightTheme = {
@@ -49,4 +60,5 @@ export const lightTheme = {
     borderRadius: 8,
     fontFamilyCode: "'JetBrains Mono', 'Fira Code', monospace",
   },
+  components: COMPONENTS,
 };

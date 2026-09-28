@@ -13,6 +13,7 @@
 import { Button, Space } from 'antd';
 import { ExclamationCircleFilled } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
+import { Z_DIRTY_BAR } from '../theme';
 
 interface Props {
   visible: boolean;
@@ -74,11 +75,9 @@ export default function StickyDirtyBar({
       // margins; the inner bar re-enables them.
       style={{
         ...positionStyle,
-        // Above the AntD Drawer/Modal (z-index 1000): a rule edited INSIDE the
-        // Jobs drawer raises this page-level bar, so it must float OVER the
-        // drawer to stay reachable (it sat behind it at z-index 20). Inline mode
-        // has no positioning, so the high z is harmless there.
-        zIndex: 1001,
+        // Above the Drawer, below every Modal (see Z_DIRTY_BAR in theme.ts).
+        // Inline mode has no positioning, so the high z is harmless there.
+        zIndex: Z_DIRTY_BAR,
         display: 'flex',
         justifyContent: 'center',
         pointerEvents: 'none',
