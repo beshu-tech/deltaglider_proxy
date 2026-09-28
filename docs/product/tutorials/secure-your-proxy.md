@@ -41,11 +41,11 @@ docker run --rm -it -p 9000:9000 -v dgp-data:/data \
 
 Notice that there is no password box in the logs this time. The proxy found our hash on the volume and used it.
 
-Now prove the password works. Open [http://localhost:9000/_/admin](http://localhost:9000/_/admin). You should see an **Admin Login** gate that says **Enter the admin password to continue.** Type `acme-rocks-mauve-42` (or the password that you chose) and sign in. The Settings area opens, with a navigation sidebar on the left.
+Now prove the password works. Open [http://localhost:9000/_/admin](http://localhost:9000/_/admin). You should see an **Admin Login** gate that says **Enter the admin password to continue.** Type `acme-rocks-mauve-42` (or the password that you chose) and sign in. The admin settings open, with a navigation sidebar on the left.
 
 ## Step 2: require S3 authentication
 
-Now we close the open door. The proxy is still in open mode because we started it with `DGP_AUTHENTICATION=none`. An environment variable wins over the settings, so the **S3 authentication mode** choice on **Access → Credentials & mode** is read-only right now, with a note that names the variable. Take a look, then restart the proxy without that variable and with a bootstrap credential pair instead.
+Now we close the open door. The proxy is still in open mode because we started it with `DGP_AUTHENTICATION=none`. An environment variable wins over the settings, so the **S3 authentication mode** choice on **Access → Credentials & mode** is read-only right now, with a note that names the variable. For this reason, this step changes the environment and not the admin UI: we restart the proxy without that variable and with a bootstrap credential pair instead.
 
 Stop the running proxy (`Ctrl+C`), and start it again:
 
@@ -56,7 +56,17 @@ docker run --rm -it -p 9000:9000 -v dgp-data:/data \
   beshultd/deltaglider_proxy
 ```
 
-Sign in to [http://localhost:9000/_/admin](http://localhost:9000/_/admin) again with your password, because a restart ends every session. **Access → Credentials & mode** now shows **Auto-detect (recommended)**, and the access key ID `acme-admin` with a badge that says it comes from the environment. Test it from the second terminal, where the `dummy` credentials from tutorial 1 are still exported:
+Sign in to [http://localhost:9000/_/admin](http://localhost:9000/_/admin) again with your password, because a restart ends every session. Then look at the result in the admin UI:
+
+1. In the sidebar, open **Access → Credentials & mode** (`/_/admin/access/credentials`).
+2. Under **S3 authentication mode**, **Auto-detect (recommended)** is now selected, and the banner above it says that SigV4 authentication is on.
+3. The **Bootstrap SigV4 credentials** card shows the access key ID `acme-admin`. Because the value comes from `DGP_ACCESS_KEY_ID`, the field is read-only and carries a badge that says so.
+
+   ![The Credentials & mode page; callout 1 marks Auto-detect (recommended) under S3 authentication mode, and callout 2 marks the Bootstrap SigV4 credentials card, which holds the access key ID of the proxy.](/_/screenshots/secure-credentials-mode.webp)
+
+   The screenshot comes from a proxy whose key is in the config file, so its field has no environment badge.
+
+Test the new rule from the second terminal, where the `dummy` credentials from tutorial 1 are still exported:
 
 ```bash
 aws --endpoint-url http://localhost:9000 s3 ls
@@ -81,20 +91,34 @@ aws --endpoint-url http://localhost:9000 s3 ls
 
 The proxy and the bucket are the same, but now only signed requests with the right key get in.
 
+### The same change in YAML
+
+The two environment variables set the `access` section of the configuration ([why the UI and the file hold the same configuration](../explanation/two-ways-to-configure.md)). On a proxy without these variables, you can put the pair in `deltaglider_proxy.yaml` instead:
+
+```yaml
+# validate
+access:
+  access_key_id: acme-admin
+  secret_access_key: correct-horse-battery-staple-acme-1
+```
+
+When the variables are not set, you can also type the pair into the **Bootstrap SigV4 credentials** card and click **Review & apply**, and then **Apply and Persist**. The environment variables `DGP_ACCESS_KEY_ID` and `DGP_SECRET_ACCESS_KEY` override the file, and the admin UI then shows both fields as read-only. After you edit the file, restart the proxy, or apply the file to the running proxy with `deltaglider_proxy config apply deltaglider_proxy.yaml --server http://localhost:9000`.
+
 ## Step 3: create the `ci-uploader` user
 
-One shared credential is better than none, but Acme's CI pipeline should not hold the keys to everything. Next, we give it its own identity, scoped to the firmware folder.
+One shared credential is better than none, but Acme's CI pipeline should not hold the keys to everything. Next, we give it its own identity, scoped to the firmware folder. Users live in the encrypted config database, so the admin UI is the place to create one, and there is no YAML for this step. (To manage users in YAML, see [How to manage IAM as code](../how-to/manage-iam-as-code.md).)
 
-In Settings, go to **Access → Users**. Because no IAM users exist yet, the page says **Create the first user**. Notice the note under it: your current credentials are kept as an admin user, so nothing you just set up breaks. Click **New** above the user list.
+In the admin UI:
 
-![IAM users panel](/_/screenshots/iam.jpg)
+1. In the sidebar, open **Access → Users** (`/_/admin/access/users`). Because no IAM users exist yet, the page says **Create the first user**. Notice the note under it: your current credentials are kept as an admin user, so nothing that you just set up breaks.
+2. Click **New** above the user list.
+3. In **Name**, type `ci-uploader`. Leave **Access Key ID** and **Secret Access Key** empty, so that the proxy generates them.
+4. Edit the rule under **Permissions**. A new user starts with one rule that allows **List** and **Read** everywhere. Keep **Allow**, replace `*` under **WHERE** with `releases/firmware/*`, and click **Write** under **CAN DO**, so that **List**, **Read** and **Write** are on.
+5. Click **Create User**.
 
-In the user form:
+   ![The Users page with the form of the new ci-uploader user; callout 1 marks Users in the sidebar, callout 2 the New button, callout 3 the Name field, callout 4 the rule that allows List, Read and Write on releases/firmware/*, and callout 5 the Create User button.](/_/screenshots/iam-users-new-form.webp)
 
-1. **Name**: `ci-uploader`.
-2. Leave **Access key ID** and **Secret access key** blank. The proxy generates them.
-3. Edit the pre-filled permission rule: keep **Effect** on `Allow`, set **Actions** to `read`, `write`, `list`, and **Resources** to `releases/firmware/*`.
-4. Click **Create User**.
+   The screenshot comes from a proxy that already has more users, so its list is not empty.
 
 You should see a dialog titled **User created: save these credentials**, showing the generated access key and secret. Copy both now, because the proxy shows the secret only this once.
 
