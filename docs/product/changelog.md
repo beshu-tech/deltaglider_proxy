@@ -8,7 +8,239 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-09-27_
+_Last updated: 2026-09-28_
+
+## v2.0.1 — 2026-09-28
+
+### Upgrade steps for 2.0.1
+
+2.0.1 needs no upgrade step. Four answers changed, so check scripts that
+depend on them:
+
+- A "Config only" backup restore (`mode=config-only`) keeps this instance's
+  admin password. Only "Everything, including the admin password"
+  (`mode=full`) restores it.
+- In `access.iam_mode: declarative`, `POST /_/api/admin/config/declarative-iam-apply`
+  answers `403 iam_declarative`. Edit the YAML config and apply it instead.
+- A restore that includes the config answers `409 config_file_read_only` when
+  the config file is read-only, before anything changes.
+- Section validate and PUT responses carry `restart_reasons`, apply and PUT
+  responses carry `persist_error` on a failed file write, and `GET /config`
+  carries `config_file_path` and `config_file_writable`.
+
+### Fixed — Listing facts keep up with a busy node
+
+Since 2.0 the proxy writes the listing facts of a PUT in the background, in
+one task per backend. That task wrote the facts objects of a batch one after
+another, so on a node with many writes the queue grew and a LIST showed the
+stored size of new objects for longer and longer. Each batch is now written
+with up to 32 requests at once, and a key that a batch holds twice is written
+once.
+
+### Added — `config lint` warns about a `legacy_key_id` without a `legacy_key`
+
+A backend's decrypt-only shim reads old objects with the retired key in
+`legacy_key`. A config with `legacy_key_id` and no `legacy_key` loaded without
+a word, but the objects written with that key stayed unreadable. The config
+check (at startup, on apply and in `config lint`) now warns about it.
+
+### Fixed — "Add Rule" no longer stores an empty mapping rule
+
+On **Access → External authentication**, **Add Rule** stored a new, empty
+group mapping rule on the server at once. If you left the page without
+saving, the empty rule stayed. The new rule is now a draft in the page: the
+proxy stores it when you click **Save Rules**, and **Save Rules** refuses a
+new rule with no pattern.
+
+### Fixed — The permission editor shows every condition of a rule
+
+The permission editor has inputs only for a list prefix (`StringLike` on
+`s3:prefix`) and an IP restriction (`IpAddress` on `aws:SourceIp`). A rule
+with other conditions, such as `StringNotLike` or `NotIpAddress` from the API
+or YAML, showed empty filters, so you could not see what the rule does. The
+editor now lists those conditions read-only under **Other conditions**, and an
+edit of the rule keeps them.
+
+### Fixed — The IAM mode card says why it cannot switch to declarative
+
+On **Access → Credentials & mode**, the **Declarative** option asked for
+confirmation and then failed, because the proxy refuses a switch to
+`declarative` while the YAML has no users or groups: it would empty the user
+database. The page never sends users, so the switch always failed. The option
+is now disabled while the YAML has no users, groups or providers, and it says
+to apply a full YAML document instead, with a link to "How to manage IAM as
+code".
+
+### Fixed — A running job's progress is readable in the Jobs table
+
+In the Jobs table, the progress meter of a running migration took no width
+in its Status cell, so it showed only "run…". The meter now fills the
+column and shows its track and its label, for example "running · 12 copied".
+
+### Fixed — A replication rule made in the admin UI gets the server defaults
+
+A new replication rule in the admin UI started with the exclude glob `.dg/*`
+and an interval of 15 minutes. A rule written in YAML gets `.deltaglider/**`
+and 24 hours. So a rule made in the UI did not exclude the config-sync prefix.
+The UI now starts a rule with the same defaults as YAML. The defaults of the
+replication scheduler lease (`lease_ttl` 300s, `heartbeat_interval` 60s) are
+also the server defaults now.
+
+### Fixed — The key panel says where a generated AES key is stored
+
+When the admin UI generates a proxy-side AES key, the proxy writes it in plain
+text into the config file. The panel did not say so. It now says it, and it
+names the environment variable (for example
+`DGP_BACKEND_HETZNER_FSN1_ENCRYPTION_KEY`) that keeps the key out of the file.
+
+### Fixed — The encryption editor names the re-encrypt job
+
+When you turn on proxy-side AES encryption, the editor said that old objects
+stay as they are until you upload them again. It now also says that the proxy
+offers a re-encrypt job after you apply, and that **Re-encrypt existing
+objects** on a bucket in **Storage → Buckets** starts it later.
+
+### Fixed — The replication rule's Enabled help names the real switch
+
+The help of a replication rule's **Enabled** switch said that "the global
+scheduler" must also be on, but no control in the admin UI sets it. The help
+now says that the rule runs on its own only while
+`storage.replication.enabled` is on, that it is on by default, and that only
+YAML sets it.
+
+### Fixed — IAM hints point at the real backup button
+
+The section YAML preview of **Access** and the banner on the IAM pages sent
+you to "Avatar menu → Backup" and to "Full Backup". Neither exists. They now
+name **Download backup** on **System → System**.
+
+### Fixed — The "Enable delivery" help says which events delivery sends later
+
+The help of **Enable delivery** said that the proxy keeps no events while
+delivery is off. With replication on, the proxy keeps each event until
+event-driven replication reads it, so turning delivery on also sends the events
+that are still in the event log. The help text and the event outbox reference
+now say so.
+
+### Fixed — "Restart required" names the settings that need a restart
+
+The server and the admin UI did not agree about which settings need a
+restart. A change of the reference cache size answered "restart required",
+but the proxy rebuilds its caches at once when you apply a new size. The UI
+also marked **Codec concurrency** as restart-only, but it applies at once as
+well. A change of `blocking_threads` needs a restart, because the proxy sizes
+that thread pool at startup, but the server did not say so. Now the server and
+the UI mark the same four settings: `listen_addr`, the TLS settings,
+`blocking_threads` and `config_sync_bucket`.
+
+### Fixed — The review dialog is no longer under the unsaved-changes bar
+
+The unsaved-changes bar sits over the Jobs drawer, so that a rule that you edit
+in the drawer stays easy to apply. It also sat over the "Review & apply"
+dialog, and it hid the bottom of that dialog. Dialogs now sit over the bar.
+
+### Fixed — The Jobs row says why a lifecycle rule cannot run now
+
+The proxy refuses "Run now" on a lifecycle rule that is disabled or paused, and
+on every lifecycle rule while "Run lifecycle rules on schedule" is off. The Jobs
+row hid the button without a reason. It now shows "Run now" disabled, and its
+title says what to turn on first. Replication keeps "Run once" for a disabled
+or paused rule, because the proxy runs that rule one time.
+
+### Fixed — A refused lifecycle "Run now" names the GUI switch
+
+When lifecycle is off, "Run now" on a lifecycle rule is refused. The message
+named only the YAML key `storage.lifecycle.enabled`. It now also says to turn
+on "Run lifecycle rules on schedule" on the Jobs page. The message for a
+disabled rule now names the rule's Enabled switch as well as `enabled: true`
+in YAML.
+
+### Fixed — The YAML import says when the config file is read-only
+
+When `POST /_/api/admin/config/apply` worked in the running proxy but could not
+write the config file, the "Import configuration from YAML" dialog showed a
+generic error. The response now carries `persist_error`, and the dialog says
+"Applied to the running proxy, but the config file is read-only, so this
+change is lost at the next restart. Export the YAML and update your
+deployment."
+
+### Changed — A "Config only" restore keeps the admin password
+
+A backup restore with `mode=config-only` also replaced the admin password of
+the instance with the one in the backup. That did not match the name of the
+mode, and "Everything, including the admin password" (`mode=full`) exists for
+that purpose. A config-only restore now keeps the admin password of this
+instance. Only `mode=full` restores the admin password.
+
+### Fixed — A read-only config file is visible in the admin GUI
+
+Docker Compose (`:ro`), the Helm chart and the operator mount the config file
+read-only. A section apply then worked in the running proxy, but the proxy
+could not write the file, so the change was lost at the next restart, and a
+setting that needs a restart never took effect. The GUI showed only "Apply
+failed". Now:
+
+- `GET /_/api/admin/config` reports `config_file_path` and
+  `config_file_writable`, and the admin GUI shows a banner while the file is
+  read-only.
+- A section apply that works in memory but cannot write the file answers
+  with `persist_error` (still HTTP 500 and `ok: true`). The GUI says "Applied
+  to the running proxy, but the config file is read-only, so this change is
+  lost at the next restart. Export the YAML and update your deployment."
+- A backup restore that includes the config is refused with `409` before it
+  changes anything, with a message that says the config file is read-only.
+  A restore of users and groups only still works.
+
+### Fixed — The Apply dialog names the fields that need a restart
+
+The "Restart required" banner always named `listen_addr` and `cache_size_mb`,
+but a change to TLS or to the sync bucket also needs a restart. The section
+validate and apply responses now carry `restart_reasons`, one line for each
+changed field that needs a restart, and the banner lists them.
+
+### Fixed — The TLS and backup-restore help texts match what the proxy does
+
+The help of **Enable TLS** said that TLS needs a certificate path and a key
+path. When both paths are empty, the proxy makes a self-signed certificate at
+startup, and the help now says so. In the **Restore backup** dialog, the help
+of "Everything, including the admin password" said that the restore fails
+when the admin password of the backup does not match. The restore takes the
+admin password of the backup instead, unless `DGP_BOOTSTRAP_PASSWORD_HASH`
+sets it. The help of "Config only" now says that it also restores the admin
+password.
+
+### Fixed — The full-IAM YAML import is refused in declarative mode
+
+In `access.iam_mode: declarative` the YAML config owns IAM, but
+`POST /_/api/admin/config/declarative-iam-apply` still reconciled the database
+from an uploaded file. The database then differed from the config file until
+the next config apply undid the import without a word. The import now gets
+`403 iam_declarative`, like the other IAM changes, and the account menu item
+"Import full IAM (YAML)" is disabled with a title that says why. The dry run
+(`declarative-iam-validate`) stays open.
+
+### Fixed — Quota and object size units say GiB and MiB
+
+The bucket Quota field said "GB", but it converts with 1024³ bytes, which is a
+GiB. The field, the quota chip on the bucket card, the upload page's refusal
+message and the server's `Bucket quota exceeded` message now say GiB, MiB and
+KiB. The object size limit field is now "Maximum object size (MiB)" for the
+same reason. The stored values do not change: `quota_bytes` and
+`max_object_size` stay in bytes.
+
+### Fixed — The Sync bucket help describes the merge
+
+The help text of the Sync bucket field said that "the most recently saved copy
+wins". The sync is a three-way merge by name, so edits from two instances both
+survive. The help now says so, and says that only a field that two instances
+change goes to the newer change.
+
+### Fixed — The Jobs page can turn the lifecycle scheduler on
+
+No admin GUI control set `storage.lifecycle.enabled`, and its default is off.
+An operator who used only the GUI could not make a lifecycle rule run. The
+Jobs page now has the switch "Run lifecycle rules on schedule". It applies
+through the same review-and-apply step as the lifecycle rules.
 
 ## v2.0.0 — 2026-09-27
 

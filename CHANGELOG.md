@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.1 — 2026-09-28
+
 ### Upgrade steps for 2.0.1
 
 2.0.1 needs no upgrade step. Four answers changed, so check scripts that
