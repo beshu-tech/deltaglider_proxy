@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Upgrade steps for 2.0.1
+
+2.0.1 needs no upgrade step. Four answers changed, so check scripts that
+depend on them:
+
+- A "Config only" backup restore (`mode=config-only`) keeps this instance's
+  admin password. Only "Everything, including the admin password"
+  (`mode=full`) restores it.
+- In `access.iam_mode: declarative`, `POST /_/api/admin/config/declarative-iam-apply`
+  answers `403 iam_declarative`. Edit the YAML config and apply it instead.
+- A restore that includes the config answers `409 config_file_read_only` when
+  the config file is read-only, before anything changes.
+- Section validate and PUT responses carry `restart_reasons`, apply and PUT
+  responses carry `persist_error` on a failed file write, and `GET /config`
+  carries `config_file_path` and `config_file_writable`.
+
 ### Fixed — Listing facts keep up with a busy node
 
 Since 2.0 the proxy writes the listing facts of a PUT in the background, in
