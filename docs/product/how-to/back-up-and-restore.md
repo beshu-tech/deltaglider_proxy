@@ -10,7 +10,7 @@ People often confuse these three mechanisms:
 
 | Mechanism | What it is | Use it when |
 |---|---|---|
-| **Full Backup** (zip via admin API) | Operator-initiated, point-in-time snapshot: config + IAM + secrets, sha256-verified, atomic restore | Before every upgrade; on a schedule; before risky config changes. This is THE backup. |
+| **Full Backup** (zip from the admin UI or the admin API) | Operator-initiated, point-in-time snapshot: config + IAM + secrets, sha256-verified, atomic restore | Before every upgrade; on a schedule; before risky config changes. This is THE backup. |
 | **DB snapshot** (file copy) | Filesystem-level copy of `deltaglider_config.db` (SQLCipher-encrypted SQLite) | You already snapshot volumes (PVC snapshots, ZFS, etc.) and preserve the config DB key alongside |
 | **S3 config sync** (`config_sync_bucket`) | Automatic live replication of the encrypted DB across instances | Horizontal scaling or blue-green deployments. See [How to run multiple instances](run-multiple-instances.md). **Not a backup**: a bad mutation propagates to every reader. |
 
@@ -18,9 +18,16 @@ Take a Full Backup in every case. The other two mechanisms add to it and do not 
 
 ## Take a Full Backup
 
-![Full Backup export and restore](/_/screenshots/backup-restore.jpg)
+A backup is not configuration, so there is no YAML for this task. You take it in the admin UI or with the admin API.
 
-In the admin UI, open **Settings → System → Backup → Export**. Or use the API:
+In the admin UI:
+
+1. In the sidebar, open **System → System** (`/_/admin/system`), and scroll to the backup card at the bottom of the page.
+2. Click **Download backup**. The browser saves a zip named `dgp-backup-v<version>-<time>.zip`.
+
+   ![The backup card at the bottom of the System page; the box marks the Download backup button.](/_/screenshots/backup-download.webp)
+
+With the admin API, send the same request with an admin session cookie:
 
 ```bash
 curl -b /tmp/admin.cookies \
@@ -41,18 +48,53 @@ A secret that comes from an environment variable (for example `DGP_SECRET_ACCESS
 
 ## Restore a Full Backup
 
+In the admin UI:
+
+1. On **System → System**, click **Restore backup** in the backup card, and select the zip file.
+
+   ![The backup card at the bottom of the System page; the box marks the Restore backup button.](/_/screenshots/backup-restore-open.webp)
+
+2. In the **Restore backup** dialog, select what to restore. The first choice is selected when the dialog opens.
+   - **Everything except the admin password**: the config, the backends, the bucket policies, the users, the groups, the OIDC providers and the secrets. This instance keeps its own admin password.
+   - **Config only**: the config, the backends and the bucket policies. The users, the groups, the OIDC providers and the admin password stay as they are.
+   - **Users and groups only**: the users, the groups and the OIDC providers. The storage settings stay as they are.
+   - **Everything, including the admin password**: everything in the backup. This instance takes the admin password of the backup, unless `DGP_BOOTSTRAP_PASSWORD_HASH` sets it.
+3. When the choice includes users and groups, select what happens to the users, groups and OIDC providers that exist now:
+   - **Replace (point in time)**: after the restore, the instance holds exactly the entries of the backup. Entries that the backup does not hold are deleted.
+   - **Merge (keep existing)**: entries that the backup does not hold are kept, and entries that exist now are not overwritten. Only the missing entries are added.
+4. Click **Restore**. After a successful restore, the page reloads.
+
+   ![The Restore backup dialog lists what to restore; callout 1 marks the four restore modes, callout 2 marks Replace and Merge for the users and groups that exist now, and callout 3 marks the Restore button.](/_/screenshots/backup-restore-modes.webp)
+
+In declarative IAM mode, the YAML file owns the users and groups, so the dialog offers only **Config only**. To restore users, groups and OIDC providers in that mode, edit `access.iam_*` in the YAML file and apply it.
+
+With the admin API, send the zip in the body of a `POST` request:
+
 ```bash
 curl -b cookies -X POST \
   -H "Content-Type: application/zip" \
   --data-binary @dgp-backup-20260612-090000.zip \
-  https://s3.acme.example/_/api/admin/backup
+  "https://s3.acme.example/_/api/admin/backup?mode=preserve-bootstrap&iam=replace"
 ```
+
+The `mode` parameter selects what to restore, and the `iam` parameter selects `replace` or `merge`:
+
+| Dialog choice | `mode` | Restores the admin password |
+|---|---|---|
+| Everything except the admin password | `preserve-bootstrap` | no |
+| Config only | `config-only` | no |
+| Users and groups only | `iam-only` | no |
+| Everything, including the admin password | `full` | yes |
+
+Without a `mode` parameter, the API restores in `full` mode, which also restores the admin password. The dialog starts from **Everything except the admin password** instead.
 
 The import is atomic. The proxy unpacks all four parts and verifies their sha256 before any state changes. The proxy then applies the configuration, the secrets and the IAM state in that order, and it writes the OAuth client secrets last. The live OAuth providers pick up these secrets without a restart. Before the first of these steps, it records the running configuration, the admin password and the IAM database. When a later step fails, the proxy puts the recorded state back, in memory and in the config file, so a failed restore leaves the instance as it was before. The proxy remaps `external_identities` through the imported user and provider IDs, so OAuth users keep working. The proxy also accepts a legacy JSON-only body for IAM-only restores from pre-v0.8.4 scripts.
 
-A restore of users, groups and OIDC providers is point-in-time by default (`iam=replace`). The proxy deletes every user, group, OIDC provider, mapping rule and external identity that exists now, and then writes the rows from the backup, in one database transaction. So after the restore, the instance holds exactly the backup's users and groups: a user that someone created after the backup is gone, and a user that someone changed after the backup has the backup's settings again. If any row fails to write, the transaction rolls back and nothing changes. The proxy keeps the backup's user IDs, so OAuth logins keep working, and it ends the OAuth sessions of users that the restore deletes. To keep the users and groups that exist now, add `iam=merge` to the URL (for example `https://s3.acme.example/_/api/admin/backup?iam=merge`). A merge adds the users and groups that the instance does not have and does not change the ones that it has. The restore dialog in the admin GUI offers the same two choices.
+A restore of the config must be saved to the config file, or it would revert at the next restart. When the config file is read-only, for example because a Docker Compose file, the Helm chart or the Kubernetes operator mounts it read-only, the proxy refuses every mode that restores the config, before it changes anything. It answers `409` with the error `config_file_read_only`. On such an instance, restore with **Users and groups only** (`mode=iam-only`), and change the config in the YAML of your deployment.
 
-A full restore (the default mode, and `mode=config-only`) also restores the admin password: when the zip's `secrets.json` carries a bootstrap password hash that differs from the running instance's, the instance adopts it, and the backup's admin password works from then on. The hash does not encrypt anything, so this is safe. There is one exception: when `DGP_BOOTSTRAP_PASSWORD_HASH` is set, it sets the hash at every start, so the restore keeps the running password and logs a warning. Use `mode=preserve-bootstrap` to restore everything except the admin password, or `mode=iam-only` to keep this instance's admin password and storage configuration.
+A restore of users, groups and OIDC providers is point-in-time by default (`iam=replace`). The proxy deletes every user, group, OIDC provider, mapping rule and external identity that exists now, and then writes the rows from the backup, in one database transaction. So after the restore, the instance holds exactly the backup's users and groups: a user that someone created after the backup is gone, and a user that someone changed after the backup has the backup's settings again. If any row fails to write, the transaction rolls back and nothing changes. The proxy keeps the backup's user IDs, so OAuth logins keep working, and it ends the OAuth sessions of users that the restore deletes. A merge (`iam=merge`) adds the users and groups that the instance does not have and does not change the ones that it has.
+
+Only the `full` mode restores the admin password: when the zip's `secrets.json` carries a bootstrap password hash that differs from the running instance's, the instance adopts it, and the backup's admin password works from then on. The hash does not encrypt anything, so this is safe. There is one exception: when `DGP_BOOTSTRAP_PASSWORD_HASH` is set, it sets the hash at every start, so the restore keeps the running password and logs a warning. The modes `preserve-bootstrap`, `config-only` and `iam-only` keep this instance's admin password.
 
 The zip carries the IAM state as plain JSON (`iam.json`), so a restore onto a **fresh instance** does not need the old instance's config DB key: the fresh instance writes the imported users into its own database, under its own key. The zip's `secrets.json` holds the bootstrap password hash only when the config file held it; a hash that came from the environment is not in the backup.
 
@@ -87,7 +129,7 @@ aws --endpoint-url https://s3.acme.example s3 cp s3://releases/known-file ./out
 sha256sum out   # matches the recorded checksum
 ```
 
-Then log in to the admin UI with the bootstrap password. If the login works, the restored bootstrap password hash is live.
+Then log in to the admin UI. After a restore in `full` mode, the admin password of the backup works. After any other mode, the admin password of this instance still works.
 
 ## Related
 
