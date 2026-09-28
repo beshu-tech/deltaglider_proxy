@@ -49,6 +49,7 @@ import {
 import { removeBootstrapCredentials, type IamMode } from '../adminApi';
 import { ApiError, normalizeUiError } from '../errorHandling';
 import { confirmDialog } from '../confirmDialog';
+import { docsUrlToInAppHref } from '../linkifyDocUrl';
 import { qk } from '../queries/keys';
 import { useColors } from '../ThemeContext';
 import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
@@ -248,6 +249,15 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
   }
 
   const declarativeActive = form.iam_mode === 'declarative';
+  // The server refuses a gui → declarative flip whose YAML holds no IAM
+  // (EMPTY_DECLARATIVE_FLIP, transition.rs): it would empty the user DB.
+  // This page never sends users, so offer the flip only when the access
+  // section already carries some.
+  const yamlIam = form as Record<string, unknown>;
+  const yamlHasIam = ['iam_users', 'iam_groups', 'auth_providers', 'group_mapping_rules'].some(
+    (k) => Array.isArray(yamlIam[k]) && (yamlIam[k] as unknown[]).length > 0,
+  );
+  const declarativeBlocked = !declarativeActive && !yamlHasIam;
 
   return (
     <div
@@ -280,7 +290,7 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
                 </Text>
               </div>
             </Radio>
-            <Radio value="declarative" style={{ alignItems: 'flex-start' }}>
+            <Radio value="declarative" disabled={declarativeBlocked} style={{ alignItems: 'flex-start' }}>
               <div>
                 <div style={{ fontWeight: 600 }}>Declarative (YAML-authoritative)</div>
                 <Text type="secondary" style={{ fontSize: 12, lineHeight: 1.5 }}>
@@ -291,6 +301,18 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
                 </Text>
               </div>
             </Radio>
+            {declarativeBlocked && (
+              <Text type="secondary" style={{ fontSize: 12, lineHeight: 1.5, marginLeft: 24 }}>
+                Not available here: your YAML config has no users yet, and the proxy refuses a
+                switch that would empty the user database. Apply a full YAML document that lists
+                your users in <code>access.iam_users</code> and sets <code>iam_mode: declarative</code>.
+                See{' '}
+                <a href={docsUrlToInAppHref('https://deltaglider.com/docs/how-to/manage-iam-as-code') ?? undefined}>
+                  How to manage IAM as code
+                </a>
+                .
+              </Text>
+            )}
           </Radio.Group>
           {declarativeActive && (
             <Alert

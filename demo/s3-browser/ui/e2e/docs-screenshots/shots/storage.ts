@@ -238,7 +238,9 @@ const BUCKET_POLICY_SHOTS: Shot[] = [
     annotations: [
       { target: bucketRow('db-archive'), kind: 'callout', label: '1' },
       { target: { text: /^Advanced/ }, kind: 'callout', label: '2', side: 'right' },
-      { target: { role: 'spinbutton', name: 'Quota' }, kind: 'box', label: '3', side: 'right' },
+      // Box the whole InputNumber, not the inner <input>: a callout to the
+      // right of the input covered the GiB suffix.
+      { target: { css: '.ant-input-number:has(input[placeholder="Unlimited"])' }, kind: 'box', label: '3', side: 'right' },
     ],
   },
   {

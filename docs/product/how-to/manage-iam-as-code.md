@@ -4,7 +4,7 @@
 
 This guide shows you how to move IAM from the admin UI into `deltaglider_proxy.yaml`. Switch to declarative mode when IAM changes should go through code review: every grant is then in `git log`, and all replicas converge from one file. In declarative mode the Users, Groups and External authentication pages of the admin UI are read-only, and the admin API refuses IAM changes with `403 {"error": "iam_declarative"}`, so the database cannot drift from the file. Stay in `gui` mode if you manage IAM in the admin UI every day. See [GUI-managed vs declarative IAM](../explanation/security-model.md#gui-managed-vs-declarative-iam) for the trade-off.
 
-The admin UI cannot author the IAM YAML, so this guide uses the YAML file, the CLI and the admin API. The admin UI has two parts in it: the export of the current state (step 1) and the read-only view after the switch (Verify). The **IAM mode** card on **Access → Credentials & mode** also has a switch, but a switch alone carries no users or groups, and the proxy refuses a switch to `declarative` with no users or groups in the YAML (step 2). So switch the mode in the same document that lists the users.
+The admin UI cannot author the IAM YAML, so this guide uses the YAML file, the CLI and the admin API. The admin UI has two parts in it: the export of the current state (step 1) and the read-only view after the switch (Verify). The **IAM mode** card on **Access → Credentials & mode** also has a switch. A switch alone carries no users or groups, and the proxy refuses a switch to `declarative` with no users or groups in the YAML (step 2), so the card disables the **Declarative** option while the YAML has none. Switch the mode in the same document that lists the users.
 
 ## 1. Export the current state
 

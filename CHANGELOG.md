@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed — The IAM mode card says why it cannot switch to declarative
+
+On **Access → Credentials & mode**, the **Declarative** option asked for
+confirmation and then failed, because the proxy refuses a switch to
+`declarative` while the YAML has no users or groups: it would empty the user
+database. The page never sends users, so the switch always failed. The option
+is now disabled while the YAML has no users, groups or providers, and it says
+to apply a full YAML document instead, with a link to "How to manage IAM as
+code".
+
 ### Fixed — A running job's progress is readable in the Jobs table
 
 The Status column of the Jobs table could shrink so far that a running
