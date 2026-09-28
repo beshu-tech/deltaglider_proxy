@@ -100,7 +100,7 @@ Mapping rules decide which IAM groups an identity joins, based on its claims. Ac
 
 In the admin UI:
 
-1. On **Access → External authentication**, click **Add Rule** next to **Allowed Users & Group Assignment**. The proxy saves a new, empty rule at once, and the rule appears as a row.
+1. On **Access → External authentication**, click **Add Rule** next to **Allowed Users & Group Assignment**. A new, empty rule appears as a row. The proxy does not store it until you click **Save Rules**, so if you leave the page first, the rule is gone.
 2. Fill in the row. In **Match type**, select **Claim value**. Type `groups` in **Claim field** and `engineering` in **Match value**. In **Assign to group**, select `Engineering`. In **Provider**, select `Okta`, or **All providers**.
 3. Click **Save Rules**.
 

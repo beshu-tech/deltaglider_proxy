@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed — "Add Rule" no longer stores an empty mapping rule
+
+On **Access → External authentication**, **Add Rule** stored a new, empty
+group mapping rule on the server at once. If you left the page without
+saving, the empty rule stayed. The new rule is now a draft in the page: the
+proxy stores it when you click **Save Rules**, and **Save Rules** refuses a
+new rule with no pattern.
+
 ### Fixed — The permission editor shows every condition of a rule
 
 The permission editor has inputs only for a list prefix (`StringLike` on

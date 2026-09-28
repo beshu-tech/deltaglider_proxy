@@ -77,11 +77,15 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
   // Mapping rules dirty/saving state (local edits, batch-saved)
   const [pendingRules, setPendingRules] = useState<Record<number, Partial<typeof rules[number]>>>({});
   const [rulesSaving, setRulesSaving] = useState(false);
-  const rulesDirty = Object.keys(pendingRules).length > 0;
+  // "Add Rule" makes a local draft (negative id); Save Rules creates it.
+  // Creating at once left an empty rule on the server when the operator
+  // left the page without saving.
+  const [draftRules, setDraftRules] = useState<typeof rules>([]);
+  const rulesDirty = Object.keys(pendingRules).length > 0 || draftRules.length > 0;
   useDirtyFlag(IAM_DIRTY_KEYS.mappingRules, rulesDirty && !readOnly);
   // The rule rows render the server snapshot with any pending local edits merged
   // on top (keyed by stable rule id — never array index).
-  const mergedRules = rules.map(r => (pendingRules[r.id] ? { ...r, ...pendingRules[r.id] } : r));
+  const mergedRules = [...rules, ...draftRules].map(r => (pendingRules[r.id] ? { ...r, ...pendingRules[r.id] } : r));
 
   const createRuleMutation = useCreateMappingRule();
   const updateRuleMutation = useUpdateMappingRule();
@@ -146,6 +150,18 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
   const flushPendingRules = async () => {
     if (!rulesDirty) return;
     for (const rule of mergedRules) {
+      if (rule.id < 0) {
+        await createRuleMutation.mutateAsync({
+          match_type: rule.match_type,
+          match_field: rule.match_field,
+          match_value: rule.match_value,
+          group_id: rule.group_id,
+          provider_id: rule.provider_id,
+          priority: rule.priority,
+        });
+        setDraftRules((prev) => prev.filter((d) => d.id !== rule.id));
+        continue;
+      }
       if (!pendingRules[rule.id]) continue;
       await updateRuleMutation.mutateAsync({
         id: rule.id,
@@ -163,6 +179,10 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
   };
 
   const saveRules = async () => {
+    if (mergedRules.some((r) => r.id < 0 && !r.match_value.trim())) {
+      message.error('Type a pattern in every new rule, or remove the rule.');
+      return;
+    }
     setRulesSaving(true);
     try {
       await flushPendingRules();
@@ -298,31 +318,24 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
           <Button
             size="small"
             icon={<PlusOutlined />}
-            loading={rulesSaving}
-            onClick={async () => {
+            disabled={rulesSaving}
+            onClick={() => {
               if (groups.length === 0) { message.warning('Create a group first'); return; }
-              // Disable the rule rows for the whole flush+create+refetch round-trip
-              // (same `rulesSaving` gate the Save Rules button uses). Without this,
-              // edits the operator types between flushPendingRules()'s setPendingRules({})
-              // and the create-triggered refetch land in pendingRules only to be
-              // clobbered by the incoming server snapshot — silently lost.
-              setRulesSaving(true);
-              try {
-                // Flush any pending local edits before creating + refetching.
-                // Otherwise the refetch overwrites in-memory rule edits with the
-                // server snapshot and silently drops the operator's unsaved edits.
-                await flushPendingRules();
-                await createRuleMutation.mutateAsync({
-                  // New rules start empty — the placeholder shows the syntax hint.
+              // A local draft, saved with Save Rules. It starts empty; the
+              // placeholder shows the syntax hint.
+              setDraftRules((prev) => [
+                ...prev,
+                {
+                  id: -(prev.length + 1) - Date.now(),
+                  provider_id: null,
+                  priority: 0,
                   match_type: 'email_glob',
+                  match_field: 'email',
                   match_value: '',
                   group_id: groups[0].id,
-                });
-              } catch (e) {
-                message.error(normalizeUiError(e, 'Failed'));
-              } finally {
-                setRulesSaving(false);
-              }
+                  created_at: '',
+                },
+              ]);
             }}
           >
             Add Rule
@@ -357,6 +370,10 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
               }}
               onDelete={async () => {
                 // MappingRuleRow's menu confirms before this runs.
+                if (rule.id < 0) {
+                  setDraftRules((prev) => prev.filter((d) => d.id !== rule.id));
+                  return;
+                }
                 try {
                   await deleteRuleMutation.mutateAsync(rule.id);
                   setPendingRules((prev) => {
