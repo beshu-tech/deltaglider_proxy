@@ -9,6 +9,7 @@ import {
   triggerLabel,
   availableActions,
   draftBlocksAction,
+  lifecycleRunNowBlock,
   progressLabel,
   busyJobForBucket,
   mergeDraftRules,
@@ -113,17 +114,15 @@ test('availableActions matrix', () => {
     ['pause', 'preview', 'delete'],
     'lifecycle has NO kill (backend would 400)',
   );
-  // Lifecycle run-now is NOT a paused/disabled one-off (backend 409s both) — the
-  // UI must not offer a button the backend structurally rejects.
+  // Lifecycle run-now stays in the list for a paused/disabled rule: the row
+  // renders it disabled with the reason from lifecycleRunNowBlock.
   assert.deepEqual(
     availableActions(row({ kind: 'lifecycle', paused: true })),
-    ['resume', 'preview', 'delete'],
-    'paused lifecycle: no run-now (backend 409s it)',
+    ['resume', 'preview', 'run-now', 'delete'],
   );
   assert.deepEqual(
     availableActions(row({ kind: 'lifecycle', enabled: false })),
-    ['preview', 'delete'],
-    'disabled lifecycle: no run-now (backend 409s it)',
+    ['preview', 'run-now', 'delete'],
   );
   // Replication one-off is unchanged: paused/disabled still runnable.
   assert.deepEqual(
@@ -144,6 +143,16 @@ test('availableActions matrix', () => {
     availableActions(row({ kind: 'migrate', trigger: 'oneoff', status: 'succeeded' })),
     [],
   );
+});
+
+test('lifecycleRunNowBlock mirrors the server 409s', () => {
+  const lc = (over: Partial<JobRow> = {}) => row({ kind: 'lifecycle', ...over });
+  assert.equal(lifecycleRunNowBlock(lc(), true), null);
+  assert.match(lifecycleRunNowBlock(lc(), false) ?? '', /Run lifecycle rules on schedule/);
+  assert.match(lifecycleRunNowBlock(lc({ enabled: false }), true) ?? '', /Enable the rule first/);
+  assert.match(lifecycleRunNowBlock(lc({ paused: true }), true) ?? '', /Resume the rule first/);
+  // Replication has its one-off: never blocked here.
+  assert.equal(lifecycleRunNowBlock(row({ enabled: false, paused: true }), false), null);
 });
 
 test('progressLabel', () => {

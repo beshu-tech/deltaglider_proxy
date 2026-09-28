@@ -265,15 +265,11 @@ export function availableActions(row: JobRow): JobAction[] {
     if (row.paused) out.push('resume');
     else if (row.enabled !== false) out.push('pause');
     if (row.kind === 'lifecycle') out.push('preview');
-    // run-now availability differs by kind (matches the backend contract):
-    //  - replication: a deliberate ONE-OFF that runs even a disabled/paused
-    //    rule once (without flipping the flag) — offer whenever not running.
-    //  - lifecycle: the backend 409s a disabled OR paused rule, so only offer
-    //    run-now for an enabled, non-paused, non-running lifecycle rule.
-    const runnable =
-      row.status !== 'running' &&
-      (row.kind === 'replication' || (row.enabled !== false && !row.paused));
-    if (runnable) out.push('run-now');
+    // run-now whenever not running. Replication runs even a disabled/paused
+    // rule once (without flipping the flag). The backend 409s a disabled or
+    // paused lifecycle rule: the row shows that button disabled, with the
+    // reason from `lifecycleRunNowBlock`.
+    if (row.status !== 'running') out.push('run-now');
     // Kill the in-flight run at will (interrupts mid-object, unlike pause).
     // Replication only — the backend has no lifecycle-kill arm (would 400).
     if (row.kind === 'replication' && row.status === 'running') out.push('kill');
@@ -282,6 +278,21 @@ export function availableActions(row: JobRow): JobAction[] {
   }
   if (isActiveJobStatus(row.status) && row.status !== 'cancelling') out.push('cancel');
   return out;
+}
+
+/**
+ * Why lifecycle run-now would be refused (409), or null. Mirrors the server's
+ * checks: the global scheduler switch, the rule's Enabled switch, the pause.
+ * A lifecycle run deletes or moves objects, so there is no one-off override.
+ */
+export function lifecycleRunNowBlock(row: JobRow, schedulerOn: boolean): string | null {
+  if (row.kind !== 'lifecycle') return null;
+  if (!schedulerOn)
+    return 'Turn on "Run lifecycle rules on schedule" first. While it is off, the proxy refuses every lifecycle run.';
+  if (row.enabled === false)
+    return 'Enable the rule first. A lifecycle run deletes or moves objects, so the proxy refuses to run a disabled rule.';
+  if (row.paused) return 'Resume the rule first. The proxy refuses to run a paused lifecycle rule.';
+  return null;
 }
 
 /**

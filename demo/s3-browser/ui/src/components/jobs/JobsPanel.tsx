@@ -41,6 +41,7 @@ import {
   kindTone,
   mergeDraftRules,
   draftBlocksAction,
+  lifecycleRunNowBlock,
   planRuleDeleteSync,
   runNowMessage,
   triggerLabel,
@@ -555,15 +556,21 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
             {availableActions(d.row)
               .filter((a) => !MENU_ACTIONS.includes(a))
               .map((a) => {
-                // A one-off on a disabled/paused rule reads as "Run once" (it runs
-                // the rule a single time without re-enabling/resuming it).
+                // A replication one-off on a disabled/paused rule reads as "Run
+                // once" (it runs the rule a single time without re-enabling it).
                 const oneOff =
-                  a === 'run-now' && (d.row.enabled === false || d.row.paused === true);
+                  a === 'run-now' &&
+                  d.row.kind === 'replication' &&
+                  (d.row.enabled === false || d.row.paused === true);
                 const label = oneOff ? 'Run once' : ACTION_META[a].label;
-                const blocked = draftBlocksAction(a, d.row.kind, {
-                  replication: repl.isDirty,
-                  lifecycle: lc.isDirty,
-                });
+                const blocked =
+                  draftBlocksAction(a, d.row.kind, {
+                    replication: repl.isDirty,
+                    lifecycle: lc.isDirty,
+                  }) ??
+                  // Not dirty here, so lc.value.enabled is the saved switch
+                  // (unknown while it loads: do not block on the default).
+                  (a === 'run-now' ? lifecycleRunNowBlock(d.row, lc.loading || lc.value.enabled) : null);
                 const title = oneOff
                   ? 'Run this rule once now — does not enable or resume it'
                   : label;

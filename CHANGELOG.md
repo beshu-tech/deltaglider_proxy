@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed — The Jobs row says why a lifecycle rule cannot run now
+
+The proxy refuses "Run now" on a lifecycle rule that is disabled or paused, and
+on every lifecycle rule while "Run lifecycle rules on schedule" is off. The Jobs
+row hid the button without a reason. It now shows "Run now" disabled, and its
+title says what to turn on first. Replication keeps "Run once" for a disabled
+or paused rule, because the proxy runs that rule one time.
+
 ### Fixed — A refused lifecycle "Run now" names the GUI switch
 
 When lifecycle is off, "Run now" on a lifecycle rule is refused. The message

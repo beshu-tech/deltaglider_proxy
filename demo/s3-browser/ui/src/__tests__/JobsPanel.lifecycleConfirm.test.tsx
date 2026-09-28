@@ -42,7 +42,8 @@ let http: ReturnType<typeof mockFetch>;
 beforeEach(() => {
   http = mockFetch();
   http.on('GET', JOBS, json({ jobs: [row] }));
-  http.on('GET', '/_/api/admin/config/section/storage', json({}));
+  // The scheduler switch is on: with it off, the row disables Run now.
+  http.on('GET', '/_/api/admin/config/section/storage', json({ lifecycle: { enabled: true, rules: [] } }));
   http.on('GET', '/_/api/admin/buckets', json({ buckets: [] }));
   http.on('POST', PREVIEW, json({
     rule_name: 'expire-nightlies', status: 'preview', objects_scanned: 40, objects_affected: 2, objects_skipped: 0,
