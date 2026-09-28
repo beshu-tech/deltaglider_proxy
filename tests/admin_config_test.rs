@@ -2087,8 +2087,25 @@ async fn test_read_only_config_file_is_reported() {
         .await
         .unwrap();
 
+    let exported = admin
+        .get(format!("{ep}/_/api/admin/config/export"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
     let dir = server.config_path().parent().unwrap().to_path_buf();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let doc = admin
+        .post(format!("{ep}/_/api/admin/config/apply"))
+        .json(&json!({ "yaml": exported }))
+        .send()
+        .await
+        .unwrap();
+    let doc_status = doc.status();
+    let doc_body: serde_json::Value = doc.json().await.unwrap();
     let config: serde_json::Value = admin
         .get(format!("{ep}/_/api/admin/config"))
         .send()
@@ -2124,6 +2141,15 @@ async fn test_read_only_config_file_is_reported() {
             .as_str()
             .is_some_and(|e| !e.is_empty()),
         "{put_body}"
+    );
+    assert_eq!(doc_status, StatusCode::INTERNAL_SERVER_ERROR, "{doc_body}");
+    assert_eq!(doc_body["applied"], true, "{doc_body}");
+    assert_eq!(doc_body["persisted"], false, "{doc_body}");
+    assert!(
+        doc_body["persist_error"]
+            .as_str()
+            .is_some_and(|e| !e.is_empty()),
+        "{doc_body}"
     );
     assert_eq!(restore_status, StatusCode::CONFLICT, "{restore_body}");
     assert!(restore_body.contains("read-only"), "{restore_body}");

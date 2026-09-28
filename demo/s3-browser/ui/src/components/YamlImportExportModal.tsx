@@ -34,6 +34,7 @@ import {
 import { useColors } from '../ThemeContext';
 import { useCopyToClipboard } from '../useCopyToClipboard';
 import { normalizeUiError } from '../errorHandling';
+import { persistFailureText } from '../applySection';
 
 const { Text, Paragraph } = Typography;
 
@@ -261,6 +262,9 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
               description="Click Apply to swap the running config."
               showIcon
             />
+          )}
+          {applyResult?.applied && persistFailureText(applyResult) && (
+            <Alert type="warning" showIcon title={persistFailureText(applyResult)} />
           )}
           {applyResult && applyResult.applied && (
             <Alert

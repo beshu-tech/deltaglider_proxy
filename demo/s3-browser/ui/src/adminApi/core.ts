@@ -483,6 +483,8 @@ export interface ConfigApplyResponse {
   warnings: string[];
   error?: string;
   persisted_path?: string;
+  /** Set when the apply worked in memory but the file write failed. */
+  persist_error?: string;
 }
 
 /**
@@ -492,7 +494,16 @@ export interface ConfigApplyResponse {
  * "Paste YAML" flows both terminate here.
  */
 export async function applyConfigYaml(yaml: string): Promise<ConfigApplyResponse> {
-  return adminJson('/api/admin/config/apply', { method: 'POST', body: { yaml } });
+  const path = '/api/admin/config/apply';
+  const res = await adminFetch(path, 'POST', { yaml });
+  // 500 with `applied: true` + `persist_error`: live, but not saved to the
+  // file. An outcome to report, not a failed apply (same as putSection).
+  if (res.status === 500) {
+    const data = (await res.clone().json().catch(() => null)) as ConfigApplyResponse | null;
+    if (data?.applied && data.persist_error) return data;
+  }
+  if (!res.ok) await throwApiError(res, defaultContext(path));
+  return safeJson<ConfigApplyResponse>(res);
 }
 
 // ═══════════════════════════════════════════════════════════════════

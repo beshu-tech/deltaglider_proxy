@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed — The YAML import says when the config file is read-only
+
+When `POST /_/api/admin/config/apply` worked in the running proxy but could not
+write the config file, the "Import configuration from YAML" dialog showed a
+generic error. The response now carries `persist_error`, and the dialog says
+"Applied to the running proxy, but the config file is read-only, so this
+change is lost at the next restart. Export the YAML and update your
+deployment."
+
 ### Changed — A "Config only" restore keeps the admin password
 
 A backup restore with `mode=config-only` also replaced the admin password of

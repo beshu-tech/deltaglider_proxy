@@ -92,6 +92,10 @@ pub struct ConfigApplyResponse {
     /// Path the config was written to. `None` when persist failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persisted_path: Option<String>,
+    /// Set when the apply worked in memory but the file write failed
+    /// (`<path>: <error>`); the GUI explains that the change is lost at restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persist_error: Option<String>,
 }
 
 /// Query params shared by `/config/export` and `/config/defaults`.
@@ -448,6 +452,7 @@ fn shape_apply(outcome: Outcome) -> (StatusCode, ConfigApplyResponse) {
         error: Some(error),
         current_version: None,
         persisted_path: None,
+        persist_error: None,
     };
     match outcome {
         Outcome::Conflict { current } => {
@@ -479,11 +484,12 @@ fn shape_apply(outcome: Outcome) -> (StatusCode, ConfigApplyResponse) {
             // `persist_to_file` is atomic (tempfile + rename); the write can
             // still fail (permissions, disk full): `persisted: false` + 500,
             // so a GitOps pipeline never mistakes it for a clean apply.
-            let (persisted_path, status, persist_warning) = match persist {
-                Ok(path) => (Some(path), StatusCode::OK, None),
+            let (persisted_path, status, persist_error, persist_warning) = match persist {
+                Ok(path) => (Some(path), StatusCode::OK, None, None),
                 Err((path, e)) => (
                     None,
                     StatusCode::INTERNAL_SERVER_ERROR,
+                    Some(format!("{path}: {e}")),
                     Some(format!(
                         "Applied in memory but FAILED to persist to {path}: {e}. Server will \
                          revert to the on-disk config on next restart — fix the underlying IO \
@@ -504,6 +510,7 @@ fn shape_apply(outcome: Outcome) -> (StatusCode, ConfigApplyResponse) {
                 error: None,
                 current_version: None,
                 persisted_path,
+                persist_error,
             };
             (status, resp)
         }
