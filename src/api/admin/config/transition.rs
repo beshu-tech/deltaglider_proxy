@@ -514,22 +514,11 @@ async fn declarative_iam_precommit_gate(
         .map_err(|e| format!("declarative IAM reconcile failed (no state changed): {e}"))
 }
 
-/// The YAML paths that the proxy reads only at startup. The GUI marks exactly
-/// these with a "Restart required" chip (source test below). Everything else
-/// is hot: engine-affecting fields rebuild the engine, which also re-sizes
-/// the reference cache and the codec permits.
-pub(crate) const RESTART_ONLY_YAML_PATHS: &[&str] = &[
-    "advanced.listen_addr",
-    "advanced.tls",
-    "advanced.blocking_threads",
-    "advanced.config_sync_bucket",
-];
-
 /// Return one warning per restart-required field that changed between
 /// `old` and `new`. Empty vec = no restart required.
 ///
-/// Single source of truth for the restart-required fieldset
-/// ([`RESTART_ONLY_YAML_PATHS`]): [`apply_config_transition`] uses this to
+/// Single source of truth for the restart-required fieldset (the GUI chips
+/// follow it, see `restart_chip_parity_tests`): [`apply_config_transition`] uses this to
 /// emit warnings + set its `requires_restart` flag, and the write pipeline's
 /// dry run uses the same predicate.
 pub(super) fn requires_restart_warnings(
@@ -569,7 +558,50 @@ pub(super) fn requires_restart_warnings(
 /// nothing, a missing chip hides a change that has no effect yet.
 #[cfg(test)]
 mod restart_chip_parity_tests {
-    use super::RESTART_ONLY_YAML_PATHS;
+    use super::requires_restart_warnings;
+    use crate::config::{Config, TlsConfig};
+
+    /// The YAML paths that the proxy reads only at startup. Everything else
+    /// is hot: engine-affecting fields rebuild the engine, which also
+    /// re-sizes the reference cache and the codec permits.
+    const RESTART_ONLY_YAML_PATHS: &[&str] = &[
+        "advanced.listen_addr",
+        "advanced.tls",
+        "advanced.blocking_threads",
+        "advanced.config_sync_bucket",
+    ];
+
+    /// The list is the one `requires_restart_warnings` checks: a change of
+    /// each field warns.
+    #[test]
+    fn the_list_is_what_requires_restart_warnings_checks() {
+        let base = Config::default();
+        type Change = (&'static str, fn(&mut Config));
+        let changes: [Change; 4] = [
+            ("advanced.listen_addr", |c| {
+                c.listen_addr = "127.0.0.1:1".parse().unwrap()
+            }),
+            ("advanced.tls", |c| {
+                c.tls = Some(TlsConfig {
+                    enabled: true,
+                    cert_path: None,
+                    key_path: None,
+                })
+            }),
+            ("advanced.blocking_threads", |c| {
+                c.blocking_threads = Some(3)
+            }),
+            ("advanced.config_sync_bucket", |c| {
+                c.config_sync_bucket = Some("s".into())
+            }),
+        ];
+        assert_eq!(changes.map(|(p, _)| p), RESTART_ONLY_YAML_PATHS);
+        for (path, change) in changes {
+            let mut c = base.clone();
+            change(&mut c);
+            assert_eq!(requires_restart_warnings(&base, &c).len(), 1, "{path}");
+        }
+    }
 
     fn is_restart_only(path: &str) -> bool {
         RESTART_ONLY_YAML_PATHS

@@ -20,10 +20,10 @@ You need three files:
 
 ## 1. Write the config
 
-The block uses `${env:...}` references. The proxy expands them from the environment of the container when it loads the file, so the file holds no secret. To lint the file, load the secrets first, as the Verify section shows.
+The block uses `${env:...}` references. The proxy expands them from the environment of the container when it loads the file, so the file holds no secret. The docs check does not validate this block, because the JSON Schema of the admin UI editor expects a boolean in `force_path_style`, not a reference. To lint the file, load the secrets first, as the Verify section shows.
 
 ```yaml
-# validate
+# fragment
 # deltaglider_proxy.yaml — secret-free, safe to commit
 storage:
   backends:
