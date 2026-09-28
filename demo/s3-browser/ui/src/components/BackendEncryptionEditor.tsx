@@ -336,7 +336,9 @@ export default function BackendEncryptionEditor({ backendName, current, onApply,
                 id={`${uid}-key`}
                 value={pendingKey}
                 readOnly
-                autoSize={{ minRows: 2, maxRows: 2 }}
+                // Fixed rows, not autoSize with min = max: autoSize measured
+                // the box at 36 or 44 px depending on when it ran.
+                rows={2}
                 style={{
                   ...inputRadius,
                   marginTop: 4,

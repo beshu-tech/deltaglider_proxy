@@ -107,6 +107,15 @@ async function capture(browser: Browser, shot: Shot, theme: (typeof THEMES)[numb
       await shot.setup(page);
       await settle(page, quiet);
     }
+    // An autosize textarea can measure itself before the layout settles, and
+    // its height then differs from run to run: make it measure again.
+    await page.evaluate(
+      () =>
+        new Promise<void>((done) => {
+          window.dispatchEvent(new Event('resize'));
+          requestAnimationFrame(() => requestAnimationFrame(() => done()));
+        }),
+    );
     let boxes;
     try {
       boxes = await drawAnnotations(page, shot.annotations ?? []);

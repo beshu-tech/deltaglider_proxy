@@ -29,6 +29,9 @@ async function newJob(page: Page, item: RegExp): Promise<void> {
 /** No focus ring, no open suggestion list, no hover chip. (No Escape: it closes the drawer.) */
 async function calm(page: Page): Promise<void> {
   await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+  // scrollIntoView on a field in the drawer also scrolls the page behind it,
+  // by a different amount on each run; the page behind a drawer stays at the top.
+  await page.evaluate(() => window.scrollTo(0, 0));
   await page.mouse.move(1, 1);
 }
 
@@ -304,6 +307,7 @@ export const JOBS_SHOTS: Shot[] = [
       await lifecycleDraft(page);
       await page.getByRole('button', { name: 'Review & apply' }).dispatchEvent('click');
       await page.getByTestId('apply-dialog-confirm').waitFor();
+      await page.evaluate(() => window.scrollTo(0, 0));
     },
     annotations: [{ target: { testId: 'apply-dialog-confirm' }, kind: 'arrow', side: 'bottom' }],
   },
@@ -372,6 +376,8 @@ export const JOBS_SHOTS: Shot[] = [
     setup: async (page) => {
       await newJob(page, /^Backfill metadata/);
       await page.getByRole('checkbox', { name: 'releases', exact: true }).check();
+      // check() may scroll the page behind the dialog; put it back.
+      await page.evaluate(() => window.scrollTo(0, 0));
       await calm(page);
     },
     annotations: [{ target: { role: 'button', name: /^Start now/ }, kind: 'arrow', side: 'bottom' }],

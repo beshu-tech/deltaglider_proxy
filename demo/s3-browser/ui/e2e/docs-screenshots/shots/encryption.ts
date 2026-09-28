@@ -95,7 +95,9 @@ async function pickMode(page: Page, backend: string, label: string): Promise<voi
 async function aesKeyReady(page: Page): Promise<void> {
   await pickMode(page, 'hetzner-fsn1', 'AES-256-GCM (proxy-side)');
   await page.getByTestId('encryption-key-stored').check();
-  await page.getByTestId('encryption-apply').scrollIntoViewIfNeeded();
+  // Always the same scroll position: scrollIntoViewIfNeeded depended on
+  // where check() had scrolled to, so the shot moved from run to run.
+  await page.getByTestId('encryption-apply').evaluate((el) => el.scrollIntoView({ block: 'center' }));
   await page.mouse.move(1, 1);
 }
 

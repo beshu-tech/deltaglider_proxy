@@ -3,6 +3,7 @@
  * the live logs (docs: how-to/trace-requests,
  * how-to/gate-requests-with-admission-rules, how-to/view-live-logs).
  */
+import { expect } from '@playwright/test';
 import type { Shot } from '../shot';
 
 export const OBSERVABILITY_SHOTS: Shot[] = [
@@ -58,9 +59,16 @@ export const OBSERVABILITY_SHOTS: Shot[] = [
     route: '/_/admin/dashboard?view=analytics',
     alt: 'The Analytics view of the dashboard shows the storage that delta compression saves, in total and for each bucket.',
     setup: async (page) => {
-      // Sizes come from the usage scan: scan every bucket, then wait for the numbers.
+      // Sizes come from the usage scan: scan every bucket, then wait until
+      // the page says so (the text before the click can already read 4 of 4
+      // from the cache of an earlier capture).
       await page.getByRole('button', { name: /Re-scan all/ }).click();
-      await page.getByText(/4 of 4 scanned/).waitFor({ timeout: 60_000 });
+      await expect
+        .poll(async () => {
+          const t = await page.locator('body').innerText();
+          return /4 of 4 scanned/.test(t) && !/\d+ buckets? not scanned|Scan missing/.test(t);
+        }, { timeout: 60_000 })
+        .toBe(true);
       await page.mouse.move(1, 1);
     },
     // The uptime in the page header changes from run to run.
