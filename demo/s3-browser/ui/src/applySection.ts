@@ -37,6 +37,19 @@ export async function applySection<Wire>(
 }
 
 /**
+ * What to tell the operator when a section PUT applied in memory but the
+ * config file write failed (`persist_error`); null when it was saved.
+ */
+export function persistFailureText(resp: Pick<SectionApplyResponse, 'persist_error'>): string | null {
+  const e = resp.persist_error;
+  if (!e) return null;
+  if (/read-only|os error 30|permission denied|os error 13/i.test(e)) {
+    return 'Applied to the running proxy, but the config file is read-only, so this change is lost at the next restart. Export the YAML and update your deployment.';
+  }
+  return `Applied to the running proxy, but the config file could not be written (${e}), so this change is lost at the next restart.`;
+}
+
+/**
  * The error text for a failed one-shot section apply (a PUT built from a
  * fresh GET): a 409 says what happened and that a retry is safe, not the
  * caller's generic label.

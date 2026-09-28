@@ -98,6 +98,10 @@ pub struct SectionApplyResponse {
     /// Absent for dry-run (validate) responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persisted_path: Option<String>,
+    /// Only set when a PUT applied in memory but the file write failed
+    /// (HTTP 500, `ok: true`): the change is lost at the next restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persist_error: Option<String>,
     /// Machine-readable error string when `ok: false`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -133,6 +137,7 @@ fn reject(status: StatusCode, error: impl Into<String>) -> Response {
             requires_restart: false,
             restart_reasons: Vec::new(),
             persisted_path: None,
+            persist_error: None,
             error: Some(error.into()),
             diff: None,
         }),
@@ -321,6 +326,7 @@ fn shape_section(section: SectionName, result: WriteResult) -> Response {
                 requires_restart: false,
                 restart_reasons: Vec::new(),
                 persisted_path: None,
+                persist_error: None,
                 error: Some(error),
                 diff,
             };
@@ -338,6 +344,7 @@ fn shape_section(section: SectionName, result: WriteResult) -> Response {
                 requires_restart: !restart.is_empty(),
                 restart_reasons: restart,
                 persisted_path: None,
+                persist_error: None,
                 error: None,
                 diff,
             };
@@ -350,13 +357,14 @@ fn shape_section(section: SectionName, result: WriteResult) -> Response {
             persist,
             version,
         } => {
-            // The persist outcome is the HTTP status (200 vs. 500) plus the
-            // warning text; there is no separate `persisted` field here.
-            let (persisted_path, status, persist_warning) = match persist {
-                Ok(path) => (Some(path), StatusCode::OK, None),
+            // The persist outcome is the HTTP status (200 vs. 500), the
+            // warning text, and `persist_error` for the GUI.
+            let (persisted_path, status, persist_error, persist_warning) = match persist {
+                Ok(path) => (Some(path), StatusCode::OK, None, None),
                 Err((path, e)) => (
                     None,
                     StatusCode::INTERNAL_SERVER_ERROR,
+                    Some(format!("{path}: {e}")),
                     Some(format!(
                         "Applied section '{}' in memory but FAILED to persist to {}: {}. Server \
                          will revert on next restart — fix the IO and re-apply.",
@@ -377,6 +385,7 @@ fn shape_section(section: SectionName, result: WriteResult) -> Response {
                 requires_restart: !restart.is_empty(),
                 restart_reasons: restart,
                 persisted_path,
+                persist_error,
                 error: None,
                 diff,
             };

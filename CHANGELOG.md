@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Fixed — A read-only config file is visible in the admin GUI
+
+Docker Compose (`:ro`), the Helm chart and the operator mount the config file
+read-only. A section apply then worked in the running proxy, but the proxy
+could not write the file, so the change was lost at the next restart, and a
+setting that needs a restart never took effect. The GUI showed only "Apply
+failed". Now:
+
+- `GET /_/api/admin/config` reports `config_file_path` and
+  `config_file_writable`, and the admin GUI shows a banner while the file is
+  read-only.
+- A section apply that works in memory but cannot write the file answers
+  with `persist_error` (still HTTP 500 and `ok: true`). The GUI says "Applied
+  to the running proxy, but the config file is read-only, so this change is
+  lost at the next restart. Export the YAML and update your deployment."
+- A backup restore that includes the config is refused with `409` before it
+  changes anything, with a message that says the config file is read-only.
+  A restore of users and groups only still works.
+
 ### Fixed — The Apply dialog names the fields that need a restart
 
 The "Restart required" banner always named `listen_addr` and `cache_size_mb`,

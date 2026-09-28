@@ -1275,6 +1275,23 @@ async fn import_zip_full_backup(
     );
     verify_manifest(&files)?;
     let parts = parse_backup_parts(&files)?;
+    // A config restore must be saved to the file, or it reverts at the
+    // next restart: refuse it up front, before anything changes.
+    if mode.restores_config() {
+        let path = crate::api::admin::config::active_config_path(&state);
+        if !crate::config::config_file_writable(std::path::Path::new(&path)) {
+            return Err(import_fail(
+                StatusCode::CONFLICT,
+                "config_file_read_only",
+                "config.yaml",
+                format!(
+                    "the config file {path} is read-only, so a restore that includes the \
+                     config cannot be saved and nothing is restored. Make the file writable, \
+                     or restore only users and groups (mode=iam-only)."
+                ),
+            ));
+        }
+    }
     let oauth_secrets = mode.restores_config()
         && parts
             .secrets

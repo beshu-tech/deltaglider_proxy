@@ -3,6 +3,8 @@
 //! Unit tests of `crate::config`, one file per concern.
 
 #[cfg(test)]
+mod config_file_writable_tests;
+#[cfg(test)]
 mod effective_backend_tests;
 #[cfg(test)]
 mod env_ref_roundtrip_tests;

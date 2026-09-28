@@ -42,7 +42,7 @@ import { Button, Modal, Space, Typography, message } from 'antd';
 import { useQueryClient } from '@tanstack/react-query';
 import type { SectionApplyResponse, SectionName } from './adminApi';
 import { ConfigConflictError, getSectionVersioned, validateSection } from './adminApi';
-import { SECTION_CONFLICT_TITLE, applySection } from './applySection';
+import { SECTION_CONFLICT_TITLE, applySection, persistFailureText } from './applySection';
 import { onSectionVersionAdvanced } from './sectionVersionBus';
 import { useApplyHandler, useDirtySection } from './useDirtySection';
 import { normalizeUiError } from './errorHandling';
@@ -321,9 +321,9 @@ export function useSectionEditor<Wire, Local = Wire>(
       }
       // This editor now stands on the version its own PUT produced.
       if (resp.version) versionRef.current = resp.version;
-      message.success(
-        resp.persisted_path ? `Applied + persisted to ${resp.persisted_path}` : 'Applied'
-      );
+      const lost = persistFailureText(resp);
+      if (lost) message.warning(lost, 10);
+      else message.success(resp.persisted_path ? `Applied + persisted to ${resp.persisted_path}` : 'Applied');
       markApplied(pendingLocalRef.current ?? undefined);
       setApplyOpen(false);
       setPendingBody(null);

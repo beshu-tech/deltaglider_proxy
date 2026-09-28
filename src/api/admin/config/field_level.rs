@@ -93,6 +93,11 @@ pub struct ConfigResponse {
     // (secrets carry no value). The GUI shows them read-only with a
     // "from env" badge instead of an empty, editable-looking input.
     env_overrides: Vec<crate::config::env_overrides::EnvOverride>,
+    // The file an apply persists to, and whether that write can work. A
+    // read-only file (Docker `:ro`, a Kubernetes `subPath`) keeps an apply
+    // live only until the next restart; the GUI warns about it.
+    config_file_path: String,
+    config_file_writable: bool,
 }
 
 /// Per-backend encryption status summary. Exposed in
@@ -515,7 +520,10 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
     let tuning = &cfg.tuning;
     let (rate_limit_max_attempts, rate_limit_window, rate_limit_lockout) =
         state.rate_limiter.per_ip_policy();
-    let tainted_fields = compute_tainted_fields(&cfg, &active_config_path(&state));
+    let config_file_path = active_config_path(&state);
+    let tainted_fields = compute_tainted_fields(&cfg, &config_file_path);
+    let config_file_writable =
+        crate::config::config_file_writable(std::path::Path::new(&config_file_path));
 
     // Assemble the per-backend response list. When the operator is on
     // the legacy singleton path (no `backends:` in YAML), synthesise
@@ -582,6 +590,8 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
             iam_mode: cfg.iam_mode,
             tainted_fields,
             env_overrides: crate::config::env_overrides::process_env_overrides(&cfg),
+            config_file_path,
+            config_file_writable,
             // Encryption status is now per-backend. Each `BackendInfoResponse`
             // in `backends` carries an `encryption: BackendEncryptionSummary`
             // non-secret summary. The former top-level `encryption_enabled`

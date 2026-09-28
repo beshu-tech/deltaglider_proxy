@@ -7,7 +7,7 @@ import { Button, Input, Radio, Switch, Typography, Space, Alert, Spin, message }
 import { PlusOutlined, DeleteOutlined, DatabaseOutlined, CloudOutlined, CheckCircleOutlined, ApiOutlined } from '@ant-design/icons';
 import type { BackendHealthEntry, BackendInfo, CreateBackendRequest } from '../adminApi';
 import { createBackend, deleteBackend, probeBackend, testS3Connection, updateAdminConfig, getSectionVersioned } from '../adminApi';
-import { applySection, sectionApplyErrorText } from '../applySection';
+import { applySection, persistFailureText, sectionApplyErrorText } from '../applySection';
 import { useAdminConfig } from '../queries/config';
 import { useBackends, useBucketOrigins } from '../queries/backends';
 import CreateBucketModal from './CreateBucketModal';
@@ -324,7 +324,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
       }
       setSaveResult({
         ok: true,
-        message: `Encryption updated on backend '${backendName}'`,
+        message: [`Encryption updated on backend '${backendName}'`, persistFailureText(result)].filter(Boolean).join('. '),
       });
       await refresh();
       // Existing objects keep their OLD at-rest state — propose the canned
@@ -365,7 +365,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
         setSaveResult({ ok: false, message: result.error || 'Failed to clear the legacy key' });
         return;
       }
-      setSaveResult({ ok: true, message: `Legacy key cleared on backend '${backendName}'` });
+      setSaveResult({ ok: true, message: [`Legacy key cleared on backend '${backendName}'`, persistFailureText(result)].filter(Boolean).join('. ') });
       qc.removeQueries({ queryKey: qk.backends.legacyKeyUsage(backendName) });
       await refresh();
     } catch (e) {

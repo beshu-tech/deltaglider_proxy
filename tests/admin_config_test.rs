@@ -2048,3 +2048,83 @@ async fn config_other_surfaces_answer_as_the_golden_file() {
         "the config responses changed; if on purpose, update {golden_path}"
     );
 }
+
+/// A read-only config file (Docker `:ro`, a Kubernetes `subPath`) keeps a
+/// section apply live but loses it at the next restart. The admin API says
+/// so: `GET /config` reports `config_file_writable: false`, a section PUT
+/// answers with `persist_error`, and a restore that includes the config is
+/// refused before it changes anything. (A read-only directory stands in for
+/// the read-only mount; root ignores mode bits, so the test skips as root.)
+#[cfg(unix)]
+#[tokio::test]
+async fn test_read_only_config_file_is_reported() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let server = TestServer::builder()
+        .auth("ROCFGKEY", "ROCFGSECRET")
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let config: serde_json::Value = admin
+        .get(format!("{ep}/_/api/admin/config"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(config["config_file_writable"], true, "{config}");
+    let zip = admin
+        .get(format!("{ep}/_/api/admin/backup"))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+
+    let dir = server.config_path().parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let config: serde_json::Value = admin
+        .get(format!("{ep}/_/api/admin/config"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let put = admin
+        .put(format!("{ep}/_/api/admin/config/section/advanced"))
+        .json(&json!({ "filtered_list_max_engine_pages": 7 }))
+        .send()
+        .await
+        .unwrap();
+    let put_status = put.status();
+    let put_body: serde_json::Value = put.json().await.unwrap();
+    let restore = admin
+        .post(format!("{ep}/_/api/admin/backup?mode=config-only"))
+        .header("content-type", "application/zip")
+        .body(zip)
+        .send()
+        .await
+        .unwrap();
+    let restore_status = restore.status();
+    let restore_body = restore.text().await.unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(config["config_file_writable"], false, "{config}");
+    assert_eq!(put_status, StatusCode::INTERNAL_SERVER_ERROR, "{put_body}");
+    assert_eq!(put_body["ok"], true, "applied in memory: {put_body}");
+    assert!(
+        put_body["persist_error"]
+            .as_str()
+            .is_some_and(|e| !e.is_empty()),
+        "{put_body}"
+    );
+    assert_eq!(restore_status, StatusCode::CONFLICT, "{restore_body}");
+    assert!(restore_body.contains("read-only"), "{restore_body}");
+}

@@ -229,6 +229,9 @@ export interface AdminConfig {
   tainted_fields: string[];
   /** Fields a `DGP_*` environment variable controls (secrets carry no value). */
   env_overrides?: EnvOverride[];
+  /** The file an apply persists to, and whether that write can work. */
+  config_file_path?: string;
+  config_file_writable?: boolean;
 }
 
 export type IamMode = 'gui' | 'declarative';
@@ -580,6 +583,9 @@ export interface SectionApplyResponse {
   /** One line per changed restart-required field (what `requires_restart` is about). */
   restart_reasons?: string[];
   persisted_path?: string;
+  /** Set when the PUT applied in memory but the config file write failed
+   *  (HTTP 500, `ok: true`): the change is lost at the next restart. */
+  persist_error?: string;
   error?: string;
   /**
    * `{ section: { "field.path": { before, after } } }`. Only present
@@ -662,6 +668,12 @@ export async function putSection<T = unknown>(
       data.error ?? `The ${section} section changed after you loaded it.`,
       res.headers.get('etag'),
     );
+  }
+  // 500 with `ok: true` + `persist_error`: applied in memory, not saved to
+  // the file. That is an outcome to report, not a failed apply.
+  if (res.status === 500) {
+    const data = (await res.clone().json().catch(() => null)) as SectionApplyResponse | null;
+    if (data?.ok && data.persist_error) return { ...data, version: res.headers.get('etag') };
   }
   if (!res.ok) await throwApiError(res, defaultContext(path));
   const resp = await safeJson<SectionApplyResponse>(res);

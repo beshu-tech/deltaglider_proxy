@@ -1,5 +1,5 @@
 import { cloneElement, isValidElement, useState, useEffect, useCallback, useMemo } from 'react';
-import { Button, Spin, Drawer } from 'antd';
+import { Alert, Button, Spin, Drawer } from 'antd';
 import { checkSession, whoami, loginAs, isNotAdminDenial, type ExternalProviderInfo, type LoginAsResult } from '../adminApi';
 import { getCredentials } from '../s3client';
 import { MenuOutlined } from '@ant-design/icons';
@@ -540,6 +540,16 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
             overflow: 'auto',
           }}
         >
+          {adminConfig.data?.config_file_writable === false && (
+            // A read-only mount (Docker `:ro`, a Kubernetes subPath) keeps
+            // applies live only until the next restart.
+            <Alert
+              type="warning"
+              showIcon
+              banner
+              title={`The config file ${adminConfig.data.config_file_path ?? ''} is read-only. Changes you apply here work until the next restart, and settings that need a restart (listener, TLS, cache size, sync bucket) never take effect. Export the YAML and update your deployment.`}
+            />
+          )}
           {unknownPath ? (
             <AdminNotFound path={unknownPath} nearest={nearestAdminPath(unknownPath, ADMIN_LEAVES)} onNavigate={navigateAdmin} />
           ) : (

@@ -2565,6 +2565,41 @@ fn escape_dollar_for_persist(v: &mut serde_yaml::Value) {
 ///
 /// Sibling-tempfile is critical: cross-filesystem rename would fall back to
 /// a copy+unlink that is *not* atomic.
+/// Can [`atomic_write`] save the config at `path`? It needs a writable
+/// parent directory (the sibling tempfile) on a read-write mount. A file
+/// mounted on its own read-only (Docker `:ro`, a Kubernetes `subPath` or
+/// ConfigMap) sits on a read-only mount, which `statvfs` reports. A
+/// best-effort probe: the persist itself stays the authority.
+#[cfg(unix)]
+pub fn config_file_writable(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
+    let c = |p: &std::path::Path| std::ffi::CString::new(p.as_os_str().as_bytes()).ok();
+    let Some(dir) = c(parent) else { return false };
+    // SAFETY: `dir` is a valid NUL-terminated path; access has no other
+    // preconditions.
+    if unsafe { libc::access(dir.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
+        return false;
+    }
+    // The mount of the file itself when it exists, else of the directory.
+    let probe = if path.exists() { c(path) } else { Some(dir) };
+    let Some(probe) = probe else { return false };
+    // SAFETY: `probe` is a valid path and `vfs` a writable out-parameter.
+    let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(probe.as_ptr(), &mut vfs) } != 0 {
+        return false;
+    }
+    vfs.f_flag & libc::ST_RDONLY == 0
+}
+
+#[cfg(not(unix))]
+pub fn config_file_writable(_path: &std::path::Path) -> bool {
+    true
+}
+
 pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), ConfigError> {
     use std::io::Write as _;
 
