@@ -6,9 +6,34 @@ S3 clients expect HTTPS. The UI (`/_/*`) and the S3 API (`/`) share one listener
 
 ## Option A: terminate TLS at the proxy
 
-If you run the proxy directly on the edge, enable native TLS with your PEM pair:
+If you run the proxy directly on the edge, enable native TLS with your PEM pair. The proxy binds its listener once at startup, so a TLS change takes effect only after a restart.
+
+In the admin UI:
+
+1. In the sidebar, open **System → System** (`/_/admin/system`).
+2. In the **TLS** card, turn on **Enable TLS**.
+
+   ![The TLS card of the System page with TLS off; callout 2 marks the Enable TLS switch.](/_/screenshots/tls-enable.webp)
+
+3. Type the path of your certificate in **Certificate path** and the path of its key in **Private key path**. Both files must be PEM files that the proxy process can read. If you leave both fields empty, the proxy generates a self-signed certificate at startup. That certificate is fine for testing, but clients that verify certificates refuse it.
+4. Click **Review & apply** in the bar above the cards.
+
+   ![TLS is on and both certificate paths are filled in; callout 3 marks the Certificate path and Private key path fields, and callout 4 marks Review & apply in the bar above the cards.](/_/screenshots/tls-paths.webp)
+
+5. Check the diff in the dialog, and then click **Apply and Persist**. The dialog says that a restart is required.
+
+   ![The review dialog shows the TLS change and says that a restart is required; the arrow points at Apply and Persist.](/_/screenshots/tls-apply.webp)
+
+6. Restart the proxy. After the restart, the listener speaks HTTPS on the same port.
+
+The proxy writes the change into its config file, and the restart reads it from there. When the config file is mounted read-only, as the Compose example, the Helm chart and the Kubernetes operator mount it, the proxy cannot save the change. The restart then starts without TLS. In that case, set TLS in the YAML of your deployment instead. The admin UI shows a warning banner when the config file is read-only.
+
+### The same change in YAML
+
+The steps above write this configuration into the `advanced` section of `deltaglider_proxy.yaml` ([why the UI and the file hold the same configuration](../explanation/two-ways-to-configure.md)):
 
 ```yaml
+# validate
 advanced:
   tls:
     enabled: true
@@ -16,19 +41,20 @@ advanced:
     key_path: /etc/ssl/private/proxy-key.pem
 ```
 
-You can also use env vars: `DGP_TLS_ENABLED=true`, `DGP_TLS_CERT=...`, `DGP_TLS_KEY=...`. If you omit both paths, the proxy generates a self-signed certificate on startup. That certificate is fine for testing, but clients that verify certificates refuse it.
+The environment variables `DGP_TLS_ENABLED=true`, `DGP_TLS_CERT` and `DGP_TLS_KEY` override these fields. When one of them is set, the admin UI shows the field as read-only with a from env badge. After you edit the file, restart the proxy. An apply through `POST /_/api/admin/config/apply` or `deltaglider_proxy config apply` stores the change, but the listener still needs the restart.
 
-With TLS at the proxy, the admin session cookies carry the `Secure` flag automatically. This is true whether you enable TLS in the YAML file or with `DGP_TLS_ENABLED`.
+With TLS at the proxy, the admin session cookies carry the `Secure` flag automatically. This is true whether you enable TLS in the YAML file, in the admin UI, or with `DGP_TLS_ENABLED`.
 
-When the proxy faces the internet directly, keep `DGP_TRUST_PROXY_HEADERS=false` (the default). Otherwise clients can spoof `X-Forwarded-For` and bypass rate limiting.
+When the proxy faces the internet directly, keep `DGP_TRUST_PROXY_HEADERS=false` (the default). Otherwise clients can spoof `X-Forwarded-For` and bypass rate limiting. `DGP_TRUST_PROXY_HEADERS`, `DGP_TRUSTED_PROXY_CIDRS` and `DGP_SECURE_COOKIES` exist only as environment variables. The YAML file and the admin UI cannot set them.
 
 ## Option B: terminate TLS at a reverse proxy
 
-If you terminate TLS at nginx or Caddy on the same host, bind the proxy to `127.0.0.1:9000` and forward over the loopback. If Traefik runs in Docker, it reaches the proxy container over the Docker network instead.
+If you terminate TLS at nginx or Caddy on the same host, bind the proxy to `127.0.0.1:9000` and forward over the loopback. To bind it, set **Listen address** in the **HTTP listener** card of **System → System** to `127.0.0.1:9000`, or set `advanced.listen_addr: "127.0.0.1:9000"` in the YAML file, and restart the proxy. The container image sets `DGP_LISTEN_ADDR=0.0.0.0:9000`, so in a container the field is read-only and the variable decides. If Traefik runs in Docker, it reaches the proxy container over the Docker network instead.
 
 **Traefik** (Docker Compose labels):
 
 ```yaml
+# not-proxy-config: docker-compose service
 deltaglider_proxy:
   image: beshultd/deltaglider_proxy:latest
   environment:
@@ -93,6 +119,7 @@ If you terminate TLS at a reverse proxy, you must raise its request read-timeout
 Traefik static config:
 
 ```yaml
+# not-proxy-config: traefik static config
 entryPoints:
   websecure:
     address: ":443"
@@ -106,6 +133,7 @@ entryPoints:
 You can also set them as CLI flags on the Traefik container:
 
 ```yaml
+# not-proxy-config: docker-compose command
 command:
   - '--entrypoints.websecure.transport.respondingTimeouts.readTimeout=30m'
   - '--entrypoints.websecure.transport.respondingTimeouts.writeTimeout=30m'
@@ -134,3 +162,4 @@ If the large upload fails with 502/504 and the proxy log shows a request finishi
 - [How to take a proxy to production](go-to-production.md): the full checklist
 - [Security model](../explanation/security-model.md): where TLS sits among the layers
 - [Configuration reference](../reference/configuration.md): TLS and listener fields
+- [Two ways to configure DeltaGlider](../explanation/two-ways-to-configure.md): how the admin UI and the YAML file relate
