@@ -82,6 +82,8 @@ http://127.0.0.1:19090/_/
 
 You should see the DeltaGlider Proxy connect screen. The chart's development bootstrap password is `change-me-in-production`. It exists so that the chart is testable out of the box. Override it first on any cluster that isn't a throwaway cluster.
 
+You can look around the settings pages, but notice the warning banner at the top: the chart mounts the config file read-only, so a settings change that you apply here lasts only until the pod restarts. On a real cluster, you change the configuration in the chart values instead, as [How to deploy on Kubernetes with Helm](../how-to/deploy-on-kubernetes.md) shows.
+
 ## Step 4: verify health and login
 
 Now we check the same things that a load balancer and an operator would check. First, the health probe:
