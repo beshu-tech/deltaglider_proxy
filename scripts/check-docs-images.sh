@@ -66,7 +66,23 @@ while IFS= read -r -d '' md; do
     }' "$md")
 done < <(find "$ROOT/docs/product" -name '*.md' -print0 | sort -z)
 
+# docs/screenshots/ holds pipeline pairs only, and every pair is in use: the
+# binary embeds the folder, so a stray or unused file costs every download.
+for f in "$SHOTS"/*; do
+  name="$(basename "$f")"
+  if [[ ! "$name" =~ ^[a-z0-9]+(-[a-z0-9]+)*\.(light|dark)\.webp$ ]]; then
+    echo "NOT A PIPELINE SHOT: docs/screenshots/$name (only <id>.light.webp / <id>.dark.webp from scripts/docs-screenshots.sh)" >&2
+    fail=1
+    continue
+  fi
+  stem="${name%.*.webp}"
+  if ! git -C "$ROOT" grep -q -F "$stem" -- docs/product README.md marketing/src demo/s3-browser/ui/src ':!demo/s3-browser/ui/src/__tests__'; then
+    echo "UNUSED SCREENSHOT: docs/screenshots/$name (no page references $stem; delete the pair and its shot)" >&2
+    fail=1
+  fi
+done
+
 if [[ "$fail" -eq 0 ]]; then
-  echo "docs images OK: $count image references, every file present, every alt text set"
+  echo "docs images OK: $count image references, every file present, every alt text set, every shot in use"
 fi
 exit "$fail"

@@ -1,4 +1,5 @@
-import { useColors } from '../ThemeContext';
+import { useColors, useTheme } from '../ThemeContext';
+import { themedShotSrc } from '../docsMarkdown';
 import type { DocsBundle, DocGroup } from '../docsBundle';
 import Lightbox from './Lightbox';
 import { useIsNarrow } from '../useIsNarrow';
@@ -32,6 +33,7 @@ const HERO_IMG = {
 
 export default function DocsLanding({ bundle, onSelectDoc }: Props) {
   const colors = useColors();
+  const { isDark } = useTheme();
   // Same breakpoint as the docs sidebar's `hide-mobile` (768px). With the
   // sidebar on screen, a card lists only where each group starts — the full
   // list would repeat the sidebar. Without it, the cards are the navigation.
@@ -98,11 +100,19 @@ export default function DocsLanding({ bundle, onSelectDoc }: Props) {
         className="responsive-grid-2"
         style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 40 }}
       >
-        <Lightbox caption="S3 file browser with compression indicators and bulk operations">
-          <img src="/_/screenshots/filebrowser.jpg" alt="Object Browser" style={HERO_IMG} />
+        <Lightbox caption="The object browser: each firmware build is stored as a delta.">
+          <img
+            src={themedShotSrc('/_/screenshots/browser-releases.webp', isDark)}
+            alt="The object browser lists firmware builds in the releases bucket, each stored as a delta."
+            style={HERO_IMG}
+          />
         </Lightbox>
-        <Lightbox caption="Storage analytics — per-bucket savings and cost estimation">
-          <img src="/_/screenshots/analytics.jpg" alt="Analytics" style={HERO_IMG} />
+        <Lightbox caption="Storage analytics: the savings in total and for each bucket.">
+          <img
+            src={themedShotSrc('/_/screenshots/dashboard-savings.webp', isDark)}
+            alt="The Analytics view of the dashboard shows the storage that delta compression saves, in total and for each bucket."
+            style={HERO_IMG}
+          />
         </Lightbox>
       </div>
 

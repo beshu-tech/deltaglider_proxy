@@ -244,7 +244,7 @@ groups:
 
 ## The built-in admin dashboard
 
-![Built-in analytics dashboard](/_/screenshots/analytics.jpg)
+![The Analytics view of the dashboard shows the storage that delta compression saves, in total and for each bucket.](/_/screenshots/dashboard-savings.webp)
 
 The admin UI has a live monitoring page, **Observability → Dashboard** (`/_/admin/dashboard`). It shows the same metrics, refreshes them every 5s, and has an **Analytics** view that shows the savings and the estimated cost for each bucket. The Monitoring view leads with 9 headline KPIs; deeper codec/latency telemetry sits behind a default-closed "Detailed telemetry" toggle. It does not replace Grafana in production, because it has no historical retention and no alerting. It answers "is the proxy healthy right now?" without leaving the UI.
 

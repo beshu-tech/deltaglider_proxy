@@ -38,23 +38,25 @@ const features = [
   },
 ] as const;
 
+// Pipeline shots (docs/screenshots/<id>.{light,dark}.webp): the page shows
+// the variant of the site theme, the lightbox too.
 const shots = [
   {
-    src: '/screenshots/iam.jpg',
-    alt: 'IAM user management screen in the embedded admin UI',
+    id: 'iam-users-new-form',
+    alt: 'The Users page of the admin UI with the form of a new IAM user and its permission rule.',
     caption: 'IAM users with ABAC permissions and group mapping.',
   },
   {
-    src: '/screenshots/object-replication.jpg',
-    alt: 'Jobs screen showing replication and lifecycle rules',
+    id: 'jobs-list',
+    alt: 'The Jobs page lists a replication rule and a lifecycle rule in one table.',
     caption: 'One Jobs screen for replication, lifecycle, and migrations.',
   },
   {
-    src: '/screenshots/analytics.jpg',
-    alt: 'Storage analytics dashboard with per-bucket savings',
+    id: 'dashboard-savings',
+    alt: 'The Analytics view of the dashboard shows the storage that delta compression saves, in total and for each bucket.',
     caption: 'Per-bucket savings, measured live.',
   },
-];
+].map((s) => ({ ...s, light: `/screenshots/${s.id}.light.webp`, dark: `/screenshots/${s.id}.dark.webp` }));
 import Glyph from './Glyph.astro';
 ---
 
@@ -90,8 +92,9 @@ import Glyph from './Glyph.astro';
     <div class="shots">
       {shots.map((s) => (
         <figure class="shot">
-          <button class="shot-frame" type="button" data-src={s.src} data-alt={s.alt} aria-label={`Enlarge screenshot: ${s.caption}`}>
-            <img src={s.src} alt={s.alt} width="1147" height="1440" loading="lazy" decoding="async" />
+          <button class="shot-frame" type="button" data-light={s.light} data-dark={s.dark} data-alt={s.alt} aria-label={`Enlarge screenshot: ${s.caption}`}>
+            <img class="shot-light" src={s.light} alt={s.alt} width="2560" height="1600" loading="lazy" decoding="async" />
+            <img class="shot-dark" src={s.dark} alt={s.alt} width="2560" height="1600" loading="lazy" decoding="async" />
           </button>
           <figcaption class="shot-caption">{s.caption}</figcaption>
         </figure>
@@ -122,7 +125,8 @@ import Glyph from './Glyph.astro';
     const show = (i: number) => {
       current = (i + frames.length) % frames.length;
       const frame = frames[current];
-      img.src = frame.getAttribute('data-src') || '';
+      const light = document.documentElement.dataset.theme === 'light';
+      img.src = frame.getAttribute(light ? 'data-light' : 'data-dark') || '';
       img.alt = frame.getAttribute('data-alt') || '';
     };
 
@@ -255,6 +259,11 @@ import Glyph from './Glyph.astro';
     object-fit: cover;
     object-position: top;
     display: block;
+  }
+  /* Show the variant of the site theme (data-theme on <html>, dark by default). */
+  :global(:root:not([data-theme='light'])) .shot-frame img.shot-light,
+  :global(:root[data-theme='light']) .shot-frame img.shot-dark {
+    display: none;
   }
 
   .shot-caption {

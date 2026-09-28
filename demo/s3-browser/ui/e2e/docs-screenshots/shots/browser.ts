@@ -34,22 +34,6 @@ export const BROWSER_SHOTS: Shot[] = [
     mask: [{ text: /^\d{1,2}\/\d{1,2}\/\d{4}, / }],
   },
   {
-    id: 'browser-bulk-actions',
-    route: FW,
-    alt: 'Three selected firmware files show the bulk bar with copy, move, ZIP download and delete; the box marks the bar.',
-    setup: async (page) => {
-      for (const v of ['0', '1', '2']) {
-        await page.getByRole('checkbox', { name: `Select fw-1.4.${v}.tar` }).check();
-      }
-    },
-    annotations: [
-      {
-        target: { union: [{ role: 'button', name: 'Copy 3 selected items' }, { role: 'button', name: 'Delete 3 selected items' }] },
-        kind: 'box',
-      },
-    ],
-  },
-  {
     id: 'command-palette',
     // Not the dashboard: its live numbers change on every run.
     route: '/_/admin/access/admission',
@@ -71,21 +55,5 @@ export const BROWSER_SHOTS: Shot[] = [
       await page.locator('body').press('?');
       await page.getByRole('dialog').waitFor();
     },
-  },
-  {
-    id: 'admin-mobile-drawer',
-    route: '/_/admin/jobs',
-    viewport: { width: 390, height: 844 },
-    alt: 'On a narrow screen the admin navigation opens as a drawer from the left; the box marks Jobs in the drawer.',
-    setup: async (page) => {
-      await page.getByRole('button', { name: /menu|navigation/i }).first().click();
-      await page.getByRole('navigation', { name: 'Admin navigation' }).waitFor();
-    },
-    annotations: [
-      {
-        target: { role: 'button', name: /(^|\s)Jobs$/, within: { role: 'navigation', name: 'Admin navigation' } },
-        kind: 'box',
-      },
-    ],
   },
 ];

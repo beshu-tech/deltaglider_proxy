@@ -13,7 +13,11 @@ Reference for the proxy's authentication modes, the bootstrap password, SigV4 ve
 
 The proxy refuses to start without authentication credentials unless `authentication: none` is set explicitly. IAM users count as credentials: a config with declarative `access.iam_users`, or a config DB that already holds IAM users, starts without a bootstrap SigV4 pair. When IAM users exist, the proxy checks an S3 request only against the IAM users, so the bootstrap pair on its own no longer works. In `gui` mode, the creation of the first IAM user carries the bootstrap pair over as a `legacy-admin` IAM user, so the pair keeps working. In `declarative` mode the YAML file lists every IAM user, so the bootstrap pair works only when one of the `iam_users` carries it. The bootstrap password still opens the admin GUI in both modes. The file browser then gets the bootstrap pair only when the S3 API accepts it; otherwise it asks for S3 credentials.
 
-The **Credentials** page (Settings → Access) shows the configured bootstrap access key ID, because an access key ID is not a secret. The secret is never shown. An empty field on that page keeps the current value, so clearing the fields does not remove the pair. To remove the pair, use **Remove bootstrap credentials** on the same page (`DELETE /_/api/admin/config/bootstrap-credentials`), or delete both keys from the YAML config. The proxy refuses the removal (`409`) while no IAM user exists, because the proxy would then have no credentials to check S3 requests against. When `DGP_ACCESS_KEY_ID` sets the key, the page does not offer the removal, because the environment variable would keep the key in place.
+When IAM users exist, the sign-in page asks for the access key ID and the secret access key of an IAM user:
+
+![The sign-in page of a proxy with IAM users asks for an access key ID and a secret access key; the box marks the two fields.](/_/screenshots/login-iam.webp)
+
+The **Access → Credentials & mode** page (`/_/admin/access/credentials`) shows the configured bootstrap access key ID, because an access key ID is not a secret. The secret is never shown. An empty field on that page keeps the current value, so clearing the fields does not remove the pair. To remove the pair, use **Remove bootstrap credentials** on the same page (`DELETE /_/api/admin/config/bootstrap-credentials`), or delete both keys from the YAML config. The proxy refuses the removal (`409`) while no IAM user exists, because the proxy would then have no credentials to check S3 requests against. When `DGP_ACCESS_KEY_ID` sets the key, the page does not offer the removal, because the environment variable would keep the key in place.
 
 ```yaml
 # validate
@@ -26,7 +30,7 @@ The orthogonal `access.iam_mode` selector (`gui`, default, or `declarative`) con
 
 OAuth providers appear as buttons on the `/_/` login page:
 
-![OAuth login with Google SSO](/_/screenshots/oauth_login.jpg)
+![The sign-in page of a proxy with the Okta provider; the arrow points at the Sign in with Okta button above the link to sign in with credentials.](/_/screenshots/sso-login-button.webp)
 
 ## Bootstrap password
 

@@ -2,7 +2,7 @@
 
 *Every Prometheus metric the proxy exposes, with labels, types, and bucket boundaries.*
 
-![Storage analytics dashboard](/_/screenshots/analytics.jpg)
+![The Analytics view of the dashboard shows the storage that delta compression saves, in total and for each bucket.](/_/screenshots/dashboard-savings.webp)
 
 `GET /_/metrics` returns Prometheus text format on the same port as the S3 API. The proxy collects metrics with lock-free atomics on the hot path. It uses no mutexes and no sampling, and the collection has no measurable performance impact.
 

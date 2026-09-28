@@ -8,7 +8,19 @@ A common first question is "does this replace S3 or proxy to it?" It proxies to 
 
 Your client speaks the standard S3 API to the proxy. The proxy authenticates the request, decides whether the object is delta-eligible, runs xdelta3 if it is, and reads or writes the bytes on the backend that the bucket is routed to.
 
-![The data path: an S3 client speaks the S3 API (SigV4) to the DeltaGlider Proxy, which runs auth and admission, routes the bucket to a backend, and runs the xdelta3 codec (encode on PUT, reconstruct on GET) before reading and writing baselines and deltas on the backend: AWS S3, Hetzner, Backblaze, or a local filesystem.](/_/screenshots/data-path-architecture.jpg)
+```mermaid
+flowchart LR
+    C["S3 client<br/>(SigV4)"] -->|S3 API| P
+    subgraph P["DeltaGlider Proxy"]
+        A["Auth and admission"] --> R["Bucket routing"]
+        R --> X["xdelta3 codec<br/>encode on PUT, reconstruct on GET"]
+    end
+    X -->|baselines and deltas| B1["hetzner-fsn1<br/>(S3-compatible)"]
+    X --> B2["local-disk<br/>(filesystem)"]
+    X --> B3["aws-dr<br/>(AWS S3)"]
+```
+
+The diagram shows the data path. An S3 client sends S3 API requests, signed with SigV4, to the proxy. The proxy runs authentication and admission, routes the bucket to its backend, and runs the xdelta3 codec, which encodes on PUT and reconstructs on GET. It then reads and writes the baselines and the deltas on the backend: `hetzner-fsn1`, `local-disk` or `aws-dr`.
 
 The control plane (IAM, routing table, per-object metadata, jobs) lives in the proxy, and the data plane (your bytes) lives on the backends. For the encode/reconstruct mechanics, see [how delta compression works](delta-compression.md). For the CPU/RAM cost of a proxy that actively rewrites payloads, see [capacity planning](../reference/capacity-planning.md).
 
@@ -16,7 +28,7 @@ The control plane (IAM, routing table, per-object metadata, jobs) lives in the p
 
 Consider how Acme runs it. Their admin, `dana`, registers three backends: `hetzner-fsn1` (cheap S3-compatible storage in Falkenstein), `local-disk` (a filesystem path on the proxy host), and `aws-dr` (an AWS bucket kept as a disaster-recovery target). She then routes buckets across them. `releases`, which holds the firmware artifacts that `ci-uploader` pushes, lives on `hetzner-fsn1`. `db-archive`, where `backup-bot` drops nightly Postgres dumps, is on `local-disk`. DR copies replicate to `aws-dr`.
 
-![Storage backends](/_/screenshots/storage_backends.jpg)
+![The Backends page lists hetzner-fsn1, local-disk and aws-dr; the arrow points at hetzner-fsn1, the default backend.](/_/screenshots/backends-three.webp)
 
 Neither `ci-uploader` nor `backup-bot` knows any of this. Both talk to the same endpoint, on the same port, with the same SigV4 credentials. The Engineering group's permissions are expressed against bucket names, not backends. You run the binary and point your S3 clients at it. The question of *where bytes physically land* then becomes an operator decision that you make in one place, and not a setting in every client config. The proxy serves the S3 API and the admin UI on a single port, and it works behind an ALB or any reverse proxy. It treats a directory on disk as a first-class backend. For this reason, "start on local disk, graduate to S3" is a routing change for your clients, not a migration project.
 

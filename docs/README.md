@@ -5,9 +5,7 @@ This tree splits into two audiences, enforced by CI so it can't drift:
 - **[product/](product/)** — operator-facing, bundled into the running binary at `/_/docs/`. Install, configure, secure, run, debug. If you operate an instance, this is what you read.
 - **[dev/](dev/)** — contributor-facing, **never** bundled. Build from source, release workflow, CI infrastructure, historical design docs.
 
-`screenshots/` is shared — the same images ship in the binary (via the UI build/static asset pipeline) and render on GitHub. The marketing site also copies from this directory at build time and fails if the required product screenshots are missing or smaller than 900×700:
-`filebrowser.jpg`, `analytics.jpg`, `iam.jpg`, `advanced_security.jpg`
-and `object-replication.jpg`.
+`screenshots/` is shared: the binary embeds it (served at `/_/screenshots/`), GitHub renders it in the READMEs, and the marketing site copies it at build time. Every file comes from the screenshot pipeline (`scripts/docs-screenshots.sh`) as a `<id>.light.webp` and `<id>.dark.webp` pair; see [dev/writing-task-pages.md](dev/writing-task-pages.md#screenshots).
 
 ## Product docs index
 

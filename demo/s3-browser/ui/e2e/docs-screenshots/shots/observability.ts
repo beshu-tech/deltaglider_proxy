@@ -52,4 +52,18 @@ export const OBSERVABILITY_SHOTS: Shot[] = [
       { target: { union: [{ role: 'switch', name: 'Follow' }, { text: 'Follow', exact: true }] }, kind: 'box', label: '3', side: 'right' },
     ],
   },
+  // ── README, reference/metrics, how-to/monitor-with-prometheus, marketing ──
+  {
+    id: 'dashboard-savings',
+    route: '/_/admin/dashboard?view=analytics',
+    alt: 'The Analytics view of the dashboard shows the storage that delta compression saves, in total and for each bucket.',
+    setup: async (page) => {
+      // Sizes come from the usage scan: scan every bucket, then wait for the numbers.
+      await page.getByRole('button', { name: /Re-scan all/ }).click();
+      await page.getByText(/4 of 4 scanned/).waitFor({ timeout: 60_000 });
+      await page.mouse.move(1, 1);
+    },
+    // The uptime in the page header changes from run to run.
+    mask: [{ text: / backend · up / }],
+  },
 ];

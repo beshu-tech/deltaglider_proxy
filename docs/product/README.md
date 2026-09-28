@@ -6,7 +6,7 @@
 
 Versioned binary artifacts, such as firmware builds, backup archives, AI model variants, game builds, and DB dumps, pay full price for every copy, even when each new version is 99% identical to the last. DeltaGlider Proxy stores those copies as xdelta3 deltas against a reference baseline. On high-similarity workloads, this typically cuts storage by 60 to 95%. Clients see a standard S3 API and cannot tell that the proxy compresses anything. You run the binary, point an S3 client at it, and use it as before.
 
-![Object Browser](/_/screenshots/filebrowser.jpg)
+![The object browser lists four firmware tarballs in the releases bucket, each stored as a delta; the box marks how much smaller the folder is than its original size.](/_/screenshots/browser-releases.webp)
 
 ## Where it sits
 

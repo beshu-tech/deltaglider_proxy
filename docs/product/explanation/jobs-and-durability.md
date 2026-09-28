@@ -6,7 +6,7 @@ DeltaGlider Proxy runs five kinds of background work (replication rules, lifecyc
 
 The operator's mental model should be: *anything that runs in the background is a job, and every job has runs, failures, and actions.* An operator asks the same questions about every job: is it running, when did it last run, what failed, and can I pause it? This is true whether the proxy is mirroring `releases` to `aws-dr`, expiring `db-archive` dumps after 90 days, or re-encrypting a bucket after a key change. Separate screens would mean several places to look during an incident, and slightly different words for "it's stuck." So the proxy has one jobs list and one runs/failures drawer. A per-kind capability matrix replaces one API per kind: you can pause a rule but not a migration, and you can cancel a migration but not a rule.
 
-![The Jobs screen](/_/screenshots/jobs-screen.jpg)
+![The Jobs page lists the releases-to-dr replication rule and the expire-old-downloads lifecycle rule in one table; callout 1 marks Jobs in the sidebar and callout 2 marks New job.](/_/screenshots/jobs-list.webp)
 
 ## Rules vs one-offs
 

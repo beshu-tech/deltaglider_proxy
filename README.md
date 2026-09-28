@@ -22,13 +22,13 @@ DeltaGlider Proxy sits in front of all your backends and presents a single, auth
 
 Clients see standard S3. They cannot tell which backend stores their bucket, that repeated binaries are stored as deltas, or that objects are encrypted before an untrusted backend sees them. They authenticate once, with corporate SSO if you want, and the proxy handles the rest.
 
-![DeltaGlider UI: file browser with delta compression stats](docs/screenshots/filebrowser.jpg)
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/browser-releases.dark.webp"><img alt="The object browser lists firmware builds in the releases bucket, each stored as a delta, with the savings of the folder." src="docs/screenshots/browser-releases.light.webp"></picture>
 
 ## Core capabilities
 
 ### Unified storage gateway
 
-![Storage backends: multi-backend routing with per-bucket policies](docs/screenshots/storage_backends.jpg)
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/buckets-routing.dark.webp"><img alt="The Buckets page shows the backend of each bucket, with the Backend list of db-archive open." src="docs/screenshots/buckets-routing.light.webp"></picture>
 
 - Multi-backend routing: route each bucket to a different storage backend (AWS S3, Hetzner, Backblaze, MinIO, filesystem), and mix providers behind one endpoint.
 - Bucket aliasing and migration: present virtual bucket names to clients and map them to real buckets on the backends. A one-click bucket migration between backends runs as a durable, resumable job that blocks writes while it runs, so you can move providers without changing any client config.
@@ -37,12 +37,12 @@ Clients see standard S3. They cannot tell which backend stores their bucket, tha
 
 ### Delegated authentication
 
-![OAuth login with Google](docs/screenshots/oauth_login.jpg)
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/sso-login-button.dark.webp"><img alt="The sign-in page offers Sign in with Okta above the sign-in with credentials." src="docs/screenshots/sso-login-button.light.webp"></picture>
 
 - OAuth/OIDC single sign-on: your team logs in with Google, Okta, Azure AD, or any OIDC provider, so nobody shares S3 credentials.
 - Group mapping rules: assign permissions automatically from the email domain (`*@company.com`), glob patterns, regex, or identity provider claims. New hires get the right access on their first login.
 
-![Group mapping rules: automatic permission assignment from identity provider claims](docs/screenshots/oauth_group_mapping.jpg)
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/sso-mapping-rule.dark.webp"><img alt="A group mapping rule assigns everyone whose groups claim contains engineering to the Engineering group." src="docs/screenshots/sso-mapping-rule.light.webp"></picture>
 - Multi-user IAM: per-user S3 credentials with ABAC permission rules. Rules Allow or Deny actions (read, write, delete, list) on resource patterns (bucket/prefix/*), with conditions (IP ranges, prefix restrictions).
 - SigV4 authentication: full AWS Signature V4 support, including presigned URLs up to 7 days. It works with every S3 SDK and CLI tool.
 - Public prefixes: publish specific folders (e.g. release artifacts) for anonymous download without exposing the rest of the bucket. Anonymous access is read-only: it allows no writes and no listing beyond the published prefix.
@@ -78,13 +78,13 @@ You manage everything from a web UI on the same port as the S3 API, without extr
 - Storage analytics: per-bucket savings breakdown, estimated monthly cost savings, compression opportunity detection
 - Embedded documentation: full-text searchable reference docs with architecture diagrams
 
-![Admin GUI: IAM user management with ABAC permissions](docs/screenshots/iam.jpg)
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/iam-users-new-form.dark.webp"><img alt="The Users page with the form of a new IAM user and its permission rule." src="docs/screenshots/iam-users-new-form.light.webp"></picture>
 
-![Storage analytics: per-bucket savings breakdown and cost estimation](docs/screenshots/analytics.jpg)
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/dashboard-savings.dark.webp"><img alt="The Analytics view of the dashboard shows the storage that delta compression saves, in total and for each bucket." src="docs/screenshots/dashboard-savings.light.webp"></picture>
 
 ### Security
 
-![Advanced security settings: rate limiting, session hardening, anti-fingerprinting](docs/screenshots/advanced_security.jpg)
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/secure-credentials-mode.dark.webp"><img alt="The Credentials & mode page shows the S3 authentication mode and the bootstrap SigV4 credentials." src="docs/screenshots/secure-credentials-mode.light.webp"></picture>
 
 - Mandatory authentication: the proxy refuses to start without credentials, so a deployment cannot be open by accident
 - Encrypted config database: the proxy stores IAM users and OAuth config in a SQLCipher-encrypted database, synced across instances through S3

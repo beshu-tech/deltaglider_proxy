@@ -58,12 +58,6 @@ To keep a composed value under the control of the environment, put the whole val
 
 If you manage the file in Git, keep your commented copy in the repository and treat the file on the server as generated output. To see the layout that the proxy writes, with its secrets redacted, request `GET /api/admin/config/export`.
 
-![Access configuration form](/_/screenshots/config-access-form.jpg)
-
-![Storage backend configuration form](/_/screenshots/config-storage-form.jpg)
-
-![System limits configuration form](/_/screenshots/config-limits-form.jpg)
-
 ## Shorthands
 
 The proxy expands these operator shorthands into their canonical forms at load time.
