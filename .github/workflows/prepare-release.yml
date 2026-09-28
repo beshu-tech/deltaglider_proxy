@@ -39,6 +39,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      actions: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -142,3 +143,9 @@ jobs:
             exit 1
           fi
           echo "Release PR opened: $PR_URL"
+
+          # A branch pushed and a PR opened with GITHUB_TOKEN fire no
+          # workflows, so the release PR had no CI (v2.0.1). Start CI on the
+          # release branch; its checks report on the PR's head commit.
+          gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$BRANCH"
+          echo "Started ci.yml on $BRANCH"
