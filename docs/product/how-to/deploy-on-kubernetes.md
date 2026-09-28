@@ -4,6 +4,8 @@ This guide shows you how to run DeltaGlider Proxy in production on Kubernetes wi
 
 The chart lives in `charts/deltaglider-proxy` and is intentionally minimal: one `Deployment`, one `Service`, a PVC for `/data`, a rendered config file, and an optional Ingress, HPA, PDB, and NetworkPolicy. It deploys the same single-port binary that every other deployment uses. The S3 API is on `/`, the admin UI on `/_/`, health on `/_/health`, and metrics on `/_/metrics`.
 
+The configuration of the proxy lives in the chart values (`config.inline`), and you set it before the install, so this guide uses YAML only. The chart mounts the rendered config file read-only. A change that you make later in the admin UI therefore works in the running pod, but the proxy cannot write it into the file, and the change is lost when the pod restarts. Settings that need a restart (the listener, TLS, the reference cache size and the sync bucket) never take effect from the UI at all, and a backup restore that includes the config answers `409 config_file_read_only`. The admin UI shows a warning banner about the read-only file. To keep a change, put it into `config.inline` (export the YAML from the UI if you tried it there first) and run `helm upgrade`. [Two ways to configure DeltaGlider](../explanation/two-ways-to-configure.md) explains how the file and the UI relate. IAM users and groups are not in the file in the default `iam_mode: gui`: they live in the encrypted database on the PVC, so the UI changes to them persist.
+
 ## 1. Create the credentials Secret
 
 Keep the credentials outside the values file. Create a Kubernetes Secret outside Helm and point the chart at it.
@@ -11,6 +13,7 @@ Keep the credentials outside the values file. Create a Kubernetes Secret outside
 Minimum filesystem-backed Secret:
 
 ```yaml
+# not-proxy-config: kubernetes secret
 apiVersion: v1
 kind: Secret
 metadata:
@@ -25,6 +28,7 @@ stringData:
 If you use an S3 storage backend, add the backend credentials too:
 
 ```yaml
+# not-proxy-config: kubernetes secret (more stringData keys)
   DGP_BE_AWS_ACCESS_KEY_ID: "..."
   DGP_BE_AWS_SECRET_ACCESS_KEY: "..."
 ```
@@ -47,9 +51,10 @@ helm upgrade --install dgp ./charts/deltaglider-proxy \
 
 ## 3. Choose the storage backend
 
-**If you use the filesystem backend** (the chart default), object data and the encrypted IAM DB live on the chart PVC:
+**If you use the filesystem backend** (the chart default), object data and the encrypted IAM DB live on the chart PVC. The default `config.inline` renders this proxy config:
 
 ```yaml
+# validate
 storage:
   filesystem: /data/storage
 access:
@@ -62,6 +67,7 @@ advanced:
 Size the PVC for your data:
 
 ```yaml
+# not-proxy-config: helm values
 persistence:
   enabled: true
   storageClass: fast-ssd
@@ -71,6 +77,7 @@ persistence:
 **If you use an S3 backend**, render the S3 config through `config.inline` and keep the backend credentials in the Secret. The chart deliberately does not store them in `config.inline`. The proxy reads them from `DGP_BE_AWS_ACCESS_KEY_ID` / `DGP_BE_AWS_SECRET_ACCESS_KEY`:
 
 ```yaml
+# not-proxy-config: helm values (config.inline holds the proxy config)
 auth:
   createSecret: false
   existingSecret: deltaglider-secrets
@@ -91,13 +98,14 @@ config:
 
 ### Why the config is mounted under `/data`
 
-The binary derives the encrypted IAM database path from `DGP_CONFIG`: `dirname($DGP_CONFIG)/deltaglider_config.db`. The chart therefore mounts the rendered config as `/data/deltaglider_proxy.yaml`, so the config DB lands at `/data/deltaglider_config.db`. Both files are on the writable PVC. Do not mount the config under a read-only ConfigMap directory such as `/config`, or IAM will be disabled because SQLite cannot create the encrypted DB.
+The binary derives the encrypted IAM database path from `DGP_CONFIG`: `dirname($DGP_CONFIG)/deltaglider_config.db`. The chart therefore mounts the rendered config as the single file `/data/deltaglider_proxy.yaml`, read-only from a ConfigMap, over the writable PVC at `/data`. The config DB then lands at `/data/deltaglider_config.db`, on the PVC, where the proxy can write it. Do not mount the config under a read-only ConfigMap directory such as `/config`, or IAM will be disabled because SQLite cannot create the encrypted DB.
 
 ## 4. Expose it with Ingress
 
 Route the whole host to the service. The admin UI and S3 API share one listener, so do not split the paths.
 
 ```yaml
+# not-proxy-config: helm values
 ingress:
   enabled: true
   className: nginx
