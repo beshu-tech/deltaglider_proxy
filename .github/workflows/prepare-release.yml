@@ -109,7 +109,9 @@ jobs:
           fi
 
           git checkout -b "$BRANCH"
-          git add Cargo.toml Cargo.lock CHANGELOG.md docs/product/changelog.md
+          git add Cargo.toml Cargo.lock CHANGELOG.md docs/product/changelog.md \
+            operator/Cargo.toml operator/Cargo.lock operator/src/crd.rs operator/README.md \
+            operator/deploy/operator.yaml charts/deltaglider-proxy/Chart.yaml
           git commit -m "chore(release): v${NEW_VERSION}
 
           Bump version, roll CHANGELOG. Merging this PR fires

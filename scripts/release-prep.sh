@@ -174,5 +174,37 @@ if [ -x "$ROOT/scripts/gen-changelog-doc.sh" ]; then
         || err "gen-changelog-doc.sh failed after CHANGELOG stamp"
 fi
 
+# ── Stamp the deployment pins ───────────────────────────────────────
+# The Kubernetes operator and the Helm chart default to a proxy image, so a
+# release that leaves them behind ships a fix that Helm and operator users do
+# not get (v2.0.1). Point both at the new proxy version, and bump the
+# operator's and the chart's own patch versions: operator-ci.yml publishes a
+# new operator image on main when the operator version changes. The lib test
+# `deployment_pins_follow_the_proxy_version` fails when these drift.
+bump_patch() { awk -F. -v OFS=. '{ $3 = $3 + 1; print }' <<< "$1"; }
+OP_TOML="$ROOT/operator/Cargo.toml"
+OP_CUR="$(grep -E '^version = ' "$OP_TOML" | head -1 | sed -E 's/^version = "([^"]+)".*/\1/')"
+OP_NEW="$(bump_patch "$OP_CUR")"
+CHART="$ROOT/charts/deltaglider-proxy/Chart.yaml"
+CH_CUR="$(sed -nE 's/^version: *([0-9.]+).*/\1/p' "$CHART" | head -1)"
+CH_NEW="$(bump_patch "$CH_CUR")"
+[[ "$OP_NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$CH_NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || err "could not read the operator ($OP_CUR) or chart ($CH_CUR) version"
+stamp() { # file, awk program; atomic replace
+    local f="$1" t; t="$(mktemp)"
+    awk -v proxy="$NEW_VERSION" -v op="$OP_NEW" -v chart="$CH_NEW" "$2" "$f" > "$t" && mv "$t" "$f"
+}
+stamp "$OP_TOML" '/^version = "/ && !d { print "version = \"" op "\""; d = 1; next } { print }'
+stamp "$ROOT/operator/src/crd.rs" '{ sub(/beshultd\/deltaglider_proxy:[0-9]+\.[0-9]+\.[0-9]+/, "beshultd/deltaglider_proxy:" proxy); print }'
+stamp "$ROOT/operator/README.md" '{ sub(/beshultd\/deltaglider_proxy:[0-9]+\.[0-9]+\.[0-9]+/, "beshultd/deltaglider_proxy:" proxy); print }'
+stamp "$ROOT/operator/deploy/operator.yaml" '{ sub(/beshultd\/deltaglider-operator:[0-9]+\.[0-9]+\.[0-9]+/, "beshultd/deltaglider-operator:" op); print }'
+stamp "$CHART" '/^version:/ { print "version: " chart; next } /^appVersion:/ { print "appVersion: \"" proxy "\""; next } { print }'
+( cd "$ROOT/operator" && { cargo update -p deltaglider-operator --offline >/dev/null 2>&1 \
+    || cargo update -p deltaglider-operator >/dev/null 2>&1; } ) \
+    || err "cargo update failed in operator/ — operator/Cargo.lock won't be in sync"
+grep -q "beshultd/deltaglider_proxy:${NEW_VERSION}\"" "$ROOT/operator/src/crd.rs" \
+    || err "operator DEFAULT_IMAGE stamp didn't take"
+echo "operator: $OP_CUR → $OP_NEW, chart: $CH_CUR → $CH_NEW" >&2
+
 # ── Output for the workflow to consume ──────────────────────────────
 echo "NEW_VERSION=$NEW_VERSION"

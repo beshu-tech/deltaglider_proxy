@@ -619,6 +619,38 @@ mod source_guards {
         out_of_line_test_modules, prod_mask, rel as rel_path, root, rust_files, test_module_lines,
     };
 
+    /// The operator and the Helm chart default to the proxy image of this
+    /// version. v2.0.1 shipped while both still pointed at 2.0.0, so Helm and
+    /// operator users did not get the fix. release-prep.sh stamps these pins.
+    #[test]
+    fn deployment_pins_follow_the_proxy_version() {
+        let field = |text: &str, prefix: &str| -> String {
+            text.lines()
+                .find_map(|l| l.trim().strip_prefix(prefix))
+                .unwrap_or_else(|| panic!("no `{prefix}` line"))
+                .trim()
+                .trim_matches('"')
+                .to_string()
+        };
+        let proxy = field(&crate::source_scan::read("Cargo.toml"), "version = ");
+        let crd = crate::source_scan::read("operator/src/crd.rs");
+        assert!(
+            crd.contains(&format!("beshultd/deltaglider_proxy:{proxy}\"")),
+            "operator DEFAULT_IMAGE is not the proxy version {proxy}"
+        );
+        let chart = crate::source_scan::read("charts/deltaglider-proxy/Chart.yaml");
+        assert_eq!(field(&chart, "appVersion:"), proxy, "chart appVersion");
+        let operator = field(
+            &crate::source_scan::read("operator/Cargo.toml"),
+            "version = ",
+        );
+        let deploy = crate::source_scan::read("operator/deploy/operator.yaml");
+        assert!(
+            deploy.contains(&format!("beshultd/deltaglider-operator:{operator}")),
+            "operator/deploy/operator.yaml does not pin operator {operator}"
+        );
+    }
+
     /// The release image compiles with the toolchain that rust-toolchain.toml
     /// pins. v2.0.0's image build failed because the Dockerfile still pinned
     /// rust:1.92 while the AWS SDK needed 1.94.1 and the repo used 1.98.
