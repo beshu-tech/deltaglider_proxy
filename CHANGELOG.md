@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed — Listing facts keep up with a busy node
+
+Since 2.0 the proxy writes the listing facts of a PUT in the background, in
+one task per backend. That task wrote the facts objects of a batch one after
+another, so on a node with many writes the queue grew and a LIST showed the
+stored size of new objects for longer and longer. Each batch is now written
+with up to 32 requests at once, and a key that a batch holds twice is written
+once.
+
 ### Added — `config lint` warns about a `legacy_key_id` without a `legacy_key`
 
 A backend's decrypt-only shim reads old objects with the retired key in

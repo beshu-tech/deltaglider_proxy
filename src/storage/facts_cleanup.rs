@@ -18,6 +18,7 @@
 //! by key) then costs a few requests, not 1000 LISTs. Cleanup is best effort
 //! by design: an entry that is left behind never matches a later object.
 
+use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -36,6 +37,8 @@ const DEBOUNCE: Duration = Duration::from_millis(200);
 const MAX_BATCH: usize = 10_000;
 /// `DeleteObjects` takes at most 1000 keys.
 const DELETE_CHUNK: usize = 1000;
+/// Facts objects that one drain batch writes at once.
+const FACTS_WRITE_CONCURRENCY: usize = 32;
 
 /// A facts key with the backend's `LastModified` as `(secs, nanos)`.
 type Listed = (String, Option<(i64, u32)>);
@@ -356,13 +359,25 @@ async fn drain(
         let (writes, deletes): (Vec<Queued>, Vec<Queued>) = batch
             .into_iter()
             .partition(|q| matches!(q, Queued::Write { .. }));
-        for job in writes {
-            if let Queued::Write { bucket, facts_key } = job {
-                if let Err(e) = put_facts_object(&client, &native, &bucket, &facts_key).await {
-                    warn!("listing facts {bucket}/{facts_key} not written: {e}");
+        // Concurrently, one write per key: one task serves every client, so
+        // a sequential loop capped the facts rate at one S3 round-trip each.
+        let writes: HashSet<(String, String)> = writes
+            .into_iter()
+            .filter_map(|q| match q {
+                Queued::Write { bucket, facts_key } => Some((bucket, facts_key)),
+                Queued::Deleted(..) => None,
+            })
+            .collect();
+        futures::stream::iter(writes)
+            .for_each_concurrent(FACTS_WRITE_CONCURRENCY, |(bucket, facts_key)| {
+                let (client, native) = (&client, &native);
+                async move {
+                    if let Err(e) = put_facts_object(client, native, &bucket, &facts_key).await {
+                        warn!("listing facts {bucket}/{facts_key} not written: {e}");
+                    }
                 }
-            }
-        }
+            })
+            .await;
         let batch: Vec<(String, String, Option<i64>)> = deletes
             .into_iter()
             .filter_map(|q| match q {
@@ -590,6 +605,58 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(metrics.num_alive_tasks(), before, "tasks leaked");
+    }
+
+    /// storage-8 moved the facts write off the PUT path into this one drain
+    /// task. It wrote a batch one object at a time, so every client's facts
+    /// queued behind one S3 round-trip each: on a busy node the unbounded
+    /// queue grew and listings showed stored sizes for longer and longer.
+    /// A batch is written concurrently now, one write per key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_batch_of_facts_writes_runs_concurrently() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        fake.set_put_delay_ms(100);
+        let conf = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "a", "b", None, None, "t",
+            ))
+            .force_path_style(true)
+            .endpoint_url(endpoint)
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .build();
+        let queue = FactsCleanupQueue::start(Client::from_conf(conf), NativeEncryptionConfig::None);
+        const N: usize = 32;
+        let started = std::time::Instant::now();
+        for i in 0..N {
+            queue.write("b", &format!("p/k{i}"), format!(".dg/facts/p/k{i}"));
+        }
+        // The same key twice in one batch is written once.
+        queue.write("b", "p/k0", ".dg/facts/p/k0".to_string());
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let puts = || {
+            fake.requests()
+                .iter()
+                .filter(|r| r.starts_with("PUT /b/.dg/facts/p/"))
+                .count()
+        };
+        while puts() < N && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Let a second write of the repeated key show up if the drain sent one.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(puts(), N, "every key written, a repeated key once");
+        assert!(
+            fake.peak_puts_in_flight() > 1,
+            "facts writes ran one at a time"
+        );
+        // One at a time would take N x 100 ms = 3.2 s.
+        assert!(
+            started.elapsed() < Duration::from_millis(1600),
+            "{:?} for {N} writes",
+            started.elapsed()
+        );
     }
 
     #[test]

@@ -22,12 +22,29 @@ pub(crate) struct FakeS3 {
     objects: parking_lot::Mutex<HashMap<String, Stored>>,
     requests: parking_lot::Mutex<Vec<String>>,
     changed: tokio::sync::Notify,
+    /// Delay of every object PUT, in ms (0 = none), and the in-flight
+    /// PUT count and its peak: a test can see whether a client writes
+    /// concurrently.
+    put_delay_ms: std::sync::atomic::AtomicU64,
+    puts_in_flight: std::sync::atomic::AtomicUsize,
+    puts_peak: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeS3 {
     /// Every request so far, in order.
     pub(crate) fn requests(&self) -> Vec<String> {
         self.requests.lock().clone()
+    }
+
+    /// Make every object PUT take `ms` milliseconds.
+    pub(crate) fn set_put_delay_ms(&self, ms: u64) {
+        self.put_delay_ms
+            .store(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The most object PUTs that were in flight at once.
+    pub(crate) fn peak_puts_in_flight(&self) -> usize {
+        self.puts_peak.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Forget the requests so far.
@@ -109,6 +126,15 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                         let current = f.objects.lock().get(&path).cloned();
                         match method {
                             Method::PUT => {
+                                use std::sync::atomic::Ordering::SeqCst;
+                                let now = f.puts_in_flight.fetch_add(1, SeqCst) + 1;
+                                f.puts_peak.fetch_max(now, SeqCst);
+                                let delay = f.put_delay_ms.load(SeqCst);
+                                if delay > 0 {
+                                    tokio::time::sleep(std::time::Duration::from_millis(delay))
+                                        .await;
+                                }
+                                f.puts_in_flight.fetch_sub(1, SeqCst);
                                 let etag = format!("\"{}\"", hex::encode(md5::Md5::digest(&body)));
                                 let meta = headers
                                     .iter()

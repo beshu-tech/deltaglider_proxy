@@ -1114,7 +1114,12 @@ async fn test_multipart_single_part() {
         &[(1, &etag)],
     )
     .await;
-    assert!(resp.status().is_success());
+    let status = resp.status();
+    assert!(
+        status.is_success(),
+        "complete answered {status}: {}",
+        resp.text().await.unwrap_or_default()
+    );
 
     let retrieved = get_bytes(&http, &server.endpoint(), server.bucket(), &key).await;
     assert_eq!(retrieved, data);
