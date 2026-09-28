@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed — A running job's progress is readable in the Jobs table
+
+The Status column of the Jobs table could shrink so far that a running
+migration showed only "run…". The column now keeps room for the progress
+meter and its label, for example "running · 12 copied".
+
 ### Fixed — A replication rule made in the admin UI gets the server defaults
 
 A new replication rule in the admin UI started with the exclude glob `.dg/*`

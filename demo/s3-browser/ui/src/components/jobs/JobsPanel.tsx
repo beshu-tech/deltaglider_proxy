@@ -484,7 +484,8 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
     {
       key: 'status',
       label: 'Status',
-      track: 'minmax(0,1fr)',
+      // Fits a running OutcomeMeter (dot + track + label); at 0 it read "run…".
+      track: 'minmax(200px,1fr)',
       render: (d) => {
         const live = d.row.trigger === 'oneoff' && isActiveJobStatus(d.row.status);
         return (
