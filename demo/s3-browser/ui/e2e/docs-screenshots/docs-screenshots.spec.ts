@@ -148,6 +148,7 @@ async function capture(browser: Browser, shot: Shot, theme: (typeof THEMES)[numb
     });
     await clearAnnotations(page);
   } finally {
+    if (shot.teardown) await shot.teardown(ctx.request);
     await ctx.close();
   }
 }

@@ -9,7 +9,7 @@
  * references `/_/screenshots/<id>.webp` once; both renderers pick the
  * `<id>.light.webp` or `<id>.dark.webp` file for the active theme.
  */
-import type { Locator, Page } from '@playwright/test';
+import type { APIRequestContext, Locator, Page } from '@playwright/test';
 
 /**
  * How to find an element, in the order of preference: a role and its
@@ -54,6 +54,13 @@ export interface Shot {
   alt: string;
   /** Actions after the route loads: open a form, type, select. Must not depend on the theme. */
   setup?: (page: Page) => Promise<void>;
+  /**
+   * Undo what `setup` changed on the server, with the signed-in admin API.
+   * Runs after each capture, also after a failure, so every later shot sees
+   * the seed. Setup changes the server only when a shot needs a state that
+   * the seed cannot hold (the seed state is what the other shots show).
+   */
+  teardown?: (api: APIRequestContext) => Promise<void>;
   annotations?: Annotation[];
   /** Crop to this element or group (plus `clipPadding` CSS px). Default: the whole viewport. */
   clip?: MarkTarget;

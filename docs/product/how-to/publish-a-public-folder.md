@@ -18,7 +18,9 @@ In the admin UI:
 
    ![The downloads bucket is open; callout 3 marks the Specific prefixes public option and callout 4 marks the prefix field, which holds public/.](/_/screenshots/bucket-public-prefix.webp)
 
-5. Click **Review & apply** in the bar at the bottom of the page. Check the diff in the dialog, and then click **Apply and Persist**. The dialog is the same as in [How to route a bucket to a different backend](route-a-bucket-to-a-backend.md#2-route-the-bucket).
+5. Click **Review & apply** in the bar at the bottom of the page. Check the diff in the dialog, and then click **Apply and Persist**.
+
+   ![The review dialog shows that the downloads bucket gets the public prefix public/; the arrow points at Apply and Persist.](/_/screenshots/bucket-public-prefix-apply.webp)
 
 The three options of **Public access** map directly to the YAML:
 

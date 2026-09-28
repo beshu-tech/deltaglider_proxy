@@ -2,9 +2,10 @@
  * Storage shots: Backends and Buckets (docs: how-to/route-a-bucket-to-a-backend,
  * explanation/multi-backend-architecture, how-to/set-bucket-compression-and-quotas).
  */
-import type { Page } from '@playwright/test';
+import type { APIRequestContext, Page } from '@playwright/test';
 import type { Shot, Target } from '../shot';
 import { nav } from './common';
+import { BASE } from '../seed';
 
 /** The collapsed status row of a bucket on the Buckets page. */
 const bucketRow = (name: string): Target => ({ role: 'button', name: new RegExp(`^${name} — click to`) });
@@ -167,6 +168,15 @@ async function compressionOffOnDownloads(page: Page): Promise<void> {
   await page.evaluate(() => window.scrollTo(0, 0));
 }
 
+/** Set the public prefixes of downloads through the admin API (a storage merge-patch). */
+async function setDownloadsPublicPrefixes(api: APIRequestContext, prefixes: string[]): Promise<void> {
+  const r = await api.put('/_/api/admin/config/section/storage', {
+    data: { buckets: { downloads: { public_prefixes: prefixes } } },
+    headers: { Origin: BASE },
+  });
+  if (!r.ok()) throw new Error(`public prefixes of downloads: HTTP ${r.status()} ${await r.text()}`);
+}
+
 async function reviewDialog(page: Page): Promise<void> {
   // dispatchEvent, not click: see route-bucket-apply-dialog.
   await page.getByRole('button', { name: 'Review & apply' }).dispatchEvent('click');
@@ -242,6 +252,26 @@ const BUCKET_POLICY_SHOTS: Shot[] = [
       // right of the input covered the GiB suffix.
       { target: { css: '.ant-input-number:has(input[placeholder="Unlimited"])' }, kind: 'box', label: '3', side: 'right' },
     ],
+  },
+  {
+    // The seed publishes downloads/public/ (the rule tester shots need it), so
+    // there would be nothing to apply: take the prefix away for this shot and
+    // give it back after.
+    id: 'bucket-public-prefix-apply',
+    route: '/_/admin/storage/buckets',
+    alt: 'The review dialog shows that the downloads bucket gets the public prefix public/; the arrow points at Apply and Persist.',
+    setup: async (page) => {
+      await setDownloadsPublicPrefixes(page.request, []);
+      await page.reload();
+      await openBucket(page, 'downloads');
+      await page.getByText('Specific prefixes public', { exact: true }).click();
+      await page.getByRole('textbox', { name: 'Public prefix' }).fill('public/');
+      await reviewDialog(page);
+    },
+    teardown: (api) => setDownloadsPublicPrefixes(api, ['public/']),
+    clip: { role: 'dialog' },
+    clipPadding: 16,
+    annotations: [{ target: { testId: 'apply-dialog-confirm' }, kind: 'arrow', side: 'bottom' }],
   },
   {
     id: 'bucket-public-prefix',
