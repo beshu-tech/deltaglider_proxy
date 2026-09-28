@@ -150,7 +150,8 @@ export function uploadCreatedBaseline(
   return folderWasEmpty === true && isBaselineObject(headers);
 }
 
-/** Bytes in one GiB. The UI labels it "GB", like `formatBytes`. */
+/** Bytes in one GiB. The quota field labels it "GiB"; the analytics cost
+ *  rate still says "GB" (like `formatBytes`) for the same unit. */
 export const GIB = 1024 ** 3;
 
 /** Bytes → GiB for an editable quota field: 3 decimals, so 500 MiB reads

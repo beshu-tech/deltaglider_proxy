@@ -276,14 +276,15 @@ pub(crate) fn check_quota(
     quota_decision(quota, used, incoming_bytes).map_err(S3Error::AccessDeniedReason)
 }
 
+/// 1024-based, so IEC labels: the quota field in the admin GUI says GiB.
 fn human_bytes(b: u64) -> String {
     const MIB: u64 = 1024 * 1024;
     if b >= 1024 * MIB {
-        format!("{:.1} GB", b as f64 / (1024 * MIB) as f64)
+        format!("{:.1} GiB", b as f64 / (1024 * MIB) as f64)
     } else if b >= MIB {
-        format!("{:.1} MB", b as f64 / MIB as f64)
+        format!("{:.1} MiB", b as f64 / MIB as f64)
     } else {
-        format!("{} KB", b.div_ceil(1024))
+        format!("{} KiB", b.div_ceil(1024))
     }
 }
 
@@ -377,11 +378,21 @@ mod quota_tests {
         let mib = 1024 * 1024;
         assert_eq!(
             quota_decision(25 * mib, Some(24 * mib), 3 * mib).unwrap_err(),
-            "Bucket quota exceeded: 24.0 MB used + 3.0 MB upload > 25.0 MB limit"
+            "Bucket quota exceeded: 24.0 MiB used + 3.0 MiB upload > 25.0 MiB limit"
         );
         assert!(
             quota_decision(100, Some(u64::MAX), 1).is_err(),
             "saturating, never wraps"
+        );
+    }
+
+    #[test]
+    fn quota_message_units_are_iec() {
+        // The sizes are 1024-based, so the labels are KiB/MiB/GiB.
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(
+            quota_decision(10 * gib, Some(10 * gib), 1000).unwrap_err(),
+            "Bucket quota exceeded: 10.0 GiB used + 1 KiB upload > 10.0 GiB limit"
         );
     }
 }

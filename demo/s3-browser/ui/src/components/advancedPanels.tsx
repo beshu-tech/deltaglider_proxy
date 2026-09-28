@@ -483,7 +483,7 @@ export function ObjectSizeLimitCard({ onSessionExpired }: PanelProps) {
           description="The largest object that any bucket accepts. The proxy refuses a bigger upload, and the upload page refuses it before the upload starts."
         />
         <FormField
-          label="Maximum object size (MB)"
+          label="Maximum object size (MiB)"
           yamlPath="advanced.max_object_size"
           helpText="Applies to every bucket. The YAML value is in bytes."
           defaultPlaceholder="100"
@@ -491,13 +491,13 @@ export function ObjectSizeLimitCard({ onSessionExpired }: PanelProps) {
           onExampleClick={(v) => setValue({ ...value, max_object_size: Number(v) * MIB })}
         >
           <InputNumber
-            aria-label="Maximum object size (MB)"
+            aria-label="Maximum object size (MiB)"
             value={mb}
             onChange={(v) => setValue({ ...value, max_object_size: v != null ? v * MIB : undefined })}
             min={1}
             placeholder="100"
             style={{ width: 180, ...inputRadius }}
-            suffix="MB"
+            suffix="MiB"
           />
         </FormField>
       </div>

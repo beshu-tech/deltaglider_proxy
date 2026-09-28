@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed — Quota and object size units say GiB and MiB
+
+The bucket Quota field said "GB", but it converts with 1024³ bytes, which is a
+GiB. The field, the quota chip on the bucket card, the upload page's refusal
+message and the server's `Bucket quota exceeded` message now say GiB, MiB and
+KiB. The object size limit field is now "Maximum object size (MiB)" for the
+same reason. The stored values do not change: `quota_bytes` and
+`max_object_size` stay in bytes.
+
 ### Fixed — The Sync bucket help describes the merge
 
 The help text of the Sync bucket field said that "the most recently saved copy

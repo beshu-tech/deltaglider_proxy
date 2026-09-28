@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'vitest';
-import { clamp, formatDuration, relativeTime, formatBytes, getFileName, pluralize, noun, parentPrefix, isAbsolutePath, cacheEntrySubtitle } from '../utils';
+import { clamp, formatDuration, relativeTime, formatBytes, formatBytesIec, getFileName, pluralize, noun, parentPrefix, isAbsolutePath, cacheEntrySubtitle } from '../utils';
 
 test('isAbsolutePath (backend data directory, issue #92 comment item 3)', () => {
   assert.equal(isAbsolutePath('/var/lib/deltaglider'), true);
@@ -83,6 +83,14 @@ test('formatBytes (regression guard for the shared analytics formatter)', () => 
   // non-finite input never reaches the log math
   assert.equal(formatBytes(NaN), '—');
   assert.equal(formatBytes(Infinity), '—');
+});
+
+test('formatBytesIec labels the 1024 base with IEC units (quota, size limits)', () => {
+  assert.equal(formatBytesIec(0), '0 B');
+  assert.equal(formatBytesIec(1536), '1.5 KiB');
+  assert.equal(formatBytesIec(10 * 1024 ** 3), '10.0 GiB');
+  assert.equal(formatBytesIec(-1536), '-1.5 KiB');
+  assert.equal(formatBytesIec(NaN), '—');
 });
 
 test('getFileName (shared filename extraction for Inspector + Preview)', () => {

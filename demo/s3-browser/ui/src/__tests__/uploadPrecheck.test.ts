@@ -19,14 +19,15 @@ test('a file over max_object_size is refused with the limit named', () => {
   assert.deepEqual(r.accepted.map((x) => x.name), ['ok.bin']);
   assert.equal(r.refused.length, 1);
   assert.equal(r.refused[0].file.name, 'big.bin');
-  assert.match(r.refused[0].reason, /143\.0 MB.*100\.0 MB/);
+  // The limits are 1024-based, so the units say MiB (docs-audit finding 5).
+  assert.match(r.refused[0].reason, /143\.0 MiB.*100\.0 MiB/);
 });
 
 test('the quota counts the used bytes and the files before it in the batch', () => {
   const r = precheckUpload([f('a', 30 * MB), f('b', 30 * MB), f('c', 10 * MB)], { maxObjectSize: null, quotaBytes: 100 * MB, usedBytes: 50 * MB });
   assert.deepEqual(r.accepted.map((x) => x.name), ['a', 'c']);
   assert.equal(r.refused[0].file.name, 'b');
-  assert.match(r.refused[0].reason, /quota/);
+  assert.equal(r.refused[0].reason, '30.0 MiB does not fit in the bucket quota: 20.0 MiB of 100.0 MiB left');
 });
 
 test('an unknown usage never refuses on quota, and quota 0 is a frozen bucket', () => {

@@ -24,7 +24,7 @@ afterEach(() => vi.unstubAllGlobals());
 test('edits max_object_size in MB and PUTs bytes', async () => {
   const user = userEvent.setup();
   renderWithQuery(<ObjectSizeLimitCard />);
-  const input = await screen.findByRole('spinbutton', { name: /Maximum object size/ });
+  const input = await screen.findByRole('spinbutton', { name: 'Maximum object size (MiB)' });
   await waitFor(() => expect(input).toHaveValue('100'));
   await user.clear(input);
   await user.type(input, '250');

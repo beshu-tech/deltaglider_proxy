@@ -37,7 +37,7 @@ import MigrateBucketModal from './MigrateBucketModal';
 import type { JobRow } from '../jobsView';
 import { progressLabel } from '../jobsView';
 import { runJobAction } from '../adminApi';
-import { formatBytes } from '../utils';
+import { formatBytesIec } from '../utils';
 import { bytesFromGib, gibFromBytes } from '../savings';
 import { activateOnKey } from '../keyboard';
 import RowActionsMenu from './RowActionsMenu';
@@ -237,7 +237,7 @@ export default function BucketCard({
     chips.push(
       // A quota is a normal setting, not a problem: neutral, not amber.
       <Chip key="quota" tone={colors.TEXT_MUTED} title="Storage quota">
-        ≤ {formatBytes(eff.quota_bytes)}
+        ≤ {formatBytesIec(eff.quota_bytes)}
       </Chip>
     );
   }
@@ -621,7 +621,7 @@ export default function BucketCard({
                         placeholder="Unlimited"
                         style={{ width: 170, ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 11 }}
                         size="small"
-                        suffix="GB"
+                        suffix="GiB"
                       />
                     </div>
                   </div>

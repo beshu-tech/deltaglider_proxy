@@ -2,8 +2,18 @@
  *  "-1.5 KB"); sub-byte input stays in B; the unit clamps at PB; non-finite
  *  input renders "—". */
 export function formatBytes(bytes: number): string {
+  return formatWithUnits(bytes, ['B', 'KB', 'MB', 'GB', 'TB', 'PB']);
+}
+
+/** `formatBytes` with IEC labels ("1.5 KiB"), for values an operator types
+ *  in a 1024-based field (bucket quota, object size limit): the label then
+ *  matches the field's unit. */
+export function formatBytesIec(bytes: number): string {
+  return formatWithUnits(bytes, ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']);
+}
+
+function formatWithUnits(bytes: number, units: readonly string[]): string {
   if (!Number.isFinite(bytes)) return '—';
-  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
   const sign = bytes < 0 ? '-' : '';
   const abs = Math.abs(bytes);
   const i = abs < 1 ? 0 : Math.min(units.length - 1, Math.floor(Math.log(abs) / Math.log(1024)));
