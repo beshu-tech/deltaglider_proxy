@@ -2,6 +2,8 @@
 
 This guide shows you how to run DeltaGlider Proxy with Docker Compose using a secret-free, commit-safe config. The files are also in the repo under [`examples/docker-compose/`](https://github.com/beshu-tech/deltaglider_proxy/tree/main/examples/docker-compose).
 
+The container reads its configuration when it starts, so you write the configuration as files before the first `docker compose up`, and the admin UI plays no part in this guide. The compose file mounts `deltaglider_proxy.yaml` read-only (`:ro`). A change that you make later in the admin UI therefore works in the running container, but the proxy cannot write it into the file, and the change is lost when the container restarts. Settings that need a restart (the listener, TLS, the reference cache size and the sync bucket) never take effect from the UI at all, and a backup restore that includes the config answers `409 config_file_read_only`. The admin UI shows a warning banner about the read-only file. To keep a change, edit `deltaglider_proxy.yaml` (or export the YAML from the UI and commit it) and restart the container. [Two ways to configure DeltaGlider](../explanation/two-ways-to-configure.md) explains how the file and the UI relate.
+
 The proxy expands `${env:NAME}` and `${env:NAME:-default}` references inside its config file, in-process, at load time. This replaces an external `envsubst` step. You ship a secret-free `deltaglider_proxy.yaml` with placeholders, you supply the real values as environment variables, and the proxy fills them in at startup. When a placeholder is unset and has no default, the proxy stops with an error, so it never starts with a blank secret.
 
 > The `env:` prefix is required. It keeps load-time config placeholders distinct from the request-time IAM permission templates (`${iam:username}`, `${iam:access_key_id}`). A bare `${...}` is left untouched.
@@ -18,7 +20,10 @@ You need three files:
 
 ## 1. Write the config
 
+The block uses `${env:...}` placeholders, so the docs lint cannot check it on its own. Lint it with the secrets loaded, as the Verify section shows.
+
 ```yaml
+# fragment
 # deltaglider_proxy.yaml — secret-free, safe to commit
 storage:
   backends:
@@ -63,6 +68,7 @@ PROXY_SECRET_ACCESS_KEY=
 ## 3. Write the compose file
 
 ```yaml
+# not-proxy-config: docker-compose
 services:
   # One-time: make the config volume writable by the proxy's non-root user (999)
   # so it can create its encrypted config DB. (A fresh named volume is root-owned.)
@@ -132,6 +138,7 @@ deltaglider_proxy config lint deltaglider_proxy.yaml
 For a self-contained deployment with no external object store, replace the `storage.backends` block with a filesystem backend pointed at the data volume:
 
 ```yaml
+# fragment
 storage:
   filesystem: /data
 ```
@@ -155,7 +162,14 @@ AWS_ACCESS_KEY_ID=$PROXY_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY=$PROXY_SECRET_ACCES
   aws --endpoint-url http://localhost:9000 s3 ls
 ```
 
-Then open the admin GUI at `http://localhost:9000/_/` and log in with the bootstrap password. The S3 API and the GUI share port 9000.
+Then open the admin GUI at `http://localhost:9000/_/` and log in with the bootstrap password. The S3 API and the GUI share port 9000. On a fresh proxy, the setup wizard at `/_/admin/setup` walks you through the first backend, bucket and user; remember that its changes, like every UI change, last only until the next restart while the config file is mounted read-only.
+
+Lint the config with the secrets loaded, so that every `${env:...}` placeholder resolves:
+
+```bash
+set -a; . ./secrets.env; set +a
+deltaglider_proxy config lint deltaglider_proxy.yaml
+```
 
 ## Related
 
