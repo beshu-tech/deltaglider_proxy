@@ -282,6 +282,11 @@
       "order": 120
     },
     {
+      "path": "explanation/two-ways-to-configure",
+      "group": "Concepts",
+      "order": 1
+    },
+    {
       "path": "explanation/delta-compression",
       "group": "Concepts",
       "order": 0

@@ -1,6 +1,6 @@
 # Configuration
 
-You configure DeltaGlider Proxy with a YAML file, with environment variables (`DGP_*` prefix), or with both. Environment variables always take precedence over the file contents.
+You configure DeltaGlider Proxy with a YAML file, with environment variables (`DGP_*` prefix), or with both. Environment variables always take precedence over the file contents. The admin GUI edits the same configuration and writes it back to the file; see [Two ways to configure DeltaGlider](../explanation/two-ways-to-configure.md) for how the GUI, the file, the environment and the IAM database relate.
 
 YAML is the only supported format. TOML support was removed in v1.4.1. A `.toml` config makes the proxy fail at startup, whether you set it with `DGP_CONFIG` or the proxy finds it on the default search path. The error is `TOML configs are no longer supported (removed in v1.4.1)`. If you still carry a TOML config, run `deltaglider_proxy config migrate` **on v1.4.0** to convert it, then point the server at the YAML file before upgrading. See [How to upgrade the proxy](../how-to/upgrade.md).
 

@@ -26,7 +26,7 @@ Three hands-on tutorials, each a complete session from nothing to a working resu
 
 ### Get something done
 
-Task-shaped guides, grouped by what you're touching:
+Task-shaped guides, grouped by what you're touching. Most configuration changes work both in the admin UI and in the YAML file. [Two ways to configure DeltaGlider](explanation/two-ways-to-configure.md) explains how the two forms relate.
 
 - Deploy and operate: [go to production](how-to/go-to-production.md), [deploy with Docker Compose](how-to/deploy-with-docker-compose.md), [deploy on Kubernetes](how-to/deploy-on-kubernetes.md), [troubleshooting](how-to/troubleshooting.md), [upgrade to 2.0](how-to/upgrade-to-2-0.md). Also: TLS, other upgrades, backups, HA, Prometheus, request tracing.
 - Storage: [route a bucket to a backend](how-to/route-a-bucket-to-a-backend.md), [migrate existing data into the proxy](how-to/migrate-existing-data-into-the-proxy.md), [encrypt data at rest](how-to/encrypt-data-at-rest.md), [replicate a bucket](how-to/replicate-a-bucket.md). Also: quotas and compression policy, bucket migration, lifecycle, key rotation, event notifications.
@@ -48,6 +48,7 @@ Plus references for [authentication](reference/authentication.md), [IAM permissi
 
 The why behind the design, one concept per page:
 
+- [Two ways to configure DeltaGlider](explanation/two-ways-to-configure.md): the admin GUI and the YAML file edit one configuration, environment variables override both, and IAM has its own switch.
 - [How delta compression works](explanation/delta-compression.md): what deltas well, what does not, and why GETs are byte-identical.
 - [How migration works](explanation/how-migration-works.md): in-place vs. copy-through, why it's not lazy-on-read, and why there's no downtime.
 - [Compression vs. S3 Object Versioning](explanation/versioning-vs-s3-versioning.md): DeltaGlider does not implement native S3 versioning, and what that means for ransomware rollback.
