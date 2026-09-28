@@ -63,10 +63,17 @@ export const OBSERVABILITY_SHOTS: Shot[] = [
       // the page says so (the text before the click can already read 4 of 4
       // from the cache of an earlier capture).
       await page.getByRole('button', { name: /Re-scan all/ }).click();
+      // Done twice, 2 s apart: a replicated object can mark a bucket stale
+      // again right after its scan.
+      const scanned = async () => {
+        const t = await page.locator('body').innerText();
+        return /4 of 4 scanned/.test(t) && !/\d+ buckets? not scanned|Scan missing/.test(t);
+      };
       await expect
         .poll(async () => {
-          const t = await page.locator('body').innerText();
-          return /4 of 4 scanned/.test(t) && !/\d+ buckets? not scanned|Scan missing/.test(t);
+          const missing = page.getByRole('button', { name: /Scan missing/ });
+          if (await missing.isVisible()) await missing.click({ timeout: 1000 }).catch(() => undefined);
+          return (await scanned()) && (await page.waitForTimeout(2000), await scanned());
         }, { timeout: 60_000 })
         .toBe(true);
       await page.mouse.move(1, 1);

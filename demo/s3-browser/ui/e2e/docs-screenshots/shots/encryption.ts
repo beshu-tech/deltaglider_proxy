@@ -152,7 +152,7 @@ export const ENCRYPTION_SHOTS: Shot[] = [
     setup: async (page) => {
       await pickMode(page, 'aws-dr', 'SSE-KMS (AWS KMS)');
       await page.getByPlaceholder('arn:aws:kms:us-east-1:123456789012:key/abcd-efgh').fill('arn:aws:kms:eu-west-1:123456789012:key/abcd-ef01');
-      await page.getByTestId('encryption-apply').scrollIntoViewIfNeeded();
+      await page.getByTestId('encryption-apply').evaluate((el) => el.scrollIntoView({ block: 'center' }));
       await page.mouse.move(1, 1);
     },
     annotations: [

@@ -182,13 +182,20 @@ export const INTEGRATIONS_SHOTS: Shot[] = [
           secretAccessKey: process.env.E2E_SECRET_KEY ?? 'qa-admin-secret-0123456789',
         },
       });
-      await s3.send(new PutObjectCommand({ Bucket: 'releases', Key: 'reports/probe.txt', Body: 'probe\n' }));
+      const failed = async () => {
+        const r = await page.request.get('/_/api/admin/event-outbox?limit=50');
+        return ((await r.json()) as { counts?: { failed?: number } }).counts?.failed ?? 0;
+      };
+      // One probe for both themes: the second capture must see the same rows.
+      if ((await failed()) === 0) {
+        await s3.send(new PutObjectCommand({ Bucket: 'releases', Key: 'reports/probe.txt', Body: 'probe\n' }));
+      }
       s3.destroy();
       const end = Date.now() + 60_000;
       for (;;) {
-        const r = await page.request.get('/_/api/admin/event-outbox?limit=50');
-        const body = (await r.json()) as { counts?: { failed?: number } };
-        if ((body.counts?.failed ?? 0) > 0) break;
+        // Two rows: the upload, and the copy that event-driven replication
+        // makes into releases-dr (its event arrives a moment later).
+        if ((await failed()) >= 2) break;
         if (Date.now() > end) throw new Error('events-log-requeue: no failed event after 60 s');
         await new Promise((res) => setTimeout(res, 500));
       }
