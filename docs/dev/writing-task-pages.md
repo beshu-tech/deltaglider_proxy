@@ -114,6 +114,8 @@ To add a shot:
 4. When a shot needs a server state that the seed cannot hold, because the other shots show the seed state, the shot changes the state in `setup` through the admin API and restores it in `teardown`. The runner calls `teardown` after each capture, also after a failure.
 5. Reference the shot once, theme-neutral, as `![Full sentence.](/_/screenshots/<id>.webp)`. Both viewers pick the variant that matches the theme.
 
+The folder has a budget, because the binary embeds `docs/screenshots/` and every byte is in every download: 150 KB per file and 12 MB for the folder (11.3 MB for 90 shots in September 2026). The script encodes WebP at quality 65 and steps down to 50 for a busy shot; at device scale 2, the text stays sharp. A shot that no page uses, or a file that the pipeline did not make, fails `scripts/check-docs-images.sh`. When a new shot does not fit, crop it with `clip` or replace an old one.
+
 The alt text is a full sentence that ends with a period. It says what the arrow, the box or each numbered callout points at, because the viewers show it as the caption and a screen reader reads it. No version number and no build chip may be visible in a shot, because the screenshots are served to anonymous requests.
 
 ## Checklist

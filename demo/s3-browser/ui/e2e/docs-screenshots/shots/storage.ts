@@ -135,7 +135,8 @@ export const STORAGE_SHOTS: Shot[] = [
     alt: 'The releases bucket is open with its Advanced settings; callout 1 marks the bucket row, callout 2 marks Advanced, and callout 3 marks Real name on backend, set to acme-prod-releases-fsn1.',
     setup: async (page) => {
       await openBucket(page, 'releases');
-      await page.getByText(/^Advanced/).click();
+      // releases has a quota, so its Advanced part is open already.
+      await openAdvanced(page);
       await page.getByRole('textbox', { name: 'Real name on backend' }).fill('acme-prod-releases-fsn1');
     },
     annotations: [
