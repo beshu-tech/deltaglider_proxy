@@ -7,6 +7,7 @@ Two endpoints answer monitoring systems that have no S3 credentials: `GET /_/hea
 ## 1. Configure the scrape
 
 ```yaml
+# not-proxy-config: prometheus
 # prometheus.yml
 scrape_configs:
   - job_name: deltaglider
@@ -19,6 +20,7 @@ scrape_configs:
 For multiple instances, use service discovery or list each target directly:
 
 ```yaml
+# not-proxy-config: prometheus
 scrape_configs:
   - job_name: deltaglider
     metrics_path: /_/metrics
@@ -32,9 +34,10 @@ scrape_configs:
 
 The `/_/metrics` endpoint is exempt from SigV4 auth, so Prometheus doesn't need credentials. Bare `/metrics` is part of the S3-compatible namespace, so do not scrape it.
 
-If the proxy is reachable from the internet, you can stop anonymous clients from reading the metric set (which identifies the release) by setting `DGP_METRICS_BEARER_TOKEN` on the proxy and giving Prometheus the same token:
+If the proxy is reachable from the internet, you can stop anonymous clients from reading the metric set (which identifies the release) by setting `DGP_METRICS_BEARER_TOKEN` on the proxy and giving Prometheus the same token. The token exists only as an environment variable: the YAML file and the admin UI cannot set it.
 
 ```yaml
+# not-proxy-config: prometheus
 scrape_configs:
   - job_name: deltaglider
     metrics_path: /_/metrics
@@ -49,6 +52,7 @@ With the token set, a request without it receives `401`. The admin dashboard kee
 If you don't have a Prometheus + Grafana stack yet, this starter compose gets you one:
 
 ```yaml
+# not-proxy-config: docker-compose
 services:
   prometheus:
     image: prom/prometheus:latest
@@ -176,6 +180,7 @@ The [metrics reference](../reference/metrics.md#tokio-runtime-series-opt-in-buil
 Drop these into your Prometheus `rules.yml`. Tune thresholds to your SLO. The `DeltaGliderConfigSyncUnhealthy` rule matters only when several instances share a `config_sync_bucket`: the gauge is always `1` without one. It waits longer than one sync poll (5 minutes), because the other instances do not receive the IAM changes of an instance whose sync fails.
 
 ```yaml
+# not-proxy-config: prometheus rules
 groups:
   - name: deltaglider
     rules:
@@ -241,7 +246,7 @@ groups:
 
 ![Built-in analytics dashboard](/_/screenshots/analytics.jpg)
 
-The admin UI has a live monitoring page at `/_/admin/dashboard`. It shows the same metrics, refreshes them every 5s, and has an **Analytics** view that shows the savings and the estimated cost for each bucket. The Monitoring view leads with 9 headline KPIs; deeper codec/latency telemetry sits behind a default-closed "Detailed telemetry" toggle. It does not replace Grafana in production, because it has no historical retention and no alerting. It answers "is the proxy healthy right now?" without leaving the UI.
+The admin UI has a live monitoring page, **Observability → Dashboard** (`/_/admin/dashboard`). It shows the same metrics, refreshes them every 5s, and has an **Analytics** view that shows the savings and the estimated cost for each bucket. The Monitoring view leads with 9 headline KPIs; deeper codec/latency telemetry sits behind a default-closed "Detailed telemetry" toggle. It does not replace Grafana in production, because it has no historical retention and no alerting. It answers "is the proxy healthy right now?" without leaving the UI.
 
 ## Verify
 
