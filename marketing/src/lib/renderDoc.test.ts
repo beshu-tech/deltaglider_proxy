@@ -71,3 +71,25 @@ describe('renderDoc heading anchors', () => {
     expect(html).toMatch(/<a class="docs-heading-anchor"[^>]*data-pagefind-ignore/);
   });
 });
+
+describe('themed screenshots', () => {
+  it('turns one theme-neutral shot into a light and a dark image', async () => {
+    const html = await renderDoc(
+      '![The backends page lists three backends.](/_/screenshots/route-bucket-add-backend.webp)\n',
+      'how-to/route-a-bucket-to-a-backend.md',
+    );
+    expect(html).toContain('src="/screenshots/route-bucket-add-backend.light.webp"');
+    expect(html).toContain('src="/screenshots/route-bucket-add-backend.dark.webp"');
+    expect(html.match(/class="shot-light"/g)).toHaveLength(1);
+    expect(html.match(/class="shot-dark"/g)).toHaveLength(1);
+    expect(html.match(/alt="The backends page lists three backends."/g)).toHaveLength(2);
+    expect(html.match(/loading="lazy"/g)).toHaveLength(2);
+  });
+
+  it('leaves any other image as one image', async () => {
+    const html = await renderDoc('![Old shot.](/_/screenshots/storage_backends.jpg)\n', 'x.md');
+    expect(html.match(/<img/g)).toHaveLength(1);
+    expect(html).toContain('src="/screenshots/storage_backends.jpg"');
+    expect(html).not.toContain('shot-light');
+  });
+});

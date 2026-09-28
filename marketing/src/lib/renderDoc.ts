@@ -17,7 +17,7 @@ import remarkRehype from 'remark-rehype';
 import rehypeRaw from 'rehype-raw';
 import rehypeStringify from 'rehype-stringify';
 import { visit } from 'unist-util-visit';
-import { rewriteDocLink, rewriteAssetSrc } from './docs';
+import { rewriteDocLink, rewriteAssetSrc, themedShotVariants } from './docs';
 import { highlightCode } from './highlight';
 export { extractTitle, extractSummary } from './docText';
 
@@ -101,7 +101,7 @@ function rehypeDocRewrites(fromPath: string) {
     const usedHeadingIds = new Set<string>();
     const fences: { node: any; code: string; lang: string }[] = [];
 
-    visit(tree, 'element', (node: any) => {
+    visit(tree, 'element', (node: any, index: number | undefined, parent: any) => {
       // Changelog version headings ("v1.4.3 — 2026-06-18"): tuck the
       // release date into a span we can reveal on hover via CSS, and tag
       // the h2 so it lays out version + date on one baseline. Runs BEFORE
@@ -134,6 +134,21 @@ function rehypeDocRewrites(fromPath: string) {
       }
       // Screenshot/image src → website-served path.
       if (node.tagName === 'img' && typeof node.properties?.src === 'string') {
+        // A pipeline screenshot becomes two images, one per theme; docs.css
+        // shows the one that matches [data-theme]. A <picture> with a
+        // prefers-color-scheme media query would ignore the site's toggle.
+        const shot = themedShotVariants(node.properties.src);
+        if (shot && parent && typeof index === 'number') {
+          const base = { ...node.properties, loading: 'lazy' };
+          node.properties = { ...base, src: shot.light, className: ['shot-light'] };
+          parent.children.splice(index + 1, 0, {
+            type: 'element',
+            tagName: 'img',
+            properties: { ...base, src: shot.dark, className: ['shot-dark'] },
+            children: [],
+          });
+          return index + 2;
+        }
         node.properties.src = rewriteAssetSrc(node.properties.src);
         node.properties.loading = 'lazy';
       }

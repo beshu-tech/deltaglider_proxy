@@ -414,6 +414,10 @@ body.shell-wide { --shell: 1240px; }
   font-size: 0.9rem; display: block; overflow-x: auto;
   border: 1px solid var(--rule); border-radius: 10px;
 }
+/* A pipeline screenshot ships as a light and a dark image (renderDoc.ts);
+   show the one that matches the site theme. No data-theme = the dark default. */
+:root:not([data-theme='light']) .docs-prose img.shot-light,
+:root[data-theme='light'] .docs-prose img.shot-dark { display: none; }
 .docs-prose thead th {
   font-family: var(--doc-label); font-size: 0.7rem; font-weight: 600;
   color: var(--ink-soft); background: var(--bg-soft);

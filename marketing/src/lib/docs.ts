@@ -120,6 +120,17 @@ export function rewriteAssetSrc(src: string): string {
   return src.replace(/^\/_\/screenshots\//, '/screenshots/');
 }
 
+/** A pipeline screenshot: `/_/screenshots/<name>.webp`, referenced once and
+ *  theme-neutral. On disk it is `<name>.light.webp` + `<name>.dark.webp`
+ *  (scripts/docs-screenshots.sh). Returns the two website srcs, or null for
+ *  any other image. The product viewer has the same rule (themedShotSrc in
+ *  demo/s3-browser/ui/src/docsMarkdown.ts). */
+export function themedShotVariants(src: string): { light: string; dark: string } | null {
+  const m = /^\/_\/screenshots\/([A-Za-z0-9_-]+)\.webp$/.exec(src);
+  if (!m) return null;
+  return { light: `/screenshots/${m[1]}.light.webp`, dark: `/screenshots/${m[1]}.dark.webp` };
+}
+
 /**
  * The docs in *sidebar reading order* — group order (DOC_GROUPS) first, then
  * `order` within each group. This is the order a reader walks the docs, so it's
