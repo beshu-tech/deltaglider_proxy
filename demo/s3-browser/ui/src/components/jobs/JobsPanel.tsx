@@ -15,7 +15,7 @@
  * have no dirty state, just live progress + cancel.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Alert, Button, Space, Spin, Tag, Typography, message } from 'antd';
+import { Alert, Button, Space, Spin, Switch, Tag, Typography, message } from 'antd';
 import Dropdown from '../KeyboardDropdown';
 import {
   CaretRightOutlined,
@@ -79,6 +79,7 @@ import {
 import ReplicationApplySummary from '../ReplicationApplySummary';
 import { LifecycleApplySummary } from '../LifecycleSummary';
 import { normalizeUiError } from '../../errorHandling';
+import FormField from '../FormField';
 
 const { Text } = Typography;
 
@@ -674,6 +675,21 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
             </Button>
           </Dropdown>
         </div>
+
+        {/* The lifecycle master switch (default off): without it no lifecycle
+            rule runs, on schedule or with Run now. */}
+        <FormField
+          label="Run lifecycle rules on schedule"
+          yamlPath="storage.lifecycle.enabled"
+          helpText="Off by default. While it is off, no lifecycle rule runs, and Run now is refused. Each rule also has its own Enabled switch."
+          style={{ marginTop: 16, marginBottom: 0 }}
+        >
+          <Switch
+            checked={lc.value.enabled}
+            disabled={lc.loading}
+            onChange={(enabled) => lc.setValue((cur) => ({ ...cur, enabled }))}
+          />
+        </FormField>
 
         {jobsQuery.error ? (
           <Alert

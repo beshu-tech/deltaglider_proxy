@@ -78,7 +78,7 @@ export default function RuleEditor({
         <FormField
           label="Enabled"
           yamlPath="storage.lifecycle.rules[].enabled"
-          helpText="Per-rule delete switch. The global scheduler must also be enabled for this rule to run automatically."
+          helpText="Per-rule switch. The rule runs only when “Run lifecycle rules on schedule” on the Jobs page is also on."
         >
           <Switch checked={rule.enabled} onChange={(enabled) => onChange({ enabled })} />
         </FormField>

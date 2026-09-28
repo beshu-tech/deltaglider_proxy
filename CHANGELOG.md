@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed — The Jobs page can turn the lifecycle scheduler on
+
+No admin GUI control set `storage.lifecycle.enabled`, and its default is off.
+An operator who used only the GUI could not make a lifecycle rule run. The
+Jobs page now has the switch "Run lifecycle rules on schedule". It applies
+through the same review-and-apply step as the lifecycle rules.
+
 ## v2.0.0 — 2026-09-27
 
 ### Upgrade steps for 2.0.0 (read before you upgrade)
