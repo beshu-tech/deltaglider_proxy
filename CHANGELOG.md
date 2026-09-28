@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed — IAM hints point at the real backup button
+
+The section YAML preview of **Access** and the banner on the IAM pages sent
+you to "Avatar menu → Backup" and to "Full Backup". Neither exists. They now
+name **Download backup** on **System → System**.
+
 ### Fixed — The "Enable delivery" help says which events delivery sends later
 
 The help of **Enable delivery** said that the proxy keeps no events while

@@ -26,7 +26,7 @@ const ACCESS_EMPTY_YAML_EXPLAINER = `# -----------------------------------------
 # • Proxy access_key_id / secret_access_key are redacted in every admin API YAML response.
 # • GUI IAM mode: users, groups, OAuth providers, and mapping rules live in the encrypted
 #   config database only — they are never embedded in section or settings YAML exports.
-# • Need IAM in a file? Avatar menu → Backup → Download backup (portable bundle).
+# • Need IAM in a file? System → System → Download backup (portable bundle).
 # -----------------------------------------------------------------------------
 
 `;
@@ -132,7 +132,7 @@ export function SectionYamlModal({ section, open, onClose }: SectionYamlModalPro
               <>
                 SigV4 keys are redacted from exported YAML. IAM users and groups in GUI mode live in the encrypted
                 database, not in <code style={{ fontSize: 11 }}>access:</code>. The comment block in the text area
-                below is included when you copy — use Backup → Download backup for a full IAM bundle.
+                below is included when you copy. For a full IAM bundle, click Download backup on System → System.
               </>
             }
           />

@@ -27,7 +27,7 @@ export default function IamSourceBanner({ iamMode, loadError, resource }: Props)
     ? `Read-only — could not load the IAM mode, so editing ${resource} is off until it loads. ${loadError}`
     : isDeclarative
     ? `Read-only — your YAML config owns ${resource}. Edit it and apply to make changes.`
-    : `${capitalise(resource)} live in the encrypted database, not YAML — use Full Backup to export everything.`;
+    : `${capitalise(resource)} live in the encrypted database, not YAML. To export everything, click Download backup on System → System.`;
 
   return (
     <div
