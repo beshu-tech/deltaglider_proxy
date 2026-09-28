@@ -98,6 +98,7 @@ backend that does not support them (see
 [How to use a backend without conditional writes](backend-capability-validation.md)). A resource that meets these requirements:
 
 ```yaml
+# not-proxy-config: DeltaGliderProxy resource (configYaml holds the proxy config)
 apiVersion: deltaglider.beshu.tech/v1alpha1
 kind: DeltaGliderProxy
 metadata:
@@ -133,6 +134,18 @@ kubectl -n dgp get dgp dgp -w     # wait for phase: Ready
 The proxy expands the `${env:...}` references inside the pod, against the
 environment variables that the Secret provides. The credentials therefore reach the storage
 backend, and the ConfigMap never contains them.
+
+The `DeltaGliderProxy` resource owns the configuration: `configYaml` is the only place to
+change it, so this guide uses YAML only. The operator renders `configYaml` into a
+ConfigMap and mounts it read-only into every pod. A change that you make in the admin UI
+therefore works only on the pod that served it, the proxy cannot write it into the file,
+and the change is lost when that pod restarts. Settings that need a restart (the
+listener, TLS, the reference cache size and the sync bucket) never take effect from the UI
+at all, and a backup restore that includes the config answers `409 config_file_read_only`.
+The admin UI shows a warning banner about the read-only file. To keep a change, edit
+`configYaml` and apply the resource again; the operator then rolls the pods. IAM users and
+groups in `iam_mode: gui` live in the synced database, not in the file, so UI changes to
+them persist. See [Two ways to configure DeltaGlider](../explanation/two-ways-to-configure.md).
 
 If your backend is an in-cluster MinIO reached over plain `http://`, add
 `DGP_BACKEND_ALLOW_LOCAL: "true"` to the Secret. By default, the SSRF guard refuses plain-http
