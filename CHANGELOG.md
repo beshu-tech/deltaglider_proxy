@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed — The "Enable delivery" help says which events delivery sends later
+
+The help of **Enable delivery** said that the proxy keeps no events while
+delivery is off. With replication on, the proxy keeps each event until
+event-driven replication reads it, so turning delivery on also sends the events
+that are still in the event log. The help text and the event outbox reference
+now say so.
+
 ### Fixed — "Restart required" names the settings that need a restart
 
 The server and the admin UI did not agree about which settings need a

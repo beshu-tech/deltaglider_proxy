@@ -314,7 +314,7 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
           <FormField
             label="Enable delivery"
             yamlPath="advanced.event_delivery.enabled"
-            helpText="Sends object events (create/delete/copy) to the destination below. While this is off, events are not kept for later, so turning it on sends only new events."
+            helpText="Sends object events (create/delete/copy) to the destination below. While this is off, the proxy keeps an event only until event-driven replication reads it, and with replication off it deletes events soon after they happen. Turning delivery on sends the events that are still in the event log, then every new event."
           >
             <Switch checked={form.enabled} onChange={(v) => setField({ enabled: v })} />
           </FormField>
