@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed — The encryption editor names the re-encrypt job
+
+When you turn on proxy-side AES encryption, the editor said that old objects
+stay as they are until you upload them again. It now also says that the proxy
+offers a re-encrypt job after you apply, and that **Re-encrypt existing
+objects** on a bucket in **Storage → Buckets** starts it later.
+
 ### Fixed — The replication rule's Enabled help names the real switch
 
 The help of a replication rule's **Enabled** switch said that "the global

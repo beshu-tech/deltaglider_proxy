@@ -34,3 +34,11 @@ test('replication Enabled help names the YAML-only switch', () => {
   expect(s).not.toContain('The global scheduler must also be enabled');
   expect(s).toContain('storage.replication.enabled');
 });
+
+// BackendsPanel opens ReencryptProposalModal after an encryption apply, and
+// BucketCard has "Re-encrypt existing objects": the alert must name that job.
+test('encryption alert names the re-encrypt job for old objects', () => {
+  const s = src('components/BackendEncryptionEditor.tsx');
+  expect(s).toMatch(/Applies to newly written objects only[\s\S]{0,800}re-encrypt job/);
+  expect(s).toContain('Re-encrypt existing objects');
+});

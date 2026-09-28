@@ -284,8 +284,13 @@ export default function BackendEncryptionEditor({ backendName, current, onApply,
                 <span>
                   Objects already stored on <code>{backendName}</code> are NOT
                   re-encrypted — they stay on disk exactly as they are until
-                  rewritten (re-upload them, or move them to another folder and
-                  back). Reads work transparently for both old and new objects.
+                  something rewrites them.{' '}
+                  {pending.mode === 'aes256-gcm-proxy'
+                    ? <>After you apply, the proxy offers a re-encrypt job that
+                      rewrites them. You can also start it later with{' '}
+                      <b>Re-encrypt existing objects</b> on a bucket in Storage → Buckets.</>
+                    : <>Re-upload them, or move them to another folder and back.</>}{' '}
+                  Reads work transparently for both old and new objects.
                 </span>
               }
             />
