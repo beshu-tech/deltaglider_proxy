@@ -5,6 +5,7 @@
 import type { Shot } from '../shot';
 import { ACCESS_SHOTS } from './access';
 import { BROWSER_SHOTS } from './browser';
+import { INTEGRATIONS_SHOTS } from './integrations';
 import { JOBS_SHOTS } from './jobs';
 import { OBSERVABILITY_SHOTS } from './observability';
 import { STORAGE_SHOTS } from './storage';
@@ -17,4 +18,6 @@ export const SHOTS: Shot[] = [
   ...OBSERVABILITY_SHOTS,
   ...SYSTEM_SHOTS,
   ...BROWSER_SHOTS,
+  // Last: its final shot turns event delivery on.
+  ...INTEGRATIONS_SHOTS,
 ];

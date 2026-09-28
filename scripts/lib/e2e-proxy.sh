@@ -105,12 +105,16 @@ YAML
   # cwd = the temp dir: the proxy writes state files next to its cwd.
   (
     cd "$E2E_DIR"
-    if [[ "$mode" == docs ]]; then export DGP_BACKEND_ALLOW_LOCAL=true; fi
+    if [[ "$mode" == docs ]]; then
+      export DGP_BACKEND_ALLOW_LOCAL=true
+    else
+      # Not for docs: RUST_LOG locks the Log level card of the System page.
+      export RUST_LOG="${E2E_RUST_LOG:-deltaglider_proxy=info}"
+    fi
     # Deterministic admin password `testpass` (same hash as tests/common/mod.rs).
     DGP_CONFIG="$config" \
       DGP_BOOTSTRAP_PASSWORD_HASH='$2b$04$s7/yy6Z363jZoQodArpuDeP00U.zE1QPi0bxM/o9BOZDs6tDbss5q' \
       DGP_BOOT_BACKEND_PROBE=off \
-      RUST_LOG="${E2E_RUST_LOG:-deltaglider_proxy=info}" \
       exec "$E2E_BIN" > "$E2E_DIR/proxy.log" 2>&1
   ) &
   E2E_PID=$!
