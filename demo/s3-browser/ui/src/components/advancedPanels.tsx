@@ -702,7 +702,7 @@ export function ConfigDbSyncPanel({ onSessionExpired }: PanelProps) {
             </>
           }
           yamlPath="advanced.config_sync_bucket"
-          helpText="S3 bucket on the default backend where the user database is shared between instances. Every instance must point at the same bucket. Instances sync periodically — the most recently saved copy wins."
+          helpText="S3 bucket on the default backend where the user database is shared between instances. Every instance must point at the same bucket. Each instance uploads the database after every change and checks the bucket every 5 minutes. Changes from different instances merge by name, field by field; when two instances change the same field, the newer change wins."
           examples={['dgp-iam-state', 'prod-dgp-config']}
           onExampleClick={(v) =>
             setValue({ ...value, config_sync_bucket: String(v) })

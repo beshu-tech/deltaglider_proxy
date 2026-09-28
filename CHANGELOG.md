@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed — The Sync bucket help describes the merge
+
+The help text of the Sync bucket field said that "the most recently saved copy
+wins". The sync is a three-way merge by name, so edits from two instances both
+survive. The help now says so, and says that only a field that two instances
+change goes to the newer change.
+
 ### Fixed — The Jobs page can turn the lifecycle scheduler on
 
 No admin GUI control set `storage.lifecycle.enabled`, and its default is off.
