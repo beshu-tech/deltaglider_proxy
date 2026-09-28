@@ -102,6 +102,7 @@ storage:
 Each S3 backend takes its credentials in `access_key_id` and `secret_access_key`. Keep the secret out of the file with a `${env:...}` reference:
 
 ```yaml
+# fragment
       access_key_id: "${env:HETZNER_S3_KEY}"
       secret_access_key: "${env:HETZNER_S3_SECRET}"
 ```
