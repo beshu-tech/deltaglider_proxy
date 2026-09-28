@@ -589,6 +589,10 @@ jobs:
       #    at /_/api/docs — and no dev docs (docs/dev/**) sneak in. ──
       - name: Docs registry allow-list
         run: ./scripts/check-docs-registry.sh
+      # ── Blocking: every image a product doc shows exists (a pipeline
+      #    shot in both theme variants) and has alt text. ──
+      - name: Docs images exist and have alt text
+        run: ./scripts/check-docs-images.sh
       # ── Blocking: the bundled changelog doc (docs/product/changelog.md)
       #    is generated from the root CHANGELOG.md. Fail if it drifted —
       #    run scripts/gen-changelog-doc.sh and commit. ──
