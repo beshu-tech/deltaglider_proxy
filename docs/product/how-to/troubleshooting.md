@@ -7,7 +7,7 @@ This guide maps the symptoms you'll see in the wild to their fixes. If your symp
 **Check the audit log first.** `/_/admin/diagnostics/audit` shows every IAM denial with the user, action, bucket, and path. The most common causes:
 
 1. **Wrong prefix.** The user has `Allow read on releases/public/*` but tried `releases/private/foo.zip`. Prefix ABAC is exact, so a trailing `/` matters.
-2. **User disabled.** Access → Users → confirm the row is `Enabled`.
+2. **User disabled.** Open **Access → Users** (`/_/admin/access/users`), select the user, and check that its **Enabled** switch is on.
 3. **Deny rule wins.** Any matching Deny rule in the user's permissions (or any group they're in) wins over an Allow. Search the permissions of the user and of its groups.
 4. **`iam_mode: declarative`**, and you try to mutate IAM through the admin API. This is expected behaviour: the API returns `403 { "error": "iam_declarative" }`. Edit the YAML and apply the document.
 5. **Stale `${username}` template.** A permission resource written as `${username}` instead of `${iam:username}` is not substituted, so it matches nothing and the user is denied. Fix the template; the save-time config advisories flag this.
@@ -91,7 +91,7 @@ Mitigation without operator access: the embedded uploader uploads one file at a 
 
 A `503 SlowDown` comes either from the upstream S3 backend, when it throttles the proxy, or from the proxy itself. SDKs retry it. The message of the error says which limit refused the request. The proxy answers `503 SlowDown` in these cases:
 
-1. **All delta codec slots are busy** (`all delta codec slots busy — try again later`). A PUT that needs a delta encode does not wait for a slot: it fails at once, because a waiting PUT would hold its whole body in memory. (A delta GET waits up to 60 seconds for a slot.) Check `/_/metrics` → `deltaglider_codec_semaphore_available` (`0` = saturated) and `deltaglider_delta_encode_duration_seconds`. If the codec is saturated, raise `DGP_CODEC_CONCURRENCY`.
+1. **All delta codec slots are busy** (`all delta codec slots busy — try again later`). A PUT that needs a delta encode does not wait for a slot: it fails at once, because a waiting PUT would hold its whole body in memory. (A delta GET waits up to 60 seconds for a slot.) Check `/_/metrics` → `deltaglider_codec_semaphore_available` (`0` = saturated) and `deltaglider_delta_encode_duration_seconds`. If the codec is saturated, raise **Codec concurrency** in the **Caches** card of **System → System** (`advanced.codec_concurrency`, or `DGP_CODEC_CONCURRENCY`), and restart the proxy.
 2. **The spool budget is used up** (`spool budget exhausted; retry shortly`). A request that holds no spool space waits for it, up to `DGP_SPOOL_ACQUIRE_TIMEOUT_SECS` (default 120). A request that already holds spool space and needs more fails at once. Raise `DGP_SPOOL_MAX_BYTES` if this happens often.
 3. **Too many multipart uploads** (`Too many concurrent multipart uploads`), limited by `DGP_MAX_MULTIPART_UPLOADS` (default 1000), or too many multipart bytes in flight (`Multipart in-flight bytes cap reached`), limited by `DGP_MAX_TOTAL_MULTIPART_BYTES`.
 4. **A maintenance job gates the bucket** (see the next entry).
@@ -101,7 +101,7 @@ A `503 ServiceUnavailable` that names a backend is a different case: see [How to
 
 ## Writes to one bucket return 503 SlowDown
 
-A maintenance job (re-encryption, migration, or metadata backfill) is running on that bucket. The proxy intentionally refuses writes while the job rewrites objects. SDKs retry automatically and succeed when the job finishes. Reads are unaffected. Check **Settings → Jobs** (or `GET /_/api/admin/jobs`) for the job's progress; cancel it if it shouldn't be running. A job survives restarts by design, so if a job is stuck, cancel it through `POST /_/api/admin/jobs/maintenance:<id>/cancel` rather than restarting the proxy. See [Jobs reference](../reference/jobs.md).
+A maintenance job (re-encryption, migration, or metadata backfill) is running on that bucket. The proxy intentionally refuses writes while the job rewrites objects. SDKs retry automatically and succeed when the job finishes. Reads are unaffected. Check **Storage → Jobs** (`/_/admin/jobs`, or `GET /_/api/admin/jobs`) for the job's progress; cancel it if it shouldn't be running. A job survives restarts by design, so if a job is stuck, cancel it through `POST /_/api/admin/jobs/maintenance:<id>/cancel` rather than restarting the proxy. See [Jobs reference](../reference/jobs.md).
 
 ## Cache miss storm on GET
 
@@ -116,6 +116,7 @@ Very rare: a write burst pushes new references into the cache and evicts the hot
 ## Public prefix returns 403
 
 ```yaml
+# validate
 storage:
   buckets:
     downloads:
@@ -183,7 +184,7 @@ Background and mode mechanics: [Encryption at rest](../explanation/encryption-at
 
 ### Reads return 500 with "object is encrypted but no key is configured"
 
-The object's metadata carries `dg-encrypted` (it was encrypted) but the backend has no key now. Either the mode was changed to `none`, or proxy-AES mode is missing the `key`. Restore the key through the `DGP_*_ENCRYPTION_KEY` env var, the YAML, or the Backends panel of the admin GUI. If the key is lost, the object is unrecoverable.
+The object's metadata carries `dg-encrypted` (it was encrypted) but the backend has no key now. Either the mode was changed to `none`, or proxy-AES mode is missing the `key`. Restore the key through the `DGP_*_ENCRYPTION_KEY` env var, the YAML, or the backend card on **Storage → Backends** in the admin GUI. If the key is lost, the object is unrecoverable.
 
 ### Reads return 500 with "object was encrypted with key id 'X', but this backend is configured with key id 'Y'"
 
@@ -223,7 +224,7 @@ GET returns 200 with an object that looks like random bytes, and no error. This 
 ## Where to look next
 
 - **Trace it.** Dry-run the failing request through the admission chain and read the audit log: [How to trace and audit requests](trace-requests.md).
-- Set `RUST_LOG=deltaglider_proxy=trace` for maximum verbosity (`RUST_LOG` beats `DGP_LOG_LEVEL`, which beats `advanced.log_level`). Without any of them, the level is `deltaglider_proxy=info,tower_http=info`. To change the level without a restart, use the admin UI: Settings → System → Logging.
+- Set `RUST_LOG=deltaglider_proxy=trace` for maximum verbosity (`RUST_LOG` beats `DGP_LOG_LEVEL`, which beats `advanced.log_level`). Without any of them, the level is `deltaglider_proxy=info,tower_http=info`. To change the level without a restart, select a level in the **Log level** card of **System → System** and apply it; see [View live logs](view-live-logs.md#2-raise-the-log-level-to-debug). The card is read-only while `RUST_LOG` or `DGP_LOG_LEVEL` is set.
 - Hit the audit log API: `GET /_/api/admin/audit?limit=500` for a JSON dump of recent mutations and denials.
 - `curl /_/metrics | grep deltaglider_` lists more than 20 Prometheus metrics. Mapping: [How to monitor with Prometheus and Grafana](monitor-with-prometheus.md).
 - [Admin API reference](../reference/admin-api.md): every admin endpoint that helps with debugging.
