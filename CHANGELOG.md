@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added — `config lint` warns about a `legacy_key_id` without a `legacy_key`
+
+A backend's decrypt-only shim reads old objects with the retired key in
+`legacy_key`. A config with `legacy_key_id` and no `legacy_key` loaded without
+a word, but the objects written with that key stayed unreadable. The config
+check (at startup, on apply and in `config lint`) now warns about it.
+
 ### Fixed — "Add Rule" no longer stores an empty mapping rule
 
 On **Access → External authentication**, **Add Rule** stored a new, empty

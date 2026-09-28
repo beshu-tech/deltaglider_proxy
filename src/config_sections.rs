@@ -3482,7 +3482,10 @@ mod ui_rule_default_parity_tests {
     #[test]
     fn gui_lifecycle_defaults_are_the_server_defaults() {
         let src = include_str!("../demo/s3-browser/ui/src/components/lifecyclePayload.ts");
-        let want = format!("  tick_interval: {},", quoted(&default_lifecycle_tick_interval()));
+        let want = format!(
+            "  tick_interval: {},",
+            quoted(&default_lifecycle_tick_interval())
+        );
         assert!(src.contains(&want), "lifecyclePayload.ts lacks `{want}`");
         let globs = default_lifecycle_exclude_globs()
             .iter()

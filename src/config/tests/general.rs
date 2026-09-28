@@ -2444,3 +2444,27 @@ fn default_codec_concurrency_is_four_per_core_at_least_16() {
     };
     assert_eq!(pinned.effective_codec_concurrency(), 3);
 }
+
+/// A decrypt-only shim needs the retired key itself: `legacy_key_id` alone
+/// decrypts nothing, and the objects that carry that id stay unreadable.
+#[test]
+fn test_check_warns_legacy_key_id_without_legacy_key() {
+    let warnings = check_yaml(
+        r#"
+storage:
+  backends:
+    - name: local-disk
+      type: filesystem
+      path: /var/lib/deltaglider/local-disk
+      encryption:
+        mode: none
+        legacy_key_id: k-2025
+"#,
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("local-disk")
+            && w.contains("legacy_key_id")
+            && w.contains("legacy_key")),
+        "legacy_key_id without legacy_key must warn, got {warnings:?}"
+    );
+}

@@ -263,6 +263,15 @@ impl Config {
                     enc.mode_tag()
                 ));
             }
+            // The shim decrypts with the retired KEY; its id alone reads nothing.
+            if enc.legacy_key_id().is_some() && enc.legacy_key().is_none() {
+                warnings.push(format!(
+                    "backend '{}' sets encryption.legacy_key_id but no legacy_key — \
+                     objects written with that key stay unreadable. Add the retired key \
+                     as legacy_key, or remove legacy_key_id.",
+                    label
+                ));
+            }
             if let BackendEncryptionConfig::Aes256GcmProxy {
                 key,
                 key_id,
