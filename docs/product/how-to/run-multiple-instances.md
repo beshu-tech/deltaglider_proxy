@@ -6,16 +6,41 @@ The shared bucket does three jobs: it syncs the encrypted config DB (`deltaglide
 
 ## 1. Point every instance at a sync bucket
 
-Set the same sync bucket on every instance, in YAML or as an environment variable:
+Set the same sync bucket on every instance. The proxy starts the sync task once at startup, so the setting takes effect after a restart.
+
+In the admin UI of each instance:
+
+1. In the sidebar, open **System → System** (`/_/admin/system`), and scroll to the **Config DB sync** card.
+2. Type `dgp-iam-sync` in **Sync bucket**. The status next to the card title changes from **Disabled** to **Pending restart**.
+3. Click **Review & apply** in the bar above the card.
+
+   ![The Config DB sync card holds the sync bucket dgp-iam-sync and shows Pending restart; callout 1 marks the Sync bucket field and callout 2 marks Review & apply.](/_/screenshots/ha-sync-bucket.webp)
+
+4. Check the diff in the dialog, and then click **Apply and Persist**. The dialog says that a restart is required.
+
+   ![The review dialog shows the new config_sync_bucket value and says that a restart is required; the arrow points at Apply and Persist.](/_/screenshots/ha-apply.webp)
+
+5. Set the shared config DB key (section 2), and restart the instance. After the restart, the status reads **Active · dgp-iam-sync**.
+
+The bucket lives on the default backend. When the config file is mounted read-only, as on Kubernetes, the UI cannot save the setting, and the restart discards it. Set it in the YAML of your deployment there.
+
+### The same change in YAML
+
+The steps above write this configuration into the `advanced` section of `deltaglider_proxy.yaml` ([why the UI and the file hold the same configuration](../explanation/two-ways-to-configure.md)):
 
 ```yaml
+# validate
 advanced:
   config_sync_bucket: dgp-iam-sync
 ```
 
+The environment variable `DGP_CONFIG_SYNC_BUCKET` overrides this field. When it is set, the admin UI shows the field as read-only with a from env badge:
+
 ```bash
 DGP_CONFIG_SYNC_BUCKET=dgp-iam-sync
 ```
+
+After you edit the file, restart the proxy. An apply through `POST /_/api/admin/config/apply` or `deltaglider_proxy config apply` stores the value, but the sync starts only at the next start.
 
 After every IAM mutation, the mutating instance uploads the encrypted DB to the bucket. The other instances poll every 5 minutes and download when the ETag changes.
 
@@ -32,18 +57,11 @@ DGP_CONFIG_DB_KEY=<that value> # on every instance
 
 An instance with a sync bucket but without `DGP_CONFIG_DB_KEY` refuses to start, because a per-node key file cannot open the other nodes' uploads. An instance whose key differs refuses to merge the synced DB and logs an error that names `DGP_CONFIG_DB_KEY`; it never overwrites the synced copy. Also share the bootstrap password hash (`DGP_BOOTSTRAP_PASSWORD_HASH`) if you want the same admin password on every instance; it no longer encrypts anything.
 
+The key exists only as an environment variable. The admin UI and the YAML file cannot set it.
+
 ### Rotate the config DB key
 
-The synced database, and the local database of every instance, move to the new key during one rolling restart:
-
-1. Generate a new key (`openssl rand -hex 32`).
-2. On every instance, set `DGP_CONFIG_DB_KEY_PREVIOUS` to the current key and `DGP_CONFIG_DB_KEY` to the new key.
-3. Restart the instances one at a time. Each instance re-encrypts its local database with the new key. Because its database changed key, it also uploads its database to the sync bucket at start, so the synced copy moves to the new key too. An instance that downloads a synced copy that opens only with the previous key also uploads its merged database under the new key. While the rollout runs, the instances that already run with the new key still read a synced copy under the previous key.
-4. When every instance runs with the new key, remove `DGP_CONFIG_DB_KEY_PREVIOUS` everywhere and restart again. An instance that later finds a synced copy under the old key logs an error that names `DGP_CONFIG_DB_KEY` and does not merge it.
-
-Instances that have not restarted yet cannot read uploads under the new key, so avoid IAM changes during step 3.
-
-**Upgrading a fleet from a release before the config DB key.** Those releases encrypted the DB with the bootstrap password hash. Set the same new `DGP_CONFIG_DB_KEY` on every instance and restart all of them. Also set `DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC=true` on every instance for the rollout. On the first start, each instance re-encrypts its local DB with the new key. The variable lets it also accept a synced DB under the old hash. Without the variable, an instance refuses such a synced DB, because the hash is in configuration files and backups, so it cannot protect a database that other instances trust. Remove the variable and restart when the rollout is complete. Until the last instance runs the new release, the old instances cannot read the uploads of the new ones, so avoid IAM changes during the rollout.
+A rolling restart moves the synced database and the local database of every instance to a new key, with `DGP_CONFIG_DB_KEY_PREVIOUS` holding the old key during the rollout. The same page covers a fleet that comes from a release before the config DB key, which encrypted the database with the bootstrap password hash. See [How to rotate the config DB key](rotate-the-config-db-key.md).
 
 ## 3. Decide where operators edit IAM
 
@@ -61,7 +79,7 @@ If you want no writer at all, switch to `iam_mode: declarative` and manage IAM t
 
 ## 4. Force a sync when you can't wait
 
-After a known-good mutation on the writer, make a reader pull immediately instead of waiting out the poll interval:
+The admin UI has no control for this step, so you send the request to the admin API. After a known-good mutation on the writer, make a reader pull immediately instead of waiting out the poll interval:
 
 ```bash
 curl -b cookies -X POST https://dgp-reader-1:9000/_/api/admin/config/sync-now
@@ -180,4 +198,5 @@ Watch the reader's logs for the lines `Config DB downloaded from S3` and `IAM in
 - [How to back up and restore](back-up-and-restore.md): sync replicates state; it does not protect it
 - [How to manage IAM as code](manage-iam-as-code.md): the GitOps alternative to a designated writer
 - [How to monitor with Prometheus and Grafana](monitor-with-prometheus.md): scraping multiple targets
+- [How to rotate the config DB key](rotate-the-config-db-key.md): the rolling key rotation
 - [Configuration reference](../reference/configuration.md): config-sync fields
