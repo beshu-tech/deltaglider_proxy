@@ -4,7 +4,7 @@ This guide takes a proxy that runs 1.19 to 2.0.0. Version 2.0.0 is a major relea
 
 ## Before you start
 
-Read the whole guide once. Most installs need only steps 1, 2 and 7. Steps 3 to 6 apply only when your setup uses the feature that the step names.
+Read the whole guide once. Most installs need only steps 1, 2 and 7. Steps 3 to 6 apply only when your setup uses the feature that the step names. Apart from the backup, the steps set environment variables, copy files or run `kubectl`. The settings that 2.0 changes (the config DB key, the spool and the trusted proxy networks) exist only as environment variables, so the admin UI and the YAML file cannot make these steps.
 
 You cannot go back to 1.19 by starting the old binary on the new files. The first start of 2.0 moves the config database schema from version 24 to version 29, and a 1.19 binary refuses a database with a newer schema. To go back, you put back the copy that you make in step 1.
 
@@ -12,7 +12,7 @@ You cannot go back to 1.19 by starting the old binary on the new files. The firs
 
 The config database `deltaglider_config.db` holds the IAM users, the groups, the OAuth providers and the mapping rules. It lives in the directory of the config file (the directory of `DGP_CONFIG`), or in the working directory of the proxy when `DGP_CONFIG` is not set.
 
-1. Make a full backup from the admin UI, or with a request to `GET /_/api/admin/backup` (see [Back up and restore](back-up-and-restore.md)).
+1. Make a full backup. In the admin UI of 1.19, open **System → System** (`/_/admin/system`) and click **Download backup** in the backup card at the bottom of the page. Or send a request to `GET /_/api/admin/backup` (see [Back up and restore](back-up-and-restore.md)).
 2. Stop the proxy, and copy `deltaglider_config.db`, the YAML config file and the `.deltaglider_bootstrap_hash` file (when it exists) to a safe place. This copy is the only way back to 1.19.
 
 In 1.19, the bootstrap password hash was the encryption key of the config database. In 2.0, the database has its own key. The first start of 2.0 re-encrypts the database with `DGP_CONFIG_DB_KEY`. When that variable is not set, the proxy generates a random key, writes it to the file `deltaglider_config.db.key` next to the database (mode 0600), and uses that key. The re-encryption works on a copy, and the copy replaces the original only after it opens with the new key, so a failed start leaves the original unchanged. From now on, back up `deltaglider_config.db.key` together with the database, because the database cannot be read without its key.
@@ -87,7 +87,7 @@ To get the old log output, set `advanced.log_level` or `DGP_LOG_LEVEL` to `delta
 4. Log in to the admin UI, and check that your users and groups are there.
 5. List a bucket with your usual client, for example `aws --endpoint-url https://s3.acme.example s3 ls s3://releases/`.
 6. With config sync, send a request to `GET /_/api/admin/config/sync` on each instance. Check that `healthy` is `true`. When it is `false`, `pull_error` and `push_error` say why.
-7. Make a new full backup. It is the first backup that holds the new key.
+7. Make a new full backup with **Download backup** on **System → System**. It is the first backup that holds the new key.
 
 ## Go back to 1.19
 
