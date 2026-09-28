@@ -326,7 +326,7 @@ export default function BackendEncryptionEditor({ backendName, current, onApply,
               <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
                 When you apply, the proxy writes this key in plain text into the config file. A new
                 config file is readable only by its owner; a rewritten file keeps the owner and group
-                read bits of the old one. To keep the key out of the file, set it in the environment
+                permissions of the old one, and nobody else can read it. To keep the key out of the file, set it in the environment
                 variable <code>{encryptionKeyEnvVar(backendName)}</code> instead.
               </Text>
               <label htmlFor={`${uid}-key`} style={{ fontSize: 11, color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
