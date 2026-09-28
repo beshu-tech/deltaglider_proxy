@@ -65,10 +65,11 @@ ls -lh fw-1.4.0.tar
 
 Now back in the browser:
 
-1. In the left sidebar, click the **+** button (Create bucket). Name it `releases` and click **Create**. The bucket appears in the sidebar. Click it.
+1. In the left sidebar, click the **+** button (**Create bucket**). Type `releases` in **Bucket name** and click **Create**. The bucket appears in the sidebar. Click it.
 2. Click **Upload Files** in the sidebar.
 3. In the **Files will be uploaded to** box, type `firmware/widget-3000` as the destination path. The target readout above the field changes to `releases / firmware/widget-3000/`.
-4. Drop `fw-1.4.0.tar` onto the drop zone (or use the select button) and click **Upload**.
+4. Drop `fw-1.4.0.tar` onto the drop zone, or click **Select files** and pick it. The page lists the file as ready to upload.
+5. Click **Upload 1 file to firmware/widget-3000/**.
 
 When the upload finishes, navigate back into the bucket and open the `firmware/widget-3000/` folder. You should see one row:
 
@@ -121,9 +122,9 @@ Both rows are tagged **Delta**, because the proxy stores every version as a diff
 
 Click the `fw-1.4.1.tar` row. An inspector drawer slides in from the right with the object's details, and near the top is the number we came for, in the **Savings** panel:
 
-![Delta savings badge in the object inspector](/_/screenshots/delta-savings-badge.jpg)
+![The object inspector shows that fw-1.4.1.tar is stored as a delta of about 48 KB for a 3 MB file; the box marks the savings.](/_/screenshots/inspector-delta-savings.webp)
 
-You should see **100.0%** (the display rounds; the exact figure is a string of nines), and below it two comparison bars: **Original** at 5.0 MB, and **Stored** at a few hundred bytes (393 B in our run). That small number is the xdelta3 diff that the proxy wrote to disk.
+The screenshot comes from a proxy with a smaller example tarball, so its numbers differ from yours. In your run, you should see **100.0%** (the display rounds; the exact figure is a string of nines), and below it two comparison bars: **Original** at 5.0 MB, and **Stored** at a few hundred bytes (393 B in our run). That small number is the xdelta3 diff that the proxy wrote to disk.
 
 The folder holds exactly one full copy, which is the reference baseline from step 3, and the proxy stores every version as a tiny diff against it. Two full releases take one release's worth of storage plus a few hundred bytes. The ratio improves with every version that you ship. ([How delta compression works](../explanation/delta-compression.md) has the whole story.)
 

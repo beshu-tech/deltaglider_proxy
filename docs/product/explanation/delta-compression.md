@@ -10,7 +10,7 @@ The proxy stores the *difference* between versions instead of the versions thems
 
 So when `ci-uploader` pushes `fw-1.4.0.tar`, the proxy keeps it in full as the reference. When `fw-1.4.1.tar` arrives, xdelta3 compares it against the reference and produces a delta of perhaps 60 KB, which holds the changed bytes plus bookkeeping. The proxy writes that 60 KB to storage. The client uploaded a full tarball and will download a full tarball, but the proxy stored less than one percent of it.
 
-![Delta savings on a firmware upload](/_/screenshots/delta-savings-badge.jpg)
+![The object inspector shows that fw-1.4.1.tar is stored as a delta of about 48 KB for a 3 MB file; the box marks the savings.](/_/screenshots/inspector-delta-savings.webp)
 
 Two design choices matter here. First, the proxy computes every delta directly against the reference, and never against the previous delta. There are no delta chains, so reconstructing any version is always a single decode, and a corrupt delta can never cascade into its neighbours. Second, the baseline is per-prefix, not per-bucket. We call the unit a **deltaspace**: everything sharing the key prefix up to the last `/`. `firmware/widget-3000/` is one deltaspace with one `reference.bin`; `firmware/widget-9000/` would be another. This works because similar binaries tend to live together. A CI pipeline writes versions of the same artifact into the same folder. A bucket-wide baseline would force unrelated objects to diff against each other, and that produces useless deltas. A per-prefix baseline keeps the comparison local, where the similarity is. It also limits the damage of a bad reference to one folder.
 
