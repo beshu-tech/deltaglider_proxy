@@ -4,20 +4,24 @@ Follow this when a bucket answers `503 ServiceUnavailable`, the Backends panel s
 
 ## Read the verdict
 
-Open **Settings → Storage → Backends**. Each backend carries a live health badge:
+In the sidebar of the admin UI, open **Storage → Backends** (`/_/admin/storage/backends`). Each backend card carries a live health badge next to the name of the backend:
 
 | Badge | Meaning | Fix |
 |---|---|---|
-| **Connected** | An authenticated request succeeded | Nothing to do |
-| **Credentials rejected** | The backend answered and refused the key/secret | Check `access_key_id` / `secret_access_key` (typo, rotated key, unset `${env:...}` variable) |
-| **Unreachable** | DNS / connect / TLS / timeout failure | Check `endpoint`, network egress, firewall |
-| **Erroring** | Reachable but answering 5xx | The provider is degraded. Wait, or check the provider's status page. The proxy does **not** block requests in this state, because the backend still serves. Only *Credentials rejected* and *Unreachable* block requests |
+| **Connected** | An authenticated request succeeded. | Nothing to do. |
+| **CREDENTIALS REJECTED** | The backend answered and refused the access key or the secret. | Check `access_key_id` and `secret_access_key`: a typo, a rotated key, or an unset `${env:...}` variable. |
+| **UNREACHABLE** | The request failed at DNS, connect, TLS, or a timeout. | Check `endpoint`, the network egress and the firewall. |
+| **ERRORING** | The backend is reachable, but it answers with 5xx errors. | The provider is degraded. Wait, or check the status page of the provider. The proxy does **not** block requests in this state, because the backend still serves some of them. Only **CREDENTIALS REJECTED** and **UNREACHABLE** block requests. |
 
-The same cause string appears verbatim in the boot log ERROR line, in the `503` body clients receive, and in a rejected config apply, so these places always agree.
+When the badge is not **Connected**, the card also shows an alert with the cause: **Backend unavailable** for the two states that block requests, and **Backend degraded** for **ERRORING**. The same cause string appears in the ERROR line of the boot log, in the body of the `503` that clients receive, and in a rejected config apply, so these places always agree.
 
 ## Force a probe now
 
-Click **Test connection** on the backend card. This runs the probe on the server, with the server's own credentials, endpoint, and network. A green result means that the proxy itself can serve from this backend, which is more than your browser being able to reach it. Buckets that an unhealthy verdict blocks reopen automatically within about 30 seconds of recovery, and Test connection reopens them immediately.
+Click **Test connection** on the backend card. The server runs the probe with its own credentials, endpoint and network, and the card shows the result below the buttons. A green result means that the proxy itself can serve from this backend, which proves more than a browser that can reach the endpoint. The same probe is `POST /_/api/admin/backends/<name>/probe`.
+
+![The hetzner-fsn1 backend card after a probe; one box marks its Connected badge, the arrow points at its Test connection button, and a second box marks the probe result.](/_/screenshots/backend-health-test-connection.webp)
+
+Buckets that an unhealthy verdict blocks reopen by themselves within about 30 seconds of the recovery, and **Test connection** reopens them at once.
 
 ## What happens while a backend is down
 
@@ -56,8 +60,26 @@ secret_access_key. Fix the endpoint/credentials and re-apply (nothing was change
 
 Two related states are fatal config errors, which the proxy refuses at boot and on every apply: a bucket routed to a backend name that doesn't exist, and duplicate backend names.
 
+## Verify
+
+1. Check the live state of every backend. `GET /_/ready` needs no authentication, and its `backends` field maps each backend name to `healthy`, `unreachable`, `auth-rejected` or `erroring`:
+
+   ```bash
+   curl -s https://s3.acme.example/_/ready
+   # {"status":"ready","backend":"ready","config_db":"ready","backends":{"aws-dr":"healthy","hetzner-fsn1":"healthy","local-disk":"healthy"}}
+   ```
+
+2. Check that a bucket on the repaired backend serves again. A list request must succeed instead of answering `503`:
+
+   ```bash
+   aws --endpoint-url https://s3.acme.example s3 ls s3://releases/
+   ```
+
+3. In the proxy log, check for the recovery line of the backend after the next probe.
+
 ## Related
 
 - [Backend capability validation](backend-capability-validation.md): the other backend check, for conditional-write (CAS) support in multi-instance deployments.
 - [Route a bucket to a backend](route-a-bucket-to-a-backend.md)
 - [Configuration reference](../reference/configuration.md): `DGP_BOOT_BACKEND_PROBE`.
+- [Admin API reference](../reference/admin-api.md): the probe endpoint and `GET /_/ready`.
