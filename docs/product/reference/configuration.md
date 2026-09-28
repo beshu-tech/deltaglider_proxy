@@ -137,7 +137,7 @@ advanced:
 
 ### `log_level`
 
-Tracing filter string (`tracing-subscriber` syntax). `RUST_LOG` overrides it when set. You can change it at runtime in the admin GUI (Settings → System → Logging card), which hot-reloads the filter through the apply pipeline. When `RUST_LOG` or `DGP_LOG_LEVEL` is set, that variable decides the level, so the Logging card shows its value read-only and names the variable. An apply cannot replace that level, because the environment variable wins over the file at every apply, not only at startup.
+Tracing filter string (`tracing-subscriber` syntax). `RUST_LOG` overrides it when set. You can change it at runtime in the admin GUI (the **Logging** card of **System → System**), which hot-reloads the filter through the apply pipeline. When `RUST_LOG` or `DGP_LOG_LEVEL` is set, that variable decides the level, so the Logging card shows its value read-only and names the variable. An apply cannot replace that level, because the environment variable wins over the file at every apply, not only at startup.
 
 Resolution order: `RUST_LOG` > `DGP_LOG_LEVEL` > `advanced.log_level` in the file > the `--verbose` CLI flag (`deltaglider_proxy=trace,tower_http=trace`) > default. A file `log_level` equal to the default counts as not set, so `--verbose` wins over it.
 

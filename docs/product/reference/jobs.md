@@ -39,7 +39,7 @@ An object that reached the backend without the proxy (it was there before the pr
 
 A server-side copy does not carry the object's ACL or its Object Lock settings, so the proxy restates them on the copy. It reads the object's ACL first, and when the ACL grants more than the owner's full control, the copy sends the same grants. When the object has a retention period that has not ended, or a legal hold that is on, the copy sends the same retention mode, date and legal hold. When the backend does not answer the ACL request, the copy gets the bucket's default ACL, as before.
 
-By default the job keeps the Last-Modified time that the proxy serves for each object, so sync tools and replication do not copy the objects again. Set `refresh_last_modified: true` to make the backfilled objects read as modified at the time of the job. A multipart object keeps the ETag that clients know. Start the job from **Settings → Jobs → New job → Backfill metadata…**, or with the API row above.
+By default the job keeps the Last-Modified time that the proxy serves for each object, so sync tools and replication do not copy the objects again. Set `refresh_last_modified: true` to make the backfilled objects read as modified at the time of the job. A multipart object keeps the ETag that clients know. Start the job from **Storage → Jobs** (`/_/admin/jobs`) → **New job** → **Backfill metadata…**, or with the API row above.
 
 ## The write gate
 

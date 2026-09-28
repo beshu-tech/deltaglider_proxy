@@ -152,7 +152,7 @@ A PUT to a non-existent bucket returns `404 NoSuchBucket` on every backend. This
 
 ## Canned policy templates
 
-The user form (**Settings → Access → Users**) shows four preset buttons above the permission editor. A click replaces the permissions in the form, after a confirmation when the form already has permissions. You can edit them before you save. A new user starts with `read` and `list` on every resource.
+The user form (**Access → Users**, `/_/admin/access/users`) shows four preset buttons above the permission editor. A click replaces the permissions in the form, after a confirmation when the form already has permissions. You can edit them before you save. A new user starts with `read` and `list` on every resource.
 
 | Preset | Permissions |
 |----------|-------------|
