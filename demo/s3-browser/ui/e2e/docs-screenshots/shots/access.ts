@@ -156,6 +156,12 @@ async function fillExampleRule(page: Page): Promise<void> {
   await dialog.getByPlaceholder('any bucket').fill('downloads');
   await dialog.locator('label', { hasText: /^Anonymous only$/ }).click();
   await dialog.locator('label', { hasText: /^Deny \(403\)$/ }).click();
+  // The Source IPs box sizes itself to its text; it can measure itself while
+  // the dialog opens and end up a few px off. A typed and deleted character
+  // makes it measure again, once the layout is final.
+  const ips = dialog.getByPlaceholder('203.0.113.5\n198.51.100.0/24');
+  await ips.press('x');
+  await ips.press('Backspace');
   await calm(page);
 }
 
