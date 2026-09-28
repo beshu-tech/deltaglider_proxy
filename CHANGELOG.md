@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed — The YAML editor accepts `${env:NAME}` in a non-text field
+
+The proxy gives a whole-value `${env:NAME}` or `${env:NAME:-default}`
+reference the type of its field, so `force_path_style: ${env:S3_PATH_STYLE}`
+loads as a boolean. The JSON Schema that the admin YAML editor and
+`config schema` use still asked for a real boolean, number or list value
+there, and so it marked the reference as an error. Every boolean, number and
+list-of-choices field in the schema now also accepts a whole reference, and
+a plain wrong value is still an error.
+
 ## v2.0.1 — 2026-09-28
 
 ### Upgrade steps for 2.0.1

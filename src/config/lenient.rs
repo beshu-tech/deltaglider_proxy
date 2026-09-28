@@ -52,6 +52,107 @@ pub(crate) fn bool_or_string_schema(
     .expect("a well-formed schema")
 }
 
+/// A string that is one whole `${env:NAME}` / `${env:NAME:-default}`
+/// reference: the JSON Schema form of [`super::expansion::is_env_ref`].
+pub(crate) const ENV_REF_PATTERN: &str = r"^\$\{env:[^}]*\}$";
+
+/// Post-process a served JSON Schema (`config schema`, `GET
+/// /config/defaults`, the admin YAML editor): every non-string scalar
+/// (bool, number, integer, enum) also accepts a whole `${env:NAME}`
+/// string, because [`from_value`] types such a value by its field. A
+/// one-value enum that is a `required` property is a variant tag and
+/// stays literal: wrapping it would let a `oneOf` match two variants.
+pub(crate) fn accept_env_refs_in_schema(schema: &mut serde_json::Value) {
+    use serde_json::Value as J;
+
+    fn is_scalar_leaf(s: &J) -> bool {
+        let Some(o) = s.as_object() else {
+            return false;
+        };
+        if ["$ref", "anyOf", "oneOf", "allOf"]
+            .iter()
+            .any(|k| o.contains_key(*k))
+        {
+            return false;
+        }
+        if o.contains_key("enum") || o.contains_key("const") {
+            return true;
+        }
+        let types: Vec<&str> = match o.get("type") {
+            Some(J::String(t)) => vec![t.as_str()],
+            Some(J::Array(ts)) => ts.iter().filter_map(J::as_str).collect(),
+            _ => return false,
+        };
+        types
+            .iter()
+            .all(|t| matches!(*t, "boolean" | "integer" | "number" | "null"))
+            && types.iter().any(|t| *t != "null")
+    }
+
+    fn is_tag(s: &J) -> bool {
+        s.get("enum")
+            .and_then(J::as_array)
+            .is_some_and(|e| e.len() == 1)
+    }
+
+    fn wrap(s: &mut J) {
+        let J::Object(mut inner) = std::mem::take(s) else {
+            return;
+        };
+        let mut outer = serde_json::Map::new();
+        // The docs stay on the outside, where editors show them.
+        for key in ["description", "title", "default", "examples", "deprecated"] {
+            if let Some(v) = inner.remove(key) {
+                outer.insert(key.into(), v);
+            }
+        }
+        let env = serde_json::json!({ "type": "string", "pattern": ENV_REF_PATTERN });
+        outer.insert("anyOf".into(), J::Array(vec![J::Object(inner), env]));
+        *s = J::Object(outer);
+    }
+
+    fn walk(s: &mut J) {
+        // A composite of scalars (e.g. `bool_or_string`, a documented unit
+        // enum) takes ONE env branch, so a `oneOf` never matches twice.
+        let composite_of_scalars = ["anyOf", "oneOf"].iter().any(|k| {
+            s.get(*k)
+                .and_then(J::as_array)
+                .is_some_and(|b| b.iter().all(is_scalar_leaf))
+        });
+        if composite_of_scalars || is_scalar_leaf(s) {
+            wrap(s);
+            return;
+        }
+        let J::Object(o) = s else {
+            return;
+        };
+        let required: Vec<String> = o
+            .get("required")
+            .and_then(J::as_array)
+            .map(|r| r.iter().filter_map(J::as_str).map(str::to_string).collect())
+            .unwrap_or_default();
+        for (key, child) in o.iter_mut() {
+            match (key.as_str(), child) {
+                ("properties", J::Object(props)) => {
+                    for (name, p) in props.iter_mut() {
+                        if !(required.contains(name) && is_tag(p)) {
+                            walk(p);
+                        }
+                    }
+                }
+                ("definitions" | "patternProperties", J::Object(m)) => {
+                    m.values_mut().for_each(walk)
+                }
+                ("anyOf" | "oneOf" | "allOf" | "items", J::Array(a)) => a.iter_mut().for_each(walk),
+                ("items" | "additionalProperties" | "not", c @ J::Object(_)) => walk(c),
+                _ => {}
+            }
+        }
+    }
+
+    walk(schema);
+}
+
 /// The tag the expander puts on a whole-scalar env value.
 pub(crate) const ENV_REF_TAG: &str = "!envref";
 

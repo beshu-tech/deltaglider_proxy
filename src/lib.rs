@@ -356,15 +356,7 @@ mod schema_conformance {
     }
 
     fn section_schema(name: &str) -> Value {
-        use crate::config_sections::*;
-        serde_json::to_value(match name {
-            "admission" => schemars::schema_for!(AdmissionSection),
-            "access" => schemars::schema_for!(AccessSection),
-            "storage" => schemars::schema_for!(StorageSection),
-            "advanced" => schemars::schema_for!(AdvancedSection),
-            other => panic!("not a section: {other}"),
-        })
-        .unwrap()
+        crate::cli::config::section_schema(name).unwrap_or_else(|| panic!("not a section: {name}"))
     }
 
     /// Errors of a sectioned YAML document against the section schemas.
@@ -436,6 +428,43 @@ mod schema_conformance {
             "schema refuses valid YAML:\n{}",
             errs.join("\n")
         );
+    }
+
+    /// The loader types a whole-value `${env:NAME}` by its field
+    /// (`config::lenient`), so the editor schema must accept one in a
+    /// bool, an integer and an enum field, and still refuse plain text.
+    #[test]
+    fn served_schema_accepts_env_refs_in_non_string_scalars() {
+        let doc = "storage:
+  backends:
+    - name: hetzner-fsn1
+      type: s3
+      force_path_style: ${env:S3_PATH_STYLE:-false}
+  default_backend: hetzner-fsn1
+  buckets:
+    releases:
+      compression: ${env:COMPRESS}
+access:
+  iam_mode: ${env:IAM_MODE:-gui}
+advanced:
+  max_object_size: ${env:MAX_OBJECT_SIZE}
+  max_delta_ratio: ${env:RATIO:-0.5}
+";
+        let errs = check_document("env refs", doc);
+        assert!(
+            errs.is_empty(),
+            "schema refuses env refs:\n{}",
+            errs.join("\n")
+        );
+        for bad in [
+            "storage:\n  buckets:\n    releases:\n      compression: maybe\n",
+            "access:\n  iam_mode: sometimes\n",
+            "advanced:\n  max_object_size: big\n",
+            "advanced:\n  max_object_size: ${env:SIZE}0\n",
+            "advanced:\n  max_object_size: ${iam:username}\n",
+        ] {
+            assert!(!check_document("bad", bad).is_empty(), "accepted: {bad}");
+        }
     }
 
     /// The example's commented `lifecycle:` block (every action shape).

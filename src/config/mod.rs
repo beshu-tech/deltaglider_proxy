@@ -13,6 +13,7 @@ mod lenient;
 
 pub use env::*;
 pub use expansion::*;
+pub(crate) use lenient::accept_env_refs_in_schema;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

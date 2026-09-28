@@ -45,8 +45,34 @@ pub fn schema_string() -> Result<String, ConfigError> {
 /// JSON Schema of the canonical document: the SECTIONED shape that export,
 /// persist and every doc example write. The flat runtime `Config` is only a
 /// legacy input shape; a YAML LSP fed its schema flags every canonical file.
-pub fn canonical_schema() -> schemars::schema::RootSchema {
-    schemars::schema_for!(crate::config_sections::SectionedConfig)
+pub fn canonical_schema() -> serde_json::Value {
+    served(schemars::schema_for!(
+        crate::config_sections::SectionedConfig
+    ))
+}
+
+/// JSON Schema of one section (`admission` / `access` / `storage` /
+/// `advanced`), what the admin YAML editor lints a section with. `None`
+/// for any other name.
+pub fn section_schema(section: &str) -> Option<serde_json::Value> {
+    use crate::config_sections::*;
+    let root = match section {
+        "admission" => schemars::schema_for!(AdmissionSection),
+        "access" => schemars::schema_for!(AccessSection),
+        "storage" => schemars::schema_for!(StorageSection),
+        "advanced" => schemars::schema_for!(AdvancedSection),
+        _ => return None,
+    };
+    Some(served(root))
+}
+
+/// Every served schema goes through here: the loader's leniency (a
+/// whole-value `${env:NAME}` in a bool, number or enum field) is not in
+/// the derives, so it is added once, after generation.
+fn served(root: schemars::schema::RootSchema) -> serde_json::Value {
+    let mut v = serde_json::to_value(root).expect("a schemars schema serializes");
+    crate::config::accept_env_refs_in_schema(&mut v);
+    v
 }
 
 /// Shared emitter for `config schema` and `config defaults`. Both

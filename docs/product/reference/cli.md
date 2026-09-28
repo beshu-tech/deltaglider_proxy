@@ -32,7 +32,7 @@ deltaglider_proxy config lint <FILE>
 deltaglider_proxy config schema [--out <OUTPUT>]
 ```
 
-Emits the JSON Schema for the canonical sectioned document, with the `admission`, `access`, `storage` and `advanced` sections at the root. This is the shape that `config export` and every admin save write. The schema comes from the schemars derives, so it follows the code automatically. CI and YAML LSP autocompletion consume it.
+Emits the JSON Schema for the canonical sectioned document, with the `admission`, `access`, `storage` and `advanced` sections at the root. This is the shape that `config export` and every admin save write. The schema comes from the schemars derives, so it follows the code automatically. Every field that is not text, such as a boolean, a number or a choice from a list, also accepts a whole `${env:NAME}` or `${env:NAME:-default}` reference, because the proxy gives the expanded value the type of the field. CI and YAML LSP autocompletion consume the schema.
 
 ## `config defaults`
 

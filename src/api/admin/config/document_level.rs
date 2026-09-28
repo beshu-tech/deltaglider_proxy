@@ -197,26 +197,12 @@ fn yaml_response(
 pub async fn config_defaults(
     AdminQuery(query): AdminQuery<SectionFilterQuery>,
 ) -> Result<Response, AdminError> {
-    let schema = match query.section.as_deref() {
-        None => serde_json::to_value(crate::cli::config::canonical_schema()),
-        Some(name) => match SectionName::parse(name) {
-            Some(SectionName::Admission) => serde_json::to_value(schemars::schema_for!(
-                crate::config_sections::AdmissionSection
-            )),
-            Some(SectionName::Access) => {
-                serde_json::to_value(schemars::schema_for!(crate::config_sections::AccessSection))
-            }
-            Some(SectionName::Storage) => serde_json::to_value(schemars::schema_for!(
-                crate::config_sections::StorageSection
-            )),
-            Some(SectionName::Advanced) => serde_json::to_value(schemars::schema_for!(
-                crate::config_sections::AdvancedSection
-            )),
-            None => return Err(AdminError::not_found(unknown_section_error(name))),
-        },
+    let v = match query.section.as_deref() {
+        None => crate::cli::config::canonical_schema(),
+        Some(name) => SectionName::parse(name)
+            .and_then(|s| crate::cli::config::section_schema(s.as_str()))
+            .ok_or_else(|| AdminError::not_found(unknown_section_error(name)))?,
     };
-    let v =
-        schema.map_err(|e| AdminError::internal(format!("failed to serialize schema: {}", e)))?;
     Ok((
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/schema+json")],
