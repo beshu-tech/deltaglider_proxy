@@ -5,9 +5,9 @@
  * how-to/set-up-sso, how-to/gate-requests-with-admission-rules,
  * explanation/security-model).
  */
-import { request, type Page } from '@playwright/test';
+import { request, type APIRequestContext, type Page } from '@playwright/test';
 import type { Shot, Target } from '../shot';
-import { BASE, ADMIN_PASSWORD } from '../seed';
+import { BASE, ADMIN_PASSWORD, ENGINEERING, ENGINEERING_MEMBERS, USERS } from '../seed';
 
 /** Select a row of a master-detail list (users, groups) by its name. */
 async function pick(page: Page, name: string): Promise<void> {
@@ -91,6 +91,48 @@ async function oktaWithoutRules(): Promise<void> {
   await ctx.dispose();
 }
 
+// ── "New" forms: the seed already holds the example user and group ──────
+// A shot of the form that creates ci-uploader (or Engineering) must not show
+// that user (or group) in the list already. Setup deletes it through the
+// admin API, and the teardown creates it again as the seed did.
+
+type Named = { id: number; name: string };
+
+/** A state change whose reply body does not matter (DELETE may answer 204). */
+async function sent(p: Promise<Reply>, what: string): Promise<void> {
+  const r = await p;
+  if (!r.ok()) throw new Error(`access shots: ${what}: HTTP ${r.status()}`);
+}
+
+async function withoutUser(page: Page, name: string): Promise<void> {
+  const users = await json<Named[]>(page.request.get('/_/api/admin/users'), 'users');
+  const u = users.find((x) => x.name === name);
+  if (u) await sent(page.request.delete(`/_/api/admin/users/${u.id}`, { headers: { Origin: BASE } }), `delete ${name}`);
+  await page.reload();
+}
+
+async function restoreUser(api: APIRequestContext, name: string): Promise<void> {
+  const users = await json<Named[]>(api.get('/_/api/admin/users'), 'users');
+  if (users.some((x) => x.name === name)) return;
+  const def = USERS.find((x) => x.name === name)!;
+  await sent(api.post('/_/api/admin/users', { data: def, headers: { Origin: BASE } }), `create ${name}`);
+}
+
+async function withoutEngineering(page: Page): Promise<void> {
+  const groups = await json<Named[]>(page.request.get('/_/api/admin/groups'), 'groups');
+  const g = groups.find((x) => x.name === ENGINEERING.name);
+  if (g) await sent(page.request.delete(`/_/api/admin/groups/${g.id}`, { headers: { Origin: BASE } }), 'delete Engineering');
+  await page.reload();
+}
+
+async function restoreEngineering(api: APIRequestContext): Promise<void> {
+  const groups = await json<Named[]>(api.get('/_/api/admin/groups'), 'groups');
+  if (groups.some((x) => x.name === ENGINEERING.name)) return;
+  const users = await json<Named[]>(api.get('/_/api/admin/users'), 'users');
+  const member_ids = ENGINEERING_MEMBERS.map((n) => users.find((u) => u.name === n)!.id);
+  await sent(api.post('/_/api/admin/groups', { data: { ...ENGINEERING, member_ids }, headers: { Origin: BASE } }), 'create Engineering');
+}
+
 // ── Request rules ────────────────────────────────────────────────────────
 
 /**
@@ -162,12 +204,14 @@ export const ACCESS_SHOTS: Shot[] = [
     alt: 'The Users page with the form of the new ci-uploader user; callout 1 marks Users in the sidebar, callout 2 the New button, callout 3 the Name field, callout 4 the rule that allows List, Read and Write on releases/firmware/*, and callout 5 the Create User button.',
     viewport: { width: 1280, height: 1200 },
     setup: async (page) => {
+      await withoutUser(page, 'ci-uploader');
       await page.getByRole('button', { name: 'New User' }).click();
       await page.getByRole('textbox', { name: 'User name' }).fill('ci-uploader');
       await setResource(page, 0, 'releases/firmware/*');
       await page.getByRole('checkbox', { name: 'Write', exact: true }).click();
       await calm(page);
     },
+    teardown: (api) => restoreUser(api, 'ci-uploader'),
     annotations: [
       // Not nav(): an unsaved form adds a marker to the sidebar entry's name.
       {
@@ -219,6 +263,7 @@ export const ACCESS_SHOTS: Shot[] = [
     alt: 'The form of a new Engineering group; callout 1 marks the New button, callout 2 the Name field, callout 3 the rule that allows List and Read on releases/*, callout 4 the members dana and backup-bot, and callout 5 the Create Group button.',
     viewport: TALL,
     setup: async (page) => {
+      await withoutEngineering(page);
       await page.getByRole('button', { name: 'New Group' }).click();
       await page.getByRole('textbox', { name: 'Group name' }).fill('Engineering');
       await page.getByPlaceholder('e.g. Development team access').fill('Firmware and platform engineers');
@@ -229,6 +274,7 @@ export const ACCESS_SHOTS: Shot[] = [
       await page.getByRole('checkbox', { name: 'backup-bot' }).click();
       await calm(page);
     },
+    teardown: restoreEngineering,
     clip: { union: [{ css: '.dg-md-list >> text="Groups"' }, { role: 'button', name: 'Create group' }] },
     clipPadding: 24,
     annotations: [

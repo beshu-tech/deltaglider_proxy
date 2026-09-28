@@ -136,7 +136,7 @@ const OBJECTS: { bucket: string; key: string; body: () => Buffer; type?: string 
   })),
 ];
 
-const USERS = [
+export const USERS = [
   {
     name: 'ci-uploader',
     access_key_id: 'AKIADOCSCIUPLOADER01',
@@ -163,6 +163,14 @@ const USERS = [
     permissions: [{ effect: 'Allow', actions: ['read', 'list'], resources: ['*'] }],
   },
 ];
+
+/** The seeded group; its members are dana and backup-bot. */
+export const ENGINEERING = {
+  name: 'Engineering',
+  description: 'Firmware and platform engineers',
+  permissions: [{ effect: 'Allow', actions: ['read', 'list'], resources: ['releases/*'] }],
+};
+export const ENGINEERING_MEMBERS = ['dana', 'backup-bot'];
 
 async function iamVersion(ctx: APIRequestContext): Promise<number> {
   const v = (await ok(ctx.get('/_/api/admin/iam/version'), 'iam version')) as { version: number };
@@ -275,14 +283,7 @@ export async function seed(): Promise<void> {
     await waitFor('iam rebuild', async () => ((await iamVersion(ctx)) > before ? true : undefined));
   }
   await ok(
-    ctx.post('/_/api/admin/groups', {
-      data: {
-        name: 'Engineering',
-        description: 'Firmware and platform engineers',
-        permissions: [{ effect: 'Allow', actions: ['read', 'list'], resources: ['releases/*'] }],
-        member_ids: [ids['dana'], ids['backup-bot']],
-      },
-    }),
+    ctx.post('/_/api/admin/groups', { data: { ...ENGINEERING, member_ids: [ids['dana'], ids['backup-bot']] } }),
     'group Engineering',
   );
 
