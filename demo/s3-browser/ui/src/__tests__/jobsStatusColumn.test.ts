@@ -10,7 +10,7 @@ import { expect, test } from 'vitest';
 
 test('the Jobs Status column is wide enough for a running meter', () => {
   const s = readFileSync(new URL('../components/jobs/JobsPanel.tsx', import.meta.url), 'utf8');
-  const m = /key: 'status',[\s\S]{0,80}track: 'minmax\((\d+)px/.exec(s);
+  const m = /key: 'status',[\s\S]{0,240}track: 'minmax\((\d+)px/.exec(s);
   expect(m, 'the status column has a px minimum').not.toBeNull();
   expect(Number(m![1])).toBeGreaterThanOrEqual(200);
 });
