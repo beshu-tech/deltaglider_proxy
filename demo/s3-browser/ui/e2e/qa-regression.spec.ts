@@ -130,6 +130,7 @@ test.beforeAll(async ({ browser }) => {
   watch = new Watch(page);
 });
 
+// eslint-disable-next-line no-empty-pattern -- Playwright reads the fixtures from a destructured first argument.
 test.afterEach(async ({}, info) => {
   watch.assertClean(info.title);
 });
@@ -636,7 +637,7 @@ test('6. config: export YAML, edit + Review & apply, persisted; env refs in YAML
   // YAML import: an env ref the boot config does not use is refused, with a
   // message that names it and says why.
   const withLevel = (lvl: string) =>
-    edited.replace(/^  log_level: .*\n/m, '').replace(/advanced:\n/, `advanced:\n  log_level: "${lvl}"\n`);
+    edited.replace(/^ {2}log_level: .*\n/m, '').replace(/advanced:\n/, `advanced:\n  log_level: "${lvl}"\n`);
   watch.expectFailure(400, /\/_\/api\/admin\/config\/validate$/, 'POST');
   let dlg = await importYaml(withLevel('${env:NOT_IN_BOOT_CONFIG}'));
   const err = dlg.getByRole('alert').filter({ hasText: 'Validation error' });

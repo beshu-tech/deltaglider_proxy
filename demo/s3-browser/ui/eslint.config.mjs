@@ -204,4 +204,11 @@ export default tseslint.config(
     files: ['src/useCopyToClipboard.ts'],
     rules: { 'no-restricted-properties': 'off' },
   },
+  // Playwright specs: page.addInitScript / evaluate bodies run in the page,
+  // where src/safeStorage.ts cannot be imported. They wrap raw storage in
+  // try/catch themselves.
+  {
+    files: ['e2e/**'],
+    rules: { 'no-restricted-properties': 'off', 'no-restricted-globals': 'off' },
+  },
 );
