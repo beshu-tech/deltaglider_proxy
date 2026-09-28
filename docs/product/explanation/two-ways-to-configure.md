@@ -33,6 +33,7 @@ An environment value never reaches the config file. When the proxy persists the 
 A `${env:NAME}` reference inside the file is a different mechanism. The proxy replaces the reference with the value of `NAME` when it loads the file, and it records which fields came from which variable. When the proxy writes the file or exports it, it writes `${env:NAME}` back into those fields. A secret that you keep in the environment, such as the secret key of a backend, therefore stays a reference through every GUI change:
 
 ```yaml
+# validate
 storage:
   backends:
     - name: hetzner-fsn1

@@ -204,7 +204,7 @@ advanced:
 becomes:
 
 ```yaml
-# fragment
+# validate
 # NEW (v0.9+)
 storage:
   backend_encryption:

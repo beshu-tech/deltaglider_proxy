@@ -40,6 +40,7 @@ Env vars override only the secret fields (`key`, `kms_key_id`); the mode itself 
 Proxy-AES on a named S3 backend, key supplied by env var:
 
 ```yaml
+# validate
 storage:
   backends:
     - name: hetzner-fsn1
@@ -61,6 +62,7 @@ DGP_BACKEND_HETZNER_FSN1_ENCRYPTION_KEY=$(openssl rand -hex 32)
 Proxy-AES on a singleton filesystem backend:
 
 ```yaml
+# validate
 storage:
   backend:
     type: filesystem
@@ -74,6 +76,7 @@ storage:
 SSE-KMS on an AWS backend:
 
 ```yaml
+# validate
 storage:
   backends:
     - name: aws-dr
@@ -88,6 +91,7 @@ storage:
 SSE-S3 on an AWS backend:
 
 ```yaml
+# validate
 storage:
   backends:
     - name: aws-dr

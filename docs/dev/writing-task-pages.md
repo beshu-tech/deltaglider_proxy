@@ -78,6 +78,16 @@ After you edit the file, restart the proxy, or apply the file to the running pro
 
 For a YAML-only task, replace the "In the admin UI" part with one sentence, for example: "The admin UI cannot change this setting, so you set it in `deltaglider_proxy.yaml`." For a UI-only task, end the UI steps with one sentence, for example: "Users live in the encrypted config database in `gui` mode, so there is no YAML for this step. To manage users in YAML, see [How to manage IAM as code](../how-to/manage-iam-as-code.md)."
 
+## YAML blocks
+
+Every ```` ```yaml ```` block in `docs/product/` starts with exactly one marker line, and `scripts/check-docs-yaml-examples.sh` fails the build for a block without one:
+
+- `# validate`: a complete proxy config document. The check runs `deltaglider_proxy config lint` on it. "The same change in YAML" is always a `# validate` block.
+- `# fragment`: part of a proxy config, such as one section, one list item or a few lines of a backend, shown for reading. On a task page, the same content also appears in a full `# validate` block. Keep fragments short.
+- `# not-proxy-config: <kind>`: a file that is not a proxy config, for example `# not-proxy-config: helm-values`, `kubernetes`, `compose` or `prometheus`.
+
+A `# validate` block may use `${env:NAME}` references. The lint expands them and fails on an unset variable, so the check gives every referenced variable a placeholder value (64 hex characters for a name that contains `ENCRYPTION_KEY`, text otherwise). Keep secrets as references in the example; do not turn a block into a fragment only because it references a variable. The generated `changelog.md` is not checked.
+
 ## Screenshots
 
 Screenshots come only from the screenshot pipeline, never from a manual capture. The pipeline boots a proxy with the fixed example cast, seeds it, and takes every shot in a light and a dark theme. The script is `scripts/docs-screenshots.sh`, and the shots are data: one file per docs area under `demo/s3-browser/ui/e2e/docs-screenshots/shots/<area>.ts`. A shot entry has this form:
@@ -100,8 +110,9 @@ To add a shot:
 
 1. Pick the id: the page slug, a hyphen, and a short name of what the shot shows, for example `route-bucket-alias`. Use hyphens only.
 2. Add the entry to the shot file of the area (storage, access, jobs, or observability and system). If you cannot write the setup yourself, describe it in the pull request or the plan: the route, the state to set up with the fixed cast, the control to point at by its label, and the step number.
-3. Run `scripts/docs-screenshots.sh --update`. It writes `docs/screenshots/<id>.light.webp` and `docs/screenshots/<id>.dark.webp`.
-4. Reference the shot once, theme-neutral, as `![Full sentence.](/_/screenshots/<id>.webp)`. Both viewers pick the variant that matches the theme.
+3. Run `scripts/docs-screenshots.sh --update --only <id>`. It writes `docs/screenshots/<id>.light.webp` and `docs/screenshots/<id>.dark.webp`. Run one capture at a time on a machine (for example under `flock`), because every run uses MinIO on port 9000 and the fixed state directory `/tmp/dgp-docs`. With `--update`, the script rewrites every shot that it captures, so always name the shots with `--only`. Without `--update`, the script compares the capture with the committed files and calls a shot unchanged when fewer than 0.5 percent of its pixels differ. A small change, such as a moved annotation or a new help sentence, can stay under that limit: re-capture such a shot with `--update --only <id>` yourself, because the compare run does not flag it.
+4. When a shot needs a server state that the seed cannot hold, because the other shots show the seed state, the shot changes the state in `setup` through the admin API and restores it in `teardown`. The runner calls `teardown` after each capture, also after a failure.
+5. Reference the shot once, theme-neutral, as `![Full sentence.](/_/screenshots/<id>.webp)`. Both viewers pick the variant that matches the theme.
 
 The alt text is a full sentence that ends with a period. It says what the arrow, the box or each numbered callout points at, because the viewers show it as the caption and a screen reader reads it. No version number and no build chip may be visible in a shot, because the screenshots are served to anonymous requests.
 

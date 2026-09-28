@@ -78,7 +78,7 @@ In the admin UI, the provider form sets them in its **Network** fields: the **Al
 In the admin API, the provider body carries them as `"extra_config": {"allow_local": true, "ca_cert_path": "/etc/deltaglider/idp-ca.pem"}`. In declarative YAML they go under the provider entry:
 
 ```yaml
-# fragment
+# validate
 access:
   auth_providers:
     - name: corp-keycloak

@@ -20,10 +20,10 @@ You need three files:
 
 ## 1. Write the config
 
-The block uses `${env:...}` placeholders, so the docs lint cannot check it on its own. Lint it with the secrets loaded, as the Verify section shows.
+The block uses `${env:...}` references. The proxy expands them from the environment of the container when it loads the file, so the file holds no secret. To lint the file, load the secrets first, as the Verify section shows.
 
 ```yaml
-# fragment
+# validate
 # deltaglider_proxy.yaml — secret-free, safe to commit
 storage:
   backends:

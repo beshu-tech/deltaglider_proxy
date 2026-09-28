@@ -1,25 +1,23 @@
 #!/usr/bin/env bash
-# Validate every `# validate`-tagged YAML block in product docs.
+# Check every ```yaml block in docs/product/ (docs/dev/writing-task-pages.md).
 #
-# Shape we expect:
+# The first line of each block is a marker:
 #
-#     ```yaml
-#     # validate
-#     storage:
-#       backend:
-#         type: s3
-#     ```
+#     # validate                   a complete proxy config: it must pass `config lint`
+#     # fragment                   part of a proxy config, shown for reading
+#     # not-proxy-config: <kind>   Helm values, Kubernetes, Compose, Prometheus, ...
 #
-# Every such block is extracted to a temp file and fed to
-# `deltaglider_proxy config lint`. If any block fails, CI fails —
-# prevents drift between documentation examples and the real schema.
+# A block without a marker fails the check. For a `# validate` block, every
+# `${env:NAME}` reference without a default gets a placeholder value in the
+# environment of `config lint`, because the lint expands references and fails
+# on an unset one. changelog.md is skipped: gen-changelog-doc.sh generates it
+# from CHANGELOG.md, whose old entries predate the markers.
 #
-# Requires `deltaglider_proxy` on PATH (built from `cargo build`).
+# Requires the proxy binary: DELTAGLIDER_PROXY_BIN, or `deltaglider_proxy` on PATH.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PRODUCT_DIR="$ROOT/docs/product"
 BIN="${DELTAGLIDER_PROXY_BIN:-deltaglider_proxy}"
 
 if ! command -v "$BIN" >/dev/null 2>&1; then
@@ -31,57 +29,50 @@ fi
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
-fail=0
-total=0
+python3 - "$ROOT/docs/product" "$tmpdir" "$(command -v "$BIN")" <<'PY'
+import os, re, subprocess, sys, textwrap
+from pathlib import Path
 
-# Walk every .md under docs/product/. Python extracts fenced `yaml`
-# blocks whose first line after the fence is `# validate`; each block
-# is written as a separate file in $tmpdir.
-#
-# The choice of Python (vs bash/awk) is deliberate: markdown fenced
-# blocks can nest or have leading whitespace, and a simple sed script
-# misidentifies blocks inside lists. Python's regex is readable +
-# correct; we already require python3 for other CI jobs.
-while IFS= read -r -d '' md; do
-  rel="${md#"$ROOT"/}"
-  python3 - "$md" "$tmpdir" "$rel" <<'PY'
-import re, sys, os
+product, tmp, binary = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+FENCE = re.compile(r'^([ \t]*)```ya?ml[^\n]*\n(.*?)^\1```', re.M | re.S)
+REF = re.compile(r'\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}')  # no `:-default`
+AES_HEX = '0123456789abcdef' * 4
 
-src_path, tmp_dir, rel = sys.argv[1], sys.argv[2], sys.argv[3]
-with open(src_path) as f:
-    text = f.read()
+def placeholder(name: str) -> str:
+    # An AES key must be 64 hex characters; any other string field takes text.
+    return AES_HEX if 'ENCRYPTION_KEY' in name or name.endswith('_AES_KEY') else f'docs-placeholder-{name.lower()}'
 
-pattern = re.compile(
-    r'```yaml\s*\n(?P<body># validate\s*\n[\s\S]*?)```',
-    re.MULTILINE,
-)
+errors, validated = [], 0
+for md in sorted(product.rglob('*.md')):
+    rel = md.relative_to(product.parent.parent)
+    if md.name == 'changelog.md' and md.parent == product:
+        continue
+    text = md.read_text()
+    for n, m in enumerate(FENCE.finditer(text)):
+        line = text.count('\n', 0, m.start()) + 1
+        body = textwrap.dedent(m.group(2))
+        first = next((l.strip() for l in body.splitlines() if l.strip()), '')
+        if first == '# validate':
+            pass
+        elif first == '# fragment' or re.fullmatch(r'# not-proxy-config: \S.*', first):
+            continue
+        else:
+            errors.append(f'{rel}:{line}: yaml block without a marker (# validate, # fragment, # not-proxy-config: <kind>)')
+            continue
+        validated += 1
+        body = re.sub(r'^[ \t]*# validate[ \t]*\n', '', body, count=1)
+        f = tmp / f'{rel.as_posix().replace("/", "__")}__{n}.yaml'
+        f.write_text(body)
+        env = {'PATH': os.environ['PATH'], 'HOME': os.environ.get('HOME', '/tmp')}
+        env.update({name: placeholder(name) for name in REF.findall(body)})
+        r = subprocess.run([binary, 'config', 'lint', str(f)], env=env, capture_output=True, text=True)
+        if r.returncode != 0:
+            out = (r.stdout + r.stderr).strip().replace('\n', '\n    ')
+            errors.append(f'{rel}:{line}: `config lint` failed\n    {out}')
 
-basename = rel.replace('/', '__').replace('.md', '')
-for idx, m in enumerate(pattern.finditer(text)):
-    body = m.group('body')
-    # Drop the `# validate` marker line.
-    body = re.sub(r'^# validate\s*\n', '', body, count=1)
-    out = os.path.join(tmp_dir, f"{basename}__{idx}.yaml")
-    with open(out, 'w') as f:
-        f.write(body)
-    # Print rel|path so the shell loop can invoke config lint.
-    print(f"{rel}|{out}")
+for e in errors:
+    print(e, file=sys.stderr)
+if errors:
+    sys.exit(1)
+print(f'docs YAML examples OK: {validated} blocks validated, every block marked')
 PY
-done < <(find "$PRODUCT_DIR" -type f -name '*.md' -print0) > "$tmpdir/index.txt"
-
-while IFS='|' read -r rel yaml; do
-  total=$((total + 1))
-  if out=$("$BIN" config lint "$yaml" 2>&1); then
-    :  # valid, no warnings → 0
-  else
-    echo "INVALID: $rel (block extracted to $yaml)" >&2
-    echo "$out" | sed 's/^/    /' >&2
-    fail=1
-  fi
-done < "$tmpdir/index.txt"
-
-if [ "$fail" -eq 0 ]; then
-  echo "docs YAML examples OK: $total blocks validated"
-fi
-
-exit "$fail"

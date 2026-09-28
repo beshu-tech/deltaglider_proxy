@@ -39,7 +39,7 @@ Decide where the bytes live and say so explicitly. Do not take the filesystem de
 In YAML, the backend goes into the `storage` section ([why the UI and the file hold the same configuration](../explanation/two-ways-to-configure.md)). Keep the credentials out of the file with `${env:NAME}` references:
 
 ```yaml
-# fragment
+# validate
 storage:
   backends:
     - name: hetzner-fsn1
@@ -51,8 +51,6 @@ storage:
       secret_access_key: ${env:S3_SECRET_ACCESS_KEY}
   default_backend: hetzner-fsn1
 ```
-
-The docs lint cannot check this block, because it needs the four environment variables. The complete production config at the end of this checklist shows the same backend with the values filled in.
 
 If you use the filesystem backend, the data directory must support xattrs (ext4, XFS, Btrfs, ZFS, APFS). Otherwise, the proxy refuses to start. Backend options: [Configuration → Storage](../reference/configuration.md).
 
@@ -99,7 +97,7 @@ The environment variables `DGP_CACHE_MB` and `DGP_METADATA_CACHE_MB` override th
 
 ## The same change in YAML
 
-Items 2, 3 and 8 write this configuration into `deltaglider_proxy.yaml` ([why the UI and the file hold the same configuration](../explanation/two-ways-to-configure.md)). The backend credentials are shown as literal values here so that the block is complete; in your file, keep them as `${env:NAME}` references:
+Items 2, 3 and 8 write this configuration into `deltaglider_proxy.yaml` ([why the UI and the file hold the same configuration](../explanation/two-ways-to-configure.md)). The backend credentials stay out of the file as `${env:NAME}` references, which the proxy expands from its environment when it loads the file:
 
 ```yaml
 # validate
@@ -110,8 +108,8 @@ storage:
       endpoint: https://fsn1.your-objectstorage.com
       region: fsn1
       force_path_style: true
-      access_key_id: HETZNER-ACCESS-KEY-ID
-      secret_access_key: hetzner-secret-access-key
+      access_key_id: ${env:S3_ACCESS_KEY_ID}
+      secret_access_key: ${env:S3_SECRET_ACCESS_KEY}
   default_backend: hetzner-fsn1
 advanced:
   tls:

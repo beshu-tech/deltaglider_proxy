@@ -19,6 +19,7 @@ An idempotent validate reports `declarative IAM preview: no IAM changes (idempot
 ## Wire shape
 
 ```yaml
+# validate
 access:
   iam_mode: declarative
 

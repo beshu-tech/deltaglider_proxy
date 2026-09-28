@@ -31,6 +31,7 @@ The full reconcile is a directory-scoped tree walk instead of an up-front full l
 ## YAML shape
 
 ```yaml
+# validate
 storage:
   replication:
     enabled: true                    # master kill-switch

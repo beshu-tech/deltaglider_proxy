@@ -92,7 +92,7 @@ Because the diff matches entities by name, an edited `access_key_id` on an exist
 Use `${env:NAME}` references in the committed file:
 
 ```yaml
-# fragment
+# validate
 access:
   iam_users:
     - name: ci-uploader

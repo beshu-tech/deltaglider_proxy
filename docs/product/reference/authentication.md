@@ -134,6 +134,7 @@ s3.upload_file("dump.sql.gz", "db-archive", "nightly/dump.sql.gz")
 Per-bucket configuration grants anonymous read-only access to specific prefixes:
 
 ```yaml
+# validate
 storage:
   buckets:
     downloads:

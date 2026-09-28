@@ -11,6 +11,7 @@ Lifecycle is disabled by default. A rule has to be present, the global switch mu
 ## YAML grammar
 
 ```yaml
+# validate
 storage:
   lifecycle:
     enabled: false                 # default; must be true for run-now/scheduler
@@ -34,6 +35,7 @@ Rule names use `[A-Za-z0-9_.-]{1,64}` and must be unique.
 `action` is either the string `delete` or a tagged transition object:
 
 ```yaml
+# fragment
         action:
           type: transition          # "archive" is accepted as an alias
           destination:
@@ -49,6 +51,7 @@ Rule names use `[A-Za-z0-9_.-]{1,64}` and must be unique.
 `retain-newest` keeps the newest `count` objects in a prefix and deletes the rest. It selects by *count* instead of age, which native S3 lifecycle does not offer. `expire_after` does not apply to a `retain-newest` rule and may be omitted.
 
 ```yaml
+# fragment
       - name: keep-last-two-nightly-dumps
         enabled: true
         bucket: db-archive

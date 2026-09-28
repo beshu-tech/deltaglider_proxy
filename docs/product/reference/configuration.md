@@ -11,6 +11,7 @@ Most readers need three sections of this page: the [YAML layout](#yaml-layout), 
 The canonical YAML has four optional top-level sections:
 
 ```yaml
+# fragment
 # deltaglider_proxy.yaml
 
 admission:   # pre-auth request gating (deny / reject / allow-anonymous)
@@ -70,6 +71,7 @@ The proxy expands these operator shorthands into their canonical forms at load t
 ### Storage shorthand for a single backend
 
 ```yaml
+# validate
 storage:
   s3: https://s3.example.com       # expands to backend: { type: s3, endpoint: ... }
   region: eu-central-1             # optional
@@ -81,6 +83,7 @@ storage:
 or
 
 ```yaml
+# validate
 storage:
   filesystem: /var/lib/deltaglider
 ```
@@ -90,6 +93,7 @@ Only one of `backend:` / `s3:` / `filesystem:` may be set. Companion fields (`re
 ### Bucket `public: true`
 
 ```yaml
+# validate
 storage:
   buckets:
     docs-site:
@@ -132,6 +136,7 @@ HTTP listen address.
 | **Hot-reload** | No (restart required) |
 
 ```yaml
+# validate
 advanced:
   listen_addr: "0.0.0.0:8080"
 ```
@@ -150,6 +155,7 @@ Resolution order: `RUST_LOG` > `DGP_LOG_LEVEL` > `advanced.log_level` in the fil
 | **Hot-reload** | Yes (via admin GUI or `config apply`) |
 
 ```yaml
+# validate
 advanced:
   log_level: deltaglider_proxy=info,tower_http=warn
 ```
@@ -354,6 +360,7 @@ Local filesystem. The proxy uses it when you set `DGP_DATA_DIR` or a `backend:` 
 | **Hot-reload** | Yes (triggers engine rebuild) |
 
 ```yaml
+# fragment
 # Shorthand
 storage:
   filesystem: /var/lib/deltaglider
@@ -383,6 +390,7 @@ AWS S3, MinIO, Hetzner, Backblaze, or any other S3-compatible service. The proxy
 | secret_access_key | `DGP_BE_AWS_SECRET_ACCESS_KEY` | `storage.secret_access_key` | `storage.backend.secret_access_key` | — |
 
 ```yaml
+# fragment
 # Shorthand
 storage:
   s3: https://hel1.your-objectstorage.com
@@ -432,6 +440,7 @@ Proxy-level SigV4 credentials (the "bootstrap admin" credential pair).
 | **Hot-reload** | Yes |
 
 ```yaml
+# validate
 access:
   access_key_id: admin
   secret_access_key: changeme
@@ -478,6 +487,7 @@ The `access.iam_mode` YAML selector controls where IAM state (users, groups, OAu
 | `declarative` | YAML `access.iam_users`, `iam_groups`, `auth_providers`, and `group_mapping_rules` are authoritative. Admin API IAM mutation routes (`POST/PUT/PATCH/DELETE` on `/users`, `/groups`, `/ext-auth/*`, `/migrate`, backup import) return `403 { "error": "iam_declarative" }`. Read routes stay accessible. |
 
 ```yaml
+# validate
 access:
   iam_mode: declarative
 ```
@@ -491,6 +501,7 @@ The initial `gui → declarative` flip is guarded: if YAML contains no users or 
 Request rules gate requests before authentication. Each entry of `blocks` is one rule. The proxy checks the rules from top to bottom, and the first rule that matches decides. The proxy checks your rules *before* the public-access rules that it creates from `storage.buckets[*].public_prefixes`.
 
 ```yaml
+# validate
 admission:
   blocks:
     - name: deny-known-bad-ips
@@ -635,6 +646,7 @@ Per-IP brute-force protection for auth endpoints. See [Rate limits and concurren
 When TLS is enabled, both the S3 API and the admin GUI serve HTTPS on the single listener.
 
 ```yaml
+# validate
 advanced:
   tls:
     enabled: true
@@ -669,6 +681,7 @@ Config sync coordinates several instances through an S3 bucket. When you enable 
 `DGP_CONFIG_SYNC_KEY` (YAML `advanced.config_sync_object_key`) sets the object key of the synced DB in the sync bucket. The default is `.deltaglider/config.db`.
 
 ```yaml
+# validate
 advanced:
   config_sync_bucket: dgp-iam-sync
 ```
@@ -695,6 +708,7 @@ The sync poller starts once, at boot. When you enable or change `config_sync_buc
 You can route different buckets to different storage backends. When `backends` is non-empty, the proxy ignores the legacy single `backend` at runtime.
 
 ```yaml
+# validate
 storage:
   default_backend: hetzner-fsn1
   backends:
@@ -726,6 +740,7 @@ You can add and remove backends in the admin GUI (**Storage → Backends**) with
 Bucket policies are per-bucket overrides. All fields are optional.
 
 ```yaml
+# fragment
 storage:
   buckets:
     releases:
@@ -763,6 +778,7 @@ When `public_prefixes` (or `public: true`) is set, anonymous users can GET, HEAD
 Expiration (delete) and transition/archive rules live under `storage.lifecycle`. Lifecycle is disabled by default. Every delete and copy goes through the DeltaGlider engine.
 
 ```yaml
+# validate
 storage:
   lifecycle:
     enabled: false
@@ -808,6 +824,7 @@ enable `advanced.event_delivery`, a background dispatcher starts, and it POSTs
 each event to every configured webhook endpoint.
 
 ```yaml
+# validate
 advanced:
   event_delivery:
     enabled: true
@@ -842,6 +859,7 @@ fallback) instead of the raw `{schema,event}` envelope. There are two modes, and
 you pick one:
 
 ```yaml
+# validate
 advanced:
   event_delivery:
     enabled: true
@@ -886,6 +904,7 @@ Per-backend encryption with four modes: `none`, `aes256-gcm-proxy`, `sse-kms`, `
 YAML for the named-backends path:
 
 ```yaml
+# validate
 storage:
   backends:
     - name: hetzner-fsn1
@@ -907,6 +926,7 @@ storage:
 YAML for the singleton-backend path (`backends:` empty):
 
 ```yaml
+# fragment
 storage:
   backend: { ... }
   backend_encryption:
@@ -940,6 +960,7 @@ See [Command-line tools](cli.md).
 This YAML example covers every top-level section. The fields that it leaves out keep their defaults.
 
 ```yaml
+# validate
 # deltaglider_proxy.yaml
 
 # Request rules (checked before authentication)

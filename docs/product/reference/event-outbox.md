@@ -25,6 +25,7 @@ After each successful S3 mutation, the proxy writes a durable object event to th
 ## YAML grammar
 
 ```yaml
+# validate
 advanced:
   event_delivery:
     enabled: true
@@ -92,6 +93,7 @@ Filtering: `slack_notify_kinds` (default `["ObjectCreated"]`) selects which even
 Per-bucket / per-prefix channel routing (`slack_routes`) is bot-token-mode-only. An eligible event posts to every route it matches; `slack_channel` is the fallback for events that match no route. The top-level kind/glob filters are a global pre-filter; routes then decide which channels.
 
 ```yaml
+# fragment
   slack_routes:
     - name: "Releases → #ci"
       bucket: "releases"
