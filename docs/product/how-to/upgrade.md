@@ -6,7 +6,11 @@ This guide shows you how to move between DeltaGlider Proxy versions safely, incl
 
 The proxy is a single stateful binary. Every upgrade has three steps: back up, swap, and verify.
 
-1. **Back up first.** Use **Full Backup → Export** in the admin UI, or send a request to the API:
+1. **Back up first.** In the admin UI, open **System → System** (`/_/admin/system`), and click **Download backup** in the backup card at the bottom of the page.
+
+   ![The backup card at the bottom of the System page; the box marks the Download backup button.](/_/screenshots/backup-download.webp)
+
+   Or send a request to the API:
 
    ```bash
    curl -b /tmp/admin.cookies \
@@ -45,7 +49,7 @@ The proxy is a single stateful binary. Every upgrade has three steps: back up, s
    curl -b cookies https://s3.acme.example/_/api/admin/users | jq '.[] | .name'
    ```
 
-4. **If something broke**, the backup zip from step 1 imports atomically:
+4. **If something broke**, the backup zip from step 1 imports atomically. In the admin UI, click **Restore backup** in the same card, select the zip, and choose what to restore. Or send it to the API:
 
    ```bash
    curl -b cookies -X POST \
@@ -53,6 +57,8 @@ The proxy is a single stateful binary. Every upgrade has three steps: back up, s
      --data-binary @dgp-backup-...zip \
      https://s3.acme.example/_/api/admin/backup
    ```
+
+   Without a `mode` parameter, the API restores everything, including the admin password of the backup. When the config file is read-only, a restore that includes the config answers `409 config_file_read_only`. [How to back up and restore](back-up-and-restore.md) lists the modes.
 
 ## Version compatibility
 
@@ -93,6 +99,7 @@ Without `--out`, the migrator writes the YAML to stdout, and you can pipe it to 
 **2. Inspect the output.** Canonical YAML uses the four-section shape:
 
 ```yaml
+# fragment
 admission:
   blocks: []
 
@@ -110,8 +117,9 @@ storage:
 
 advanced:
   cache_size_mb: 1024
-  session_ttl_hours: 4
 ```
+
+The `...` values stand for your own values. The session lifetime of the admin UI is not in the file: it is the environment variable `DGP_SESSION_TTL_HOURS` (default `4`). The proxy refuses an unknown key, so do not add it to `advanced`.
 
 The migrator keeps the SigV4 credentials (`access.access_key_id` / `secret_access_key` and the storage backend credentials), so you can use the output as it is. It strips only the infrastructure secrets (the bootstrap password hash and any encryption keys). Supply those again with env vars (see step 5).
 
@@ -187,6 +195,7 @@ The changes:
 To convert the pre-v0.9 YAML of a single-backend deployment, start from this YAML:
 
 ```yaml
+# not-proxy-config: pre-0.9 config, which current releases refuse
 # OLD (pre-0.9)
 advanced:
   encryption_key: 0123456789abcdef...
@@ -195,6 +204,7 @@ advanced:
 becomes:
 
 ```yaml
+# fragment
 # NEW (v0.9+)
 storage:
   backend_encryption:
