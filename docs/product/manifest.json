@@ -102,6 +102,11 @@
       "order": 60
     },
     {
+      "path": "how-to/rotate-the-config-db-key",
+      "group": "Guides: deploy & operate",
+      "order": 62
+    },
+    {
       "path": "how-to/backend-capability-validation",
       "group": "Guides: deploy & operate",
       "order": 65
