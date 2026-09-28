@@ -111,6 +111,8 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Verify tests/*.rs map to CI --test flags
         run: ./scripts/check-integration-tests-in-ci.sh
+      - name: Memory-derived cargo parallelism truth table
+        run: ./scripts/test-cargo-jobs.sh
 
   verify-spdx-headers:
     name: SPDX license headers

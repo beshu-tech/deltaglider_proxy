@@ -49,8 +49,12 @@ COPY --from=ui-build /app/demo/s3-browser/ui/dist demo/s3-browser/ui/dist
 # node:alpine UI stage: that image has no bash and its BusyBox grep has no
 # --include, which would make the script fail (or, worse, pass vacuously).
 COPY scripts/check-bundle-fingerprints.sh scripts/check-bundle-fingerprints.sh
+COPY scripts/cargo-jobs.sh scripts/cargo-jobs.sh
 RUN ./scripts/check-bundle-fingerprints.sh demo/s3-browser/ui/dist Cargo.toml
-RUN cargo build --release
+# Parallel jobs from the memory budget, not the CPU count: cargo alone starts
+# one rustc per CPU and a build container with a modest memory limit is killed
+# mid-build (scripts/cargo-jobs.sh has the measured per-job peaks).
+RUN CARGO_BUILD_JOBS="$(./scripts/cargo-jobs.sh)" cargo build --release
 
 # ── Runtime ──
 # Security notes:
