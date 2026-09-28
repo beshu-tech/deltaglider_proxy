@@ -49,7 +49,7 @@ test('the editor shows the other conditions read-only and keeps them on edit', a
 
   const user = userEvent.setup();
   await user.type(screen.getByPlaceholderText(/192\.168\.0\.0\/16, 10/), '1.2.3.4/32');
-  const last = onChange.mock.calls.at(-1)![0][0] as PermissionRow;
+  const last = onChange.mock.calls[onChange.mock.calls.length - 1][0][0] as PermissionRow;
   expect(last.conditions?.StringNotLike).toEqual(conditions.StringNotLike);
   expect(last.conditions?.NotIpAddress).toEqual(conditions.NotIpAddress);
 });
