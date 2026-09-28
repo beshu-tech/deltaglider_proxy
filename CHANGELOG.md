@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed — A refused lifecycle "Run now" names the GUI switch
+
+When lifecycle is off, "Run now" on a lifecycle rule is refused. The message
+named only the YAML key `storage.lifecycle.enabled`. It now also says to turn
+on "Run lifecycle rules on schedule" on the Jobs page. The message for a
+disabled rule now names the rule's Enabled switch as well as `enabled: true`
+in YAML.
+
 ### Fixed — The YAML import says when the config file is read-only
 
 When `POST /_/api/admin/config/apply` worked in the running proxy but could not

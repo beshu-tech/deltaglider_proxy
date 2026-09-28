@@ -100,6 +100,25 @@ async fn set_paused(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Why run-now refuses a lifecycle rule, or `None` when it may run. Names
+/// the GUI switch as well as the YAML key: a GUI-only operator has no YAML.
+fn run_now_refusal(global_enabled: bool, rule_enabled: bool, rule: &str) -> Option<String> {
+    if !global_enabled {
+        return Some(
+            "lifecycle is globally disabled (storage.lifecycle.enabled = false). Turn on \
+             \"Run lifecycle rules on schedule\" on the Jobs page, or set \
+             storage.lifecycle.enabled: true"
+                .to_string(),
+        );
+    }
+    (!rule_enabled).then(|| {
+        format!(
+            "rule '{rule}' is disabled. Turn on its Enabled switch in the rule's Definition \
+             tab on the Jobs page, or set enabled: true on the rule in YAML"
+        )
+    })
+}
+
 pub async fn run_now(
     state: Arc<AdminState>,
     name: String,
@@ -119,16 +138,8 @@ pub async fn run_now(
         .cloned()
         .ok_or_else(|| AdminError::not_found("rule not found"))?;
 
-    if !lifecycle_cfg.enabled {
-        return Err(AdminError::conflict(
-            "lifecycle is globally disabled (storage.lifecycle.enabled = false)",
-        ));
-    }
-    if !rule.enabled {
-        return Err(AdminError::conflict(format!(
-            "rule '{}' is disabled (set enabled: true in YAML to run it)",
-            rule.name
-        )));
+    if let Some(why) = run_now_refusal(lifecycle_cfg.enabled, rule.enabled, &rule.name) {
+        return Err(AdminError::conflict(why));
     }
 
     // Pre-gate: a fatal-config rule (missing expire_after, empty transition
@@ -269,4 +280,34 @@ pub async fn run_now(
             ..Default::default()
         },
     ))
+}
+
+#[cfg(test)]
+mod run_now_refusal_tests {
+    use super::run_now_refusal;
+
+    #[test]
+    fn names_the_gui_switch_and_the_yaml_key() {
+        assert_eq!(run_now_refusal(true, true, "expire-old"), None);
+        let global = run_now_refusal(false, true, "expire-old").unwrap();
+        assert!(
+            global.starts_with("lifecycle is globally disabled"),
+            "{global}"
+        );
+        assert!(
+            global.contains("Turn on \"Run lifecycle rules on schedule\" on the Jobs page")
+                && global.contains("storage.lifecycle.enabled: true"),
+            "{global}"
+        );
+        // The master switch is reported first: turning on the rule alone
+        // would not make it run.
+        assert_eq!(run_now_refusal(false, false, "expire-old"), Some(global));
+        let rule = run_now_refusal(true, false, "expire-old").unwrap();
+        assert!(
+            rule.contains("rule 'expire-old' is disabled")
+                && rule.contains("Enabled switch")
+                && rule.contains("enabled: true"),
+            "{rule}"
+        );
+    }
 }
