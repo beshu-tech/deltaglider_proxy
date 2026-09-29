@@ -67,7 +67,7 @@ export interface Shot {
   clipPadding?: number;
   /** Extra volatile regions to paint over (server times, live numbers). */
   mask?: Target[];
-  /** CSS viewport; default 1280x800 at device scale 2. */
+  /** CSS viewport; default 1040x820 at device scale 2. */
   viewport?: { width: number; height: number };
   /** `none`: capture signed out. Default: signed in as the bootstrap admin. */
   auth?: 'admin' | 'none';

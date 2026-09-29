@@ -68,7 +68,7 @@ export const STORAGE_SHOTS: Shot[] = [
     setup: openNewS3Backend,
     // The form is taller than what is left of the screen under the list:
     // scroll it to the middle, then crop to it.
-    viewport: { width: 1280, height: 900 },
+    viewport: { width: 1040, height: 900 },
     clip: { union: [{ text: 'New Backend', exact: true }, { testId: 'backend-create' }] },
     clipPadding: 56,
     annotations: [
@@ -303,7 +303,7 @@ const BUCKET_POLICY_SHOTS: Shot[] = [
     route: '/_/admin/storage/buckets',
     alt: 'A new settings row is open; callout 4 marks the Bucket name field, callout 5 marks the Backend list, set to aws-dr, callout 6 marks Advanced, and callout 7 marks Real name on backend, set to acme-firmware.',
     // The new row sits below the four buckets: a taller screen shows all of it.
-    viewport: { width: 1280, height: 1000 },
+    viewport: { width: 1040, height: 1000 },
     setup: async (page) => {
       await openDraft(page);
       await backendSelect(page).click();

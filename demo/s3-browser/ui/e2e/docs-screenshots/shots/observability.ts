@@ -30,6 +30,7 @@ export const OBSERVABILITY_SHOTS: Shot[] = [
   },
   {
     id: 'logs-follow',
+    viewport: { width: 1280, height: 820 }, // the layout drops this control below 1280 px
     route: '/_/admin/diagnostics/logs',
     // The startup line carries the crate version, which no shot may show:
     // filter the view to one replication line of the seed (a short list

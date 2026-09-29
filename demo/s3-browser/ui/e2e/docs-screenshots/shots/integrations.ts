@@ -97,7 +97,7 @@ export const INTEGRATIONS_SHOTS: Shot[] = [
       await slack(page, 'webhook');
       await page.getByText('Payload format', { exact: true }).evaluate((el) => el.scrollIntoView({ block: 'start' }));
     },
-    viewport: { width: 1280, height: 1000 },
+    viewport: { width: 1040, height: 1000 },
     clip: { union: [{ text: 'Payload format', exact: true }, { css: 'button[title="Remove webhook URL"]' }, { role: 'button', name: /Add webhook URL/ }] },
     clipPadding: 56,
     annotations: [

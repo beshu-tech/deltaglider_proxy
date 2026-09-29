@@ -103,7 +103,7 @@ export const SYSTEM_SHOTS: Shot[] = [
     route: '/_/admin/system',
     alt: 'TLS is on and both certificate paths are filled in; callout 3 marks the Certificate path and Private key path fields, and callout 4 marks Review & apply in the bar above the cards.',
     setup: fillTls,
-    viewport: { width: 1280, height: 1000 },
+    viewport: { width: 1040, height: 1000 },
     clip: { union: [reviewApply, { text: 'TLS', exact: true }, { placeholder: keyPath }] },
     clipPadding: 48,
     annotations: [

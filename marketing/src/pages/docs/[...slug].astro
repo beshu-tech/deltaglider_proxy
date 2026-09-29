@@ -325,6 +325,22 @@ if (showToc && html) {
       });
     }
 
+    // ── Click a screenshot to see it full size ────────────────────────────
+    const box = document.createElement('dialog');
+    box.className = 'docs-lightbox';
+    box.setAttribute('aria-label', 'Screenshot, full size');
+    const big = document.createElement('img');
+    box.append(big);
+    document.body.append(box);
+    box.addEventListener('click', () => box.close());
+    document.querySelectorAll<HTMLImageElement>('.docs-prose img').forEach((img) => {
+      img.addEventListener('click', () => {
+        big.src = img.currentSrc || img.src;
+        big.alt = img.alt;
+        box.showModal();
+      });
+    });
+
     // ── Copy-to-clipboard on every code block ─────────────────────────────
     // Skip mermaid (it's a diagram, not copyable source).
     const blocks = document.querySelectorAll<HTMLElement>('.docs-prose pre:not(.mermaid)');

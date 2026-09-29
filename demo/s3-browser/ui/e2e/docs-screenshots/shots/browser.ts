@@ -20,6 +20,7 @@ const FW = '/_/browse/releases/firmware/widget-3000/';
 export const BROWSER_SHOTS: Shot[] = [
   {
     id: 'browser-releases',
+    viewport: { width: 1280, height: 820 }, // the layout drops this control below 1280 px
     route: FW,
     alt: 'The object browser lists four firmware tarballs in the releases bucket, each stored as a delta; the box marks how much smaller the folder is than its original size.',
     // The chip counts up to its value; wait until the text stops changing.
@@ -47,7 +48,7 @@ export const BROWSER_SHOTS: Shot[] = [
   {
     id: 'shortcuts-help',
     route: '/_/admin/jobs',
-    viewport: { width: 1280, height: 1400 },
+    viewport: { width: 1040, height: 1400 },
     clip: { role: 'dialog' },
     clipPadding: 24,
     alt: 'The shortcuts dialog lists the keyboard shortcuts of the admin pages.',

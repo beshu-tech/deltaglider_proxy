@@ -16,7 +16,7 @@ async function pick(page: Page, name: string): Promise<void> {
 }
 
 /** The user and group editors are taller than one screen. */
-const TALL = { width: 1280, height: 1800 };
+const TALL = { width: 1040, height: 1800 };
 
 /** An option of the one open (visible) AntD select dropdown. */
 const openOption = (page: Page, title: string) =>
@@ -195,7 +195,7 @@ export const ACCESS_SHOTS: Shot[] = [
     id: 'secure-credentials-mode',
     route: '/_/admin/access/credentials',
     alt: 'The Credentials & mode page; callout 1 marks Auto-detect (recommended) under S3 authentication mode, and callout 2 marks the Bootstrap SigV4 credentials card, which holds the access key ID of the proxy.',
-    viewport: { width: 1280, height: 1300 },
+    viewport: { width: 1040, height: 1300 },
     clip: { union: [{ text: 'S3 authentication mode', exact: true }, BOOTSTRAP_CARD] },
     clipPadding: 40,
     annotations: [
@@ -208,7 +208,7 @@ export const ACCESS_SHOTS: Shot[] = [
     id: 'iam-users-new-form',
     route: '/_/admin/access/users',
     alt: 'The Users page with the form of the new ci-uploader user; callout 1 marks Users in the sidebar, callout 2 the New button, callout 3 the Name field, callout 4 the rule that allows List, Read and Write on releases/firmware/*, and callout 5 the Create User button.',
-    viewport: { width: 1280, height: 1200 },
+    viewport: { width: 1040, height: 1200 },
     setup: async (page) => {
       await withoutUser(page, 'ci-uploader');
       await page.getByRole('button', { name: 'New User' }).click();
@@ -316,7 +316,7 @@ export const ACCESS_SHOTS: Shot[] = [
     id: 'iam-conditions-list-prefix',
     route: '/_/admin/access/users',
     alt: 'A second rule of the dana user denies List on every bucket when the listed prefix matches .*; callout 1 marks Add Permission Rule, callout 2 the Deny setting, callout 3 the List prefix field, and callout 4 the Save button.',
-    viewport: { width: 1280, height: 2200 },
+    viewport: { width: 1040, height: 2200 },
     setup: async (page) => {
       await pick(page, 'dana');
       await page.getByRole('button', { name: 'Add Permission Rule' }).click();
@@ -442,7 +442,7 @@ export const ACCESS_SHOTS: Shot[] = [
     id: 'admission-add-rule',
     route: '/_/admin/access/admission',
     alt: 'The Add request rule form holds the rule deny-anonymous-writes-downloads; callout 1 marks the Add rule button of the page, callout 2 the conditions, callout 3 the Deny (403) action under Then, and callout 4 the Add rule button of the form.',
-    viewport: { width: 1280, height: 1000 },
+    viewport: { width: 1040, height: 1000 },
     setup: async (page) => {
       await withoutExampleRule(page);
       await fillExampleRule(page);

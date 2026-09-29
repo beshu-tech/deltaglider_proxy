@@ -69,7 +69,7 @@ const SHOT_CSS = `
 `;
 
 async function capture(browser: Browser, shot: Shot, theme: (typeof THEMES)[number]): Promise<void> {
-  const viewport = shot.viewport ?? { width: 1280, height: 800 };
+  const viewport = shot.viewport ?? { width: 1040, height: 820 };
   const ctx = await browser.newContext({
     baseURL: BASE,
     viewport,

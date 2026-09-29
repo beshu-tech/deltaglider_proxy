@@ -252,7 +252,7 @@ export const JOBS_SHOTS: Shot[] = [
     alt: 'A new lifecycle rule named expire-nightly-dumps; callout 3 marks Rule name, callout 4 marks the Enabled switch, which stays off, callout 5 marks Scope, set to db-archive and nightly/, callout 6 marks Expire after, set to 90d, and callout 7 marks Action, set to Delete.',
     setup: lifecycleDraft,
     // The Action field sits below the fold of the default 800px viewport.
-    viewport: { width: 1280, height: 960 },
+    viewport: { width: 1040, height: 960 },
     annotations: [
       { target: { text: 'Rule name', exact: true, within: drawer }, kind: 'callout', label: '3', side: 'left' },
       { target: { text: 'Enabled', exact: true, within: drawer }, kind: 'callout', label: '4', side: 'left' },
@@ -323,6 +323,7 @@ export const JOBS_SHOTS: Shot[] = [
   },
   {
     id: 'lifecycle-scheduler-switch',
+    viewport: { width: 1280, height: 820 }, // the layout drops this control below 1280 px
     route: '/_/admin/jobs',
     alt: 'The Jobs page with the switch Run lifecycle rules on schedule, which is on; the arrow points at the switch.',
     annotations: [{ target: { role: 'switch', name: 'Run lifecycle rules on schedule' }, kind: 'arrow', side: 'left' }],

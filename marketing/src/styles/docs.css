@@ -31,7 +31,7 @@
   gap: 48px;
   /* Same cap as .has-toc below — the landing (no TOC) must not be narrower
      than a doc page, or the layout visibly jumps when navigating. */
-  max-width: 1240px;
+  max-width: 1400px;
   margin: 0 auto;
   padding: 44px 2rem 96px;
   align-items: start;
@@ -41,12 +41,12 @@
 /* 3-column (sidebar | content | TOC) on docs that carry a TOC. */
 .docs-shell.has-toc {
   grid-template-columns: 250px minmax(0, 1fr) 210px;
-  max-width: 1240px;
+  max-width: 1400px;
 }
 
 /* The docs header and footer use the docs shell width, so the logo lines
    up with the sidebar. */
-body.shell-wide { --shell: 1240px; }
+body.shell-wide { --shell: 1400px; }
 
 /* ── Left sidebar: logbook index ───────────────────────────────────────── */
 .docs-sidebar {
@@ -447,6 +447,16 @@ body.shell-wide { --shell: 1240px; }
 .docs-prose img {
   max-width: 100%; height: auto; display: block; margin: 20px 0;
   border: 1px solid var(--rule); border-radius: 10px;
+  cursor: zoom-in;
+}
+/* Click-to-zoom: the full-resolution shot on a dimmed page. */
+.docs-lightbox {
+  border: none; padding: 0; background: transparent; max-width: 96vw; max-height: 96vh;
+}
+.docs-lightbox::backdrop { background: rgb(2 6 23 / 0.82); }
+.docs-lightbox img {
+  display: block; margin: 0; max-width: 96vw; max-height: 94vh; width: auto; height: auto;
+  border-radius: 10px; cursor: zoom-out; background: var(--bg);
 }
 
 /* ════════════════════════════════════════════════════════════════════════
