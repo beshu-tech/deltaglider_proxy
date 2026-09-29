@@ -453,7 +453,7 @@ body.shell-wide { --shell: 1400px; }
 .docs-lightbox {
   border: none; padding: 0; background: transparent; max-width: 96vw; max-height: 96vh;
 }
-.docs-lightbox::backdrop { background: rgb(2 6 23 / 0.82); }
+.docs-lightbox::backdrop { background: var(--scrim-strong); }
 .docs-lightbox img {
   display: block; margin: 0; max-width: 96vw; max-height: 94vh; width: auto; height: auto;
   border-radius: 10px; cursor: zoom-out; background: var(--bg);
