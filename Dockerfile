@@ -17,45 +17,18 @@ COPY Cargo.toml /app/Cargo.toml
 RUN npm run build
 
 # ── Build stage: Rust ──
-# Base: debian:bookworm-slim, the runtime base, so the binary's glibc always
-# matches the image it runs in. Rust comes from rustup-init (checksum-pinned
-# per arch) at the version in rust-toolchain.toml, the single toolchain pin.
-# This is the official rust image's own recipe; it does not wait for Docker
-# Hub to publish rust:<new>-bookworm (on 2026-10-01, release day of 1.99.0,
-# no rust:1.99* tag existed yet). NOTE: we deliberately do NOT use cargo-chef
+# Pin the Rust toolchain (the floating `rust:1-bookworm` tag drifts and has
+# caused reproducibility breaks). NOTE: we deliberately do NOT use cargo-chef
 # here — cargo-chef 0.1.77's prepare/cook round-trip writes a recipe whose
 # auto-discovered targets carry a target-level `edition`, which modern `cargo
 # build` rejects as a hard error ("failed to parse manifest"), breaking the
 # image build on every recent Rust. A plain single-stage build is correct and
 # robust; dependency compilation is cached by buildx's GHA layer cache across
 # release runs, so the lost cargo-chef dep-layer is not a meaningful regression.
-FROM debian:bookworm-slim AS rust-build
-# Bump RUSTUP_VERSION together with both sha256 values below
-# (static.rust-lang.org/rustup/archive/<version>/<host>/rustup-init.sha256).
-ARG RUSTUP_VERSION=1.29.1
-ENV RUSTUP_HOME=/usr/local/rustup \
-    CARGO_HOME=/usr/local/cargo \
-    PATH=/usr/local/cargo/bin:$PATH
-COPY rust-toolchain.toml /tmp/rust-toolchain.toml
-# gcc + libc6-dev: C parts of aws-lc-sys, ring and sqlcipher. libssl-dev +
-# pkg-config: sqlcipher links the system libcrypto.
+FROM rust:1.98-bookworm AS rust-build
 RUN apt-get -o Acquire::Retries=3 update && apt-get install -y --no-install-recommends \
-    ca-certificates curl gcc libc6-dev libssl-dev pkg-config \
-    xdelta3=3.0.11-dfsg-1.2 \
+    pkg-config xdelta3=3.0.11-dfsg-1.2 \
     && rm -rf /var/lib/apt/lists/* \
-    && case "$(dpkg --print-architecture)" in \
-         amd64) host=x86_64-unknown-linux-gnu; sha=dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71 ;; \
-         arm64) host=aarch64-unknown-linux-gnu; sha=15f6e4ce9f583b929c996c91562bad6d4454f3281de858b02cdfdef615fac433 ;; \
-         *) echo "unsupported architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
-       esac \
-    && curl -fsSLo /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${host}/rustup-init" \
-    && echo "${sha}  /tmp/rustup-init" | sha256sum -c - \
-    && chmod +x /tmp/rustup-init \
-    && toolchain="$(sed -n 's/^channel = "\(.*\)"$/\1/p' /tmp/rust-toolchain.toml)" \
-    && [ -n "$toolchain" ] \
-    && /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain "$toolchain" --default-host "$host" \
-    && rm /tmp/rustup-init /tmp/rust-toolchain.toml \
-    && rustc --version \
     # Pin xdelta3 so the delta FORMAT the proxy produces can't silently drift on
     # a base-image bump (newer xdelta3 armors by default — see codec.rs `-a`).
     # Assert it actually landed.
