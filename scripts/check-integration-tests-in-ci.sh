@@ -39,6 +39,16 @@ for name in "${names[@]}"; do
     fi
   done
 done
+# Every libtest filter in ci.yml: the `cargo test --test all` command lines
+# (with their `\` continuations) and the test-integration matrix `filters: >-`
+# blocks (one `<name>::` per line).
+ci_filters() {
+  {
+    awk '/cargo test .*--test all/ {c=1} c {print; if ($0 !~ /\\$/) c=0}' .github/workflows/ci.yml
+    awk '/filters: >-/ {f=1; next} f && /^[[:space:]]+[a-z0-9_]+::[[:space:]]*$/ {print; next} {f=0}' .github/workflows/ci.yml
+  } | grep -oE '[a-z0-9_]+::' | sed 's/::$//'
+}
+
 # Reverse direction: a filter naming no test module would silently run zero
 # tests (the old `--test <name>` form failed loudly on a missing target).
 while read -r filter; do
@@ -46,8 +56,14 @@ while read -r filter; do
     echo "error: ci.yml filter '${filter}::' matches no tests/${filter}.rs (it would run zero tests)" >&2
     err=1
   fi
-done < <(awk '/cargo test .*--test all/ {c=1} c {print; if ($0 !~ /\\$/) c=0}' .github/workflows/ci.yml \
-          | grep -oE '[a-z0-9_]+::' | sed 's/::$//' | sort -u)
+done < <(ci_filters | sort -u)
+
+# A module in two selections (two matrix groups, or a group and test-delta)
+# runs twice per CI run.
+while read -r dup; do
+  echo "error: ci.yml selects '${dup}::' more than once" >&2
+  err=1
+done < <(ci_filters | sort | uniq -d)
 
 # An #[ignore]d test is "selected" above but never runs in CI (no job passes
 # --ignored). Allow one only when its reason names the manual command that

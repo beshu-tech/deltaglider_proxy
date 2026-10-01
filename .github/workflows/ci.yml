@@ -251,10 +251,9 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --locked --no-deps
 
-  # ── Test jobs: split into 3 parallel groups for ~3x faster wall-clock ──
+  # ── Test jobs: unit, delta, and the 3-way integration matrix run in parallel ──
   # Each job restores the shared `test` dependency cache, then compiles only
   # this crate.
-  # Split by execution time: unit (~60s), integration-fast (~50s), integration-slow (~70s).
 
   test-unit:
     name: Unit Tests
@@ -297,7 +296,7 @@ jobs:
         run: cargo test --bins --locked
 
   test-integration:
-    name: Integration Tests
+    name: Integration Tests (${{ matrix.group }}/3)
     # Runs on every event. The repo commits straight to main, so a push is
     # the only gate before production; skipping it there let the whole MinIO
     # suite gate nothing. `[skip-integration]` in the commit message opts a
@@ -308,6 +307,99 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-ui
     timeout-minutes: 60
+    # Three parallel jobs. Groups are balanced on measured per-test time
+    # (libtest --report-time, 4 threads, 2026-10-01: ~430 test-seconds each);
+    # one job ran the whole suite in ~6 min of test time. Rebalance when a
+    # group's step grows past the others.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: 1
+            filters: >-
+              admin_login_as_test::
+              auth_integration_test::
+              aws_chunked_upload_test::
+              cli_s3_migrate_test::
+              cli_s3_purge_test::
+              cli_s3_rm_test::
+              coordination_bucket_reserved_test::
+              delta_passthrough_test::
+              folder_marker_test::
+              harness_port_test::
+              iam_declarative_reconcile_test::
+              iam_identity_test::
+              iam_mode_test::
+              iam_persona_test::
+              list_truncation_test::
+              mismatch_boot_test::
+              parity_test::
+              quota_test::
+              race_conditions_test::
+              reference_lock_race_test::
+              s3_backend_test::
+              s3_correctness_test::
+              s3_integration_test::
+              savings_test::
+              streaming_copy_test::
+          - group: 2
+            filters: >-
+              admin_config_test::
+              admin_handlers_test::
+              admin_section_test::
+              bootstrap_password_hash_invariant_test::
+              cli_admin_test::
+              cli_s3_bucket_acl_test::
+              cli_s3_cp_test::
+              cli_s3_stats_test::
+              cli_s3_verify_test::
+              config_sync_ha_test::
+              config_sync_test::
+              coordination_lease_test::
+              encryption_test::
+              error_test::
+              generation_pin_test::
+              iam_list_scope_test::
+              large_object_e2e_test::
+              lifecycle_test::
+              logs_test::
+              maintenance_backfill_test::
+              metadata_validation_test::
+              migrate_job_test::
+              multipart_etag_test::
+              multipart_relay_test::
+              replication_target_only_test::
+              replication_test::
+              storage_resilience_test::
+              unmanaged_objects_test::
+          - group: 3
+            filters: >-
+              admin_bulk_objects_test::
+              admission_test::
+              backend_capability_gate_test::
+              backend_health_test::
+              browser_session_connect_test::
+              bucket_existence_test::
+              bucket_usage_test::
+              cli_s3_ls_test::
+              cli_s3_sync_test::
+              concurrency_test::
+              external_auth_test::
+              harness_signed_http_test::
+              iam_authorization_test::
+              iam_test::
+              iam_variables_clone_test::
+              maintenance_reencrypt_test::
+              multipart_complete_resilience_test::
+              oidc_login_test::
+              prod_shape_matrix_test::
+              public_prefix_list_test::
+              public_prefix_test::
+              s3_api_test::
+              s3_compat_test::
+              s3_edge_semantics_test::
+              status_endpoints_test::
+              tls_listener_test::
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       # Raise the open-file limit: the integration suite runs many proxies
@@ -330,7 +422,7 @@ jobs:
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
         with:
           shared-key: test
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.group == 1 }}
           cache-bin: "false"
       - uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v6.0.0
         with:
@@ -359,95 +451,10 @@ jobs:
           mc mb --ignore-existing local/deltaglider-test
           mc mb --ignore-existing local/deltaglider-data
           echo "MINIO_ENDPOINT=http://localhost:9000" >> $GITHUB_ENV
-      - name: Integration tests (fast)
+      - name: Integration tests (group ${{ matrix.group }})
         env:
           RUST_BACKTRACE: "1"
-        run: |
-          cargo test --locked --test all -- --nocapture \
-            bootstrap_password_hash_invariant_test:: \
-            auth_integration_test:: \
-            concurrency_test:: \
-            error_test:: \
-            iam_authorization_test:: \
-            iam_persona_test:: \
-            iam_test:: \
-            list_truncation_test:: \
-            metadata_validation_test:: \
-            s3_api_test:: \
-            s3_backend_test:: \
-            s3_compat_test:: \
-            s3_edge_semantics_test:: \
-            s3_integration_test:: \
-            status_endpoints_test:: \
-            storage_resilience_test:: \
-            tls_listener_test:: \
-            unmanaged_objects_test::
-      - name: Integration tests (admin, IAM, replication, lifecycle, …)
-        env:
-          RUST_BACKTRACE: "1"
-        run: |
-          cargo test --locked --test all -- --nocapture \
-            admin_bulk_objects_test:: \
-            browser_session_connect_test:: \
-            admin_config_test:: \
-            admin_handlers_test:: \
-            admin_login_as_test:: \
-            admin_section_test:: \
-            bucket_existence_test:: \
-            cli_admin_test:: \
-            cli_s3_bucket_acl_test:: \
-            cli_s3_cp_test:: \
-            cli_s3_ls_test:: \
-            cli_s3_migrate_test:: \
-            cli_s3_purge_test:: \
-            cli_s3_rm_test:: \
-            cli_s3_stats_test:: \
-            cli_s3_sync_test:: \
-            cli_s3_verify_test:: \
-            backend_capability_gate_test:: \
-            backend_health_test:: \
-            config_sync_ha_test:: \
-            config_sync_test:: \
-            coordination_bucket_reserved_test:: \
-            oidc_login_test:: \
-            coordination_lease_test:: \
-            race_conditions_test:: \
-            reference_lock_race_test:: \
-            encryption_test:: \
-            external_auth_test:: \
-            iam_declarative_reconcile_test:: \
-            iam_identity_test:: \
-            iam_mode_test:: \
-            iam_variables_clone_test:: \
-            lifecycle_test:: \
-            maintenance_backfill_test:: \
-            maintenance_reencrypt_test:: \
-            migrate_job_test:: \
-            mismatch_boot_test:: \
-            harness_port_test:: \
-            harness_signed_http_test:: \
-            quota_test:: \
-            replication_target_only_test:: \
-            replication_test:: \
-            delta_passthrough_test:: \
-            streaming_copy_test:: \
-            generation_pin_test:: \
-            large_object_e2e_test:: \
-            parity_test:: \
-            savings_test:: \
-            bucket_usage_test:: \
-            logs_test:: \
-            admission_test:: \
-            aws_chunked_upload_test:: \
-            iam_list_scope_test:: \
-            multipart_etag_test:: \
-            multipart_complete_resilience_test:: \
-            multipart_relay_test:: \
-            prod_shape_matrix_test:: \
-            public_prefix_list_test:: \
-            public_prefix_test:: \
-            folder_marker_test:: \
-            s3_correctness_test::
+        run: cargo test --locked --test all -- --nocapture ${{ matrix.filters }}
       - name: Clean up MinIO test data
         if: always()
         run: |
