@@ -233,7 +233,8 @@ jobs:
       - name: cargo build --release
         run: scripts/ci-memwatch.sh cargo build --locked --release --bin deltaglider_proxy
       - name: Install Playwright Chromium
-        run: cd demo/s3-browser/ui && npx playwright install chromium --with-deps
+        # Browser only: system libraries are in the builder image.
+        run: cd demo/s3-browser/ui && npx playwright install chromium
       - name: QA regression spec
         env:
           DELTAGLIDER_PROXY_BIN: ${{ github.workspace }}/target/release/deltaglider_proxy

@@ -524,7 +524,9 @@ jobs:
       - name: Install Playwright Chromium
         run: |
           cd demo/s3-browser/ui
-          npx playwright install chromium --with-deps
+          # Browser only: the builder image carries Chromium's system
+          # libraries (.github/builder/Dockerfile, PLAYWRIGHT_VERSION).
+          npx playwright install chromium
       - name: Smoke + full flow, open access
         env:
           DELTAGLIDER_PROXY_BIN: ${{ github.workspace }}/target/release/deltaglider_proxy
