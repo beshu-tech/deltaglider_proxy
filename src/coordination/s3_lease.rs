@@ -19,7 +19,6 @@
 //! clocks do not matter. A body from the previous release (no `ttl_secs`) is
 //! still judged by its writer-clock `expires_at`.
 
-use async_trait::async_trait;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use serde::{Deserialize, Serialize};
@@ -278,7 +277,6 @@ impl S3Lease {
     }
 }
 
-#[async_trait]
 impl CoordinationLease for S3Lease {
     async fn try_acquire(
         &self,

@@ -826,7 +826,7 @@ mod generation_tests {
 
     #[test]
     fn same_generation_truth_table() {
-        type E = DeltaGliderEngine<Box<dyn crate::storage::StorageBackend>>;
+        type E = DeltaGliderEngine<Box<crate::storage::DynStorageBackend<'static>>>;
         // Identical sha → same.
         assert!(E::same_generation(
             &meta(10, "aa", "m1", None),

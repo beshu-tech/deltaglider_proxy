@@ -23,6 +23,7 @@
 //! reported separately.
 
 use crate::api::admin::extract::AdminQuery;
+use crate::coordination::CoordinationLease;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;

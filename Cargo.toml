@@ -67,7 +67,13 @@ aws-smithy-http-client = { version = "1", default-features = false, features = [
 aws-smithy-runtime-api = { version = "1", features = ["client"] }
 
 # Async support
+# Only for the s3s traits (s3s::S3, S3Auth, S3Access), which s3s declares with
+# #[async_trait]. Our own async traits use native `async fn` (RPITIT + Send).
 async-trait = "0.1"
+# `dyn` dispatch for our native async traits (StorageBackend, CoordinationLease,
+# ReferenceLock, EventDeliveryClient): generates `DynX` with boxed futures;
+# static dispatch stays unboxed. Native `dyn` async traits are not stable yet.
+dynosaur = "0.3"
 
 # Delta compression (uses xdelta3 CLI binary, no Rust crate needed)
 

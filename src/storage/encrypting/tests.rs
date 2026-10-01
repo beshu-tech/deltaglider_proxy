@@ -721,7 +721,6 @@ mod wrapper_tests {
     // fetch must cover `[0, CHUNK_HEADER_LEN)`.
     // ─────────────────────────────────────────────────────────────────
 
-    use async_trait::async_trait;
     use bytes::Bytes;
     use chrono::Utc;
     use futures::stream::BoxStream;
@@ -765,7 +764,6 @@ mod wrapper_tests {
         StorageError::Other("CountingBackend: not implemented for this test".into())
     }
 
-    #[async_trait]
     impl StorageBackend for CountingBackend {
         async fn reference_fence(
             &self,

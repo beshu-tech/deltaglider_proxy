@@ -19,6 +19,7 @@ use deltaglider_proxy::deltaglider::DynEngine;
 use deltaglider_proxy::multipart::MultipartStore;
 use deltaglider_proxy::rate_limiter::RateLimiter;
 use deltaglider_proxy::session::SessionStore;
+use deltaglider_proxy::storage::StorageBackend;
 use deltaglider_proxy::usage_scanner::UsageScanner;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

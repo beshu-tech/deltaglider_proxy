@@ -4,6 +4,7 @@
 //! cross-instance reference lock, with the only engine path to reference writes.
 
 use super::*;
+use crate::coordination::ReferenceLock;
 
 /// RAII guard for the optional cross-instance reference lock. Held for the
 /// duration of a reference read-modify-write, inside the in-process prefix
@@ -25,7 +26,7 @@ pub(crate) struct ReferenceLockGuard {
 }
 
 struct CrossNodeHold {
-    lock: Arc<dyn crate::coordination::ReferenceLock>,
+    lock: Arc<crate::coordination::DynReferenceLock<'static>>,
     owner: String,
     /// The lock objects held, in acquisition order. Released in reverse.
     keys: Vec<HeldKey>,
@@ -87,7 +88,7 @@ impl ReferenceLockGuard {
 
     /// A cross-instance hold with no lock object yet: [`Self::push_key`]
     /// adds each one when it is acquired, so a drop releases what is held.
-    fn holding(lock: Arc<dyn crate::coordination::ReferenceLock>, owner: String) -> Self {
+    fn holding(lock: Arc<crate::coordination::DynReferenceLock<'static>>, owner: String) -> Self {
         Self {
             hold: Some(CrossNodeHold {
                 lock,
@@ -138,7 +139,7 @@ impl ReferenceLockGuard {
     /// lock lost, or errors for `ttl / 2` since the last confirmation, marks
     /// the hold lost; the next commit then refuses.
     async fn heartbeat(
-        lock: Arc<dyn crate::coordination::ReferenceLock>,
+        lock: Arc<crate::coordination::DynReferenceLock<'static>>,
         key: String,
         owner: String,
         state: Arc<HoldState>,

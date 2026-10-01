@@ -36,6 +36,7 @@
 
 use super::path_guard::{AdminBucket, AdminObjectPath};
 use crate::api::admin::extract::{AdminJson, AdminQuery};
+use crate::storage::StorageBackend;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;

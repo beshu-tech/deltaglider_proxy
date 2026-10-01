@@ -68,7 +68,7 @@ pub struct AppState {
     /// Cross-instance per-deltaspace reference lock (multi-instance only; `None`
     /// single-instance). Re-attached to the engine on every rebuild, mirroring
     /// `bucket_usage`, so a config reload never drops the cross-node protection.
-    pub reference_lock: Option<Arc<dyn crate::coordination::ReferenceLock>>,
+    pub reference_lock: Option<Arc<crate::coordination::DynReferenceLock<'static>>>,
     pub config_db: Option<Arc<tokio::sync::Mutex<ConfigDb>>>,
     /// Per-bucket WRITE gate for maintenance jobs (re-encryption). Layered
     /// into the S3 router as middleware; admin handlers and background

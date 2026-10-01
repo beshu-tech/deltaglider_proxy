@@ -222,6 +222,7 @@ pub(crate) fn lease_timing(jobs: &JobsConfig) -> LeaseTiming {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::DynStorageBackend;
 
     #[test]
     fn scheduler_tick_uses_configured_duration() {
@@ -261,7 +262,7 @@ mod tests {
     async fn env() -> Env {
         let data = tempfile::tempdir().unwrap();
         let config = crate::config::Config::default();
-        let backend: Box<dyn crate::storage::StorageBackend> = Box::new(
+        let backend: Box<crate::storage::DynStorageBackend<'static>> = DynStorageBackend::new_box(
             crate::storage::FilesystemBackend::new(data.path().to_path_buf())
                 .await
                 .unwrap(),

@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::config::Config;
+use crate::storage::DynStorageBackend;
 use crate::storage::{EncryptingBackend, EncryptionConfig, EncryptionKey, FilesystemBackend};
 use arc_swap::ArcSwap;
 
@@ -15,7 +16,7 @@ async fn engines() -> Vec<(tempfile::TempDir, DynEngine)> {
         let fs = FilesystemBackend::new(dir.path().to_path_buf())
             .await
             .unwrap();
-        let backend: Box<dyn StorageBackend> = if encrypted {
+        let backend: Box<DynStorageBackend<'static>> = if encrypted {
             let key = EncryptionKey::from_hex(
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             )
@@ -25,9 +26,9 @@ async fn engines() -> Vec<(tempfile::TempDir, DynEngine)> {
                 key_id: Some("kid-1".to_string()),
                 ..Default::default()
             })));
-            Box::new(EncryptingBackend::new(fs, cfg))
+            DynStorageBackend::new_box(EncryptingBackend::new(fs, cfg))
         } else {
-            Box::new(fs)
+            DynStorageBackend::new_box(fs)
         };
         let engine: DynEngine =
             DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None);

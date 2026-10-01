@@ -15,6 +15,7 @@
 //! Capability answers "does this backend enforce conditional writes?";
 //! health answers "can we talk to it at all?".
 
+use crate::storage::StorageBackend;
 use std::collections::HashMap;
 use std::sync::Arc;
 

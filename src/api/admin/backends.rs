@@ -3,6 +3,7 @@
 //! Admin API for managing named backends (multi-backend routing).
 
 use crate::api::admin::extract::AdminJson;
+use crate::storage::StorageBackend;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;

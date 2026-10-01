@@ -185,7 +185,7 @@ pub struct AdminState {
 #[derive(Clone)]
 pub struct JobPlane {
     pub db: Arc<tokio::sync::Mutex<ConfigDb>>,
-    pub lease: Arc<dyn crate::coordination::CoordinationLease>,
+    pub lease: Arc<crate::coordination::DynCoordinationLease<'static>>,
 }
 
 impl AdminState {

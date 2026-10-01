@@ -2,7 +2,7 @@
 
 //! The [`CoordinationLease`] seam + its node-local SQLite implementation.
 
-use async_trait::async_trait;
+use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -67,48 +67,48 @@ impl LeaseSubsystem {
 /// The two `<`/`>=` predicates partition the timeline, so the exact expiry
 /// instant is never simultaneously renewable by the owner and stealable by a
 /// rival. `ttl_secs.max(1)` and saturating expiry math are part of the contract.
-#[async_trait]
+#[dynosaur::dynosaur(pub DynCoordinationLease = dyn(box) CoordinationLease)]
 pub trait CoordinationLease: Send + Sync {
     /// Take the lease for `(subsystem, rule)` if free or expired. `true` = held.
-    async fn try_acquire(
+    fn try_acquire(
         &self,
         subsystem: LeaseSubsystem,
         rule: &str,
         owner: &str,
         now: i64,
         ttl_secs: i64,
-    ) -> Result<bool, LeaseError>;
+    ) -> impl Future<Output = Result<bool, LeaseError>> + Send;
 
     /// Extend a lease this owner still holds. `Err(Lost)` = lost/stolen/lapsed
     /// → the caller must stop before starting more work.
-    async fn renew(
+    fn renew(
         &self,
         subsystem: LeaseSubsystem,
         rule: &str,
         owner: &str,
         now: i64,
         ttl_secs: i64,
-    ) -> Result<(), LeaseError>;
+    ) -> impl Future<Output = Result<(), LeaseError>> + Send;
 
     /// Release a lease this owner holds (no-op for a different owner).
-    async fn release(
+    fn release(
         &self,
         subsystem: LeaseSubsystem,
         rule: &str,
         owner: &str,
-    ) -> Result<(), LeaseError>;
+    ) -> impl Future<Output = Result<(), LeaseError>> + Send;
 
     /// Read-only: is a (non-expired) lease currently held for `(subsystem,
     /// rule)`? Used by admin handlers (run-now / verify / delete) to gate against
     /// an in-flight run REGARDLESS of which lease backend holds it — the
     /// node-local SQLite check alone is blind to a scheduler holding the S3 lease,
     /// which let run-now double-run and verify/delete race a live run (H14/H29/H48).
-    async fn is_held(
+    fn is_held(
         &self,
         subsystem: LeaseSubsystem,
         rule: &str,
         now: i64,
-    ) -> Result<bool, LeaseError>;
+    ) -> impl Future<Output = Result<bool, LeaseError>> + Send;
 }
 
 /// Node-local lease backed by the SQLite CAS in `config_db/job_store.rs` (via the
@@ -125,7 +125,6 @@ impl LocalLease {
     }
 }
 
-#[async_trait]
 impl CoordinationLease for LocalLease {
     async fn try_acquire(
         &self,

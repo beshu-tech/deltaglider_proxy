@@ -11,6 +11,7 @@ use crate::background::parse_duration_or;
 use crate::config::SharedConfig;
 use crate::config_db::ConfigDb;
 use crate::config_sections::ReplicationConfig;
+use crate::coordination::DynCoordinationLease;
 use crate::coordination::{CoordinationLease, LeaseSubsystem};
 use crate::replication::{current_unix_seconds, run_rule, RunLease};
 use std::sync::Arc;
@@ -27,7 +28,7 @@ pub fn spawn_scheduler(
     config: SharedConfig,
     db: Arc<Mutex<ConfigDb>>,
     state: Arc<AppState>,
-    lease: Arc<dyn CoordinationLease>,
+    lease: Arc<DynCoordinationLease<'static>>,
 ) -> tokio::task::JoinHandle<()> {
     let instance_id = format!("scheduler:{}", uuid::Uuid::new_v4());
     tokio::spawn(async move {
@@ -55,7 +56,7 @@ async fn run_due_rules(
     db: &Arc<Mutex<ConfigDb>>,
     state: &Arc<AppState>,
     instance_id: &str,
-    lease: &Arc<dyn CoordinationLease>,
+    lease: &Arc<DynCoordinationLease<'static>>,
 ) {
     for rule in replication.rules.iter().filter(|rule| rule.enabled) {
         let now = current_unix_seconds();

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 use super::*;
+use crate::storage::DynStorageBackend;
 
 /// X-ray H17: CopyObject source-read auth must honor IP-scoped conditions.
 /// The context-free can() ignored aws:SourceIp; can_with_context + the
@@ -781,9 +782,8 @@ fn completed_parts_conversion_requires_etags() {
 #[tokio::test]
 async fn copy_source_above_the_spool_threshold_streams_to_a_spool() {
     use crate::deltaglider::{DeltaGliderEngine, DynEngine};
-    use crate::storage::StorageBackend;
     let dir = tempfile::tempdir().unwrap();
-    let backend: Box<dyn StorageBackend> = Box::new(
+    let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(
         crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
             .await
             .unwrap(),
@@ -839,10 +839,9 @@ async fn copy_source_above_the_spool_threshold_streams_to_a_spool() {
 #[tokio::test]
 async fn completion_assembles_only_a_delta_candidate() {
     use crate::deltaglider::{DeltaGliderEngine, DynEngine};
-    use crate::storage::StorageBackend;
     use std::collections::HashMap;
     let dir = tempfile::tempdir().unwrap();
-    let backend: Box<dyn StorageBackend> = Box::new(
+    let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(
         crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
             .await
             .unwrap(),

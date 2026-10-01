@@ -590,6 +590,7 @@ fn partial_or_ok(succeeded: u64, failed: u64) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::DynStorageBackend;
     use std::sync::Arc;
 
     #[test]
@@ -741,7 +742,7 @@ mod tests {
 
     /// Filesystem-backed engine with a 1 MiB delta ceiling.
     async fn fs_engine(dir: &Path) -> DynEngine {
-        let backend: Box<dyn crate::storage::StorageBackend> = Box::new(
+        let backend: Box<crate::storage::DynStorageBackend<'static>> = DynStorageBackend::new_box(
             crate::storage::FilesystemBackend::new(dir.to_path_buf())
                 .await
                 .unwrap(),

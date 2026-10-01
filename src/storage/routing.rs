@@ -7,11 +7,11 @@
 //! The engine sees a single `StorageBackend` — caches, codec, prefix locks,
 //! and compression policies remain shared across all backends.
 
+use crate::storage::DynStorageBackend;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use tracing::warn;
@@ -81,7 +81,7 @@ struct BackendHealth {
 }
 
 pub struct RoutingBackend {
-    backends: HashMap<String, Arc<Box<dyn StorageBackend>>>,
+    backends: HashMap<String, Arc<Box<DynStorageBackend<'static>>>>,
     routes: HashMap<String, BucketRoute>,
     default_backend: String,
     health: parking_lot::Mutex<BackendHealth>,
@@ -108,7 +108,7 @@ impl RoutingBackend {
     /// # Errors
     /// Returns an error if `default_backend` doesn't reference a known backend.
     pub fn new(
-        backends: HashMap<String, Arc<Box<dyn StorageBackend>>>,
+        backends: HashMap<String, Arc<Box<DynStorageBackend<'static>>>>,
         routes: HashMap<String, (String, Option<String>)>,
         default_backend: String,
     ) -> Result<Self, StorageError> {
@@ -140,7 +140,7 @@ impl RoutingBackend {
 
     /// Constructor with injectable cooldown/timeout — the test seam.
     fn with_health_config(
-        backends: HashMap<String, Arc<Box<dyn StorageBackend>>>,
+        backends: HashMap<String, Arc<Box<DynStorageBackend<'static>>>>,
         routes: HashMap<String, (String, Option<String>)>,
         default_backend: String,
         list_cooldown: std::time::Duration,
@@ -234,7 +234,7 @@ impl RoutingBackend {
         virtual_name.starts_with(crate::maintenance::migrate::TRANSIENT_PREFIX)
     }
 
-    fn default_backend(&self) -> &dyn StorageBackend {
+    fn default_backend(&self) -> &DynStorageBackend<'_> {
         self.backends[&self.default_backend].as_ref().as_ref()
     }
 
@@ -248,7 +248,7 @@ impl RoutingBackend {
     async fn resolve_existing<'a>(
         &'a self,
         virtual_bucket: &'a str,
-    ) -> (&'a dyn StorageBackend, Cow<'a, str>) {
+    ) -> (&'a DynStorageBackend<'a>, Cow<'a, str>) {
         let (_, backend, real) = self.resolve_existing_named(virtual_bucket).await;
         (backend, real)
     }
@@ -444,7 +444,7 @@ impl RoutingBackend {
     /// `MultipartUpload.backend` is the configured name stamped by
     /// `create_multipart_upload`; fall back to the default backend when it
     /// is absent (single-backend) or no longer configured.
-    fn resolve_multipart_backend(&self, upload: &MultipartUpload) -> &dyn StorageBackend {
+    fn resolve_multipart_backend(&self, upload: &MultipartUpload) -> &DynStorageBackend<'_> {
         if let Some(name) = upload.backend.as_deref() {
             if let Some(b) = self.backends.get(name) {
                 return b.as_ref().as_ref();
@@ -459,7 +459,7 @@ impl RoutingBackend {
     async fn resolve_existing_named<'a>(
         &'a self,
         virtual_bucket: &'a str,
-    ) -> (String, &'a dyn StorageBackend, Cow<'a, str>) {
+    ) -> (String, &'a DynStorageBackend<'a>, Cow<'a, str>) {
         if let Some(route) = self.routes.get(virtual_bucket) {
             let backend = self.backends[&route.backend_name].as_ref().as_ref();
             let real = match &route.real_bucket {
@@ -558,7 +558,6 @@ impl RoutingBackend {
     }
 }
 
-#[async_trait]
 impl StorageBackend for RoutingBackend {
     // === Bucket operations ===
 
@@ -1427,7 +1426,6 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl StorageBackend for TestBackend {
         async fn reference_fence(
             &self,
@@ -1667,7 +1665,7 @@ mod tests {
 
     #[test]
     fn test_routing_backend_rejects_unknown_route_backend() {
-        let backends: HashMap<String, Arc<Box<dyn StorageBackend>>> = HashMap::new();
+        let backends: HashMap<String, Arc<Box<DynStorageBackend<'static>>>> = HashMap::new();
         let mut routes = HashMap::new();
         routes.insert(
             "test".to_string(),
@@ -1749,9 +1747,9 @@ mod tests {
     #[tokio::test]
     async fn create_bucket_resolves_existing_unrouted_bucket_before_defaulting() {
         let primary_probe = TestBackend::default();
-        let primary = Arc::new(Box::new(primary_probe.clone()) as Box<dyn StorageBackend>);
+        let primary = Arc::new(DynStorageBackend::new_box(primary_probe.clone()));
         let archive_probe = TestBackend::with_buckets(&["shared"]);
-        let archive = Arc::new(Box::new(archive_probe.clone()) as Box<dyn StorageBackend>);
+        let archive = Arc::new(DynStorageBackend::new_box(archive_probe.clone()));
         let mut backends = HashMap::new();
         backends.insert("primary".to_string(), primary.clone());
         backends.insert("archive".to_string(), archive);
@@ -1780,9 +1778,9 @@ mod tests {
     #[tokio::test]
     async fn unrouted_name_skips_a_real_bucket_owned_by_an_alias() {
         let primary_probe = TestBackend::default();
-        let primary = Arc::new(Box::new(primary_probe.clone()) as Box<dyn StorageBackend>);
+        let primary = Arc::new(DynStorageBackend::new_box(primary_probe.clone()));
         let archive_probe = TestBackend::with_buckets(&["shared"]);
-        let archive = Arc::new(Box::new(archive_probe.clone()) as Box<dyn StorageBackend>);
+        let archive = Arc::new(DynStorageBackend::new_box(archive_probe.clone()));
         let mut backends = HashMap::new();
         backends.insert("primary".to_string(), primary);
         backends.insert("archive".to_string(), archive);
@@ -1816,9 +1814,7 @@ mod tests {
     /// differs, for the two-key reference lock of this release.
     #[test]
     fn every_route_has_a_backend_scoped_identity() {
-        let mk = |b: &str| {
-            Arc::new(Box::new(TestBackend::with_buckets(&[b])) as Box<dyn StorageBackend>)
-        };
+        let mk = |b: &str| Arc::new(DynStorageBackend::new_box(TestBackend::with_buckets(&[b])));
         let backends = HashMap::from([
             ("local-disk".to_string(), mk("x")),
             ("hetzner-fsn1".to_string(), mk("releases")),
@@ -1860,11 +1856,11 @@ mod tests {
         let mut backends = HashMap::new();
         backends.insert(
             "primary".to_string(),
-            Arc::new(Box::new(primary_probe.clone()) as Box<dyn StorageBackend>),
+            Arc::new(DynStorageBackend::new_box(primary_probe.clone())),
         );
         backends.insert(
             "archive".to_string(),
-            Arc::new(Box::new(archive_probe.clone()) as Box<dyn StorageBackend>),
+            Arc::new(DynStorageBackend::new_box(archive_probe.clone())),
         );
         let routing = RoutingBackend::new(backends, HashMap::new(), "primary".to_string())
             .expect("routing backend");
@@ -1898,8 +1894,8 @@ mod tests {
     async fn resolve_existing_named_routes_to_erroring_backend_not_default() {
         // Default is a clean empty backend (Ok(false) on head); the secondary
         // "archive" backend transiently 503s on its head probe.
-        let primary = Arc::new(Box::new(TestBackend::with_buckets(&[])) as Box<dyn StorageBackend>);
-        let archive = Arc::new(Box::new(TestBackend::failing_head()) as Box<dyn StorageBackend>);
+        let primary = Arc::new(DynStorageBackend::new_box(TestBackend::with_buckets(&[])));
+        let archive = Arc::new(DynStorageBackend::new_box(TestBackend::failing_head()));
         let mut backends = HashMap::new();
         backends.insert("primary".to_string(), primary);
         backends.insert("archive".to_string(), archive);
@@ -1913,9 +1909,10 @@ mod tests {
         );
 
         // And when the DEFAULT backend itself errors, route to it (not scan on).
-        let primary = Arc::new(Box::new(TestBackend::failing_head()) as Box<dyn StorageBackend>);
-        let archive =
-            Arc::new(Box::new(TestBackend::with_buckets(&["shared"])) as Box<dyn StorageBackend>);
+        let primary = Arc::new(DynStorageBackend::new_box(TestBackend::failing_head()));
+        let archive = Arc::new(DynStorageBackend::new_box(TestBackend::with_buckets(&[
+            "shared",
+        ])));
         let mut backends = HashMap::new();
         backends.insert("primary".to_string(), primary);
         backends.insert("archive".to_string(), archive);
@@ -1936,9 +1933,10 @@ mod tests {
     #[tokio::test]
     async fn default_error_keeps_a_bucket_last_found_elsewhere() {
         let primary_probe = TestBackend::with_buckets(&[]);
-        let primary = Arc::new(Box::new(primary_probe.clone()) as Box<dyn StorageBackend>);
-        let archive =
-            Arc::new(Box::new(TestBackend::with_buckets(&["shared"])) as Box<dyn StorageBackend>);
+        let primary = Arc::new(DynStorageBackend::new_box(primary_probe.clone()));
+        let archive = Arc::new(DynStorageBackend::new_box(TestBackend::with_buckets(&[
+            "shared",
+        ])));
         let mut backends = HashMap::new();
         backends.insert("primary".to_string(), primary);
         backends.insert("archive".to_string(), archive);
@@ -1969,7 +1967,7 @@ mod tests {
         let mut backends = HashMap::new();
         backends.insert(
             "only".to_string(),
-            Arc::new(Box::new(TestBackend::failing()) as Box<dyn StorageBackend>),
+            Arc::new(DynStorageBackend::new_box(TestBackend::failing())),
         );
         let routing = RoutingBackend::new(backends, HashMap::new(), "only".to_string())
             .expect("routing backend");
@@ -1991,11 +1989,13 @@ mod tests {
         let mut backends = HashMap::new();
         backends.insert(
             "up".to_string(),
-            Arc::new(Box::new(TestBackend::with_buckets(&["alive"])) as Box<dyn StorageBackend>),
+            Arc::new(DynStorageBackend::new_box(TestBackend::with_buckets(&[
+                "alive",
+            ]))),
         );
         backends.insert(
             "down".to_string(),
-            Arc::new(Box::new(TestBackend::failing()) as Box<dyn StorageBackend>),
+            Arc::new(DynStorageBackend::new_box(TestBackend::failing())),
         );
         // Two buckets are config-declared as routed to the DOWN backend.
         let mut routes = HashMap::new();
@@ -2048,11 +2048,13 @@ mod tests {
         let mut backends = HashMap::new();
         backends.insert(
             "up".to_string(),
-            Arc::new(Box::new(TestBackend::with_buckets(&["alive"])) as Box<dyn StorageBackend>),
+            Arc::new(DynStorageBackend::new_box(TestBackend::with_buckets(&[
+                "alive",
+            ]))),
         );
         backends.insert(
             "flaky".to_string(),
-            Arc::new(Box::new(flaky) as Box<dyn StorageBackend>),
+            Arc::new(DynStorageBackend::new_box(flaky)),
         );
         // Freshness OFF: this test flips the backend dark right after a
         // successful listing and needs the very next call to re-probe.
@@ -2088,7 +2090,7 @@ mod tests {
     /// Build a routing backend with an injected cooldown TTL (timeout large so
     /// it never fires in these logic tests).
     fn routing_with_cooldown(
-        backends: HashMap<String, Arc<Box<dyn StorageBackend>>>,
+        backends: HashMap<String, Arc<Box<DynStorageBackend<'static>>>>,
         default: &str,
         cooldown: std::time::Duration,
     ) -> RoutingBackend {
@@ -2108,7 +2110,7 @@ mod tests {
     /// Build a routing backend with the freshness window ON (cooldown/timeout
     /// large so they never interfere).
     fn routing_with_fresh(
-        backends: HashMap<String, Arc<Box<dyn StorageBackend>>>,
+        backends: HashMap<String, Arc<Box<DynStorageBackend<'static>>>>,
         default: &str,
         fresh: std::time::Duration,
     ) -> RoutingBackend {
@@ -2129,8 +2131,11 @@ mod tests {
         // call must be served from the fresh roster, not re-probe upstream.
         let backend = TestBackend::with_buckets(&["b1"]);
         let probes = backend.list_calls.clone();
-        let mut backends: HashMap<String, Arc<Box<dyn StorageBackend>>> = HashMap::new();
-        backends.insert("primary".into(), Arc::new(Box::new(backend)));
+        let mut backends: HashMap<String, Arc<Box<DynStorageBackend<'static>>>> = HashMap::new();
+        backends.insert(
+            "primary".into(),
+            Arc::new(DynStorageBackend::new_box(backend)),
+        );
         let routing = routing_with_fresh(backends, "primary", std::time::Duration::from_secs(5));
 
         let first = routing.list_buckets().await.expect("first listing");
@@ -2149,8 +2154,11 @@ mod tests {
         // the very next listing even inside the freshness window.
         let backend = TestBackend::with_buckets(&["b1"]);
         let probes = backend.list_calls.clone();
-        let mut backends: HashMap<String, Arc<Box<dyn StorageBackend>>> = HashMap::new();
-        backends.insert("primary".into(), Arc::new(Box::new(backend)));
+        let mut backends: HashMap<String, Arc<Box<DynStorageBackend<'static>>>> = HashMap::new();
+        backends.insert(
+            "primary".into(),
+            Arc::new(DynStorageBackend::new_box(backend)),
+        );
         let routing = routing_with_fresh(backends, "primary", std::time::Duration::from_secs(5));
 
         let before = routing.list_buckets().await.expect("first listing");
@@ -2179,8 +2187,11 @@ mod tests {
         *backend.list_gate.lock().unwrap() = Some(gate.clone());
         let gate_field = backend.list_gate.clone();
 
-        let mut backends: HashMap<String, Arc<Box<dyn StorageBackend>>> = HashMap::new();
-        backends.insert("primary".into(), Arc::new(Box::new(backend)));
+        let mut backends: HashMap<String, Arc<Box<DynStorageBackend<'static>>>> = HashMap::new();
+        backends.insert(
+            "primary".into(),
+            Arc::new(DynStorageBackend::new_box(backend)),
+        );
         let routing = Arc::new(routing_with_fresh(
             backends,
             "primary",
@@ -2221,11 +2232,13 @@ mod tests {
         let mut backends = HashMap::new();
         backends.insert(
             "up".to_string(),
-            Arc::new(Box::new(TestBackend::with_buckets(&["alive"])) as Box<dyn StorageBackend>),
+            Arc::new(DynStorageBackend::new_box(TestBackend::with_buckets(&[
+                "alive",
+            ]))),
         );
         backends.insert(
             "dead".to_string(),
-            Arc::new(Box::new(dead) as Box<dyn StorageBackend>),
+            Arc::new(DynStorageBackend::new_box(dead)),
         );
         let routing = routing_with_cooldown(backends, "up", std::time::Duration::from_secs(300));
 
@@ -2255,11 +2268,13 @@ mod tests {
         let mut backends = HashMap::new();
         backends.insert(
             "up".to_string(),
-            Arc::new(Box::new(TestBackend::with_buckets(&["alive"])) as Box<dyn StorageBackend>),
+            Arc::new(DynStorageBackend::new_box(TestBackend::with_buckets(&[
+                "alive",
+            ]))),
         );
         backends.insert(
             "flaky".to_string(),
-            Arc::new(Box::new(flaky) as Box<dyn StorageBackend>),
+            Arc::new(DynStorageBackend::new_box(flaky)),
         );
         let routing = routing_with_cooldown(backends, "up", std::time::Duration::from_secs(300));
 
@@ -2284,11 +2299,13 @@ mod tests {
         let mut backends = HashMap::new();
         backends.insert(
             "up".to_string(),
-            Arc::new(Box::new(TestBackend::with_buckets(&["alive"])) as Box<dyn StorageBackend>),
+            Arc::new(DynStorageBackend::new_box(TestBackend::with_buckets(&[
+                "alive",
+            ]))),
         );
         backends.insert(
             "flaky".to_string(),
-            Arc::new(Box::new(flaky) as Box<dyn StorageBackend>),
+            Arc::new(DynStorageBackend::new_box(flaky)),
         );
         // TTL zero → every request re-probes (no lingering cooldown).
         let routing = routing_with_cooldown(backends, "up", std::time::Duration::ZERO);
@@ -2313,14 +2330,8 @@ mod tests {
         let d1 = TestBackend::failing();
         let d2 = TestBackend::failing();
         let mut backends = HashMap::new();
-        backends.insert(
-            "a".to_string(),
-            Arc::new(Box::new(d1) as Box<dyn StorageBackend>),
-        );
-        backends.insert(
-            "b".to_string(),
-            Arc::new(Box::new(d2) as Box<dyn StorageBackend>),
-        );
+        backends.insert("a".to_string(), Arc::new(DynStorageBackend::new_box(d1)));
+        backends.insert("b".to_string(), Arc::new(DynStorageBackend::new_box(d2)));
         let routing = routing_with_cooldown(backends, "a", std::time::Duration::from_secs(300));
 
         // First call fails all → arms cooldowns and returns Err.
@@ -2339,11 +2350,13 @@ mod tests {
         let mut backends = HashMap::new();
         backends.insert(
             "up".to_string(),
-            Arc::new(Box::new(TestBackend::with_buckets(&["alive"])) as Box<dyn StorageBackend>),
+            Arc::new(DynStorageBackend::new_box(TestBackend::with_buckets(&[
+                "alive",
+            ]))),
         );
         backends.insert(
             "down".to_string(),
-            Arc::new(Box::new(TestBackend::failing()) as Box<dyn StorageBackend>),
+            Arc::new(DynStorageBackend::new_box(TestBackend::failing())),
         );
         let routing = RoutingBackend::new(backends, HashMap::new(), "up".to_string())
             .expect("routing backend");
@@ -2356,10 +2369,12 @@ mod tests {
     /// names storage on that other backend, not this one.
     #[tokio::test]
     async fn list_bucket_origins_keeps_default_bucket_shadowed_by_foreign_alias() {
-        let primary =
-            Arc::new(Box::new(TestBackend::with_buckets(&["shared"])) as Box<dyn StorageBackend>);
-        let archive =
-            Arc::new(Box::new(TestBackend::with_buckets(&["shared"])) as Box<dyn StorageBackend>);
+        let primary = Arc::new(DynStorageBackend::new_box(TestBackend::with_buckets(&[
+            "shared",
+        ])));
+        let archive = Arc::new(DynStorageBackend::new_box(TestBackend::with_buckets(&[
+            "shared",
+        ])));
         let mut backends = HashMap::new();
         backends.insert("primary".to_string(), primary);
         backends.insert("archive".to_string(), archive);
@@ -2389,14 +2404,14 @@ mod tests {
 
     #[tokio::test]
     async fn list_bucket_origins_reports_routed_backend() {
-        let primary = Arc::new(
-            Box::new(TestBackend::with_buckets(&["shared", "local-only"]))
-                as Box<dyn StorageBackend>,
-        );
-        let archive = Arc::new(
-            Box::new(TestBackend::with_buckets(&["shared", "real-archive"]))
-                as Box<dyn StorageBackend>,
-        );
+        let primary = Arc::new(DynStorageBackend::new_box(TestBackend::with_buckets(&[
+            "shared",
+            "local-only",
+        ])) as Box<DynStorageBackend<'static>>);
+        let archive = Arc::new(DynStorageBackend::new_box(TestBackend::with_buckets(&[
+            "shared",
+            "real-archive",
+        ])) as Box<DynStorageBackend<'static>>);
         let mut backends = HashMap::new();
         backends.insert("primary".to_string(), primary);
         backends.insert("archive".to_string(), archive);
@@ -2437,11 +2452,15 @@ mod tests {
     #[tokio::test]
     async fn list_bucket_origins_reports_non_default_backend_no_alias() {
         let primary =
-            Arc::new(Box::new(TestBackend::with_buckets(&["only-on-primary"]))
-                as Box<dyn StorageBackend>);
+            Arc::new(
+                DynStorageBackend::new_box(TestBackend::with_buckets(&["only-on-primary"]))
+                    as Box<DynStorageBackend<'static>>,
+            );
         let secondary =
-            Arc::new(Box::new(TestBackend::with_buckets(&["only-on-secondary"]))
-                as Box<dyn StorageBackend>);
+            Arc::new(
+                DynStorageBackend::new_box(TestBackend::with_buckets(&["only-on-secondary"]))
+                    as Box<DynStorageBackend<'static>>,
+            );
         let mut backends = HashMap::new();
         backends.insert("primary".to_string(), primary);
         backends.insert("secondary".to_string(), secondary);
@@ -2466,20 +2485,20 @@ mod tests {
     }
 
     // Regression for the real prod bug: the engine holds its storage as a
-    // `Box<dyn StorageBackend>`. The blanket `impl StorageBackend for
-    // Box<dyn StorageBackend>` must FORWARD list_bucket_origins to the inner
+    // `Box<DynStorageBackend<'static>>`. The blanket `impl StorageBackend for
+    // Box<DynStorageBackend<'static>>` must FORWARD list_bucket_origins to the inner
     // backend — if it falls through to the trait default, every bucket comes
     // back with `backend_name: None` and the admin API mis-attributes them all
     // to the default backend. This test calls through the Box exactly like the
     // engine does.
     #[tokio::test]
     async fn list_bucket_origins_forwards_through_box_dyn() {
-        let primary = Arc::new(
-            Box::new(TestBackend::with_buckets(&["on-primary"])) as Box<dyn StorageBackend>
-        );
-        let secondary = Arc::new(
-            Box::new(TestBackend::with_buckets(&["on-secondary"])) as Box<dyn StorageBackend>
-        );
+        let primary = Arc::new(DynStorageBackend::new_box(TestBackend::with_buckets(&[
+            "on-primary",
+        ])));
+        let secondary = Arc::new(DynStorageBackend::new_box(TestBackend::with_buckets(&[
+            "on-secondary",
+        ])));
         let mut backends = HashMap::new();
         backends.insert("primary".to_string(), primary);
         backends.insert("secondary".to_string(), secondary);
@@ -2489,14 +2508,14 @@ mod tests {
             RoutingBackend::new(backends, routes, "primary".to_string()).expect("routing backend");
 
         // Box it, exactly as DeltaGliderEngine stores its storage.
-        let boxed: Box<dyn StorageBackend> = Box::new(routing);
+        let boxed: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(routing);
         let origins = boxed.list_bucket_origins().await.expect("origins via box");
         let by_name: HashMap<_, _> = origins.iter().map(|b| (b.name.as_str(), b)).collect();
 
         assert_eq!(
             by_name["on-secondary"].backend_name.as_deref(),
             Some("secondary"),
-            "list_bucket_origins must forward through Box<dyn StorageBackend>, not fall back \
+            "list_bucket_origins must forward through Box<DynStorageBackend<'static>>, not fall back \
              to the default impl that drops backend attribution"
         );
         assert_eq!(
@@ -2513,8 +2532,9 @@ mod tests {
     /// prefixes, IAM resources `dr/*`) is bypassed by using the real name.
     #[tokio::test]
     async fn review2_alias_storage_on_the_default_backend_is_not_reachable_by_its_real_name() {
-        let primary =
-            Arc::new(Box::new(TestBackend::with_buckets(&["realdr"])) as Box<dyn StorageBackend>);
+        let primary = Arc::new(DynStorageBackend::new_box(TestBackend::with_buckets(&[
+            "realdr",
+        ])));
         let mut backends = HashMap::new();
         backends.insert("primary".to_string(), primary);
         let mut routes = HashMap::new();

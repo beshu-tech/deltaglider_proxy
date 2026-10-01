@@ -29,6 +29,7 @@
 //! This module hosts the PURE helpers (filtering, compaction, routing); they
 //! are unit-tested without any I/O. The background loop is `spawn_event_consumer`.
 
+use crate::coordination::DynCoordinationLease;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -269,7 +270,7 @@ pub fn spawn_event_consumer(
     config: SharedConfig,
     db: Arc<Mutex<ConfigDb>>,
     state: Arc<AppState>,
-    lease: Arc<dyn CoordinationLease>,
+    lease: Arc<DynCoordinationLease<'static>>,
 ) -> tokio::task::JoinHandle<()> {
     let instance_id = format!("event-consumer:{}", uuid::Uuid::new_v4());
     // Per-rule leases go through the SAME lease the scheduler uses (S3 when a
@@ -440,7 +441,7 @@ async fn live_rule_gate(
 /// the live config and state ([`live_rule_gate`]). Every outcome other than
 /// `Held` leaves the lease released.
 async fn claim_rule(
-    lease: &dyn CoordinationLease,
+    lease: &(impl CoordinationLease + ?Sized),
     db: &Arc<Mutex<ConfigDb>>,
     config: &crate::config::SharedConfig,
     rule_name: &str,
@@ -521,7 +522,7 @@ async fn drain_once(
     engine: &Arc<crate::deltaglider::DynEngine>,
     gate: &crate::maintenance::gate::MaintenanceGate,
     replication: &crate::config_sections::ReplicationConfig,
-    lease: &dyn CoordinationLease,
+    lease: &(impl CoordinationLease + ?Sized),
     instance_id: &str,
     now: i64,
 ) {
@@ -622,7 +623,7 @@ async fn drain_rules(
     engine: &Arc<crate::deltaglider::DynEngine>,
     gate: &crate::maintenance::gate::MaintenanceGate,
     replication: &crate::config_sections::ReplicationConfig,
-    lease: &dyn CoordinationLease,
+    lease: &(impl CoordinationLease + ?Sized),
     claims: &mut std::collections::HashMap<String, RuleClaim>,
     instance_id: &str,
     now: i64,
@@ -774,7 +775,7 @@ async fn drain_rule_rows(
     engine: &Arc<crate::deltaglider::DynEngine>,
     gate: &crate::maintenance::gate::MaintenanceGate,
     replication: &crate::config_sections::ReplicationConfig,
-    lease: &dyn CoordinationLease,
+    lease: &(impl CoordinationLease + ?Sized),
     claims: &mut std::collections::HashMap<String, RuleClaim>,
     instance_id: &str,
     now: i64,
@@ -1502,7 +1503,6 @@ mod classify_tests {
 mod claim_rule_tests {
     use super::*;
     use crate::config::Config;
-    use async_trait::async_trait;
     use std::sync::Mutex as StdMutex;
 
     /// A lease another worker already holds for rule "r"; records releases.
@@ -1510,7 +1510,6 @@ mod claim_rule_tests {
         released: StdMutex<Vec<String>>,
     }
 
-    #[async_trait]
     impl CoordinationLease for HeldElsewhere {
         async fn try_acquire(
             &self,
@@ -1673,12 +1672,12 @@ mod per_rule_cursor_tests {
     use super::*;
     use crate::config::Config;
     use crate::deltaglider::{DeltaGliderEngine, DynEngine};
-    use crate::storage::{FilesystemBackend, StorageBackend};
+    use crate::storage::DynStorageBackend;
+    use crate::storage::FilesystemBackend;
 
     /// Lease that another worker holds for one rule; free for the rest.
     struct BusyFor(&'static str);
 
-    #[async_trait::async_trait]
     impl CoordinationLease for BusyFor {
         async fn try_acquire(
             &self,
@@ -1734,7 +1733,7 @@ mod per_rule_cursor_tests {
         Arc<DynEngine>,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let backend: Box<dyn StorageBackend> = Box::new(
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(
             FilesystemBackend::new(dir.path().to_path_buf())
                 .await
                 .unwrap(),
@@ -1785,7 +1784,7 @@ mod per_rule_cursor_tests {
         config: &crate::config::SharedConfig,
         db: &Arc<Mutex<ConfigDb>>,
         engine: &Arc<DynEngine>,
-        lease: &dyn CoordinationLease,
+        lease: &(impl CoordinationLease + ?Sized),
     ) {
         let replication = config.read().await.replication.clone();
         let gate = crate::maintenance::gate::MaintenanceGate::default();

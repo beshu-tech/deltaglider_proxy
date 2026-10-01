@@ -26,6 +26,7 @@
 //!
 //! [`needs_rewrite`]: super::needs_rewrite
 
+use crate::storage::StorageBackend;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -913,6 +914,7 @@ pub(crate) async fn record_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::DynStorageBackend;
 
     fn claimed_job(ttl: i64) -> (Arc<Mutex<ConfigDb>>, i64) {
         let db = ConfigDb::in_memory("testpass").unwrap();
@@ -1026,7 +1028,7 @@ mod tests {
     async fn a_counting_resume_keeps_the_count_so_far() {
         let data = tempfile::tempdir().unwrap();
         let config = crate::config::Config::default();
-        let backend: Box<dyn crate::storage::StorageBackend> = Box::new(
+        let backend: Box<crate::storage::DynStorageBackend<'static>> = DynStorageBackend::new_box(
             crate::storage::FilesystemBackend::new(data.path().to_path_buf())
                 .await
                 .unwrap(),

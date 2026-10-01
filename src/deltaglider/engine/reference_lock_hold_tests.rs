@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 use super::*;
+use crate::coordination::DynReferenceLock;
 use crate::coordination::LeaseError;
+use crate::storage::DynStorageBackend;
 use crate::storage::FilesystemBackend;
-use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// A lock that always grants, and whose renew answer the test sets.
@@ -29,7 +30,6 @@ impl ScriptedLock {
     }
 }
 
-#[async_trait]
 impl crate::coordination::ReferenceLock for ScriptedLock {
     async fn try_acquire(&self, _: &str, _: &str, _: i64) -> Result<bool, LeaseError> {
         self.acquires.fetch_add(1, Ordering::SeqCst);
@@ -62,7 +62,7 @@ async fn engine_with(
         .unwrap();
     backend.create_bucket("releases").await.unwrap();
     let engine = DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None)
-        .with_reference_lock(Some(lock));
+        .with_reference_lock(Some(DynReferenceLock::from_arc(lock)));
     (tmp, engine)
 }
 
@@ -282,7 +282,6 @@ struct CasLock {
     interval: Duration,
 }
 
-#[async_trait]
 impl crate::coordination::ReferenceLock for CasLock {
     async fn try_acquire(&self, _: &str, owner: &str, _: i64) -> Result<bool, LeaseError> {
         let mut s = self.state.lock();
@@ -346,7 +345,7 @@ async fn review2_commit_racing_the_heartbeat_renew_keeps_the_lock() {
         .await
         .unwrap();
     let engine = DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None)
-        .with_reference_lock(Some(lock.clone()));
+        .with_reference_lock(Some(DynReferenceLock::from_arc(lock.clone())));
     let guard = engine
         .acquire_reference_lock("review2-releases", "v1")
         .await
@@ -368,7 +367,6 @@ struct WireLock {
     interval: Duration,
 }
 
-#[async_trait]
 impl crate::coordination::ReferenceLock for WireLock {
     async fn try_acquire(&self, _: &str, owner: &str, _: i64) -> Result<bool, LeaseError> {
         let mut s = self.state.lock();
@@ -433,7 +431,7 @@ async fn release_does_not_race_a_heartbeat_renew() {
         .await
         .unwrap();
     let engine = DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None)
-        .with_reference_lock(Some(lock));
+        .with_reference_lock(Some(DynReferenceLock::from_arc(lock)));
     let guard = engine
         .acquire_reference_lock("release-race", "v1")
         .await
@@ -524,7 +522,6 @@ impl FencingFs {
     }
 }
 
-#[async_trait]
 impl crate::storage::StorageBackend for FencingFs {
     async fn create_bucket(&self, b: &str) -> Result<(), StorageError> {
         self.inner.create_bucket(b).await
@@ -738,7 +735,7 @@ async fn fencing_engine(
         peer_race_on_delta: AtomicBool::new(false),
     };
     let engine = DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None)
-        .with_reference_lock(Some(lock));
+        .with_reference_lock(Some(DynReferenceLock::from_arc(lock)));
     (tmp, engine)
 }
 
@@ -870,7 +867,6 @@ struct KeyedLock {
     log: parking_lot::Mutex<Vec<(&'static str, String)>>,
 }
 
-#[async_trait]
 impl crate::coordination::ReferenceLock for KeyedLock {
     async fn try_acquire(&self, key: &str, owner: &str, _: i64) -> Result<bool, LeaseError> {
         let mut held = self.held.lock();
@@ -921,19 +917,19 @@ fn new_key() -> String {
 /// the bucket whose lock key changes in this release.
 async fn routed_engine(lock: Arc<KeyedLock>) -> (tempfile::TempDir, DynEngine) {
     let tmp = tempfile::tempdir().unwrap();
-    let mut backends: HashMap<String, Arc<Box<dyn StorageBackend>>> = HashMap::new();
+    let mut backends: HashMap<String, Arc<Box<DynStorageBackend<'static>>>> = HashMap::new();
     for name in ["local-disk", "hetzner-fsn1"] {
         let dir = tmp.path().join(name);
         let fs = FilesystemBackend::new(dir).await.unwrap();
-        backends.insert(name.to_string(), Arc::new(Box::new(fs)));
+        backends.insert(name.to_string(), Arc::new(DynStorageBackend::new_box(fs)));
     }
     let routes = HashMap::from([("releases".to_string(), ("hetzner-fsn1".to_string(), None))]);
     let routing =
         crate::storage::RoutingBackend::new(backends, routes, "local-disk".to_string()).unwrap();
-    let backend: Box<dyn StorageBackend> = Box::new(routing);
+    let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(routing);
     backend.create_bucket("releases").await.unwrap();
     let engine = DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None)
-        .with_reference_lock(Some(lock));
+        .with_reference_lock(Some(DynReferenceLock::from_arc(lock)));
     (tmp, engine)
 }
 

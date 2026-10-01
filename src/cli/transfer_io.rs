@@ -272,10 +272,11 @@ pub(crate) async fn copy_object(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::DynStorageBackend;
     use std::sync::Arc;
 
     async fn fs_engine(dir: &Path) -> DynEngine {
-        let backend: Box<dyn crate::storage::StorageBackend> = Box::new(
+        let backend: Box<crate::storage::DynStorageBackend<'static>> = DynStorageBackend::new_box(
             crate::storage::FilesystemBackend::new(dir.to_path_buf())
                 .await
                 .unwrap(),

@@ -44,7 +44,6 @@ use super::traits::{
 };
 use crate::config::BackendConfig;
 use crate::types::{FileMetadata, StorageInfo};
-use async_trait::async_trait;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::config::BehaviorVersion;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
@@ -299,7 +298,6 @@ impl S3Backend {
     // These helpers centralise that logic so changes only need to happen once.
 }
 
-#[async_trait]
 impl StorageBackend for S3Backend {
     // === Bucket operations ===
 

@@ -18,6 +18,7 @@
 //! request that either side refuses before that point is fine: it is never
 //! served.
 
+use crate::storage::DynStorageBackend;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -238,7 +239,7 @@ async fn harness() -> Harness {
     let chain = crate::admission::build_shared_chain_from_parts(&config.buckets, &[]);
 
     let data = tempfile::tempdir().unwrap();
-    let backend: Box<dyn crate::storage::StorageBackend> = Box::new(
+    let backend: Box<crate::storage::DynStorageBackend<'static>> = DynStorageBackend::new_box(
         crate::storage::FilesystemBackend::new(data.path().to_path_buf())
             .await
             .unwrap(),

@@ -10,14 +10,15 @@
 
 use crate::deltaglider::{EngineError, ListObjectsPage};
 use crate::iam::{user_can_see_common_prefix, user_can_see_listed_key, ListScope};
+use std::future::Future;
 
 /// The one engine call the listing algebra makes: one LIST page.
-/// (`async_trait`: a native async trait method trips the `Send` check of
-/// the s3s handler futures over `Box<dyn StorageBackend>`.)
-#[async_trait::async_trait]
+/// `list` is declared `-> impl Future + Send` (not `async fn`) because the
+/// s3s handler futures that await it must be `Send`; impls still write
+/// `async fn`.
 pub(crate) trait Lister: Sync {
     #[allow(clippy::too_many_arguments)]
-    async fn list(
+    fn list(
         &self,
         bucket: &str,
         prefix: &str,
@@ -25,11 +26,13 @@ pub(crate) trait Lister: Sync {
         max_keys: u32,
         cursor: Option<&str>,
         metadata: bool,
-    ) -> Result<ListObjectsPage, EngineError>;
+    ) -> impl Future<Output = Result<ListObjectsPage, EngineError>> + Send;
 }
 
-#[async_trait::async_trait]
-impl Lister for crate::deltaglider::DynEngine {
+// Generic over the backend, not just `DynEngine`: the `Send` check of an
+// s3s handler future erases lifetimes, so it needs this impl for
+// `DeltaGliderEngine<Box<DynStorageBackend<'any>>>`, not only `<'static>`.
+impl<S: crate::storage::StorageBackend> Lister for crate::deltaglider::DeltaGliderEngine<S> {
     async fn list(
         &self,
         bucket: &str,
@@ -295,6 +298,7 @@ mod tests {
     use super::*;
     use crate::iam::permissions::permission_to_iam_policy;
     use crate::iam::AuthenticatedUser;
+    use crate::storage::DynStorageBackend;
     use std::sync::Arc;
 
     /// A lister over a fixed key set (no delimiter), counting its calls.
@@ -303,7 +307,6 @@ mod tests {
         calls: std::sync::atomic::AtomicUsize,
     }
 
-    #[async_trait::async_trait]
     impl Lister for CountingLister {
         async fn list(
             &self,
@@ -378,7 +381,6 @@ mod tests {
     /// A lister whose entries all lack listing facts.
     struct NoFactsLister(CountingLister);
 
-    #[async_trait::async_trait]
     impl Lister for NoFactsLister {
         async fn list(
             &self,
@@ -439,7 +441,7 @@ mod tests {
         use crate::iam::permissions::permission_to_iam_policy;
         use crate::iam::Permission;
         let dir = tempfile::tempdir().unwrap();
-        let backend: Box<dyn crate::storage::StorageBackend> = Box::new(
+        let backend: Box<crate::storage::DynStorageBackend<'static>> = DynStorageBackend::new_box(
             crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
                 .await
                 .unwrap(),
@@ -573,7 +575,7 @@ mod tests {
 
     async fn fs_engine(keys: &[&str]) -> (tempfile::TempDir, crate::deltaglider::DynEngine) {
         let dir = tempfile::tempdir().unwrap();
-        let backend: Box<dyn crate::storage::StorageBackend> = Box::new(
+        let backend: Box<crate::storage::DynStorageBackend<'static>> = DynStorageBackend::new_box(
             crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
                 .await
                 .unwrap(),
@@ -764,7 +766,7 @@ mod tests {
     #[tokio::test]
     async fn review3_a_write_only_grant_does_not_hide_the_readable_prefix() {
         let dir = tempfile::tempdir().unwrap();
-        let backend: Box<dyn crate::storage::StorageBackend> = Box::new(
+        let backend: Box<crate::storage::DynStorageBackend<'static>> = DynStorageBackend::new_box(
             crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
                 .await
                 .unwrap(),

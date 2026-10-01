@@ -16,11 +16,11 @@ use crate::event_outbox::{
     STATUS_PENDING,
 };
 use crate::security::{validate_outbound_url, UrlKind};
-use async_trait::async_trait;
 use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::Url;
 use serde::Serialize;
 use serde_json::Value;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -67,26 +67,28 @@ pub struct EventWebhookPayload<'a> {
     pub event: &'a EventOutboxRecord,
 }
 
-#[async_trait]
-pub trait EventDeliveryClient: Send + Sync + 'static {
+#[dynosaur::dynosaur(pub DynEventDeliveryClient = dyn(box) EventDeliveryClient)]
+pub trait EventDeliveryClient: Send + Sync {
     /// Deliver the whole event (Slack format: one formatted message).
-    async fn deliver(
+    fn deliver(
         &self,
         config: &EventDeliveryConfig,
         event: &EventOutboxRecord,
-    ) -> Result<(), String>;
+    ) -> impl Future<Output = Result<(), String>> + Send;
 
     /// Deliver the event to ONE target (a webhook URL or a Slack channel). The
     /// dispatcher calls it per target and records each outcome, so a retry
     /// skips the targets that already succeeded.
-    async fn deliver_target(
+    fn deliver_target(
         &self,
         config: &EventDeliveryConfig,
         event: &EventOutboxRecord,
         target: &DeliveryTarget,
-    ) -> Result<(), String> {
-        let _ = target;
-        self.deliver(config, event).await
+    ) -> impl Future<Output = Result<(), String>> + Send {
+        async move {
+            let _ = target;
+            self.deliver(config, event).await
+        }
     }
 }
 
@@ -444,7 +446,6 @@ fn persistable_error(error: &str) -> String {
     truncate_error(&redact_urls_in_text(error))
 }
 
-#[async_trait]
 impl EventDeliveryClient for HttpWebhookDeliveryClient {
     /// Direct delivery to every target (the dispatcher goes target by target).
     async fn deliver(
@@ -624,13 +625,17 @@ pub fn spawn_dispatcher(
     config: SharedConfig,
     db: Arc<Mutex<ConfigDb>>,
 ) -> tokio::task::JoinHandle<()> {
-    spawn_dispatcher_with_client(config, db, Arc::new(HttpWebhookDeliveryClient::default()))
+    spawn_dispatcher_with_client(
+        config,
+        db,
+        DynEventDeliveryClient::new_arc(HttpWebhookDeliveryClient::default()),
+    )
 }
 
 pub fn spawn_dispatcher_with_client(
     config: SharedConfig,
     db: Arc<Mutex<ConfigDb>>,
-    client: Arc<dyn EventDeliveryClient>,
+    client: Arc<DynEventDeliveryClient<'static>>,
 ) -> tokio::task::JoinHandle<()> {
     let claimant = format!("event-delivery:{}", uuid::Uuid::new_v4());
     tokio::spawn(async move {
@@ -719,7 +724,7 @@ pub async fn prune_while_inactive(
 
 pub async fn dispatch_once(
     db: &Arc<Mutex<ConfigDb>>,
-    client: &dyn EventDeliveryClient,
+    client: &(impl EventDeliveryClient + ?Sized),
     config: &EventDeliveryConfig,
     claimant: &str,
     now: i64,
@@ -845,7 +850,7 @@ pub async fn dispatch_once(
 /// key, so that would be a duplicate message).
 async fn deliver_to_targets(
     db: &Arc<Mutex<ConfigDb>>,
-    client: &dyn EventDeliveryClient,
+    client: &(impl EventDeliveryClient + ?Sized),
     config: &EventDeliveryConfig,
     event: &EventOutboxRecord,
 ) -> Result<(), String> {
@@ -1000,7 +1005,6 @@ mod tests {
         calls: AtomicUsize,
     }
 
-    #[async_trait]
     impl EventDeliveryClient for FakeClient {
         async fn deliver(
             &self,
@@ -1232,7 +1236,6 @@ mod tests {
         posts: std::sync::Mutex<Vec<String>>,
     }
 
-    #[async_trait]
     impl EventDeliveryClient for EndpointClient {
         async fn deliver(
             &self,

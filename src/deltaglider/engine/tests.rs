@@ -5,6 +5,7 @@ use super::construction::{
 };
 use super::metadata::reference_integrity_ok;
 use super::*;
+use crate::storage::DynStorageBackend;
 
 // ──────────────────────────────────────────────────────────────
 // Step 2: per-backend wrapping + key_id collision detection
@@ -16,7 +17,6 @@ use super::*;
 /// CountingBackend tests in `storage::encrypting::tests::wrapper_tests`.
 struct NullInner;
 
-#[async_trait::async_trait]
 impl crate::storage::StorageBackend for NullInner {
     async fn reference_fence(
         &self,
@@ -252,7 +252,7 @@ fn test_wrap_backend_with_none_mode_wraps_anyway() {
     // wrapper in the pipeline to fire. This test just verifies
     // construction succeeds; the sniffer behaviour itself is
     // covered in `storage::encrypting::tests::wrapper_tests::test_stripped_xattr_*`.
-    let inner: Box<dyn StorageBackend> = Box::new(NullInner);
+    let inner: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(NullInner);
     let mut coll = KeyIdCollisionCheck::new();
     let wrapped = wrap_backend_with_encryption(
         "some-backend",
@@ -265,7 +265,7 @@ fn test_wrap_backend_with_none_mode_wraps_anyway() {
 
 #[test]
 fn test_wrap_backend_with_aes_mode_accepts_hex_key() {
-    let inner: Box<dyn StorageBackend> = Box::new(NullInner);
+    let inner: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(NullInner);
     let mut coll = KeyIdCollisionCheck::new();
     let wrapped = wrap_backend_with_encryption(
         "enc-backend",
@@ -286,7 +286,7 @@ fn test_wrap_backend_with_aes_mode_accepts_hex_key() {
 
 #[test]
 fn test_wrap_backend_with_aes_mode_rejects_malformed_hex() {
-    let inner: Box<dyn StorageBackend> = Box::new(NullInner);
+    let inner: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(NullInner);
     let mut coll = KeyIdCollisionCheck::new();
     let result = wrap_backend_with_encryption(
         "bad",
@@ -299,7 +299,7 @@ fn test_wrap_backend_with_aes_mode_rejects_malformed_hex() {
         },
         &mut coll,
     );
-    // Box<dyn StorageBackend> doesn't impl Debug, so we can't use
+    // Box<DynStorageBackend<'static>> doesn't impl Debug, so we can't use
     // `.unwrap_err()`; destructure by hand.
     let err = match result {
         Ok(_) => panic!("malformed hex must error"),
@@ -322,7 +322,7 @@ fn test_key_id_collision_detected_at_construction() {
     let mut coll = KeyIdCollisionCheck::new();
     let first = wrap_backend_with_encryption(
         "a",
-        Box::new(NullInner),
+        DynStorageBackend::new_box(NullInner),
         &crate::config::BackendEncryptionConfig::Aes256GcmProxy {
             key: Some(HEX32_KEY_A.into()),
             key_id: Some("shared-id".into()),
@@ -334,7 +334,7 @@ fn test_key_id_collision_detected_at_construction() {
     assert!(first.is_ok());
     let second = wrap_backend_with_encryption(
         "b",
-        Box::new(NullInner),
+        DynStorageBackend::new_box(NullInner),
         &crate::config::BackendEncryptionConfig::Aes256GcmProxy {
             key: Some(HEX32_KEY_B.into()),
             key_id: Some("shared-id".into()),
@@ -363,7 +363,7 @@ fn test_key_id_collision_allowed_with_same_key() {
     let mut coll = KeyIdCollisionCheck::new();
     let first = wrap_backend_with_encryption(
         "primary",
-        Box::new(NullInner),
+        DynStorageBackend::new_box(NullInner),
         &crate::config::BackendEncryptionConfig::Aes256GcmProxy {
             key: Some(HEX32_KEY_A.into()),
             key_id: Some("portable".into()),
@@ -375,7 +375,7 @@ fn test_key_id_collision_allowed_with_same_key() {
     assert!(first.is_ok());
     let second = wrap_backend_with_encryption(
         "replica",
-        Box::new(NullInner),
+        DynStorageBackend::new_box(NullInner),
         &crate::config::BackendEncryptionConfig::Aes256GcmProxy {
             key: Some(HEX32_KEY_A.into()),
             key_id: Some("portable".into()),
@@ -402,7 +402,7 @@ fn test_wrap_backend_sse_modes_wrap_for_sniffer_defense() {
     let mut coll = KeyIdCollisionCheck::new();
     let wrapped = wrap_backend_with_encryption(
         "s3-kms",
-        Box::new(NullInner),
+        DynStorageBackend::new_box(NullInner),
         &crate::config::BackendEncryptionConfig::SseKms {
             kms_key_id: "arn:aws:kms:us-east-1:1:key/x".into(),
             bucket_key_enabled: true,
@@ -415,7 +415,7 @@ fn test_wrap_backend_sse_modes_wrap_for_sniffer_defense() {
 
     let wrapped2 = wrap_backend_with_encryption(
         "s3-aes",
-        Box::new(NullInner),
+        DynStorageBackend::new_box(NullInner),
         &crate::config::BackendEncryptionConfig::SseS3 {
             legacy_key: None,
             legacy_key_id: None,

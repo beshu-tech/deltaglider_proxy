@@ -7,6 +7,7 @@
 
 use super::{AdminError, AdminState};
 use crate::config_sections::{LeaseTiming, ReplicationConfig, ReplicationRule};
+use crate::coordination::CoordinationLease;
 use crate::replication;
 use axum::http::{HeaderMap, StatusCode};
 use serde::Serialize;

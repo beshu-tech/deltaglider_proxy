@@ -3,6 +3,7 @@
 //! Engine construction: backend build, per-backend encryption wrapping, builders.
 
 use super::*;
+use crate::storage::DynStorageBackend;
 
 impl DynEngine {
     /// Create a new engine with the appropriate backend based on configuration.
@@ -35,7 +36,7 @@ impl DynEngine {
         // The two layers are mutually exclusive on a given backend: you
         // get ONE of {proxy AES-GCM, SSE-KMS, SSE-S3, none}. The
         // encryption config enum enforces this by construction.
-        let storage: Box<dyn StorageBackend> = if config.backends.is_empty() {
+        let storage: Box<DynStorageBackend<'static>> = if config.backends.is_empty() {
             // Singleton backend path. Synthetic name "default" matches
             // what `apply_backend_encryption_env` uses for this entry.
             let raw =
@@ -71,7 +72,7 @@ impl DynEngine {
             );
             let routes = registry.routing_table();
 
-            Box::new(crate::storage::RoutingBackend::new(
+            DynStorageBackend::new_box(crate::storage::RoutingBackend::new(
                 backends,
                 routes,
                 default_name,
@@ -115,14 +116,14 @@ async fn build_raw_backend(
     name: &str,
     cfg: &BackendConfig,
     enc: &crate::config::BackendEncryptionConfig,
-) -> Result<Box<dyn StorageBackend>, StorageError> {
+) -> Result<Box<DynStorageBackend<'static>>, StorageError> {
     match cfg {
-        BackendConfig::Filesystem { path } => {
-            Ok(Box::new(FilesystemBackend::new(path.clone()).await?))
-        }
+        BackendConfig::Filesystem { path } => Ok(DynStorageBackend::new_box(
+            FilesystemBackend::new(path.clone()).await?,
+        )),
         BackendConfig::S3 { .. } => {
             let native = native_encryption_for(enc);
-            Ok(Box::new(
+            Ok(DynStorageBackend::new_box(
                 S3Backend::new(cfg, native)
                     .await?
                     .with_health_name(name, cfg),
@@ -189,10 +190,10 @@ impl KeyIdCollisionCheck {
 ///     backend is running in native or no-key mode.
 pub(super) fn wrap_backend_with_encryption(
     backend_name: &str,
-    inner: Box<dyn StorageBackend>,
+    inner: Box<DynStorageBackend<'static>>,
     enc: &crate::config::BackendEncryptionConfig,
     collisions: &mut KeyIdCollisionCheck,
-) -> Result<Box<dyn StorageBackend>, StorageError> {
+) -> Result<Box<DynStorageBackend<'static>>, StorageError> {
     use crate::config::BackendEncryptionConfig as E;
     // Resolve primary (key, key_id) + pick the write_mode.
     let (primary_key, primary_kid, write_mode): (
@@ -285,9 +286,9 @@ pub(super) fn wrap_backend_with_encryption(
         legacy_key: legacy_key_opt,
         legacy_key_id: legacy_kid_opt,
     })));
-    Ok(Box::new(crate::storage::EncryptingBackend::new(
-        inner, enc_config,
-    )))
+    Ok(DynStorageBackend::new_box(
+        crate::storage::EncryptingBackend::new(inner, enc_config),
+    ))
 }
 
 /// Pull the legacy_key / legacy_key_id pair out of the per-backend
@@ -447,7 +448,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// round-trip is paid.
     pub fn with_reference_lock(
         mut self,
-        lock: Option<Arc<dyn crate::coordination::ReferenceLock>>,
+        lock: Option<Arc<crate::coordination::DynReferenceLock<'static>>>,
     ) -> Self {
         self.reference_lock = lock;
         self

@@ -8,7 +8,6 @@ use super::traits::{
 };
 use super::xattr_meta;
 use crate::types::FileMetadata;
-use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use std::collections::BTreeMap;
@@ -722,7 +721,6 @@ impl FilesystemBackend {
     }
 }
 
-#[async_trait]
 impl StorageBackend for FilesystemBackend {
     async fn flush_pending(&self) -> Result<(), StorageError> {
         tokio::task::spawn_blocking(flush_pending_fsync)

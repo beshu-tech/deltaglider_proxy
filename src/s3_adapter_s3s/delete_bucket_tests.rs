@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 use super::*;
+use crate::storage::DynStorageBackend;
 
 /// Forwards to the engine and records each request's delimiter.
 struct Recording<'a> {
@@ -8,7 +9,6 @@ struct Recording<'a> {
     delimiters: Mutex<Vec<Option<String>>>,
 }
 
-#[async_trait::async_trait]
 impl crate::iam::listing::Lister for Recording<'_> {
     async fn list(
         &self,
@@ -46,7 +46,7 @@ async fn first_visible_key_is_the_flat_first_key_by_delimited_reads() {
     ];
     for keys in layouts {
         let dir = tempfile::tempdir().unwrap();
-        let backend: Box<dyn crate::storage::StorageBackend> = Box::new(
+        let backend: Box<crate::storage::DynStorageBackend<'static>> = DynStorageBackend::new_box(
             crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
                 .await
                 .unwrap(),

@@ -64,10 +64,10 @@
 //! whose lock lapsed while a peer wrote gets a precondition failure, never an
 //! overwrite. The renew-and-check above still stops most such writes early.
 
+use std::future::Future;
 use std::time::Duration;
 
 use super::lease::LeaseError;
-use async_trait::async_trait;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use serde::{Deserialize, Serialize};
@@ -168,23 +168,37 @@ pub fn plan_lock_renew(current: &Observed, now: i64, owner: &str) -> RenewLockAc
 }
 
 /// A per-deltaspace cross-instance mutex.
-#[async_trait]
+#[dynosaur::dynosaur(pub DynReferenceLock = dyn(box) ReferenceLock)]
 pub trait ReferenceLock: Send + Sync {
     /// One acquisition attempt. `Ok(true)` = acquired (we now hold it), `Ok(false)`
     /// = a live foreign holder blocks us (caller should back off and retry),
     /// `Err` = an I/O error (caller treats conservatively — fail the write rather
     /// than risk two baselines).
-    async fn try_acquire(&self, key: &str, owner: &str, now: i64) -> Result<bool, LeaseError>;
+    fn try_acquire(
+        &self,
+        key: &str,
+        owner: &str,
+        now: i64,
+    ) -> impl Future<Output = Result<bool, LeaseError>> + Send;
 
     /// Release the lock, but only if we still own it (owner-scoped delete), so a
     /// release can never clobber a lock a peer legitimately stole after our TTL
     /// lapsed. Best-effort: the TTL backstops a failed release.
-    async fn release(&self, key: &str, owner: &str) -> Result<(), LeaseError>;
+    fn release(
+        &self,
+        key: &str,
+        owner: &str,
+    ) -> impl Future<Output = Result<(), LeaseError>> + Send;
 
     /// Extend a lock this owner still holds. `Err(Lost)` = lost (stolen,
     /// lapsed, gone): the holder must not commit. `Err(Backend)` = could not
     /// tell.
-    async fn renew(&self, key: &str, owner: &str, now: i64) -> Result<(), LeaseError>;
+    fn renew(
+        &self,
+        key: &str,
+        owner: &str,
+        now: i64,
+    ) -> impl Future<Output = Result<(), LeaseError>> + Send;
 
     /// The crash-backstop TTL applied to a freshly acquired lock, in seconds.
     fn ttl_secs(&self) -> i64 {
@@ -321,7 +335,6 @@ impl S3ReferenceLock {
     }
 }
 
-#[async_trait]
 impl ReferenceLock for S3ReferenceLock {
     async fn try_acquire(&self, key: &str, owner: &str, now: i64) -> Result<bool, LeaseError> {
         let current = self.read_lock(key, now).await?;
@@ -392,7 +405,7 @@ impl ReferenceLock for S3ReferenceLock {
 /// (also fail-closed). `now_fn` supplies the clock so the whole loop is
 /// unit-testable against a mock lock without real time.
 pub async fn acquire_blocking(
-    lock: &dyn ReferenceLock,
+    lock: &(impl ReferenceLock + ?Sized),
     key: &str,
     owner: &str,
     deadline: std::time::Instant,
@@ -623,7 +636,6 @@ mod tests {
     #[test]
     fn renew_interval_is_a_quarter_ttl() {
         struct T;
-        #[async_trait]
         impl ReferenceLock for T {
             async fn try_acquire(&self, _: &str, _: &str, _: i64) -> Result<bool, LeaseError> {
                 Ok(true)
@@ -668,7 +680,6 @@ mod tests {
         held_by: TokioMutex<Option<String>>,
     }
 
-    #[async_trait]
     impl ReferenceLock for MockLock {
         async fn try_acquire(
             &self,
@@ -735,7 +746,6 @@ mod tests {
     #[tokio::test]
     async fn acquire_blocking_propagates_io_error_fail_closed() {
         struct ErrLock;
-        #[async_trait]
         impl ReferenceLock for ErrLock {
             async fn try_acquire(&self, _k: &str, _o: &str, _n: i64) -> Result<bool, LeaseError> {
                 Err(LeaseError::Backend(

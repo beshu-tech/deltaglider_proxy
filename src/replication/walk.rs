@@ -894,7 +894,7 @@ impl WalkMachine {
             self.tracker.open_marker(&marker);
         }
         let mk = || SideStream::new(task.rel_dir.clone(), false, token.clone(), marker.clone());
-        let (src, dest) = (want_src.then(&mk), want_dest.then(&mk));
+        let (src, dest) = (want_src.then(mk), want_dest.then(mk));
 
         // Abandon old streams: close live markers and drop any in-flight
         // listing routes so a late page can't feed the new flat streams.

@@ -25,6 +25,7 @@
 //! `dg-multipart-etag`, which the read path serves in preference to the
 //! raw ETag — clients keep the ETag they know.
 
+use crate::storage::StorageBackend;
 use chrono::{DateTime, Utc};
 use md5::Md5;
 use sha2::{Digest, Sha256};

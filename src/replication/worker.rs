@@ -33,6 +33,7 @@ use super::walk;
 use crate::background::{LeaseAlive, LeaseKeeper, RunLease};
 use crate::config_db::ConfigDb;
 use crate::config_sections::ReplicationRule;
+use crate::coordination::CoordinationLease;
 use crate::deltaglider::DynEngine;
 use crate::event_outbox::{EventKind, EventSource, NewEvent};
 use crate::job_loop::MAX_JOB_PAGES;
@@ -374,7 +375,7 @@ pub async fn run_rule(
     lease: Option<RunLease>,
     concurrency: RunConcurrency,
     maintenance_gate: Option<Arc<crate::maintenance::gate::MaintenanceGate>>,
-    coordination_lease: Arc<dyn crate::coordination::CoordinationLease>,
+    coordination_lease: Arc<crate::coordination::DynCoordinationLease<'static>>,
 ) -> Result<(i64, RunOutcome), crate::config_db::ConfigDbError> {
     let transfers = concurrency.transfers.clamp(1, 64) as usize;
     let upload_concurrency = concurrency.upload_concurrency.clamp(1, 16) as usize;
@@ -795,7 +796,7 @@ fn page_is_throttle_aborted(copied: i64, throttled: i64, attempted: i64) -> bool
 fn spawn_lease_keeper(
     rule_name: &str,
     lease: Option<RunLease>,
-    coordination_lease: Arc<dyn crate::coordination::CoordinationLease>,
+    coordination_lease: Arc<crate::coordination::DynCoordinationLease<'static>>,
 ) -> Option<LeaseKeeper> {
     let lease = lease?;
     let rule_name = rule_name.to_string();
@@ -830,7 +831,7 @@ struct RunLeaseGuard {
     keeper: Option<LeaseKeeper>,
     /// (lease, rule, owner) to release on an abnormal exit.
     release: Option<(
-        Arc<dyn crate::coordination::CoordinationLease>,
+        Arc<crate::coordination::DynCoordinationLease<'static>>,
         String,
         String,
     )>,
@@ -1127,6 +1128,8 @@ fn compute_next_due(rule: &ReplicationRule, finished_at: i64) -> i64 {
 mod tests {
     use super::*;
     use crate::config_sections::{ConflictPolicy, ReplicationEndpoint, ReplicationRule};
+    use crate::coordination::DynCoordinationLease;
+    use crate::storage::DynStorageBackend;
 
     #[test]
     fn throttle_abort_fires_for_small_batch_full_page() {
@@ -1299,7 +1302,6 @@ mod tests {
         std::sync::atomic::AtomicUsize,
         std::sync::atomic::AtomicUsize,
     );
-    #[async_trait::async_trait]
     impl crate::coordination::CoordinationLease for CountingLease {
         async fn try_acquire(
             &self,
@@ -1345,7 +1347,7 @@ mod tests {
     async fn control_check_does_not_renew_the_coordination_lease() {
         let data = tempfile::tempdir().unwrap();
         let config = crate::config::Config::default();
-        let backend: Box<dyn crate::storage::StorageBackend> = Box::new(
+        let backend: Box<crate::storage::DynStorageBackend<'static>> = DynStorageBackend::new_box(
             crate::storage::FilesystemBackend::new(data.path().to_path_buf())
                 .await
                 .unwrap(),
@@ -1390,7 +1392,7 @@ mod tests {
             }),
             RunConcurrency::default(),
             None,
-            lease.clone(),
+            DynCoordinationLease::from_arc(lease.clone()),
         )
         .await
         .unwrap();
@@ -1411,7 +1413,7 @@ mod tests {
     async fn dropped_run_releases_its_lease() {
         let data = tempfile::tempdir().unwrap();
         let config = crate::config::Config::default();
-        let backend: Box<dyn crate::storage::StorageBackend> = Box::new(
+        let backend: Box<crate::storage::DynStorageBackend<'static>> = DynStorageBackend::new_box(
             crate::storage::FilesystemBackend::new(data.path().to_path_buf())
                 .await
                 .unwrap(),
@@ -1450,7 +1452,7 @@ mod tests {
                     }),
                     RunConcurrency::default(),
                     None,
-                    lease,
+                    DynCoordinationLease::from_arc(lease),
                 )
                 .await
             }
@@ -1472,11 +1474,15 @@ mod tests {
                 ttl_secs: 300,
                 heartbeat_secs: 60,
             }),
-            lease.clone(),
+            DynCoordinationLease::from_arc(lease.clone()),
         );
         let guard = RunLeaseGuard {
             keeper,
-            release: Some((lease.clone(), "r".into(), "w".into())),
+            release: Some((
+                DynCoordinationLease::from_arc(lease.clone()),
+                "r".into(),
+                "w".into(),
+            )),
         };
         drop(guard);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1487,7 +1493,11 @@ mod tests {
         // finish() is the normal exit: the caller releases, the guard does not.
         RunLeaseGuard {
             keeper: None,
-            release: Some((lease.clone(), "r".into(), "w".into())),
+            release: Some((
+                DynCoordinationLease::from_arc(lease.clone()),
+                "r".into(),
+                "w".into(),
+            )),
         }
         .finish();
         tokio::task::yield_now().await;
@@ -1500,7 +1510,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn one_failed_renewal_does_not_stop_the_run() {
         struct Flaky(std::sync::atomic::AtomicUsize);
-        #[async_trait::async_trait]
         impl crate::coordination::CoordinationLease for Flaky {
             async fn try_acquire(
                 &self,
@@ -1551,7 +1560,7 @@ mod tests {
                 ttl_secs: 300,
                 heartbeat_secs: 60,
             }),
-            lease.clone(),
+            DynCoordinationLease::from_arc(lease.clone()),
         )
         .unwrap();
         tokio::time::sleep(std::time::Duration::from_secs(150)).await;

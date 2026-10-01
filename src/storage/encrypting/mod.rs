@@ -72,7 +72,6 @@ use crate::types::FileMetadata;
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use arc_swap::ArcSwap;
-use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use rand::RngCore;
@@ -533,7 +532,6 @@ pub fn check_key_id_match(
 
 // Generate the full StorageBackend impl. Encrypt/decrypt methods are hand-written;
 // all other methods delegate to self.inner unchanged.
-#[async_trait]
 impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     // ── Encrypt on write ──
 

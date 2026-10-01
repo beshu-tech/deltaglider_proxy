@@ -1272,12 +1272,13 @@ mod tests {
     use crate::config::Config;
     use crate::config_sections::LifecycleRule;
     use crate::deltaglider::{DeltaGliderEngine, DynEngine};
-    use crate::storage::{FilesystemBackend, StorageBackend};
+    use crate::storage::DynStorageBackend;
+    use crate::storage::FilesystemBackend;
     use std::sync::Arc;
 
     async fn fs_engine(dir: &std::path::Path) -> Arc<DynEngine> {
-        let backend: Box<dyn StorageBackend> =
-            Box::new(FilesystemBackend::new(dir.to_path_buf()).await.unwrap());
+        let backend: Box<DynStorageBackend<'static>> =
+            DynStorageBackend::new_box(FilesystemBackend::new(dir.to_path_buf()).await.unwrap());
         let engine =
             DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None);
         engine.create_bucket("b").await.ok();
@@ -1581,7 +1582,8 @@ mod review3_tests {
     use super::*;
     use crate::config::Config;
     use crate::deltaglider::DeltaGliderEngine;
-    use crate::storage::{FilesystemBackend, StorageBackend};
+    use crate::storage::DynStorageBackend;
+    use crate::storage::FilesystemBackend;
 
     /// The run's lease heartbeat is a detached task, aborted only on the
     /// normal return. A run that unwinds (panic in the spawned run-now task)
@@ -1591,7 +1593,7 @@ mod review3_tests {
     #[tokio::test]
     async fn review3_an_aborted_run_does_not_keep_its_lease_alive() {
         let dir = tempfile::tempdir().unwrap();
-        let backend: Box<dyn StorageBackend> = Box::new(
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(
             FilesystemBackend::new(dir.path().to_path_buf())
                 .await
                 .unwrap(),

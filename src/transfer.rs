@@ -1513,10 +1513,10 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::deltaglider::DeltaGliderEngine;
-    use crate::storage::StorageBackend;
+    use crate::storage::DynStorageBackend;
 
     async fn fs_engine_with(dir: &std::path::Path, buckets: &[&str]) -> Arc<DynEngine> {
-        let backend: Box<dyn StorageBackend> = Box::new(
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(
             crate::storage::FilesystemBackend::new(dir.to_path_buf())
                 .await
                 .unwrap(),
@@ -1648,7 +1648,7 @@ mod tests {
     #[tokio::test]
     async fn delta_fast_path_refuses_a_source_overwritten_after_head() {
         let dir = tempfile::tempdir().unwrap();
-        let backend: Box<dyn StorageBackend> = Box::new(
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(
             crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
                 .await
                 .unwrap(),
@@ -2079,9 +2079,9 @@ mod multipart_abort_tests {
     use super::*;
     use crate::config::Config;
     use crate::deltaglider::DeltaGliderEngine;
+    use crate::storage::DynStorageBackend;
     use crate::storage::{MultipartUpload, StorageBackend, StorageError, UploadedPart};
     use crate::types::FileMetadata;
-    use async_trait::async_trait;
     use bytes::Bytes;
     use futures::stream::BoxStream;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2124,7 +2124,6 @@ mod multipart_abort_tests {
         StorageError::Other("AbortSpy: not implemented".into())
     }
 
-    #[async_trait]
     impl StorageBackend for AbortSpy {
         async fn reference_fence(
             &self,
@@ -2372,7 +2371,8 @@ mod multipart_abort_tests {
 
     fn spy_engine(spy: AbortSpy) -> (Arc<DynEngine>, Arc<AbortSpy>) {
         let spy = Arc::new(spy);
-        let backend: Box<dyn StorageBackend> = Box::new(SpyRef(spy.clone()));
+        let backend: Box<DynStorageBackend<'static>> =
+            DynStorageBackend::new_box(SpyRef(spy.clone()));
         let engine =
             DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None);
         (Arc::new(engine), spy)
@@ -2382,7 +2382,6 @@ mod multipart_abort_tests {
     /// assertions while the engine owns the boxed backend.
     struct SpyRef(Arc<AbortSpy>);
 
-    #[async_trait]
     impl StorageBackend for SpyRef {
         async fn reference_fence(
             &self,

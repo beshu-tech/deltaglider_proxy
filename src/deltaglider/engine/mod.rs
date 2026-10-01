@@ -2,6 +2,7 @@
 
 //! DeltaGlider engine - main orchestrator for delta-based storage
 
+use crate::storage::DynStorageBackend;
 use arc_swap::ArcSwap;
 
 use super::cache::ReferenceCache;
@@ -209,7 +210,7 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
     /// single-instance → zero S3 round-trips). Held INSIDE `prefix_locks` around
     /// the reference read-modify-write so two nodes cannot both create a
     /// `reference.bin` baseline for the same deltaspace and corrupt it.
-    reference_lock: Option<Arc<dyn crate::coordination::ReferenceLock>>,
+    reference_lock: Option<Arc<crate::coordination::DynReferenceLock<'static>>>,
     /// Optional Prometheus metrics (None in tests).
     metrics: Option<Arc<Metrics>>,
     /// In-memory cache for object metadata (eliminates HEAD requests).
@@ -232,7 +233,7 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
 }
 
 /// Type alias for engine with dynamic backend dispatch
-pub type DynEngine = DeltaGliderEngine<Box<dyn StorageBackend>>;
+pub type DynEngine = DeltaGliderEngine<Box<DynStorageBackend<'static>>>;
 
 impl<S: StorageBackend> DeltaGliderEngine<S> {
     const INTERNAL_REFERENCE_NAME: &'static str = "__reference__";

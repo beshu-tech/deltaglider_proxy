@@ -1034,10 +1034,12 @@ pub async fn build_coordination_lease(
     config: &Config,
     config_db: &Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>>,
     db_keys: &deltaglider_proxy::config_db::ConfigDbKeys,
-) -> Arc<dyn deltaglider_proxy::coordination::CoordinationLease> {
-    use deltaglider_proxy::coordination::{durable_node_id, process_boot_ids, LocalLease, S3Lease};
+) -> Arc<deltaglider_proxy::coordination::DynCoordinationLease<'static>> {
+    use deltaglider_proxy::coordination::{
+        durable_node_id, process_boot_ids, DynCoordinationLease, LocalLease, S3Lease,
+    };
 
-    let local = || Arc::new(LocalLease::new(config_db.clone()));
+    let local = || DynCoordinationLease::new_arc(LocalLease::new(config_db.clone()));
 
     let sync_bucket = match &config.config_sync_bucket {
         Some(b) if !b.is_empty() => b.clone(),
@@ -1098,7 +1100,7 @@ pub async fn build_coordination_lease(
                     .parent()
                     .unwrap_or_else(|| std::path::Path::new(".")),
             );
-            Arc::new(S3Lease::with_boot(client, sync_bucket, node_id, boot))
+            DynCoordinationLease::new_arc(S3Lease::with_boot(client, sync_bucket, node_id, boot))
         }
         Err(e) => {
             warn!("Job-plane lease: coordination client build failed ({e}) — node-local fallback");
@@ -1121,8 +1123,8 @@ pub async fn build_coordination_lease(
 /// wedge startup, and the single-writer routing contract still applies.
 pub async fn build_reference_lock(
     config: &Config,
-) -> Option<Arc<dyn deltaglider_proxy::coordination::ReferenceLock>> {
-    use deltaglider_proxy::coordination::{durable_node_id, S3ReferenceLock};
+) -> Option<Arc<deltaglider_proxy::coordination::DynReferenceLock<'static>>> {
+    use deltaglider_proxy::coordination::{durable_node_id, DynReferenceLock, S3ReferenceLock};
 
     let sync_bucket = match &config.config_sync_bucket {
         Some(b) if !b.is_empty() => b.clone(),
@@ -1148,7 +1150,7 @@ pub async fn build_reference_lock(
                 "Reference lock: S3-CAS on bucket '{sync_bucket}' (cross-node reference.bin \
                  protection, node_id={node_id})"
             );
-            Some(Arc::new(
+            Some(DynReferenceLock::new_arc(
                 S3ReferenceLock::new(client, sync_bucket, node_id)
                     .with_tunables(ttl_secs, acquire_timeout_secs),
             ))
