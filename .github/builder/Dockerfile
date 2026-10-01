@@ -36,6 +36,16 @@ RUN curl -fsSL https://deb.nodesource.com/setup_26.x | bash - \
   && apt-get install -y --no-install-recommends nodejs \
   && rm -rf /var/lib/apt/lists/*
 
+# ── Chromium system libraries for the Playwright e2e jobs ───────────
+# `playwright install --with-deps` ran apt-get in every e2e job: package
+# lists + ~85 MB of libraries from archive.ubuntu.com, 9 min on 2026-10-01
+# at ~200 kB/s. The jobs now download only the browser (Playwright CDN).
+# Keep PLAYWRIGHT_VERSION in step with demo/s3-browser/ui/package-lock.json:
+# a Playwright that needs a library this layer lacks fails to launch Chromium.
+ARG PLAYWRIGHT_VERSION=1.61.1
+RUN npx -y "playwright@${PLAYWRIGHT_VERSION}" install-deps chromium \
+  && rm -rf /var/lib/apt/lists/* /root/.npm
+
 # ── Rust via rustup, pinned (keep in step with rust-toolchain.toml) ──
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
