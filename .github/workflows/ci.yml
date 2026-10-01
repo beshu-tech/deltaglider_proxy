@@ -27,14 +27,13 @@ env:
   CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: unpacked
   CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: unpacked
   BUILDER_IMAGE: ghcr.io/${{ github.repository }}/builder:latest
-  # ── sccache: GitHub Actions cache backend. Each compiling job runs
-  #    mozilla-actions/sccache-action, which exports the cache credentials. ──
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
-  # sccache logs a failed cache write only at debug level; the
-  # "sccache write-error reasons" step prints them from this file.
-  SCCACHE_ERROR_LOG: /tmp/sccache.log
-  SCCACHE_LOG: "warn,sccache::server=debug"
+  # ── Dependency cache: Swatinem/rust-cache restores target/ + the cargo
+  #    registry as ONE Actions-cache entry per job. sccache's GHA backend made
+  #    one cache request per object file (~860 per job, 5 jobs in parallel);
+  #    GitHub answered 429 "rate limit exceeded" to most reads and writes, so
+  #    each job recompiled C/asm (aws-lc, sqlcipher) on every run. Jobs that
+  #    build the same dependency set share a key; one job per key saves, and
+  #    only on main (a branch cache could not be read by main anyway). ──
   CARGO_INCREMENTAL: "0"
 
 jobs:
@@ -86,7 +85,11 @@ jobs:
         shell: bash
         run: rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          shared-key: release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-bin: "false"
       - uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v6.0.0
         with:
           name: ui-dist
@@ -101,9 +104,6 @@ jobs:
           path: target/release/deltaglider_proxy
           if-no-files-found: error
           retention-days: 1
-      - name: sccache write-error reasons
-        if: always()
-        run: ./scripts/ci-sccache-summary.sh
 
   verify-integration-test-registry:
     name: Integration test registry
@@ -181,8 +181,6 @@ jobs:
           rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: cargo fmt
-        env:
-          RUSTC_WRAPPER: ""  # fmt doesn't need sccache
         run: cargo fmt --all -- --check
 
   clippy:
@@ -203,14 +201,17 @@ jobs:
         run: |
           rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          shared-key: clippy
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-bin: "false"
       - uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v6.0.0
         with:
           name: ui-dist
           path: demo/s3-browser/ui/dist
-      - name: cargo clippy (with sccache bypass + diagnostic capture)
+      - name: cargo clippy (with diagnostic capture)
         shell: bash
-        env:
-          RUSTC_WRAPPER: ""
         run: |
           set +e
           # Write a heartbeat to step summary FIRST so we can at least
@@ -247,12 +248,12 @@ jobs:
       # Broken intra-doc links and links to private items fail the build.
       - name: cargo doc (rustdoc warnings are errors)
         env:
-          RUSTC_WRAPPER: ""
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --locked --no-deps
 
   # ── Test jobs: split into 3 parallel groups for ~3x faster wall-clock ──
-  # Each job compiles via sccache (near-instant after first job populates cache).
+  # Each job restores the shared `test` dependency cache, then compiles only
+  # this crate.
   # Split by execution time: unit (~60s), integration-fast (~50s), integration-slow (~70s).
 
   test-unit:
@@ -274,7 +275,11 @@ jobs:
         run: |
           rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          shared-key: test
+          save-if: false
+          cache-bin: "false"
       - uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v6.0.0
         with:
           name: ui-dist
@@ -290,9 +295,6 @@ jobs:
         env:
           RUST_BACKTRACE: "1"
         run: cargo test --bins --locked
-      - name: sccache write-error reasons
-        if: always()
-        run: ./scripts/ci-sccache-summary.sh
 
   test-integration:
     name: Integration Tests
@@ -325,7 +327,11 @@ jobs:
         run: |
           rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-bin: "false"
       - uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v6.0.0
         with:
           name: ui-dist
@@ -450,9 +456,6 @@ jobs:
       - name: Stop MinIO
         if: always()
         run: docker rm -f minio-ci 2>/dev/null || true
-      - name: sccache write-error reasons
-        if: always()
-        run: ./scripts/ci-sccache-summary.sh
 
   test-delta:
     name: Delta & Optimization Tests
@@ -473,7 +476,11 @@ jobs:
         run: |
           rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          shared-key: test
+          save-if: false
+          cache-bin: "false"
       - uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v6.0.0
         with:
           name: ui-dist
@@ -486,9 +493,6 @@ jobs:
             delta_test:: \
             optimization_test:: \
             memory_test::
-      - name: sccache write-error reasons
-        if: always()
-        run: ./scripts/ci-sccache-summary.sh
 
   e2e-smoke:
     name: E2E smoke (embedded UI)
@@ -647,8 +651,6 @@ jobs:
         # `timeout` bounds the whole thing; on expiry we just warn and move on.
         timeout-minutes: 4
         continue-on-error: true
-        env:
-          RUSTC_WRAPPER: ""
         run: |
           set +e
           # lychee is baked into the builder image; fall back to a from-source
