@@ -31,6 +31,10 @@ env:
   #    mozilla-actions/sccache-action, which exports the cache credentials. ──
   RUSTC_WRAPPER: sccache
   SCCACHE_GHA_ENABLED: "true"
+  # sccache logs a failed cache write only at debug level; the
+  # "sccache write-error reasons" step prints them from this file.
+  SCCACHE_ERROR_LOG: /tmp/sccache.log
+  SCCACHE_LOG: "warn,sccache::server=debug"
   CARGO_INCREMENTAL: "0"
 
 jobs:
@@ -97,6 +101,9 @@ jobs:
           path: target/release/deltaglider_proxy
           if-no-files-found: error
           retention-days: 1
+      - name: sccache write-error reasons
+        if: always()
+        run: ./scripts/ci-sccache-summary.sh
 
   verify-integration-test-registry:
     name: Integration test registry
@@ -283,6 +290,9 @@ jobs:
         env:
           RUST_BACKTRACE: "1"
         run: cargo test --bins --locked
+      - name: sccache write-error reasons
+        if: always()
+        run: ./scripts/ci-sccache-summary.sh
 
   test-integration:
     name: Integration Tests
@@ -440,6 +450,9 @@ jobs:
       - name: Stop MinIO
         if: always()
         run: docker rm -f minio-ci 2>/dev/null || true
+      - name: sccache write-error reasons
+        if: always()
+        run: ./scripts/ci-sccache-summary.sh
 
   test-delta:
     name: Delta & Optimization Tests
@@ -473,6 +486,9 @@ jobs:
             delta_test:: \
             optimization_test:: \
             memory_test::
+      - name: sccache write-error reasons
+        if: always()
+        run: ./scripts/ci-sccache-summary.sh
 
   e2e-smoke:
     name: E2E smoke (embedded UI)
