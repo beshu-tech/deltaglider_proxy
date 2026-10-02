@@ -7,7 +7,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Default proxy image when `spec.image` is not set.
-pub const DEFAULT_IMAGE: &str = "beshultd/deltaglider_proxy:2.0.1";
+pub const DEFAULT_IMAGE: &str = "beshultd/deltaglider_proxy:2.0.2";
 /// Default router image when `spec.router.image` is not set.
 pub const DEFAULT_ROUTER_IMAGE: &str = "haproxy:3.0-alpine";
 /// Default `spec.router.trustedProxyCidrs`: every private range, because the

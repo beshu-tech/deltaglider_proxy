@@ -8,7 +8,27 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-09-28_
+_Last updated: 2026-10-02_
+
+## v2.0.2 — 2026-10-02
+
+### Changed — Built with Rust 1.99
+
+The release binaries and the Docker image are now compiled with Rust 1.99.0
+instead of 1.98.0. The proxy's behaviour does not change. Inside the code,
+the storage, lease, lock and event-delivery interfaces now use the
+language's own `async fn` support instead of the `async-trait` macro, which
+Rust 1.99's linter flagged.
+
+### Fixed — The YAML editor accepts `${env:NAME}` in a non-text field
+
+The proxy gives a whole-value `${env:NAME}` or `${env:NAME:-default}`
+reference the type of its field, so `force_path_style: ${env:S3_PATH_STYLE}`
+loads as a boolean. The JSON Schema that the admin YAML editor and
+`config schema` use still asked for a real boolean, number or list value
+there, and so it marked the reference as an error. Every boolean, number and
+list-of-choices field in the schema now also accepts a whole reference, and
+a plain wrong value is still an error.
 
 ## v2.0.1 — 2026-09-28
 

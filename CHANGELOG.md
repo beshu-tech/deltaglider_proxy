@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.2 — 2026-10-02
+
 ### Changed — Built with Rust 1.99
 
 The release binaries and the Docker image are now compiled with Rust 1.99.0
