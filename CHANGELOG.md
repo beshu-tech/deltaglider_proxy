@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Changed — Built with Rust 1.99
+
+The release binaries and the Docker image are now compiled with Rust 1.99.0
+instead of 1.98.0. The proxy's behaviour does not change. Inside the code,
+the storage, lease, lock and event-delivery interfaces now use the
+language's own `async fn` support instead of the `async-trait` macro, which
+Rust 1.99's linter flagged.
+
 ### Fixed — The YAML editor accepts `${env:NAME}` in a non-text field
 
 The proxy gives a whole-value `${env:NAME}` or `${env:NAME:-default}`
