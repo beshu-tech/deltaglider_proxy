@@ -52,7 +52,7 @@ ENV RUSTUP_HOME=/usr/local/rustup \
     PATH="/usr/local/cargo/bin:${PATH}"
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --default-toolchain 1.98.0 --profile minimal \
+    | sh -s -- -y --default-toolchain 1.99.0 --profile minimal \
   && rustup component add rustfmt clippy \
   && rm -rf "$RUSTUP_HOME"/toolchains/*/share/doc \
   && rm -rf "$RUSTUP_HOME"/toolchains/*/share/man
