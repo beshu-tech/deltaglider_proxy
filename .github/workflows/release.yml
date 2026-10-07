@@ -339,7 +339,7 @@ jobs:
         include:
           - platform: linux/amd64
             arch: amd64
-            runner: homelab
+            runner: ${{ vars.HOMELAB_RUNS_ON || 'homelab' }}
           - platform: linux/arm64
             arch: arm64
             runner: blacksmith-4vcpu-ubuntu-2404-arm
