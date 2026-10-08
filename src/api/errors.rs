@@ -18,6 +18,15 @@ fn escape_xml(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// The `Retry-After` of a 503, in seconds. A caller that knows the real wait
+/// (the auth lockout) replaces it.
+pub(crate) const RETRY_AFTER_SECS: u64 = 5;
+
+/// The client text of a 503 for a transient backend fault. The cause can
+/// carry backend detail, so it goes to the log only.
+const TRANSIENT_503: &str =
+    "The storage backend failed while it served this request. A retry can succeed.";
+
 /// S3 API errors
 #[derive(Debug, Error)]
 pub enum S3Error {
@@ -168,6 +177,13 @@ impl S3Error {
         }
     }
 
+    /// The `Retry-After` of a 503 (`SlowDown`, `ServiceUnavailable`): both
+    /// say that a retry can succeed. `None` for every other answer.
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        matches!(self, S3Error::SlowDown(_) | S3Error::ServiceUnavailable(_))
+            .then_some(RETRY_AFTER_SECS)
+    }
+
     /// Generate XML error response with a unique request ID.
     pub fn to_xml(&self, request_id: &str) -> String {
         let resource = match self {
@@ -199,20 +215,28 @@ impl IntoResponse for S3Error {
 
         let body = self.to_xml(&request_id);
 
+        let retry_after = self.retry_after_secs();
         let mut response = (status, [("Content-Type", "application/xml")], body).into_response();
         response.headers_mut().insert(
             "x-amz-request-id",
             axum::http::HeaderValue::from_str(&request_id).unwrap(),
         );
+        if let Some(secs) = retry_after {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, secs.into());
+        }
         response
     }
 }
 
 /// THE mapping from the proxy's error vocabulary to the s3s wire error.
 /// Exhaustive on purpose: a new variant cannot fall into a silent 500.
+/// A 503 also carries `Retry-After`.
 impl From<S3Error> for s3s::S3Error {
     fn from(err: S3Error) -> Self {
-        match err {
+        let retry_after = err.retry_after_secs();
+        let mut wire = match err {
             S3Error::NoSuchKey(_) => s3s::s3_error!(NoSuchKey),
             S3Error::NoSuchBucket(_) => s3s::s3_error!(NoSuchBucket),
             S3Error::BucketAlreadyExists(_) => s3s::s3_error!(BucketAlreadyExists),
@@ -268,7 +292,13 @@ impl From<S3Error> for s3s::S3Error {
                 }
                 s3s::s3_error!(InternalError, "{}", other.code())
             }
+        };
+        if let Some(secs) = retry_after {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(axum::http::header::RETRY_AFTER, secs.into());
+            wire.set_headers(headers);
         }
+        wire
     }
 }
 
@@ -342,6 +372,12 @@ impl From<crate::storage::StorageError> for S3Error {
             // S3Backend knows it), never credentials or endpoint URLs.
             crate::storage::StorageError::Unavailable(msg) => {
                 S3Error::ServiceUnavailable(format!("the storage backend did not answer: {msg}"))
+            }
+            // A fault that a retry can clear (a backend 5xx, a response body
+            // that broke off): 503, so the client knows that a retry is safe.
+            crate::storage::StorageError::Transient(cause) => {
+                tracing::error!("transient storage fault answered 503, cause: {cause}");
+                S3Error::ServiceUnavailable(TRANSIENT_503.to_string())
             }
             other => S3Error::InternalError(sanitise_for_client(&other)),
         }
@@ -608,6 +644,72 @@ mod tests {
         assert_eq!(s3.status_code(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(s3.status_code().as_u16(), 503);
         assert_eq!(s3.code(), "SlowDown");
+    }
+
+    /// #102: a transient backend fault (a 5xx, a response body that broke
+    /// off) answers 503 ServiceUnavailable, so the client knows that a
+    /// retry is safe. The cause stays out of the client text.
+    #[test]
+    fn transient_storage_error_maps_to_service_unavailable() {
+        let storage = crate::storage::StorageError::Transient(
+            "Failed to read response body: streaming error: minimum throughput \
+             was specified at 1 B/s, but throughput of 0 B/s was observed"
+                .into(),
+        );
+        let s3: S3Error = storage.into();
+        assert_eq!(s3.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(s3.code(), "ServiceUnavailable");
+        let text = s3.to_string();
+        assert!(
+            !text.contains("throughput") && !text.contains("streaming error"),
+            "the cause stays in the log: {text}"
+        );
+    }
+
+    /// Every 503 carries `Retry-After` on both wire paths (s3s and axum);
+    /// no other answer does.
+    #[test]
+    fn retry_after_is_on_every_503_and_only_there() {
+        let retry_after = RETRY_AFTER_SECS.to_string();
+        let both = || {
+            [
+                S3Error::SlowDown("x".into()),
+                S3Error::ServiceUnavailable("x".into()),
+            ]
+        };
+        for (e, again) in both().into_iter().zip(both()) {
+            let code = e.code();
+            let axum_resp = again.into_response();
+            assert_eq!(axum_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                axum_resp
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .unwrap(),
+                retry_after.as_str(),
+                "{code} over axum"
+            );
+            let wire = s3s::S3Error::from(e);
+            assert_eq!(
+                wire.headers()
+                    .and_then(|h| h.get(axum::http::header::RETRY_AFTER))
+                    .unwrap(),
+                retry_after.as_str(),
+                "{code} over s3s"
+            );
+        }
+        for e in [
+            S3Error::InternalError("x".into()),
+            S3Error::NoSuchKey("k".into()),
+        ] {
+            assert!(e.retry_after_secs().is_none());
+            assert!(s3s::S3Error::from(e).headers().is_none());
+        }
+        assert!(S3Error::AccessDenied
+            .into_response()
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .is_none());
     }
 
     /// E4 security fix: `sanitise_for_client` must return a generic string,

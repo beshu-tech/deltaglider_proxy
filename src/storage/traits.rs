@@ -162,8 +162,9 @@ pub enum StorageError {
 
     /// The backend answered with a fault that a retry can clear: a 5xx
     /// other than 503 (500, 502, 504), or the response body broke off
-    /// while it was read. Same Display and wire answer (500) as `S3`:
-    /// only the classification is new.
+    /// while it was read. Same Display as `S3`. Maps to 503
+    /// ServiceUnavailable with `Retry-After`: the client gets a generic
+    /// text, and the cause goes to the log.
     #[error("S3 error: {0}")]
     Transient(String),
 

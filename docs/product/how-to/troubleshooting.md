@@ -99,6 +99,14 @@ A `503 SlowDown` comes either from the upstream S3 backend, when it throttles th
 
 A `503 ServiceUnavailable` that names a backend is a different case: see [How to diagnose a backend that isn't serving](diagnose-backend-connectivity.md).
 
+## A request returns 503 ServiceUnavailable that names no backend
+
+The message of this error is "The storage backend failed while it served this request. A retry can succeed." The S3 backend answered the proxy, but it failed while it served the request: it answered with a `500`, `502` or `504` after the SDK's own retries, or it stopped sending the body of an object. The proxy answers `503` with a `Retry-After` header, because a retry of the same request can succeed. SDKs and `curl --retry` retry it.
+
+When the backend stops sending the body of an object, the proxy first tries to recover by itself. It requests the rest of the object again, starting at the first byte that it did not receive. The proxy asks for the same version of the object, so it never joins two versions. The client gets the error only when these new requests fail too.
+
+The proxy log has one line for each such error: `transient storage fault answered 503, cause: …`. The cause names what failed. A cause with `minimum throughput was specified at 1 B/s, but throughput of 0 B/s was observed` means that the backend sent no bytes for the stall grace period. This period is `DGP_S3_STALL_GRACE_SECS` (default 20 seconds). A backend that often pauses for longer than this needs a larger value. A cause with `status=502` or `status=504` comes from the backend or from a load balancer in front of it.
+
 ## Writes to one bucket return 503 SlowDown
 
 A maintenance job (re-encryption, migration, or metadata backfill) is running on that bucket. The proxy intentionally refuses writes while the job rewrites objects. SDKs retry automatically and succeed when the job finishes. Reads are unaffected. Check **Storage → Jobs** (`/_/admin/jobs`, or `GET /_/api/admin/jobs`) for the job's progress; cancel it if it shouldn't be running. A job survives restarts by design, so if a job is stuck, cancel it through `POST /_/api/admin/jobs/maintenance:<id>/cancel` rather than restarting the proxy. See [Jobs reference](../reference/jobs.md).

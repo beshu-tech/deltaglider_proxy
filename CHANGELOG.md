@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### Fixed — A GET survives a backend that stops sending the body (#102)
+
+The S3 SDK retries a GET only until the response headers arrive. When the
+backend then stopped sending the body of an object, the stalled-stream
+protection ended the read after its grace period (`DGP_S3_STALL_GRACE_SECS`,
+20 seconds), and the client got `500 InternalError` after about 22 seconds.
+A delta-stored object failed this way most often, because the proxy reads
+its reference and its delta before it sends the first byte.
+
+Now the proxy requests the rest of the object again, starting at the first
+byte that it did not receive. The new request carries `If-Match` with the
+ETag of the first response, so the proxy never joins two versions of an
+object. The proxy tries this up to 3 times for each read. The counter
+`deltaglider_backend_get_body_resumes_total` on `/_/metrics` counts these
+new requests.
+
+### Changed — A transient backend fault answers 503 with Retry-After
+
+A backend that failed while it served a request (a `500`, `502` or `504`
+after the SDK's retries, or a body that broke off and did not recover)
+answered `500 InternalError`. It now answers `503 ServiceUnavailable` with a
+generic message, so the client knows that a retry is safe. Every `503`
+answer (`SlowDown` and `ServiceUnavailable`) now carries `Retry-After: 5`;
+the sign-in lockout keeps its own wait. The log line
+`transient storage fault answered 503, cause: …` names the cause. Before,
+the cause of a body that broke off showed only as `streaming error`.
+
 ## v2.0.2 — 2026-10-02
 
 ### Changed — Built with Rust 1.99
