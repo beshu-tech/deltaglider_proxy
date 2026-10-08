@@ -584,7 +584,12 @@ pub async fn oauth_callback(
         provider_name: pending.provider_name.clone(),
         user_id: user.id,
     };
-    let is_admin = super::auth::session_principal_is_admin(&auth_method, &state.iam_state.load());
+    let client_ip = rate_limiter::extract_client_ip_with_peer(
+        &req_headers,
+        connect_info.as_ref().map(|ci| ci.0.ip()),
+    );
+    let is_admin =
+        super::auth::session_principal_is_admin(&auth_method, &state.iam_state.load(), client_ip);
     let session_kind = if is_admin {
         crate::session::SessionKind::AdminGui
     } else {

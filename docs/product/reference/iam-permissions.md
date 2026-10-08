@@ -43,6 +43,8 @@ The proxy derives the action from the method and the path: a `GET` or `HEAD` of 
 
 A user is an **admin** (admin GUI access, config changes) when at least one Allow rule has actions containing `*` or `admin` AND resources containing `*`. A Deny rule of the same shape (actions `*` or `admin`, resources `*`) removes the admin status. Direct rules and group rules count together.
 
+The conditions of that Allow rule must hold for the admin request. An `aws:SourceIp` condition therefore admits the admin GUI and the admin API only from that address range, at sign-in and on every later request. An admin request carries no other condition key, so a condition on any other key never holds for it. A Deny rule of the admin shape removes the admin status whatever its conditions.
+
 ### Resources
 
 Glob patterns matched against `bucket/key`:

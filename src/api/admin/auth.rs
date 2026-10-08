@@ -684,7 +684,7 @@ pub async fn whoami(
     let session_valid = session.is_some();
     let auth_method = session.as_ref().map(auth_method_label);
     let user = match session {
-        Some(method) => session_user_info(&state, method).await,
+        Some(method) => session_user_info(&state, method, client_ip).await,
         None => None,
     };
 
@@ -759,7 +759,8 @@ pub async fn resolve_iam_identity(
 
     guard.record_success();
 
-    let is_admin = crate::iam::permissions::is_admin(&user.permissions);
+    let client_ip = request_client_ip(&req_headers, connect_info.as_ref());
+    let is_admin = user.is_admin(client_ip);
     Ok(Json(WhoamiResponse {
         mode: "iam".into(),
         // The IAM credentials were verified just above — an authenticated caller.
@@ -795,6 +796,7 @@ pub(crate) fn auth_method_label(method: &crate::session::AuthMethod) -> &'static
 async fn session_user_info(
     state: &AdminState,
     auth_method: crate::session::AuthMethod,
+    client_ip: Option<IpAddr>,
 ) -> Option<WhoamiUserInfo> {
     match auth_method {
         crate::session::AuthMethod::OpenLift => None,
@@ -813,7 +815,7 @@ async fn session_user_info(
         crate::session::AuthMethod::IamLoginAs { access_key_id }
         | crate::session::AuthMethod::IamBrowserLift { access_key_id } => {
             let user = resolve_effective_iam_user(state, &access_key_id).await?;
-            let is_admin = user.enabled && crate::iam::permissions::is_admin(&user.permissions);
+            let is_admin = user.enabled && user.is_admin(client_ip);
             Some(WhoamiUserInfo {
                 name: user.name,
                 access_key_id: user.access_key_id,
@@ -835,8 +837,7 @@ async fn session_user_info(
             let effective = resolve_effective_iam_user(state, &user.access_key_id)
                 .await
                 .unwrap_or(user);
-            let is_admin =
-                effective.enabled && crate::iam::permissions::is_admin(&effective.permissions);
+            let is_admin = effective.enabled && effective.is_admin(client_ip);
             Some(WhoamiUserInfo {
                 name: display_name,
                 access_key_id: effective.access_key_id,
@@ -931,7 +932,8 @@ pub async fn login_as(
     let auth_method = AuthMethod::IamLoginAs {
         access_key_id: body.access_key_id.clone(),
     };
-    if !session_principal_is_admin(&auth_method, &iam_state) {
+    let client_ip = request_client_ip(&req_headers, connect_info.as_ref());
+    if !session_principal_is_admin(&auth_method, &iam_state, client_ip) {
         return Err(StatusCode::FORBIDDEN.into());
     }
 
@@ -1192,15 +1194,20 @@ pub async fn require_session(
     Ok(next.run(request).await.into_response())
 }
 
-/// Whether the principal behind a session is, right now, an enabled admin.
-/// `iam` is the live IAM state; its index holds EFFECTIVE (group-merged)
-/// permissions.
+/// Whether the principal behind a session is, right now, an enabled admin
+/// for a request from `client_ip`. `iam` is the live IAM state; its index
+/// holds EFFECTIVE (group-merged) permissions. A condition on the admin rule
+/// (`aws:SourceIp`) is judged on every request, as on the S3 API.
 ///
 /// - `Bootstrap`: the holder of the bootstrap password — always admin.
 /// - `IamLoginAs` / `External`: the user must still exist, be enabled, and
 ///   hold admin permissions. Anything else (IAM mode gone, user deleted) is no.
 /// - Browser-lift and open-mode sessions are never admin.
-pub(crate) fn session_principal_is_admin(method: &AuthMethod, iam: &IamState) -> bool {
+pub(crate) fn session_principal_is_admin(
+    method: &AuthMethod,
+    iam: &IamState,
+    client_ip: Option<IpAddr>,
+) -> bool {
     let IamState::Iam(index) = iam else {
         return matches!(method, AuthMethod::Bootstrap);
     };
@@ -1210,7 +1217,7 @@ pub(crate) fn session_principal_is_admin(method: &AuthMethod, iam: &IamState) ->
         AuthMethod::External { user_id, .. } => index.get_by_id(*user_id),
         AuthMethod::IamBrowserLift { .. } | AuthMethod::OpenLift => return false,
     };
-    user.is_some_and(|u| u.enabled && u.is_admin())
+    user.is_some_and(|u| u.enabled && u.is_admin(client_ip))
 }
 
 /// THE admin-surface session test: a live `AdminGui` session whose principal
@@ -1222,7 +1229,9 @@ fn admin_gui_session_ok(state: &AdminState, token: &str, client_ip: Option<IpAdd
     state
         .sessions
         .admin_gui_auth_method(token, client_ip)
-        .is_some_and(|method| session_principal_is_admin(&method, &state.iam_state.load()))
+        .is_some_and(|method| {
+            session_principal_is_admin(&method, &state.iam_state.load(), client_ip)
+        })
 }
 
 /// Middleware: valid **AdminGui** session only (rejects S3BrowserLift cookies),
@@ -1819,38 +1828,78 @@ mod tests {
             user_id: id,
         };
 
-        assert!(session_principal_is_admin(&AuthMethod::Bootstrap, &iam));
-        assert!(session_principal_is_admin(&login_as("AKADMIN"), &iam));
-        assert!(session_principal_is_admin(&external(1), &iam));
+        assert!(session_principal_is_admin(
+            &AuthMethod::Bootstrap,
+            &iam,
+            None
+        ));
+        assert!(session_principal_is_admin(&login_as("AKADMIN"), &iam, None));
+        assert!(session_principal_is_admin(&external(1), &iam, None));
         // Admin through a group only.
-        assert!(session_principal_is_admin(&external(3), &iam));
-        assert!(session_principal_is_admin(&login_as("AKGROUP"), &iam));
+        assert!(session_principal_is_admin(&external(3), &iam, None));
+        assert!(session_principal_is_admin(&login_as("AKGROUP"), &iam, None));
         // Disabled admin, non-admin, deleted user.
-        assert!(!session_principal_is_admin(&login_as("AKOFF"), &iam));
-        assert!(!session_principal_is_admin(&external(2), &iam));
-        assert!(!session_principal_is_admin(&external(4), &iam));
-        assert!(!session_principal_is_admin(&login_as("AKGONE"), &iam));
-        assert!(!session_principal_is_admin(&external(99), &iam));
+        assert!(!session_principal_is_admin(&login_as("AKOFF"), &iam, None));
+        assert!(!session_principal_is_admin(&external(2), &iam, None));
+        assert!(!session_principal_is_admin(&external(4), &iam, None));
+        assert!(!session_principal_is_admin(&login_as("AKGONE"), &iam, None));
+        assert!(!session_principal_is_admin(&external(99), &iam, None));
         // Browser-lift kinds never reach the admin surface.
         assert!(!session_principal_is_admin(
             &AuthMethod::IamBrowserLift {
                 access_key_id: "AKADMIN".into()
             },
-            &iam
+            &iam,
+            None
         ));
-        assert!(!session_principal_is_admin(&AuthMethod::OpenLift, &iam));
+        assert!(!session_principal_is_admin(
+            &AuthMethod::OpenLift,
+            &iam,
+            None
+        ));
         // IAM mode gone: only the bootstrap holder stays admin.
         assert!(session_principal_is_admin(
             &AuthMethod::Bootstrap,
-            &IamState::Disabled
+            &IamState::Disabled,
+            None
         ));
         assert!(!session_principal_is_admin(
             &login_as("AKADMIN"),
-            &IamState::Disabled
+            &IamState::Disabled,
+            None
         ));
         assert!(!session_principal_is_admin(
             &external(1),
-            &IamState::Disabled
+            &IamState::Disabled,
+            None
+        ));
+    }
+
+    /// B005: an admin rule scoped by `aws:SourceIp` admits the admin surface
+    /// only from that range, on login and on every later request.
+    #[test]
+    fn session_principal_is_admin_honours_the_admin_rule_ip_condition() {
+        let mut user = admin_test_user(5, "AKCI", true, false, vec![]);
+        user.permissions = vec![Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["*".into()],
+            resources: vec!["*".into()],
+            conditions: Some(serde_json::json!({"IpAddress": {"aws:SourceIp": "10.0.0.0/8"}})),
+        }];
+        let iam = IamState::Iam(IamIndex::from_users(vec![user]));
+        let login_as = AuthMethod::IamLoginAs {
+            access_key_id: "AKCI".into(),
+        };
+        assert!(session_principal_is_admin(
+            &login_as,
+            &iam,
+            Some("10.9.8.7".parse().unwrap())
+        ));
+        assert!(!session_principal_is_admin(
+            &login_as,
+            &iam,
+            Some("203.0.113.9".parse().unwrap())
         ));
     }
 

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Security — An IP condition on an admin rule applies to the admin GUI
+
+A Full Access rule (`*` on `*`) with an `aws:SourceIp` condition limited the
+S3 requests of its user to that address range. The admin GUI and the admin
+API did not read the condition, so they accepted the same user from any
+address. Now the condition applies at sign-in and on every later admin
+request, as it does on the S3 API. A condition on another key never holds
+for an admin request, because an admin request carries only the source
+address.
+
 ### Security — Removing the last IAM user no longer opens S3 access
 
 When IAM mode had no bootstrap pair (the pair was removed while IAM users

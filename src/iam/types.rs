@@ -273,9 +273,10 @@ impl AuthenticatedUser {
         self.permissions.iter().any(|p| p.conditions.is_some())
     }
 
-    /// Returns true if this user has full admin permissions.
-    pub fn is_admin(&self) -> bool {
-        permissions::is_admin(&self.permissions)
+    /// Returns true if this user has full admin permissions for a request
+    /// from `client_ip` (conditions on the admin rule must hold).
+    pub fn is_admin(&self, client_ip: Option<std::net::IpAddr>) -> bool {
+        permissions::is_admin(&self.permissions, client_ip)
     }
 }
 
@@ -323,8 +324,9 @@ impl IamUser {
     /// Returns true if this user has full admin permissions:
     /// actions must contain "*" or "admin", AND resources must contain "*".
     /// A user with actions=["*"] on a specific bucket is NOT considered admin.
-    pub fn is_admin(&self) -> bool {
-        permissions::is_admin(&self.permissions)
+    /// Conditions on the admin rule must hold for a request from `client_ip`.
+    pub fn is_admin(&self, client_ip: Option<std::net::IpAddr>) -> bool {
+        permissions::is_admin(&self.permissions, client_ip)
     }
 }
 
@@ -363,7 +365,7 @@ mod principal_tests {
         let user = AuthenticatedUser::bootstrap("AKBOOT");
         assert_eq!(user.name, BOOTSTRAP_USER_NAME);
         assert_eq!(user.access_key_id, "AKBOOT");
-        assert!(user.is_admin());
+        assert!(user.is_admin(None));
         for action in [
             S3Action::Read,
             S3Action::Write,

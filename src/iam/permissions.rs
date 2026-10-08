@@ -887,24 +887,39 @@ pub fn may_attempt_batch_delete(
         })
 }
 
-/// Check if a permission set grants full admin access:
-/// actions must contain "*" or "admin", AND resources must contain "*".
-/// Respects Deny overrides.
-pub(crate) fn is_admin(permissions: &[Permission]) -> bool {
-    let has_deny = permissions.iter().any(|p| {
-        p.effect == "Deny"
-            && p.actions.iter().any(|a| a == "*" || a == "admin")
-            && p.resources.iter().any(|r| r == "*")
-    });
-    if has_deny {
+/// Check if a permission set grants full admin access to a request from
+/// `client_ip`: an Allow whose actions contain "*" or "admin" AND whose
+/// resources contain "*", and whose conditions hold for that request.
+/// An admin-shaped Deny removes admin whatever its conditions (fail closed).
+pub(crate) fn is_admin(permissions: &[Permission], client_ip: Option<std::net::IpAddr>) -> bool {
+    let admin_shaped = |p: &Permission| {
+        p.actions.iter().any(|a| a == "*" || a == "admin") && p.resources.iter().any(|r| r == "*")
+    };
+    if permissions
+        .iter()
+        .any(|p| p.effect == "Deny" && admin_shaped(p))
+    {
         return false;
     }
+    permissions
+        .iter()
+        .any(|p| p.effect == "Allow" && admin_shaped(p) && admin_conditions_hold(p, client_ip))
+}
 
-    permissions.iter().any(|p| {
-        p.effect == "Allow"
-            && p.actions.iter().any(|a| a == "*" || a == "admin")
-            && p.resources.iter().any(|r| r == "*")
-    })
+/// Whether an admin-shaped Allow's conditions hold for an admin request.
+/// The request context holds only `aws:SourceIp`, so a condition on any other
+/// key does not hold; an unknown client IP satisfies no condition.
+fn admin_conditions_hold(perm: &Permission, client_ip: Option<std::net::IpAddr>) -> bool {
+    if perm.conditions.is_none() {
+        return true;
+    }
+    let Some(ip) = client_ip else {
+        return false;
+    };
+    let mut context = Context::default();
+    insert_source_ip(&mut context, Some(ip));
+    let policy = permission_to_iam_policy(perm);
+    evaluate_iam(&[policy], S3Action::Admin, "admin", "", &context)
 }
 
 /// Check whether a permission rule matches the given action and resource.
@@ -1336,7 +1351,35 @@ mod tests {
             resources: vec!["*".into()],
             conditions: None,
         }];
-        assert!(is_admin(&perms));
+        assert!(is_admin(&perms, None));
+    }
+
+    /// B005: a Full Access rule scoped by `aws:SourceIp` grants no admin to a
+    /// request from outside that range.
+    #[test]
+    fn is_admin_honours_ip_condition_on_allow() {
+        let perms = vec![Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["*".into()],
+            resources: vec!["*".into()],
+            conditions: Some(serde_json::json!({"IpAddress": {"aws:SourceIp": "10.0.0.0/8"}})),
+        }];
+        let inside = Some("10.1.2.3".parse().unwrap());
+        let outside = Some("203.0.113.9".parse().unwrap());
+        assert!(is_admin(&perms, inside));
+        assert!(
+            !is_admin(&perms, outside),
+            "admin from outside the IP range"
+        );
+        assert!(!is_admin(&perms, None), "admin from an unknown IP");
+
+        // A condition on a key an admin request does not carry never holds.
+        let prefix_only = vec![Permission {
+            conditions: Some(serde_json::json!({"StringLike": {"s3:prefix": "a/"}})),
+            ..perms[0].clone()
+        }];
+        assert!(!is_admin(&prefix_only, inside));
     }
 
     #[test]
@@ -1357,7 +1400,7 @@ mod tests {
                 conditions: None,
             },
         ];
-        assert!(!is_admin(&perms));
+        assert!(!is_admin(&perms, None));
     }
 
     #[test]
@@ -1369,7 +1412,7 @@ mod tests {
             resources: vec!["my-bucket/*".into()],
             conditions: None,
         }];
-        assert!(!is_admin(&perms));
+        assert!(!is_admin(&perms, None));
     }
 
     #[test]
