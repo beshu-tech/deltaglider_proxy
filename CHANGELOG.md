@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed — `sync --delete` keeps the remote copies of unreadable local files
+
+`deltaglider_proxy s3 sync <dir> s3://… --delete` walked the local directory
+and silently left out every directory that it could not list and every file
+that it could not read. The delete step then removed the remote copies of
+those files, and the command exited with status 0. When the root directory
+itself was unreadable, the command deleted the whole remote prefix. Now the
+command prints a warning for each path that it cannot read, skips the delete
+step when the local listing is incomplete, and exits with an error status.
+
 ### Fixed — An empty `delimiter=` lists every object
 
 `mc ls --recursive`, `mc mirror`, `rclone --fast-list` and restic send

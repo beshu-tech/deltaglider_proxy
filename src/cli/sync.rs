@@ -196,7 +196,10 @@ async fn sync_local_to_s3(args: &SyncArgs, filter: &Filter, opts: SyncDecisionOp
         Err(code) => return code,
     };
 
-    let local_entries = collect_local_entries(&src_dir, filter);
+    let LocalListing {
+        entries: local_entries,
+        unreadable,
+    } = collect_local_entries(&src_dir, filter);
     let s3_entries = match collect_s3_entries(&engine, &dst_loc.bucket, &dst_loc.key, filter).await
     {
         Ok(m) => m,
@@ -204,7 +207,7 @@ async fn sync_local_to_s3(args: &SyncArgs, filter: &Filter, opts: SyncDecisionOp
     };
 
     let mut succeeded = 0u64;
-    let mut failed = 0u64;
+    let mut failed = unreadable;
     let mut deleted = 0u64;
 
     for (rel, src) in &local_entries {
@@ -239,7 +242,14 @@ async fn sync_local_to_s3(args: &SyncArgs, filter: &Filter, opts: SyncDecisionOp
         }
     }
 
-    if args.delete {
+    if args.delete && unreadable > 0 {
+        // A path the walk could not read is missing from the listing, not
+        // deleted locally: deleting its remote copy would lose data.
+        eprintln!(
+            "error: --delete skipped: {unreadable} local path(s) could not be read, \
+             so the local listing is incomplete"
+        );
+    } else if args.delete {
         for rel in s3_entries.keys() {
             if local_entries.contains_key(rel) {
                 continue;
@@ -294,7 +304,8 @@ async fn sync_s3_to_local(args: &SyncArgs, filter: &Filter, opts: SyncDecisionOp
         Ok(m) => m,
         Err(code) => return code,
     };
-    let local_entries = collect_local_entries(&dst_dir, filter);
+    // An unreadable local file only hides a delete candidate here: safe.
+    let local_entries = collect_local_entries(&dst_dir, filter).entries;
 
     let mut succeeded = 0u64;
     let mut failed = 0u64;
@@ -452,9 +463,26 @@ async fn sync_s3_to_s3(args: &SyncArgs, filter: &Filter, opts: SyncDecisionOpts)
     summarize(args, succeeded, failed, deleted)
 }
 
-fn collect_local_entries(root: &Path, filter: &Filter) -> HashMap<String, Entry> {
+/// The local side of a sync. `unreadable` counts the paths the walk could not
+/// read (a directory it could not list, a file it could not stat): their
+/// files are missing from `entries`, so the listing is incomplete.
+struct LocalListing {
+    entries: HashMap<String, Entry>,
+    unreadable: u64,
+}
+
+fn collect_local_entries(root: &Path, filter: &Filter) -> LocalListing {
     let mut out = HashMap::new();
-    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+    let mut unreadable = 0u64;
+    for entry in WalkDir::new(root) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                eprintln!("warning: cannot read local path: {e}");
+                unreadable += 1;
+                continue;
+            }
+        };
         if !entry.file_type().is_file() {
             continue;
         }
@@ -467,7 +495,11 @@ fn collect_local_entries(root: &Path, filter: &Filter) -> HashMap<String, Entry>
         }
         let metadata = match entry.metadata() {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(e) => {
+                eprintln!("warning: cannot read {}: {e}", entry.path().display());
+                unreadable += 1;
+                continue;
+            }
         };
         let mtime_ms = metadata
             .modified()
@@ -483,7 +515,10 @@ fn collect_local_entries(root: &Path, filter: &Filter) -> HashMap<String, Entry>
             },
         );
     }
-    out
+    LocalListing {
+        entries: out,
+        unreadable,
+    }
 }
 
 async fn collect_s3_entries(

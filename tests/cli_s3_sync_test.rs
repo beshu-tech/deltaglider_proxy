@@ -170,6 +170,59 @@ async fn sync_with_delete_removes_orphans_on_dst() {
     cleanup(&bucket).await;
 }
 
+/// B009: a local subtree the walk cannot read is not "deleted locally".
+/// `--delete` must keep its remote copies, and the run must not report success.
+#[cfg(unix)]
+#[tokio::test]
+async fn sync_delete_keeps_remote_copies_of_unreadable_local_files() {
+    use std::os::unix::fs::PermissionsExt;
+    skip_unless_minio!();
+    let bucket = unique_bucket("unreadable");
+    let s3 = common::minio_client().await;
+    s3.create_bucket().bucket(&bucket).send().await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let private = tmp.path().join("private");
+    std::fs::write(tmp.path().join("keep.txt"), b"keep").unwrap();
+    std::fs::create_dir(&private).unwrap();
+    std::fs::write(private.join("secret.txt"), b"secret").unwrap();
+    let src = tmp.path().to_string_lossy().to_string();
+    let dst = format!("s3://{bucket}/data/");
+    assert_eq!(
+        sync_run(sync_args(src.clone(), dst.clone())).await,
+        deltaglider_proxy::cli::config::EXIT_OK
+    );
+
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(&private).is_ok() {
+        // Root ignores mode bits: nothing to prove here.
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o755)).unwrap();
+        cleanup(&bucket).await;
+        return;
+    }
+    let mut args = sync_args(src, dst);
+    args.delete = true;
+    let code = sync_run(args).await;
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let head = s3
+        .head_object()
+        .bucket(&bucket)
+        .key("data/private/secret.txt")
+        .send()
+        .await;
+    cleanup(&bucket).await;
+    assert!(
+        head.is_ok(),
+        "--delete removed the remote copy of an unreadable local file"
+    );
+    assert_ne!(
+        code,
+        deltaglider_proxy::cli::config::EXIT_OK,
+        "a sync that could not read part of its source reported success"
+    );
+}
+
 #[tokio::test]
 async fn sync_local_to_local_is_rejected() {
     // No MinIO needed — pure usage-error path.
