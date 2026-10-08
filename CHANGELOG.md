@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Fixed — A large copy into an S3 backend keeps the object's metadata
+
+Replication, lifecycle transitions and migrations copy a large plain object
+(64 MiB or more by default) in parts. When the destination was an S3 backend
+without proxy encryption, the stored copy had no DeltaGlider metadata: the
+proxy wrote the metadata only when it created the upload, before it knew
+the hashes, and S3 ignores the metadata that the last step sends. The proxy
+that made the copy hid this with its cache. Another node, or the same node
+after a restart, then saw the copy without its Content-Type and its user
+metadata, and with a different ETag. Now the proxy stores the complete
+metadata when it creates the upload.
+
 ### Fixed — The lifecycle scheduler runs only the rules that are still configured
 
 On each tick the lifecycle scheduler took a copy of the rules and ran the

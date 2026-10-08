@@ -13,7 +13,7 @@ pub mod spool;
 pub use cache::ReferenceCache;
 pub use codec::{CodecError, DeltaCodec};
 pub use engine::conditional::{ConditionalError, ObjectWriteGuard, Precondition};
-pub use engine::store::PassthroughMultipartHandle;
+pub use engine::store::{MultipartObjectFacts, PassthroughMultipartHandle};
 pub(crate) use engine::{derive_key_id, effective_legacy_key_id, interleave_and_paginate};
 pub use engine::{
     ConditionalDelete, DeltaGliderEngine, DynEngine, EngineError, ListObjectsPage, RefWriteProof,

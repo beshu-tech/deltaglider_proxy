@@ -380,13 +380,21 @@ async fn stream_copy_passthrough(
     // non-encrypting destination yields an undecryptable replica.
     crate::storage::encrypting::strip_encryption_markers(&mut user_metadata);
 
+    // Hashes come from the COPY source (a copy doesn't recompute them) so the
+    // streaming path never holds the whole object to hash it. They go in at
+    // create: a native S3 complete stores no metadata.
     let handle = engine
         .begin_passthrough_multipart(
             request.destination_bucket,
             request.destination_key,
-            total,
-            source_head.content_type.clone(),
-            user_metadata,
+            crate::deltaglider::MultipartObjectFacts {
+                total_size: total,
+                content_type: source_head.content_type.clone(),
+                user_metadata,
+                sha256: source_head.file_sha256.clone(),
+                md5: source_head.md5.clone(),
+                multipart_etag: source_head.multipart_etag.clone(),
+            },
         )
         .await
         .map_err(|e| CopyError::engine("multipart create failed", e))?;
@@ -488,12 +496,6 @@ async fn stream_copy_passthrough(
     retained.sort_by_key(|(n, _)| *n);
     let assembled: Vec<Bytes> = retained.into_iter().map(|(_, b)| b).collect();
 
-    // Hashes come from the COPY source (a copy doesn't recompute them) so the
-    // streaming path never holds the whole object to hash it.
-    let sha256 = source_head.file_sha256.clone();
-    let md5 = source_head.md5.clone();
-    let multipart_etag = source_head.multipart_etag.clone();
-
     // Reached complete: disarm the guard (it holds a clone) so the Arc is sole-owned.
     drop(handle);
     let handle = match Arc::try_unwrap(abort_guard.disarm()) {
@@ -509,7 +511,7 @@ async fn stream_copy_passthrough(
         }
     };
     let result = engine
-        .finish_passthrough_multipart(handle, parts, assembled, sha256, md5, multipart_etag)
+        .finish_passthrough_multipart(handle, parts, assembled)
         .await
         .map_err(|e| CopyError::engine("multipart complete failed", e))?;
 

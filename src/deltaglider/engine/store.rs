@@ -23,10 +23,22 @@ pub struct PassthroughMultipartHandle {
     deltaspace_id: String,
     filename: String,
     total_size: u64,
-    content_type: Option<String>,
-    user_metadata: HashMap<String, String>,
+    /// The object's final metadata, stored when the upload is created.
+    metadata: FileMetadata,
     upload: MultipartUpload,
     _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+/// The facts of an object that a streaming multipart copy writes, all known
+/// from the copy source before the first part. The backend must store them
+/// when it creates the upload: a native S3 complete stores no metadata.
+pub struct MultipartObjectFacts {
+    pub total_size: u64,
+    pub content_type: Option<String>,
+    pub user_metadata: HashMap<String, String>,
+    pub sha256: String,
+    pub md5: String,
+    pub multipart_etag: Option<String>,
 }
 
 /// A body spool with the hashes that the streaming PUT computed from it
@@ -1499,35 +1511,36 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// `store_passthrough_chunked_inner`. The caller drives parts via
     /// [`Self::upload_passthrough_part`] then finalizes with
     /// [`Self::finish_passthrough_multipart`] (or aborts).
-    #[allow(clippy::too_many_arguments)]
     pub async fn begin_passthrough_multipart(
         &self,
         bucket: &str,
         key: &str,
-        total_size: u64,
-        content_type: Option<String>,
-        user_metadata: HashMap<String, String>,
+        facts: MultipartObjectFacts,
     ) -> Result<PassthroughMultipartHandle, EngineError> {
+        let total_size = facts.total_size;
         self.ensure_within_passthrough_ceiling(total_size)?;
 
         self.metadata_cache.invalidate(bucket, key);
         let (obj_key, deltaspace_id) = self.validated_key_ingest(bucket, key)?;
         let guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
 
-        // The create call needs metadata headers (content-type, user
-        // metadata) so the backend stamps them at create time.
-        let mut create_meta = FileMetadata::new_passthrough(
+        // The FINAL metadata, hashes included: a native S3 backend stores
+        // object metadata only at create time (its complete takes none), so
+        // empty hashes here made every reader fall back to a foreign-object
+        // HEAD (no Content-Type, no user metadata, the `<md5>-N` ETag).
+        let mut metadata = FileMetadata::new_passthrough(
             obj_key.filename.clone(),
-            String::new(),
-            String::new(),
+            facts.sha256,
+            facts.md5,
             total_size,
-            content_type.clone(),
+            facts.content_type,
         );
-        create_meta.set_user_metadata(user_metadata.clone());
+        metadata.set_user_metadata(facts.user_metadata);
+        metadata.multipart_etag = facts.multipart_etag;
 
         let upload = self
             .storage
-            .create_multipart_upload(bucket, &deltaspace_id, &obj_key.filename, &create_meta)
+            .create_multipart_upload(bucket, &deltaspace_id, &obj_key.filename, &metadata)
             .await?;
 
         Ok(PassthroughMultipartHandle {
@@ -1536,8 +1549,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             deltaspace_id,
             filename: obj_key.filename,
             total_size,
-            content_type,
-            user_metadata,
+            metadata,
             upload,
             _guard: guard,
         })
@@ -1567,20 +1579,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Ok(part)
     }
 
-    /// Finalize a passthrough multipart upload: complete on the backend,
-    /// write FileMetadata (with the supplied source hashes + multipart ETag),
-    /// and clean the old delta variant. Consumes the handle (releases the
-    /// lock). `parts` and `assembled` must be in part-number order;
-    /// `assembled` is empty for native backends.
-    #[allow(clippy::too_many_arguments)]
+    /// Finalize a passthrough multipart upload: complete on the backend
+    /// (a buffering backend writes the handle's metadata now), and clean the
+    /// old delta variant. Consumes the handle (releases the lock). `parts`
+    /// and `assembled` must be in part-number order; `assembled` is empty
+    /// for native backends.
     pub async fn finish_passthrough_multipart(
         &self,
-        mut handle: PassthroughMultipartHandle,
+        handle: PassthroughMultipartHandle,
         mut parts: Vec<UploadedPart>,
         assembled: Vec<Bytes>,
-        sha256: String,
-        md5: String,
-        multipart_etag: Option<String>,
     ) -> Result<StoreResult, EngineError> {
         // `parts` must be part-number-ordered for the multipart complete;
         // `assembled` (buffering backends only) is already caller-ordered.
@@ -1590,15 +1598,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // handle already holds the per-deltaspace lock, so this is race-safe.
         let prior_for_counter = self.prior_for_counter(&handle.bucket, &handle.key).await;
 
-        let mut metadata = FileMetadata::new_passthrough(
-            handle.filename.clone(),
-            sha256,
-            md5,
-            handle.total_size,
-            handle.content_type.clone(),
-        );
-        metadata.set_user_metadata(std::mem::take(&mut handle.user_metadata));
-        metadata.multipart_etag = multipart_etag;
+        let metadata = handle.metadata.clone();
 
         if let Err(e) = self
             .storage
