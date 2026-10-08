@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Security — A declarative change to an OAuth provider takes effect at once
+
+In `iam_mode: declarative`, a config apply or a full-IAM YAML import wrote
+OAuth provider changes to the IAM database, but the running sign-in flow
+kept the providers that it loaded at startup. A provider that the YAML
+disabled (for example after an identity provider was compromised) therefore
+kept signing users in, admins included, until a restart. A new provider was
+not available, and a changed client secret was not used. Now both paths
+reload the providers when the reconcile changes one. A sign-in that started
+before its provider was disabled is refused when it returns.
+
 ### Fixed — `sync --delete` keeps the remote copies of unreadable local files
 
 `deltaglider_proxy s3 sync <dir> s3://… --delete` walked the local directory

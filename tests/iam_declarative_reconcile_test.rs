@@ -14,7 +14,9 @@
 
 use crate::common;
 
-use common::{admin_http_client, get_iam_version, wait_for_iam_rebuild, TestServer};
+use common::{
+    admin_http_client, get_ext_auth_version, get_iam_version, wait_for_iam_rebuild, TestServer,
+};
 use reqwest::StatusCode;
 use serde_json::json;
 
@@ -1056,4 +1058,49 @@ async fn reconcile_refuses_a_provider_type_other_than_oidc() {
     assert!(status.is_client_error(), "{status}: {body}");
     assert!(body.contains("'oidc'"), "{body}");
     assert!(list_users(&admin, &endpoint).await.is_empty());
+}
+
+/// B006: a declarative apply that changes an OAuth provider must rebuild the
+/// live provider set. Otherwise a provider disabled in YAML keeps logging
+/// users in until a restart.
+#[tokio::test]
+async fn reconcile_rebuilds_the_live_provider_set() {
+    let server = TestServer::builder()
+        .auth("BOOTKEY1", "BOOTSECRET1")
+        .build()
+        .await;
+    let endpoint = server.endpoint();
+    let admin = admin_http_client(&endpoint).await;
+    let access = |enabled: bool| {
+        json!({
+            "iam_mode": "declarative",
+            "iam_users": [{
+                "name": "dana",
+                "access_key_id": "AKIADANA00001",
+                "secret_access_key": "dana-secret",
+                "enabled": true,
+                "permissions": []
+            }],
+            "auth_providers": [{
+                "name": "corp",
+                "provider_type": "oidc",
+                "enabled": enabled,
+                "client_id": "c",
+                "client_secret": "s",
+                "issuer_url": "https://idp.example.com"
+            }]
+        })
+    };
+
+    let before = get_ext_auth_version(&admin, &endpoint).await;
+    apply_access_section(&admin, &endpoint, access(true)).await;
+    let created = get_ext_auth_version(&admin, &endpoint).await;
+    assert!(
+        created > before,
+        "creating provider corp left the live set stale"
+    );
+
+    apply_access_section(&admin, &endpoint, access(false)).await;
+    let disabled = get_ext_auth_version(&admin, &endpoint).await;
+    assert!(disabled > created, "disabling provider corp left it live");
 }

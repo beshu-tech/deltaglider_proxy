@@ -435,6 +435,16 @@ async fn reconcile_declarative_iam(
         ));
     }
     drop(db);
+    if stats.providers_changed() {
+        if let Err(e) = super::super::external_auth::rebuild_external_auth(state).await {
+            warnings.push(format!(
+                "declarative IAM reconciled, but the live OAuth providers could not be \
+                 rebuilt ({:?}): the previous providers serve until the next provider change \
+                 or restart",
+                e.status_code()
+            ));
+        }
+    }
 
     // Sync + stats warning only when the reconcile changed state: GitOps
     // re-applies stay silent and cause no peer churn.

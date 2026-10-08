@@ -434,8 +434,9 @@ pub async fn oauth_callback(
     let db = config_db.lock().await;
 
     // Look up the provider in config DB to get its ID
+    // A provider disabled while this login was in flight logs nobody in.
     let provider_config = match db.get_auth_provider_by_name(&pending.provider_name) {
-        Ok(Some(p)) => p,
+        Ok(Some(p)) if p.enabled => p,
         _ => {
             return error_page("Authentication Failed", "Provider not found in database")
                 .into_response();

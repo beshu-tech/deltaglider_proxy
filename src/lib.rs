@@ -1265,6 +1265,26 @@ mod source_guards {
         }
     }
 
+    /// A declarative reconcile writes the `auth_providers` table, and the
+    /// login flow reads the in-memory `ExternalAuthManager`. Every admin
+    /// file that reconciles must rebuild it, or a provider disabled in YAML
+    /// keeps logging users in (B006).
+    #[test]
+    fn declarative_reconcile_rebuilds_the_live_providers() {
+        let mut reconcilers = 0;
+        for (file, text) in crate::source_scan::prod_sources("src/api/admin") {
+            let prod = crate::source_scan::prod_text(&text);
+            if prod.contains("crate::iam::reconcile_declarative_iam(") {
+                reconcilers += 1;
+                assert!(
+                    prod.contains("rebuild_external_auth("),
+                    "{file} reconciles declarative IAM without rebuild_external_auth"
+                );
+            }
+        }
+        assert!(reconcilers >= 2, "the scan found the reconcile call sites");
+    }
+
     /// The request path reads no environment variable: a request reads the
     /// config snapshot (`config::RuntimeTuning`, copied into the engine at
     /// build) or a value its owner parsed at construction. `clippy.toml`

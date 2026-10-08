@@ -1391,6 +1391,14 @@ impl ReconcileStats {
         ]
     }
 
+    /// True when the reconcile created, updated or deleted an OAuth provider:
+    /// the live provider set (`ExternalAuthManager`) must then be rebuilt.
+    pub fn providers_changed(&self) -> bool {
+        !(self.providers_created.is_empty()
+            && self.providers_updated.is_empty()
+            && self.providers_deleted.is_empty())
+    }
+
     /// Total count of name-level changes. Excludes `mapping_rules_replaced`
     /// because mapping rules are a replace-semantic count, not a per-name list.
     pub fn total_named_changes(&self) -> usize {

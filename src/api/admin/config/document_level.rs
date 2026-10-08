@@ -739,6 +739,14 @@ pub async fn apply_declarative_iam(
         )));
     }
     drop(db);
+    if stats.providers_changed() {
+        if let Err(e) = super::super::external_auth::rebuild_external_auth(&state).await {
+            return Err(AdminError::internal(format!(
+                "rebuild_external_auth after IAM import: {:?}",
+                e.status_code()
+            )));
+        }
+    }
 
     if !stats.is_noop() {
         super::super::trigger_config_sync(&state);
