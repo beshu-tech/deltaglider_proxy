@@ -118,6 +118,14 @@ deltaglider_cache_miss_rate_ratio > 0.5     # cache thrashing
 
 A client listing of an S3-backed bucket costs one `list` request per page when the page holds deltas or ciphertext that this proxy did not write or read since it started. A `list` rate far above the client listing rate means that the index holds many old entries.
 
+## Backend downloads
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `deltaglider_backend_get_body_resumes_total` | Counter | — | Downloads from S3 whose response body broke off and that the proxy resumed with a ranged request for the remaining bytes |
+
+A response body breaks off when the backend stops sending bytes for longer than `DGP_S3_STALL_GRACE_SECS` (20 seconds by default), or when the connection closes before the last byte. The proxy then requests the remaining bytes of the same object version, up to three times for one download. A download that still fails answers `503 ServiceUnavailable`. A counter that rises steadily means that the backend often stalls.
+
 ## Codec concurrency
 
 | Metric | Type | Labels | Description |

@@ -1447,15 +1447,34 @@ pub(crate) mod test_support {
 
     /// A backend on a test endpoint (no retries, no SSRF guard).
     pub(crate) fn for_test_endpoint(endpoint: &str) -> S3Backend {
-        let conf = aws_sdk_s3::config::Builder::new()
+        for_test_endpoint_with_stall_grace(endpoint, None)
+    }
+
+    /// [`for_test_endpoint`] whose stalled-stream protection ends a read
+    /// after `grace` without bytes (the SDK default, 20 s, when `None`).
+    pub(crate) fn for_test_endpoint_with_stall_grace(
+        endpoint: &str,
+        grace: Option<std::time::Duration>,
+    ) -> S3Backend {
+        let mut conf = aws_sdk_s3::config::Builder::new()
             .behavior_version(BehaviorVersion::latest())
             .region(aws_sdk_s3::config::Region::new("us-east-1"))
             .credentials_provider(Credentials::new("a", "b", None, None, "t"))
             .force_path_style(true)
             .endpoint_url(endpoint)
-            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
-            .build();
-        let client = Client::from_conf(conf);
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled());
+        if let Some(grace) = grace {
+            conf = conf.stalled_stream_protection(
+                aws_sdk_s3::config::StalledStreamProtectionConfig::enabled()
+                    .grace_period(grace)
+                    .build(),
+            );
+        }
+        with_client(endpoint, Client::from_conf(conf.build()))
+    }
+
+    /// A backend that sends its requests with `client`.
+    pub(crate) fn with_client(endpoint: &str, client: Client) -> S3Backend {
         S3Backend {
             facts_cleanup: super::super::super::facts_cleanup::FactsCleanupQueue::start(
                 client.clone(),
@@ -2090,5 +2109,249 @@ mod declared_bucket_tests {
         // Present now: no second CreateBucket.
         s3.ensure_declared_bucket("releases").await.unwrap();
         assert_eq!(creates.load(Ordering::SeqCst), 1);
+    }
+}
+
+/// Issue #102: a GET body that breaks off (the backend stops sending and
+/// the SDK's stalled-stream protection ends the read, or the connection
+/// closes) resumes from the next byte, with a ranged GET pinned to the
+/// object's ETag.
+#[cfg(test)]
+mod body_resume_tests {
+    use super::*;
+    use crate::storage::s3::body::BODY_RESUMES;
+    use axum::http::{HeaderMap, StatusCode};
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// How the body of one GET is sent.
+    #[derive(Clone, Copy)]
+    enum Send {
+        /// `n` bytes of the range, then nothing more on an open connection.
+        Stall(usize),
+        /// `n` bytes of the range, then the connection closes.
+        Drop(usize),
+    }
+
+    /// One object; each GET takes the next plan entry (no entry: the whole
+    /// range).
+    #[derive(Default)]
+    struct FlakyS3 {
+        body: parking_lot::Mutex<Vec<u8>>,
+        etag: parking_lot::Mutex<String>,
+        plan: parking_lot::Mutex<VecDeque<Send>>,
+        /// `(Range, If-Match)` of every GET, in order.
+        gets: parking_lot::Mutex<Vec<(Option<String>, Option<String>)>>,
+    }
+
+    impl FlakyS3 {
+        fn replace(&self, body: Vec<u8>) {
+            *self.etag.lock() = format!("\"etag-{}-{}\"", body.len(), body[0]);
+            *self.body.lock() = body;
+        }
+
+        fn gets(&self) -> Vec<(Option<String>, Option<String>)> {
+            self.gets.lock().clone()
+        }
+    }
+
+    fn header(h: &HeaderMap, name: &str) -> Option<String> {
+        h.get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    }
+
+    async fn serve(
+        f: Arc<FlakyS3>,
+        headers: HeaderMap,
+    ) -> (StatusCode, HeaderMap, axum::body::Body) {
+        let range = header(&headers, "range");
+        let if_match = header(&headers, "if-match");
+        f.gets.lock().push((range.clone(), if_match.clone()));
+        let body = f.body.lock().clone();
+        let etag = f.etag.lock().clone();
+        let mut h = HeaderMap::new();
+        if if_match.is_some_and(|m| m != etag) {
+            let xml = "<Error><Code>PreconditionFailed</Code></Error>";
+            return (
+                StatusCode::PRECONDITION_FAILED,
+                h,
+                axum::body::Body::from(xml),
+            );
+        }
+        let (status, start, end) = match range
+            .as_deref()
+            .and_then(|r| r.strip_prefix("bytes="))
+            .and_then(|r| r.split_once('-'))
+        {
+            Some((a, b)) => {
+                let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
+                let end = (b + 1).min(body.len());
+                let cr = format!("bytes {a}-{}/{}", end - 1, body.len());
+                h.insert("content-range", cr.parse().unwrap());
+                (StatusCode::PARTIAL_CONTENT, a, end)
+            }
+            None => (StatusCode::OK, 0, body.len()),
+        };
+        let part = body[start..end].to_vec();
+        h.insert("etag", etag.parse().unwrap());
+        h.insert("content-length", part.len().to_string().parse().unwrap());
+        let out = match f.plan.lock().pop_front() {
+            None => axum::body::Body::from(part),
+            Some(Send::Stall(n)) => {
+                let first = bytes::Bytes::from(part[..n].to_vec());
+                let s = futures::stream::iter([Ok::<_, std::io::Error>(first)])
+                    .chain(futures::stream::pending());
+                axum::body::Body::from_stream(s)
+            }
+            Some(Send::Drop(n)) => {
+                // The close waits until the headers and the first bytes
+                // are on the wire, or the client sees no response at all.
+                let first = bytes::Bytes::from(part[..n].to_vec());
+                let s = futures::stream::iter([Ok(first)]).chain(futures::stream::once(async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Err(std::io::Error::other("connection dropped"))
+                }));
+                axum::body::Body::from_stream(s)
+            }
+        };
+        (status, h, out)
+    }
+
+    async fn start(body: Vec<u8>, plan: Vec<Send>) -> (String, Arc<FlakyS3>) {
+        let fake = Arc::new(FlakyS3::default());
+        fake.replace(body);
+        *fake.plan.lock() = plan.into();
+        let f = fake.clone();
+        let app = axum::Router::new().route(
+            "/:bucket/*key",
+            axum::routing::get(move |headers: HeaderMap| serve(f.clone(), headers)),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), fake)
+    }
+
+    /// 200 000 bytes that differ at every offset mod 251, so a splice at
+    /// the wrong byte shows.
+    fn object() -> Vec<u8> {
+        (0..200_000u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// A stall ends a read after about 2 s.
+    fn backend(ep: &str) -> S3Backend {
+        test_support::for_test_endpoint_with_stall_grace(ep, Some(Duration::from_secs(1)))
+    }
+
+    /// The #102 shape: the body of a delta GET stalls after 70 000 bytes.
+    /// The read resumes from byte 70 000, pinned to the object's ETag.
+    #[tokio::test]
+    async fn a_stalled_delta_read_resumes_from_the_next_byte() {
+        let obj = object();
+        let (ep, fake) = start(obj.clone(), vec![Send::Stall(70_000)]).await;
+        let got = backend(&ep)
+            .get_delta("b", "v", "a.zip")
+            .await
+            .expect("the read resumes");
+        assert!(got == obj, "the resumed body differs from the object");
+        let etag = fake.etag.lock().clone();
+        let range = format!("bytes=70000-{}", obj.len() - 1);
+        assert_eq!(fake.gets(), vec![(None, None), (Some(range), Some(etag))]);
+    }
+
+    /// A connection that closes mid-body resumes the same way.
+    #[tokio::test]
+    async fn a_dropped_connection_resumes_from_the_next_byte() {
+        let obj = object();
+        let (ep, fake) = start(obj.clone(), vec![Send::Drop(30_000)]).await;
+        let got = backend(&ep)
+            .get_passthrough("b", "v", "a.bin")
+            .await
+            .expect("the read resumes");
+        assert!(got == obj, "the resumed body differs from the object");
+        let range = format!("bytes=30000-{}", obj.len() - 1);
+        assert_eq!(fake.gets()[1].0, Some(range));
+    }
+
+    /// The reference download behind a large delta GET resumes into its
+    /// file, twice.
+    #[tokio::test]
+    async fn a_reference_download_resumes_into_its_file() {
+        let obj = object();
+        let (ep, fake) = start(obj.clone(), vec![Send::Drop(1), Send::Stall(50_000)]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reference.bin");
+        let written = backend(&ep)
+            .get_reference_to_file("b", "v", &path)
+            .await
+            .expect("the download resumes");
+        assert_eq!(written, obj.len() as u64);
+        assert!(
+            std::fs::read(&path).unwrap() == obj,
+            "the file differs from the object"
+        );
+        let ranges: Vec<_> = fake.gets().into_iter().map(|g| g.0).collect();
+        let last = obj.len() - 1;
+        let expected = vec![
+            None,
+            Some(format!("bytes=1-{last}")),
+            Some(format!("bytes=50001-{last}")),
+        ];
+        assert_eq!(ranges, expected);
+    }
+
+    /// A range read resumes inside its range.
+    #[tokio::test]
+    async fn a_range_read_resumes_inside_its_range() {
+        let obj = object();
+        let (ep, fake) = start(obj.clone(), vec![Send::Drop(10_000)]).await;
+        let (stream, len) = backend(&ep)
+            .get_passthrough_stream_range("b", "v", "a.bin", 1_000, 99_999)
+            .await
+            .unwrap();
+        assert_eq!(len, 99_000);
+        let got: Vec<u8> = stream
+            .map(|c| c.expect("the read resumes").to_vec())
+            .concat()
+            .await;
+        assert!(got[..] == obj[1_000..100_000], "the resumed range differs");
+        assert_eq!(fake.gets()[1].0.as_deref(), Some("bytes=11000-99999"));
+    }
+
+    /// An object replaced while its body broke off: the read fails, and no
+    /// bytes of the new version follow the bytes of the old one.
+    #[tokio::test]
+    async fn a_read_never_splices_two_versions_of_an_object() {
+        let obj = object();
+        let (ep, fake) = start(obj.clone(), vec![Send::Stall(10_000)]).await;
+        let old_etag = fake.etag.lock().clone();
+        let f = fake.clone();
+        tokio::spawn(async move {
+            while f.gets.lock().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            f.replace(vec![7u8; 150_000]);
+        });
+        let err = backend(&ep).get_delta("b", "v", "a.zip").await.unwrap_err();
+        assert!(matches!(err, StorageError::Transient(_)), "{err:?}");
+        assert!(err.to_string().contains("the object changed"), "{err}");
+        assert_eq!(fake.gets()[1].1, Some(old_etag));
+    }
+
+    /// A body that breaks off on every GET fails after the resume budget,
+    /// and the error names the cause that the SDK's "streaming error"
+    /// hides.
+    #[tokio::test]
+    async fn a_body_that_keeps_stalling_fails_after_the_resume_budget() {
+        let plan = vec![Send::Stall(10); BODY_RESUMES as usize + 1];
+        let (ep, fake) = start(object(), plan).await;
+        let err = backend(&ep).get_delta("b", "v", "a.zip").await.unwrap_err();
+        assert!(matches!(err, StorageError::Transient(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("b/v/a.zip.delta"), "{text}");
+        assert!(text.contains("minimum throughput"), "{text}");
+        assert_eq!(fake.gets().len(), BODY_RESUMES as usize + 1);
     }
 }

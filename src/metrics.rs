@@ -565,6 +565,9 @@ impl Metrics {
             .register(Box::new(crate::storage::BACKEND_HEAD_REQUESTS.clone()))
             .expect("duplicate metric name");
         registry
+            .register(Box::new(crate::storage::BACKEND_GET_BODY_RESUMES.clone()))
+            .expect("duplicate metric name");
+        registry
             .register(Box::new(crate::storage::LISTING_FACTS_REQUESTS.clone()))
             .expect("duplicate metric name");
         registry

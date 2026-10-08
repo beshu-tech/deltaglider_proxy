@@ -743,6 +743,43 @@ mod source_guards {
         );
     }
 
+    /// Every GET body of the S3 backend is read through
+    /// `S3Backend::body_stream` (`src/storage/s3/body.rs`), which resumes a
+    /// body that breaks off. A body read anywhere else fails the whole
+    /// request when the backend stalls once (#102). The `.body` field of a
+    /// response is the sign; `.body(..)` is the request builder of a PUT.
+    #[test]
+    fn every_s3_get_body_is_read_through_the_resuming_stream() {
+        let mut offenders = Vec::new();
+        for file in rust_files("src/storage") {
+            let rel = rel_path(&file);
+            if rel == "src/storage/s3/body.rs"
+                || rel == "src/storage/fake_s3.rs"
+                || rel.ends_with("/tests.rs")
+            {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).unwrap();
+            for (n, line) in text.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                let field_read = line.match_indices(".body").any(|(i, m)| {
+                    let next = line[i + m.len()..].chars().next();
+                    !next.is_some_and(|c| c == '(' || c == '_' || c.is_alphanumeric())
+                });
+                if field_read {
+                    offenders.push(format!("{rel}:{}", n + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "read a GET response body with S3Backend::body_stream or collect_body:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     /// A log excerpt of a string is cut with `security::str_prefix`, never
     /// with a byte-index slice ending at `s.len().min(n)`: an index inside a
     /// multi-byte char panics, and the OAuth callback died on a client-sent

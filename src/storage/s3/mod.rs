@@ -10,6 +10,7 @@
 //! Layout (split 2026-09):
 //!   - `mod.rs`      — `S3Backend`, its constructor, key helpers, the
 //!     `StorageBackend` impl, and the request counters
+//!   - `body.rs`     — GET bodies that resume after a read breaks off
 //!   - `client.rs`   — client construction and the SSRF endpoint guard
 //!   - `errors.rs`   — SDK error classification and write/delete verdicts
 //!   - `metadata.rs` — DG metadata headers, self-copy plan, native SSE
@@ -18,6 +19,7 @@
 //!   - `listing.rs`  — listing classification, HEAD enrichment, anchors
 //!   - `tests.rs`    — unit tests
 
+mod body;
 mod client;
 mod errors;
 mod facts;
@@ -29,6 +31,7 @@ mod tests;
 #[cfg(test)]
 pub(crate) use tests::test_support;
 
+pub use body::BACKEND_GET_BODY_RESUMES;
 pub(crate) use client::{backend_request_timeout, check_s3_endpoint, guard_s3_endpoint};
 use errors::*;
 pub(in crate::storage) use facts::put_facts_object;
@@ -490,7 +493,7 @@ impl StorageBackend for S3Backend {
             .await
             .map_err(|e| self.classify_get(bucket, &key, &e))?;
 
-        let mut stream = Self::s3_body_to_stream(response.body);
+        let mut stream = self.body_stream(bucket, &key, response);
         let mut file = tokio::fs::File::create(dest).await?;
         let mut written: u64 = 0;
         while let Some(chunk) = stream.next().await {
@@ -843,7 +846,7 @@ impl StorageBackend for S3Backend {
 
         debug!("S3 GET stream {}/{}", bucket, key);
 
-        Ok(Box::pin(Self::s3_body_to_stream(response.body)))
+        Ok(self.body_stream(bucket, &key, response))
     }
 
     /// One GET: the body, and the metadata from the response's own headers.
@@ -878,7 +881,7 @@ impl StorageBackend for S3Backend {
             },
         );
         debug!("S3 GET stream {}/{} (with its metadata)", bucket, key);
-        Ok((Self::s3_body_to_stream(response.body), meta))
+        Ok((self.body_stream(bucket, &key, response), meta))
     }
 
     #[instrument(skip(self))]
@@ -908,10 +911,7 @@ impl StorageBackend for S3Backend {
             bucket, key, range_header, content_length
         );
 
-        Ok((
-            Box::pin(Self::s3_body_to_stream(response.body)),
-            content_length,
-        ))
+        Ok((self.body_stream(bucket, &key, response), content_length))
     }
 
     // === Multipart upload (Phase B native streaming copy) ===

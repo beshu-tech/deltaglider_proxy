@@ -522,26 +522,6 @@ impl S3Backend {
         unreachable!("retry loop must return on every path")
     }
 
-    /// Convert an S3 response body into a streaming `BoxStream` of `Bytes` chunks.
-    /// Used by both `get_passthrough_stream` and `get_passthrough_stream_range`.
-    pub(super) fn s3_body_to_stream(
-        body: aws_sdk_s3::primitives::ByteStream,
-    ) -> BoxStream<'static, Result<Bytes, StorageError>> {
-        Box::pin(futures::stream::unfold(body, |mut body| async {
-            match body.try_next().await {
-                Ok(Some(chunk)) => Some((Ok(chunk), body)),
-                Ok(None) => None,
-                Err(e) => Some((
-                    Err(StorageError::Transient(format!(
-                        "Failed to read response body: {}",
-                        e
-                    ))),
-                    body,
-                )),
-            }
-        }))
-    }
-
     /// Get an object from S3
     pub(super) async fn get_object(
         &self,
@@ -557,13 +537,7 @@ impl S3Backend {
             .await
             .map_err(|e| self.classify_get(bucket, key, &e))?;
 
-        let data = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| StorageError::Transient(format!("Failed to read response body: {}", e)))?
-            .into_bytes()
-            .to_vec();
+        let data = self.collect_body(bucket, key, response).await?;
 
         debug!("S3 GET {}/{} ({} bytes)", bucket, key, data.len());
         Ok(data)
