@@ -678,6 +678,40 @@ mod source_guards {
             deploy.contains(&format!("beshultd/deltaglider-operator:{operator}")),
             "operator/deploy/operator.yaml does not pin operator {operator}"
         );
+        // The docs that name one image version (release-prep.sh stamps them
+        // too). Every `X.Y.Z` after the prefix is the proxy version.
+        for (path, prefix) in [
+            (
+                "docs/product/how-to/upgrade.md",
+                "beshultd/deltaglider_proxy:",
+            ),
+            ("DOCKERHUB.md", "| `"),
+            (
+                "docs/product/tutorials/first-delta-savings.md",
+                "Starting DeltaGlider Proxy v",
+            ),
+            (
+                "examples/docker-compose/secrets.env.example",
+                "DGP_IMAGE_TAG=",
+            ),
+        ] {
+            let text = crate::source_scan::read(path);
+            let versions: Vec<&str> = text
+                .match_indices(prefix)
+                .filter_map(|(i, _)| {
+                    let rest = &text[i + prefix.len()..];
+                    let end = rest
+                        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+                        .unwrap_or(rest.len());
+                    let v = &rest[..end];
+                    (v.split('.').count() == 3 && v.split('.').all(|p| !p.is_empty())).then_some(v)
+                })
+                .collect();
+            assert!(!versions.is_empty(), "{path}: no `{prefix}X.Y.Z` to stamp");
+            for v in versions {
+                assert_eq!(v, proxy, "{path} names {v}, the proxy is {proxy}");
+            }
+        }
     }
 
     /// The release image compiles with the toolchain that rust-toolchain.toml
@@ -706,6 +740,47 @@ mod source_guards {
                 "Dockerfile pins rust:{pin}, rust-toolchain.toml pins {channel}: bump them together"
             );
         }
+    }
+
+    /// A step of a job that runs in a `container:` runs under `sh`, not
+    /// bash, unless it names a shell. `set -o pipefail` fails under `sh`,
+    /// and the Docker Hub description sync failed that way in v2.0.0 to
+    /// v2.0.2, hidden by `continue-on-error`.
+    #[test]
+    fn container_job_steps_with_bash_syntax_name_their_shell() {
+        let shell_of = |v: &serde_yaml::Value| {
+            v.get("defaults")
+                .and_then(|d| d.get("run"))
+                .and_then(|r| r.get("shell"))
+                .is_some()
+        };
+        let mut offenders = Vec::new();
+        for file in crate::source_scan::files(".github/workflows", "yml") {
+            let rel = rel_path(&file);
+            let doc: serde_yaml::Value =
+                serde_yaml::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+            let Some(jobs) = doc.get("jobs").and_then(|j| j.as_mapping()) else {
+                continue;
+            };
+            for (name, job) in jobs {
+                if job.get("container").is_none() || shell_of(&doc) || shell_of(job) {
+                    continue;
+                }
+                let steps = job.get("steps").and_then(|s| s.as_sequence());
+                for step in steps.into_iter().flatten() {
+                    let run = step.get("run").and_then(|r| r.as_str()).unwrap_or("");
+                    if run.contains("pipefail") && step.get("shell").is_none() {
+                        let step_name = step.get("name").and_then(|n| n.as_str());
+                        offenders.push(format!("{rel} {name:?} {step_name:?}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "add `shell: bash` to these container-job steps:\n{}",
+            offenders.join("\n")
+        );
     }
 
     /// Every object HEAD the server sends is counted in
@@ -776,6 +851,39 @@ mod source_guards {
         assert!(
             offenders.is_empty(),
             "read a GET response body with S3Backend::body_stream or collect_body:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// s3s replaces every header of an error response with the error's own
+    /// header map, so a header map on an error with an XML body drops its
+    /// `Content-Type` and, with it, the `<RequestId>`. Only `304 Not
+    /// Modified`, which has no body, may set one. A 503's `Retry-After`
+    /// comes from `api::errors::ensure_retry_after` on the response.
+    #[test]
+    fn only_a_bodyless_s3s_error_carries_headers() {
+        let mut offenders = Vec::new();
+        for file in rust_files("src") {
+            let rel = rel_path(&file);
+            if rel.ends_with("/tests.rs") || rel.ends_with("_tests.rs") || rel == "src/lib.rs" {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            for (n, line) in lines.iter().enumerate() {
+                if line.trim_start().starts_with("//") || !line.contains(".set_headers(") {
+                    continue;
+                }
+                let not_modified = n > 0 && lines[n - 1].contains("s3_error!(NotModified)");
+                if !not_modified {
+                    offenders.push(format!("{rel}:{}", n + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "an s3s error header map replaces Content-Type; set response headers in \
+             the S3 response layer instead:\n{}",
             offenders.join("\n")
         );
     }

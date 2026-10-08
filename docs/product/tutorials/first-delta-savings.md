@@ -21,7 +21,7 @@ docker run --rm -it -p 9000:9000 -v dgp-data:/data \
 You should see the proxy come up and complain loudly about open access:
 
 ```
-INFO Starting DeltaGlider Proxy v2.0.0 (built ...)
+INFO Starting DeltaGlider Proxy v2.0.2 (built ...)
 WARN   Authentication: DISABLED (`authentication: none`)
 WARN   ╔══════════════════════════════════════════════════════════════════╗
 WARN   ║  WARNING: All S3 data is accessible without credentials.        ║

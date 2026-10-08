@@ -29,6 +29,55 @@ the sign-in lockout keeps its own wait. The log line
 `transient storage fault answered 503, cause: …` names the cause. Before,
 the cause of a body that broke off showed only as `streaming error`.
 
+### Changed — A write to a busy bucket says why it is refused
+
+When a re-encryption or a migration made a bucket read-only, an S3 write to
+it got `503 SlowDown` with the generic message "Please reduce your request
+rate." It now gets the message of the write gate, which names the bucket
+and the background job, as a browser form upload already did. The message
+of the backend-health `503` no longer starts with `ServiceUnavailable:`; the
+error code stays in `<Code>`.
+
+### Security — The Docker image takes the Debian security updates
+
+The image is built on `debian:bookworm-slim`, and the published base image
+did not have the Debian fixes for `perl-base` (CVE-2026-13221,
+CVE-2026-42496, CVE-2026-8376 and four more) and `libpcre2-8-0`
+(CVE-2026-103111) yet. The 2.0.2 image therefore showed 3 critical and 5
+high findings in an image scanner. The proxy does not run Perl, but the
+build now runs `apt-get upgrade`, so the image has every Debian fix that
+exists when it is built.
+
+### Security — Dependency updates
+
+- The Kubernetes operator uses rustls 0.23.45 (RUSTSEC-2026-0285: TLS 1.3
+  handshake messages accepted across encryption levels). The operator has
+  its own `Cargo.lock`, which the nightly supply-chain check did not read;
+  it reads it now.
+- The admin UI uses fixed versions of `mermaid`, `dompurify` and its
+  build-time packages (npm advisories for `postcss`, `nanoid`,
+  `brace-expansion`, `sharp` and others).
+
+### Fixed — The Docker Hub description updates at release again
+
+The release workflow uploads `DOCKERHUB.md` as the repository description
+on Docker Hub. The step runs in a container, where its default shell is
+`sh`, and `set -o pipefail` failed there. Because the step may fail without
+failing the release, nobody saw that the description stayed at its
+pre-2.0 text in v2.0.0, v2.0.1 and v2.0.2. The step now runs under bash, and
+a test refuses a container step that uses `pipefail` without naming its
+shell.
+
+### Fixed — The Docker quick start starts the proxy
+
+The README and the documentation home page gave `docker run -p 9000:9000
+beshultd/deltaglider_proxy`. The proxy refuses to start without
+credentials, so this command ended with "No authentication configured". The
+command now sets `DGP_AUTHENTICATION=none` for a local trial. The upgrade
+steps, the Docker Hub tag table, the first tutorial and the compose example
+named old versions (2.0.0 and 1.3.0); the release script now stamps them
+with each new version.
+
 ## v2.0.2 — 2026-10-02
 
 ### Changed — Built with Rust 1.99

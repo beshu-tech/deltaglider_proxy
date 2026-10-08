@@ -132,6 +132,8 @@ where
         if head_range_is_partial(&method, response.status(), response.headers()) {
             *response.status_mut() = axum::http::StatusCode::PARTIAL_CONTENT;
         }
+        let status = response.status();
+        crate::api::errors::ensure_retry_after(status, response.headers_mut());
         let request_id = response
             .headers()
             .get("x-amz-request-id")

@@ -150,17 +150,17 @@ The Docker image includes a built-in healthcheck on port 9000 (15s interval).
 ## Image details
 
 - Base: `debian:bookworm-slim`
-- Runtime deps: `xdelta3`, `ca-certificates`, `curl`
+- Runtime deps: `xdelta3`, `ca-certificates`, `curl`, `chrony`, `ntpstat`
 - Runs as: non-root user `dg`
 - Platforms: `linux/amd64`, `linux/arm64`
-- Size: about 60 MB compressed
+- Size: about 75 MB compressed
 
 ## Tags
 
 | Tag | Description |
 |-----|-------------|
 | `latest` | Latest stable release |
-| `2.0.0` | Specific version |
+| `2.0.2` | Specific version |
 | `2.0` | Latest patch in 2.0.x |
 | `2` | Latest minor in 2.x.x |
 

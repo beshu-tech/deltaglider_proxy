@@ -22,6 +22,19 @@ fn escape_xml(s: &str) -> String {
 /// (the auth lockout) replaces it.
 pub(crate) const RETRY_AFTER_SECS: u64 = 5;
 
+/// Give a 503 on the S3 surface its `Retry-After`, whoever built it: the
+/// `From<S3Error>` bridge, the s3s access hook, a replayed multipart
+/// completion. A header that is already there (the auth lockout's real
+/// wait) stays. It runs on the response because an s3s error's own header
+/// map replaces every response header, `Content-Type` included.
+pub(crate) fn ensure_retry_after(status: StatusCode, headers: &mut axum::http::HeaderMap) {
+    if status == StatusCode::SERVICE_UNAVAILABLE
+        && !headers.contains_key(axum::http::header::RETRY_AFTER)
+    {
+        headers.insert(axum::http::header::RETRY_AFTER, RETRY_AFTER_SECS.into());
+    }
+}
+
 /// The client text of a 503 for a transient backend fault. The cause can
 /// carry backend detail, so it goes to the log only.
 const TRANSIENT_503: &str =
@@ -232,11 +245,12 @@ impl IntoResponse for S3Error {
 
 /// THE mapping from the proxy's error vocabulary to the s3s wire error.
 /// Exhaustive on purpose: a new variant cannot fall into a silent 500.
-/// A 503 also carries `Retry-After`.
+/// It sets no headers: s3s replaces every response header with an error's
+/// own header map, so a 503's `Retry-After` comes from
+/// [`ensure_retry_after`] on the response instead.
 impl From<S3Error> for s3s::S3Error {
     fn from(err: S3Error) -> Self {
-        let retry_after = err.retry_after_secs();
-        let mut wire = match err {
+        match err {
             S3Error::NoSuchKey(_) => s3s::s3_error!(NoSuchKey),
             S3Error::NoSuchBucket(_) => s3s::s3_error!(NoSuchBucket),
             S3Error::BucketAlreadyExists(_) => s3s::s3_error!(BucketAlreadyExists),
@@ -292,13 +306,7 @@ impl From<S3Error> for s3s::S3Error {
                 }
                 s3s::s3_error!(InternalError, "{}", other.code())
             }
-        };
-        if let Some(secs) = retry_after {
-            let mut headers = axum::http::HeaderMap::new();
-            headers.insert(axum::http::header::RETRY_AFTER, secs.into());
-            wire.set_headers(headers);
         }
-        wire
     }
 }
 
@@ -671,15 +679,12 @@ mod tests {
     #[test]
     fn retry_after_is_on_every_503_and_only_there() {
         let retry_after = RETRY_AFTER_SECS.to_string();
-        let both = || {
-            [
-                S3Error::SlowDown("x".into()),
-                S3Error::ServiceUnavailable("x".into()),
-            ]
-        };
-        for (e, again) in both().into_iter().zip(both()) {
+        for e in [
+            S3Error::SlowDown("x".into()),
+            S3Error::ServiceUnavailable("x".into()),
+        ] {
             let code = e.code();
-            let axum_resp = again.into_response();
+            let axum_resp = e.into_response();
             assert_eq!(axum_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(
                 axum_resp
@@ -689,27 +694,57 @@ mod tests {
                 retry_after.as_str(),
                 "{code} over axum"
             );
-            let wire = s3s::S3Error::from(e);
-            assert_eq!(
-                wire.headers()
-                    .and_then(|h| h.get(axum::http::header::RETRY_AFTER))
-                    .unwrap(),
-                retry_after.as_str(),
-                "{code} over s3s"
-            );
+        }
+        // The s3s path: the response layer adds it to any 503.
+        let mut headers = axum::http::HeaderMap::new();
+        ensure_retry_after(StatusCode::SERVICE_UNAVAILABLE, &mut headers);
+        assert_eq!(
+            headers.get(axum::http::header::RETRY_AFTER).unwrap(),
+            retry_after.as_str()
+        );
+        // A real wait that is already there (the auth lockout) stays.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(axum::http::header::RETRY_AFTER, 540u64.into());
+        ensure_retry_after(StatusCode::SERVICE_UNAVAILABLE, &mut headers);
+        assert_eq!(headers.get(axum::http::header::RETRY_AFTER).unwrap(), "540");
+        for status in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::OK,
+            StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            let mut headers = axum::http::HeaderMap::new();
+            ensure_retry_after(status, &mut headers);
+            assert!(headers.is_empty(), "{status}");
         }
         for e in [
             S3Error::InternalError("x".into()),
             S3Error::NoSuchKey("k".into()),
         ] {
             assert!(e.retry_after_secs().is_none());
-            assert!(s3s::S3Error::from(e).headers().is_none());
         }
         assert!(S3Error::AccessDenied
             .into_response()
             .headers()
             .get(axum::http::header::RETRY_AFTER)
             .is_none());
+    }
+
+    /// The s3s bridge sets no header map on any error: s3s replaces every
+    /// response header with that map, and a 503 then lost its XML
+    /// `Content-Type` and, with it, the `<RequestId>` that the response
+    /// layer adds only to an XML body.
+    #[test]
+    fn s3s_bridge_sets_no_headers() {
+        for e in [
+            S3Error::SlowDown("x".into()),
+            S3Error::ServiceUnavailable("x".into()),
+            S3Error::InternalError("x".into()),
+            S3Error::NoSuchKey("k".into()),
+            S3Error::AccessDenied,
+        ] {
+            let code = e.code();
+            assert!(s3s::S3Error::from(e).headers().is_none(), "{code}");
+        }
     }
 
     /// E4 security fix: `sanitise_for_client` must return a generic string,

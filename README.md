@@ -192,10 +192,10 @@ The admin API supports GitOps with full-document apply, per-section PATCH (RFC 7
 
 | | Operations |
 |-|------------|
-| **Objects** | PutObject, GetObject, HeadObject, DeleteObject, CopyObject |
-| **Listing** | ListObjectsV2 (start-after, encoding-type, fetch-owner, continuation tokens) |
+| **Objects** | PutObject, GetObject, HeadObject, DeleteObject, DeleteObjects, CopyObject |
+| **Listing** | ListObjectsV2 (start-after, encoding-type, fetch-owner, continuation tokens), ListObjects (v1) |
 | **Buckets** | CreateBucket, HeadBucket, DeleteBucket, ListBuckets |
-| **Multipart** | Create, UploadPart, Complete, Abort, ListParts, ListUploads |
+| **Multipart** | Create, UploadPart, UploadPartCopy, Complete, Abort, ListParts, ListUploads |
 | **Auth** | SigV4 header + presigned URLs, per-user IAM, OAuth/OIDC, public prefixes |
 | **Conditional** | If-Match, If-None-Match (304), If-Modified-Since, If-Unmodified-Since (412) |
 | **Range** | Range requests (206 Partial Content) |
@@ -220,11 +220,16 @@ S3 request
 
 ## Docker
 
-Every release publishes multi-arch images (amd64 and arm64):
+Every release publishes multi-arch images (amd64 and arm64). The proxy
+refuses to start without credentials, so this command for a local trial turns
+authentication off explicitly:
 
 ```bash
-docker run -p 9000:9000 beshultd/deltaglider_proxy
+docker run -p 9000:9000 -e DGP_AUTHENTICATION=none beshultd/deltaglider_proxy
 ```
+
+For production, set `DGP_ACCESS_KEY_ID` and `DGP_SECRET_ACCESS_KEY` instead of
+`DGP_AUTHENTICATION=none`.
 
 ## Kubernetes / Helm
 
@@ -276,13 +281,13 @@ The docs follow [Diátaxis](https://diataxis.fr): every page is exactly one of t
 - [Securing your first proxy](docs/product/tutorials/secure-your-proxy.md): your own password, SigV4, and a least-privilege CI user.
 - [Your first Helm deployment on kind](docs/product/tutorials/kubernetes-hello-world.md)
 
-**How-to guides** (goal-named recipes): [take a proxy to production](docs/product/how-to/go-to-production.md) · [Docker Compose](docs/product/how-to/deploy-with-docker-compose.md) · [Kubernetes](docs/product/how-to/deploy-on-kubernetes.md) · [Kubernetes operator](docs/product/how-to/scale-out-with-the-kubernetes-operator.md) · [TLS](docs/product/how-to/serve-tls.md) · [upgrade](docs/product/how-to/upgrade.md) · [back up & restore](docs/product/how-to/back-up-and-restore.md) · [HA](docs/product/how-to/run-multiple-instances.md) · [monitor](docs/product/how-to/monitor-with-prometheus.md) · [trace & audit](docs/product/how-to/trace-requests.md) · [troubleshooting](docs/product/how-to/troubleshooting.md) · [route a bucket](docs/product/how-to/route-a-bucket-to-a-backend.md) · [migrate data in](docs/product/how-to/migrate-existing-data-into-the-proxy.md) · [move a bucket](docs/product/how-to/move-a-bucket-between-backends.md) · [compression & quotas](docs/product/how-to/set-bucket-compression-and-quotas.md) · [replicate](docs/product/how-to/replicate-a-bucket.md) · [expire & archive](docs/product/how-to/expire-and-archive-objects.md) · [encrypt](docs/product/how-to/encrypt-data-at-rest.md) · [rotate keys](docs/product/how-to/rotate-encryption-keys.md) · [events](docs/product/how-to/send-event-notifications.md) · [IAM users](docs/product/how-to/create-iam-users.md) · [conditions](docs/product/how-to/restrict-access-with-conditions.md) · [SSO](docs/product/how-to/set-up-sso.md) · [IAM as code](docs/product/how-to/manage-iam-as-code.md) · [admission rules](docs/product/how-to/gate-requests-with-admission-rules.md) · [public folders](docs/product/how-to/publish-a-public-folder.md)
+**How-to guides** (goal-named recipes): [take a proxy to production](docs/product/how-to/go-to-production.md) · [Docker Compose](docs/product/how-to/deploy-with-docker-compose.md) · [Kubernetes](docs/product/how-to/deploy-on-kubernetes.md) · [Kubernetes operator](docs/product/how-to/scale-out-with-the-kubernetes-operator.md) · [TLS](docs/product/how-to/serve-tls.md) · [upgrade](docs/product/how-to/upgrade.md) · [upgrade to 2.0](docs/product/how-to/upgrade-to-2-0.md) · [back up & restore](docs/product/how-to/back-up-and-restore.md) · [HA](docs/product/how-to/run-multiple-instances.md) · [monitor](docs/product/how-to/monitor-with-prometheus.md) · [trace & audit](docs/product/how-to/trace-requests.md) · [troubleshooting](docs/product/how-to/troubleshooting.md) · [diagnose a backend](docs/product/how-to/diagnose-backend-connectivity.md) · [live logs](docs/product/how-to/view-live-logs.md) · [route a bucket](docs/product/how-to/route-a-bucket-to-a-backend.md) · [backends without conditional writes](docs/product/how-to/backend-capability-validation.md) · [migrate data in](docs/product/how-to/migrate-existing-data-into-the-proxy.md) · [move a bucket](docs/product/how-to/move-a-bucket-between-backends.md) · [compression & quotas](docs/product/how-to/set-bucket-compression-and-quotas.md) · [replicate](docs/product/how-to/replicate-a-bucket.md) · [expire & archive](docs/product/how-to/expire-and-archive-objects.md) · [encrypt](docs/product/how-to/encrypt-data-at-rest.md) · [rotate keys](docs/product/how-to/rotate-encryption-keys.md) · [rotate the config DB key](docs/product/how-to/rotate-the-config-db-key.md) · [events](docs/product/how-to/send-event-notifications.md) · [IAM users](docs/product/how-to/create-iam-users.md) · [conditions](docs/product/how-to/restrict-access-with-conditions.md) · [SSO](docs/product/how-to/set-up-sso.md) · [IAM as code](docs/product/how-to/manage-iam-as-code.md) · [admission rules](docs/product/how-to/gate-requests-with-admission-rules.md) · [public folders](docs/product/how-to/publish-a-public-folder.md)
 
 **Reference** (pure facts):
-- [Configuration](docs/product/reference/configuration.md) · [CLI](docs/product/reference/cli.md) · [Admin API](docs/product/reference/admin-api.md) · [Authentication](docs/product/reference/authentication.md) · [IAM permissions](docs/product/reference/iam-permissions.md) · [Rate limits](docs/product/reference/rate-limits.md) · [Encryption](docs/product/reference/encryption.md) · [Jobs](docs/product/reference/jobs.md) · [Replication](docs/product/reference/replication.md) · [Lifecycle](docs/product/reference/lifecycle.md) · [Event outbox](docs/product/reference/event-outbox.md) · [Declarative IAM](docs/product/reference/declarative-iam.md) · [Metrics](docs/product/reference/metrics.md)
+- [Configuration](docs/product/reference/configuration.md) · [S3 API compatibility](docs/product/reference/s3-api-compatibility.md) · [Capacity planning](docs/product/reference/capacity-planning.md) · [CLI](docs/product/reference/cli.md) · [Admin API](docs/product/reference/admin-api.md) · [Authentication](docs/product/reference/authentication.md) · [IAM permissions](docs/product/reference/iam-permissions.md) · [Rate limits](docs/product/reference/rate-limits.md) · [Encryption](docs/product/reference/encryption.md) · [Jobs](docs/product/reference/jobs.md) · [Replication](docs/product/reference/replication.md) · [Lifecycle](docs/product/reference/lifecycle.md) · [Event outbox](docs/product/reference/event-outbox.md) · [Declarative IAM](docs/product/reference/declarative-iam.md) · [Metrics](docs/product/reference/metrics.md)
 
 **Concepts** (how it works and why):
-- [Delta compression](docs/product/explanation/delta-compression.md) · [Multi-backend routing](docs/product/explanation/multi-backend-architecture.md) · [The security model](docs/product/explanation/security-model.md) · [Encryption at rest](docs/product/explanation/encryption-at-rest.md) · [Jobs & durability](docs/product/explanation/jobs-and-durability.md)
+- [Delta compression](docs/product/explanation/delta-compression.md) · [Multi-backend routing](docs/product/explanation/multi-backend-architecture.md) · [The security model](docs/product/explanation/security-model.md) · [Encryption at rest](docs/product/explanation/encryption-at-rest.md) · [Jobs & durability](docs/product/explanation/jobs-and-durability.md) · [Two ways to configure](docs/product/explanation/two-ways-to-configure.md) · [How migration works](docs/product/explanation/how-migration-works.md) · [Compression vs. S3 versioning](docs/product/explanation/versioning-vs-s3-versioning.md) · [The compute tax](docs/product/explanation/the-compute-tax.md) · [The license](docs/product/explanation/the-deltaglider-license.md)
 
 Plus the [FAQ index](docs/product/faq.md).
 
