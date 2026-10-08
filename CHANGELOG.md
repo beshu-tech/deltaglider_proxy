@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed — The lifecycle scheduler runs only the rules that are still configured
+
+On each tick the lifecycle scheduler took a copy of the rules and ran the
+due ones one after another. One rule can run for hours. When the operator
+deleted, disabled or edited a later rule in that time, or turned lifecycle
+off, the scheduler still ran that rule as it was in the copy, and it could
+delete objects under a rule that no longer existed. Now the scheduler reads
+the live configuration again before it runs each rule, and skips a rule that
+changed.
+
 ### Fixed — A delta copy no longer replaces a reference it could not read
 
 Replication, lifecycle transitions, migrations and the admin copy send a

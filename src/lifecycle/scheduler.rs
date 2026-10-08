@@ -41,7 +41,7 @@ pub fn spawn_scheduler(
                 (cfg.lifecycle.clone(), lease_timing(&cfg.jobs))
             };
             if lifecycle.enabled {
-                run_due_rules(&lifecycle, lease, db.clone(), &state, &instance_id).await;
+                run_due_rules(&lifecycle, &config, lease, db.clone(), &state, &instance_id).await;
             } else {
                 debug!("Lifecycle scheduler skipped: global lifecycle disabled");
             }
@@ -49,8 +49,17 @@ pub fn spawn_scheduler(
     })
 }
 
+/// Whether `rule` (from the tick's snapshot) is still the live rule, under a
+/// live lifecycle that is on. One rule of a tick can run for hours; the
+/// operator can delete, disable or edit a later rule meanwhile.
+async fn rule_is_live(live: &SharedConfig, rule: &crate::config_sections::LifecycleRule) -> bool {
+    let cfg = live.read().await;
+    cfg.lifecycle.enabled && super::planner::claimed_rule_is_current(rule, &cfg.lifecycle.rules)
+}
+
 async fn run_due_rules(
     lifecycle: &LifecycleConfig,
+    live: &SharedConfig,
     lease: LeaseTiming,
     db: Option<Arc<Mutex<ConfigDb>>>,
     state: &Arc<AppState>,
@@ -82,6 +91,15 @@ async fn run_due_rules(
                 "Lifecycle scheduler skipping invalid rule '{}': {}",
                 rule.name,
                 fatal.join("; ")
+            );
+            continue;
+        }
+        // Before the state row and the lease: a deleted rule must not get its
+        // state row back.
+        if !rule_is_live(live, rule).await {
+            debug!(
+                "Lifecycle scheduler skipping rule '{}': it changed after the tick started",
+                rule.name
             );
             continue;
         }
@@ -143,6 +161,19 @@ async fn run_due_rules(
             }
         };
         if !should_run {
+            continue;
+        }
+        // Again under the lease: only the lease makes a delete refuse, so a
+        // change between the first check and the lease is visible now.
+        if !rule_is_live(live, rule).await {
+            info!(
+                "Lifecycle scheduler skipping rule '{}': it changed after the tick started",
+                rule.name
+            );
+            if let Some(db) = db.as_ref() {
+                let db = db.lock().await;
+                let _ = db.lifecycle_release_lease(&rule.name, instance_id);
+            }
             continue;
         }
 
@@ -328,14 +359,53 @@ mod tests {
     }
 
     async fn run(env: &Env, cfg: &LifecycleConfig) {
+        run_with_live(env, cfg, cfg).await;
+    }
+
+    /// One tick over the `snapshot`, while the live config holds `live`.
+    async fn run_with_live(env: &Env, snapshot: &LifecycleConfig, live: &LifecycleConfig) {
+        let live = crate::config::Config {
+            lifecycle: live.clone(),
+            ..Default::default()
+        }
+        .into_shared();
         run_due_rules(
-            cfg,
+            snapshot,
+            &live,
             LeaseTiming::LIFECYCLE,
             Some(env.db.clone()),
             &env.state,
             "sched-test",
         )
         .await;
+    }
+
+    /// B008: a tick runs its rules one after another from a snapshot, and
+    /// one rule can run for hours. A rule deleted, disabled or edited in that
+    /// time, or lifecycle turned off, must not run from the snapshot.
+    #[tokio::test]
+    async fn a_rule_changed_after_the_snapshot_does_not_run() {
+        let env = env().await;
+        for (i, case) in ["deleted", "disabled", "edited", "lifecycle-off"]
+            .iter()
+            .enumerate()
+        {
+            let bucket = format!("sched-stale-{i}");
+            seed(&env, &bucket).await;
+            let snapshot = lifecycle(&[(&format!("sched-stale-rule-{i}"), &bucket)]);
+            let mut live = snapshot.clone();
+            match *case {
+                "deleted" => live.rules.clear(),
+                "disabled" => live.rules[0].enabled = false,
+                "edited" => live.rules[0].expire_after = Some("30d".into()),
+                _ => live.enabled = false,
+            }
+            run_with_live(&env, &snapshot, &live).await;
+            assert!(
+                exists(&env, &bucket).await,
+                "a {case} rule ran from the tick's snapshot"
+            );
+        }
     }
 
     /// A due rule runs, releases its lease, and is not due again until one
@@ -478,11 +548,32 @@ mod tests {
         let env = env().await;
         seed(&env, "sched-nodb").await;
         let cfg = lifecycle(&[("sched-nodb-rule", "sched-nodb")]);
+        let live = crate::config::Config {
+            lifecycle: cfg.clone(),
+            ..Default::default()
+        }
+        .into_shared();
         let held = crate::lifecycle::try_acquire_rule("sched-nodb-rule").unwrap();
-        run_due_rules(&cfg, LeaseTiming::LIFECYCLE, None, &env.state, "sched-test").await;
+        run_due_rules(
+            &cfg,
+            &live,
+            LeaseTiming::LIFECYCLE,
+            None,
+            &env.state,
+            "sched-test",
+        )
+        .await;
         assert!(exists(&env, "sched-nodb").await, "busy here: skipped");
         drop(held);
-        run_due_rules(&cfg, LeaseTiming::LIFECYCLE, None, &env.state, "sched-test").await;
+        run_due_rules(
+            &cfg,
+            &live,
+            LeaseTiming::LIFECYCLE,
+            None,
+            &env.state,
+            "sched-test",
+        )
+        .await;
         assert!(!exists(&env, "sched-nodb").await, "free: runs");
     }
 
