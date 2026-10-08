@@ -350,7 +350,9 @@ pub fn spawn_cache_monitor(state: &Arc<AppState>, metrics: &Arc<Metrics>) {
     });
 }
 
-/// Build IAM state from config (legacy single-credential or disabled).
+/// Build IAM state from config: the bootstrap pair (`Legacy`), open access
+/// for explicit `authentication: none` (`Disabled`), else deny all until the
+/// IAM users load. "No pair" alone never means open access.
 pub fn init_iam_state(config: &Config) -> SharedIamState {
     Arc::new(arc_swap::ArcSwap::from_pointee(
         if let (Some(ref key_id), Some(ref secret)) =
@@ -360,8 +362,10 @@ pub fn init_iam_state(config: &Config) -> SharedIamState {
                 access_key_id: key_id.clone(),
                 secret_access_key: secret.clone(),
             })
-        } else {
+        } else if config.open_access_requested() {
             IamState::Disabled
+        } else {
+            IamState::deny_all()
         },
     ))
 }
@@ -1890,21 +1894,29 @@ mod tests {
         }
     }
 
-    /// No creds + no IAM users = open access. The proxy will refuse
-    /// to start later (`authentication = "none"` must be explicit),
-    /// but `init_iam_state` itself returns Disabled — the refusal
-    /// happens in a separate boot-safety check.
-    #[test]
-    fn init_iam_state_without_creds_returns_disabled() {
-        let cfg = Config::default(); // access_key_id=None, secret_access_key=None
+    fn denies_all(state: &SharedIamState) -> bool {
+        matches!(state.load_full().as_ref(), IamState::Iam(index) if index.is_empty())
+    }
 
-        let state = init_iam_state(&cfg);
-        let loaded = state.load_full();
-        assert!(
-            matches!(loaded.as_ref(), IamState::Disabled),
-            "expected Disabled, got {:?}",
-            std::mem::discriminant(loaded.as_ref())
-        );
+    /// No creds and no `authentication: none` = deny all until IAM users
+    /// load (an IAM-users boot). Without users the boot-safety check refuses
+    /// to start; `init_iam_state` itself never opens access for it.
+    #[test]
+    fn init_iam_state_without_creds_denies_all() {
+        assert!(denies_all(&init_iam_state(&Config::default())));
+    }
+
+    /// Only explicit `authentication: none` gives open access.
+    #[test]
+    fn init_iam_state_with_authentication_none_returns_disabled() {
+        let cfg = Config {
+            authentication: Some(" None ".to_string()),
+            ..Config::default()
+        };
+        assert!(matches!(
+            init_iam_state(&cfg).load_full().as_ref(),
+            IamState::Disabled
+        ));
     }
 
     /// Partial credentials (only access_key_id set, or only secret
@@ -1912,35 +1924,23 @@ mod tests {
     /// proxy should treat auth as absent. A silent "half-configured"
     /// state would leak the set half via SigV4 auth mismatches.
     #[test]
-    fn init_iam_state_with_only_access_key_id_returns_disabled() {
+    fn init_iam_state_with_only_access_key_id_denies_all() {
         let cfg = Config {
             access_key_id: Some("AKIAHALFSET".to_string()),
             // secret_access_key stays None
             ..Config::default()
         };
-
-        let state = init_iam_state(&cfg);
-        let loaded = state.load_full();
-        assert!(
-            matches!(loaded.as_ref(), IamState::Disabled),
-            "half-configured creds must yield Disabled"
-        );
+        assert!(denies_all(&init_iam_state(&cfg)), "half-configured creds");
     }
 
     #[test]
-    fn init_iam_state_with_only_secret_returns_disabled() {
+    fn init_iam_state_with_only_secret_denies_all() {
         let cfg = Config {
             secret_access_key: Some("dangling-secret".to_string()),
             // access_key_id stays None
             ..Config::default()
         };
-
-        let state = init_iam_state(&cfg);
-        let loaded = state.load_full();
-        assert!(
-            matches!(loaded.as_ref(), IamState::Disabled),
-            "half-configured creds (secret only) must yield Disabled"
-        );
+        assert!(denies_all(&init_iam_state(&cfg)), "half-configured creds");
     }
 
     /// A named-backends deployment ignores the legacy singleton `backend`, so

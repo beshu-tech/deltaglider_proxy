@@ -385,7 +385,7 @@ pub async fn remove_bootstrap_credentials(
 ) -> axum::response::Response {
     // The refusals answer `{"error": ..}`; an env re-apply failure a text 500.
     let conflict = |msg: &str| AdminError::<JsonError>::conflict(msg).into_response();
-    let iam_active = matches!(&**state.iam_state.load(), IamState::Iam(_));
+    let iam_active = state.iam_state.load().has_iam_users();
     let (env_controlled, has_pair) = {
         let cfg = state.config.read().await;
         (

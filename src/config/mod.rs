@@ -1766,6 +1766,14 @@ impl Config {
         self.access_key_id.is_some() && self.secret_access_key.is_some()
     }
 
+    /// Whether the operator asked for open access (`authentication: none`).
+    /// Credentials and IAM users still win while they exist.
+    pub fn open_access_requested(&self) -> bool {
+        self.authentication
+            .as_deref()
+            .is_some_and(|mode| mode.trim().eq_ignore_ascii_case("none"))
+    }
+
     /// Pure classification of the auth configuration at startup. Decides
     /// *which* outcome the process should take; the caller (`startup.rs`)
     /// owns the logging and the `process::exit` so this stays unit-testable

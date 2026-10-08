@@ -604,8 +604,33 @@ mod tests {
         }
     }
 
-    /// Without bootstrap credentials (explicit `authentication: none`), an
-    /// empty DB keeps meaning open access.
+    /// B007: the bootstrap pair removed while IAM is active (DELETE
+    /// /config/bootstrap-credentials), then the last user deleted: S3
+    /// authentication must stay on.
+    #[test]
+    fn last_user_delete_after_bootstrap_removal_does_not_open_access() {
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let state = legacy_state();
+        db.create_user("alice", "AKALICE", "alice-secret", true, &[])
+            .unwrap();
+        rebuild_iam_index::<Bare>(&db, &state).unwrap();
+        let IamState::Iam(index) = &**state.load() else {
+            panic!("expected IAM mode");
+        };
+        state.store(Arc::new(index.with_bootstrap_fallback(None)));
+
+        for u in db.load_users().unwrap() {
+            db.delete_user(u.id).unwrap();
+        }
+        rebuild_iam_index::<Bare>(&db, &state).unwrap();
+        assert!(
+            !matches!(&**state.load(), IamState::Disabled),
+            "deleting the last user opened access"
+        );
+    }
+
+    /// IAM mode entered from open access (explicit `authentication: none`):
+    /// an empty DB returns to open access.
     #[test]
     fn last_user_delete_without_bootstrap_stays_open() {
         let db = ConfigDb::in_memory("test-pass").unwrap();

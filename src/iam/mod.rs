@@ -80,7 +80,8 @@ pub fn current_iam_version() -> u64 {
 
 /// Runtime IAM state — supports legacy single-credential mode and multi-user IAM.
 pub enum IamState {
-    /// No auth configured — open access.
+    /// Open access. Only explicit `authentication: none` leads here: every
+    /// other path to "no credential" is an empty `Iam` index (deny all).
     Disabled,
     /// Legacy single credential pair (backward compatible with old config).
     Legacy(AuthConfig),
@@ -89,6 +90,19 @@ pub enum IamState {
 }
 
 impl IamState {
+    /// IAM mode with no users and no fallback: every signed request is
+    /// denied. The state for "authentication is configured, but no
+    /// credential is left" (the bootstrap pair removed, the last user gone).
+    pub fn deny_all() -> Self {
+        IamState::Iam(IamIndex::from_users(Vec::new()))
+    }
+
+    /// IAM mode with at least one user. A `deny_all` index is IAM mode
+    /// without users: it must not pass for "IAM users exist".
+    pub fn has_iam_users(&self) -> bool {
+        matches!(self, IamState::Iam(index) if !index.is_empty())
+    }
+
     /// The bootstrap credential to fall back to when the IAM DB has no users.
     pub fn bootstrap_fallback(&self) -> Option<&AuthConfig> {
         match self {
@@ -130,6 +144,9 @@ pub struct IamIndex {
     /// The YAML/env bootstrap credential this process runs with, carried
     /// through IAM mode so an empty DB falls back to it, not to open access.
     bootstrap_fallback: Option<AuthConfig>,
+    /// IAM mode was entered from open access (`IamState::Disabled`, that is
+    /// explicit `authentication: none`), so an empty DB returns to it.
+    open_when_empty: bool,
 }
 
 impl IamIndex {
@@ -189,16 +206,37 @@ impl IamIndex {
             users: map,
             groups,
             bootstrap_fallback: None,
+            open_when_empty: false,
         }
     }
 
-    /// The same index with another bootstrap fallback (the bootstrap pair
-    /// changed or was removed from the config while IAM mode is active).
-    pub fn with_bootstrap_fallback(&self, fallback: Option<AuthConfig>) -> Self {
-        Self {
+    /// The state with another bootstrap fallback (the bootstrap pair changed
+    /// or was removed from the config while IAM mode is active). An index
+    /// with no users is the fallback itself, so it collapses like
+    /// [`Self::build_iam_state`] does.
+    pub fn with_bootstrap_fallback(&self, fallback: Option<AuthConfig>) -> IamState {
+        if self.users.is_empty() {
+            return Self::empty_state(fallback, self.open_when_empty, self.groups.clone());
+        }
+        IamState::Iam(Self {
             users: self.users.clone(),
             groups: self.groups.clone(),
             bootstrap_fallback: fallback,
+            open_when_empty: self.open_when_empty,
+        })
+    }
+
+    /// The state of an empty user set: the bootstrap credential, else open
+    /// access when IAM mode came from it, else deny all.
+    fn empty_state(
+        fallback: Option<AuthConfig>,
+        open_when_empty: bool,
+        groups: Vec<Group>,
+    ) -> IamState {
+        match fallback {
+            Some(auth) => IamState::Legacy(auth),
+            None if open_when_empty => IamState::Disabled,
+            None => IamState::Iam(Self::from_users_and_groups(Vec::new(), groups)),
         }
     }
 
@@ -231,24 +269,28 @@ impl IamIndex {
     ///
     /// Returns `Iam(index)` if users exist. An EMPTY user set (last user
     /// deleted, or a peer synced an empty DB) falls back to the bootstrap
-    /// credential `current` carries — `Legacy` — and only to `Disabled`
-    /// when the process has no bootstrap credential at all (explicit
-    /// `authentication: none`). Returning `Disabled` unconditionally
-    /// turned "delete the last user" into open access.
+    /// credential `current` carries (`Legacy`). Without one it returns to
+    /// open access only when IAM mode came from open access (explicit
+    /// `authentication: none`), and otherwise denies everything. "No
+    /// bootstrap pair" alone never means open access: the pair can be
+    /// removed while IAM is active, and an IAM-users boot has none.
     pub fn build_iam_state(
         users: Vec<IamUser>,
         groups: Vec<Group>,
         current: &IamState,
     ) -> IamState {
         let fallback = current.bootstrap_fallback().cloned();
+        let open_when_empty = match current {
+            IamState::Disabled => true,
+            IamState::Legacy(_) => false,
+            IamState::Iam(index) => index.open_when_empty,
+        };
         if users.is_empty() {
-            return match fallback {
-                Some(auth) => IamState::Legacy(auth),
-                None => IamState::Disabled,
-            };
+            return Self::empty_state(fallback, open_when_empty, Vec::new());
         }
         let mut index = Self::from_users_and_groups(users, groups);
         index.bootstrap_fallback = fallback;
+        index.open_when_empty = open_when_empty;
         IamState::Iam(index)
     }
 }
@@ -329,13 +371,11 @@ mod tests {
         assert!(legacy.accepts_credentials("AKBOOT", "SKBOOT"));
         assert!(!legacy.accepts_credentials("AKBOOT", "wrong"));
         assert!(!legacy.accepts_credentials("AKOTHER", "SKBOOT"));
-        let iam = IamState::Iam(
-            IamIndex::from_users(vec![
-                user("AKCI", "SKCI", true),
-                user("AKOFF", "SKOFF", false),
-            ])
-            .with_bootstrap_fallback(Some(boot.clone())),
-        );
+        let iam = IamIndex::from_users(vec![
+            user("AKCI", "SKCI", true),
+            user("AKOFF", "SKOFF", false),
+        ])
+        .with_bootstrap_fallback(Some(boot.clone()));
         assert!(iam.accepts_credentials("AKCI", "SKCI"));
         assert!(!iam.accepts_credentials("AKCI", "wrong"));
         assert!(!iam.accepts_credentials("AKOFF", "SKOFF"), "disabled");
@@ -669,6 +709,53 @@ mod tests {
         let again = IamIndex::build_iam_state(one_user(), vec![], &iam);
         let empty = IamIndex::build_iam_state(vec![], vec![], &again);
         assert!(matches!(empty, IamState::Legacy(a) if a.access_key_id == "AKBOOT"));
+    }
+
+    /// B007: without a bootstrap pair, an empty user set returns to open
+    /// access only when IAM mode came from open access. An IAM-users boot
+    /// (`deny_all`) or a removed pair stays closed.
+    #[test]
+    fn test_build_iam_state_empty_without_pair_stays_closed() {
+        let closed = |s: &IamState| matches!(s, IamState::Iam(i) if i.is_empty());
+
+        let iam_boot = IamIndex::build_iam_state(one_user(), vec![], &IamState::deny_all());
+        assert!(closed(&IamIndex::build_iam_state(
+            vec![],
+            vec![],
+            &iam_boot
+        )));
+
+        let IamState::Iam(index) =
+            IamIndex::build_iam_state(one_user(), vec![], &IamState::Legacy(boot()))
+        else {
+            panic!("expected IAM mode");
+        };
+        let pair_removed = index.with_bootstrap_fallback(None);
+        assert!(closed(&IamIndex::build_iam_state(
+            vec![],
+            vec![],
+            &pair_removed
+        )));
+
+        let open = IamIndex::build_iam_state(one_user(), vec![], &IamState::Disabled);
+        let again = IamIndex::build_iam_state(one_user(), vec![], &open);
+        assert!(matches!(
+            IamIndex::build_iam_state(vec![], vec![], &again),
+            IamState::Disabled
+        ));
+    }
+
+    /// An empty index takes a new bootstrap pair as the fallback itself.
+    #[test]
+    fn test_with_bootstrap_fallback_on_empty_index_collapses() {
+        let IamState::Iam(empty) = IamState::deny_all() else {
+            panic!("deny_all is IAM mode");
+        };
+        assert!(matches!(
+            empty.with_bootstrap_fallback(Some(boot())),
+            IamState::Legacy(a) if a.access_key_id == "AKBOOT"
+        ));
+        assert!(matches!(empty.with_bootstrap_fallback(None), IamState::Iam(i) if i.is_empty()));
     }
 
     #[test]

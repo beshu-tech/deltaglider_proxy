@@ -739,8 +739,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // by now) are credentials. A DB this key cannot read may hold users too.
     validate_auth_config(
         &config,
-        config_db_mismatch
-            || matches!(**iam_state.load(), deltaglider_proxy::iam::IamState::Iam(_)),
+        config_db_mismatch || iam_state.load().has_iam_users(),
     );
 
     // Load the synced session-revocation snapshot so a revoke performed on any

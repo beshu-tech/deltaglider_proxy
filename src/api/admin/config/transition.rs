@@ -169,7 +169,7 @@ pub(crate) async fn apply_config_transition(
     };
     let sigv4 = match admin {
         Some((state, _)) => {
-            let iam_active = matches!(**state.iam_state.load(), IamState::Iam(_));
+            let iam_active = state.iam_state.load().has_iam_users();
             sigv4_transition(old_cfg, &new_cfg, iam_active)?
         }
         // Checked above: the pair did not change.
@@ -215,9 +215,9 @@ pub(crate) async fn apply_config_transition(
     if let (Some(new_pair), Some((state, _))) = (sigv4, admin) {
         let current_iam = state.iam_state.load();
         if let IamState::Iam(index) = &**current_iam {
-            state.iam_state.store(Arc::new(IamState::Iam(
-                index.with_bootstrap_fallback(new_pair),
-            )));
+            state
+                .iam_state
+                .store(Arc::new(index.with_bootstrap_fallback(new_pair)));
             warnings.push(
                 "IAM mode is active: the bootstrap SigV4 pair is only the fallback for an empty \
                  IAM database. IAM users (including 'legacy-admin', which carries the old pair) \

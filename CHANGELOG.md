@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Security — Removing the last IAM user no longer opens S3 access
+
+When IAM mode had no bootstrap pair (the pair was removed while IAM users
+existed, or the proxy started with IAM users only), the proxy went to open
+access when its last IAM user was removed. This happened on a user delete,
+on a declarative apply without `iam_users`, and on a synced empty IAM
+database, and it lasted until the next restart. Now the proxy refuses every
+S3 request in this state. Only `authentication: none` gives open access: IAM
+mode that started from it returns to it. The bootstrap password still opens
+the admin GUI, where you can create a user.
+
 ### Fixed — A GET survives a backend that stops sending the body (#102)
 
 The S3 SDK retries a GET only until the response headers arrive. When the
