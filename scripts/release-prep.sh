@@ -15,6 +15,8 @@
 #   - Cargo.toml: package.version bumped to NEW_VERSION
 #   - Cargo.lock: refreshed via `cargo update -p deltaglider_proxy --offline`
 #                 (falls back to `cargo update -p deltaglider_proxy` if needed)
+#   - operator, Helm chart and the docs that name an image version: stamped
+#     (see "Stamp the deployment pins" below)
 #   - CHANGELOG.md: `## Unreleased` block renamed to
 #                   `## vX.Y.Z — YYYY-MM-DD` and a fresh `## Unreleased`
 #                   inserted above it.
@@ -199,6 +201,13 @@ stamp "$ROOT/operator/src/crd.rs" '{ sub(/beshultd\/deltaglider_proxy:[0-9]+\.[0
 stamp "$ROOT/operator/README.md" '{ sub(/beshultd\/deltaglider_proxy:[0-9]+\.[0-9]+\.[0-9]+/, "beshultd/deltaglider_proxy:" proxy); print }'
 stamp "$ROOT/operator/deploy/operator.yaml" '{ sub(/beshultd\/deltaglider-operator:[0-9]+\.[0-9]+\.[0-9]+/, "beshultd/deltaglider-operator:" op); print }'
 stamp "$CHART" '/^version:/ { print "version: " chart; next } /^appVersion:/ { print "appVersion: \"" proxy "\""; next } { print }'
+# The docs that name one image version: the upgrade steps, the Docker Hub tag
+# table, the first tutorial's startup line and the compose example. They
+# still said 2.0.0 at v2.0.2.
+stamp "$ROOT/docs/product/how-to/upgrade.md" '{ gsub(/beshultd\/deltaglider_proxy:[0-9]+\.[0-9]+\.[0-9]+/, "beshultd/deltaglider_proxy:" proxy); print }'
+stamp "$ROOT/DOCKERHUB.md" '{ sub(/^[|] `[0-9]+\.[0-9]+\.[0-9]+` [|]/, "| `" proxy "` |"); print }'
+stamp "$ROOT/docs/product/tutorials/first-delta-savings.md" '{ sub(/Starting DeltaGlider Proxy v[0-9]+\.[0-9]+\.[0-9]+/, "Starting DeltaGlider Proxy v" proxy); print }'
+stamp "$ROOT/examples/docker-compose/secrets.env.example" '{ sub(/DGP_IMAGE_TAG=[0-9]+\.[0-9]+\.[0-9]+/, "DGP_IMAGE_TAG=" proxy); print }'
 ( cd "$ROOT/operator" && { cargo update -p deltaglider-operator --offline >/dev/null 2>&1 \
     || cargo update -p deltaglider-operator >/dev/null 2>&1; } ) \
     || err "cargo update failed in operator/ — operator/Cargo.lock won't be in sync"

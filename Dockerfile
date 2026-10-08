@@ -87,8 +87,12 @@ LABEL org.opencontainers.image.title="DeltaGlider Proxy" \
 
 # Install ca-certificates (HTTPS) and curl (healthcheck).
 # xdelta3 is copied from build stage to reduce apt dependency surface.
+# `upgrade` takes the Debian security fixes that the base image does not
+# have yet: the published debian:bookworm-slim can lag them by weeks
+# (perl-base CVEs, October 2026), and a scanner reports them against us.
 # Use multiple retries + fallback to handle unreliable deb.debian.org.
-RUN (apt-get -o Acquire::Retries=5 update && apt-get install -y --no-install-recommends \
+RUN (apt-get -o Acquire::Retries=5 update && apt-get upgrade -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends \
     ca-certificates curl ntpstat chrony \
     && rm -rf /var/lib/apt/lists/*) \
     || (echo "WARN: apt-get failed — continuing without curl (healthcheck will use wget fallback)" && apt-get clean)

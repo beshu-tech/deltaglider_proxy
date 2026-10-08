@@ -67,7 +67,9 @@ Pick one. All three give you the same binary.
 
 ```bash
 # Docker (recommended) — then follow the first tutorial
-docker run --rm -it -p 9000:9000 -v dgp-data:/data beshultd/deltaglider_proxy
+docker run --rm -it -p 9000:9000 -v dgp-data:/data \
+  -e DGP_AUTHENTICATION=none \
+  beshultd/deltaglider_proxy
 ```
 
 Binary release: download the latest release for macOS or Linux from the [releases page](https://github.com/beshu-tech/deltaglider_proxy/releases), unpack it, and run `./deltaglider_proxy`.

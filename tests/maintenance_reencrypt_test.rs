@@ -270,10 +270,34 @@ async fn test_reencrypt_full_cycle() {
         503,
         "writes must be gated during the job"
     );
+    // The gate answers from the s3s access hook: the 503 keeps its XML
+    // Content-Type and RequestId, and tells the client when to retry.
+    let header = |name: &str| {
+        put_resp
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert_eq!(header("retry-after"), "5", "a 503 says when to retry");
+    assert!(
+        header("content-type").contains("xml"),
+        "the 503 body is S3 XML: {:?}",
+        header("content-type")
+    );
     let put_body = put_resp.text().await.unwrap_or_default();
     assert!(
         put_body.contains("SlowDown"),
         "gated write should be an S3 SlowDown error, got: {put_body}"
+    );
+    assert!(
+        put_body.contains("<RequestId>"),
+        "the 503 body names its request: {put_body}"
+    );
+    assert!(
+        put_body.contains("temporarily read-only"),
+        "the 503 says why the bucket refuses writes: {put_body}"
     );
     let read_back = get_bytes(&http, &endpoint, bucket, "plain-00.json").await;
     assert!(

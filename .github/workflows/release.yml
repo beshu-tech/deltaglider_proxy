@@ -654,6 +654,10 @@ jobs:
         # published at this point.
         continue-on-error: true
         timeout-minutes: 5
+        # The job runs in a container, where a step's default shell is `sh`:
+        # `set -o pipefail` failed there, and the description did not sync
+        # in v2.0.0 to v2.0.2.
+        shell: bash
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}

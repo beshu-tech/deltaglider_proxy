@@ -225,10 +225,15 @@ impl S3Backend {
         key: &str,
         response: GetObjectOutput,
     ) -> Result<Vec<u8>, StorageError> {
+        // The backend's Content-Length sizes the first allocation, capped: a
+        // wrong or huge value must not abort the process on a failed
+        // reservation. Past the cap the buffer grows as the bytes arrive.
+        const PREALLOC_CAP: usize = 64 * 1024 * 1024;
         let capacity = response
             .content_length()
             .and_then(|n| usize::try_from(n).ok())
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .min(PREALLOC_CAP);
         let mut out = Vec::with_capacity(capacity);
         let mut stream = self.body_stream(bucket, key, response);
         while let Some(chunk) = stream.next().await {

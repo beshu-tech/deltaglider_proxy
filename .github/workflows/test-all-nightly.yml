@@ -206,6 +206,10 @@ jobs:
         run: cargo audit
       - name: cargo deny check
         run: cargo deny check
+      # The operator is its own workspace with its own Cargo.lock, so the
+      # two checks above do not see it (rustls RUSTSEC-2026-0285, Oct 2026).
+      - name: cargo deny check advisories (operator)
+        run: cargo deny --manifest-path operator/Cargo.toml check advisories
 
 
   # ── QA regression pass (demo/s3-browser/ui/e2e/qa-regression.spec.ts):

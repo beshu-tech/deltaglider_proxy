@@ -122,9 +122,11 @@ A client listing of an S3-backed bucket costs one `list` request per page when t
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `deltaglider_backend_get_body_resumes_total` | Counter | — | Downloads from S3 whose response body broke off and that the proxy resumed with a ranged request for the remaining bytes |
+| `deltaglider_backend_get_body_resumes_total` | Counter | — | Ranged requests that the proxy sent to S3 to get the remaining bytes of a response body that broke off. One download can add up to three |
 
-A response body breaks off when the backend stops sending bytes for longer than `DGP_S3_STALL_GRACE_SECS` (20 seconds by default), or when the connection closes before the last byte. The proxy then requests the remaining bytes of the same object version, up to three times for one download. A download that still fails answers `503 ServiceUnavailable`. A counter that rises steadily means that the backend often stalls.
+A response body breaks off when the backend stops sending bytes for longer than `DGP_S3_STALL_GRACE_SECS` (20 seconds by default), or when the connection closes before the last byte. The proxy then requests the remaining bytes of the same object version, up to three times for one download.
+
+What the client sees when the last of these requests fails depends on when the proxy answers. For a delta-stored object, the proxy reads the whole object before it sends the first byte, so the client gets `503 ServiceUnavailable`. For a passthrough object, the proxy sends the `200` headers first and then streams the bytes as they arrive, so the response ends before its last byte. A counter that rises steadily means that the backend often stalls.
 
 ## Codec concurrency
 
