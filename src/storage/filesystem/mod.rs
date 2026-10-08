@@ -34,6 +34,8 @@ async fn is_dir(path: &Path) -> bool {
 use super::io_to_storage_error;
 
 #[cfg(test)]
+pub(crate) mod fault;
+#[cfg(test)]
 mod tests;
 mod write;
 

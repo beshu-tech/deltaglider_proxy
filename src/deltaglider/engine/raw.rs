@@ -100,22 +100,23 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.storage.get_reference_metadata(bucket, prefix).await
     }
 
-    /// Reference metadata for a deltaspace, or `None` when no reference exists.
-    /// A backend error is treated as "no reference" here (read-only reporting
-    /// path — the write paths propagate the error instead).
-    pub async fn reference_meta(&self, bucket: &str, prefix: &str) -> Option<FileMetadata> {
-        if !self
-            .storage
-            .has_reference(bucket, prefix)
-            .await
-            .unwrap_or(false)
-        {
-            return None;
+    /// Reference metadata for a deltaspace. `Ok(None)` only when the backend
+    /// confirms that no reference exists: a failed read (an S3 HEAD that
+    /// answers 503) is an `Err`, never an absence, because a caller that
+    /// writes on "no reference" would overwrite a live reference.bin.
+    pub async fn reference_meta(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Option<FileMetadata>, StorageError> {
+        if !self.storage.has_reference(bucket, prefix).await? {
+            return Ok(None);
         }
-        self.storage
-            .get_reference_metadata(bucket, prefix)
-            .await
-            .ok()
+        match self.storage.get_reference_metadata(bucket, prefix).await {
+            Ok(meta) => Ok(Some(meta)),
+            Err(StorageError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Delta metadata for one object (full Delta info incl. `ref_sha256`).

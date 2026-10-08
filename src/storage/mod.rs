@@ -23,6 +23,8 @@ mod traits;
 pub(crate) mod xattr_meta;
 
 pub use encrypting::{EncryptingBackend, EncryptionConfig, EncryptionKey, WriteMode};
+#[cfg(test)]
+pub(crate) use filesystem::fault::FaultyFs;
 pub use filesystem::FilesystemBackend;
 pub use routing::RoutingBackend;
 pub(crate) use s3::{check_s3_endpoint, guard_s3_endpoint};

@@ -1234,14 +1234,17 @@ async fn delta_passthrough_copy(
     let shipped: Result<Option<u64>, CopyError> = engine
         .with_dest_prefix_lock(&counter_dest_bucket, &dest_prefix, || async move {
             // Re-read the dest reference UNDER the lock and re-run the SAME pure
-            // gate — identical sha + enc precedence to the first read.
-            let dest_ref = engine2
-                .reference_meta(&dest_bucket, &dest_prefix2)
-                .await
-                .map(|m| DestRefFacts {
+            // gate — identical sha + enc precedence to the first read. A read
+            // that fails is not "no reference": seeding on it would overwrite
+            // a live reference.bin. Fall back to reconstruct + store, which
+            // surfaces the backend error itself.
+            let dest_ref = match engine2.reference_meta(&dest_bucket, &dest_prefix2).await {
+                Ok(meta) => meta.map(|m| DestRefFacts {
                     file_sha256: m.file_sha256.clone(),
                     enc: enc_fingerprint(&m),
-                });
+                }),
+                Err(_) => return Ok(None),
+            };
             let mut seeded_ref_bytes = 0u64;
             match can_delta_passthrough(&src, dest_ref.as_ref()) {
                 DeltaPassthroughDecision::Fallback { .. } => return Ok(None),
@@ -1738,6 +1741,90 @@ mod tests {
             engine.retrieve("dst", "p/b.zip").await.unwrap().0,
             versioned_bytes(3, n)
         );
+    }
+
+    /// B003: under the dest lock, a failed read of the dest reference (an S3
+    /// HEAD that answers 503) is not "no reference". Seeding on it overwrote
+    /// the live reference.bin, and the dest deltas against it stopped
+    /// decoding.
+    #[tokio::test]
+    async fn delta_fast_path_never_seeds_over_an_unreadable_dest_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let faulty = crate::storage::FaultyFs::new(
+            crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let fail_has_reference = faulty.fail_has_reference.clone();
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(faulty);
+        let engine: Arc<DynEngine> = Arc::new(DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &Config::default(),
+            None,
+        ));
+        engine.create_bucket("src").await.unwrap();
+        engine.create_bucket("dst").await.unwrap();
+        let n = 256 * 1024;
+        // Two deltaspaces with different references: dst X (seed 1), src Y
+        // (seed 4); each has one delta against its own reference.
+        for (bucket, key, seed) in [
+            ("dst", "p/a.zip", 1u8),
+            ("dst", "p/a2.zip", 2),
+            ("src", "p/b.zip", 4),
+            ("src", "p/b2.zip", 5),
+        ] {
+            engine
+                .store(
+                    bucket,
+                    key,
+                    &versioned_bytes(seed, n),
+                    None,
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let head = engine.head("src", "p/b2.zip").await.unwrap();
+        assert!(
+            matches!(head.storage_info, crate::types::StorageInfo::Delta { .. }),
+            "fixture must store b2.zip as a delta"
+        );
+
+        let x_sha = engine
+            .reference_metadata_raw("dst", "p")
+            .await
+            .unwrap()
+            .file_sha256;
+        *fail_has_reference.lock().unwrap() = Some("dst/p".to_string());
+        let request = ObjectTransferRequest {
+            source_bucket: "src",
+            source_key: "p/b2.zip",
+            destination_bucket: "dst",
+            destination_key: "p/c.zip",
+            provenance: None,
+            strip_user_metadata_keys: &[],
+            operation: "replication",
+            upload_concurrency: None,
+            keep_created_at: false,
+        };
+        let _ = delta_passthrough_copy(&engine, request, &head).await;
+        *fail_has_reference.lock().unwrap() = None;
+        let after = engine
+            .reference_metadata_raw("dst", "p")
+            .await
+            .unwrap()
+            .file_sha256;
+        assert_eq!(after, x_sha, "the copy replaced the live dest reference");
+
+        // A fresh engine has no cached reference: it reads reference.bin.
+        let fresh = fs_engine_with(dir.path(), &[]).await;
+        let read = fresh.retrieve("dst", "p/a2.zip").await;
+        assert!(
+            read.is_ok(),
+            "a dest delta no longer decodes: {:?}",
+            read.err()
+        );
+        assert_eq!(read.unwrap().0, versioned_bytes(2, n));
     }
 
     /// Round-2 review: `ReplicationObjectCopied` reported the stored delta

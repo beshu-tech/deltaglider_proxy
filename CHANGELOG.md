@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed — A delta copy no longer replaces a reference it could not read
+
+Replication, lifecycle transitions, migrations and the admin copy send a
+delta-stored object to its destination as a delta when they can. They read
+the reference of the destination first. When that read failed (an S3 `503`
+or a timeout), the copy took the failure for "no reference" and wrote the
+reference of the source over the live reference of the destination. Every
+other delta-stored object in that folder of the destination then could not
+be read. Now a failed read makes the copy rebuild the object and store it
+the normal way.
+
 ### Security — A declarative change to an OAuth provider takes effect at once
 
 In `iam_mode: declarative`, a config apply or a full-IAM YAML import wrote
