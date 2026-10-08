@@ -158,3 +158,26 @@ async fn review3_a_marker_put_passes_the_ingest_gate() {
         }
     }
 }
+
+/// B004: an empty delimiter (`delimiter=`, sent by mc, rclone and restic) is
+/// no delimiter, as on AWS. It must not collapse every key into one
+/// CommonPrefix.
+#[tokio::test]
+async fn an_empty_delimiter_is_no_delimiter() {
+    for (_dir, engine) in engines().await {
+        for key in ["a/b.txt", "c.txt"] {
+            engine
+                .store("b", key, b"x", None, Default::default())
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            keys(&engine, "", Some("")).await,
+            keys(&engine, "", None).await
+        );
+        assert_eq!(
+            keys(&engine, "a/", Some("")).await,
+            keys(&engine, "a/", None).await
+        );
+    }
+}

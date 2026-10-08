@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed — An empty `delimiter=` lists every object
+
+`mc ls --recursive`, `mc mirror`, `rclone --fast-list` and restic send
+`delimiter=` with an empty value. On a filesystem backend the proxy then
+answered with no objects and one common prefix equal to the request prefix,
+because every key contains the empty string. A mirror with `--remove` could
+then delete every object at its destination. Now an empty delimiter is no
+delimiter, as on AWS S3.
+
 ### Fixed — A GET of a key with a leading space serves that key
 
 On an S3 backend, a GET of `shared/ payroll.csv` (with a leading space)

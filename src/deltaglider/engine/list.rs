@@ -164,6 +164,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ) -> Result<ListObjectsPage, EngineError> {
         // S3 requires max-keys >= 1; clamp to prevent pagination invariant violations.
         let max_keys = max_keys_raw.max(1);
+        // `delimiter=` (mc, rclone, restic send it) is no delimiter, as on
+        // AWS. Every key contains "" at offset 0, so it would collapse the
+        // whole listing into one CommonPrefix.
+        let delimiter = delimiter.filter(|d| !d.is_empty());
 
         ObjectKey::validate_prefix(prefix)
             .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
