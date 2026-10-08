@@ -2,12 +2,13 @@
 
 //! S3 backend parity tests
 //!
-//! TWO tests only (trimmed in a prior QA pass — see the note below): an
-//! S3-plumbing smoke test and the delta+S3 interaction that no other suite
-//! covers. NOT a re-run of s3_api_test's operations — those trait-level
-//! behaviours are guaranteed by the AWS SDK + the filesystem suites, so we
-//! don't re-pay a MinIO round-trip for them. Both gated with
-//! skip_unless_minio!() — skip gracefully without MinIO.
+//! THREE tests only (trimmed in a prior QA pass — see the note below): an
+//! S3-plumbing smoke test, the delta+S3 interaction that no other suite
+//! covers, and the S3 SDK's header trimming (a leading-space key). NOT a
+//! re-run of s3_api_test's operations — those trait-level behaviours are
+//! guaranteed by the AWS SDK + the filesystem suites, so we don't re-pay a
+//! MinIO round-trip for them. All gated with skip_unless_minio!() — skip
+//! gracefully without MinIO.
 
 use crate::common;
 
@@ -1032,4 +1033,45 @@ async fn review3_a_deleted_multipart_passthrough_leaves_no_facts() {
         left = facts().await;
     }
     assert!(left.is_empty(), "facts of a deleted object stay: {left:?}");
+}
+
+/// B001: a key with a leading space is an object of its own. The S3 SDK trims
+/// the `dg-original-name` header value on read, so a GET of `p/ payroll.csv`
+/// must not serve the bytes of `p/payroll.csv`.
+#[tokio::test]
+async fn test_s3_leading_space_key_serves_its_own_bytes() {
+    skip_unless_minio!();
+    let server = TestServer::s3().await;
+    let client = server.s3_client().await;
+    let prefix = unique_prefix();
+    let other = format!("{prefix}/payroll.csv");
+    let spaced = format!("{prefix}/ payroll.csv");
+
+    for (key, body) in [(&other, b"SECRET-AAAA"), (&spaced, b"public-bbbb")] {
+        client
+            .put_object()
+            .bucket(server.bucket())
+            .key(key.as_str())
+            .body(ByteStream::from(body.to_vec()))
+            .send()
+            .await
+            .unwrap();
+    }
+    let body = client
+        .get_object()
+        .bucket(server.bucket())
+        .key(&spaced)
+        .send()
+        .await
+        .unwrap()
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
+    assert_eq!(
+        String::from_utf8_lossy(&body),
+        "public-bbbb",
+        "GET of a leading-space key served another object's bytes"
+    );
 }

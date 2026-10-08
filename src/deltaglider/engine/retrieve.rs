@@ -141,9 +141,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ) -> Result<RetrieveResponse, EngineError> {
         match &metadata.storage_info {
             StorageInfo::Passthrough => {
-                // Use the stored original_name (may differ from obj_key.filename if the file
-                // was copied with a .delta suffix from another deployment)
-                let stored_name = &metadata.original_name;
+                let stored_name = passthrough_stored_name(&obj_key.filename, &metadata);
                 let stream = self
                     .storage
                     .get_passthrough_stream(bucket, deltaspace_id, stored_name)
@@ -502,7 +500,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         match &metadata.storage_info {
             StorageInfo::Passthrough => {
-                let stored_name = &metadata.original_name;
+                let stored_name = passthrough_stored_name(&obj_key.filename, &metadata);
                 let range_result = self
                     .storage
                     .get_passthrough_stream_range(bucket, &deltaspace_id, stored_name, start, end)
@@ -529,7 +527,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                                     .get_passthrough_stream_range(
                                         bucket,
                                         &deltaspace_id,
-                                        &fresh_meta.original_name,
+                                        passthrough_stored_name(&obj_key.filename, &fresh_meta),
                                         start,
                                         end,
                                     )
@@ -809,6 +807,55 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             (Some(e), Some(a)) if !e.is_empty() && !a.is_empty() => e == a,
             _ => false,
         }
+    }
+}
+
+/// The stored name of the passthrough object that answers a request for
+/// `filename`. The object lives at the request key. The one exception is a
+/// `.delta` file copied in without its DG metadata (rclone between
+/// deployments): it reads as passthrough and lives at `filename.delta`.
+/// Never any other name from the metadata: the S3 SDK trims header values
+/// and a backend copy keeps the source's `dg-original-name`, so a GET that
+/// trusted it served the bytes of another key.
+fn passthrough_stored_name<'a>(filename: &'a str, metadata: &'a FileMetadata) -> &'a str {
+    if metadata.original_name.strip_suffix(".delta") == Some(filename) {
+        &metadata.original_name
+    } else {
+        filename
+    }
+}
+
+#[cfg(test)]
+mod passthrough_name_tests {
+    use super::*;
+
+    fn meta(original_name: &str) -> FileMetadata {
+        FileMetadata::fallback(
+            original_name.to_string(),
+            1,
+            String::new(),
+            chrono::Utc::now(),
+            None,
+            StorageInfo::Passthrough,
+        )
+    }
+
+    #[test]
+    fn the_request_key_names_the_stored_object() {
+        assert_eq!(passthrough_stored_name("a.csv", &meta("a.csv")), "a.csv");
+        // Trimmed by the SDK, copied from another key, or encoded: the
+        // request key wins.
+        assert_eq!(passthrough_stored_name(" a.csv", &meta("a.csv")), " a.csv");
+        assert_eq!(passthrough_stored_name("b.csv", &meta("a.csv")), "b.csv");
+        assert_eq!(
+            passthrough_stored_name("é.csv", &meta("=?UTF-8?Q?=C3=A9.csv?=")),
+            "é.csv"
+        );
+        // A metadata-less `.delta` copy is stored under its suffix.
+        assert_eq!(
+            passthrough_stored_name("x.zip", &meta("x.zip.delta")),
+            "x.zip.delta"
+        );
     }
 }
 

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Fixed — A GET of a key with a leading space serves that key
+
+On an S3 backend, a GET of `shared/ payroll.csv` (with a leading space)
+returned the bytes of `shared/payroll.csv`. The proxy read the stored name
+of the object from its `dg-original-name` metadata, and the S3 SDK trims the
+spaces of every header value that it reads. The IAM check saw only the
+requested key, so a user could read an object that a Deny rule protected.
+An object that a backend copy made from another key had the same defect,
+because the copy keeps the metadata of its source. Now the proxy always
+reads a plain object from the requested key. A `.delta` file that was
+copied in without its DeltaGlider metadata is still read from its stored
+name.
+
 ### Security — An IP condition on an admin rule applies to the admin GUI
 
 A Full Access rule (`*` on `*`) with an `aws:SourceIp` condition limited the
