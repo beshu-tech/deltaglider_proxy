@@ -39,6 +39,13 @@ impl Filter {
         !self.has_include && self.exclude.is_empty()
     }
 
+    /// The exclude patterns leave out every key under `dir` (review A7):
+    /// they match `dir/` itself, as `lost+found/*` or `**/cache/**` do. A
+    /// pattern on the name alone (`lost+found`, `*.tmp`) does not prove it.
+    pub fn excludes_everything_under(&self, dir: &str) -> bool {
+        !dir.is_empty() && self.exclude.is_match(format!("{dir}/"))
+    }
+
     /// Returns true iff this filter would accept `key`. Pure: no I/O,
     /// no side effects.
     pub fn matches(&self, key: &str) -> bool {

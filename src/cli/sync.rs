@@ -200,6 +200,7 @@ async fn sync_local_to_s3(args: &SyncArgs, filter: &Filter, opts: SyncDecisionOp
         entries: local_entries,
         unreadable,
     } = collect_local_entries(&src_dir, filter);
+    let unreadable_failures = unreadable_failures(&unreadable, filter);
     let s3_entries = match collect_s3_entries(&engine, &dst_loc.bucket, &dst_loc.key, filter).await
     {
         Ok(m) => m,
@@ -207,7 +208,7 @@ async fn sync_local_to_s3(args: &SyncArgs, filter: &Filter, opts: SyncDecisionOp
     };
 
     let mut succeeded = 0u64;
-    let mut failed = unreadable;
+    let mut failed = unreadable_failures;
     let mut deleted = 0u64;
 
     for (rel, src) in &local_entries {
@@ -242,18 +243,15 @@ async fn sync_local_to_s3(args: &SyncArgs, filter: &Filter, opts: SyncDecisionOp
         }
     }
 
-    if args.delete && unreadable > 0 {
-        // A path the walk could not read is missing from the listing, not
-        // deleted locally: deleting its remote copy would lose data.
-        eprintln!(
-            "error: --delete skipped: {unreadable} local path(s) could not be read, \
-             so the local listing is incomplete"
-        );
-    } else if args.delete {
-        for rel in s3_entries.keys() {
-            if local_entries.contains_key(rel) {
-                continue;
-            }
+    if args.delete {
+        let plan = delete_plan(s3_entries.keys(), &local_entries, &unreadable);
+        for (rel, path) in &plan.kept {
+            eprintln!(
+                "warning: delete skipped: {rel} is under the local path `{path}`, \
+                 which could not be read"
+            );
+        }
+        for rel in plan.delete {
             let key = join_prefix(&dst_loc.key, rel);
             if !args.quiet {
                 println!("delete: s3://{}/{}", dst_loc.bucket, key);
@@ -463,23 +461,77 @@ async fn sync_s3_to_s3(args: &SyncArgs, filter: &Filter, opts: SyncDecisionOpts)
     summarize(args, succeeded, failed, deleted)
 }
 
-/// The local side of a sync. `unreadable` counts the paths the walk could not
-/// read (a directory it could not list, a file it could not stat): their
-/// files are missing from `entries`, so the listing is incomplete.
+/// The local side of a sync. `unreadable` holds the paths (relative to the
+/// root, `""` for the root itself) the walk could not read: a directory it
+/// could not list, a file it could not stat. Their files are missing from
+/// `entries`.
 struct LocalListing {
     entries: HashMap<String, Entry>,
-    unreadable: u64,
+    unreadable: Vec<String>,
+}
+
+/// Which remote keys a `--delete` removes (review A7): the keys with no
+/// local file, except a key at or under a local path the walk could not
+/// read. That file may exist, so its remote copy stays (`kept`, with the
+/// path). One unreadable path no longer stops every delete.
+struct DeletePlan<'a> {
+    delete: Vec<&'a String>,
+    kept: Vec<(&'a String, &'a str)>,
+}
+
+fn delete_plan<'a>(
+    remote: impl Iterator<Item = &'a String>,
+    local: &HashMap<String, Entry>,
+    unreadable: &'a [String],
+) -> DeletePlan<'a> {
+    let mut plan = DeletePlan {
+        delete: Vec::new(),
+        kept: Vec::new(),
+    };
+    for key in remote {
+        if local.contains_key(key) {
+            continue;
+        }
+        let hidden = unreadable.iter().find(|p| {
+            p.is_empty()
+                || key == *p
+                || key
+                    .strip_prefix(p.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        });
+        match hidden {
+            Some(path) => plan.kept.push((key, path.as_str())),
+            None => plan.delete.push(key),
+        }
+    }
+    plan.delete.sort();
+    plan.kept.sort();
+    plan
+}
+
+/// The unreadable paths that fail the run: all except a path whose whole
+/// subtree `--exclude` leaves out (no key under it is synced).
+fn unreadable_failures(unreadable: &[String], filter: &Filter) -> u64 {
+    unreadable
+        .iter()
+        .filter(|p| !filter.excludes_everything_under(p))
+        .count() as u64
 }
 
 fn collect_local_entries(root: &Path, filter: &Filter) -> LocalListing {
     let mut out = HashMap::new();
-    let mut unreadable = 0u64;
+    let mut unreadable = Vec::new();
+    let relative = |path: &Path| {
+        path.strip_prefix(root)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default()
+    };
     for entry in WalkDir::new(root) {
         let entry = match entry {
             Ok(entry) => entry,
             Err(e) => {
                 eprintln!("warning: cannot read local path: {e}");
-                unreadable += 1;
+                unreadable.push(e.path().map(relative).unwrap_or_default());
                 continue;
             }
         };
@@ -497,7 +549,7 @@ fn collect_local_entries(root: &Path, filter: &Filter) -> LocalListing {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("warning: cannot read {}: {e}", entry.path().display());
-                unreadable += 1;
+                unreadable.push(rel);
                 continue;
             }
         };
@@ -697,6 +749,41 @@ mod tests {
             size,
             mtime_ms,
         }
+    }
+
+    /// Review A7: an unreadable local path hides only the remote keys at
+    /// or under it. One such path stopped every delete of the run.
+    #[test]
+    fn delete_skips_only_keys_under_an_unreadable_path() {
+        let remote: Vec<String> = ["keep.txt", "gone.txt", "private/s.txt", "privateer.txt"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let local: HashMap<String, Entry> =
+            HashMap::from([("keep.txt".to_string(), entry("keep.txt", 1, None))]);
+        let unreadable = vec!["private".to_string()];
+        let plan = delete_plan(remote.iter(), &local, &unreadable);
+        assert_eq!(
+            plan.delete,
+            [&"gone.txt".to_string(), &"privateer.txt".to_string()]
+        );
+        assert_eq!(plan.kept, [(&"private/s.txt".to_string(), "private")]);
+        // An unreadable root hides everything.
+        let root = vec![String::new()];
+        let plan = delete_plan(remote.iter(), &local, &root);
+        assert!(plan.delete.is_empty() && plan.kept.len() == 3);
+    }
+
+    /// Review A7: an unreadable path that `--exclude` leaves out fails
+    /// nothing: no key under it is synced.
+    #[test]
+    fn an_excluded_unreadable_dir_is_not_a_failure() {
+        let filter = Filter::build(&[], &["lost+found/*".to_string()]).unwrap();
+        let unreadable = vec!["lost+found".to_string(), "private".to_string()];
+        assert_eq!(unreadable_failures(&unreadable, &filter), 1);
+        // A name-only pattern does not prove the subtree is left out.
+        let by_name = Filter::build(&[], &["lost+found".to_string()]).unwrap();
+        assert_eq!(unreadable_failures(&unreadable, &by_name), 2);
     }
 
     #[test]

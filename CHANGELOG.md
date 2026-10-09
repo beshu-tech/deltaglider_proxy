@@ -487,8 +487,11 @@ and silently left out every directory that it could not list and every file
 that it could not read. The delete step then removed the remote copies of
 those files, and the command exited with status 0. When the root directory
 itself was unreadable, the command deleted the whole remote prefix. Now the
-command prints a warning for each path that it cannot read, skips the delete
-step when the local listing is incomplete, and exits with an error status.
+command prints a warning for each path that it cannot read, keeps the remote
+objects at or under such a path, and exits with an error status. The other
+deletes still run. A path that `--exclude` leaves out completely (for example
+`lost+found` with `--exclude 'lost+found/*'`) is not an error, because no
+object under it is synced.
 
 ### Fixed — An empty `delimiter=` lists every object
 
