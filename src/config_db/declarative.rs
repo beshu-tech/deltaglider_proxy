@@ -92,7 +92,7 @@ fn delete_rows(
     //      idempotent re-apply.
     match &diff.mapping_rules {
         MappingRulesAction::Keep => {}
-        MappingRulesAction::ClearAll | MappingRulesAction::ReplaceWith(_) => {
+        MappingRulesAction::ClearAll(_) | MappingRulesAction::ReplaceWith(_) => {
             tx.execute("DELETE FROM group_mapping_rules", [])?;
             // We'll re-insert in step 8 iff ReplaceWith.
         }
@@ -339,7 +339,7 @@ fn replace_mapping_rules(
             )?;
         }
         stats.mapping_rules_replaced = rules.len();
-    } else if matches!(diff.mapping_rules, MappingRulesAction::ClearAll) {
+    } else if matches!(diff.mapping_rules, MappingRulesAction::ClearAll(_)) {
         // Track the clear for audit accuracy — stats previously
         // showed 0 even when rules were wiped. We don't know the
         // old count cheaply (it's in `current.mapping_rules` but

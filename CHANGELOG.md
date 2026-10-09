@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed — The IAM import preview shows a deletion of every mapping rule
+
+A full-IAM YAML import without `group_mapping_rules` deletes every group
+mapping rule. The preview counted that as 0 rules, and when it was the only
+change it reported "no changes", so the GUI disabled Apply while a direct
+API apply still deleted every rule. Now the preview counts the rules it
+deletes and reports a change.
+
 ### Fixed — An admin change finishes even when the browser disconnects
 
 When the client of an admin request disconnected (a closed tab, a client

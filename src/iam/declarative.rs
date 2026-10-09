@@ -316,7 +316,8 @@ pub struct IamDiff {
 pub enum MappingRulesAction {
     #[default]
     Keep,
-    ClearAll,
+    /// Delete every rule; the payload is how many the DB holds.
+    ClearAll(usize),
     ReplaceWith(Vec<DeclarativeMappingRule>),
 }
 
@@ -365,7 +366,7 @@ impl IamDiff {
     pub fn summary_line(&self) -> String {
         let mapping_rules = match &self.mapping_rules {
             MappingRulesAction::Keep => "keep".to_string(),
-            MappingRulesAction::ClearAll => "clear".to_string(),
+            MappingRulesAction::ClearAll(_) => "clear".to_string(),
             MappingRulesAction::ReplaceWith(rules) => format!("replace({})", rules.len()),
         };
         format!(
@@ -1026,7 +1027,7 @@ pub fn diff_iam(yaml: &DeclarativeIam, db: &CurrentIam) -> Result<IamDiff, Strin
     diff.mapping_rules = if mapping_rules_equal(&yaml.mapping_rules, &db.mapping_rules, db) {
         MappingRulesAction::Keep
     } else if yaml.mapping_rules.is_empty() {
-        MappingRulesAction::ClearAll
+        MappingRulesAction::ClearAll(db.mapping_rules.len())
     } else {
         MappingRulesAction::ReplaceWith(yaml.mapping_rules.clone())
     };
@@ -2107,7 +2108,7 @@ mod tests {
         let diff = diff_iam(&yaml, &current).unwrap();
         assert_eq!(
             diff.mapping_rules,
-            MappingRulesAction::ClearAll,
+            MappingRulesAction::ClearAll(1),
             "YAML empty + DB non-empty must explicitly ClearAll"
         );
     }

@@ -775,7 +775,7 @@ fn summarise_diff(diff: &crate::iam::IamDiff) -> IamImportSummary {
         providers_deleted: diff.providers_to_delete.len(),
         mapping_rules_replaced: match &diff.mapping_rules {
             crate::iam::MappingRulesAction::ReplaceWith(v) => v.len(),
-            crate::iam::MappingRulesAction::ClearAll => 0,
+            crate::iam::MappingRulesAction::ClearAll(n) => *n,
             crate::iam::MappingRulesAction::Keep => 0,
         },
         external_identities_applied: diff.external_identities.len(),
@@ -791,7 +791,8 @@ fn summarise_diff(diff: &crate::iam::IamDiff) -> IamImportSummary {
         && s.providers_updated == 0
         && s.providers_deleted == 0
         && s.mapping_rules_replaced == 0
-        && s.external_identities_applied == 0;
+        && s.external_identities_applied == 0
+        && diff.mapping_rules.is_noop();
     IamImportSummary { no_changes, ..s }
 }
 
@@ -862,6 +863,23 @@ access:
         let snap = parse_iam_yaml("access: {}").expect("empty access parses");
         assert!(snap.users.is_empty());
         assert!(snap.groups.is_empty());
+    }
+
+    #[test]
+    fn summarise_diff_reports_a_mapping_rule_wipe() {
+        let diff = IamDiff {
+            mapping_rules: crate::iam::MappingRulesAction::ClearAll(6),
+            ..IamDiff::default()
+        };
+        let s = summarise_diff(&diff);
+        assert!(
+            !s.no_changes,
+            "a wipe of every mapping rule reads as no change"
+        );
+        assert_eq!(
+            s.mapping_rules_replaced, 6,
+            "the preview hides the deleted rules"
+        );
     }
 
     #[test]
