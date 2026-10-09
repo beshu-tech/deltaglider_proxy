@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.3 — 2026-10-09
+
 ### Fixed — A filesystem listing names each object by its file
 
 On the filesystem backend, a listing without a delimiter took each key from
