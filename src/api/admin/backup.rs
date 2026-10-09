@@ -1090,18 +1090,7 @@ fn hydrate_config_with_backup_secrets(cfg: &mut Config, secrets: &BackupSecrets)
         if cfg.event_delivery.webhook_url.as_deref() == Some(sentinel) {
             cfg.event_delivery.webhook_url = ed.webhook_url.clone();
         }
-        if cfg.event_delivery.webhook_urls.len() == ed.webhook_urls.len() {
-            for (url, saved) in cfg
-                .event_delivery
-                .webhook_urls
-                .iter_mut()
-                .zip(&ed.webhook_urls)
-            {
-                if url == sentinel {
-                    *url = saved.clone();
-                }
-            }
-        }
+        super::config::restore_masked_list(&mut cfg.event_delivery.webhook_urls, &ed.webhook_urls);
     }
 }
 

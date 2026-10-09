@@ -569,18 +569,27 @@ pub(super) fn preserve_event_delivery_secrets(
         new.webhook_url = old.webhook_url.clone();
     }
     // webhook_urls are masked element-wise on export. A masked entry carries no
-    // identity, so index-based restore is only SOUND when the list wasn't
-    // reordered or resized — otherwise index i in the new list can align to the
-    // WRONG old URL and silently restore a different secret. Restore by index
-    // ONLY when the lengths match (a pure in-place edit); if they differ, leave
-    // the sentinel in place so config validation rejects it (the operator must
-    // supply the real URL for the entry they added/moved) rather than us guessing.
-    if new.webhook_urls.len() == old.webhook_urls.len() {
-        for (i, url) in new.webhook_urls.iter_mut().enumerate() {
+    // identity, so index-based restore is only SOUND when the list kept its
+    // shape: the same length, and every entry that is not masked equal to the
+    // old entry at its index. A list with a deleted entry and an added one
+    // has the same length ([mask, C] for [A, B]) and would restore the
+    // deleted A. Otherwise leave the sentinel in place, so config validation
+    // rejects it and the operator supplies the real URL, rather than guess.
+    restore_masked_list(&mut new.webhook_urls, &old.webhook_urls);
+}
+
+/// Put `saved` back over the masked (sentinel) entries of `list`, only when
+/// the list kept its shape: the same length, and every unmasked entry equal
+/// to the saved entry at its index. Shared by the section/document write and
+/// the backup restore.
+pub(crate) fn restore_masked_list(list: &mut [String], saved: &[String]) {
+    let sentinel = crate::config::REDACTED_SENTINEL;
+    let aligned =
+        list.len() == saved.len() && list.iter().zip(saved).all(|(n, o)| n == sentinel || n == o);
+    if aligned {
+        for (url, prev) in list.iter_mut().zip(saved) {
             if url == sentinel {
-                if let Some(prev) = old.webhook_urls.get(i) {
-                    *url = prev.clone();
-                }
+                *url = prev.clone();
             }
         }
     }
@@ -1220,6 +1229,26 @@ mod preserve_tests {
         assert_eq!(
             shortened.webhook_urls[0], REDACTED_SENTINEL,
             "a length change must NOT index-restore (would swap secrets)"
+        );
+    }
+
+    /// B087: [A, B] masked; the operator deletes A and appends C, so the
+    /// body is [mask, C]. Index restore gave [A, C]: the deleted URL came
+    /// back and the kept one (B) was lost. Ambiguous: keep the mask.
+    #[test]
+    fn webhook_urls_restore_refuses_an_edited_list() {
+        let old = EventDeliveryConfig {
+            webhook_urls: vec!["https://a/secret1".into(), "https://b/secret2".into()],
+            ..EventDeliveryConfig::default()
+        };
+        let mut new = EventDeliveryConfig {
+            webhook_urls: vec![REDACTED_SENTINEL.into(), "https://c/new".into()],
+            ..EventDeliveryConfig::default()
+        };
+        preserve_event_delivery_secrets(&mut new, &old);
+        assert_ne!(
+            new.webhook_urls[0], "https://a/secret1",
+            "a deleted webhook URL came back"
         );
     }
 

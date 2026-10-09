@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed — Editing a masked webhook list cannot bring back a deleted URL
+
+In Slack incoming-webhook mode, the exported `webhook_urls` list shows each
+URL masked. When an operator deleted one entry and added another, the list
+kept its length, and the proxy put the old URLs back by position: the
+deleted URL returned and the kept one was lost. Now the proxy restores the
+masked entries only when every visible entry is unchanged at its position.
+Otherwise the masked entry stays masked, and the apply asks for the real URL.
+
 ### Fixed — A `$` in a multi-line text no longer doubles at each save
 
 The proxy writes a literal `$` as `$$` in the configuration file and reads
