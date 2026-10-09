@@ -164,7 +164,9 @@ pub async fn list_backends(State(state): State<Arc<AdminState>>) -> impl IntoRes
 
     Json(BackendListResponse {
         backends,
-        default_backend: cfg.default_backend.clone(),
+        // The effective default (the first named backend when the key is
+        // unset), so the panel marks the backend that unrouted buckets use.
+        default_backend: (!cfg.backends.is_empty()).then(|| cfg.default_backend_name()),
     })
 }
 
@@ -571,66 +573,93 @@ pub async fn delete_backend(
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let refuse = |status, error: String| Err((status, error));
     apply_backend_edit(
         &state,
         &headers,
         "backend_delete",
         &name,
         StatusCode::OK,
-        |cfg| {
-            // Guard: the synthesised "default" entry surfaced by list_backends
-            // when `cfg.backends` is empty is NOT a real named backend — it's
-            // a virtual projection of `cfg.backend`. A DELETE on it would
-            // otherwise fall into the generic "not found" branch below with
-            // a misleading error; surface the specific shape issue instead.
-            if name == "default" && cfg.backends.iter().all(|b| b.name != name) {
-                return refuse(
-                    StatusCode::CONFLICT,
-                    "Cannot delete the synthesised 'default' backend — it represents the \
-                     legacy singleton `cfg.backend`. To move off the singleton, add a named \
-                     backend alongside it, then clear the singleton via section PUT on `storage`."
-                        .into(),
-                );
-            }
-            if !cfg.backends.iter().any(|b| b.name == name) {
-                return refuse(
-                    StatusCode::NOT_FOUND,
-                    format!("Backend '{}' not found", name),
-                );
-            }
-            if cfg.default_backend.as_deref() == Some(&name) {
-                return refuse(
-                    StatusCode::CONFLICT,
-                    "Cannot delete the default backend. Assign a new default first.".into(),
-                );
-            }
-            let routed: Vec<String> = cfg
-                .buckets
-                .iter()
-                .filter(|(_, p)| p.backend.as_deref() == Some(&name))
-                .map(|(bucket, _)| bucket.clone())
-                .collect();
-            if !routed.is_empty() {
-                return refuse(
-                    StatusCode::CONFLICT,
-                    format!(
-                        "Cannot delete '{}': buckets [{}] route to it. Re-route them first.",
-                        name,
-                        routed.join(", ")
-                    ),
-                );
-            }
-            cfg.backends.retain(|b| b.name != name);
-            Ok(())
-        },
+        |cfg| delete_backend_edit(cfg, &name),
     )
     .await
+}
+
+/// The edit of `DELETE /backends/:name`: refuse the synthesised singleton,
+/// an unknown name, the default backend and a backend that buckets route
+/// to; else remove it.
+fn delete_backend_edit(
+    cfg: &mut crate::config::Config,
+    name: &str,
+) -> Result<(), (StatusCode, String)> {
+    let refuse = |status: StatusCode, error: String| Err((status, error));
+    // Guard: the synthesised "default" entry surfaced by list_backends
+    // when `cfg.backends` is empty is NOT a real named backend — it's
+    // a virtual projection of `cfg.backend`. A DELETE on it would
+    // otherwise fall into the generic "not found" branch below with
+    // a misleading error; surface the specific shape issue instead.
+    if name == "default" && cfg.backends.iter().all(|b| b.name != name) {
+        return refuse(
+            StatusCode::CONFLICT,
+            "Cannot delete the synthesised 'default' backend — it represents the \
+             legacy singleton `cfg.backend`. To move off the singleton, add a named \
+             backend alongside it, then clear the singleton via section PUT on `storage`."
+                .into(),
+        );
+    }
+    if !cfg.backends.iter().any(|b| b.name == name) {
+        return refuse(
+            StatusCode::NOT_FOUND,
+            format!("Backend '{}' not found", name),
+        );
+    }
+    // The EFFECTIVE default: without a `default_backend` key the first
+    // named backend is it, and deleting it moves every unrouted bucket.
+    if cfg.default_backend_name() == name {
+        return refuse(
+            StatusCode::CONFLICT,
+            "Cannot delete the default backend. Assign a new default first.".into(),
+        );
+    }
+    let routed: Vec<String> = cfg
+        .buckets
+        .iter()
+        .filter(|(_, p)| p.backend.as_deref() == Some(name))
+        .map(|(bucket, _)| bucket.clone())
+        .collect();
+    if !routed.is_empty() {
+        return refuse(
+            StatusCode::CONFLICT,
+            format!(
+                "Cannot delete '{}': buckets [{}] route to it. Re-route them first.",
+                name,
+                routed.join(", ")
+            ),
+        );
+    }
+    cfg.backends.retain(|b| b.name != name);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B091: with no `default_backend` key, the first named backend is the
+    /// default; deleting it moves every unrouted bucket elsewhere.
+    #[test]
+    fn the_implicit_default_backend_cannot_be_deleted() {
+        let mut cfg = crate::config::Config::from_yaml_str(
+            "storage:\n  backends:\n  - name: a\n    type: filesystem\n    path: /tmp/b091a\n  - name: b\n    type: filesystem\n    path: /tmp/b091b\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.default_backend_name(), "a");
+        let refused = delete_backend_edit(&mut cfg, "a");
+        assert!(
+            matches!(refused, Err((StatusCode::CONFLICT, _))),
+            "the implicit default was deleted: {refused:?}"
+        );
+        assert!(delete_backend_edit(&mut cfg, "b").is_ok());
+    }
 
     fn fs_request(path: Option<&str>) -> CreateBackendRequest {
         CreateBackendRequest {

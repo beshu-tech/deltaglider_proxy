@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed — The implicit default backend cannot be deleted
+
+Without a `default_backend` key, the first named backend holds every
+bucket that has no route. The admin API refused to delete only a backend
+named in `default_backend`, so it deleted the implicit default, and every
+such bucket then answered `NoSuchBucket`. Now the implicit default is
+refused too, and the backend list marks it as the default.
+
 ### Fixed — The IAM import preview shows a deletion of every mapping rule
 
 A full-IAM YAML import without `group_mapping_rules` deletes every group
