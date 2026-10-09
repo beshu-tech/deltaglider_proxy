@@ -123,6 +123,30 @@ pub struct ScanProgress {
 }
 
 impl ScanProgress {
+    /// The frame of one LIST page. Never terminal: the reference walk still
+    /// runs after the last page, and the scan is done only once its result
+    /// is recorded (the task sends the terminal frame then).
+    fn page(
+        bucket: &str,
+        counts: (u64, u64, u64),
+        pages: u32,
+        has_more: bool,
+        started_at: DateTime<Utc>,
+    ) -> Self {
+        let (objects, original_bytes, stored_bytes) = counts;
+        Self {
+            bucket: bucket.to_string(),
+            objects,
+            original_bytes,
+            stored_bytes,
+            pages_done: pages,
+            has_more,
+            finished: false,
+            error: None,
+            started_at,
+        }
+    }
+
     fn initial(bucket: &str) -> Self {
         Self {
             bucket: bucket.to_string(),
@@ -303,6 +327,10 @@ impl BucketScanner {
                 cancel.clone(),
             )
             .await;
+            let (outcome, done_frame) = match outcome {
+                Ok((result, done)) => (Ok(result), Some(done)),
+                Err(e) => (Err(e), None),
+            };
 
             // Replace the running entry: the new result on success, the
             // previous one (or nothing) on cancel / error.
@@ -335,6 +363,10 @@ impl BucketScanner {
                     Some(r) => buckets.insert(bucket_for_task.clone(), BucketState::Done(r)),
                     None => buckets.remove(&bucket_for_task),
                 };
+            }
+            drop(buckets);
+            if let Some(done) = done_frame {
+                let _ = tx.send(done);
             }
         });
 
@@ -446,7 +478,7 @@ async fn run_scan(
     started_at: DateTime<Utc>,
     tx: watch::Sender<ScanProgress>,
     cancel: CancellationToken,
-) -> Result<ScanResult, ScanFailure> {
+) -> Result<(ScanResult, ScanProgress), ScanFailure> {
     let started_instant = std::time::Instant::now();
     // limit=None on the reference walk: the dashboard scan is the "real
     // number" path the operator triggered explicitly (the chip endpoint
@@ -465,17 +497,17 @@ async fn run_scan(
             pages_done = pages;
             // send() fails only when every receiver is gone; the scan keeps
             // running for the background result + disk cache.
-            let _ = tx.send(ScanProgress {
-                bucket: bucket.to_string(),
-                objects: totals.user_visible_count(),
-                original_bytes: totals.original_bytes,
-                stored_bytes: totals.stored_bytes,
-                pages_done: pages,
+            let _ = tx.send(ScanProgress::page(
+                bucket,
+                (
+                    totals.user_visible_count(),
+                    totals.original_bytes,
+                    totals.stored_bytes,
+                ),
+                pages,
                 has_more,
-                finished: !has_more,
-                error: None,
                 started_at,
-            });
+            ));
         })
         .await
         .map_err(|e| match e {
@@ -500,9 +532,9 @@ async fn run_scan(
         version: CURRENT_VERSION,
     };
 
-    // Emit one final terminal frame so any SSE subscriber gets a
-    // clean "done" signal before the channel closes.
-    let _ = tx.send(ScanProgress {
+    // The terminal frame: the task sends it once the result is recorded,
+    // so a subscriber that sees "done" finds the scan Done.
+    let done = ScanProgress {
         bucket: bucket.to_string(),
         objects: totals.user_visible_count(),
         original_bytes: totals.original_bytes,
@@ -512,9 +544,9 @@ async fn run_scan(
         finished: true,
         error: None,
         started_at,
-    });
+    };
 
-    Ok(result)
+    Ok((result, done))
 }
 
 // ─── HTTP handlers ───────────────────────────────────────────────────
@@ -694,6 +726,15 @@ mod tests {
         );
         assert_eq!(got(Some(r(1)), Ok(r(2))), Some(2));
         assert_eq!(got(None, Err(ScanFailure::Cancelled)), None);
+    }
+
+    #[test]
+    fn a_list_page_frame_is_never_terminal() {
+        let last = ScanProgress::page("b", (1, 2, 3), 7, false, Utc::now());
+        assert!(
+            !last.finished,
+            "the last LIST page ended the scan before its reference walk"
+        );
     }
 
     #[test]

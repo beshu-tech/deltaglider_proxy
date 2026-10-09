@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed — The bucket scan ends when its result is ready
+
+The diagnostics bucket scan marked its progress as finished after the last
+page of the object listing, but it then still read the delta references.
+The GUI ended the scan too early: the bucket dropped out of the totals,
+"Scan all" started the next bucket on top of it, and the stored size
+excluded the references. Now the scan reports "finished" only after its
+result, references included, is recorded.
+
 ### Fixed — Selecting a folder of exactly 10,000 objects works
 
 The bulk copy, move, delete and ZIP endpoints accept up to 10,000 keys. The
