@@ -230,6 +230,17 @@ pub fn permission_to_iam_policy(perm: &Permission) -> IAMPolicy {
     // Parse conditions from JSON if present
     if let Some(ref cond_json) = perm.conditions {
         match serde_json::from_value::<iam_rs::ConditionBlock>(cond_json.clone()) {
+            Ok(cb) if effect == IAMEffect::Allow && multi_valued_negated(&cb).is_some() => {
+                // iam-rs would grant whenever the key misses ONE value (see
+                // `multi_valued_negated`); validation refuses this shape, so
+                // only stored data reaches here. Grant nothing.
+                tracing::error!(
+                    "Allow permission has a negated condition with several values; dropping \
+                     statement — this should have been rejected at config time: {}",
+                    cond_json
+                );
+                return IAMPolicy::new();
+            }
             Ok(cb) => {
                 for (operator, key_values) in &cb.conditions {
                     for (key, value) in key_values {
@@ -265,6 +276,71 @@ pub fn permission_to_iam_policy(perm: &Permission) -> IAMPolicy {
     }
 
     IAMPolicy::new().add_statement(stmt)
+}
+
+/// A negated operator (`NotIpAddress`, `StringNotLike`, ...) with several
+/// values. AWS reads it as "matches none of the values"; iam-rs reads it as
+/// "misses at least one", which holds for nearly every request: a Deny then
+/// fires for the allowed networks too, and an Allow lets the excluded
+/// prefixes through. Returns `operator on key`.
+fn multi_valued_negated(block: &iam_rs::ConditionBlock) -> Option<String> {
+    block.conditions.iter().find_map(|(op, entries)| {
+        (op.is_negated_operator() && !op.is_multivalued_operator())
+            .then(|| {
+                entries.iter().find_map(|(key, value)| {
+                    matches!(value, iam_rs::ConditionValue::StringList(v) if v.len() > 1)
+                        .then(|| format!("{op} on {key}"))
+                })
+            })
+            .flatten()
+    })
+}
+
+/// Why iam-rs cannot evaluate a condition block as meant, or `None`: a
+/// multi-valued negated operator, or a value its operator cannot read (an
+/// IP network such as `10.0.0.0/33`, a number, a date, a bool). iam-rs
+/// would fail every evaluation of it at request time.
+fn condition_block_problem(block: &iam_rs::ConditionBlock) -> Option<String> {
+    if let Some(what) = multi_valued_negated(block) {
+        return Some(format!(
+            "`{what}` has several values, which is not supported: use one value, or \
+             put the positive operator with the list on the Allow rule"
+        ));
+    }
+    for (op, entries) in &block.conditions {
+        for (key, value) in entries {
+            let values: Vec<String> = match value {
+                iam_rs::ConditionValue::String(s) => vec![s.clone()],
+                iam_rs::ConditionValue::StringList(v) => v.clone(),
+                iam_rs::ConditionValue::Number(n) => vec![n.to_string()],
+                iam_rs::ConditionValue::Boolean(b) => vec![b.to_string()],
+            };
+            for v in values.iter().filter(|v| !v.contains("${")) {
+                let ok = if op.is_ip_operator() {
+                    let net = if v.contains('/') {
+                        v.clone()
+                    } else if v.contains(':') {
+                        format!("{v}/128")
+                    } else {
+                        format!("{v}/32")
+                    };
+                    net.parse::<ipnet::IpNet>().is_ok()
+                } else if op.is_numeric_operator() {
+                    v.parse::<f64>().is_ok()
+                } else if op.is_date_operator() {
+                    chrono::DateTime::parse_from_rfc3339(v).is_ok() || v.parse::<i64>().is_ok()
+                } else if op.is_boolean_operator() {
+                    v.parse::<bool>().is_ok()
+                } else {
+                    true
+                };
+                if !ok {
+                    return Some(format!("`{op}` on {key}: '{v}' is not a valid value"));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Build the S3 resource ARN string from bucket and key.
@@ -366,9 +442,12 @@ pub(crate) fn is_explicitly_denied_iam(
         None => return true, // fail closed: assume denied if ARN can't be parsed
     };
 
-    matches!(
+    // An evaluation error (a condition value iam-rs cannot read) fails
+    // closed, as evaluate_iam does: "not denied" would show the keys a Deny
+    // hides in a LIST filter.
+    !matches!(
         evaluator.evaluate(&request),
-        Ok(result) if result.decision == Decision::Deny
+        Ok(result) if result.decision != Decision::Deny
     )
 }
 
@@ -485,8 +564,11 @@ pub fn validate_permissions(permissions: &[Permission]) -> Result<(), String> {
             // would otherwise be tempted to broaden into an unconditional Deny.
             // Catching it here keeps the condition's intent: an un-evaluatable
             // condition is a configuration error, not a silent scope change.
-            serde_json::from_value::<iam_rs::ConditionBlock>(conditions.clone())
+            let block = serde_json::from_value::<iam_rs::ConditionBlock>(conditions.clone())
                 .map_err(|e| format!("{}: condition could not be parsed: {}", ctx, e))?;
+            if let Some(problem) = condition_block_problem(&block) {
+                return Err(format!("{}: condition {}", ctx, problem));
+            }
         }
     }
     Ok(())
@@ -732,6 +814,14 @@ pub fn user_can_see_common_prefix(
     prefix: &str,
     context: &Context,
 ) -> bool {
+    // A Deny that covers the prefix covers every key under it, so it hides
+    // the folder name too, whatever grants the listing (the bucket-ARN list
+    // disjunct below never sees a Deny on a key pattern).
+    if user.is_explicitly_denied(S3Action::Read, bucket, prefix, context)
+        || user.is_explicitly_denied(S3Action::List, bucket, prefix, context)
+    {
+        return false;
+    }
     user.can_with_context(S3Action::Read, bucket, prefix, context)
         || user.can_with_context(S3Action::List, bucket, prefix, context)
         || can_list_prefix_with_context(user, bucket, prefix, context)
@@ -1510,6 +1600,104 @@ mod tests {
             "secret/b.txt",
             &ctx
         ));
+    }
+
+    fn user_of(perms: Vec<Permission>) -> crate::iam::AuthenticatedUser {
+        crate::iam::AuthenticatedUser {
+            name: "u".into(),
+            access_key_id: "AK".into(),
+            iam_policies: perms.iter().map(permission_to_iam_policy).collect(),
+            permissions: perms,
+        }
+    }
+
+    fn with_cond(mut perm: Permission, cond: serde_json::Value) -> Permission {
+        perm.conditions = Some(cond);
+        perm
+    }
+
+    /// B027: a Deny carve-out also hides the folder names under it: a
+    /// delimiter LIST of `secret/` must not show `secret/projX/`.
+    #[test]
+    fn a_deny_carve_out_hides_the_common_prefixes_under_it() {
+        let user = user_of(vec![
+            p("Allow", &["read", "list"], &["carve", "carve/*"]),
+            p("Deny", &["read", "list"], &["carve/secret/*"]),
+        ]);
+        let ctx = Context::new();
+        assert!(user_can_see_common_prefix(&user, "carve", "pub/", &ctx));
+        assert!(!user_can_see_common_prefix(
+            &user,
+            "carve",
+            "secret/projX/",
+            &ctx
+        ));
+    }
+
+    /// B028: iam-rs reads a negated operator with several values as "misses
+    /// at least one value" (AWS: "matches none"). Validation refuses the
+    /// shape; a stored Allow with it grants nothing; one value still works.
+    #[test]
+    fn multi_valued_negated_conditions_are_refused() {
+        let allow = p("Allow", &["read"], &["b/*"]);
+        let deny_outside = with_cond(
+            p("Deny", &["read"], &["b/*"]),
+            serde_json::json!({"NotIpAddress": {"aws:SourceIp": ["10.0.0.0/8", "192.168.0.0/16"]}}),
+        );
+        let err = validate_permissions(&[allow.clone(), deny_outside]).unwrap_err();
+        assert!(err.contains("NotIpAddress"), "{err}");
+
+        let deny_one = with_cond(
+            p("Deny", &["read"], &["b/*"]),
+            serde_json::json!({"NotIpAddress": {"aws:SourceIp": "10.0.0.0/8"}}),
+        );
+        assert!(validate_permissions(&[allow.clone(), deny_one.clone()]).is_ok());
+        let policies: Vec<_> = [allow, deny_one]
+            .iter()
+            .map(permission_to_iam_policy)
+            .collect();
+        let mut inside = Context::new();
+        insert_source_ip(&mut inside, Some("10.1.2.3".parse().unwrap()));
+        assert!(evaluate_iam(&policies, S3Action::Read, "b", "k", &inside));
+        let mut outside = Context::new();
+        insert_source_ip(&mut outside, Some("203.0.113.9".parse().unwrap()));
+        assert!(!evaluate_iam(&policies, S3Action::Read, "b", "k", &outside));
+
+        let not_secret = with_cond(
+            p("Allow", &["list"], &["b"]),
+            serde_json::json!({"StringNotLike": {"s3:prefix": ["secret/*", "private/*"]}}),
+        );
+        assert!(validate_permissions(std::slice::from_ref(&not_secret)).is_err());
+        let policies = vec![permission_to_iam_policy(&not_secret)];
+        let mut ctx = Context::new();
+        ctx.insert(
+            "s3:prefix".to_string(),
+            iam_rs::ContextValue::String("secret/x".into()),
+        );
+        assert!(
+            !evaluate_iam(&policies, S3Action::List, "b", "", &ctx),
+            "StringNotLike [secret/*, private/*] let secret/x through"
+        );
+    }
+
+    /// B075: a condition value iam-rs cannot evaluate (a /33 network) must
+    /// fail validation, and at runtime a Deny that errors must still deny
+    /// in the LIST filter.
+    #[test]
+    fn an_unevaluable_condition_value_fails_closed() {
+        let allow = p("Allow", &["read", "list"], &["b/*"]);
+        let deny = with_cond(
+            p("Deny", &["read", "list"], &["b/secret/*"]),
+            serde_json::json!({"IpAddress": {"aws:SourceIp": "10.0.0.0/33"}}),
+        );
+        assert!(
+            validate_permissions(&[allow.clone(), deny.clone()]).is_err(),
+            "a /33 network passed validation"
+        );
+        let user = user_of(vec![allow, deny]);
+        let mut ctx = Context::new();
+        insert_source_ip(&mut ctx, Some("10.0.0.5".parse().unwrap()));
+        assert!(!user_can_see_listed_key(&user, "b", "secret/x", &ctx));
     }
 
     /// Review3 #10: a write-only grant shows no key, so it neither makes a

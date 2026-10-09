@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Security — IAM conditions: three cases that showed or granted too much
+
+- A Deny rule on a sub-folder (for example `Deny` on `photos/secret/*`
+  under an `Allow` on the whole bucket) hid the objects in the folder, but a
+  listing with `delimiter=/` still showed the names of its sub-folders. Now
+  the Deny hides the folder names too.
+- A negated condition with several values, such as `NotIpAddress` with two
+  networks or `StringNotLike` with two prefixes, was true when the request
+  missed only one of the values. A Deny then also refused the allowed
+  networks, and an Allow let the excluded prefixes through. AWS reads such a
+  condition as "matches none of the values". Now the proxy refuses this
+  shape when you save the rule, and an existing Allow rule of this shape
+  grants nothing. A negated condition with one value works as before.
+- A condition value that the proxy cannot read, such as the network
+  `10.0.0.0/33`, passed validation. A Deny rule with it then hid nothing in
+  listings. Now the proxy refuses such a value when you save the rule, and
+  a Deny rule whose condition cannot be read counts as a Deny.
+
 ### Security — Starting an OAuth sign-in no longer clears the lockout counter
 
 The proxy counts failed sign-ins per client address and locks the address
