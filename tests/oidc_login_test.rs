@@ -469,9 +469,10 @@ async fn oauth_authorize_does_not_reset_the_brute_force_counter() {
 }
 
 /// B041/B090/B092: a client that disconnects drops the handler future. A
-/// mutating admin request must still run to its end: here the provider is
-/// created in the DB, and the live provider set (rebuilt after a slow
-/// discovery) must follow it.
+/// mutating admin request must still run to its end. The provider set is
+/// rebuilt before the slow discovery, so a dropped request lost the steps
+/// after it: the version bump that this test waits for, and the push to the
+/// other nodes.
 #[tokio::test]
 async fn a_dropped_admin_request_still_completes_its_mutation() {
     let (issuer, ca_pem) = start_idp_with_delay(std::time::Duration::from_secs(2)).await;

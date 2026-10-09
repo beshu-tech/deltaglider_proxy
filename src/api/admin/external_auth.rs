@@ -1294,19 +1294,49 @@ fn build_callback_uri_with(headers: &HeaderMap, trust_proxy: bool) -> String {
 /// a provider mutation whose rebuild failed surfaces a 500 instead of a lying
 /// 2xx — mirroring how `rebuild_iam_index` errors propagate.
 pub(super) async fn rebuild_external_auth(state: &Arc<AdminState>) -> Result<(), AdminError<Bare>> {
-    if let (Some(ext_auth), Some(config_db)) = (&state.external_auth, &state.config_db) {
+    let Some(config_db) = &state.config_db else {
+        return Ok(());
+    };
+    let discovery = {
         let db = config_db.lock().await;
-        let providers = db.load_auth_providers().inspect_err(|e| {
-            tracing::error!("rebuild_external_auth: load_auth_providers failed: {e}");
-        })?;
-        ext_auth.rebuild(&providers);
-        drop(db);
-        ext_auth.discover_all().await;
-        // Bump AFTER the rebuilt provider set is live + discovery kicked off,
-        // so a version observer never sees the new number before the new state.
-        bump_ext_auth_version();
+        publish_provider_set(state, &db)?
+    };
+    if let Some(discovery) = discovery {
+        discovery.run().await;
     }
     Ok(())
+}
+
+/// Make the provider set in `db` live (no network I/O). The caller holds
+/// the DB lock, so a provider disabled in the DB stops at once. The
+/// returned discovery is network I/O: run it after every lock is released
+/// (review A8: under the config write guard it stalled every LIST).
+pub(super) fn publish_provider_set(
+    state: &AdminState,
+    db: &crate::config_db::ConfigDb,
+) -> Result<Option<ProviderDiscovery>, AdminError<Bare>> {
+    let Some(ext_auth) = &state.external_auth else {
+        return Ok(None);
+    };
+    let providers = db.load_auth_providers().inspect_err(|e| {
+        tracing::error!("publish_provider_set: load_auth_providers failed: {e}");
+    })?;
+    ext_auth.rebuild(&providers);
+    Ok(Some(ProviderDiscovery(ext_auth.clone())))
+}
+
+/// The OIDC discovery of a published provider set (one HTTP request per
+/// provider, up to 10 s each), and then the version bump.
+#[must_use = "run the discovery after the locks are released"]
+pub(crate) struct ProviderDiscovery(Arc<crate::iam::external_auth::ExternalAuthManager>);
+
+impl ProviderDiscovery {
+    pub(crate) async fn run(self) {
+        self.0.discover_all().await;
+        // Bump AFTER the rebuilt provider set is live + discovery ran, so a
+        // version observer never sees the new number before the new state.
+        bump_ext_auth_version();
+    }
 }
 
 /// Themed HTML error page for OAuth callback errors.

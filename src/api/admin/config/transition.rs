@@ -95,6 +95,10 @@ impl TransitionCtx<'_> {
 /// What a successful transition reports.
 pub(crate) struct TransitionReport {
     pub warnings: Vec<String>,
+    /// OIDC discovery of a provider set the reconcile published. Network
+    /// I/O: the caller runs it after it drops the config write guard
+    /// (review A8).
+    pub discovery: Option<super::super::external_auth::ProviderDiscovery>,
 }
 
 /// Decision on whether two `Config` snapshots require the storage engine to
@@ -184,11 +188,11 @@ pub(crate) async fn apply_config_transition(
 
     // ── Phase 2: commit ──────────────────────────────────────────────────
     // The only fallible commit step; it runs before every publish below.
-    let mut warnings = match admin {
+    let (mut warnings, discovery) = match admin {
         Some((state, headers, restoring)) => {
             commit_iam(state, old_cfg, &new_cfg, headers, restoring).await?
         }
-        None => Vec::new(),
+        None => (Vec::new(), None),
     };
     // Nothing below returns Err.
 
@@ -247,7 +251,10 @@ pub(crate) async fn apply_config_transition(
     }
     **cfg = new_cfg;
 
-    Ok(TransitionReport { warnings })
+    Ok(TransitionReport {
+        warnings,
+        discovery,
+    })
 }
 
 /// The gates of [`transition_gates`] that need no I/O. The validate
@@ -330,7 +337,13 @@ async fn commit_iam(
     new_cfg: &crate::config::Config,
     headers: &HeaderMap,
     restoring: bool,
-) -> Result<Vec<String>, String> {
+) -> Result<
+    (
+        Vec<String>,
+        Option<super::super::external_auth::ProviderDiscovery>,
+    ),
+    String,
+> {
     let mut warnings = Vec::new();
     let yaml_snapshot = declarative_reconcile_needed(old_cfg, new_cfg).then(|| {
         crate::iam::snapshot_from_access(
@@ -358,7 +371,7 @@ async fn commit_iam(
     // delete, keeps the DB lock across its transition) and nothing to
     // refuse (the lockout rule compares two equal surfaces).
     if yaml_snapshot.is_none() && state.iam_state.load().when_empty() == outcome {
-        return Ok(warnings);
+        return Ok((warnings, None));
     }
     let db = match &state.config_db {
         Some(db) => Some(db.lock().await),
@@ -430,21 +443,30 @@ async fn commit_iam(
             tracing::info!("S3 authentication now: {}", outcome.describe());
         }
     }
+    // The live provider set follows the reconcile under the same DB lock:
+    // a provider disabled in YAML stops before the lock is released. Its
+    // discovery (network I/O) goes back to the caller, which runs it after
+    // it drops the config write guard (review A8: under the guard, every
+    // LIST and config read waited for it).
+    let mut discovery = None;
+    if let (Some(stats), Some(db)) = (&stats, &db) {
+        if stats.providers_changed() {
+            match super::super::external_auth::publish_provider_set(state, db) {
+                Ok(d) => discovery = d,
+                Err(e) => warnings.push(format!(
+                    "declarative IAM reconciled, but the live OAuth providers could not be \
+                     rebuilt ({:?}): the previous providers serve until the next provider \
+                     change or restart",
+                    e.status_code()
+                )),
+            }
+        }
+    }
     drop(db);
 
     let Some(stats) = stats else {
-        return Ok(warnings);
+        return Ok((warnings, discovery));
     };
-    if stats.providers_changed() {
-        if let Err(e) = super::super::external_auth::rebuild_external_auth(state).await {
-            warnings.push(format!(
-                "declarative IAM reconciled, but the live OAuth providers could not be \
-                 rebuilt ({:?}): the previous providers serve until the next provider change \
-                 or restart",
-                e.status_code()
-            ));
-        }
-    }
 
     // Sync + stats warning only when the reconcile changed state: GitOps
     // re-applies stay silent and cause no peer churn.
@@ -479,7 +501,7 @@ async fn commit_iam(
             stats.summary_line(),
         ));
     }
-    Ok(warnings)
+    Ok((warnings, discovery))
 }
 
 const EMPTY_DECLARATIVE_FLIP: &str =
@@ -756,6 +778,19 @@ mod transition_order_tests {
                 assert!(at <= swap, "{p} runs after the config swap");
             }
         }
+    }
+
+    /// Review A8: the transition runs under the config write guard, so it
+    /// makes no network request. OIDC discovery goes back to the caller in
+    /// `TransitionReport::discovery`.
+    #[test]
+    fn the_transition_runs_no_oidc_discovery() {
+        let src = include_str!("transition.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        for call in ["discover_all", "rebuild_external_auth(", ".run().await"] {
+            assert!(!prod.contains(call), "transition.rs calls {call}");
+        }
+        assert!(prod.contains("publish_provider_set("));
     }
 
     /// `commit_iam` is fallible only before its first write: after the

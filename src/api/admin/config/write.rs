@@ -273,7 +273,8 @@ pub(super) async fn run(
 
     // Apply: the write lock is held from the version check to the persist.
     let mut cfg = state.config.write().await;
-    let outcome = apply_locked(state, &mut cfg, &write, &mut refs, build).await;
+    let mut discoveries = Vec::new();
+    let outcome = apply_locked(state, &mut cfg, &write, &mut refs, &mut discoveries, build).await;
     if let Outcome::Applied {
         persist: Ok(path) | Err((path, _)),
         ..
@@ -281,6 +282,8 @@ pub(super) async fn run(
     {
         audit_write(&write, path);
     }
+    drop(cfg);
+    run_discoveries(discoveries).await;
     WriteResult { outcome, refs }
 }
 
@@ -303,13 +306,24 @@ fn audit_write(write: &ConfigWrite<'_>, path: &str) {
     }
 }
 
+/// The OIDC discoveries of the provider sets a write published (review A8).
+/// Network I/O: the caller runs them after it drops the config write guard,
+/// and before it answers, so the ext-auth version is bumped first.
+async fn run_discoveries(discoveries: Vec<super::super::external_auth::ProviderDiscovery>) {
+    for discovery in discoveries {
+        discovery.run().await;
+    }
+}
+
 /// Steps 1–5 of an apply, under the caller's config write guard: version
-/// check, build, prepare, transition, persist. The caller audits.
+/// check, build, prepare, transition, persist. The caller audits, and runs
+/// the transition's `discoveries` after it drops the guard.
 async fn apply_locked(
     state: &Arc<AdminState>,
     cfg: &mut RwLockWriteGuard<'_, Config>,
     write: &ConfigWrite<'_>,
     refs: &mut ScrubMap,
+    discoveries: &mut Vec<super::super::external_auth::ProviderDiscovery>,
     build: impl FnOnce(&Config) -> Result<Built, Rejection>,
 ) -> Outcome {
     refs.extend(cfg.env_refs.clone());
@@ -363,6 +377,7 @@ async fn apply_locked(
         }
     };
     refs.extend(cfg.env_refs.clone());
+    discoveries.extend(report.discovery);
     warnings.transition = report.warnings;
     let version = super::version::config_version(cfg, section);
     Outcome::Applied {
@@ -722,66 +737,88 @@ where
         extra_env: &ScrubMap::new(),
     };
     let mut refs = ScrubMap::new();
+    let mut discoveries = Vec::new();
     let mut cfg = state.config.write().await;
-    let mut held = hold.await;
-    let old = cfg.clone();
-    let mut refused = None;
-    let outcome = apply_locked(state, &mut cfg, &config_write, &mut refs, |running| {
-        let mut incoming = running.clone();
-        match edit(&mut incoming, &mut held) {
-            Ok(()) => Ok(Built {
-                incoming,
-                warnings: Vec::new(),
-            }),
-            Err(e) => {
-                refused = Some(e);
-                Err(Rejection::new(Stage::Build, StatusCode::BAD_REQUEST, ""))
+    let result = 'locked: {
+        let mut held = hold.await;
+        let old = cfg.clone();
+        let mut refused = None;
+        let outcome = apply_locked(
+            state,
+            &mut cfg,
+            &config_write,
+            &mut refs,
+            &mut discoveries,
+            |running| {
+                let mut incoming = running.clone();
+                match edit(&mut incoming, &mut held) {
+                    Ok(()) => Ok(Built {
+                        incoming,
+                        warnings: Vec::new(),
+                    }),
+                    Err(e) => {
+                        refused = Some(e);
+                        Err(Rejection::new(Stage::Build, StatusCode::BAD_REQUEST, ""))
+                    }
+                }
+            },
+        )
+        .await;
+        if let Some(e) = refused {
+            break 'locked Err(HeldRefusal::Edit(e));
+        }
+        let scrub = |s: String| crate::config::scrub_env_values(&s, &refs);
+        let (warnings, persist) = match outcome {
+            Outcome::Applied {
+                warnings, persist, ..
+            } => (warnings, persist),
+            Outcome::Rejected(r) => {
+                break 'locked Err(HeldRefusal::Pipeline(match r.stage {
+                    Stage::EnvReapply => InternalRefusal::EnvReapply(scrub(r.error)),
+                    Stage::Transition => InternalRefusal::Transition(scrub(r.error)),
+                    _ => InternalRefusal::Invalid {
+                        status: r.status,
+                        error: scrub(r.error),
+                    },
+                }))
             }
+            Outcome::Conflict { .. } | Outcome::Validated { .. } => {
+                unreachable!("an internal write is an apply without If-Match")
+            }
+        };
+        if let (Err((path, error)), OnPersistError::RollBack) = (&persist, write.on_persist_error) {
+            roll_back(state, &mut cfg, write.headers, old, false, &mut discoveries).await;
+            break 'locked Err(HeldRefusal::Persist {
+                path: path.clone(),
+                error: scrub(error.clone()),
+            });
         }
-    })
-    .await;
-    if let Some(e) = refused {
-        return Err(HeldRefusal::Edit(e));
-    }
-    let scrub = |s: String| crate::config::scrub_env_values(&s, &refs);
-    let (warnings, persist) = match outcome {
-        Outcome::Applied {
-            warnings, persist, ..
-        } => (warnings, persist),
-        Outcome::Rejected(r) => {
-            return Err(HeldRefusal::Pipeline(match r.stage {
-                Stage::EnvReapply => InternalRefusal::EnvReapply(scrub(r.error)),
-                Stage::Transition => InternalRefusal::Transition(scrub(r.error)),
-                _ => InternalRefusal::Invalid {
-                    status: r.status,
-                    error: scrub(r.error),
-                },
-            }))
+        if let Err(e) = commit(held).await {
+            roll_back(
+                state,
+                &mut cfg,
+                write.headers,
+                old,
+                persist.is_ok(),
+                &mut discoveries,
+            )
+            .await;
+            break 'locked Err(HeldRefusal::Edit(e));
         }
-        Outcome::Conflict { .. } | Outcome::Validated { .. } => {
-            unreachable!("an internal write is an apply without If-Match")
-        }
+        let (Ok(path) | Err((path, _))) = &persist;
+        audit_write(&config_write, path);
+        let mut all = warnings.env;
+        all.extend(warnings.check_new);
+        all.extend(warnings.transition);
+        Ok(InternalApplied {
+            warnings: all.into_iter().map(scrub).collect(),
+            persist: persist.map_err(|(p, e)| (p, scrub(e))),
+        })
     };
-    if let (Err((path, error)), OnPersistError::RollBack) = (&persist, write.on_persist_error) {
-        roll_back(state, &mut cfg, write.headers, old, false).await;
-        return Err(HeldRefusal::Persist {
-            path: path.clone(),
-            error: scrub(error.clone()),
-        });
-    }
-    if let Err(e) = commit(held).await {
-        roll_back(state, &mut cfg, write.headers, old, persist.is_ok()).await;
-        return Err(HeldRefusal::Edit(e));
-    }
-    let (Ok(path) | Err((path, _))) = &persist;
-    audit_write(&config_write, path);
-    let mut all = warnings.env;
-    all.extend(warnings.check_new);
-    all.extend(warnings.transition);
-    Ok(InternalApplied {
-        warnings: all.into_iter().map(scrub).collect(),
-        persist: persist.map_err(|(p, e)| (p, scrub(e))),
-    })
+    // OIDC discovery is network I/O: after the guard (review A8).
+    drop(cfg);
+    run_discoveries(discoveries).await;
+    result
 }
 
 /// The internal-write action of a backup restore's rollback: it puts back
@@ -796,15 +833,19 @@ async fn roll_back(
     headers: &HeaderMap,
     old: Config,
     re_persist: bool,
+    discoveries: &mut Vec<super::super::external_auth::ProviderDiscovery>,
 ) {
     let ctx = TransitionCtx::Admin {
         state,
         headers,
         restoring: true,
     };
-    if let Err(e) = super::apply_config_transition(ctx, cfg, old).await {
-        tracing::error!("config write rollback failed, the new config stays live: {e}");
-        return;
+    match super::apply_config_transition(ctx, cfg, old).await {
+        Ok(report) => discoveries.extend(report.discovery),
+        Err(e) => {
+            tracing::error!("config write rollback failed, the new config stays live: {e}");
+            return;
+        }
     }
     if re_persist {
         if let Err((path, e)) = persist(state, cfg) {

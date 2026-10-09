@@ -166,7 +166,7 @@ timeout, a dropped network), the proxy stopped the request where it was. A
 change could then stay half done: a bucket route saved without its bucket, a
 restored configuration without the restored IAM database, a deleted user or
 a revoked key whose change never reached the other nodes, or a new sign-in
-provider in the database but not in the running sign-in flow. Now every
+provider whose change never reached the other nodes. Now every
 admin request that changes state runs to its end, whether or not the client
 still waits for the answer.
 
@@ -480,8 +480,11 @@ kept the providers that it loaded at startup. A provider that the YAML
 disabled (for example after an identity provider was compromised) therefore
 kept signing users in, admins included, until a restart. A new provider was
 not available, and a changed client secret was not used. Now both paths
-reload the providers when the reconcile changes one. A sign-in that started
-before its provider was disabled is refused when it returns.
+reload the providers when the reconcile changes one, before the IAM
+database is released, so a disabled provider stops at once. A sign-in that
+started before its provider was disabled is refused when it returns. The
+discovery request to each provider runs after the configuration lock is
+released, so S3 listings and configuration reads do not wait for it.
 
 ### Fixed — `sync --delete` keeps the remote copies of unreadable local files
 

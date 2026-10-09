@@ -1410,8 +1410,9 @@ mod source_guards {
             if prod.contains("crate::iam::reconcile_declarative_iam(") {
                 reconcilers += 1;
                 assert!(
-                    prod.contains("rebuild_external_auth("),
-                    "{file} reconciles declarative IAM without rebuild_external_auth"
+                    prod.contains("rebuild_external_auth(")
+                        || prod.contains("publish_provider_set("),
+                    "{file} reconciles declarative IAM without rebuilding the providers"
                 );
             }
         }

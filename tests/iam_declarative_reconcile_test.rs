@@ -1214,3 +1214,82 @@ async fn an_access_section_round_trip_keeps_declarative_secrets() {
         "the provider secret was dropped from the persisted YAML:\n{persisted}"
     );
 }
+
+/// Review A8: OIDC discovery runs after the config write guard is released.
+/// Under the guard, every LIST and config read waited for it, up to 10 s
+/// per provider.
+#[tokio::test]
+async fn a_provider_discovery_does_not_hold_the_config_lock() {
+    // An issuer that accepts the TCP connection and never answers: the
+    // discovery waits for its 10 s timeout.
+    let blackhole = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let issuer = format!(
+        "https://127.0.0.1:{}",
+        blackhole.local_addr().unwrap().port()
+    );
+    let server = TestServer::builder()
+        .auth("BOOTKEY9", "BOOTSECRET9")
+        .build()
+        .await;
+    let endpoint = server.endpoint();
+    let admin = admin_http_client(&endpoint).await;
+    let before = get_ext_auth_version(&admin, &endpoint).await;
+    let body = json!({
+        "iam_mode": "declarative",
+        "iam_users": [{
+            "name": "dana",
+            "access_key_id": "AKIADANA00009",
+            "secret_access_key": "dana-secret-9",
+            "enabled": true,
+            "permissions": [{ "effect": "Allow", "actions": ["read", "list"], "resources": ["*"] }]
+        }],
+        "auth_providers": [{
+            "name": "corp",
+            "provider_type": "oidc",
+            "enabled": true,
+            "client_id": "c",
+            "client_secret": "s",
+            "issuer_url": issuer,
+            "extra_config": { "allow_local": true }
+        }]
+    });
+    let put = {
+        let (admin, endpoint) = (admin.clone(), endpoint.clone());
+        tokio::spawn(async move { apply_access_section(&admin, &endpoint, body).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert!(
+        !put.is_finished(),
+        "the apply must still wait for the discovery"
+    );
+
+    let started = std::time::Instant::now();
+    let read = admin
+        .get(format!("{endpoint}/_/api/admin/config"))
+        .send()
+        .await
+        .unwrap();
+    assert!(read.status().is_success(), "config read: {}", read.status());
+    let config_read = started.elapsed();
+    let started = std::time::Instant::now();
+    let dana = server
+        .s3_client_with_creds("AKIADANA00009", "dana-secret-9")
+        .await;
+    dana.list_objects_v2()
+        .bucket(server.bucket())
+        .send()
+        .await
+        .expect("LIST as dana");
+    let list = started.elapsed();
+    let limit = std::time::Duration::from_secs(3);
+    assert!(
+        config_read < limit && list < limit,
+        "a read waited for the discovery: config {config_read:?}, LIST {list:?}"
+    );
+
+    put.await.unwrap();
+    assert!(
+        get_ext_auth_version(&admin, &endpoint).await > before,
+        "the apply returned before the discovery bumped the version"
+    );
+}
