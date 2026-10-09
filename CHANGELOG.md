@@ -125,7 +125,11 @@ page of the object listing, but it then still read the delta references.
 The GUI ended the scan too early: the bucket dropped out of the totals,
 "Scan all" started the next bucket on top of it, and the stored size
 excluded the references. Now the scan reports "finished" only after its
-result, references included, is recorded.
+result, references included, is recorded. A scan that fails or is stopped
+also ends with a last message that carries its error: the GUI shows the
+error, keeps the previous result, and "Scan all" goes on with the next
+bucket. When the GUI loses the progress of a scan, it stops the queue and
+says so, instead of starting the next scan beside it.
 
 ### Fixed — Selecting a folder of exactly 10,000 objects works
 

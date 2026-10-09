@@ -318,7 +318,6 @@ impl BucketScanner {
         let bucket_for_task = bucket.clone();
         tokio::spawn(async move {
             let started_at = Utc::now();
-            let started_instant = std::time::Instant::now();
             let outcome = run_scan(
                 s3_state,
                 &bucket_for_task,
@@ -327,47 +326,19 @@ impl BucketScanner {
                 cancel.clone(),
             )
             .await;
-            let (outcome, done_frame) = match outcome {
-                Ok((result, done)) => (Ok(result), Some(done)),
-                Err(e) => (Err(e), None),
-            };
-
-            // Replace the running entry: the new result on success, the
-            // previous one (or nothing) on cancel / error.
-            let mut buckets = scanner_buckets.write();
-            match &outcome {
-                Ok(result) => {
-                    // Persist to disk before we publish into the
-                    // in-memory map. If the write fails the warn
-                    // shows up in the logs but the in-memory result
-                    // is still valid for THIS process — restart
-                    // would lose it.
-                    persist_scan(&scan_dir, result);
-                    debug!(
-                        bucket = %bucket_for_task,
-                        objects = result.total_objects,
-                        duration_ms = started_instant.elapsed().as_millis() as u64,
-                        "Bucket scan complete"
-                    );
-                }
-                Err(ScanFailure::Cancelled) => {}
-                Err(ScanFailure::Error(e)) => {
-                    warn!(bucket = %bucket_for_task, error = %e, "Bucket scan failed");
-                }
-            }
-            // Only settle our own Running entry (a forget() may have run).
-            if matches!(buckets.get(&bucket_for_task), Some(BucketState::Running(_)))
-                || outcome.is_ok()
-            {
-                match result_after_scan(previous, outcome) {
-                    Some(r) => buckets.insert(bucket_for_task.clone(), BucketState::Done(r)),
-                    None => buckets.remove(&bucket_for_task),
-                };
-            }
-            drop(buckets);
-            if let Some(done) = done_frame {
-                let _ = tx.send(done);
-            }
+            let last = tx.borrow().clone();
+            // The terminal frame exists only once the record is settled
+            // (review A10): every end (done, failed, cancelled) sends one,
+            // and a subscriber that sees it finds the record final.
+            let frame = settle_scan(
+                &scanner_buckets,
+                &scan_dir,
+                &bucket_for_task,
+                previous,
+                &last,
+                outcome,
+            );
+            let _ = tx.send(frame);
         });
 
         buckets.insert(bucket, BucketState::Running(job));
@@ -470,6 +441,71 @@ fn result_after_scan(
     }
 }
 
+impl ScanProgress {
+    /// The last frame of a scan: the result's totals when it completed, the
+    /// last counts and the error when it failed or was cancelled. Always
+    /// `finished`, so a client that reads only `finished` moves on too.
+    fn terminal(last: &ScanProgress, outcome: &Result<ScanResult, ScanFailure>) -> Self {
+        let mut frame = Self {
+            has_more: false,
+            finished: true,
+            error: None,
+            ..last.clone()
+        };
+        match outcome {
+            Ok(r) => {
+                frame.objects = r.total_objects;
+                frame.original_bytes = r.total_original_bytes;
+                frame.stored_bytes = r.total_stored_bytes;
+            }
+            Err(ScanFailure::Error(e)) => frame.error = Some(e.clone()),
+            Err(ScanFailure::Cancelled) => frame.error = Some("the scan was cancelled".into()),
+        }
+        frame
+    }
+}
+
+/// Record how a scan ended, then return its terminal frame (review A10:
+/// only a completed scan sent one, so a failed or cancelled scan ended its
+/// stream without `done`, and "Scan all" stopped). A completed result is
+/// persisted and recorded; a failure puts back the previous result. Only
+/// our own Running entry is settled (a `forget()` may have run).
+fn settle_scan(
+    buckets: &RwLock<HashMap<String, BucketState>>,
+    scan_dir: &std::path::Path,
+    bucket: &str,
+    previous: Option<ScanResult>,
+    last: &ScanProgress,
+    outcome: Result<ScanResult, ScanFailure>,
+) -> ScanProgress {
+    let frame = ScanProgress::terminal(last, &outcome);
+    match &outcome {
+        Ok(result) => {
+            // Persist before the in-memory publish. A failed write warns;
+            // the in-memory result still serves this process.
+            persist_scan(scan_dir, result);
+            debug!(
+                bucket = %bucket,
+                objects = result.total_objects,
+                duration_ms = result.duration_ms,
+                "Bucket scan complete"
+            );
+        }
+        Err(ScanFailure::Cancelled) => {}
+        Err(ScanFailure::Error(e)) => {
+            warn!(bucket = %bucket, error = %e, "Bucket scan failed");
+        }
+    }
+    let mut buckets = buckets.write();
+    if matches!(buckets.get(bucket), Some(BucketState::Running(_))) || outcome.is_ok() {
+        match result_after_scan(previous, outcome) {
+            Some(r) => buckets.insert(bucket.to_string(), BucketState::Done(r)),
+            None => buckets.remove(bucket),
+        };
+    }
+    frame
+}
+
 /// The actual paginated scan loop. Yields progress through `tx` and
 /// honours `cancel`.
 async fn run_scan(
@@ -478,7 +514,7 @@ async fn run_scan(
     started_at: DateTime<Utc>,
     tx: watch::Sender<ScanProgress>,
     cancel: CancellationToken,
-) -> Result<(ScanResult, ScanProgress), ScanFailure> {
+) -> Result<ScanResult, ScanFailure> {
     let started_instant = std::time::Instant::now();
     // limit=None on the reference walk: the dashboard scan is the "real
     // number" path the operator triggered explicitly (the chip endpoint
@@ -491,10 +527,8 @@ async fn run_scan(
         ref_limit: None,
         cancel: Some(&cancel),
     };
-    let mut pages_done = 0u32;
     let (totals, _) =
         super::savings::scan_totals(&s3_state, bucket, opts, |totals, pages, has_more| {
-            pages_done = pages;
             // send() fails only when every receiver is gone; the scan keeps
             // running for the background result + disk cache.
             let _ = tx.send(ScanProgress::page(
@@ -532,21 +566,7 @@ async fn run_scan(
         version: CURRENT_VERSION,
     };
 
-    // The terminal frame: the task sends it once the result is recorded,
-    // so a subscriber that sees "done" finds the scan Done.
-    let done = ScanProgress {
-        bucket: bucket.to_string(),
-        objects: totals.user_visible_count(),
-        original_bytes: totals.original_bytes,
-        stored_bytes: totals.stored_bytes,
-        pages_done,
-        has_more: false,
-        finished: true,
-        error: None,
-        started_at,
-    };
-
-    Ok((result, done))
+    Ok(result)
 }
 
 // ─── HTTP handlers ───────────────────────────────────────────────────
@@ -751,6 +771,103 @@ mod tests {
         );
         assert_eq!(got(Some(r(1)), Ok(r(2))), Some(2));
         assert_eq!(got(None, Err(ScanFailure::Cancelled)), None);
+    }
+
+    /// Review A10: a scan that fails ends its stream with a terminal frame
+    /// that carries the error. Only a completed scan sent one, so the SSE
+    /// stream ended without `done` and "Scan all" stopped.
+    #[tokio::test]
+    async fn a_failed_reference_walk_ends_with_a_terminal_error_frame() {
+        use crate::storage::{DynStorageBackend, Fault, FaultPoint, FaultyFs, FilesystemBackend};
+        let dir = tempfile::tempdir().unwrap();
+        let faulty = FaultyFs::new(
+            FilesystemBackend::new(dir.path().join("data"))
+                .await
+                .unwrap(),
+        );
+        let faults = faulty.faults.clone();
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(faulty);
+        let engine = crate::deltaglider::DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &crate::config::Config::default(),
+            None,
+        );
+        engine.create_bucket("b").await.unwrap();
+        engine
+            .store("b", "a.txt", b"x", None, Default::default())
+            .await
+            .unwrap();
+        faults.arm(FaultPoint::ListDeltaspaces, "b//", Fault::Io);
+        let scanner = BucketScanner::load(dir.path().join("scans"));
+        let mut rx = scanner.start("b".into(), AppState::for_tests(engine));
+        let mut last = rx.borrow().clone();
+        while rx.changed().await.is_ok() {
+            last = rx.borrow().clone();
+        }
+        assert!(faults.fired(FaultPoint::ListDeltaspaces, "b//") > 0);
+        assert!(
+            last.finished,
+            "the stream ended without a terminal frame: {last:?}"
+        );
+        assert!(
+            last.error
+                .as_deref()
+                .is_some_and(|e| e.contains("injected")),
+            "{last:?}"
+        );
+        assert!(scanner.snapshot_running().is_empty());
+    }
+
+    /// Review A10: every end of a scan records its result first and then
+    /// gives a terminal frame: the totals on success, the previous result
+    /// back and the error otherwise.
+    #[test]
+    fn settle_scan_records_then_gives_a_terminal_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = |n: u64| ScanResult {
+            bucket: "b".into(),
+            total_objects: n,
+            total_original_bytes: 10 * n,
+            total_stored_bytes: n,
+            total_reference_bytes: 0,
+            savings_percentage: 0.0,
+            started_at: Utc::now(),
+            completed_at: Utc::now(),
+            duration_ms: 0,
+            version: default_version(),
+        };
+        let last = ScanProgress::page("b", (3, 30, 3), 2, true, Utc::now());
+        let running = || {
+            let (_tx, rx) = watch::channel(ScanProgress::initial("b"));
+            RwLock::new(HashMap::from([(
+                "b".to_string(),
+                BucketState::Running(RunningJob {
+                    progress_rx: rx,
+                    cancel: CancellationToken::new(),
+                }),
+            )]))
+        };
+        let done = |map: &RwLock<HashMap<String, BucketState>>| match map.read().get("b") {
+            Some(BucketState::Done(r)) => Some(r.total_objects),
+            _ => None,
+        };
+
+        let map = running();
+        let frame = settle_scan(&map, dir.path(), "b", Some(result(1)), &last, Ok(result(5)));
+        assert_eq!(done(&map), Some(5));
+        assert!(frame.finished && !frame.has_more && frame.error.is_none());
+        assert_eq!((frame.objects, frame.original_bytes), (5, 50));
+
+        for (failure, text) in [
+            (ScanFailure::Error("injected".into()), "injected"),
+            (ScanFailure::Cancelled, "cancelled"),
+        ] {
+            let map = running();
+            let frame = settle_scan(&map, dir.path(), "b", Some(result(1)), &last, Err(failure));
+            assert_eq!(done(&map), Some(1), "the previous result is back");
+            assert!(frame.finished && frame.error.as_deref().is_some_and(|e| e.contains(text)));
+            assert_eq!(frame.objects, 3, "the last counts");
+        }
     }
 
     #[test]

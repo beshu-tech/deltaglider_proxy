@@ -157,22 +157,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn app_with(engine: DynEngine) -> Arc<AppState> {
-        let config = Config::default();
-        Arc::new(AppState {
-            engine: arc_swap::ArcSwap::from_pointee(engine),
-            multipart: Arc::new(crate::multipart::MultipartStore::new(
-                config.max_object_size,
-            )),
-            metrics: Arc::new(crate::metrics::Metrics::new()),
-            usage_scanner: Arc::new(crate::usage_scanner::UsageScanner::new()),
-            bucket_usage: None,
-            reference_lock: None,
-            config_db: None,
-            maintenance_gate: Arc::new(crate::maintenance::gate::MaintenanceGate::new()),
-            maintenance_notify: Arc::new(tokio::sync::Notify::new()),
-            backend_capabilities: Default::default(),
-            backend_health: Default::default(),
-        })
+        AppState::for_tests(engine)
     }
 
     /// B085: a strict mutation whose persist fails and whose engine

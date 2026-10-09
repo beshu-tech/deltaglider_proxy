@@ -56,6 +56,29 @@ pub use status::{
 pub(crate) use status::get_peak_rss_bytes;
 
 /// Application state shared across handlers
+#[cfg(test)]
+impl AppState {
+    /// An app state around `engine` with no config DB and no counters.
+    pub(crate) fn for_tests(engine: DynEngine) -> Arc<Self> {
+        let config = crate::config::Config::default();
+        Arc::new(Self {
+            engine: arc_swap::ArcSwap::from_pointee(engine),
+            multipart: Arc::new(crate::multipart::MultipartStore::new(
+                config.max_object_size,
+            )),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+            usage_scanner: Arc::new(crate::usage_scanner::UsageScanner::new()),
+            bucket_usage: None,
+            reference_lock: None,
+            config_db: None,
+            maintenance_gate: Arc::new(crate::maintenance::gate::MaintenanceGate::new()),
+            maintenance_notify: Arc::new(tokio::sync::Notify::new()),
+            backend_capabilities: Default::default(),
+            backend_health: Default::default(),
+        })
+    }
+}
+
 pub struct AppState {
     pub engine: ArcSwap<DynEngine>,
     pub multipart: Arc<MultipartStore>,

@@ -28,7 +28,7 @@
  *     N ago" line + "Re-scan" button.
  */
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { Button, Progress } from 'antd';
 import {
   PlayCircleOutlined,
@@ -41,14 +41,8 @@ import { useVisiblePolling } from '../useVisiblePolling';
 import { formatBytes, relativeTime } from '../utils';
 import { summarizeScopeSavings } from '../savings';
 import { fmtNum } from './dashboard/chartDefaults';
-import {
-  getAllBucketScans,
-  startBucketScan,
-  stopBucketScan,
-  subscribeBucketScan,
-  type BucketScanResult,
-  type BucketScanProgress,
-} from '../adminApi';
+import { getAllBucketScans, type BucketScanResult } from '../adminApi';
+import { useBucketScanQueue } from '../hooks/useBucketScanQueue';
 import { listBuckets } from '../s3client';
 
 interface Props {
@@ -119,17 +113,7 @@ export default function BucketScanCard({ onRenderActions, scopeBucket }: Props) 
 
   const [scans, setScans] = useState<Record<string, BucketScanResult>>({});
   const [scansLoaded, setScansLoaded] = useState(false);
-  const [liveProgress, setLiveProgress] = useState<BucketScanProgress | null>(
-    null,
-  );
-  /**
-   * Multi-bucket fan-out queue. When the user runs an "all buckets"
-   * scan, we walk the bucket list sequentially. The current head of
-   * the queue is whatever bucket the live SSE is following.
-   */
-  const [queue, setQueue] = useState<string[]>([]);
   const [allBuckets, setAllBuckets] = useState<string[]>([]);
-  const unsubRef = useRef<(() => void) | null>(null);
 
   /** Hard-refresh the all-bucket cache (cheap — server-side disk read). */
   const refreshAllScans = useCallback(async () => {
@@ -142,6 +126,13 @@ export default function BucketScanCard({ onRenderActions, scopeBucket }: Props) 
       setScansLoaded(true);
     }
   }, []);
+
+  /**
+   * Multi-bucket fan-out queue (shared with the analytics page). The
+   * head of the queue is the bucket whose live progress shows.
+   */
+  const scan = useBucketScanQueue(refreshAllScans);
+  const { live: liveProgress, queue } = scan;
 
   // Initial load: scans + bucket list (for the fan-out).
   useEffect(() => {
@@ -158,83 +149,20 @@ export default function BucketScanCard({ onRenderActions, scopeBucket }: Props) 
   // backgrounded tab stops wasting requests (Tier 3.3).
   useVisiblePolling(refreshAllScans, 30_000);
 
-  /** Tear down any live subscription on unmount. */
-  useEffect(() => {
-    return () => {
-      if (unsubRef.current) unsubRef.current();
-      unsubRef.current = null;
-    };
-  }, []);
-
-  /** Wire an SSE subscription for a single bucket. */
-  const subscribe = useCallback(
-    (bucket: string) => {
-      if (unsubRef.current) unsubRef.current();
-      unsubRef.current = subscribeBucketScan(
-        bucket,
-        (frame) => {
-          setLiveProgress(frame);
-          if (frame.finished) {
-            // Re-pull the cache so the headline switches to the
-            // newly-completed result, then advance the queue.
-            refreshAllScans();
-            setLiveProgress(null);
-            setQueue((q) => q.slice(1));
-          }
-        },
-        () => {
-          // Transport error: tear down so the UI doesn't show a
-          // ghost progress bar forever.
-          setLiveProgress(null);
-          if (unsubRef.current) unsubRef.current();
-          unsubRef.current = null;
-        },
-      );
-    },
-    [refreshAllScans],
-  );
-
-  /** When the queue head changes, follow that bucket. */
-  useEffect(() => {
-    if (queue.length === 0) {
-      if (unsubRef.current) {
-        unsubRef.current();
-        unsubRef.current = null;
-      }
-      return;
-    }
-    const head = queue[0];
-    // Kick the scan (idempotent — if it's already running we just
-    // attach to it) then subscribe.
-    startBucketScan(head).catch(() => {
-      // If start fails, skip this bucket and advance.
-      setQueue((q) => q.slice(1));
-    });
-    subscribe(head);
-  }, [queue, subscribe]);
-
   // ─── Actions ──────────────────────────────────────────────────────
 
+  const { replace: replaceQueue, stop: handleStop } = scan;
   const handleScanOne = useCallback(
     (bucket: string) => {
-      setQueue([bucket]);
+      replaceQueue([bucket]);
     },
-    [],
+    [replaceQueue],
   );
 
   const handleScanAll = useCallback(() => {
     if (allBuckets.length === 0) return;
-    setQueue(allBuckets);
-  }, [allBuckets]);
-
-  const handleStop = useCallback(() => {
-    const head = queue[0];
-    if (head) {
-      stopBucketScan(head).catch(() => {});
-    }
-    setQueue([]);
-    setLiveProgress(null);
-  }, [queue]);
+    replaceQueue(allBuckets);
+  }, [allBuckets, replaceQueue]);
 
   // ─── Render ───────────────────────────────────────────────────────
 

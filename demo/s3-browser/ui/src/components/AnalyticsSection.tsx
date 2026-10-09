@@ -28,7 +28,7 @@
  * explicitly re-scans. The banner shows oldest + newest scan age so
  * staleness is never invisible.
  */
-import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { Button } from 'antd';
 import { CaretRightOutlined, ReloadOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
@@ -38,12 +38,10 @@ import { getBucketUsage } from '../adminApi';
 import type { AdminConfig, BucketUsage } from '../adminApi';
 import {
   getAllBucketScans,
-  startBucketScan,
-  stopBucketScan,
-  subscribeBucketScan,
   type BucketScanResult,
   type BucketScanProgress,
 } from '../adminApi';
+import { useBucketScanQueue } from '../hooks/useBucketScanQueue';
 import { formatBytes, relativeTime } from '../utils';
 import { monthlyCost, parseCostRate, summarizeScopeSavings } from '../savings';
 import { bucketPolicyFor } from '../bucketPolicyLookup';
@@ -101,10 +99,6 @@ export default function AnalyticsSection({ config }: Props) {
   // scan still overrides while it runs, and a completed cached scan takes
   // precedence (it's the same ground truth the counter is reconciled against).
   const [counters, setCounters] = useState<Record<string, BucketUsage>>({});
-  const [liveProgress, setLiveProgress] = useState<BucketScanProgress | null>(
-    null,
-  );
-  const [queue, setQueue] = useState<string[]>([]);
   /**
    * Top-buckets sort key. Persisted to localStorage so the operator's
    * preference survives reloads — repeatedly re-picking "savings" each
@@ -117,8 +111,6 @@ export default function AnalyticsSection({ config }: Props) {
   useEffect(() => {
     writeStorage('dgp-top-sort', topBucketsSort);
   }, [topBucketsSort]);
-  const unsubRef = useRef<(() => void) | null>(null);
-
   const [costRate, setCostRate] = useState(() => parseCostRate(readStorage('dg-cost-per-gb')));
   // The cost-rate cog popover (and the COST_PRESETS list, and the
   // localStorage setter) all live inside HeroSavingsPanel now —
@@ -149,6 +141,15 @@ export default function AnalyticsSection({ config }: Props) {
     }
   }, []);
 
+  // The fan-out queue and the live progress of its head (shared with the
+  // dashboard card). A finished scan refreshes the persisted map.
+  const scan = useBucketScanQueue(
+    useCallback(() => {
+      void refreshScans();
+    }, [refreshScans]),
+  );
+  const { live: liveProgress, queue, seed: seedQueue } = scan;
+
   // Initial load: bucket list + persisted scans, in parallel.
   //
   // RE-ATTACH on mount: scans run server-side and keep going even if the
@@ -160,9 +161,7 @@ export default function AnalyticsSection({ config }: Props) {
   useEffect(() => {
     refreshScans().then((running) => {
       const inFlight = Object.keys(running);
-      if (inFlight.length > 0) {
-        setQueue((prev) => (prev.length > 0 ? prev : inFlight));
-      }
+      if (inFlight.length > 0) seedQueue(inFlight);
     });
     listBuckets()
       .then(bs => {
@@ -178,59 +177,11 @@ export default function AnalyticsSection({ config }: Props) {
         });
       })
       .catch(() => setAllBuckets([]));
-  }, [refreshScans]);
+  }, [refreshScans, seedQueue]);
 
   // Re-poll every 30s for cross-tab scan settling. Routed through
   // useVisiblePolling so a backgrounded tab stops wasting requests (Tier 3.3).
   useVisiblePolling(refreshScans, 30_000);
-
-  // Tear down any SSE on unmount so we don't leak listeners.
-  useEffect(() => {
-    return () => {
-      if (unsubRef.current) unsubRef.current();
-      unsubRef.current = null;
-    };
-  }, []);
-
-  /**
-   * Wire SSE for a single bucket. On terminal frame, refresh the
-   * cache map and shift the queue head — the next effect tick picks
-   * up the new head and continues.
-   */
-  const subscribe = useCallback((bucket: string) => {
-    if (unsubRef.current) unsubRef.current();
-    unsubRef.current = subscribeBucketScan(
-      bucket,
-      frame => {
-        setLiveProgress(frame);
-        if (frame.finished) {
-          refreshScans();
-          setLiveProgress(null);
-          setQueue(q => q.slice(1));
-          if (unsubRef.current) unsubRef.current();
-          unsubRef.current = null;
-        }
-      },
-      () => {
-        // Transport error: tear down so we don't show a ghost bar.
-        setLiveProgress(null);
-        if (unsubRef.current) unsubRef.current();
-        unsubRef.current = null;
-      },
-    );
-  }, [refreshScans]);
-
-  // Follow the queue head. Idempotent — start endpoint just attaches
-  // to an in-flight scan if one is already running on the server.
-  useEffect(() => {
-    if (queue.length === 0) return;
-    const head = queue[0];
-    startBucketScan(head).catch(() => {
-      // Drop this bucket and try the next.
-      setQueue(q => q.slice(1));
-    });
-    subscribe(head);
-  }, [queue, subscribe]);
 
   /**
    * Default action: scan only the buckets that aren't yet cached.
@@ -240,11 +191,13 @@ export default function AnalyticsSection({ config }: Props) {
    * If everything is already scanned, we fall through to the
    * explicit "Re-scan all" path below.
    */
+  const { replace: replaceQueue, append: appendQueue, stopOne: handleStopOne, stop: handleStop } =
+    scan;
   const handleScanMissing = useCallback(() => {
     const missing = allBuckets.filter(b => !scans[b]);
     if (missing.length === 0) return;
-    setQueue(missing);
-  }, [allBuckets, scans]);
+    replaceQueue(missing);
+  }, [allBuckets, scans, replaceQueue]);
 
   /**
    * Explicit "really redo every bucket" action — only surfaced when
@@ -253,8 +206,8 @@ export default function AnalyticsSection({ config }: Props) {
    */
   const handleRescanAll = useCallback(() => {
     if (allBuckets.length === 0) return;
-    setQueue(allBuckets);
-  }, [allBuckets]);
+    replaceQueue(allBuckets);
+  }, [allBuckets, replaceQueue]);
 
   /**
    * Scan a single bucket on demand. Used by the per-row Re-scan
@@ -263,34 +216,11 @@ export default function AnalyticsSection({ config }: Props) {
    * something else is already running and instead just enqueues this
    * one for after.
    */
-  const handleScanOne = useCallback((bucket: string) => {
-    setQueue(q => (q.includes(bucket) ? q : [...q, bucket]));
-  }, []);
+  const handleScanOne = appendQueue;
 
-  /**
-   * Cancel the currently-running scan if it's THIS bucket. Otherwise
-   * remove the bucket from the queued tail.
-   */
-  const handleStopOne = useCallback((bucket: string) => {
-    setQueue(q => {
-      if (q[0] === bucket) {
-        // Cancel the live one and drop it from the queue. The next
-        // queue head will start automatically.
-        stopBucketScan(bucket).catch(() => {});
-        return q.slice(1);
-      }
-      return q.filter(b => b !== bucket);
-    });
-  }, []);
-
-  const handleStop = useCallback(() => {
-    const head = queue[0];
-    if (head) stopBucketScan(head).catch(() => {});
-    setQueue([]);
-    setLiveProgress(null);
-    if (unsubRef.current) unsubRef.current();
-    unsubRef.current = null;
-  }, [queue]);
+  // Stop: `handleStopOne` cancels the live scan when it is THIS bucket,
+  // else it removes the bucket from the queued tail; `handleStop` ends
+  // the whole fan-out (both from useBucketScanQueue).
 
   /**
    * Synthesise per-bucket rows from the cache map + live progress.

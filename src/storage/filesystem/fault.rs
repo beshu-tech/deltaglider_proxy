@@ -38,6 +38,8 @@ pub(crate) enum FaultPoint {
     HasReference,
     /// A conditional delete of either variant (versioned [`FaultyFs`]).
     DeleteVariantIf,
+    /// The key is `"bucket//"`: the call names no prefix and no file.
+    ListDeltaspaces,
 }
 
 /// Work a test runs inside a storage call, before the call goes on: a
@@ -577,6 +579,8 @@ impl StorageBackend for FaultyFs {
     }
 
     async fn list_deltaspaces(&self, bucket: &str) -> Result<Vec<String>, StorageError> {
+        self.armed(FaultPoint::ListDeltaspaces, bucket, "", "")
+            .await?;
         self.inner.list_deltaspaces(bucket).await
     }
 
