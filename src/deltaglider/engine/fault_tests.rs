@@ -6,7 +6,9 @@
 
 use super::*;
 use crate::config::Config;
-use crate::storage::{DynStorageBackend, Fault, FaultyFs, FilesystemBackend, StorageBackend};
+use crate::storage::{
+    DynStorageBackend, Fault, FaultPoint, Faults, FaultyFs, FilesystemBackend, StorageBackend,
+};
 use md5::{Digest, Md5};
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -32,7 +34,7 @@ fn near(base: &[u8], seed: u8) -> Vec<u8> {
     v
 }
 
-async fn faulty_engine() -> (tempfile::TempDir, DynEngine, crate::storage::FaultTable) {
+async fn faulty_engine() -> (tempfile::TempDir, DynEngine, Faults) {
     let dir = tempfile::tempdir().unwrap();
     let faulty = FaultyFs::new(
         FilesystemBackend::new(dir.path().to_path_buf())
@@ -90,10 +92,7 @@ async fn an_io_error_on_metadata_is_not_an_absent_object() {
         .await
         .unwrap();
     engine.metadata_cache.invalidate("b", "v/app-2.zip");
-    faults
-        .lock()
-        .unwrap()
-        .insert(("get_delta_metadata", "b/v/app-2.zip".into()), Fault::Io);
+    faults.arm(FaultPoint::GetDeltaMetadata, "b/v/app-2.zip", Fault::Io);
     let head = engine.head("b", "v/app-2.zip").await;
     assert!(
         !matches!(head, Err(EngineError::NotFound(_))),
@@ -104,6 +103,7 @@ async fn an_io_error_on_metadata_is_not_an_absent_object() {
         !matches!(del, Ok(_) | Err(EngineError::NotFound(_))),
         "DELETE read an I/O error as an absent object: {del:?}"
     );
+    assert!(faults.fired(FaultPoint::GetDeltaMetadata, "b/v/app-2.zip") > 0);
 }
 
 /// B065: a DELETE whose sibling-variant cleanup fails must not report
@@ -132,12 +132,14 @@ async fn a_failed_sibling_cleanup_fails_the_delete() {
         .await
         .unwrap();
     engine.metadata_cache.invalidate("b", "p/k.zip");
-    faults
-        .lock()
-        .unwrap()
-        .insert(("delete_passthrough", "b/p/k.zip".into()), Fault::Throttled);
+    faults.arm(FaultPoint::DeletePassthrough, "b/p/k.zip", Fault::Throttled);
     let del = engine.delete("b", "p/k.zip").await;
-    faults.lock().unwrap().clear();
+    faults.disarm_all();
+    assert_eq!(
+        faults.fired(FaultPoint::DeletePassthrough, "b/p/k.zip"),
+        1,
+        "the sibling delete never met the fault"
+    );
     let after = engine.retrieve("b", "p/k.zip").await;
     assert!(
         del.is_err() || after.is_err(),

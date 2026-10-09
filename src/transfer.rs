@@ -1757,7 +1757,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let fail_has_reference = faulty.fail_has_reference.clone();
+        let faults = faulty.faults.clone();
         let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(faulty);
         let engine: Arc<DynEngine> = Arc::new(DeltaGliderEngine::new_with_backend(
             Arc::new(backend),
@@ -1797,7 +1797,11 @@ mod tests {
             .await
             .unwrap()
             .file_sha256;
-        *fail_has_reference.lock().unwrap() = Some("dst/p".to_string());
+        faults.arm(
+            crate::storage::FaultPoint::HasReference,
+            "dst/p/",
+            crate::storage::Fault::Throttled,
+        );
         let request = ObjectTransferRequest {
             source_bucket: "src",
             source_key: "p/b2.zip",
@@ -1810,7 +1814,8 @@ mod tests {
             keep_created_at: false,
         };
         let _ = delta_passthrough_copy(&engine, request, &head).await;
-        *fail_has_reference.lock().unwrap() = None;
+        faults.disarm_all();
+        assert!(faults.fired(crate::storage::FaultPoint::HasReference, "dst/p/") > 0);
         let after = engine
             .reference_metadata_raw("dst", "p")
             .await

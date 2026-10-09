@@ -24,43 +24,79 @@ impl Fault {
     }
 }
 
-/// `(method, "bucket/prefix/filename")` → the fault that call returns.
-pub(crate) type FaultTable =
-    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(&'static str, String), Fault>>>;
+/// A storage call that a test can fail. An enum, so a misspelt point is a
+/// compile error and not a fault that never fires (review C3). Add a point
+/// when a test needs one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum FaultPoint {
+    GetDeltaMetadata,
+    GetPassthroughMetadata,
+    DeleteDelta,
+    DeletePassthrough,
+    /// The key is `"bucket/prefix/"`: the call names no file.
+    HasReference,
+}
+
+#[derive(Default)]
+struct FaultState {
+    armed: std::collections::HashMap<(FaultPoint, String), Fault>,
+    fired: std::collections::HashMap<(FaultPoint, String), usize>,
+}
+
+/// The faults armed on a [`FaultyFs`], by point and `"bucket/prefix/filename"`.
+/// Shared, so a test arms them after the engine owns the backend. A test
+/// asserts [`Faults::fired`]: a fault that never fires proves nothing.
+#[derive(Clone, Default)]
+pub(crate) struct Faults(std::sync::Arc<std::sync::Mutex<FaultState>>);
+
+impl Faults {
+    pub(crate) fn arm(&self, point: FaultPoint, key: &str, fault: Fault) {
+        let mut state = self.0.lock().unwrap();
+        state.armed.insert((point, key.to_string()), fault);
+    }
+
+    /// Disarm every fault. The fire counts stay.
+    pub(crate) fn disarm_all(&self) {
+        self.0.lock().unwrap().armed.clear();
+    }
+
+    /// How many calls the fault at `point` on `key` failed.
+    pub(crate) fn fired(&self, point: FaultPoint, key: &str) -> usize {
+        let state = self.0.lock().unwrap();
+        state
+            .fired
+            .get(&(point, key.to_string()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn check(&self, point: FaultPoint, key: String) -> Result<(), StorageError> {
+        let mut state = self.0.lock().unwrap();
+        let Some(fault) = state.armed.get(&(point, key.clone())).copied() else {
+            return Ok(());
+        };
+        *state.fired.entry((point, key)).or_default() += 1;
+        Err(fault.error())
+    }
+}
 
 /// [`FilesystemBackend`] that forwards every call, except the faults armed
 /// on it.
 pub(crate) struct FaultyFs {
     pub(crate) inner: FilesystemBackend,
-    /// Armed per call: `get_delta_metadata`, `get_passthrough_metadata`,
-    /// `delete_delta`, `delete_passthrough`. Shared, like the field below.
-    pub(crate) faults: FaultTable,
-    /// `"bucket/prefix"` whose `has_reference` answers `Throttled`. Shared,
-    /// so a test arms it after the engine owns the backend.
-    pub(crate) fail_has_reference: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    pub(crate) faults: Faults,
 }
 
 impl FaultyFs {
     pub(crate) fn new(inner: FilesystemBackend) -> Self {
         Self {
             inner,
-            fail_has_reference: Default::default(),
-            faults: Default::default(),
+            faults: Faults::default(),
         }
     }
-}
 
-impl FaultyFs {
-    fn armed(&self, method: &'static str, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
-        match self
-            .faults
-            .lock()
-            .unwrap()
-            .get(&(method, format!("{b}/{p}/{f}")))
-        {
-            Some(fault) => Err(fault.error()),
-            None => Ok(()),
-        }
+    fn armed(&self, point: FaultPoint, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
+        self.faults.check(point, format!("{b}/{p}/{f}"))
     }
 }
 
@@ -184,10 +220,7 @@ impl StorageBackend for FaultyFs {
     }
 
     async fn has_reference(&self, bucket: &str, prefix: &str) -> Result<bool, StorageError> {
-        if self.fail_has_reference.lock().unwrap().as_deref() == Some(&format!("{bucket}/{prefix}"))
-        {
-            return Err(StorageError::Throttled("injected SlowDown".into()));
-        }
+        self.armed(FaultPoint::HasReference, bucket, prefix, "")?;
         self.inner.has_reference(bucket, prefix).await
     }
 
@@ -229,7 +262,7 @@ impl StorageBackend for FaultyFs {
         prefix: &str,
         filename: &str,
     ) -> Result<FileMetadata, StorageError> {
-        self.armed("get_delta_metadata", bucket, prefix, filename)?;
+        self.armed(FaultPoint::GetDeltaMetadata, bucket, prefix, filename)?;
         self.inner
             .get_delta_metadata(bucket, prefix, filename)
             .await
@@ -241,7 +274,7 @@ impl StorageBackend for FaultyFs {
         prefix: &str,
         filename: &str,
     ) -> Result<(), StorageError> {
-        self.armed("delete_delta", bucket, prefix, filename)?;
+        self.armed(FaultPoint::DeleteDelta, bucket, prefix, filename)?;
         self.inner.delete_delta(bucket, prefix, filename).await
     }
 
@@ -301,7 +334,7 @@ impl StorageBackend for FaultyFs {
         prefix: &str,
         filename: &str,
     ) -> Result<FileMetadata, StorageError> {
-        self.armed("get_passthrough_metadata", bucket, prefix, filename)?;
+        self.armed(FaultPoint::GetPassthroughMetadata, bucket, prefix, filename)?;
         self.inner
             .get_passthrough_metadata(bucket, prefix, filename)
             .await
@@ -313,7 +346,7 @@ impl StorageBackend for FaultyFs {
         prefix: &str,
         filename: &str,
     ) -> Result<(), StorageError> {
-        self.armed("delete_passthrough", bucket, prefix, filename)?;
+        self.armed(FaultPoint::DeletePassthrough, bucket, prefix, filename)?;
         self.inner
             .delete_passthrough(bucket, prefix, filename)
             .await
