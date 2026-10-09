@@ -4087,3 +4087,38 @@ async fn review_a14_a_full_iam_import_that_leaves_no_credential_is_refused() {
         "the refused import deleted alice"
     );
 }
+
+/// Review B2 (B040 left half done): a verified SigV4 request cleared the
+/// shared per-IP failure count, so a holder of any working key could guess
+/// other secrets with no lockout, one correct request every few guesses.
+#[tokio::test]
+async fn review_b2_a_verified_request_does_not_clear_the_ip_failure_count() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .env("DGP_RATE_LIMIT_MAX_ATTEMPTS", "6")
+        .env("DGP_RATE_LIMIT_WINDOW_SECS", "60")
+        .env("DGP_RATE_LIMIT_LOCKOUT_SECS", "60")
+        .build()
+        .await;
+    let path = format!("/{}", server.bucket());
+    let signed = |secret: &'static str| {
+        let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        build_signed_get(&server.endpoint(), &path, "testkey", secret, &now)
+            .header("x-forwarded-for", "10.0.0.97")
+    };
+    for _ in 0..3 {
+        let r = signed("testsecret").send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "the correct secret");
+        for _ in 0..2 {
+            let r = signed("wrong-secret").send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        }
+    }
+    let resp = signed("testsecret").send().await.unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        503,
+        "six wrong secrets from one address did not lock it: the correct \
+         requests between them cleared the count"
+    );
+}

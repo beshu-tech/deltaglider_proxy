@@ -22,7 +22,7 @@ If the audit log is **empty** and you still see 403, the denial is in SigV4 veri
 
 Symptom: requests succeed most of the time but fail intermittently, and the failures cluster. When one client is busy, *other* clients start to fail too. This is a rate-limit lockout from a shared rate-limit bucket, not an auth problem.
 
-Cause: the proxy is behind a reverse proxy (Coolify, Traefik, nginx, ALB) but `DGP_TRUST_PROXY_HEADERS` is `false`, so every request looks like it comes from the proxy's IP. All clients share one rate-limit bucket; one busy client exhausts it and the rest get throttled.
+Cause: the proxy is behind a reverse proxy (Coolify, Traefik, nginx, ALB) but `DGP_TRUST_PROXY_HEADERS` is `false`, so every request looks like it comes from the proxy's IP. All clients share one rate-limit bucket; one client that keeps sending a wrong secret exhausts it, and the rest get throttled. The successful requests of the other clients do not clear the bucket.
 
 Tells:
 - Throttling returns `503 SlowDown`, but a client retry that re-sends auth can show up as `403`.

@@ -223,7 +223,8 @@ pub async fn require_metrics_access(
             Err(blocked) => return blocked.into_response(),
         };
         if bearer_matches(&headers, token) {
-            guard.record_success();
+            // The bearer proves no account: the per-IP count stays.
+            drop(guard);
             return next.run(request).await.into_response();
         }
         guard.record_failure();
@@ -566,8 +567,8 @@ pub async fn login(
             .into_response();
     }
 
-    // Successful login — reset rate limiter for this IP
-    guard.record_success();
+    // The bootstrap password is proven: clear its account count.
+    guard.record_proven();
     // Rotate the session: drop any pre-login cookie so an XSS-leaked
     // earlier token can't outlive the password re-entry.
     let token = mint_session(
@@ -787,7 +788,8 @@ pub async fn resolve_iam_identity(
         return Err(StatusCode::FORBIDDEN.into());
     }
 
-    guard.record_success();
+    // A per-IP guard has no account to clear; the IP count stays (B2).
+    drop(guard);
 
     let client_ip = request_client_ip(&req_headers, connect_info.as_ref());
     let is_admin = user.is_admin(client_ip);
@@ -967,8 +969,8 @@ pub async fn login_as(
         return Err(StatusCode::FORBIDDEN.into());
     }
 
-    // Successful login — reset rate limiter
-    guard.record_success();
+    // The access key's secret is proven: clear its account count.
+    guard.record_proven();
 
     // Rotate the session: drop any pre-login cookie so an XSS-leaked
     // earlier token can't outlive the credential re-entry.
@@ -1063,7 +1065,7 @@ pub async fn browser_session_connect(
         return Err(StatusCode::FORBIDDEN.into());
     }
 
-    guard.record_success();
+    // A per-IP guard has no account to clear; the IP count stays (B2).
     let ak = user.access_key_id.clone();
     let ak_for_log = ak.clone();
 
@@ -1148,7 +1150,8 @@ pub async fn open_browser_connect(
         return Err(StatusCode::FORBIDDEN.into());
     }
 
-    guard.record_success();
+    // A per-IP guard has no account to clear; the IP count stays (B2).
+    drop(guard);
 
     let region = {
         let cfg = state.config.read().await;

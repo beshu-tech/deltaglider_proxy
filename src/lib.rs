@@ -1322,6 +1322,32 @@ mod source_guards {
         }
     }
 
+    /// Review B2: a rate-limit success clears only the account whose
+    /// secret the same fn proved: `record_proven()` follows an
+    /// `enter_with_account(` and a secret check in its fn. Nothing clears a
+    /// per-IP count (`RateLimiter::record_success` is gone).
+    #[test]
+    fn a_rate_limit_success_follows_a_proven_secret() {
+        let checks = ["bcrypt::verify(", "iam_user_secret_valid(", "probe_key("];
+        let mut sites = 0;
+        for (file, text) in crate::source_scan::prod_sources("src") {
+            let prod = crate::source_scan::prod_text(&text);
+            for (at, _) in prod.match_indices(".record_proven()") {
+                let fn_start = prod[..at].rfind("fn ").unwrap_or(0);
+                let body = &prod[fn_start..at];
+                if file == "src/rate_limiter.rs" {
+                    continue;
+                }
+                sites += 1;
+                assert!(
+                    body.contains("enter_with_account(") && checks.iter().any(|c| body.contains(c)),
+                    "{file}: record_proven() without an account guard and a secret check before it"
+                );
+            }
+        }
+        assert!(sites >= 3, "the scan found the proven sign-ins ({sites})");
+    }
+
     /// Review A14: every admin path that can remove IAM users decides the
     /// lockout rule (`check_lockout`, or `allow_empty` for the restore)
     /// BEFORE the write, in the same function. A new path that deletes

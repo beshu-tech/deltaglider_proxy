@@ -290,13 +290,29 @@ succeed.
   listings. Now the proxy refuses such a value when you save the rule, and
   a Deny rule whose condition cannot be read counts as a Deny.
 
-### Security — Starting an OAuth sign-in no longer clears the lockout counter
+### Security — A successful sign-in no longer clears the failure count of its address
 
-The proxy counts failed sign-ins per client address and locks the address
-out after too many. A request that only started an OAuth sign-in cleared
-that count, so a client could guess IAM secrets without limit by starting
-an OAuth sign-in after every few guesses. Now only a completed sign-in
-clears the count.
+The proxy counts failed sign-ins for each client address and locks the
+address out after too many. Several successful requests cleared that count:
+a signed S3 request, an admin or browser sign-in, a `/_/metrics` request with
+the correct bearer token, a completed OAuth sign-in, a request that only
+started an OAuth sign-in, and an open-mode browser session. The count holds
+guesses at every secret, but each of these requests proves at most one
+secret. A client that held any working credential could therefore guess
+other secrets without limit, because it cleared the count after every few
+guesses. Now no request clears the count of its address. The count ends when
+its window ends (`DGP_RATE_LIMIT_WINDOW_SECS`) or when the lockout ends. A
+successful admin sign-in still clears the failure count of its own account.
+The progressive delay now slows only the refused response, never a request
+that succeeds.
+
+Clients that reach the proxy from one address share one count, for example
+clients behind a NAT, or all clients behind a load balancer whose forwarding
+headers the proxy does not trust. Before, the successful requests of the
+other clients cleared the failures of a client with a wrong secret. Now a
+client that keeps sending a wrong secret locks out every client at its
+address. Behind a load balancer, set `DGP_TRUST_PROXY_HEADERS=true` and
+`DGP_TRUSTED_PROXY_CIDRS`, so that each client has its own count.
 
 ### Security — A blank bootstrap secret is no credential
 

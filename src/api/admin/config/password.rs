@@ -300,7 +300,7 @@ pub async fn recover_db(
 
     match matched {
         Some((kind, key)) => {
-            guard.record_success();
+            guard.record_proven();
             audit_log("recover_db_success", "admin", "", &headers);
             let (correct_hash, correct_hash_base64) = if kind == "bootstrap_hash" {
                 let b64 = base64::Engine::encode(

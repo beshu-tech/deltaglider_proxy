@@ -228,11 +228,6 @@ impl RateLimiter {
         }
     }
 
-    /// Record a successful authentication (resets the failure counter for the IP).
-    pub fn record_success(&self, ip: &IpAddr) {
-        self.entries.remove(ip);
-    }
-
     /// Per-account variant: is this subject (bootstrap / AKID /
     /// username) currently locked out? Empty subject → not limited
     /// (caller didn't supply a subject dimension).
@@ -279,7 +274,7 @@ impl RateLimiter {
     }
 
     /// Per-account variant: clear the failure counter for this subject.
-    pub fn record_success_account(&self, subject: &str) {
+    fn record_success_account(&self, subject: &str) {
         if subject.is_empty() {
             return;
         }
@@ -288,7 +283,7 @@ impl RateLimiter {
 
     /// Remember that `ip` logged in to `subject`. Bounded: past the cap the
     /// oldest pair is dropped.
-    pub fn record_known_good(&self, subject: &str, ip: IpAddr) {
+    fn record_known_good(&self, subject: &str, ip: IpAddr) {
         // No resolved IP (the guard's 0.0.0.0 fallback) is not an identity.
         if subject.is_empty() || ip.is_unspecified() {
             return;
@@ -661,14 +656,14 @@ pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
 // };
 // // ... do the auth check ...
 // if bad { guard.record_failure(); return 401; }
-// guard.record_success();
+// guard.record_proven();
 // ```
 //
 // Why a guard and not free functions:
 // - The "log on lockout transition" logic needs both `record_failure`'s
 //   return value AND the `event_prefix` string; bundling them onto the
 //   guard avoids passing both at every call site.
-// - `record_failure` vs `record_success` are clearly adjacent operations
+// - `record_failure` vs `record_proven` are clearly adjacent operations
 //   that share the same `(rl, ip)` context; a method call on a guard reads
 //   more naturally than `rate_limit::record_failure(rl, ip, "admin")`.
 // - The unspecified-IP fallback (present at three+ sites before the guard)
@@ -760,7 +755,7 @@ impl Blocked {
 /// RAII-style wrapper that ties a rate-limited operation to the
 /// `(RateLimiter, IpAddr, event_prefix)` triple it needs. The guard
 /// itself does not enforce cleanup at drop — callers must explicitly
-/// call `record_success` or `record_failure` to communicate the outcome.
+/// call `record_proven` or `record_failure` to communicate the outcome.
 /// Dropping without calling either is valid and means "no-op" (useful
 /// for short-circuits that aren't auth failures, e.g. internal errors).
 pub struct RateLimitGuard<'a> {
@@ -855,11 +850,13 @@ impl<'a> RateLimitGuard<'a> {
         self.ip
     }
 
-    /// Record a successful operation. Resets the failure counter for
-    /// BOTH the per-IP and per-account buckets so future attempts
-    /// start from zero on either dimension.
-    pub fn record_success(&self) {
-        self.rl.record_success(&self.ip);
+    /// Record a sign-in that PROVED the secret of the guard's subject (the
+    /// account given to `enter_with_account`): clear that account's count
+    /// and remember the (subject, IP) pair. The per-IP count is never
+    /// cleared (review B2): it holds the guesses at every secret this
+    /// address tried, and one success proves only one of them. A guard
+    /// without a subject has nothing to clear.
+    pub fn record_proven(&self) {
         // A known-good IP may log in while the account is locked; that must
         // not hand the botnet a fresh account budget.
         if !self.rl.is_limited_account(&self.subject) {
@@ -1014,7 +1011,7 @@ mod tests {
         };
         let enter = |ip: &'static str| enter_with(ip, axum::http::HeaderMap::new());
         // The operator logs in once from their usual IP.
-        enter("203.0.113.10").await.unwrap().record_success();
+        enter("203.0.113.10").await.unwrap().record_proven();
         // A botnet burns the account budget from fresh IPs.
         for i in 1..=3 {
             let ip: &'static str = Box::leak(format!("198.51.100.{i}").into_boxed_str());
@@ -1050,7 +1047,7 @@ mod tests {
             );
         }
         // The operator's login while locked keeps the lock for everyone else.
-        enter("203.0.113.10").await.unwrap().record_success();
+        enter("203.0.113.10").await.unwrap().record_proven();
         assert!(enter("198.51.100.201").await.is_err(), "lock not reset");
     }
 
@@ -1313,16 +1310,34 @@ mod tests {
         assert!(limiter.is_limited(&ip));
     }
 
-    #[test]
-    fn test_success_resets() {
-        let limiter = RateLimiter::new(3, Duration::from_secs(60), Duration::from_secs(120));
-        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
-
-        limiter.record_failure(&ip);
-        limiter.record_failure(&ip);
-        limiter.record_success(&ip);
-        assert!(!limiter.is_limited(&ip));
-        assert!(!limiter.record_failure(&ip)); // Counter reset
+    /// Review B2: a success proves one secret; the per-IP count holds the
+    /// guesses at every secret the address tried, so a success never
+    /// clears it. The proven account's own count still clears.
+    #[tokio::test]
+    async fn a_proven_success_keeps_the_ip_failure_count() {
+        let limiter = RateLimiter::new(10, Duration::from_secs(60), Duration::from_secs(120));
+        let headers = axum::http::HeaderMap::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 7));
+        let peer = Some(ip);
+        for _ in 0..2 {
+            RateLimitGuard::enter(&limiter, &headers, peer, "t")
+                .await
+                .unwrap()
+                .record_failure();
+        }
+        let guard =
+            RateLimitGuard::enter_with_account(&limiter, &headers, peer, "alice", true, "t")
+                .await
+                .unwrap();
+        guard.record_failure();
+        assert_eq!(limiter.failure_count(&ip), 3);
+        guard.record_proven();
+        assert_eq!(
+            limiter.failure_count(&ip),
+            3,
+            "a success cleared the IP count"
+        );
+        assert!(!limiter.is_limited_account("alice"));
     }
 
     #[test]
@@ -1453,9 +1468,8 @@ mod tests {
         assert!(!limiter.is_limited_account("other-akid"));
     }
 
-    /// record_success on the guard clears BOTH the per-IP and the
-    /// per-account counters so a legitimate login fully rotates the
-    /// bucket state.
+    /// A proven sign-in clears the per-account counter (the per-IP one
+    /// stays: `a_proven_success_keeps_the_ip_failure_count`).
     #[test]
     fn account_bucket_success_clears_failures() {
         let limiter = RateLimiter::new(100, Duration::from_secs(60), Duration::from_secs(120))
@@ -1612,7 +1626,7 @@ mod tests {
         RateLimitGuard::enter_with_account(&rl, &op, Some(ip("10.0.0.1")), "bootstrap", true, "t")
             .await
             .unwrap()
-            .record_success();
+            .record_proven();
         for i in 1..=3 {
             let a = format!("198.51.100.{i}");
             let h = hdrs(&[("x-forwarded-for", a.as_str())]);

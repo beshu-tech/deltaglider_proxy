@@ -577,8 +577,9 @@ pub async fn oauth_callback(
         trigger_config_sync(&state);
     }
 
-    // Successful OAuth login — reset rate limiter for this IP
-    guard.record_success();
+    // An IdP login proves no secret the proxy holds: the per-IP count
+    // stays (review B2).
+    drop(guard);
 
     // Only an EFFECTIVE admin (direct or group-inherited permissions, read
     // from the index rebuilt above) gets the admin surface. Everyone else gets

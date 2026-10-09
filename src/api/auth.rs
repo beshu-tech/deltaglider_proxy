@@ -955,12 +955,6 @@ pub async fn sigv4_auth_middleware(
             }
             return Err(resp);
         }
-        // Progressive delay: slow down responses proportional to failure count.
-        // Makes brute force expensive even before lockout threshold.
-        let delay = rl.progressive_delay(ip);
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
     }
 
     let query_string = request.uri().query().unwrap_or("");
@@ -1149,14 +1143,25 @@ pub async fn sigv4_auth_middleware(
     }
     match limiter_verdict(&outcome, response.status(), is_presigned) {
         LimiterVerdict::Success => {
+            // No limiter write: a verified request proves one access key's
+            // secret, and the per-IP count holds the guesses at every
+            // secret this address tried (review B2).
             if let Some(m) = &metrics {
                 m.auth_attempts_total.with_label_values(&["success"]).inc();
             }
+        }
+        LimiterVerdict::Failure => {
+            record_auth_failure("signature_rejected");
+            // Progressive delay on the REFUSED response only: a verified
+            // request from a shared address is never slowed by another
+            // client's failures.
             if let (Some(rl), Some(ip)) = (&rate_limiter, &client_ip) {
-                rl.record_success(ip);
+                let delay = rl.progressive_delay(ip);
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
             }
         }
-        LimiterVerdict::Failure => record_auth_failure("signature_rejected"),
         LimiterVerdict::Neither => {}
     }
     Ok(response)
