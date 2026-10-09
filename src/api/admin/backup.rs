@@ -409,6 +409,12 @@ struct SecretsEventDelivery {
     slack_bot_token: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     webhook_headers: BTreeMap<String, String>,
+    /// Slack incoming-webhook URLs: the URL path is the credential, so the
+    /// export masks them (Slack format without a bot token).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    webhook_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    webhook_urls: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -910,10 +916,16 @@ fn harvest_config_secrets(
         .as_deref()
         .map(|t| !t.trim().is_empty())
         .unwrap_or(false);
-    if has_token || !ed.webhook_headers.is_empty() {
+    if has_token
+        || !ed.webhook_headers.is_empty()
+        || ed.webhook_url.is_some()
+        || !ed.webhook_urls.is_empty()
+    {
         s.event_delivery = Some(SecretsEventDelivery {
             slack_bot_token: ed.slack_bot_token.clone(),
             webhook_headers: ed.webhook_headers.clone(),
+            webhook_url: ed.webhook_url.clone(),
+            webhook_urls: ed.webhook_urls.clone(),
         });
     }
     Ok(s)
@@ -1072,6 +1084,23 @@ fn hydrate_config_with_backup_secrets(cfg: &mut Config, secrets: &BackupSecrets)
             cfg.event_delivery
                 .webhook_headers
                 .insert(k.clone(), v.clone());
+        }
+        // Only over the export's mask: a URL in config.yaml is the truth.
+        let sentinel = crate::config::REDACTED_SENTINEL;
+        if cfg.event_delivery.webhook_url.as_deref() == Some(sentinel) {
+            cfg.event_delivery.webhook_url = ed.webhook_url.clone();
+        }
+        if cfg.event_delivery.webhook_urls.len() == ed.webhook_urls.len() {
+            for (url, saved) in cfg
+                .event_delivery
+                .webhook_urls
+                .iter_mut()
+                .zip(&ed.webhook_urls)
+            {
+                if url == sentinel {
+                    *url = saved.clone();
+                }
+            }
         }
     }
 }
@@ -1926,6 +1955,31 @@ mod tests {
         // Old secrets.json (no key fields) still parses.
         let old: BackupSecrets = serde_json::from_str("{}").unwrap();
         assert!(config_yaml_hydrated_for_restore(&exported, Some(&old)).is_ok());
+    }
+
+    /// B039: a full backup restores Slack incoming-webhook URLs. The export
+    /// masks them (the URL path is the credential), so secrets.json must
+    /// carry them back.
+    #[test]
+    fn full_backup_round_trips_webhook_urls() {
+        const URL: &str = "https://hooks.slack.com/services/T0/B0/SECRET0001";
+        const URL2: &str = "https://hooks.example.com/hook/SECRET0002";
+        let yaml = format!(
+            "advanced:\n  event_delivery:\n    enabled: true\n    format: slack\n    webhook_url: \"{URL}\"\n    webhook_urls:\n      - \"{URL2}\"\n"
+        );
+        let cfg = crate::config::Config::from_yaml_str(&yaml).unwrap();
+        let secrets = harvest_config_secrets(&cfg).unwrap();
+        let exported = cfg.redact_all_secrets().to_canonical_yaml().unwrap();
+        assert!(!exported.contains("SECRET0001"), "export did not mask");
+        let restored = config_yaml_hydrated_for_restore(&exported, Some(&secrets)).unwrap();
+        assert!(
+            restored.contains(URL),
+            "restore lost webhook_url:\n{restored}"
+        );
+        assert!(
+            restored.contains(URL2),
+            "restore lost webhook_urls:\n{restored}"
+        );
     }
 
     /// N7: a full backup of a declarative-IAM config carries the users' and

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed — A full backup restores Slack incoming-webhook URLs
+
+In Slack format without a bot token, the URL of an incoming webhook is its
+credential, so a backup's `config.yaml` masks it. The backup did not save
+the URL in `secrets.json`, so a restore on another instance lost a single
+`webhook_url` and refused a `webhook_urls` list. Now the backup saves the
+URLs and the restore puts them back.
+
 ### Fixed — Saving the access section keeps declarative IAM secrets
 
 The access section of the admin API hides each declarative user's secret
