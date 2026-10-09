@@ -1703,3 +1703,31 @@ async fn env_ref_values_never_echo_in_config_write_responses() {
         );
     }
 }
+
+/// B088: a value resolved through DGP_CONFIG_ENV_ALLOWLIST (a name the boot
+/// file does not use) must not echo in a validate or refused-apply response
+/// either.
+#[tokio::test]
+async fn allowlisted_env_values_never_echo_in_config_write_responses() {
+    const SECRET: &str = "allowlisted-secret-value-b088";
+    let server = TestServer::builder()
+        .env("AWS_B088_SECRET", SECRET)
+        .env("DGP_CONFIG_ENV_ALLOWLIST", "AWS_*")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let url = |p: &str| format!("{}/_/api/admin/config/{p}", server.endpoint());
+    let alias = json!({ "buckets": { "releases": { "alias": "${env:AWS_B088_SECRET}" } } });
+    let resp = admin
+        .post(url("section/storage/validate"))
+        .json(&alias)
+        .send()
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("alias"),
+        "the alias warning or diff is missing: {body}"
+    );
+    assert!(!body.contains(SECRET), "validate echoed the value: {body}");
+}

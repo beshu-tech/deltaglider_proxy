@@ -242,7 +242,8 @@ pub(super) async fn run(
     if write.mode == Mode::DryRun {
         let old = state.config.read().await.clone();
         refs.extend(old.env_refs.clone());
-        let outcome = match build(&old).and_then(|b| prepare(&old, b, &write)) {
+        let outcome = match build(&old).and_then(|b| prepare_with_refs(&old, b, &write, &mut refs))
+        {
             Err(r) => Outcome::Rejected(r),
             Ok(mut p) => {
                 if write.surface.section().is_some() {
@@ -312,7 +313,7 @@ async fn apply_locked(
     {
         return Outcome::Conflict { current };
     }
-    let prepared = match build(cfg).and_then(|b| prepare(cfg, b, write)) {
+    let prepared = match build(cfg).and_then(|b| prepare_with_refs(cfg, b, write, refs)) {
         Ok(p) => p,
         Err(r) => return Outcome::Rejected(r),
     };
@@ -362,10 +363,24 @@ fn persist(state: &Arc<AdminState>, cfg: &Config) -> Result<String, (String, Str
 
 /// Steps 3a–3h: turn `incoming` into the config the transition gets, with
 /// no side effect. Pure over `old` (reads only the `DGP_*` env).
+#[cfg(test)]
 pub(super) fn prepare(
     old: &Config,
     built: Built,
     write: &ConfigWrite<'_>,
+) -> Result<Prepared, Rejection> {
+    prepare_with_refs(old, built, write, &mut EnvRefs::new())
+}
+
+/// [`prepare`] that adds every env value the section body resolved to
+/// `refs`, the map the response is scrubbed with: a name resolved through
+/// DGP_CONFIG_ENV_ALLOWLIST is in no old provenance, and its value must
+/// not echo in a validate result or a rejection either.
+pub(super) fn prepare_with_refs(
+    old: &Config,
+    built: Built,
+    write: &ConfigWrite<'_>,
+    refs: &mut EnvRefs,
 ) -> Result<Prepared, Rejection> {
     let steps = write.surface.steps();
     let Built {
@@ -421,7 +436,9 @@ pub(super) fn prepare(
         // them back). Only recorded names resolve, never the server env (S7).
         Surface::Section { .. } => {
             incoming.env_refs = old.env_refs.clone();
-            if let Err(e) = incoming.resolve_env_ref_scalars() {
+            let resolved = incoming.resolve_env_ref_scalars();
+            refs.extend(incoming.env_refs.clone());
+            if let Err(e) = resolved {
                 reject!(
                     Stage::EnvResolve,
                     StatusCode::BAD_REQUEST,
