@@ -1030,3 +1030,101 @@ async fn test_bulk_copy_waits_for_a_completion_of_the_destination() {
     let bytes = got.body.collect().await.unwrap().into_bytes();
     assert_eq!(bytes.as_ref(), b"copied", "the later write wins");
 }
+
+/// The `keys` parameter as the admin GUI builds it (bulkZipDownloadUrl).
+fn zip_keys_param(keys: &[String]) -> String {
+    serde_json::to_string(keys).unwrap()
+}
+
+/// B044: a key with a comma survives the ZIP request the GUI sends.
+#[tokio::test]
+async fn zip_download_keeps_a_key_with_a_comma() {
+    let server = TestServer::builder().build().await;
+    let http = server.http();
+    let admin = admin_http_client(&server.endpoint()).await;
+    let bucket = server.bucket();
+    let ep = server.endpoint();
+    for (key, body) in [("reports/Q1,%20final.pdf", "q1"), ("a.txt", "a")] {
+        let r = http
+            .put(format!("{ep}/{bucket}/{key}"))
+            .body(body.as_bytes().to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success(), "seed {key}: {}", r.status());
+    }
+    let keys = vec![
+        format!("{bucket}/reports/Q1, final.pdf"),
+        format!("{bucket}/a.txt"),
+    ];
+    let resp = admin
+        .get(format!("{ep}/_/api/admin/objects/zip"))
+        .query(&[("keys", zip_keys_param(&keys))])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let entries = unzip(&resp.bytes().await.unwrap());
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        entries
+            .iter()
+            .any(|(n, c)| n.ends_with("Q1, final.pdf") && c == b"q1"),
+        "the comma key is missing from the archive: {names:?}"
+    );
+}
+
+/// B045: a move between two virtual bucket names that alias the same
+/// storage is a move onto itself: it must not delete the only copy.
+#[tokio::test]
+async fn move_between_two_aliases_of_one_bucket_keeps_the_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = TestServer::builder()
+        .bucket("releases")
+        .bucket_policy("releases", "backend: local-disk\nalias: shared-store")
+        .bucket_policy("downloads", "backend: local-disk\nalias: shared-store")
+        .extra_yaml_storage_section(&format!(
+            "backends:\n  - name: local-disk\n    type: filesystem\n    path: \"{}\"\ndefault_backend: local-disk\n",
+            dir.path().display()
+        ))
+        .build()
+        .await;
+    let http = server.http();
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    http.put(format!("{ep}/releases")).send().await.unwrap();
+    let r = http
+        .put(format!("{ep}/releases/v1.zip"))
+        .body(b"hello".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "seed: {}", r.status());
+    let same = http
+        .get(format!("{ep}/downloads/v1.zip"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        same.status().as_u16(),
+        200,
+        "fixture: the two names share storage"
+    );
+    let _ = admin
+        .post(format!("{ep}/_/api/admin/objects/move"))
+        .json(&json!({
+            "source_bucket": "releases",
+            "dest_bucket": "downloads",
+            "dest_prefix": "",
+            "items": [{ "source_key": "v1.zip", "relative": "v1.zip" }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let got = http
+        .get(format!("{ep}/downloads/v1.zip"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.status().as_u16(), 200, "the move deleted the only copy");
+}

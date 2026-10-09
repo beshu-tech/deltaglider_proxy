@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Fixed — Bulk ZIP and move: non-ASCII folders, commas in keys, aliased buckets
+
+- A ZIP download of objects from folders with non-ASCII names (for example
+  `docs/` and `日本/`) closed the connection without a response, because
+  the proxy cut a name inside a character.
+- A ZIP download of a key that contains a comma split the key in two: the
+  archive left the object out, or held an unrelated object. The admin GUI
+  now sends the keys as a JSON array, and an entry that is not
+  `bucket/key` fails the request with `400`.
+- A bulk move between two bucket names that point to the same storage
+  (`alias`) copied each object onto itself and then deleted it, so the
+  object was lost under both names. Now the move sees that the two names are
+  one bucket and keeps the object.
+
 ### Fixed — "Create bucket here" no longer moves an existing bucket
 
 `POST /_/api/admin/buckets` with the name of a bucket that already existed

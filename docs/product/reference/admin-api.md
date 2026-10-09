@@ -209,7 +209,7 @@ These endpoints accept an admin GUI session and also the browser session of a us
 
 | Parameter | Value |
 |---|---|
-| `keys` | A comma-separated list of `bucket/key` entries, at most 10,000. The request line must stay below 64 KiB. |
+| `keys` | A JSON array of `bucket/key` strings, at most 10,000, for example `["releases/a.zip","releases/b, final.zip"]`. A comma-separated list of `bucket/key` entries is also accepted, but it cannot name a key that contains a comma. An entry without a `/` makes the request fail with `400`. The request line must stay below 64 KiB. |
 
 The response is `200` with `Content-Type: application/zip` and `Content-Disposition: attachment; filename="deltaglider-<date>.zip"`. The proxy streams the archive while it reads the objects, so the response has no `Content-Length` header and no size limit. Each object is read through the same path as an S3 `GET`, so a delta-stored object is reconstructed before its bytes enter the archive. The proxy does not hold a whole object or the whole archive in memory.
 

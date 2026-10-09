@@ -147,14 +147,28 @@ fn dest_key(dest_prefix: &str, relative: &str) -> String {
 /// True when a move item's destination resolves to the exact same
 /// bucket+key as its source — i.e. the "copy" is a self no-op and the source
 /// must NOT be deleted (doing so is data loss). Pure decision point; unit-tested.
+/// The storage a virtual bucket name resolves to (backend + real bucket).
+/// Two names that alias one storage are ONE bucket for the overwrite and
+/// self-move guards; comparing virtual names let a move between two aliases
+/// overwrite its source with itself and then delete it.
+#[derive(Debug, PartialEq, Eq)]
+struct StorageId(String);
+
+impl StorageId {
+    fn of(engine: &crate::deltaglider::DynEngine, bucket: &str) -> Self {
+        use crate::storage::StorageBackend;
+        Self(engine.storage().storage_identity(bucket))
+    }
+}
+
 fn is_same_location_move(
-    source_bucket: &str,
-    dest_bucket: &str,
+    source: &StorageId,
+    dest: &StorageId,
     dest_prefix: &str,
     source_key: &str,
     relative: &str,
 ) -> bool {
-    source_bucket == dest_bucket && dest_key(dest_prefix, relative) == source_key
+    source == dest && dest_key(dest_prefix, relative) == source_key
 }
 
 /// Detect duplicate destination keys in a copy/move plan. The client
@@ -181,11 +195,11 @@ fn detect_collisions(items: &[CopyItem], dest_prefix: &str) -> Vec<String> {
 /// same-location case, handled in the delete loop.
 fn dest_overwrites_other_source(
     items: &[CopyItem],
-    source_bucket: &str,
-    dest_bucket: &str,
+    source: &StorageId,
+    dest: &StorageId,
     dest_prefix: &str,
 ) -> Option<String> {
-    if source_bucket != dest_bucket {
+    if source != dest {
         return None;
     }
     let sources: std::collections::HashSet<&str> =
@@ -200,8 +214,8 @@ fn dest_overwrites_other_source(
 /// no destination that is another selected source.
 fn validate_plan(
     items: &[CopyItem],
-    source_bucket: &str,
-    dest_bucket: &str,
+    source: &StorageId,
+    dest: &StorageId,
     dest_prefix: &str,
 ) -> Result<(), AdminError> {
     let collisions = detect_collisions(items, dest_prefix);
@@ -212,7 +226,7 @@ fn validate_plan(
             collisions.first().cloned().unwrap_or_default()
         )));
     }
-    if let Some(k) = dest_overwrites_other_source(items, source_bucket, dest_bucket, dest_prefix) {
+    if let Some(k) = dest_overwrites_other_source(items, source, dest, dest_prefix) {
         return Err(AdminError::conflict(format!(
             "destination {k:?} is also a selected source: the operation would overwrite \
                  it before it is copied (is the destination inside the selection?)"
@@ -377,12 +391,9 @@ pub async fn copy_objects(
         )));
     }
 
-    validate_plan(
-        &req.items,
-        &req.source_bucket,
-        &req.dest_bucket,
-        &req.dest_prefix,
-    )?;
+    let source_storage = StorageId::of(&state.s3_state.engine.load(), &req.source_bucket);
+    let dest_storage = StorageId::of(&state.s3_state.engine.load(), &req.dest_bucket);
+    validate_plan(&req.items, &source_storage, &dest_storage, &req.dest_prefix)?;
 
     let actor = BulkActor::for_session(&state, &session)?;
     let s3 = state.s3_state.clone();
@@ -603,12 +614,9 @@ pub async fn move_objects(
         )));
     }
 
-    validate_plan(
-        &req.items,
-        &req.source_bucket,
-        &req.dest_bucket,
-        &req.dest_prefix,
-    )?;
+    let source_storage = StorageId::of(&state.s3_state.engine.load(), &req.source_bucket);
+    let dest_storage = StorageId::of(&state.s3_state.engine.load(), &req.dest_bucket);
+    validate_plan(&req.items, &source_storage, &dest_storage, &req.dest_prefix)?;
 
     let s3 = state.s3_state.clone();
     let copy_req = CopyRequest {
@@ -658,8 +666,8 @@ pub async fn move_objects(
             // client computed. (The GUI should also prevent offering this, but
             // this is the last line of defence.)
             if is_same_location_move(
-                &req.source_bucket,
-                &req.dest_bucket,
+                &source_storage,
+                &dest_storage,
                 &req.dest_prefix,
                 &it.source_key,
                 &it.relative,
@@ -890,11 +898,17 @@ fn zip_entry_names(items: &[(String, String)]) -> Vec<String> {
         let limit = common.min(dir_of(p));
         let first = &full[0];
         let mut n = 0;
-        for (i, (a, b)) in first[..limit].bytes().zip(p[..limit].bytes()).enumerate() {
+        // Bytes, not `&str` slices: `limit` is a boundary of one path only,
+        // and slicing the other there can cut a multi-byte character.
+        for (i, (a, b)) in first.as_bytes()[..limit]
+            .iter()
+            .zip(&p.as_bytes()[..limit])
+            .enumerate()
+        {
             if a != b {
                 break;
             }
-            if a == b'/' {
+            if *a == b'/' {
                 n = i + 1;
             }
         }
@@ -903,23 +917,38 @@ fn zip_entry_names(items: &[(String, String)]) -> Vec<String> {
     full.into_iter().map(|p| p[common..].to_string()).collect()
 }
 
+/// `?keys=` of a ZIP download: a JSON array of `bucket/key` strings (what
+/// the GUI sends: a key may hold a comma), or the older comma-separated
+/// list. A bucket name never starts with `[`, so the two cannot be confused.
+/// Each entry splits on its FIRST '/'; an entry without one is an error,
+/// never silently dropped.
+fn parse_zip_keys(raw: &str) -> Result<Vec<(String, String)>, String> {
+    let entries: Vec<String> = if raw.trim_start().starts_with('[') {
+        serde_json::from_str(raw)
+            .map_err(|e| format!("?keys is not a JSON array of strings: {e}"))?
+    } else {
+        raw.split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    entries
+        .iter()
+        .map(|item| {
+            item.split_once('/')
+                .map(|(b, k)| (b.to_string(), k.to_string()))
+                .ok_or_else(|| format!("?keys entry {item:?} is not bucket/key"))
+        })
+        .collect()
+}
+
 pub async fn download_zip(
     Extension(session): Extension<BulkSession>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
     headers: axum::http::HeaderMap,
     AdminQuery(q): AdminQuery<ZipQuery>,
 ) -> Result<axum::response::Response, AdminError> {
-    let parsed: Vec<(String, String)> = q
-        .keys
-        .split(',')
-        .filter(|s| !s.is_empty())
-        .filter_map(|item| {
-            // Each entry is `bucket/key`, split on the FIRST '/' so
-            // keys with embedded slashes round-trip correctly.
-            item.split_once('/')
-                .map(|(b, k)| (b.to_string(), k.to_string()))
-        })
-        .collect();
+    let parsed = parse_zip_keys(&q.keys).map_err(AdminError::invalid)?;
     if parsed.is_empty() {
         return Err(AdminError::invalid(
             "?keys must be a comma-separated list of bucket/key entries",
@@ -1269,6 +1298,24 @@ mod tests {
         super::zip_entry_names(&owned)
     }
 
+    /// B043: the shared-prefix walk sliced `&str` at a byte offset taken
+    /// from another path, which panics inside a multi-byte character.
+    #[test]
+    fn zip_entry_names_handle_non_ascii_folders() {
+        assert_eq!(
+            names(&[("b", "docs/a.txt"), ("b", "日本/b.txt")]),
+            ["docs/a.txt", "日本/b.txt"]
+        );
+        assert_eq!(
+            names(&[("b", "日本/a.txt"), ("b", "x/b.txt")]),
+            ["日本/a.txt", "x/b.txt"]
+        );
+        assert_eq!(
+            names(&[("b", "日本/a.txt"), ("b", "日本/b.txt")]),
+            ["a.txt", "b.txt"]
+        );
+    }
+
     #[test]
     fn zip_skip_report_never_hides_missing_files() {
         let skip = |k: &str| (k.to_string(), "not found".to_string());
@@ -1372,7 +1419,7 @@ mod tests {
         );
     }
 
-    use super::{dest_key, is_same_location_move};
+    use super::{dest_key, is_same_location_move, StorageId};
 
     #[test]
     fn dest_key_joins_prefix_and_relative() {
@@ -1385,15 +1432,19 @@ mod tests {
         // Same bucket, dest_prefix + relative == source_key → self no-op.
         // The source MUST NOT be deleted (this is the data-loss case).
         assert!(is_same_location_move(
-            "beshu",
-            "beshu",
+            &StorageId("beshu".into()),
+            &StorageId("beshu".into()),
             "ror/builds/",
             "ror/builds/app.zip",
             "app.zip",
         ));
         // Empty dest_prefix, relative IS the full source key → still self.
         assert!(is_same_location_move(
-            "beshu", "beshu", "", "app.zip", "app.zip",
+            &StorageId("beshu".into()),
+            &StorageId("beshu".into()),
+            "",
+            "app.zip",
+            "app.zip",
         ));
     }
 
@@ -1401,24 +1452,24 @@ mod tests {
     fn genuine_relocations_are_not_flagged() {
         // Different bucket → real move.
         assert!(!is_same_location_move(
-            "beshu",
-            "archive",
+            &StorageId("beshu".into()),
+            &StorageId("archive".into()),
             "ror/builds/",
             "ror/builds/app.zip",
             "app.zip",
         ));
         // Same bucket, different dest prefix → real move.
         assert!(!is_same_location_move(
-            "beshu",
-            "beshu",
+            &StorageId("beshu".into()),
+            &StorageId("beshu".into()),
             "ror/old/",
             "ror/builds/app.zip",
             "app.zip",
         ));
         // Same bucket, dest key differs from source key → real move.
         assert!(!is_same_location_move(
-            "beshu",
-            "beshu",
+            &StorageId("beshu".into()),
+            &StorageId("beshu".into()),
             "ror/builds/",
             "ror/staging/app.zip",
             "app.zip",

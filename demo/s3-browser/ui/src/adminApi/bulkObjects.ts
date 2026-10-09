@@ -98,6 +98,7 @@ export async function listAllUnderPrefix(bucket: string, prefix: string): Promis
  * Admin GUI session required when the URL is fetched.
  */
 export function bulkZipDownloadUrl(bucketKeys: string[]): string {
-  const qs = new URLSearchParams({ keys: bucketKeys.join(',') });
+  // A JSON array, not a comma join: an object key may contain a comma.
+  const qs = new URLSearchParams({ keys: JSON.stringify(bucketKeys) });
   return `${BASE}/api/admin/objects/zip?${qs.toString()}`;
 }
