@@ -938,7 +938,35 @@ fn zip_entry_names(items: &[(String, String)]) -> Vec<String> {
         }
         common = n;
     }
-    full.into_iter().map(|p| p[common..].to_string()).collect()
+    full.into_iter()
+        .map(|p| zip_safe_name(p[common..].to_string()))
+        .collect()
+}
+
+/// An entry name that every extractor keeps inside its folder (review E12):
+/// a key may start with `/` once its shared folder is cut (`a//etc/passwd`),
+/// hold `\` (a separator to Windows tools) or start with a drive (`C:`).
+/// Such a name is percent-escaped (`%` itself too, so names stay distinct);
+/// every other name is left as it is.
+fn zip_safe_name(name: String) -> String {
+    let b = name.as_bytes();
+    let drive = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+    if !(name.starts_with('/') || name.contains('\\') || drive) {
+        return name;
+    }
+    let mut out = String::with_capacity(name.len() + 8);
+    let mut leading = true;
+    for (i, c) in name.chars().enumerate() {
+        match c {
+            '%' => out.push_str("%25"),
+            '\\' => out.push_str("%5C"),
+            '/' if leading => out.push_str("%2F"),
+            ':' if drive && i == 1 => out.push_str("%3A"),
+            _ => out.push(c),
+        }
+        leading &= c == '/';
+    }
+    out
 }
 
 /// `?keys=` of a ZIP download: a JSON array of `bucket/key` strings (what
@@ -1349,6 +1377,50 @@ mod tests {
             super::MAX_BULK_OBJECTS,
             "the extra key is not kept"
         );
+    }
+
+    /// Review E12: an entry name comes from an object key, which a writer
+    /// chooses. An extractor must never place it outside its folder: no
+    /// absolute name (a trimmed `a//etc/passwd`), no `\\` separator, no drive.
+    #[test]
+    fn zip_entry_names_cannot_leave_the_extraction_folder() {
+        let unsafe_name = |n: &String| {
+            n.starts_with('/')
+                || n.contains('\\')
+                || n.as_bytes().get(1) == Some(&b':') && n.as_bytes()[0].is_ascii_alphabetic()
+        };
+        for items in [
+            &[("b", "x//etc/passwd"), ("b", "x/y")][..],
+            &[("b", "team/..\\..\\Users\\Public\\evil.lnk")][..],
+            &[("b", "C:/Windows/evil.dll")][..],
+            &[("b", "d/C:/evil.dll"), ("b", "d/x")][..],
+        ] {
+            for n in names(items) {
+                assert!(!unsafe_name(&n), "unsafe entry name {n:?} for {items:?}");
+            }
+        }
+        // A plain name is unchanged.
+        assert_eq!(names(&[("b", "release-3.0/docs/NOTES.md")]), ["NOTES.md"]);
+    }
+
+    proptest::proptest! {
+        /// E12 guard: whatever the keys, no entry name is absolute, holds a
+        /// `\\` or starts with a drive; and distinct keys keep distinct names.
+        #[test]
+        fn zip_entry_names_are_always_safe_and_distinct(
+            keys in proptest::collection::btree_set("[a/C:%.\\\\]{1,8}", 1..6),
+        ) {
+            let items: Vec<(String, String)> =
+                keys.iter().map(|k| ("b".to_string(), k.clone())).collect();
+            let out = super::zip_entry_names(&items);
+            for n in &out {
+                let b = n.as_bytes();
+                proptest::prop_assert!(!n.starts_with('/') && !n.contains('\\'), "{n:?}");
+                proptest::prop_assert!(!(b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'), "{n:?}");
+            }
+            let distinct: std::collections::BTreeSet<&String> = out.iter().collect();
+            proptest::prop_assert_eq!(distinct.len(), out.len(), "names collide: {:?}", out);
+        }
     }
 
     /// B043: the shared-prefix walk sliced `&str` at a byte offset taken

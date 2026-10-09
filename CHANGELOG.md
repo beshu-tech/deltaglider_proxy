@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Security — ZIP entry names cannot point outside the extraction folder
+
+The ZIP download named each entry after its object key below the shared
+folder. A key is chosen by whoever writes the object, so a name could start
+with `/` (the key `a//etc/passwd` with the folder `a/` cut), hold `\` (a
+folder separator for Windows tools), or start with a drive such as `C:`.
+Some extractors then wrote such an entry outside the folder the user chose.
+Now such a name is percent-escaped, and every other name is unchanged.
+
 ### Fixed — A masked secret that cannot be restored is refused by name
 
 A config write that kept a masked value (`__redacted__`) which the proxy
