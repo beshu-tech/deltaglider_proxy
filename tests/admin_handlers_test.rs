@@ -2134,3 +2134,44 @@ async fn session_gate_error_bodies_keep_their_shape() {
     .await;
     assert_eq!(got, (StatusCode::NOT_FOUND, ErrorBody::Empty));
 }
+
+/// B042: "create bucket here" on a bucket that already exists on another
+/// backend must not re-route it (its objects would vanish for clients).
+#[tokio::test]
+async fn creating_an_existing_bucket_on_another_backend_is_refused() {
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let yaml = format!(
+        "backends:\n  - name: hetzner-fsn1\n    type: filesystem\n    path: \"{}\"\n  - name: local-disk\n    type: filesystem\n    path: \"{}\"\ndefault_backend: hetzner-fsn1\n",
+        a.path().display(),
+        b.path().display()
+    );
+    let server = TestServer::builder()
+        .extra_yaml_storage_section(&yaml)
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let http = server.http();
+    let admin = admin_http_client(&ep).await;
+    http.put(format!("{ep}/releases")).send().await.unwrap();
+    let r = http
+        .put(format!("{ep}/releases/a.txt"))
+        .body(b"keep".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+
+    let r = admin
+        .post(format!("{ep}/_/api/admin/buckets"))
+        .json(&json!({ "name": "releases", "backend_name": "local-disk" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 409, "an existing bucket was re-routed");
+    let got = http
+        .get(format!("{ep}/releases/a.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.status().as_u16(), 200, "the bucket's objects vanished");
+}

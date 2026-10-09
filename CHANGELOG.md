@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed — "Create bucket here" no longer moves an existing bucket
+
+`POST /_/api/admin/buckets` with the name of a bucket that already existed
+on another backend routed the name to the new backend and created an empty
+bucket there. The objects of the bucket then disappeared for every client.
+Now the request is refused with `409`; a migrate job moves a bucket to
+another backend.
+
 ### Fixed — A full backup restores Slack incoming-webhook URLs
 
 In Slack format without a bot token, the URL of an incoming webhook is its

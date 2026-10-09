@@ -293,6 +293,25 @@ pub async fn create_bucket_on_backend(
     // Buckets are keyed by virtual bucket name, normalized lowercase.
     let bucket_key = bucket.to_ascii_lowercase();
 
+    // An existing bucket is not created again: routing it to another backend
+    // would hide every object it holds from clients.
+    let existing = state
+        .s3_state
+        .engine
+        .load()
+        .list_bucket_origins()
+        .await
+        .map_err(|e| AdminError::internal(format!("failed to list buckets: {e}")))?;
+    if existing
+        .iter()
+        .any(|b| b.name.eq_ignore_ascii_case(&bucket_key))
+    {
+        return Err(AdminError::conflict(format!(
+            "bucket '{bucket_key}' already exists; to move it to backend '{backend_name}', \
+             run a migrate job"
+        )));
+    }
+
     // Same write-capability gate as a config apply: a client-writable bucket
     // on a non-CAS backend under multi-instance makes the next boot exit(1).
     // Checked first for its 409; the transition runs the gate again under
