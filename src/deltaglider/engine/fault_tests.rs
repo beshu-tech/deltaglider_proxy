@@ -241,7 +241,7 @@ async fn a_failed_sibling_cleanup_fails_the_delete() {
     assert!(
         read == v2,
         "the failed DELETE left the stale sibling as the object: {:?}",
-        String::from_utf8_lossy(&read[..read.len().min(32)])
+        String::from_utf8_lossy(&read.iter().take(32).copied().collect::<Vec<u8>>())
     );
     assert!(
         engine
