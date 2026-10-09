@@ -2283,9 +2283,13 @@ impl Config {
     /// `env_refs` so future persists re-emit the ref. Only strings that are
     /// EXACTLY one ref resolve — mid-string refs in GUI fields stay literal.
     pub fn resolve_env_ref_scalars(&mut self) -> Result<(), ConfigError> {
+        /// `found`: each name the body names in a whole ref, with the path
+        /// of the field (see [`push_seq_label`]).
         fn walk(
             v: &mut serde_yaml::Value,
             refs: &mut std::collections::BTreeMap<String, String>,
+            label: &mut String,
+            found: &mut Vec<(String, String)>,
         ) -> Result<(), ConfigError> {
             match v {
                 serde_yaml::Value::String(s) if is_env_ref(s) => {
@@ -2304,19 +2308,26 @@ impl Config {
                         }
                         v
                     })?;
+                    found.extend(hits.iter().map(|(name, _)| (name.clone(), label.clone())));
                     refs.extend(hits);
                     *s = resolved;
                     Ok(())
                 }
                 serde_yaml::Value::Sequence(seq) => {
-                    for item in seq {
-                        walk(item, refs)?;
+                    for (i, item) in seq.iter_mut().enumerate() {
+                        let len = label.len();
+                        push_seq_label(label, i, item);
+                        walk(item, refs, label, found)?;
+                        label.truncate(len);
                     }
                     Ok(())
                 }
                 serde_yaml::Value::Mapping(map) => {
-                    for (_, value) in map.iter_mut() {
-                        walk(value, refs)?;
+                    for (key, value) in map.iter_mut() {
+                        let len = label.len();
+                        push_key_label(label, key);
+                        walk(value, refs, label, found)?;
+                        label.truncate(len);
                     }
                     Ok(())
                 }
@@ -2327,9 +2338,25 @@ impl Config {
         let mut refs = self.env_refs.clone();
         let mut tree =
             serde_yaml::to_value(&*self).map_err(|e| ConfigError::Parse(e.to_string()))?;
-        walk(&mut tree, &mut refs)?;
+        let mut found = Vec::new();
+        walk(&mut tree, &mut refs, &mut String::new(), &mut found)?;
         let mut resolved: Config =
             serde_yaml::from_value(tree).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        // Review A2: the body names the field of each ref. A name written in
+        // exactly one field gets that path (the field moved: a renamed
+        // backend, a shifted list item); the path recorded at load went
+        // stale, and the persist wrote the literal. A name in several
+        // fields has no one path, as at load.
+        let mut sites: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for (name, label) in found {
+            sites.entry(name).or_default().push(label);
+        }
+        for (name, labels) in sites {
+            match labels.as_slice() {
+                [only] => refs.paths.insert(name, only.clone()),
+                _ => refs.paths.remove(&name),
+            };
+        }
         resolved.env_refs = refs;
         resolved.record_env_ref_paths();
         resolved.env_shadow = std::mem::take(&mut self.env_shadow);

@@ -134,10 +134,16 @@ impl Extend<(String, String)> for EnvRefs {
     }
 }
 
-/// Pure: `name → default` of every `${env:NAME:-default}` in `input`
-/// outside whole-line comments (`$$` is a literal `$`, not a ref).
+/// Pure: `name → default` of the `${env:NAME:-default}` refs in `input`
+/// outside whole-line comments (`$$` is a literal `$`, not a ref). A name
+/// gets a default only when every ref to it carries that same default
+/// (review A3): one default per name went back at every site, so a secret
+/// written `${env:S}` next to `${env:S:-}` came back as `${env:S:-}` and
+/// loaded empty. With no default, every site stays fail-loud.
 fn ref_defaults(input: &str) -> std::collections::BTreeMap<String, String> {
-    let mut out = std::collections::BTreeMap::new();
+    let mut seen: std::collections::BTreeMap<String, Option<String>> =
+        std::collections::BTreeMap::new();
+    let mut conflict: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut line_start = 0;
     for line in input.split_inclusive('\n') {
         let this_start = line_start;
@@ -157,14 +163,26 @@ fn ref_defaults(input: &str) -> std::collections::BTreeMap<String, String> {
                 continue;
             };
             let Some(close) = spec.find('}') else { break };
-            if let Some((name, default)) = spec[..close].split_once(":-") {
-                out.entry(name.to_string())
-                    .or_insert_with(|| default.to_string());
+            let (name, default) = match spec[..close].split_once(":-") {
+                Some((name, default)) => (name, Some(default.to_string())),
+                None => (&spec[..close], None),
+            };
+            match seen.get(name) {
+                Some(first) if *first != default => {
+                    conflict.insert(name.to_string());
+                }
+                Some(_) => {}
+                None => {
+                    seen.insert(name.to_string(), default);
+                }
             }
             rest = &spec[close + 1..];
         }
     }
-    out
+    seen.into_iter()
+        .filter(|(name, _)| !conflict.contains(name))
+        .filter_map(|(name, default)| Some((name, default?)))
+        .collect()
 }
 
 /// Expansion for documents that arrive over the ADMIN API (`/config/apply`,

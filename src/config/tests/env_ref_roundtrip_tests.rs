@@ -284,3 +284,78 @@ fn a_short_ref_is_not_reinserted_into_an_unrelated_field() {
         matches!(&aws.backend, BackendConfig::S3 { region, .. } if region == "${env:DR_REGION}")
     );
 }
+
+/// Review A2: a ref follows its field through a section write. The body
+/// carries the ref text at the field's new place (here a renamed backend);
+/// the path recorded at load went stale, so the persist wrote the literal.
+#[test]
+fn a_ref_follows_its_renamed_field_through_a_section_resolve() {
+    let tpl = "storage:\n  backends:\n  - name: aws-dr\n    type: s3\n    region: ${env:DR_REGION}\n  - name: minio\n    type: s3\n    endpoint: http://minio:9000\n    region: eu-central-1\n";
+    let set = |n: &str| (n == "DR_REGION").then(|| "us-east-1".to_string());
+    let (exp, refs) = crate::config::expansion::expand_env_with_recording(tpl, set).unwrap();
+    let mut old = Config::from_yaml_str(&exp).unwrap();
+    old.env_refs = refs;
+    old.record_env_ref_paths();
+    // The body as the GUI sends it back: the section GET showed the ref
+    // text, and the operator renamed the backend.
+    let mut incoming = old.with_env_refs_reinserted();
+    for b in &mut incoming.backends {
+        if b.name == "aws-dr" {
+            b.name = "aws-east".into();
+        }
+    }
+    incoming.env_refs = old.env_refs.clone();
+    incoming.resolve_env_ref_scalars().unwrap();
+    let out = incoming.with_env_refs_reinserted();
+    let region = |name: &str| match &out
+        .backends
+        .iter()
+        .find(|b| b.name == name)
+        .unwrap()
+        .backend
+    {
+        BackendConfig::S3 { region, .. } => region.clone(),
+        _ => unreachable!(),
+    };
+    assert_eq!(region("aws-east"), "${env:DR_REGION}");
+    assert_eq!(region("minio"), "eu-central-1");
+}
+
+/// Review A3: a name written with different defaults at different sites
+/// (or with one and without one) keeps no default. The first default of a
+/// name went back at every site, so a secret written `${env:S}` came back
+/// as `${env:S:-}` and loaded EMPTY when S was unset.
+#[test]
+fn a_name_with_two_defaults_keeps_neither() {
+    let secret = "  secret_access_key: ${env:S}\n";
+    let region = "    region: ${env:S:-}\n";
+    let backends = |region: &str| {
+        format!("storage:\n  backends:\n  - name: remote\n    type: s3\n    endpoint: http://minio:9000\n{region}")
+    };
+    let access = |secret: &str| format!("access:\n  access_key_id: admin\n{secret}");
+    // Both orders: the defaulted site first, and the secret first.
+    for tpl in [
+        format!("{}{}", backends(region), access(secret)),
+        format!("{}{}", access(secret), backends(region)),
+    ] {
+        let set = |n: &str| (n == "S").then(|| "sekret-value-000000000000001".to_string());
+        let (exp, refs) = crate::config::expansion::expand_env_with_recording(&tpl, set).unwrap();
+        let mut cfg = Config::from_yaml_str(&exp).unwrap();
+        cfg.env_refs = refs;
+        cfg.record_env_ref_paths();
+        let out = cfg.to_canonical_yaml_for_persist_with(&|_| None).unwrap();
+        assert!(
+            !out.contains("${env:S:-"),
+            "a site got another site's default:\n{out}"
+        );
+        assert!(
+            crate::config::expansion::expand_env_with_recording(&out, |_| None).is_err(),
+            "the secret must fail loud without S:\n{out}"
+        );
+    }
+    // One default everywhere is kept (B037).
+    let tpl = "advanced:\n  log_level: ${env:L:-info}\nconfig_sync_object_key: ${env:L:-info}\n";
+    let (_, refs) =
+        crate::config::expansion::expand_env_with_recording(tpl, |_| Some("debug".into())).unwrap();
+    assert_eq!(refs.ref_text("L"), "${env:L:-info}");
+}

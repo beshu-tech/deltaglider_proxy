@@ -183,7 +183,9 @@ as `us-east-1` had filled, the proxy could write `${env:DR_REGION}` into
 another field that held the same text, for example the region of another
 backend. Now the proxy remembers where each short value came from and
 writes the reference back only there, and only while the value is
-unchanged. A secret-length value is still replaced wherever it appears.
+unchanged. When a configuration section is saved with the reference in it
+at another place (a renamed backend, a moved list item), the place moves
+with it. A secret-length value is still replaced wherever it appears.
 
 ### Fixed — Config validate refuses what the apply refuses
 
@@ -238,7 +240,10 @@ hash is excluded, and a `*` pattern never matches a `DGP_*` variable.
 When `NAME` was set at startup, a change in the admin GUI saved the
 reference as `${env:NAME}` without its default. The next start without
 `NAME` then failed with a missing-variable error. Now the saved file and the
-export keep the reference as it was written.
+export keep the reference as it was written. A name that the file writes
+with two different defaults, or once with a default and once without,
+keeps no default: every reference to it stays required, so a secret never
+falls back to another field's default.
 
 ### Fixed — `${env:…}` in a lifecycle count or an admission status loads again
 
