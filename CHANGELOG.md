@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed — An abandoned filesystem write no longer lands late
+
+- On a filesystem backend, a write renamed its temp file into place on a
+  detached task. When the client went away mid-upload, the proxy released
+  the folder lock, but the detached task still renamed. A later upload to
+  the same key could then be overwritten by the abandoned one. Now the
+  rename checks that its caller is still waiting; an abandoned write
+  removes its temp file and does not rename.
+
 ### Fixed — Storage faults no longer make objects vanish or come back
 
 - On a filesystem backend, an object whose metadata could not be read was

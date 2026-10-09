@@ -1155,6 +1155,7 @@ impl StorageBackend for FilesystemBackend {
         let meta_json = serde_json::to_vec(metadata)?;
         let durability = Durability::for_object();
 
+        let (_gate, ticket) = write::commit_gate();
         tokio::task::spawn_blocking(move || {
             let mut tmp = dir.temp()?;
             for path in &parts {
@@ -1162,7 +1163,7 @@ impl StorageBackend for FilesystemBackend {
                 std::io::copy(&mut src, &mut tmp).map_err(io_to_storage_error)?;
             }
             xattr_meta::set_metadata_xattr(tmp.path(), &meta_json)?;
-            durable_rename(tmp, &target, durability)
+            durable_rename(tmp, &target, durability, ticket)
         })
         .await
         .map_err(super::join_error)?
@@ -1228,6 +1229,7 @@ impl StorageBackend for FilesystemBackend {
         let meta_json = serde_json::to_vec(metadata)?;
         let durability = Durability::for_object();
 
+        let (_gate, ticket) = write::commit_gate();
         tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
             let mut tmp = dir.temp()?;
             for chunk in &chunks {
@@ -1235,7 +1237,7 @@ impl StorageBackend for FilesystemBackend {
             }
             // Write xattr before rename — atomic metadata+data visibility.
             xattr_meta::set_metadata_xattr(tmp.path(), &meta_json)?;
-            durable_rename(tmp, &target, durability)
+            durable_rename(tmp, &target, durability, ticket)
         })
         .await
         .map_err(super::join_error)??;

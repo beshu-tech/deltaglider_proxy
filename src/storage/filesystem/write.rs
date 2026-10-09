@@ -175,6 +175,32 @@ pub(super) fn flush_pending_fsync() -> Result<(), StorageError> {
     fsync_paths(paths)
 }
 
+/// The async side of a detached blocking write's commit. A blocking task
+/// keeps running when its caller's future is dropped (a cancelled request),
+/// and its rename then landed after the caller had released its locks: a
+/// late reference.bin rename replaced the baseline of a PUT that ran in
+/// between (B021). Dropping the gate before the commit cancels the rename;
+/// a rename in progress finishes before the drop returns, so once the
+/// caller's later locals (its locks) are released, no rename can land.
+pub(super) struct CommitGate(std::sync::Arc<parking_lot::Mutex<bool>>);
+
+/// The blocking side of a [`CommitGate`]: [`durable_rename`] commits
+/// through it.
+pub(super) struct CommitTicket(std::sync::Arc<parking_lot::Mutex<bool>>);
+
+/// A gate for one write: keep the gate in the async function across the
+/// `await` of the blocking task, move the ticket into the task.
+pub(super) fn commit_gate() -> (CommitGate, CommitTicket) {
+    let cancelled = std::sync::Arc::new(parking_lot::Mutex::new(false));
+    (CommitGate(cancelled.clone()), CommitTicket(cancelled))
+}
+
+impl Drop for CommitGate {
+    fn drop(&mut self) {
+        *self.0.lock() = true;
+    }
+}
+
 /// The end of every atomic write, and the one owner of its durability:
 /// fsync the file, rename it over `target`, fsync the parent directory
 /// (the rename is an entry of it); or, `Deferred`, rename and record the
@@ -184,12 +210,23 @@ pub(super) fn durable_rename(
     tmp: NamedTempFile,
     target: &Path,
     durability: Durability,
+    ticket: CommitTicket,
 ) -> Result<(), StorageError> {
     if durability == Durability::Sync {
         tmp.as_file().sync_all().map_err(io_to_storage_error)?;
     }
-    tmp.persist(target)
-        .map_err(|e| io_to_storage_error(e.error))?;
+    {
+        // Held across the rename only: a cancelling drop waits for it.
+        let cancelled = ticket.0.lock();
+        if *cancelled {
+            // `tmp` is dropped (and removed) with this return.
+            return Err(StorageError::Other(
+                "write cancelled before its commit".to_string(),
+            ));
+        }
+        tmp.persist(target)
+            .map_err(|e| io_to_storage_error(e.error))?;
+    }
     // The rename is an entry of the parent directory: durable only once
     // the directory is fsynced too (storage-5).
     let parent = target.parent().map(Path::to_path_buf);
@@ -243,12 +280,13 @@ pub(super) async fn atomic_write_with_metadata(
     file.write_all(data).await.map_err(io_to_storage_error)?;
     file.flush().await.map_err(io_to_storage_error)?;
     drop(file);
+    let (_gate, ticket) = commit_gate();
     tokio::task::spawn_blocking(move || {
         // Write xattr to temp file BEFORE rename — atomic metadata+data visibility.
         if let Some(json) = &meta_json {
             xattr_meta::set_metadata_xattr(tmp.path(), json)?;
         }
-        durable_rename(tmp, &path, durability)
+        durable_rename(tmp, &path, durability, ticket)
     })
     .await
     .map_err(crate::storage::join_error)?
@@ -281,13 +319,43 @@ pub(super) async fn atomic_copy_with_metadata(
     let target = target_path.to_path_buf();
     let meta_json = serde_json::to_vec(metadata)?;
 
+    let (_gate, ticket) = commit_gate();
     tokio::task::spawn_blocking(move || {
         let mut src = std::fs::File::open(&source).map_err(io_to_storage_error)?;
         let mut tmp = dir.temp()?;
         std::io::copy(&mut src, &mut tmp).map_err(io_to_storage_error)?;
         xattr_meta::set_metadata_xattr(tmp.path(), &meta_json)?;
-        durable_rename(tmp, &target, durability)
+        durable_rename(tmp, &target, durability, ticket)
     })
     .await
     .map_err(crate::storage::join_error)?
+}
+
+#[cfg(test)]
+mod commit_gate_tests {
+    use super::*;
+
+    /// B021: once the caller's future is gone (its gate dropped), a
+    /// detached blocking write must not rename into place.
+    #[test]
+    fn a_cancelled_write_never_renames() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.bin");
+        let tmp = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        let tmp_path = tmp.path().to_path_buf();
+        let (gate, ticket) = commit_gate();
+        drop(gate);
+        assert!(durable_rename(tmp, &target, Durability::Sync, ticket).is_err());
+        assert!(!target.exists(), "a cancelled write renamed into place");
+        assert!(
+            !tmp_path.exists(),
+            "the cancelled temp file was left behind"
+        );
+
+        // Without a cancel, the rename lands.
+        let tmp = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        let (_gate, ticket) = commit_gate();
+        durable_rename(tmp, &target, Durability::Sync, ticket).unwrap();
+        assert!(target.exists());
+    }
 }
