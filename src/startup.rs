@@ -780,7 +780,16 @@ fn init_config_db_attempt(
                 // Preview the diff (no writes), then apply the pure policy.
                 let diff = match deltaglider_proxy::iam::preview_declarative_iam_at_boot(&db, &yaml)
                 {
-                    Ok(d) => d,
+                    Ok((d, contained)) => {
+                        for w in &contained {
+                            error!(
+                                "Declarative IAM: {w} — the rule is contained (an Allow grants \
+                                 nothing; a Deny applies without its condition). Fix it in the \
+                                 YAML: `config lint` and a config apply refuse it."
+                            );
+                        }
+                        d
+                    }
                     Err(e) => {
                         error!(
                             "FATAL: could not compute the declarative IAM diff at startup: {e}. \

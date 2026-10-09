@@ -4122,3 +4122,39 @@ async fn review_b2_a_verified_request_does_not_clear_the_ip_failure_count() {
          requests between them cleared the count"
     );
 }
+
+/// Review A13: a declarative YAML with a rule the save refuses (a negated
+/// condition with several values) started the previous release; this one
+/// stopped with FATAL. Now the boot contains the rule: the proxy starts,
+/// alice works, and dana's contained Allow grants nothing.
+#[tokio::test]
+async fn review_a13_a_contained_rule_does_not_stop_the_boot() {
+    let yaml = format!(
+        "{}  - name: dana\n    access_key_id: AKIAREVIEWDANA000001\n    \
+         secret_access_key: review-dana-secret-key-000000000000001\n    permissions:\n      \
+         - effect: Allow\n        actions: [\"read\", \"list\"]\n        resources: [\"*\"]\n        \
+         conditions: {{StringNotLike: {{\"s3:prefix\": [\"secret/*\", \"private/*\"]}}}}\n",
+        declarative_alice_yaml()
+    );
+    let server = TestServer::builder()
+        .client_credentials_only(ALICE_AK, ALICE_SK)
+        .extra_yaml_root(&yaml)
+        .build()
+        .await;
+    let users = user_names(
+        &admin_http_client(&server.endpoint()).await,
+        &server.endpoint(),
+    )
+    .await;
+    assert!(
+        users.iter().any(|(_, n)| n == "dana"),
+        "dana was not reconciled: {users:?}"
+    );
+    let alice = server.s3_client().await;
+    alice
+        .list_objects_v2()
+        .bucket(server.bucket())
+        .send()
+        .await
+        .expect("alice signs in");
+}

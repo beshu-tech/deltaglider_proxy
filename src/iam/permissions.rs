@@ -551,6 +551,29 @@ pub fn normalize_permissions(permissions: &mut [Permission]) {
 /// - `${iam:username}` and `${iam:access_key_id}` may appear in resources or string condition values
 /// - Maximum 100 rules per user/group
 pub fn validate_permissions(permissions: &[Permission]) -> Result<(), String> {
+    validate_permissions_with(permissions, ConditionPolicy::Refuse).map(|_| ())
+}
+
+/// What a validation does with a condition the proxy cannot evaluate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionPolicy {
+    /// An error: every attended save (admin API, config apply, lint).
+    Refuse,
+    /// A warning, and the policy build contains the rule (an Allow grants
+    /// nothing; a Deny applies without its condition): the boot and the
+    /// restore, which must not stop or lose a user over a rule that an
+    /// older release accepted (review A13).
+    Contain,
+}
+
+/// [`validate_permissions`] under a condition policy. Statement defects
+/// (effect, actions, resources, templates, count) are errors under both;
+/// the `Ok` warnings name each contained condition.
+pub fn validate_permissions_with(
+    permissions: &[Permission],
+    policy: ConditionPolicy,
+) -> Result<Vec<String>, String> {
+    let mut contained = Vec::new();
     if permissions.len() > MAX_PERMISSION_RULES {
         return Err(format!(
             "too many permission rules ({}, max {})",
@@ -621,10 +644,16 @@ pub fn validate_permissions(permissions: &[Permission]) -> Result<(), String> {
             // would otherwise be tempted to broaden into an unconditional Deny.
             // Catching it here keeps the condition's intent: an un-evaluatable
             // condition is a configuration error, not a silent scope change.
-            parse_conditions(conditions).map_err(|e| format!("{}: condition {}", ctx, e))?;
+            if let Err(e) = parse_conditions(conditions) {
+                let finding = format!("{}: condition {}", ctx, e);
+                match policy {
+                    ConditionPolicy::Refuse => return Err(finding),
+                    ConditionPolicy::Contain => contained.push(finding),
+                }
+            }
         }
     }
-    Ok(())
+    Ok(contained)
 }
 
 /// Check if a user's permissions allow the given action on the given resource.

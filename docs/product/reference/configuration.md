@@ -621,7 +621,6 @@ At save time, the proxy runs a set of cross-field checks in the admin **Apply** 
 | Advisory | Fires when | Why it matters |
 |---|---|---|
 | Shared rate-limit bucket | Rate limiting is enabled but `trust_proxy_headers` is `false` | Behind a reverse proxy, every client appears with the IP of the reverse proxy and shares one bucket, so one client can lock out all others. |
-| Stale IAM template | A permission resource uses a bare `${username}` instead of `${iam:username}` | The bare form is not substituted, so the rule matches nothing and silently denies the user. |
 | Frozen bucket quota | A bucket's `quota_bytes` is `0` | A zero quota rejects all writes to that bucket. |
 | Redundant public prefix | `public_prefixes` are set while `authentication: none` | Auth is already open, so the public-prefix rules add nothing. |
 

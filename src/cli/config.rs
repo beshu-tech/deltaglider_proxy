@@ -199,10 +199,7 @@ pub fn lint(file: &str) -> i32 {
     // The same rule gates as the admin write pipeline. Offline there is no
     // running config, so every rule counts as changed.
     if let Err(refusal) = cfg.rule_gates(&Config::default()) {
-        let (errors, kind) = match &refusal {
-            crate::config::RuleGateRefusal::Lifecycle(e) => (e, "lifecycle"),
-            crate::config::RuleGateRefusal::Replication(e) => (e, "replication"),
-        };
+        let (errors, kind) = (refusal.errors(), refusal.kind());
         for e in errors {
             eprintln!("error: {e}");
         }
@@ -693,6 +690,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(lint(path.to_str().unwrap()), EXIT_REJECTED);
+    }
+
+    /// Review A13: `config lint` passed a declarative YAML that the apply
+    /// refuses (and that stopped the boot before the boot contained it).
+    #[test]
+    fn lint_refuses_a_declarative_rule_the_apply_refuses() {
+        let negated = r#"[{"effect": "Allow", "actions": ["read"], "resources": ["releases/*"], "conditions": {"StringNotLike": {"s3:prefix": ["secret/*", "private/*"]}}}]"#;
+        let cases = [
+            format!(
+                "access:\n  iam_mode: declarative\n  iam_users:\n    - name: dana\n      \
+                 access_key_id: AKDANA0000000001\n      secret_access_key: s3cr3t-dana-0001\n      \
+                 permissions: {negated}\n"
+            ),
+            format!(
+                "access:\n  iam_mode: declarative\n  iam_groups:\n    - name: Engineering\n      \
+                 permissions: {negated}\n"
+            ),
+            "access:\n  iam_mode: declarative\n  iam_users:\n    - name: dana\n      \
+             access_key_id: AKDANA0000000001\n      secret_access_key: s3cr3t-dana-0001\n      \
+             groups: [Nowhere]\n"
+                .to_string(),
+        ];
+        for yaml in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("cfg.yaml");
+            std::fs::write(&path, format!("storage:\n  filesystem: /var/dgp\n{yaml}")).unwrap();
+            assert_eq!(
+                lint(path.to_str().unwrap()),
+                EXIT_REJECTED,
+                "lint passed:\n{yaml}"
+            );
+        }
     }
 
     // ── Phase 4: lint + defaults ───────────────────────────────────────

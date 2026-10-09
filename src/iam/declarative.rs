@@ -64,7 +64,8 @@ use crate::config_db::auth_providers::{AuthProviderConfig, GroupMappingRule};
 use crate::config_db::ConfigDb;
 use crate::iam::external_auth::mapping::{evaluate_mappings, filter_rules_for_email_verification};
 use crate::iam::external_auth::types::ExternalIdentityInfo;
-use crate::iam::{normalize_permissions, validate_permissions, Group, IamUser, Permission};
+use crate::iam::permissions::{validate_permissions_with, ConditionPolicy};
+use crate::iam::{normalize_permissions, Group, IamUser, Permission};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -596,7 +597,8 @@ pub fn export_as_declarative_inner(
 /// both surfaces funnel through `diff_iam`, so the dry-run can't
 /// lie about what the live apply will actually do.
 pub fn preview_declarative_iam(db: &ConfigDb, yaml: &DeclarativeIam) -> Result<IamDiff, String> {
-    let diff = preview_declarative_iam_at_boot(db, yaml)?;
+    let current = load_current_iam(db)?;
+    let diff = diff_iam(yaml, &current)?;
     check_provider_changes(&diff)?;
     Ok(diff)
 }
@@ -607,9 +609,12 @@ pub fn preview_declarative_iam(db: &ConfigDb, yaml: &DeclarativeIam) -> Result<I
 pub fn preview_declarative_iam_at_boot(
     db: &ConfigDb,
     yaml: &DeclarativeIam,
-) -> Result<IamDiff, String> {
+) -> Result<(IamDiff, Vec<String>), String> {
     let current = load_current_iam(db)?;
-    diff_iam(yaml, &current)
+    // The boot contains a condition the save would refuse (review A13): a
+    // YAML that started the previous release must not stop the next one.
+    // The warnings name each contained rule.
+    diff_iam_with(yaml, &current, ConditionPolicy::Contain)
 }
 
 /// The providers that an attended apply would create or change and that the
@@ -741,7 +746,16 @@ fn compute_external_baseline_groups(
 /// Run every validator; on the first error, return with no writes
 /// planned. Called unconditionally at the top of [`diff_iam`] so
 /// "validation before side-effects" holds as a pure predicate.
-fn validate(yaml: &DeclarativeIam, db: &CurrentIam) -> Result<(), String> {
+/// The I/O-free half of the declarative validation: names, references and
+/// permission shapes. `config lint`, the config write gates and the
+/// reconcile all run it (review A13: lint passed what the boot refused).
+/// With [`ConditionPolicy::Contain`] a condition the proxy cannot evaluate
+/// is a warning (the boot: the build contains it); with `Refuse` an error.
+pub fn validate_declared(
+    yaml: &DeclarativeIam,
+    policy: ConditionPolicy,
+) -> Result<Vec<String>, String> {
+    let mut warnings = Vec::new();
     // Uniqueness within YAML
     require_unique_names(yaml.users.iter().map(|u| &u.name), "iam_users")?;
     require_unique_names(yaml.groups.iter().map(|g| &g.name), "iam_groups")?;
@@ -803,17 +817,27 @@ fn validate(yaml: &DeclarativeIam, db: &CurrentIam) -> Result<(), String> {
 
     // Permissions shape validation — per-entity so the error message
     // says which entity was bad.
-    for u in &yaml.users {
-        let mut perms = u.permissions.clone();
+    let entities = yaml
+        .users
+        .iter()
+        .map(|u| (format!("user '{}'", u.name), &u.permissions))
+        .chain(
+            yaml.groups
+                .iter()
+                .map(|g| (format!("group '{}'", g.name), &g.permissions)),
+        );
+    for (who, permissions) in entities {
+        let mut perms = permissions.clone();
         normalize_permissions(&mut perms);
-        validate_permissions(&perms).map_err(|e| format!("user '{}': {e}", u.name))?;
+        let found = validate_permissions_with(&perms, policy).map_err(|e| format!("{who}: {e}"))?;
+        warnings.extend(found.into_iter().map(|w| format!("{who}: {w}")));
     }
-    for g in &yaml.groups {
-        let mut perms = g.permissions.clone();
-        normalize_permissions(&mut perms);
-        validate_permissions(&perms).map_err(|e| format!("group '{}': {e}", g.name))?;
-    }
+    Ok(warnings)
+}
 
+/// The DB half of the declarative validation: secrets on create and
+/// access-key collisions with existing users.
+fn validate_against_db(yaml: &DeclarativeIam, db: &CurrentIam) -> Result<(), String> {
     // Empty-secret-on-CREATE guard: a redacted export blanks secrets, and for an
     // EXISTING user/provider the reconciler preserves the DB value
     // (desired_existing_*). But a user/provider being CREATED (name not in the
@@ -906,8 +930,22 @@ where
 /// on YAML validation failure. The error string is suitable for
 /// surfacing in the apply response verbatim.
 pub fn diff_iam(yaml: &DeclarativeIam, db: &CurrentIam) -> Result<IamDiff, String> {
-    validate(yaml, db)?;
+    diff_iam_with(yaml, db, ConditionPolicy::Refuse).map(|(diff, _)| diff)
+}
 
+/// [`diff_iam`] under a condition policy; the warnings name the contained
+/// conditions (`ConditionPolicy::Contain`, the boot).
+pub fn diff_iam_with(
+    yaml: &DeclarativeIam,
+    db: &CurrentIam,
+    policy: ConditionPolicy,
+) -> Result<(IamDiff, Vec<String>), String> {
+    let warnings = validate_declared(yaml, policy)?;
+    validate_against_db(yaml, db)?;
+    diff_iam_unchecked(yaml, db).map(|diff| (diff, warnings))
+}
+
+fn diff_iam_unchecked(yaml: &DeclarativeIam, db: &CurrentIam) -> Result<IamDiff, String> {
     let mut diff = IamDiff::default();
 
     // ── Groups ──
@@ -1498,7 +1536,7 @@ pub fn reconcile_declarative_iam_at_boot(
     yaml: &DeclarativeIam,
 ) -> Result<ReconcileStats, String> {
     let current = load_current_iam(db)?;
-    let diff = diff_iam(yaml, &current)?;
+    let (diff, _) = diff_iam_with(yaml, &current, ConditionPolicy::Contain)?;
     db.apply_iam_reconcile(&diff, &current)
         .map_err(|e| format!("apply reconcile: {e}"))
 }
@@ -1518,6 +1556,84 @@ pub fn validate_declarative_iam(db: &ConfigDb, yaml: &DeclarativeIam) -> Result<
 
 #[cfg(test)]
 mod tests {
+    /// Review A13 guard: `config lint` (the rule gates) and the apply's
+    /// reconcile give the same verdict on every declaration, so a YAML that
+    /// lints clean never stops an apply (or a boot) and the reverse.
+    #[test]
+    fn lint_and_apply_refuse_the_same_declarations() {
+        let users = |extra: &str| {
+            format!(
+                "- name: dana\n  access_key_id: AKDANA0000000001\n  \
+                 secret_access_key: s3cr3t-dana-0001\n{extra}"
+            )
+        };
+        let rule = |cond: &str| {
+            format!(
+                "  permissions:\n    - effect: Allow\n      actions: [read]\n      \
+                 resources: [\"releases/*\"]\n{cond}"
+            )
+        };
+        let cases = [
+            users(&rule("")),
+            users(&rule(
+                "      conditions: {StringNotLike: {\"s3:prefix\": [\"a/*\", \"b/*\"]}}\n",
+            )),
+            users(&rule("      conditions: {Null: {\"aws:SourceIp\": \"true\"}}\n")),
+            users(&rule("      conditions: {StringLike: {\"s3:prefix\": \"home/${iam:username}/*\"}}\n")),
+            users("  groups: [Nowhere]\n"),
+            users(&rule("").replace("releases/*", "releases/${username}/*")),
+            "- name: $root\n  access_key_id: AKROOT0000000001\n  secret_access_key: s3cr3t-root-0001\n"
+                .to_string(),
+        ];
+        for yaml in cases {
+            let declared: Vec<DeclarativeUser> = serde_yaml::from_str(&yaml).unwrap();
+            let cfg = crate::config::Config {
+                iam_mode: crate::config_sections::IamMode::Declarative,
+                iam_users: declared.clone(),
+                ..Default::default()
+            };
+            let lint_refuses = cfg.rule_gates(&crate::config::Config::default()).is_err();
+            let snapshot = snapshot_from_access(&declared, &[], &[], &[], &[]);
+            let apply_refuses = diff_iam(&snapshot, &CurrentIam::default()).is_err();
+            assert_eq!(
+                lint_refuses, apply_refuses,
+                "lint and apply disagree on:\n{yaml}"
+            );
+        }
+    }
+
+    /// Review A13: a declarative YAML with a condition the save refuses
+    /// started the previous release; the boot now contains it (warning),
+    /// while the attended preview still refuses it.
+    #[test]
+    fn boot_contains_a_condition_the_apply_refuses() {
+        let db = crate::config_db::ConfigDb::in_memory("test-pass").unwrap();
+        let users: Vec<DeclarativeUser> = serde_yaml::from_str(
+            r#"
+- name: dana
+  access_key_id: AKDANA0000000001
+  secret_access_key: s3cr3t-dana-0001
+  permissions:
+    - effect: Allow
+      actions: [read]
+      resources: ["releases/*"]
+      conditions: {StringNotLike: {"s3:prefix": ["secret/*", "private/*"]}}
+"#,
+        )
+        .unwrap();
+        let yaml = snapshot_from_access(&users, &[], &[], &[], &[]);
+        let (diff, contained) = preview_declarative_iam_at_boot(&db, &yaml).unwrap();
+        assert_eq!(diff.users_to_create.len(), 1);
+        assert!(
+            contained.iter().any(|w| w.contains("dana")),
+            "the boot did not name the contained rule: {contained:?}"
+        );
+        assert!(
+            preview_declarative_iam(&db, &yaml).is_err(),
+            "the apply must still refuse it"
+        );
+    }
+
     use super::*;
 
     fn perm(actions: &[&str], resources: &[&str]) -> Permission {

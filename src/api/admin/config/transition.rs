@@ -311,23 +311,12 @@ async fn transition_gates(
     }
 }
 
-/// True when the transition must run the declarative reconcile: the target
-/// mode is declarative and the IAM fields (or the mode) changed. Shared by
-/// the pre-commit gate and the reconcile so the two cannot disagree.
+/// See [`crate::config::Config::declarative_reconcile_needed`].
 pub(super) fn declarative_reconcile_needed(
     old_cfg: &crate::config::Config,
     new_cfg: &crate::config::Config,
 ) -> bool {
-    use crate::config_sections::IamMode;
-    if !matches!(new_cfg.iam_mode, IamMode::Declarative) {
-        return false;
-    }
-    let old_iam_unchanged = matches!(old_cfg.iam_mode, IamMode::Declarative)
-        && old_cfg.iam_users == new_cfg.iam_users
-        && old_cfg.iam_groups == new_cfg.iam_groups
-        && old_cfg.auth_providers == new_cfg.auth_providers
-        && old_cfg.group_mapping_rules == new_cfg.group_mapping_rules;
-    !old_iam_unchanged
+    new_cfg.declarative_reconcile_needed(old_cfg)
 }
 
 /// The IAM half of a transition, in ONE DB-locked section: (a) the A14

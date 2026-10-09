@@ -548,13 +548,13 @@ pub(super) fn prepare_with_refs(
                 format!("config refused: {}", fatal.join("; "))
             ),
         }
-        // The changed-only rule gates (lifecycle, replication): the same
-        // step `config lint` runs.
+        // The changed-only rule gates (lifecycle, replication, declarative
+        // IAM): the same step `config lint` runs.
         match incoming.rule_gates(old) {
             Ok(standing) => {
                 if !standing.is_empty() {
                     tracing::warn!(
-                        "config write: pre-existing invalid lifecycle config left unchanged: {}",
+                        "config write: pre-existing invalid rules left unchanged: {}",
                         standing.join("; ")
                     );
                 }

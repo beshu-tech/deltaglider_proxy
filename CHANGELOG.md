@@ -296,7 +296,12 @@ succeed.
   the rule, and refuses it with a message that names the rule. A rule that is
   already stored (synced from an older instance, for example) is contained:
   an Allow rule grants nothing, and a Deny rule applies without its
-  condition.
+  condition. A declarative YAML file with such a rule still starts the
+  proxy: the proxy logs an error that names the rule and contains it, and a
+  backup restore keeps the user instead of skipping it. `config lint` and a
+  config apply refuse the rule, so run `config lint` on your YAML before you
+  upgrade. Before, `config lint` passed such a file, and the proxy refused to
+  start with it.
 
 ### Security — A successful sign-in no longer clears the failure count of its address
 

@@ -28,12 +28,23 @@ pub enum DocumentRefusal {
 pub enum RuleGateRefusal {
     Lifecycle(Vec<String>),
     Replication(Vec<String>),
+    /// Declarative IAM the reconcile would refuse (review A13).
+    DeclarativeIam(Vec<String>),
 }
 
 impl RuleGateRefusal {
     pub fn errors(&self) -> &[String] {
         match self {
-            Self::Lifecycle(e) | Self::Replication(e) => e,
+            Self::Lifecycle(e) | Self::Replication(e) | Self::DeclarativeIam(e) => e,
+        }
+    }
+
+    /// The rule family, for the refusal line.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Lifecycle(_) => "lifecycle",
+            Self::Replication(_) => "replication",
+            Self::DeclarativeIam(_) => "declarative IAM",
         }
     }
 }
@@ -72,12 +83,56 @@ impl Config {
     /// unrelated edit. `config lint` passes a default `old`: every rule
     /// counts as changed.
     pub fn rule_gates(&self, old: &Config) -> Result<Vec<String>, RuleGateRefusal> {
-        let standing = crate::lifecycle::planner::lifecycle_gate(&old.lifecycle, &self.lifecycle)
-            .map_err(RuleGateRefusal::Lifecycle)?;
+        let mut standing =
+            crate::lifecycle::planner::lifecycle_gate(&old.lifecycle, &self.lifecycle)
+                .map_err(RuleGateRefusal::Lifecycle)?;
         // State, cursor and lease are keyed by rule name (#13).
         crate::config_sections::replication_gate(&old.replication, &self.replication)
             .map_err(RuleGateRefusal::Replication)?;
+        standing.extend(self.declarative_iam_gate(old)?);
         Ok(standing)
+    }
+
+    /// The I/O-free half of the declarative reconcile's validation (review
+    /// A13: `config lint` passed a YAML the boot then refused). A change the
+    /// reconcile will apply is refused like the apply refuses it; unchanged
+    /// declarative IAM (a node that booted with a contained rule) only warns,
+    /// so an unrelated edit is not blocked. Gui-mode YAML IAM is inert.
+    fn declarative_iam_gate(&self, old: &Config) -> Result<Vec<String>, RuleGateRefusal> {
+        use crate::iam::permissions::ConditionPolicy;
+        if !matches!(self.iam_mode, crate::config_sections::IamMode::Declarative) {
+            return Ok(Vec::new());
+        }
+        let policy = if self.declarative_reconcile_needed(old) {
+            ConditionPolicy::Refuse
+        } else {
+            ConditionPolicy::Contain
+        };
+        let yaml = crate::iam::snapshot_from_access(
+            &self.iam_users,
+            &self.iam_groups,
+            &self.auth_providers,
+            &self.group_mapping_rules,
+            &[],
+        );
+        crate::iam::declarative::validate_declared(&yaml, policy)
+            .map_err(|e| RuleGateRefusal::DeclarativeIam(vec![e]))
+    }
+
+    /// True when a change from `old` must run the declarative reconcile:
+    /// the target mode is declarative and the IAM fields (or the mode)
+    /// changed. The one rule of the write gates and the transition.
+    pub fn declarative_reconcile_needed(&self, old: &Config) -> bool {
+        use crate::config_sections::IamMode;
+        if !matches!(self.iam_mode, IamMode::Declarative) {
+            return false;
+        }
+        let old_iam_unchanged = matches!(old.iam_mode, IamMode::Declarative)
+            && old.iam_users == self.iam_users
+            && old.iam_groups == self.iam_groups
+            && old.auth_providers == self.auth_providers
+            && old.group_mapping_rules == self.group_mapping_rules;
+        !old_iam_unchanged
     }
 
     /// Check the config for problems. Returns a list of human-readable

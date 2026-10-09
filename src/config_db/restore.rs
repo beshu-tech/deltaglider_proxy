@@ -19,7 +19,8 @@ use std::collections::{HashMap, HashSet};
 
 use super::auth_providers::{AuthProviderConfig, ExternalIdentity, GroupMappingRule};
 use super::{first_free_user_name, ConfigDb, ConfigDbError};
-use crate::iam::{normalize_permissions, validate_permissions, Permission};
+use crate::iam::permissions::{validate_permissions_with, ConditionPolicy};
+use crate::iam::{normalize_permissions, Permission};
 
 /// Full IAM backup: users (with credentials) + groups + memberships + external auth.
 #[derive(Serialize, Deserialize, Clone)]
@@ -101,6 +102,11 @@ pub struct ImportResult {
     /// Skipped because the referenced user/provider didn't make it,
     /// or a matching (provider, external_sub) already exists.
     pub external_identities_skipped: u32,
+    /// Rules kept with a condition the proxy cannot evaluate (review A13):
+    /// stored and contained (an Allow grants nothing; a Deny applies
+    /// without its condition), so a restore loses no user over it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub contained_rules: Vec<String>,
     /// Local user ids that no longer name the same user (deleted, or now
     /// another user). The caller ends the OAuth sessions bound to them.
     #[serde(skip)]
@@ -238,10 +244,17 @@ fn restore_on(
         }
         let mut perms = bg.permissions.clone();
         normalize_permissions(&mut perms);
-        if let Err(msg) = validate_permissions(&perms) {
-            tracing::warn!("Skipping group '{}': invalid permissions: {}", bg.name, msg);
-            result.groups_skipped += 1;
-            continue;
+        match validate_permissions_with(&perms, ConditionPolicy::Contain) {
+            Ok(contained) => result.contained_rules.extend(
+                contained
+                    .into_iter()
+                    .map(|w| format!("group '{}': {w}", bg.name)),
+            ),
+            Err(msg) => {
+                tracing::warn!("Skipping group '{}': invalid permissions: {}", bg.name, msg);
+                result.groups_skipped += 1;
+                continue;
+            }
         }
         let id = keep_id(replace, Some(bg.id), &group_ids_taken);
         conn.execute(
@@ -299,10 +312,17 @@ fn restore_on(
         }
         let mut perms = bu.permissions.clone();
         normalize_permissions(&mut perms);
-        if let Err(msg) = validate_permissions(&perms) {
-            tracing::warn!("Skipping user '{}': invalid permissions: {}", bu.name, msg);
-            result.users_skipped += 1;
-            continue;
+        match validate_permissions_with(&perms, ConditionPolicy::Contain) {
+            Ok(contained) => result.contained_rules.extend(
+                contained
+                    .into_iter()
+                    .map(|w| format!("user '{}': {w}", bu.name)),
+            ),
+            Err(msg) => {
+                tracing::warn!("Skipping user '{}': invalid permissions: {}", bu.name, msg);
+                result.users_skipped += 1;
+                continue;
+            }
         }
         // User names are unique (`${iam:username}` isolation). A name in use
         // gets the same `-N` suffix as the v25 upgrade, not a silent skip.
@@ -512,6 +532,39 @@ mod tests {
             .collect();
         n.sort();
         n
+    }
+
+    /// Review A13: a backup user whose condition the save would refuse is
+    /// kept (contained), not skipped: a Replace restore deleted it for good.
+    #[test]
+    fn restore_keeps_a_user_whose_condition_the_save_refuses() {
+        let (_d, db) = open();
+        let mut dana = backup_user(7, "dana", "AKDANA", vec![]);
+        dana.permissions = vec![Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["read".into()],
+            resources: vec!["releases/*".into()],
+            conditions: Some(serde_json::json!({"StringNotLike": {"s3:prefix": ["a/*", "b/*"]}})),
+        }];
+        let backup = IamBackup {
+            version: 2,
+            users: vec![dana],
+            groups: vec![],
+            auth_providers: vec![],
+            mapping_rules: vec![],
+            external_identities: vec![],
+        };
+        let r = db
+            .restore_iam(&backup, IamRestoreMode::Replace, None, true)
+            .unwrap();
+        assert_eq!(names(&db), ["dana"], "the user was skipped");
+        assert_eq!(r.users_skipped, 0);
+        assert!(
+            r.contained_rules.iter().any(|w| w.contains("dana")),
+            "{:?}",
+            r.contained_rules
+        );
     }
 
     /// Review A14: a Replace restore of a backup with no user, when the

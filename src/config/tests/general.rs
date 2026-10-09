@@ -970,40 +970,6 @@ fn test_check_warns_aes_without_key() {
     );
 }
 
-#[test]
-fn test_check_surfaces_stale_iam_template_advisory() {
-    // End-to-end wiring proof: a user whose permission uses the stale bare
-    // `${username}` (removed in the breaking ${iam:username} rename) must
-    // surface as a check() warning at save/lint time — the footgun that's
-    // silently denying the `xperi` user in prod.
-    let mut cfg = Config {
-        iam_users: vec![crate::iam::DeclarativeUser {
-            name: "xperi".into(),
-            access_key_id: "AKXPERI".into(),
-            secret_access_key: "s".into(),
-            enabled: true,
-            groups: vec![],
-            permissions: vec![crate::iam::types::Permission {
-                id: 0,
-                effect: "Allow".into(),
-                actions: vec!["write".into()],
-                resources: vec!["scrap/customers/${username}/*".into()],
-                conditions: None,
-            }],
-            auth_source: None,
-        }],
-        ..Config::default()
-    };
-    let warnings = cfg.check();
-    assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("xperi") && w.contains("${iam:username}")),
-        "stale ${{username}} template must surface as a check() advisory, got {:?}",
-        warnings
-    );
-}
-
 /// Parse a sectioned YAML doc and run check(), returning the warnings.
 fn check_yaml(yaml: &str) -> Vec<String> {
     let mut cfg = Config::from_yaml_str(yaml).expect("fixture must parse");

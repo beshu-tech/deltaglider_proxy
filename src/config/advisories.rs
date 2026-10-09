@@ -93,7 +93,6 @@ impl EnvView {
 pub fn advisories(cfg: &Config, env: &EnvView) -> Vec<Advisory> {
     [
         rule_shared_rate_limit_bucket(cfg, env),
-        rule_stale_iam_template(cfg, env),
         rule_frozen_bucket_quota(cfg, env),
         rule_public_prefix_redundant_with_open_auth(cfg, env),
     ]
@@ -117,31 +116,6 @@ fn rule_shared_rate_limit_bucket(_cfg: &Config, env: &EnvView) -> Option<Advisor
              X-Forwarded-For.",
         )
     })
-}
-
-/// A permission using a bare `${username}` / `${access_key_id}` (the pre-`iam:`
-/// form removed in the breaking template rename) no longer substitutes — DGP
-/// fails closed and DENIES ALL of that user's permissions. Reuses the canonical
-/// `validate_permissions` so this advisory and the runtime check agree exactly.
-fn rule_stale_iam_template(cfg: &Config, _env: &EnvView) -> Option<Advisory> {
-    let mut offenders: Vec<String> = cfg
-        .iam_users
-        .iter()
-        .filter(|u| crate::iam::permissions::validate_permissions(&u.permissions).is_err())
-        .map(|u| u.name.clone())
-        .collect();
-    if offenders.is_empty() {
-        return None;
-    }
-    offenders.sort();
-    offenders.dedup();
-    Some(Advisory::warn(format!(
-        "IAM user(s) {:?} have permissions with an invalid/stale template variable (e.g. a \
-         bare ${{username}} — the supported forms are ${{iam:username}} and \
-         ${{iam:access_key_id}}). DGP fails closed on these and DENIES ALL of the user's \
-         permissions until fixed.",
-        offenders
-    )))
 }
 
 /// A bucket with `quota_bytes: 0` is FROZEN (rejects every write). Easy to set by
@@ -192,8 +166,6 @@ fn rule_public_prefix_redundant_with_open_auth(cfg: &Config, _env: &EnvView) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::iam::types::Permission;
-    use crate::iam::DeclarativeUser;
 
     fn base_cfg() -> Config {
         Config::default()
@@ -204,27 +176,6 @@ mod tests {
             rate_limit_enabled: rl,
         }
     }
-    fn perm(resources: Vec<&str>) -> Permission {
-        Permission {
-            id: 0,
-            effect: "Allow".into(),
-            actions: vec!["read".into()],
-            resources: resources.into_iter().map(String::from).collect(),
-            conditions: None,
-        }
-    }
-    fn user(name: &str, resources: Vec<&str>) -> DeclarativeUser {
-        DeclarativeUser {
-            name: name.into(),
-            access_key_id: format!("AK{name}"),
-            secret_access_key: "s".into(),
-            enabled: true,
-            groups: vec![],
-            permissions: vec![perm(resources)],
-            auth_source: None,
-        }
-    }
-
     // ── shared-rate-limit-bucket truth table ──────────────────────────
     #[test]
     fn rate_limit_bucket_fires_only_when_on_and_untrusted() {
@@ -233,29 +184,6 @@ mod tests {
         assert!(rule_shared_rate_limit_bucket(&c, &env(true, true)).is_none()); // trusted → ok
         assert!(rule_shared_rate_limit_bucket(&c, &env(false, false)).is_none()); // rl off → ok
         assert!(rule_shared_rate_limit_bucket(&c, &env(true, false)).is_none());
-    }
-
-    // ── stale-iam-template ────────────────────────────────────────────
-    #[test]
-    fn stale_template_flags_bare_username_only() {
-        let mut c = base_cfg();
-        c.iam_users = vec![
-            user("good", vec!["scrap/${iam:username}/*"]),
-            user("plain", vec!["bucket/*"]),
-        ];
-        assert!(
-            rule_stale_iam_template(&c, &env(true, true)).is_none(),
-            "valid templates + plain resources → no advisory"
-        );
-
-        c.iam_users.push(user("xperi", vec!["scrap/${username}/*"]));
-        let a = rule_stale_iam_template(&c, &env(true, true)).expect("bare ${username} must fire");
-        assert!(
-            a.message.contains("xperi"),
-            "names the offender: {}",
-            a.message
-        );
-        assert_eq!(a.severity, Severity::Warn);
     }
 
     // ── frozen quota ──────────────────────────────────────────────────
