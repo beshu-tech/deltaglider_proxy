@@ -61,10 +61,103 @@ pub fn is_env_ref(s: &str) -> bool {
 /// `:-default` (var unset/empty) are NOT recorded — the literal default came
 /// from the file, and re-emitting it as a bare `${env:NAME}` would make the
 /// next load fail where the original template defaulted.
-pub fn expand_env_vars_recording(
-    input: &str,
-) -> Result<(String, std::collections::BTreeMap<String, String>), ConfigError> {
+pub fn expand_env_vars_recording(input: &str) -> Result<(String, EnvRefs), ConfigError> {
     expand_env_with_recording(input, super::process_env)
+}
+
+/// Recorded `${env:…}` provenance: the value each ref resolved to (the map
+/// this derefs to, `name → value`), and the `:-default` each such ref was
+/// written with, so persist and export re-emit `${env:NAME:-default}` as
+/// written. One type, so every copy of the provenance carries both.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EnvRefs {
+    values: std::collections::BTreeMap<String, String>,
+    /// `name → default` of the recorded refs written with `:-default`.
+    pub defaults: std::collections::BTreeMap<String, String>,
+}
+
+impl EnvRefs {
+    /// The ref as written: `${env:NAME}` or `${env:NAME:-default}`.
+    pub fn ref_text(&self, name: &str) -> String {
+        match self.defaults.get(name) {
+            Some(d) => format!("${{env:{name}:-{d}}}"),
+            None => format!("${{env:{name}}}"),
+        }
+    }
+}
+
+impl std::ops::Deref for EnvRefs {
+    type Target = std::collections::BTreeMap<String, String>;
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+impl std::ops::DerefMut for EnvRefs {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.values
+    }
+}
+
+impl From<std::collections::BTreeMap<String, String>> for EnvRefs {
+    fn from(values: std::collections::BTreeMap<String, String>) -> Self {
+        Self {
+            values,
+            defaults: Default::default(),
+        }
+    }
+}
+
+impl IntoIterator for EnvRefs {
+    type Item = (String, String);
+    type IntoIter = std::collections::btree_map::IntoIter<String, String>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.values.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a EnvRefs {
+    type Item = (&'a String, &'a String);
+    type IntoIter = std::collections::btree_map::Iter<'a, String, String>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.values.iter()
+    }
+}
+
+impl Extend<(String, String)> for EnvRefs {
+    fn extend<I: IntoIterator<Item = (String, String)>>(&mut self, iter: I) {
+        self.values.extend(iter)
+    }
+}
+
+/// Pure: `name → default` of every `${env:NAME:-default}` in `input`
+/// outside whole-line comments (`$$` is a literal `$`, not a ref).
+fn ref_defaults(input: &str) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for line in input.lines() {
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        let mut rest = line;
+        while let Some(i) = rest.find('$') {
+            let after = &rest[i + 1..];
+            if let Some(a) = after.strip_prefix('$') {
+                rest = a;
+                continue;
+            }
+            let Some(spec) = after.strip_prefix("{env:") else {
+                rest = after;
+                continue;
+            };
+            let Some(close) = spec.find('}') else { break };
+            if let Some((name, default)) = spec[..close].split_once(":-") {
+                out.entry(name.to_string())
+                    .or_insert_with(|| default.to_string());
+            }
+            rest = &spec[close + 1..];
+        }
+    }
+    out
 }
 
 /// Expansion for documents that arrive over the ADMIN API (`/config/apply`,
@@ -84,7 +177,7 @@ pub fn expand_env_vars_recording(
 pub fn expand_env_admin(
     input: &str,
     known: &std::collections::BTreeMap<String, String>,
-) -> Result<(String, std::collections::BTreeMap<String, String>), ConfigError> {
+) -> Result<(String, EnvRefs), ConfigError> {
     expand_env_with_recording(input, |name| admin_env_lookup(name, known))
 }
 
@@ -152,7 +245,7 @@ pub fn escape_dollars(s: &str) -> String {
 pub(crate) fn expand_env_with_recording(
     input: &str,
     lookup: impl Fn(&str) -> Option<String>,
-) -> Result<(String, std::collections::BTreeMap<String, String>), ConfigError> {
+) -> Result<(String, EnvRefs), ConfigError> {
     let mut used = std::collections::BTreeMap::new();
     let expanded = expand_env_doc_with(input, |name| {
         let v = lookup(name);
@@ -163,7 +256,15 @@ pub(crate) fn expand_env_with_recording(
         }
         v
     })?;
-    Ok((expanded, used))
+    let mut defaults = ref_defaults(input);
+    defaults.retain(|name, _| used.contains_key(name));
+    Ok((
+        expanded,
+        EnvRefs {
+            values: used,
+            defaults,
+        },
+    ))
 }
 
 /// Testable core of [`expand_env_vars`]: `lookup` resolves a var name to its

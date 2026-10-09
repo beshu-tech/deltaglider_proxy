@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed — `${env:NAME:-default}` keeps its default when the proxy saves the file
+
+When `NAME` was set at startup, a change in the admin GUI saved the
+reference as `${env:NAME}` without its default. The next start without
+`NAME` then failed with a missing-variable error. Now the saved file and the
+export keep the reference as it was written.
+
 ### Fixed — `${env:…}` in a lifecycle count or an admission status loads again
 
 Since v2.0.0, a configuration with `count: ${env:KEEP}` in a `retain-newest`

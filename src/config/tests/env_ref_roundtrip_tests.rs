@@ -222,3 +222,18 @@ fn section_echo_back_resolves_instead_of_clobbering() {
     cfg.access_key_id = Some("${env:HOME}".into());
     assert!(cfg.resolve_env_ref_scalars().is_err());
 }
+
+/// B037: a `${env:NAME:-default}` ref keeps its default through persist,
+/// so the next boot without NAME still loads.
+#[test]
+fn a_defaulted_ref_keeps_its_default_through_persist() {
+    let tpl = "advanced:\n  log_level: ${env:LOG_LEVEL:-info}\n";
+    let set = |n: &str| (n == "LOG_LEVEL").then(|| "debug".to_string());
+    let (exp, refs) = crate::config::expansion::expand_env_with_recording(tpl, set).unwrap();
+    let mut cfg = Config::from_yaml_str(&exp).unwrap();
+    cfg.env_refs = refs;
+    let out = cfg.to_canonical_yaml_for_persist_with(&|_| None).unwrap();
+    assert!(out.contains("${env:LOG_LEVEL:-info}"), "{out}");
+    crate::config::expansion::expand_env_with_recording(&out, |_| None)
+        .expect("the persisted file needs LOG_LEVEL at the next boot");
+}

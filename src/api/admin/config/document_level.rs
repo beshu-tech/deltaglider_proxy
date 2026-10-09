@@ -281,7 +281,7 @@ pub async fn validate_config_doc(
     State(state): State<Arc<AdminState>>,
     AdminJson(body): AdminJson<ConfigDocumentRequest>,
 ) -> impl IntoResponse {
-    let known = state.config.read().await.env_refs.clone();
+    let known = (*state.config.read().await.env_refs).clone();
     let no_env = EnvRefs::new();
     let write = ConfigWrite {
         surface: Surface::Document { yaml: &body.yaml },
@@ -411,7 +411,7 @@ pub(crate) async fn apply_config_inner_with_env(
     body: ConfigDocumentRequest,
     extra_env: &std::collections::BTreeMap<String, String>,
 ) -> (StatusCode, ConfigApplyResponse) {
-    let mut known = state.config.read().await.env_refs.clone();
+    let mut known = (*state.config.read().await.env_refs).clone();
     known.extend(extra_env.iter().map(|(k, v)| (k.clone(), v.clone())));
     // Parse before the lock (pure work): a bad document answers 400 even
     // with a stale `If-Match`.

@@ -327,7 +327,7 @@ pub struct Config {
     /// [`expand_env_vars_recording`]).
     #[serde(skip)]
     #[schemars(skip)]
-    pub env_refs: std::collections::BTreeMap<String, String>,
+    pub env_refs: EnvRefs,
 
     /// What the config FILE had in every slot a `DGP_*` variable overrode
     /// (see [`env_shadow`]). NEVER serialized. Persist and export restore
@@ -862,7 +862,7 @@ impl Default for Config {
             iam_groups: Vec::new(),
             auth_providers: Vec::new(),
             group_mapping_rules: Vec::new(),
-            env_refs: std::collections::BTreeMap::new(),
+            env_refs: EnvRefs::default(),
             env_shadow: env_shadow::EnvShadow::default(),
             tuning: RuntimeTuning::default(),
         }
@@ -2037,7 +2037,7 @@ impl Config {
             if !value.is_empty() {
                 inverse
                     .entry(value.as_str())
-                    .or_insert_with(|| format!("${{env:{name}}}"));
+                    .or_insert_with(|| self.env_refs.ref_text(name));
             }
         }
 
