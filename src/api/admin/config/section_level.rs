@@ -45,7 +45,7 @@ use std::sync::Arc;
 
 use super::super::{AdminError, AdminState};
 use super::write::{
-    self, Built, ConfigWrite, EnvRefs, Mode, Outcome, Rejection, ScrubEnv, Stage, Surface,
+    self, Built, ConfigWrite, Mode, Outcome, Rejection, ScrubEnv, ScrubMap, Stage, Surface,
     WriteResult,
 };
 use super::{unknown_section_error, SectionName};
@@ -270,7 +270,7 @@ async fn section_write(
     let Some(section) = SectionName::parse(name) else {
         return reject(StatusCode::NOT_FOUND, unknown_section_error(name));
     };
-    let no_env = EnvRefs::new();
+    let no_env = ScrubMap::new();
     let write = ConfigWrite {
         surface: Surface::Section { section, body },
         mode,
@@ -396,7 +396,7 @@ fn shape_section(section: SectionName, result: WriteResult) -> Response {
 }
 
 impl ScrubEnv for SectionApplyResponse {
-    fn scrub_env(&mut self, refs: &EnvRefs) {
+    fn scrub_env(&mut self, refs: &ScrubMap) {
         write::scrub_strings(
             self.warnings
                 .iter_mut()

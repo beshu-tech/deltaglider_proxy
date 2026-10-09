@@ -30,7 +30,7 @@ use std::sync::Arc;
 use super::super::AdminState;
 use super::active_config_path;
 use super::write::{
-    self, Built, ConfigWrite, EnvRefs, Mode, Outcome, Rejection, ScrubEnv, Stage, Surface,
+    self, Built, ConfigWrite, Mode, Outcome, Rejection, ScrubEnv, ScrubMap, Stage, Surface,
     WriteResult,
 };
 
@@ -618,7 +618,7 @@ pub async fn update_config(
     headers: axum::http::HeaderMap,
     AdminJson(body): AdminJson<ConfigUpdateRequest>,
 ) -> axum::response::Response {
-    let no_env = EnvRefs::new();
+    let no_env = ScrubMap::new();
     let write = ConfigWrite {
         surface: Surface::Patch,
         mode: Mode::Apply,
@@ -682,7 +682,7 @@ fn shape_patch(result: WriteResult) -> axum::response::Response {
 }
 
 impl ScrubEnv for ConfigUpdateResponse {
-    fn scrub_env(&mut self, refs: &EnvRefs) {
+    fn scrub_env(&mut self, refs: &ScrubMap) {
         write::scrub_strings(&mut self.warnings, refs);
     }
 }

@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use super::super::{audit_log, AdminError, AdminState, Bare};
 use super::write::{
-    self, Built, ConfigWrite, EnvRefs, Mode, Outcome, Rejection, ScrubEnv, Stage, Surface,
+    self, Built, ConfigWrite, Mode, Outcome, Rejection, ScrubEnv, ScrubMap, Stage, Surface,
     Warnings, WriteResult,
 };
 use super::{unknown_section_error, SectionName};
@@ -283,7 +283,7 @@ pub async fn validate_config_doc(
     AdminJson(body): AdminJson<ConfigDocumentRequest>,
 ) -> impl IntoResponse {
     let known = (*state.config.read().await.env_refs).clone();
-    let no_env = EnvRefs::new();
+    let no_env = ScrubMap::new();
     let write = ConfigWrite {
         surface: Surface::Document { yaml: &body.yaml },
         mode: Mode::DryRun,
@@ -299,7 +299,7 @@ pub async fn validate_config_doc(
 async fn run_document(
     state: &Arc<AdminState>,
     yaml: &str,
-    known: EnvRefs,
+    known: ScrubMap,
     write: ConfigWrite<'_>,
 ) -> WriteResult {
     match parse_and_validate_yaml(yaml, &known) {
@@ -512,7 +512,7 @@ fn shape_apply(outcome: Outcome) -> (StatusCode, ConfigApplyResponse) {
 }
 
 impl ScrubEnv for ConfigApplyResponse {
-    fn scrub_env(&mut self, refs: &EnvRefs) {
+    fn scrub_env(&mut self, refs: &ScrubMap) {
         write::scrub_strings(
             self.warnings
                 .iter_mut()
@@ -524,7 +524,7 @@ impl ScrubEnv for ConfigApplyResponse {
 }
 
 impl ScrubEnv for ConfigValidateResponse {
-    fn scrub_env(&mut self, refs: &EnvRefs) {
+    fn scrub_env(&mut self, refs: &ScrubMap) {
         write::scrub_strings(
             self.warnings
                 .iter_mut()
@@ -1142,7 +1142,7 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let running = crate::config::Config::default();
-        let no_env = EnvRefs::new();
+        let no_env = ScrubMap::new();
         for (name, yaml, ok) in corpus {
             let path = dir.path().join("cfg.yaml");
             std::fs::write(&path, yaml).unwrap();

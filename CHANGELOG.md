@@ -117,12 +117,13 @@ apply.
 
 ### Security — Allowlisted env values no longer echo in validate responses
 
-An admin section validate (and a refused apply) replaces every resolved
+An admin config validate (and a refused apply) replaces every resolved
 `${env:…}` value with its reference before it answers. A value resolved
 through `DGP_CONFIG_ENV_ALLOWLIST`, which the boot config file did not use,
 was missing from that list, so the response showed the value in plain text,
 for example in a warning about a bucket alias. Now such values are hidden
-too.
+too, for a section write, a whole-document validate or apply, and every
+other config write.
 
 ### Fixed — Editing a masked webhook list cannot bring back a deleted URL
 

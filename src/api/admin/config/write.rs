@@ -36,7 +36,9 @@ use super::super::AdminState;
 use super::{SectionName, TransitionCtx};
 use crate::config::Config;
 
-pub(super) type EnvRefs = BTreeMap<String, String>;
+/// The env values a response is scrubbed of (`name -> value`): not the
+/// provenance (`crate::config::EnvRefs`), only what must never echo.
+pub(super) type ScrubMap = BTreeMap<String, String>;
 
 /// Which surface feeds the pipeline, with the raw body the steps that must
 /// tell an absent key from `null` read.
@@ -128,7 +130,7 @@ pub(super) struct ConfigWrite<'a> {
     pub headers: Option<&'a HeaderMap>,
     /// Extra `${env:NAME}` values the write may resolve (backup restore);
     /// also scrubbed from the response.
-    pub extra_env: &'a EnvRefs,
+    pub extra_env: &'a ScrubMap,
 }
 
 /// What the handler's build step returns.
@@ -220,7 +222,7 @@ pub(super) enum Outcome {
 /// A finished write: the outcome plus the env refs its response scrubs.
 pub(super) struct WriteResult {
     pub outcome: Outcome,
-    pub refs: EnvRefs,
+    pub refs: ScrubMap,
 }
 
 /// The output of [`prepare`].
@@ -307,7 +309,7 @@ async fn apply_locked(
     state: &Arc<AdminState>,
     cfg: &mut RwLockWriteGuard<'_, Config>,
     write: &ConfigWrite<'_>,
-    refs: &mut EnvRefs,
+    refs: &mut ScrubMap,
     build: impl FnOnce(&Config) -> Result<Built, Rejection>,
 ) -> Outcome {
     refs.extend(cfg.env_refs.clone());
@@ -390,7 +392,7 @@ pub(super) fn prepare(
     built: Built,
     write: &ConfigWrite<'_>,
 ) -> Result<Prepared, Rejection> {
-    prepare_with_refs(old, built, write, &mut EnvRefs::new())
+    prepare_with_refs(old, built, write, &mut ScrubMap::new())
 }
 
 /// [`prepare`] that adds every env value the section body resolved to
@@ -401,7 +403,7 @@ pub(super) fn prepare_with_refs(
     old: &Config,
     built: Built,
     write: &ConfigWrite<'_>,
-    refs: &mut EnvRefs,
+    refs: &mut ScrubMap,
 ) -> Result<Prepared, Rejection> {
     let steps = write.surface.steps();
     let Built {
@@ -493,6 +495,16 @@ pub(super) fn prepare_with_refs(
         }
         _ => {}
     }
+    // Every surface: the values this body resolved (a document's parse, a
+    // section's resolve, a name admitted by DGP_CONFIG_ENV_ALLOWLIST) are
+    // scrubbed from every later answer, a rejection included (review B6:
+    // only the section surface added them).
+    refs.extend(
+        incoming
+            .env_refs
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone())),
+    );
 
     // Secret preservation: the GET/export surfaces redact every secret, so a
     // round-trip must not clear them.
@@ -707,9 +719,9 @@ where
         },
         mode: Mode::Apply,
         headers: Some(write.headers),
-        extra_env: &EnvRefs::new(),
+        extra_env: &ScrubMap::new(),
     };
-    let mut refs = EnvRefs::new();
+    let mut refs = ScrubMap::new();
     let mut cfg = state.config.write().await;
     let mut held = hold.await;
     let old = cfg.clone();
@@ -848,10 +860,10 @@ async fn declarative_preview(state: &Arc<AdminState>, old: &Config, new: &Config
 /// S7 (review 4 config-2): a response body scrubs the resolved values of
 /// the recorded env refs out of every string it carries.
 pub(super) trait ScrubEnv {
-    fn scrub_env(&mut self, refs: &EnvRefs);
+    fn scrub_env(&mut self, refs: &ScrubMap);
 }
 
-pub(super) fn scrub_strings<'a>(items: impl IntoIterator<Item = &'a mut String>, refs: &EnvRefs) {
+pub(super) fn scrub_strings<'a>(items: impl IntoIterator<Item = &'a mut String>, refs: &ScrubMap) {
     for s in items {
         *s = crate::config::scrub_env_values(s, refs);
     }
@@ -861,7 +873,7 @@ pub(super) fn scrub_strings<'a>(items: impl IntoIterator<Item = &'a mut String>,
 pub(super) fn respond<T: serde::Serialize + ScrubEnv>(
     status: StatusCode,
     mut body: T,
-    refs: &EnvRefs,
+    refs: &ScrubMap,
     etag: Option<HeaderValue>,
 ) -> Response {
     body.scrub_env(refs);
@@ -873,7 +885,7 @@ pub(super) fn respond<T: serde::Serialize + ScrubEnv>(
 }
 
 impl ScrubEnv for serde_json::Value {
-    fn scrub_env(&mut self, refs: &EnvRefs) {
+    fn scrub_env(&mut self, refs: &ScrubMap) {
         super::scrub_env_json(self, refs);
     }
 }
@@ -907,12 +919,64 @@ mod tests {
     }
 
     fn write(surface: Surface<'_>, mode: Mode) -> ConfigWrite<'_> {
-        static EMPTY: std::sync::OnceLock<EnvRefs> = std::sync::OnceLock::new();
+        static EMPTY: std::sync::OnceLock<ScrubMap> = std::sync::OnceLock::new();
         ConfigWrite {
             surface,
             mode,
             headers: None,
             extra_env: EMPTY.get_or_init(Default::default),
+        }
+    }
+
+    /// Review B6 guard: whatever the surface, the env values the incoming
+    /// config resolved are in the scrub map after `prepare`, on success and
+    /// on a rejection. The match has no `_` arm: a new surface does not
+    /// compile until it is listed here.
+    #[test]
+    fn every_surface_scrubs_its_incoming_refs() {
+        let body = serde_json::json!({});
+        let surfaces = [
+            Surface::Patch,
+            Surface::Section {
+                section: super::SectionName::Storage,
+                body: &body,
+            },
+            Surface::Document { yaml: "" },
+            Surface::Internal {
+                action: "t",
+                target: "t",
+            },
+        ];
+        for surface in surfaces {
+            match surface {
+                Surface::Patch
+                | Surface::Section { .. }
+                | Surface::Document { .. }
+                | Surface::Internal { .. } => {}
+            }
+            let mut old = running();
+            // The section surface starts from the running provenance.
+            old.env_refs
+                .insert("B6_NAME".into(), "b6-secret-value-0001".into());
+            let mut incoming = old.clone();
+            incoming
+                .env_refs
+                .insert("B6_NAME".into(), "b6-secret-value-0001".into());
+            for mode in [Mode::DryRun, Mode::Apply] {
+                let mut refs = ScrubMap::new();
+                let _ = prepare_with_refs(
+                    &old,
+                    built(incoming.clone()),
+                    &write(surface, mode),
+                    &mut refs,
+                );
+                assert_eq!(
+                    refs.get("B6_NAME").map(String::as_str),
+                    Some("b6-secret-value-0001"),
+                    "a write (apply: {}) scrubs nothing it resolved",
+                    matches!(mode, Mode::Apply)
+                );
+            }
         }
     }
 
@@ -1095,7 +1159,7 @@ mod tests {
 
     #[tokio::test]
     async fn respond_scrubs_every_string_of_the_body() {
-        let refs: EnvRefs = [("S".to_string(), "sekret-value-1234".to_string())].into();
+        let refs: ScrubMap = [("S".to_string(), "sekret-value-1234".to_string())].into();
         let body = serde_json::json!({
             "error": "bad sekret-value-1234",
             "warnings": ["w sekret-value-1234"],

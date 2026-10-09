@@ -1731,3 +1731,57 @@ async fn allowlisted_env_values_never_echo_in_config_write_responses() {
     );
     assert!(!body.contains(SECRET), "validate echoed the value: {body}");
 }
+
+/// Review B6 (c43f7aae fixed the section surface only): a DOCUMENT validate
+/// or apply that resolves an allowlisted name echoed its value.
+#[tokio::test]
+async fn allowlisted_env_values_never_echo_in_document_writes() {
+    const SECRET: &str = "allowlisted-secret-value-b6doc";
+    let server = TestServer::builder()
+        .env("AWS_B6_SECRET", SECRET)
+        .env("DGP_CONFIG_ENV_ALLOWLIST", "AWS_*")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let url = |p: &str| format!("{}/_/api/admin/config/{p}", server.endpoint());
+    let export = admin
+        .get(url("export"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(&export).unwrap();
+    let storage = doc
+        .as_mapping_mut()
+        .unwrap()
+        .entry("storage".into())
+        .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
+    let buckets = storage
+        .as_mapping_mut()
+        .unwrap()
+        .entry("buckets".into())
+        .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
+    buckets.as_mapping_mut().unwrap().insert(
+        "releases".into(),
+        serde_yaml::from_str("alias: ${env:AWS_B6_SECRET}").unwrap(),
+    );
+    let yaml = serde_yaml::to_string(&doc).unwrap();
+    for op in ["validate", "apply"] {
+        let body = admin
+            .post(url(op))
+            .json(&json!({ "yaml": yaml }))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            body.contains("alias"),
+            "{op}: the alias warning is missing: {body}"
+        );
+        assert!(!body.contains(SECRET), "{op} echoed the value: {body}");
+    }
+}
