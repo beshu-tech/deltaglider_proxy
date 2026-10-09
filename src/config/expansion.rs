@@ -74,6 +74,10 @@ pub struct EnvRefs {
     values: std::collections::BTreeMap<String, String>,
     /// `name → default` of the recorded refs written with `:-default`.
     pub defaults: std::collections::BTreeMap<String, String>,
+    /// `name → path` in the config tree of a SHORT value (a region, a port):
+    /// such a value is re-emitted only there, and only while it is unchanged
+    /// (see [`super::Config::with_env_refs_reinserted`]).
+    pub paths: std::collections::BTreeMap<String, String>,
 }
 
 impl EnvRefs {
@@ -103,7 +107,7 @@ impl From<std::collections::BTreeMap<String, String>> for EnvRefs {
     fn from(values: std::collections::BTreeMap<String, String>) -> Self {
         Self {
             values,
-            defaults: Default::default(),
+            ..Default::default()
         }
     }
 }
@@ -276,6 +280,7 @@ pub(crate) fn expand_env_with_recording(
         EnvRefs {
             values: used,
             defaults,
+            paths: Default::default(),
         },
     ))
 }

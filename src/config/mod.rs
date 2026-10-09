@@ -1059,6 +1059,65 @@ pub fn unknown_flat_root_keys(doc: &serde_yaml::Value) -> Vec<String> {
         .collect()
 }
 
+/// Shortest env value treated as a secret when it occurs in several fields
+/// (see [`Config::with_env_refs_reinserted`]). 16: a region (`us-east-1`) or
+/// a host name shared by two fields is not a secret.
+const SHARED_REF_MIN_LEN: usize = 16;
+
+/// The label of a sequence item in an env-ref path: its `name` when it is a
+/// mapping with one (a backend, a user, a rule: stable when the list is
+/// reordered), else its index.
+fn push_seq_label(label: &mut String, index: usize, item: &serde_yaml::Value) {
+    match item.get("name").and_then(serde_yaml::Value::as_str) {
+        Some(name) => {
+            label.push_str("/[");
+            label.push_str(name);
+            label.push(']');
+        }
+        None => {
+            label.push_str("/#");
+            label.push_str(&index.to_string());
+        }
+    }
+}
+
+fn push_key_label(label: &mut String, key: &serde_yaml::Value) {
+    label.push('/');
+    match key.as_str() {
+        Some(k) => label.push_str(k),
+        None => label.push_str(&serde_yaml::to_string(key).unwrap_or_default()),
+    }
+}
+
+/// Every path (see [`push_seq_label`]) of a String scalar equal to `value`.
+fn env_ref_value_paths(
+    v: &serde_yaml::Value,
+    value: &str,
+    label: &mut String,
+    out: &mut Vec<String>,
+) {
+    match v {
+        serde_yaml::Value::String(s) if s == value => out.push(label.clone()),
+        serde_yaml::Value::Sequence(seq) => {
+            for (i, item) in seq.iter().enumerate() {
+                let len = label.len();
+                push_seq_label(label, i, item);
+                env_ref_value_paths(item, value, label, out);
+                label.truncate(len);
+            }
+        }
+        serde_yaml::Value::Mapping(map) => {
+            for (key, item) in map {
+                let len = label.len();
+                push_key_label(label, key);
+                env_ref_value_paths(item, value, label, out);
+                label.truncate(len);
+            }
+        }
+        _ => {}
+    }
+}
+
 impl Config {
     /// Load configuration from a file. YAML is the only supported format;
     /// a `.toml` path fails loudly with [`TOML_REMOVED_MSG`] (operators
@@ -1095,6 +1154,7 @@ impl Config {
         let (content, env_refs) = expand_env_vars_recording(&content)?;
         let mut cfg = Self::from_yaml_str(&content)?;
         cfg.env_refs = env_refs;
+        cfg.record_env_ref_paths();
         Ok(cfg)
     }
 
@@ -1318,6 +1378,7 @@ impl Config {
         report.refs_added.dedup();
 
         file_view.env_refs = env_refs;
+        file_view.record_env_ref_paths();
         file_view.apply_env_overrides_tracked(env);
         // What the ORIGINAL file held stays allowed; the edit cannot add to it.
         file_view.env_shadow.1 = running.env_shadow.1.clone();
@@ -2021,11 +2082,29 @@ impl Config {
     /// a ref (`listen_addr: SocketAddr`, an enum): that one target is
     /// skipped, never the whole reinsertion (which wrote every ref-sourced
     /// secret in plaintext).
+    /// Record where each SHORT env value sits in the config tree, when it
+    /// sits in exactly one field: [`Self::with_env_refs_reinserted`]
+    /// re-emits a short value only there. Called right after the refs are
+    /// recorded (file load, document apply, section resolve).
+    pub fn record_env_ref_paths(&mut self) {
+        let Ok(tree) = serde_yaml::to_value(&*self) else {
+            return;
+        };
+        let mut found: Vec<(String, String)> = Vec::new();
+        for (name, value) in self.env_refs.iter() {
+            if value.len() >= SHARED_REF_MIN_LEN || self.env_refs.paths.contains_key(name) {
+                continue;
+            }
+            let mut hits = Vec::new();
+            env_ref_value_paths(&tree, value, &mut String::new(), &mut hits);
+            if let [only] = hits.as_slice() {
+                found.push((name.clone(), only.clone()));
+            }
+        }
+        self.env_refs.paths.extend(found);
+    }
+
     pub fn with_env_refs_reinserted(&self) -> Self {
-        /// Shortest env value treated as a secret when it occurs in several
-        /// fields (see the count rule below). 16: a region (`us-east-1`) or a
-        /// host name shared by two fields is not a secret.
-        const SHARED_REF_MIN_LEN: usize = 16;
         if self.env_refs.is_empty() {
             return self.clone();
         }
@@ -2041,28 +2120,13 @@ impl Config {
             }
         }
 
-        // Count how many string scalars in the whole tree hold each env value.
-        // A SHORT value that appears in more than one field is ambiguous —
-        // rewriting `9000` or `us-east-1` everywhere would COUPLE an unrelated
-        // field to that env var — so it stays materialized. A secret-length
-        // value (>= SHARED_REF_MIN_LEN) is rewritten in every field (S9): the
-        // file used the ref twice, or a GUI edit copied the secret; either
-        // way plaintext on disk is the worse outcome.
-        fn count_values<'a>(
-            v: &'a serde_yaml::Value,
-            counts: &mut std::collections::HashMap<&'a str, u32>,
-        ) {
-            match v {
-                serde_yaml::Value::String(s) => *counts.entry(s.as_str()).or_insert(0) += 1,
-                serde_yaml::Value::Sequence(seq) => {
-                    seq.iter().for_each(|i| count_values(i, counts))
-                }
-                serde_yaml::Value::Mapping(map) => {
-                    map.iter().for_each(|(_, val)| count_values(val, counts))
-                }
-                _ => {}
-            }
-        }
+        // A SHORT value (a region, a port) is re-emitted only at the path
+        // recorded for it, while the value there is unchanged: matched by
+        // value alone, an edit of the ref's own field turned another field
+        // that holds the same literal into the ref. A secret-length value
+        // (>= SHARED_REF_MIN_LEN) is rewritten in every field (S9): the file
+        // used the ref twice, or a GUI edit copied the secret; either way
+        // plaintext on disk is the worse outcome.
 
         /// One step of a path into the value tree.
         enum Seg {
@@ -2070,19 +2134,25 @@ impl Config {
             Idx(usize),
         }
 
-        /// The path of every String scalar to rewrite, with its ref.
+        /// The path of every String scalar to rewrite, with its ref. A
+        /// secret-length value is rewritten wherever it is; a short one only
+        /// at the path recorded for its name (`label` is that path so far).
         fn collect(
             v: &serde_yaml::Value,
             path: &mut Vec<Seg>,
-            inverse: &std::collections::BTreeMap<&str, String>,
-            counts: &std::collections::HashMap<&str, u32>,
+            label: &mut String,
+            refs: (&std::collections::BTreeMap<&str, String>, &EnvRefs),
             out: &mut Vec<(Vec<Seg>, String)>,
         ) {
+            let (inverse, env_refs) = refs;
             match v {
                 serde_yaml::Value::String(s) => {
-                    if counts.get(s.as_str()).copied().unwrap_or(0) == 1
-                        || s.len() >= SHARED_REF_MIN_LEN
-                    {
+                    let at_recorded_path = || {
+                        env_refs.iter().any(|(name, value)| {
+                            value == s && env_refs.paths.get(name) == Some(label)
+                        })
+                    };
+                    if s.len() >= SHARED_REF_MIN_LEN || at_recorded_path() {
                         if let Some(reference) = inverse.get(s.as_str()) {
                             let copy = path
                                 .iter()
@@ -2097,16 +2167,22 @@ impl Config {
                 }
                 serde_yaml::Value::Sequence(seq) => {
                     for (i, item) in seq.iter().enumerate() {
+                        let len = label.len();
+                        push_seq_label(label, i, item);
                         path.push(Seg::Idx(i));
-                        collect(item, path, inverse, counts, out);
+                        collect(item, path, label, refs, out);
                         path.pop();
+                        label.truncate(len);
                     }
                 }
                 serde_yaml::Value::Mapping(map) => {
                     for (key, value) in map {
+                        let len = label.len();
+                        push_key_label(label, key);
                         path.push(Seg::Key(key.clone()));
-                        collect(value, path, inverse, counts, out);
+                        collect(value, path, label, refs, out);
                         path.pop();
+                        label.truncate(len);
                     }
                 }
                 _ => {}
@@ -2131,11 +2207,13 @@ impl Config {
             }
         };
         let mut targets = Vec::new();
-        {
-            let mut counts: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
-            count_values(&tree, &mut counts);
-            collect(&tree, &mut Vec::new(), &inverse, &counts, &mut targets);
-        }
+        collect(
+            &tree,
+            &mut Vec::new(),
+            &mut String::new(),
+            (&inverse, &self.env_refs),
+            &mut targets,
+        );
         let original = tree.clone();
         for (path, reference) in &targets {
             if let Some(slot) = at(&mut tree, path) {
@@ -2247,6 +2325,7 @@ impl Config {
         let mut resolved: Config =
             serde_yaml::from_value(tree).map_err(|e| ConfigError::Parse(e.to_string()))?;
         resolved.env_refs = refs;
+        resolved.record_env_ref_paths();
         resolved.env_shadow = std::mem::take(&mut self.env_shadow);
         *self = resolved;
         Ok(())

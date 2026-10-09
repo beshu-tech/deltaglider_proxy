@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed — A short `${env:…}` value goes back only where it came from
+
+When the proxy saves its configuration, it writes `${env:NAME}` back in
+place of each value that came from the environment. It found those values
+by their text. After an operator changed the field that a short value such
+as `us-east-1` had filled, the proxy could write `${env:DR_REGION}` into
+another field that held the same text, for example the region of another
+backend. Now the proxy remembers where each short value came from and
+writes the reference back only there, and only while the value is
+unchanged. A secret-length value is still replaced wherever it appears.
+
 ### Fixed — Config validate refuses what the apply refuses
 
 The admin validate endpoints (`POST /config/validate` and

@@ -466,10 +466,18 @@ pub(super) fn prepare_with_refs(
         // recorded names win over stale ones.
         Surface::Document { .. } if steps.merge_env_refs => {
             for (name, value) in &old.env_refs {
-                incoming
-                    .env_refs
-                    .entry(name.clone())
-                    .or_insert_with(|| value.clone());
+                if !incoming.env_refs.contains_key(name) {
+                    incoming.env_refs.insert(name.clone(), value.clone());
+                    if let Some(path) = old.env_refs.paths.get(name) {
+                        incoming.env_refs.paths.insert(name.clone(), path.clone());
+                    }
+                    if let Some(default) = old.env_refs.defaults.get(name) {
+                        incoming
+                            .env_refs
+                            .defaults
+                            .insert(name.clone(), default.clone());
+                    }
+                }
             }
         }
         _ => {}

@@ -67,6 +67,7 @@ fn load_template() -> Config {
     let (expanded, refs) = expand_env_with_recording(TEMPLATE, lookup).expect("template expands");
     let mut cfg = Config::from_yaml_str(&expanded).expect("expanded template parses");
     cfg.env_refs = refs;
+    cfg.record_env_ref_paths();
     cfg
 }
 
@@ -142,6 +143,7 @@ fn collision_resolves_deterministically() {
     };
     cfg.env_refs.insert("ZED".into(), "same-value".into());
     cfg.env_refs.insert("ALPHA".into(), "same-value".into());
+    cfg.record_env_ref_paths();
     let out = cfg.with_env_refs_reinserted();
     assert_eq!(out.access_key_id.as_deref(), Some("${env:ALPHA}"));
 }
@@ -181,6 +183,7 @@ fn ambiguous_value_in_two_fields_is_not_reinserted() {
         ..Default::default()
     };
     cfg.env_refs.insert("SHARED".into(), "hunter2".into());
+    cfg.record_env_ref_paths();
     let out = cfg.with_env_refs_reinserted();
     assert_eq!(
         out.access_key_id.as_deref(),
@@ -195,6 +198,7 @@ fn ambiguous_value_in_two_fields_is_not_reinserted() {
         ..Default::default()
     };
     cfg2.env_refs.insert("UNIQ".into(), "only-here".into());
+    cfg2.record_env_ref_paths();
     assert_eq!(
         cfg2.with_env_refs_reinserted().access_key_id.as_deref(),
         Some("${env:UNIQ}")
@@ -232,8 +236,51 @@ fn a_defaulted_ref_keeps_its_default_through_persist() {
     let (exp, refs) = crate::config::expansion::expand_env_with_recording(tpl, set).unwrap();
     let mut cfg = Config::from_yaml_str(&exp).unwrap();
     cfg.env_refs = refs;
+    cfg.record_env_ref_paths();
     let out = cfg.to_canonical_yaml_for_persist_with(&|_| None).unwrap();
     assert!(out.contains("${env:LOG_LEVEL:-info}"), "{out}");
     crate::config::expansion::expand_env_with_recording(&out, |_| None)
         .expect("the persisted file needs LOG_LEVEL at the next boot");
+}
+
+/// B084: a short env value is re-emitted only where the ref was. After the
+/// GUI changed aws-dr's region (the field the ref filled), the value left
+/// in env_refs must not turn the minio backend's own literal region into
+/// `${env:DR_REGION}`.
+#[test]
+fn a_short_ref_is_not_reinserted_into_an_unrelated_field() {
+    let tpl = "storage:\n  backends:\n  - name: aws-dr\n    type: s3\n    region: ${env:DR_REGION}\n  - name: minio\n    type: s3\n    endpoint: http://minio:9000\n    region: eu-central-1\n";
+    let set = |n: &str| (n == "DR_REGION").then(|| "us-east-1".to_string());
+    let (exp, refs) = crate::config::expansion::expand_env_with_recording(tpl, set).unwrap();
+    let mut cfg = Config::from_yaml_str(&exp).unwrap();
+    cfg.env_refs = refs;
+    cfg.record_env_ref_paths();
+    // The GUI edits: aws-dr moves to eu-west-1, minio to us-east-1.
+    for b in &mut cfg.backends {
+        if let BackendConfig::S3 { region, .. } = &mut b.backend {
+            *region = if b.name == "aws-dr" {
+                "eu-west-1"
+            } else {
+                "us-east-1"
+            }
+            .into();
+        }
+    }
+    let out = cfg.with_env_refs_reinserted();
+    for b in &out.backends {
+        if let BackendConfig::S3 { region, .. } = &b.backend {
+            assert!(!region.contains("${env:"), "{}: {region}", b.name);
+        }
+    }
+    // Unedited, the ref goes back where it was.
+    let mut cfg = Config::from_yaml_str(&exp).unwrap();
+    cfg.env_refs = crate::config::expansion::expand_env_with_recording(tpl, set)
+        .unwrap()
+        .1;
+    cfg.record_env_ref_paths();
+    let out = cfg.with_env_refs_reinserted();
+    let aws = out.backends.iter().find(|b| b.name == "aws-dr").unwrap();
+    assert!(
+        matches!(&aws.backend, BackendConfig::S3 { region, .. } if region == "${env:DR_REGION}")
+    );
 }

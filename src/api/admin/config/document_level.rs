@@ -264,6 +264,7 @@ fn parse_and_validate_yaml(
             })
         })?;
     cfg.env_refs = env_refs.clone();
+    cfg.record_env_ref_paths();
     // The rule gates need the RUNNING config (a new defect vs. a standing
     // one): the write pipeline runs them.
     Ok((cfg, warnings.into_iter().map(scrub).collect()))

@@ -1131,6 +1131,7 @@ fn hydrate_restore_doc(
         }
     }
     cfg.env_refs.extend(refs.clone());
+    cfg.record_env_ref_paths();
     // The persist serializer, not the export one: export strips the AES keys
     // just hydrated (D13). It also escapes `$`, so apply's env pass returns
     // the hydrated values unchanged (only the refs above expand).
