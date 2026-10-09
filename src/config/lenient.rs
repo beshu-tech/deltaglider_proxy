@@ -37,6 +37,31 @@ pub(crate) fn bool_or_string<'de, D: de::Deserializer<'de>>(d: D) -> Result<bool
     }
 }
 
+/// A number as a buffered shape delivers it: a number, or (from an
+/// `!envref` value) a string that parses as one.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum NumWire<T> {
+    Num(T),
+    Str(String),
+}
+
+impl<T> NumWire<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    fn into_num<E: de::Error>(self) -> Result<T, E> {
+        match self {
+            NumWire::Num(n) => Ok(n),
+            NumWire::Str(s) => s
+                .trim()
+                .parse()
+                .map_err(|e| E::custom(format!("{s:?} is not a valid number: {e}"))),
+        }
+    }
+}
+
 /// `deserialize_with` for a number field that serde buffers (inside an
 /// untagged or internally tagged enum, or a struct only such an enum holds):
 /// an `!envref` value reaches it as a string, so `count: ${env:KEEP}` failed
@@ -48,30 +73,22 @@ where
     T: std::str::FromStr + serde::Deserialize<'de>,
     T::Err: std::fmt::Display,
 {
-    #[derive(serde::Deserialize)]
-    #[serde(untagged)]
-    enum Wire<T> {
-        Num(T),
-        Str(String),
-    }
-    match <Wire<T> as serde::Deserialize>::deserialize(d)? {
-        Wire::Num(n) => Ok(n),
-        Wire::Str(s) => s
-            .trim()
-            .parse()
-            .map_err(|e| de::Error::custom(format!("{s:?} is not a valid number: {e}"))),
-    }
+    <NumWire<T> as serde::Deserialize>::deserialize(d)?.into_num()
 }
 
 /// [`num_or_string`] for an `Option` field (with `#[serde(default)]`: an
-/// absent field stays `None`).
+/// absent field stays `None`). `null` and `~` are `None`, as for a plain
+/// `Option` field (review A4: the first version refused them, and a config
+/// that loaded before failed to load).
 pub(crate) fn opt_num_or_string<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
 where
     D: de::Deserializer<'de>,
     T: std::str::FromStr + serde::Deserialize<'de>,
     T::Err: std::fmt::Display,
 {
-    num_or_string(d).map(Some)
+    <Option<NumWire<T>> as serde::Deserialize>::deserialize(d)?
+        .map(NumWire::into_num)
+        .transpose()
 }
 
 /// `schema_with` for a [`bool_or_string`] field: the schema accepts what
@@ -515,6 +532,90 @@ impl<'de> de::VariantAccess<'de> for VariantAccess {
 
 #[cfg(test)]
 mod tests {
+    /// Review A4: a lenient helper is never stricter than the plain type it
+    /// stands in for. For each input, when the plain field (unbuffered)
+    /// accepts it, the helper inside a buffered shape (an untagged enum)
+    /// accepts it too, with the same value.
+    #[test]
+    fn helpers_are_never_stricter_than_their_plain_type() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        struct PlainOpt {
+            #[serde(default)]
+            v: Option<u64>,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum BufferedOpt {
+            Only {
+                #[serde(default, deserialize_with = "super::opt_num_or_string")]
+                v: Option<u64>,
+            },
+        }
+        #[derive(Deserialize)]
+        struct PlainNum {
+            v: u32,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum BufferedNum {
+            Only {
+                #[serde(deserialize_with = "super::num_or_string")]
+                v: u32,
+            },
+        }
+        #[derive(Deserialize)]
+        struct PlainBool {
+            v: bool,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum BufferedBool {
+            Only {
+                #[serde(deserialize_with = "super::bool_or_string")]
+                v: bool,
+            },
+        }
+
+        let inputs = [
+            "v: 5",
+            "v: '5'",
+            "v: null",
+            "v: ~",
+            "{}",
+            "v: true",
+            "v: !envref '5'",
+            "v: !envref ''",
+            "v: !envref 'null'",
+            "v: !envref 'true'",
+        ];
+        let doc = |text: &str| serde_yaml::from_str::<serde_yaml::Value>(text).unwrap();
+        for text in inputs {
+            if let Ok(PlainOpt { v }) = super::from_value::<PlainOpt>(doc(text)) {
+                let got = super::from_value::<BufferedOpt>(doc(text));
+                assert!(
+                    matches!(got, Ok(BufferedOpt::Only { v: b }) if b == v),
+                    "Option<u64> {text:?}: plain {v:?}, helper refused or differs"
+                );
+            }
+            if let Ok(PlainNum { v }) = super::from_value::<PlainNum>(doc(text)) {
+                let got = super::from_value::<BufferedNum>(doc(text));
+                assert!(
+                    matches!(got, Ok(BufferedNum::Only { v: b }) if b == v),
+                    "u32 {text:?}: plain {v}, helper refused or differs"
+                );
+            }
+            if let Ok(PlainBool { v }) = super::from_value::<PlainBool>(doc(text)) {
+                let got = super::from_value::<BufferedBool>(doc(text));
+                assert!(
+                    matches!(got, Ok(BufferedBool::Only { v: b }) if b == v),
+                    "bool {text:?}: plain {v}, helper refused or differs"
+                );
+            }
+        }
+    }
+
     /// serde buffers an internally tagged or untagged enum before it knows
     /// the variant, so a `!envref` reaches its fields as a string. Every
     /// `bool` or number field in such an enum, or in a struct that only such

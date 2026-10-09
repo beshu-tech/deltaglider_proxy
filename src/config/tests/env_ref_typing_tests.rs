@@ -117,3 +117,24 @@ fn env_refs_in_buffered_numeric_and_bool_fields_load() {
         }
     }
 }
+
+/// Review A4: an empty optional number in a buffered shape loads as unset,
+/// as it did before B036. `null`, `~` and an env ref that expands to
+/// nothing or to `null` failed with "did not match any variant".
+#[test]
+fn an_empty_optional_number_in_a_buffered_field_loads() {
+    let lookup = |n: &str| match n {
+        "NULLWORD" => Some("null".to_string()),
+        _ => None,
+    };
+    for value in ["null", "~", "${env:UNSET:-}", "${env:NULLWORD}"] {
+        let doc = format!(
+            "storage:\n  lifecycle:\n    rules:\n    - name: keep\n      bucket: b\n      action:\n        type: retain-newest\n        count: 3\n        qualify:\n          min_size_bytes: {value}\n"
+        );
+        let (exp, _) = crate::config::expansion::expand_env_with_recording(&doc, lookup).unwrap();
+        let cfg =
+            Config::from_yaml_str(&exp).unwrap_or_else(|e| panic!("{value}\n-> {exp}\n-> {e}"));
+        let action = format!("{:?}", cfg.lifecycle.rules[0].action);
+        assert!(action.contains("min_size_bytes: None"), "{value}: {action}");
+    }
+}
