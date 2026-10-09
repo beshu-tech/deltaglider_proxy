@@ -12,9 +12,23 @@
 use serde::Deserialize;
 
 /// Bucket name that passes the S3 naming rules (`security::validate_bucket_name`).
+/// Opaque: a handler reads the name only through [`AdminBucket::admit`],
+/// which also refuses the coordination bucket (review B3: four endpoints
+/// skipped a per-handler check).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String")]
 pub struct AdminBucket(String);
+
+impl AdminBucket {
+    /// Admit the bucket for this request: `403` for the coordination
+    /// bucket, which no admin request may read or write.
+    pub(crate) fn admit<B: super::ErrorBody>(
+        self,
+        state: &super::AdminState,
+    ) -> Result<crate::bucket_policy::ClientBucket, super::AdminError<B>> {
+        super::admit_bucket(state, &self.0)
+    }
+}
 
 /// Object key or prefix with no path-escape shape (see [`check_object_path`]).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
@@ -94,7 +108,6 @@ macro_rules! str_newtype {
         }
     };
 }
-str_newtype!(AdminBucket);
 str_newtype!(AdminObjectPath);
 
 #[cfg(test)]
@@ -134,7 +147,7 @@ mod tests {
         assert!(serde_json::from_str::<AdminBucket>(r#""/etc""#).is_err());
         assert!(serde_json::from_str::<AdminObjectPath>(r#""../x""#).is_err());
         let b: AdminBucket = serde_json::from_str(r#""releases""#).unwrap();
-        assert_eq!(&*b, "releases");
+        assert_eq!(b, AdminBucket("releases".into()));
     }
 
     /// Source guard: every inbound admin request struct (derives Deserialize

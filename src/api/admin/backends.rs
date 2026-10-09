@@ -278,15 +278,7 @@ pub async fn create_bucket_on_backend(
     if bucket.is_empty() {
         return Err(AdminError::invalid("Bucket name cannot be empty"));
     }
-    if let Some(reason) = state
-        .s3_state
-        .engine
-        .load()
-        .bucket_policy_registry()
-        .reserved_bucket_reason(&bucket)
-    {
-        return Err(AdminError::forbidden(reason));
-    }
+    let bucket = super::admit_bucket::<super::Text>(&state, &bucket)?.into_string();
     let backend_name = body.backend_name.trim().to_string();
     if backend_name.is_empty() {
         return Err(AdminError::invalid("backend_name cannot be empty"));

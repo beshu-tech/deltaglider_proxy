@@ -237,27 +237,23 @@ pub(crate) async fn push_config_sync_now(state: &Arc<AdminState>) -> SyncPush {
     }
 }
 
-/// Trigger an async config DB upload to S3 if sync is enabled.
-/// Spawns a background task so the caller is not blocked.
-/// No-op when config_db_mismatch is true (prevents overwriting good DB with empty one).
-/// 403 when `bucket` is the coordination bucket (`config_sync_bucket`). It
-/// holds the synced IAM database, the leases and the locks, so no admin job,
-/// scan or bulk operation may read or rewrite it. Admin endpoints bypass the
-/// S3 request gate, so every one that takes a bucket checks here.
-pub(crate) fn reject_reserved_bucket<B: ErrorBody>(
+/// Admit a bucket name for an admin request (the name came as a raw
+/// string, not an [`path_guard::AdminBucket`]): `403` when it is the
+/// coordination bucket (`config_sync_bucket`). It holds the synced IAM
+/// database, the leases and the locks, so no admin job, scan or bulk
+/// operation may read or rewrite it. Admin endpoints bypass the S3 request
+/// gate; `AdminBucket::admit` and this are their one way to a bucket name.
+pub(crate) fn admit_bucket<B: ErrorBody>(
     state: &AdminState,
     bucket: &str,
-) -> Result<(), AdminError<B>> {
-    match state
+) -> Result<crate::bucket_policy::ClientBucket, AdminError<B>> {
+    state
         .s3_state
         .engine
         .load()
         .bucket_policy_registry()
-        .reserved_bucket_reason(bucket)
-    {
-        Some(reason) => Err(AdminError::forbidden(reason)),
-        None => Ok(()),
-    }
+        .client_bucket(bucket)
+        .map_err(AdminError::forbidden)
 }
 
 /// Middleware: a state-changing admin request runs to its end even when the
@@ -285,6 +281,9 @@ pub async fn run_to_completion(
     }
 }
 
+/// Trigger an async config DB upload to S3 if sync is enabled.
+/// Spawns a background task so the caller is not blocked.
+/// No-op when config_db_mismatch is true (prevents overwriting good DB with empty one).
 pub(crate) fn trigger_config_sync(state: &Arc<AdminState>) {
     if state.config_db_mismatch {
         tracing::warn!("Config sync blocked — the config DB key does not open the config DB (recovery required)");

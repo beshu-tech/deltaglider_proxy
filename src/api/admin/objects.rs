@@ -39,6 +39,7 @@ use tracing::{debug, info, warn};
 use super::auth::BulkSession;
 use super::path_guard::{AdminBucket, AdminObjectPath};
 use super::AdminError;
+use crate::bucket_policy::ClientBucket;
 use crate::iam::{AuthenticatedUser, S3Action};
 
 // ---------------------------------------------------------------------------
@@ -105,6 +106,12 @@ pub struct MoveResponse {
 pub struct DeleteRequest {
     pub bucket: AdminBucket,
     pub keys: Vec<AdminObjectPath>,
+}
+
+/// A bulk delete with its bucket admitted.
+struct DeletePlan {
+    bucket: ClientBucket,
+    keys: Vec<AdminObjectPath>,
 }
 
 #[derive(Debug, Serialize)]
@@ -350,14 +357,30 @@ fn reject_if_under_maintenance(
     Ok(())
 }
 
-/// 403 for the coordination bucket (`config_sync_bucket`): reserved for the
-/// proxy's own sync client, for every identity. Admin bulk ops bypass the S3
-/// gate, so they check explicitly.
-fn reject_if_reserved(
-    state: &std::sync::Arc<crate::api::admin::AdminState>,
-    bucket: &str,
-) -> Result<(), AdminError> {
-    super::reject_reserved_bucket(state, bucket)
+/// A copy or move with its two buckets admitted (not the coordination
+/// bucket): the copy loop reads names only from here.
+struct BulkPlan {
+    source_bucket: ClientBucket,
+    dest_bucket: ClientBucket,
+    dest_prefix: AdminObjectPath,
+    items: Vec<CopyItem>,
+}
+
+impl BulkPlan {
+    fn admit(
+        state: &crate::api::admin::AdminState,
+        source_bucket: AdminBucket,
+        dest_bucket: AdminBucket,
+        dest_prefix: AdminObjectPath,
+        items: Vec<CopyItem>,
+    ) -> Result<Self, AdminError> {
+        Ok(Self {
+            source_bucket: source_bucket.admit(state)?,
+            dest_bucket: dest_bucket.admit(state)?,
+            dest_prefix,
+            items,
+        })
+    }
 }
 
 /// 403 when the bucket is `replication_target_only` — admin bulk ops are
@@ -376,8 +399,13 @@ pub async fn copy_objects(
     headers: axum::http::HeaderMap,
     AdminJson(req): AdminJson<CopyRequest>,
 ) -> Result<Json<CopyResponse>, AdminError> {
-    reject_if_reserved(&state, &req.source_bucket)?;
-    reject_if_reserved(&state, &req.dest_bucket)?;
+    let req = BulkPlan::admit(
+        &state,
+        req.source_bucket,
+        req.dest_bucket,
+        req.dest_prefix,
+        req.items,
+    )?;
     reject_if_under_maintenance(&state, &req.dest_bucket)?;
     reject_if_replication_target_only(&state, &req.dest_bucket)?;
     if req.items.is_empty() {
@@ -419,7 +447,7 @@ pub async fn copy_objects(
 /// `delete_source`: a move, so the actor also needs delete on each source.
 async fn run_copy_loop(
     s3: &Arc<AppState>,
-    req: &CopyRequest,
+    req: &BulkPlan,
     actor: &BulkActor,
     delete_source: bool,
 ) -> (CopyResponse, Vec<Option<crate::types::FileMetadata>>) {
@@ -596,8 +624,13 @@ pub async fn move_objects(
     headers: axum::http::HeaderMap,
     AdminJson(req): AdminJson<MoveRequest>,
 ) -> Result<Json<MoveResponse>, AdminError> {
-    reject_if_reserved(&state, &req.source_bucket)?;
-    reject_if_reserved(&state, &req.dest_bucket)?;
+    let req = BulkPlan::admit(
+        &state,
+        req.source_bucket,
+        req.dest_bucket,
+        req.dest_prefix,
+        req.items,
+    )?;
     reject_if_under_maintenance(&state, &req.dest_bucket)?;
     reject_if_under_maintenance(&state, &req.source_bucket)?;
     // Move = store into dest + delete from source: both are client writes.
@@ -619,21 +652,8 @@ pub async fn move_objects(
     validate_plan(&req.items, &source_storage, &dest_storage, &req.dest_prefix)?;
 
     let s3 = state.s3_state.clone();
-    let copy_req = CopyRequest {
-        source_bucket: req.source_bucket.clone(),
-        dest_bucket: req.dest_bucket.clone(),
-        dest_prefix: req.dest_prefix.clone(),
-        items: req
-            .items
-            .iter()
-            .map(|i| CopyItem {
-                source_key: i.source_key.clone(),
-                relative: i.relative.clone(),
-            })
-            .collect(),
-    };
     let actor = BulkActor::for_session(&state, &session)?;
-    let (copy_result, copied) = run_copy_loop(&s3, &copy_req, &actor, true).await;
+    let (copy_result, copied) = run_copy_loop(&s3, &req, &actor, true).await;
 
     // Atomicity rule: only delete sources if EVERY copy succeeded.
     // Pre-migration the client implemented this same rule client-side;
@@ -761,7 +781,11 @@ pub async fn bulk_delete(
     headers: axum::http::HeaderMap,
     AdminJson(req): AdminJson<DeleteRequest>,
 ) -> Result<Json<DeleteResponse>, AdminError> {
-    reject_if_reserved(&state, &req.bucket)?;
+    let bucket = req.bucket.admit(&state)?;
+    let req = DeletePlan {
+        bucket,
+        keys: req.keys,
+    };
     reject_if_under_maintenance(&state, &req.bucket)?;
     reject_if_replication_target_only(&state, &req.bucket)?;
     if req.keys.is_empty() {
@@ -968,7 +992,7 @@ pub async fn download_zip(
         super::path_guard::check_bucket(b)
             .and_then(|()| super::path_guard::check_object_path(k))
             .map_err(AdminError::invalid)?;
-        reject_if_reserved(&state, b)?;
+        super::admit_bucket::<super::Text>(&state, b)?;
     }
     if parsed.len() > MAX_BULK_OBJECTS {
         return Err(AdminError::invalid(format!(
@@ -1248,13 +1272,13 @@ pub async fn list_all(
         ));
     }
 
-    reject_if_reserved(&state, &q.bucket)?;
+    let bucket = q.bucket.admit(&state)?;
     let actor = BulkActor::for_session(&state, &session)?;
-    if !actor.may_list(&q.bucket, &q.prefix) {
+    if !actor.may_list(&bucket, &q.prefix) {
         return Err(AdminError::forbidden(format!(
             "AccessDenied: {} may not list {}/{}",
             actor.label(),
-            &*q.bucket,
+            &*bucket,
             &*q.prefix
         )));
     }
@@ -1265,7 +1289,7 @@ pub async fn list_all(
     loop {
         let page = engine
             .list_objects(
-                &q.bucket,
+                &bucket,
                 &q.prefix,
                 None,
                 cap,
@@ -1276,7 +1300,7 @@ pub async fn list_all(
             .map_err(|e| AdminError::internal(format!("{}", e)))?;
         for (k, _) in &page.objects {
             // The S3 LIST filter: a key the actor cannot see is left out.
-            if !actor.may_see(&q.bucket, k) {
+            if !actor.may_see(&bucket, k) {
                 continue;
             }
             if push_listed_key(&mut keys, k.clone()) {

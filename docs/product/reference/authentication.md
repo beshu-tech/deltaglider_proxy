@@ -187,7 +187,7 @@ S3-path errors are returned as standard S3 XML error documents:
 | `InvalidArgument` | 400 | Malformed Authorization header, unparseable date/expiry, or replayed mutating signature |
 | `SlowDown` | 503 | The client address is locked out after too many refused signatures. The response carries `Retry-After`, and the message names the wait. |
 
-The proxy answers `403 AccessDenied` to every S3 request to the coordination bucket (`config_sync_bucket`), for every identity, because that bucket holds the synced IAM database, the replication leases, and the reference locks. The bucket is also left out of ListBuckets.
+The proxy answers `403 AccessDenied` to every S3 request to the coordination bucket (`config_sync_bucket`), for every identity, because that bucket holds the synced IAM database, the replication leases, and the reference locks. The bucket is also left out of ListBuckets. Every admin API request that names that bucket answers `403` too: jobs, scans, usage and savings reads, and the bulk object operations.
 
 The S3 lockout counts only a request whose signature the proxy checked and refused. A request without credentials, with a malformed `Authorization` header, or with an unknown access key does not count, so anonymous traffic behind a shared load-balancer address cannot lock that address out.
 

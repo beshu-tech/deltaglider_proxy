@@ -35,14 +35,15 @@ pub async fn scan_usage(
     State(state): State<Arc<AdminState>>,
     AdminJson(req): AdminJson<ScanUsageRequest>,
 ) -> axum::response::Response {
-    if let Err(e) = super::reject_reserved_bucket::<JsonError>(&state, req.bucket.as_str()) {
-        return e.into_response();
-    }
+    let bucket = match req.bucket.admit::<JsonError>(&state) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
     let prefix = req.prefix.unwrap_or_default().into_string();
     let started =
         state
             .usage_scanner
-            .enqueue_scan(req.bucket.into_string(), prefix, state.s3_state.clone());
+            .enqueue_scan(bucket.into_string(), prefix, state.s3_state.clone());
     if started {
         (
             StatusCode::ACCEPTED,
@@ -65,13 +66,14 @@ pub async fn migrate_legacy(
     State(state): State<Arc<AdminState>>,
     AdminJson(req): AdminJson<MigrateRequest>,
 ) -> Result<Json<serde_json::Value>, AdminError<JsonError>> {
+    let bucket = req.bucket.admit(&state)?;
     let engine = state.s3_state.engine.load();
     let (migrated, skipped, errors) = engine
-        .migrate_legacy_references(&req.bucket)
+        .migrate_legacy_references(&bucket)
         .await
         .map_err(|e| AdminError::internal(e.to_string()))?;
     Ok(Json(serde_json::json!({
-        "bucket": req.bucket,
+        "bucket": bucket,
         "migrated": migrated,
         "skipped": skipped,
         "errors": errors,
@@ -88,8 +90,12 @@ pub async fn get_usage(
     State(state): State<Arc<AdminState>>,
     AdminQuery(q): AdminQuery<UsageQuery>,
 ) -> impl IntoResponse {
+    let bucket = match q.bucket.admit::<JsonError>(&state) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
     let prefix = q.prefix.unwrap_or_default();
-    match state.usage_scanner.get(&q.bucket, &prefix) {
+    match state.usage_scanner.get(&bucket, &prefix) {
         Some(entry) => (StatusCode::OK, Json(serde_json::json!(entry))).into_response(),
         None => {
             // "Not cached yet" is an expected state (no scan has run, or the
@@ -98,7 +104,7 @@ pub async fn get_usage(
             // `cached: false` so the client can treat it as "no data yet"
             // without a console trace. (Mirrors the reasoning behind
             // delta_efficiency's 202 — 404/"not found" is the wrong semantic.)
-            let scanning = state.usage_scanner.is_scanning(&q.bucket, &prefix);
+            let scanning = state.usage_scanner.is_scanning(&bucket, &prefix);
             (
                 StatusCode::OK,
                 Json(serde_json::json!({"cached": false, "scanning": scanning})),
@@ -140,6 +146,7 @@ pub async fn get_bucket_usage(
     State(state): State<Arc<AdminState>>,
     Path(bucket): Path<AdminBucket>,
 ) -> Result<Json<serde_json::Value>, AdminError<JsonError>> {
+    let bucket = bucket.admit(&state)?;
     let Some(usage) = state.s3_state.bucket_usage.as_ref() else {
         return Ok(Json(
             serde_json::json!({"bucket": bucket, "disabled": true}),
@@ -157,16 +164,16 @@ pub async fn refresh_bucket_usage(
     State(state): State<Arc<AdminState>>,
     AdminQuery(q): AdminQuery<UsageQuery>,
 ) -> Result<Json<serde_json::Value>, AdminError<JsonError>> {
-    super::reject_reserved_bucket(&state, &q.bucket)?;
+    let bucket = q.bucket.admit(&state)?;
     let Some(usage) = state.s3_state.bucket_usage.as_ref() else {
         return Ok(Json(
-            serde_json::json!({"bucket": q.bucket, "disabled": true}),
+            serde_json::json!({"bucket": bucket, "disabled": true}),
         ));
     };
     // The ticket marks the scan start: a write that lands while the scan
     // runs is kept on top of the scan result (H14b).
-    let ticket = usage.begin_scan(&q.bucket);
-    let totals = scan_bucket_totals(&state.s3_state, &q.bucket)
+    let ticket = usage.begin_scan(&bucket);
+    let totals = scan_bucket_totals(&state.s3_state, &bucket)
         .await
         .map_err(AdminError::internal)?;
     let now = crate::replication::current_unix_seconds();
@@ -174,9 +181,9 @@ pub async fn refresh_bucket_usage(
         .overwrite_from_scan(ticket, &totals, now)
         .map_err(|e| AdminError::internal(e.to_string()))?;
     let row = usage
-        .read(&q.bucket)
+        .read(&bucket)
         .map_err(|e| AdminError::internal(e.to_string()))?;
-    Ok(Json(usage_json(&q.bucket, row)))
+    Ok(Json(usage_json(&bucket, row)))
 }
 
 /// Full, UNCAPPED bucket scan -> `SavingsTotals` (logical + stored + counts,

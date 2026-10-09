@@ -178,14 +178,15 @@ pub async fn get_savings(
     AdminQuery(q): AdminQuery<SavingsQuery>,
 ) -> Result<Json<SavingsResponse>, AdminError<JsonError>> {
     // `AdminBucket` refuses an empty name at extraction (400
-    // `invalid_bucket`), so `q.bucket` is never empty here.
+    // `invalid_bucket`), so the bucket is never empty here.
+    let bucket = q.bucket.admit(&state)?;
     let s3_state = state.s3_state.clone();
-    let bucket_for_compute = q.bucket.clone();
+    let bucket_for_compute = bucket.clone();
     let prefix_for_compute = q.prefix.clone();
 
     let arc = state
         .savings_cache
-        .get_or_compute(&q.bucket, &q.prefix, move || async move {
+        .get_or_compute(&bucket, &q.prefix, move || async move {
             compute_savings(&s3_state, &bucket_for_compute, &prefix_for_compute).await
         })
         .await

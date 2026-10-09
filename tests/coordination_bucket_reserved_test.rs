@@ -232,4 +232,33 @@ async fn admin_jobs_and_scans_refuse_the_coordination_bucket() {
         403,
         "the bucket scan read the coordination bucket"
     );
+    // Review B3: the per-handler check skipped these. Each starts a scan,
+    // lists the bucket, or rewrites its references.
+    for (what, request) in [
+        (
+            "scan stream",
+            admin.get(format!(
+                "{ep}/_/api/admin/diagnostics/scan/stream?bucket={SYNC}"
+            )),
+        ),
+        (
+            "delta-efficiency read",
+            admin.get(format!(
+                "{ep}/_/api/admin/diagnostics/delta-efficiency?bucket={SYNC}"
+            )),
+        ),
+        (
+            "savings",
+            admin.get(format!("{ep}/_/api/admin/deltaspace/savings?bucket={SYNC}")),
+        ),
+        (
+            "legacy migrate",
+            admin
+                .post(format!("{ep}/_/api/admin/migrate"))
+                .json(&serde_json::json!({"bucket": SYNC})),
+        ),
+    ] {
+        let r = request.send().await.unwrap();
+        assert_eq!(r.status(), 403, "{what} reached the coordination bucket");
+    }
 }

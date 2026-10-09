@@ -591,14 +591,31 @@ pub async fn get_scan_status(
 ) -> axum::response::Response {
     let scanner = &state.bucket_scanner;
     if let Some(bucket) = q.bucket {
+        let bucket = match bucket.admit::<super::JsonError>(&state) {
+            Ok(b) => b,
+            Err(e) => return e.into_response(),
+        };
         match scanner.snapshot_one(&bucket) {
             Some(snap) => Json(snap).into_response(),
             None => Json(serde_json::json!({ "state": "idle", "bucket": bucket })).into_response(),
         }
     } else {
+        // A result the previous release cached for the coordination bucket
+        // stays out of sight (review B3).
+        let engine = state.s3_state.engine.load();
+        let registry = engine.bucket_policy_registry();
+        let client = |b: &String| !registry.is_reserved(b);
         Json(AllStatusResponse {
-            buckets: scanner.snapshot_all(),
-            running: scanner.snapshot_running(),
+            buckets: scanner
+                .snapshot_all()
+                .into_iter()
+                .filter(|(b, _)| client(b))
+                .collect(),
+            running: scanner
+                .snapshot_running()
+                .into_iter()
+                .filter(|(b, _)| client(b))
+                .collect(),
         })
         .into_response()
     }
@@ -612,10 +629,10 @@ pub async fn post_scan_start(
     State(state): State<Arc<AdminState>>,
     AdminQuery(q): AdminQuery<BucketQuery>,
 ) -> Result<Json<ScanProgress>, super::AdminError<super::JsonError>> {
-    super::reject_reserved_bucket(&state, q.bucket.as_str())?;
+    let bucket = q.bucket.admit(&state)?;
     let rx = state
         .bucket_scanner
-        .start(q.bucket.into_string(), state.s3_state.clone());
+        .start(bucket.into_string(), state.s3_state.clone());
     let snapshot = rx.borrow().clone();
     Ok(Json(snapshot))
 }
@@ -624,9 +641,10 @@ pub async fn post_scan_start(
 pub async fn post_scan_stop(
     State(state): State<Arc<AdminState>>,
     AdminQuery(q): AdminQuery<BucketQuery>,
-) -> Json<serde_json::Value> {
-    let cancelled = state.bucket_scanner.cancel(&q.bucket);
-    Json(serde_json::json!({ "cancelled": cancelled }))
+) -> Result<Json<serde_json::Value>, super::AdminError<super::JsonError>> {
+    let bucket = q.bucket.admit(&state)?;
+    let cancelled = state.bucket_scanner.cancel(&bucket);
+    Ok(Json(serde_json::json!({ "cancelled": cancelled })))
 }
 
 /// `DELETE /_/api/admin/diagnostics/scan?bucket=X` — drop the
@@ -634,9 +652,10 @@ pub async fn post_scan_stop(
 pub async fn delete_scan(
     State(state): State<Arc<AdminState>>,
     AdminQuery(q): AdminQuery<BucketQuery>,
-) -> Json<serde_json::Value> {
-    let forgotten = state.bucket_scanner.forget(&q.bucket);
-    Json(serde_json::json!({ "forgotten": forgotten }))
+) -> Result<Json<serde_json::Value>, super::AdminError<super::JsonError>> {
+    let bucket = q.bucket.admit(&state)?;
+    let forgotten = state.bucket_scanner.forget(&bucket);
+    Ok(Json(serde_json::json!({ "forgotten": forgotten })))
 }
 
 /// `GET /_/api/admin/diagnostics/scan/stream?bucket=X`
@@ -650,10 +669,16 @@ pub async fn get_scan_stream(
     State(state): State<Arc<AdminState>>,
     Extension(session): Extension<super::auth::AdminSessionCheck>,
     AdminQuery(q): AdminQuery<BucketQuery>,
-) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+) -> Result<
+    Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>,
+    super::AdminError<super::JsonError>,
+> {
+    // Opening the stream STARTS a scan: the coordination bucket is refused
+    // like POST scan/start (review B3).
+    let bucket = q.bucket.admit(&state)?;
     let rx = state
         .bucket_scanner
-        .start(q.bucket.into_string(), state.s3_state.clone());
+        .start(bucket.into_string(), state.s3_state.clone());
 
     // Emit the current frame immediately so the client gets state
     // without waiting for the next page.
@@ -693,7 +718,7 @@ pub async fn get_scan_stream(
         },
     );
 
-    super::auth::end_when_admin_session_lapses(stream, session).keep_alive(KeepAlive::new())
+    Ok(super::auth::end_when_admin_session_lapses(stream, session).keep_alive(KeepAlive::new()))
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────

@@ -106,13 +106,14 @@ pub struct ReencryptResponse {
 /// The request gate that the reencrypt and backfill starts share: 1 to
 /// 100 buckets, a config DB, and the real bucket set from the engine
 /// (authoritative across backends), lowercased.
-async fn check_job_request<'a>(
-    state: &'a AdminState,
-    buckets: &[super::path_guard::AdminBucket],
+async fn check_job_request(
+    state: &AdminState,
+    buckets: Vec<super::path_guard::AdminBucket>,
 ) -> Result<
     (
-        &'a Arc<tokio::sync::Mutex<crate::config_db::ConfigDb>>,
+        &Arc<tokio::sync::Mutex<crate::config_db::ConfigDb>>,
         std::collections::HashSet<String>,
+        Vec<crate::bucket_policy::ClientBucket>,
     ),
     AdminError,
 > {
@@ -122,9 +123,10 @@ async fn check_job_request<'a>(
     if buckets.len() > 100 {
         return Err(AdminError::invalid("too many buckets (max 100)"));
     }
-    for bucket in buckets {
-        super::reject_reserved_bucket(state, bucket.as_str())?;
-    }
+    let buckets = buckets
+        .into_iter()
+        .map(|b| b.admit(state))
+        .collect::<Result<Vec<_>, _>>()?;
     let db = state
         .config_db
         .as_ref()
@@ -137,7 +139,7 @@ async fn check_job_request<'a>(
         .into_iter()
         .map(|b| b.name.to_ascii_lowercase())
         .collect();
-    Ok((db, real))
+    Ok((db, real, buckets))
 }
 
 /// POST /_/api/admin/jobs/reencrypt
@@ -146,12 +148,12 @@ pub async fn start_reencrypt(
     headers: HeaderMap,
     AdminJson(req): AdminJson<ReencryptRequest>,
 ) -> Result<Json<ReencryptResponse>, AdminError> {
-    let (db, real) = check_job_request(&state, &req.buckets).await?;
+    let (db, real, buckets) = check_job_request(&state, req.buckets).await?;
 
     let cfg = state.config.read().await;
     let mut started = Vec::new();
     let mut errors = Vec::new();
-    for bucket in &req.buckets {
+    for bucket in &buckets {
         let key = bucket.to_ascii_lowercase();
         if !real.contains(&key) {
             errors.push(ReencryptError {
@@ -235,7 +237,7 @@ pub async fn start_backfill(
     headers: HeaderMap,
     AdminJson(req): AdminJson<BackfillRequest>,
 ) -> Result<Json<ReencryptResponse>, AdminError> {
-    let (db, real) = check_job_request(&state, &req.buckets).await?;
+    let (db, real, buckets) = check_job_request(&state, req.buckets).await?;
 
     let params = serde_json::to_string(&crate::maintenance::backfill::BackfillParams {
         refresh_last_modified: req.refresh_last_modified,
@@ -244,7 +246,7 @@ pub async fn start_backfill(
 
     let mut started = Vec::new();
     let mut errors = Vec::new();
-    for bucket in &req.buckets {
+    for bucket in &buckets {
         let key = bucket.to_ascii_lowercase();
         if !real.contains(&key) {
             errors.push(ReencryptError {
@@ -332,7 +334,7 @@ pub async fn start_migrate(
         ));
     }
     super::path_guard::check_bucket(&bucket).map_err(AdminError::invalid)?;
-    super::reject_reserved_bucket(&state, &bucket)?;
+    let bucket = super::admit_bucket::<super::Text>(&state, &bucket)?.into_string();
     let db = state
         .config_db
         .as_ref()
@@ -513,6 +515,7 @@ pub async fn bucket_status(
     headers: axum::http::HeaderMap,
     Path(bucket): Path<super::path_guard::AdminBucket>,
 ) -> Result<Json<serde_json::Value>, AdminError<Bare>> {
+    let bucket = bucket.admit(&state)?;
     // Session-light, but bucket-scoped: only a principal that may list the
     // bucket learns its maintenance state (403, as the S3 LIST answers).
     let client_ip = crate::rate_limiter::extract_client_ip_with_peer(

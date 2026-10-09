@@ -618,10 +618,14 @@ pub async fn get_delta_efficiency(
     State(state): State<Arc<AdminState>>,
     AdminQuery(q): AdminQuery<EfficiencyQuery>,
 ) -> impl IntoResponse {
+    let bucket = match q.bucket.admit::<JsonError>(&state) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
     let min_deltas = clamp_min_deltas(q.min_deltas);
 
     // Cache hit → return immediately.
-    if let Some(cached) = state.delta_efficiency_scanner.get(&q.bucket, min_deltas) {
+    if let Some(cached) = state.delta_efficiency_scanner.get(&bucket, min_deltas) {
         return (StatusCode::OK, Json(cached)).into_response();
     }
 
@@ -631,19 +635,19 @@ pub async fn get_delta_efficiency(
     // because "the work has been accepted" is the more accurate
     // semantic than "not found".
     let started = state.delta_efficiency_scanner.enqueue_scan(
-        q.bucket.to_string(),
+        bucket.to_string(),
         min_deltas,
         state.s3_state.clone(),
     );
     let scanning = started
         || state
             .delta_efficiency_scanner
-            .is_scanning(&q.bucket, min_deltas);
+            .is_scanning(&bucket, min_deltas);
 
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({
-            "bucket": q.bucket,
+            "bucket": bucket,
             "min_deltas": min_deltas,
             "scanning": scanning,
             "status": if started { "scan_started" } else { "scan_already_running" },
@@ -667,19 +671,20 @@ pub async fn post_delta_efficiency_scan(
     State(state): State<Arc<AdminState>>,
     AdminJson(req): AdminJson<EfficiencyScanRequest>,
 ) -> axum::response::Response {
-    if let Err(e) = super::reject_reserved_bucket::<JsonError>(&state, req.bucket.as_str()) {
-        return e.into_response();
-    }
+    let bucket = match req.bucket.admit::<JsonError>(&state) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
     let min_deltas = clamp_min_deltas(req.min_deltas);
     let started = state.delta_efficiency_scanner.enqueue_scan(
-        req.bucket.to_string(),
+        bucket.to_string(),
         min_deltas,
         state.s3_state.clone(),
     );
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({
-            "bucket": req.bucket,
+            "bucket": bucket,
             "min_deltas": min_deltas,
             "status": if started { "scan_started" } else { "scan_already_running" },
         })),
@@ -752,20 +757,20 @@ pub async fn verify_delta_efficiency(
     State(state): State<Arc<AdminState>>,
     AdminJson(req): AdminJson<VerifyRequest>,
 ) -> Result<Json<VerifyResponse>, AdminError<JsonError>> {
-    super::reject_reserved_bucket(&state, &req.bucket)?;
+    let bucket = req.bucket.admit(&state)?;
     let engine = state.s3_state.engine.load_full();
     let scan = engine
         .storage()
-        .scan_deltaspace(&req.bucket, &req.prefix)
+        .scan_deltaspace(&bucket, &req.prefix)
         .await
         .inspect_err(|e| {
             warn!(
                 "delta-efficiency verify failed for {}/{}: {}",
-                req.bucket, req.prefix, e
+                bucket, req.prefix, e
             );
         })?;
 
-    Ok(Json(build_verify_response(&req.bucket, &req.prefix, &scan)))
+    Ok(Json(build_verify_response(&bucket, &req.prefix, &scan)))
 }
 
 /// Pure aggregator over a HEAD-resolved scan. Same shape as

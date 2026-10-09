@@ -225,6 +225,45 @@ pub struct BucketPolicyRegistry {
     reserved_bucket: Option<String>,
 }
 
+/// A bucket name admitted by [`BucketPolicyRegistry::client_bucket`]: not
+/// the coordination bucket. Only that function makes one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientBucket(String);
+
+impl ClientBucket {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::ops::Deref for ClientBucket {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for ClientBucket {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ClientBucket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl serde::Serialize for ClientBucket {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.0)
+    }
+}
+
 impl BucketPolicyRegistry {
     /// Reserve the coordination bucket (`config_sync_bucket`). Builder;
     /// `None` or empty reserves nothing.
@@ -241,6 +280,17 @@ impl BucketPolicyRegistry {
         self.reserved_bucket
             .as_deref()
             .is_some_and(|r| r.eq_ignore_ascii_case(bucket))
+    }
+
+    /// THE admission of a bucket name that a client or admin request (or an
+    /// admin-born job) will read or write: refused when it is the
+    /// coordination bucket. A [`ClientBucket`] exists only past this check,
+    /// so a code path that needs one cannot skip it (review B3).
+    pub fn client_bucket(&self, bucket: &str) -> Result<ClientBucket, String> {
+        match self.reserved_bucket_reason(bucket) {
+            Some(reason) => Err(reason),
+            None => Ok(ClientBucket(bucket.to_string())),
+        }
     }
 
     /// Why a client request to `bucket` is refused, for every identity

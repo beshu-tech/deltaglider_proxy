@@ -174,7 +174,16 @@ async fn run_job(
         holder.lease.ttl_secs,
         std::time::Duration::from_secs(holder.lease.heartbeat_secs.max(1) as u64),
     );
+    // A row on the coordination bucket (queued by an older release, which
+    // admitted it) fails before any phase touches that bucket (review B3).
+    let reserved = state
+        .engine
+        .load()
+        .bucket_policy_registry()
+        .client_bucket(&bucket)
+        .err();
     let outcome = match job.kind.as_str() {
+        _ if reserved.is_some() => Err(reserved.unwrap_or_default().into()),
         "reencrypt" => execute_phases(config, db, state, holder, &job).await,
         "migrate" => super::migrate::execute_migrate_phases(mutator, db, state, holder, &job).await,
         super::backfill::KIND => {
@@ -1086,6 +1095,82 @@ mod tests {
         assert_eq!(
             count, 3,
             "the resumed count includes the objects before the cursor"
+        );
+    }
+
+    /// Review B3: a job row on the coordination bucket that an older
+    /// release accepted resumes after the upgrade; it fails before any
+    /// phase reads or rewrites that bucket.
+    #[tokio::test]
+    async fn a_resumed_job_on_the_coordination_bucket_fails() {
+        let data = tempfile::tempdir().unwrap();
+        let config = crate::config::Config {
+            config_sync_bucket: Some("dgp-sync".into()),
+            ..Default::default()
+        };
+        let backend: Box<crate::storage::DynStorageBackend<'static>> = DynStorageBackend::new_box(
+            crate::storage::FilesystemBackend::new(data.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let engine = crate::deltaglider::DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &config,
+            None,
+        );
+        engine.create_bucket("dgp-sync").await.unwrap();
+        engine
+            .store("dgp-sync", "lease.json", b"{}", None, Default::default())
+            .await
+            .unwrap();
+        let state = Arc::new(AppState {
+            engine: arc_swap::ArcSwap::from_pointee(engine),
+            multipart: Arc::new(crate::multipart::MultipartStore::new(
+                config.max_object_size,
+            )),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+            usage_scanner: Arc::new(crate::usage_scanner::UsageScanner::new()),
+            bucket_usage: None,
+            reference_lock: None,
+            config_db: None,
+            maintenance_gate: Arc::new(crate::maintenance::gate::MaintenanceGate::new()),
+            maintenance_notify: Arc::new(tokio::sync::Notify::new()),
+            backend_capabilities: Default::default(),
+            backend_health: Default::default(),
+        });
+        let db = ConfigDb::in_memory("testpass").unwrap();
+        let id = db
+            .maintenance_create_job(
+                super::super::backfill::KIND,
+                "dgp-sync",
+                "scanning",
+                None,
+                "admin",
+                1,
+            )
+            .unwrap()
+            .unwrap();
+        let job = db
+            .maintenance_claim_next_job("inst", current_unix_seconds(), 60)
+            .unwrap()
+            .unwrap();
+        let db = Arc::new(Mutex::new(db));
+        let shared: crate::config::SharedConfig = Arc::new(tokio::sync::RwLock::new(config));
+        let mutator = crate::config_apply::ConfigMutator {
+            config: shared.clone(),
+            app: state.clone(),
+            persist_path: data.path().join("cfg.yaml").display().to_string(),
+        };
+        run_job(&mutator, &shared, &db, &state, Holder::test("inst"), job).await;
+        let row = db.lock().await.maintenance_job_by_id(id).unwrap().unwrap();
+        assert_eq!(row.status, "failed", "{row:?}");
+        assert!(
+            row.last_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("coordination bucket"),
+            "{:?}",
+            row.last_error
         );
     }
 

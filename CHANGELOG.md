@@ -239,8 +239,12 @@ The admin API refused the coordination bucket (`config_sync_bucket`) for
 object operations, but a re-encrypt, metadata-backfill or migrate job and
 the bucket, usage and delta-efficiency scans accepted it. A re-encrypt job
 there encrypted the synced IAM database and the lease objects, so the other
-nodes could no longer read them. Now these endpoints answer `403` for the
-coordination bucket.
+nodes could no longer read them. Now every admin request that names a bucket
+answers `403` for the coordination bucket: jobs, scans (opening the scan
+progress stream starts a scan), the savings and delta-efficiency reads, the
+legacy-reference migration, and the bulk object operations. A job that an
+earlier release queued on that bucket fails when it resumes after the
+upgrade, before it touches the bucket.
 
 ### Security — The replay window covers signatures dated ahead of the clock
 
