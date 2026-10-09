@@ -113,9 +113,21 @@ pub(crate) fn default_email() -> String {
     "email".to_string()
 }
 
+/// `null` reads as `Some(None)` (clear) and an absent field as `None`
+/// (keep). Plain serde reads both as `None`, so a `null` was ignored.
+fn absent_or_nullable<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(de).map(Some)
+}
+
 /// Request to update a mapping rule.
 #[derive(Debug, Deserialize)]
 pub struct UpdateMappingRuleRequest {
+    /// Absent: keep. `null`: all providers. A number: that provider.
+    #[serde(default, deserialize_with = "absent_or_nullable")]
     pub provider_id: Option<Option<i64>>,
     pub priority: Option<i64>,
     pub match_type: Option<String>,
@@ -755,6 +767,19 @@ impl ConfigDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B030: `{"provider_id": null}` clears the provider scope ("All
+    /// providers"); an absent field keeps it.
+    #[test]
+    fn mapping_rule_update_null_provider_clears_the_scope() {
+        let clear: UpdateMappingRuleRequest =
+            serde_json::from_str(r#"{"provider_id":null}"#).unwrap();
+        assert_eq!(clear.provider_id, Some(None), "null was read as absent");
+        let keep: UpdateMappingRuleRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(keep.provider_id, None);
+        let set: UpdateMappingRuleRequest = serde_json::from_str(r#"{"provider_id":3}"#).unwrap();
+        assert_eq!(set.provider_id, Some(Some(3)));
+    }
     use crate::config_db::ConfigDb;
 
     fn no_change() -> UpdateAuthProviderRequest {

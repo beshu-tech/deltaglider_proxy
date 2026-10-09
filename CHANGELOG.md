@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed — A mapping rule can be set back to "All providers"
+
+The admin GUI sends `"provider_id": null` to change a group mapping rule's
+scope to all providers. The proxy read `null` as "not sent", answered `200`,
+and left the rule scoped to its old provider. Now `null` clears the scope.
+
 ### Security — Admin jobs and scans refuse the coordination bucket
 
 The admin API refused the coordination bucket (`config_sync_bucket`) for
