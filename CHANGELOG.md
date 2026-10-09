@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed — A `$` in a multi-line text no longer doubles at each save
+
+The proxy writes a literal `$` as `$$` in the configuration file and reads
+`$$` back as `$`. In a multi-line text (`|` or `>`), a line that started
+with `#` was read as a comment, so its `$$` stayed `$$`: a reject message
+line such as `# Fee: $5` became `$$5`, then `$$$$5` after the next save.
+Now such a line is text, and `${env:…}` on it is expanded too.
+
 ### Security — `DGP_CONFIG_ENV_ALLOWLIST` never admits the config-DB key
 
 `DGP_CONFIG_ENV_ALLOWLIST` lets an admin request resolve extra environment

@@ -134,8 +134,11 @@ impl Extend<(String, String)> for EnvRefs {
 /// outside whole-line comments (`$$` is a literal `$`, not a ref).
 fn ref_defaults(input: &str) -> std::collections::BTreeMap<String, String> {
     let mut out = std::collections::BTreeMap::new();
-    for line in input.lines() {
-        if line.trim_start().starts_with('#') {
+    let mut line_start = 0;
+    for line in input.split_inclusive('\n') {
+        let this_start = line_start;
+        line_start += line.len();
+        if line.trim_start().starts_with('#') && !in_block_scalar(input, this_start) {
             continue;
         }
         let mut rest = line;
@@ -464,9 +467,12 @@ fn expand_core(
         // A whole-line YAML comment is not config: a commented-out template
         // line must not fail the load on its unset variable (review 4
         // config-8). Copied verbatim, `$$` included.
+        // A `#` line inside a block scalar is text, not a comment.
         if doc {
             let line_start = input[..i].rfind('\n').map_or(0, |p| p + 1);
-            if input[line_start..i].trim_start().starts_with('#') {
+            if input[line_start..i].trim_start().starts_with('#')
+                && !in_block_scalar(input, line_start)
+            {
                 out.push('$');
                 i += 1;
                 cursor = i;
@@ -896,6 +902,23 @@ mod tests {
         assert_eq!(
             expand_env_doc_with("k: ${env:X}", q).unwrap(),
             r#"k: !envref "a\"b\\c""#
+        );
+    }
+
+    /// B086: a `#` line inside a block scalar is text, not a comment: its
+    /// `$$` unescapes (and its refs expand) like any other text, or every
+    /// persist + load doubled the `$`.
+    #[test]
+    fn a_hash_line_inside_a_block_scalar_is_text() {
+        let v = |_: &str| Some("x".to_string());
+        assert_eq!(
+            expand_env_doc_with("k: |-\n  a\n  # fee $$5 ${env:X}\n", v).unwrap(),
+            "k: |-\n  a\n  # fee $5 x\n"
+        );
+        // A real comment line stays verbatim.
+        assert_eq!(
+            expand_env_doc_with("# fee $$5 ${env:UNSET}\nk: v\n", |_| None).unwrap(),
+            "# fee $$5 ${env:UNSET}\nk: v\n"
         );
     }
 
