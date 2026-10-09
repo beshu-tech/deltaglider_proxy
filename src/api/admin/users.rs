@@ -423,12 +423,52 @@ pub async fn delete_user(
     State(state): State<Arc<AdminState>>,
     axum::extract::Path(user_id): axum::extract::Path<i64>,
     headers: HeaderMap,
-) -> Result<StatusCode, AdminError<Bare>> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match delete_user_inner(&state, user_id, &headers).await {
+        Ok(status) => status.into_response(),
+        Err(DeleteRefusal::Lockout(e)) => {
+            AdminError::<super::JsonError>::conflict(e.to_string()).into_response()
+        }
+        Err(DeleteRefusal::Other(e)) => e.into_response(),
+    }
+}
+
+enum DeleteRefusal {
+    /// The delete would leave no credential: a `{"error"}` body names why.
+    Lockout(iam::Lockout),
+    Other(AdminError<Bare>),
+}
+
+impl<E: Into<AdminError<Bare>>> From<E> for DeleteRefusal {
+    fn from(e: E) -> Self {
+        DeleteRefusal::Other(e.into())
+    }
+}
+
+async fn delete_user_inner(
+    state: &Arc<AdminState>,
+    user_id: i64,
+    headers: &HeaderMap,
+) -> Result<StatusCode, DeleteRefusal> {
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(AdminError::no_config_db)?;
+        .ok_or_else(AdminError::<Bare>::no_config_db)?;
     let db = db.lock().await;
+
+    // A14: under the DB lock, so a concurrent delete or config change sees
+    // this one. Deleting a missing id changes nothing (the delete answers 404).
+    let users_now = db.load_users()?;
+    if users_now.iter().any(|u| u.id == user_id) {
+        let when_empty = state.iam_state.load().when_empty();
+        let surface = |users| iam::AuthSurface {
+            users,
+            when_empty: &when_empty,
+        };
+        iam::check_lockout(surface(users_now.len()), surface(users_now.len() - 1))
+            .map_err(DeleteRefusal::Lockout)?;
+    }
 
     // Capture every revocation identity BEFORE the rows disappear: the access
     // key plus each external login (`provider:user_id`, see AuthMethod).
@@ -453,7 +493,7 @@ pub async fn delete_user(
     drop(db);
     // No separate trigger_config_sync: revoke_identities_everywhere pushes the
     // same DB file (a second concurrent push just self-inflicts CAS churn).
-    let outcome = super::sessions::revoke_identities_everywhere(&state, &identities).await;
+    let outcome = super::sessions::revoke_identities_everywhere(state, &identities).await;
     if outcome.revoked_local > 0 {
         tracing::info!(
             "Revoked {} live session(s) of deleted user {}",
@@ -468,7 +508,7 @@ pub async fn delete_user(
         user_id,
         remaining
     );
-    audit_log("delete_user", "admin", &target, &headers);
+    audit_log("delete_user", "admin", &target, headers);
     Ok(StatusCode::NO_CONTENT)
 }
 

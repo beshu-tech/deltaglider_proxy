@@ -1256,9 +1256,19 @@ pub async fn reopen_and_rebuild_iam(
     let emptied = users.is_empty() && current.has_iam_users();
     let state = IamIndex::build_iam_state(users, groups, when_empty.clone());
     if emptied {
+        // A peer emptied the DB: it cannot be refused (the peers converge),
+        // so it is recorded where the operator looks.
         warn!(
             "Config DB S3 sync ({context}): the synced DB holds no IAM user; now {}",
             when_empty.describe()
+        );
+        crate::audit::audit_log(
+            "iam_sync_emptied",
+            "config-sync",
+            when_empty.describe(),
+            &axum::http::HeaderMap::new(),
+            "",
+            "",
         );
     }
     if matches!(&state, IamState::Iam(_)) {

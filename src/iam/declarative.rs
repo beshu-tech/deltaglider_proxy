@@ -329,6 +329,11 @@ impl MappingRulesAction {
 }
 
 impl IamDiff {
+    /// The IAM user count once this diff is applied to `users_now` users.
+    pub fn users_after(&self, users_now: usize) -> usize {
+        (users_now + self.users_to_create.len()).saturating_sub(self.users_to_delete.len())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.groups_to_create.is_empty()
             && self.groups_to_update.is_empty()

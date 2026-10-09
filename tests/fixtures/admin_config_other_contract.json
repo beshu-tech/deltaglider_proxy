@@ -51,7 +51,7 @@
   },
   "remove_bootstrap_409": {
     "body": {
-      "error": "no IAM users exist: removing the bootstrap SigV4 pair would leave the proxy without authentication. Create an IAM admin user first"
+      "error": "this change leaves the proxy without authentication: no IAM user, no bootstrap SigV4 pair and no `authentication: none` would remain. Create an IAM user or set a bootstrap pair first"
     },
     "content_type": "application/json",
     "status": 409

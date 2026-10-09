@@ -705,7 +705,25 @@ pub async fn validate_declarative_iam(
     let db = db_arc.lock().await;
     let diff = crate::iam::preview_declarative_iam(&db, &snapshot)
         .map_err(|e| AdminError::invalid(format!("validation failed: {e}")))?;
+    import_lockout_check(&state, &db, &diff)?;
     Ok(Json(summarise_diff(&diff)))
+}
+
+/// Review A14: a full-IAM import may not leave no credential. The validate
+/// and the apply run the same check.
+fn import_lockout_check(
+    state: &AdminState,
+    db: &crate::config_db::ConfigDb,
+    diff: &crate::iam::IamDiff,
+) -> Result<(), AdminError> {
+    let users_now = db.load_users()?.len();
+    let when_empty = state.iam_state.load().when_empty();
+    let surface = |users| crate::iam::AuthSurface {
+        users,
+        when_empty: &when_empty,
+    };
+    crate::iam::check_lockout(surface(users_now), surface(diff.users_after(users_now)))
+        .map_err(|e| AdminError::conflict(e.to_string()))
 }
 
 /// `POST /_/api/admin/config/declarative-iam-apply` — apply a full-IAM YAML
@@ -722,6 +740,9 @@ pub async fn apply_declarative_iam(
     let snapshot = parse_iam_yaml(&body.yaml).map_err(AdminError::invalid)?;
 
     let db = db_arc.lock().await;
+    let diff = crate::iam::preview_declarative_iam(&db, &snapshot)
+        .map_err(|e| AdminError::invalid(format!("IAM import failed (no state changed): {e}")))?;
+    import_lockout_check(&state, &db, &diff)?;
     let stats = crate::iam::reconcile_declarative_iam(&db, &snapshot)
         .map_err(|e| AdminError::invalid(format!("IAM import failed (no state changed): {e}")))?;
     // Rebuild the in-memory index from the now-committed DB. Use the

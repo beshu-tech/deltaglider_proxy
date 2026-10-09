@@ -1322,6 +1322,40 @@ mod source_guards {
         }
     }
 
+    /// Review A14: every admin path that can remove IAM users decides the
+    /// lockout rule (`check_lockout`, or `allow_empty` for the restore)
+    /// BEFORE the write, in the same function. A new path that deletes
+    /// users without it fails here.
+    #[test]
+    fn every_user_removing_path_checks_the_lockout_rule_first() {
+        let writers = [
+            ".delete_user(",
+            "reconcile_declarative_iam(",
+            ".restore_iam(",
+        ];
+        let mut sites = 0;
+        for (file, text) in crate::source_scan::prod_sources("src/api") {
+            let prod = crate::source_scan::prod_text(&text);
+            for w in writers {
+                for (at, _) in prod.match_indices(w) {
+                    let fn_start = prod[..at].rfind("fn ").unwrap_or(0);
+                    let before = &prod[fn_start..at];
+                    sites += 1;
+                    assert!(
+                        before.contains("check_lockout(")
+                            || before.contains("import_lockout_check(")
+                            || before.contains("allow_empty"),
+                        "{file}: `{w}` without a lockout decision before it in its fn"
+                    );
+                }
+            }
+        }
+        assert!(
+            sites >= 4,
+            "the scan found the user-removing sites ({sites})"
+        );
+    }
+
     /// A declarative reconcile writes the `auth_providers` table, and the
     /// login flow reads the in-memory `ExternalAuthManager`. Every admin
     /// file that reconciles must rebuild it, or a provider disabled in YAML

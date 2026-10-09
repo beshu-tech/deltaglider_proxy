@@ -39,6 +39,7 @@ pub(crate) use transition::{apply_config_transition, TransitionCtx};
 pub use version::install_version_key as install_config_version_key;
 pub(crate) use write::{
     run_internal, run_internal_held, HeldRefusal, Internal, InternalRefusal, OnPersistError,
+    RESTORE_ROLLBACK_ACTION,
 };
 
 /// Names of the four sections the admin API understands. Canonical
@@ -353,23 +354,17 @@ pub(crate) enum BootstrapRemoval {
     /// `DGP_ACCESS_KEY_ID` / `DGP_SECRET_ACCESS_KEY` set it: the env var
     /// must go, the config edit would not stick.
     EnvControlled,
-    /// No IAM users: removing the pair turns authentication off.
-    WouldDisableAuth,
+    /// Remove it. The config transition refuses a removal that would leave
+    /// no credential (`iam::check_lockout`, the one rule for every path).
     Remove,
 }
 
 /// Pure decision for the remove-bootstrap-credentials endpoint.
-pub(crate) fn bootstrap_removal_decision(
-    has_pair: bool,
-    env_controlled: bool,
-    iam_active: bool,
-) -> BootstrapRemoval {
+pub(crate) fn bootstrap_removal_decision(has_pair: bool, env_controlled: bool) -> BootstrapRemoval {
     if !has_pair {
         BootstrapRemoval::NothingToRemove
     } else if env_controlled {
         BootstrapRemoval::EnvControlled
-    } else if !iam_active {
-        BootstrapRemoval::WouldDisableAuth
     } else {
         BootstrapRemoval::Remove
     }
@@ -377,15 +372,14 @@ pub(crate) fn bootstrap_removal_decision(
 
 /// `DELETE /api/admin/config/bootstrap-credentials` — remove the bootstrap
 /// SigV4 pair from the config: the explicit action the Credentials page
-/// offers (clearing both fields was ambiguous). Refused (409) while no IAM
-/// users exist, and when env vars set the pair.
+/// offers (clearing both fields was ambiguous). Refused (409) when no
+/// credential would remain, and when env vars set the pair.
 pub async fn remove_bootstrap_credentials(
     State(state): State<Arc<AdminState>>,
     headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     // The refusals answer `{"error": ..}`; an env re-apply failure a text 500.
     let conflict = |msg: &str| AdminError::<JsonError>::conflict(msg).into_response();
-    let iam_active = state.iam_state.load().has_iam_users();
     let (env_controlled, has_pair) = {
         let cfg = state.config.read().await;
         (
@@ -393,7 +387,7 @@ pub async fn remove_bootstrap_credentials(
             cfg.access_key_id.is_some() || cfg.secret_access_key.is_some(),
         )
     };
-    match bootstrap_removal_decision(has_pair, env_controlled, iam_active) {
+    match bootstrap_removal_decision(has_pair, env_controlled) {
         BootstrapRemoval::NothingToRemove => {
             return Json(serde_json::json!({ "removed": false, "warnings": [] })).into_response()
         }
@@ -401,12 +395,6 @@ pub async fn remove_bootstrap_credentials(
             return conflict(
                 "the bootstrap SigV4 pair comes from DGP_ACCESS_KEY_ID / DGP_SECRET_ACCESS_KEY: \
                  unset those environment variables and restart",
-            )
-        }
-        BootstrapRemoval::WouldDisableAuth => {
-            return conflict(
-                "no IAM users exist: removing the bootstrap SigV4 pair would leave the proxy \
-                 without authentication. Create an IAM admin user first",
             )
         }
         BootstrapRemoval::Remove => {}
@@ -1709,11 +1697,10 @@ advanced:
     fn bootstrap_removal_truth_table() {
         use super::BootstrapRemoval::*;
         let d = super::bootstrap_removal_decision;
-        assert_eq!(d(false, false, false), NothingToRemove);
-        assert_eq!(d(false, true, true), NothingToRemove);
-        assert_eq!(d(true, true, true), EnvControlled);
-        assert_eq!(d(true, false, false), WouldDisableAuth);
-        assert_eq!(d(true, false, true), Remove);
+        assert_eq!(d(false, false), NothingToRemove);
+        assert_eq!(d(false, true), NothingToRemove);
+        assert_eq!(d(true, true), EnvControlled);
+        assert_eq!(d(true, false), Remove);
     }
 
     fn preserve_all(new: &mut Config, old: &Config) {

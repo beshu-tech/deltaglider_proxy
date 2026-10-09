@@ -39,7 +39,7 @@ All three scopes route through the same `apply_config_transition` path, so hot-r
 | `PUT` | `/_/api/admin/config` | Partial JSON update |
 | `DELETE` | `/_/api/admin/config/bootstrap-credentials` | Remove the bootstrap SigV4 pair from the config: `{removed, warnings}` |
 
-The bootstrap `access_key_id` is an identifier, not a secret, so every GET and export shows it; `secret_access_key` stays redacted. An unchanged `access_key_id` with no secret in a PUT or apply keeps the secret. A change that removes the bootstrap pair while no IAM users exist is refused, because the proxy would then run without authentication: `DELETE …/bootstrap-credentials` answers `409`, and the field-level PUT keeps the pair and returns a warning. The DELETE also answers `409` when `DGP_ACCESS_KEY_ID` or `DGP_SECRET_ACCESS_KEY` sets the pair. When the key id is also an IAM user (the first IAM user carries the pair over as `legacy-admin`), the warnings say so: that user still signs requests until you delete or disable it.
+The bootstrap `access_key_id` is an identifier, not a secret, so every GET and export shows it; `secret_access_key` stays redacted. An unchanged `access_key_id` with no secret in a PUT or apply keeps the secret. A change that leaves no credential (no IAM user, no bootstrap pair, no `authentication: none`) is refused, because the proxy would then refuse every S3 request: `DELETE …/bootstrap-credentials` and the config writes answer `409`, and the field-level PUT keeps the pair and returns a warning. `DELETE /users/:id` of the last IAM user answers `409` for the same reason. The DELETE also answers `409` when `DGP_ACCESS_KEY_ID` or `DGP_SECRET_ACCESS_KEY` sets the pair. When the key id is also an IAM user (the first IAM user carries the pair over as `legacy-admin`), the warnings say so: that user still signs requests until you delete or disable it.
 
 ### Section-level
 
@@ -109,7 +109,7 @@ deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.e
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` / `POST` | `/_/api/admin/users` | List / create |
-| `PUT` / `DELETE` | `/_/api/admin/users/:id` | Update / delete |
+| `PUT` / `DELETE` | `/_/api/admin/users/:id` | Update / delete (`409` for the last user when no other credential is left) |
 | `POST` | `/_/api/admin/users/:id/rotate-keys` | Rotate access keys |
 | `POST` | `/_/api/admin/users/:id/clone` | Clone a user (new keys, copied permissions) |
 | `GET` / `POST` | `/_/api/admin/groups` | List / create |

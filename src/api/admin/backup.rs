@@ -695,7 +695,7 @@ pub async fn import_backup(
             format!("malformed IAM backup JSON: {e}"),
         )
     })?;
-    import_backup_iam(state, headers, backup, query.iam)
+    import_backup_iam(state, headers, backup, query.iam, false)
         .await
         .map_err(|e| {
             let status = e.status_code();
@@ -1212,7 +1212,7 @@ impl RestoreSnapshot {
         let applied = crate::api::admin::config::run_internal(
             state,
             headers,
-            "restore_rollback",
+            crate::api::admin::config::RESTORE_ROLLBACK_ACTION,
             "config",
             |cfg| *cfg = config,
         )
@@ -1235,9 +1235,14 @@ impl RestoreSnapshot {
             }
         }
         if let Some(iam) = self.iam.filter(|_| now_declarative) {
-            if let Err(e) =
-                import_backup_iam(state.clone(), headers.clone(), iam, IamRestoreMode::Replace)
-                    .await
+            if let Err(e) = import_backup_iam(
+                state.clone(),
+                headers.clone(),
+                iam,
+                IamRestoreMode::Replace,
+                true,
+            )
+            .await
             {
                 first_err.get_or_insert(format!("IAM DB not restored: {e}"));
             }
@@ -1666,20 +1671,21 @@ async fn apply_backup_iam(
                 external_identities = backup.external_identities.len(),
                 "Full-backup import: applying iam.json"
             );
-            let Json(result) = import_backup_iam(state.clone(), headers.clone(), backup, iam_mode)
-                .await
-                .map_err(|e| {
-                    let status = e.status_code();
-                    import_fail(
-                        status,
-                        "restore_iam",
-                        "iam.json",
-                        status
-                            .canonical_reason()
-                            .unwrap_or("IAM backup import failed")
-                            .to_string(),
-                    )
-                })?;
+            let Json(result) =
+                import_backup_iam(state.clone(), headers.clone(), backup, iam_mode, false)
+                    .await
+                    .map_err(|e| {
+                        let status = e.status_code();
+                        import_fail(
+                            status,
+                            "restore_iam",
+                            "iam.json",
+                            status
+                                .canonical_reason()
+                                .unwrap_or("IAM backup import failed")
+                                .to_string(),
+                        )
+                    })?;
             tracing::info!(
                 users_created = result.users_created,
                 users_skipped = result.users_skipped,
@@ -1857,6 +1863,7 @@ async fn import_backup_iam(
     headers: HeaderMap,
     backup: IamBackup,
     mode: IamRestoreMode,
+    restoring: bool,
 ) -> Result<Json<ImportResult>, AdminError<Bare>> {
     let db = state
         .config_db
@@ -1869,8 +1876,19 @@ async fn import_backup_iam(
         crate::iam::IamState::Legacy(auth) => Some(auth.access_key_id.clone()),
         _ => None,
     };
+    // A14: a restore may not leave no credential (a rollback puts back
+    // what was live).
+    let allow_empty = restoring || {
+        let current = state.iam_state.load();
+        let when_empty = current.when_empty();
+        let surface = |users| crate::iam::AuthSurface {
+            users,
+            when_empty: &when_empty,
+        };
+        crate::iam::check_lockout(surface(db.load_users()?.len()), surface(0)).is_ok()
+    };
     let result = db
-        .restore_iam(&backup, mode, bootstrap_key.as_deref())
+        .restore_iam(&backup, mode, bootstrap_key.as_deref(), allow_empty)
         .inspect_err(|e| {
             tracing::warn!("IAM restore rolled back: {e}");
         })?;

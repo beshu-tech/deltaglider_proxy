@@ -14,7 +14,6 @@ use tracing_subscriber::EnvFilter;
 use super::super::{AdminState, Bare};
 use crate::api::handlers::AppState;
 use crate::config::Config;
-use crate::iam::AuthConfig;
 
 /// Who runs a transition, and so which runtime handles it has.
 pub(crate) enum TransitionCtx<'a> {
@@ -22,6 +21,9 @@ pub(crate) enum TransitionCtx<'a> {
     Admin {
         state: &'a Arc<AdminState>,
         headers: &'a HeaderMap,
+        /// The write puts back a config that was live before (a rollback):
+        /// the forward-only gates (the A14 lockout check) do not apply.
+        restoring: bool,
     },
     /// A background task (the migrate stage/flip via `ConfigMutator`). It
     /// has the engine, the backend gates and nothing else, so it SKIPS the
@@ -139,12 +141,13 @@ pub(super) fn engine_affecting_fields_changed(
 ///
 /// 1. **Pre-commit** — every fallible step, with no side effect: the
 ///    background-scope check, config-graph and capability/health gates, the
-///    declarative-IAM validation, the SigV4 decision ([`sigv4_transition`])
-///    and the engine BUILD (the new engine is held, not stored).
-/// 2. **Commit** — the declarative-IAM reconcile first (the only fallible
-///    commit step; one SQLite transaction, so its `Err` changes nothing),
-///    then the infallible publishes: log filter, IAM state, bucket-derived
-///    snapshots, the engine store, and the config swap LAST.
+///    declarative-IAM validation and the engine BUILD (the new engine is
+///    held, not stored).
+/// 2. **Commit** — [`commit_iam`] first (the lockout re-check and the
+///    declarative-IAM reconcile are its only fallible steps; the reconcile is
+///    one SQLite transaction, so its `Err` changes nothing; then it publishes
+///    the IAM state), then the infallible publishes: log filter,
+///    bucket-derived snapshots, the engine store, and the config swap LAST.
 ///
 /// A failure after the reconcile commits (the in-memory index rebuild) is a
 /// warning, not an `Err`: the DB and the new config already agree.
@@ -166,13 +169,13 @@ pub(crate) async fn apply_config_transition(
     }
     transition_gates(&ctx, old_cfg, &new_cfg).await?;
     let admin = match &ctx {
-        TransitionCtx::Admin { state, headers } => Some((*state, *headers)),
+        TransitionCtx::Admin {
+            state,
+            headers,
+            restoring,
+        } => Some((*state, *headers, *restoring)),
         TransitionCtx::Background { .. } => None,
     };
-    if let Some((state, _)) = admin {
-        let iam_active = state.iam_state.load().has_iam_users();
-        sigv4_transition(old_cfg, &new_cfg, iam_active)?;
-    }
     let new_engine = if engine_affecting_fields_changed(old_cfg, &new_cfg) {
         Some(crate::config_apply::build_engine(ctx.app(), &new_cfg).await?)
     } else {
@@ -182,8 +185,8 @@ pub(crate) async fn apply_config_transition(
     // ── Phase 2: commit ──────────────────────────────────────────────────
     // The only fallible commit step; it runs before every publish below.
     let mut warnings = match admin {
-        Some((state, headers)) => {
-            reconcile_declarative_iam(state, old_cfg, &new_cfg, headers).await?
+        Some((state, headers, restoring)) => {
+            commit_iam(state, old_cfg, &new_cfg, headers, restoring).await?
         }
         None => Vec::new(),
     };
@@ -191,7 +194,7 @@ pub(crate) async fn apply_config_transition(
 
     // Log-level hot reload. An invalid filter is a warning: the old filter
     // stays, the config change goes through.
-    if let Some((state, _)) = admin.filter(|_| old_cfg.log_level != new_cfg.log_level) {
+    if let Some((state, _, _)) = admin.filter(|_| old_cfg.log_level != new_cfg.log_level) {
         match crate::audit::with_audit_directive(&new_cfg.log_level).parse::<EnvFilter>() {
             Ok(new_filter) => {
                 if let Err(e) = state.log_reload.reload(new_filter) {
@@ -206,38 +209,8 @@ pub(crate) async fn apply_config_transition(
         }
     }
 
-    // What S3 does with no IAM user: derived from the NEW config (the pair,
-    // `authentication: none`, or deny all), judged on the state AFTER the
-    // reconcile. Users stay; only the empty-set outcome changes. Under the
-    // DB lock: a concurrent rebuild (user delete, sync) stores a state from
-    // the DB, and this load + store must not undo it.
-    if let Some((state, _)) = admin {
-        let _db = match &state.config_db {
-            Some(db) => Some(db.lock().await),
-            None => None,
-        };
-        let outcome = new_cfg.empty_iam_outcome();
-        let current = state.iam_state.load();
-        if let Some(next) = current.with_when_empty(outcome.clone()) {
-            let users_exist = current.has_iam_users();
-            state.iam_state.store(Arc::new(next));
-            crate::iam::bump_iam_version();
-            if users_exist && old_cfg.bootstrap_pair() != new_cfg.bootstrap_pair() {
-                warnings.push(
-                    "IAM mode is active: the bootstrap SigV4 pair is only the fallback for an \
-                     empty IAM database. IAM users (including 'legacy-admin', which carries the \
-                     old pair) are unchanged; manage them in the Users panel."
-                        .to_string(),
-                );
-            }
-            if !users_exist {
-                tracing::info!("S3 authentication now: {}", outcome.describe());
-            }
-        }
-    }
-
     // Bucket-derived snapshots — public prefix + admission chain.
-    if let Some((state, _)) = admin.filter(|_| {
+    if let Some((state, _, _)) = admin.filter(|_| {
         old_cfg.buckets != new_cfg.buckets || old_cfg.admission_blocks != new_cfg.admission_blocks
     }) {
         super::rebuild_bucket_derived_snapshots(state, &new_cfg.buckets, &new_cfg.admission_blocks);
@@ -338,39 +311,6 @@ async fn transition_gates(
     }
 }
 
-/// Pure SigV4 decision of a transition. `Ok(None)`: the pair did not change.
-/// `Ok(Some(pair))`: publish `pair` (`None` = no pair). `Err`: without IAM
-/// users (`iam_active == false`), dropping the pair would turn S3
-/// authentication off at runtime (and the next boot refuses to start).
-pub(crate) fn sigv4_transition(
-    old_cfg: &crate::config::Config,
-    new_cfg: &crate::config::Config,
-    iam_active: bool,
-) -> Result<Option<Option<AuthConfig>>, String> {
-    if old_cfg.access_key_id == new_cfg.access_key_id
-        && old_cfg.secret_access_key == new_cfg.secret_access_key
-    {
-        return Ok(None);
-    }
-    let new_pair = new_cfg.bootstrap_pair();
-    if !iam_active
-        && new_pair.is_none()
-        && old_cfg.auth_enabled()
-        && !matches!(
-            new_cfg.classify_auth_config(false),
-            crate::config::AuthConfigOutcome::OpenAccess
-        )
-    {
-        return Err(
-            "removing the bootstrap SigV4 pair would leave the proxy without \
-             authentication: create an IAM admin user first, or set \
-             `authentication: none` explicitly"
-                .to_string(),
-        );
-    }
-    Ok(Some(new_pair))
-}
-
 /// True when the transition must run the declarative reconcile: the target
 /// mode is declarative and the IAM fields (or the mode) changed. Shared by
 /// the pre-commit gate and the reconcile so the two cannot disagree.
@@ -390,57 +330,122 @@ pub(super) fn declarative_reconcile_needed(
     !old_iam_unchanged
 }
 
-/// Phase 3c.3 declarative IAM reconcile, the first commit step of
-/// [`apply_config_transition`]. Validation + diff run before any DB write
-/// (`diff_iam`); one SQLite transaction covers every create/update/delete,
-/// so an `Err` leaves the DB unchanged. Returns the operator warnings.
-async fn reconcile_declarative_iam(
+/// The IAM half of a transition, in ONE DB-locked section: (a) the A14
+/// lockout re-check, (b) the declarative reconcile (one SQLite
+/// transaction), (c) the publish of the new config's empty-IAM outcome. A
+/// rebuild elsewhere (user delete, peer sync) takes the same lock, so
+/// neither undoes the other. Fallible only before its first write.
+async fn commit_iam(
     state: &Arc<AdminState>,
     old_cfg: &crate::config::Config,
     new_cfg: &crate::config::Config,
     headers: &HeaderMap,
+    restoring: bool,
 ) -> Result<Vec<String>, String> {
     let mut warnings = Vec::new();
-    if !declarative_reconcile_needed(old_cfg, new_cfg) {
+    let yaml_snapshot = declarative_reconcile_needed(old_cfg, new_cfg).then(|| {
+        crate::iam::snapshot_from_access(
+            &new_cfg.iam_users,
+            &new_cfg.iam_groups,
+            &new_cfg.auth_providers,
+            &new_cfg.group_mapping_rules,
+            &[],
+        )
+    });
+    if let Some(yaml) = &yaml_snapshot {
+        // The empty-YAML gate and the DB-presence check ran in the pre-commit
+        // gate; they repeat here because the DB lock was released in between.
+        if matches!(old_cfg.iam_mode, crate::config_sections::IamMode::Gui)
+            && yaml.declares_no_users_or_groups()
+        {
+            return Err(EMPTY_DECLARATIVE_FLIP.to_string());
+        }
+        if state.config_db.is_none() {
+            return Err(NO_CONFIG_DB_FOR_DECLARATIVE.to_string());
+        }
+    }
+    let outcome = new_cfg.empty_iam_outcome();
+    // Nothing IAM-side changes: no lock (a held write, such as the rule
+    // delete, keeps the DB lock across its transition) and nothing to
+    // refuse (the lockout rule compares two equal surfaces).
+    if yaml_snapshot.is_none() && state.iam_state.load().when_empty() == outcome {
         return Ok(warnings);
     }
-    let yaml_snapshot = crate::iam::snapshot_from_access(
-        &new_cfg.iam_users,
-        &new_cfg.iam_groups,
-        &new_cfg.auth_providers,
-        &new_cfg.group_mapping_rules,
-        &[],
-    );
-    // The empty-YAML gate and the DB-presence check ran in the pre-commit
-    // gate; they repeat here because the DB lock was released in between.
-    if matches!(old_cfg.iam_mode, crate::config_sections::IamMode::Gui)
-        && yaml_snapshot.declares_no_users_or_groups()
-    {
-        return Err(EMPTY_DECLARATIVE_FLIP.to_string());
-    }
-    let Some(db_arc) = state.config_db.as_ref() else {
-        return Err(NO_CONFIG_DB_FOR_DECLARATIVE.to_string());
+    let db = match &state.config_db {
+        Some(db) => Some(db.lock().await),
+        None => None,
     };
-    let db = db_arc.lock().await;
-    let stats = crate::iam::reconcile_declarative_iam(&db, &yaml_snapshot)
-        .map_err(|e| format!("declarative IAM reconcile failed (no state changed): {e}"))?;
 
-    // The DB is committed from here: a failed in-memory rebuild is a
-    // warning, never an `Err` (the caller would keep the old config over
-    // the new DB). The `_declarative` variant skips the legacy-admin
-    // auto-migration: YAML is authoritative.
-    if let Err(e) = super::super::users::rebuild_iam_index_declarative::<Bare>(
-        &db,
-        &state.iam_state,
-        new_cfg.empty_iam_outcome(),
-    ) {
-        warnings.push(format!(
-            "declarative IAM reconciled, but the in-memory IAM index could not be rebuilt \
-             ({:?}): the previous index serves until the next IAM change or restart",
-            e.status_code()
-        ));
+    // (a) A14: the change may not take S3 from a credential to none.
+    if !restoring {
+        let current = state.iam_state.load();
+        let users_now = match &db {
+            Some(db) => db
+                .load_users()
+                .map_err(|e| format!("could not count the IAM users (no state changed): {e}"))?
+                .len(),
+            None => current.user_count(),
+        };
+        let users_after = match (&yaml_snapshot, &db) {
+            (Some(yaml), Some(db)) => crate::iam::preview_declarative_iam(db, yaml)
+                .map_err(|e| format!("declarative IAM reconcile failed (no state changed): {e}"))?
+                .users_after(users_now),
+            _ => users_now,
+        };
+        let before = current.when_empty();
+        let surface = |users, when_empty| crate::iam::AuthSurface { users, when_empty };
+        crate::iam::check_lockout(surface(users_now, &before), surface(users_after, &outcome))
+            .map_err(|e| e.to_string())?;
+    }
+
+    // (b) The declarative reconcile: the only fallible write.
+    let mut stats = None;
+    if let (Some(yaml), Some(db)) = (&yaml_snapshot, &db) {
+        stats = Some(
+            crate::iam::reconcile_declarative_iam(db, yaml)
+                .map_err(|e| format!("declarative IAM reconcile failed (no state changed): {e}"))?,
+        );
+        // The DB is committed from here: a failed in-memory rebuild is a
+        // warning, never an `Err` (the caller would keep the old config over
+        // the new DB). The `_declarative` variant skips the legacy-admin
+        // auto-migration: YAML is authoritative.
+        if let Err(e) = super::super::users::rebuild_iam_index_declarative::<Bare>(
+            db,
+            &state.iam_state,
+            outcome.clone(),
+        ) {
+            warnings.push(format!(
+                "declarative IAM reconciled, but the in-memory IAM index could not be rebuilt \
+                 ({:?}): the previous index serves until the next IAM change or restart",
+                e.status_code()
+            ));
+        }
+    }
+
+    // (c) What S3 does with no IAM user, from the NEW config (judged on the
+    // state after the reconcile). Users stay; only the outcome changes.
+    let current = state.iam_state.load();
+    if let Some(next) = current.with_when_empty(outcome.clone()) {
+        let users_exist = current.has_iam_users();
+        state.iam_state.store(Arc::new(next));
+        crate::iam::bump_iam_version();
+        if users_exist && old_cfg.bootstrap_pair() != new_cfg.bootstrap_pair() {
+            warnings.push(
+                "IAM mode is active: the bootstrap SigV4 pair is only the fallback for an \
+                 empty IAM database. IAM users (including 'legacy-admin', which carries the \
+                 old pair) are unchanged; manage them in the Users panel."
+                    .to_string(),
+            );
+        }
+        if !users_exist {
+            tracing::info!("S3 authentication now: {}", outcome.describe());
+        }
     }
     drop(db);
+
+    let Some(stats) = stats else {
+        return Ok(warnings);
+    };
     if stats.providers_changed() {
         if let Err(e) = super::super::external_auth::rebuild_external_auth(state).await {
             warnings.push(format!(
@@ -670,7 +675,7 @@ mod restart_chip_parity_tests {
 /// steps.
 #[cfg(test)]
 mod transition_order_tests {
-    use super::{background_needs_skipped_steps, sigv4_transition};
+    use super::background_needs_skipped_steps;
     use crate::config::Config;
 
     /// A background change may reroute buckets (the migrate stage/flip) but
@@ -708,44 +713,15 @@ mod transition_order_tests {
         );
     }
 
-    fn with_pair(k: Option<&str>, s: Option<&str>) -> Config {
-        Config {
-            access_key_id: k.map(str::to_string),
-            secret_access_key: s.map(str::to_string),
-            ..Config::default()
-        }
-    }
-
-    #[test]
-    fn sigv4_decision_is_made_before_commit() {
-        let old = with_pair(Some("K"), Some("S"));
-        // Unchanged pair: nothing to publish.
-        assert!(matches!(sigv4_transition(&old, &old, false), Ok(None)));
-        // Removal without IAM users: refused (the pre-commit phase).
-        let none = with_pair(None, None);
-        assert!(sigv4_transition(&old, &none, false).is_err());
-        // Half pair = no pair: refused the same way.
-        let half = with_pair(Some("NEW"), None);
-        assert!(sigv4_transition(&old, &half, false).is_err());
-        // With IAM users the pair is only the fallback: removal is fine.
-        assert!(matches!(
-            sigv4_transition(&old, &none, true),
-            Ok(Some(None))
-        ));
-        // A new full pair is published.
-        let new = with_pair(Some("K2"), Some("S2"));
-        match sigv4_transition(&old, &new, false) {
-            Ok(Some(Some(p))) => assert_eq!(p.access_key_id, "K2"),
-            other => panic!("{:?}", other.map(|o| o.map(|p| p.is_some()))),
-        }
-    }
-
     /// The body of `apply_config_transition` (comments stripped).
     fn transition_body() -> String {
+        fn_body(concat!("pub(crate) async fn ", "apply_config_transition("))
+    }
+
+    /// The body of the fn whose signature starts with `head`.
+    fn fn_body(head: &str) -> String {
         let src = include_str!("transition.rs");
-        let start = src
-            .find(concat!("pub(crate) async fn ", "apply_config_transition("))
-            .unwrap();
+        let start = src.find(head).unwrap();
         let end = start + src[start..].find("\n}\n").unwrap();
         src[start..end]
             .lines()
@@ -774,14 +750,9 @@ mod transition_order_tests {
             !tail.contains(")?") && !tail.contains("return Err"),
             "a fallible step follows a publish in apply_config_transition:\n{tail}"
         );
-        // Every fallible step (gates, SigV4 decision, engine build, reconcile)
-        // sits before the first publish.
-        for step in [
-            "transition_gates(",
-            "sigv4_transition(",
-            "build_engine(",
-            "reconcile_declarative_iam(",
-        ] {
+        // Every fallible step (gates, engine build, the IAM commit) sits
+        // before the first publish.
+        for step in ["transition_gates(", "build_engine(", "commit_iam("] {
             let at = body.find(step).unwrap_or_else(|| panic!("{step} missing"));
             assert!(at < first_publish, "{step} runs after a publish");
         }
@@ -796,5 +767,23 @@ mod transition_order_tests {
                 assert!(at <= swap, "{p} runs after the config swap");
             }
         }
+    }
+
+    /// `commit_iam` is fallible only before its first write: after the
+    /// reconcile committed, nothing returns `Err`.
+    #[test]
+    fn commit_iam_fails_only_before_its_first_write() {
+        let body = fn_body(concat!("async fn ", "commit_iam("));
+        let lockout = body.find("check_lockout(").expect("the lockout re-check");
+        let reconcile = body
+            .find("reconcile_declarative_iam(")
+            .expect("the reconcile");
+        let publish = body.find(".store(").expect("the IAM publish");
+        assert!(lockout < reconcile && reconcile < publish);
+        let after_write = &body[body.find("rebuild_iam_index_declarative").unwrap()..];
+        assert!(
+            !after_write.contains(")?") && !after_write.contains("return Err"),
+            "commit_iam can fail after the reconcile committed:\n{after_write}"
+        );
     }
 }

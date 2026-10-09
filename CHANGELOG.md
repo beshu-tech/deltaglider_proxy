@@ -410,6 +410,20 @@ request, as it does on the S3 API. A condition on another key never holds
 for an admin request, because an admin request carries only the source
 address.
 
+### Fixed — The proxy refuses a change that leaves no credential
+
+You could delete the last IAM user while no bootstrap SigV4 pair and no
+`authentication: none` was set. The proxy then refused every S3 request, the
+log said that the proxy used a bootstrap credential that did not exist, and
+the next restart stopped with "No authentication configured". Now the proxy
+refuses (`409`) every change that leaves no credential: the delete of the
+last IAM user, the removal of the bootstrap pair, the removal of
+`authentication: none` while no IAM user exists, a declarative apply without
+`iam_users`, and an IAM restore without users. Create an IAM user or set a
+bootstrap pair first. A configuration sync from another instance can still
+remove the last user; the proxy then logs a warning and writes the audit
+entry `iam_sync_emptied`.
+
 ### Security — Removing the last IAM user or `authentication: none` no longer opens S3 access
 
 The proxy chose what S3 does with an empty IAM user list from the state it

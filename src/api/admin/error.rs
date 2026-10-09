@@ -197,6 +197,7 @@ fn db_error_status(e: &ConfigDbError) -> StatusCode {
     use crate::config_db::{classify_sqlite_error, SqliteErrorClass};
     match e {
         ConfigDbError::NotFound(_) => StatusCode::NOT_FOUND,
+        ConfigDbError::Refused(_) => StatusCode::CONFLICT,
         ConfigDbError::Sqlite(rusqlite::Error::SqliteFailure(f, _))
             if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY =>
         {

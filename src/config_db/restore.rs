@@ -175,14 +175,27 @@ impl ConfigDb {
     /// Restore `backup` in one transaction (see the module doc).
     /// `bootstrap_key`: the bootstrap access key; a backup user with it is
     /// skipped, because the key would collide with the bootstrap login.
+    /// `allow_empty`: false refuses (`Refused`, nothing committed) a restore
+    /// that leaves no IAM user (review A14: the caller has no other
+    /// credential left).
     pub fn restore_iam(
         &self,
         backup: &IamBackup,
         mode: IamRestoreMode,
         bootstrap_key: Option<&str>,
+        allow_empty: bool,
     ) -> Result<ImportResult, ConfigDbError> {
         let tx = self.conn.unchecked_transaction()?;
         let result = restore_on(&tx, backup, mode, bootstrap_key)?;
+        if !allow_empty {
+            let users: i64 = tx.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
+            if users == 0 {
+                return Err(ConfigDbError::Refused(format!(
+                    "the IAM restore leaves no IAM user: {}",
+                    crate::iam::Lockout
+                )));
+            }
+        }
         tx.commit()?;
         Ok(result)
     }
@@ -501,6 +514,33 @@ mod tests {
         n
     }
 
+    /// Review A14: a Replace restore of a backup with no user, when the
+    /// caller has no other credential, is refused and changes nothing.
+    #[test]
+    fn a_restore_that_empties_the_users_is_refused_unless_allowed() {
+        let (_d, db) = open();
+        db.create_user("dana", "AKDANA", "s", true, &[perm()])
+            .unwrap();
+        let empty = IamBackup {
+            version: 2,
+            users: vec![],
+            groups: vec![],
+            auth_providers: vec![],
+            mapping_rules: vec![],
+            external_identities: vec![],
+        };
+        let refused = db.restore_iam(&empty, IamRestoreMode::Replace, None, false);
+        assert!(
+            matches!(refused, Err(ConfigDbError::Refused(_))),
+            "{:?}",
+            refused.map(|r| r.users_deleted)
+        );
+        assert_eq!(names(&db), ["dana"], "a refused restore changed the DB");
+        db.restore_iam(&empty, IamRestoreMode::Replace, None, true)
+            .unwrap();
+        assert!(names(&db).is_empty());
+    }
+
     #[test]
     fn replace_deletes_what_the_backup_lacks_and_keeps_ids() {
         let (_d, db) = open();
@@ -521,7 +561,7 @@ mod tests {
             external_identities: vec![],
         };
         let r = db
-            .restore_iam(&backup, IamRestoreMode::Replace, None)
+            .restore_iam(&backup, IamRestoreMode::Replace, None, true)
             .unwrap();
         assert_eq!(names(&db), ["ci-uploader"]);
         assert_eq!(r.users_deleted, 1);
@@ -533,7 +573,7 @@ mod tests {
         db.create_user("dana", "AKDANA", "s", true, &[perm()])
             .unwrap();
         let r = db
-            .restore_iam(&backup, IamRestoreMode::Merge, None)
+            .restore_iam(&backup, IamRestoreMode::Merge, None, true)
             .unwrap();
         assert_eq!(names(&db), ["ci-uploader", "dana"]);
         assert_eq!((r.users_deleted, r.users_skipped), (0, 1));
@@ -558,7 +598,7 @@ mod tests {
         .unwrap();
         for mode in [IamRestoreMode::Replace, IamRestoreMode::Merge] {
             let (_d, db) = open();
-            db.restore_iam(&backup, mode, None).unwrap();
+            db.restore_iam(&backup, mode, None, true).unwrap();
             let src = |k: &str| db.get_user_by_access_key(k).unwrap().unwrap().auth_source;
             assert_eq!(src("AKDANA"), "external", "{mode:?}");
             assert_eq!(src("AKCI"), "local", "{mode:?}");
@@ -586,7 +626,7 @@ mod tests {
             external_identities: vec![],
         };
         assert!(db
-            .restore_iam(&backup, IamRestoreMode::Replace, None)
+            .restore_iam(&backup, IamRestoreMode::Replace, None, true)
             .is_err());
         assert_eq!(names(&db), ["dana"]);
     }

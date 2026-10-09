@@ -33,7 +33,7 @@
   "doc_apply_422": {
     "body": {
       "applied": false,
-      "error": "Config transition refused (no state changed): removing the bootstrap SigV4 pair would leave the proxy without authentication: create an IAM admin user first, or set `authentication: none` explicitly",
+      "error": "Config transition refused (no state changed): this change leaves the proxy without authentication: no IAM user, no bootstrap SigV4 pair and no `authentication: none` would remain. Create an IAM user or set a bootstrap pair first",
       "persisted": false,
       "requires_restart": false,
       "warnings": [
@@ -141,7 +141,7 @@
       "requires_restart": false,
       "success": true,
       "warnings": [
-        "Failed to apply config patch: removing the bootstrap SigV4 pair would leave the proxy without authentication: create an IAM admin user first, or set `authentication: none` explicitly. Pre-patch config restored."
+        "Failed to apply config patch: this change leaves the proxy without authentication: no IAM user, no bootstrap SigV4 pair and no `authentication: none` would remain. Create an IAM user or set a bootstrap pair first. Pre-patch config restored."
       ]
     },
     "etag": false,

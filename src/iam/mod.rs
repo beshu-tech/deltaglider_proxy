@@ -124,6 +124,47 @@ impl EmptyIamOutcome {
     }
 }
 
+/// The credentials S3 has at one moment: the IAM users, and what applies
+/// while there are none.
+#[derive(Debug, Clone, Copy)]
+pub struct AuthSurface<'a> {
+    pub users: usize,
+    pub when_empty: &'a EmptyIamOutcome,
+}
+
+impl AuthSurface<'_> {
+    /// Some request can still authenticate (or open access is on).
+    pub fn has_credential(&self) -> bool {
+        self.users > 0 || *self.when_empty != EmptyIamOutcome::DenyAll
+    }
+}
+
+/// An admin change refused because it would leave S3 with no credential.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Lockout;
+
+impl std::fmt::Display for Lockout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "this change leaves the proxy without authentication: no IAM user, no bootstrap \
+             SigV4 pair and no `authentication: none` would remain. Create an IAM user or set \
+             a bootstrap pair first",
+        )
+    }
+}
+
+/// Review A14, THE rule of every admin action that removes credentials (a
+/// user delete, a config change, an IAM restore): it may not take S3 from
+/// a credential to none. A deny-all state stays reachable only through a
+/// peer sync, which cannot be refused.
+pub fn check_lockout(before: AuthSurface<'_>, after: AuthSurface<'_>) -> Result<(), Lockout> {
+    if before.has_credential() && !after.has_credential() {
+        Err(Lockout)
+    } else {
+        Ok(())
+    }
+}
+
 /// Runtime IAM state — supports legacy single-credential mode and multi-user IAM.
 pub enum IamState {
     /// Open access. Only explicit `authentication: none` leads here: every
@@ -149,6 +190,14 @@ impl IamState {
             EmptyIamOutcome::Legacy(pair) => IamState::Legacy(pair),
             EmptyIamOutcome::Disabled => IamState::Disabled,
             EmptyIamOutcome::DenyAll => IamState::Iam(IamIndex::from_users(Vec::new())),
+        }
+    }
+
+    /// The IAM users in force (0 outside IAM mode).
+    pub fn user_count(&self) -> usize {
+        match self {
+            IamState::Iam(index) => index.len(),
+            IamState::Disabled | IamState::Legacy(_) => 0,
         }
     }
 
@@ -783,6 +832,69 @@ mod tests {
             IamState::Legacy(boot()).with_when_empty(DenyAll),
             Some(IamState::Iam(i)) if i.is_empty()
         ));
+    }
+
+    /// A14: only a change from some credential to none is refused.
+    #[test]
+    fn check_lockout_table() {
+        let pair = Legacy(boot());
+        let surface = |users, when_empty| AuthSurface { users, when_empty };
+        let refused = |b: AuthSurface<'_>, a: AuthSurface<'_>| check_lockout(b, a).is_err();
+        // The last user deleted, no pair, no `none`.
+        assert!(refused(surface(1, &DenyAll), surface(0, &DenyAll)));
+        // The last user deleted with a pair or `none` left.
+        assert!(!refused(surface(1, &pair), surface(0, &pair)));
+        assert!(!refused(surface(1, &Disabled), surface(0, &Disabled)));
+        // The pair removed: fine with users, refused without.
+        assert!(!refused(surface(2, &pair), surface(2, &DenyAll)));
+        assert!(refused(surface(0, &pair), surface(0, &DenyAll)));
+        // `none` removed without users.
+        assert!(refused(surface(0, &Disabled), surface(0, &DenyAll)));
+        // Already deny-all (a peer sync emptied the DB): any change passes.
+        assert!(!refused(surface(0, &DenyAll), surface(0, &DenyAll)));
+        assert!(!refused(surface(0, &DenyAll), surface(0, &Disabled)));
+        // D1: `none` set while users exist, the last user deleted: open.
+        assert!(!refused(surface(1, &Disabled), surface(0, &Disabled)));
+    }
+
+    /// The boot and the lockout rule agree: a config the boot refuses
+    /// (FATAL) is exactly a state with no credential, so an admin change
+    /// can never reach a state the next boot refuses.
+    #[test]
+    fn the_boot_rule_and_the_lockout_rule_agree() {
+        use crate::config::{AuthConfigOutcome, Config};
+        let pairs: [(Option<&str>, Option<&str>); 4] = [
+            (None, None),
+            (Some("AK"), Some("SK")),
+            (Some("AK"), None),
+            (Some("AK"), Some("  ")),
+        ];
+        for (ak, sk) in pairs {
+            for auth in [None, Some("none"), Some(" NONE "), Some("bogus")] {
+                for users in [0usize, 1] {
+                    let cfg = Config {
+                        access_key_id: ak.map(str::to_string),
+                        secret_access_key: sk.map(str::to_string),
+                        authentication: auth.map(str::to_string),
+                        ..Config::default()
+                    };
+                    let fatal = matches!(
+                        cfg.classify_auth_config(users > 0),
+                        AuthConfigOutcome::Missing | AuthConfigOutcome::UnrecognizedMode
+                    );
+                    let outcome = cfg.empty_iam_outcome();
+                    let has = AuthSurface {
+                        users,
+                        when_empty: &outcome,
+                    }
+                    .has_credential();
+                    assert_eq!(
+                        fatal, !has,
+                        "pair ({ak:?}, {sk:?}), authentication {auth:?}, users {users}"
+                    );
+                }
+            }
+        }
     }
 
     /// The outcome's Debug never prints the pair's secret.

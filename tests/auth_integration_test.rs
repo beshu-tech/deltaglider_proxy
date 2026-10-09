@@ -3924,3 +3924,166 @@ async fn review_b1_authentication_none_applies_at_once() {
         "`authentication: none` did not apply: unsigned PUT {put}, whoami mode {mode:?}"
     );
 }
+
+// ============================================================================
+// Review A14: an admin change never leaves the proxy with no credential (no
+// IAM user, no bootstrap pair, no `authentication: none`).
+// ============================================================================
+
+async fn user_names(admin: &reqwest::Client, ep: &str) -> Vec<(i64, String)> {
+    let users: serde_json::Value = admin
+        .get(format!("{ep}/_/api/admin/users"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    users
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| {
+            (
+                u["id"].as_i64().unwrap(),
+                u["name"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn review_a14_the_last_user_delete_without_a_credential_is_refused() {
+    let server = TestServer::builder()
+        .auth(
+            "AKIAREVIEWBOOTA14001",
+            "review-a14-bootstrap-secret-00000000001",
+        )
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let alice = create_user(
+        &admin,
+        &server,
+        "alice",
+        vec![json!({"effect":"Allow","actions":["*"],"resources":["*"]})],
+    )
+    .await;
+    let r = admin
+        .delete(format!("{ep}/_/api/admin/config/bootstrap-credentials"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "{}", r.text().await.unwrap());
+    for (id, name) in user_names(&admin, &ep).await {
+        if id != alice.id {
+            let s = admin
+                .delete(format!("{ep}/_/api/admin/users/{id}"))
+                .send()
+                .await
+                .unwrap()
+                .status();
+            assert_eq!(s, StatusCode::NO_CONTENT, "delete {name}");
+        }
+    }
+    let r = admin
+        .delete(format!("{ep}/_/api/admin/users/{}", alice.id))
+        .send()
+        .await
+        .unwrap();
+    let status = r.status();
+    let body = r.text().await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the last credential went: {body}"
+    );
+    assert!(body.contains("IAM"), "{body}");
+    assert!(
+        user_names(&admin, &ep)
+            .await
+            .iter()
+            .any(|(id, _)| *id == alice.id),
+        "alice is gone"
+    );
+    let (put, mode) = unsigned_put_status_and_mode(&server, "a14.txt").await;
+    assert!(!put.is_success() && mode != "open", "{put} {mode}");
+}
+
+#[tokio::test]
+async fn review_a14_an_apply_that_leaves_no_credential_is_refused() {
+    let server = TestServer::builder()
+        .auth(ALICE_AK, ALICE_SK)
+        .extra_yaml_root(&declarative_alice_yaml())
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let r = admin
+        .put(format!("{ep}/_/api/admin/config/section/access"))
+        .json(&json!({ "iam_users": [], "secret_access_key": "" }))
+        .send()
+        .await
+        .unwrap();
+    let status = r.status();
+    let body = r.text().await.unwrap();
+    assert!(
+        status.is_client_error() && body.contains("without authentication"),
+        "the apply that leaves no credential went through: {status} {body}"
+    );
+    assert!(
+        user_names(&admin, &ep)
+            .await
+            .iter()
+            .any(|(_, n)| n == "alice"),
+        "the refused apply still deleted alice"
+    );
+}
+
+/// A14: the full-IAM YAML import (validate and apply) refuses a document
+/// that leaves no IAM user while no other credential is left.
+#[tokio::test]
+async fn review_a14_a_full_iam_import_that_leaves_no_credential_is_refused() {
+    let server = TestServer::builder()
+        .auth(
+            "AKIAREVIEWBOOTA14002",
+            "review-a14-bootstrap-secret-00000000002",
+        )
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    create_user(
+        &admin,
+        &server,
+        "alice",
+        vec![json!({"effect":"Allow","actions":["*"],"resources":["*"]})],
+    )
+    .await;
+    let r = admin
+        .delete(format!("{ep}/_/api/admin/config/bootstrap-credentials"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "{}", r.text().await.unwrap());
+    for op in ["declarative-iam-validate", "declarative-iam-apply"] {
+        let r = admin
+            .post(format!("{ep}/_/api/admin/config/{op}"))
+            .json(&json!({ "yaml": "access:\n  iam_users: []\n" }))
+            .send()
+            .await
+            .unwrap();
+        let status = r.status();
+        let body = r.text().await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{op}: {body}");
+        assert!(body.contains("without authentication"), "{op}: {body}");
+    }
+    assert!(
+        user_names(&admin, &ep)
+            .await
+            .iter()
+            .any(|(_, n)| n == "alice"),
+        "the refused import deleted alice"
+    );
+}

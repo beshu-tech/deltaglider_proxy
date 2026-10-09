@@ -1374,6 +1374,9 @@ pub enum ConfigDbError {
     /// Used for "validation should have caught this" defence-in-depth
     /// cases inside the transaction.
     Other(String),
+    /// The write would leave the DB in a state the caller refuses (HTTP
+    /// 409): nothing was committed.
+    Refused(String),
 }
 
 impl std::fmt::Display for ConfigDbError {
@@ -1388,7 +1391,7 @@ impl std::fmt::Display for ConfigDbError {
             ),
             Self::NotFound(what) => write!(f, "Not found: {}", what),
             Self::Io(e) => write!(f, "I/O error: {}", e),
-            Self::Other(msg) => write!(f, "{}", msg),
+            Self::Other(msg) | Self::Refused(msg) => write!(f, "{}", msg),
         }
     }
 }

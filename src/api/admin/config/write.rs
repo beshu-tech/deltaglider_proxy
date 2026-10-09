@@ -336,7 +336,18 @@ async fn apply_locked(
 
     let no_headers = HeaderMap::new();
     let headers = write.headers.unwrap_or(&no_headers);
-    let ctx = TransitionCtx::Admin { state, headers };
+    let ctx = TransitionCtx::Admin {
+        state,
+        headers,
+        // A backup restore's rollback puts back the config that was live.
+        restoring: matches!(
+            write.surface,
+            Surface::Internal {
+                action: RESTORE_ROLLBACK_ACTION,
+                ..
+            }
+        ),
+    };
     let report = match super::apply_config_transition(ctx, cfg, new_cfg).await {
         Ok(r) => r,
         Err(e) => {
@@ -675,6 +686,10 @@ pub(crate) enum HeldRefusal<E> {
 /// nothing changes; `commit` runs after the persist, and a refusal puts the
 /// old config back (live and in the file). The audit entry is written only
 /// when everything succeeded.
+// A `hold` that keeps the config DB lock (the rule delete) must wrap an
+// edit that leaves the IAM fields, the bootstrap pair and `authentication`
+// unchanged: `commit_iam` takes that lock for an IAM change, and a tokio
+// Mutex is not reentrant (the step-2 deadlock of the bugscan review).
 pub(crate) async fn run_internal_held<H, E, C>(
     state: &Arc<AdminState>,
     write: Internal<'_>,
@@ -757,6 +772,10 @@ where
     })
 }
 
+/// The internal-write action of a backup restore's rollback: it puts back
+/// a config that was live, so the forward-only gates do not apply.
+pub(crate) const RESTORE_ROLLBACK_ACTION: &str = "restore_rollback";
+
 /// Put `old` back after a failed internal write, and into the file when
 /// the write reached it.
 async fn roll_back(
@@ -766,7 +785,11 @@ async fn roll_back(
     old: Config,
     re_persist: bool,
 ) {
-    let ctx = TransitionCtx::Admin { state, headers };
+    let ctx = TransitionCtx::Admin {
+        state,
+        headers,
+        restoring: true,
+    };
     if let Err(e) = super::apply_config_transition(ctx, cfg, old).await {
         tracing::error!("config write rollback failed, the new config stays live: {e}");
         return;
