@@ -777,12 +777,33 @@ pub(crate) fn has_unrestricted_allow_for_bucket_prefix(
 /// Does this statement's action set let a key show in a listing (read or
 /// list)? Write, delete and admin alone do not.
 fn grants_discovery(perm: &Permission) -> bool {
-    perm.actions.iter().any(|a| {
-        matches!(
-            a.as_str(),
-            "*" | "read" | "list" | "s3:GetObject" | "s3:ListBucket" | "s3:*"
-        )
-    })
+    grants_read(perm) || grants_list(perm)
+}
+
+fn grants_read(perm: &Permission) -> bool {
+    perm.actions
+        .iter()
+        .any(|a| matches!(a.as_str(), "*" | "read" | "s3:GetObject" | "s3:*"))
+}
+
+fn grants_list(perm: &Permission) -> bool {
+    perm.actions
+        .iter()
+        .any(|a| matches!(a.as_str(), "*" | "list" | "s3:ListBucket" | "s3:*"))
+}
+
+/// THE listing-Deny rule of both listing predicates (review A9): a name
+/// (key or folder) is hidden when a Deny on LIST covers it. A Deny on READ
+/// alone hides no name: AWS does not hide keys from ListBucket for a
+/// GetObject Deny. An exact List Deny on the folder marker `a/b/` hides the
+/// folder only, not the keys under it.
+fn hidden_by_list_deny(
+    user: &super::AuthenticatedUser,
+    bucket: &str,
+    name: &str,
+    context: &Context,
+) -> bool {
+    user.is_explicitly_denied(S3Action::List, bucket, name, context)
 }
 
 /// Can this Deny statement hide some key of `bucket` under `prefix` from a
@@ -819,21 +840,23 @@ fn resource_descends_from_prefix(resource: &str, bucket: &str, prefix: &str) -> 
     resource_base.starts_with(&prefix_path)
 }
 
-fn allow_references_common_prefix(
+/// An unconditioned Allow on a resource under `prefix` makes the folder
+/// navigable: one that grants LIST always (its keys list), one that grants
+/// only READ unless a READ Deny fires for the folder (then nothing under it
+/// can show).
+fn descendant_allow_reaches(
     user: &super::AuthenticatedUser,
     bucket: &str,
     prefix: &str,
+    context: &Context,
 ) -> bool {
+    let read_denied = user.is_explicitly_denied(S3Action::Read, bucket, prefix, context);
     user.permissions.iter().any(|perm| {
-        if perm.effect != "Allow" {
-            return false;
-        }
-        if perm.conditions.is_some() {
-            // Non-prefix request context cannot be proven here. Prefix-list
-            // conditions are handled by can_list_prefix_with_context above.
-            return false;
-        }
-        grants_discovery(perm)
+        // Non-prefix request context cannot be proven here. Prefix-list
+        // conditions are handled by can_list_prefix_with_context.
+        perm.effect == "Allow"
+            && perm.conditions.is_none()
+            && (grants_list(perm) || (grants_read(perm) && !read_denied))
             && perm
                 .resources
                 .iter()
@@ -864,7 +887,7 @@ pub fn user_can_see_listed_key(
     // The third disjunct evaluates the BUCKET ARN, which a Deny on a key
     // pattern (`b/secret/*`) never matches: a Deny on listing this key
     // must hide it whatever grants the listing.
-    if user.is_explicitly_denied(S3Action::List, bucket, key, context) {
+    if hidden_by_list_deny(user, bucket, key, context) {
         return false;
     }
     user.can_with_context(S3Action::Read, bucket, key, context)
@@ -896,23 +919,18 @@ pub fn user_can_see_common_prefix(
     prefix: &str,
     context: &Context,
 ) -> bool {
-    // A Deny that covers the prefix covers every key under it, so it hides
-    // the folder name too, whatever grants the listing (the bucket-ARN list
-    // disjunct below never sees a Deny on a key pattern).
-    if user.is_explicitly_denied(S3Action::Read, bucket, prefix, context)
-        || user.is_explicitly_denied(S3Action::List, bucket, prefix, context)
-    {
+    // A List Deny that covers the prefix covers every key under it, so it
+    // hides the folder name too, whatever grants the listing (the
+    // bucket-ARN list disjunct below never sees a Deny on a key pattern).
+    // The same rule as the per-key filter, so a visible key never sits in
+    // a hidden folder.
+    if hidden_by_list_deny(user, bucket, prefix, context) {
         return false;
     }
     user.can_with_context(S3Action::Read, bucket, prefix, context)
         || user.can_with_context(S3Action::List, bucket, prefix, context)
         || can_list_prefix_with_context(user, bucket, prefix, context)
-        // A descendant Allow makes the prefix navigable, unless a Deny that
-        // fires for this request covers the prefix itself (and so every
-        // key under it).
-        || (allow_references_common_prefix(user, bucket, prefix)
-            && !user.is_explicitly_denied(S3Action::Read, bucket, prefix, context)
-            && !user.is_explicitly_denied(S3Action::List, bucket, prefix, context))
+        || descendant_allow_reaches(user, bucket, prefix, context)
 }
 
 /// Pure: key prefixes that together hold every key `user` can see in
@@ -1714,6 +1732,71 @@ mod tests {
             "secret/projX/",
             &ctx
         ));
+    }
+
+    /// Review A9: a Deny on READ alone hides no name (AWS: a GetObject Deny
+    /// does not hide keys from ListBucket). The B027 guard hid the folder
+    /// while the per-key filter listed every key in it.
+    #[test]
+    fn a_read_only_deny_hides_no_name() {
+        let user = user_of(vec![
+            p("Allow", &["read", "list"], &["carve", "carve/*"]),
+            p("Deny", &["read"], &["carve/secret/*"]),
+        ]);
+        let ctx = Context::new();
+        assert!(user_can_see_listed_key(&user, "carve", "secret/x", &ctx));
+        assert!(
+            user_can_see_common_prefix(&user, "carve", "secret/", &ctx),
+            "the folder is hidden while its keys are listed"
+        );
+    }
+
+    const A9_ACTIONS: &[&[&str]] = &[&["read"], &["list"], &["read", "list"], &["*"]];
+    const A9_ALLOW: &[&str] = &["b/a/*", "b/a/b/*", "b/c/*", "b/*", "b", "b/a/b/k"];
+    const A9_DENY: &[&str] = &["b/a/*", "b/a/b/*", "b/c/*", "b/*"];
+    const A9_KEYS: &[&str] = &["a/k", "a/b/k", "a/b/c/k", "c/d/k", "c/k"];
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(512))]
+        /// Review A9 guard: the two listing predicates agree — a key the
+        /// per-key filter shows never sits in a folder the folder
+        /// predicate hides.
+        #[test]
+        fn a_visible_key_never_sits_in_a_hidden_folder(
+            allows in proptest::collection::vec(
+                (proptest::sample::select(A9_ACTIONS), proptest::sample::select(A9_ALLOW)),
+                1..4),
+            denies in proptest::collection::vec(
+                (proptest::sample::select(A9_ACTIONS), proptest::sample::select(A9_DENY)),
+                0..3),
+            key in proptest::sample::select(A9_KEYS),
+        ) {
+            let mut perms: Vec<Permission> =
+                allows.iter().map(|(a, r)| p("Allow", a, &[r])).collect();
+            perms.extend(denies.iter().map(|(a, r)| p("Deny", a, &[r])));
+            let user = user_of(perms);
+            let ctx = Context::new();
+            if user_can_see_listed_key(&user, "b", key, &ctx) {
+                for (i, _) in key.match_indices('/') {
+                    let folder = &key[..=i];
+                    proptest::prop_assert!(
+                        user_can_see_common_prefix(&user, "b", folder, &ctx),
+                        "key {key} is visible, folder {folder} is hidden"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A read Deny still hides a folder that only a read grant reaches.
+    #[test]
+    fn a_read_deny_hides_a_folder_only_read_reaches() {
+        let user = user_of(vec![
+            p("Allow", &["read"], &["carve/secret/a/*"]),
+            p("Deny", &["read"], &["carve/secret/*"]),
+        ]);
+        let ctx = Context::new();
+        assert!(!user_can_see_common_prefix(&user, "carve", "secret/", &ctx));
     }
 
     /// B028: iam-rs reads a negated operator with several values as "misses

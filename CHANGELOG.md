@@ -277,7 +277,9 @@ succeed.
 - A Deny rule on a sub-folder (for example `Deny` on `photos/secret/*`
   under an `Allow` on the whole bucket) hid the objects in the folder, but a
   listing with `delimiter=/` still showed the names of its sub-folders. Now
-  the Deny hides the folder names too.
+  a Deny on `list` hides the folder names too. A Deny on `read` alone hides
+  no name, as in AWS: the listing shows the keys and their folders, and the
+  read of an object is refused.
 - A negated condition with several values, such as `NotIpAddress` with two
   networks or `StringNotLike` with two prefixes, was true when the request
   missed only one of the values. A Deny then also refused the allowed
