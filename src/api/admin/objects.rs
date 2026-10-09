@@ -942,6 +942,16 @@ fn parse_zip_keys(raw: &str) -> Result<Vec<(String, String)>, String> {
         .collect()
 }
 
+/// Add one visible key to a select-all listing; `true` when the listing
+/// holds more keys than the bulk endpoints take (MAX_BULK_OBJECTS).
+fn push_listed_key(keys: &mut Vec<String>, key: String) -> bool {
+    if keys.len() == MAX_BULK_OBJECTS {
+        return true; // a key past the limit: not kept
+    }
+    keys.push(key);
+    false
+}
+
 pub async fn download_zip(
     Extension(session): Extension<BulkSession>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
@@ -1269,8 +1279,7 @@ pub async fn list_all(
             if !actor.may_see(&q.bucket, k) {
                 continue;
             }
-            keys.push(k.clone());
-            if keys.len() >= MAX_BULK_OBJECTS {
+            if push_listed_key(&mut keys, k.clone()) {
                 return Ok(Json(ListAllResponse {
                     keys,
                     truncated: true,
@@ -1296,6 +1305,26 @@ mod tests {
             .map(|(b, k)| (b.to_string(), k.to_string()))
             .collect();
         super::zip_entry_names(&owned)
+    }
+
+    /// B096: the bulk endpoints take MAX_BULK_OBJECTS keys, so a folder of
+    /// exactly that many is not truncated; one more key is.
+    #[test]
+    fn a_listing_of_exactly_the_bulk_limit_is_not_truncated() {
+        let mut keys = Vec::new();
+        for i in 0..super::MAX_BULK_OBJECTS {
+            assert!(
+                !super::push_listed_key(&mut keys, format!("k{i}")),
+                "truncated at key {}",
+                i + 1
+            );
+        }
+        assert!(super::push_listed_key(&mut keys, "one-more".into()));
+        assert_eq!(
+            keys.len(),
+            super::MAX_BULK_OBJECTS,
+            "the extra key is not kept"
+        );
     }
 
     /// B043: the shared-prefix walk sliced `&str` at a byte offset taken

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed — Selecting a folder of exactly 10,000 objects works
+
+The bulk copy, move, delete and ZIP endpoints accept up to 10,000 keys. The
+listing that the admin GUI uses to select a whole folder reported a folder
+of exactly 10,000 objects as "more than 10,000", so the GUI refused the
+selection. Now only a folder with more keys than that is reported as too
+large.
+
 ### Fixed — The Jobs screen always shows the running maintenance job
 
 `GET /_/api/admin/jobs` listed the 50 newest maintenance jobs, but the
