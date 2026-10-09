@@ -49,6 +49,30 @@ pub(crate) fn current_request_peer() -> Option<std::net::IpAddr> {
     REQUEST_PEER.try_with(|p| *p).ok().flatten()
 }
 
+/// Spawn `fut` with this request's audit scope (peer, actor): a spawned
+/// task does not inherit task-locals, so its audit entries and the
+/// trusted-proxy decisions would lose the peer IP.
+pub fn spawn_in_request_scope<F>(fut: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let peer = REQUEST_PEER.try_with(|p| *p).ok();
+    let actor = REQUEST_ACTOR.try_with(|a| a.clone()).ok();
+    tokio::spawn(async move {
+        match (peer, actor) {
+            (Some(peer), Some(actor)) => {
+                REQUEST_PEER
+                    .scope(peer, REQUEST_ACTOR.scope(actor, fut))
+                    .await
+            }
+            (Some(peer), None) => REQUEST_PEER.scope(peer, fut).await,
+            (None, Some(actor)) => REQUEST_ACTOR.scope(actor, fut).await,
+            (None, None) => fut.await,
+        }
+    })
+}
+
 tokio::task_local! {
     /// Principal of the admin session serving this request, set by the
     /// admin-session middleware (S23: entries used to say just "admin").

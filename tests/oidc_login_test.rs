@@ -30,9 +30,12 @@ struct Idp {
     jwk: Value,
     /// Authorization code → nonce.
     codes: Mutex<HashMap<String, String>>,
+    /// How long the discovery document takes to answer.
+    discovery_delay: std::time::Duration,
 }
 
 async fn discovery(State(idp): State<Arc<Idp>>) -> Json<Value> {
+    tokio::time::sleep(idp.discovery_delay).await;
     let i = &idp.issuer;
     Json(json!({
         "issuer": i,
@@ -94,6 +97,10 @@ async fn token(
 /// Starts the IdP on 127.0.0.1 with a leaf certificate from a fresh CA.
 /// Returns the issuer URL and the CA certificate (PEM).
 async fn start_idp() -> (String, String) {
+    start_idp_with_delay(std::time::Duration::ZERO).await
+}
+
+async fn start_idp_with_delay(discovery_delay: std::time::Duration) -> (String, String) {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let ca_key = rcgen::KeyPair::generate().unwrap();
     let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -127,6 +134,7 @@ async fn start_idp() -> (String, String) {
         signing_pem: signing.serialize_pem(),
         jwk,
         codes: Mutex::new(HashMap::new()),
+        discovery_delay,
     });
     let app = Router::new()
         .route("/.well-known/openid-configuration", get(discovery))
@@ -458,4 +466,43 @@ async fn oauth_authorize_does_not_reset_the_brute_force_counter() {
         statuses.contains(&429),
         "secret guessing never hit the lockout: {statuses:?}"
     );
+}
+
+/// B041/B090/B092: a client that disconnects drops the handler future. A
+/// mutating admin request must still run to its end: here the provider is
+/// created in the DB, and the live provider set (rebuilt after a slow
+/// discovery) must follow it.
+#[tokio::test]
+async fn a_dropped_admin_request_still_completes_its_mutation() {
+    let (issuer, ca_pem) = start_idp_with_delay(std::time::Duration::from_secs(2)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let ca_path = dir.path().join("idp-ca.pem");
+    std::fs::write(&ca_path, &ca_pem).unwrap();
+    let server = TestServer::builder().build().await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let before = crate::common::get_ext_auth_version(&admin, &ep).await;
+    let impatient = admin
+        .post(format!("{ep}/_/api/admin/ext-auth/providers"))
+        .timeout(std::time::Duration::from_millis(500))
+        .json(&json!({
+            "name": "corp", "provider_type": "oidc", "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET, "issuer_url": issuer,
+            "scopes": "openid email profile",
+            "extra_config": { "allow_local": true, "ca_cert_path": ca_path.display().to_string() },
+        }))
+        .send()
+        .await;
+    assert!(impatient.is_err(), "the client was meant to give up first");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        if crate::common::get_ext_auth_version(&admin, &ep).await > before {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dropped request never finished its mutation (provider set not rebuilt)"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
 }

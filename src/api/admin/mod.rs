@@ -260,6 +260,31 @@ pub(crate) fn reject_reserved_bucket<B: ErrorBody>(
     }
 }
 
+/// Middleware: a state-changing admin request runs to its end even when the
+/// client disconnects. hyper drops the handler future with the connection,
+/// and a mutation cut halfway (a config persisted but neither committed nor
+/// rolled back, a DB change without its sync push or audit entry, a rebuilt
+/// DB without the live provider set) is worse than a finished one that
+/// nobody reads. The request runs in a spawned task; this future only waits
+/// for it. Reads (and the SSE streams) are not spawned.
+pub async fn run_to_completion(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::Method;
+    use axum::response::IntoResponse;
+    if matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
+        return next.run(req).await;
+    }
+    match crate::audit::spawn_in_request_scope(next.run(req)).await {
+        Ok(response) => response,
+        Err(e) => {
+            tracing::error!("admin request task failed: {e}");
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 pub(crate) fn trigger_config_sync(state: &Arc<AdminState>) {
     if state.config_db_mismatch {
         tracing::warn!("Config sync blocked — the config DB key does not open the config DB (recovery required)");

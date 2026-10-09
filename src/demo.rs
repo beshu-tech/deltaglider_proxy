@@ -566,6 +566,9 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         .merge(metrics_route)
         .merge(stats_route)
         .merge(static_routes)
+        // Innermost of the shared layers: a mutation runs to its end even if
+        // the client disconnects (route-level auth runs inside the task).
+        .layer(middleware::from_fn(admin::run_to_completion))
         // CSRF: state-changing requests must prove same origin (S5).
         .layer(middleware::from_fn_with_state(
             admin_state.clone(),

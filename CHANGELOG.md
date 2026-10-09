@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed — An admin change finishes even when the browser disconnects
+
+When the client of an admin request disconnected (a closed tab, a client
+timeout, a dropped network), the proxy stopped the request where it was. A
+change could then stay half done: a bucket route saved without its bucket, a
+restored configuration without the restored IAM database, a deleted user or
+a revoked key whose change never reached the other nodes, or a new sign-in
+provider in the database but not in the running sign-in flow. Now every
+admin request that changes state runs to its end, whether or not the client
+still waits for the answer.
+
 ### Fixed — A short `${env:…}` value goes back only where it came from
 
 When the proxy saves its configuration, it writes `${env:NAME}` back in
