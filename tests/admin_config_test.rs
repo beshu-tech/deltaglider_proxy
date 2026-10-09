@@ -2183,3 +2183,34 @@ async fn test_read_only_config_file_is_reported() {
     assert_eq!(restore_status, StatusCode::CONFLICT, "{restore_body}");
     assert!(restore_body.contains("read-only"), "{restore_body}");
 }
+
+/// B089: validate answers what the apply would: a change the apply refuses
+/// (here a sync bucket without DGP_CONFIG_DB_KEY) is not `ok: true`.
+#[tokio::test]
+async fn validate_runs_the_apply_gates() {
+    let server = TestServer::builder()
+        .auth("SYNCKEYAK", "SYNCKEYSECRET")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let resp = admin
+        .post(format!(
+            "{}/_/api/admin/config/section/advanced/validate",
+            server.endpoint()
+        ))
+        .json(&json!({ "config_sync_bucket": "dgp-sync" }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    let ok = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v["ok"].as_bool())
+        .unwrap_or(false);
+    assert!(
+        !(status.is_success() && ok),
+        "validate passed a change the apply refuses: {status} {body}"
+    );
+    assert!(body.contains("DGP_CONFIG_DB_KEY"), "{body}");
+}

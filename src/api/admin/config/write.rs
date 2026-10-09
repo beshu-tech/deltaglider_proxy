@@ -245,16 +245,26 @@ pub(super) async fn run(
         let outcome = match build(&old).and_then(|b| prepare_with_refs(&old, b, &write, &mut refs))
         {
             Err(r) => Outcome::Rejected(r),
-            Ok(mut p) => {
-                if write.surface.section().is_some() {
-                    p.warnings.preview = declarative_preview(state, &old, &p.new_cfg).await;
-                }
-                Outcome::Validated {
-                    warnings: p.warnings,
-                    restart: p.restart,
+            Ok(mut p) => match super::transition::static_transition_gates(&old, &p.new_cfg) {
+                // What the apply would refuse, a validate refuses too.
+                Err(error) => Outcome::Rejected(Rejection {
+                    stage: Stage::Transition,
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    error,
+                    warnings: Box::new(p.warnings),
                     diff: p.diff,
+                }),
+                Ok(()) => {
+                    if write.surface.section().is_some() {
+                        p.warnings.preview = declarative_preview(state, &old, &p.new_cfg).await;
+                    }
+                    Outcome::Validated {
+                        warnings: p.warnings,
+                        restart: p.restart,
+                        diff: p.diff,
+                    }
                 }
-            }
+            },
         };
         return WriteResult { outcome, refs };
     }

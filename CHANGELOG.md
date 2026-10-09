@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed — Config validate refuses what the apply refuses
+
+The admin validate endpoints (`POST /config/validate` and
+`POST /config/section/<name>/validate`) answered `ok: true` for some changes
+that the apply then refused with `422`: a configuration error that also
+stops the proxy at startup, a webhook URL that every delivery would refuse,
+and a sync bucket without `DGP_CONFIG_DB_KEY`. Now validate runs the same
+checks and answers `422`. The live backend probes still run only when you
+apply.
+
 ### Security — Allowlisted env values no longer echo in validate responses
 
 An admin section validate (and a refused apply) replaces every resolved

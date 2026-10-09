@@ -278,15 +278,13 @@ pub(crate) async fn apply_config_transition(
     Ok(TransitionReport { warnings })
 }
 
-/// The pre-commit gates of [`apply_config_transition`] that need no plan
-/// output: config-graph errors, the sync-bucket key rule, the backend
-/// capability and health probes, and the declarative-IAM validation.
-async fn transition_gates(
-    ctx: &TransitionCtx<'_>,
+/// The gates of [`transition_gates`] that need no I/O. The validate
+/// endpoints run them too, so a validate answers what the apply would (the
+/// backend probes and the declarative DB validation run on apply only).
+pub(super) fn static_transition_gates(
     old_cfg: &crate::config::Config,
     new_cfg: &crate::config::Config,
 ) -> Result<(), String> {
-    let app = ctx.app();
     // FATAL config-graph errors (bucket → undefined backend, duplicate
     // backend names): un-runnable states that boot refuses too.
     let mut fatal = new_cfg.check_fatal();
@@ -307,7 +305,19 @@ async fn transition_gates(
         new_cfg.config_sync_bucket.as_deref(),
         crate::config::process_env(crate::config_db::key::CONFIG_DB_KEY_ENV).as_deref(),
     )
-    .map_err(|e| format!("config refused: {e}"))?;
+    .map_err(|e| format!("config refused: {e}"))
+}
+
+/// The pre-commit gates of [`apply_config_transition`] that need no plan
+/// output: config-graph errors, the sync-bucket key rule, the backend
+/// capability and health probes, and the declarative-IAM validation.
+async fn transition_gates(
+    ctx: &TransitionCtx<'_>,
+    old_cfg: &crate::config::Config,
+    new_cfg: &crate::config::Config,
+) -> Result<(), String> {
+    let app = ctx.app();
+    static_transition_gates(old_cfg, new_cfg)?;
 
     // Backend write-capability gate (guard B, hot-apply half): refuse routing
     // a client-writable bucket onto a non-CAS backend under multi-instance.
