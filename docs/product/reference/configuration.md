@@ -298,6 +298,8 @@ In-memory `FileMetadata` cache size in MB. Set it to `0` to disable the cache. 5
 
 The number of backend pages that one filtered LIST request may read. A LIST is filtered when the caller's policy cannot be narrowed to key prefixes, for example an `Allow` on the whole bucket with a `Deny` exception. The proxy then reads the requested prefix page by page and skips the keys that the caller cannot see. When it finds no visible key within this number of pages, the request fails with `400 InvalidRequest`, and the caller must list a narrower prefix.
 
+The same limit applies to the folder listing of the file browser (`GET /_/api/admin/objects/list`) for a user without admin rights. There, the limit is for the whole folder and not for one page, and a folder that the limit cannot read to its end makes the request fail with `400`.
+
 | | |
 |---|---|
 | **Env var** | `DGP_FILTERED_LIST_MAX_ENGINE_PAGES` |

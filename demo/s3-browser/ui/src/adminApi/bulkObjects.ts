@@ -83,7 +83,8 @@ interface ListAllResponse {
  * equivalent of the previous browser-side `listAllKeys`.
  * The server stops at 10,000 keys and sets `truncated`; callers go through
  * `expandSelection` (bulkSelection.ts), which refuses a truncated folder.
- * Admin GUI session required.
+ * For a user without admin rights the server lists only the visible keys,
+ * and a folder of too many hidden keys answers 400 (an ApiError).
  */
 export async function listAllUnderPrefix(bucket: string, prefix: string): Promise<ListAllResponse> {
   if (!prefix) throw new Error('listAllUnderPrefix: prefix must be non-empty');

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Security — A folder selection reads only what the user can see
+
+When a user without admin rights selected a folder in the file browser, the
+proxy listed every key under the folder and only then skipped the keys that
+the user may not see. A folder with millions of hidden keys made one request
+read all of them. Now the folder listing uses the same walk as an S3 `LIST`:
+it reads only the prefixes that the user's policy can reach, and when it must
+skip hidden keys, it reads at most `advanced.filtered_list_max_engine_pages`
+backend pages for the whole folder. A folder that this limit cannot read to
+its end fails with `400`, because a partial folder must not become the
+selection of a copy, move or delete.
+
 ### Security — ZIP entry names cannot point outside the extraction folder
 
 The ZIP download named each entry after its object key below the shared

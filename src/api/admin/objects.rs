@@ -324,13 +324,14 @@ impl BulkActor {
         }
     }
 
-    /// May the actor see `key` in a listing (the S3 LIST filter)?
-    fn may_see(&self, bucket: &str, key: &str) -> bool {
+    /// The S3 LIST's scope for this actor: filtered per key for a user.
+    fn list_scope(&self) -> Option<crate::iam::ListScope> {
         match self {
-            Self::Unrestricted => true,
-            Self::User { user, context } => {
-                crate::iam::permissions::user_can_see_listed_key(user, bucket, key, context)
-            }
+            Self::Unrestricted => None,
+            Self::User { user, context } => Some(crate::iam::ListScope::Filtered {
+                user: user.clone(),
+                context: context.clone(),
+            }),
         }
     }
 
@@ -994,16 +995,6 @@ fn parse_zip_keys(raw: &str) -> Result<Vec<(String, String)>, String> {
         .collect()
 }
 
-/// Add one visible key to a select-all listing; `true` when the listing
-/// holds more keys than the bulk endpoints take (MAX_BULK_OBJECTS).
-fn push_listed_key(keys: &mut Vec<String>, key: String) -> bool {
-    if keys.len() == MAX_BULK_OBJECTS {
-        return true; // a key past the limit: not kept
-    }
-    keys.push(key);
-    false
-}
-
 pub async fn download_zip(
     Extension(session): Extension<BulkSession>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
@@ -1310,43 +1301,31 @@ pub async fn list_all(
             &*q.prefix
         )));
     }
+    // The S3 LIST's walk and budget (review D7): a scoped user reads only
+    // its visible prefixes, under `filtered_list_max_engine_pages` pages in
+    // all; the per-key filter is the S3 LIST's.
     let engine = state.s3_state.engine.load();
-    let mut keys: Vec<String> = Vec::new();
-    let mut continuation: Option<String> = None;
-    let cap = 1000u32;
-    loop {
-        let page = engine
-            .list_objects(
-                &bucket,
-                &q.prefix,
-                None,
-                cap,
-                continuation.as_deref(),
-                false,
-            )
-            .await
-            .map_err(|e| AdminError::internal(format!("{}", e)))?;
-        for (k, _) in &page.objects {
-            // The S3 LIST filter: a key the actor cannot see is left out.
-            if !actor.may_see(&bucket, k) {
-                continue;
-            }
-            if push_listed_key(&mut keys, k.clone()) {
-                return Ok(Json(ListAllResponse {
-                    keys,
-                    truncated: true,
-                }));
-            }
+    let budget = state.config.read().await.filtered_list_max_engine_pages;
+    let scope = actor.list_scope();
+    match crate::iam::listing::list_keys_for_caller(
+        &**engine,
+        &bucket,
+        &q.prefix,
+        scope.as_ref(),
+        MAX_BULK_OBJECTS,
+        budget,
+    )
+    .await
+    {
+        Ok((keys, truncated)) => Ok(Json(ListAllResponse { keys, truncated })),
+        Err(crate::iam::listing::ListingError::NoVisibleKeyInBudget) => Err(AdminError::invalid(
+            "the folder holds more objects you cannot see than one listing may read \
+             (advanced.filtered_list_max_engine_pages); select a narrower folder",
+        )),
+        Err(crate::iam::listing::ListingError::Engine(e)) => {
+            Err(AdminError::internal(e.to_string()))
         }
-        if !page.is_truncated || page.next_continuation_token.is_none() {
-            break;
-        }
-        continuation = page.next_continuation_token;
     }
-    Ok(Json(ListAllResponse {
-        keys,
-        truncated: false,
-    }))
 }
 
 #[cfg(test)]
@@ -1366,17 +1345,42 @@ mod tests {
         let mut keys = Vec::new();
         for i in 0..super::MAX_BULK_OBJECTS {
             assert!(
-                !super::push_listed_key(&mut keys, format!("k{i}")),
+                !crate::iam::listing::push_listed_key(
+                    &mut keys,
+                    format!("k{i}"),
+                    super::MAX_BULK_OBJECTS
+                ),
                 "truncated at key {}",
                 i + 1
             );
         }
-        assert!(super::push_listed_key(&mut keys, "one-more".into()));
+        assert!(crate::iam::listing::push_listed_key(
+            &mut keys,
+            "one-more".into(),
+            super::MAX_BULK_OBJECTS
+        ));
         assert_eq!(
             keys.len(),
             super::MAX_BULK_OBJECTS,
             "the extra key is not kept"
         );
+    }
+
+    /// Review D7: a browser session reaches these handlers, so a listing
+    /// here must go through the S3 LIST's walk (`iam::listing`), which
+    /// reads only the visible prefixes under the page budget. A raw engine
+    /// listing walks every hidden key.
+    #[test]
+    fn bulk_handlers_list_only_through_the_s3_list_walk() {
+        let src = std::fs::read_to_string("src/api/admin/objects.rs").unwrap();
+        let body = src.split("#[cfg(test)]").next().unwrap();
+        for raw in [".list_objects", ".list("] {
+            assert!(
+                !body.contains(raw),
+                "objects.rs calls `{raw}`: use iam::listing"
+            );
+        }
+        assert!(body.contains("listing::list_keys_for_caller("));
     }
 
     /// Review E12: an entry name comes from an object key, which a writer

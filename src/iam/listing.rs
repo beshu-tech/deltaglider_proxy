@@ -148,6 +148,89 @@ pub(crate) async fn list_page_for_caller<L: Lister>(
     scope: Option<&ListScope>,
     budget: usize,
 ) -> Result<ListObjectsPage, ListingError> {
+    let mut budget = budget;
+    list_page_within(
+        lister,
+        bucket,
+        prefix,
+        delimiter,
+        max_keys,
+        cursor,
+        metadata,
+        scope,
+        &mut budget,
+    )
+    .await
+}
+
+/// Every visible key under `prefix` (no delimiter), at most `max_keys`, and
+/// whether a visible key past them exists (review D7: the admin folder
+/// listing walked a whole prefix of hidden keys with no budget). For a
+/// filtered caller the walk reads at most `budget` engine pages IN ALL; a
+/// walk that spends it before the end is `NoVisibleKeyInBudget`, because a
+/// partial folder must never be acted on. An unrestricted caller is bounded
+/// by `max_keys`.
+pub(crate) async fn list_keys_for_caller<L: Lister>(
+    lister: &L,
+    bucket: &str,
+    prefix: &str,
+    scope: Option<&ListScope>,
+    max_keys: usize,
+    budget: usize,
+) -> Result<(Vec<String>, bool), ListingError> {
+    let mut budget = budget;
+    let mut keys = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = list_page_within(
+            lister,
+            bucket,
+            prefix,
+            None,
+            1000,
+            cursor.as_deref(),
+            false,
+            scope,
+            &mut budget,
+        )
+        .await?;
+        for (key, _) in page.objects {
+            if push_listed_key(&mut keys, key, max_keys) {
+                return Ok((keys, true));
+            }
+        }
+        match page.next_continuation_token.filter(|_| page.is_truncated) {
+            Some(token) => cursor = Some(token),
+            None => return Ok((keys, false)),
+        }
+    }
+}
+
+/// Add one visible key to a walk's result; `true` when the walk holds more
+/// keys than `max` (B096: exactly `max` is not truncated). The extra key is
+/// not kept.
+pub(crate) fn push_listed_key(keys: &mut Vec<String>, key: String, max: usize) -> bool {
+    if keys.len() == max {
+        return true;
+    }
+    keys.push(key);
+    false
+}
+
+/// [`list_page_for_caller`] spending a caller-owned engine-page budget, so a
+/// multi-page walk shares one budget.
+#[allow(clippy::too_many_arguments)]
+async fn list_page_within<L: Lister>(
+    lister: &L,
+    bucket: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+    max_keys: u32,
+    cursor: Option<&str>,
+    metadata: bool,
+    scope: Option<&ListScope>,
+    budget: &mut usize,
+) -> Result<ListObjectsPage, ListingError> {
     let (user, context) = match scope {
         Some(ListScope::Filtered { user, context }) => (user, context),
         _ => {
@@ -178,12 +261,11 @@ pub(crate) async fn list_page_for_caller<L: Lister>(
     // ONE engine-page budget for the whole request, shared by every target
     // (scans and roll-up probes): per target, N visible prefixes read N
     // budgets for one LIST.
-    let mut budget = budget;
     for target in targets {
         if objects.len() + prefixes.len() >= want {
             break;
         }
-        if budget == 0 {
+        if *budget == 0 {
             // Stopped before this target: the listing goes on after the
             // last visible entry.
             more = true;
@@ -200,11 +282,11 @@ pub(crate) async fn list_page_for_caller<L: Lister>(
                     continue;
                 }
                 for probe in probes {
-                    if budget == 0 {
+                    if *budget == 0 {
                         more = true;
                         break;
                     }
-                    budget -= 1;
+                    *budget -= 1;
                     let page = lister
                         .list(bucket, &probe, delimiter, 1, None, false)
                         .await?;
@@ -217,8 +299,8 @@ pub(crate) async fn list_page_for_caller<L: Lister>(
             ListTarget::Scan(scan_prefix) => {
                 let need = want - objects.len() - prefixes.len();
                 let mut scan_cursor = cursor.map(str::to_string);
-                while budget > 0 {
-                    budget -= 1;
+                while *budget > 0 {
+                    *budget -= 1;
                     let page = lister
                         .list(
                             bucket,
@@ -825,5 +907,69 @@ mod tests {
             page.objects.first().map(|(k, _)| k.as_str()),
             Some("releases/a.png")
         );
+    }
+
+    fn counting(keys: Vec<String>) -> CountingLister {
+        CountingLister {
+            keys,
+            calls: Default::default(),
+        }
+    }
+
+    fn calls(lister: &CountingLister) -> usize {
+        lister.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Review D7: a folder walk spends ONE budget across its pages, and a
+    /// walk that spends it before the end fails: the visible keys of the
+    /// first pages are never returned as the whole folder.
+    #[tokio::test]
+    async fn a_folder_walk_shares_one_budget_and_never_returns_a_partial_folder() {
+        let mut keys: Vec<String> = (0..1000).map(|i| format!("a/{i:04}")).collect();
+        keys.extend((0..3000).map(|i| format!("h/{i:04}")));
+        keys.push("z/0".into());
+        let read = |effect: &str, res: &str| crate::iam::Permission {
+            actions: vec!["read".into()],
+            ..rule(effect, &[res])
+        };
+        let scope = scoped(vec![read("Allow", "b/*"), read("Deny", "b/h/*")]);
+        let lister = counting(keys);
+        let err = list_keys_for_caller(&lister, "b", "", Some(&scope), 5000, 2)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ListingError::NoVisibleKeyInBudget), "{err:?}");
+        assert_eq!(calls(&lister), 2, "the budget is for the whole walk");
+        let (keys, truncated) = list_keys_for_caller(&lister, "b", "", Some(&scope), 5000, 10)
+            .await
+            .unwrap();
+        assert_eq!(keys.len(), 1001);
+        assert_eq!(keys.last().map(String::as_str), Some("z/0"));
+        assert!(!truncated);
+    }
+
+    /// A folder the user cannot reach reads no engine page.
+    #[tokio::test]
+    async fn a_folder_walk_outside_the_grant_reads_nothing() {
+        let lister = counting((0..10).map(|i| format!("y/{i}")).collect());
+        let scope = scoped(vec![rule("Allow", &["b/x/*"])]);
+        let (keys, truncated) = list_keys_for_caller(&lister, "b", "y/", Some(&scope), 5000, 10)
+            .await
+            .unwrap();
+        assert!(keys.is_empty() && !truncated);
+        assert_eq!(calls(&lister), 0);
+    }
+
+    /// `max_keys` keys exactly is not truncated; one more is (B096).
+    #[tokio::test]
+    async fn a_folder_walk_stops_one_key_past_max() {
+        let lister = counting((0..5).map(|i| format!("k/{i}")).collect());
+        let (keys, truncated) = list_keys_for_caller(&lister, "b", "k/", None, 5, 1)
+            .await
+            .unwrap();
+        assert_eq!((keys.len(), truncated), (5, false));
+        let (keys, truncated) = list_keys_for_caller(&lister, "b", "k/", None, 4, 1)
+            .await
+            .unwrap();
+        assert_eq!((keys.len(), truncated), (4, true));
     }
 }

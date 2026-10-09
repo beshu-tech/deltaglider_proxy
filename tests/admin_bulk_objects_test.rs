@@ -1128,3 +1128,81 @@ async fn move_between_two_aliases_of_one_bucket_keeps_the_object() {
         .unwrap();
     assert_eq!(got.status().as_u16(), 200, "the move deleted the only copy");
 }
+
+/// Review D7: `/objects/list` for a scoped browser session paged the whole
+/// prefix, however many keys the user could not see, with no budget; the
+/// S3 LIST stops at `filtered_list_max_engine_pages`. A folder that holds
+/// more hidden keys than one listing may read is refused (a partial folder
+/// must never be acted on).
+#[tokio::test]
+async fn folder_listing_of_a_scoped_user_stops_at_the_list_budget() {
+    let server = TestServer::builder()
+        .auth("BUDGETLIFT", "BUDGETLIFTSECRET")
+        .extra_yaml_root("filtered_list_max_engine_pages: 1\n")
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let bucket = server.bucket().to_string();
+    let admin = admin_http_client(&ep).await;
+    let s3 = server.s3_client().await;
+    let keys: Vec<String> = (0..1001)
+        .map(|i| format!("d/h/{i:05}.txt"))
+        .chain(["d/z.txt".to_string()])
+        .collect();
+    for chunk in keys.chunks(64) {
+        futures::future::join_all(chunk.iter().map(|k| {
+            s3.put_object()
+                .bucket(&bucket)
+                .key(k)
+                .body(aws_sdk_s3::primitives::ByteStream::from_static(b"x"))
+                .send()
+        }))
+        .await
+        .into_iter()
+        .for_each(|r| {
+            r.unwrap();
+        });
+    }
+    let resp = admin
+        .post(format!("{ep}/_/api/admin/users"))
+        .json(&json!({
+            "name": "erin",
+            "permissions": [
+                {"effect": "Allow", "actions": ["read", "list"], "resources": [format!("{bucket}/*")]},
+                {"effect": "Deny", "actions": ["read", "list"], "resources": [format!("{bucket}/d/h/*")]}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 201);
+    let user: Value = resp.json().await.unwrap();
+    let erin = reqwest::Client::builder()
+        .cookie_store(true)
+        .no_proxy()
+        .build()
+        .unwrap();
+    let resp = erin
+        .post(format!("{ep}/_/api/admin/session/browser-connect"))
+        .json(&json!({
+            "access_key_id": user["access_key_id"],
+            "secret_access_key": user["secret_access_key"],
+            "endpoint": ep,
+            "bucket": "",
+            "region": "us-east-1",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let resp = erin
+        .get(format!("{ep}/_/api/admin/objects/list"))
+        .query(&[("bucket", bucket.as_str()), ("prefix", "d/")])
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap();
+    assert_eq!(status, 400, "the walk was not bounded: {body}");
+    assert!(body.contains("filtered_list_max_engine_pages"), "{body}");
+}
