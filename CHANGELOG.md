@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Security — An IAM import cannot take over a user that an OAuth sign-in created
+
+A declarative apply or a full-IAM import refused a local user whose name
+matched a user that an OAuth sign-in had created, but only when the entry
+had no `auth_source`. An entry with `auth_source: external`, another access
+key and admin groups updated that user, so the person who held the OAuth
+account got the new access key and groups at the next sign-in. Now any entry
+with another access key than the OAuth user of the same name is refused.
+
 ### Security — A replayed request stays refused after a retry succeeded
 
 When an SDK retried a PUT or DELETE within the same second, the proxy served

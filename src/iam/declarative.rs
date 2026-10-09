@@ -953,20 +953,18 @@ pub fn diff_iam(yaml: &DeclarativeIam, db: &CurrentIam) -> Result<IamDiff, Strin
         match db.users.iter().find(|du| du.name == yu.name) {
             // An OAuth login named this DB row from the identity provider's
             // name claim, which the user can often edit. A YAML entry that
-            // omits `auth_source` and keeps the row's access key manages that
-            // row (for example a secret rotation). One that brings a DIFFERENT
-            // access key declares another person: binding it by name would
-            // hand those credentials and permissions to whoever holds the IdP
-            // account. Refuse; the operator renames one of the two. (An
-            // explicit `local` is refused by validation as a downgrade.)
-            Some(du)
-                if du.auth_source == "external"
-                    && yu.auth_source.is_none()
-                    && yu.access_key_id != du.access_key_id =>
-            {
+            // keeps the row's access key manages that row (for example a
+            // secret rotation, or the export round trip, which marks it
+            // `auth_source: external`). One that brings a DIFFERENT access
+            // key declares another person, whatever its `auth_source`:
+            // binding it by name would hand those credentials and groups to
+            // whoever holds the row's IdP account. Refuse; the operator
+            // renames one of the two. (An explicit `local` is refused by
+            // validation as a downgrade.)
+            Some(du) if du.auth_source == "external" && yu.access_key_id != du.access_key_id => {
                 return Err(format!(
-                    "user '{}' is declared as a local user, but an OAuth login already \
-                     created a user with that name; rename one of them",
+                    "user '{}' is declared with another access key than the user that an \
+                     OAuth login already created with that name; rename one of them",
                     yu.name
                 ));
             }
@@ -1648,6 +1646,26 @@ mod tests {
             };
             assert!(diff_iam(&yaml, &current).is_ok());
         }
+    }
+
+    /// B078: `auth_source: external` does not license another access key
+    /// on an OAuth row of the same name: that binds the YAML user's
+    /// credentials and groups to whoever holds the row's IdP account.
+    #[test]
+    fn diff_refuses_an_external_yaml_user_with_another_key_over_an_oauth_row() {
+        let mut external = db_user(7, "carol", "AKEXT");
+        external.auth_source = "external".into();
+        let current = CurrentIam {
+            users: vec![external],
+            ..empty_db()
+        };
+        let mut squat = yu("carol", "AKCAROL");
+        squat.auth_source = Some("external".into());
+        let yaml = DeclarativeIam {
+            users: vec![squat],
+            ..Default::default()
+        };
+        assert!(diff_iam(&yaml, &current).is_err());
     }
 
     #[test]
