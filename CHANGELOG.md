@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Security — ListMultipartUploads respects the caller's prefixes
+
+A user allowed to list only some prefixes of a bucket, or an anonymous
+client on a public prefix, got every in-progress multipart upload of the
+bucket from `GET /<bucket>?uploads`, with keys and upload IDs outside their
+scope. Now the listing shows only the uploads of keys that the caller may
+list, as ListObjects does.
+
 ### Fixed — A large copy into an S3 backend keeps the object's metadata
 
 Replication, lifecycle transitions and migrations copy a large plain object

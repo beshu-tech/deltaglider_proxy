@@ -255,10 +255,19 @@ pub(super) async fn list_multipart_uploads(
     svc: &DeltaGliderS3Service,
     req: s3s::S3Request<s3s::dto::ListMultipartUploadsInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::ListMultipartUploadsOutput>> {
+    let list_scope = req.extensions.get::<ListScope>().cloned();
     let input = req.input;
     ensure_bucket_exists_s3s(&svc.state, &input.bucket).await?;
     let max_uploads = input.max_uploads.unwrap_or(1000).clamp(1, 1000) as u32;
     let enc = ListKeyEncoding::of(input.encoding_type.as_ref());
+    // A bucket-level LIST like ListObjects: a Filtered caller sees only the
+    // uploads of keys it may list.
+    let visible = |key: &str| match &list_scope {
+        Some(ListScope::Filtered { user, context }) => {
+            crate::iam::permissions::user_can_see_listed_key(user, &input.bucket, key, context)
+        }
+        _ => true,
+    };
     let (uploads, is_truncated, next_key, next_upload_id) =
         svc.state.multipart.list_uploads_paginated(
             Some(&input.bucket),
@@ -266,6 +275,7 @@ pub(super) async fn list_multipart_uploads(
             input.key_marker.as_deref().unwrap_or(""),
             input.upload_id_marker.as_deref().unwrap_or(""),
             max_uploads,
+            &visible,
         );
     let uploads = uploads
         .into_iter()

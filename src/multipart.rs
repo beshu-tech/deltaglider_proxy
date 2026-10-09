@@ -1219,12 +1219,17 @@ impl MultipartStore {
         key_marker: &str,
         upload_id_marker: &str,
         max_uploads: u32,
+        visible: &dyn Fn(&str) -> bool,
     ) -> (Vec<UploadInfo>, bool, String, String) {
         let uploads = self.uploads.read();
         let cap = max_uploads.clamp(1, 1000) as usize;
         let mut filtered: Vec<UploadInfo> = uploads
             .values()
             .filter(|u| {
+                // Before the page cut, so a marker never names a hidden key.
+                if !visible(&u.key) {
+                    return false;
+                }
                 if let Some(b) = bucket {
                     if u.bucket != b {
                         return false;

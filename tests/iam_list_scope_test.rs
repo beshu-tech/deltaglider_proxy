@@ -722,3 +722,44 @@ async fn filtered_list_budget_follows_the_config() {
     let keys: Vec<&str> = page.contents().iter().filter_map(|o| o.key()).collect();
     assert_eq!(keys, vec!["v.txt"]);
 }
+
+/// B026: ListMultipartUploads is a bucket-level LIST. Under a Filtered scope
+/// it must not show in-progress uploads outside the caller's prefixes.
+#[tokio::test]
+async fn list_multipart_uploads_hides_uploads_outside_the_scope() {
+    let h = ScopeHarness::setup().await;
+    let admin = h.admin_client().await;
+    let _ = admin.create_bucket().bucket("prod").send().await;
+    for key in ["alice/mine.bin", "bob/secret-plan.bin"] {
+        admin
+            .create_multipart_upload()
+            .bucket("prod")
+            .key(key)
+            .send()
+            .await
+            .expect("create upload");
+    }
+    let (alice_key, alice_secret) = h
+        .create_user(
+            "alice-mpu",
+            vec![json!({
+                "effect": "Allow",
+                "actions": ["read", "write", "list"],
+                "resources": ["prod/alice/*"],
+            })],
+        )
+        .await;
+    let alice = h.user_client(&alice_key, &alice_secret).await;
+    let keys: Vec<String> = match alice.list_multipart_uploads().bucket("prod").send().await {
+        Ok(out) => out
+            .uploads()
+            .iter()
+            .filter_map(|u| u.key().map(str::to_string))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    assert!(
+        keys.iter().all(|k| k.starts_with("alice/")),
+        "uploads outside the scope are listed: {keys:?}"
+    );
+}
