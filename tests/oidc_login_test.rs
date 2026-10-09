@@ -397,3 +397,65 @@ async fn oidc_login_against_a_private_idp_with_a_private_ca() {
         .unwrap();
     assert!(!list.contains(CLIENT_SECRET), "{list}");
 }
+
+/// B040: starting an OAuth login proves no credential, so it must not clear
+/// the per-IP failure counter that guards secret guessing.
+#[tokio::test]
+async fn oauth_authorize_does_not_reset_the_brute_force_counter() {
+    let (issuer, ca_pem) = start_idp().await;
+    let dir = tempfile::tempdir().unwrap();
+    let ca_path = dir.path().join("idp-ca.pem");
+    std::fs::write(&ca_path, &ca_pem).unwrap();
+    let server = TestServer::builder()
+        .env("DGP_RATE_LIMIT_MAX_ATTEMPTS", "3")
+        .env("DGP_RATE_LIMIT_WINDOW_SECS", "60")
+        .env("DGP_RATE_LIMIT_LOCKOUT_SECS", "60")
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let r = admin
+        .post(format!("{ep}/_/api/admin/ext-auth/providers"))
+        .json(&json!({
+            "name": "corp", "provider_type": "oidc", "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET, "issuer_url": issuer,
+            "scopes": "openid email profile",
+            "extra_config": { "allow_local": true, "ca_cert_path": ca_path.display().to_string() },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    let anon = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let mut statuses = Vec::new();
+    for _ in 0..3 {
+        for _ in 0..2 {
+            let r = anon
+                .post(format!("{ep}/_/api/iam/identity"))
+                .json(&json!({ "access_key_id": "AKGUESS", "secret_access_key": "wrong" }))
+                .send()
+                .await
+                .unwrap();
+            statuses.push(r.status().as_u16());
+        }
+        let r = anon
+            .get(format!("{ep}/_/api/admin/oauth/authorize/corp"))
+            .send()
+            .await
+            .unwrap();
+        // 307 starts the flow; 429 once the lockout covers this IP.
+        assert!(
+            [307, 429].contains(&r.status().as_u16()),
+            "authorize: {}",
+            r.status()
+        );
+    }
+    assert!(
+        statuses.contains(&429),
+        "secret guessing never hit the lockout: {statuses:?}"
+    );
+}

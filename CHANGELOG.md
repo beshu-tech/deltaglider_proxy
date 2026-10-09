@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Security — Starting an OAuth sign-in no longer clears the lockout counter
+
+The proxy counts failed sign-ins per client address and locks the address
+out after too many. A request that only started an OAuth sign-in cleared
+that count, so a client could guess IAM secrets without limit by starting
+an OAuth sign-in after every few guesses. Now only a completed sign-in
+clears the count.
+
 ### Security — A blank bootstrap secret is no credential
 
 `DGP_SECRET_ACCESS_KEY=` (a compose file that substitutes an unset

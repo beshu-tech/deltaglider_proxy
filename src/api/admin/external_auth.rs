@@ -211,8 +211,11 @@ pub async fn oauth_authorize(
 
     match ext_auth.initiate_auth(&provider_name, &redirect_uri, client_ip, next_url) {
         Ok(auth_req) => {
-            // Reset the rate limiter — legitimate initiation succeeded.
-            guard.record_success();
+            // No `record_success`: starting a login proves no credential,
+            // and the per-IP counter it would clear also guards secret
+            // guessing on the other sign-in endpoints. The callback, which
+            // proves the IdP login, resets it.
+            drop(guard);
             // Bind the OAuth `state` token to THIS browser via a
             // short-lived cookie. On callback we cross-check the
             // query-string state against this cookie value; a hostile
