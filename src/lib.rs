@@ -710,6 +710,13 @@ mod source_guards {
     /// operator users did not get the fix. release-prep.sh stamps these pins.
     #[test]
     fn deployment_pins_follow_the_proxy_version() {
+        // The release PR commits every file release-prep.sh stamps: a hand
+        // list in the workflow left out the stamped docs (v2.0.3).
+        let workflow = crate::source_scan::read(".github/workflows/prepare-release.yml");
+        assert!(
+            workflow.contains("git add -u"),
+            "prepare-release.yml must stage every file release-prep.sh changes (git add -u)"
+        );
         let field = |text: &str, prefix: &str| -> String {
             text.lines()
                 .find_map(|l| l.trim().strip_prefix(prefix))
