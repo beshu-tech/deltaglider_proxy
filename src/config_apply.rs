@@ -99,6 +99,9 @@ impl ConfigMutator {
         };
         let mut cfg = self.config.write().await;
         let rollback = cfg.clone();
+        // The engine that serves `rollback`: put back as is if the engine
+        // rollback below cannot rebuild it.
+        let rollback_engine = self.app.engine.load_full();
         let mut new_cfg = rollback.clone();
         mutate(&mut new_cfg);
         // On Err nothing changed: the old config and engine keep serving.
@@ -117,8 +120,11 @@ impl ConfigMutator {
                     .await
                     .err();
                 if restore_err.is_some() {
-                    // The file still holds the old config: memory follows it.
+                    // The file still holds the old config: memory follows
+                    // it, and so must the engine (the new one routes the
+                    // way the file does not).
                     *cfg = rollback;
+                    self.app.engine.store(rollback_engine);
                 }
                 return Err(format!(
                     "config persist to '{}' failed ({context}): {e}{}",
@@ -142,5 +148,81 @@ impl ConfigMutator {
     /// Read-lock the live config.
     pub async fn read(&self) -> tokio::sync::RwLockReadGuard<'_, Config> {
         self.config.read().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn app_with(engine: DynEngine) -> Arc<AppState> {
+        let config = Config::default();
+        Arc::new(AppState {
+            engine: arc_swap::ArcSwap::from_pointee(engine),
+            multipart: Arc::new(crate::multipart::MultipartStore::new(
+                config.max_object_size,
+            )),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+            usage_scanner: Arc::new(crate::usage_scanner::UsageScanner::new()),
+            bucket_usage: None,
+            reference_lock: None,
+            config_db: None,
+            maintenance_gate: Arc::new(crate::maintenance::gate::MaintenanceGate::new()),
+            maintenance_notify: Arc::new(tokio::sync::Notify::new()),
+            backend_capabilities: Default::default(),
+            backend_health: Default::default(),
+        })
+    }
+
+    /// B085: a strict mutation whose persist fails and whose engine
+    /// rollback also fails must leave the config and the serving engine on
+    /// the SAME routing (the file's): the config went back while the
+    /// engine kept routing the bucket to the target.
+    #[tokio::test]
+    async fn a_failed_strict_rollback_keeps_config_and_engine_in_step() {
+        let (src, dst, spare, ro) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        let yaml = format!(
+            "storage:\n  backends:\n  - name: src\n    type: filesystem\n    path: {}\n  - name: dst\n    type: filesystem\n    path: {}\n  - name: spare\n    type: filesystem\n    path: {}\n  default_backend: src\n  buckets:\n    b:\n      backend: src\n",
+            src.path().display(),
+            dst.path().display(),
+            spare.path().display()
+        );
+        let cfg = Config::from_yaml_str(&yaml).unwrap();
+        let engine = DynEngine::new(&cfg, None).await.unwrap();
+        let app = app_with(engine);
+        let mutator = ConfigMutator {
+            config: cfg.into_shared(),
+            app: app.clone(),
+            persist_path: ro.path().join("c.yaml").display().to_string(),
+        };
+        // The persist fails (read-only dir), and so does a rebuild that
+        // needs `spare` (read-only root).
+        std::fs::set_permissions(ro.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        std::fs::set_permissions(spare.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::write(ro.path().join("probe"), b"x").is_ok() {
+            return; // root ignores mode bits
+        }
+        let result = mutator
+            .mutate_and_apply_strict("test flip", |c| {
+                c.buckets.get_mut("b").unwrap().backend = Some("dst".into());
+                c.backends.retain(|b| b.name != "spare");
+            })
+            .await;
+        std::fs::set_permissions(ro.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(spare.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err(), "the persist was meant to fail");
+        let cfg_backend = mutator.read().await.buckets["b"].backend.clone();
+        use crate::storage::StorageBackend;
+        let engine_identity = app.engine.load().storage().storage_identity("b");
+        assert!(
+            engine_identity.starts_with(cfg_backend.as_deref().unwrap_or("?")),
+            "config routes b to {cfg_backend:?}, the engine to {engine_identity:?}"
+        );
     }
 }

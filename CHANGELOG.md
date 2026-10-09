@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed — A failed migrate flip cannot leave the routing split
+
+A migrate job switches a bucket to its new backend and saves the
+configuration file in one step. When the save failed and the proxy also
+could not rebuild the previous storage setup, it restored the previous
+configuration but kept serving the bucket from the new backend. New writes
+then went where the configuration did not point, and a later cleanup could
+remove them. Now the proxy also restores the storage setup that served the
+previous configuration.
+
 ### Fixed — The bucket scan ends when its result is ready
 
 The diagnostics bucket scan marked its progress as finished after the last
