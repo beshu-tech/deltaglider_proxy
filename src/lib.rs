@@ -648,6 +648,63 @@ mod source_guards {
         out_of_line_test_modules, prod_mask, rel as rel_path, root, rust_files, test_module_lines,
     };
 
+    /// Review B1: what S3 does with no IAM user has ONE derivation
+    /// (`Config::empty_iam_outcome` → `IamState::from_outcome`). Production
+    /// code outside `iam/mod.rs` may match on `IamState::Disabled` /
+    /// `IamState::Legacy`, never build one: a hand-built `Disabled` was how
+    /// "no pair" turned into open access (N1).
+    #[test]
+    fn open_or_legacy_iam_state_is_built_in_one_place() {
+        let mut bad = Vec::new();
+        for (file, text) in crate::source_scan::prod_sources("src") {
+            if file == "src/iam/mod.rs" {
+                continue;
+            }
+            for (n, line) in crate::source_scan::prod_lines(&text) {
+                if builds_open_or_legacy_state(line) {
+                    bad.push(format!("{file}:{n}: {}", line.trim()));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "IamState built by hand:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// A line that names `IamState::Disabled` / `IamState::Legacy(` outside
+    /// a pattern (left of `=>`, `matches!`, `if let`, let-else).
+    fn builds_open_or_legacy_state(line: &str) -> bool {
+        let pattern_line = ["matches!(", "if let ", "let IamState"]
+            .iter()
+            .any(|p| line.contains(p));
+        let arm = line.find("=>");
+        ["IamState::Disabled", "IamState::Legacy("].iter().any(|t| {
+            line.match_indices(t)
+                .any(|(at, _)| !pattern_line && arm.is_none_or(|a| at > a))
+        })
+    }
+
+    #[test]
+    fn the_iam_state_guard_sees_an_arm_that_builds_open_access() {
+        assert!(builds_open_or_legacy_state(
+            "            None => IamState::Disabled,"
+        ));
+        assert!(builds_open_or_legacy_state(
+            "    let s = IamState::Legacy(pair);"
+        ));
+        assert!(!builds_open_or_legacy_state(
+            "        IamState::Disabled => false,"
+        ));
+        assert!(!builds_open_or_legacy_state(
+            "    if let IamState::Legacy(ref a) = **cur {"
+        ));
+        assert!(!builds_open_or_legacy_state(
+            "    matches!(s, IamState::Disabled)"
+        ));
+    }
+
     /// The operator and the Helm chart default to the proxy image of this
     /// version. v2.0.1 shipped while both still pointed at 2.0.0, so Helm and
     /// operator users did not get the fix. release-prep.sh stamps these pins.

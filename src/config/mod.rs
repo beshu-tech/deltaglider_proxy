@@ -1847,6 +1847,12 @@ impl Config {
             .is_some_and(|mode| mode.trim().eq_ignore_ascii_case("none"))
     }
 
+    /// What S3 does while no IAM user exists, under this config: the one
+    /// derivation the boot, every config change and every rebuild share.
+    pub fn empty_iam_outcome(&self) -> crate::iam::EmptyIamOutcome {
+        crate::iam::EmptyIamOutcome::from_parts(self.bootstrap_pair(), self.open_access_requested())
+    }
+
     /// Pure classification of the auth configuration at startup. Decides
     /// *which* outcome the process should take; the caller (`startup.rs`)
     /// owns the logging and the `process::exit` so this stays unit-testable

@@ -843,15 +843,14 @@ pub async fn sigv4_auth_middleware(
     // decision. The lock is a first-class match arm (not a pre-match `if`),
     // so a router-layer reorder can never silently un-lock the server. The
     // `ConfigDbMismatchGuard` marker is injected by `build_s3_router` when no
-    // config DB key decrypts the config DB. Absence of the IAM
-    // extension is treated as `Disabled` (open access).
+    // config DB key decrypts the config DB. A missing IAM extension (a
+    // router built without it) fails closed: deny all.
     let config_db_locked = request
         .extensions()
         .get::<crate::api::ConfigDbMismatchGuard>()
         .is_some();
-    // No IAM extension == open access; model it as `Disabled` for the fold.
-    let disabled_fallback = IamState::Disabled;
-    let iam_state = iam_snapshot.as_deref().unwrap_or(&disabled_fallback);
+    let deny_all = IamState::deny_all();
+    let iam_state = iam_snapshot.as_deref().unwrap_or(&deny_all);
 
     let auth_config = match classify_auth_gate(config_db_locked, iam_state) {
         AuthGateDecision::Locked => {

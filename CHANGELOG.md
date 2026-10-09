@@ -410,16 +410,21 @@ request, as it does on the S3 API. A condition on another key never holds
 for an admin request, because an admin request carries only the source
 address.
 
-### Security — Removing the last IAM user no longer opens S3 access
+### Security — Removing the last IAM user or `authentication: none` no longer opens S3 access
 
-When IAM mode had no bootstrap pair (the pair was removed while IAM users
-existed, or the proxy started with IAM users only), the proxy went to open
-access when its last IAM user was removed. This happened on a user delete,
-on a declarative apply without `iam_users`, and on a synced empty IAM
-database, and it lasted until the next restart. Now the proxy refuses every
-S3 request in this state. Only `authentication: none` gives open access: IAM
-mode that started from it returns to it. The bootstrap password still opens
-the admin GUI, where you can create a user.
+The proxy chose what S3 does with an empty IAM user list from the state it
+started in, not from the current configuration. Without a bootstrap SigV4
+pair, the proxy went to open access when its last IAM user was removed (a
+user delete, a declarative apply without `iam_users`, a synced empty IAM
+database). This also happened when the proxy had started with
+`authentication: none` and you removed that setting later. One `access`
+section change in declarative mode that removed every `iam_users` entry and
+cleared the bootstrap secret opened S3 access too. In the other direction,
+`authentication: none` set at runtime had no effect until a restart.
+
+Now the proxy decides from the current configuration at every change: the
+bootstrap SigV4 pair signs S3 requests when it is set, `authentication: none`
+gives open access, and otherwise the proxy refuses every S3 request.
 
 ### Fixed — A GET survives a backend that stops sending the body (#102)
 

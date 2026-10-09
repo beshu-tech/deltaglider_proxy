@@ -14,7 +14,7 @@ use tracing_subscriber::EnvFilter;
 use super::super::{AdminState, Bare};
 use crate::api::handlers::AppState;
 use crate::config::Config;
-use crate::iam::{AuthConfig, IamState};
+use crate::iam::AuthConfig;
 
 /// Who runs a transition, and so which runtime handles it has.
 pub(crate) enum TransitionCtx<'a> {
@@ -40,7 +40,7 @@ pub(crate) const BACKGROUND_SKIPPED_STEPS: &[(&str, &str)] = &[
     ("log filter reload", "log_level"),
     (
         "SigV4 / IAM state publish",
-        "access_key_id, secret_access_key",
+        "access_key_id, secret_access_key, authentication",
     ),
     (
         "declarative IAM reconcile",
@@ -63,7 +63,9 @@ pub(crate) fn background_needs_skipped_steps(old: &Config, new: &Config) -> Vec<
     };
     let needs = [
         old.log_level != new.log_level,
-        old.access_key_id != new.access_key_id || old.secret_access_key != new.secret_access_key,
+        old.access_key_id != new.access_key_id
+            || old.secret_access_key != new.secret_access_key
+            || old.open_access_requested() != new.open_access_requested(),
         old.iam_mode != new.iam_mode
             || old.iam_users != new.iam_users
             || old.iam_groups != new.iam_groups
@@ -167,14 +169,10 @@ pub(crate) async fn apply_config_transition(
         TransitionCtx::Admin { state, headers } => Some((*state, *headers)),
         TransitionCtx::Background { .. } => None,
     };
-    let sigv4 = match admin {
-        Some((state, _)) => {
-            let iam_active = state.iam_state.load().has_iam_users();
-            sigv4_transition(old_cfg, &new_cfg, iam_active)?
-        }
-        // Checked above: the pair did not change.
-        None => None,
-    };
+    if let Some((state, _)) = admin {
+        let iam_active = state.iam_state.load().has_iam_users();
+        sigv4_transition(old_cfg, &new_cfg, iam_active)?;
+    }
     let new_engine = if engine_affecting_fields_changed(old_cfg, &new_cfg) {
         Some(crate::config_apply::build_engine(ctx.app(), &new_cfg).await?)
     } else {
@@ -208,32 +206,33 @@ pub(crate) async fn apply_config_transition(
         }
     }
 
-    // Legacy SigV4 pair. Judged on the state AFTER the reconcile: in IAM
-    // mode the per-user index is authoritative and the pair is only its
-    // fallback for an empty DB — overwriting the index would destroy every
-    // per-user credential.
-    if let (Some(new_pair), Some((state, _))) = (sigv4, admin) {
-        let current_iam = state.iam_state.load();
-        if let IamState::Iam(index) = &**current_iam {
-            state
-                .iam_state
-                .store(Arc::new(index.with_bootstrap_fallback(new_pair)));
-            warnings.push(
-                "IAM mode is active: the bootstrap SigV4 pair is only the fallback for an empty \
-                 IAM database. IAM users (including 'legacy-admin', which carries the old pair) \
-                 are unchanged; manage them in the Users panel."
-                    .to_string(),
-            );
-        } else {
-            let new_state = match new_pair {
-                Some(pair) => IamState::Legacy(pair),
-                None => IamState::Disabled,
-            };
-            state.iam_state.store(Arc::new(new_state));
-            tracing::info!(
-                "Auth credentials hot-reloaded (auth enabled: {})",
-                new_cfg.auth_enabled()
-            );
+    // What S3 does with no IAM user: derived from the NEW config (the pair,
+    // `authentication: none`, or deny all), judged on the state AFTER the
+    // reconcile. Users stay; only the empty-set outcome changes. Under the
+    // DB lock: a concurrent rebuild (user delete, sync) stores a state from
+    // the DB, and this load + store must not undo it.
+    if let Some((state, _)) = admin {
+        let _db = match &state.config_db {
+            Some(db) => Some(db.lock().await),
+            None => None,
+        };
+        let outcome = new_cfg.empty_iam_outcome();
+        let current = state.iam_state.load();
+        if let Some(next) = current.with_when_empty(outcome.clone()) {
+            let users_exist = current.has_iam_users();
+            state.iam_state.store(Arc::new(next));
+            crate::iam::bump_iam_version();
+            if users_exist && old_cfg.bootstrap_pair() != new_cfg.bootstrap_pair() {
+                warnings.push(
+                    "IAM mode is active: the bootstrap SigV4 pair is only the fallback for an \
+                     empty IAM database. IAM users (including 'legacy-admin', which carries the \
+                     old pair) are unchanged; manage them in the Users panel."
+                        .to_string(),
+                );
+            }
+            if !users_exist {
+                tracing::info!("S3 authentication now: {}", outcome.describe());
+            }
         }
     }
 
@@ -430,9 +429,11 @@ async fn reconcile_declarative_iam(
     // warning, never an `Err` (the caller would keep the old config over
     // the new DB). The `_declarative` variant skips the legacy-admin
     // auto-migration: YAML is authoritative.
-    if let Err(e) =
-        super::super::users::rebuild_iam_index_declarative::<Bare>(&db, &state.iam_state)
-    {
+    if let Err(e) = super::super::users::rebuild_iam_index_declarative::<Bare>(
+        &db,
+        &state.iam_state,
+        new_cfg.empty_iam_outcome(),
+    ) {
         warnings.push(format!(
             "declarative IAM reconciled, but the in-memory IAM index could not be rebuilt \
              ({:?}): the previous index serves until the next IAM change or restart",
@@ -698,6 +699,13 @@ mod transition_order_tests {
         all.access_key_id = Some("K".into());
         all.iam_mode = crate::config_sections::IamMode::Declarative;
         assert_eq!(background_needs_skipped_steps(&old, &all).len(), 4);
+        let mut open = old.clone();
+        open.authentication = Some("none".into());
+        assert_eq!(
+            background_needs_skipped_steps(&old, &open),
+            ["SigV4 / IAM state publish"],
+            "`authentication` decides the empty-IAM outcome"
+        );
     }
 
     fn with_pair(k: Option<&str>, s: Option<&str>) -> Config {

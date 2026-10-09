@@ -20,7 +20,7 @@ impl From<&IamUser> for AuthenticatedUser {
 }
 
 /// Shared auth configuration extracted from Config at startup.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AuthConfig {
     pub access_key_id: String,
     pub secret_access_key: String,

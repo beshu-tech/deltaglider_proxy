@@ -3790,3 +3790,137 @@ async fn bucket_busy_state_only_for_a_principal_that_may_list_the_bucket() {
     );
     assert_eq!(status(&admin, "db-archive").await, StatusCode::OK, "admin");
 }
+
+// ============================================================================
+// Review B1 / N1: what S3 does with an empty IAM user set comes from the
+// LIVE config, never from the state the process started in.
+// ============================================================================
+
+const ALICE_AK: &str = "AKIAREVIEWALICE00001";
+const ALICE_SK: &str = "review-alice-secret-key-0000000000000001";
+
+fn declarative_alice_yaml() -> String {
+    format!(
+        "iam_mode: declarative\niam_users:\n  - name: alice\n    access_key_id: {ALICE_AK}\n    \
+         secret_access_key: {ALICE_SK}\n    permissions:\n      - effect: Allow\n        \
+         actions: [\"*\"]\n        resources: [\"*\"]\n"
+    )
+}
+
+/// An unsigned PUT and the whoami mode: open access answers 200 and "open".
+async fn unsigned_put_status_and_mode(server: &TestServer, key: &str) -> (StatusCode, String) {
+    let anon = reqwest::Client::new();
+    let ep = server.endpoint();
+    let put = anon
+        .put(format!("{ep}/{}/{key}", server.bucket()))
+        .body("x")
+        .send()
+        .await
+        .unwrap()
+        .status();
+    let who: serde_json::Value = anon
+        .get(format!("{ep}/_/api/whoami"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    (put, who["mode"].as_str().unwrap_or_default().to_string())
+}
+
+/// N1: one declarative section PUT that removed every IAM user and blanked
+/// the bootstrap secret gave open S3 access, with no `authentication:
+/// none` anywhere: the publish step mapped "no pair" to open access.
+#[tokio::test]
+async fn review_n1_emptying_users_and_the_pair_keeps_s3_closed() {
+    let server = TestServer::builder()
+        .auth(ALICE_AK, ALICE_SK)
+        .extra_yaml_root(&declarative_alice_yaml())
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let resp = admin
+        .put(format!("{ep}/_/api/admin/config/section/access"))
+        .json(&json!({ "iam_users": [], "secret_access_key": "" }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    let (put, mode) = unsigned_put_status_and_mode(&server, "n1.txt").await;
+    assert!(
+        !put.is_success() && mode != "open",
+        "S3 opened after the apply ({status} {body}): unsigned PUT {put}, whoami mode {mode:?}"
+    );
+}
+
+/// B1: a proxy started with `authentication: none` that later dropped it
+/// returned to open access when its last IAM user went away.
+#[tokio::test]
+async fn review_b1_removing_authentication_none_then_the_last_user_keeps_s3_closed() {
+    // Unsigned requests are the point: the proxy starts in open access.
+    let server = TestServer::builder().open_access().build().await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let alice = create_user(
+        &admin,
+        &server,
+        "alice",
+        vec![json!({"effect":"Allow","actions":["*"],"resources":["*"]})],
+    )
+    .await;
+    let resp = admin
+        .put(format!("{ep}/_/api/admin/config/section/access"))
+        .json(&json!({ "authentication": null }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{}", resp.text().await.unwrap());
+    let del = admin
+        .delete(format!("{ep}/_/api/admin/users/{}", alice.id))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    let (put, mode) = unsigned_put_status_and_mode(&server, "b1.txt").await;
+    assert!(
+        !put.is_success() && mode != "open",
+        "S3 opened after the last-user delete ({del}): unsigned PUT {put}, whoami mode {mode:?}"
+    );
+}
+
+/// B1, the other direction: `authentication: none` applied at runtime had
+/// no effect until a restart (and the response said no restart needed).
+#[tokio::test]
+async fn review_b1_authentication_none_applies_at_once() {
+    let server = TestServer::builder()
+        .client_credentials_only(ALICE_AK, ALICE_SK)
+        .extra_yaml_root(&declarative_alice_yaml())
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    for body in [
+        json!({ "authentication": "none" }),
+        json!({ "iam_users": [] }),
+    ] {
+        let resp = admin
+            .put(format!("{ep}/_/api/admin/config/section/access"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "{body}: {}",
+            resp.text().await.unwrap()
+        );
+    }
+    let (put, mode) = unsigned_put_status_and_mode(&server, "none.txt").await;
+    assert!(
+        put.is_success() && mode == "open",
+        "`authentication: none` did not apply: unsigned PUT {put}, whoami mode {mode:?}"
+    );
+}

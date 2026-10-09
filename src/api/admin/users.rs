@@ -64,9 +64,9 @@ fn mask_user(user: &IamUser) -> IamUser {
     }
 }
 
-/// Rebuild the in-memory IamIndex from the database and store it.
-/// If no users exist, falls back to the bootstrap credential (Legacy), or to
-/// open access only when the process has none (see `build_iam_state`).
+/// Rebuild the in-memory IamIndex from the database and store it. With no
+/// users the state is the carried empty-set outcome (`IamState::when_empty`,
+/// derived from the live config: the pair, open access, or deny all).
 /// On first IAM user creation (Legacy -> IAM transition), auto-migrates the
 /// legacy config-file credentials as a "legacy-admin" user with full access so
 /// existing S3 clients don't break.
@@ -74,7 +74,8 @@ pub(super) fn rebuild_iam_index<B: ErrorBody>(
     db: &ConfigDb,
     iam_state: &SharedIamState,
 ) -> Result<(), AdminError<B>> {
-    Ok(rebuild_iam_index_inner(db, iam_state, false)?)
+    let when_empty = iam_state.load().when_empty();
+    Ok(rebuild_iam_index_inner(db, iam_state, false, when_empty)?)
 }
 
 /// Internal: `rebuild_iam_index` with a `skip_legacy_migration` knob.
@@ -83,29 +84,31 @@ pub(super) fn rebuild_iam_index<B: ErrorBody>(
 /// must not auto-author a `legacy-admin` user that YAML didn't declare.
 /// Callers outside the declarative reconcile path keep the legacy
 /// behaviour via the public [`rebuild_iam_index`] entry point.
+/// `when_empty` is the outcome of the config being applied.
 pub(super) fn rebuild_iam_index_declarative<B: ErrorBody>(
     db: &ConfigDb,
     iam_state: &SharedIamState,
+    when_empty: iam::EmptyIamOutcome,
 ) -> Result<(), AdminError<B>> {
-    Ok(rebuild_iam_index_inner(db, iam_state, true)?)
+    Ok(rebuild_iam_index_inner(db, iam_state, true, when_empty)?)
 }
 
 fn rebuild_iam_index_inner(
     db: &ConfigDb,
     iam_state: &SharedIamState,
     skip_legacy_migration: bool,
+    when_empty: iam::EmptyIamOutcome,
 ) -> Result<(), crate::config_db::ConfigDbError> {
     let mut users = db.load_users().inspect_err(|e| {
         tracing::error!("Failed to load users from config DB: {}", e);
     })?;
     if users.is_empty() {
-        let state = IamIndex::build_iam_state(users, Vec::new(), &iam_state.load());
-        if matches!(state, IamState::Disabled) {
-            tracing::info!("No IAM users in database and no bootstrap credential — open access");
-        } else {
-            tracing::info!("No IAM users in database — falling back to the bootstrap credential");
-        }
-        iam_state.store(Arc::new(state));
+        tracing::info!("No IAM users in database: {}", when_empty.describe());
+        iam_state.store(Arc::new(IamIndex::build_iam_state(
+            users,
+            Vec::new(),
+            when_empty,
+        )));
         iam::bump_iam_version();
         return Ok(());
     }
@@ -159,7 +162,7 @@ fn rebuild_iam_index_inner(
 
     let count = users.len();
     let group_count = groups.len();
-    let state = IamIndex::build_iam_state(users, groups, &iam_state.load());
+    let state = IamIndex::build_iam_state(users, groups, when_empty);
     iam_state.store(Arc::new(state));
     // Bump AFTER the store so observers see the new state when they
     // see a new version — lets integration tests poll `iam/version`
@@ -442,15 +445,7 @@ pub async fn delete_user(
     db.delete_user(user_id).inspect_err(|e| {
         tracing::warn!("Failed to delete user {}: {}", user_id, e);
     })?;
-
-    // Check if this was the last user before rebuilding
     let remaining = db.load_users().map(|u| u.len()).unwrap_or(0);
-    if remaining == 0 {
-        tracing::warn!(
-            "Last IAM user deleted: falling back to the bootstrap credential \
-             (open access only when authentication is explicitly none)"
-        );
-    }
 
     // Rebuild AFTER capturing the result — the revocation below must run even
     // when the rebuild errs (a deleted user's sessions dying is the invariant).
@@ -614,10 +609,15 @@ mod tests {
         db.create_user("alice", "AKALICE", "alice-secret", true, &[])
             .unwrap();
         rebuild_iam_index::<Bare>(&db, &state).unwrap();
-        let IamState::Iam(index) = &**state.load() else {
-            panic!("expected IAM mode");
-        };
-        state.store(Arc::new(index.with_bootstrap_fallback(None)));
+        assert!(
+            matches!(&**state.load(), IamState::Iam(_)),
+            "expected IAM mode"
+        );
+        let next = state
+            .load()
+            .with_when_empty(iam::EmptyIamOutcome::DenyAll)
+            .expect("the pair was the outcome");
+        state.store(Arc::new(next));
 
         for u in db.load_users().unwrap() {
             db.delete_user(u.id).unwrap();

@@ -351,19 +351,12 @@ pub fn spawn_cache_monitor(state: &Arc<AppState>, metrics: &Arc<Metrics>) {
     });
 }
 
-/// Build IAM state from config: the bootstrap pair (`Legacy`), open access
-/// for explicit `authentication: none` (`Disabled`), else deny all until the
-/// IAM users load. "No pair" alone never means open access.
+/// Build IAM state from config ([`Config::empty_iam_outcome`]): the IAM
+/// users load into it later. "No pair" alone never means open access.
 pub fn init_iam_state(config: &Config) -> SharedIamState {
-    Arc::new(arc_swap::ArcSwap::from_pointee(
-        if let Some(pair) = config.bootstrap_pair() {
-            IamState::Legacy(pair)
-        } else if config.open_access_requested() {
-            IamState::Disabled
-        } else {
-            IamState::deny_all()
-        },
-    ))
+    Arc::new(arc_swap::ArcSwap::from_pointee(IamState::from_outcome(
+        config.empty_iam_outcome(),
+    )))
 }
 
 /// What the startup declarative-IAM reconcile should do, decided purely from
@@ -889,11 +882,12 @@ fn init_config_db_attempt(
                     let state = deltaglider_proxy::iam::IamIndex::build_iam_state(
                         users,
                         groups,
-                        &iam_state.load(),
+                        config.empty_iam_outcome(),
                     );
                     iam_state.store(Arc::new(state));
                 }
-                // If no users exist, keep current IamState (Legacy or Disabled)
+                // No users: keep the state `init_iam_state` derived from the
+                // config (Legacy, Disabled or deny-all).
             }
             (Some(Arc::new(tokio::sync::Mutex::new(db))), false)
         }

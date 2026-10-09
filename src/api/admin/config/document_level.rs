@@ -730,9 +730,11 @@ pub async fn apply_declarative_iam(
     // the entire IAM set, so we must not silently auto-author a `legacy-admin`
     // row the imported document didn't declare — same contract as the
     // declarative config-apply path (config/mod.rs).
-    if let Err(e) =
-        super::super::users::rebuild_iam_index_declarative::<Bare>(&db, &state.iam_state)
-    {
+    if let Err(e) = super::super::users::rebuild_iam_index_declarative::<Bare>(
+        &db,
+        &state.iam_state,
+        state.iam_state.load().when_empty(),
+    ) {
         // The message names the status only, as it always did.
         return Err(AdminError::internal(format!(
             "rebuild_iam_index after IAM import: {:?}",
