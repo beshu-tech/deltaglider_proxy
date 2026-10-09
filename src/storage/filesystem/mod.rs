@@ -1383,7 +1383,22 @@ impl StorageBackend for FilesystemBackend {
                             }
                         }
                         Err(e) => {
-                            debug!("Error reading xattr for {:?}: {}", path, e);
+                            // An object whose metadata cannot be read is
+                            // still an object: listing it as one keeps
+                            // reference reclaim from deleting reference.bin
+                            // under a delta (fail closed).
+                            tracing::warn!("Error reading xattr for {:?}: {}", path, e);
+                            match Self::fallback_metadata_from_path(&path, name).await {
+                                Ok(meta) => metadata_list.push(meta),
+                                Err(_) => metadata_list.push(FileMetadata::fallback(
+                                    name.to_string(),
+                                    0,
+                                    String::new(),
+                                    chrono::Utc::now(),
+                                    None,
+                                    crate::types::StorageInfo::Passthrough,
+                                )),
+                            }
                         }
                     }
                 }

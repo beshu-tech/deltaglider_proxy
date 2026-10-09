@@ -240,6 +240,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 }
 
 #[cfg(test)]
+mod fault_tests;
+#[cfg(test)]
 mod folder_marker_tests;
 
 #[cfg(test)]

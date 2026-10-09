@@ -1715,6 +1715,23 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             return Ok(false);
         }
 
+        // A client stored `filename` after the legacy reference: that
+        // variant is the object now. Only restamp the reference; writing
+        // its bytes as `filename` would put the legacy version back over it.
+        if self
+            .resolve_object_metadata(bucket, deltaspace_id, filename)
+            .await?
+            .is_some()
+        {
+            ref_meta.original_name = Self::INTERNAL_REFERENCE_NAME.to_string();
+            xnode
+                .put_reference_metadata(&*self.storage, bucket, deltaspace_id, &ref_meta)
+                .await?;
+            self.cache
+                .invalidate(&self.cache_key(bucket, deltaspace_id));
+            return Ok(true);
+        }
+
         let (reference, _cache_hit) = self
             .get_reference_cached(bucket, deltaspace_id, &ref_meta.file_sha256)
             .await?;

@@ -6,10 +6,35 @@
 
 use super::*;
 
+/// The error an armed call returns.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Fault {
+    /// An I/O error (EIO), as a failing disk or an unreadable xattr gives.
+    Io,
+    /// A retryable backend refusal (S3 503 SlowDown).
+    Throttled,
+}
+
+impl Fault {
+    fn error(self) -> StorageError {
+        match self {
+            Fault::Io => StorageError::Io(std::io::Error::other("injected EIO")),
+            Fault::Throttled => StorageError::Throttled("injected SlowDown".into()),
+        }
+    }
+}
+
+/// `(method, "bucket/prefix/filename")` → the fault that call returns.
+pub(crate) type FaultTable =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(&'static str, String), Fault>>>;
+
 /// [`FilesystemBackend`] that forwards every call, except the faults armed
 /// on it.
 pub(crate) struct FaultyFs {
     pub(crate) inner: FilesystemBackend,
+    /// Armed per call: `get_delta_metadata`, `get_passthrough_metadata`,
+    /// `delete_delta`, `delete_passthrough`. Shared, like the field below.
+    pub(crate) faults: FaultTable,
     /// `"bucket/prefix"` whose `has_reference` answers `Throttled`. Shared,
     /// so a test arms it after the engine owns the backend.
     pub(crate) fail_has_reference: std::sync::Arc<std::sync::Mutex<Option<String>>>,
@@ -20,6 +45,21 @@ impl FaultyFs {
         Self {
             inner,
             fail_has_reference: Default::default(),
+            faults: Default::default(),
+        }
+    }
+}
+
+impl FaultyFs {
+    fn armed(&self, method: &'static str, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
+        match self
+            .faults
+            .lock()
+            .unwrap()
+            .get(&(method, format!("{b}/{p}/{f}")))
+        {
+            Some(fault) => Err(fault.error()),
+            None => Ok(()),
         }
     }
 }
@@ -189,6 +229,7 @@ impl StorageBackend for FaultyFs {
         prefix: &str,
         filename: &str,
     ) -> Result<FileMetadata, StorageError> {
+        self.armed("get_delta_metadata", bucket, prefix, filename)?;
         self.inner
             .get_delta_metadata(bucket, prefix, filename)
             .await
@@ -200,6 +241,7 @@ impl StorageBackend for FaultyFs {
         prefix: &str,
         filename: &str,
     ) -> Result<(), StorageError> {
+        self.armed("delete_delta", bucket, prefix, filename)?;
         self.inner.delete_delta(bucket, prefix, filename).await
     }
 
@@ -259,6 +301,7 @@ impl StorageBackend for FaultyFs {
         prefix: &str,
         filename: &str,
     ) -> Result<FileMetadata, StorageError> {
+        self.armed("get_passthrough_metadata", bucket, prefix, filename)?;
         self.inner
             .get_passthrough_metadata(bucket, prefix, filename)
             .await
@@ -270,6 +313,7 @@ impl StorageBackend for FaultyFs {
         prefix: &str,
         filename: &str,
     ) -> Result<(), StorageError> {
+        self.armed("delete_passthrough", bucket, prefix, filename)?;
         self.inner
             .delete_passthrough(bucket, prefix, filename)
             .await

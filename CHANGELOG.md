@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Fixed — Storage faults no longer make objects vanish or come back
+
+- On a filesystem backend, an object whose metadata could not be read was
+  left out when the proxy checked whether a folder still held objects. A
+  delete of the last other object then removed the folder's delta
+  reference, and the unreadable object could never be read again. Now such
+  an object counts as present.
+- An I/O error while the proxy read an object's metadata (a permission
+  error, a disk fault) counted as "no such object": HEAD and GET answered
+  `404`, DELETE answered `204` without deleting, and a PUT with
+  `If-None-Match: *` overwrote the object. Now the request fails with an
+  error and changes nothing.
+- When a DELETE removed an object but could not remove an older second copy
+  of it (left behind by an interrupted upload), it still answered success,
+  and the older copy then came back as the object. Now the DELETE fails, and
+  a retry removes the older copy.
+- `POST /_/api/admin/migrate` (the legacy reference migration) wrote the
+  legacy bytes back over an object that a client had stored later under the
+  same name. Now it leaves such an object alone and only renames the
+  reference.
+
 ### Fixed — A failed migrate flip cannot leave the routing split
 
 A migrate job switches a bucket to its new backend and saves the

@@ -5,18 +5,18 @@
 use super::*;
 
 impl<S: StorageBackend> DeltaGliderEngine<S> {
-    /// Best-effort delete of the sibling storage variant (the one NOT matched by
+    /// Delete the sibling storage variant (the one NOT matched by
     /// resolve_metadata) so a stale passthrough/delta pair can't resurrect a
-    /// deleted key. NotFound (the normal case — only one variant exists) and
-    /// transient errors are swallowed with a debug log; the primary delete's
-    /// result is authoritative.
-    async fn delete_sibling_variant_best_effort(
+    /// deleted key. NotFound (the normal case: only one variant exists) is
+    /// success; any other error fails the DELETE (a retry finds the sibling
+    /// and deletes it), or the stale variant would come back as the object.
+    async fn delete_sibling_variant(
         &self,
         bucket: &str,
         deltaspace_id: &str,
         filename: &str,
         delete_delta: bool,
-    ) {
+    ) -> Result<(), StorageError> {
         let res = if delete_delta {
             self.storage
                 .delete_delta(bucket, deltaspace_id, filename)
@@ -26,12 +26,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 .delete_passthrough(bucket, deltaspace_id, filename)
                 .await
         };
-        if let Err(e) = res {
-            if !matches!(e, StorageError::NotFound(_)) {
-                debug!(
+        match res {
+            Ok(()) | Err(StorageError::NotFound(_)) => Ok(()),
+            Err(e) => {
+                warn!(
                     "sibling-variant cleanup for {}/{}/{} (delta={}) failed: {}",
                     bucket, deltaspace_id, filename, delete_delta, e
                 );
+                Err(e)
             }
         }
     }
@@ -258,13 +260,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                         .delete_passthrough(bucket, &deltaspace_id, &obj_key.filename)
                         .await?;
                 }
-                self.delete_sibling_variant_best_effort(
+                self.delete_sibling_variant(
                     bucket,
                     &deltaspace_id,
                     &obj_key.filename,
                     /* delete_delta = */ true,
                 )
-                .await;
+                .await?;
             }
             StorageInfo::Delta { .. } => {
                 if let Some(version) = &pinned {
@@ -281,13 +283,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                         .delete_delta(bucket, &deltaspace_id, &obj_key.filename)
                         .await?;
                 }
-                self.delete_sibling_variant_best_effort(
+                self.delete_sibling_variant(
                     bucket,
                     &deltaspace_id,
                     &obj_key.filename,
                     /* delete_delta = */ false,
                 )
-                .await;
+                .await?;
             }
             StorageInfo::Reference { .. } => {
                 return Err(EngineError::InvalidArgument(

@@ -86,7 +86,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// Look up object metadata by checking both delta and passthrough storage,
     /// returning the most recent version if both exist.
-    async fn resolve_object_metadata(
+    pub(super) async fn resolve_object_metadata(
         &self,
         bucket: &str,
         prefix: &str,
@@ -101,28 +101,18 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 .get_passthrough_metadata(bucket, prefix, filename),
         );
 
+        // Only NotFound means absent. An I/O error (EACCES, EIO) is an
+        // error: read as absent, HEAD answered 404 for a live object, DELETE
+        // reported success without deleting, and `If-None-Match: *`
+        // overwrote it.
         let delta = match delta_result {
             Ok(meta) => Some(meta),
             Err(StorageError::NotFound(_)) => None,
-            Err(StorageError::Io(ref e)) => {
-                warn!(
-                    "I/O error reading delta metadata for {}/{}: {}",
-                    prefix, filename, e
-                );
-                None
-            }
             Err(e) => return Err(e),
         };
         let passthrough = match passthrough_result {
             Ok(meta) => Some(meta),
             Err(StorageError::NotFound(_)) => None,
-            Err(StorageError::Io(ref e)) => {
-                warn!(
-                    "I/O error reading passthrough metadata for {}/{}: {}",
-                    prefix, filename, e
-                );
-                None
-            }
             Err(e) => return Err(e),
         };
         match (delta, passthrough) {
