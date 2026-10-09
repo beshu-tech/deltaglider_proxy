@@ -10,7 +10,9 @@ export interface ExternalProviderInfo {
 }
 
 export interface WhoamiResponse {
-  mode: 'bootstrap' | 'iam' | 'open';
+  /** `deny_all`: no IAM user, no bootstrap pair and no `authentication:
+   *  none` — S3 refuses every request; only the admin password signs in. */
+  mode: 'bootstrap' | 'iam' | 'open' | 'deny_all';
   /** Running proxy version — only present when the request carried a live session. */
   version?: string;
   /** UTC build timestamp of the running binary — same gate as `version`. */

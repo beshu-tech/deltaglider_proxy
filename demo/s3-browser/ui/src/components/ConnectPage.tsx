@@ -3,7 +3,9 @@ import { Button, Input, Typography, Space, Alert, Spin, message } from 'antd';
 import { WarningOutlined, CheckCircleOutlined, CopyOutlined, SunOutlined, MoonOutlined } from '@ant-design/icons';
 import { testConnection, setEndpoint, setCredentials, setBucket, initFromSession, getBucket } from '../s3client';
 import { adminLogin, loginAs, isNotAdminDenial, whoami, isConfigDbLocked, recoverDb, browserSessionConnect, openBrowserConnect } from '../adminApi';
-import type { ExternalProviderInfo } from '../adminApi';
+import type { ExternalProviderInfo, WhoamiResponse } from '../adminApi';
+import { signInChoices } from '../signInChoices';
+import { buildViewUrl } from '../urlState';
 import OAuthProviderList from './OAuthProviderList';
 import { detectDefaultEndpoint } from '../utils';
 import { useColors, useTheme } from '../ThemeContext';
@@ -52,7 +54,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   // and double-fire.  The ref is set synchronously before the first await.
   const loginInFlight = useRef(false);
   const [error, setError] = useState('');
-  const [authMode, setAuthMode] = useState<'bootstrap' | 'iam' | 'open' | null>(null);
+  const [authMode, setAuthMode] = useState<WhoamiResponse['mode'] | null>(null);
   const [externalProviders, setExternalProviders] = useState<ExternalProviderInfo[]>([]);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [detecting, setDetecting] = useState(true);
@@ -120,7 +122,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
     whoami()
       .then(async (info) => {
         if (cancelled) return;
-        setAuthMode(info.mode as 'bootstrap' | 'iam' | 'open');
+        setAuthMode(info.mode);
         setExternalProviders(info.external_providers || []);
         if (isConfigDbLocked(info)) {
           setShowRecovery(true);
@@ -160,7 +162,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
     setLoading(true);
     setError('');
     try {
-      if (authMode === 'bootstrap') {
+      if (signInChoices(authMode).primary === 'password') {
         // Bootstrap mode: login with password, session auto-provides S3 creds
         if (!adminPassword.trim()) {
           setError('Admin password is required');
@@ -179,6 +181,13 @@ export default function ConnectPage({ onConnect, showError }: Props) {
         if (isConfigDbLocked(info)) {
           setShowRecovery(true);
           setLoading(false);
+          return;
+        }
+        // No credential is left: the session has no S3 keys to hand out.
+        // Go straight to the users page to create one.
+        if (info.mode === 'deny_all') {
+          clearSignedOutFlag();
+          window.location.assign(buildViewUrl('admin', 'access/users'));
           return;
         }
 
@@ -312,7 +321,8 @@ export default function ConnectPage({ onConnect, showError }: Props) {
     void copy(text, { successMessage: `${label} copied to clipboard` });
   };
 
-  const isBootstrap = authMode === 'bootstrap';
+  const choices = signInChoices(authMode);
+  const isBootstrap = choices.primary === 'password';
   const isOpenSignedOutReconnect = authMode === 'open' && openSignedOut;
   const canSubmit = isBootstrap ? adminPassword.trim() : (accessKey.trim() && secretKey.trim());
 
@@ -561,6 +571,14 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                 </div>
               )}
 
+              {choices.noCredentialNotice && (
+                <Alert
+                  type="warning"
+                  showIcon
+                  title="No IAM user and no bootstrap key pair exist, so the proxy refuses every S3 request. Sign in with the admin password and create an IAM user."
+                  style={{ marginBottom: 12 }}
+                />
+              )}
               {isBootstrap ? (
                 /* Bootstrap mode: password only */
                 <div>

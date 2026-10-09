@@ -422,7 +422,10 @@ last IAM user, the removal of the bootstrap pair, the removal of
 `iam_users`, and an IAM restore without users. Create an IAM user or set a
 bootstrap pair first. A configuration sync from another instance can still
 remove the last user; the proxy then logs a warning and writes the audit
-entry `iam_sync_emptied`.
+entry `iam_sync_emptied`. In that state the sign-in page now offers the
+admin password, which opens **Access → Users**; before, it asked only for
+an IAM access key, which nobody had, and a password sign-in handed the
+file browser anonymous keys that every request refused.
 
 ### Security — Removing the last IAM user or `authentication: none` no longer opens S3 access
 

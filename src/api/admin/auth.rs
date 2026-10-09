@@ -587,20 +587,21 @@ pub async fn login(
     {
         let config = state.config.read().await;
         let iam = state.iam_state.load();
-        let creds = config
-            .access_key_id
-            .clone()
-            .zip(config.secret_access_key.clone())
-            .filter(|(ak, sk)| iam.accepts_credentials(ak, sk));
-        let auth_on = config.auth_enabled();
+        let creds = login_s3_creds(
+            config
+                .access_key_id
+                .clone()
+                .zip(config.secret_access_key.clone()),
+            &iam,
+        );
         let region = match &config.backend {
             crate::config::BackendConfig::S3 { region, .. } => region.clone(),
             _ => "us-east-1".to_string(),
         };
         drop(config);
-        if let Some((ak, sk)) = creds {
+        if let LoginS3Creds::Pair(ak, sk) = creds {
             auto_populate_s3_creds(&state, &token, ak, sk).await;
-        } else if !auth_on {
+        } else if creds == LoginS3Creds::Anonymous {
             // Open-access deployments: no proxy SigV4 keys. Without session S3 creds,
             // a hard refresh clears the in-memory SDK and the file browser stops listing
             // (PUT/GET would fail). Mirror `open_browser_connect` anonymous pair.
@@ -662,18 +663,47 @@ pub async fn check_session(
     Json(SessionResponse { valid, admin_gui })
 }
 
+/// The S3 keys a password sign-in hands the file browser.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LoginS3Creds {
+    /// The bootstrap pair, when the S3 API accepts it.
+    Pair(String, String),
+    /// Open access: anonymous keys.
+    Anonymous,
+    /// None: the browser asks for keys (or no key works: deny-all).
+    None,
+}
+
+/// Decided from the IAM state, never from "the config has no pair": in
+/// deny-all there is no pair either, and anonymous keys would only fail
+/// (review N3).
+pub(crate) fn login_s3_creds(pair: Option<(String, String)>, iam: &IamState) -> LoginS3Creds {
+    match pair.filter(|(ak, sk)| iam.accepts_credentials(ak, sk)) {
+        Some((ak, sk)) => LoginS3Creds::Pair(ak, sk),
+        None if matches!(iam, IamState::Disabled) => LoginS3Creds::Anonymous,
+        None => LoginS3Creds::None,
+    }
+}
+
+/// The whoami `mode`: how a client signs in now. `deny_all` (review A14):
+/// no IAM user, no bootstrap pair, no `authentication: none` — S3 refuses
+/// every request, and only the admin password signs in (to create a user).
+pub(crate) fn whoami_mode(state: &IamState) -> &'static str {
+    match state {
+        IamState::Disabled => "open",
+        IamState::Legacy(_) => "bootstrap",
+        IamState::Iam(index) if index.is_empty() => "deny_all",
+        IamState::Iam(_) => "iam",
+    }
+}
+
 /// GET /api/whoami — returns current auth mode and (if session exists) the logged-in user.
 pub async fn whoami(
     State(state): State<Arc<AdminState>>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
 ) -> Json<WhoamiResponse> {
-    let iam_state = state.iam_state.load();
-    let mode = match &**iam_state {
-        IamState::Disabled => "open",
-        IamState::Legacy(_) => "bootstrap",
-        IamState::Iam(_) => "iam",
-    };
+    let mode = whoami_mode(&state.iam_state.load());
 
     let client_ip = request_client_ip(&headers, connect_info.as_ref());
     // One session lookup answers both questions: is there a live session
@@ -1547,6 +1577,22 @@ pub async fn clear_s3_session_creds(
 
 #[cfg(test)]
 mod tests {
+    /// Review A14 / N3: deny-all has its own mode, and its password sign-in
+    /// hands out no anonymous keys.
+    #[test]
+    fn deny_all_is_its_own_mode_without_anonymous_keys() {
+        use super::{login_s3_creds, whoami_mode, LoginS3Creds};
+        use crate::iam::IamState;
+        let deny = IamState::deny_all();
+        assert_eq!(whoami_mode(&deny), "deny_all");
+        assert_eq!(login_s3_creds(None, &deny), LoginS3Creds::None);
+        assert_eq!(whoami_mode(&IamState::Disabled), "open");
+        assert_eq!(
+            login_s3_creds(None, &IamState::Disabled),
+            LoginS3Creds::Anonymous
+        );
+    }
+
     use super::*;
     use crate::iam::{AuthConfig, Permission, SharedIamState};
     use arc_swap::ArcSwap;

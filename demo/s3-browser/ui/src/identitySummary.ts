@@ -18,6 +18,12 @@ export function identitySummary(
     return { name: 'Open access', detail: 'Authentication is off: every request has full access.' };
   }
   const user = identity.user;
+  if (identity.mode === 'deny_all') {
+    return {
+      name: user?.name || 'Administrator',
+      detail: 'No IAM user and no bootstrap key pair: S3 refuses every request. Create an IAM user.',
+    };
+  }
   if (identity.mode === 'bootstrap') {
     return {
       name: user?.name || 'Administrator',

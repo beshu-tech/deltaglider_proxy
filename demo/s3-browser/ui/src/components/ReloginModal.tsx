@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import { Alert, Input, Modal, Typography } from 'antd';
 import { adminLogin, loginAs, whoami } from '../adminApi';
+import type { WhoamiResponse } from '../adminApi';
+import { signInChoices } from '../signInChoices';
 import { normalizeUiError } from '../errorHandling';
 import { registerReloginHandler } from '../sessionRelogin';
 
-type Mode = 'bootstrap' | 'iam' | 'open';
+type Mode = WhoamiResponse['mode'];
 
 /**
  * The "sign in again" prompt for an admin session that expired mid-edit
@@ -51,7 +53,8 @@ export default function ReloginModal() {
     setBusy(true);
     setError('');
     try {
-      const result = mode === 'iam' ? await loginAs(accessKey.trim(), secretKey) : await adminLogin(password);
+      const keys = signInChoices(mode).primary === 'keys';
+      const result = keys ? await loginAs(accessKey.trim(), secretKey) : await adminLogin(password);
       if (result.ok) finish(true);
       else setError(result.error ?? 'Sign-in failed');
     } catch (e) {
@@ -77,7 +80,7 @@ export default function ReloginModal() {
         Sign in again to continue. Your unsaved changes stay on the page, and the step you started runs again.
       </Typography.Paragraph>
       <form onSubmit={(e) => { e.preventDefault(); void signIn(); }}>
-        {mode === 'iam' ? (
+        {signInChoices(mode).primary === 'keys' ? (
           <>
             <label htmlFor="relogin-ak" style={{ display: 'block', fontSize: 12, marginBottom: 4 }}>Access key ID</label>
             <Input id="relogin-ak" value={accessKey} onChange={(e) => setAccessKey(e.target.value)} autoComplete="username" style={{ marginBottom: 12 }} />
