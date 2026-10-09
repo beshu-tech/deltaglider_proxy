@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 0eab0ee4da62f10ad456906d5737cfbe5e99904f7a2eb08e99fc8f1501ad2049 # shrinks to op = "StringEquals", qualifier = "", if_exists = false, key = "aws:SourceIp", value = Bool(false), deny = false, prefix = ""

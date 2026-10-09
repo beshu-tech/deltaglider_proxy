@@ -1322,6 +1322,22 @@ mod source_guards {
         }
     }
 
+    /// Review B5: a permission's condition block is parsed in ONE place,
+    /// `iam::permissions::parse_conditions`, which save-time validation and
+    /// the policy build share; a second parser would drift from it.
+    #[test]
+    fn condition_blocks_are_parsed_by_the_one_rule() {
+        for (file, text) in crate::source_scan::prod_sources("src") {
+            let prod = crate::source_scan::prod_text(&text);
+            let hits = prod.matches("ConditionBlock>(").count();
+            let allowed = usize::from(file == "src/iam/permissions.rs");
+            assert!(
+                hits <= allowed,
+                "{file} parses an iam-rs ConditionBlock outside parse_conditions"
+            );
+        }
+    }
+
     /// Review B2: a rate-limit success clears only the account whose
     /// secret the same fn proved: `record_proven()` follows an
     /// `enter_with_account(` and a secret check in its fn. Nothing clears a

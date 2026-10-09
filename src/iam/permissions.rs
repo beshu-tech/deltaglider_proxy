@@ -227,20 +227,14 @@ pub fn permission_to_iam_policy(perm: &Permission) -> IAMPolicy {
         .with_action(IAMAction::Multiple(actions))
         .with_resource(IAMResource::Multiple(resources));
 
-    // Parse conditions from JSON if present
+    // Conditions go through THE rule (`parse_conditions`), as at save time.
+    // Stored data that slipped past validation (an older peer, a legacy row)
+    // is contained, never evaluated as written: an Allow grants nothing, and
+    // a Deny applies without its condition (fail closed). A condition iam-rs
+    // cannot evaluate errs every request it reaches, which denied the
+    // user's OTHER grants too (review B5).
     if let Some(ref cond_json) = perm.conditions {
-        match serde_json::from_value::<iam_rs::ConditionBlock>(cond_json.clone()) {
-            Ok(cb) if effect == IAMEffect::Allow && multi_valued_negated(&cb).is_some() => {
-                // iam-rs would grant whenever the key misses ONE value (see
-                // `multi_valued_negated`); validation refuses this shape, so
-                // only stored data reaches here. Grant nothing.
-                tracing::error!(
-                    "Allow permission has a negated condition with several values; dropping \
-                     statement — this should have been rejected at config time: {}",
-                    cond_json
-                );
-                return IAMPolicy::new();
-            }
+        match parse_conditions(cond_json) {
             Ok(cb) => {
                 for (operator, key_values) in &cb.conditions {
                     for (key, value) in key_values {
@@ -252,25 +246,21 @@ pub fn permission_to_iam_policy(perm: &Permission) -> IAMPolicy {
                     }
                 }
             }
-            Err(e) => {
-                // An un-evaluatable condition is a configuration error.
-                // `validate_permissions` rejects these at config time, so reaching
-                // here means stored/legacy data slipped past validation. Drop the
-                // statement entirely (empty policy) for BOTH effects rather than
-                // changing its semantics:
-                //   - For Allow: dropping it correctly fails closed (no grant).
-                //   - For Deny: keeping it WITHOUT the condition would silently
-                //     broaden "deny IF <cond>" into an unconditional deny, blocking
-                //     access the admin scoped to a specific context. The condition's
-                //     intent is "only deny when this holds" — if it can't be
-                //     evaluated, the Deny must not fire unconditionally.
+            Err(e) if effect == IAMEffect::Allow => {
                 tracing::error!(
-                    "Permission has unparseable conditions (effect={}); dropping statement — this should have been rejected at config time: {} — input: {}",
-                    perm.effect,
-                    e,
+                    "Allow permission has a condition the proxy cannot evaluate ({e}); it \
+                     grants nothing — this should have been rejected at config time: {}",
                     cond_json
                 );
                 return IAMPolicy::new();
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Deny permission has a condition the proxy cannot evaluate ({e}); it \
+                     applies WITHOUT the condition — this should have been rejected at \
+                     config time: {}",
+                    cond_json
+                );
             }
         }
     }
@@ -278,69 +268,136 @@ pub fn permission_to_iam_policy(perm: &Permission) -> IAMPolicy {
     IAMPolicy::new().add_statement(stmt)
 }
 
-/// A negated operator (`NotIpAddress`, `StringNotLike`, ...) with several
-/// values. AWS reads it as "matches none of the values"; iam-rs reads it as
-/// "misses at least one", which holds for nearly every request: a Deny then
-/// fires for the allowed networks too, and an Allow lets the excluded
-/// prefixes through. Returns `operator on key`.
-fn multi_valued_negated(block: &iam_rs::ConditionBlock) -> Option<String> {
-    block.conditions.iter().find_map(|(op, entries)| {
-        (op.is_negated_operator() && !op.is_multivalued_operator())
-            .then(|| {
-                entries.iter().find_map(|(key, value)| {
-                    matches!(value, iam_rs::ConditionValue::StringList(v) if v.len() > 1)
-                        .then(|| format!("{op} on {key}"))
-                })
-            })
-            .flatten()
-    })
+/// The value type of a request context key the proxy sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyType {
+    Ip,
+    Text,
+    Number,
 }
 
-/// Why iam-rs cannot evaluate a condition block as meant, or `None`: a
-/// multi-valued negated operator, or a value its operator cannot read (an
-/// IP network such as `10.0.0.0/33`, a number, a date, a bool). iam-rs
-/// would fail every evaluation of it at request time.
-fn condition_block_problem(block: &iam_rs::ConditionBlock) -> Option<String> {
-    if let Some(what) = multi_valued_negated(block) {
-        return Some(format!(
-            "`{what}` has several values, which is not supported: use one value, or \
-             put the positive operator with the list on the Allow rule"
-        ));
-    }
+/// THE request context keys the proxy sets (iam/middleware.rs and
+/// `insert_source_ip`), with their value types. A condition on another key
+/// sees it absent.
+pub(crate) const PROXY_CONTEXT_KEYS: &[(&str, KeyType)] = &[
+    ("aws:SourceIp", KeyType::Ip),
+    ("s3:prefix", KeyType::Text),
+    ("s3:delimiter", KeyType::Text),
+    ("s3:max-keys", KeyType::Number),
+];
+
+/// THE rule for a permission's condition block (review B5): parse it, and
+/// refuse what iam-rs cannot evaluate as meant. Save-time validation
+/// refuses on `Err`; the policy build contains it. Checks, in order:
+/// - an empty value list (never matches; a Deny with it never fires);
+/// - a negated operator with several values, set-qualified ones too
+///   (AWS: "none of the values"; iam-rs: "misses one", nearly always true);
+/// - a `${…}` template in an operator that does not compare text;
+/// - each value, asked of iam-rs itself in a one-condition statement with
+///   an empty context (iam-rs type-checks a value before the key lookup, so
+///   an error here errs every request);
+/// - the operator family against the type of a key the proxy sets.
+pub(crate) fn parse_conditions(c: &serde_json::Value) -> Result<iam_rs::ConditionBlock, String> {
+    let block = serde_json::from_value::<iam_rs::ConditionBlock>(c.clone())
+        .map_err(|e| format!("could not be parsed: {e}"))?;
     for (op, entries) in &block.conditions {
         for (key, value) in entries {
-            let values: Vec<String> = match value {
-                iam_rs::ConditionValue::String(s) => vec![s.clone()],
-                iam_rs::ConditionValue::StringList(v) => v.clone(),
-                iam_rs::ConditionValue::Number(n) => vec![n.to_string()],
-                iam_rs::ConditionValue::Boolean(b) => vec![b.to_string()],
+            let list = match value {
+                iam_rs::ConditionValue::StringList(v) => Some(v),
+                _ => None,
             };
-            for v in values.iter().filter(|v| !v.contains("${")) {
-                let ok = if op.is_ip_operator() {
-                    let net = if v.contains('/') {
-                        v.clone()
-                    } else if v.contains(':') {
-                        format!("{v}/128")
-                    } else {
-                        format!("{v}/32")
-                    };
-                    net.parse::<ipnet::IpNet>().is_ok()
-                } else if op.is_numeric_operator() {
-                    v.parse::<f64>().is_ok()
+            if list.is_some_and(|v| v.is_empty()) {
+                return Err(format!("`{op}` on {key} has no value"));
+            }
+            if op.is_negated_operator() && list.is_some_and(|v| v.len() > 1) {
+                return Err(format!(
+                    "`{op}` on {key} has several values, which is not supported: use one \
+                     value, or the positive operator with the list on the opposite rule \
+                     (a Deny with `StringLike [..]` in place of an Allow with \
+                     `StringNotLike [..]`; an Allow with `IpAddress [..]` in place of a Deny \
+                     with `NotIpAddress [..]`)"
+                ));
+            }
+            let texts = |v: &iam_rs::ConditionValue| -> Vec<String> {
+                match v {
+                    iam_rs::ConditionValue::String(s) => vec![s.clone()],
+                    iam_rs::ConditionValue::StringList(v) => v.clone(),
+                    _ => Vec::new(),
+                }
+            };
+            let templated = texts(value).iter().any(|t| t.contains("${"));
+            if templated && !(op.is_string_operator() || op.is_arn_operator()) {
+                return Err(format!(
+                    "`{op}` on {key}: a `${{…}}` variable works only in a String or Arn \
+                     operator"
+                ));
+            }
+            probe_condition_value(op, key, value, templated)?;
+            if let Some((_, ty)) = PROXY_CONTEXT_KEYS.iter().find(|(k, _)| k == key) {
+                let fits = if op.is_numeric_operator() {
+                    *ty == KeyType::Number
                 } else if op.is_date_operator() {
-                    chrono::DateTime::parse_from_rfc3339(v).is_ok() || v.parse::<i64>().is_ok()
-                } else if op.is_boolean_operator() {
-                    v.parse::<bool>().is_ok()
+                    false
+                } else if op.is_ip_operator() {
+                    *ty == KeyType::Ip
                 } else {
                     true
                 };
-                if !ok {
-                    return Some(format!("`{op}` on {key}: '{v}' is not a valid value"));
+                if !fits {
+                    return Err(format!(
+                        "`{op}` cannot compare {key}, which holds {}",
+                        match ty {
+                            KeyType::Ip => "an IP address",
+                            KeyType::Text => "text",
+                            KeyType::Number => "a number",
+                        }
+                    ));
                 }
             }
         }
     }
-    None
+    Ok(block)
+}
+
+/// Ask iam-rs whether it can read `value` for `op`: one Allow statement
+/// with only this condition, evaluated against an empty context.
+fn probe_condition_value(
+    op: &iam_rs::IAMOperator,
+    key: &str,
+    value: &iam_rs::ConditionValue,
+    templated: bool,
+) -> Result<(), String> {
+    // A `${iam:…}` template is substituted at index build; give iam-rs a
+    // plain stand-in so its own variable syntax does not trip on it.
+    let value = if templated {
+        match value {
+            iam_rs::ConditionValue::String(_) => iam_rs::ConditionValue::String("x".into()),
+            iam_rs::ConditionValue::StringList(v) => {
+                iam_rs::ConditionValue::StringList(vec!["x".into(); v.len()])
+            }
+            other => other.clone(),
+        }
+    } else {
+        value.clone()
+    };
+    let stmt = IAMStatement::new(IAMEffect::Allow)
+        .with_action(IAMAction::Multiple(vec!["s3:*".into()]))
+        .with_resource(IAMResource::Multiple(vec!["arn:aws:s3:::*".into()]))
+        .with_condition_struct(iam_rs::Condition::new(op.clone(), key.to_string(), value));
+    let policy = IAMPolicy::new().add_statement(stmt);
+    let Some((request, evaluator, _)) =
+        build_iam_evaluator(&[policy], S3Action::Read, "probe", "probe", &Context::new())
+    else {
+        return Err(format!("`{op}` on {key} could not be checked"));
+    };
+    evaluator.evaluate(&request).map(|_| ()).map_err(|e| {
+        let hint = if *op == iam_rs::IAMOperator::Null {
+            " (`Null` takes true or false without quotes)"
+        } else {
+            ""
+        };
+        format!("`{op}` on {key}: {e}{hint}")
+    })
 }
 
 /// Build the S3 resource ARN string from bucket and key.
@@ -564,11 +621,7 @@ pub fn validate_permissions(permissions: &[Permission]) -> Result<(), String> {
             // would otherwise be tempted to broaden into an unconditional Deny.
             // Catching it here keeps the condition's intent: an un-evaluatable
             // condition is a configuration error, not a silent scope change.
-            let block = serde_json::from_value::<iam_rs::ConditionBlock>(conditions.clone())
-                .map_err(|e| format!("{}: condition could not be parsed: {}", ctx, e))?;
-            if let Some(problem) = condition_block_problem(&block) {
-                return Err(format!("{}: condition {}", ctx, problem));
-            }
+            parse_conditions(conditions).map_err(|e| format!("{}: condition {}", ctx, e))?;
         }
     }
     Ok(())
@@ -2545,11 +2598,11 @@ mod tests {
     }
 
     #[test]
-    fn test_unparseable_deny_condition_drops_statement_not_broadens() {
-        // Defense in depth: if a malformed Deny condition slips past validation
-        // (e.g. legacy data), the runtime must NOT turn it into an unconditional
-        // deny. Dropping the statement means the Deny does not fire, so a
-        // co-existing Allow still applies.
+    fn an_unparseable_deny_condition_fails_closed() {
+        // Stored data that slipped past validation (an older peer, a legacy
+        // row): a Deny whose condition the proxy cannot evaluate applies
+        // WITHOUT the condition (review B5). Dropping it, as before, failed
+        // open: the access it was meant to deny went through.
         let allow = Permission {
             id: 0,
             effect: "Allow".into(),
@@ -2568,19 +2621,9 @@ mod tests {
             .iter()
             .map(permission_to_iam_policy)
             .collect();
-
-        // The malformed Deny is dropped, so the Allow governs — delete is permitted
-        // rather than being unconditionally blocked everywhere.
-        assert!(
-            evaluate_iam(
-                &policies,
-                S3Action::Delete,
-                "bucket",
-                "key",
-                &Default::default()
-            ),
-            "unparseable Deny condition must drop the statement, not broaden to unconditional deny"
-        );
+        let can = |action| evaluate_iam(&policies, action, "bucket", "key", &Default::default());
+        assert!(!can(S3Action::Delete), "the unevaluable Deny did not apply");
+        assert!(can(S3Action::Read), "the Deny covers delete only");
     }
 
     /// Names with ordinary punctuation go in verbatim, because authorization
@@ -2813,6 +2856,208 @@ mod tests {
                     "{key} visible but not under {visible:?}"
                 );
             }
+        }
+    }
+}
+
+/// Review B5 (+ B028/B075 gaps): one rule decides whether iam-rs can
+/// evaluate a condition as written; save refuses it, the build contains it.
+#[cfg(test)]
+mod review_b5_tests {
+    use super::*;
+
+    fn perm(
+        effect: &str,
+        actions: &[&str],
+        resources: &[&str],
+        cond: Option<serde_json::Value>,
+    ) -> Permission {
+        Permission {
+            id: 0,
+            effect: effect.into(),
+            actions: actions.iter().map(|s| s.to_string()).collect(),
+            resources: resources.iter().map(|s| s.to_string()).collect(),
+            conditions: cond,
+        }
+    }
+
+    #[test]
+    fn validate_refuses_values_iam_rs_cannot_read() {
+        let bad = [
+            serde_json::json!({"Null": {"aws:SourceIp": "true"}}),
+            serde_json::json!({"Null": {"aws:SourceIp": ["true"]}}),
+            serde_json::json!({"StringEquals": {"s3:prefix": 5}}),
+            serde_json::json!({"DateLessThan": {"aws:CurrentTime": 1700000000}}),
+            serde_json::json!({"ArnLike": {"aws:SourceArn": 5}}),
+            serde_json::json!({"StringEqualsIfExists": {"s3:prefix": 5}}),
+            serde_json::json!({"StringLike": {"s3:prefix": []}}),
+            serde_json::json!({"IpAddress": {"s3:prefix": "10.0.0.0/8"}}),
+            serde_json::json!({"NumericLessThan": {"s3:prefix": "5"}}),
+            serde_json::json!({"ForAllValues:StringNotLike": {"s3:prefix": ["a/*", "b/*"]}}),
+            serde_json::json!({"ForAnyValue:StringNotLike": {"s3:prefix": ["a/*", "b/*"]}}),
+        ];
+        for c in bad {
+            let r = validate_permissions(&[perm("Allow", &["read"], &["b/*"], Some(c.clone()))]);
+            assert!(r.is_err(), "validation accepted {c}");
+        }
+        // The shapes that work stay accepted.
+        let good = [
+            serde_json::json!({"Null": {"aws:SourceIp": false}}),
+            serde_json::json!({"StringLike": {"s3:prefix": ["a/*", "b/*"]}}),
+            serde_json::json!({"StringLike": {"s3:prefix": "home/${iam:username}/*"}}),
+            serde_json::json!({"NotIpAddress": {"aws:SourceIp": "10.0.0.0/8"}}),
+            serde_json::json!({"NumericLessThan": {"s3:max-keys": "100"}}),
+        ];
+        for c in good {
+            let r = validate_permissions(&[perm("Allow", &["read"], &["b/*"], Some(c.clone()))]);
+            assert!(r.is_ok(), "validation refused {c}: {r:?}");
+        }
+    }
+
+    /// One Allow whose condition iam-rs cannot read errs every evaluation it
+    /// reaches, which took the user's OTHER grants with it.
+    #[test]
+    fn a_bad_allow_does_not_disable_the_other_grants() {
+        let perms = [
+            perm("Allow", &["read"], &["b/*"], None),
+            perm(
+                "Allow",
+                &["read"],
+                &["b/x/*"],
+                Some(serde_json::json!({"Null": {"aws:SourceIp": "true"}})),
+            ),
+        ];
+        let policies: Vec<IAMPolicy> = perms.iter().map(permission_to_iam_policy).collect();
+        assert!(
+            evaluate_iam(&policies, S3Action::Read, "b", "x/k", &Context::new()),
+            "the plain Allow on b/* stopped working"
+        );
+    }
+
+    const OPS: &[&str] = &[
+        "StringEquals",
+        "StringNotEquals",
+        "StringEqualsIgnoreCase",
+        "StringNotEqualsIgnoreCase",
+        "StringLike",
+        "StringNotLike",
+        "NumericEquals",
+        "NumericNotEquals",
+        "NumericLessThan",
+        "NumericLessThanEquals",
+        "NumericGreaterThan",
+        "NumericGreaterThanEquals",
+        "DateEquals",
+        "DateNotEquals",
+        "DateLessThan",
+        "DateLessThanEquals",
+        "DateGreaterThan",
+        "DateGreaterThanEquals",
+        "Bool",
+        "BinaryEquals",
+        "IpAddress",
+        "NotIpAddress",
+        "ArnEquals",
+        "ArnLike",
+        "ArnNotEquals",
+        "ArnNotLike",
+        "Null",
+    ];
+    const KEYS: &[&str] = &[
+        "aws:SourceIp",
+        "s3:prefix",
+        "s3:delimiter",
+        "s3:max-keys",
+        "aws:CurrentTime",
+    ];
+    const TEXTS: &[&str] = &[
+        "10.0.0.0/8",
+        "10.1.2.3",
+        "2020-01-01T00:00:00Z",
+        "photos/*",
+        "true",
+        "5",
+        "x",
+        "",
+        "arn:aws:s3:::b",
+        "home/${iam:username}/*",
+    ];
+
+    fn condition_value() -> impl proptest::strategy::Strategy<Value = serde_json::Value> {
+        use proptest::prelude::*;
+        let text = proptest::sample::select(TEXTS).prop_map(|t| serde_json::json!(t));
+        prop_oneof![
+            any::<bool>().prop_map(|b| serde_json::json!(b)),
+            (-5i64..500).prop_map(|n| serde_json::json!(n)),
+            text,
+            proptest::collection::vec(proptest::sample::select(TEXTS), 0..3)
+                .prop_map(|v| serde_json::json!(v)),
+        ]
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(768))]
+        /// Review B5 guard: whatever condition a stored rule carries, the
+        /// policy the proxy builds from it never makes iam-rs fail an
+        /// evaluation (an Err denies the user's OTHER grants too).
+        #[test]
+        fn a_built_rule_never_fails_evaluation(
+            op in proptest::sample::select(OPS),
+            qualifier in proptest::sample::select(&["", "ForAllValues:", "ForAnyValue:"][..]),
+            if_exists in proptest::prelude::any::<bool>(),
+            key in proptest::sample::select(KEYS),
+            value in condition_value(),
+            deny in proptest::prelude::any::<bool>(),
+            prefix in "[a-z/]{0,6}",
+        ) {
+            let name = format!("{qualifier}{op}{}", if if_exists { "IfExists" } else { "" });
+            let cond = serde_json::json!({ name: { key: value } });
+            let rule = perm(if deny { "Deny" } else { "Allow" }, &["read", "list"], &["b/*"], Some(cond.clone()));
+            let policies = vec![permission_to_iam_policy(&rule)];
+            let mut get = Context::new();
+            insert_source_ip(&mut get, Some("10.1.2.3".parse().unwrap()));
+            let mut list = get.clone();
+            list.insert("s3:prefix".to_string(), iam_rs::ContextValue::String(prefix.clone()));
+            list.insert("s3:delimiter".to_string(), iam_rs::ContextValue::String("/".into()));
+            list.insert("s3:max-keys".to_string(), iam_rs::ContextValue::Number(100.0));
+            for (action, ctx) in [
+                (S3Action::Read, &get),
+                (S3Action::List, &list),
+                (S3Action::Read, &Context::new()),
+            ] {
+                let (request, evaluator, _) =
+                    build_iam_evaluator(&policies, action, "b", "k", ctx).unwrap();
+                proptest::prop_assert!(
+                    evaluator.evaluate(&request).is_ok(),
+                    "{cond} errs on {action:?}"
+                );
+            }
+        }
+    }
+
+    /// A Deny whose condition iam-rs cannot read applies without it, every
+    /// time (it denied at random in a multi-condition block: iam-rs walks a
+    /// HashMap).
+    #[test]
+    fn an_unevaluable_deny_applies_without_its_condition() {
+        for _ in 0..50 {
+            let perms = [
+                perm("Allow", &["read"], &["b/*"], None),
+                perm(
+                    "Deny",
+                    &["read"],
+                    &["b/*"],
+                    Some(serde_json::json!({
+                        "StringLike": {"s3:prefix": "zzz*"},
+                        "Null": {"aws:SourceIp": "true"}
+                    })),
+                ),
+            ];
+            let policies: Vec<IAMPolicy> = perms.iter().map(permission_to_iam_policy).collect();
+            assert!(
+                !evaluate_iam(&policies, S3Action::Read, "b", "k", &Context::new()),
+                "an unevaluable Deny let the read through"
+            );
         }
     }
 }

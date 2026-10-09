@@ -283,12 +283,20 @@ succeed.
   missed only one of the values. A Deny then also refused the allowed
   networks, and an Allow let the excluded prefixes through. AWS reads such a
   condition as "matches none of the values". Now the proxy refuses this
-  shape when you save the rule, and an existing Allow rule of this shape
-  grants nothing. A negated condition with one value works as before.
-- A condition value that the proxy cannot read, such as the network
-  `10.0.0.0/33`, passed validation. A Deny rule with it then hid nothing in
-  listings. Now the proxy refuses such a value when you save the rule, and
-  a Deny rule whose condition cannot be read counts as a Deny.
+  shape when you save the rule, also with `ForAllValues:` or
+  `ForAnyValue:`, and an existing Allow rule of this shape grants nothing.
+  A negated condition with one value works as before.
+- A condition that the proxy cannot evaluate passed validation: a value of
+  the wrong type (`Null` with `"true"` in quotes, a number for a string
+  operator, a number for a date), an empty list, an IP or number operator on
+  `s3:prefix`, or a network such as `10.0.0.0/33`. Every request that reached
+  such a rule then failed its permission check, so the rule also took away
+  the user's other grants, and a Deny rule hid nothing in listings. Now the
+  proxy asks its policy engine whether it can read each value when you save
+  the rule, and refuses it with a message that names the rule. A rule that is
+  already stored (synced from an older instance, for example) is contained:
+  an Allow rule grants nothing, and a Deny rule applies without its
+  condition.
 
 ### Security — A successful sign-in no longer clears the failure count of its address
 

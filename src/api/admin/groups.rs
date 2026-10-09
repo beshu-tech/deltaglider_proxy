@@ -80,7 +80,8 @@ pub async fn create_group(
     normalize_permissions(&mut perms);
     if let Err(msg) = validate_permissions(&perms) {
         tracing::warn!("Invalid permissions for group '{}': {}", body.name, msg);
-        return Err(AdminError::invalid("invalid permissions"));
+        // The text names the caller's own rule, so the operator can fix it.
+        return Err(AdminError::invalid(format!("invalid permissions: {msg}")));
     }
 
     let group = db
@@ -213,7 +214,8 @@ pub async fn update_group(
     if let Some(ref perms) = normalized_perms {
         if let Err(msg) = validate_permissions(perms) {
             tracing::warn!("Invalid permissions for group {}: {}", group_id, msg);
-            return Err(AdminError::invalid("invalid permissions"));
+            // The text names the caller's own rule, so the operator can fix it.
+            return Err(AdminError::invalid(format!("invalid permissions: {msg}")));
         }
     }
 

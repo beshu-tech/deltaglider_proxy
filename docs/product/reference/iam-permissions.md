@@ -101,7 +101,9 @@ For `dana` this expands to `db-archive/home/dana/*`.
 
 ## Conditions
 
-Conditions within a single rule are ANDed: all must match for the rule to apply. Multiple values for the same key are ORed.
+Conditions within a single rule are ANDed: all must match for the rule to apply. For a positive operator (`StringLike`, `IpAddress`, …), several values for one key are ORed: one match is enough. A negated operator (`StringNotLike`, `NotIpAddress`, …) takes one value only, because the policy engine would read several values as "misses at least one", which is true for nearly every request. To exclude several values, use the opposite rule: a Deny with `StringLike` and the list, in place of an Allow with `StringNotLike`.
+
+The proxy checks every condition when you save the rule, and refuses one that its policy engine cannot evaluate: a value of the wrong type for its operator (`Null` takes `true` or `false` without quotes; a String or Arn operator takes text; a date operator takes a date as text), an empty value list, or an operator that cannot compare the key (an IP or number operator on `s3:prefix`). A `${iam:…}` variable works only in a String or Arn operator. A rule that is already stored and that the proxy cannot evaluate (synced from an older instance, for example) is contained: an Allow rule grants nothing, and a Deny rule applies without its condition.
 
 ### Condition operators
 
@@ -119,7 +121,9 @@ Conditions within a single rule are ANDed: all must match for the rule to apply.
 | Key | Type | Available on | Value |
 |-----|------|--------------|-------|
 | `aws:SourceIp` | IP address (CIDR) | All requests | Client IP: the address of the TCP connection, or the client that `X-Forwarded-For` names when the connection comes from a network in `DGP_TRUSTED_PROXY_CIDRS` |
-| `s3:prefix` | String | LIST requests | The `prefix` query parameter |
+| `s3:prefix` | String | LIST requests | The `prefix` query parameter (empty when the request has none) |
+| `s3:delimiter` | String | LIST requests | The `delimiter` query parameter |
+| `s3:max-keys` | Number | LIST requests | The `max-keys` query parameter |
 
 A client can write any `X-Forwarded-For` value, so the proxy reads that header for `aws:SourceIp` only when `DGP_TRUST_PROXY_HEADERS=true` and the connection comes from a reverse proxy that `DGP_TRUSTED_PROXY_CIDRS` lists. The proxy refuses to start with `DGP_TRUST_PROXY_HEADERS=true` and no `DGP_TRUSTED_PROXY_CIDRS`.
 

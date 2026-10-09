@@ -262,7 +262,8 @@ pub async fn create_user(
     normalize_permissions(&mut perms);
     if let Err(msg) = validate_permissions(&perms) {
         tracing::warn!("Invalid permissions for user '{}': {}", body.name, msg);
-        return Err(AdminError::invalid("invalid permissions"));
+        // The text names the caller's own rule, so the operator can fix it.
+        return Err(AdminError::invalid(format!("invalid permissions: {msg}")));
     }
 
     let user = db
@@ -394,7 +395,8 @@ pub async fn update_user(
     if let Some(ref perms) = normalized_perms {
         if let Err(msg) = validate_permissions(perms) {
             tracing::warn!("Invalid permissions for user {}: {}", user_id, msg);
-            return Err(AdminError::invalid("invalid permissions"));
+            // The text names the caller's own rule, so the operator can fix it.
+            return Err(AdminError::invalid(format!("invalid permissions: {msg}")));
         }
     }
 
