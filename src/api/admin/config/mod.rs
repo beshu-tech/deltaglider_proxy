@@ -476,7 +476,7 @@ pub(super) fn preserve_runtime_secrets(
     preserve_primary_backend_creds(incoming, current, &mut warnings);
     preserve_named_backends_creds(incoming, current, &mut warnings);
     // Webhook header values are masked to REDACTED_SENTINEL on GET/export.
-    preserve_event_delivery_secrets(&mut incoming.event_delivery, &current.event_delivery);
+    preserve_event_delivery_secrets(&mut incoming.event_delivery, &current.event_delivery)?;
     preserve_declarative_iam_secrets(incoming, current);
     Ok(warnings)
 }
@@ -515,72 +515,98 @@ fn preserve_declarative_iam_secrets(
     }
 }
 
-/// Preserve unredacted `event_delivery.webhook_headers` values across a section
-/// round-trip. The GET masks each header value to
-/// [`crate::config::REDACTED_SENTINEL`] (keeping the key), so an unedited
-/// round-trip would otherwise overwrite the real bearer token with the mask.
-///
-/// Per-key, three cases mirror the SigV4 "None means unchanged" contract:
-/// - value still equals the sentinel → the operator did not retype it → restore
-///   the old value (or drop the key if `old` has no such header — a masked value
-///   for a key that never existed is meaningless, treat as unset).
-/// - value differs from the sentinel → the operator typed a real value → keep it.
-/// - key absent from `new` → the operator removed it (the merge-patch already
-///   applied the delete) → nothing to do here.
+/// Put the saved event-delivery secrets back over the masks of a GET/export
+/// round-trip. R4 (review E11): a mask claims that a value exists; when the
+/// write cannot restore it (no saved value, or a list edited around a
+/// mask), the write is refused by name, never cleared, dropped or left for
+/// the URL policy to reject with unrelated advice.
 pub(super) fn preserve_event_delivery_secrets(
     new: &mut crate::config_sections::EventDeliveryConfig,
     old: &crate::config_sections::EventDeliveryConfig,
-) {
+) -> Result<(), String> {
     let sentinel = crate::config::REDACTED_SENTINEL;
-    let mut drop_keys: Vec<String> = Vec::new();
+    let unsaved = |field: &str| {
+        format!(
+            "event_delivery.{field} is still masked ({sentinel:?}), and there is no saved \
+             value for it. Enter the value."
+        )
+    };
     for (key, value) in new.webhook_headers.iter_mut() {
         if value == sentinel {
             match old.webhook_headers.get(key) {
                 Some(prev) => *value = prev.clone(),
-                None => drop_keys.push(key.clone()),
+                None => return Err(unsaved(&format!("webhook_headers.{key}"))),
             }
         }
     }
-    for key in drop_keys {
-        new.webhook_headers.remove(&key);
-    }
-    // Slack bot token: an untouched (sentinel) value preserves the old token; a
-    // sentinel with no old token to restore is meaningless → clear it.
     if new.slack_bot_token.as_deref() == Some(sentinel) {
-        new.slack_bot_token = old.slack_bot_token.clone();
+        match &old.slack_bot_token {
+            Some(prev) => new.slack_bot_token = Some(prev.clone()),
+            None => return Err(unsaved("slack_bot_token")),
+        }
     }
     // Slack incoming-webhook URLs are masked to the sentinel on export (the
-    // hooks.slack.com path token is the credential); restore an untouched one.
-    // A sentinel with no old value to restore is meaningless → leave it (config
-    // validation will reject a literal sentinel as not a valid URL).
+    // hooks.slack.com path token is the credential).
     if new.webhook_url.as_deref() == Some(sentinel) {
-        new.webhook_url = old.webhook_url.clone();
-    }
-    // webhook_urls are masked element-wise on export. A masked entry carries no
-    // identity, so index-based restore is only SOUND when the list kept its
-    // shape: the same length, and every entry that is not masked equal to the
-    // old entry at its index. A list with a deleted entry and an added one
-    // has the same length ([mask, C] for [A, B]) and would restore the
-    // deleted A. Otherwise leave the sentinel in place, so config validation
-    // rejects it and the operator supplies the real URL, rather than guess.
-    restore_masked_list(&mut new.webhook_urls, &old.webhook_urls);
-}
-
-/// Put `saved` back over the masked (sentinel) entries of `list`, only when
-/// the list kept its shape: the same length, and every unmasked entry equal
-/// to the saved entry at its index. Shared by the section/document write and
-/// the backup restore.
-pub(crate) fn restore_masked_list(list: &mut [String], saved: &[String]) {
-    let sentinel = crate::config::REDACTED_SENTINEL;
-    let aligned =
-        list.len() == saved.len() && list.iter().zip(saved).all(|(n, o)| n == sentinel || n == o);
-    if aligned {
-        for (url, prev) in list.iter_mut().zip(saved) {
-            if url == sentinel {
-                *url = prev.clone();
-            }
+        match &old.webhook_url {
+            Some(prev) => new.webhook_url = Some(prev.clone()),
+            None => return Err(unsaved("webhook_url")),
         }
     }
+    restore_masked_list(&mut new.webhook_urls, &old.webhook_urls).map_err(|m| {
+        if m.nothing_saved {
+            unsaved(&format!("webhook_urls[{}]", m.index))
+        } else {
+            format!(
+                "event_delivery.webhook_urls[{}] is still masked ({sentinel:?}), but the \
+                 list changed, so the proxy cannot tell which saved URL the mask stands \
+                 for. Enter every URL of event_delivery.webhook_urls again.",
+                m.index
+            )
+        }
+    })
+}
+
+/// A list entry that is still masked after [`restore_masked_list`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct StillMasked {
+    pub index: usize,
+    pub nothing_saved: bool,
+}
+
+/// Put `saved` back over the masked (sentinel) entries of `list`. A masked
+/// entry carries no identity, so the restore is by index, and only while
+/// the list kept the saved prefix: at least `saved.len()` entries, each of
+/// the first `saved.len()` masked or equal to the saved one, and no mask
+/// past them (new entries may be appended). Otherwise `Err` names the first
+/// mask. Shared by the config writes and the backup restore.
+pub(crate) fn restore_masked_list(
+    list: &mut [String],
+    saved: &[String],
+) -> Result<(), StillMasked> {
+    let sentinel = crate::config::REDACTED_SENTINEL;
+    let Some(first) = list.iter().position(|u| u == sentinel) else {
+        return Ok(());
+    };
+    let n = saved.len();
+    let aligned = list.len() >= n
+        && list
+            .iter()
+            .zip(saved)
+            .all(|(new, old)| new == sentinel || new == old)
+        && !list.iter().skip(n).any(|u| u == sentinel);
+    if !aligned {
+        return Err(StillMasked {
+            index: first,
+            nothing_saved: n == 0,
+        });
+    }
+    for (url, prev) in list.iter_mut().zip(saved) {
+        if url == sentinel {
+            *url = prev.clone();
+        }
+    }
+    Ok(())
 }
 
 /// Preserve credentials on the PRIMARY backend across a config swap.
@@ -1202,7 +1228,7 @@ mod preserve_tests {
             webhook_urls: vec![REDACTED_SENTINEL.into(), "https://b/secret2".into()],
             ..EventDeliveryConfig::default()
         };
-        preserve_event_delivery_secrets(&mut new, &old);
+        preserve_event_delivery_secrets(&mut new, &old).unwrap();
         assert_eq!(new.webhook_urls[0], "https://a/secret1");
 
         // Different length (operator deleted an entry) → NO index restore, or a
@@ -1213,7 +1239,11 @@ mod preserve_tests {
             webhook_urls: vec![REDACTED_SENTINEL.into()],
             ..EventDeliveryConfig::default()
         };
-        preserve_event_delivery_secrets(&mut shortened, &old);
+        let refused = preserve_event_delivery_secrets(&mut shortened, &old);
+        assert!(
+            refused.is_err_and(|e| e.contains("webhook_urls[0]")),
+            "a shortened list must be refused"
+        );
         assert_eq!(
             shortened.webhook_urls[0], REDACTED_SENTINEL,
             "a length change must NOT index-restore (would swap secrets)"
@@ -1233,7 +1263,8 @@ mod preserve_tests {
             webhook_urls: vec![REDACTED_SENTINEL.into(), "https://c/new".into()],
             ..EventDeliveryConfig::default()
         };
-        preserve_event_delivery_secrets(&mut new, &old);
+        let refused = preserve_event_delivery_secrets(&mut new, &old);
+        assert!(refused.is_err_and(|e| e.contains("list changed")));
         assert_ne!(
             new.webhook_urls[0], "https://a/secret1",
             "a deleted webhook URL came back"
@@ -1245,7 +1276,7 @@ mod preserve_tests {
         // Operator left "Authorization" masked → restore the old token.
         let old = ed_with(&[("Authorization", "Bearer real-token")]);
         let mut new = ed_with(&[("Authorization", REDACTED_SENTINEL)]);
-        preserve_event_delivery_secrets(&mut new, &old);
+        preserve_event_delivery_secrets(&mut new, &old).unwrap();
         assert_eq!(
             new.webhook_headers.get("Authorization").map(String::as_str),
             Some("Bearer real-token")
@@ -1257,7 +1288,7 @@ mod preserve_tests {
         // Operator typed a new token → keep it, don't restore the old one.
         let old = ed_with(&[("Authorization", "Bearer old")]);
         let mut new = ed_with(&[("Authorization", "Bearer NEW")]);
-        preserve_event_delivery_secrets(&mut new, &old);
+        preserve_event_delivery_secrets(&mut new, &old).unwrap();
         assert_eq!(
             new.webhook_headers.get("Authorization").map(String::as_str),
             Some("Bearer NEW")
@@ -1265,12 +1296,47 @@ mod preserve_tests {
     }
 
     #[test]
-    fn preserve_drops_sentinel_for_unknown_key() {
-        // A masked value for a key the old config never had is meaningless → drop.
+    fn restore_masked_list_rule() {
+        let m = || REDACTED_SENTINEL.to_string();
+        let a = || "https://a/1".to_string();
+        let b = || "https://b/2".to_string();
+        let c = || "https://c/3".to_string();
+        let saved = [a(), b()];
+        let run =
+            |mut list: Vec<String>| super::restore_masked_list(&mut list, &saved).map(|()| list);
+        assert_eq!(run(vec![m(), m()]), Ok(vec![a(), b()]), "untouched");
+        assert_eq!(
+            run(vec![m(), m(), c()]),
+            Ok(vec![a(), b(), c()]),
+            "appended"
+        );
+        assert_eq!(run(vec![a(), c()]), Ok(vec![a(), c()]), "no mask: as sent");
+        for (edited, why) in [
+            (vec![m(), c()], "B087: A deleted, C appended"),
+            (vec![c(), m()], "an entry changed in place"),
+            (vec![m()], "shorter"),
+            (vec![a(), b(), m()], "a mask past the saved entries"),
+        ] {
+            assert!(run(edited).is_err(), "{why}");
+        }
+        let mut list = vec![m()];
+        assert_eq!(
+            super::restore_masked_list(&mut list, &[]),
+            Err(super::StillMasked {
+                index: 0,
+                nothing_saved: true
+            })
+        );
+    }
+
+    #[test]
+    fn preserve_refuses_a_sentinel_for_an_unknown_key() {
+        // A mask for a key the old config never had (a foreign export, or a
+        // header another admin deleted): refused by name, never dropped.
         let old = ed_with(&[]);
         let mut new = ed_with(&[("X-New", REDACTED_SENTINEL)]);
-        preserve_event_delivery_secrets(&mut new, &old);
-        assert!(!new.webhook_headers.contains_key("X-New"));
+        let refused = preserve_event_delivery_secrets(&mut new, &old);
+        assert!(refused.is_err_and(|e| e.contains("webhook_headers.X-New")));
     }
 
     #[test]
@@ -1279,7 +1345,7 @@ mod preserve_tests {
         // a different untouched header is restored.
         let old = ed_with(&[("Authorization", "Bearer real"), ("X-Env", "prod")]);
         let mut new = ed_with(&[("X-Env", REDACTED_SENTINEL)]);
-        preserve_event_delivery_secrets(&mut new, &old);
+        preserve_event_delivery_secrets(&mut new, &old).unwrap();
         assert!(!new.webhook_headers.contains_key("Authorization"));
         assert_eq!(
             new.webhook_headers.get("X-Env").map(String::as_str),
@@ -1298,7 +1364,7 @@ mod preserve_tests {
             slack_bot_token: Some(REDACTED_SENTINEL.to_string()),
             ..Default::default()
         };
-        preserve_event_delivery_secrets(&mut new, &old);
+        preserve_event_delivery_secrets(&mut new, &old).unwrap();
         assert_eq!(new.slack_bot_token.as_deref(), Some("xoxb-real-token"));
 
         // retyped token → keep it
@@ -1306,16 +1372,16 @@ mod preserve_tests {
             slack_bot_token: Some("xoxb-NEW".to_string()),
             ..Default::default()
         };
-        preserve_event_delivery_secrets(&mut new2, &old);
+        preserve_event_delivery_secrets(&mut new2, &old).unwrap();
         assert_eq!(new2.slack_bot_token.as_deref(), Some("xoxb-NEW"));
 
-        // sentinel with no old token → cleared
+        // sentinel with no old token → refused (review E11), never cleared
         let mut new3 = EventDeliveryConfig {
             slack_bot_token: Some(REDACTED_SENTINEL.to_string()),
             ..Default::default()
         };
-        preserve_event_delivery_secrets(&mut new3, &EventDeliveryConfig::default());
-        assert_eq!(new3.slack_bot_token, None);
+        let refused = preserve_event_delivery_secrets(&mut new3, &EventDeliveryConfig::default());
+        assert!(refused.is_err_and(|e| e.contains("slack_bot_token")));
     }
 
     #[test]
@@ -1415,7 +1481,7 @@ mod preserve_tests {
             webhook_urls: vec![REDACTED_SENTINEL.to_string()],
             ..Default::default()
         };
-        preserve_event_delivery_secrets(&mut new, &old);
+        preserve_event_delivery_secrets(&mut new, &old).unwrap();
         assert_eq!(
             new.webhook_url.as_deref(),
             Some("https://hooks.slack.com/services/REAL")
@@ -1431,7 +1497,7 @@ mod preserve_tests {
             webhook_url: Some("https://hooks.slack.com/services/NEW".to_string()),
             ..Default::default()
         };
-        preserve_event_delivery_secrets(&mut new2, &old);
+        preserve_event_delivery_secrets(&mut new2, &old).unwrap();
         assert_eq!(
             new2.webhook_url.as_deref(),
             Some("https://hooks.slack.com/services/NEW")

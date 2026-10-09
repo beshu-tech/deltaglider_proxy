@@ -1181,7 +1181,12 @@ fn hydrate_config_with_backup_secrets(cfg: &mut Config, secrets: &BackupSecrets)
         if cfg.event_delivery.webhook_url.as_deref() == Some(sentinel) {
             cfg.event_delivery.webhook_url = ed.webhook_url.clone();
         }
-        super::config::restore_masked_list(&mut cfg.event_delivery.webhook_urls, &ed.webhook_urls);
+        // A list this cannot align keeps its mask: the document write's
+        // preserve step then tries the running config, and refuses by name.
+        let _ = super::config::restore_masked_list(
+            &mut cfg.event_delivery.webhook_urls,
+            &ed.webhook_urls,
+        );
     }
 }
 

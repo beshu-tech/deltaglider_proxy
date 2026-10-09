@@ -1182,11 +1182,16 @@ impl EventDeliveryConfig {
             .into_iter()
             .filter(|(_, u, _)| !before.contains(u))
             .map(|(label, u, e)| {
-                format!(
-                    "{label} {u:?} is refused by the outbound-URL policy: {e}. Set \
-                     event_delivery.allow_local: true for a receiver on http:// or a \
-                     private address (cloud-metadata addresses are never allowed)"
-                )
+                if u == crate::config::REDACTED_SENTINEL {
+                    // An export's mask, not a URL: `allow_local` is no help.
+                    format!("{label} holds the export mask {u:?}, not a URL: enter the real URL")
+                } else {
+                    format!(
+                        "{label} {u:?} is refused by the outbound-URL policy: {e}. Set \
+                         event_delivery.allow_local: true for a receiver on http:// or a \
+                         private address (cloud-metadata addresses are never allowed)"
+                    )
+                }
             })
             .collect()
     }

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed — A masked secret that cannot be restored is refused by name
+
+A config write that kept a masked value (`__redacted__`) which the proxy
+could not put back ended in four different ways: a webhook header was
+dropped, the Slack bot token or the webhook URL was cleared, and a masked
+entry of an edited `webhook_urls` list stayed and was refused with advice to
+set `event_delivery.allow_local`. Now every such write is refused at once
+with a message that names the field and says what to enter. A masked URL
+list may also grow: URLs appended after the masked ones are kept.
+
 ### Fixed — A backup no longer holds values that come from `${env:…}` references
 
 A full backup's `secrets.json` held the resolved value of every secret that

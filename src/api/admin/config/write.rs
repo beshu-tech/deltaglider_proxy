@@ -980,6 +980,45 @@ mod tests {
         }
     }
 
+    /// Review E11: a webhook URL list edited around a mask ([mask, C] for
+    /// [A, B]) cannot be restored. The write must refuse it at the preserve
+    /// step and say why, not fail later on the URL policy with advice to
+    /// set `allow_local`.
+    #[test]
+    fn a_still_masked_url_is_refused_at_preserve() {
+        let mut old = running();
+        old.event_delivery.webhook_urls = vec![
+            "https://a.example/secret1".into(),
+            "https://b.example/secret2".into(),
+        ];
+        let mut incoming = old.clone();
+        incoming.event_delivery.webhook_urls = vec![
+            crate::config::REDACTED_SENTINEL.into(),
+            "https://c.example/new".into(),
+        ];
+        let w = write(Surface::Document { yaml: "" }, Mode::DryRun);
+        let rejection = match prepare(&old, built(incoming), &w) {
+            Ok(_) => panic!("an unrestorable mask went through"),
+            Err(r) => r,
+        };
+        assert!(
+            matches!(rejection.stage, Stage::Preserve),
+            "{}",
+            rejection.error
+        );
+        assert_eq!(rejection.status, StatusCode::BAD_REQUEST);
+        assert!(
+            rejection.error.contains("webhook_urls[0]"),
+            "{}",
+            rejection.error
+        );
+        assert!(
+            !rejection.error.contains("allow_local"),
+            "{}",
+            rejection.error
+        );
+    }
+
     fn built(incoming: Config) -> Built {
         Built {
             incoming,
