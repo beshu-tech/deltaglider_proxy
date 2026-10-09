@@ -1104,3 +1104,113 @@ async fn reconcile_rebuilds_the_live_provider_set() {
     let disabled = get_ext_auth_version(&admin, &endpoint).await;
     assert!(disabled > created, "disabling provider corp left it live");
 }
+
+/// B031: a gui-to-declarative flip whose YAML declares only an auth provider
+/// still wipes every local user and group: the empty-YAML gate must refuse
+/// it like an empty YAML.
+#[tokio::test]
+async fn reconcile_rejects_gui_to_declarative_with_only_a_provider() {
+    let server = TestServer::builder()
+        .auth("BOOTKEY3", "BOOTSECRET3")
+        .build()
+        .await;
+    let endpoint = server.endpoint();
+    let admin = admin_http_client(&endpoint).await;
+    let v0 = get_iam_version(&admin, &endpoint).await;
+    let resp = admin
+        .post(format!("{endpoint}/_/api/admin/users"))
+        .json(&json!({
+            "name": "pre-existing",
+            "access_key_id": "AKIAPRE0001",
+            "secret_access_key": "sk-pre",
+            "permissions": [{ "effect": "Allow", "actions": ["read"], "resources": ["*"] }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    wait_for_iam_rebuild(&admin, &endpoint, v0).await;
+
+    let resp = admin
+        .put(format!("{endpoint}/_/api/admin/config/section/access"))
+        .json(&json!({
+            "iam_mode": "declarative",
+            "auth_providers": [{
+                "name": "corp", "provider_type": "oidc", "client_id": "c",
+                "client_secret": "s", "issuer_url": "https://idp.example.com"
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    assert!(
+        !status.is_success(),
+        "a provider-only flip was applied: {status}"
+    );
+    let users = list_users(&admin, &endpoint).await;
+    assert!(
+        users.iter().any(|u| u["name"] == "pre-existing"),
+        "the flip deleted the local users: {users:?}"
+    );
+}
+
+/// B038: the access section GET hides declarative secrets; PUTting the body
+/// back (what the Credentials page does) must keep them, in memory and in
+/// the persisted YAML.
+#[tokio::test]
+async fn an_access_section_round_trip_keeps_declarative_secrets() {
+    let server = TestServer::builder()
+        .extra_yaml_root(
+            "iam_mode: declarative\n\
+             iam_users:\n\
+             \x20 - name: alice\n\
+             \x20   access_key_id: AKALICE0001\n\
+             \x20   secret_access_key: sk-alice-literal-0001\n\
+             \x20   enabled: true\n\
+             \x20   permissions:\n\
+             \x20     - effect: Allow\n\
+             \x20       actions: [read]\n\
+             \x20       resources: [\"*\"]\n\
+             auth_providers:\n\
+             \x20 - name: corp\n\
+             \x20   provider_type: oidc\n\
+             \x20   client_id: dgp\n\
+             \x20   client_secret: cs-corp-literal-0002\n\
+             \x20   issuer_url: https://idp.example.com\n",
+        )
+        .build()
+        .await;
+    let endpoint = server.endpoint();
+    let admin = admin_http_client(&endpoint).await;
+    let resp = admin
+        .get(format!("{endpoint}/_/api/admin/config/section/access"))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let etag = resp
+        .headers()
+        .get("etag")
+        .map(|v| v.to_str().unwrap().to_string());
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let mut put = admin
+        .put(format!("{endpoint}/_/api/admin/config/section/access"))
+        .json(&body);
+    if let Some(etag) = etag {
+        put = put.header("if-match", etag);
+    }
+    let resp = put.send().await.unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert!(status.is_success(), "{status}: {text}");
+    let persisted = std::fs::read_to_string(server.config_path()).unwrap();
+    assert!(
+        persisted.contains("sk-alice-literal-0001"),
+        "the user secret was blanked in the persisted YAML:\n{persisted}"
+    );
+    assert!(
+        persisted.contains("cs-corp-literal-0002"),
+        "the provider secret was dropped from the persisted YAML:\n{persisted}"
+    );
+}

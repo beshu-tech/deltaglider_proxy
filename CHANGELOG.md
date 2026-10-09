@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed — Saving the access section keeps declarative IAM secrets
+
+The access section of the admin API hides each declarative user's secret
+key and each auth provider's client secret. When the admin GUI sent the
+section back, for example after a change on the Credentials page, the proxy
+stored the hidden values: an empty secret key, and no client secret, in
+memory and in the YAML file. Now an entry that comes back without its secret
+keeps the current one, matched by name (a user only while its access key id
+is the same).
+
 ### Fixed — A declarative flip with only an auth provider no longer wipes the users
 
 A switch from `iam_mode: gui` to `declarative` with no `iam_users` and no

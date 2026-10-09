@@ -489,7 +489,42 @@ pub(super) fn preserve_runtime_secrets(
     preserve_named_backends_creds(incoming, current, &mut warnings);
     // Webhook header values are masked to REDACTED_SENTINEL on GET/export.
     preserve_event_delivery_secrets(&mut incoming.event_delivery, &current.event_delivery);
+    preserve_declarative_iam_secrets(incoming, current);
     Ok(warnings)
+}
+
+/// Declarative IAM secrets are stripped on GET/export: a user's
+/// `secret_access_key` comes back empty and a provider's `client_secret`
+/// absent. Such an entry keeps the runtime secret, matched by name (a user
+/// only while its access key id is unchanged: a new key id needs its own
+/// secret). Without this, a round-trip of the access section blanked them in
+/// memory and in the persisted YAML.
+fn preserve_declarative_iam_secrets(
+    incoming: &mut crate::config::Config,
+    current: &crate::config::Config,
+) {
+    for user in &mut incoming.iam_users {
+        if user.secret_access_key.is_empty() {
+            if let Some(prev) = current
+                .iam_users
+                .iter()
+                .find(|c| c.name == user.name && c.access_key_id == user.access_key_id)
+            {
+                user.secret_access_key = prev.secret_access_key.clone();
+            }
+        }
+    }
+    for provider in &mut incoming.auth_providers {
+        if provider.client_secret.as_deref().is_none_or(str::is_empty) {
+            if let Some(prev) = current
+                .auth_providers
+                .iter()
+                .find(|c| c.name == provider.name)
+            {
+                provider.client_secret = prev.client_secret.clone();
+            }
+        }
+    }
 }
 
 /// Preserve unredacted `event_delivery.webhook_headers` values across a section
