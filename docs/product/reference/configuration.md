@@ -1162,7 +1162,7 @@ These variables tune the streaming multipart copy of large objects (replication 
 | `DGP_TRUST_PROXY_HEADERS` | false | Trust `X-Forwarded-For` / `X-Real-IP` from the `DGP_TRUSTED_PROXY_CIDRS` networks for the client address |
 | `DGP_TRUSTED_PROXY_CIDRS` | unset | Comma-separated networks of trusted reverse proxies. Only a connection from these networks can name the client in `X-Forwarded-For`. Required when `DGP_TRUST_PROXY_HEADERS=true` |
 | `DGP_SESSION_TTL_HOURS` | 4 | Admin session lifetime |
-| `DGP_CONFIG_ENV_ALLOWLIST` | — | Comma-separated names (a trailing `*` matches a prefix) that an admin apply, import, restore or section PUT may resolve as `${env:NAME}` from the server environment, in addition to the names that the boot config file uses. `DGP_BOOTSTRAP_*`, `DGP_*ENCRYPTION_KEY*` and `DGP_*SECRET*` never match |
+| `DGP_CONFIG_ENV_ALLOWLIST` | — | Comma-separated names (a trailing `*` matches a prefix) that an admin apply, import, restore or section PUT may resolve as `${env:NAME}` from the server environment, in addition to the names that the boot config file uses. A `DGP_*` name never matches a `*` pattern (list it exactly), and a `DGP_*` name that contains `BOOTSTRAP_`, `ENCRYPTION_KEY`, `SECRET`, `DB_KEY`, `PASSWORD` or `TOKEN` never matches |
 | `DGP_CLOCK_SKEW_SECONDS` | 900 | SigV4 clock skew tolerance |
 | `DGP_REPLAY_WINDOW_SECS` | 2 × clock skew (1800) | SigV4 replay detection window for mutating requests (0 disables) |
 | `DGP_SECURE_COOKIES` | auto | `Secure` flag on session cookies: `true` always, `false` never; unset = when the listener serves TLS or a trusted `X-Forwarded-Proto: https` arrives |

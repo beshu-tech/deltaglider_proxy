@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Security — `DGP_CONFIG_ENV_ALLOWLIST` never admits the config-DB key
+
+`DGP_CONFIG_ENV_ALLOWLIST` lets an admin request resolve extra environment
+variables. Its built-in exclusions covered the bootstrap, encryption-key
+and `SECRET` variables, but not `DGP_CONFIG_DB_KEY`,
+`DGP_CONFIG_DB_KEY_PREVIOUS`, `DGP_METRICS_BEARER_TOKEN` or
+`DGP_ADMIN_PASSWORD_HASH`. With an allowlist of `*` or `DGP_*`, an admin
+could put `${env:DGP_CONFIG_DB_KEY}` into a webhook header and receive the
+key. Now every `DGP_*` variable that holds a key, secret, token or password
+hash is excluded, and a `*` pattern never matches a `DGP_*` variable.
+
 ### Fixed — `${env:NAME:-default}` keeps its default when the proxy saves the file
 
 When `NAME` was set at startup, a change in the admin GUI saved the

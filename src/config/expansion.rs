@@ -201,19 +201,29 @@ pub fn admin_env_lookup(
 }
 
 /// Pure: does `allowlist` (comma-separated names; a trailing `*` matches a
-/// prefix) admit `name`? Bootstrap, encryption-key and secret `DGP_*`
-/// variables never match: admin input must not read the proxy's own secrets.
+/// prefix) admit `name`? A `DGP_*` variable that holds one of the proxy's
+/// own secrets (bootstrap, encryption keys, the config-DB keys, secrets,
+/// tokens, password hashes) never matches: admin input must not read them.
+/// A wildcard never admits any `DGP_*` variable; the operator names such a
+/// variable exactly.
 pub fn env_name_allowlisted(name: &str, allowlist: &str) -> bool {
-    let never = name.starts_with("DGP_BOOTSTRAP_")
-        || (name.starts_with("DGP_")
-            && (name.contains("ENCRYPTION_KEY") || name.contains("SECRET")));
+    const SECRET_PARTS: &[&str] = &[
+        "BOOTSTRAP_",
+        "ENCRYPTION_KEY",
+        "SECRET",
+        "DB_KEY",
+        "PASSWORD",
+        "TOKEN",
+    ];
+    let proxy_var = name.starts_with("DGP_");
+    let never = proxy_var && SECRET_PARTS.iter().any(|part| name.contains(part));
     !never
         && allowlist
             .split(',')
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .any(|p| match p.strip_suffix('*') {
-                Some(prefix) => name.starts_with(prefix),
+                Some(prefix) => !proxy_var && name.starts_with(prefix),
                 None => name == p,
             })
 }
@@ -887,6 +897,25 @@ mod tests {
             expand_env_doc_with("k: ${env:X}", q).unwrap(),
             r#"k: !envref "a\"b\\c""#
         );
+    }
+
+    /// B083: the config-DB key, the previous key, the metrics token and the
+    /// admin password hash are the proxy's own secrets too; and a wildcard
+    /// never admits a `DGP_*` variable (name those exactly).
+    #[test]
+    fn env_allowlist_never_admits_the_proxy_secrets() {
+        for never in [
+            "DGP_CONFIG_DB_KEY",
+            "DGP_CONFIG_DB_KEY_PREVIOUS",
+            "DGP_METRICS_BEARER_TOKEN",
+            "DGP_ADMIN_PASSWORD_HASH",
+        ] {
+            for list in ["*", "DGP_*", "DGP_CONFIG_*", never] {
+                assert!(!env_name_allowlisted(never, list), "{never} via {list}");
+            }
+        }
+        assert!(!env_name_allowlisted("DGP_LISTEN_ADDR", "DGP_*"));
+        assert!(env_name_allowlisted("DGP_LISTEN_ADDR", "DGP_LISTEN_ADDR"));
     }
 
     #[test]

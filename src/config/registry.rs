@@ -376,7 +376,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_CONFIG_ENV_ALLOWLIST",
-        description: "Comma-separated env var names (a trailing * matches a prefix) that admin config apply, import and restore may resolve as ${env:NAME}, beyond those the boot config uses. DGP_BOOTSTRAP_*, DGP_*ENCRYPTION_KEY* and DGP_*SECRET* never match",
+        description: "Comma-separated env var names (a trailing * matches a prefix) that admin config apply, import and restore may resolve as ${env:NAME}, beyond those the boot config uses. A * pattern never matches a DGP_* name (list it exactly), and a DGP_* name containing BOOTSTRAP_, ENCRYPTION_KEY, SECRET, DB_KEY, PASSWORD or TOKEN never matches",
         example: "LOG_LEVEL,APP_*",
         category: "Security",
     },
