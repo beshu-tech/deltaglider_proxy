@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed — `${env:…}` inside a glob, a list or a block text stays plain text
+
+Since v2.0.0, a reference that fills a whole YAML value is replaced by a
+tagged string, so that YAML does not turn the value into a number or a
+bool. The proxy also tagged a reference that was only part of a value when
+a `{`, `[` or `,` came before it, and every reference in a block text
+(`|` or `>`). An exclude glob such as `keep/*.{pin,${env:EXTRA}}` then held
+the text `!envref "lock"`, so a lifecycle rule deleted the objects that it
+was meant to keep. Values such as `a,${env:X}` and `http://[${env:V6}]:9000`
+broke the same way. Now only a reference that is a whole value is tagged.
+
 ### Fixed — Bulk ZIP and move: non-ASCII folders, commas in keys, aliased buckets
 
 - A ZIP download of objects from folders with non-ASCII names (for example

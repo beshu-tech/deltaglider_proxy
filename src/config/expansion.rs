@@ -190,13 +190,18 @@ pub(crate) fn expand_env_doc_with(
 
 /// Pure: where a ref starting at byte `start` (its `$`) and ending at byte
 /// `end` (its `}`) sits in `input`. `Some(quote)` when the ref is a whole
-/// scalar (`quote` = the enclosing quote char, or `None` for plain), else
-/// `None` (mid-string, a key, a block scalar line).
+/// node (`quote` = the enclosing quote char, or `None` for plain), else
+/// `None` (mid-scalar, a key, a block scalar line). Only a whole node can be
+/// tagged: inside a plain scalar `{`, `[` and `,` are text (a glob such as
+/// `keep/*.{pin,${env:X}}`), and a block scalar holds no nodes at all.
 fn whole_scalar_quote(input: &str, start: usize, end: usize) -> Option<Option<char>> {
     let line_start = input[..start].rfind('\n').map_or(0, |i| i + 1);
     let line_end = input[end + 1..]
         .find('\n')
         .map_or(input.len(), |i| end + 1 + i);
+    if in_block_scalar(input, line_start) {
+        return None;
+    }
     let mut before = &input[line_start..start];
     let mut after = &input[end + 1..line_end];
     let quote = match (before.chars().next_back(), after.chars().next()) {
@@ -207,24 +212,107 @@ fn whole_scalar_quote(input: &str, start: usize, end: usize) -> Option<Option<ch
         }
         _ => None,
     };
-    // What precedes must end a mapping key (`key: `), a sequence dash
-    // (`- `) or a flow opener/separator, after whitespace.
-    let head = before.trim_end();
-    if head.len() == before.len() && !before.ends_with(['[', '{', ',']) {
-        return None; // `key:${env:X}` or text glued to the ref
-    }
-    let opens_scalar = head.ends_with(':')
-        || head.ends_with(['[', '{', ','])
-        || (!head.is_empty() && head.split_whitespace().all(|t| t == "-"));
-    if !opens_scalar || head.contains('#') {
-        return None;
-    }
-    // What follows: end of line, a comment, or a flow separator/closer.
+    // A node opened on this line (`key:`, `-`, a flow bracket); a ref with
+    // no opener before it continues a multi-line scalar.
+    let pre = node_prefix(before)?;
     let tail = after.trim_start();
-    let closes = tail.is_empty()
-        || (tail.starts_with('#') && tail.len() < after.len())
-        || tail.starts_with([',', ']', '}']);
-    closes.then_some(quote)
+    if pre.starts_with(['[', '{']) {
+        // A flow collection: an item after an opener or a separator, or a
+        // flow mapping value after its key.
+        let head = pre.trim_end();
+        let opens = head.ends_with(['[', '{', ',']) || head.ends_with(':');
+        let closes = tail.starts_with([',', ']', '}']);
+        return (opens && closes && !head.contains('#')).then_some(quote);
+    }
+    // A block node: the ref must be all of it, up to the end of the line or
+    // a comment.
+    let closes = tail.is_empty() || (tail.starts_with('#') && tail.len() < after.len());
+    (pre.is_empty() && closes).then_some(quote)
+}
+
+/// The text between the start of the node that holds a ref and the ref:
+/// `before` (the line up to the ref) without its indentation, sequence
+/// dashes and mapping key. `None` when the line opens no node before the
+/// ref (no dash, no key, no flow bracket).
+fn node_prefix(before: &str) -> Option<&str> {
+    let mut rest = before.trim_start();
+    let mut opened = false;
+    while let Some(r) = rest.strip_prefix('-') {
+        if !(r.is_empty() || r.starts_with([' ', '\t'])) {
+            break;
+        }
+        rest = r.trim_start();
+        opened = true;
+    }
+    if rest.starts_with(['[', '{']) {
+        return Some(rest);
+    }
+    // A mapping key: a quoted key up to its closing quote, else up to the
+    // first `:` that a space, a tab or the end follows.
+    let key_end = match rest.chars().next() {
+        Some(q @ ('"' | '\'')) => rest[1..].find(q).map(|i| i + 2),
+        _ => Some(0),
+    };
+    let Some(from) = key_end else {
+        return opened.then_some(rest);
+    };
+    let sep = rest[from..].char_indices().find(|&(i, c)| {
+        c == ':'
+            && rest[from + i + 1..]
+                .chars()
+                .next()
+                .is_none_or(|n| n == ' ' || n == '\t')
+    });
+    match sep {
+        Some((i, _)) => Some(rest[from + i + 1..].trim_start()),
+        None => opened.then_some(rest),
+    }
+}
+
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start_matches([' ', '\t']).len()
+}
+
+/// Whether the line that starts at byte `line_start` is content of a block
+/// scalar (`|`, `>`): it is text, not YAML nodes. Walks up the chain of
+/// less-indented lines to the nearest block-scalar opener.
+fn in_block_scalar(input: &str, line_start: usize) -> bool {
+    let line = input[line_start..].split('\n').next().unwrap_or("");
+    if line.trim().is_empty() {
+        return false;
+    }
+    let indent = indent_of(line);
+    let mut pos = line_start;
+    while pos > 0 {
+        let prev_end = pos - 1;
+        let prev_start = input[..prev_end].rfind('\n').map_or(0, |i| i + 1);
+        let prev = &input[prev_start..prev_end];
+        pos = prev_start;
+        if prev.trim().is_empty() || indent_of(prev) >= indent {
+            continue;
+        }
+        return opens_block_scalar(prev) || in_block_scalar(input, prev_start);
+    }
+    false
+}
+
+/// Whether `line` ends with a block-scalar indicator (`key: |`, `- >-`,
+/// `key: |2+`), before an optional comment.
+fn opens_block_scalar(line: &str) -> bool {
+    let code = match line.find(" #") {
+        Some(i) => &line[..i],
+        None => line,
+    }
+    .trim_end();
+    let Some((head, last)) = code.rsplit_once([' ', '\t']) else {
+        return false;
+    };
+    let indicator = last.starts_with(['|', '>'])
+        && last[1..]
+            .chars()
+            .all(|c| matches!(c, '-' | '+' | '1'..='9'));
+    let head = head.trim_end();
+    indicator && (head.ends_with(':') || head.trim_start() == "-" || head.ends_with(" -"))
 }
 
 /// `value` as a YAML double-quoted scalar.
@@ -425,6 +513,38 @@ mod tests {
         assert_eq!(expand_env_admin("${env:HOME:-d}", &known).unwrap().0, "d");
     }
     use super::*;
+
+    /// B035: only a ref that IS the whole node (block plain scalar, quoted
+    /// scalar, flow-collection item) is tagged. Inside a plain scalar that
+    /// contains `{`, `[` or `,`, or inside a block scalar, it is plain text.
+    #[test]
+    fn a_ref_inside_a_plain_or_block_scalar_is_spliced_as_text() {
+        let v = |_: &str| Some("lock".to_string());
+        let cases = [
+            (
+                "g:\n  - keep/*.{pin,${env:X}}\n",
+                "g:\n  - keep/*.{pin,lock}\n",
+            ),
+            ("k: a,${env:X}\n", "k: a,lock\n"),
+            (
+                "k: |\n  foo: ${env:X}\n  - ${env:X}\n",
+                "k: |\n  foo: lock\n  - lock\n",
+            ),
+            ("u: http://[${env:X}]:9000\n", "u: http://[lock]:9000\n"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(expand_env_doc_with(input, v).unwrap(), want, "{input:?}");
+        }
+        // Whole nodes stay tagged.
+        for (input, want) in [
+            ("k: ${env:X}\n", "k: !envref \"lock\"\n"),
+            ("- ${env:X}\n", "- !envref \"lock\"\n"),
+            ("k: [a, ${env:X}]\n", "k: [a, !envref \"lock\"]\n"),
+            ("k: {a: ${env:X}}\n", "k: {a: !envref \"lock\"}\n"),
+        ] {
+            assert_eq!(expand_env_doc_with(input, v).unwrap(), want, "{input:?}");
+        }
+    }
 
     /// Review 4 config-8: a commented-out template line with an unset
     /// variable failed the whole load with `MissingEnvVar`.
