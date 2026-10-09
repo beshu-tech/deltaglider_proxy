@@ -118,6 +118,49 @@ impl Faults {
     }
 }
 
+/// I/O faults by path, for the `fsio` probes (stat, read, open, remove):
+/// a failing disk under one file. Process-wide, because the backend has
+/// no handle to carry them; each test's paths are under its own temp
+/// dir, so tests do not meet.
+static IO_FAULTS: parking_lot::Mutex<Vec<(PathBuf, i32, usize)>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// Every `fsio` probe of `path` fails with `errno` until the guard drops.
+pub(crate) fn fail_io(path: &Path, errno: i32) -> IoFault {
+    let path = path.to_path_buf();
+    let mut faults = IO_FAULTS.lock();
+    faults.retain(|(p, _, _)| p != &path);
+    faults.push((path.clone(), errno, 0));
+    IoFault(path)
+}
+
+/// An armed [`fail_io`] fault; disarmed on drop.
+pub(crate) struct IoFault(PathBuf);
+
+impl IoFault {
+    /// How many probes the fault failed.
+    pub(crate) fn fired(&self) -> usize {
+        IO_FAULTS
+            .lock()
+            .iter()
+            .find(|(p, _, _)| p == &self.0)
+            .map_or(0, |(_, _, n)| *n)
+    }
+}
+
+impl Drop for IoFault {
+    fn drop(&mut self) {
+        IO_FAULTS.lock().retain(|(p, _, _)| p != &self.0);
+    }
+}
+
+pub(super) fn io_fault(path: &Path) -> Option<std::io::Error> {
+    let mut faults = IO_FAULTS.lock();
+    let (_, errno, fired) = faults.iter_mut().find(|(p, _, _)| p == path)?;
+    *fired += 1;
+    Some(std::io::Error::from_raw_os_error(*errno))
+}
+
 /// [`FilesystemBackend`] that forwards every call, except the faults armed
 /// on it.
 pub(crate) struct FaultyFs {

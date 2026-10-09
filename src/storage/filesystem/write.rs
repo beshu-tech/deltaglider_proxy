@@ -41,7 +41,7 @@ pub(super) fn mkdir_within(
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    if !bucket_dir.is_dir() {
+                    if !super::fsio::dir_exists_blocking(bucket_dir)? {
                         return Err(StorageError::BucketNotFound(bucket.to_string()));
                     }
                     continue 'walk;
@@ -163,7 +163,7 @@ pub(super) static SYNCED: parking_lot::Mutex<Vec<PathBuf>> = parking_lot::Mutex:
 /// durable: without it, a rename can be lost on power loss (ext4, XFS)
 /// although the file's own data is on disk.
 pub(super) fn sync_path(path: &Path) -> std::io::Result<()> {
-    std::fs::File::open(path)?.sync_all()?;
+    std::fs::File::open(path)?.sync_all()?; // fsio-exempt: errors propagate
     #[cfg(test)]
     SYNCED.lock().push(path.to_path_buf());
     Ok(())
@@ -300,7 +300,7 @@ pub(super) async fn atomic_write_with_metadata(
 /// touches. Never use it to WRITE a stored object — see
 /// `put_reference_from_file`.
 pub(super) async fn hardlink_or_copy(src: &Path, dest: &Path) -> Result<(), StorageError> {
-    let _ = fs::remove_file(dest).await;
+    let _ = super::fsio::remove_file(dest).await;
     if fs::hard_link(src, dest).await.is_err() {
         fs::copy(src, dest).await?;
     }
@@ -321,6 +321,7 @@ pub(super) async fn atomic_copy_with_metadata(
 
     let (_gate, ticket) = commit_gate();
     tokio::task::spawn_blocking(move || {
+        // fsio-exempt: a write source, not a probe of the store.
         let mut src = std::fs::File::open(&source).map_err(io_to_storage_error)?;
         let mut tmp = dir.temp()?;
         std::io::copy(&mut src, &mut tmp).map_err(io_to_storage_error)?;

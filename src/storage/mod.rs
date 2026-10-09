@@ -24,7 +24,7 @@ pub(crate) mod xattr_meta;
 
 pub use encrypting::{EncryptingBackend, EncryptionConfig, EncryptionKey, WriteMode};
 #[cfg(test)]
-pub(crate) use filesystem::fault::{Fault, FaultPoint, Faults, FaultyFs, Hook};
+pub(crate) use filesystem::fault::{fail_io, Fault, FaultPoint, Faults, FaultyFs, Hook};
 pub use filesystem::FilesystemBackend;
 pub use routing::RoutingBackend;
 pub(crate) use s3::{check_s3_endpoint, guard_s3_endpoint};

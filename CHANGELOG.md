@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Fixed — A disk fault no longer reads as a missing file on the filesystem backend
+
+The filesystem backend checked whether a file or a directory existed, and
+it read every error of that check (a disk fault, a permission error) as "it
+does not exist". So, on a disk fault, a PUT could write a new delta
+reference over the live one, and the objects stored as deltas against it
+could not be read again. A DELETE could remove the delta reference while
+deltas still needed it, or answer success without deleting. A listing could
+come back empty, and a mirror tool then deleted its copies, and a bucket
+could look missing. Now only "no such file" means that a file does not
+exist. Every other error fails the request, and nothing changes.
+
 ### Security — A folder selection reads only what the user can see
 
 When a user without admin rights selected a folder in the file browser, the

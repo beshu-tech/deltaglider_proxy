@@ -18,23 +18,11 @@ use tokio::fs;
 use tokio_util::io::ReaderStream;
 use tracing::{debug, instrument};
 
-/// Async-safe path existence check (avoids blocking the Tokio runtime)
-async fn path_exists(path: &Path) -> bool {
-    fs::try_exists(path).await.unwrap_or(false)
-}
-
-/// Async-safe directory check
-async fn is_dir(path: &Path) -> bool {
-    fs::metadata(path)
-        .await
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
-}
-
 use super::io_to_storage_error;
 
 #[cfg(test)]
 pub(crate) mod fault;
+mod fsio;
 #[cfg(test)]
 mod tests;
 mod write;
@@ -259,17 +247,10 @@ impl FilesystemBackend {
         // A directory (a key prefix) or a path under a file is no object
         // (s3surface-2): without this a GET of `dir` answered 200 with the
         // directory's size and then failed mid-body.
-        let stat = fs::metadata(path).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound || super::io_error_is_path_type_conflict(&e)
-            {
-                StorageError::NotFound(path.display().to_string())
-            } else {
-                StorageError::from(e)
-            }
-        })?;
-        if !stat.is_file() {
-            return Err(StorageError::NotFound(path.display().to_string()));
-        }
+        let stat = match fsio::stat(path).await? {
+            Some(stat) if stat.is_file() => stat,
+            _ => return Err(StorageError::NotFound(path.display().to_string())),
+        };
         let modified: DateTime<Utc> = stat
             .modified()
             .map(DateTime::<Utc>::from)
@@ -303,7 +284,7 @@ impl FilesystemBackend {
     async fn ensure_dir(&self, bucket: &str, path: &Path) -> Result<WriteDir, StorageError> {
         let bucket_dir = self.bucket_dir(bucket);
         let dir = path.parent().unwrap_or(&bucket_dir).to_path_buf();
-        if !is_dir(&bucket_dir).await {
+        if !fsio::dir_exists(&bucket_dir).await? {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
         let wd = WriteDir {
@@ -328,7 +309,7 @@ impl FilesystemBackend {
     /// catches the common case with a clean HTTP error; this guard is belt-
     /// and-braces for any future internal caller that forgets the precheck.
     async fn require_bucket_exists(&self, bucket: &str) -> Result<(), StorageError> {
-        if !is_dir(&self.bucket_dir(bucket)).await {
+        if !fsio::dir_exists(&self.bucket_dir(bucket)).await? {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
         Ok(())
@@ -337,7 +318,7 @@ impl FilesystemBackend {
     /// Calculate total size of a directory recursively
     async fn dir_size(&self, path: &Path) -> Result<u64, StorageError> {
         let mut total = 0;
-        if is_dir(path).await {
+        if fsio::dir_exists(path).await? {
             let mut entries = fs::read_dir(path).await?;
             while let Some(entry) = entries.next_entry().await? {
                 let path = entry.path();
@@ -390,7 +371,7 @@ impl FilesystemBackend {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, StorageError>> + Send + 'a>>
     {
         Box::pin(async move {
-            if !path_exists(current_dir).await {
+            if !fsio::exists(current_dir).await? {
                 return Ok(true);
             }
             if Self::dir_has_visible_data_recursive(current_dir).await? {
@@ -422,10 +403,10 @@ impl FilesystemBackend {
                     }
                 } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                     if is_internal_temp_name(name) || name == "reference.bin" {
-                        match fs::remove_file(&path).await {
+                        match fsio::remove_file(&path).await {
                             Ok(()) => {}
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(e) => return Err(StorageError::from(e)),
+                            Err(e) if fsio::absent(&e) => {}
+                            Err(e) => return Err(io_to_storage_error(e)),
                         }
                     } else {
                         has_visible_data = true;
@@ -468,7 +449,7 @@ impl FilesystemBackend {
                 if file_type.is_dir() {
                     fs::remove_dir_all(&path).await?;
                 } else {
-                    fs::remove_file(&path).await?;
+                    fsio::remove_file(&path).await?;
                 }
             }
 
@@ -538,14 +519,17 @@ impl FilesystemBackend {
                 // A baseline is never a user object; report its stored size
                 // (one local stat, the walk already reads each file's xattrs).
                 if name == "reference.bin" {
-                    if let Ok(md) = entry.metadata().await {
-                        let rel = path
-                            .strip_prefix(deltaspaces_dir)
-                            .unwrap_or(Path::new(&name))
-                            .to_string_lossy()
-                            .into_owned();
-                        baselines.push((rel, md.len()));
-                    }
+                    let md = match entry.metadata().await {
+                        Ok(md) => md,
+                        Err(e) if fsio::absent(&e) => continue,
+                        Err(e) => return Err(io_to_storage_error(e)),
+                    };
+                    let rel = path
+                        .strip_prefix(deltaspaces_dir)
+                        .unwrap_or(Path::new(&name))
+                        .to_string_lossy()
+                        .into_owned();
+                    baselines.push((rel, md.len()));
                     continue;
                 }
                 // Skip this backend's temp files (not user objects)
@@ -615,13 +599,9 @@ impl FilesystemBackend {
         prefix: &str,
         filename: &str,
     ) -> Result<Vec<u8>, StorageError> {
-        if !path_exists(data_path).await {
-            return Err(StorageError::NotFound(format!(
-                "{}: {}/{}",
-                label, prefix, filename
-            )));
-        }
-        let data = fs::read(data_path).await?;
+        let data = fsio::read(data_path)
+            .await
+            .map_err(|e| fsio::storage_error(e, || format!("{label}: {prefix}/{filename}")))?;
         debug!(
             "Read {} ({} bytes) for {}/{}",
             label,
@@ -664,19 +644,9 @@ impl FilesystemBackend {
         prefix: &str,
         filename: &str,
     ) -> Result<(), StorageError> {
-        if !path_exists(data_path).await {
-            return Err(StorageError::NotFound(format!(
-                "{}: {}/{}",
-                label, prefix, filename
-            )));
-        }
-        fs::remove_file(data_path).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                StorageError::NotFound(format!("{}: {}/{}", label, prefix, filename))
-            } else {
-                StorageError::from(e)
-            }
-        })?;
+        fsio::remove_file(data_path)
+            .await
+            .map_err(|e| fsio::storage_error(e, || format!("{label}: {prefix}/{filename}")))?;
         if let Some(parent) = data_path.parent() {
             Self::prune_empty_dirs(parent, prune_root).await?;
         }
@@ -749,12 +719,12 @@ impl StorageBackend for FilesystemBackend {
     #[instrument(skip(self))]
     async fn delete_bucket(&self, bucket: &str) -> Result<(), StorageError> {
         let bucket_dir = self.bucket_dir(bucket);
-        if !path_exists(&bucket_dir).await {
+        if !fsio::exists(&bucket_dir).await? {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
         // Check if bucket has any user-visible object content.
         let deltaspaces_dir = bucket_dir.join("deltaspaces");
-        if path_exists(&deltaspaces_dir).await {
+        if fsio::exists(&deltaspaces_dir).await? {
             if !Self::prune_invisible_data_recursive(&deltaspaces_dir).await? {
                 return Err(StorageError::BucketNotEmpty(bucket.to_string()));
             }
@@ -797,7 +767,7 @@ impl StorageBackend for FilesystemBackend {
         &self,
     ) -> Result<Vec<(String, chrono::DateTime<chrono::Utc>)>, StorageError> {
         let mut buckets = Vec::new();
-        if !path_exists(&self.root).await {
+        if !fsio::exists(&self.root).await? {
             return Ok(buckets);
         }
         let mut entries = fs::read_dir(&self.root).await?;
@@ -805,6 +775,7 @@ impl StorageBackend for FilesystemBackend {
             let ft = entry.file_type().await?;
             if ft.is_dir() {
                 if let Some(name) = entry.file_name().to_str() {
+                    // fsio-exempt: a date only.
                     let created = entry
                         .metadata()
                         .await
@@ -823,7 +794,7 @@ impl StorageBackend for FilesystemBackend {
 
     #[instrument(skip(self))]
     async fn head_bucket(&self, bucket: &str) -> Result<bool, StorageError> {
-        Ok(is_dir(&self.bucket_dir(bucket)).await)
+        fsio::dir_exists(&self.bucket_dir(bucket)).await
     }
 
     // === Reference operations ===
@@ -849,14 +820,14 @@ impl StorageBackend for FilesystemBackend {
         dest: &Path,
     ) -> Result<u64, StorageError> {
         let src = self.reference_path(bucket, prefix)?;
-        if !path_exists(&src).await {
+        if !fsio::exists(&src).await? {
             return Err(StorageError::NotFound(format!(
                 "reference: {}/reference.bin",
                 prefix
             )));
         }
         hardlink_or_copy(&src, dest).await?;
-        let len = tokio::fs::metadata(dest).await?.len();
+        let len = tokio::fs::metadata(dest).await?.len(); // fsio-exempt: the caller's copy
         Ok(len)
     }
 
@@ -923,7 +894,7 @@ impl StorageBackend for FilesystemBackend {
     ) -> Result<(), StorageError> {
         self.require_bucket_exists(bucket).await?;
         let path = self.passthrough_path(bucket, prefix, filename)?;
-        if !path_exists(&path).await {
+        if !fsio::exists(&path).await? {
             return Err(StorageError::NotFound(format!(
                 "{bucket}/{prefix}/{filename}"
             )));
@@ -969,9 +940,9 @@ impl StorageBackend for FilesystemBackend {
     }
 
     async fn has_reference(&self, bucket: &str, prefix: &str) -> Result<bool, StorageError> {
-        // Local disk: a stat is either present or not; there is no transient
-        // remote-throttle case to disambiguate.
-        Ok(path_exists(&self.reference_path(bucket, prefix)?).await)
+        // A stat error is an error (B11): read as "no reference", a PUT
+        // wrote a new baseline over the live one.
+        fsio::exists(&self.reference_path(bucket, prefix)?).await
     }
 
     #[instrument(skip(self))]
@@ -1159,6 +1130,7 @@ impl StorageBackend for FilesystemBackend {
         tokio::task::spawn_blocking(move || {
             let mut tmp = dir.temp()?;
             for path in &parts {
+                // fsio-exempt: a write source, not a probe of the store.
                 let mut src = std::fs::File::open(path).map_err(io_to_storage_error)?;
                 std::io::copy(&mut src, &mut tmp).map_err(io_to_storage_error)?;
             }
@@ -1261,14 +1233,9 @@ impl StorageBackend for FilesystemBackend {
         use futures::StreamExt;
 
         let data_path = self.passthrough_path(bucket, prefix, filename)?;
-        if !path_exists(&data_path).await {
-            return Err(StorageError::NotFound(format!(
-                "passthrough: {}/{}",
-                prefix, filename
-            )));
-        }
-
-        let file = tokio::fs::File::open(&data_path).await?;
+        let file = fsio::open(&data_path)
+            .await
+            .map_err(|e| fsio::storage_error(e, || format!("passthrough: {prefix}/{filename}")))?;
         let reader_stream = ReaderStream::new(file);
         let stream = reader_stream.map(|result| result.map_err(StorageError::Io));
         debug!(
@@ -1307,13 +1274,9 @@ impl StorageBackend for FilesystemBackend {
                 f,
             ),
         };
-        let file = match tokio::fs::File::open(&path).await {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(StorageError::NotFound(format!("{label}: {prefix}/{name}")));
-            }
-            Err(e) => return Err(e.into()),
-        };
+        let file = fsio::open(&path)
+            .await
+            .map_err(|e| fsio::storage_error(e, || format!("{label}: {prefix}/{name}")))?;
         let stream = ReaderStream::new(file).map(|r| r.map_err(StorageError::Io));
         Ok((Box::pin(stream), meta))
     }
@@ -1331,14 +1294,9 @@ impl StorageBackend for FilesystemBackend {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
         let data_path = self.passthrough_path(bucket, prefix, filename)?;
-        if !path_exists(&data_path).await {
-            return Err(StorageError::NotFound(format!(
-                "passthrough: {}/{}",
-                prefix, filename
-            )));
-        }
-
-        let mut file = tokio::fs::File::open(&data_path).await?;
+        let mut file = fsio::open(&data_path)
+            .await
+            .map_err(|e| fsio::storage_error(e, || format!("passthrough: {prefix}/{filename}")))?;
         let (start, end) = super::clamp_range(start, end, file.metadata().await?.len())?;
         file.seek(std::io::SeekFrom::Start(start)).await?;
         let range_len = end - start + 1;
@@ -1361,7 +1319,9 @@ impl StorageBackend for FilesystemBackend {
         prefix: &str,
     ) -> Result<Vec<FileMetadata>, StorageError> {
         let dir = self.deltaspace_dir(bucket, prefix)?;
-        if !path_exists(&dir).await {
+        // A stat error is an error (B11): an empty scan let a delete
+        // reclaim reference.bin under live deltas.
+        if !fsio::exists(&dir).await? {
             return Ok(Vec::new());
         }
 
@@ -1419,7 +1379,7 @@ impl StorageBackend for FilesystemBackend {
     #[instrument(skip(self))]
     async fn list_deltaspaces(&self, bucket: &str) -> Result<Vec<String>, StorageError> {
         let deltaspaces_dir = self.bucket_dir(bucket).join("deltaspaces");
-        if !path_exists(&deltaspaces_dir).await {
+        if !fsio::exists(&deltaspaces_dir).await? {
             return Ok(Vec::new());
         }
 
@@ -1493,7 +1453,7 @@ impl StorageBackend for FilesystemBackend {
             deltaspaces_dir.join(dir_part)
         };
 
-        if !path_exists(&walk_root).await {
+        if !fsio::exists(&walk_root).await? {
             return Ok(BulkListing::default());
         }
 
@@ -1564,7 +1524,7 @@ impl StorageBackend for FilesystemBackend {
         };
 
         // Non-existent directory → empty result (not an error).
-        if !path_exists(&read_dir_path).await {
+        if !fsio::exists(&read_dir_path).await? {
             return Ok(Some(DelegatedListResult {
                 objects: Vec::new(),
                 common_prefixes: Vec::new(),

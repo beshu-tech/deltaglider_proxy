@@ -1279,3 +1279,45 @@ mod backend_tests {
         );
     }
 }
+
+/// Review B11: a stat error on a bucket or listing directory is an error,
+/// never "no bucket" or "no objects". An empty listing made a mirror tool
+/// delete every copy; a missing bucket made the router pick another backend.
+#[tokio::test]
+async fn a_stat_error_never_reads_as_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = FilesystemBackend::new(dir.path().to_path_buf())
+        .await
+        .unwrap();
+    fs.create_bucket("b").await.unwrap();
+    let meta = FileMetadata::new_passthrough("k".into(), "s".into(), "m".into(), 1, None);
+    fs.put_passthrough("b", "d", "k", b"x", &meta)
+        .await
+        .unwrap();
+    let bucket = fault::fail_io(&dir.path().join("b"), libc::EIO);
+    assert!(fs.head_bucket("b").await.is_err());
+    assert!(matches!(
+        fs.put_passthrough("b", "d", "k2", b"x", &meta).await,
+        Err(StorageError::Io(_))
+    ));
+    assert!(fs.delete_bucket("b").await.is_err());
+    assert!(bucket.fired() >= 3);
+    drop(bucket);
+    let listing = fault::fail_io(&dir.path().join("b/deltaspaces"), libc::EIO);
+    assert!(fs.bulk_list_objects("b", "").await.is_err());
+    assert!(fs.list_deltaspaces("b").await.is_err());
+    assert!(fs
+        .list_objects_delegated("b", "", Some("/"), 1000, None)
+        .await
+        .is_err());
+    drop(listing);
+    let object = fault::fail_io(&dir.path().join("b/deltaspaces/d/k"), libc::EIO);
+    assert!(matches!(
+        fs.get_passthrough("b", "d", "k").await,
+        Err(StorageError::Io(_))
+    ));
+    assert!(fs.get_passthrough_stream("b", "d", "k").await.is_err());
+    assert!(fs.get_passthrough_metadata("b", "d", "k").await.is_ok());
+    drop(object);
+    assert_eq!(fs.bulk_list_objects("b", "").await.unwrap().len(), 1);
+}

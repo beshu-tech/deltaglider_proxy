@@ -7,7 +7,8 @@
 use super::*;
 use crate::config::Config;
 use crate::storage::{
-    DynStorageBackend, Fault, FaultPoint, Faults, FaultyFs, FilesystemBackend, StorageBackend,
+    fail_io, DynStorageBackend, Fault, FaultPoint, Faults, FaultyFs, FilesystemBackend,
+    StorageBackend,
 };
 use md5::{Digest, Md5};
 use sha2::Sha256;
@@ -316,4 +317,91 @@ async fn legacy_reference_migration_keeps_a_live_object() {
         v2,
         "the migration put the legacy bytes back over the live object"
     );
+}
+
+/// Review B11: a stat error on reference.bin is not "no reference". Read as
+/// absent, the PUT wrote a new baseline over the live one, and the deltas
+/// against it stopped decoding.
+#[tokio::test]
+async fn a_reference_stat_error_is_not_absent() {
+    let (dir, engine, _) = faulty_engine().await;
+    let base = noise(5, 200_000);
+    for (key, seed) in [("rel/a.zip", 1u8), ("rel/b.zip", 2)] {
+        engine
+            .store("b", key, &near(&base, seed), None, HashMap::new())
+            .await
+            .unwrap();
+    }
+    let sha = engine
+        .reference_metadata_raw("b", "rel")
+        .await
+        .unwrap()
+        .file_sha256;
+    let fault = fail_io(
+        &dir.path().join("b/deltaspaces/rel/reference.bin"),
+        libc::EIO,
+    );
+    assert!(engine.storage().has_reference("b", "rel").await.is_err());
+    let put = engine
+        .store("b", "rel/c.zip", &noise(6, 200_000), None, HashMap::new())
+        .await;
+    assert!(fault.fired() > 0);
+    drop(fault);
+    assert!(put.is_err(), "the PUT went on past a failed reference stat");
+    let fresh = DeltaGliderEngine::new_with_backend(
+        Arc::new(
+            FilesystemBackend::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        ),
+        &Config::default(),
+        None,
+    );
+    assert_eq!(
+        fresh
+            .reference_metadata_raw("b", "rel")
+            .await
+            .unwrap()
+            .file_sha256,
+        sha,
+        "the reference was replaced"
+    );
+    assert!(fresh.retrieve("b", "rel/b.zip").await.unwrap().0 == near(&base, 2));
+}
+
+/// Review B11: a stat error on the deltaspace directory is not an empty
+/// deltaspace. Read as empty, a DELETE reclaimed reference.bin under the
+/// remaining deltas.
+#[tokio::test]
+async fn an_unreadable_deltaspace_dir_keeps_its_reference() {
+    let (dir, engine, _) = faulty_engine().await;
+    let base = noise(7, 200_000);
+    for (key, seed) in [("rel/a.zip", 1u8), ("rel/b.zip", 2)] {
+        engine
+            .store("b", key, &near(&base, seed), None, HashMap::new())
+            .await
+            .unwrap();
+    }
+    let fault = fail_io(&dir.path().join("b/deltaspaces/rel"), libc::EIO);
+    engine.delete("b", "rel/a.zip").await.unwrap();
+    assert!(fault.fired() > 0);
+    drop(fault);
+    assert!(engine.storage().has_reference("b", "rel").await.unwrap());
+    engine.metadata_cache.invalidate("b", "rel/b.zip");
+    assert!(engine.retrieve("b", "rel/b.zip").await.unwrap().0 == near(&base, 2));
+}
+
+/// Review B11: a failing remove of the stale sibling is not "already
+/// gone". The pre-check read the error as absent, the DELETE answered
+/// success, and GET served the stale sibling.
+#[tokio::test]
+async fn a_sibling_disk_error_does_not_pass_for_deleted() {
+    let (dir, engine, _faults, v2) = object_with_a_stale_sibling().await;
+    let fault = fail_io(&dir.path().join("b/deltaspaces/p/k.zip"), libc::EIO);
+    let del = engine.delete("b", "p/k.zip").await;
+    assert!(fault.fired() > 0);
+    drop(fault);
+    assert!(del.is_err(), "DELETE answered success: {del:?}");
+    engine.metadata_cache.invalidate("b", "p/k.zip");
+    assert!(engine.retrieve("b", "p/k.zip").await.unwrap().0 == v2);
 }
