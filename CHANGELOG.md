@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed — The Jobs screen always shows the running maintenance job
+
+`GET /_/api/admin/jobs` listed the 50 newest maintenance jobs, but the
+worker runs the oldest queued job first. With more than 50 jobs (for example
+a re-encrypt of 60 buckets), the running job and its Cancel button were not
+shown. Now every queued, running or cancelling job is listed, plus the
+newest finished ones.
+
 ### Fixed — The implicit default backend cannot be deleted
 
 Without a `default_backend` key, the first named backend holds every

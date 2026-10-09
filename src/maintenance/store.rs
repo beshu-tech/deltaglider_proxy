@@ -151,13 +151,19 @@ impl ConfigDb {
         }
     }
 
-    /// Newest-first job listing (active and terminal), capped at `limit`.
+    /// Newest-first job listing: every active job, plus the newest `limit`.
     pub fn maintenance_list_jobs(
         &self,
         limit: usize,
     ) -> Result<Vec<MaintenanceJob>, ConfigDbError> {
+        // The newest `limit` rows PLUS every active one: the worker runs
+        // the oldest queued job first, so a newest-N cut hid the running
+        // job (and its Cancel control) behind a long queue.
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {JOB_COLUMNS} FROM maintenance_jobs ORDER BY id DESC LIMIT ?"
+            "SELECT {JOB_COLUMNS} FROM maintenance_jobs
+             WHERE status IN {ACTIVE_STATUSES}
+                OR id IN (SELECT id FROM maintenance_jobs ORDER BY id DESC LIMIT ?)
+             ORDER BY id DESC"
         ))?;
         let rows = stmt
             .query_map(params![limit as i64], row_to_job)?
@@ -1118,5 +1124,35 @@ mod tests {
         let jobs = db.maintenance_list_jobs(10).unwrap();
         assert_eq!(jobs.len(), 2);
         assert_eq!(jobs[0].id, b);
+    }
+
+    /// B094: the worker runs the OLDEST queued job first, so with more jobs
+    /// than the listing limit the running one fell off a newest-N list (and
+    /// its Cancel control with it). Active jobs are always listed.
+    #[test]
+    fn list_jobs_always_includes_the_active_ones() {
+        let db = db();
+        for i in 0..60 {
+            db.maintenance_create_job(
+                "reencrypt",
+                &format!("b{i:02}"),
+                "counting",
+                None,
+                "admin",
+                1,
+            )
+            .unwrap()
+            .unwrap();
+        }
+        let running = db
+            .maintenance_claim_next_job("w", current_unix_seconds(), 60)
+            .unwrap()
+            .unwrap();
+        let rows = db.maintenance_list_jobs(50).unwrap();
+        assert!(
+            rows.iter().any(|j| j.id == running.id),
+            "the running job is not listed"
+        );
+        assert!(rows.windows(2).all(|w| w[0].id > w[1].id), "newest first");
     }
 }
