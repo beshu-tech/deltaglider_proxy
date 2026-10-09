@@ -404,7 +404,8 @@ async fn reconcile_declarative_iam(
     );
     // The empty-YAML gate and the DB-presence check ran in the pre-commit
     // gate; they repeat here because the DB lock was released in between.
-    if matches!(old_cfg.iam_mode, crate::config_sections::IamMode::Gui) && yaml_snapshot.is_empty()
+    if matches!(old_cfg.iam_mode, crate::config_sections::IamMode::Gui)
+        && yaml_snapshot.declares_no_users_or_groups()
     {
         return Err(EMPTY_DECLARATIVE_FLIP.to_string());
     }
@@ -477,8 +478,8 @@ async fn reconcile_declarative_iam(
 }
 
 const EMPTY_DECLARATIVE_FLIP: &str =
-    "Refusing to flip to iam_mode: declarative with empty IAM in YAML — \
-     this would wipe the existing users/groups in the encrypted config DB. \
+    "Refusing to flip to iam_mode: declarative with no iam_users or iam_groups \
+     in YAML — this would wipe the existing users/groups in the encrypted config DB. \
      Add access.iam_users / access.iam_groups to the YAML first, or keep \
      iam_mode: gui to preserve the DB as source of truth.";
 
@@ -506,7 +507,8 @@ async fn declarative_iam_precommit_gate(
         &new_cfg.group_mapping_rules,
         &[],
     );
-    if matches!(old_cfg.iam_mode, crate::config_sections::IamMode::Gui) && yaml_snapshot.is_empty()
+    if matches!(old_cfg.iam_mode, crate::config_sections::IamMode::Gui)
+        && yaml_snapshot.declares_no_users_or_groups()
     {
         return Err(EMPTY_DECLARATIVE_FLIP.to_string());
     }

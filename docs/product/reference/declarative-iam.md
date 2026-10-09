@@ -135,10 +135,10 @@ Secrets in YAML applied through `config apply` or loaded from disk pass through 
 
 ## The empty-YAML gate
 
-A flip from `gui` to `declarative` with empty `iam_users` AND empty `iam_groups` is refused:
+A flip from `gui` to `declarative` with empty `iam_users` AND empty `iam_groups` is refused. Auth providers and mapping rules in the YAML do not change this, because the reconcile still deletes every local user and group:
 
 ```
-Refusing to flip to iam_mode: declarative with empty IAM in YAML —
+Refusing to flip to iam_mode: declarative with no iam_users or iam_groups in YAML —
 this would wipe the existing users/groups in the encrypted config DB.
 Add access.iam_users / access.iam_groups to the YAML first, or keep
 iam_mode: gui to preserve the DB as source of truth.

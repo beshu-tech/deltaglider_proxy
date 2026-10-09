@@ -757,7 +757,9 @@ async fn declarative_preview(state: &Arc<AdminState>, old: &Config, new: &Config
         &new.group_mapping_rules,
         &[],
     );
-    if matches!(old.iam_mode, crate::config_sections::IamMode::Gui) && yaml_snapshot.is_empty() {
+    if matches!(old.iam_mode, crate::config_sections::IamMode::Gui)
+        && yaml_snapshot.declares_no_users_or_groups()
+    {
         return vec![
             "declarative IAM preview: flip to declarative mode with empty iam_users / \
              iam_groups would be REFUSED by the live apply (would wipe the DB). \

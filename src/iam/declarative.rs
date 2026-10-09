@@ -206,6 +206,13 @@ pub struct DeclarativeIam {
 }
 
 impl DeclarativeIam {
+    /// No users and no groups: a reconcile of it deletes every local user
+    /// and group, whatever providers or mapping rules it declares. The
+    /// gui-to-declarative flip gate refuses it.
+    pub fn declares_no_users_or_groups(&self) -> bool {
+        self.users.is_empty() && self.groups.is_empty()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.users.is_empty()
             && self.groups.is_empty()

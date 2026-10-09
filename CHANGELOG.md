@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed — A declarative flip with only an auth provider no longer wipes the users
+
+A switch from `iam_mode: gui` to `declarative` with no `iam_users` and no
+`iam_groups` is refused, because the reconcile would delete every local user
+and group. A YAML that declared an auth provider or a mapping rule passed
+this check anyway, and the reconcile then deleted every user and group.
+Now such a switch is refused too.
+
 ### Fixed — A mapping rule can be set back to "All providers"
 
 The admin GUI sends `"provider_id": null` to change a group mapping rule's
