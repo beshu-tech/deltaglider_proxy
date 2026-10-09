@@ -263,11 +263,14 @@ with another access key than the OAuth user of the same name is refused.
 
 ### Security — A replayed request stays refused after a retry succeeded
 
-When an SDK retried a PUT or DELETE within the same second, the proxy served
-the retry. If the retry succeeded and the first copy then failed, the first
-copy removed the signature from the replay cache, so a captured copy of the
-request could be sent again later and was accepted. Now a retry that
-succeeds keeps the signature in the cache.
+When an SDK retries a PUT or DELETE in the second in which it signed it, the
+retry carries the same signature, and the proxy serves it. If the retry
+succeeded and the first copy then failed, the first copy removed the
+signature from the replay cache, so a captured copy of the request could be
+sent again later and was accepted. Now a copy that succeeds keeps the
+signature in the cache until the replay window ends, and the proxy serves a
+retry only within one second after the first copy, however many retries
+succeed.
 
 ### Security — IAM conditions: three cases that showed or granted too much
 

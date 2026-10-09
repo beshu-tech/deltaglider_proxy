@@ -294,8 +294,11 @@ pub fn init_replay_cache(
     spawn_periodic_blocking(Duration::from_secs(60), {
         let cache = replay_cache.clone();
         move || {
-            let cutoff = std::time::Instant::now() - Duration::from_secs(replay_window_secs);
-            cache.retain(|_, instant: &mut std::time::Instant| *instant > cutoff);
+            deltaglider_proxy::api::auth::expire_replay_cache(
+                &cache,
+                Duration::from_secs(replay_window_secs),
+                std::time::Instant::now(),
+            );
         }
     });
     replay_cache

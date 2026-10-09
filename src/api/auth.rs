@@ -26,6 +26,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
 use sha2::{Digest, Sha256};
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -34,14 +35,47 @@ use tracing::{debug, info, warn};
 
 /// The SigV4 replay window (`DGP_REPLAY_WINDOW_SECS`, see
 /// [`crate::config::RuntimeTuning`]), layered as an extension beside the
-/// [`ReplayCache`]. Default: the clock-skew window (`DGP_CLOCK_SKEW_SECONDS`,
-/// 900 s, s3s's own default), so a captured mutation cannot be replayed while
-/// its signature is still accepted. 0 switches replay rejection off.
+/// [`ReplayCache`]. The default and its reason live on
+/// `RuntimeTuning::replay_window_secs`. 0 switches replay rejection off.
 #[derive(Debug, Clone, Copy)]
 pub struct ReplayWindow(pub Duration);
 
-/// Shared replay cache type: signature string -> timestamp of first use.
-pub type ReplayCache = Arc<DashMap<String, Instant>>;
+/// One signature in the [`ReplayCache`]. The time base and the claim that
+/// may give the slot back are two fields: a time used as the owner had to
+/// move to change the owner, and that restarted the retry second (review A1).
+#[derive(Debug, Clone, Copy)]
+pub struct ReplaySlot {
+    /// When the proxy first saw the signature: the base of the window and of
+    /// the retry second. A new slot sets it; a seal keeps the earlier of two
+    /// times, so it never moves later.
+    first_seen: Instant,
+    /// The claim whose failure gives the slot back. `None` once a copy
+    /// succeeded (sealed): the mutation happened.
+    pending: Option<NonZeroU64>,
+}
+
+impl ReplaySlot {
+    /// THE expiry rule of the cache, for the claim, the inline prune and the
+    /// periodic sweep.
+    fn live(&self, now: Instant, window: Duration) -> bool {
+        now.saturating_duration_since(self.first_seen) < window
+    }
+}
+
+/// Shared replay cache type: signature string -> its slot.
+pub type ReplayCache = Arc<DashMap<String, ReplaySlot>>;
+
+/// Drop every slot outside the replay window (the periodic sweep and the
+/// first pass of the inline prune).
+pub fn expire_replay_cache(cache: &ReplayCache, window: Duration, now: Instant) {
+    cache.retain(|_, slot| slot.live(now, window));
+}
+
+/// A fresh claim id: the owner of a pending slot.
+fn next_claim_id() -> NonZeroU64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NonZeroU64::new(NEXT.fetch_add(1, Ordering::Relaxed)).unwrap_or(NonZeroU64::MIN)
+}
 
 const MAX_REPLAY_ENTRIES: usize = 500_000;
 
@@ -85,45 +119,63 @@ enum ReplayClaim {
     /// Seen within the window: a replay.
     Duplicate,
     /// A same-second SDK retry of a PUT/DELETE (`same_second_retry_served`):
-    /// served, and the slot stays with the first copy.
-    Retry,
-    /// Stored at this instant (a failed request gives it back).
-    Claimed(Instant),
+    /// served; it carries the slot's time base, so a success can seal the
+    /// slot (or put it back) without moving that base.
+    Retry { first_seen: Instant },
+    /// A new slot owned by claim `id` (a failed request gives it back).
+    Claimed { id: NonZeroU64, first_seen: Instant },
 }
 
 /// Check-and-insert one signature: one DashMap `entry()` call, atomic under
-/// the per-key shard lock, so two concurrent duplicates cannot both pass.
-/// The timestamp is reset only once the window expired, never on a
-/// duplicate hit, so the window is measured from first-seen.
+/// the per-key shard lock, so two concurrent duplicates cannot both pass
+/// (except PUT/DELETE copies inside the first copy's second, which are
+/// served as retries). A slot is replaced only once the window expired, so
+/// the window is measured from the first copy.
 fn claim_replay_slot(
     cache: &ReplayCache,
     sig: &str,
     method: &axum::http::Method,
     replay_window: Duration,
+    now: Instant,
 ) -> ReplayClaim {
     if replay_window.is_zero() {
         return ReplayClaim::Off;
     }
     let mut verdict = None;
-    let claimed_at = Instant::now();
+    let id = next_claim_id();
+    let fresh = ReplaySlot {
+        first_seen: now,
+        pending: Some(id),
+    };
     cache
         .entry(sig.to_string())
-        .and_modify(|first_seen: &mut Instant| {
-            if same_second_retry_served(method, first_seen.elapsed()) {
-                verdict = Some(ReplayClaim::Retry);
-            } else if first_seen.elapsed() < replay_window {
+        .and_modify(|slot| {
+            let since_first = now.saturating_duration_since(slot.first_seen);
+            if same_second_retry_served(method, since_first) {
+                verdict = Some(ReplayClaim::Retry {
+                    first_seen: slot.first_seen,
+                });
+            } else if slot.live(now, replay_window) {
                 verdict = Some(ReplayClaim::Duplicate);
             } else {
-                *first_seen = claimed_at;
+                *slot = fresh;
             }
         })
-        .or_insert(claimed_at);
-    verdict.unwrap_or(ReplayClaim::Claimed(claimed_at))
+        .or_insert(fresh);
+    verdict.unwrap_or(ReplayClaim::Claimed {
+        id,
+        first_seen: now,
+    })
 }
 
-fn prune_replay_cache(cache: &ReplayCache, replay_window: Duration, max_entries: usize) {
+fn prune_replay_cache(
+    cache: &ReplayCache,
+    replay_window: Duration,
+    max_entries: usize,
+    now: Instant,
+) {
     // Pass 1: cheap TTL cleanup.
-    cache.retain(|_, instant| instant.elapsed() < replay_window);
+    expire_replay_cache(cache, replay_window, now);
     let len_after_ttl = cache.len();
     if len_after_ttl <= max_entries {
         return;
@@ -143,7 +195,7 @@ fn prune_replay_cache(cache: &ReplayCache, replay_window: Duration, max_entries:
     let to_remove = len_after_ttl - max_entries;
     let mut entries: Vec<(String, Instant)> = cache
         .iter()
-        .map(|entry| (entry.key().clone(), *entry.value()))
+        .map(|entry| (entry.key().clone(), entry.value().first_seen))
         .collect();
     // `to_remove` is in `1..len_after_ttl` here (len_after_ttl > max_entries),
     // so the pivot index is always valid.
@@ -266,26 +318,48 @@ pub fn same_second_retry_served(method: &axum::http::Method, since_first: Durati
     matches!(*method, Method::PUT | Method::DELETE) && since_first < Duration::from_secs(1)
 }
 
-/// Settle a replay-cache claim once the response is known: a first copy
+/// Settle a replay-cache claim once the response is known. A first copy
 /// that failed gives its slot back (a retry of a failed mutation is not a
-/// replay). A served same-second retry that succeeded re-stamps the slot as
-/// its own: the mutation happened, and the first copy, which may still
-/// fail, must not give the slot back.
+/// replay), but only while the slot is still its own. Any copy that
+/// succeeded seals the slot: the mutation happened, so a later failure of
+/// another copy must not give it back. The seal keeps the earlier time
+/// base, and it puts the slot back when a failed first copy already gave it
+/// up. A retry that failed changes nothing.
 fn settle_replay_claim(
     cache: &ReplayCache,
     sig: &str,
     claim: &ReplayClaim,
     status: axum::http::StatusCode,
 ) {
+    let kept = replay_slot_kept(status);
     match claim {
-        ReplayClaim::Claimed(claimed_at) if !replay_slot_kept(status) => {
-            cache.remove_if(sig, |_, seen| *seen == *claimed_at);
+        ReplayClaim::Claimed { id, .. } if !kept => {
+            cache.remove_if(sig, |_, slot| slot.pending == Some(*id));
         }
-        ReplayClaim::Retry if replay_slot_kept(status) => {
-            cache.insert(sig.to_string(), Instant::now());
+        ReplayClaim::Claimed { first_seen, .. } | ReplayClaim::Retry { first_seen } if kept => {
+            seal_replay_slot(cache, sig, *first_seen);
         }
         _ => {}
     }
+}
+
+fn seal_replay_slot(cache: &ReplayCache, sig: &str, first_seen: Instant) {
+    let seal = |slot: &mut ReplaySlot| {
+        slot.pending = None;
+        slot.first_seen = slot.first_seen.min(first_seen);
+    };
+    // The common case (the slot is there) needs no key allocation.
+    if let Some(mut slot) = cache.get_mut(sig) {
+        seal(&mut slot);
+        return;
+    }
+    cache
+        .entry(sig.to_string())
+        .and_modify(seal)
+        .or_insert(ReplaySlot {
+            first_seen,
+            pending: None,
+        });
 }
 
 /// Whether a request that claimed a replay-cache slot keeps it once its
@@ -983,15 +1057,14 @@ pub async fn sigv4_auth_middleware(
     request.extensions_mut().insert(outcome.clone());
 
     // Replay attack detection: reject a duplicate signature of a MUTATING
-    // request within DGP_REPLAY_WINDOW_SECS. The default is the clock-skew
-    // window (DGP_CLOCK_SKEW_SECONDS, 900 s): a signature outside the skew
-    // fails verification anyway, so a captured mutation is refused for its
-    // whole valid life. Memory is capped at MAX_REPLAY_ENTRIES. The cache is
-    // per instance: behind a load balancer, a replay sent to another node is
-    // not detected.
+    // request within DGP_REPLAY_WINDOW_SECS (the default and its reason:
+    // `RuntimeTuning::replay_window_secs`). Memory is capped at
+    // MAX_REPLAY_ENTRIES. The cache is per instance: behind a load balancer,
+    // a replay sent to another node is not detected.
     //
     // The check-and-insert is one DashMap `entry()` call, atomic under the
-    // per-key shard lock, so two concurrent duplicates cannot both pass.
+    // per-key shard lock, so two concurrent duplicates cannot both pass
+    // (except PUT/DELETE retries inside the first copy's second).
     //
     // Not tracked: presigned URLs (designed to be reused) and GET/HEAD (see
     // `replay_tracked`).
@@ -1005,7 +1078,7 @@ pub async fn sigv4_auth_middleware(
             // not here: a full retain per request is O(cache) with a 900 s
             // window. Only an over-cap cache is pruned inline.
             if cache.len() > MAX_REPLAY_ENTRIES {
-                prune_replay_cache(cache, replay_window, MAX_REPLAY_ENTRIES);
+                prune_replay_cache(cache, replay_window, MAX_REPLAY_ENTRIES, Instant::now());
                 if cache.len() > MAX_REPLAY_ENTRIES {
                     warn!(
                         "SECURITY | Replay cache still at {} entries after hard-cap eviction — possible flood attack",
@@ -1015,7 +1088,8 @@ pub async fn sigv4_auth_middleware(
             }
 
             let sig = &params.signature;
-            let claim = claim_replay_slot(cache, sig, request.method(), replay_window);
+            let claim =
+                claim_replay_slot(cache, sig, request.method(), replay_window, Instant::now());
 
             if claim == ReplayClaim::Duplicate {
                 warn!(
@@ -1141,6 +1215,14 @@ fn parse_auth_header(header: &str) -> Option<ParsedAuthHeader> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sealed slot first seen at `at` (a mutation that succeeded).
+    fn sealed_at(at: Instant) -> ReplaySlot {
+        ReplaySlot {
+            first_seen: at,
+            pending: None,
+        }
+    }
     use std::time::Duration;
 
     /// X-Amz-Expires is client text. A huge negative value made
@@ -1369,19 +1451,20 @@ mod tests {
     fn replay_cache_pruning_enforces_hard_cap() {
         let cache: ReplayCache = Arc::new(DashMap::new());
         for i in 0..10 {
-            cache.insert(format!("sig-{i}"), Instant::now());
+            cache.insert(format!("sig-{i}"), sealed_at(Instant::now()));
         }
-        prune_replay_cache(&cache, Duration::from_secs(60), 3);
+        prune_replay_cache(&cache, Duration::from_secs(60), 3, Instant::now());
         assert!(cache.len() <= 3);
     }
 
     #[test]
     fn replay_cache_pruning_removes_expired_entries_before_size_eviction() {
         let cache: ReplayCache = Arc::new(DashMap::new());
-        cache.insert("expired".into(), Instant::now() - Duration::from_secs(20));
-        cache.insert("fresh-1".into(), Instant::now());
-        cache.insert("fresh-2".into(), Instant::now());
-        prune_replay_cache(&cache, Duration::from_secs(5), 10);
+        let now = Instant::now();
+        cache.insert("expired".into(), sealed_at(now - Duration::from_secs(20)));
+        cache.insert("fresh-1".into(), sealed_at(now));
+        cache.insert("fresh-2".into(), sealed_at(now));
+        prune_replay_cache(&cache, Duration::from_secs(5), 10, now);
         assert!(!cache.contains_key("expired"));
         assert!(cache.contains_key("fresh-1"));
         assert!(cache.contains_key("fresh-2"));
@@ -1599,6 +1682,13 @@ mod tests {
 #[cfg(test)]
 mod review3_tests {
     use super::*;
+    use axum::http::{Method, StatusCode};
+
+    const W: Duration = Duration::from_secs(900);
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
 
     /// With the 900 s window, legit traffic above ~555 mutations/s keeps the
     /// cache over the cap. The inline prune cuts to EXACTLY the cap, so the
@@ -1607,11 +1697,16 @@ mod review3_tests {
     #[test]
     fn review3_hard_cap_prune_leaves_headroom() {
         let cache: ReplayCache = Arc::new(DashMap::new());
+        let now = Instant::now();
+        let sealed_at = |at| ReplaySlot {
+            first_seen: at,
+            pending: None,
+        };
         for i in 0..101 {
-            cache.insert(format!("sig-{i}"), Instant::now());
+            cache.insert(format!("sig-{i}"), sealed_at(now));
         }
-        prune_replay_cache(&cache, Duration::from_secs(900), 100);
-        cache.insert("next".into(), Instant::now());
+        prune_replay_cache(&cache, Duration::from_secs(900), 100, now);
+        cache.insert("next".into(), sealed_at(now));
         assert!(
             cache.len() <= 100,
             "one insert after a prune is over the cap again ({}), so the next request prunes again",
@@ -1631,8 +1726,9 @@ mod review3_tests {
                 claim_replay_slot(
                     &cache,
                     &format!("sig-{i}"),
-                    &axum::http::Method::PUT,
-                    Duration::ZERO
+                    &Method::PUT,
+                    Duration::ZERO,
+                    Instant::now()
                 ),
                 ReplayClaim::Duplicate
             );
@@ -1645,20 +1741,100 @@ mod review3_tests {
     /// the mutation happened: the signature must stay refused.
     #[test]
     fn a_successful_retry_keeps_the_slot_when_the_first_copy_fails() {
-        use axum::http::{Method, StatusCode};
         let cache: ReplayCache = Arc::new(DashMap::new());
-        let w = Duration::from_secs(900);
-        let first = claim_replay_slot(&cache, "S", &Method::PUT, w);
-        assert!(matches!(first, ReplayClaim::Claimed(_)));
-        let retry = claim_replay_slot(&cache, "S", &Method::PUT, w);
-        assert_eq!(retry, ReplayClaim::Retry);
+        let t0 = Instant::now();
+        let first = claim_replay_slot(&cache, "S", &Method::PUT, W, t0);
+        assert!(matches!(first, ReplayClaim::Claimed { .. }));
+        let retry = claim_replay_slot(&cache, "S", &Method::PUT, W, t0 + ms(100));
+        assert!(matches!(retry, ReplayClaim::Retry { .. }));
         settle_replay_claim(&cache, "S", &retry, StatusCode::OK);
         settle_replay_claim(&cache, "S", &first, StatusCode::SERVICE_UNAVAILABLE);
-        std::thread::sleep(Duration::from_millis(1100));
         assert_eq!(
-            claim_replay_slot(&cache, "S", &Method::PUT, w),
+            claim_replay_slot(&cache, "S", &Method::PUT, W, t0 + ms(1100)),
             ReplayClaim::Duplicate,
             "the replay of a mutation that succeeded was accepted"
+        );
+    }
+
+    /// Review A1: a retry that succeeded re-stamped the slot with its own
+    /// time, which opened a new retry second. Copies sent less than 1 s
+    /// apart were then each served for the whole window.
+    #[test]
+    fn a_succeeded_retry_does_not_restart_the_retry_second() {
+        let cache: ReplayCache = Arc::new(DashMap::new());
+        let t0 = Instant::now();
+        let first = claim_replay_slot(&cache, "S", &Method::PUT, W, t0);
+        settle_replay_claim(&cache, "S", &first, StatusCode::OK);
+        let retry = claim_replay_slot(&cache, "S", &Method::PUT, W, t0 + ms(600));
+        assert!(matches!(retry, ReplayClaim::Retry { .. }));
+        settle_replay_claim(&cache, "S", &retry, StatusCode::OK);
+        assert_eq!(
+            claim_replay_slot(&cache, "S", &Method::PUT, W, t0 + ms(1200)),
+            ReplayClaim::Duplicate,
+            "a copy 1.2 s after the first one was served as a retry"
+        );
+    }
+
+    /// The reverse order of B076: the first copy fails and gives the slot
+    /// back, THEN its same-second retry succeeds. The retry puts a sealed
+    /// slot back, dated from the first copy. A retry that fails changes
+    /// nothing.
+    #[test]
+    fn a_retry_that_succeeds_after_the_first_copy_failed_restores_the_slot() {
+        let cache: ReplayCache = Arc::new(DashMap::new());
+        let t0 = Instant::now();
+        let first = claim_replay_slot(&cache, "S", &Method::DELETE, W, t0);
+        let retry = claim_replay_slot(&cache, "S", &Method::DELETE, W, t0 + ms(200));
+        settle_replay_claim(&cache, "S", &first, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            !cache.contains_key("S"),
+            "a failed first copy gives the slot back"
+        );
+        settle_replay_claim(&cache, "S", &retry, StatusCode::NO_CONTENT);
+        assert_eq!(
+            claim_replay_slot(&cache, "S", &Method::DELETE, W, t0 + ms(1100)),
+            ReplayClaim::Duplicate,
+            "the retry's success must put the slot back"
+        );
+
+        // A failed retry leaves a failed first copy's free slot free.
+        let first = claim_replay_slot(&cache, "T", &Method::PUT, W, t0);
+        let retry = claim_replay_slot(&cache, "T", &Method::PUT, W, t0 + ms(200));
+        settle_replay_claim(&cache, "T", &first, StatusCode::SERVICE_UNAVAILABLE);
+        settle_replay_claim(&cache, "T", &retry, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!cache.contains_key("T"));
+    }
+
+    /// POST is never a retry: a concurrent duplicate is refused at once.
+    #[test]
+    fn a_concurrent_post_duplicate_is_refused() {
+        let cache: ReplayCache = Arc::new(DashMap::new());
+        let t0 = Instant::now();
+        let first = claim_replay_slot(&cache, "P", &Method::POST, W, t0);
+        assert!(matches!(first, ReplayClaim::Claimed { .. }));
+        assert_eq!(
+            claim_replay_slot(&cache, "P", &Method::POST, W, t0 + ms(10)),
+            ReplayClaim::Duplicate
+        );
+    }
+
+    /// The window counts from the first copy: once it ends, the slot is
+    /// claimed again, and the sweep drops it.
+    #[test]
+    fn the_window_counts_from_the_first_copy() {
+        let cache: ReplayCache = Arc::new(DashMap::new());
+        let t0 = Instant::now();
+        let w = Duration::from_secs(10);
+        let first = claim_replay_slot(&cache, "S", &Method::PUT, w, t0);
+        settle_replay_claim(&cache, "S", &first, StatusCode::OK);
+        let retry = claim_replay_slot(&cache, "S", &Method::PUT, w, t0 + ms(500));
+        settle_replay_claim(&cache, "S", &retry, StatusCode::OK);
+        expire_replay_cache(&cache, w, t0 + ms(9_900));
+        assert!(cache.contains_key("S"));
+        expire_replay_cache(&cache, w, t0 + ms(10_000));
+        assert!(
+            !cache.contains_key("S"),
+            "a seal must not extend the window"
         );
     }
 }

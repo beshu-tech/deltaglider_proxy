@@ -63,7 +63,10 @@ pub struct RuntimeTuning {
     pub secure_cookies: Option<bool>,
     /// `DGP_CLOCK_SKEW_SECONDS`: the SigV4 skew s3s enforces.
     pub clock_skew_secs: u32,
-    /// `DGP_REPLAY_WINDOW_SECS` (default: the skew; 0 turns it off).
+    /// `DGP_REPLAY_WINDOW_SECS`: how long a mutating request's signature is
+    /// refused after its first copy. Default: twice the skew, because s3s
+    /// accepts a signature dated up to the skew ahead, so one first used at
+    /// t0 verifies until t0 + 2 x skew. 0 turns the check off.
     pub replay_window_secs: u64,
     pub codec: CodecTimeouts,
     /// `DGP_SPOOL_THRESHOLD_BYTES`; `None` = the engine's default for its
