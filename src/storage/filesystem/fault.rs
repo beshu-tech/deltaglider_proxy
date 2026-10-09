@@ -5,6 +5,7 @@
 //! never pass for "not found" on a path that writes.
 
 use super::*;
+use crate::storage::ObjectVariant;
 
 /// The error an armed call returns.
 #[derive(Clone, Copy, Debug)]
@@ -35,11 +36,26 @@ pub(crate) enum FaultPoint {
     DeletePassthrough,
     /// The key is `"bucket/prefix/"`: the call names no file.
     HasReference,
+    /// A conditional delete of either variant (versioned [`FaultyFs`]).
+    DeleteVariantIf,
+}
+
+/// Work a test runs inside a storage call, before the call goes on: a
+/// peer's write that lands at that exact point.
+pub(crate) type Hook =
+    std::sync::Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
+#[derive(Clone)]
+enum Arm {
+    /// The call fails, each time.
+    Fail(Fault),
+    /// The hook runs once, then the call goes on.
+    Run(Hook),
 }
 
 #[derive(Default)]
 struct FaultState {
-    armed: std::collections::HashMap<(FaultPoint, String), Fault>,
+    armed: std::collections::HashMap<(FaultPoint, String), Arm>,
     fired: std::collections::HashMap<(FaultPoint, String), usize>,
 }
 
@@ -52,7 +68,15 @@ pub(crate) struct Faults(std::sync::Arc<std::sync::Mutex<FaultState>>);
 impl Faults {
     pub(crate) fn arm(&self, point: FaultPoint, key: &str, fault: Fault) {
         let mut state = self.0.lock().unwrap();
-        state.armed.insert((point, key.to_string()), fault);
+        state
+            .armed
+            .insert((point, key.to_string()), Arm::Fail(fault));
+    }
+
+    /// Run `hook` once, at the next call at `point` on `key`.
+    pub(crate) fn hook(&self, point: FaultPoint, key: &str, hook: Hook) {
+        let mut state = self.0.lock().unwrap();
+        state.armed.insert((point, key.to_string()), Arm::Run(hook));
     }
 
     /// Disarm every fault. The fire counts stay.
@@ -60,7 +84,8 @@ impl Faults {
         self.0.lock().unwrap().armed.clear();
     }
 
-    /// How many calls the fault at `point` on `key` failed.
+    /// How many calls met the arm at `point` on `key` (failed, or ran the
+    /// hook).
     pub(crate) fn fired(&self, point: FaultPoint, key: &str) -> usize {
         let state = self.0.lock().unwrap();
         state
@@ -70,13 +95,26 @@ impl Faults {
             .unwrap_or(0)
     }
 
-    fn check(&self, point: FaultPoint, key: String) -> Result<(), StorageError> {
-        let mut state = self.0.lock().unwrap();
-        let Some(fault) = state.armed.get(&(point, key.clone())).copied() else {
-            return Ok(());
+    async fn trip(&self, point: FaultPoint, key: String) -> Result<(), StorageError> {
+        let arm = {
+            let mut state = self.0.lock().unwrap();
+            let k = (point, key);
+            let Some(arm) = state.armed.get(&k).cloned() else {
+                return Ok(());
+            };
+            if matches!(arm, Arm::Run(_)) {
+                state.armed.remove(&k);
+            }
+            *state.fired.entry(k).or_default() += 1;
+            arm
         };
-        *state.fired.entry((point, key)).or_default() += 1;
-        Err(fault.error())
+        match arm {
+            Arm::Fail(fault) => Err(fault.error()),
+            Arm::Run(hook) => {
+                hook().await;
+                Ok(())
+            }
+        }
     }
 }
 
@@ -85,6 +123,9 @@ impl Faults {
 pub(crate) struct FaultyFs {
     pub(crate) inner: FilesystemBackend,
     pub(crate) faults: Faults,
+    /// Answer `variant_version` and honour `delete_variant_if` like S3
+    /// `If-Match` (the filesystem backend has no conditional delete).
+    versioned: bool,
 }
 
 impl FaultyFs {
@@ -92,11 +133,53 @@ impl FaultyFs {
         Self {
             inner,
             faults: Faults::default(),
+            versioned: false,
         }
     }
 
-    fn armed(&self, point: FaultPoint, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
-        self.faults.check(point, format!("{b}/{p}/{f}"))
+    /// A backend with S3's conditional delete: the version of a variant is
+    /// its metadata's creation time and hash.
+    pub(crate) fn versioned(inner: FilesystemBackend) -> Self {
+        Self {
+            versioned: true,
+            ..Self::new(inner)
+        }
+    }
+
+    async fn armed(
+        &self,
+        point: FaultPoint,
+        b: &str,
+        p: &str,
+        f: &str,
+    ) -> Result<(), StorageError> {
+        self.faults.trip(point, format!("{b}/{p}/{f}")).await
+    }
+
+    async fn version_of(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        variant: ObjectVariant,
+    ) -> Result<String, StorageError> {
+        let meta = match variant {
+            ObjectVariant::Delta => {
+                self.inner
+                    .get_delta_metadata(bucket, prefix, filename)
+                    .await
+            }
+            ObjectVariant::Passthrough => {
+                self.inner
+                    .get_passthrough_metadata(bucket, prefix, filename)
+                    .await
+            }
+        }?;
+        Ok(format!(
+            "{}/{}",
+            meta.created_at.to_rfc3339(),
+            meta.file_sha256
+        ))
     }
 }
 
@@ -220,8 +303,48 @@ impl StorageBackend for FaultyFs {
     }
 
     async fn has_reference(&self, bucket: &str, prefix: &str) -> Result<bool, StorageError> {
-        self.armed(FaultPoint::HasReference, bucket, prefix, "")?;
+        self.armed(FaultPoint::HasReference, bucket, prefix, "")
+            .await?;
         self.inner.has_reference(bucket, prefix).await
+    }
+
+    async fn variant_version(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        variant: ObjectVariant,
+    ) -> Result<Option<String>, StorageError> {
+        if !self.versioned {
+            return Ok(None);
+        }
+        self.version_of(bucket, prefix, filename, variant)
+            .await
+            .map(Some)
+    }
+
+    async fn delete_variant_if(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        variant: ObjectVariant,
+        version: &str,
+    ) -> Result<bool, StorageError> {
+        self.armed(FaultPoint::DeleteVariantIf, bucket, prefix, filename)
+            .await?;
+        if self.versioned {
+            match self.version_of(bucket, prefix, filename, variant).await {
+                Ok(now) if now == version => {}
+                Ok(_) | Err(StorageError::NotFound(_)) => return Ok(false),
+                Err(e) => return Err(e),
+            }
+        }
+        match variant {
+            ObjectVariant::Delta => self.delete_delta(bucket, prefix, filename).await?,
+            ObjectVariant::Passthrough => self.delete_passthrough(bucket, prefix, filename).await?,
+        }
+        Ok(true)
     }
 
     async fn delete_reference(
@@ -262,7 +385,8 @@ impl StorageBackend for FaultyFs {
         prefix: &str,
         filename: &str,
     ) -> Result<FileMetadata, StorageError> {
-        self.armed(FaultPoint::GetDeltaMetadata, bucket, prefix, filename)?;
+        self.armed(FaultPoint::GetDeltaMetadata, bucket, prefix, filename)
+            .await?;
         self.inner
             .get_delta_metadata(bucket, prefix, filename)
             .await
@@ -274,7 +398,8 @@ impl StorageBackend for FaultyFs {
         prefix: &str,
         filename: &str,
     ) -> Result<(), StorageError> {
-        self.armed(FaultPoint::DeleteDelta, bucket, prefix, filename)?;
+        self.armed(FaultPoint::DeleteDelta, bucket, prefix, filename)
+            .await?;
         self.inner.delete_delta(bucket, prefix, filename).await
     }
 
@@ -334,7 +459,8 @@ impl StorageBackend for FaultyFs {
         prefix: &str,
         filename: &str,
     ) -> Result<FileMetadata, StorageError> {
-        self.armed(FaultPoint::GetPassthroughMetadata, bucket, prefix, filename)?;
+        self.armed(FaultPoint::GetPassthroughMetadata, bucket, prefix, filename)
+            .await?;
         self.inner
             .get_passthrough_metadata(bucket, prefix, filename)
             .await
@@ -346,7 +472,8 @@ impl StorageBackend for FaultyFs {
         prefix: &str,
         filename: &str,
     ) -> Result<(), StorageError> {
-        self.armed(FaultPoint::DeletePassthrough, bucket, prefix, filename)?;
+        self.armed(FaultPoint::DeletePassthrough, bucket, prefix, filename)
+            .await?;
         self.inner
             .delete_passthrough(bucket, prefix, filename)
             .await

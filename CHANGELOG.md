@@ -72,8 +72,12 @@ config does not use them).
   error and changes nothing.
 - When a DELETE removed an object but could not remove an older second copy
   of it (left behind by an interrupted upload), it still answered success,
-  and the older copy then came back as the object. Now the DELETE fails, and
-  a retry removes the older copy.
+  and the older copy then came back as the object. Now the DELETE removes
+  the older copy first. When either step fails, the DELETE fails and the
+  object stays as it was, and a retry removes both. On an S3 backend, a
+  conditional delete (a lifecycle expiry, the source delete of a move) also
+  pins the older copy that it saw, so a newer object that another proxy
+  instance writes under the same name during the delete is never removed.
 - `POST /_/api/admin/migrate` (the legacy reference migration) wrote the
   legacy bytes back over an object that a client had stored later under the
   same name. Now it leaves such an object alone and only renames the

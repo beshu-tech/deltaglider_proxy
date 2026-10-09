@@ -141,7 +141,8 @@ pub const REFERENCE_SCAN_LIMIT: usize = 1000;
 pub enum ConditionalDelete {
     /// The object passed the check and is deleted.
     Deleted(Box<FileMetadata>),
-    /// The object failed the check (e.g. overwritten): nothing deleted.
+    /// The object failed the check (e.g. overwritten): the object is
+    /// unchanged. A stale older variant of it may be gone.
     Changed,
     /// No such object: nothing deleted.
     Gone,

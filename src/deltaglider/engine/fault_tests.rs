@@ -35,8 +35,14 @@ fn near(base: &[u8], seed: u8) -> Vec<u8> {
 }
 
 async fn faulty_engine() -> (tempfile::TempDir, DynEngine, Faults) {
+    faulty_engine_with(FaultyFs::new).await
+}
+
+async fn faulty_engine_with(
+    make: fn(FilesystemBackend) -> FaultyFs,
+) -> (tempfile::TempDir, DynEngine, Faults) {
     let dir = tempfile::tempdir().unwrap();
-    let faulty = FaultyFs::new(
+    let faulty = make(
         FilesystemBackend::new(dir.path().to_path_buf())
             .await
             .unwrap(),
@@ -106,32 +112,120 @@ async fn an_io_error_on_metadata_is_not_an_absent_object() {
     assert!(faults.fired(FaultPoint::GetDeltaMetadata, "b/v/app-2.zip") > 0);
 }
 
-/// B065: a DELETE whose sibling-variant cleanup fails must not report
-/// success: the stale variant would come back as the object.
-#[tokio::test]
-async fn a_failed_sibling_cleanup_fails_the_delete() {
-    let (_dir, engine, faults) = faulty_engine().await;
+/// v2 stored as a delta (the newest variant), plus an older v1 passthrough
+/// left at the same name (a PUT whose cleanup failed).
+async fn object_with_a_stale_sibling() -> (tempfile::TempDir, DynEngine, Faults, Vec<u8>) {
+    let (dir, engine, faults, v2) = delta_object(FaultyFs::new).await;
+    put_passthrough_sibling(&engine, b"old-passthrough-bytes", -1).await;
+    (dir, engine, faults, v2)
+}
+
+/// v2 at `p/k.zip`, stored as a delta.
+async fn delta_object(
+    make: fn(FilesystemBackend) -> FaultyFs,
+) -> (tempfile::TempDir, DynEngine, Faults, Vec<u8>) {
+    let (dir, engine, faults) = faulty_engine_with(make).await;
     let v2 = noise(3, 200_000);
     engine
         .store("b", "p/k.zip", &v2, None, HashMap::new())
         .await
         .unwrap();
-    // An older passthrough variant left behind (a PUT whose cleanup failed).
-    let v1 = b"old-passthrough-bytes".to_vec();
+    let head = engine.head("b", "p/k.zip").await.unwrap();
+    assert!(
+        matches!(head.storage_info, StorageInfo::Delta { .. }),
+        "fixture: v2 is a delta"
+    );
+    (dir, engine, faults, v2)
+}
+
+/// A passthrough variant of `p/k.zip`, `hours` from now (negative: older
+/// than the delta), written past the engine like a failed cleanup or a
+/// peer instance.
+async fn put_passthrough_sibling(engine: &DynEngine, bytes: &[u8], hours: i64) {
+    write_passthrough(engine.storage(), bytes, hours).await;
+    engine.metadata_cache.invalidate("b", "p/k.zip");
+}
+
+async fn write_passthrough<S: StorageBackend>(storage: &S, bytes: &[u8], hours: i64) {
     let mut meta = crate::types::FileMetadata::new_passthrough(
         "k.zip".into(),
-        hex::encode(Sha256::digest(&v1)),
-        hex::encode(Md5::digest(&v1)),
-        v1.len() as u64,
+        hex::encode(Sha256::digest(bytes)),
+        hex::encode(Md5::digest(bytes)),
+        bytes.len() as u64,
         None,
     );
-    meta.created_at -= chrono::Duration::hours(1);
-    engine
-        .storage()
-        .put_passthrough("b", "p", "k.zip", &v1, &meta)
+    meta.created_at += chrono::Duration::hours(hours);
+    storage
+        .put_passthrough("b", "p", "k.zip", bytes, &meta)
         .await
         .unwrap();
+}
+
+/// A peer instance that writes a newer passthrough `p/k.zip` straight to
+/// the data directory: its PUT takes no lock of ours.
+fn peer_write(dir: &std::path::Path, bytes: &'static [u8]) -> crate::storage::Hook {
+    let dir = dir.to_path_buf();
+    Arc::new(move || {
+        let dir = dir.clone();
+        Box::pin(async move {
+            let peer = FilesystemBackend::new(dir).await.unwrap();
+            write_passthrough(&peer, bytes, 1).await;
+        })
+    })
+}
+
+/// Review A6, S3 twin: a conditional delete pins the sibling it saw. No
+/// sibling at the check, and a peer's PUT of the passthrough kind lands
+/// right after it: that is a new object, and the delete must not remove it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_conditional_delete_keeps_a_sibling_written_after_its_check() {
+    let (dir, engine, _faults, _v2) = delta_object(FaultyFs::versioned).await;
+    let peer = peer_write(dir.path(), b"peer-bytes");
+    // The check is the last step before the deletes: the peer writes there.
+    let still_ours = move |_: &FileMetadata| {
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(peer()));
+        true
+    };
+    let out = engine.delete_if("b", "p/k.zip", &still_ours).await.unwrap();
+    assert!(matches!(out, ConditionalDelete::Deleted(_)), "{out:?}");
     engine.metadata_cache.invalidate("b", "p/k.zip");
+    let read = engine.retrieve("b", "p/k.zip").await;
+    assert!(
+        matches!(&read, Ok(r) if r.0 == b"peer-bytes"),
+        "the peer's new object is gone: {:?}",
+        read.map(|r| r.0.len())
+    );
+}
+
+/// The sibling the check saw is overwritten by a peer before its delete:
+/// `Changed`, and the peer's object stays.
+#[tokio::test]
+async fn a_conditional_delete_stops_when_its_sibling_changes() {
+    let (dir, engine, faults, _v2) = delta_object(FaultyFs::versioned).await;
+    put_passthrough_sibling(&engine, b"old-passthrough-bytes", -1).await;
+    faults.hook(
+        FaultPoint::DeleteVariantIf,
+        "b/p/k.zip",
+        peer_write(dir.path(), b"peer-bytes"),
+    );
+    let out = engine.delete_if("b", "p/k.zip", &|_| true).await.unwrap();
+    assert_eq!(faults.fired(FaultPoint::DeleteVariantIf, "b/p/k.zip"), 1);
+    assert!(matches!(out, ConditionalDelete::Changed), "{out:?}");
+    engine.metadata_cache.invalidate("b", "p/k.zip");
+    let read = engine.retrieve("b", "p/k.zip").await;
+    assert!(
+        matches!(&read, Ok(r) if r.0 == b"peer-bytes"),
+        "the peer's new object is gone: {:?}",
+        read.map(|r| r.0.len())
+    );
+}
+
+/// B065 + review A6: a DELETE whose sibling cleanup fails reports the
+/// failure AND changes nothing visible. It deleted the newest variant
+/// first, so the stale sibling came back as the object.
+#[tokio::test]
+async fn a_failed_sibling_cleanup_fails_the_delete() {
+    let (_dir, engine, faults, v2) = object_with_a_stale_sibling().await;
     faults.arm(FaultPoint::DeletePassthrough, "b/p/k.zip", Fault::Throttled);
     let del = engine.delete("b", "p/k.zip").await;
     faults.disarm_all();
@@ -140,12 +234,42 @@ async fn a_failed_sibling_cleanup_fails_the_delete() {
         1,
         "the sibling delete never met the fault"
     );
-    let after = engine.retrieve("b", "p/k.zip").await;
+    assert!(del.is_err(), "DELETE answered success: {del:?}");
+    engine.metadata_cache.invalidate("b", "p/k.zip");
+    let read = engine.retrieve("b", "p/k.zip").await.unwrap().0;
     assert!(
-        del.is_err() || after.is_err(),
-        "DELETE answered success, and the deleted object reads back: {:?}",
-        after.map(|r| r.0.len())
+        read == v2,
+        "the failed DELETE left the stale sibling as the object: {:?}",
+        String::from_utf8_lossy(&read[..read.len().min(32)])
     );
+    assert!(
+        engine
+            .storage()
+            .get_passthrough_metadata("b", "p", "k.zip")
+            .await
+            .is_ok(),
+        "the sibling is still stored, so a retry deletes it"
+    );
+}
+
+/// The newest variant's delete fails after the sibling went: the object is
+/// still v2, and a retry converges.
+#[tokio::test]
+async fn a_failed_delete_of_the_newest_variant_keeps_the_object() {
+    let (_dir, engine, faults, v2) = object_with_a_stale_sibling().await;
+    faults.arm(FaultPoint::DeleteDelta, "b/p/k.zip", Fault::Io);
+    let del = engine.delete("b", "p/k.zip").await;
+    faults.disarm_all();
+    assert_eq!(faults.fired(FaultPoint::DeleteDelta, "b/p/k.zip"), 1);
+    assert!(del.is_err(), "DELETE answered success: {del:?}");
+    engine.metadata_cache.invalidate("b", "p/k.zip");
+    assert!(engine.retrieve("b", "p/k.zip").await.unwrap().0 == v2);
+    engine.delete("b", "p/k.zip").await.unwrap();
+    engine.metadata_cache.invalidate("b", "p/k.zip");
+    assert!(matches!(
+        engine.retrieve("b", "p/k.zip").await,
+        Err(EngineError::NotFound(_))
+    ));
 }
 
 /// B012: the legacy-reference migration must not overwrite a live object
