@@ -285,12 +285,10 @@ pub fn init_replay_cache(
 ) -> deltaglider_proxy::api::auth::ReplayCache {
     let replay_cache: deltaglider_proxy::api::auth::ReplayCache = Arc::new(dashmap::DashMap::new());
     // The TTL sweep drops what the check no longer reads: entries older
-    // than the window (DGP_REPLAY_WINDOW_SECS, default the skew). A window
-    // longer than the skew is capped at it: an older signature fails
-    // verification anyway.
-    let replay_window_secs = tuning
-        .replay_window_secs
-        .min(u64::from(tuning.clock_skew_secs));
+    // than the window (DGP_REPLAY_WINDOW_SECS). Never less: a signature
+    // dated ahead of the clock still verifies after the skew has passed
+    // since its first use, so a shorter sweep let its replay through.
+    let replay_window_secs = tuning.replay_window_secs;
     // #86: the retain is an O(live-signatures) walk — up to 500k shards under
     // load (MAX_REPLAY_ENTRIES) — so it runs on the blocking pool.
     spawn_periodic_blocking(Duration::from_secs(60), {

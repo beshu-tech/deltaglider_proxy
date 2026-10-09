@@ -587,7 +587,7 @@ SigV4 clock skew tolerance.
 
 ### `replay_window_secs`
 
-SigV4 replay detection window. The proxy treats a mutating request as a replay when it already saw the same signature within this many seconds. The default is the clock skew tolerance (`DGP_CLOCK_SKEW_SECONDS`, 900 s). A signature older than that fails verification anyway, so the default refuses a captured mutation for its whole valid life.
+SigV4 replay detection window. The proxy treats a mutating request as a replay when it already saw the same signature within this many seconds. The default is twice the clock skew tolerance (`DGP_CLOCK_SKEW_SECONDS`, 900 s). The proxy accepts a signature that is dated up to the skew in the future, so a signature can stay valid for up to twice the skew after its first use. The default therefore refuses a captured mutation for its whole valid life.
 
 - The proxy rejects a replayed mutating request (PUT, POST, DELETE and the other mutating methods) with `400 Request replay detected`.
 - The proxy serves a PUT or DELETE that the client retries inside its signing second. SigV4 timestamps have 1-second granularity, so when an SDK retries a PUT or DELETE within the same second in which it signed it, the retry carries the same signature. This happens, for example, when a load balancer loses the response of a PUT that succeeded. The proxy serves a duplicate PUT or DELETE that arrives less than one second after the first copy, measured on the proxy's own clock, so client clock skew cannot stretch that second. Repeating a PUT or DELETE repeats the same effect. A duplicate that arrives one second or more after the first copy is rejected, and every other mutating method (POST) stays strict.
@@ -601,7 +601,7 @@ Set `DGP_REPLAY_WINDOW_SECS=0` to disable replay rejection entirely (the window 
 | | |
 |---|---|
 | **Env var** | `DGP_REPLAY_WINDOW_SECS` |
-| **Default** | the value of `DGP_CLOCK_SKEW_SECONDS` (`900`) |
+| **Default** | twice the value of `DGP_CLOCK_SKEW_SECONDS` (`1800`) |
 | **Hot-reload** | No |
 
 ### `secure_cookies`
@@ -1164,7 +1164,7 @@ These variables tune the streaming multipart copy of large objects (replication 
 | `DGP_SESSION_TTL_HOURS` | 4 | Admin session lifetime |
 | `DGP_CONFIG_ENV_ALLOWLIST` | — | Comma-separated names (a trailing `*` matches a prefix) that an admin apply, import, restore or section PUT may resolve as `${env:NAME}` from the server environment, in addition to the names that the boot config file uses. `DGP_BOOTSTRAP_*`, `DGP_*ENCRYPTION_KEY*` and `DGP_*SECRET*` never match |
 | `DGP_CLOCK_SKEW_SECONDS` | 900 | SigV4 clock skew tolerance |
-| `DGP_REPLAY_WINDOW_SECS` | clock skew (900) | SigV4 replay detection window for mutating requests (0 disables) |
+| `DGP_REPLAY_WINDOW_SECS` | 2 × clock skew (1800) | SigV4 replay detection window for mutating requests (0 disables) |
 | `DGP_SECURE_COOKIES` | auto | `Secure` flag on session cookies: `true` always, `false` never; unset = when the listener serves TLS or a trusted `X-Forwarded-Proto: https` arrives |
 | `DGP_RATE_LIMIT_MAX_ATTEMPTS` | 100 | Max auth failures before lockout |
 | `DGP_RATE_LIMIT_WINDOW_SECS` | 300 | Rate-limit rolling window |

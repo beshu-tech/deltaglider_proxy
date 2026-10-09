@@ -562,7 +562,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_REPLAY_WINDOW_SECS",
-        description: "SigV4 replay detection window for mutating requests, in seconds (default: the clock skew, DGP_CLOCK_SKEW_SECONDS; 0 disables)",
+        description: "SigV4 replay detection window for mutating requests, in seconds (default: twice the clock skew, DGP_CLOCK_SKEW_SECONDS; 0 disables)",
         example: "900",
         category: "Security",
     },

@@ -103,7 +103,7 @@ The proxy caches the SigV4 signatures of mutating requests and rejects duplicate
 
 | Setting | Default | Env var |
 |---------|---------|---------|
-| Replay window | the clock skew tolerance (900 s) | `DGP_REPLAY_WINDOW_SECS` |
+| Replay window | twice the clock skew tolerance (1800 s) | `DGP_REPLAY_WINDOW_SECS` |
 | Clock skew tolerance | 900 s | `DGP_CLOCK_SKEW_SECONDS` |
 | Max cache entries | 500,000 | — |
 
@@ -134,7 +134,7 @@ During a LIST request that needs per-object metadata, the proxy sends HEAD reque
 | `DGP_REQUEST_TIMEOUT_SECS` | 300 | Per-request timeout |
 | `DGP_MAX_MULTIPART_UPLOADS` | 1000 | Max concurrent multipart uploads |
 | `DGP_CLOCK_SKEW_SECONDS` | 900 | SigV4 request-timestamp drift tolerance |
-| `DGP_REPLAY_WINDOW_SECS` | `DGP_CLOCK_SKEW_SECONDS` (900) | SigV4 replay detection window for mutating requests (0 disables) |
+| `DGP_REPLAY_WINDOW_SECS` | 2 × `DGP_CLOCK_SKEW_SECONDS` (1800) | SigV4 replay detection window for mutating requests (0 disables) |
 
 ## Related
 

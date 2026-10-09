@@ -115,7 +115,9 @@ impl RuntimeTuning {
             trust_proxy_headers: lookup_bool(env, "DGP_TRUST_PROXY_HEADERS", false),
             secure_cookies: env("DGP_SECURE_COOKIES").and_then(|raw| parse_bool(&raw)),
             clock_skew_secs,
-            replay_window_secs: parse_or("DGP_REPLAY_WINDOW_SECS", u64::from(clock_skew_secs)),
+            // Twice the skew: s3s accepts a signature dated up to the skew
+            // ahead, so one first used at t0 verifies until t0 + 2 x skew.
+            replay_window_secs: parse_or("DGP_REPLAY_WINDOW_SECS", 2 * u64::from(clock_skew_secs)),
             codec: CodecTimeouts {
                 buffered_secs: parse_or("DGP_CODEC_TIMEOUT_SECS", codec.buffered_secs),
                 stall_secs: parse_or("DGP_CODEC_STALL_SECS", codec.stall_secs),
@@ -179,6 +181,20 @@ mod tests {
         RuntimeTuning::from_env(&move |n: &str| map.get(n).cloned())
     }
 
+    /// B109: s3s accepts a signature dated up to the skew AHEAD, so one
+    /// first used at t0 still verifies at t0 + 2 x skew. The default window
+    /// must refuse its replay that long.
+    #[test]
+    fn the_default_replay_window_covers_a_future_dated_signature() {
+        let t = RuntimeTuning::default();
+        assert!(
+            t.replay_window_secs >= 2 * u64::from(t.clock_skew_secs),
+            "window {} < 2 x skew {}",
+            t.replay_window_secs,
+            t.clock_skew_secs
+        );
+    }
+
     #[test]
     fn empty_env_gives_the_documented_defaults() {
         let t = RuntimeTuning::default();
@@ -186,7 +202,7 @@ mod tests {
         assert_eq!(t.max_concurrent_requests, 1024);
         assert!(!t.cors_permissive && !t.debug_headers && !t.trust_proxy_headers);
         assert_eq!(t.secure_cookies, None);
-        assert_eq!((t.clock_skew_secs, t.replay_window_secs), (900, 900));
+        assert_eq!((t.clock_skew_secs, t.replay_window_secs), (900, 1800));
         assert_eq!(t.codec, CodecTimeouts::default());
         assert_eq!(
             (
@@ -255,7 +271,7 @@ mod tests {
         assert!(t.cors_permissive && t.debug_headers && t.trust_proxy_headers);
         assert_eq!(t.secure_cookies, Some(false));
         // The replay window follows the skew unless set on its own.
-        assert_eq!((t.clock_skew_secs, t.replay_window_secs), (60, 60));
+        assert_eq!((t.clock_skew_secs, t.replay_window_secs), (60, 120));
         assert_eq!(
             t.codec,
             CodecTimeouts {

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Security — The replay window covers signatures dated ahead of the clock
+
+The proxy accepts a signature that is dated up to the clock skew
+(`DGP_CLOCK_SKEW_SECONDS`, 900 s) in the future, so a signature stays valid
+for up to twice the skew after its first use. The replay window was the
+skew, and the cache cleanup also cut any longer window down to the skew, so
+such a request could be replayed in the second half of its valid life. Now
+the default window (`DGP_REPLAY_WINDOW_SECS`) is twice the skew (1800 s),
+and the cleanup keeps every signature for the whole configured window.
+
 ### Security — An IAM import cannot take over a user that an OAuth sign-in created
 
 A declarative apply or a full-IAM import refused a local user whose name
