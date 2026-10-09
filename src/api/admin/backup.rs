@@ -376,7 +376,10 @@ impl SecretsEncryption {
             | E::SseKms { legacy_key, .. }
             | E::SseS3 { legacy_key, .. } => (None, legacy_key.clone()),
         };
-        let s = Self { key, legacy_key };
+        let s = Self {
+            key: literal(&key),
+            legacy_key: literal(&legacy_key),
+        };
         (s != Self::default()).then_some(s)
     }
 
@@ -848,10 +851,20 @@ fn unzip_bounded(
 /// backup, so a restore never writes it into another instance's YAML file.
 /// The restored instance takes such values from its own environment.
 /// OAuth client secrets come from the IAM DB and are added by the caller.
+/// A slot's value worth carrying in secrets.json: not empty, and not a
+/// `${env:…}` ref (review A11). A ref travels as text in config.yaml; its
+/// value belongs to the host's environment, never to a backup file.
+fn literal(v: &Option<String>) -> Option<String> {
+    v.clone()
+        .filter(|s| !s.is_empty() && !crate::config::is_env_ref(s))
+}
+
 fn harvest_config_secrets(
     runtime: &crate::config::Config,
 ) -> Result<BackupSecrets, crate::config::ConfigError> {
-    let file = runtime.file_view()?;
+    // The file TEXT view: an env-sourced slot holds its `${env:…}` ref, the
+    // same text config.yaml carries.
+    let file = runtime.file_view()?.with_env_refs_reinserted();
     let cfg = &file;
     let mut s = BackupSecrets {
         bootstrap_password_hash: cfg.bootstrap_password_hash.clone(),
@@ -869,10 +882,11 @@ fn harvest_config_secrets(
             .collect(),
     };
     // Access-section bootstrap SigV4 pair.
-    if cfg.access_key_id.is_some() || cfg.secret_access_key.is_some() {
+    let (ak, sk) = (literal(&cfg.access_key_id), literal(&cfg.secret_access_key));
+    if ak.is_some() || sk.is_some() {
         s.access = Some(SecretsAccess {
-            access_key_id: cfg.access_key_id.clone(),
-            secret_access_key: cfg.secret_access_key.clone(),
+            access_key_id: ak,
+            secret_access_key: sk,
         });
     }
     // Storage-section backend credentials (S3 only — filesystem
@@ -883,10 +897,11 @@ fn harvest_config_secrets(
         ..
     } = &cfg.backend
     {
-        if access_key_id.is_some() || secret_access_key.is_some() {
+        let (ak, sk) = (literal(access_key_id), literal(secret_access_key));
+        if ak.is_some() || sk.is_some() {
             s.storage = Some(SecretsStorage {
-                access_key_id: access_key_id.clone(),
-                secret_access_key: secret_access_key.clone(),
+                access_key_id: ak,
+                secret_access_key: sk,
             });
         }
     }
@@ -897,12 +912,13 @@ fn harvest_config_secrets(
             ..
         } = &named.backend
         {
-            if access_key_id.is_some() || secret_access_key.is_some() {
+            let (ak, sk) = (literal(access_key_id), literal(secret_access_key));
+            if ak.is_some() || sk.is_some() {
                 s.storage_backends.insert(
                     named.name.clone(),
                     SecretsStorage {
-                        access_key_id: access_key_id.clone(),
-                        secret_access_key: secret_access_key.clone(),
+                        access_key_id: ak,
+                        secret_access_key: sk,
                     },
                 );
             }
@@ -911,20 +927,21 @@ fn harvest_config_secrets(
     // Event-delivery secrets (Slack bot token + webhook header values) —
     // masked in config.yaml, so captured here for cross-instance restore.
     let ed = &cfg.event_delivery;
-    let has_token = ed
-        .slack_bot_token
-        .as_deref()
-        .map(|t| !t.trim().is_empty())
-        .unwrap_or(false);
-    if has_token
-        || !ed.webhook_headers.is_empty()
-        || ed.webhook_url.is_some()
-        || !ed.webhook_urls.is_empty()
-    {
+    let token = literal(&ed.slack_bot_token).filter(|t| !t.trim().is_empty());
+    let headers: std::collections::BTreeMap<String, String> = ed
+        .webhook_headers
+        .iter()
+        .filter(|(_, v)| !crate::config::is_env_ref(v))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let url = literal(&ed.webhook_url);
+    if token.is_some() || !headers.is_empty() || url.is_some() || !ed.webhook_urls.is_empty() {
         s.event_delivery = Some(SecretsEventDelivery {
-            slack_bot_token: ed.slack_bot_token.clone(),
-            webhook_headers: ed.webhook_headers.clone(),
-            webhook_url: ed.webhook_url.clone(),
+            slack_bot_token: token,
+            webhook_headers: headers,
+            webhook_url: url,
+            // Whole, as file text: a ref entry stays its `${env:…}` text, so
+            // the restore aligns like with like (review A5).
             webhook_urls: ed.webhook_urls.clone(),
         });
     }
@@ -940,7 +957,23 @@ fn harvest_config_secrets(
 /// keeps the DB's key, so the DB can be its only home). A `${env:NAME}` ref
 /// stays in config.yaml, so it needs no copy here.
 fn harvest_iam_secrets(cfg: &Config, iam: &IamBackup, s: &mut BackupSecrets) {
+    // A declarative provider whose YAML secret is a `${env:…}` ref keeps it
+    // in config.yaml: its DB copy (the resolved value) stays out (A11).
+    let file = cfg.with_env_refs_reinserted();
+    let from_env: std::collections::HashSet<&str> = file
+        .auth_providers
+        .iter()
+        .filter(|p| {
+            p.client_secret
+                .as_deref()
+                .is_some_and(crate::config::is_env_ref)
+        })
+        .map(|p| p.name.as_str())
+        .collect();
     for p in &iam.auth_providers {
+        if from_env.contains(p.name.as_str()) {
+            continue;
+        }
         if let Some(cs) = &p.client_secret {
             s.oauth_client_secrets.insert(p.name.clone(), cs.clone());
         }
@@ -975,21 +1008,76 @@ fn hydrate_config_secrets(
             cfg.bootstrap_password_hash = Some(h.clone());
         }
     }
+    // A slot whose running file text is a `${env:…}` ref keeps it: a
+    // backup's value never replaces this host's env (review NEW-1).
+    let file = cfg.with_env_refs_reinserted();
+    let from_env = |v: &Option<String>| v.as_deref().is_some_and(crate::config::is_env_ref);
     if let Some(a) = &secrets.access {
-        if let Some(ak) = &a.access_key_id {
+        if let Some(ak) = a
+            .access_key_id
+            .as_ref()
+            .filter(|_| !from_env(&file.access_key_id))
+        {
             cfg.access_key_id = Some(ak.clone());
         }
-        if let Some(sk) = &a.secret_access_key {
+        if let Some(sk) = a
+            .secret_access_key
+            .as_ref()
+            .filter(|_| !from_env(&file.secret_access_key))
+        {
             cfg.secret_access_key = Some(sk.clone());
         }
     }
     if let Some(s) = &secrets.storage {
-        hydrate_s3_backend_credentials(&mut cfg.backend, s);
+        if !s3_creds_from_env(&file.backend) {
+            hydrate_s3_backend_credentials(&mut cfg.backend, s);
+        }
     }
     for named in &mut cfg.backends {
-        if let Some(s) = secrets.storage_backends.get(&named.name) {
+        let env_sourced = file
+            .backends
+            .iter()
+            .find(|b| b.name == named.name)
+            .is_some_and(|b| s3_creds_from_env(&b.backend));
+        if let Some(s) = secrets
+            .storage_backends
+            .get(&named.name)
+            .filter(|_| !env_sourced)
+        {
             hydrate_s3_backend_credentials(&mut named.backend, s);
         }
+    }
+}
+
+/// Whether this backend's S3 credentials come from `${env:…}` refs.
+fn s3_creds_from_env(backend: &BackendConfig) -> bool {
+    matches!(backend, BackendConfig::S3 { access_key_id, secret_access_key, .. }
+        if [access_key_id, secret_access_key]
+            .iter()
+            .any(|v| v.as_deref().is_some_and(crate::config::is_env_ref)))
+}
+
+/// R2 of the restore (review NEW-1): fill a slot only where the export
+/// masked it (`None` or empty for a cleared field). A `${env:…}` ref or a
+/// literal in config.yaml is the truth and stays.
+fn fill_cleared(slot: &mut Option<String>, saved: &Option<String>) {
+    if slot.as_deref().is_none_or(str::is_empty) {
+        if let Some(v) = saved {
+            *slot = Some(v.clone());
+        }
+    }
+}
+
+/// [`fill_cleared`] for an S3 backend's two credential slots.
+fn fill_s3_backend_credentials(backend: &mut BackendConfig, secrets: &SecretsStorage) {
+    if let BackendConfig::S3 {
+        access_key_id,
+        secret_access_key,
+        ..
+    } = backend
+    {
+        fill_cleared(access_key_id, &secrets.access_key_id);
+        fill_cleared(secret_access_key, &secrets.secret_access_key);
     }
 }
 
@@ -1010,22 +1098,22 @@ fn hydrate_s3_backend_credentials(backend: &mut BackendConfig, secrets: &Secrets
 }
 
 fn hydrate_config_with_backup_secrets(cfg: &mut Config, secrets: &BackupSecrets) {
+    // config.yaml here is the export text: a secret the export masked is
+    // empty (or the sentinel), an env-sourced one is its `${env:…}` ref.
+    // Only the masks are filled (review NEW-1: the hydrate wrote backup
+    // values over the refs).
     if let Some(a) = &secrets.access {
-        if let Some(ak) = &a.access_key_id {
-            cfg.access_key_id = Some(ak.clone());
-        }
-        if let Some(sk) = &a.secret_access_key {
-            cfg.secret_access_key = Some(sk.clone());
-        }
+        fill_cleared(&mut cfg.access_key_id, &a.access_key_id);
+        fill_cleared(&mut cfg.secret_access_key, &a.secret_access_key);
     }
 
     if let Some(s) = &secrets.storage {
-        hydrate_s3_backend_credentials(&mut cfg.backend, s);
+        fill_s3_backend_credentials(&mut cfg.backend, s);
     }
 
     for named in &mut cfg.backends {
         if let Some(s) = secrets.storage_backends.get(&named.name) {
-            hydrate_s3_backend_credentials(&mut named.backend, s);
+            fill_s3_backend_credentials(&mut named.backend, s);
         }
     }
 
@@ -1042,7 +1130,7 @@ fn hydrate_config_with_backup_secrets(cfg: &mut Config, secrets: &BackupSecrets)
                 .filter_map(|(idx, b)| matches!(b.backend, BackendConfig::S3 { .. }).then_some(idx))
                 .collect();
             if let [idx] = s3_named.as_slice() {
-                hydrate_s3_backend_credentials(&mut cfg.backends[*idx].backend, s);
+                fill_s3_backend_credentials(&mut cfg.backends[*idx].backend, s);
             }
         }
     }
@@ -1077,16 +1165,19 @@ fn hydrate_config_with_backup_secrets(cfg: &mut Config, secrets: &BackupSecrets)
     // cross-instance / DR restore (where the running instance has no token to
     // preserve from) would lose them.
     if let Some(ed) = &secrets.event_delivery {
-        if let Some(tok) = &ed.slack_bot_token {
-            cfg.event_delivery.slack_bot_token = Some(tok.clone());
+        // Only over the export's mask: a ref or a value in config.yaml is
+        // the truth.
+        let sentinel = crate::config::REDACTED_SENTINEL;
+        if cfg.event_delivery.slack_bot_token.as_deref() == Some(sentinel) {
+            cfg.event_delivery.slack_bot_token = ed.slack_bot_token.clone();
         }
         for (k, v) in &ed.webhook_headers {
-            cfg.event_delivery
-                .webhook_headers
-                .insert(k.clone(), v.clone());
+            if let Some(slot) = cfg.event_delivery.webhook_headers.get_mut(k) {
+                if slot == sentinel {
+                    slot.clone_from(v);
+                }
+            }
         }
-        // Only over the export's mask: a URL in config.yaml is the truth.
-        let sentinel = crate::config::REDACTED_SENTINEL;
         if cfg.event_delivery.webhook_url.as_deref() == Some(sentinel) {
             cfg.event_delivery.webhook_url = ed.webhook_url.clone();
         }
@@ -1987,6 +2078,90 @@ mod tests {
         assert!(
             restored.contains(URL2),
             "restore lost webhook_urls:\n{restored}"
+        );
+    }
+
+    /// Review A11 + NEW-1 + A5: a value that came from `${env:…}` stays a
+    /// ref. secrets.json never holds it, and a restore never writes a backup
+    /// value over the ref; a masked literal is filled back, also in a list
+    /// that mixes a ref and a masked entry.
+    fn env_sourced_fixture() -> Config {
+        let yaml = "access:\n  access_key_id: AKBOOTSTRAP00001\n  secret_access_key: \"proxy-secret-from-env-0001\"\n\
+storage:\n  backends:\n    - name: aws-dr\n      type: s3\n      endpoint: https://s3.example.test\n      access_key_id: AKDR\n      secret_access_key: \"dr-secret-from-env-00000002\"\n\
+advanced:\n  event_delivery:\n    enabled: true\n    format: slack\n    webhook_urls:\n      - \"https://hooks.slack.com/services/T/A/FROMENV0003\"\n      - \"https://hooks.slack.com/services/T/B/LITERAL0004\"\n    webhook_headers:\n      X-From-Env: \"header-value-from-env-0005\"\n      X-Literal: \"header-literal-value-0006\"\n";
+        let mut cfg = Config::from_yaml_str(yaml).unwrap();
+        for (name, value) in [
+            ("PROXY_SK", "proxy-secret-from-env-0001"),
+            ("DR_SK", "dr-secret-from-env-00000002"),
+            ("HOOK1", "https://hooks.slack.com/services/T/A/FROMENV0003"),
+            ("HDR", "header-value-from-env-0005"),
+        ] {
+            cfg.env_refs.insert(name.into(), value.into());
+        }
+        cfg.record_env_ref_paths();
+        cfg
+    }
+
+    #[test]
+    fn env_sourced_secrets_stay_out_of_secrets_json() {
+        let cfg = env_sourced_fixture();
+        let json = serde_json::to_string(&harvest_config_secrets(&cfg).unwrap()).unwrap();
+        for v in [
+            "proxy-secret-from-env-0001",
+            "dr-secret-from-env-00000002",
+            "FROMENV0003",
+            "header-value-from-env-0005",
+        ] {
+            assert!(
+                !json.contains(v),
+                "secrets.json holds the env value {v}: {json}"
+            );
+        }
+        assert!(
+            json.contains("LITERAL0004") && json.contains("header-literal-value-0006"),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn restore_keeps_env_refs_and_fills_only_masks() {
+        let cfg = env_sourced_fixture();
+        let secrets = harvest_config_secrets(&cfg).unwrap();
+        let exported = cfg.redact_all_secrets().to_canonical_yaml().unwrap();
+        let (restored, _) = hydrate_restore_doc(&exported, Some(&secrets), &|_| None).unwrap();
+        for want in [
+            "${env:PROXY_SK}",
+            "${env:DR_SK}",
+            "${env:HOOK1}",
+            "${env:HDR}",
+            "LITERAL0004",
+            "header-literal-value-0006",
+        ] {
+            assert!(
+                restored.contains(want),
+                "the restore lost {want}:\n{restored}"
+            );
+        }
+        assert!(
+            !restored.contains(crate::config::REDACTED_SENTINEL),
+            "a mask stayed:\n{restored}"
+        );
+
+        // A secrets.json of an older release holds the resolved values: the
+        // refs in config.yaml still win.
+        let mut old = secrets;
+        old.access = Some(SecretsAccess {
+            access_key_id: Some("AKBOOTSTRAP00001".into()),
+            secret_access_key: Some("proxy-secret-from-env-0001".into()),
+        });
+        let (restored, _) = hydrate_restore_doc(&exported, Some(&old), &|_| None).unwrap();
+        assert!(
+            restored.contains("${env:PROXY_SK}"),
+            "an old backup's value replaced the ref:\n{restored}"
+        );
+        assert!(
+            !restored.contains("proxy-secret-from-env-0001"),
+            "{restored}"
         );
     }
 

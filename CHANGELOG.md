@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Fixed — A backup no longer holds values that come from `${env:…}` references
+
+A full backup's `secrets.json` held the resolved value of every secret that
+the config file takes from a `${env:NAME}` reference: the bootstrap SigV4
+secret, the S3 credentials of a backend, an encryption key, the Slack bot
+token, webhook header values and webhook URLs. A restore then wrote those
+values over the `${env:NAME}` references in the restored config, so the
+config file held the other host's secrets in plain text. A Slack webhook
+list that mixed a reference and a masked URL was also refused at restore
+(`422`). Now the backup carries only literal secrets, the restore fills
+only the values that the export masked, and every `${env:NAME}` reference
+stays a reference. A backup from an earlier release still restores: its
+values for referenced slots are ignored, so set the variables on the new
+instance (and list them in `DGP_CONFIG_ENV_ALLOWLIST` when the new boot
+config does not use them).
+
 ### Fixed — An abandoned filesystem write no longer lands late
 
 - On a filesystem backend, a write renamed its temp file into place on a
