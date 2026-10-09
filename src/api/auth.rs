@@ -266,6 +266,28 @@ pub fn same_second_retry_served(method: &axum::http::Method, since_first: Durati
     matches!(*method, Method::PUT | Method::DELETE) && since_first < Duration::from_secs(1)
 }
 
+/// Settle a replay-cache claim once the response is known: a first copy
+/// that failed gives its slot back (a retry of a failed mutation is not a
+/// replay). A served same-second retry that succeeded re-stamps the slot as
+/// its own: the mutation happened, and the first copy, which may still
+/// fail, must not give the slot back.
+fn settle_replay_claim(
+    cache: &ReplayCache,
+    sig: &str,
+    claim: &ReplayClaim,
+    status: axum::http::StatusCode,
+) {
+    match claim {
+        ReplayClaim::Claimed(claimed_at) if !replay_slot_kept(status) => {
+            cache.remove_if(sig, |_, seen| *seen == *claimed_at);
+        }
+        ReplayClaim::Retry if replay_slot_kept(status) => {
+            cache.insert(sig.to_string(), Instant::now());
+        }
+        _ => {}
+    }
+}
+
 /// Whether a request that claimed a replay-cache slot keeps it once its
 /// response is known: only on success (2xx/3xx). A failed mutation had no
 /// effect, so a byte-identical retry of it is not a replay.
@@ -974,9 +996,9 @@ pub async fn sigv4_auth_middleware(
     // Not tracked: presigned URLs (designed to be reused) and GET/HEAD (see
     // `replay_tracked`).
     let is_presigned = has_presigned_query_params(request.uri().query().unwrap_or(""));
-    // The cache slot this request claimed (signature + the instant it
-    // stored), so a failed request can give it back below.
-    let mut replay_claim: Option<(ReplayCache, String, Instant)> = None;
+    // The cache slot this request claimed or retried, settled once the
+    // response is known (`settle_replay_claim`).
+    let mut replay_claim: Option<(ReplayCache, String, ReplayClaim)> = None;
     if let Some(ref cache) = replay_cache {
         if !is_presigned && replay_tracked(request.method()) {
             // Expired entries go in the periodic sweep (`init_replay_cache`),
@@ -1009,10 +1031,7 @@ pub async fn sigv4_auth_middleware(
                     S3Error::InvalidArgument("Request replay detected".to_string()).into_response(),
                 );
             }
-            // A served retry (`Retry`) does not own the slot: the first copy does.
-            if let ReplayClaim::Claimed(claimed_at) = claim {
-                replay_claim = Some((cache.clone(), sig.clone(), claimed_at));
-            }
+            replay_claim = Some((cache.clone(), sig.clone(), claim));
         }
     }
 
@@ -1052,10 +1071,8 @@ pub async fn sigv4_auth_middleware(
     // signing second with a byte-identical signature; refusing that retry
     // as a replay would turn a retryable error into a hard 400. The slot is
     // held while the request runs, so a concurrent duplicate still fails.
-    if let Some((cache, sig, claimed_at)) = replay_claim {
-        if !replay_slot_kept(response.status()) {
-            cache.remove_if(&sig, |_, seen| *seen == claimed_at);
-        }
+    if let Some((cache, sig, claim)) = replay_claim {
+        settle_replay_claim(&cache, &sig, &claim, response.status());
     }
     match limiter_verdict(&outcome, response.status(), is_presigned) {
         LimiterVerdict::Success => {
@@ -1391,7 +1408,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_window_defaults_to_the_clock_skew() {
+    fn replay_window_defaults_to_twice_the_clock_skew() {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
             move |n: &str| {
                 pairs
@@ -1405,8 +1422,8 @@ mod tests {
                 .replay_window()
                 .as_secs()
         };
-        assert_eq!(secs(&env(&[])), 900);
-        assert_eq!(secs(&env(&[("DGP_CLOCK_SKEW_SECONDS", "300")])), 300);
+        assert_eq!(secs(&env(&[])), 1800);
+        assert_eq!(secs(&env(&[("DGP_CLOCK_SKEW_SECONDS", "300")])), 600);
         assert_eq!(secs(&env(&[("DGP_REPLAY_WINDOW_SECS", "0")])), 0);
         assert_eq!(
             secs(&env(&[
@@ -1416,7 +1433,7 @@ mod tests {
             60
         );
         // Blank or invalid = unset.
-        assert_eq!(secs(&env(&[("DGP_REPLAY_WINDOW_SECS", "")])), 900);
+        assert_eq!(secs(&env(&[("DGP_REPLAY_WINDOW_SECS", "")])), 1800);
     }
 
     #[test]
@@ -1621,5 +1638,27 @@ mod review3_tests {
             );
         }
         assert_eq!(cache.len(), 0, "the off switch must store no signature");
+    }
+
+    /// B076: an SDK retry of a PUT inside the signing second is served
+    /// (`Retry`). When that retry succeeds and the first copy then fails,
+    /// the mutation happened: the signature must stay refused.
+    #[test]
+    fn a_successful_retry_keeps_the_slot_when_the_first_copy_fails() {
+        use axum::http::{Method, StatusCode};
+        let cache: ReplayCache = Arc::new(DashMap::new());
+        let w = Duration::from_secs(900);
+        let first = claim_replay_slot(&cache, "S", &Method::PUT, w);
+        assert!(matches!(first, ReplayClaim::Claimed(_)));
+        let retry = claim_replay_slot(&cache, "S", &Method::PUT, w);
+        assert_eq!(retry, ReplayClaim::Retry);
+        settle_replay_claim(&cache, "S", &retry, StatusCode::OK);
+        settle_replay_claim(&cache, "S", &first, StatusCode::SERVICE_UNAVAILABLE);
+        std::thread::sleep(Duration::from_millis(1100));
+        assert_eq!(
+            claim_replay_slot(&cache, "S", &Method::PUT, w),
+            ReplayClaim::Duplicate,
+            "the replay of a mutation that succeeded was accepted"
+        );
     }
 }

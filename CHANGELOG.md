@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Security — A replayed request stays refused after a retry succeeded
+
+When an SDK retried a PUT or DELETE within the same second, the proxy served
+the retry. If the retry succeeded and the first copy then failed, the first
+copy removed the signature from the replay cache, so a captured copy of the
+request could be sent again later and was accepted. Now a retry that
+succeeds keeps the signature in the cache.
+
 ### Security — IAM conditions: three cases that showed or granted too much
 
 - A Deny rule on a sub-folder (for example `Deny` on `photos/secret/*`
