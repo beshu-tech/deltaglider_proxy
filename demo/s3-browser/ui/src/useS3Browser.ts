@@ -476,7 +476,7 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     // saves the response. See zipDownload.ts for how failures stay visible.
     const bucket = getBucket();
     const keys = await resolveSelectedKeys(bucket);
-    const url = bulkZipDownloadUrl(keys.map((k) => `${bucket}/${k}`));
+    const url = bulkZipDownloadUrl(bucket, keys);
     const blocked = zipPreflightError(keys.length, url.length);
     if (blocked) throw new Error(blocked);
     const filename = `deltaglider-${new Date().toISOString().slice(0, 10)}.zip`;

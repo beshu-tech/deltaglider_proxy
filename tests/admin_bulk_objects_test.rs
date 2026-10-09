@@ -1031,9 +1031,24 @@ async fn test_bulk_copy_waits_for_a_completion_of_the_destination() {
     assert_eq!(bytes.as_ref(), b"copied", "the later write wins");
 }
 
-/// The `keys` parameter as the admin GUI builds it (bulkZipDownloadUrl).
-fn zip_keys_param(keys: &[String]) -> String {
-    serde_json::to_string(keys).unwrap()
+/// The ZIP query as the admin GUI builds it (bulkZipDownloadUrl): the
+/// bucket, the shared folder, and the keys below it as a JSON array.
+fn zip_query(bucket: &str, keys: &[&str]) -> Vec<(&'static str, String)> {
+    let mut prefix = keys
+        .first()
+        .map_or("", |k| &k[..k.rfind('/').map_or(0, |i| i + 1)]);
+    for k in keys {
+        while !prefix.is_empty() && !k.starts_with(prefix) {
+            let up = prefix[..prefix.len() - 1].rfind('/').map_or(0, |i| i + 1);
+            prefix = &prefix[..up];
+        }
+    }
+    let rel: Vec<&str> = keys.iter().map(|k| &k[prefix.len()..]).collect();
+    vec![
+        ("bucket", bucket.to_string()),
+        ("prefix", prefix.to_string()),
+        ("keys", serde_json::to_string(&rel).unwrap()),
+    ]
 }
 
 /// B044: a key with a comma survives the ZIP request the GUI sends.
@@ -1044,7 +1059,7 @@ async fn zip_download_keeps_a_key_with_a_comma() {
     let admin = admin_http_client(&server.endpoint()).await;
     let bucket = server.bucket();
     let ep = server.endpoint();
-    for (key, body) in [("reports/Q1,%20final.pdf", "q1"), ("a.txt", "a")] {
+    for (key, body) in [("reports/Q1,%20final.pdf", "q1"), ("reports/a.txt", "a")] {
         let r = http
             .put(format!("{ep}/{bucket}/{key}"))
             .body(body.as_bytes().to_vec())
@@ -1053,13 +1068,12 @@ async fn zip_download_keeps_a_key_with_a_comma() {
             .unwrap();
         assert!(r.status().is_success(), "seed {key}: {}", r.status());
     }
-    let keys = vec![
-        format!("{bucket}/reports/Q1, final.pdf"),
-        format!("{bucket}/a.txt"),
-    ];
     let resp = admin
         .get(format!("{ep}/_/api/admin/objects/zip"))
-        .query(&[("keys", zip_keys_param(&keys))])
+        .query(&zip_query(
+            bucket,
+            &["reports/Q1, final.pdf", "reports/a.txt"],
+        ))
         .send()
         .await
         .unwrap();

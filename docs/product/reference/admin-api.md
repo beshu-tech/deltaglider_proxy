@@ -209,7 +209,11 @@ These endpoints accept an admin GUI session and also the browser session of a us
 
 | Parameter | Value |
 |---|---|
-| `keys` | A JSON array of `bucket/key` strings, at most 10,000, for example `["releases/a.zip","releases/b, final.zip"]`. A comma-separated list of `bucket/key` entries is also accepted, but it cannot name a key that contains a comma. An entry without a `/` makes the request fail with `400`. The request line must stay below 64 KiB. |
+| `bucket` | The bucket that holds every object of the archive, for example `releases`. |
+| `prefix` | Optional. A folder that every key is under, for example `builds/v1/`. The proxy puts it in front of each key. The file browser sends the deepest folder that the selected keys share, so that more keys fit in one request. |
+| `keys` | A JSON array of keys below `prefix`, at most 10,000, for example `["a.zip","b, final.zip"]`. A JSON array keeps a key that contains a comma intact. The request line must stay below 64 KiB. |
+
+The older form without `bucket` is still accepted in this release: `keys` is then a JSON array, or a comma-separated list, of `bucket/key` entries. A comma-separated list cannot name a key that contains a comma, and an entry without a `/` makes the request fail with `400`.
 
 The response is `200` with `Content-Type: application/zip` and `Content-Disposition: attachment; filename="deltaglider-<date>.zip"`. The proxy streams the archive while it reads the objects, so the response has no `Content-Length` header and no size limit. Each object is read through the same path as an S3 `GET`, so a delta-stored object is reconstructed before its bytes enter the archive. The proxy does not hold a whole object or the whole archive in memory.
 

@@ -127,12 +127,19 @@ pub struct DeleteFailure {
     pub error: String,
 }
 
+/// A query string, not a body, so a plain `<a href download>` can start
+/// the download.
 #[derive(Debug, Deserialize)]
 pub struct ZipQuery {
-    /// Comma-separated list of fully-qualified `bucket/key` pairs.
-    /// Could be a body param too, but a query string lets the client
-    /// trigger the response via plain `<a href>` for browser-driven
-    /// download UX.
+    /// The bucket of every key (the GUI's form). Absent: the legacy form,
+    /// in which each `keys` entry is `bucket/key`.
+    #[serde(default)]
+    pub bucket: Option<AdminBucket>,
+    /// The folder that every key is under, put in front of each key.
+    #[serde(default)]
+    pub prefix: AdminObjectPath,
+    /// With `bucket`: a JSON array of keys below `prefix`. Without it
+    /// (deprecated): a JSON array or a comma list of `bucket/key`.
     pub keys: String,
 }
 
@@ -975,7 +982,22 @@ fn zip_safe_name(name: String) -> String {
 /// list. A bucket name never starts with `[`, so the two cannot be confused.
 /// Each entry splits on its FIRST '/'; an entry without one is an error,
 /// never silently dropped.
-fn parse_zip_keys(raw: &str) -> Result<Vec<(String, String)>, String> {
+/// The `(bucket, key)` pairs of a ZIP request. With `bucket` (the GUI's
+/// form, review A12): `raw` is a JSON array of keys below `prefix`.
+/// Without: the legacy `bucket/key` list.
+fn parse_zip_keys(
+    bucket: Option<&str>,
+    prefix: &str,
+    raw: &str,
+) -> Result<Vec<(String, String)>, String> {
+    if let Some(bucket) = bucket {
+        let keys: Vec<String> = serde_json::from_str(raw)
+            .map_err(|e| format!("?keys is not a JSON array of strings: {e}"))?;
+        return Ok(keys
+            .into_iter()
+            .map(|k| (bucket.to_string(), format!("{prefix}{k}")))
+            .collect());
+    }
     let entries: Vec<String> = if raw.trim_start().starts_with('[') {
         serde_json::from_str(raw)
             .map_err(|e| format!("?keys is not a JSON array of strings: {e}"))?
@@ -1001,11 +1023,11 @@ pub async fn download_zip(
     headers: axum::http::HeaderMap,
     AdminQuery(q): AdminQuery<ZipQuery>,
 ) -> Result<axum::response::Response, AdminError> {
-    let parsed = parse_zip_keys(&q.keys).map_err(AdminError::invalid)?;
+    let bucket = q.bucket.map(|b| b.admit(&state)).transpose()?;
+    let parsed =
+        parse_zip_keys(bucket.as_deref(), &q.prefix, &q.keys).map_err(AdminError::invalid)?;
     if parsed.is_empty() {
-        return Err(AdminError::invalid(
-            "?keys must be a comma-separated list of bucket/key entries",
-        ));
+        return Err(AdminError::invalid("?keys names no object"));
     }
     for (b, k) in &parsed {
         super::path_guard::check_bucket(b)
@@ -1363,6 +1385,26 @@ mod tests {
             keys.len(),
             super::MAX_BULK_OBJECTS,
             "the extra key is not kept"
+        );
+    }
+
+    /// Review A12: the GUI's form names the bucket once and each key below
+    /// the shared folder; the legacy `bucket/key` forms still parse.
+    #[test]
+    fn zip_keys_parse_in_both_forms() {
+        let pair = |b: &str, k: &str| (b.to_string(), k.to_string());
+        assert_eq!(
+            super::parse_zip_keys(Some("b"), "r/", r#"["x, y.pdf","z/w"]"#).unwrap(),
+            [pair("b", "r/x, y.pdf"), pair("b", "r/z/w")]
+        );
+        assert!(super::parse_zip_keys(Some("b"), "", "x,y").is_err());
+        assert_eq!(
+            super::parse_zip_keys(None, "", "b/x,c/y").unwrap(),
+            [pair("b", "x"), pair("c", "y")]
+        );
+        assert_eq!(
+            super::parse_zip_keys(None, "", r#"["b/x, y"]"#).unwrap(),
+            [pair("b", "x, y")]
         );
     }
 

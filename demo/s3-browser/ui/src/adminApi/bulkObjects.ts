@@ -92,14 +92,32 @@ export async function listAllUnderPrefix(bucket: string, prefix: string): Promis
   return adminJson(`/api/admin/objects/list?${qs.toString()}`, { context: 'List under prefix' });
 }
 
+/** The deepest folder (`a/b/`) that every key is under, or `''`. */
+function sharedFolder(keys: string[]): string {
+  let folder = keys.length ? keys[0].slice(0, keys[0].lastIndexOf('/') + 1) : '';
+  for (const key of keys) {
+    while (folder && !key.startsWith(folder)) {
+      folder = folder.slice(0, folder.slice(0, -1).lastIndexOf('/') + 1);
+    }
+  }
+  return folder;
+}
+
 /**
- * Build the same-origin URL for a server-streamed zip download. Used
- * by the browser as an `<a href download>` target — no JS-side body
- * assembly. Pass `bucketKeys` as `["bucket/key1", "bucket/key2"]`.
- * Admin GUI session required when the URL is fetched.
+ * Build the same-origin URL for a server-streamed zip download of `keys`
+ * in `bucket`. Used by the browser as an `<a href download>` target — no
+ * JS-side body assembly. The bucket and the shared folder go once, and
+ * the keys below that folder as a JSON array (a key may contain a comma).
+ * That fits more keys in one URL than a list of full `bucket/key` names
+ * (review A12). A session of the file browser is required when the URL is
+ * fetched.
  */
-export function bulkZipDownloadUrl(bucketKeys: string[]): string {
-  // A JSON array, not a comma join: an object key may contain a comma.
-  const qs = new URLSearchParams({ keys: JSON.stringify(bucketKeys) });
+export function bulkZipDownloadUrl(bucket: string, keys: string[]): string {
+  const prefix = sharedFolder(keys);
+  const qs = new URLSearchParams({
+    bucket,
+    prefix,
+    keys: JSON.stringify(keys.map((k) => k.slice(prefix.length))),
+  });
   return `${BASE}/api/admin/objects/zip?${qs.toString()}`;
 }

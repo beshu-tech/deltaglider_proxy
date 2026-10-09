@@ -159,7 +159,7 @@ mod tests {
         const ALLOW: &[&str] = &[
             "auth.rs:BrowserSessionConnectRequest.bucket",
             "auth.rs:OpenBrowserConnectRequest.bucket",
-            // Parsed from one comma list, each entry checked in download_zip.
+            // A JSON array (or a legacy list); download_zip checks each key.
             "objects.rs:ZipQuery.keys",
         ];
         let mut offenders = Vec::new();

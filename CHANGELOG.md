@@ -263,8 +263,11 @@ broke the same way. Now only a reference that is a whole value is tagged.
   the proxy cut a name inside a character.
 - A ZIP download of a key that contains a comma split the key in two: the
   archive left the object out, or held an unrelated object. The admin GUI
-  now sends the keys as a JSON array, and an entry that is not
-  `bucket/key` fails the request with `400`.
+  now sends the bucket once, the folder that the keys share once, and the
+  keys below that folder as a JSON array (new `bucket` and `prefix`
+  parameters), so one ZIP holds at least as many keys as before. The older
+  `bucket/key` form is still accepted, and an entry that is not `bucket/key`
+  fails the request with `400`.
 - A bulk move between two bucket names that point to the same storage
   (`alias`) copied each object onto itself and then deleted it, so the
   object was lost under both names. Now the move sees that the two names are
