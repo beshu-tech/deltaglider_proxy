@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Security — The coordination bucket is not a copy source
+
+The coordination bucket (`config_sync_bucket`) refused every S3 request
+that named it as the request bucket, but CopyObject and UploadPartCopy
+accepted it as the copy source. A user with read access on `*` could copy
+the synced IAM database, leases and locks into a bucket of their own and
+read them. Now a copy from the coordination bucket gets `403 AccessDenied`
+for every identity.
+
 ### Security — ListMultipartUploads respects the caller's prefixes
 
 A user allowed to list only some prefixes of a bucket, or an anonymous

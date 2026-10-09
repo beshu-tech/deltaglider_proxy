@@ -3,6 +3,21 @@
 use super::*;
 use crate::storage::DynStorageBackend;
 
+/// B029: the coordination bucket is refused as a copy source, for every
+/// identity (open mode included), before the IAM check.
+#[test]
+fn the_reserved_bucket_is_no_copy_source() {
+    let registry = crate::bucket_policy::BucketPolicyRegistry::new(std::iter::empty(), 0.75)
+        .with_reserved_bucket(Some("dgp-sync"));
+    let refused =
+        check_copy_source_access_s3s(&registry, None, "DGP-Sync", "k", None, &Default::default());
+    assert!(refused.is_err(), "a reserved copy source was read");
+    assert!(
+        check_copy_source_access_s3s(&registry, None, "other", "k", None, &Default::default())
+            .is_ok()
+    );
+}
+
 /// X-ray H17: CopyObject source-read auth must honor IP-scoped conditions.
 /// The context-free can() ignored aws:SourceIp; can_with_context + the
 /// threaded client IP fixes it.
@@ -37,6 +52,7 @@ fn copy_source_access_honors_source_ip_condition() {
     // From a denied IP → AccessDenied (was silently allowed before the fix).
     assert!(
         check_copy_source_access_s3s(
+            &crate::bucket_policy::BucketPolicyRegistry::new(std::iter::empty(), 0.75),
             Some(&user),
             "src",
             "k",
@@ -49,6 +65,7 @@ fn copy_source_access_honors_source_ip_condition() {
     // From an allowed IP → Ok.
     assert!(
         check_copy_source_access_s3s(
+            &crate::bucket_policy::BucketPolicyRegistry::new(std::iter::empty(), 0.75),
             Some(&user),
             "src",
             "k",

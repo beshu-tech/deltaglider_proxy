@@ -17,6 +17,7 @@ pub(super) async fn copy_object(
         .get::<crate::api::auth::RequestClientIp>()
         .map(|c| c.0);
     check_copy_source_access_s3s(
+        svc.state.engine.load().bucket_policy_registry(),
         auth_user.as_ref(),
         &source_bucket,
         &source_key,
@@ -222,6 +223,7 @@ pub(super) async fn upload_part_copy(
         .get::<crate::api::auth::RequestClientIp>()
         .map(|c| c.0);
     check_copy_source_access_s3s(
+        svc.state.engine.load().bucket_policy_registry(),
         auth_user.as_ref(),
         &source_bucket,
         &source_key,
@@ -337,12 +339,18 @@ pub(crate) fn copy_source_bucket_key(
 }
 
 pub(super) fn check_copy_source_access_s3s(
+    registry: &crate::bucket_policy::BucketPolicyRegistry,
     auth_user: Option<&AuthenticatedUser>,
     source_bucket: &str,
     source_key: &str,
     client_ip: Option<std::net::IpAddr>,
     headers: &axum::http::HeaderMap,
 ) -> s3s::S3Result<()> {
+    // The request gate refuses the coordination bucket as the PATH bucket;
+    // a copy names a second bucket, refused here for every identity.
+    if let Some(reason) = registry.reserved_bucket_reason(source_bucket) {
+        return Err(crate::api::errors::S3Error::AccessDeniedReason(reason).into());
+    }
     let Some(user) = auth_user else {
         return Ok(());
     };

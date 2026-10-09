@@ -143,3 +143,49 @@ async fn a_config_that_exposes_the_coordination_bucket_is_refused() {
         r.status()
     );
 }
+
+/// B029: the coordination bucket is not a copy source either.
+#[tokio::test]
+async fn the_coordination_bucket_is_not_a_copy_source() {
+    let server = reserved_server().await;
+    let data = server.data_dir().expect("filesystem data dir");
+    // The filesystem layout: {root}/{bucket}/deltaspaces/{prefix}/{file}.
+    let dir = data.join(SYNC).join("deltaspaces").join("_dgp");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("lease.json"), b"secret").unwrap();
+    let s3 = server.s3_client().await;
+    let copy = s3
+        .copy_object()
+        .bucket(server.bucket())
+        .key("stolen")
+        .copy_source(format!("{SYNC}/_dgp/lease.json"))
+        .send()
+        .await;
+    assert_eq!(
+        status_of(copy),
+        403,
+        "CopyObject from the coordination bucket"
+    );
+
+    let upload = s3
+        .create_multipart_upload()
+        .bucket(server.bucket())
+        .key("stolen-part")
+        .send()
+        .await
+        .expect("create upload");
+    let part = s3
+        .upload_part_copy()
+        .bucket(server.bucket())
+        .key("stolen-part")
+        .upload_id(upload.upload_id().unwrap())
+        .part_number(1)
+        .copy_source(format!("{SYNC}/_dgp/lease.json"))
+        .send()
+        .await;
+    assert_eq!(
+        status_of(part),
+        403,
+        "UploadPartCopy from the coordination bucket"
+    );
+}
