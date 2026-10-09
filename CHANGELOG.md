@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Fixed — A filesystem listing names each object by its file
+
+On the filesystem backend, a listing without a delimiter took each key from
+the metadata stored with the file, not from the file name. A delta stored
+without that metadata was listed as `name.delta`, which no request can
+delete, so a mirror tool failed on it at every run. A copy made by
+replication or a bulk copy cloned the metadata of its source, so a copy
+under a new name was listed under the source's name. An object whose
+metadata could not be read was left out of every listing, so a mirror tool
+deleted its copies. Now every listing names each object by its file, and an
+object whose metadata cannot be read is listed with its stored size and
+date.
+
 ### Fixed — A disk fault no longer reads as a missing file on the filesystem backend
 
 The filesystem backend checked whether a file or a directory existed, and

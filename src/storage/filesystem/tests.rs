@@ -1321,3 +1321,100 @@ async fn a_stat_error_never_reads_as_absent() {
     drop(object);
     assert_eq!(fs.bulk_list_objects("b", "").await.unwrap().len(), 1);
 }
+
+/// One bucket `b` with, under `x/`: a passthrough `a.txt`, a delta
+/// `app-2.zip` without its xattr, a delta `app-3.zip` whose xattr names
+/// another file (a copy that cloned the source metadata), a delta
+/// `app-4.zip` whose xattr is not JSON, and the folder marker `x/`.
+async fn listing_fixture() -> (tempfile::TempDir, FilesystemBackend) {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = FilesystemBackend::new(dir.path().to_path_buf())
+        .await
+        .unwrap();
+    fs.create_bucket("b").await.unwrap();
+    let pass = FileMetadata::new_passthrough("a.txt".into(), "s".into(), "m".into(), 1, None);
+    fs.put_passthrough("b", "x", "a.txt", b"a", &pass)
+        .await
+        .unwrap();
+    let delta = |name: &str| {
+        FileMetadata::new_delta(
+            name.into(),
+            "s".into(),
+            "m".into(),
+            100,
+            "x/reference.bin".into(),
+            "r".into(),
+            3,
+            None,
+        )
+    };
+    let proof = crate::deltaglider::RefWriteProof::for_tests();
+    for (file, named) in [
+        ("app-2.zip", "app-2.zip"),
+        ("app-3.zip", "app-1.zip"),
+        ("app-4.zip", "app-4.zip"),
+    ] {
+        fs.put_delta("b", "x", file, b"ddd", &delta(named), proof)
+            .await
+            .unwrap();
+    }
+    let deltas = dir.path().join("b/deltaspaces/x");
+    xattr::remove(deltas.join("app-2.zip.delta"), xattr_meta::XATTR_NAME).unwrap();
+    xattr::set(
+        deltas.join("app-4.zip.delta"),
+        xattr_meta::XATTR_NAME,
+        b"not json {{{",
+    )
+    .unwrap();
+    fs.put_directory_marker("b", "x/").await.unwrap();
+    (dir, fs)
+}
+
+/// Review D4: both listing forms name each object by its stored file. The
+/// flat listing named a delta without an xattr `x/app-2.zip.delta`, and a
+/// delta with a cloned xattr by the SOURCE's name.
+#[tokio::test]
+async fn flat_and_delimited_listings_name_the_same_keys() {
+    let (_dir, fs) = listing_fixture().await;
+    let flat: std::collections::BTreeSet<String> = fs
+        .bulk_list_objects("b", "x/")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    let delimited: std::collections::BTreeSet<String> = fs
+        .list_objects_delegated("b", "x/", Some("/"), 1000, None)
+        .await
+        .unwrap()
+        .unwrap()
+        .objects
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    let want: std::collections::BTreeSet<String> =
+        ["x/", "x/a.txt", "x/app-2.zip", "x/app-3.zip", "x/app-4.zip"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+    assert_eq!(flat, want, "flat listing");
+    assert_eq!(delimited, want, "delimited listing");
+}
+
+/// Review D3: an object whose metadata cannot be read is still listed
+/// (from its stat, as a delta when its name says so), and the deltaspace
+/// scan counts it. A listing that dropped it let a mirror tool delete the
+/// copies.
+#[tokio::test]
+async fn list_keeps_an_object_whose_metadata_cannot_be_read() {
+    let (_dir, fs) = listing_fixture().await;
+    let flat = fs.bulk_list_objects("b", "x/").await.unwrap();
+    let (_, meta) = flat.iter().find(|(k, _)| k == "x/app-4.zip").unwrap();
+    assert!(meta.is_unresolved_delta_stub(), "{:?}", meta.storage_info);
+    assert_eq!(meta.file_size, 3, "the stored size");
+    assert_eq!(meta.original_name, "app-4.zip");
+    let scan = fs.scan_deltaspace("b", "x").await.unwrap();
+    let mut names: Vec<&str> = scan.iter().map(|m| m.original_name.as_str()).collect();
+    names.sort();
+    assert_eq!(names, ["", "a.txt", "app-2.zip", "app-3.zip", "app-4.zip"]);
+}

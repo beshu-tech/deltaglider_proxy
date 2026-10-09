@@ -47,6 +47,42 @@ fn key_filename(name: &str) -> &str {
     }
 }
 
+/// What a file of a deltaspace directory stores, by its name (review D4:
+/// a listing takes the key and the kind from the stored name, never from
+/// the metadata inside, which a copy can clone from another file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoredName<'a> {
+    /// This backend's temp file: no object.
+    Internal,
+    /// The deltaspace's delta reference.
+    Reference,
+    /// An object, whose key ends in `key_filename` (empty: the folder
+    /// marker).
+    Object {
+        key_filename: &'a str,
+        variant: super::traits::ObjectVariant,
+    },
+}
+
+fn stored_name(name: &str) -> StoredName<'_> {
+    use super::traits::ObjectVariant;
+    if is_internal_temp_name(name) {
+        StoredName::Internal
+    } else if name == "reference.bin" {
+        StoredName::Reference
+    } else if let Some(stem) = name.strip_suffix(".delta") {
+        StoredName::Object {
+            key_filename: stem,
+            variant: ObjectVariant::Delta,
+        }
+    } else {
+        StoredName::Object {
+            key_filename: key_filename(name),
+            variant: ObjectVariant::Passthrough,
+        }
+    }
+}
+
 /// Is `name` one of this backend's temp files, and so never a user object?
 /// `.dg-tmp.*` (current) or tempfile's default `.tmpXXXXXX` (older
 /// releases). Every other `.`-name (`.env`, `.gitignore`) is a user object:
@@ -266,6 +302,70 @@ impl FilesystemBackend {
             None,
             StorageInfo::Passthrough,
         ))
+    }
+
+    /// One object file of a listing or a scan (review D3, D4): the key and
+    /// the kind come from the file name; the metadata is the xattr. A file
+    /// without one, or with one that cannot be read or that names the other
+    /// kind, is listed from its stat (a delta as an unresolved stub): a
+    /// listing that dropped it let a mirror tool delete the copies, and a
+    /// scan that dropped it let a delete reclaim the reference. `None`: not
+    /// an object file, or deleted during the walk. A stat error fails.
+    async fn listed_entry(
+        path: &Path,
+        name: &str,
+    ) -> Result<Option<(String, FileMetadata)>, StorageError> {
+        use super::traits::ObjectVariant;
+        use crate::types::StorageInfo;
+        let StoredName::Object {
+            key_filename,
+            variant,
+        } = stored_name(name)
+        else {
+            return Ok(None);
+        };
+        let kind_matches = |meta: &FileMetadata| match variant {
+            ObjectVariant::Delta => matches!(meta.storage_info, StorageInfo::Delta { .. }),
+            ObjectVariant::Passthrough => matches!(meta.storage_info, StorageInfo::Passthrough),
+        };
+        match xattr_meta::read_metadata(path).await {
+            Ok(mut meta) if kind_matches(&meta) => {
+                meta.original_name = key_filename.to_string();
+                return Ok(Some((key_filename.to_string(), meta)));
+            }
+            Ok(meta) => tracing::warn!(
+                "{path:?}: the metadata names another kind ({:?}); listed from its stat",
+                meta.storage_info
+            ),
+            Err(StorageError::NotFound(_)) => {} // an unmanaged file
+            Err(e @ (StorageError::Io(_) | StorageError::Serialization(_))) => {
+                tracing::warn!("{path:?}: unreadable metadata ({e}); listed from its stat")
+            }
+            Err(e) => return Err(e),
+        }
+        let Some(stat) = fsio::stat(path).await? else {
+            return Ok(None);
+        };
+        if !stat.is_file() {
+            return Ok(None);
+        }
+        let modified = stat
+            .modified()
+            .map(chrono::DateTime::<chrono::Utc>::from)
+            .unwrap_or_else(|_| chrono::Utc::now());
+        let kind = match variant {
+            ObjectVariant::Delta => StorageInfo::delta_stub(stat.len()),
+            ObjectVariant::Passthrough => StorageInfo::Passthrough,
+        };
+        let meta = FileMetadata::fallback(
+            key_filename.to_string(),
+            stat.len(),
+            synthesise_unmanaged_etag(stat.len(), &modified),
+            modified,
+            None,
+            kind,
+        );
+        Ok(Some((key_filename.to_string(), meta)))
     }
 
     /// Ensure a directory exists, **without** silently creating the
@@ -532,49 +632,15 @@ impl FilesystemBackend {
                     baselines.push((rel, md.len()));
                     continue;
                 }
-                // Skip this backend's temp files (not user objects)
-                if is_internal_temp_name(&name) {
+                let Some((key_name, meta)) = Self::listed_entry(&path, &name).await? else {
                     continue;
-                }
-
-                // Read xattr metadata, falling back to filesystem stats for unmanaged files
-                let meta = match xattr_meta::read_metadata(&path).await {
-                    Ok(m) => m,
-                    Err(StorageError::NotFound(_)) => {
-                        match Self::fallback_metadata_from_path(&path, &name).await {
-                            Ok(m) => m,
-                            Err(e) => {
-                                debug!("Failed to read metadata for {:?}: {}", path, e);
-                                continue;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        debug!("Error reading xattr for {:?}: {}", path, e);
-                        continue;
-                    }
                 };
-
-                // Skip Reference storage info entries
-                if matches!(
-                    meta.storage_info,
-                    crate::types::StorageInfo::Reference { .. }
-                ) {
-                    continue;
-                }
 
                 // Compute user-visible key from relative path
                 let relative_dir = current_dir
                     .strip_prefix(deltaspaces_dir)
                     .unwrap_or(Path::new(""));
                 let dir_str = relative_dir.to_string_lossy();
-
-                // The marker file is the key `dir/`, whatever its xattr says.
-                let key_name = if name == DIR_MARKER_FILE {
-                    ""
-                } else {
-                    meta.original_name.as_str()
-                };
                 if dir_str.is_empty() && key_name.is_empty() {
                     continue;
                 }
@@ -1013,7 +1079,11 @@ impl StorageBackend for FilesystemBackend {
     ) -> Result<FileMetadata, StorageError> {
         let path = self.delta_path(bucket, prefix, filename)?;
         match xattr_meta::read_metadata(&path).await {
-            Ok(meta) => Ok(meta),
+            // The key's file name, whatever the xattr says (review D4).
+            Ok(meta) => Ok(FileMetadata {
+                original_name: filename.to_string(),
+                ..meta
+            }),
             Err(StorageError::NotFound(_)) => {
                 // No xattr metadata — fall back to filesystem stats if the file exists.
                 Self::fallback_metadata_from_path(&path, filename).await
@@ -1150,7 +1220,11 @@ impl StorageBackend for FilesystemBackend {
     ) -> Result<FileMetadata, StorageError> {
         let path = self.passthrough_path(bucket, prefix, filename)?;
         match xattr_meta::read_metadata(&path).await {
-            Ok(meta) => Ok(meta),
+            // The key's file name, whatever the xattr says (review D4).
+            Ok(meta) => Ok(FileMetadata {
+                original_name: filename.to_string(),
+                ..meta
+            }),
             Err(StorageError::NotFound(_)) => {
                 // No xattr metadata — file may exist without DG metadata (unmanaged).
                 // Fall back to filesystem stats if the file exists.
@@ -1330,38 +1404,27 @@ impl StorageBackend for FilesystemBackend {
         let mut entries = fs::read_dir(&dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                // Match data files: reference.bin, *.delta, or passthrough files (any other file)
-                let is_data_file = !is_internal_temp_name(name);
-
-                if is_data_file {
-                    match xattr_meta::read_metadata(&path).await {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if entry.file_type().await?.is_dir() {
+                continue; // a child deltaspace
+            }
+            match stored_name(name) {
+                StoredName::Internal => {}
+                StoredName::Reference => match xattr_meta::read_metadata(&path).await {
+                    Ok(meta) => metadata_list.push(meta),
+                    // Listed as a passthrough, so a delete never reclaims a
+                    // reference that it cannot describe (fail closed).
+                    Err(_) => match Self::fallback_metadata_from_path(&path, name).await {
                         Ok(meta) => metadata_list.push(meta),
-                        Err(StorageError::NotFound(_)) => {
-                            // No xattr — try filesystem stats for unmanaged files
-                            if let Ok(meta) = Self::fallback_metadata_from_path(&path, name).await {
-                                metadata_list.push(meta);
-                            }
-                        }
-                        Err(e) => {
-                            // An object whose metadata cannot be read is
-                            // still an object: listing it as one keeps
-                            // reference reclaim from deleting reference.bin
-                            // under a delta (fail closed).
-                            tracing::warn!("Error reading xattr for {:?}: {}", path, e);
-                            match Self::fallback_metadata_from_path(&path, name).await {
-                                Ok(meta) => metadata_list.push(meta),
-                                Err(_) => metadata_list.push(FileMetadata::fallback(
-                                    name.to_string(),
-                                    0,
-                                    String::new(),
-                                    chrono::Utc::now(),
-                                    None,
-                                    crate::types::StorageInfo::Passthrough,
-                                )),
-                            }
-                        }
+                        Err(StorageError::NotFound(_)) => {}
+                        Err(e) => return Err(e),
+                    },
+                },
+                StoredName::Object { .. } => {
+                    if let Some((_, meta)) = Self::listed_entry(&path, name).await? {
+                        metadata_list.push(meta);
                     }
                 }
             }
@@ -1577,17 +1640,15 @@ impl StorageBackend for FilesystemBackend {
                 common_prefixes.insert(cp);
             } else {
                 // Temp files and reference.bin are internal, not objects.
-                if is_internal_temp_name(&name) || name == "reference.bin" {
+                let StoredName::Object {
+                    key_filename: user_filename,
+                    variant,
+                } = stored_name(&name)
+                else {
                     continue;
-                }
-
-                let is_delta = name.ends_with(".delta");
-                let user_filename = if is_delta {
-                    // Strip ".delta" suffix to get the user-visible name.
-                    name[..name.len() - 6].to_string()
-                } else {
-                    key_filename(&name).to_string()
                 };
+                let is_delta = variant == super::traits::ObjectVariant::Delta;
+                let user_filename = user_filename.to_string();
 
                 // Apply name filter. A marker file at the bucket root names
                 // no key.
@@ -1643,34 +1704,9 @@ impl StorageBackend for FilesystemBackend {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or_default();
-            let meta = match xattr_meta::read_metadata(&path).await {
-                Ok(m) => m,
-                Err(StorageError::NotFound(_)) => {
-                    match Self::fallback_metadata_from_path(&path, filename).await {
-                        Ok(m) => m,
-                        Err(e) => {
-                            debug!(
-                                "Skipping {:?} in delegated list (metadata error): {}",
-                                path, e
-                            );
-                            continue;
-                        }
-                    }
-                }
-                Err(e) => {
-                    debug!("Skipping {:?} in delegated list (xattr error): {}", path, e);
-                    continue;
-                }
+            let Some((_, meta)) = Self::listed_entry(&path, filename).await? else {
+                continue; // deleted during the listing
             };
-
-            // Skip Reference storage info (should not appear as user objects).
-            if matches!(
-                meta.storage_info,
-                crate::types::StorageInfo::Reference { .. }
-            ) {
-                continue;
-            }
-
             final_objects.push((key, meta));
         }
 

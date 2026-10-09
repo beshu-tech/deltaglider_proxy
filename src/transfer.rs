@@ -1191,6 +1191,9 @@ async fn delta_passthrough_copy(
     // LOGICAL fields (file_sha256/file_size/multipart_etag/original_name/
     // content_type/StorageInfo::Delta{}) survive; stamp provenance + strip.
     let mut meta = source_head.clone();
+    // The destination's own name (review D4): a cloned source name named a
+    // renamed copy after its source.
+    meta.original_name = dest_filename.clone();
     if let Some(provenance) = request.provenance {
         meta.user_metadata.insert(
             provenance.metadata_key.to_string(),
