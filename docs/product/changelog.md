@@ -8,7 +8,656 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-10-02_
+_Last updated: 2026-10-09_
+
+## v2.0.3 — 2026-10-09
+
+### Fixed — A filesystem listing names each object by its file
+
+On the filesystem backend, a listing without a delimiter took each key from
+the metadata stored with the file, not from the file name. A delta stored
+without that metadata was listed as `name.delta`, which no request can
+delete, so a mirror tool failed on it at every run. A copy made by
+replication or a bulk copy cloned the metadata of its source, so a copy
+under a new name was listed under the source's name. An object whose
+metadata could not be read was left out of every listing, so a mirror tool
+deleted its copies. Now every listing names each object by its file, and an
+object whose metadata cannot be read is listed with its stored size and
+date.
+
+### Fixed — A disk fault no longer reads as a missing file on the filesystem backend
+
+The filesystem backend checked whether a file or a directory existed, and
+it read every error of that check (a disk fault, a permission error) as "it
+does not exist". So, on a disk fault, a PUT could write a new delta
+reference over the live one, and the objects stored as deltas against it
+could not be read again. A DELETE could remove the delta reference while
+deltas still needed it, or answer success without deleting. A listing could
+come back empty, and a mirror tool then deleted its copies, and a bucket
+could look missing. Now only "no such file" means that a file does not
+exist. Every other error fails the request, and nothing changes.
+
+### Security — A folder selection reads only what the user can see
+
+When a user without admin rights selected a folder in the file browser, the
+proxy listed every key under the folder and only then skipped the keys that
+the user may not see. A folder with millions of hidden keys made one request
+read all of them. Now the folder listing uses the same walk as an S3 `LIST`:
+it reads only the prefixes that the user's policy can reach, and when it must
+skip hidden keys, it reads at most `advanced.filtered_list_max_engine_pages`
+backend pages for the whole folder. A folder that this limit cannot read to
+its end fails with `400`, because a partial folder must not become the
+selection of a copy, move or delete.
+
+### Security — ZIP entry names cannot point outside the extraction folder
+
+The ZIP download named each entry after its object key below the shared
+folder. A key is chosen by whoever writes the object, so a name could start
+with `/` (the key `a//etc/passwd` with the folder `a/` cut), hold `\` (a
+folder separator for Windows tools), or start with a drive such as `C:`.
+Some extractors then wrote such an entry outside the folder the user chose.
+Now such a name is percent-escaped, and every other name is unchanged.
+
+### Fixed — A masked secret that cannot be restored is refused by name
+
+A config write that kept a masked value (`__redacted__`) which the proxy
+could not put back ended in four different ways: a webhook header was
+dropped, the Slack bot token or the webhook URL was cleared, and a masked
+entry of an edited `webhook_urls` list stayed and was refused with advice to
+set `event_delivery.allow_local`. Now every such write is refused at once
+with a message that names the field and says what to enter. A masked URL
+list may also grow: URLs appended after the masked ones are kept.
+
+### Fixed — A backup no longer holds values that come from `${env:…}` references
+
+A full backup's `secrets.json` held the resolved value of every secret that
+the config file takes from a `${env:NAME}` reference: the bootstrap SigV4
+secret, the S3 credentials of a backend, an encryption key, the Slack bot
+token, webhook header values and webhook URLs. A restore then wrote those
+values over the `${env:NAME}` references in the restored config, so the
+config file held the other host's secrets in plain text. A Slack webhook
+list that mixed a reference and a masked URL was also refused at restore
+(`422`). Now the backup carries only literal secrets, the restore fills
+only the values that the export masked, and every `${env:NAME}` reference
+stays a reference. A backup from an earlier release still restores: its
+values for referenced slots are ignored, so set the variables on the new
+instance (and list them in `DGP_CONFIG_ENV_ALLOWLIST` when the new boot
+config does not use them).
+
+### Fixed — An abandoned filesystem write no longer lands late
+
+- On a filesystem backend, a write renamed its temp file into place on a
+  detached task. When the client went away mid-upload, the proxy released
+  the folder lock, but the detached task still renamed. A later upload to
+  the same key could then be overwritten by the abandoned one. Now the
+  rename checks that its caller is still waiting; an abandoned write
+  removes its temp file and does not rename.
+
+### Fixed — Storage faults no longer make objects vanish or come back
+
+- On a filesystem backend, an object whose metadata could not be read was
+  left out when the proxy checked whether a folder still held objects. A
+  delete of the last other object then removed the folder's delta
+  reference, and the unreadable object could never be read again. Now such
+  an object counts as present.
+- An I/O error while the proxy read an object's metadata (a permission
+  error, a disk fault) counted as "no such object": HEAD and GET answered
+  `404`, DELETE answered `204` without deleting, and a PUT with
+  `If-None-Match: *` overwrote the object. Now the request fails with an
+  error and changes nothing.
+- When a DELETE removed an object but could not remove an older second copy
+  of it (left behind by an interrupted upload), it still answered success,
+  and the older copy then came back as the object. Now the DELETE removes
+  the older copy first. When either step fails, the DELETE fails and the
+  object stays as it was, and a retry removes both. On an S3 backend, a
+  conditional delete (a lifecycle expiry, the source delete of a move) also
+  pins the older copy that it saw, so a newer object that another proxy
+  instance writes under the same name during the delete is never removed.
+- `POST /_/api/admin/migrate` (the legacy reference migration) wrote the
+  legacy bytes back over an object that a client had stored later under the
+  same name. Now it leaves such an object alone and only renames the
+  reference.
+
+### Fixed — A failed migrate flip cannot leave the routing split
+
+A migrate job switches a bucket to its new backend and saves the
+configuration file in one step. When the save failed and the proxy also
+could not rebuild the previous storage setup, it restored the previous
+configuration but kept serving the bucket from the new backend. New writes
+then went where the configuration did not point, and a later cleanup could
+remove them. Now the proxy also restores the storage setup that served the
+previous configuration.
+
+### Fixed — The bucket scan ends when its result is ready
+
+The diagnostics bucket scan marked its progress as finished after the last
+page of the object listing, but it then still read the delta references.
+The GUI ended the scan too early: the bucket dropped out of the totals,
+"Scan all" started the next bucket on top of it, and the stored size
+excluded the references. Now the scan reports "finished" only after its
+result, references included, is recorded. A scan that fails or is stopped
+also ends with a last message that carries its error: the GUI shows the
+error, keeps the previous result, and "Scan all" goes on with the next
+bucket. When the GUI loses the progress of a scan, it stops the queue and
+says so, instead of starting the next scan beside it.
+
+### Fixed — Selecting a folder of exactly 10,000 objects works
+
+The bulk copy, move, delete and ZIP endpoints accept up to 10,000 keys. The
+listing that the admin GUI uses to select a whole folder reported a folder
+of exactly 10,000 objects as "more than 10,000", so the GUI refused the
+selection. Now only a folder with more keys than that is reported as too
+large.
+
+### Fixed — The Jobs screen always shows the running maintenance job
+
+`GET /_/api/admin/jobs` listed the 50 newest maintenance jobs, but the
+worker runs the oldest queued job first. With more than 50 jobs (for example
+a re-encrypt of 60 buckets), the running job and its Cancel button were not
+shown. Now every queued, running or cancelling job is listed, plus the
+newest finished ones.
+
+### Fixed — The implicit default backend cannot be deleted
+
+Without a `default_backend` key, the first named backend holds every
+bucket that has no route. The admin API refused to delete only a backend
+named in `default_backend`, so it deleted the implicit default, and every
+such bucket then answered `NoSuchBucket`. Now the implicit default is
+refused too, and the backend list marks it as the default.
+
+### Fixed — The IAM import preview shows a deletion of every mapping rule
+
+A full-IAM YAML import without `group_mapping_rules` deletes every group
+mapping rule. The preview counted that as 0 rules, and when it was the only
+change it reported "no changes", so the GUI disabled Apply while a direct
+API apply still deleted every rule. Now the preview counts the rules it
+deletes and reports a change.
+
+### Fixed — An admin change finishes even when the browser disconnects
+
+When the client of an admin request disconnected (a closed tab, a client
+timeout, a dropped network), the proxy stopped the request where it was. A
+change could then stay half done: a bucket route saved without its bucket, a
+restored configuration without the restored IAM database, a deleted user or
+a revoked key whose change never reached the other nodes, or a new sign-in
+provider whose change never reached the other nodes. Now every
+admin request that changes state runs to its end, whether or not the client
+still waits for the answer.
+
+### Fixed — A short `${env:…}` value goes back only where it came from
+
+When the proxy saves its configuration, it writes `${env:NAME}` back in
+place of each value that came from the environment. It found those values
+by their text. After an operator changed the field that a short value such
+as `us-east-1` had filled, the proxy could write `${env:DR_REGION}` into
+another field that held the same text, for example the region of another
+backend. Now the proxy remembers where each short value came from and
+writes the reference back only there, and only while the value is
+unchanged. When a configuration section is saved with the reference in it
+at another place (a renamed backend, a moved list item), the place moves
+with it. A secret-length value is still replaced wherever it appears.
+
+### Fixed — Config validate refuses what the apply refuses
+
+The admin validate endpoints (`POST /config/validate` and
+`POST /config/section/<name>/validate`) answered `ok: true` for some changes
+that the apply then refused with `422`: a configuration error that also
+stops the proxy at startup, a webhook URL that every delivery would refuse,
+and a sync bucket without `DGP_CONFIG_DB_KEY`. Now validate runs the same
+checks and answers `422`. The live backend probes still run only when you
+apply.
+
+### Security — Allowlisted env values no longer echo in validate responses
+
+An admin config validate (and a refused apply) replaces every resolved
+`${env:…}` value with its reference before it answers. A value resolved
+through `DGP_CONFIG_ENV_ALLOWLIST`, which the boot config file did not use,
+was missing from that list, so the response showed the value in plain text,
+for example in a warning about a bucket alias. Now such values are hidden
+too, for a section write, a whole-document validate or apply, and every
+other config write.
+
+### Fixed — Editing a masked webhook list cannot bring back a deleted URL
+
+In Slack incoming-webhook mode, the exported `webhook_urls` list shows each
+URL masked. When an operator deleted one entry and added another, the list
+kept its length, and the proxy put the old URLs back by position: the
+deleted URL returned and the kept one was lost. Now the proxy restores the
+masked entries only when every visible entry is unchanged at its position.
+Otherwise the masked entry stays masked, and the apply asks for the real URL.
+
+### Fixed — A `$` in a multi-line text no longer doubles at each save
+
+The proxy writes a literal `$` as `$$` in the configuration file and reads
+`$$` back as `$`. In a multi-line text (`|` or `>`), a line that started
+with `#` was read as a comment, so its `$$` stayed `$$`: a reject message
+line such as `# Fee: $5` became `$$5`, then `$$$$5` after the next save.
+Now such a line is text, and `${env:…}` on it is expanded too.
+
+### Security — `DGP_CONFIG_ENV_ALLOWLIST` never admits the config-DB key
+
+`DGP_CONFIG_ENV_ALLOWLIST` lets an admin request resolve extra environment
+variables. Its built-in exclusions covered the bootstrap, encryption-key
+and `SECRET` variables, but not `DGP_CONFIG_DB_KEY`,
+`DGP_CONFIG_DB_KEY_PREVIOUS`, `DGP_METRICS_BEARER_TOKEN` or
+`DGP_ADMIN_PASSWORD_HASH`. With an allowlist of `*` or `DGP_*`, an admin
+could put `${env:DGP_CONFIG_DB_KEY}` into a webhook header and receive the
+key. Now every `DGP_*` variable that holds a key, secret, token or password
+hash is excluded, and a `*` pattern never matches a `DGP_*` variable.
+
+### Fixed — `${env:NAME:-default}` keeps its default when the proxy saves the file
+
+When `NAME` was set at startup, a change in the admin GUI saved the
+reference as `${env:NAME}` without its default. The next start without
+`NAME` then failed with a missing-variable error. Now the saved file and the
+export keep the reference as it was written. A name that the file writes
+with two different defaults, or once with a default and once without,
+keeps no default: every reference to it stays required, so a secret never
+falls back to another field's default.
+
+### Fixed — `${env:…}` in a lifecycle count or an admission status loads again
+
+Since v2.0.0, a configuration with `count: ${env:KEEP}` in a `retain-newest`
+lifecycle rule, `status: ${env:S}` in an admission `reject` action,
+`delete_source_after_success: ${env:D}` or `min_size_bytes: ${env:M}`
+failed to load with "data did not match any variant of untagged enum", and
+the proxy did not start. These fields now accept a value from the
+environment.
+
+### Fixed — `${env:…}` inside a glob, a list or a block text stays plain text
+
+Since v2.0.0, a reference that fills a whole YAML value is replaced by a
+tagged string, so that YAML does not turn the value into a number or a
+bool. The proxy also tagged a reference that was only part of a value when
+a `{`, `[` or `,` came before it, and every reference in a block text
+(`|` or `>`). An exclude glob such as `keep/*.{pin,${env:EXTRA}}` then held
+the text `!envref "lock"`, so a lifecycle rule deleted the objects that it
+was meant to keep. Values such as `a,${env:X}` and `http://[${env:V6}]:9000`
+broke the same way. Now only a reference that is a whole value is tagged.
+
+### Fixed — Bulk ZIP and move: non-ASCII folders, commas in keys, aliased buckets
+
+- A ZIP download of objects from folders with non-ASCII names (for example
+  `docs/` and `日本/`) closed the connection without a response, because
+  the proxy cut a name inside a character.
+- A ZIP download of a key that contains a comma split the key in two: the
+  archive left the object out, or held an unrelated object. The admin GUI
+  now sends the bucket once, the folder that the keys share once, and the
+  keys below that folder as a JSON array (new `bucket` and `prefix`
+  parameters), so one ZIP holds at least as many keys as before. The older
+  `bucket/key` form is still accepted, and an entry that is not `bucket/key`
+  fails the request with `400`.
+- A bulk move between two bucket names that point to the same storage
+  (`alias`) copied each object onto itself and then deleted it, so the
+  object was lost under both names. Now the move sees that the two names are
+  one bucket and keeps the object.
+
+### Fixed — "Create bucket here" no longer moves an existing bucket
+
+`POST /_/api/admin/buckets` with the name of a bucket that already existed
+on another backend routed the name to the new backend and created an empty
+bucket there. The objects of the bucket then disappeared for every client.
+Now the request is refused with `409`; a migrate job moves a bucket to
+another backend.
+
+### Fixed — A full backup restores Slack incoming-webhook URLs
+
+In Slack format without a bot token, the URL of an incoming webhook is its
+credential, so a backup's `config.yaml` masks it. The backup did not save
+the URL in `secrets.json`, so a restore on another instance lost a single
+`webhook_url` and refused a `webhook_urls` list. Now the backup saves the
+URLs and the restore puts them back.
+
+### Fixed — Saving the access section keeps declarative IAM secrets
+
+The access section of the admin API hides each declarative user's secret
+key and each auth provider's client secret. When the admin GUI sent the
+section back, for example after a change on the Credentials page, the proxy
+stored the hidden values: an empty secret key, and no client secret, in
+memory and in the YAML file. Now an entry that comes back without its secret
+keeps the current one, matched by name (a user only while its access key id
+is the same).
+
+### Fixed — A declarative flip with only an auth provider no longer wipes the users
+
+A switch from `iam_mode: gui` to `declarative` with no `iam_users` and no
+`iam_groups` is refused, because the reconcile would delete every local user
+and group. A YAML that declared an auth provider or a mapping rule passed
+this check anyway, and the reconcile then deleted every user and group.
+Now such a switch is refused too.
+
+### Fixed — A mapping rule can be set back to "All providers"
+
+The admin GUI sends `"provider_id": null` to change a group mapping rule's
+scope to all providers. The proxy read `null` as "not sent", answered `200`,
+and left the rule scoped to its old provider. Now `null` clears the scope.
+
+### Security — Admin jobs and scans refuse the coordination bucket
+
+The admin API refused the coordination bucket (`config_sync_bucket`) for
+object operations, but a re-encrypt, metadata-backfill or migrate job and
+the bucket, usage and delta-efficiency scans accepted it. A re-encrypt job
+there encrypted the synced IAM database and the lease objects, so the other
+nodes could no longer read them. Now every admin request that names a bucket
+answers `403` for the coordination bucket: jobs, scans (opening the scan
+progress stream starts a scan), the savings and delta-efficiency reads, the
+legacy-reference migration, and the bulk object operations. A job that an
+earlier release queued on that bucket fails when it resumes after the
+upgrade, before it touches the bucket.
+
+### Security — The replay window covers signatures dated ahead of the clock
+
+The proxy accepts a signature that is dated up to the clock skew
+(`DGP_CLOCK_SKEW_SECONDS`, 900 s) in the future, so a signature stays valid
+for up to twice the skew after its first use. The replay window was the
+skew, and the cache cleanup also cut any longer window down to the skew, so
+such a request could be replayed in the second half of its valid life. Now
+the default window (`DGP_REPLAY_WINDOW_SECS`) is twice the skew (1800 s),
+and the cleanup keeps every signature for the whole configured window.
+
+### Security — An IAM import cannot take over a user that an OAuth sign-in created
+
+A declarative apply or a full-IAM import refused a local user whose name
+matched a user that an OAuth sign-in had created, but only when the entry
+had no `auth_source`. An entry with `auth_source: external`, another access
+key and admin groups updated that user, so the person who held the OAuth
+account got the new access key and groups at the next sign-in. Now any entry
+with another access key than the OAuth user of the same name is refused.
+
+### Security — A replayed request stays refused after a retry succeeded
+
+When an SDK retries a PUT or DELETE in the second in which it signed it, the
+retry carries the same signature, and the proxy serves it. If the retry
+succeeded and the first copy then failed, the first copy removed the
+signature from the replay cache, so a captured copy of the request could be
+sent again later and was accepted. Now a copy that succeeds keeps the
+signature in the cache until the replay window ends, and the proxy serves a
+retry only within one second after the first copy, however many retries
+succeed.
+
+### Security — IAM conditions: three cases that showed or granted too much
+
+- A Deny rule on a sub-folder (for example `Deny` on `photos/secret/*`
+  under an `Allow` on the whole bucket) hid the objects in the folder, but a
+  listing with `delimiter=/` still showed the names of its sub-folders. Now
+  a Deny on `list` hides the folder names too. A Deny on `read` alone hides
+  no name, as in AWS: the listing shows the keys and their folders, and the
+  read of an object is refused.
+- A negated condition with several values, such as `NotIpAddress` with two
+  networks or `StringNotLike` with two prefixes, was true when the request
+  missed only one of the values. A Deny then also refused the allowed
+  networks, and an Allow let the excluded prefixes through. AWS reads such a
+  condition as "matches none of the values". Now the proxy refuses this
+  shape when you save the rule, also with `ForAllValues:` or
+  `ForAnyValue:`, and an existing Allow rule of this shape grants nothing.
+  A negated condition with one value works as before.
+- A condition that the proxy cannot evaluate passed validation: a value of
+  the wrong type (`Null` with `"true"` in quotes, a number for a string
+  operator, a number for a date), an empty list, an IP or number operator on
+  `s3:prefix`, or a network such as `10.0.0.0/33`. Every request that reached
+  such a rule then failed its permission check, so the rule also took away
+  the user's other grants, and a Deny rule hid nothing in listings. Now the
+  proxy asks its policy engine whether it can read each value when you save
+  the rule, and refuses it with a message that names the rule. A rule that is
+  already stored (synced from an older instance, for example) is contained:
+  an Allow rule grants nothing, and a Deny rule applies without its
+  condition. A declarative YAML file with such a rule still starts the
+  proxy: the proxy logs an error that names the rule and contains it, and a
+  backup restore keeps the user instead of skipping it. `config lint` and a
+  config apply refuse the rule, so run `config lint` on your YAML before you
+  upgrade. Before, `config lint` passed such a file, and the proxy refused to
+  start with it.
+
+### Security — A successful sign-in no longer clears the failure count of its address
+
+The proxy counts failed sign-ins for each client address and locks the
+address out after too many. Several successful requests cleared that count:
+a signed S3 request, an admin or browser sign-in, a `/_/metrics` request with
+the correct bearer token, a completed OAuth sign-in, a request that only
+started an OAuth sign-in, and an open-mode browser session. The count holds
+guesses at every secret, but each of these requests proves at most one
+secret. A client that held any working credential could therefore guess
+other secrets without limit, because it cleared the count after every few
+guesses. Now no request clears the count of its address. The count ends when
+its window ends (`DGP_RATE_LIMIT_WINDOW_SECS`) or when the lockout ends. A
+successful admin sign-in still clears the failure count of its own account.
+The progressive delay now slows only the refused response, never a request
+that succeeds.
+
+Clients that reach the proxy from one address share one count, for example
+clients behind a NAT, or all clients behind a load balancer whose forwarding
+headers the proxy does not trust. Before, the successful requests of the
+other clients cleared the failures of a client with a wrong secret. Now a
+client that keeps sending a wrong secret locks out every client at its
+address. Behind a load balancer, set `DGP_TRUST_PROXY_HEADERS=true` and
+`DGP_TRUSTED_PROXY_CIDRS`, so that each client has its own count.
+
+### Security — A blank bootstrap secret is no credential
+
+`DGP_SECRET_ACCESS_KEY=` (a compose file that substitutes an unset
+variable) or `secret_access_key: ''` turned SigV4 on with an empty secret.
+Any client that knew the access key id, which the startup log prints, could
+sign with the empty secret and act as the bootstrap admin. Now a blank key
+id or secret counts as not set, so the proxy refuses to start unless other
+credentials or `authentication: none` are configured.
+
+### Security — The coordination bucket is not a copy source
+
+The coordination bucket (`config_sync_bucket`) refused every S3 request
+that named it as the request bucket, but CopyObject and UploadPartCopy
+accepted it as the copy source. A user with read access on `*` could copy
+the synced IAM database, leases and locks into a bucket of their own and
+read them. Now a copy from the coordination bucket gets `403 AccessDenied`
+for every identity.
+
+### Security — ListMultipartUploads respects the caller's prefixes
+
+A user allowed to list only some prefixes of a bucket, or an anonymous
+client on a public prefix, got every in-progress multipart upload of the
+bucket from `GET /<bucket>?uploads`, with keys and upload IDs outside their
+scope. Now the listing shows only the uploads of keys that the caller may
+list, as ListObjects does.
+
+### Fixed — A large copy into an S3 backend keeps the object's metadata
+
+Replication, lifecycle transitions and migrations copy a large plain object
+(64 MiB or more by default) in parts. When the destination was an S3 backend
+without proxy encryption, the stored copy had no DeltaGlider metadata: the
+proxy wrote the metadata only when it created the upload, before it knew
+the hashes, and S3 ignores the metadata that the last step sends. The proxy
+that made the copy hid this with its cache. Another node, or the same node
+after a restart, then saw the copy without its Content-Type and its user
+metadata, and with a different ETag. Now the proxy stores the complete
+metadata when it creates the upload.
+
+### Fixed — The lifecycle scheduler runs only the rules that are still configured
+
+On each tick the lifecycle scheduler took a copy of the rules and ran the
+due ones one after another. One rule can run for hours. When the operator
+deleted, disabled or edited a later rule in that time, or turned lifecycle
+off, the scheduler still ran that rule as it was in the copy, and it could
+delete objects under a rule that no longer existed. Now the scheduler reads
+the live configuration again before it runs each rule, and skips a rule that
+changed.
+
+### Fixed — A delta copy no longer replaces a reference it could not read
+
+Replication, lifecycle transitions, migrations and the admin copy send a
+delta-stored object to its destination as a delta when they can. They read
+the reference of the destination first. When that read failed (an S3 `503`
+or a timeout), the copy took the failure for "no reference" and wrote the
+reference of the source over the live reference of the destination. Every
+other delta-stored object in that folder of the destination then could not
+be read. Now a failed read makes the copy rebuild the object and store it
+the normal way.
+
+### Security — A declarative change to an OAuth provider takes effect at once
+
+In `iam_mode: declarative`, a config apply or a full-IAM YAML import wrote
+OAuth provider changes to the IAM database, but the running sign-in flow
+kept the providers that it loaded at startup. A provider that the YAML
+disabled (for example after an identity provider was compromised) therefore
+kept signing users in, admins included, until a restart. A new provider was
+not available, and a changed client secret was not used. Now both paths
+reload the providers when the reconcile changes one, before the IAM
+database is released, so a disabled provider stops at once. A sign-in that
+started before its provider was disabled is refused when it returns. The
+discovery request to each provider runs after the configuration lock is
+released, so S3 listings and configuration reads do not wait for it.
+
+### Fixed — `sync --delete` keeps the remote copies of unreadable local files
+
+`deltaglider_proxy s3 sync <dir> s3://… --delete` walked the local directory
+and silently left out every directory that it could not list and every file
+that it could not read. The delete step then removed the remote copies of
+those files, and the command exited with status 0. When the root directory
+itself was unreadable, the command deleted the whole remote prefix. Now the
+command prints a warning for each path that it cannot read, keeps the remote
+objects at or under such a path, and exits with an error status. The other
+deletes still run. A path that `--exclude` leaves out completely (for example
+`lost+found` with `--exclude 'lost+found/*'`) is not an error, because no
+object under it is synced.
+
+### Fixed — An empty `delimiter=` lists every object
+
+`mc ls --recursive`, `mc mirror`, `rclone --fast-list` and restic send
+`delimiter=` with an empty value. On a filesystem backend the proxy then
+answered with no objects and one common prefix equal to the request prefix,
+because every key contains the empty string. A mirror with `--remove` could
+then delete every object at its destination. Now an empty delimiter is no
+delimiter, as on AWS S3.
+
+### Fixed — A GET of a key with a leading space serves that key
+
+On an S3 backend, a GET of `shared/ payroll.csv` (with a leading space)
+returned the bytes of `shared/payroll.csv`. The proxy read the stored name
+of the object from its `dg-original-name` metadata, and the S3 SDK trims the
+spaces of every header value that it reads. The IAM check saw only the
+requested key, so a user could read an object that a Deny rule protected.
+An object that a backend copy made from another key had the same defect,
+because the copy keeps the metadata of its source. Now the proxy always
+reads a plain object from the requested key. A `.delta` file that was
+copied in without its DeltaGlider metadata is still read from its stored
+name.
+
+### Security — An IP condition on an admin rule applies to the admin GUI
+
+A Full Access rule (`*` on `*`) with an `aws:SourceIp` condition limited the
+S3 requests of its user to that address range. The admin GUI and the admin
+API did not read the condition, so they accepted the same user from any
+address. Now the condition applies at sign-in and on every later admin
+request, as it does on the S3 API. A condition on another key never holds
+for an admin request, because an admin request carries only the source
+address.
+
+### Fixed — The proxy refuses a change that leaves no credential
+
+You could delete the last IAM user while no bootstrap SigV4 pair and no
+`authentication: none` was set. The proxy then refused every S3 request, the
+log said that the proxy used a bootstrap credential that did not exist, and
+the next restart stopped with "No authentication configured". Now the proxy
+refuses (`409`) every change that leaves no credential: the delete of the
+last IAM user, the removal of the bootstrap pair, the removal of
+`authentication: none` while no IAM user exists, a declarative apply without
+`iam_users`, and an IAM restore without users. Create an IAM user or set a
+bootstrap pair first. A configuration sync from another instance can still
+remove the last user; the proxy then logs a warning and writes the audit
+entry `iam_sync_emptied`. In that state the sign-in page now offers the
+admin password, which opens **Access → Users**; before, it asked only for
+an IAM access key, which nobody had, and a password sign-in handed the
+file browser anonymous keys that every request refused.
+
+### Security — Removing the last IAM user or `authentication: none` no longer opens S3 access
+
+The proxy chose what S3 does with an empty IAM user list from the state it
+started in, not from the current configuration. Without a bootstrap SigV4
+pair, the proxy went to open access when its last IAM user was removed (a
+user delete, a declarative apply without `iam_users`, a synced empty IAM
+database). This also happened when the proxy had started with
+`authentication: none` and you removed that setting later. One `access`
+section change in declarative mode that removed every `iam_users` entry and
+cleared the bootstrap secret opened S3 access too. In the other direction,
+`authentication: none` set at runtime had no effect until a restart.
+
+Now the proxy decides from the current configuration at every change: the
+bootstrap SigV4 pair signs S3 requests when it is set, `authentication: none`
+gives open access, and otherwise the proxy refuses every S3 request.
+
+### Fixed — A GET survives a backend that stops sending the body (#102)
+
+The S3 SDK retries a GET only until the response headers arrive. When the
+backend then stopped sending the body of an object, the stalled-stream
+protection ended the read after its grace period (`DGP_S3_STALL_GRACE_SECS`,
+20 seconds), and the client got `500 InternalError` after about 22 seconds.
+A delta-stored object failed this way most often, because the proxy reads
+its reference and its delta before it sends the first byte.
+
+Now the proxy requests the rest of the object again, starting at the first
+byte that it did not receive. The new request carries `If-Match` with the
+ETag of the first response, so the proxy never joins two versions of an
+object. The proxy tries this up to 3 times for each read. The counter
+`deltaglider_backend_get_body_resumes_total` on `/_/metrics` counts these
+new requests.
+
+### Changed — A transient backend fault answers 503 with Retry-After
+
+A backend that failed while it served a request (a `500`, `502` or `504`
+after the SDK's retries, or a body that broke off and did not recover)
+answered `500 InternalError`. It now answers `503 ServiceUnavailable` with a
+generic message, so the client knows that a retry is safe. Every `503`
+answer (`SlowDown` and `ServiceUnavailable`) now carries `Retry-After: 5`;
+the sign-in lockout keeps its own wait. The log line
+`transient storage fault answered 503, cause: …` names the cause. Before,
+the cause of a body that broke off showed only as `streaming error`.
+
+### Changed — A write to a busy bucket says why it is refused
+
+When a re-encryption or a migration made a bucket read-only, an S3 write to
+it got `503 SlowDown` with the generic message "Please reduce your request
+rate." It now gets the message of the write gate, which names the bucket
+and the background job, as a browser form upload already did. The message
+of the backend-health `503` no longer starts with `ServiceUnavailable:`; the
+error code stays in `<Code>`.
+
+### Security — The Docker image takes the Debian security updates
+
+The image is built on `debian:bookworm-slim`, and the published base image
+did not have the Debian fixes for `perl-base` (CVE-2026-13221,
+CVE-2026-42496, CVE-2026-8376 and four more) and `libpcre2-8-0`
+(CVE-2026-103111) yet. The 2.0.2 image therefore showed 3 critical and 5
+high findings in an image scanner. The proxy does not run Perl, but the
+build now runs `apt-get upgrade`, so the image has every Debian fix that
+exists when it is built.
+
+### Security — Dependency updates
+
+- The Kubernetes operator uses rustls 0.23.45 (RUSTSEC-2026-0285: TLS 1.3
+  handshake messages accepted across encryption levels). The operator has
+  its own `Cargo.lock`, which the nightly supply-chain check did not read;
+  it reads it now.
+- The admin UI uses fixed versions of `mermaid`, `dompurify` and its
+  build-time packages (npm advisories for `postcss`, `nanoid`,
+  `brace-expansion`, `sharp` and others).
+
+### Fixed — The Docker Hub description updates at release again
+
+The release workflow uploads `DOCKERHUB.md` as the repository description
+on Docker Hub. The step runs in a container, where its default shell is
+`sh`, and `set -o pipefail` failed there. Because the step may fail without
+failing the release, nobody saw that the description stayed at its
+pre-2.0 text in v2.0.0, v2.0.1 and v2.0.2. The step now runs under bash, and
+a test refuses a container step that uses `pipefail` without naming its
+shell.
+
+### Fixed — The Docker quick start starts the proxy
+
+The README and the documentation home page gave `docker run -p 9000:9000
+beshultd/deltaglider_proxy`. The proxy refuses to start without
+credentials, so this command ended with "No authentication configured". The
+command now sets `DGP_AUTHENTICATION=none` for a local trial. The upgrade
+steps, the Docker Hub tag table, the first tutorial and the compose example
+named old versions (2.0.0 and 1.3.0); the release script now stamps them
+with each new version.
 
 ## v2.0.2 — 2026-10-02
 
