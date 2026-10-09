@@ -240,6 +240,26 @@ pub(crate) async fn push_config_sync_now(state: &Arc<AdminState>) -> SyncPush {
 /// Trigger an async config DB upload to S3 if sync is enabled.
 /// Spawns a background task so the caller is not blocked.
 /// No-op when config_db_mismatch is true (prevents overwriting good DB with empty one).
+/// 403 when `bucket` is the coordination bucket (`config_sync_bucket`). It
+/// holds the synced IAM database, the leases and the locks, so no admin job,
+/// scan or bulk operation may read or rewrite it. Admin endpoints bypass the
+/// S3 request gate, so every one that takes a bucket checks here.
+pub(crate) fn reject_reserved_bucket<B: ErrorBody>(
+    state: &AdminState,
+    bucket: &str,
+) -> Result<(), AdminError<B>> {
+    match state
+        .s3_state
+        .engine
+        .load()
+        .bucket_policy_registry()
+        .reserved_bucket_reason(bucket)
+    {
+        Some(reason) => Err(AdminError::forbidden(reason)),
+        None => Ok(()),
+    }
+}
+
 pub(crate) fn trigger_config_sync(state: &Arc<AdminState>) {
     if state.config_db_mismatch {
         tracing::warn!("Config sync blocked — the config DB key does not open the config DB (recovery required)");

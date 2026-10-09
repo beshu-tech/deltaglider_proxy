@@ -189,3 +189,47 @@ async fn the_coordination_bucket_is_not_a_copy_source() {
         "UploadPartCopy from the coordination bucket"
     );
 }
+
+/// B095: the admin jobs and scans that read or rewrite a bucket refuse the
+/// coordination bucket: a re-encrypt or backfill rewrites the synced IAM DB
+/// and the lease objects under every peer.
+#[tokio::test]
+async fn admin_jobs_and_scans_refuse_the_coordination_bucket() {
+    let server = reserved_server().await;
+    let data = server.data_dir().expect("filesystem data dir");
+    std::fs::create_dir_all(data.join(SYNC).join("deltaspaces").join("_dgp")).unwrap();
+    let ep = server.endpoint();
+    let admin = common::admin_http_client(&ep).await;
+    for (what, path, body) in [
+        (
+            "reencrypt",
+            "/_/api/admin/jobs/reencrypt",
+            serde_json::json!({"buckets": [SYNC]}),
+        ),
+        (
+            "backfill",
+            "/_/api/admin/jobs/backfill-metadata",
+            serde_json::json!({"buckets": [SYNC]}),
+        ),
+    ] {
+        let r = admin
+            .post(format!("{ep}{path}"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403, "{what} accepted the coordination bucket");
+    }
+    let r = admin
+        .post(format!(
+            "{ep}/_/api/admin/diagnostics/scan/start?bucket={SYNC}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        403,
+        "the bucket scan read the coordination bucket"
+    );
+}

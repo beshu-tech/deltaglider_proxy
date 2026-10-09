@@ -106,21 +106,24 @@ pub struct ReencryptResponse {
 /// The request gate that the reencrypt and backfill starts share: 1 to
 /// 100 buckets, a config DB, and the real bucket set from the engine
 /// (authoritative across backends), lowercased.
-async fn check_job_request(
-    state: &AdminState,
-    n_buckets: usize,
+async fn check_job_request<'a>(
+    state: &'a AdminState,
+    buckets: &[super::path_guard::AdminBucket],
 ) -> Result<
     (
-        &Arc<tokio::sync::Mutex<crate::config_db::ConfigDb>>,
+        &'a Arc<tokio::sync::Mutex<crate::config_db::ConfigDb>>,
         std::collections::HashSet<String>,
     ),
     AdminError,
 > {
-    if n_buckets == 0 {
+    if buckets.is_empty() {
         return Err(AdminError::invalid("no buckets given"));
     }
-    if n_buckets > 100 {
+    if buckets.len() > 100 {
         return Err(AdminError::invalid("too many buckets (max 100)"));
+    }
+    for bucket in buckets {
+        super::reject_reserved_bucket(state, bucket.as_str())?;
     }
     let db = state
         .config_db
@@ -143,7 +146,7 @@ pub async fn start_reencrypt(
     headers: HeaderMap,
     AdminJson(req): AdminJson<ReencryptRequest>,
 ) -> Result<Json<ReencryptResponse>, AdminError> {
-    let (db, real) = check_job_request(&state, req.buckets.len()).await?;
+    let (db, real) = check_job_request(&state, &req.buckets).await?;
 
     let cfg = state.config.read().await;
     let mut started = Vec::new();
@@ -232,7 +235,7 @@ pub async fn start_backfill(
     headers: HeaderMap,
     AdminJson(req): AdminJson<BackfillRequest>,
 ) -> Result<Json<ReencryptResponse>, AdminError> {
-    let (db, real) = check_job_request(&state, req.buckets.len()).await?;
+    let (db, real) = check_job_request(&state, &req.buckets).await?;
 
     let params = serde_json::to_string(&crate::maintenance::backfill::BackfillParams {
         refresh_last_modified: req.refresh_last_modified,
@@ -329,6 +332,7 @@ pub async fn start_migrate(
         ));
     }
     super::path_guard::check_bucket(&bucket).map_err(AdminError::invalid)?;
+    super::reject_reserved_bucket(&state, &bucket)?;
     let db = state
         .config_db
         .as_ref()

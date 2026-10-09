@@ -579,12 +579,13 @@ pub async fn get_scan_status(
 pub async fn post_scan_start(
     State(state): State<Arc<AdminState>>,
     AdminQuery(q): AdminQuery<BucketQuery>,
-) -> Json<ScanProgress> {
+) -> Result<Json<ScanProgress>, super::AdminError<super::JsonError>> {
+    super::reject_reserved_bucket(&state, q.bucket.as_str())?;
     let rx = state
         .bucket_scanner
         .start(q.bucket.into_string(), state.s3_state.clone());
     let snapshot = rx.borrow().clone();
-    Json(snapshot)
+    Ok(Json(snapshot))
 }
 
 /// `POST /_/api/admin/diagnostics/scan/stop?bucket=X`

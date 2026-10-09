@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Security — Admin jobs and scans refuse the coordination bucket
+
+The admin API refused the coordination bucket (`config_sync_bucket`) for
+object operations, but a re-encrypt, metadata-backfill or migrate job and
+the bucket, usage and delta-efficiency scans accepted it. A re-encrypt job
+there encrypted the synced IAM database and the lease objects, so the other
+nodes could no longer read them. Now these endpoints answer `403` for the
+coordination bucket.
+
 ### Security — The replay window covers signatures dated ahead of the clock
 
 The proxy accepts a signature that is dated up to the clock skew

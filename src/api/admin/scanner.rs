@@ -34,7 +34,10 @@ pub struct UsageQuery {
 pub async fn scan_usage(
     State(state): State<Arc<AdminState>>,
     AdminJson(req): AdminJson<ScanUsageRequest>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    if let Err(e) = super::reject_reserved_bucket::<JsonError>(&state, req.bucket.as_str()) {
+        return e.into_response();
+    }
     let prefix = req.prefix.unwrap_or_default().into_string();
     let started =
         state
@@ -45,11 +48,13 @@ pub async fn scan_usage(
             StatusCode::ACCEPTED,
             Json(serde_json::json!({"status": "scan_started"})),
         )
+            .into_response()
     } else {
         (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({"status": "scan_already_running"})),
         )
+            .into_response()
     }
 }
 
@@ -152,6 +157,7 @@ pub async fn refresh_bucket_usage(
     State(state): State<Arc<AdminState>>,
     AdminQuery(q): AdminQuery<UsageQuery>,
 ) -> Result<Json<serde_json::Value>, AdminError<JsonError>> {
+    super::reject_reserved_bucket(&state, &q.bucket)?;
     let Some(usage) = state.s3_state.bucket_usage.as_ref() else {
         return Ok(Json(
             serde_json::json!({"bucket": q.bucket, "disabled": true}),

@@ -343,16 +343,7 @@ fn reject_if_reserved(
     state: &std::sync::Arc<crate::api::admin::AdminState>,
     bucket: &str,
 ) -> Result<(), AdminError> {
-    match state
-        .s3_state
-        .engine
-        .load()
-        .bucket_policy_registry()
-        .reserved_bucket_reason(bucket)
-    {
-        Some(reason) => Err(AdminError::forbidden(reason)),
-        None => Ok(()),
-    }
+    super::reject_reserved_bucket(state, bucket)
 }
 
 /// 403 when the bucket is `replication_target_only` — admin bulk ops are

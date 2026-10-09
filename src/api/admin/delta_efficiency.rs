@@ -666,7 +666,10 @@ pub struct EfficiencyScanRequest {
 pub async fn post_delta_efficiency_scan(
     State(state): State<Arc<AdminState>>,
     AdminJson(req): AdminJson<EfficiencyScanRequest>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    if let Err(e) = super::reject_reserved_bucket::<JsonError>(&state, req.bucket.as_str()) {
+        return e.into_response();
+    }
     let min_deltas = clamp_min_deltas(req.min_deltas);
     let started = state.delta_efficiency_scanner.enqueue_scan(
         req.bucket.to_string(),
@@ -681,6 +684,7 @@ pub async fn post_delta_efficiency_scan(
             "status": if started { "scan_started" } else { "scan_already_running" },
         })),
     )
+        .into_response()
 }
 
 // ─── Per-prefix verified scan (HEAD-based, opt-in) ──────────────────
@@ -748,6 +752,7 @@ pub async fn verify_delta_efficiency(
     State(state): State<Arc<AdminState>>,
     AdminJson(req): AdminJson<VerifyRequest>,
 ) -> Result<Json<VerifyResponse>, AdminError<JsonError>> {
+    super::reject_reserved_bucket(&state, &req.bucket)?;
     let engine = state.s3_state.engine.load_full();
     let scan = engine
         .storage()
