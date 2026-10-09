@@ -1763,7 +1763,19 @@ impl Config {
 
     /// Returns true if SigV4 authentication is enabled (both credentials are set).
     pub fn auth_enabled(&self) -> bool {
-        self.access_key_id.is_some() && self.secret_access_key.is_some()
+        self.bootstrap_pair().is_some()
+    }
+
+    /// The bootstrap SigV4 pair, when both halves are set AND non-blank. A
+    /// blank value (compose substitutes an unset variable as "") is no
+    /// credential: an empty secret would let anyone who knows the logged
+    /// access key id sign as the bootstrap admin.
+    pub fn bootstrap_pair(&self) -> Option<crate::iam::AuthConfig> {
+        let non_blank = |v: &Option<String>| v.clone().filter(|s| !s.trim().is_empty());
+        Some(crate::iam::AuthConfig {
+            access_key_id: non_blank(&self.access_key_id)?,
+            secret_access_key: non_blank(&self.secret_access_key)?,
+        })
     }
 
     /// Whether the operator asked for open access (`authentication: none`).

@@ -343,13 +343,7 @@ pub(crate) fn sigv4_transition(
     {
         return Ok(None);
     }
-    let new_pair = match (&new_cfg.access_key_id, &new_cfg.secret_access_key) {
-        (Some(k), Some(s)) => Some(AuthConfig {
-            access_key_id: k.clone(),
-            secret_access_key: s.clone(),
-        }),
-        _ => None,
-    };
+    let new_pair = new_cfg.bootstrap_pair();
     if !iam_active
         && new_pair.is_none()
         && old_cfg.auth_enabled()

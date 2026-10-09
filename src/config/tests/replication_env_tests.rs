@@ -38,3 +38,24 @@ fn replication_concurrency_env_vars_override_the_file() {
         crate::transfer_plan::UPLOAD_CONCURRENCY as u32
     );
 }
+
+/// B034: a blank secret (compose substitutes an unset variable as "") is no
+/// credential. It must not turn SigV4 on with an empty secret that any
+/// client that knows the logged access key id can sign with.
+#[test]
+fn a_blank_bootstrap_secret_is_no_credential() {
+    let mut cfg = Config::default();
+    cfg.apply_env_overrides_with(&only(&[
+        ("DGP_ACCESS_KEY_ID", "AKTEST"),
+        ("DGP_SECRET_ACCESS_KEY", ""),
+    ]));
+    assert!(!cfg.auth_enabled(), "a blank secret enabled SigV4");
+    assert!(matches!(
+        cfg.classify_auth_config(false),
+        AuthConfigOutcome::Missing
+    ));
+
+    let yaml = Config::from_yaml_str("access:\n  access_key_id: AKTEST\n  secret_access_key: ''\n")
+        .expect("parse");
+    assert!(!yaml.auth_enabled(), "a blank YAML secret enabled SigV4");
+}

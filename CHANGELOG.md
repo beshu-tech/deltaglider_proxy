@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Security — A blank bootstrap secret is no credential
+
+`DGP_SECRET_ACCESS_KEY=` (a compose file that substitutes an unset
+variable) or `secret_access_key: ''` turned SigV4 on with an empty secret.
+Any client that knew the access key id, which the startup log prints, could
+sign with the empty secret and act as the bootstrap admin. Now a blank key
+id or secret counts as not set, so the proxy refuses to start unless other
+credentials or `authentication: none` are configured.
+
 ### Security — The coordination bucket is not a copy source
 
 The coordination bucket (`config_sync_bucket`) refused every S3 request

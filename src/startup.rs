@@ -5,7 +5,7 @@
 use deltaglider_proxy::api::handlers::AppState;
 use deltaglider_proxy::config::{BackendConfig, Config};
 use deltaglider_proxy::config_db_sync::ConfigDbSync;
-use deltaglider_proxy::iam::{AuthConfig, IamState, SharedIamState};
+use deltaglider_proxy::iam::{IamState, SharedIamState};
 use deltaglider_proxy::metrics::Metrics;
 use std::io::IsTerminal;
 use std::sync::Arc;
@@ -355,13 +355,8 @@ pub fn spawn_cache_monitor(state: &Arc<AppState>, metrics: &Arc<Metrics>) {
 /// IAM users load. "No pair" alone never means open access.
 pub fn init_iam_state(config: &Config) -> SharedIamState {
     Arc::new(arc_swap::ArcSwap::from_pointee(
-        if let (Some(ref key_id), Some(ref secret)) =
-            (&config.access_key_id, &config.secret_access_key)
-        {
-            IamState::Legacy(AuthConfig {
-                access_key_id: key_id.clone(),
-                secret_access_key: secret.clone(),
-            })
+        if let Some(pair) = config.bootstrap_pair() {
+            IamState::Legacy(pair)
         } else if config.open_access_requested() {
             IamState::Disabled
         } else {
