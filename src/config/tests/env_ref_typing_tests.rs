@@ -96,3 +96,24 @@ fn persisted_refs_reload_with_their_string_type() {
     assert!(!persisted.contains(AES), "{persisted}");
     check(&load(&persisted));
 }
+
+/// B036: a ref in a numeric or bool field of a shape that serde buffers
+/// (untagged enums: lifecycle action, admission action) must load.
+#[test]
+fn env_refs_in_buffered_numeric_and_bool_fields_load() {
+    let lookup = |n: &str| match n {
+        "KEEP" => Some("5".to_string()),
+        "S" => Some("503".to_string()),
+        _ => None,
+    };
+    let docs = [
+        "storage:\n  lifecycle:\n    rules:\n    - name: keep\n      bucket: b\n      action:\n        type: retain-newest\n        count: ${env:KEEP}\n",
+        "admission:\n  blocks:\n  - name: m\n    match:\n      method: [PUT]\n    action:\n      type: reject\n      status: ${env:S}\n      message: maintenance\n",
+    ];
+    for doc in docs {
+        let (exp, _) = crate::config::expansion::expand_env_with_recording(doc, lookup).unwrap();
+        if let Err(e) = Config::from_yaml_str(&exp) {
+            panic!("{doc}\n-> {exp}\n-> {e}");
+        }
+    }
+}

@@ -272,6 +272,7 @@ pub enum TaggedAction {
     /// and rate-exceed errors.
     Reject {
         /// HTTP status code. Validated as 4xx/5xx.
+        #[serde(deserialize_with = "crate::config::lenient::num_or_string")]
         status: u16,
         /// Optional response body. `None` = empty body; caller can
         /// rely on the status code alone.

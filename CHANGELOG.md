@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed — `${env:…}` in a lifecycle count or an admission status loads again
+
+Since v2.0.0, a configuration with `count: ${env:KEEP}` in a `retain-newest`
+lifecycle rule, `status: ${env:S}` in an admission `reject` action,
+`delete_source_after_success: ${env:D}` or `min_size_bytes: ${env:M}`
+failed to load with "data did not match any variant of untagged enum", and
+the proxy did not start. These fields now accept a value from the
+environment.
+
 ### Fixed — `${env:…}` inside a glob, a list or a block text stays plain text
 
 Since v2.0.0, a reference that fills a whole YAML value is replaced by a

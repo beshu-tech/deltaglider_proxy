@@ -37,6 +37,43 @@ pub(crate) fn bool_or_string<'de, D: de::Deserializer<'de>>(d: D) -> Result<bool
     }
 }
 
+/// `deserialize_with` for a number field that serde buffers (inside an
+/// untagged or internally tagged enum, or a struct only such an enum holds):
+/// an `!envref` value reaches it as a string, so `count: ${env:KEEP}` failed
+/// with "did not match any variant". Accepts a number, or a string that
+/// parses as one. A source test keeps every such field on it.
+pub(crate) fn num_or_string<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: de::Deserializer<'de>,
+    T: std::str::FromStr + serde::Deserialize<'de>,
+    T::Err: std::fmt::Display,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Wire<T> {
+        Num(T),
+        Str(String),
+    }
+    match <Wire<T> as serde::Deserialize>::deserialize(d)? {
+        Wire::Num(n) => Ok(n),
+        Wire::Str(s) => s
+            .trim()
+            .parse()
+            .map_err(|e| de::Error::custom(format!("{s:?} is not a valid number: {e}"))),
+    }
+}
+
+/// [`num_or_string`] for an `Option` field (with `#[serde(default)]`: an
+/// absent field stays `None`).
+pub(crate) fn opt_num_or_string<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: de::Deserializer<'de>,
+    T: std::str::FromStr + serde::Deserialize<'de>,
+    T::Err: std::fmt::Display,
+{
+    num_or_string(d).map(Some)
+}
+
 /// `schema_with` for a [`bool_or_string`] field: the schema accepts what
 /// the deserializer accepts: a bool, or a `true` / `false` string
 /// (the three spellings of [`parse_bool`], surrounding spaces allowed).
@@ -478,20 +515,33 @@ impl<'de> de::VariantAccess<'de> for VariantAccess {
 
 #[cfg(test)]
 mod tests {
-    /// serde buffers an internally tagged enum before it knows the variant,
-    /// so a `!envref` reaches its fields as a string. Every `bool` field in
-    /// such an enum must parse one (`bool_or_string`), or
-    /// `force_path_style: ${env:X}` fails to load.
+    /// serde buffers an internally tagged or untagged enum before it knows
+    /// the variant, so a `!envref` reaches its fields as a string. Every
+    /// `bool` or number field in such an enum, or in a struct that only such
+    /// an enum holds, must parse one (`bool_or_string`, `num_or_string`), or
+    /// `force_path_style: ${env:X}` / `count: ${env:KEEP}` fails to load.
     #[test]
-    fn bool_fields_of_tagged_enums_accept_env_strings() {
+    fn scalar_fields_of_buffered_shapes_accept_env_strings() {
+        const BUFFERED_STRUCTS: &[&str] =
+            &["struct LifecycleActionMap", "struct LifecycleQualifySpec"];
+        let scalar = regex_lite::Regex::new(
+            r":\s*(Option<)?(bool|u8|u16|u32|u64|usize|i8|i16|i32|i64|f32|f64)>?,\s*$",
+        )
+        .unwrap();
         let mut offenders = Vec::new();
-        for file in ["src/config/mod.rs", "src/config_sections.rs"] {
+        for file in [
+            "src/config/mod.rs",
+            "src/config_sections.rs",
+            "src/admission/spec.rs",
+        ] {
             let text = crate::source_scan::prod_text(&crate::source_scan::read(file));
             let text = text.as_str();
             for part in text
                 .split("#[serde(tag")
                 .skip(1)
-                .chain(text.split("#[serde(untagged").skip(1))
+                .chain(text.split("untagged)]").skip(1))
+                .chain(text.split("tag = \"").skip(1))
+                .chain(BUFFERED_STRUCTS.iter().flat_map(|s| text.split(s).skip(1)))
             {
                 // The enum body: from its first `{` to the matching `}`.
                 let Some(open) = part.find('{') else { continue };
@@ -513,7 +563,7 @@ mod tests {
                 let body = &part[open..end];
                 let lines: Vec<&str> = body.lines().collect();
                 for (i, l) in lines.iter().enumerate() {
-                    if l.trim_end().ends_with(": bool,") {
+                    if scalar.is_match(l) {
                         let attrs = lines[..i]
                             .iter()
                             .rev()
@@ -528,7 +578,7 @@ mod tests {
                             .copied()
                             .collect::<Vec<_>>()
                             .join(" ");
-                        if !attrs.contains("bool_or_string") {
+                        if !attrs.contains("or_string") {
                             offenders.push(format!("{file}: {}", l.trim()));
                         }
                     }
@@ -537,7 +587,7 @@ mod tests {
         }
         assert!(
             offenders.is_empty(),
-            "add deserialize_with = \"lenient::bool_or_string\": {offenders:?}"
+            "add deserialize_with = lenient::bool_or_string / num_or_string: {offenders:?}"
         );
     }
 }

@@ -690,7 +690,11 @@ pub struct LifecycleRetainNewestAction {
 pub struct LifecycleQualifySpec {
     /// Object's ORIGINAL (hydrated) size must be >= this many bytes. Guards
     /// against empty/truncated/placeholder files anchoring the keep set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::config::lenient::opt_num_or_string"
+    )]
     pub min_size_bytes: Option<u64>,
     /// Object must be older than this (humantime). Guards against half-written /
     /// in-flight objects being counted before the upload finishes.
@@ -712,10 +716,13 @@ struct LifecycleActionMap {
     kind: String,
     #[serde(default)]
     destination: Option<LifecycleDestination>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::config::lenient::bool_or_string")]
     delete_source_after_success: bool,
     // retain-newest fields
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::config::lenient::opt_num_or_string"
+    )]
     count: Option<u32>,
     #[serde(default)]
     qualify: Option<LifecycleQualifySpec>,

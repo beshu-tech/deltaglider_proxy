@@ -9,7 +9,7 @@ mod env;
 pub mod env_overrides;
 pub mod env_shadow;
 mod expansion;
-mod lenient;
+pub(crate) mod lenient;
 
 pub use env::*;
 pub use expansion::*;
