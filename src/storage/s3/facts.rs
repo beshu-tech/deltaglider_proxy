@@ -63,7 +63,9 @@ impl S3Backend {
 
     /// Lazy backfill: a HEAD learned the facts of a stored object that a LIST
     /// found without durable facts (an object stored before they existed, or
-    /// whose facts write failed). Write them in the background, once.
+    /// whose facts write failed). Write them in the background, once, through
+    /// the bounded facts drain (`FACTS_WRITE_CONCURRENCY` writes at once): a
+    /// task per HEAD put about 200 PUTs at once on a slow backend.
     pub(super) fn backfill_listing_facts(
         &self,
         bucket: &str,
@@ -87,14 +89,7 @@ impl S3Backend {
         else {
             return;
         };
-        let client = self.client.clone();
-        let native = self.native_encryption.clone();
-        let bucket = bucket.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = put_facts_object(&client, &native, &bucket, &facts_key).await {
-                debug!("listing facts backfill for {bucket} failed: {e}");
-            }
-        });
+        self.facts_cleanup.write(bucket, key, facts_key);
     }
 
     /// Delete every listing-facts object of `bucket` when nothing else is
@@ -263,4 +258,79 @@ pub(in crate::storage) async fn put_facts_object(
         .await
         .map_err(|e| S3Backend::classify_s3_error(bucket, &e, S3Op::PutObject))?;
     Ok(())
+}
+
+/// The lazy facts backfill goes through the bounded facts drain.
+#[cfg(test)]
+mod backfill_tests {
+    use super::*;
+
+    /// 200 HEADs that each learn the missing facts of an object send at
+    /// most `FACTS_WRITE_CONCURRENCY` (32) facts PUTs at once. Each one was
+    /// its own task: on a slow backend about 200 PUTs ran at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn backfill_writes_go_through_the_bounded_drain() {
+        let (s3, fake) = crate::storage::fake_s3_backend().await;
+        fake.set_put_delay_ms(200);
+        let stored_etag = "0123456789abcdef0123456789abcdef";
+        let meta = FileMetadata::new_delta(
+            "k".into(),
+            "a".repeat(64),
+            "fedcba9876543210fedcba9876543210".into(),
+            100,
+            "reference.bin".into(),
+            "b".repeat(64),
+            10,
+            None,
+        );
+        const N: usize = 200;
+        for i in 0..N {
+            let key = format!("p/k{i:03}.delta");
+            list_size_cache::mark_missing_facts(&StoredObjectId {
+                scope: &s3.list_cache_scope,
+                bucket: "b",
+                key: &key,
+                etag: stored_etag,
+                size: 10,
+            });
+            s3.backfill_listing_facts("b", &key, stored_etag, 10, &meta);
+        }
+        let puts = || {
+            fake.requests()
+                .iter()
+                .filter(|r| r.starts_with("PUT /b/.dg/facts/"))
+                .count()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while puts() < N && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(puts(), N, "every missing facts object written once");
+        assert!(
+            fake.peak_puts_in_flight() <= 32,
+            "{} facts PUTs at once",
+            fake.peak_puts_in_flight()
+        );
+    }
+
+    /// A facts object is written only by the bounded drain: every other
+    /// path queues it (`FactsCleanupQueue::write`).
+    #[test]
+    fn only_the_drain_writes_facts_objects() {
+        let writers: Vec<String> = crate::source_scan::prod_sources("src")
+            .into_iter()
+            .filter(|(_, text)| crate::source_scan::prod_text(text).contains("put_facts_object("))
+            .map(|(file, _)| file)
+            .collect();
+        assert_eq!(
+            writers,
+            ["src/storage/facts_cleanup.rs", "src/storage/s3/facts.rs"],
+            "the drain and the definition"
+        );
+        let defined =
+            crate::source_scan::prod_text(&crate::source_scan::read("src/storage/s3/facts.rs"))
+                .matches("put_facts_object(")
+                .count();
+        assert_eq!(defined, 1, "facts.rs only defines it");
+    }
 }
