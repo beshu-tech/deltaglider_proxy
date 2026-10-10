@@ -75,11 +75,14 @@ Behavior differs by operation:
 
 ## HTTP concurrency limit
 
-The proxy caps the total number of in-flight HTTP requests across the server. Requests beyond the limit wait in a queue until a slot opens or the request timeout fires.
+The proxy caps the total number of in-flight S3 API requests across the server. Requests beyond the limit wait in a queue until a slot opens or the request timeout fires, because the wait counts against the request timeout.
+
+With more than one storage backend, the requests to one backend can hold at most a share of the slots (`DGP_BACKEND_SHARE_PERCENT`, 75 % by default). A request to a backend whose share is full gets `503 SlowDown` at once, and S3 clients retry it. A slow backend therefore cannot take every slot, and the requests to the other backends and to the admin UI keep their speed. The same share applies to the spool budget (`DGP_SPOOL_MAX_BYTES`): a request that needs spool space while its backend's share of the spool is full waits for that backend's own spool space, not for the whole budget.
 
 | Setting | Default | Env var |
 |---------|---------|---------|
 | Max concurrent requests | 1024 | `DGP_MAX_CONCURRENT_REQUESTS` |
+| Share of one backend | 75 % | `DGP_BACKEND_SHARE_PERCENT` |
 
 ## Request timeout
 
@@ -130,7 +133,8 @@ During a LIST request that needs per-object metadata, the proxy sends HEAD reque
 | `DGP_TRUST_PROXY_HEADERS` | false | Trust `X-Forwarded-For` / `X-Real-IP` for IP extraction (only behind a reverse proxy) |
 | `DGP_TRUSTED_PROXY_CIDRS` | unset | Networks of the trusted reverse proxies; required when `DGP_TRUST_PROXY_HEADERS=true` |
 | `DGP_CODEC_CONCURRENCY` | cpus*4 (min 16) | Max concurrent xdelta3 processes |
-| `DGP_MAX_CONCURRENT_REQUESTS` | 1024 | Max in-flight HTTP requests |
+| `DGP_MAX_CONCURRENT_REQUESTS` | 1024 | Max in-flight S3 API requests |
+| `DGP_BACKEND_SHARE_PERCENT` | 75 | With more than one backend, the most of the request slots and of the spool budget that the requests to one backend can hold |
 | `DGP_REQUEST_TIMEOUT_SECS` | 300 | Per-request timeout |
 | `DGP_MAX_MULTIPART_UPLOADS` | 1000 | Max concurrent multipart uploads |
 | `DGP_CLOCK_SKEW_SECONDS` | 900 | SigV4 request-timestamp drift tolerance |

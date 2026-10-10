@@ -178,7 +178,7 @@ Per-request deadline (HTTP 504 when exceeded).
 
 ### `max_concurrent_requests`
 
-Global tower `ConcurrencyLimit`. Requests beyond this queue.
+The most S3 API requests that the proxy serves at the same time. A request that finds every slot taken waits for a free slot, and the wait counts against the request deadline (`DGP_REQUEST_TIMEOUT_SECS`). With more than one storage backend, the requests to one backend can hold at most `DGP_BACKEND_SHARE_PERCENT` of the slots (75 % by default). A request to a backend whose share is full gets `503 SlowDown` at once, so a slow backend cannot make the requests to the other backends wait.
 
 | | |
 |---|---|

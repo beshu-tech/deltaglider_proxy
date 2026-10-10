@@ -40,6 +40,90 @@ fn head_range_is_partial(
         && headers.contains_key(axum::http::header::CONTENT_RANGE)
 }
 
+/// The per-backend share of the request slots (`DGP_BACKEND_SHARE_PERCENT`
+/// of `DGP_MAX_CONCURRENT_REQUESTS`). One global cap served every bucket,
+/// so the requests to a slow backend (slow, so it passes its health probe)
+/// held every slot, and the requests to all other backends queued behind
+/// them. With more than one backend, a request to a bucket takes a slot of
+/// its backend's share, or gets 503 SlowDown at once when the share is
+/// full; it then runs in its backend's spool scope (`spool::scoped`).
+#[derive(Clone)]
+struct BackendShare {
+    /// Slots per backend.
+    cap: usize,
+    slots: Arc<parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>>,
+    config: crate::config::SharedConfig,
+    state: Arc<AppState>,
+}
+
+impl BackendShare {
+    fn new(config: &Config, shared: &crate::config::SharedConfig, state: &Arc<AppState>) -> Self {
+        let total = config.tuning.max_concurrent_requests;
+        let percent = usize::from(config.tuning.backend_share_percent);
+        Self {
+            cap: (total.saturating_mul(percent) / 100).max(1),
+            slots: Default::default(),
+            config: shared.clone(),
+            state: state.clone(),
+        }
+    }
+
+    /// The backend of the bucket that `path` names, when more than one
+    /// backend is configured. Never waits for the config lock (an apply
+    /// holds it while it probes): while it is held, no share applies.
+    fn backend_of(&self, path: &str) -> Option<String> {
+        let bucket = crate::maintenance::gate::bucket_from_path(path)?;
+        let cfg = self.config.try_read().ok()?;
+        if cfg.backends.len() < 2 {
+            return None;
+        }
+        use crate::storage::StorageBackend;
+        self.state
+            .engine
+            .load()
+            .storage()
+            .resolved_backend_name(&bucket)
+            .or_else(|| {
+                cfg.effective_backend_for_bucket(&bucket)
+                    .map(|(name, _)| name)
+            })
+    }
+
+    fn semaphore(&self, backend: &str) -> Arc<tokio::sync::Semaphore> {
+        self.slots
+            .lock()
+            .entry(backend.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(self.cap)))
+            .clone()
+    }
+}
+
+/// Middleware of [`BackendShare`].
+async fn backend_share(
+    axum::extract::State(share): axum::extract::State<BackendShare>,
+    request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(backend) = share.backend_of(request.uri().path()) else {
+        return next.run(request).await;
+    };
+    let Ok(_slot) = share.semaphore(&backend).try_acquire_owned() else {
+        tracing::warn!(
+            "backend '{backend}' holds its share of the request slots ({}); a request to it got 503 SlowDown",
+            share.cap
+        );
+        // The message does not name the backend: the caller is not verified yet.
+        let mut response = crate::api::S3Error::SlowDown(
+            "Too many concurrent requests to the storage of this bucket; retry shortly".into(),
+        )
+        .into_response();
+        crate::api::errors::ensure_retry_after(response.status(), response.headers_mut());
+        return response;
+    };
+    crate::deltaglider::spool::scoped(&backend, next.run(request)).await
+}
+
 /// Build the S3-compatible router with all routes and middleware layers.
 ///
 /// Backed by the `s3s` crate, which translates wire-level S3 protocol
@@ -415,12 +499,20 @@ where
         .layer(axum::Extension(rate_limiter.clone()))
         .layer(axum::Extension(metrics.clone()))
         .layer(DefaultBodyLimit::max(config.max_object_size as usize))
-        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
-            axum::http::StatusCode::GATEWAY_TIMEOUT,
-            std::time::Duration::from_secs(config.tuning.request_timeout_secs),
+        // Inside the global cap: a request takes its backend's slot only
+        // once it has a global one, and gives a full share back at once.
+        .layer(middleware::from_fn_with_state(
+            BackendShare::new(config, shared_config, state),
+            backend_share,
         ))
         .layer(tower::limit::ConcurrencyLimitLayer::new(
             config.tuning.max_concurrent_requests,
+        ))
+        // OUTSIDE the global cap: the wait for a slot counts against the
+        // request deadline. Inside, a queued request waited without one.
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            axum::http::StatusCode::GATEWAY_TIMEOUT,
+            std::time::Duration::from_secs(config.tuning.request_timeout_secs),
         ))
         .layer({
             // SECURITY: In production (single-port architecture), CORS is not
@@ -434,6 +526,118 @@ where
             crate::cors::cors_layer_for(config.tuning.cors_permissive)
         })
         .with_state(state.clone())
+}
+
+#[cfg(test)]
+mod backend_share_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    /// The production S3 router over `config` (open access).
+    async fn router(config: &Config) -> Router {
+        let engine = crate::deltaglider::DynEngine::new(config, None)
+            .await
+            .unwrap();
+        engine.create_bucket("downloads").await.unwrap();
+        engine
+            .store("downloads", "notes.txt", b"hello", None, Default::default())
+            .await
+            .unwrap();
+        let state = AppState::for_tests(engine);
+        let iam: SharedIamState = Arc::new(arc_swap::ArcSwap::from_pointee(
+            crate::iam::IamState::Disabled,
+        ));
+        let snapshot: crate::bucket_policy::SharedPublicPrefixSnapshot =
+            Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::bucket_policy::PublicPrefixSnapshot::from_config(&config.buckets),
+            ));
+        let chain = crate::admission::build_shared_chain_from_parts(&config.buckets, &[]);
+        let metrics = Arc::new(Metrics::new());
+        let rate_limiter = RateLimiter::new(
+            100,
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(600),
+        );
+        let replay_cache: crate::api::auth::ReplayCache = Default::default();
+        let shared_config = config.clone().into_shared();
+        build_s3_router(RouterDeps {
+            state: &state,
+            iam_state: &iam,
+            metrics: &metrics,
+            rate_limiter: &rate_limiter,
+            replay_cache: &replay_cache,
+            config,
+            config_db_mismatch: false,
+            public_prefix_snapshot: &snapshot,
+            admission_chain: &chain,
+            shared_config: &shared_config,
+        })
+    }
+
+    fn request(method: &str, path: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", "localhost:9000")
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    /// One global cap of request slots for every bucket: requests to a
+    /// slow backend (slow, so its probe passes and it is not gated) held
+    /// every slot, and the requests to every other backend, the local disk
+    /// and the UI queued behind them with no deadline.
+    #[tokio::test]
+    async fn a_slow_backend_cannot_take_every_request_slot() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let disk = tempfile::tempdir().unwrap();
+        let mut config = Config::from_yaml_str(&format!(
+            "storage:\n  backends:\n    - name: hetzner-fsn1\n      type: s3\n      \
+             endpoint: \"{endpoint}\"\n      region: us-east-1\n      force_path_style: true\n      \
+             access_key_id: k\n      secret_access_key: s\n      allow_local: true\n    \
+             - name: local-disk\n      type: filesystem\n      path: {}\n  \
+             default_backend: local-disk\n  buckets:\n    releases: {{ backend: hetzner-fsn1 }}\n    \
+             downloads: {{ backend: local-disk }}\n",
+            disk.path().display()
+        ))
+        .unwrap();
+        config.tuning.max_concurrent_requests = 4;
+        let app = router(&config).await;
+        fake.set_delay_ms("HEAD", 3_000);
+
+        let slow: Vec<_> = (0..4)
+            .map(|_| tokio::spawn(app.clone().oneshot(request("HEAD", "/releases/v1.zip"))))
+            .collect();
+        // Every slow request has its slot (or its answer) before the probe.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline
+            && fake
+                .requests()
+                .iter()
+                .filter(|r| r.starts_with("HEAD /releases/"))
+                .count()
+                < 3
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let started = std::time::Instant::now();
+        let resp = app
+            .clone()
+            .oneshot(request("GET", "/downloads/notes.txt"))
+            .await
+            .unwrap();
+        let waited = started.elapsed();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert!(
+            waited < std::time::Duration::from_secs(1),
+            "a local-disk GET waited {waited:?} behind a slow backend"
+        );
+        for h in slow {
+            let _ = h.await;
+        }
+    }
 }
 
 #[cfg(test)]
