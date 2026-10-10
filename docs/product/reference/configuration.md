@@ -264,7 +264,7 @@ Store an object as a delta only if `delta_size / original_size` is below this ra
 
 ### `max_object_size`
 
-Maximum object size in bytes. The proxy enforces it as the HTTP request body limit, so it caps uploads of both delta and passthrough objects. It is also the per-object ceiling for delta processing (an xdelta3 memory constraint), and it sizes the multipart upload budget. `0` rejects all uploads, and the proxy logs a warning at startup.
+Maximum object size in bytes. The proxy enforces it as the HTTP request body limit, so it caps uploads of both delta and passthrough objects. It is also the per-object ceiling for delta processing (an xdelta3 memory constraint), and it sizes the multipart upload budget. `0` rejects all uploads, and the proxy logs a warning at startup. A value above 5 GiB also gets a warning from the config check: the proxy holds a PutObject body in memory and then stores it with one backend request, and an S3 backend stores at most 5 GiB with one PUT request, so a larger body is refused after it has been buffered. Objects larger than 5 GiB arrive as multipart uploads.
 
 | | |
 |---|---|

@@ -166,6 +166,19 @@ impl Config {
         if self.max_object_size == 0 {
             warnings.push("max_object_size=0 will reject all uploads".to_string());
         }
+        // A PUT body is held in memory (its signature is checked over it),
+        // then stored with ONE backend request, and S3 stores at most 5 GiB
+        // in one request: a larger body is buffered only to be refused.
+        const SINGLE_PUT_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+        if self.max_object_size > SINGLE_PUT_MAX_BYTES {
+            warnings.push(format!(
+                "max_object_size={} is above 5 GiB ({SINGLE_PUT_MAX_BYTES} bytes), the most \
+                 that an S3 backend stores with one PUT request: the proxy holds such a body \
+                 in memory and then the backend refuses it. Set it to 5 GiB or less; larger \
+                 objects arrive as multipart uploads",
+                self.max_object_size
+            ));
+        }
         // Duplicate backend names and routes to undefined backends are FATAL,
         // not warnings: see `check_fatal`, which `check_all` runs first.
 
@@ -589,5 +602,30 @@ impl Config {
             }
         }
         errors
+    }
+}
+
+#[cfg(test)]
+mod object_size_tests {
+    use super::*;
+
+    /// A PUT is stored with one backend request, and S3 takes at most
+    /// 5 GiB in one request: a larger `max_object_size` only lets the proxy
+    /// buffer a body that the backend then refuses. `config check` says so.
+    #[test]
+    fn a_max_object_size_over_5_gib_warns() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let warns = |size: u64| {
+            let mut c = Config {
+                max_object_size: size,
+                ..Config::default()
+            };
+            c.check()
+                .into_iter()
+                .any(|w| w.contains("max_object_size") && w.contains("5 GiB"))
+        };
+        assert!(warns(5 * GIB + 1));
+        assert!(!warns(5 * GIB));
+        assert!(!warns(Config::default().max_object_size));
     }
 }
