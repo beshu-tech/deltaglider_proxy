@@ -207,8 +207,13 @@ pub(super) async fn complete_multipart_upload(
                 input.upload_id.clone(),
             );
             let parts = requested_parts.clone();
+            // The detached store is a write of the bucket until it ends, also
+            // after the request is gone (client disconnect, request timeout):
+            // the maintenance drain (`drain_inflight_writes`) must wait for it.
+            let gate_write = svc.state.maintenance_gate.begin_write(&input.bucket);
             let handle = tokio::spawn(async move {
                 let _write_lock = write_lock;
+                let _gate_write = gate_write;
                 let result = run_multipart_completion(
                     state,
                     bucket,
@@ -505,5 +510,63 @@ mod multipart_cost_tests {
             .filter(|r| *r == "HEAD /b/" || r.starts_with("HEAD /b/?"))
             .count();
         assert_eq!(head_buckets, 1, "{:?}", fake.requests());
+    }
+
+    /// A CompleteMultipartUpload whose request is gone (client disconnect,
+    /// request timeout) still counts as an in-flight write of its bucket
+    /// while its detached store runs: the maintenance drain waits for it.
+    /// It counted as none once the request future was dropped.
+    #[tokio::test]
+    async fn a_detached_completion_is_an_inflight_write() {
+        let (engine, fake) = crate::deltaglider::s3_engine().await;
+        let state = AppState::for_tests(engine);
+        let svc = service(state.clone());
+        let id = state
+            .multipart
+            .create("b", "a/photo.jpg", None, Default::default())
+            .unwrap();
+        let etag = state
+            .multipart
+            .upload_part(
+                &id,
+                "b",
+                "a/photo.jpg",
+                1,
+                bytes::Bytes::from(vec![7u8; 1024]),
+            )
+            .unwrap();
+        let input = s3s::dto::CompleteMultipartUploadInput::builder()
+            .bucket("b".into())
+            .key("a/photo.jpg".into())
+            .upload_id(id)
+            .multipart_upload(Some(s3s::dto::CompletedMultipartUpload {
+                parts: Some(vec![s3s::dto::CompletedPart {
+                    part_number: Some(1),
+                    e_tag: Some(parse_s3s_etag(&etag).unwrap()),
+                    ..Default::default()
+                }]),
+            }))
+            .build()
+            .unwrap();
+        fake.set_delay_ms("PUT", 500);
+        let cut = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            complete_multipart_upload(&svc, request(input)),
+        )
+        .await;
+        assert!(cut.is_err(), "the store ended before the request was cut");
+        assert_eq!(state.maintenance_gate.inflight_writes("b"), 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while state.maintenance_gate.inflight_writes("b") > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the write never ended"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(fake
+            .requests()
+            .iter()
+            .any(|r| r.starts_with("PUT /b/a/photo.jpg")));
     }
 }
