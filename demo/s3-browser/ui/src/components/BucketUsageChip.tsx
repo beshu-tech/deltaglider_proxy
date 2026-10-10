@@ -83,7 +83,7 @@ export default function BucketUsageChip({
     scope +
     (data.last_scan_at != null
       ? `Last full scan ${relativeTime(data.last_scan_at * 1000)}`
-      : 'Never scanned — running total maintained on every write/delete; ⟳ to reconcile');
+      : 'Not reconciled — the running total of writes and deletes may be off (never scanned, or a write could not read the object it replaced); ⟳ to reconcile');
 
   return (
     <span

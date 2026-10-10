@@ -1028,7 +1028,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         log_reload: log_reload_handle,
         s3_state: state.clone(),
         iam_state,
-        config_db,
+        config_db: config_db.clone(),
         usage_scanner: usage_scanner.clone(),
         delta_efficiency_scanner: Arc::new(
             deltaglider_proxy::api::admin::DeltaEfficiencyScanner::new(),
@@ -1133,6 +1133,21 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // the window and Refresh reconciles it.
     if let Some(usage) = bucket_usage.as_ref() {
         usage.flush_pending();
+    }
+
+    // Object events that waited for the config DB are queued for one writer
+    // task; write them before exit (event-outbox.md promises it). Bounded,
+    // like the other shutdown drains.
+    if let Some(db) = config_db.as_ref() {
+        if tokio::time::timeout(
+            Duration::from_secs(10),
+            deltaglider_proxy::event_outbox::flush_appends(db),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!("queued object events were not written within 10s");
+        }
     }
 
     info!("Server shutdown complete");
