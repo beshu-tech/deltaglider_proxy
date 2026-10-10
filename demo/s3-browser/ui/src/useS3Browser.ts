@@ -13,11 +13,17 @@ import {
   listAllUnderPrefix,
 } from './adminApi';
 import { type DeltaSummary, summaryFromResponse } from './deltaSummary';
-import { normalizeUiError } from './errorHandling';
+import { isSessionExpired, normalizeUiError } from './errorHandling';
 import { useOverlayClose } from './hooks/useOverlayClose';
 import useSelection from './useSelection';
 import { virtualWritableChildren } from './permissions';
 import { expandSelection } from './bulkSelection';
+import {
+  type BulkDeleteOutcome,
+  type BulkDeleteProgress,
+  BulkDeleteFailed,
+  deleteInBatches,
+} from './bulkDelete';
 import { downloadZip as saveZip, zipPreflightError } from './zipDownload';
 // Bulk actions → admin objects API; App gates them on `sessionCaps.canUseBulkActions`
 // (the server authorizes each key for a files-only session).
@@ -66,7 +72,10 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [isTruncated, setIsTruncated] = useState(false);
-  const [deleting, setDeleting] = useState(false);
+  // A running bulk delete (null = none): its phase and counts for the action bar.
+  const [deleteProgress, setDeleteProgress] = useState<BulkDeleteProgress | null>(null);
+  const deleting = deleteProgress !== null;
+  const deleteRun = useRef<AbortController | null>(null);
   const [connected, setConnected] = useState(hasCredentials());
   // The search box shows a local draft; the URL's ?q= follows 200ms later
   // (debounced replace, see setSearchQuery). Binding the box to ?q= directly
@@ -366,13 +375,14 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
   }, [resetBrowseState]);
 
   /**
-   * Expand the selection against `currentBucket` via the ONE shared expander.
-   * Throws (before any mutation) when a folder has more keys than the server
-   * lists, so no bulk action runs on a partial folder.
+   * Expand the selection against `currentBucket` via the ONE shared expander
+   * (a few folders listed at once). Throws (before any mutation) when a folder
+   * has more keys than the server lists, so no bulk action runs on a partial
+   * folder.
    */
   const expandSelected = useCallback(
-    (currentBucket: string) =>
-      expandSelection(selectedKeys, (pfx) => listAllUnderPrefix(currentBucket, pfx)),
+    (currentBucket: string, options?: Parameters<typeof expandSelection>[2]) =>
+      expandSelection(selectedKeys, (pfx) => listAllUnderPrefix(currentBucket, pfx), options),
     [selectedKeys],
   );
 
@@ -401,27 +411,73 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     [expandSelected],
   );
 
-  const bulkDelete = useCallback(async () => {
-    if (selectedKeys.size === 0) return;
-    setDeleting(true);
+  /**
+   * Delete the selection: list its folders (a few at once), then send the keys
+   * in batches (deleteInBatches). The action bar shows `deleteProgress`; the
+   * listing reloads after each batch, so finished folders leave the page as
+   * the run goes on. Resolves with the outcome (also after a cancel); rejects
+   * with a session expiry as-is (the bar sends the user to sign-in), and with
+   * any other error plus how many keys were deleted before it.
+   */
+  const bulkDelete = useCallback(async (): Promise<BulkDeleteOutcome> => {
+    const run = new AbortController();
+    deleteRun.current = run;
+    // Snapshot the bucket: a bucket switch mid-run must not move the deletes.
+    const bucket = getBucket();
+    const stopping = () => run.signal.aborted;
+    let total = 0;
+    let deleted = 0;
+    setDeleteProgress({ phase: 'listing', listed: 0, folders: 0, keysFound: 0, stopping: false });
     try {
-      // Server-side bulk delete: expand every folder first (aborts on a
-      // truncated folder before anything is deleted), then one batched POST.
-      const bucket = getBucket();
-      const keys = await resolveSelectedKeys(bucket);
-      if (keys.length > 0) {
-        await bulkDeleteObjects({ bucket, keys });
-      }
-      clearSelection();
-      refresh();
+      const items = await expandSelected(bucket, {
+        signal: run.signal,
+        onProgress: (p) => setDeleteProgress({ phase: 'listing', ...p, stopping: stopping() }),
+      });
+      const keys = items.map((i) => i.source);
+      total = keys.length;
+      setDeleteProgress({ phase: 'deleting', done: 0, total, stopping: stopping() });
+      const outcome = await deleteInBatches(keys, (batch) => bulkDeleteObjects({ bucket, keys: batch }), {
+        signal: run.signal,
+        onBatch: (p) => {
+          deleted = p.deleted;
+          setDeleteProgress({ phase: 'deleting', done: p.done, total: p.total, stopping: stopping() });
+          refresh();
+        },
+      });
+      // A cancelled or partly failed run keeps the selection for a retry; the
+      // reloads already dropped the entries that are gone.
+      if (!outcome.cancelled && outcome.failed === 0) clearSelection();
+      return outcome;
     } catch (e) {
-      const msg = normalizeUiError(e, 'Bulk delete failed');
-      setError(msg);
-      message.error(msg);
+      if (run.signal.aborted && e === run.signal.reason) {
+        return { total, deleted: 0, failed: 0, failures: [], cancelled: true };
+      }
+      if (total > 0) refresh(); // the failed batch may have deleted some keys
+      if (isSessionExpired(e)) throw e;
+      throw new BulkDeleteFailed(e, deleted, total);
     } finally {
-      setDeleting(false);
+      deleteRun.current = null;
+      setDeleteProgress(null);
     }
-  }, [clearSelection, refresh, resolveSelectedKeys, selectedKeys]);
+  }, [clearSelection, refresh, expandSelected]);
+
+  /** Stop the running bulk delete: the batch in flight finishes, no new one starts. */
+  const cancelBulkDelete = useCallback(() => {
+    deleteRun.current?.abort();
+    setDeleteProgress((p) => (p ? { ...p, stopping: true } : p));
+  }, []);
+
+  // Leaving the page stops the run after the batch in flight: ask first.
+  useEffect(() => {
+    if (!deleting) return;
+    const warn = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = 'A bulk delete is running. Leaving the page stops it.';
+      return e.returnValue;
+    };
+    window.addEventListener('beforeunload', warn);
+    return () => window.removeEventListener('beforeunload', warn);
+  }, [deleting]);
 
   const bulkCopy = useCallback(async (destBucket: string, destPrefix: string) => {
     // Phase B: server-side orchestration. The proxy's engine handles
@@ -562,11 +618,13 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     mutate,
     enrichKeys,
     bulkDelete,
+    cancelBulkDelete,
     bulkCopy,
     bulkMove,
     downloadZip,
     // Status
     deleting,
+    deleteProgress,
     // Search
     searchQuery,
     setSearchQuery,

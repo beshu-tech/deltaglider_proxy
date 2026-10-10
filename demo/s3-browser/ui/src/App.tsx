@@ -568,7 +568,10 @@ export default function App() {
             </span>
           </div>
         )}
-        {s3.selectedKeys.size > 0 && (
+        {/* A running delete keeps the bar (and its progress) on screen even
+            when the selection empties: each batch reloads the listing, and a
+            folder change clears the selection. */}
+        {(s3.selectedKeys.size > 0 || s3.deleting) && (
           <BulkActionBar
             selectedCount={s3.selectedKeys.size}
             selectedFolderCount={[...s3.selectedKeys].filter((k) => k.startsWith('folder:')).length}
@@ -576,7 +579,8 @@ export default function App() {
             onCopy={canCopyFromActiveBucket && sessionCaps.canUseBulkActions ? s3.bulkCopy : undefined}
             onMove={canMoveFromActiveBucket && sessionCaps.canUseBulkActions ? s3.bulkMove : undefined}
             onDownloadZip={canReadSelected && sessionCaps.canUseBulkActions ? s3.downloadZip : undefined}
-            deleting={s3.deleting}
+            deleteProgress={s3.deleteProgress}
+            onCancelDelete={s3.cancelBulkDelete}
             currentPrefix={s3.prefix}
             selectionKeys={s3.selectedKeys}
             onSessionExpired={handleSessionExpired}

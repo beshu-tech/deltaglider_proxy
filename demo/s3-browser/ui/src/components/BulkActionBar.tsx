@@ -1,5 +1,5 @@
 import { useState, useCallback } from 'react';
-import { Button, message } from 'antd';
+import { Button, Progress, message } from 'antd';
 import { DeleteOutlined, CopyOutlined, ScissorOutlined, DownloadOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import { pluralize } from '../utils';
@@ -7,13 +7,21 @@ import DestinationPickerModal from './DestinationPickerModal';
 import { isSessionExpired, normalizeUiError } from '../errorHandling';
 import { useBackClosesModal } from '../hooks/useOverlayClose';
 import { bulkDeleteConfirmText } from '../bulkSelection';
+import {
+  type BulkDeleteOutcome,
+  type BulkDeleteProgress,
+  bulkDeleteOutcomeMessage,
+  bulkDeleteProgressPercent,
+  bulkDeleteProgressText,
+} from '../bulkDelete';
 import { confirmDelete } from './confirmDelete';
 
 interface Props {
   selectedCount: number;
   /** How many of the selected entries are folders (named in the delete confirm). */
   selectedFolderCount?: number;
-  onDelete?: () => void;
+  /** Runs the whole delete; resolves with its outcome, rejects on a failure. */
+  onDelete?: () => Promise<BulkDeleteOutcome>;
   onCopy?: (destBucket: string, destPrefix: string) => Promise<{ succeeded: number; failed: number }>;
   onMove?: (destBucket: string, destPrefix: string) => Promise<{ succeeded: number; failed: number }>;
   onDownloadZip?: () => Promise<void>;
@@ -21,14 +29,17 @@ interface Props {
   currentPrefix?: string;
   /** The raw selection keys: the destination picker refuses to copy them onto themselves. */
   selectionKeys?: Iterable<string>;
-  deleting: boolean;
+  /** The running bulk delete (null/absent = none): the bar shows it instead of the actions. */
+  deleteProgress?: BulkDeleteProgress | null;
+  /** Stops the running delete after the batch in flight. */
+  onCancelDelete?: () => void;
   /** Shown when bulk handlers are omitted (user signed in for files only). */
   hint?: string;
   /** Called instead of an error toast when the admin session expired. */
   onSessionExpired?: () => void;
 }
 
-export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, onDelete, onCopy, onMove, onDownloadZip, deleting, hint, currentPrefix, selectionKeys, onSessionExpired }: Props) {
+export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, onDelete, onCopy, onMove, onDownloadZip, deleteProgress, onCancelDelete, hint, currentPrefix, selectionKeys, onSessionExpired }: Props) {
   const colors = useColors();
   const [modal, setModal] = useState<'copy' | 'move' | null>(null);
   const [operating, setOperating] = useState(false);
@@ -71,7 +82,21 @@ export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, 
     }
   };
 
-  const busy = deleting || operating || downloading;
+  // The bar unmounts when a run ends with an empty selection, so the report
+  // goes through the static `message`, never through component state.
+  const handleDelete = async () => {
+    if (!onDelete) return;
+    try {
+      const { type, text } = bulkDeleteOutcomeMessage(await onDelete());
+      message[type](text);
+    } catch (e) {
+      if (isSessionExpired(e) && onSessionExpired) onSessionExpired();
+      else message.error(normalizeUiError(e, 'Delete failed'));
+    }
+  };
+
+  const busy = operating || downloading;
+  const statusStyle = { fontSize: 13, fontFamily: 'var(--font-ui)', color: colors.TEXT_SECONDARY, whiteSpace: 'nowrap' } as const;
 
   return (
     <>
@@ -91,63 +116,89 @@ export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, 
           boxShadow: '0 8px 28px rgba(0, 0, 0, 0.35)',
         }}
       >
-        <span style={{ marginRight: 8, fontSize: 13, fontFamily: 'var(--font-ui)', color: colors.TEXT_SECONDARY, whiteSpace: 'nowrap' }}>
-          {selectedCount} selected
-          {hint ? (
-            <span style={{ display: 'block', marginTop: 4, fontSize: 12, color: colors.TEXT_MUTED }}>
-              {hint}
+        {deleteProgress ? (
+          // A running delete replaces the actions: its phase, a bar and Cancel.
+          <>
+            <span role="status" style={statusStyle}>
+              {bulkDeleteProgressText(deleteProgress)}
             </span>
-          ) : null}
-        </span>
-        {onCopy && (
-          <Button
-            size="small"
-            icon={<CopyOutlined />}
-            onClick={() => setModal('copy')}
-            disabled={busy}
-            aria-label={`Copy ${selectedCount} selected items`}
-          >
-            Copy
-          </Button>
-        )}
-        {onMove && (
-          <Button
-            size="small"
-            icon={<ScissorOutlined />}
-            onClick={() => setModal('move')}
-            disabled={busy}
-            aria-label={`Move ${selectedCount} selected items`}
-          >
-            Move
-          </Button>
-        )}
-        {onDownloadZip && (
-          <Button
-            size="small"
-            icon={<DownloadOutlined />}
-            onClick={handleZip}
-            loading={downloading}
-            disabled={busy}
-            aria-label={`Download ${selectedCount} selected items as ZIP`}
-          >
-            ZIP
-          </Button>
-        )}
-        {onDelete && (
-          // eslint-disable-next-line no-restricted-syntax -- toolbar action on the selection (confirmed), not a row action
-          <Button
-            danger
-            size="small"
-            icon={<DeleteOutlined />}
-            onClick={() =>
-              confirmDelete(bulkDeleteConfirmText(selectedCount, selectedFolderCount), () => onDelete?.())
-            }
-            loading={deleting}
-            disabled={busy}
-            aria-label={`Delete ${selectedCount} selected items`}
-          >
-            Delete
-          </Button>
+            <Progress
+              aria-label="Bulk delete progress"
+              percent={bulkDeleteProgressPercent(deleteProgress)}
+              status="active"
+              showInfo={false}
+              size="small"
+              style={{ width: 140, margin: 0 }}
+            />
+            <Button
+              size="small"
+              onClick={onCancelDelete}
+              disabled={!onCancelDelete || deleteProgress.stopping}
+              aria-label="Cancel delete"
+            >
+              Cancel
+            </Button>
+          </>
+        ) : (
+          <>
+            <span style={{ ...statusStyle, marginRight: 8 }}>
+              {selectedCount} selected
+              {hint ? (
+                <span style={{ display: 'block', marginTop: 4, fontSize: 12, color: colors.TEXT_MUTED }}>
+                  {hint}
+                </span>
+              ) : null}
+            </span>
+            {onCopy && (
+              <Button
+                size="small"
+                icon={<CopyOutlined />}
+                onClick={() => setModal('copy')}
+                disabled={busy}
+                aria-label={`Copy ${selectedCount} selected items`}
+              >
+                Copy
+              </Button>
+            )}
+            {onMove && (
+              <Button
+                size="small"
+                icon={<ScissorOutlined />}
+                onClick={() => setModal('move')}
+                disabled={busy}
+                aria-label={`Move ${selectedCount} selected items`}
+              >
+                Move
+              </Button>
+            )}
+            {onDownloadZip && (
+              <Button
+                size="small"
+                icon={<DownloadOutlined />}
+                onClick={handleZip}
+                loading={downloading}
+                disabled={busy}
+                aria-label={`Download ${selectedCount} selected items as ZIP`}
+              >
+                ZIP
+              </Button>
+            )}
+            {onDelete && (
+              // eslint-disable-next-line no-restricted-syntax -- toolbar action on the selection (confirmed), not a row action
+              <Button
+                danger
+                size="small"
+                icon={<DeleteOutlined />}
+                onClick={() =>
+                  confirmDelete(bulkDeleteConfirmText(selectedCount, selectedFolderCount), () => void handleDelete())
+                }
+                disabled={busy}
+                aria-label={`Delete ${selectedCount} selected items`}
+              >
+                Delete
+              </Button>
+            )}
+          </>
         )}
       </div>
 

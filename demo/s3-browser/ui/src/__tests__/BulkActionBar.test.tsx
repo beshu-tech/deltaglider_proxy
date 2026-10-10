@@ -6,6 +6,7 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, test, vi } from 'vitest';
+import type { BulkDeleteOutcome } from '../bulkDelete';
 import { ApiError } from '../errorHandling';
 import { renderWithQuery } from '../test/render';
 
@@ -17,13 +18,13 @@ vi.mock('../s3client', () => ({
 import BulkActionBar from '../components/BulkActionBar';
 
 type Op = (b: string, p: string) => Promise<{ succeeded: number; failed: number }>;
+const done = async (): Promise<BulkDeleteOutcome> => ({ total: 3, deleted: 3, failed: 0, failures: [], cancelled: false });
 
 function bar(props: Partial<Parameters<typeof BulkActionBar>[0]> = {}) {
   return renderWithQuery(
     <BulkActionBar
       selectedCount={2}
       selectedFolderCount={1}
-      deleting={false}
       currentPrefix="builds/"
       selectionKeys={['builds/app.zip', 'folder:builds/nightly/']}
       {...props}
@@ -34,7 +35,7 @@ function bar(props: Partial<Parameters<typeof BulkActionBar>[0]> = {}) {
 describe('delete', () => {
   test('asks for confirmation naming the folder, and deletes only on OK', async () => {
     const user = userEvent.setup();
-    const onDelete = vi.fn();
+    const onDelete = vi.fn(done);
     bar({ onDelete });
     await user.click(screen.getByRole('button', { name: 'Delete 2 selected items' }));
     const dialog = await screen.findByRole('dialog');
@@ -62,12 +63,68 @@ describe('delete', () => {
     expect(screen.getByText('Sign in as an administrator for bulk actions.')).toBeInTheDocument();
   });
 
-  test('every action is disabled while a delete runs', () => {
+  test('while a delete runs the bar shows its phase, a named progress bar and Cancel instead of the actions', async () => {
+    const user = userEvent.setup();
     const op: Op = async () => ({ succeeded: 0, failed: 0 });
-    bar({ deleting: true, onDelete: () => {}, onCopy: op, onMove: op, onDownloadZip: async () => {} });
-    for (const name of [/^Copy 2/, /^Move 2/, /^Download 2/, /^Delete 2/]) {
-      expect(screen.getByRole('button', { name })).toBeDisabled();
-    }
+    const onCancelDelete = vi.fn();
+    const props = { onDelete: done, onCopy: op, onMove: op, onDownloadZip: async () => {}, onCancelDelete };
+    const view = bar({
+      ...props,
+      deleteProgress: { phase: 'listing', listed: 12, folders: 50, keysFound: 4310, stopping: false },
+    });
+    const toolbar = screen.getByRole('toolbar', { name: 'Selection actions' });
+    expect(within(toolbar).getByRole('status')).toHaveTextContent('Listing folders 12 of 50… 4,310 objects found');
+    const progress = within(toolbar).getByRole('progressbar', { name: 'Bulk delete progress' });
+    expect(progress).toHaveAttribute('aria-valuenow', '24');
+    expect(within(toolbar).queryByRole('button', { name: /^(Copy|Move|Download|Delete) 2/ })).toBeNull();
+    await user.click(within(toolbar).getByRole('button', { name: 'Cancel delete' }));
+    expect(onCancelDelete).toHaveBeenCalledTimes(1);
+
+    view.rerender(<BulkActionBar selectedCount={2} {...props} deleteProgress={{ phase: 'deleting', done: 3400, total: 9800, stopping: false }} />);
+    expect(within(toolbar).getByRole('status')).toHaveTextContent('Deleting 3,400 of 9,800…');
+    expect(within(toolbar).getByRole('progressbar', { name: 'Bulk delete progress' })).toHaveAttribute('aria-valuenow', '34');
+
+    view.rerender(<BulkActionBar selectedCount={2} {...props} deleteProgress={{ phase: 'deleting', done: 3400, total: 9800, stopping: true }} />);
+    expect(within(toolbar).getByRole('status')).toHaveTextContent('Stopping after this batch… 3,400 of 9,800 done');
+    expect(within(toolbar).getByRole('button', { name: 'Cancel delete' })).toBeDisabled();
+  });
+
+  async function confirmDeleteWith(onDelete: () => Promise<BulkDeleteOutcome>, extra: Parameters<typeof bar>[0] = {}) {
+    const user = userEvent.setup();
+    bar({ onDelete, ...extra });
+    await user.click(screen.getByRole('button', { name: 'Delete 2 selected items' }));
+    await user.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Delete' }));
+  }
+
+  test('a finished delete reports what it did', async () => {
+    await confirmDeleteWith(async () => ({ total: 9800, deleted: 9800, failed: 0, failures: [], cancelled: false }));
+    expect(await screen.findByText('9,800 objects deleted')).toBeInTheDocument();
+  });
+
+  test('a cancelled delete reports how far it got', async () => {
+    await confirmDeleteWith(async () => ({ total: 9800, deleted: 3400, failed: 0, failures: [], cancelled: true }));
+    expect(await screen.findByText('Delete stopped. 3,400 of 9,800 objects deleted.')).toBeInTheDocument();
+  });
+
+  test('a delete that stops on an error shows the error with its count', async () => {
+    await confirmDeleteWith(async () => {
+      throw new Error('Bulk delete failed (500): disk full. 500 of 1,201 objects were deleted before the failure.');
+    });
+    expect(
+      await screen.findByText('Bulk delete failed (500): disk full. 500 of 1,201 objects were deleted before the failure.'),
+    ).toBeInTheDocument();
+  });
+
+  test('an expired session during a delete hands off instead of showing an error', async () => {
+    const onSessionExpired = vi.fn();
+    await confirmDeleteWith(
+      async () => {
+        throw new ApiError('Bulk delete failed (401): unauthorized', 401, 'unauthorized');
+      },
+      { onSessionExpired },
+    );
+    await waitFor(() => expect(onSessionExpired).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText(/unauthorized/)).toBeNull();
   });
 });
 
