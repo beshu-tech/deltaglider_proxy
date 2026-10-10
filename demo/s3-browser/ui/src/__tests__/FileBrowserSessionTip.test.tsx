@@ -33,5 +33,5 @@ test('on a phone the banner is compact', () => {
   act(() => setWidth(390));
   render(<FileBrowserSessionTip visible userKey="dana" />);
   expect(screen.getByText('Signed in for files only')).toBeInTheDocument();
-  expect(screen.queryByText(/For bulk actions, folder sizes/)).not.toBeInTheDocument();
+  expect(screen.queryByText(/For folder sizes, metrics/)).not.toBeInTheDocument();
 });

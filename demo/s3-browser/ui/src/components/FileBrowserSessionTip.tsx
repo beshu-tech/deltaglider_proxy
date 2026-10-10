@@ -51,9 +51,10 @@ export default function FileBrowserSessionTip({ visible, userKey = '' }: Props) 
         narrow ? undefined : (
           <Space orientation="vertical" size="small" style={{ width: '100%' }}>
             <span>
-              You connected with an access key, so you can browse buckets and objects. For bulk actions, folder sizes,
-              metrics, and full bucket details in the inspector, open Settings and sign in as an administrator (bootstrap
-              password or an admin IAM account, depending on your setup).
+              You connected with an access key, so you can browse buckets and objects, and copy, move, download or
+              delete the ones your permissions allow. For folder sizes, metrics, and full bucket details in the
+              inspector, open Settings and sign in as an administrator (bootstrap password or an admin IAM account,
+              depending on your setup).
             </span>
             <div>
               <Button type="primary" size="small" onClick={() => navigate('admin')}>

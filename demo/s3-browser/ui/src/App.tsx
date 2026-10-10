@@ -225,12 +225,12 @@ export default function App() {
   // THE session poller (AdminPage no longer runs its own). checkSession
   // throws on a 5xx / network blip, so the catch keeps the last-known
   // snapshot instead of ejecting the operator and losing unsaved edits. A
-  // real valid→invalid answer while in Settings returns to the browser, as
-  // the old AdminPage poller did.
-  const viewRef = useRef(view);
-  viewRef.current = view;
+  // real valid→invalid answer, in any view, goes to the sign-in screen and
+  // says why: the browser used to stay on screen (its S3 keys live in memory,
+  // so it still listed files) with the bulk actions and folder sizes gone.
   const sessionValidRef = useRef(sessionValid);
   sessionValidRef.current = sessionValid;
+  const sessionExpiredRef = useRef(() => {});
   const pollSession = useCallback(async () => {
     let session: { valid: boolean; admin_gui: boolean };
     try {
@@ -238,11 +238,13 @@ export default function App() {
     } catch {
       return; /* keep last-known session snapshot on transient errors */
     }
-    const expired = sessionValidRef.current && !session.valid;
+    if (sessionValidRef.current && !session.valid) {
+      sessionExpiredRef.current();
+      return;
+    }
     setSessionValid(session.valid);
     setSessionCaps(deriveSessionCapabilities(session));
-    if (expired && viewRef.current === 'admin') navigateToBrowse();
-  }, [navigateToBrowse]);
+  }, []);
 
   // Restore credentials from server-side session on mount; same path after ConnectPage.
   useEffect(() => {
@@ -254,7 +256,16 @@ export default function App() {
   useEffect(() => {
     if (needsConnect || sessionLoading) return;
     const id = window.setInterval(() => void pollSession(), 5 * 60 * 1000);
-    return () => clearInterval(id);
+    // A tab that comes back (a laptop that wakes up) checks at once, not up
+    // to 5 minutes later.
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void pollSession();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   }, [needsConnect, sessionLoading, pollSession]);
 
   // When session is restored and we're connected, reload the S3 browser
@@ -347,6 +358,7 @@ export default function App() {
     message.warning('Your session expired. Sign in again to continue.');
     void handleLogout();
   };
+  sessionExpiredRef.current = handleSessionExpired;
 
   const handleBucketChange = useCallback((newBucket: string) => {
     // changeBucket() already navigates the URL to /browse/<bucket>/ (PUSH).

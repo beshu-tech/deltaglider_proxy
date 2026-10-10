@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Fixed — An expired session sends the file browser to the sign-in screen
+
+When the session expired while the file browser was open (for example
+overnight, because a session lasts 4 hours), the page stayed on screen and
+said nothing. It still listed files, because the page keeps the S3 keys in
+memory and signs each request with them. But the bulk actions, the folder
+sizes and the admin reads were gone, and the account menu still said
+"Administrator". Now the browser shows "Your session expired" and opens the
+sign-in screen when the session check finds the session expired, in every
+view. The page also checks the session when its tab becomes visible again,
+not only every 5 minutes. The "Signed in for files only" tip no longer says
+that bulk actions need an administrator sign-in: they work in a files-only
+session since v2.0.0.
+
 ## v2.0.3 — 2026-10-09
 
 ### Fixed — A filesystem listing names each object by its file
