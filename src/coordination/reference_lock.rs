@@ -83,6 +83,12 @@ pub const DEFAULT_LOCK_TTL_SECS: i64 = 120;
 pub const DEFAULT_ACQUIRE_TIMEOUT_SECS: u64 = 30;
 /// Poll interval while waiting for a contended lock to free.
 const ACQUIRE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// The least time one acquire attempt gets, also when the deadline is
+/// nearer: an attempt made just before the deadline still completes.
+const MIN_ATTEMPT_TIME: Duration = Duration::from_secs(1);
+/// Deadline of one lock request (GET, conditional PUT, DELETE) when
+/// `DGP_BACKEND_REQUEST_TIMEOUT_SECS` is off. The acquire timeout caps it too.
+const DEFAULT_LOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The lock object body. `epoch` is monotonic (bumped on every steal) — purely
 /// diagnostic provenance.
@@ -256,23 +262,47 @@ pub struct S3ReferenceLock {
     node_id: String,
     ttl_secs: i64,
     acquire_timeout: Duration,
+    /// Deadline of one lock request. The coordination client has a connect
+    /// timeout only, and every delta write on every backend takes this
+    /// lock: one request that hung held the write until the 300 s request
+    /// timeout.
+    request_timeout: Duration,
 }
 
 impl S3ReferenceLock {
     pub fn new(client: Client, bucket: String, node_id: String) -> Self {
+        let acquire_timeout = Duration::from_secs(DEFAULT_ACQUIRE_TIMEOUT_SECS);
         Self {
             client,
             bucket,
             node_id,
             ttl_secs: DEFAULT_LOCK_TTL_SECS,
-            acquire_timeout: Duration::from_secs(DEFAULT_ACQUIRE_TIMEOUT_SECS),
+            acquire_timeout,
+            request_timeout: lock_request_timeout(acquire_timeout),
         }
     }
 
     pub fn with_tunables(mut self, ttl_secs: i64, acquire_timeout_secs: u64) -> Self {
         self.ttl_secs = ttl_secs.max(1);
         self.acquire_timeout = Duration::from_secs(acquire_timeout_secs.max(1));
+        self.request_timeout = lock_request_timeout(self.acquire_timeout);
         self
+    }
+
+    /// Run one lock request under [`Self::request_timeout`].
+    async fn bounded<T>(
+        &self,
+        fut: impl Future<Output = Result<T, LeaseError>>,
+    ) -> Result<T, LeaseError> {
+        tokio::time::timeout(self.request_timeout, fut)
+            .await
+            .unwrap_or_else(|_| {
+                Err(LeaseError::Backend(format!(
+                    "the coordination bucket '{}' did not answer a lock request within {}s",
+                    self.bucket,
+                    self.request_timeout.as_secs()
+                )))
+            })
     }
 
     /// Read the lock. `now` is the caller's clock: the returned lock's
@@ -280,6 +310,10 @@ impl S3ReferenceLock {
     /// `server_clock::effective_expires_at`), so the planners compare like
     /// with like.
     async fn read_lock(&self, key: &str, now: i64) -> Result<Observed, LeaseError> {
+        self.bounded(self.read_lock_unbounded(key, now)).await
+    }
+
+    async fn read_lock_unbounded(&self, key: &str, now: i64) -> Result<Observed, LeaseError> {
         match super::server_clock::get_with_server_age(&self.client, &self.bucket, key).await {
             Ok((out, age)) => {
                 let etag = out.e_tag().map(str::to_string).unwrap_or_default();
@@ -329,9 +363,12 @@ impl S3ReferenceLock {
         body: ByteStream,
         precondition: Option<&str>,
     ) -> Result<bool, LeaseError> {
-        super::cas::conditional_put(&self.client, &self.bucket, key, body, precondition)
-            .await
-            .map_err(LeaseError::Backend)
+        self.bounded(async {
+            super::cas::conditional_put(&self.client, &self.bucket, key, body, precondition)
+                .await
+                .map_err(LeaseError::Backend)
+        })
+        .await
     }
 }
 
@@ -360,14 +397,14 @@ impl ReferenceLock for S3ReferenceLock {
         let now = crate::event_outbox::current_unix_seconds();
         if let Observed::Held { lock, etag } = self.read_lock(key, now).await? {
             if lock.owner == owner {
-                let _ = self
+                let delete = self
                     .client
                     .delete_object()
                     .bucket(&self.bucket)
                     .key(key)
                     .if_match(&etag)
-                    .send()
-                    .await;
+                    .send();
+                let _ = self.bounded(async { Ok(delete.await) }).await;
             }
         }
         Ok(())
@@ -397,13 +434,24 @@ impl ReferenceLock for S3ReferenceLock {
     }
 }
 
+/// The deadline of one lock request: `DGP_BACKEND_REQUEST_TIMEOUT_SECS`
+/// (30 s by default), never longer than the acquire timeout.
+fn lock_request_timeout(acquire_timeout: Duration) -> Duration {
+    crate::storage::S3Backend::request_timeout()
+        .unwrap_or(DEFAULT_LOCK_REQUEST_TIMEOUT)
+        .min(acquire_timeout)
+}
+
 /// Block until the per-deltaspace lock is acquired or `deadline` passes.
 ///
 /// Returns `Ok(true)` once held, `Ok(false)` if the acquire timeout elapsed
 /// while a peer kept the lock (the caller fails the write with a clear "busy"
 /// error rather than risk a second baseline), and `Err` on a hard I/O error
-/// (also fail-closed). `now_fn` supplies the clock so the whole loop is
-/// unit-testable against a mock lock without real time.
+/// (also fail-closed). An attempt that does not answer by the deadline (a
+/// hung coordination bucket) is an I/O error: the deadline holds even when
+/// a request hangs (each attempt gets at least `MIN_ATTEMPT_TIME`). `now_fn`
+/// supplies the clock so the whole loop is unit-testable against a mock
+/// lock without real time.
 pub async fn acquire_blocking(
     lock: &(impl ReferenceLock + ?Sized),
     key: &str,
@@ -412,7 +460,18 @@ pub async fn acquire_blocking(
     now_fn: &(dyn Fn() -> i64 + Send + Sync),
 ) -> Result<bool, LeaseError> {
     loop {
-        if lock.try_acquire(key, owner, now_fn()).await? {
+        let left = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .max(MIN_ATTEMPT_TIME);
+        let attempt = tokio::time::timeout(left, lock.try_acquire(key, owner, now_fn())).await;
+        let Ok(acquired) = attempt else {
+            return Err(LeaseError::Backend(
+                "the coordination bucket did not answer the lock request before the acquire \
+                 timeout"
+                    .into(),
+            ));
+        };
+        if acquired? {
             return Ok(true);
         }
         if std::time::Instant::now() >= deadline {
@@ -741,6 +800,69 @@ mod tests {
             .await
             .unwrap();
         assert!(!got, "must report not-acquired rather than hang forever");
+    }
+
+    /// The deadline was checked only between attempts, so a call that
+    /// hung (a coordination bucket that accepts the connection and never
+    /// answers) held every delta write until the 300 s request timeout.
+    #[tokio::test]
+    async fn acquire_honours_its_deadline_when_a_call_hangs() {
+        struct Hung;
+        impl ReferenceLock for Hung {
+            async fn try_acquire(&self, _k: &str, _o: &str, _n: i64) -> Result<bool, LeaseError> {
+                std::future::pending().await
+            }
+            async fn release(&self, _k: &str, _o: &str) -> Result<(), LeaseError> {
+                Ok(())
+            }
+            async fn renew(&self, _k: &str, _o: &str, _n: i64) -> Result<(), LeaseError> {
+                Ok(())
+            }
+        }
+        let now_fn = || 1000i64;
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            acquire_blocking(&Hung, "k", "o", deadline, &now_fn),
+        )
+        .await;
+        let res = res.expect("the acquire hung past its deadline");
+        assert!(res.is_err(), "a hung call must fail the write closed");
+    }
+
+    /// The lock client had a connect timeout only: one lock request to a
+    /// coordination bucket that never answers hung for minutes.
+    #[tokio::test]
+    async fn a_lock_request_to_a_hung_coordination_bucket_ends() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        fake.set_delay_ms("GET", 30_000);
+        let client =
+            crate::config_db_sync::ConfigDbSync::build_client(&crate::config::BackendConfig::S3 {
+                endpoint: Some(endpoint),
+                region: "us-east-1".into(),
+                force_path_style: true,
+                access_key_id: Some("k".into()),
+                secret_access_key: Some("s".into()),
+                allow_local: true,
+                session_token: None,
+            })
+            .await
+            .unwrap();
+        let lock =
+            S3ReferenceLock::new(client, "coord".into(), "node".into()).with_tunables(120, 1);
+        let started = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            Duration::from_secs(10),
+            lock.try_acquire("k", "o", crate::event_outbox::current_unix_seconds()),
+        )
+        .await
+        .expect("a lock request hung on the coordination bucket");
+        assert!(res.is_err(), "{res:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
