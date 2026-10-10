@@ -12,11 +12,12 @@ use crate::deltaglider::{EngineError, ListObjectsPage};
 use crate::iam::{user_can_see_common_prefix, user_can_see_listed_key, ListScope};
 use std::future::Future;
 
-/// The one engine call the listing algebra makes: one LIST page.
-/// `list` is declared `-> impl Future + Send` (not `async fn`) because the
-/// s3s handler futures that await it must be `Send`; impls still write
+/// The engine calls the listing algebra makes: one LIST page.
+/// The methods are declared `-> impl Future + Send` (not `async fn`) because
+/// the s3s handler futures that await them must be `Send`; impls still write
 /// `async fn`.
 pub(crate) trait Lister: Sync {
+    /// One complete page: logical sizes, and HEAD metadata with `metadata`.
     #[allow(clippy::too_many_arguments)]
     fn list(
         &self,
@@ -27,6 +28,32 @@ pub(crate) trait Lister: Sync {
         cursor: Option<&str>,
         metadata: bool,
     ) -> impl Future<Output = Result<ListObjectsPage, EngineError>> + Send;
+
+    /// One page as the storage lists it, before [`Self::finish`]: the scan
+    /// of a filtered LIST reads hidden keys that need no logical size and no
+    /// HEAD. The default is a complete page without metadata.
+    fn list_lite(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        max_keys: u32,
+        cursor: Option<&str>,
+    ) -> impl Future<Output = Result<ListObjectsPage, EngineError>> + Send {
+        self.list(bucket, prefix, delimiter, max_keys, cursor, false)
+    }
+
+    /// Complete the page a filtered LIST returns, built from
+    /// [`Self::list_lite`] pages: logical sizes, and HEAD metadata with
+    /// `metadata`. The default returns the page as it is.
+    fn finish(
+        &self,
+        _bucket: &str,
+        page: ListObjectsPage,
+        _metadata: bool,
+    ) -> impl Future<Output = Result<ListObjectsPage, EngineError>> + Send {
+        async move { Ok(page) }
+    }
 }
 
 // Generic over the backend, not just `DynEngine`: the `Send` check of an
@@ -44,6 +71,28 @@ impl<S: crate::storage::StorageBackend> Lister for crate::deltaglider::DeltaGlid
     ) -> Result<ListObjectsPage, EngineError> {
         self.list_objects(bucket, prefix, delimiter, max_keys, cursor, metadata)
             .await
+    }
+
+    async fn list_lite(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        max_keys: u32,
+        cursor: Option<&str>,
+    ) -> Result<ListObjectsPage, EngineError> {
+        self.list_objects_lite(bucket, prefix, delimiter, max_keys, cursor)
+            .await
+    }
+
+    async fn finish(
+        &self,
+        bucket: &str,
+        mut page: ListObjectsPage,
+        metadata: bool,
+    ) -> Result<ListObjectsPage, EngineError> {
+        self.finish_listed_page(bucket, &mut page, metadata).await?;
+        Ok(page)
     }
 }
 
@@ -135,7 +184,11 @@ fn list_targets(prefix: &str, delimiter: Option<&str>, visible: &[String]) -> Ve
 /// prefixes (a bucket-wide Allow with Deny carve-outs) scans hidden keys,
 /// under `budget` engine pages (`advanced.filtered_list_max_engine_pages`):
 /// a prefix-scoped user can ask for a prefix where every key is hidden, and
-/// the scan must end.
+/// the scan must end. The scan reads lite pages ([`Lister::list_lite`]):
+/// an engine page of the scan costs its LIST requests only, never a
+/// listing-facts request or a HEAD for a key the filter then drops. The
+/// logical sizes, and with `metadata` the HEADs, are read once, for the
+/// page the caller gets ([`Lister::finish`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn list_page_for_caller<L: Lister>(
     lister: &L,
@@ -287,9 +340,7 @@ async fn list_page_within<L: Lister>(
                         break;
                     }
                     *budget -= 1;
-                    let page = lister
-                        .list(bucket, &probe, delimiter, 1, None, false)
-                        .await?;
+                    let page = lister.list_lite(bucket, &probe, delimiter, 1, None).await?;
                     if !page.objects.is_empty() || !page.common_prefixes.is_empty() {
                         prefixes.insert(common_prefix);
                         break;
@@ -301,14 +352,14 @@ async fn list_page_within<L: Lister>(
                 let mut scan_cursor = cursor.map(str::to_string);
                 while *budget > 0 {
                     *budget -= 1;
+                    // Lite: no listing facts and no HEAD for the hidden keys.
                     let page = lister
-                        .list(
+                        .list_lite(
                             bucket,
                             &scan_prefix,
                             delimiter,
                             need as u32,
                             scan_cursor.as_deref(),
-                            metadata,
                         )
                         .await?;
                     facts_missing.extend(page.facts_missing_keys);
@@ -366,13 +417,15 @@ async fn list_page_within<L: Lister>(
         .filter(|(k, _)| facts_missing.contains(k))
         .map(|(k, _)| k.clone())
         .collect();
-    Ok(ListObjectsPage {
+    let page = ListObjectsPage {
         objects: page.objects,
         common_prefixes: page.common_prefixes,
         is_truncated: page.is_truncated,
         next_continuation_token: page.next_continuation_token,
         facts_missing_keys,
-    })
+    };
+    // Sizes and metadata for the visible page only.
+    Ok(lister.finish(bucket, page, metadata).await?)
 }
 
 #[cfg(test)]
@@ -971,5 +1024,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((keys.len(), truncated), (4, true));
+    }
+
+    /// Cockroach scan (engine.md "filtered-LIST budget"): the scan loop
+    /// listed with `metadata=true`, so it HEADed (and read the listing facts
+    /// of) every hidden key it passed, before the filter dropped it.
+    #[tokio::test]
+    async fn a_filtered_metadata_listing_heads_only_the_page_it_returns() {
+        use crate::usage_scanner::test_support::{
+            facts_lists, fake_s3_engine, heads, put_raw_many,
+        };
+        let (engine, fake, endpoint) = fake_s3_engine().await;
+        put_raw_many(&endpoint, (0..40).map(|i| format!("a/h-{i:03}.zip.delta"))).await;
+        put_raw_many(&endpoint, (0..3).map(|i| format!("v/{i}.zip"))).await;
+        let scope = scoped(vec![rule("Allow", &["b/*"]), rule("Deny", &["b/a/*"])]);
+        fake.clear();
+        let page = list_page_for_caller(&engine, "b", "", None, 2, None, true, Some(&scope), 64)
+            .await
+            .unwrap();
+        let keys: Vec<&str> = page.objects.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["v/0.zip", "v/1.zip"]);
+        assert!(
+            heads(&fake) <= 2,
+            "{} HEADs for a page of 2 visible keys behind 40 hidden ones",
+            heads(&fake)
+        );
+        assert_eq!(facts_lists(&fake), 0, "listing facts read for hidden keys");
     }
 }

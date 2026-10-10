@@ -158,6 +158,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// S3 ListObjects — the single owner of prefix filtering, delimiter collapsing,
     /// and pagination. All three are coupled (CommonPrefixes count toward max-keys
     /// and must be deduplicated across pages), so they must live in one place.
+    /// `list_objects_lite` lists the page, `finish_listed_page` completes its
+    /// sizes (and its metadata when `metadata`).
     #[instrument(skip(self))]
     pub async fn list_objects(
         &self,
@@ -167,6 +169,26 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         max_keys_raw: u32,
         continuation_token: Option<&str>,
         metadata: bool,
+    ) -> Result<ListObjectsPage, EngineError> {
+        let mut page = self
+            .list_objects_lite(bucket, prefix, delimiter, max_keys_raw, continuation_token)
+            .await?;
+        self.finish_listed_page(bucket, &mut page, metadata).await?;
+        Ok(page)
+    }
+
+    /// One [`Self::list_objects`] page as the storage lists it: STORED sizes
+    /// (no listing-size cache, no listing facts, no HEAD), and an empty
+    /// `facts_missing_keys`. A caller that drops most entries (the filtered
+    /// LIST of a restricted user) reads pages with this and completes only
+    /// the page it returns with `finish_listed_page`.
+    pub(crate) async fn list_objects_lite(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        max_keys_raw: u32,
+        continuation_token: Option<&str>,
     ) -> Result<ListObjectsPage, EngineError> {
         // S3 requires max-keys >= 1; clamp to prevent pagination invariant violations.
         let max_keys = max_keys_raw.max(1);
@@ -181,7 +203,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // Fast path: delegate listing to the storage backend (S3 pages
         // natively — with OR without a delimiter — so we never materialise
         // the whole prefix just to cut one page out of it).
-        let mut page = if let Some(result) = self
+        let page = if let Some(result) = self
             .storage
             .list_objects_delegated(bucket, prefix, delimiter, max_keys, continuation_token)
             .await?
@@ -199,7 +221,17 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             self.list_objects_bulk(bucket, prefix, delimiter, max_keys, continuation_token)
                 .await?
         };
+        Ok(page)
+    }
 
+    /// Complete a page of `list_objects_lite`: the logical sizes,
+    /// and with `metadata` the HEAD enrichment of the entries that need it.
+    pub(crate) async fn finish_listed_page(
+        &self,
+        bucket: &str,
+        page: &mut ListObjectsPage,
+        metadata: bool,
+    ) -> Result<(), EngineError> {
         // Transparency without a HEAD per key: a lite LIST on an S3 backend
         // reports the STORED object (a delta's `.delta`, a ciphertext). Swap
         // in the logical size and ETag of each exact stored object (same key,
@@ -225,7 +257,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             let mut cache_misses = Vec::new();
 
             for ((key, meta), size) in
-                page.objects
+                std::mem::take(&mut page.objects)
                     .into_iter()
                     .zip(sizes.into_iter().chain(std::iter::repeat(
                         crate::storage::list_size_cache::ListedSize::Listed,
@@ -286,8 +318,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             });
             page.objects = cache_hits;
         }
-
-        Ok(page)
+        Ok(())
     }
 
     /// Return the `reference.bin` metadata for every deltaspace whose
