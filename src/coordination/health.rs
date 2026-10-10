@@ -51,9 +51,8 @@ fn health_probe_timeout() -> std::time::Duration {
     crate::storage::S3Backend::request_timeout().unwrap_or(DEFAULT_HEALTH_PROBE_TIMEOUT)
 }
 
-/// Attempts per probe. A fast failure (refused, 5xx) is retried once; an
-/// attempt that ran out its deadline is not (it waited the full deadline
-/// already); an auth rejection is definitive.
+/// Attempts per probe. A fast failure (refused, 5xx) and an attempt that
+/// ran out its deadline are retried once; an auth rejection is definitive.
 const HEALTH_PROBE_ATTEMPTS: u32 = 2;
 
 /// At most this many long-lived probe clients (one per definition).
@@ -560,8 +559,10 @@ pub async fn reprobe_all(health: &BackendHealthCache, config: &crate::config::Sh
 /// bucket absent). A HEAD answer carries no error body, so a 403 is
 /// ambiguous (a scoped key, or a Ceph-family backend hiding the bucket): a
 /// `ListBuckets` then tells a rejected credential (a hard auth code) from a
-/// soft denial (fail open). Only a connect-level fault or a rejected
-/// credential gates; a slow answer or a 5xx is `Erroring`, which does not.
+/// soft denial (fail open). Only a connect-level fault, a rejected
+/// credential, or no answer within the request deadline on both attempts
+/// (a hung backend) gates; a slow answer within the deadline or a 5xx is
+/// `Erroring` or healthy, which does not.
 /// Filesystem: the root path must exist and be a directory.
 /// ponytail: fs probe is exists+is_dir; add a write test if silent read-only
 /// mounts ever bite.
@@ -673,16 +674,21 @@ impl ProbeAttempt {
         }
     }
 
-    /// No answer within the deadline. The connect timeout is shorter and
-    /// fails as a dispatch failure, so the backend accepted the connection
-    /// and answers slowly: it is reachable, and does not gate.
+    /// No answer within the deadline, which is the data path's own request
+    /// deadline: a request to this backend would time out too. One such
+    /// attempt can be a stall of a slow backend, so it is retried; when the
+    /// second attempt gets no answer either, the backend is hung and gates
+    /// (clients get a fast 503 instead of a 30 s wait each).
     fn slow() -> Self {
-        Self::done(HealthVerdict::Erroring {
-            detail: format!(
-                "no answer within {}s: the backend is slow; requests are not blocked",
-                health_probe_timeout().as_secs()
-            ),
-        })
+        Self {
+            verdict: HealthVerdict::Unreachable {
+                detail: format!(
+                    "no answer within {}s on {HEALTH_PROBE_ATTEMPTS} attempts: the backend hangs",
+                    health_probe_timeout().as_secs()
+                ),
+            },
+            retry: true,
+        }
     }
 }
 

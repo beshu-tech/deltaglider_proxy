@@ -1298,7 +1298,9 @@ async fn test_legacy_key_usage_counts_until_reencrypted() {
     start_reencrypt(&admin, &endpoint, bucket).await;
     wait_job_done(&admin, &endpoint, bucket).await;
 
-    let after = legacy_key_usage(&admin, &endpoint, "").await;
+    // The proxy keeps a check for 60 s; a re-check after the job asks for a
+    // fresh one, like the UI's "Check again".
+    let after = legacy_key_usage(&admin, &endpoint, "?fresh=true").await;
     assert_eq!(after["objects_under_legacy_key"], 0, "{after}");
     assert_eq!(after["references_under_legacy_key"], 0, "{after}");
     assert_eq!(after["complete"], true, "{after}");

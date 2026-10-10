@@ -395,7 +395,7 @@ async fn hung_backend_times_out_fast_and_is_marked_unhealthy() {
     );
 
     // The probe that the timeout started hangs as well: two attempts of
-    // 5 s each, then the backend is gated.
+    // 2 s each (the request deadline), then the backend is gated.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
     loop {
         let (_, body) = ready(&ep).await;
@@ -449,13 +449,16 @@ async fn health_loop_finds_a_hang_and_the_recovery() {
         .extra_yaml_storage_section(&hung_backend_yaml(port, disk.path()))
         .env("DGP_BOOT_BACKEND_PROBE", "enforce")
         .env("DGP_BACKEND_HEALTH_INTERVAL_SECS", "1")
+        // The probe waits the request deadline per attempt; a hang gates
+        // after two unanswered attempts (2 × 2 s here, 2 × 30 s by default).
+        .env("DGP_BACKEND_REQUEST_TIMEOUT_SECS", "2")
         .build()
         .await;
     let ep = server.endpoint();
     let wait_for = |want: &'static str| {
         let ep = ep.clone();
         async move {
-            // A hung probe takes two 5s attempts before it reports.
+            // A hung probe takes two 2 s attempts before it reports.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
             loop {
                 let (_, body) = ready(&ep).await;

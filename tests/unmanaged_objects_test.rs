@@ -402,8 +402,10 @@ async fn test_copy_unmanaged_object_succeeds() {
     );
 }
 
-/// Regression test for M5: copy_object with unmanaged source that exceeds
-/// max_object_size should be rejected after actual size check.
+/// Regression test for M5: copy_object with an unmanaged source that exceeds
+/// max_object_size is checked against its ACTUAL size. A destination that
+/// can become a delta keeps the max_object_size limit (the codec buffers
+/// it); a passthrough destination streams the copy, up to 5 GiB.
 #[tokio::test]
 async fn test_copy_unmanaged_object_too_large_rejected() {
     let server = TestServer::builder().max_object_size(100).build().await;
@@ -420,27 +422,45 @@ async fn test_copy_unmanaged_object_too_large_rejected() {
     );
 
     let client = server.http();
-    let dest_url = format!(
-        "{}/{}/copy-big/dest.bin",
-        server.endpoint(),
-        server.bucket()
-    );
     let source = format!("/{}/copy-big/large.bin", server.bucket());
-    let resp = client
-        .put(&dest_url)
-        .header("x-amz-copy-source", &source)
-        .send()
-        .await
-        .unwrap();
+    let copy_to = |key: &str| {
+        let url = format!("{}/{}/copy-big/{key}", server.endpoint(), server.bucket());
+        client.put(&url).header("x-amz-copy-source", &source).send()
+    };
 
+    // A delta-eligible destination: refused after the actual size check.
+    let resp = copy_to("dest.zip").await.unwrap();
     let status = resp.status().as_u16();
     let body = resp.text().await.unwrap_or_default();
     assert!(
         status == 400 || status == 413,
-        "Copy of oversized unmanaged object should be rejected (400 or 413), got {}: {}",
+        "Copy of an oversized unmanaged object to a delta destination should be rejected (400 or 413), got {}: {}",
         status,
         body
     );
+
+    // A passthrough destination: streamed, byte for byte.
+    let resp = copy_to("dest.bin").await.unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "{}",
+        resp.text().await.unwrap_or_default()
+    );
+    let url = format!(
+        "{}/{}/copy-big/dest.bin",
+        server.endpoint(),
+        server.bucket()
+    );
+    let got = client
+        .get(&url)
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(got.as_ref(), &large_content[..]);
 }
 
 /// Verify that a file written directly (no xattr) and then deleted via the
