@@ -35,6 +35,7 @@ pub use body::BACKEND_GET_BODY_RESUMES;
 pub(crate) use client::{backend_request_timeout, check_s3_endpoint, guard_s3_endpoint};
 use errors::*;
 pub(in crate::storage) use facts::put_facts_object;
+#[cfg(test)]
 use listing::*;
 use metadata::*;
 use objects::*;
@@ -1446,11 +1447,8 @@ impl StorageBackend for S3Backend {
         sizes
     }
 
-    /// Optimised listing that delegates delimiter collapsing to upstream S3.
-    ///
-    /// Instead of fetching *every* object and collapsing in-memory, we ask S3
-    /// to handle the delimiter, which means S3 returns CommonPrefixes directly
-    /// and only the objects at the current level appear in Contents.
+    /// Optimised listing that delegates paging and delimiter collapsing to
+    /// upstream S3 (see `S3Backend::list_delegated_page`).
     #[instrument(skip(self))]
     async fn list_objects_delegated(
         &self,
@@ -1460,197 +1458,9 @@ impl StorageBackend for S3Backend {
         max_keys: u32,
         continuation_token: Option<&str>,
     ) -> Result<Option<DelegatedListResult>, StorageError> {
-        // We need to over-fetch from upstream because internal files
-        // (reference.bin, .delta suffixes) inflate the key count — but only
-        // until the page is provably complete (see `list_anchor` below), not
-        // until the prefix is exhausted (the old behaviour materialised the
-        // whole subtree on delimiter-less lists — the audit's memory HIGH).
-        let mut all_common_prefixes = std::collections::BTreeSet::new();
-        let mut raw_objects: Vec<S3ListedObject> = Vec::new();
-        let mut upstream_token: Option<String> = None;
-        let mut first_page = true;
-        // Set when the loop stops early at the anchor. The bounded set of raw
-        // keys that can still sort above it is confirmed after the loop.
-        let mut settled_anchor: Option<String> = None;
-        let mut skip_to: Option<&'static str> = None;
-
-        // When the engine gives us a continuation_token it's a *user-visible* key.
-        // We use start_after to skip past it on upstream S3.
-        let start_after = continuation_token.map(|s| s.to_string());
-
-        loop {
-            let mut request = self
-                .client
-                .list_objects_v2()
-                .bucket(bucket)
-                .prefix(prefix)
-                .set_delimiter(delimiter.map(String::from));
-
-            // On the first page use start_after; on subsequent pages use
-            // the upstream continuation token (or jump past the facts).
-            if first_page {
-                if let Some(ref sa) = start_after {
-                    request = request.start_after(sa);
-                }
-                first_page = false;
-            } else if let Some(past) = skip_to.take() {
-                request = request.start_after(past);
-            } else if let Some(ref token) = upstream_token {
-                request = request.continuation_token(token);
-            }
-
-            let response = request
-                .send()
-                .await
-                .map_err(|e| self.classify(bucket, &e, S3Op::ListObjects))?;
-            DELEGATED_LIST_UPSTREAM_PAGES.inc();
-
-            // Collect CommonPrefixes, skipping ONLY the `.dg/` internal deltaspace
-            // directory (never a user-visible key). Deliberately narrow: an
-            // earlier version skipped ANY dot-prefixed segment, which also hid
-            // legitimate folders like `.well-known/` from user-facing listings.
-            if let Some(cps) = response.common_prefixes {
-                for cp in cps {
-                    if let Some(p) = cp.prefix {
-                        let last_seg = p.trim_end_matches('/').rsplit('/').next().unwrap_or("");
-                        if last_seg == ".dg" || listing_facts::is_internal_common_prefix(&p) {
-                            continue;
-                        }
-                        all_common_prefixes.insert(p);
-                    }
-                }
-            }
-
-            // Collect direct objects at this level
-            let page_last = last_listed_key(response.contents.as_deref());
-            if let Some(contents) = response.contents {
-                raw_objects.extend(
-                    contents
-                        .into_iter()
-                        .filter_map(S3ListedObject::from_s3_object),
-                );
-            }
-
-            if response.is_truncated.unwrap_or(false) {
-                upstream_token = response.next_continuation_token;
-                skip_to = page_last
-                    .as_deref()
-                    .and_then(listing_facts::skip_past_facts);
-            } else {
-                break;
-            }
-
-            // Early exit: stop fetching once we are past the anchor — the
-            // (max_keys+1)-th user key — instead of draining the whole prefix
-            // into memory. The few raw keys that can still sort above the
-            // anchor and belong on the page are confirmed after the loop.
-            if let Some(anchor) = list_anchor(
-                raw_objects.iter().map(|o| o.key.as_str()),
-                all_common_prefixes.iter().map(|p| p.as_str()),
-                max_keys,
-                continuation_token,
-            ) {
-                let past_anchor = raw_objects
-                    .last()
-                    .map(|o| o.key.as_str() > anchor.as_str())
-                    .unwrap_or(false);
-                if past_anchor {
-                    settled_anchor = Some(anchor);
-                    break;
-                }
-            }
-        }
-
-        // The loop stopped at the anchor, so a raw key of the form
-        // `p + ".delta"` (p a proper prefix of the anchor) that sorts above the
-        // anchor may not have been read yet, and each one still belongs on the
-        // page. Confirm that bounded set with one exact request each — reading
-        // forward to their maximum instead is what made a delimiter-less
-        // listing walk the whole subtree (issue #82). `confirmable_candidates`
-        // owns the eligibility decision (request-prefix scope, delimiter
-        // collapse, already-read skip) so it stays unit-testable.
-        if let Some(anchor) = settled_anchor {
-            let last_read = raw_objects.last().map(|o| o.key.clone());
-            let candidates =
-                confirmable_candidates(&anchor, prefix, delimiter, last_read.as_deref());
-            // Probes are independent; run them concurrently (bounded, same
-            // doctrine as `bounded_head_calls` — never blast the backend).
-            // A probe error fails the listing closed, deliberately: silently
-            // skipping a candidate would drop a user-visible key, and the
-            // probes are the same failure class as the page fetches above.
-            let probes = candidates.into_iter().map(|candidate| {
-                let client = self.client.clone();
-                let bucket = bucket.to_string();
-                async move {
-                    DELEGATED_LIST_PROBE_REQUESTS.inc();
-                    // `max_keys(3)`: the exact key sorts first among keys
-                    // sharing its prefix, and the next slots catch foreign
-                    // multi-suffix forms (`candidate + ".delta"…`) that
-                    // classification also maps to the candidate's user key.
-                    let found = client
-                        .list_objects_v2()
-                        .bucket(&bucket)
-                        .prefix(&candidate)
-                        .max_keys(3)
-                        .send()
-                        .await
-                        .map_err(|e| self.classify(&bucket, &e, S3Op::ListObjects))?;
-                    let hits: Vec<S3ListedObject> = found
-                        .contents
-                        .into_iter()
-                        .flatten()
-                        .filter(|obj| {
-                            obj.key
-                                .as_deref()
-                                .is_some_and(|k| probe_hit_serves_candidate(k, &candidate))
-                        })
-                        .filter_map(S3ListedObject::from_s3_object)
-                        .collect();
-                    Ok::<_, StorageError>(hits)
-                }
-            });
-            let results: Vec<Result<Vec<S3ListedObject>, StorageError>> =
-                futures::stream::iter(probes)
-                    .buffer_unordered(Self::MAX_CONCURRENT_HEADS)
-                    .collect()
-                    .await;
-            for result in results {
-                // No ordering fix-up needed: `dedup_keep_latest` keys by user
-                // key and `interleave_and_paginate` sorts every entry itself —
-                // ordering (and duplicate absorption) is owned downstream.
-                raw_objects.extend(result?);
-            }
-        }
-
-        // Classify and build lite metadata (no HEAD calls — same as bulk_list_objects).
-        let listing = Self::classify_listed_objects(raw_objects);
-        let objects: Vec<(String, FileMetadata)> =
-            Self::resolve_classified_lite(listing.classified, listing.dir_markers);
-
-        // Apply max_keys across both objects and common_prefixes (interleaved)
-        let common_prefixes: Vec<String> = all_common_prefixes.into_iter().collect();
-
-        let page = crate::deltaglider::interleave_and_paginate(
-            objects,
-            common_prefixes,
-            max_keys,
-            continuation_token,
-        );
-
-        debug!(
-            "Delegated list: {} objects + {} prefixes in {}/{}",
-            page.objects.len(),
-            page.common_prefixes.len(),
-            bucket,
-            prefix
-        );
-
-        Ok(Some(DelegatedListResult {
-            objects: page.objects,
-            common_prefixes: page.common_prefixes,
-            is_truncated: page.is_truncated,
-            next_continuation_token: page.next_continuation_token,
-        }))
+        self.list_delegated_page(bucket, prefix, delimiter, max_keys, continuation_token)
+            .await
+            .map(Some)
     }
 
     async fn put_directory_marker(&self, bucket: &str, key: &str) -> Result<(), StorageError> {

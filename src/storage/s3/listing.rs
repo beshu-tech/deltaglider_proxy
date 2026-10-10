@@ -367,6 +367,9 @@ impl S3Backend {
                 skip_to = page_last
                     .as_deref()
                     .and_then(listing_facts::skip_past_facts);
+                if continuation_token.is_none() && skip_to.is_none() {
+                    return Err(truncated_without_token(bucket));
+                }
             } else {
                 break;
             }
@@ -523,4 +526,464 @@ pub(super) fn probe_hit_serves_candidate(key: &str, candidate: &str) -> bool {
                 .chunks(".delta".len())
                 .all(|c| c == b".delta")
     })
+}
+
+/// S3 answers at most this many entries per ListObjectsV2 request.
+const UPSTREAM_MAX_KEYS: u32 = 1000;
+
+/// Entries a delegated listing asks upstream for beyond the client's page:
+/// room for baselines and the two forms of a key, so the anchor of a small
+/// page is on the first upstream page.
+const UPSTREAM_SLACK: u32 = 100;
+
+/// A backend answered `IsTruncated=true` without a continuation token: the
+/// next request could only start the listing again from its first page.
+pub(super) fn truncated_without_token(bucket: &str) -> StorageError {
+    StorageError::Other(format!(
+        "the backend listing of bucket '{bucket}' is truncated but has no continuation token"
+    ))
+}
+
+impl S3Backend {
+    /// The delegated listing (`StorageBackend::list_objects_delegated`):
+    /// upstream S3 pages (and, with a delimiter, collapses) the listing, and
+    /// the proxy reads only as far as the page needs.
+    ///
+    /// A page is complete up to an ANCHOR: an entry that sorts at or below
+    /// the last key read. Every entry below it is then read, except the late
+    /// `.delta` keys that `confirmable_candidates` names, which one exact
+    /// LIST each confirms. A full page anchors at its `max_keys + 1`-th entry.
+    /// When one upstream page does not hold that many, the page is served
+    /// SHORT, up to the last entry the upstream page proves: S3 allows a
+    /// truncated page below `max_keys`, and reading the next upstream page
+    /// for one more entry made the next client page (which starts at the
+    /// page's last key) read that upstream page again. So a page costs one
+    /// upstream LIST, plus a probe when a late `.delta` key can sort into it.
+    pub(super) async fn list_delegated_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        max_keys: u32,
+        continuation_token: Option<&str>,
+    ) -> Result<DelegatedListResult, StorageError> {
+        let mut all_common_prefixes = std::collections::BTreeSet::new();
+        let mut raw_objects: Vec<S3ListedObject> = Vec::new();
+        let mut upstream_token: Option<String> = None;
+        let mut first_page = true;
+        // Set when the loop stops at an anchor; `short` when the page stops
+        // below `max_keys` at the end of the upstream page.
+        let mut settled_anchor: Option<String> = None;
+        let mut short = false;
+        let mut skip_to: Option<&'static str> = None;
+        let upstream_max_keys = max_keys
+            .saturating_add(1 + UPSTREAM_SLACK)
+            .min(UPSTREAM_MAX_KEYS);
+
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(prefix)
+                .max_keys(upstream_max_keys as i32)
+                .set_delimiter(delimiter.map(String::from));
+
+            // The client's continuation token is a user-visible key: the first
+            // upstream page starts after it; later pages follow the upstream
+            // token (or jump past the facts namespace).
+            if first_page {
+                if let Some(sa) = continuation_token {
+                    request = request.start_after(sa);
+                }
+                first_page = false;
+            } else if let Some(past) = skip_to.take() {
+                request = request.start_after(past);
+            } else if let Some(ref token) = upstream_token {
+                request = request.continuation_token(token);
+            }
+
+            let response = request
+                .send()
+                .await
+                .map_err(|e| self.classify(bucket, &e, S3Op::ListObjects))?;
+            DELEGATED_LIST_UPSTREAM_PAGES.inc();
+
+            // Collect CommonPrefixes, skipping ONLY the `.dg/` internal deltaspace
+            // directory (never a user-visible key). Deliberately narrow: an
+            // earlier version skipped ANY dot-prefixed segment, which also hid
+            // legitimate folders like `.well-known/` from user-facing listings.
+            if let Some(cps) = response.common_prefixes {
+                for cp in cps {
+                    if let Some(p) = cp.prefix {
+                        let last_seg = p.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+                        if last_seg == ".dg" || listing_facts::is_internal_common_prefix(&p) {
+                            continue;
+                        }
+                        all_common_prefixes.insert(p);
+                    }
+                }
+            }
+
+            let page_last = last_listed_key(response.contents.as_deref());
+            if let Some(contents) = response.contents {
+                raw_objects.extend(
+                    contents
+                        .into_iter()
+                        .filter_map(S3ListedObject::from_s3_object),
+                );
+            }
+
+            if !response.is_truncated.unwrap_or(false) {
+                break;
+            }
+            upstream_token = response.next_continuation_token;
+            skip_to = page_last
+                .as_deref()
+                .and_then(listing_facts::skip_past_facts);
+            if upstream_token.is_none() && skip_to.is_none() {
+                return Err(truncated_without_token(bucket));
+            }
+
+            let Some(read) = read_horizon(
+                raw_objects.last().map(|o| o.key.as_str()),
+                all_common_prefixes.last().map(String::as_str),
+            ) else {
+                continue;
+            };
+            let raw_keys = || raw_objects.iter().map(|o| o.key.as_str());
+            let cps = || all_common_prefixes.iter().map(String::as_str);
+            // A full page: past its (max_keys+1)-th entry.
+            if let Some(anchor) = list_anchor(raw_keys(), cps(), max_keys, continuation_token) {
+                if anchor.as_str() <= read {
+                    settled_anchor = Some(anchor);
+                    break;
+                }
+            }
+            // Else a short page, up to what this upstream page proves.
+            if let Some(anchor) = short_page_anchor(raw_keys(), cps(), continuation_token, read) {
+                settled_anchor = Some(anchor);
+                short = true;
+                break;
+            }
+        }
+
+        // The loop stopped at the anchor, so a raw key of the form
+        // `p + ".delta"` (p a proper prefix of the anchor) that sorts above the
+        // anchor may not have been read yet, and each one still belongs on the
+        // page. Confirm that bounded set with one exact request each — reading
+        // forward to their maximum instead is what made a delimiter-less
+        // listing walk the whole subtree (issue #82). `confirmable_candidates`
+        // owns the eligibility decision (request-prefix scope, delimiter
+        // collapse, already-read skip) so it stays unit-testable. A candidate
+        // at or below the continuation token belongs to an earlier page.
+        if let Some(anchor) = &settled_anchor {
+            let read = read_horizon(
+                raw_objects.last().map(|o| o.key.as_str()),
+                all_common_prefixes.last().map(String::as_str),
+            )
+            .map(str::to_string);
+            let token = continuation_token.unwrap_or("");
+            let candidates: Vec<String> =
+                confirmable_candidates(anchor, prefix, delimiter, read.as_deref())
+                    .into_iter()
+                    .filter(|c| c.strip_suffix(".delta").unwrap_or(c) > token)
+                    .collect();
+            // Probes are independent; run them concurrently (bounded, same
+            // doctrine as `bounded_head_calls` — never blast the backend).
+            // A probe error fails the listing closed, deliberately: silently
+            // skipping a candidate would drop a user-visible key, and the
+            // probes are the same failure class as the page fetches above.
+            let probes = candidates.into_iter().map(|candidate| {
+                let client = self.client.clone();
+                let bucket = bucket.to_string();
+                async move {
+                    DELEGATED_LIST_PROBE_REQUESTS.inc();
+                    // `max_keys(3)`: the exact key sorts first among keys
+                    // sharing its prefix, and the next slots catch foreign
+                    // multi-suffix forms (`candidate + ".delta"…`) that
+                    // classification also maps to the candidate's user key.
+                    let found = client
+                        .list_objects_v2()
+                        .bucket(&bucket)
+                        .prefix(&candidate)
+                        .max_keys(3)
+                        .send()
+                        .await
+                        .map_err(|e| self.classify(&bucket, &e, S3Op::ListObjects))?;
+                    let hits: Vec<S3ListedObject> = found
+                        .contents
+                        .into_iter()
+                        .flatten()
+                        .filter(|obj| {
+                            obj.key
+                                .as_deref()
+                                .is_some_and(|k| probe_hit_serves_candidate(k, &candidate))
+                        })
+                        .filter_map(S3ListedObject::from_s3_object)
+                        .collect();
+                    Ok::<_, StorageError>(hits)
+                }
+            });
+            let results: Vec<Result<Vec<S3ListedObject>, StorageError>> =
+                futures::stream::iter(probes)
+                    .buffer_unordered(Self::MAX_CONCURRENT_HEADS)
+                    .collect()
+                    .await;
+            for result in results {
+                // No ordering fix-up needed: `dedup_keep_latest` keys by user
+                // key and `interleave_and_paginate` sorts every entry itself —
+                // ordering (and duplicate absorption) is owned downstream.
+                raw_objects.extend(result?);
+            }
+        }
+
+        // Classify and build lite metadata (no HEAD calls — same as bulk_list_objects).
+        let listing = Self::classify_listed_objects(raw_objects);
+        let mut objects: Vec<(String, FileMetadata)> =
+            Self::resolve_classified_lite(listing.classified, listing.dir_markers);
+        let mut common_prefixes: Vec<String> = all_common_prefixes.into_iter().collect();
+        if let (true, Some(anchor)) = (short, &settled_anchor) {
+            // The anchor and what follows it start the next page.
+            objects.retain(|(k, _)| k < anchor);
+            common_prefixes.retain(|p| p < anchor);
+        }
+
+        // Apply max_keys across both objects and common_prefixes (interleaved)
+        let mut page = crate::deltaglider::interleave_and_paginate(
+            objects,
+            common_prefixes,
+            max_keys,
+            continuation_token,
+        );
+        if short && !page.is_truncated {
+            page.is_truncated = true;
+            page.next_continuation_token = page
+                .objects
+                .last()
+                .map(|(k, _)| k)
+                .into_iter()
+                .chain(page.common_prefixes.last())
+                .max()
+                .cloned();
+        }
+
+        debug!(
+            "Delegated list: {} objects + {} prefixes in {}/{}{}",
+            page.objects.len(),
+            page.common_prefixes.len(),
+            bucket,
+            prefix,
+            if short { " (short page)" } else { "" }
+        );
+
+        Ok(DelegatedListResult {
+            objects: page.objects,
+            common_prefixes: page.common_prefixes,
+            is_truncated: page.is_truncated,
+            next_continuation_token: page.next_continuation_token,
+        })
+    }
+}
+
+/// The last entry a listing read so far: its last key, or its last
+/// CommonPrefix when that sorts higher (upstream returns keys and prefixes
+/// in one order, and every key under a returned prefix is read too).
+pub(super) fn read_horizon<'a>(
+    last_key: Option<&'a str>,
+    last_prefix: Option<&'a str>,
+) -> Option<&'a str> {
+    last_key.into_iter().chain(last_prefix).max()
+}
+
+/// The anchor of a SHORT page (see `S3Backend::list_delegated_page`): the
+/// highest entry after `continuation_token` and at or below `read` (the
+/// last entry read), when at least one more entry after the token sorts
+/// below it, so the page is not empty. Pure; keys map to user keys and
+/// baselines drop out as in `list_anchor`.
+pub(super) fn short_page_anchor<'a>(
+    raw_keys: impl Iterator<Item = &'a str>,
+    common_prefixes: impl Iterator<Item = &'a str>,
+    continuation_token: Option<&str>,
+    read: &str,
+) -> Option<String> {
+    let token = continuation_token.unwrap_or("");
+    if read <= token {
+        return None;
+    }
+    let mut entries: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for key in raw_keys {
+        if key.rsplit('/').next() == Some("reference.bin") {
+            continue;
+        }
+        entries.insert(key.trim_end_matches(".delta"));
+    }
+    entries.extend(common_prefixes);
+    let mut proven = entries.range::<str, _>((
+        std::ops::Bound::Excluded(token),
+        std::ops::Bound::Included(read),
+    ));
+    let anchor = proven.next_back()?;
+    proven.next()?;
+    Some(anchor.to_string())
+}
+
+/// What a delegated listing costs in upstream requests, and how it ends.
+#[cfg(test)]
+mod delegated_cost_tests {
+    use super::*;
+    use crate::storage::FakeS3;
+
+    async fn backend_with_keys(keys: &[String]) -> (S3Backend, std::sync::Arc<FakeS3>) {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let http = reqwest::Client::new();
+        futures::stream::iter(keys)
+            .for_each_concurrent(32, |k| {
+                let req = http.put(format!("{endpoint}/b/{k}")).body("x");
+                async move {
+                    req.send().await.unwrap();
+                }
+            })
+            .await;
+        fake.clear();
+        (test_support::for_test_endpoint(&endpoint), fake)
+    }
+
+    fn lists(fake: &FakeS3) -> usize {
+        fake.requests()
+            .iter()
+            .filter(|r| r.starts_with("GET /b") && r.contains("list-type=2"))
+            .count()
+    }
+
+    /// A recursive listing of 3,000 keys sends at most two upstream LISTs
+    /// per client page. It sent three: the anchor of a full page (key 1001)
+    /// is on the second upstream page, the next client page read that page
+    /// again, and every page probed for a late `.delta` key that sorts
+    /// before the page.
+    #[tokio::test]
+    async fn a_recursive_listing_sends_at_most_two_lists_per_page() {
+        let keys: Vec<String> = (0..3000).map(|i| format!("d/img-{i:05}.jpg")).collect();
+        let (s3, fake) = backend_with_keys(&keys).await;
+        let mut got: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut per_page = Vec::new();
+        loop {
+            let before = lists(&fake);
+            let page = s3
+                .list_objects_delegated("b", "d/", None, 1000, token.as_deref())
+                .await
+                .unwrap()
+                .unwrap();
+            per_page.push(lists(&fake) - before);
+            got.extend(page.objects.into_iter().map(|(k, _)| k));
+            if !page.is_truncated {
+                break;
+            }
+            token = page.next_continuation_token;
+            assert_eq!(token.as_ref(), got.last());
+        }
+        assert_eq!(got, keys, "every key once, in order");
+        assert!(
+            per_page.iter().all(|n| *n <= 2),
+            "upstream LISTs per client page: {per_page:?}"
+        );
+    }
+
+    /// A page of a few keys is served from one upstream LIST.
+    #[tokio::test]
+    async fn a_small_page_costs_one_list() {
+        let keys: Vec<String> = (0..300).map(|i| format!("d/img-{i:05}.jpg")).collect();
+        let (s3, fake) = backend_with_keys(&keys).await;
+        let page = s3
+            .list_objects_delegated("b", "d/", None, 100, Some("d/img-00099.jpg"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.objects.len(), 100);
+        assert_eq!(page.objects[0].0, "d/img-00100.jpg");
+        assert!(page.is_truncated);
+        assert_eq!(lists(&fake), 1, "{:?}", fake.requests());
+    }
+
+    /// A backend that answers `IsTruncated=true` with no continuation
+    /// token: both listing loops fail. They sent the next request with no
+    /// token, got the first page again, and looped for ever.
+    #[tokio::test]
+    async fn a_truncated_page_without_a_token_fails_the_listing() {
+        let app = axum::Router::new().fallback(|| async {
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <Name>b</Name><Prefix></Prefix><MaxKeys>1000</MaxKeys>\
+             <IsTruncated>true</IsTruncated><Contents><Key>a</Key>\
+             <LastModified>2025-01-01T00:00:00.000Z</LastModified><ETag>\"e\"</ETag>\
+             <Size>1</Size><StorageClass>STANDARD</StorageClass></Contents>\
+             </ListBucketResult>"
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let s3 = test_support::for_test_endpoint(&endpoint);
+        let limit = std::time::Duration::from_secs(5);
+        let full = tokio::time::timeout(limit, s3.list_objects_full("b", ""))
+            .await
+            .expect("list_objects_full looped");
+        assert!(full.is_err());
+        let delegated =
+            tokio::time::timeout(limit, s3.list_objects_delegated("b", "", None, 1000, None))
+                .await
+                .expect("list_objects_delegated looped");
+        assert!(delegated.is_err());
+    }
+
+    #[test]
+    fn a_short_page_anchors_at_the_last_entry_read() {
+        let keys = ["d/a", "d/b.delta", "d/b", "d/c", "d/reference.bin", "d/e"];
+        let cps = ["d/c/", "d/z/"];
+        let anchor =
+            |token, read| short_page_anchor(keys.iter().copied(), cps.iter().copied(), token, read);
+        // Entries: d/a d/b d/c d/c/ d/e d/z/ (the baseline drops out).
+        assert_eq!(anchor(None, "d/e").as_deref(), Some("d/e"));
+        assert_eq!(anchor(None, "d/d").as_deref(), Some("d/c/"));
+        assert_eq!(
+            anchor(Some("d/a"), "d/c").as_deref(),
+            Some("d/c"),
+            "d/c/ > d/c"
+        );
+        assert_eq!(anchor(Some("d/b"), "d/c"), None, "d/c alone");
+        assert_eq!(anchor(None, "d/z/").as_deref(), Some("d/z/"));
+        // One entry after the token: no page below it.
+        assert_eq!(anchor(Some("d/c/"), "d/e"), None);
+        assert_eq!(
+            anchor(Some("d/e"), "d/e"),
+            None,
+            "nothing read after the token"
+        );
+        assert_eq!(anchor(Some("d/z"), "d/e"), None, "read is below the token");
+        assert_eq!(read_horizon(Some("d/e"), Some("d/c/")), Some("d/e"));
+        assert_eq!(read_horizon(Some("d/a"), Some("d/c/")), Some("d/c/"));
+        assert_eq!(read_horizon(None, None), None);
+    }
+
+    /// Every upstream LIST loop that follows a continuation token stops
+    /// with an error when a truncated page has none, instead of asking for
+    /// the first page again.
+    #[test]
+    fn every_token_loop_stops_without_a_token() {
+        for (file, text) in crate::source_scan::prod_sources("src/storage/s3") {
+            let lines: Vec<(usize, &str)> = crate::source_scan::prod_lines(&text);
+            for (i, (n, line)) in lines.iter().enumerate() {
+                if !line.contains("= response.next_continuation_token;") {
+                    continue;
+                }
+                let handled = lines[i..lines.len().min(i + 8)]
+                    .iter()
+                    .any(|(_, l)| l.contains("truncated_without_token("));
+                assert!(
+                    handled,
+                    "{file}:{n}: a truncated page without a token loops"
+                );
+            }
+        }
+    }
 }
