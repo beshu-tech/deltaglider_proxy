@@ -10,9 +10,11 @@
 //! lies. This module replaces that single-shot cap with a paginated
 //! scan that:
 //!
-//! 1. Walks **every** object in the bucket via the engine's
-//!    `list_objects` pagination, accumulating `objects`,
-//!    `original_bytes`, and `stored_bytes`.
+//! 1. Walks **every** object in the bucket with one lite listing
+//!    ([`super::savings::scan_totals`]), accumulating `objects`,
+//!    `original_bytes`, and `stored_bytes`. A HEAD goes only to an object
+//!    whose logical size neither the listing-size cache nor the listing
+//!    facts know.
 //! 2. Reports progress to subscribers (SSE clients) via a
 //!    `tokio::sync::watch` channel.
 //! 3. Is cancellable mid-flight via a `CancellationToken`.
@@ -38,6 +40,12 @@
 //! A successful `Running` transitions to `Done` and is persisted.
 //! A cancelled `Running` falls back to whatever `Done` was previously
 //! present (or `Idle` if none).
+//!
+//! ## The usage counter
+//!
+//! A scan is also THE usage Refresh (`POST /usage/refresh` starts or joins
+//! it): a completed scan whose sizes are all known overwrites the bucket's
+//! usage counter. An `estimated` scan (some size unknown) never does.
 //!
 //! ## Why we don't aggregate across buckets in the same job
 //!
@@ -93,6 +101,10 @@ pub struct ScanResult {
     /// "never scanned".
     #[serde(default = "default_version")]
     pub version: u32,
+    /// Some objects counted their stored size: their logical size was not
+    /// known and a HEAD did not answer. The usage counter kept its value.
+    #[serde(default)]
+    pub estimated: bool,
 }
 
 fn default_version() -> u32 {
@@ -120,6 +132,9 @@ pub struct ScanProgress {
     pub finished: bool,
     pub error: Option<String>,
     pub started_at: DateTime<Utc>,
+    /// Terminal frame only: the result is an estimate (see
+    /// [`ScanResult::estimated`]).
+    pub estimated: bool,
 }
 
 impl ScanProgress {
@@ -144,6 +159,7 @@ impl ScanProgress {
             finished: false,
             error: None,
             started_at,
+            estimated: false,
         }
     }
 
@@ -158,6 +174,7 @@ impl ScanProgress {
             finished: false,
             error: None,
             started_at: Utc::now(),
+            estimated: false,
         }
     }
 }
@@ -345,6 +362,19 @@ impl BucketScanner {
         rx
     }
 
+    /// Start a scan, or join the running one, and wait for its terminal
+    /// frame. The scan runs in its own task: a caller that goes away does
+    /// not stop it, and a second caller does not start another.
+    pub(crate) async fn run_to_end(&self, bucket: String, s3_state: Arc<AppState>) -> ScanProgress {
+        let mut rx = self.start(bucket, s3_state);
+        loop {
+            let frame = rx.borrow_and_update().clone();
+            if frame.finished || rx.changed().await.is_err() {
+                return frame;
+            }
+        }
+    }
+
     /// Cancel a running scan. Returns true if a scan was running and
     /// got signalled (it may take a beat to actually exit), false if
     /// no scan was running.
@@ -457,6 +487,7 @@ impl ScanProgress {
                 frame.objects = r.total_objects;
                 frame.original_bytes = r.total_original_bytes;
                 frame.stored_bytes = r.total_stored_bytes;
+                frame.estimated = r.estimated;
             }
             Err(ScanFailure::Error(e)) => frame.error = Some(e.clone()),
             Err(ScanFailure::Cancelled) => frame.error = Some("the scan was cancelled".into()),
@@ -516,38 +547,59 @@ async fn run_scan(
     cancel: CancellationToken,
 ) -> Result<ScanResult, ScanFailure> {
     let started_instant = std::time::Instant::now();
-    // limit=None on the reference walk: the dashboard scan is the "real
-    // number" path the operator triggered explicitly (the chip endpoint
-    // caps it instead). Progress goes out on EVERY page: the watch channel
-    // coalesces, so even a 100k-object walk cannot flood the SSE consumer,
-    // and a throttle made small buckets look stuck at "0 objects".
+    // The ticket marks the scan start: a write that lands while the scan
+    // runs is kept on top of the scan result (H14b).
+    let usage = s3_state.bucket_usage.clone();
+    let ticket = usage.as_deref().map(|u| u.begin_scan(bucket));
+    // No cap: the dashboard scan is the "real number" path the operator
+    // triggered explicitly (the chip endpoint caps it instead). HEADs go
+    // only to the objects whose size the listing cannot tell. Progress goes
+    // out on EVERY page: the watch channel coalesces, so even a 100k-object
+    // walk cannot flood the SSE consumer, and a throttle made small buckets
+    // look stuck at "0 objects".
     let opts = super::savings::TotalsScanOpts {
         prefix: "",
-        object_cap: None,
+        key_cap: None,
         ref_limit: None,
+        head_unknown: true,
         cancel: Some(&cancel),
     };
-    let (totals, _) =
-        super::savings::scan_totals(&s3_state, bucket, opts, |totals, pages, has_more| {
-            // send() fails only when every receiver is gone; the scan keeps
-            // running for the background result + disk cache.
-            let _ = tx.send(ScanProgress::page(
-                bucket,
-                (
-                    totals.user_visible_count(),
-                    totals.original_bytes,
-                    totals.stored_bytes,
-                ),
-                pages,
-                has_more,
-                started_at,
-            ));
-        })
-        .await
-        .map_err(|e| match e {
-            super::savings::TotalsScanError::Cancelled => ScanFailure::Cancelled,
-            super::savings::TotalsScanError::Failed(msg) => ScanFailure::Error(msg),
-        })?;
+    let scan = super::savings::scan_totals(&s3_state, bucket, opts, |totals, pages, has_more| {
+        // send() fails only when every receiver is gone; the scan keeps
+        // running for the background result + disk cache.
+        let _ = tx.send(ScanProgress::page(
+            bucket,
+            (
+                totals.user_visible_count(),
+                totals.original_bytes,
+                totals.stored_bytes,
+            ),
+            pages,
+            has_more,
+            started_at,
+        ));
+    })
+    .await
+    .map_err(|e| match e {
+        super::savings::TotalsScanError::Cancelled => ScanFailure::Cancelled,
+        super::savings::TotalsScanError::Failed(msg) => ScanFailure::Error(msg),
+    })?;
+    let totals = scan.totals;
+    if let (Some(usage), Some(ticket)) = (usage.as_deref(), ticket) {
+        if scan.estimated {
+            // An estimate never replaces the counter: the ticket drops, and
+            // the counter keeps its value and its writes.
+            warn!(
+                bucket = %bucket,
+                "Bucket scan is an estimate (unknown object sizes); the usage counter is kept"
+            );
+        } else {
+            let now = crate::replication::current_unix_seconds();
+            usage
+                .overwrite_from_scan(ticket, &totals, now)
+                .map_err(|e| ScanFailure::Error(format!("usage counter: {e}")))?;
+        }
+    }
 
     let completed_at = Utc::now();
     let duration_ms = started_instant.elapsed().as_millis() as u64;
@@ -564,6 +616,7 @@ async fn run_scan(
         completed_at,
         duration_ms,
         version: CURRENT_VERSION,
+        estimated: scan.estimated,
     };
 
     Ok(result)
@@ -762,6 +815,7 @@ mod tests {
             completed_at: Utc::now(),
             duration_ms: 0,
             version: default_version(),
+            estimated: false,
         };
         let got = |prev, out| result_after_scan(prev, out).map(|x: ScanResult| x.total_objects);
         assert_eq!(got(Some(r(1)), Err(ScanFailure::Cancelled)), Some(1));
@@ -777,44 +831,21 @@ mod tests {
     /// that carries the error. Only a completed scan sent one, so the SSE
     /// stream ended without `done` and "Scan all" stopped.
     #[tokio::test]
-    async fn a_failed_reference_walk_ends_with_a_terminal_error_frame() {
-        use crate::storage::{DynStorageBackend, Fault, FaultPoint, FaultyFs, FilesystemBackend};
+    async fn a_failed_listing_ends_with_a_terminal_error_frame() {
+        use crate::usage_scanner::test_support::{fake_s3_engine, put_raw};
+        let (engine, fake, endpoint) = fake_s3_engine().await;
+        put_raw(&endpoint, "a.txt", b"x").await;
+        fake.fail("LIST", "", 500, "InternalError", u32::MAX);
         let dir = tempfile::tempdir().unwrap();
-        let faulty = FaultyFs::new(
-            FilesystemBackend::new(dir.path().join("data"))
-                .await
-                .unwrap(),
-        );
-        let faults = faulty.faults.clone();
-        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(faulty);
-        let engine = crate::deltaglider::DeltaGliderEngine::new_with_backend(
-            Arc::new(backend),
-            &crate::config::Config::default(),
-            None,
-        );
-        engine.create_bucket("b").await.unwrap();
-        engine
-            .store("b", "a.txt", b"x", None, Default::default())
-            .await
-            .unwrap();
-        faults.arm(FaultPoint::ListReferencePrefixes, "b//", Fault::Io);
         let scanner = BucketScanner::load(dir.path().join("scans"));
-        let mut rx = scanner.start("b".into(), AppState::for_tests(engine));
-        let mut last = rx.borrow().clone();
-        while rx.changed().await.is_ok() {
-            last = rx.borrow().clone();
-        }
-        assert!(faults.fired(FaultPoint::ListReferencePrefixes, "b//") > 0);
+        let last = scanner
+            .run_to_end("b".into(), AppState::for_tests(engine))
+            .await;
         assert!(
             last.finished,
             "the stream ended without a terminal frame: {last:?}"
         );
-        assert!(
-            last.error
-                .as_deref()
-                .is_some_and(|e| e.contains("injected")),
-            "{last:?}"
-        );
+        assert!(last.error.is_some(), "{last:?}");
         assert!(scanner.snapshot_running().is_empty());
     }
 
@@ -835,6 +866,7 @@ mod tests {
             completed_at: Utc::now(),
             duration_ms: 0,
             version: default_version(),
+            estimated: false,
         };
         let last = ScanProgress::page("b", (3, 30, 3), 2, true, Utc::now());
         let running = || {
@@ -947,6 +979,7 @@ mod tests {
             completed_at: started,
             duration_ms: 10,
             version: CURRENT_VERSION,
+            estimated: false,
         };
         persist_scan(&dir, &result);
 
@@ -981,6 +1014,7 @@ mod tests {
             completed_at: Utc::now(),
             duration_ms: 1,
             version: CURRENT_VERSION,
+            estimated: false,
         };
         let (_tx, rx) = watch::channel(ScanProgress::initial("running-bucket"));
         let running = RunningJob {
