@@ -580,6 +580,10 @@ impl StorageBackend for FaultyFs {
         self.inner.scan_deltaspace(bucket, prefix).await
     }
 
+    async fn holds_only_reference(&self, bucket: &str, prefix: &str) -> Result<bool, StorageError> {
+        self.inner.holds_only_reference(bucket, prefix).await
+    }
+
     async fn list_deltaspaces(&self, bucket: &str) -> Result<Vec<String>, StorageError> {
         self.armed(FaultPoint::ListDeltaspaces, bucket, "", "")
             .await?;

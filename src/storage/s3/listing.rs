@@ -263,32 +263,104 @@ impl S3Backend {
     /// itself (not from subdirectories). Shared between
     /// [`scan_deltaspace`] and [`scan_deltaspace_lite`].
     ///
-    /// A LIST of `prefix/` returns the whole subtree, so the entries of
-    /// child deltaspaces are dropped here, as the filesystem backend skips
-    /// child directories. They are not this deltaspace's objects: a child's
-    /// deltas use the child's own reference.bin. (Kept, they stopped the
+    /// The LIST of `prefix/` has delimiter `/`, so a child deltaspace is one
+    /// CommonPrefix and none of its keys is read: a child's deltas use the
+    /// child's own reference.bin, and without the delimiter a root folder
+    /// read the whole bucket. (Counted, a child's objects stopped the
     /// reclaim of the parent's reference.bin, and the delta-efficiency scan
-    /// counted a child's objects in the parent too.)
+    /// counted them in the parent too.)
     pub(super) async fn list_deltaspace_eligible(
         &self,
         bucket: &str,
         prefix: &str,
     ) -> Result<Vec<S3ListedObject>, StorageError> {
-        let search_prefix = if prefix.is_empty() {
-            String::new()
-        } else {
-            format!("{}/", prefix)
-        };
-        let listed = self.list_objects_full(bucket, &search_prefix).await?;
-        let eligible: Vec<S3ListedObject> = listed
-            .into_iter()
-            .filter(|obj| {
+        let search_prefix = level_prefix(prefix);
+        let mut eligible = Vec::new();
+        let mut token = None;
+        loop {
+            let (objects, next) = self
+                .list_level_page(bucket, &search_prefix, 1000, token)
+                .await?;
+            // The delimiter keeps sub-folder keys out; this filter is for
+            // a backend that ignores it.
+            eligible.extend(objects.into_iter().filter(|obj| {
                 obj.key
                     .strip_prefix(&search_prefix)
                     .is_some_and(|name| !name.contains('/'))
-            })
+            }));
+            match next {
+                Some(t) => token = Some(t),
+                None => return Ok(eligible),
+            }
+        }
+    }
+
+    /// [`StorageBackend::holds_only_reference`] on S3: LIST the level of
+    /// `prefix/` (delimiter `/`) and stop at the first key that is not
+    /// reference.bin. The first page is small: in the common case it holds
+    /// an object and answers the question. Only a level that starts with
+    /// sub-folders reads more pages.
+    pub(super) async fn holds_only_reference_listed(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<bool, StorageError> {
+        /// Entries of the first page: enough to pass reference.bin and
+        /// a few sub-folders.
+        const FIRST_PAGE_KEYS: i32 = 8;
+        let search_prefix = level_prefix(prefix);
+        let reference = self.reference_key(prefix);
+        let mut found_reference = false;
+        let (mut max_keys, mut token) = (FIRST_PAGE_KEYS, None);
+        loop {
+            let (objects, next) = self
+                .list_level_page(bucket, &search_prefix, max_keys, token)
+                .await?;
+            for obj in objects {
+                if obj.key != reference {
+                    return Ok(false);
+                }
+                found_reference = true;
+            }
+            match next {
+                Some(t) => (max_keys, token) = (1000, Some(t)),
+                None => return Ok(found_reference),
+            }
+        }
+    }
+
+    /// One ListObjectsV2 page of the level `search_prefix` with delimiter
+    /// `/`: its objects, and the token of the next page (`None`: the last).
+    async fn list_level_page(
+        &self,
+        bucket: &str,
+        search_prefix: &str,
+        max_keys: i32,
+        token: Option<String>,
+    ) -> Result<(Vec<S3ListedObject>, Option<String>), StorageError> {
+        let response = self
+            .client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(search_prefix)
+            .delimiter("/")
+            .max_keys(max_keys)
+            .set_continuation_token(token)
+            .send()
+            .await
+            .map_err(|e| self.classify(bucket, &e, S3Op::ListObjects))?;
+        let next = response
+            .is_truncated
+            .unwrap_or(false)
+            .then_some(response.next_continuation_token)
+            .flatten();
+        let objects = response
+            .contents
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(S3ListedObject::from_s3_object)
             .collect();
-        Ok(eligible)
+        Ok((objects, next))
     }
 
     /// Build a no-HEAD FileMetadata for a listed object. For deltas the
@@ -376,6 +448,16 @@ impl S3Backend {
         }
 
         Ok(results)
+    }
+}
+
+/// The LIST prefix of the deltaspace `prefix`: `prefix/`, or `""` for
+/// the bucket root.
+fn level_prefix(prefix: &str) -> String {
+    if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix}/")
     }
 }
 

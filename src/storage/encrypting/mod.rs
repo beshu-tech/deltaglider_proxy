@@ -1293,6 +1293,9 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     async fn scan_deltaspace_lite(&self, b: &str, p: &str) -> Result<LiteScanResult, StorageError> {
         self.inner.scan_deltaspace_lite(b, p).await
     }
+    async fn holds_only_reference(&self, b: &str, p: &str) -> Result<bool, StorageError> {
+        self.inner.holds_only_reference(b, p).await
+    }
     async fn list_deltaspaces(&self, b: &str) -> Result<Vec<String>, StorageError> {
         self.inner.list_deltaspaces(b).await
     }

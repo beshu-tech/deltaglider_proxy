@@ -18,8 +18,9 @@ pub(crate) use engine::{derive_key_id, effective_legacy_key_id, interleave_and_p
 #[cfg(test)]
 pub(crate) use engine::{s3_engine, store_deltas};
 pub use engine::{
-    ConditionalDelete, DeltaGliderEngine, DynEngine, EngineError, ListObjectsPage, RefWriteProof,
-    ReferenceScan, RetrieveResponse, REFERENCE_SCAN_LIMIT,
+    ConditionalDelete, DeleteHooks, DeleteItem, DeleteOutcome, DeltaGliderEngine, DynEngine,
+    EngineError, ListObjectsPage, RefWriteProof, ReferenceScan, RetrieveResponse,
+    BULK_DELETE_CONCURRENCY, REFERENCE_SCAN_LIMIT,
 };
 pub use file_router::{CompressionStrategy, FileRouter};
 pub use savings::SavingsTotals;

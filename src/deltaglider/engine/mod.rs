@@ -41,6 +41,7 @@ mod usage;
 use locking::*;
 
 pub(crate) use construction::{derive_key_id, effective_legacy_key_id};
+pub use delete::{DeleteHooks, DeleteItem, DeleteOutcome, BULK_DELETE_CONCURRENCY};
 pub(crate) use list::interleave_and_paginate;
 pub use locking::RefWriteProof;
 
@@ -253,6 +254,10 @@ mod tests;
 mod delete_cost_tests;
 #[cfg(test)]
 pub(crate) use delete_cost_tests::{s3_engine, store_deltas};
+
+/// `delete_batch`: request costs and the per-key contract.
+#[cfg(test)]
+mod delete_batch_tests;
 
 /// The store decision, pinned for the buffered and the streaming PUT.
 #[cfg(test)]

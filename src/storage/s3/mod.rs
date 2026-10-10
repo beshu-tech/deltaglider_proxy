@@ -1179,6 +1179,11 @@ impl StorageBackend for S3Backend {
     }
 
     #[instrument(skip(self))]
+    async fn holds_only_reference(&self, bucket: &str, prefix: &str) -> Result<bool, StorageError> {
+        self.holds_only_reference_listed(bucket, prefix).await
+    }
+
+    #[instrument(skip(self))]
     async fn list_deltaspaces(&self, bucket: &str) -> Result<Vec<String>, StorageError> {
         let keys = self.list_objects_with_prefix(bucket, "").await?;
         let mut prefixes = HashSet::new();

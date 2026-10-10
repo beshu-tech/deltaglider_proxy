@@ -1337,6 +1337,10 @@ impl StorageBackend for RoutingBackend {
         route_existing!(self, bucket, scan_deltaspace_lite, prefix)
     }
 
+    async fn holds_only_reference(&self, bucket: &str, prefix: &str) -> Result<bool, StorageError> {
+        route_existing!(self, bucket, holds_only_reference, prefix)
+    }
+
     async fn list_deltaspaces(&self, bucket: &str) -> Result<Vec<String>, StorageError> {
         route_existing!(self, bucket, list_deltaspaces)
     }

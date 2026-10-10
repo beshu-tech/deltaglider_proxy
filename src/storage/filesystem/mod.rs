@@ -1678,6 +1678,38 @@ impl StorageBackend for FilesystemBackend {
         Ok(metadata_list)
     }
 
+    /// Reads the directory names only, up to the first object; a child
+    /// directory is another deltaspace.
+    #[instrument(skip(self))]
+    async fn holds_only_reference(&self, bucket: &str, prefix: &str) -> Result<bool, StorageError> {
+        let dir = self.deltaspace_dir(bucket, prefix)?;
+        if !fsio::exists(&dir).await? {
+            return Ok(false);
+        }
+        let mut reference = false;
+        let mut entries = fs::read_dir(&dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_type().await?.is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            match stored_name(name) {
+                StoredName::Internal => {}
+                StoredName::Reference => reference = true,
+                StoredName::Object { .. } => return Ok(false),
+            }
+        }
+        // A reference whose metadata cannot be read stays (fail closed, as
+        // in `scan_deltaspace`).
+        Ok(reference
+            && xattr_meta::read_metadata(&self.reference_path(bucket, prefix)?)
+                .await
+                .is_ok())
+    }
+
     #[instrument(skip(self))]
     async fn list_deltaspaces(&self, bucket: &str) -> Result<Vec<String>, StorageError> {
         let deltaspaces_dir = self.bucket_dir(bucket).join("deltaspaces");

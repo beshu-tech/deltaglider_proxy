@@ -964,6 +964,32 @@ pub trait StorageBackend: Send + Sync {
         }
     }
 
+    /// True when the deltaspace `prefix` holds reference.bin and no
+    /// object at its own level: the reference can be reclaimed. A
+    /// sub-folder is another deltaspace (its deltas use its own
+    /// reference.bin), so its objects do not count. The read stops at the
+    /// first object: on S3 one LIST page of `prefix/` with delimiter `/`
+    /// answers it in the common case, never a listing of a sub-folder or
+    /// of the bucket. The default reads the whole level through
+    /// [`Self::scan_deltaspace_lite`].
+    fn holds_only_reference(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> impl Future<Output = Result<bool, StorageError>> + Send {
+        async move {
+            let listed = self.scan_deltaspace_lite(bucket, prefix).await?;
+            let mut reference = false;
+            for m in &listed.metadata {
+                match m.storage_info {
+                    crate::types::StorageInfo::Reference { .. } => reference = true,
+                    _ => return Ok(false),
+                }
+            }
+            Ok(reference)
+        }
+    }
+
     /// List all deltaspace prefixes within a bucket: every directory, with
     /// or without a reference. A caller that wants the references uses
     /// [`Self::list_reference_prefixes`].
