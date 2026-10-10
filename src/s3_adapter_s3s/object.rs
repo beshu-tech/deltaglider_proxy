@@ -273,6 +273,7 @@ pub(super) async fn delete_objects(
     svc: &DeltaGliderS3Service,
     req: s3s::S3Request<s3s::dto::DeleteObjectsInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::DeleteObjectsOutput>> {
+    use crate::deltaglider::{DeleteHooks, DeleteItem, DeleteOutcome};
     let headers = req.headers.clone();
     let input = req.input;
     crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)?;
@@ -287,19 +288,10 @@ pub(super) async fn delete_objects(
     // protected objects get batch-deleted. (X-ray H6/H26.)
     let auth_user = req.extensions.get::<AuthenticatedUser>().cloned();
     let policy_context = request_policy_context(&req.extensions);
-    let mut deleted = Vec::new();
-    let mut errors = Vec::new();
-    // Collect ObjectDeleted events for keys that were ACTUALLY deleted
-    // (Ok, not NotFound), filtered to user objects, and batch-insert once
-    // after the loop (single DB lock).
-    let mut delete_events: Vec<crate::event_outbox::NewEvent> = Vec::new();
-    // Review C9: a plain `delete` lists the whole deltaspace after each
-    // key to decide reference reclamation, so a 1000-key batch in one
-    // deltaspace was O(N²). Delete in sweep mode and reclaim once per
-    // touched deltaspace.
-    let engine = svc.state.engine.load();
-    let mut touched_deltaspaces: std::collections::BTreeSet<String> = Default::default();
-    for obj in input.delete.objects {
+    let objects = input.delete.objects;
+    let mut allowed = vec![true; objects.len()];
+    let mut keys = Vec::with_capacity(objects.len());
+    for (i, obj) in objects.iter().enumerate() {
         let key = obj.key.trim_start_matches('/').to_string();
         if let Some(user) = auth_user.as_ref() {
             if !user.can_with_context(S3Action::Delete, &input.bucket, &key, &policy_context) {
@@ -311,68 +303,93 @@ pub(super) async fn delete_objects(
                     &input.bucket,
                     &key,
                 );
-                let s3_err: crate::api::S3Error = crate::api::S3Error::AccessDenied;
-                errors.push(s3s::dto::Error {
-                    key: Some(obj.key),
-                    version_id: obj.version_id,
-                    code: Some(s3_err.code().to_string()),
-                    message: Some(s3_err.to_string()),
-                });
+                allowed[i] = false;
                 continue;
             }
         }
-        match engine.delete_in_sweep(&input.bucket, &key).await {
-            Ok(_) => {
-                touched_deltaspaces
-                    .insert(crate::types::ObjectKey::parse(&input.bucket, &key).deltaspace_id());
-                if crate::replication::event_consumer::is_user_object_key(&key) {
-                    delete_events.push(crate::event_outbox::NewEvent::new(
-                        crate::event_outbox::EventKind::ObjectDeleted,
-                        input.bucket.clone(),
-                        key.clone(),
-                        crate::event_outbox::EventSource::S3Api,
-                        crate::replication::current_unix_seconds(),
-                        serde_json::json!({}),
-                    ));
-                }
-                if !quiet {
-                    deleted.push(s3s::dto::DeletedObject {
-                        key: Some(obj.key),
-                        version_id: obj.version_id,
-                        ..Default::default()
-                    });
-                }
-            }
-            Err(crate::deltaglider::EngineError::NotFound(_)) => {
-                if !quiet {
-                    deleted.push(s3s::dto::DeletedObject {
-                        key: Some(obj.key),
-                        version_id: obj.version_id,
-                        ..Default::default()
-                    });
-                }
-            }
-            Err(e) => {
-                let s3_err: crate::api::S3Error = e.into();
-                errors.push(s3s::dto::Error {
-                    key: Some(obj.key),
-                    version_id: obj.version_id,
-                    code: Some(s3_err.code().to_string()),
-                    message: Some(s3_err.to_string()),
-                });
-            }
-        }
+        keys.push(key);
     }
-    for ds in &touched_deltaspaces {
-        // Best effort: the objects are gone already.
-        if let Err(e) = engine.reclaim_empty_deltaspace(&input.bucket, ds).await {
-            tracing::warn!(
-                "DeleteObjects reference reclaim failed for {}/{ds}: {e}",
-                input.bucket
-            );
-        }
+    // The batch runs in a spawned task that this request awaits: a client
+    // disconnect or the request timeout drops this future, not the task.
+    // So every key that the batch deletes gets its ObjectDeleted event (one
+    // per key as it ends, never only after the loop), and each folder gets
+    // its reference reclaim. The write guard keeps a maintenance job's
+    // drain waiting for the task, not just for this request.
+    let state = svc.state.clone();
+    let bucket = input.bucket.clone();
+    let write = state.maintenance_gate.begin_write(&bucket);
+    let batch = tokio::spawn(async move {
+        let _write = write;
+        let engine = state.engine.load_full();
+        let on_outcome =
+            |key: &str, outcome: &DeleteOutcome| -> futures::future::BoxFuture<'static, ()> {
+                if !matches!(outcome, DeleteOutcome::Deleted(_)) {
+                    return Box::pin(async {});
+                }
+                let event = crate::event_outbox::NewEvent::new(
+                    crate::event_outbox::EventKind::ObjectDeleted,
+                    bucket.as_str(),
+                    key,
+                    crate::event_outbox::EventSource::S3Api,
+                    crate::replication::current_unix_seconds(),
+                    serde_json::json!({}),
+                );
+                let state = state.clone();
+                Box::pin(async move {
+                    crate::api::handlers::object_helpers::enqueue_object_event(&state, event).await
+                })
+            };
+        engine
+            .delete_batch(
+                &bucket,
+                keys.into_iter().map(DeleteItem::new).collect(),
+                DeleteHooks {
+                    on_outcome: Some(&on_outcome),
+                    ..Default::default()
+                },
+            )
+            .await
+    });
+    let mut outcomes = batch
+        .await
+        .map_err(|e| {
+            s3s::S3Error::from(crate::api::S3Error::InternalError(format!(
+                "DeleteObjects task failed: {e}"
+            )))
+        })?
+        .into_iter();
+    let mut deleted = Vec::new();
+    let mut errors = Vec::new();
+    for (obj, allowed) in objects.into_iter().zip(allowed) {
+        let s3_err: crate::api::S3Error = if !allowed {
+            crate::api::S3Error::AccessDenied
+        } else {
+            match outcomes.next() {
+                // A key that is already gone is deleted, as on S3.
+                Some(DeleteOutcome::Deleted(_) | DeleteOutcome::NotFound) => {
+                    if !quiet {
+                        deleted.push(s3s::dto::DeletedObject {
+                            key: Some(obj.key),
+                            version_id: obj.version_id,
+                            ..Default::default()
+                        });
+                    }
+                    continue;
+                }
+                Some(DeleteOutcome::Failed(e)) => e.into(),
+                // No condition and no stop hook: neither happens.
+                Some(DeleteOutcome::Changed | DeleteOutcome::Skipped) | None => {
+                    crate::api::S3Error::InternalError("the key was not deleted".to_string())
+                }
+            }
+        };
+        errors.push(s3s::dto::Error {
+            key: Some(obj.key),
+            version_id: obj.version_id,
+            code: Some(s3_err.code().to_string()),
+            message: Some(s3_err.to_string()),
+        });
     }
-    crate::api::handlers::object_helpers::enqueue_object_events(&svc.state, &delete_events).await;
     Ok(s3s::S3Response::new(s3s::dto::DeleteObjectsOutput {
         deleted: (!deleted.is_empty()).then_some(deleted),
         errors: (!errors.is_empty()).then_some(errors),
@@ -727,4 +744,155 @@ pub(super) fn get_object_output_from_metadata(
         metadata: head.metadata,
         ..Default::default()
     })
+}
+
+/// S3 DeleteObjects: what a batch costs, and what a cut request leaves.
+#[cfg(test)]
+mod delete_objects_tests {
+    use super::*;
+    use crate::deltaglider::store_deltas;
+    use crate::storage::{FakeS3, StorageBackend};
+
+    /// A service over a fake S3 with bucket `b` and an event outbox.
+    async fn service() -> (DeltaGliderS3Service, Arc<FakeS3>) {
+        let (engine, fake) = crate::deltaglider::s3_engine().await;
+        let mut state = crate::api::handlers::AppState::for_tests(engine);
+        Arc::get_mut(&mut state).unwrap().config_db = Some(Arc::new(tokio::sync::Mutex::new(
+            crate::config_db::ConfigDb::in_memory("test").unwrap(),
+        )));
+        let config = Arc::new(tokio::sync::RwLock::new(crate::config::Config::default()));
+        (DeltaGliderS3Service::new(state, config), fake)
+    }
+
+    fn request(keys: &[String]) -> s3s::S3Request<s3s::dto::DeleteObjectsInput> {
+        let input = s3s::dto::DeleteObjectsInput::builder()
+            .bucket("b".to_string())
+            .delete(s3s::dto::Delete {
+                objects: keys
+                    .iter()
+                    .map(|k| s3s::dto::ObjectIdentifier {
+                        key: k.clone(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                quiet: None,
+            })
+            .build()
+            .unwrap();
+        s3s::S3Request {
+            input,
+            method: axum::http::Method::POST,
+            uri: "/b?delete".parse().unwrap(),
+            headers: Default::default(),
+            extensions: Default::default(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    async fn deleted_events(svc: &DeltaGliderS3Service) -> i64 {
+        let db = svc.state().config_db.as_ref().unwrap().lock().await;
+        db.event_outbox_count(None).unwrap()
+    }
+
+    /// Wait (10 s at most) until `folder` has no reference.bin.
+    async fn reclaimed(svc: &DeltaGliderS3Service, folder: &str) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let engine = svc.state().engine.load_full();
+        while engine.storage().has_reference("b", folder).await.unwrap() {
+            if tokio::time::Instant::now() > deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        true
+    }
+
+    /// A request cut by a client disconnect or the request timeout does
+    /// not cut the batch: every key goes, with its ObjectDeleted event,
+    /// and the folder's reference.bin is reclaimed. The batch ran inside
+    /// the request and stored the events after its loop, so a cut lost
+    /// the events and the reclaim, and left a folder that lists no key.
+    #[tokio::test]
+    async fn a_cut_request_still_deletes_every_key_with_its_event() {
+        let (svc, fake) = service().await;
+        let keys = store_deltas(&svc.state().engine.load(), "run", 3).await;
+        fake.set_delete_delay_ms(300);
+
+        let cut = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            delete_objects(&svc, request(&keys)),
+        )
+        .await;
+
+        assert!(cut.is_err(), "the request was cut");
+        assert!(reclaimed(&svc, "run").await, "run/reference.bin stays");
+        let engine = svc.state().engine.load_full();
+        for key in &keys {
+            assert!(engine.head("b", key).await.unwrap_err().is_not_found());
+        }
+        assert_eq!(deleted_events(&svc).await, 3);
+    }
+
+    /// One DELETE per key, and the folders of one request at once. Each
+    /// key sent a second DELETE for its absent other variant, and the keys
+    /// went one after another (about 300 s for 1,000 keys at 100 ms per
+    /// request: the request timeout).
+    #[tokio::test]
+    async fn a_batch_sends_one_delete_per_key_and_runs_its_folders_at_once() {
+        let (svc, fake) = service().await;
+        let engine = svc.state().engine.load_full();
+        let mut keys = Vec::new();
+        for folder in 0..4 {
+            for i in 0..25 {
+                let key = format!("f{folder}/img-{i:02}.jpg");
+                engine
+                    .store("b", &key, b"x", None, Default::default())
+                    .await
+                    .unwrap();
+                keys.push(key);
+            }
+        }
+        fake.clear();
+        fake.set_delete_delay_ms(20);
+
+        let out = delete_objects(&svc, request(&keys)).await.unwrap().output;
+
+        assert_eq!(out.deleted.map_or(0, |d| d.len()), keys.len());
+        assert!(out.errors.is_none());
+        let deletes = fake
+            .requests()
+            .iter()
+            .filter(|r| r.starts_with("DELETE "))
+            .count();
+        let peak = fake.peak_deletes_in_flight();
+        eprintln!("100 keys in 4 folders: {deletes} DELETEs, peak {peak} in flight");
+        assert_eq!(deletes, keys.len());
+        assert!(peak > 1, "the folders went one after another");
+    }
+
+    /// A retry of a request cut before its reclaim finds the keys gone and
+    /// still reclaims their folder's reference.bin.
+    #[tokio::test]
+    async fn a_retry_reclaims_the_folder_a_cut_request_left() {
+        let (svc, _fake) = service().await;
+        let engine = svc.state().engine.load_full();
+        let keys = store_deltas(&engine, "run", 2).await;
+        for i in 0..keys.len() {
+            engine
+                .storage()
+                .delete_delta("b", "run", &format!("build-{i:03}.zip"))
+                .await
+                .unwrap();
+        }
+        assert!(engine.storage().has_reference("b", "run").await.unwrap());
+
+        let out = delete_objects(&svc, request(&keys)).await.unwrap().output;
+
+        assert_eq!(out.deleted.map_or(0, |d| d.len()), keys.len());
+        assert!(!engine.storage().has_reference("b", "run").await.unwrap());
+        assert_eq!(deleted_events(&svc).await, 0, "nothing was deleted now");
+    }
 }
