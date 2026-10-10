@@ -5,6 +5,7 @@
  * folder sizes and the admin reads disappeared without a word.
  */
 import { act, screen, waitFor } from '@testing-library/react';
+import { message } from 'antd';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import { json, mockFetch } from '../test/fetchMock';
 import { renderWithQuery } from '../test/render';
@@ -37,19 +38,28 @@ beforeEach(() => {
   http.on('POST', '/_/api/admin/logout', new Response(null, { status: 204 }));
   Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
 });
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+// A loaded machine (CI, parallel builds) takes seconds, not the default 1 s.
+const SLOW = { timeout: 10_000 };
 
 test('a session found expired when the tab comes back sends the user to sign in, and says why', async () => {
   renderWithQuery(<ThemeProvider><Root /></ThemeProvider>);
-  await screen.findByRole('navigation', { name: 'Breadcrumb' });
-  await waitFor(() => expect(http.callsTo('GET', '/_/api/whoami').length).toBeGreaterThan(0));
+  await screen.findByRole('navigation', { name: 'Breadcrumb' }, SLOW);
+  await waitFor(() => expect(http.callsTo('GET', '/_/api/whoami').length).toBeGreaterThan(0), SLOW);
 
+  // A spy, not the real toast: AntD renders it in a root of its own, whose
+  // late work outlived jsdom on a loaded machine ("window is not defined").
+  const warning = vi.spyOn(message, 'warning').mockImplementation(() => (() => {}) as never);
   sessionValid = false;
   act(() => {
     document.dispatchEvent(new Event('visibilitychange'));
   });
 
-  expect(await screen.findByText(/Your session expired/)).toBeInTheDocument();
-  expect(await screen.findByPlaceholderText('Admin password')).toBeInTheDocument();
-  await waitFor(() => expect(http.callsTo('POST', '/_/api/admin/logout')).toHaveLength(1));
+  await waitFor(() => expect(warning).toHaveBeenCalledWith(expect.stringMatching(/Your session expired/)), SLOW);
+  await waitFor(() => expect(http.callsTo('POST', '/_/api/admin/logout')).toHaveLength(1), SLOW);
+  expect(await screen.findByPlaceholderText('Admin password', {}, SLOW)).toBeInTheDocument();
 });
