@@ -1,6 +1,6 @@
 # How to diagnose a backend that isn't serving
 
-Follow this when a bucket answers `503 ServiceUnavailable`, the Backends panel shows a red health badge, or a boot log says a backend is UNHEALTHY. The proxy probes every configured backend's connectivity and credentials at boot, on every config change to a backend, and every 30 seconds after that (healthy backends too). A request that finds a backend unavailable also marks it unhealthy. Because of this, a broken backend always reports its name and its cause.
+Follow this when a bucket answers `503 ServiceUnavailable`, the Backends panel shows a red health badge, or a boot log says a backend is UNHEALTHY. The proxy probes every configured backend's connectivity and credentials at boot, on every config change to a backend, and every 30 seconds after that (healthy backends too). A request that finds a backend unavailable starts a probe of that backend at once. The proxy marks the backend unhealthy only when that probe fails too. Because of this, a broken backend always reports its name and its cause.
 
 ## Read the verdict
 
@@ -31,7 +31,7 @@ Buckets that an unhealthy verdict blocks reopen by themselves within about 30 se
 
 ## What happens when a backend hangs
 
-A backend can accept connections and then never answer, for example when its process is paused. The proxy does not wait for such a backend for minutes. Each backend request that carries no large body (HEAD, GET until the first byte, LIST, DELETE) has a deadline of 30 seconds, retries included (`DGP_BACKEND_REQUEST_TIMEOUT_SECS`). When the deadline passes, the client gets `503 ServiceUnavailable` with the backend's name, and the proxy marks the backend **Unreachable** at once. The next requests to the backend's buckets then get the 503 immediately, without a wait. The health probe also finds a hang on its own, because it probes healthy backends too. When the backend answers a probe again, its buckets reopen. `GET /_/ready` lists each backend's live state in its `backends` field.
+A backend can accept connections and then never answer, for example when its process is paused. The proxy does not wait for such a backend for minutes. Each backend request that carries no large body (HEAD, GET until the first byte, LIST, DELETE) has a deadline of 30 seconds, retries included (`DGP_BACKEND_REQUEST_TIMEOUT_SECS`). When the deadline passes, the client gets `503 ServiceUnavailable` with the backend's name, and the proxy probes the backend at once. The probe makes up to two attempts of 5 seconds each. When the probe fails too, the proxy marks the backend **Unreachable**, and the next requests to the backend's buckets get the 503 immediately, without a wait. When the probe succeeds, the buckets stay open, because one slow request among many does not prove that the backend is down. The proxy then logs one warning that names the failed request. The health probe also finds a hang on its own, because it probes healthy backends too. When the backend answers a probe again, its buckets reopen. `GET /_/ready` lists each backend's live state in its `backends` field.
 
 ## Boot behaviour
 

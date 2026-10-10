@@ -941,10 +941,15 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // Backend-health loop: every backend is probed each interval, so a
     // backend that hangs or goes down is gated within one interval, and a
-    // recovered one reopens without a restart. Requests that find a backend
-    // unavailable mark it at once (passive sink).
-    deltaglider_proxy::coordination::health::install_passive_sink(backend_health.clone());
+    // recovered one reopens without a restart. A request that finds a
+    // backend unavailable starts a probe of that backend at once (passive
+    // sink); only a failed probe gates. Without the loop nothing would
+    // reopen a gated backend, so the sink needs the loop.
     if let Some(every) = deltaglider_proxy::coordination::health::health_probe_interval() {
+        deltaglider_proxy::coordination::health::install_passive_sink(
+            backend_health.clone(),
+            shared_config.clone(),
+        );
         spawn_periodic(every, {
             let health = backend_health.clone();
             let shared_config = shared_config.clone();

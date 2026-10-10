@@ -337,9 +337,11 @@ buckets:
 
 /// Browser review #5: a backend that HANGS (answers nothing) must not hang
 /// requests. The request times out after DGP_BACKEND_REQUEST_TIMEOUT_SECS
-/// with a 503 that names the backend; the timeout marks the backend
-/// unhealthy at once, so the next request gets the gate's fast 503; and
-/// `/_/ready` lists the backend as unreachable.
+/// with a 503 that names the backend. The timeout starts a health probe of
+/// the backend at once. The probe hangs too, so the backend is gated within
+/// one probe round-trip: the next request gets the gate's fast 503, and
+/// `/_/ready` lists the backend as unreachable. The failed request alone
+/// does not gate (see `coordination::health` unit tests).
 #[tokio::test]
 async fn hung_backend_times_out_fast_and_is_marked_unhealthy() {
     let hang = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -349,7 +351,9 @@ async fn hung_backend_times_out_fast_and_is_marked_unhealthy() {
         .auth("bootstrap_key", "bootstrap_secret")
         .extra_yaml_storage_section(&hung_backend_yaml(port, disk.path()))
         .env("DGP_BOOT_BACKEND_PROBE", "enforce")
-        // The loop must not be what finds the hang in this test.
+        // The loop must not be what finds the hang in this test: its one
+        // round runs at boot, so only the probe that the timeout starts
+        // can find the hang.
         .env("DGP_BACKEND_HEALTH_INTERVAL_SECS", "3600")
         .env("DGP_BACKEND_REQUEST_TIMEOUT_SECS", "2")
         .build()
@@ -390,6 +394,21 @@ async fn hung_backend_times_out_fast_and_is_marked_unhealthy() {
         "{err:?}"
     );
 
+    // The probe that the timeout started hangs as well: two attempts of
+    // 5 s each, then the backend is gated.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+    loop {
+        let (_, body) = ready(&ep).await;
+        if body["backends"]["hetzner-fsn1"] == "unreachable" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the probe that the timeout started never gated the hung backend: {body}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
     let t1 = std::time::Instant::now();
     let err = s3
         .get_object()
@@ -400,7 +419,7 @@ async fn hung_backend_times_out_fast_and_is_marked_unhealthy() {
         .expect_err("gated");
     assert!(
         t1.elapsed() < std::time::Duration::from_secs(1),
-        "after the timeout the gate answers at once, took {:?}",
+        "after the failed probe the gate answers at once, took {:?}",
         t1.elapsed()
     );
     assert_eq!(err.meta().code(), Some("ServiceUnavailable"), "{err:?}");

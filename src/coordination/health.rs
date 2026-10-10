@@ -9,6 +9,15 @@
 //! unhealthy backend answer an honest 503 naming the backend and cause,
 //! instead of per-request timeout storms or misleading 404s).
 //!
+//! Only an ACTIVE probe sets a verdict that gates. A failed client request
+//! (a timeout, a refused connection) is a PASSIVE signal: it makes the
+//! backend "suspect" and starts one confirmation probe of that backend
+//! ([`report_unavailable`]). The probe decides. When it fails, the backend
+//! gates at once, so a dead backend is closed within one probe round-trip
+//! of its first failed request. When it answers, the buckets stay open: one
+//! slow request among thousands is partial degradation, and gating on it
+//! closes every bucket of the backend until the next probe.
+//!
 //! Sibling of [`super::capability`]: same name→(fingerprint, verdict) cache
 //! idiom (a redefined backend — rotated creds, new endpoint — misses the
 //! cache and re-probes), same snapshot→`GET /backends`→GUI surfacing path.
@@ -30,6 +39,12 @@ const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// Attempts per probe (transport/5xx failures retry once; an auth rejection
 /// is definitive and never retried).
 const HEALTH_PROBE_ATTEMPTS: u32 = 2;
+
+/// After a confirmation probe finds a suspect backend answering, failed
+/// requests start no new probe for this long. This bounds the probe rate
+/// (and the log rate) of a backend that fails a share of its requests but
+/// answers every probe.
+const SUSPECT_PROBE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Monotonic counter bumped on every health-verdict CHANGE — the
 /// `IAM_VERSION` pattern: lets tests poll for "the re-probe loop noticed"
@@ -187,27 +202,56 @@ pub struct HealthEntry {
 #[derive(Debug, Default)]
 pub struct BackendHealthCache {
     entries: parking_lot::RwLock<HashMap<String, (String, HealthEntry)>>,
+    /// Backend name → passive suspicion. Drives the confirmation probe,
+    /// never the gate.
+    suspects: parking_lot::Mutex<HashMap<String, Suspicion>>,
+}
+
+/// State of the confirmation probe of one suspect backend.
+#[derive(Debug)]
+enum Suspicion {
+    /// The confirmation probe runs now; more failures join it.
+    Probing,
+    /// The last confirmation probe found the backend answering.
+    Cleared(std::time::Instant),
 }
 
 impl BackendHealthCache {
     /// Record a verdict. Bumps the health version ONLY on change, so pollers
-    /// wake on transitions, not on every steady-state re-probe.
-    pub fn set(&self, backend: &str, config: &BackendConfig, verdict: HealthVerdict) {
+    /// wake on transitions, not on every steady-state re-probe. Returns
+    /// whether the verdict changed.
+    pub fn set(&self, backend: &str, config: &BackendConfig, verdict: HealthVerdict) -> bool {
+        self.record(backend, fingerprint(config), verdict, false) == Some(true)
+    }
+
+    /// Store `verdict` for definition `fp`. With `same_definition_only`, an
+    /// entry of ANOTHER definition stays (a probe of a definition that an
+    /// apply replaced while the probe ran must not paint the new one).
+    /// Returns `None` when the verdict was not stored, else whether it
+    /// changed (and bumped the health version).
+    fn record(
+        &self,
+        backend: &str,
+        fp: String,
+        verdict: HealthVerdict,
+        same_definition_only: bool,
+    ) -> Option<bool> {
         let entry = HealthEntry {
             verdict,
             probed_at: chrono::Utc::now().timestamp(),
         };
-        let fp = fingerprint(config);
         let mut map = self.entries.write();
-        let changed = map
-            .get(backend)
-            .map(|(old_fp, old)| *old_fp != fp || old.verdict != entry.verdict)
-            .unwrap_or(true);
+        let changed = match map.get(backend) {
+            Some((old_fp, _)) if same_definition_only && *old_fp != fp => return None,
+            Some((old_fp, old)) => *old_fp != fp || old.verdict != entry.verdict,
+            None => true,
+        };
         map.insert(backend.to_string(), (fp, entry));
         drop(map);
         if changed {
             bump_backend_health_version();
         }
+        Some(changed)
     }
 
     /// Verdict for this backend NAME, only if established against this exact
@@ -249,35 +293,80 @@ impl BackendHealthCache {
             .filter(|v| !v.is_healthy())
     }
 
-    /// Passive marking: a request found the backend with definition
-    /// fingerprint `fp` unavailable. The entry turns Unreachable unless it
-    /// belongs to ANOTHER definition (an engine still running a replaced
-    /// definition must not paint the current one). The re-probe loop turns
-    /// it back to Healthy once the backend answers.
-    pub fn mark_unavailable(&self, backend: &str, fp: &str, detail: &str) {
-        let verdict = HealthVerdict::Unreachable {
-            detail: format!("a request failed: {detail}"),
-        };
-        let mut map = self.entries.write();
-        let changed = match map.get(backend) {
-            Some((old_fp, _)) if old_fp != fp => return,
-            Some((_, old)) => !old.verdict.is_gating(),
-            None => true,
-        };
-        if !changed {
-            return; // keep the first cause and its time
+    /// Passive signal: a request found the backend with definition
+    /// fingerprint `fp` unavailable. The verdict does NOT change, so the
+    /// signal never gates on its own; it makes the backend suspect.
+    /// Returns `true` when the caller must run the confirmation probe
+    /// ([`confirm_suspect`]). Returns `false` when the signal is absorbed:
+    /// the entry belongs to ANOTHER definition (an engine still running a
+    /// replaced definition must not drive the current one), the backend
+    /// already gates (the re-probe loop owns its recovery), a confirmation
+    /// probe already runs, or one cleared the backend less than
+    /// `SUSPECT_PROBE_COOLDOWN` ago.
+    #[must_use]
+    pub fn mark_unavailable(&self, backend: &str, fp: &str, detail: &str) -> bool {
+        if let Some((old_fp, old)) = self.entries.read().get(backend) {
+            if old_fp != fp || old.verdict.is_gating() {
+                return false;
+            }
         }
-        let entry = HealthEntry {
-            verdict,
-            probed_at: chrono::Utc::now().timestamp(),
-        };
-        map.insert(backend.to_string(), (fp.to_string(), entry));
-        drop(map);
-        tracing::warn!(
-            "backend health: '{backend}' did not answer a request ({detail}) — its buckets \
-             answer 503 until the next health probe succeeds"
-        );
-        bump_backend_health_version();
+        let mut suspects = self.suspects.lock();
+        match suspects.get(backend) {
+            Some(Suspicion::Probing) => return false,
+            Some(Suspicion::Cleared(at)) if at.elapsed() < SUSPECT_PROBE_COOLDOWN => return false,
+            _ => {}
+        }
+        suspects.insert(backend.to_string(), Suspicion::Probing);
+        drop(suspects);
+        tracing::debug!("backend health: '{backend}' failed a request ({detail}) — probing it");
+        true
+    }
+
+    /// End the suspicion of `backend` with the confirmation probe's
+    /// `outcome`: the probed definition's fingerprint and its verdict.
+    /// `None` = no probe ran, because the definition was replaced or
+    /// removed. A gating verdict closes the buckets at once. A verdict that
+    /// does not gate leaves them open and starts the cooldown.
+    fn settle_suspect(
+        &self,
+        backend: &str,
+        outcome: Option<(String, HealthVerdict)>,
+        detail: &str,
+    ) {
+        let mut cooldown = false;
+        if let Some((fp, verdict)) = outcome {
+            let cause = verdict.cause();
+            let (healthy, gating) = (verdict.is_healthy(), verdict.is_gating());
+            // Not recorded = an apply replaced the definition while the
+            // probe ran; the verdict says nothing about the new one.
+            if self.record(backend, fp, verdict, true).is_some() {
+                cooldown = !gating;
+                if healthy {
+                    tracing::warn!(
+                        "backend health: '{backend}' failed a request ({detail}), but it \
+                         answered its health probe — its buckets stay open"
+                    );
+                } else if gating {
+                    tracing::warn!(
+                        "backend health: '{backend}' did not answer a request ({detail}), and \
+                         its health probe failed: {cause} — its buckets answer 503 until a \
+                         health probe succeeds"
+                    );
+                } else {
+                    tracing::warn!(
+                        "backend health: '{backend}' failed a request ({detail}); its health \
+                         probe: {cause} — requests are not blocked"
+                    );
+                }
+            }
+        }
+        let mut suspects = self.suspects.lock();
+        if cooldown {
+            let now = std::time::Instant::now();
+            suspects.insert(backend.to_string(), Suspicion::Cleared(now));
+        } else {
+            suspects.remove(backend);
+        }
     }
 
     /// Drop entries for backends no longer in the config (post-apply hygiene).
@@ -286,20 +375,81 @@ impl BackendHealthCache {
     }
 }
 
-/// The process's health cache, for passive marking from the storage layer
-/// (an `S3Backend` has no handle on `AppState`). Installed once at startup.
-static PASSIVE_SINK: std::sync::OnceLock<Arc<BackendHealthCache>> = std::sync::OnceLock::new();
+/// The process's health cache and config, for passive signals from the
+/// storage layer (an `S3Backend` has no handle on `AppState`). Installed
+/// once at startup.
+struct PassiveSink {
+    health: Arc<BackendHealthCache>,
+    config: crate::config::SharedConfig,
+}
 
-/// Install the cache that [`note_unavailable`] writes to (startup, once).
-pub fn install_passive_sink(cache: Arc<BackendHealthCache>) {
-    let _ = PASSIVE_SINK.set(cache);
+static PASSIVE_SINK: std::sync::OnceLock<PassiveSink> = std::sync::OnceLock::new();
+
+/// Install the cache and config that [`note_unavailable`] uses (startup,
+/// once). Install it only while the re-probe loop runs: the loop is what
+/// reopens a backend that a confirmation probe gated.
+pub fn install_passive_sink(health: Arc<BackendHealthCache>, config: crate::config::SharedConfig) {
+    let _ = PASSIVE_SINK.set(PassiveSink { health, config });
 }
 
 /// A request found backend `name` (definition fingerprint `fp`) unavailable.
 pub fn note_unavailable(name: &str, fp: &str, detail: &str) {
-    if let Some(cache) = PASSIVE_SINK.get() {
-        cache.mark_unavailable(name, fp, detail);
+    if let Some(sink) = PASSIVE_SINK.get() {
+        let _ = report_unavailable(&sink.health, &sink.config, name, fp, detail);
     }
+}
+
+/// [`note_unavailable`] with its sink passed in (the test seam). Marks the
+/// backend suspect and, when this call claims the confirmation probe, runs
+/// [`confirm_suspect`] on a task. At most one confirmation probe runs per
+/// backend, so a burst of failed requests starts one probe, not one per
+/// request. The handle lets a test wait for the verdict.
+pub fn report_unavailable(
+    health: &Arc<BackendHealthCache>,
+    config: &crate::config::SharedConfig,
+    name: &str,
+    fp: &str,
+    detail: &str,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !health.mark_unavailable(name, fp, detail) {
+        return None;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        health.settle_suspect(name, None, detail); // no runtime, no probe
+        return None;
+    };
+    let (health, config) = (health.clone(), config.clone());
+    let (name, fp, detail) = (name.to_string(), fp.to_string(), detail.to_string());
+    Some(runtime.spawn(async move {
+        confirm_suspect(&health, &config, &name, &fp, &detail).await;
+    }))
+}
+
+/// The confirmation probe of suspect backend `name`: the same probe as the
+/// re-probe loop ([`probe_backend_health`]: `HEALTH_PROBE_ATTEMPTS`
+/// attempts of at most `HEALTH_PROBE_TIMEOUT` each), on that one backend.
+/// Its verdict is recorded like a loop round's, so a failed probe gates
+/// and an answered probe leaves the buckets open. A backend whose
+/// definition is no longer `fp` is not probed: the failed request ran
+/// against a definition that an apply replaced.
+pub async fn confirm_suspect(
+    health: &BackendHealthCache,
+    config: &crate::config::SharedConfig,
+    name: &str,
+    fp: &str,
+    detail: &str,
+) {
+    let target = probe_targets(&*config.read().await)
+        .into_iter()
+        .find(|(n, backend, _)| n == name && fingerprint(backend) == fp);
+    let outcome = match target {
+        Some((_, backend, fallback)) => {
+            let verdict = probe_backend_health(&backend, fallback.as_deref()).await;
+            Some((fp.to_string(), verdict))
+        }
+        None => None,
+    };
+    health.settle_suspect(name, outcome, detail);
 }
 
 /// `DGP_BACKEND_HEALTH_INTERVAL_SECS` (default 30; 0 turns the loop off):
@@ -720,28 +870,155 @@ mod tests {
         );
     }
 
+    /// Prod ('HetznerHelsinki1'): one HEAD among thousands timed out, the
+    /// passive mark turned the backend Unreachable, and every bucket on it
+    /// answered 503 until the next probe. A failed request alone must never
+    /// gate, whatever definition it ran against.
     #[test]
-    fn passive_marking_gates_only_the_same_definition() {
+    fn a_failed_request_alone_never_gates() {
         let cache = BackendHealthCache::default();
         let cfg = BackendConfig::Filesystem {
             path: "/tmp/dgp-passive".into(),
         };
         let fp = fingerprint(&cfg);
         cache.set("hetzner-fsn1", &cfg, HealthVerdict::Healthy);
-        // Another definition's engine must not paint the current one.
-        cache.mark_unavailable("hetzner-fsn1", "other-fp", "timed out");
+        let _ = cache.mark_unavailable("hetzner-fsn1", "other-fp", "timed out");
+        let _ = cache.mark_unavailable(
+            "hetzner-fsn1",
+            &fp,
+            "head_object on bucket 'releases': request has timed out",
+        );
+        let v = cache.get("hetzner-fsn1", &cfg).unwrap();
+        assert!(
+            !v.is_gating(),
+            "one failed request gated the backend: {v:?}"
+        );
+        assert_eq!(v, HealthVerdict::Healthy);
+        assert!(cache.unhealthy_names().is_empty());
+    }
+
+    /// One named filesystem backend at `path`: its config handle and its
+    /// definition. A filesystem probe fails when `path` is a regular file.
+    fn fs_backend(
+        name: &str,
+        path: &std::path::Path,
+    ) -> (crate::config::SharedConfig, BackendConfig) {
+        let cfg = crate::config::Config::from_yaml_str(&format!(
+            "storage:\n  backends:\n    - name: {name}\n      type: filesystem\n      path: {}\n",
+            path.display()
+        ))
+        .expect("fixture parses");
+        let backend = cfg.backend_by_name(name).expect("named backend").clone();
+        (cfg.into_shared(), backend)
+    }
+
+    const TIMED_OUT: &str = "head_object on bucket 'releases': request has timed out";
+
+    #[tokio::test]
+    async fn a_failed_request_on_a_backend_that_answers_its_probe_stays_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, cfg) = fs_backend("hetzner-fsn1", dir.path());
+        let fp = fingerprint(&cfg);
+        let cache = Arc::new(BackendHealthCache::default());
+        cache.set("hetzner-fsn1", &cfg, HealthVerdict::Healthy);
+
+        let probe = report_unavailable(&cache, &config, "hetzner-fsn1", &fp, TIMED_OUT)
+            .expect("the first failed request starts a confirmation probe");
+        // The test runtime is single-threaded: the probe has not run yet.
+        assert!(
+            report_unavailable(&cache, &config, "hetzner-fsn1", &fp, TIMED_OUT).is_none(),
+            "a second failure joins the running probe"
+        );
         assert_eq!(
             cache.get("hetzner-fsn1", &cfg),
+            Some(HealthVerdict::Healthy),
+            "no gate before the probe answers"
+        );
+        probe.await.unwrap();
+        assert_eq!(
+            cache.get("hetzner-fsn1", &cfg),
+            Some(HealthVerdict::Healthy),
+            "the probe answered, so the buckets stay open"
+        );
+        assert!(cache.unhealthy_names().is_empty());
+        assert!(
+            report_unavailable(&cache, &config, "hetzner-fsn1", &fp, TIMED_OUT).is_none(),
+            "no new probe within the cooldown"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_on_a_dead_backend_gates_after_its_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::write(&root, b"not a directory").unwrap();
+        let (config, cfg) = fs_backend("hetzner-fsn1", &root);
+        let fp = fingerprint(&cfg);
+        let cache = Arc::new(BackendHealthCache::default());
+        cache.set("hetzner-fsn1", &cfg, HealthVerdict::Healthy);
+
+        let v0 = current_backend_health_version();
+        report_unavailable(&cache, &config, "hetzner-fsn1", &fp, TIMED_OUT)
+            .expect("confirmation probe")
+            .await
+            .unwrap();
+        let v = cache.get("hetzner-fsn1", &cfg).unwrap();
+        assert!(v.is_gating(), "the failed probe gates the backend: {v:?}");
+        assert!(current_backend_health_version() > v0, "a real change bumps");
+        assert!(
+            report_unavailable(&cache, &config, "hetzner-fsn1", &fp, TIMED_OUT).is_none(),
+            "a gated backend starts no probe: the re-probe loop reopens it"
+        );
+    }
+
+    /// The fingerprint guard: a failed request that ran against a replaced
+    /// definition neither probes nor paints the current one.
+    #[tokio::test]
+    async fn a_failed_request_of_a_replaced_definition_paints_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::write(&root, b"not a directory").unwrap();
+        // The running config holds a DEAD definition; the request ran
+        // against the old, healthy one.
+        let (config, current) = fs_backend("hetzner-fsn1", &root);
+        let old = BackendConfig::Filesystem {
+            path: dir.path().to_path_buf(),
+        };
+        let cache = Arc::new(BackendHealthCache::default());
+        cache.set("hetzner-fsn1", &current, HealthVerdict::Healthy);
+        assert!(
+            report_unavailable(
+                &cache,
+                &config,
+                "hetzner-fsn1",
+                &fingerprint(&old),
+                TIMED_OUT
+            )
+            .is_none(),
+            "another definition's failure starts no probe"
+        );
+
+        // The cache still holds the old definition (the apply has not
+        // recorded the new one yet): the probe finds the definition
+        // replaced, and records nothing.
+        let cache = Arc::new(BackendHealthCache::default());
+        cache.set("hetzner-fsn1", &old, HealthVerdict::Healthy);
+        report_unavailable(
+            &cache,
+            &config,
+            "hetzner-fsn1",
+            &fingerprint(&old),
+            TIMED_OUT,
+        )
+        .expect("same definition as the cache: probe")
+        .await
+        .unwrap();
+        assert_eq!(
+            cache.get("hetzner-fsn1", &old),
             Some(HealthVerdict::Healthy)
         );
-        let v0 = current_backend_health_version();
-        cache.mark_unavailable("hetzner-fsn1", &fp, "timed out");
-        let v = cache.get("hetzner-fsn1", &cfg).unwrap();
-        assert!(v.is_gating(), "{v:?}");
-        assert!(current_backend_health_version() > v0);
-        // A probe that succeeds reopens it.
-        cache.set("hetzner-fsn1", &cfg, HealthVerdict::Healthy);
-        assert!(cache.unhealthy_verdict("hetzner-fsn1").is_none());
+        assert_eq!(cache.get("hetzner-fsn1", &current), None);
+        assert!(cache.unhealthy_names().is_empty());
     }
 
     #[test]
@@ -761,9 +1038,10 @@ mod tests {
         cache.set("b2", &cfg, HealthVerdict::Healthy);
         assert!(current_backend_health_version() > v0, "first set bumps");
         let v1 = current_backend_health_version();
-        // Steady-state re-probe with the same verdict does NOT bump.
-        cache.set("b2", &cfg, HealthVerdict::Healthy);
-        assert_eq!(current_backend_health_version(), v1);
+        // Steady-state re-probe with the same verdict does NOT bump. (Other
+        // tests bump the global counter in parallel, so the return value
+        // proves it, not an equality on the counter.)
+        assert!(!cache.set("b2", &cfg, HealthVerdict::Healthy));
         // Transition bumps.
         cache.set(
             "b2",

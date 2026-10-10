@@ -182,7 +182,7 @@ pub struct S3Backend {
     /// CopyObject, CompleteMultipartUpload): their duration grows with the
     /// object size, so only the per-attempt and read timeouts apply.
     bulk_client: Client,
-    /// `(backend name, definition fingerprint)` for passive health marking
+    /// `(backend name, definition fingerprint)` for the passive health signal
     /// (`coordination::health::note_unavailable`). `None` for a backend that
     /// the engine did not name (tests, CLI).
     health_key: Option<(String, String)>,
@@ -233,9 +233,9 @@ impl S3Backend {
         })
     }
 
-    /// Name this backend for passive health marking: a request that finds
-    /// it unavailable marks it unhealthy at once (the request gate then
-    /// answers a fast 503), and error messages name it.
+    /// Name this backend for the passive health signal: a request that
+    /// finds it unavailable starts a health probe of it at once (a failed
+    /// probe gates its buckets with a fast 503), and error messages name it.
     pub fn with_health_name(mut self, name: &str, config: &BackendConfig) -> Self {
         self.health_key = Some((
             name.to_string(),

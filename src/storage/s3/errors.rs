@@ -65,7 +65,8 @@ impl S3Op {
 
 impl S3Backend {
     /// [`Self::classify_s3_error`], plus the passive health signal: an
-    /// `Unavailable` result names the backend and marks it unhealthy.
+    /// `Unavailable` result names the backend and starts a health probe of
+    /// it (only a failed probe gates the backend).
     pub(super) fn classify(
         &self,
         bucket: &str,
