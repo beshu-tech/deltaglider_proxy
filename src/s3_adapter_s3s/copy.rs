@@ -61,7 +61,12 @@ pub(super) async fn copy_object(
         input.copy_source_if_modified_since.as_ref(),
         input.copy_source_if_unmodified_since.as_ref(),
     )?;
-    if source_meta.file_size > engine.max_object_size() {
+    let dest_metadata = if directive.eq_ignore_ascii_case("REPLACE") {
+        input.metadata.clone().unwrap_or_default()
+    } else {
+        source_meta.user_metadata.clone()
+    };
+    if source_meta.file_size > copy_size_limit(&engine, &input.bucket, &input.key, &dest_metadata) {
         return Err(s3s::s3_error!(EntityTooLarge));
     }
     let body = read_copy_source(
@@ -135,6 +140,30 @@ pub(super) async fn copy_object(
         }),
         ..Default::default()
     }))
+}
+
+/// S3's limit on the source of one CopyObject request.
+pub(super) const COPY_OBJECT_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
+/// The largest source that CopyObject copies into `bucket/key` with
+/// `user_metadata`. A destination that stores the object as it is
+/// (passthrough) takes S3's 5 GiB copy limit (capped at
+/// `max_passthrough_object_size`): the source streams through a spool file,
+/// so its size costs disk, not memory. A destination that tries a delta keeps
+/// `max_object_size`, the store's limit for a delta. Every copy had the
+/// delta limit (100 MiB by default), so rclone and mc copies of larger
+/// objects failed with EntityTooLarge.
+pub(super) fn copy_size_limit(
+    engine: &crate::deltaglider::DynEngine,
+    bucket: &str,
+    key: &str,
+    user_metadata: &std::collections::HashMap<String, String>,
+) -> u64 {
+    if engine.write_tries_delta(bucket, key, user_metadata) {
+        engine.max_object_size()
+    } else {
+        COPY_OBJECT_MAX_BYTES.min(engine.max_passthrough_object_size())
+    }
 }
 
 /// The body of a CopyObject source, read with bounded memory.
@@ -473,4 +502,78 @@ pub(super) fn parse_copy_range(range: &str, len: usize) -> s3s::S3Result<(usize,
         return Err(s3s::s3_error!(InvalidRange));
     }
     Ok((start, end))
+}
+
+#[cfg(test)]
+mod large_copy_tests {
+    use super::super::multipart::adapter_test_support::{request, service};
+    use super::*;
+    use crate::deltaglider::{DeltaGliderEngine, DynEngine};
+    use crate::storage::DynStorageBackend;
+
+    fn copy(dst_key: &str) -> s3s::dto::CopyObjectInput {
+        s3s::dto::CopyObjectInput::builder()
+            .bucket("dst".into())
+            .key(dst_key.into())
+            .copy_source(s3s::dto::CopySource::Bucket {
+                bucket: "src".into(),
+                key: "a/photo.jpg".into(),
+                version_id: None,
+            })
+            .build()
+            .unwrap()
+    }
+
+    /// CopyObject of a passthrough source larger than `max_object_size`
+    /// streams through the spool, as a passthrough store takes objects up to
+    /// `max_passthrough_object_size` (S3 copies up to 5 GiB). It answered
+    /// EntityTooLarge, so rclone and mc copies of large objects failed. A
+    /// destination that tries a delta keeps the delta limit.
+    #[tokio::test]
+    async fn a_large_passthrough_source_is_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let engine_with = |config: crate::config::Config| {
+            let root = root.clone();
+            async move {
+                let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(
+                    crate::storage::FilesystemBackend::new(root).await.unwrap(),
+                );
+                let engine: DynEngine =
+                    DeltaGliderEngine::new_with_backend(Arc::new(backend), &config, None);
+                engine
+            }
+        };
+        let writer = engine_with(crate::config::Config::default()).await;
+        for b in ["src", "dst"] {
+            writer.create_bucket(b).await.unwrap();
+        }
+        let body: Vec<u8> = (0..300 * 1024u32).map(|i| (i * 7 % 253) as u8).collect();
+        writer
+            .store("src", "a/photo.jpg", &body, None, Default::default())
+            .await
+            .unwrap();
+        let small = crate::config::Config {
+            max_object_size: 64 * 1024,
+            ..Default::default()
+        };
+        let state = AppState::for_tests(engine_with(small).await);
+        let svc = service(state.clone());
+        copy_object(&svc, request(copy("b/photo.jpg")))
+            .await
+            .unwrap();
+        let (copied, meta) = state
+            .engine
+            .load()
+            .retrieve("dst", "b/photo.jpg")
+            .await
+            .unwrap();
+        assert_eq!(copied, body);
+        assert!(!meta.is_delta());
+        // Into a key that tries a delta, the delta limit holds.
+        let err = copy_object(&svc, request(copy("b/app.zip")))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), &s3s::S3ErrorCode::EntityTooLarge);
+    }
 }
