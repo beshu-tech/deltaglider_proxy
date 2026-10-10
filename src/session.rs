@@ -14,6 +14,11 @@ use zeroize::Zeroize;
 /// Maximum live sessions of ONE principal; its own oldest is evicted first.
 const MAX_SESSIONS_PER_PRINCIPAL: usize = 10;
 
+/// Maximum live bootstrap-password sessions. The bootstrap password is one
+/// principal for every operator who knows it, so 10 logged the 11th
+/// operator's first colleague out.
+const MAX_BOOTSTRAP_SESSIONS: usize = 100;
+
 /// Global memory bound. Only reached by many distinct principals; the
 /// eviction then prefers browser-lift sessions over admin sessions.
 const MAX_SESSIONS: usize = 1024;
@@ -109,13 +114,23 @@ struct SessionInfo {
 }
 
 impl AuthMethod {
-    /// Who owns the session, for the per-principal cap. Open-mode sessions
-    /// carry no identity, so each client IP counts as one principal.
-    fn principal(&self, ip: Option<IpAddr>) -> String {
+    /// Who owns the session, for the per-principal cap. `None`: the session
+    /// is a principal of its own. Open-mode sessions carry no identity, and
+    /// behind a reverse proxy every browser has the proxy's address, so an
+    /// open-mode session counts alone; the global cap bounds them.
+    fn principal(&self) -> Option<String> {
         match self {
-            AuthMethod::Bootstrap => "bootstrap".to_string(),
-            AuthMethod::OpenLift => format!("open:{ip:?}"),
-            other => other.revocation_identity().unwrap_or_default(),
+            AuthMethod::Bootstrap => Some("bootstrap".to_string()),
+            AuthMethod::OpenLift => None,
+            other => other.revocation_identity(),
+        }
+    }
+
+    /// The live sessions one principal of this kind may hold.
+    fn principal_cap(&self) -> usize {
+        match self {
+            AuthMethod::Bootstrap => MAX_BOOTSTRAP_SESSIONS,
+            _ => MAX_SESSIONS_PER_PRINCIPAL,
         }
     }
 
@@ -282,13 +297,17 @@ impl SessionStore {
         // A principal at its cap loses its OWN oldest session. One global
         // cap with oldest-first eviction let any IAM user log every admin
         // out by minting sessions (S22).
-        let principal = auth_method.principal(ip);
-        let owned = |info: &SessionInfo| info.auth_method.principal(info.ip) == principal;
-        while sessions.values().filter(|info| owned(info)).count() >= MAX_SESSIONS_PER_PRINCIPAL {
-            let Some(token) = oldest_evictable(&sessions, owned) else {
-                break;
+        if let Some(principal) = auth_method.principal() {
+            let cap = auth_method.principal_cap();
+            let owned = |info: &SessionInfo| {
+                info.auth_method.principal().as_deref() == Some(principal.as_str())
             };
-            sessions.remove(&token);
+            while sessions.values().filter(|info| owned(info)).count() >= cap {
+                let Some(token) = oldest_evictable(&sessions, owned) else {
+                    break;
+                };
+                sessions.remove(&token);
+            }
         }
         // Global bound: browser-lift sessions go before admin sessions.
         while sessions.len() >= MAX_SESSIONS {
@@ -620,9 +639,12 @@ mod tests {
     #[test]
     fn test_max_sessions_eviction() {
         let store = SessionStore::new();
+        let dana = || AuthMethod::IamLoginAs {
+            access_key_id: "AKDANA".into(),
+        };
         let mut tokens = Vec::new();
         for _ in 0..MAX_SESSIONS_PER_PRINCIPAL {
-            tokens.push(store.create_session(None, AuthMethod::Bootstrap, SessionKind::AdminGui));
+            tokens.push(store.create_session(None, dana(), SessionKind::AdminGui));
         }
 
         // All sessions valid
@@ -631,10 +653,61 @@ mod tests {
         }
 
         // Add one more — oldest should be evicted
-        let new_token = store.create_session(None, AuthMethod::Bootstrap, SessionKind::AdminGui);
+        let new_token = store.create_session(None, dana(), SessionKind::AdminGui);
         assert!(store.validate(&new_token, None));
         assert!(!store.validate(&tokens[0], None)); // oldest evicted
         assert_eq!(store.sessions.read().len(), MAX_SESSIONS_PER_PRINCIPAL);
+
+        // The bootstrap principal has its own, higher cap.
+        let store = SessionStore::new();
+        let first = store.create_session(None, AuthMethod::Bootstrap, SessionKind::AdminGui);
+        for _ in 0..MAX_BOOTSTRAP_SESSIONS {
+            store.create_session(None, AuthMethod::Bootstrap, SessionKind::AdminGui);
+        }
+        assert!(!store.validate(&first, None));
+        assert_eq!(store.sessions.read().len(), MAX_BOOTSTRAP_SESSIONS);
+    }
+
+    /// The bootstrap password is one principal for every operator who
+    /// knows it. With a cap of 10, the 11th admin login logged out the
+    /// first admin.
+    #[test]
+    fn an_eleventh_bootstrap_login_keeps_the_first() {
+        let store = SessionStore::new();
+        let first = store.create_session(None, AuthMethod::Bootstrap, SessionKind::AdminGui);
+        for _ in 0..10 {
+            store.create_session(None, AuthMethod::Bootstrap, SessionKind::AdminGui);
+        }
+        assert!(
+            store.validate(&first, None),
+            "the 11th bootstrap login evicted the first"
+        );
+    }
+
+    /// Open mode keyed its principal on the client IP, which is the
+    /// reverse proxy's address behind Traefik: the 11th browser logged
+    /// out another, and the UI reconnected at once, so more than 10 users
+    /// evicted each other in a loop.
+    #[test]
+    fn open_mode_browsers_behind_one_proxy_do_not_evict_each_other() {
+        let store = SessionStore::new();
+        let proxy: IpAddr = "10.0.1.5".parse().unwrap();
+        let first = store.create_session(
+            Some(proxy),
+            AuthMethod::OpenLift,
+            SessionKind::S3BrowserLift,
+        );
+        for _ in 0..10 {
+            store.create_session(
+                Some(proxy),
+                AuthMethod::OpenLift,
+                SessionKind::S3BrowserLift,
+            );
+        }
+        assert!(
+            store.validate(&first, Some(proxy)),
+            "an open-mode browser behind the same proxy evicted another"
+        );
     }
 
     /// One principal minting sessions evicts only its OWN oldest sessions,
