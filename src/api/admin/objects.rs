@@ -149,10 +149,12 @@ pub struct ZipQuery {
 
 const MAX_BULK_OBJECTS: usize = 10_000;
 const MAX_FAILURE_ENTRIES: usize = 100;
-/// Folders (deltaspaces) that a bulk delete works on at the same time. The
-/// keys of one folder go one after another: the engine's per-deltaspace
-/// lock serialises them anyway.
-const BULK_DELETE_CONCURRENCY: usize = 8;
+/// Destination folders that a bulk copy or move works on at the same time.
+/// The items of one folder go one after another: each store takes the
+/// folder's lock anyway. Lower than the delete batch's folder count
+/// (`BULK_DELETE_CONCURRENCY`): each copy holds spool space and may hold
+/// a codec permit.
+const BULK_COPY_CONCURRENCY: usize = 4;
 
 fn dest_key(dest_prefix: &str, relative: &str) -> String {
     if dest_prefix.is_empty() {
@@ -454,20 +456,32 @@ pub async fn copy_objects(
     Ok(Json(res))
 }
 
+/// What happened to one item of a bulk copy.
+enum CopyOutcome {
+    /// Copied: the source object as it was read before the copy.
+    Copied(Box<crate::types::FileMetadata>),
+    /// Not copied: the destination key and the error.
+    Failed(String, String),
+    /// Not tried: a maintenance job armed on the destination bucket first.
+    Skipped,
+}
+
 /// Also returns, per item, the source object as it was copied (`None`: not
 /// copied), so a move deletes a source only while it is still that object.
 /// `delete_source`: a move, so the actor also needs delete on each source.
+///
+/// The items are grouped by destination folder (deltaspace): the items of
+/// one folder go one after another, [`BULK_COPY_CONCURRENCY`] folders at a
+/// time. The response lists failures in request order.
 async fn run_copy_loop(
     s3: &Arc<AppState>,
     req: &BulkPlan,
     actor: &BulkActor,
     delete_source: bool,
 ) -> (CopyResponse, Vec<Option<crate::types::FileMetadata>>) {
-    let engine = s3.engine.load();
-    let mut copied = vec![None; req.items.len()];
-    let mut succeeded = 0usize;
-    let mut failed = 0usize;
-    let mut failures: Vec<CopyFailure> = Vec::new();
+    use futures::StreamExt;
+    let engine = s3.engine.load_full();
+    let engine = &engine;
     // Register with the maintenance gate for the whole loop: the
     // entry-check in the handler only sees jobs that existed when the
     // request STARTED, but this loop can write for minutes. write_started
@@ -478,76 +492,113 @@ async fn run_copy_loop(
     // (admin closes the browser mid-bulk-copy) — straight-line write_finished
     // would leak the counter and wedge every later job on the bucket (H12).
     let _write = gate.begin_write(&req.dest_bucket);
+    let mut folders: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
     for (idx, it) in req.items.iter().enumerate() {
-        if gate.is_busy(&req.dest_bucket) {
-            let remaining = req.items.len() - idx;
-            failed += remaining;
-            if failures.len() < MAX_FAILURE_ENTRIES {
-                failures.push(CopyFailure {
-                    source_key: it.source_key.to_string(),
-                    dest_key: String::new(),
-                    error: format!(
-                        "a maintenance job started on bucket '{}' — {} remaining \
-                         item(s) skipped; retry after the job finishes",
-                        req.dest_bucket, remaining
-                    ),
-                });
-            }
-            break;
-        }
         let dk = dest_key(&req.dest_prefix, &it.relative);
-        // The same checks the S3 API runs for GET source + PUT dest (+ the
-        // source DELETE of a move), before any byte moves.
-        let allowed = actor
-            .check(S3Action::Read, &req.source_bucket, &it.source_key)
-            .and_then(|()| actor.check(S3Action::Write, &req.dest_bucket, &dk))
-            .and_then(|()| {
-                if delete_source {
-                    actor.check(S3Action::Delete, &req.source_bucket, &it.source_key)
-                } else {
-                    Ok(())
+        folders
+            .entry(crate::types::ObjectKey::parse(&req.dest_bucket, &dk).deltaspace_id())
+            .or_default()
+            .push(idx);
+    }
+    let mut outcomes: Vec<(usize, CopyOutcome)> = futures::stream::iter(folders.into_values())
+        .map(|indexes| async move {
+            let mut out = Vec::with_capacity(indexes.len());
+            for idx in indexes {
+                if gate.is_busy(&req.dest_bucket) {
+                    out.push((idx, CopyOutcome::Skipped));
+                    continue;
                 }
-            });
-        let result = match allowed {
-            Ok(()) => {
-                copy_one(
-                    s3,
-                    &engine,
-                    &req.source_bucket,
-                    &it.source_key,
-                    &req.dest_bucket,
-                    &dk,
-                )
-                .await
-            }
-            Err(denied) => Err(denied),
-        };
-        match result {
-            Ok(source) => {
-                succeeded += 1;
-                copied[idx] = Some(source);
-            }
-            Err(e) => {
-                failed += 1;
-                if failures.len() < MAX_FAILURE_ENTRIES {
-                    failures.push(CopyFailure {
-                        source_key: it.source_key.to_string(),
-                        dest_key: dk,
-                        error: e,
+                let it = &req.items[idx];
+                let dk = dest_key(&req.dest_prefix, &it.relative);
+                // The same checks the S3 API runs for GET source + PUT dest
+                // (+ the source DELETE of a move), before any byte moves.
+                let allowed = actor
+                    .check(S3Action::Read, &req.source_bucket, &it.source_key)
+                    .and_then(|()| actor.check(S3Action::Write, &req.dest_bucket, &dk))
+                    .and_then(|()| {
+                        if delete_source {
+                            actor.check(S3Action::Delete, &req.source_bucket, &it.source_key)
+                        } else {
+                            Ok(())
+                        }
                     });
-                }
+                let result = match allowed {
+                    Ok(()) => {
+                        copy_one(
+                            s3,
+                            engine,
+                            &req.source_bucket,
+                            &it.source_key,
+                            &req.dest_bucket,
+                            &dk,
+                        )
+                        .await
+                    }
+                    Err(denied) => Err(denied),
+                };
+                out.push((
+                    idx,
+                    match result {
+                        Ok(source) => CopyOutcome::Copied(Box::new(source)),
+                        Err(e) => CopyOutcome::Failed(dk, e),
+                    },
+                ));
             }
+            out
+        })
+        .buffer_unordered(BULK_COPY_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+    drop(_write);
+    outcomes.sort_by_key(|(idx, _)| *idx);
+    let skipped = outcomes
+        .iter()
+        .filter(|(_, o)| matches!(o, CopyOutcome::Skipped))
+        .count();
+    let mut copied = vec![None; req.items.len()];
+    let mut res = CopyResponse {
+        succeeded: 0,
+        failed: 0,
+        failures: Vec::new(),
+    };
+    let mut skip_reported = false;
+    for (idx, outcome) in outcomes {
+        let (dest_key, error) = match outcome {
+            CopyOutcome::Copied(source) => {
+                res.succeeded += 1;
+                copied[idx] = Some(*source);
+                continue;
+            }
+            CopyOutcome::Failed(dest_key, error) => (dest_key, error),
+            CopyOutcome::Skipped if skip_reported => {
+                res.failed += 1;
+                continue;
+            }
+            CopyOutcome::Skipped => {
+                skip_reported = true;
+                (
+                    String::new(),
+                    format!(
+                        "a maintenance job started on bucket '{}' — {skipped} remaining \
+                         item(s) skipped; retry after the job finishes",
+                        req.dest_bucket
+                    ),
+                )
+            }
+        };
+        res.failed += 1;
+        if res.failures.len() < MAX_FAILURE_ENTRIES {
+            res.failures.push(CopyFailure {
+                source_key: req.items[idx].source_key.to_string(),
+                dest_key,
+                error,
+            });
         }
     }
-    drop(_write);
-    (
-        CopyResponse {
-            succeeded,
-            failed,
-            failures,
-        },
-        copied,
-    )
+    (res, copied)
 }
 
 /// Copy one object the way a client write is handled: quota gate on the
@@ -719,7 +770,10 @@ pub async fn move_objects(
 
 /// Delete the sources of a move whose copies all succeeded; returns how
 /// many went. `same_location(item)`: the item's destination is its own
-/// source, which is never deleted.
+/// source, which is never deleted. One [`DynEngine::delete_batch`]: each
+/// source folder is checked once for a reference.bin to reclaim.
+///
+/// [`DynEngine::delete_batch`]: crate::deltaglider::DynEngine::delete_batch
 async fn delete_moved_sources(
     s3: &Arc<AppState>,
     source_bucket: &str,
@@ -727,28 +781,16 @@ async fn delete_moved_sources(
     copied: &[Option<crate::types::FileMetadata>],
     same_location: impl Fn(&CopyItem) -> bool,
 ) -> usize {
-    let mut deleted = 0usize;
+    use crate::deltaglider::{DeleteHooks, DeleteItem, DeleteOutcome};
     let mut skipped_self = 0usize;
-    let engine = s3.engine.load();
+    let engine = s3.engine.load_full();
     let gate = &s3.maintenance_gate;
     // RAII drain slot — released on drop even if the handler future is
     // cancelled mid-loop (H12).
     let _write = gate.begin_write(source_bucket);
-    // Folders (deltaspaces) that lost a source: each one is checked once
-    // at the end for a reference.bin to reclaim, not after every source.
-    let mut touched = std::collections::BTreeSet::new();
+    let mut keys = Vec::new();
+    let mut batch = Vec::new();
     for (it, source) in items.iter().zip(copied) {
-        if gate.is_busy(source_bucket) {
-            // A maintenance job armed mid-loop: stop deleting sources.
-            // The copies succeeded; leftovers are benign (same contract
-            // as a failed source delete below).
-            warn!(
-                "bulk move: maintenance job started on '{}' — leaving remaining \
-                 source objects in place",
-                source_bucket
-            );
-            break;
-        }
         // DATA-LOSS GUARD: a move whose destination key resolves to the
         // SAME bucket+key as the source is a self-copy no-op. Deleting the
         // source here would destroy the only copy. Never delete a source we
@@ -762,58 +804,54 @@ async fn delete_moved_sources(
         let Some(source) = source else { continue };
         // Delete the source only while it holds the bytes we copied: a
         // client PUT since the copy is a new object, not ours to delete.
-        let still_copied = |current: &crate::types::FileMetadata| {
-            crate::deltaglider::DynEngine::same_generation(source, current)
-        };
-        match engine
-            .delete_if_in_sweep(source_bucket, &it.source_key, &still_copied)
-            .await
-        {
-            Ok(crate::deltaglider::ConditionalDelete::Deleted(_)) => {
-                deleted += 1;
-                touched.insert(
-                    crate::types::ObjectKey::parse(source_bucket, &it.source_key).deltaspace_id(),
-                );
-                emit_event(
-                    s3,
-                    crate::event_outbox::EventKind::ObjectDeleted,
-                    source_bucket,
-                    &it.source_key,
-                    serde_json::json!({}),
-                )
-                .await;
-            }
-            Ok(_) => debug!(
-                "bulk move: source {}/{} changed or gone since its copy; left in place",
-                source_bucket, it.source_key
-            ),
-            Err(e) => {
-                warn!(
-                    "bulk move: delete source {}/{} failed: {}",
-                    source_bucket, it.source_key, e
-                );
-                // Don't surface as a failure — the copy did succeed.
-                // The source object is just leftover.
-            }
-        }
+        keys.push(it.source_key.as_str());
+        batch.push(DeleteItem::only_if(
+            it.source_key.to_string(),
+            move |current: &crate::types::FileMetadata| {
+                crate::deltaglider::DynEngine::same_generation(source, current)
+            },
+        ));
     }
-    // Best effort, like a failed source delete: an orphan reference.bin
-    // goes with a later delete in its folder.
-    for folder in touched {
-        if gate.is_busy(source_bucket) {
-            break;
-        }
-        if let Err(e) = engine
-            .reclaim_empty_deltaspace(source_bucket, &folder)
-            .await
-        {
-            warn!(
-                "bulk move: reference reclaim failed for {}/{folder}: {e}",
-                source_bucket
-            );
-        }
-    }
+    // A maintenance job armed mid-move stops the deletes; the copies
+    // succeeded, so leftovers are benign (as a failed source delete).
+    let proceed = || !gate.is_busy(source_bucket);
+    let emit = deleted_event_emitter(s3, source_bucket);
+    let outcomes = engine
+        .delete_batch(
+            source_bucket,
+            batch,
+            DeleteHooks {
+                proceed: Some(&proceed),
+                on_outcome: Some(&emit),
+            },
+        )
+        .await;
     drop(_write);
+    let mut deleted = 0usize;
+    let mut skipped = 0usize;
+    for (key, outcome) in keys.into_iter().zip(outcomes) {
+        match outcome {
+            DeleteOutcome::Deleted(_) => deleted += 1,
+            DeleteOutcome::Skipped => skipped += 1,
+            DeleteOutcome::NotFound | DeleteOutcome::Changed => debug!(
+                "bulk move: source {}/{} changed or gone since its copy; left in place",
+                source_bucket, key
+            ),
+            // Not a failure of the move: the copy did succeed. The source
+            // object is just leftover.
+            DeleteOutcome::Failed(e) => warn!(
+                "bulk move: delete source {}/{} failed: {}",
+                source_bucket, key, e
+            ),
+        }
+    }
+    if skipped > 0 {
+        warn!(
+            "bulk move: maintenance job started on '{}' — left {} remaining source \
+             object(s) in place",
+            source_bucket, skipped
+        );
+    }
     if skipped_self > 0 {
         warn!(
             "bulk move: skipped deleting {} source(s) whose destination equals the source \
@@ -822,6 +860,33 @@ async fn delete_moved_sources(
         );
     }
     deleted
+}
+
+/// The `on_outcome` hook of an admin delete batch: an `ObjectDeleted`
+/// outbox event for each key as its delete lands.
+fn deleted_event_emitter(
+    s3: &Arc<AppState>,
+    bucket: &str,
+) -> impl Fn(&str, &crate::deltaglider::DeleteOutcome) -> futures::future::BoxFuture<'static, ()>
+       + Send
+       + Sync {
+    let (s3, bucket) = (s3.clone(), bucket.to_string());
+    move |key, outcome| {
+        if !matches!(outcome, crate::deltaglider::DeleteOutcome::Deleted(_)) {
+            return Box::pin(async {});
+        }
+        let (s3, bucket, key) = (s3.clone(), bucket.clone(), key.to_string());
+        Box::pin(async move {
+            emit_event(
+                &s3,
+                crate::event_outbox::EventKind::ObjectDeleted,
+                &bucket,
+                &key,
+                serde_json::json!({}),
+            )
+            .await
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -879,108 +944,66 @@ enum KeyOutcome {
     Skipped,
 }
 
-/// Delete `keys` from `bucket`. The keys of one folder (deltaspace) go one
-/// after another, [`BULK_DELETE_CONCURRENCY`] folders at a time. Each key is
-/// deleted in sweep mode: a plain delete lists its folder after every key
-/// to see whether reference.bin can go, which made a folder of N keys cost
-/// N LISTs. Here each folder is checked once, after its last key.
+/// Delete `keys` from `bucket` in one [`DynEngine::delete_batch`]: each
+/// folder is checked once for a reference.bin to reclaim, after its last
+/// key, and the folders run in parallel. A key the actor may not delete
+/// is not tried.
+///
+/// [`DynEngine::delete_batch`]: crate::deltaglider::DynEngine::delete_batch
 async fn run_bulk_delete(
     s3: &Arc<AppState>,
     bucket: &str,
     keys: &[AdminObjectPath],
     actor: &BulkActor,
 ) -> DeleteResponse {
-    use futures::StreamExt;
+    use crate::deltaglider::{DeleteHooks, DeleteItem, DeleteOutcome};
     let engine = s3.engine.load_full();
-    let engine = &*engine;
     // Same gate participation as run_copy_loop: visible to the worker's
     // drain, and stops the moment a maintenance job arms mid-loop.
     let gate = &s3.maintenance_gate;
     // RAII drain slot — released on drop even if the handler future is
     // cancelled mid-loop (H12).
     let _write = gate.begin_write(bucket);
-    let mut folders: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
-    for (i, key) in keys.iter().enumerate() {
-        folders
-            .entry(crate::types::ObjectKey::parse(bucket, key).deltaspace_id())
-            .or_default()
-            .push(i);
-    }
-    let done: Vec<(String, Vec<(usize, KeyOutcome)>)> = futures::stream::iter(folders)
-        .map(|(folder, indexes)| async move {
-            let mut outcomes = Vec::with_capacity(indexes.len());
-            for i in indexes {
-                outcomes.push((i, delete_one(s3, engine, bucket, &keys[i], actor).await));
-            }
-            (folder, outcomes)
-        })
-        .buffer_unordered(BULK_DELETE_CONCURRENCY)
-        .collect()
-        .await;
     let mut outcomes = Vec::with_capacity(keys.len());
-    let mut touched = Vec::new();
-    for (folder, folder_outcomes) in done {
-        if folder_outcomes
-            .iter()
-            .any(|(_, o)| matches!(o, KeyOutcome::Deleted))
-        {
-            touched.push(folder);
+    let mut batch = Vec::new();
+    for (i, key) in keys.iter().enumerate() {
+        match actor.check(S3Action::Delete, bucket, key) {
+            Ok(()) => batch.push(i),
+            Err(denied) => outcomes.push((i, KeyOutcome::Failed(denied))),
         }
-        outcomes.extend(folder_outcomes);
     }
-    // Best effort, like the S3 DeleteObjects path: the objects are gone
-    // already, and an orphan reference.bin goes with a later delete.
-    futures::stream::iter(touched)
-        .for_each_concurrent(BULK_DELETE_CONCURRENCY, |folder| async move {
-            if gate.is_busy(bucket) {
-                return;
-            }
-            if let Err(e) = engine.reclaim_empty_deltaspace(bucket, &folder).await {
-                warn!("bulk delete: reference reclaim failed for {bucket}/{folder}: {e}");
-            }
-        })
+    let proceed = || !gate.is_busy(bucket);
+    let emit = deleted_event_emitter(s3, bucket);
+    let done = engine
+        .delete_batch(
+            bucket,
+            batch
+                .iter()
+                .map(|&i| DeleteItem::new(keys[i].as_str()))
+                .collect(),
+            DeleteHooks {
+                proceed: Some(&proceed),
+                on_outcome: Some(&emit),
+            },
+        )
         .await;
     drop(_write);
+    for (i, outcome) in batch.into_iter().zip(done) {
+        outcomes.push((
+            i,
+            match outcome {
+                // Not-found is treated as deleted (idempotent).
+                DeleteOutcome::Deleted(_) | DeleteOutcome::NotFound => KeyOutcome::Deleted,
+                DeleteOutcome::Skipped => KeyOutcome::Skipped,
+                DeleteOutcome::Failed(e) => {
+                    KeyOutcome::Failed(crate::api::S3Error::from(e).to_string())
+                }
+                // No condition: never refused.
+                DeleteOutcome::Changed => KeyOutcome::Failed("the key changed".to_string()),
+            },
+        ));
+    }
     delete_response(bucket, keys, outcomes)
-}
-
-/// Delete one key of a bulk delete. Sweep mode: the caller reclaims the
-/// folder's reference.bin after its last key.
-async fn delete_one(
-    s3: &Arc<AppState>,
-    engine: &crate::deltaglider::DynEngine,
-    bucket: &str,
-    key: &str,
-    actor: &BulkActor,
-) -> KeyOutcome {
-    if s3.maintenance_gate.is_busy(bucket) {
-        return KeyOutcome::Skipped;
-    }
-    if let Err(denied) = actor.check(S3Action::Delete, bucket, key) {
-        return KeyOutcome::Failed(denied);
-    }
-    match engine.delete_in_sweep(bucket, key).await {
-        Ok(_) => {
-            emit_event(
-                s3,
-                crate::event_outbox::EventKind::ObjectDeleted,
-                bucket,
-                key,
-                serde_json::json!({}),
-            )
-            .await;
-            KeyOutcome::Deleted
-        }
-        Err(e) => {
-            // Not-found is treated as deleted (idempotent).
-            let s3_err: crate::api::S3Error = e.into();
-            if matches!(s3_err, crate::api::S3Error::NoSuchKey(_)) {
-                KeyOutcome::Deleted
-            } else {
-                KeyOutcome::Failed(s3_err.to_string())
-            }
-        }
-    }
 }
 
 /// The response, in request order: the skipped keys are counted as failed
@@ -1790,7 +1813,8 @@ mod tests {
     /// backend requests each one costs.
     mod bulk_delete_cost {
         use super::super::{
-            delete_moved_sources, run_bulk_delete, AdminObjectPath, BulkActor, CopyItem,
+            delete_moved_sources, run_bulk_delete, run_copy_loop, AdminObjectPath, BulkActor,
+            BulkPlan, CopyItem,
         };
         use crate::api::handlers::AppState;
         use crate::deltaglider::{s3_engine, store_deltas};
@@ -1863,7 +1887,7 @@ mod tests {
         async fn a_bulk_delete_works_on_several_folders_at_once() {
             let (engine, fake) = s3_engine().await;
             let mut keys = Vec::new();
-            for run in 0..super::super::BULK_DELETE_CONCURRENCY {
+            for run in 0..crate::deltaglider::BULK_DELETE_CONCURRENCY {
                 keys.extend(store_deltas(&engine, &format!("e2e/run-{run}"), 2).await);
             }
             let state = AppState::for_tests(engine);
@@ -1941,6 +1965,97 @@ mod tests {
                     .await
                     .unwrap(),
                 "reference.bin is reclaimed"
+            );
+        }
+
+        /// A copy plan of `keys` (under `src/`) into `copy/`, bucket `b`.
+        fn copy_plan(engine: &crate::deltaglider::DynEngine, keys: &[String]) -> BulkPlan {
+            let registry = engine.bucket_policy_registry();
+            BulkPlan {
+                source_bucket: registry.client_bucket("b").unwrap(),
+                dest_bucket: registry.client_bucket("b").unwrap(),
+                dest_prefix: AdminObjectPath::try_from("copy/".to_string()).unwrap(),
+                items: keys
+                    .iter()
+                    .map(|k| CopyItem {
+                        source_key: AdminObjectPath::try_from(k.clone()).unwrap(),
+                        relative: AdminObjectPath::try_from(
+                            k.strip_prefix("src/").unwrap().to_string(),
+                        )
+                        .unwrap(),
+                    })
+                    .collect(),
+            }
+        }
+
+        async fn sources(engine: &crate::deltaglider::DynEngine) -> Vec<String> {
+            let mut keys = Vec::new();
+            for folder in 0..4 {
+                for i in 0..3 {
+                    let key = format!("src/f{folder}/img-{i}.jpg");
+                    engine
+                        .store("b", &key, b"x", None, Default::default())
+                        .await
+                        .unwrap();
+                    keys.push(key);
+                }
+            }
+            keys
+        }
+
+        /// The destination folders of a bulk copy are written at the same
+        /// time. The copy went one item after another: about 8 round trips
+        /// per item, hours for a large selection.
+        #[tokio::test]
+        async fn a_bulk_copy_works_on_several_folders_at_once() {
+            let (engine, fake) = s3_engine().await;
+            let keys = sources(&engine).await;
+            let plan = copy_plan(&engine, &keys);
+            let state = AppState::for_tests(engine);
+            fake.set_put_delay_ms(50);
+
+            let (res, copied) = run_copy_loop(&state, &plan, &BulkActor::Unrestricted, false).await;
+
+            assert_eq!(
+                (res.succeeded, res.failed),
+                (keys.len(), 0),
+                "{:?}",
+                res.failures
+            );
+            assert!(copied.iter().all(Option::is_some));
+            let peak = fake.peak_puts_in_flight();
+            eprintln!("peak PUTs in flight: {peak}");
+            assert!(peak > 1, "the folders were copied one after another");
+            let engine = state.engine.load();
+            for key in &keys {
+                let dest = format!("copy/{}", key.strip_prefix("src/").unwrap());
+                assert!(engine.head("b", &dest).await.is_ok(), "{dest}");
+            }
+        }
+
+        /// A maintenance job armed before the copy starts stops it: every
+        /// item is reported in one failure entry.
+        #[tokio::test]
+        async fn a_maintenance_job_armed_first_skips_every_copy_and_says_so() {
+            let (engine, _fake) = s3_engine().await;
+            let keys = sources(&engine).await;
+            let plan = copy_plan(&engine, &keys);
+            let state = AppState::for_tests(engine);
+            state.maintenance_gate.set_busy("b");
+
+            let (res, _) = run_copy_loop(&state, &plan, &BulkActor::Unrestricted, false).await;
+
+            assert_eq!(
+                (res.succeeded, res.failed, res.failures.len()),
+                (0, keys.len(), 1)
+            );
+            assert_eq!(res.failures[0].source_key, keys[0]);
+            assert!(
+                res.failures[0]
+                    .error
+                    .contains(&format!("{} remaining item(s) skipped", keys.len())),
+                "{}",
+                res.failures[0].error
             );
         }
     }
