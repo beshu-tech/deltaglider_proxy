@@ -23,10 +23,9 @@
  * never ends as a ZIP that looks complete.
  */
 import { fetchWithRelogin } from './adminApi/core';
+import { MAX_BULK_OBJECTS as ZIP_MAX_KEYS } from './bulkSelection';
 import { throwApiError } from './errorHandling';
 
-/** Mirrors `MAX_BULK_OBJECTS` in src/api/admin/objects.rs. */
-const ZIP_MAX_KEYS = 10_000;
 /** The HTTP stack refuses request targets of 64 KiB and more; keep a margin. */
 const ZIP_MAX_URL_LENGTH = 60_000;
 

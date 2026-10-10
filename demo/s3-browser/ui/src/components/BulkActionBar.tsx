@@ -2,18 +2,13 @@ import { useState, useCallback } from 'react';
 import { Button, Progress, message } from 'antd';
 import { DeleteOutlined, CopyOutlined, ScissorOutlined, DownloadOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
-import { pluralize } from '../utils';
 import DestinationPickerModal from './DestinationPickerModal';
 import { isSessionExpired, normalizeUiError } from '../errorHandling';
 import { useBackClosesModal } from '../hooks/useOverlayClose';
 import { bulkDeleteConfirmText } from '../bulkSelection';
-import {
-  type BulkDeleteOutcome,
-  type BulkDeleteProgress,
-  bulkDeleteOutcomeMessage,
-  bulkDeleteProgressPercent,
-  bulkDeleteProgressText,
-} from '../bulkDelete';
+import { type BulkProgress, bulkProgressPercent, bulkProgressText } from '../bulkBatches';
+import { type BulkDeleteOutcome, bulkDeleteOutcomeMessage } from '../bulkDelete';
+import { type BulkTransferOutcome, bulkTransferOutcomeMessage } from '../bulkTransfer';
 import { confirmDelete } from './confirmDelete';
 
 interface Props {
@@ -22,24 +17,25 @@ interface Props {
   selectedFolderCount?: number;
   /** Runs the whole delete; resolves with its outcome, rejects on a failure. */
   onDelete?: () => Promise<BulkDeleteOutcome>;
-  onCopy?: (destBucket: string, destPrefix: string) => Promise<{ succeeded: number; failed: number }>;
-  onMove?: (destBucket: string, destPrefix: string) => Promise<{ succeeded: number; failed: number }>;
+  /** Run the whole copy / move; resolve with its outcome, reject on a failure. */
+  onCopy?: (destBucket: string, destPrefix: string) => Promise<BulkTransferOutcome>;
+  onMove?: (destBucket: string, destPrefix: string) => Promise<BulkTransferOutcome>;
   onDownloadZip?: () => Promise<void>;
   /** The folder being browsed: the copy/move destination starts there. */
   currentPrefix?: string;
   /** The raw selection keys: the destination picker refuses to copy them onto themselves. */
   selectionKeys?: Iterable<string>;
-  /** The running bulk delete (null/absent = none): the bar shows it instead of the actions. */
-  deleteProgress?: BulkDeleteProgress | null;
-  /** Stops the running delete after the batch in flight. */
-  onCancelDelete?: () => void;
+  /** The running bulk delete, copy or move (null/absent = none): the bar shows it instead of the actions. */
+  progress?: BulkProgress | null;
+  /** Stops the running bulk action after the batch in flight. */
+  onCancel?: () => void;
   /** Shown when bulk handlers are omitted (user signed in for files only). */
   hint?: string;
   /** Called instead of an error toast when the admin session expired. */
   onSessionExpired?: () => void;
 }
 
-export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, onDelete, onCopy, onMove, onDownloadZip, deleteProgress, onCancelDelete, hint, currentPrefix, selectionKeys, onSessionExpired }: Props) {
+export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, onDelete, onCopy, onMove, onDownloadZip, progress, onCancel, hint, currentPrefix, selectionKeys, onSessionExpired }: Props) {
   const colors = useColors();
   const [modal, setModal] = useState<'copy' | 'move' | null>(null);
   const [operating, setOperating] = useState(false);
@@ -49,23 +45,21 @@ export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, 
   const closeModal = useCallback(() => setModal(null), []);
   useBackClosesModal(modal !== null, closeModal);
 
+  // The picker closes when the run starts: the bar then shows its progress
+  // and Cancel. The report goes through the static `message` (see handleDelete).
   const handleOperation = async (op: 'copy' | 'move', destBucket: string, destPrefix: string) => {
+    closeModal();
+    const fn = op === 'copy' ? onCopy : onMove;
+    if (!fn) return;
     setOperating(true);
     try {
-      const fn = op === 'copy' ? onCopy : onMove;
-      if (!fn) return;
-      const result = await fn(destBucket, destPrefix);
-      if (result.failed > 0) {
-        message.warning(`${result.succeeded} succeeded, ${result.failed} failed`);
-      } else {
-        message.success(`${pluralize(result.succeeded, 'item')} ${op === 'copy' ? 'copied' : 'moved'}`);
-      }
+      const { type, text } = bulkTransferOutcomeMessage(await fn(destBucket, destPrefix));
+      message[type](text);
     } catch (e) {
       if (isSessionExpired(e) && onSessionExpired) onSessionExpired();
       else message.error(normalizeUiError(e, `${op} failed`));
     } finally {
       setOperating(false);
-      closeModal();
     }
   };
 
@@ -116,15 +110,15 @@ export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, 
           boxShadow: '0 8px 28px rgba(0, 0, 0, 0.35)',
         }}
       >
-        {deleteProgress ? (
-          // A running delete replaces the actions: its phase, a bar and Cancel.
+        {progress ? (
+          // A running bulk action replaces the actions: its phase, a bar and Cancel.
           <>
             <span role="status" style={statusStyle}>
-              {bulkDeleteProgressText(deleteProgress)}
+              {bulkProgressText(progress)}
             </span>
             <Progress
-              aria-label="Bulk delete progress"
-              percent={bulkDeleteProgressPercent(deleteProgress)}
+              aria-label={`Bulk ${progress.action} progress`}
+              percent={bulkProgressPercent(progress)}
               status="active"
               showInfo={false}
               size="small"
@@ -132,9 +126,9 @@ export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, 
             />
             <Button
               size="small"
-              onClick={onCancelDelete}
-              disabled={!onCancelDelete || deleteProgress.stopping}
-              aria-label="Cancel delete"
+              onClick={onCancel}
+              disabled={!onCancel || progress.stopping}
+              aria-label={`Cancel ${progress.action}`}
             >
               Cancel
             </Button>

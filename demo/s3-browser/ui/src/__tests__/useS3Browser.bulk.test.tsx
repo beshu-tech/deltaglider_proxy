@@ -12,7 +12,7 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import type { S3Object } from '../types';
 import type { BulkDeleteOutcome } from '../bulkDelete';
-import { DELETE_BATCH_SIZE } from '../bulkDelete';
+import { BULK_BATCH_SIZE } from '../bulkBatches';
 import { isSessionExpired } from '../errorHandling';
 import { json, mockFetch, type RecordedRequest } from '../test/fetchMock';
 import { renderHookWithQuery, renderWithQuery } from '../test/render';
@@ -107,11 +107,19 @@ describe.each([
     http.on('POST', path, json({ succeeded: 3, failed: 0, failures: [], deleted: 3 }));
     const { result } = await mountBrowser();
     selectFileAndFolder(result);
-    let outcome: { succeeded: number; failed: number } | undefined;
+    let outcome: unknown;
     await act(async () => {
       outcome = await result.current[op]('archive', 'old/');
     });
-    expect(outcome).toEqual({ succeeded: 3, failed: 0 });
+    expect(outcome).toEqual({
+      action: op === 'bulkCopy' ? 'copy' : 'move',
+      total: 3,
+      succeeded: 3,
+      failed: 0,
+      deleted: op === 'bulkMove' ? 3 : 0,
+      failures: [],
+      cancelled: false,
+    });
     expect(http.callsTo('POST', path)[0].body).toEqual({
       source_bucket: 'releases',
       dest_bucket: 'archive',
@@ -160,7 +168,7 @@ describe('bulkDelete', () => {
       keys: ['builds/app-1.0.zip', 'builds/nightly/a.zip', 'builds/nightly/b.zip'],
     });
     expect(result.current.selectedKeys.size).toBe(0);
-    expect(result.current.deleting).toBe(false);
+    expect(result.current.bulkRunning).toBe(false);
   });
 
   test('a failed delete keeps the selection and rejects with the error and the count', async () => {
@@ -171,7 +179,7 @@ describe('bulkDelete', () => {
       await expect(result.current.bulkDelete()).rejects.toThrow(/denied\. 0 of 3 objects were deleted before the failure\.$/);
     });
     expect(result.current.selectedKeys.size).toBe(2);
-    expect(result.current.deleting).toBe(false);
+    expect(result.current.bulkRunning).toBe(false);
   });
 
   test('a truncated folder aborts before any delete request', async () => {
@@ -220,19 +228,19 @@ describe('bulkDelete in batches', () => {
     http.on('GET', LIST, json({ keys: BIG, truncated: false }));
   });
 
-  test(`sends batches of ${DELETE_BATCH_SIZE}, reports progress and reloads the listing after each batch`, async () => {
+  test(`sends batches of ${BULK_BATCH_SIZE}, reports progress and reloads the listing after each batch`, async () => {
     const held = heldDeletes();
     const { result } = await mountBrowser();
     const run = startDelete(result);
     await waitFor(() => expect(held).toHaveLength(1));
     expect(held[0].keys).toEqual(BIG.slice(0, 500));
-    expect(result.current.deleteProgress).toEqual({ phase: 'deleting', done: 0, total: 1201, stopping: false });
+    expect(result.current.bulkProgress).toEqual({ action: 'delete', phase: 'sending', done: 0, total: 1201, stopping: false });
     const loads = listing.loads;
 
     held[0].answer();
     await waitFor(() => expect(held).toHaveLength(2));
     expect(held[1].keys).toEqual(BIG.slice(500, 1000));
-    await waitFor(() => expect(result.current.deleteProgress).toMatchObject({ done: 500, total: 1201 }));
+    await waitFor(() => expect(result.current.bulkProgress).toMatchObject({ done: 500, total: 1201 }));
     // The listing reloads after the first batch, while the second one runs.
     await waitFor(() => expect(listing.loads).toBe(loads + 1));
 
@@ -243,8 +251,8 @@ describe('bulkDelete in batches', () => {
 
     held[2].answer();
     await expect(run).resolves.toEqual({ total: 1201, deleted: 1201, failed: 0, failures: [], cancelled: false });
-    await waitFor(() => expect(result.current.deleting).toBe(false));
-    expect(result.current.deleteProgress).toBeNull();
+    await waitFor(() => expect(result.current.bulkRunning).toBe(false));
+    expect(result.current.bulkProgress).toBeNull();
     expect(result.current.selectedKeys.size).toBe(0);
     expect(listing.loads).toBeGreaterThanOrEqual(loads + 3);
   });
@@ -254,13 +262,13 @@ describe('bulkDelete in batches', () => {
     const { result } = await mountBrowser();
     const run = startDelete(result);
     await waitFor(() => expect(held).toHaveLength(1));
-    act(() => result.current.cancelBulkDelete());
-    expect(result.current.deleteProgress).toMatchObject({ phase: 'deleting', stopping: true });
+    act(() => result.current.cancelBulk());
+    expect(result.current.bulkProgress).toMatchObject({ action: 'delete', phase: 'sending', stopping: true });
 
     held[0].answer();
     await expect(run).resolves.toEqual({ total: 1201, deleted: 500, failed: 0, failures: [], cancelled: true });
     expect(http.callsTo('POST', DELETE)).toHaveLength(1);
-    await waitFor(() => expect(result.current.deleting).toBe(false));
+    await waitFor(() => expect(result.current.bulkRunning).toBe(false));
     // The folder still holds 701 keys: it stays selected for a retry.
     expect([...result.current.selectedKeys]).toEqual(['folder:builds/nightly/']);
   });
@@ -277,7 +285,7 @@ describe('bulkDelete in batches', () => {
       'Bulk delete failed (500): disk full. 500 of 1,201 objects were deleted before the failure.',
     );
     expect(http.callsTo('POST', DELETE)).toHaveLength(2);
-    await waitFor(() => expect(result.current.deleting).toBe(false));
+    await waitFor(() => expect(result.current.bulkRunning).toBe(false));
   });
 
   test('an expired session mid-run rejects with the session error itself (sign-in path)', async () => {
@@ -291,7 +299,7 @@ describe('bulkDelete in batches', () => {
       (e: unknown) => e,
     );
     expect(isSessionExpired(err)).toBe(true);
-    await waitFor(() => expect(result.current.deleting).toBe(false));
+    await waitFor(() => expect(result.current.bulkRunning).toBe(false));
   });
 
   test('leaving the page asks first while a delete runs', async () => {
@@ -306,10 +314,10 @@ describe('bulkDelete in batches', () => {
     const run = startDelete(result);
     await waitFor(() => expect(held).toHaveLength(1));
     expect(leave()).toBe(true);
-    act(() => result.current.cancelBulkDelete());
+    act(() => result.current.cancelBulk());
     held[0].answer();
     await run;
-    await waitFor(() => expect(result.current.deleting).toBe(false));
+    await waitFor(() => expect(result.current.bulkRunning).toBe(false));
     expect(leave()).toBe(false);
   });
 
@@ -321,13 +329,13 @@ describe('bulkDelete in batches', () => {
         <>
           <button onClick={() => s3.toggleKey('folder:builds/nightly/')}>pick</button>
           {/* As in App: the bar stays while a delete runs, even when the selection empties. */}
-          {(s3.selectedKeys.size > 0 || s3.deleting) && (
+          {(s3.selectedKeys.size > 0 || s3.bulkRunning) && (
             <BulkActionBar
               selectedCount={s3.selectedKeys.size}
               selectedFolderCount={1}
               onDelete={s3.bulkDelete}
-              deleteProgress={s3.deleteProgress}
-              onCancelDelete={s3.cancelBulkDelete}
+              progress={s3.bulkProgress}
+              onCancel={s3.cancelBulk}
             />
           )}
         </>

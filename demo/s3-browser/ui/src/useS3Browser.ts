@@ -17,13 +17,10 @@ import { isSessionExpired, normalizeUiError } from './errorHandling';
 import { useOverlayClose } from './hooks/useOverlayClose';
 import useSelection from './useSelection';
 import { virtualWritableChildren } from './permissions';
-import { expandSelection } from './bulkSelection';
-import {
-  type BulkDeleteOutcome,
-  type BulkDeleteProgress,
-  BulkDeleteFailed,
-  deleteInBatches,
-} from './bulkDelete';
+import { type ExpandedItem, MAX_BULK_OBJECTS, expandSelection } from './bulkSelection';
+import { type BulkAction, type BulkProgress, BulkActionFailed } from './bulkBatches';
+import { type BulkDeleteOutcome, deleteInBatches } from './bulkDelete';
+import { type BulkTransferOutcome, transferInBatches, transferPlanError } from './bulkTransfer';
 import { downloadZip as saveZip, zipPreflightError } from './zipDownload';
 // Bulk actions → admin objects API; App gates them on `sessionCaps.canUseBulkActions`
 // (the server authorizes each key for a files-only session).
@@ -89,10 +86,10 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [isTruncated, setIsTruncated] = useState(false);
-  // A running bulk delete (null = none): its phase and counts for the action bar.
-  const [deleteProgress, setDeleteProgress] = useState<BulkDeleteProgress | null>(null);
-  const deleting = deleteProgress !== null;
-  const deleteRun = useRef<AbortController | null>(null);
+  // A running bulk delete, copy or move (null = none): its phase and counts for the action bar.
+  const [bulkProgress, setBulkProgress] = useState<BulkProgress | null>(null);
+  const bulkRunning = bulkProgress !== null;
+  const bulkRun = useRef<AbortController | null>(null);
   const [connected, setConnected] = useState(hasCredentials());
   // The search box shows a local draft; the URL's ?q= follows 200ms later
   // (debounced replace, see setSearchQuery). Binding the box to ?q= directly
@@ -447,154 +444,170 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     [selectedKeys],
   );
 
-  /** Absolute keys for the selection (folders expanded, deduped). */
-  const resolveSelectedKeys = useCallback(
-    async (currentBucket: string): Promise<string[]> =>
-      (await expandSelected(currentBucket)).map((i) => i.source),
-    [expandSelected],
+  /**
+   * One bulk run (delete, copy, move), the v2.0.4 bulk-delete shape: list the
+   * selection's folders (a few at once), then send the items in batches, one
+   * request at a time. The action bar shows `bulkProgress`; `cancelBulk`
+   * stops the run after the batch in flight. Resolves with the outcome (also
+   * after a cancel); rejects with a session expiry as-is (the bar sends the
+   * user to sign-in), and with any other error plus how many objects went
+   * before it. The listing and the savings chip reload once when it ends.
+   */
+  const runBulk = useCallback(
+    async <O extends { cancelled: boolean; failed: number }>(
+      action: BulkAction,
+      run: {
+        /** List the selection; `opts` carries the abort and the listing progress. */
+        expand: (opts: NonNullable<Parameters<typeof expandSelection>[2]>) => Promise<ExpandedItem[]>;
+        /** Send the items in batches; `sent(done, went)` after each one. */
+        send: (items: ExpandedItem[], signal: AbortSignal, sent: (done: number, went: number) => void) => Promise<O>;
+        /** The outcome of a run cancelled while it listed. */
+        cancelledWhileListing: () => O;
+        /** Reload the listing after each batch: the sources leave the page as the run goes on. */
+        reloadPerBatch: boolean;
+      },
+    ): Promise<O> => {
+      const ctl = new AbortController();
+      bulkRun.current = ctl;
+      const stopping = () => ctl.signal.aborted;
+      let total = 0;
+      let went = 0;
+      setBulkProgress({ action, phase: 'listing', listed: 0, folders: 0, keysFound: 0, stopping: false });
+      try {
+        const items = await run.expand({
+          signal: ctl.signal,
+          onProgress: (p) => setBulkProgress({ action, phase: 'listing', ...p, stopping: stopping() }),
+        });
+        total = items.length;
+        setBulkProgress({ action, phase: 'sending', done: 0, total, stopping: stopping() });
+        const outcome = await run.send(items, ctl.signal, (done, n) => {
+          went = n;
+          setBulkProgress({ action, phase: 'sending', done, total, stopping: stopping() });
+          if (run.reloadPerBatch) refresh();
+        });
+        // A cancelled or partly failed run keeps the selection for a retry; the
+        // reloads already dropped the entries that are gone.
+        if (!outcome.cancelled && outcome.failed === 0) clearSelection();
+        return outcome;
+      } catch (e) {
+        if (ctl.signal.aborted && e === ctl.signal.reason) return run.cancelledWhileListing();
+        if (isSessionExpired(e)) throw e;
+        throw new BulkActionFailed(action, e, went, total);
+      } finally {
+        bulkRun.current = null;
+        setBulkProgress(null);
+        // Once for the whole run (a failed batch may have done part of its
+        // work): the listing and the savings chip, not after each batch.
+        if (total > 0) mutate();
+      }
+    },
+    [clearSelection, refresh, mutate],
   );
 
-  /**
-   * Resolve the selection into [absolute-source-key, relative-dest-suffix] pairs.
-   *
-   * Semantics:
-   * - When the user selects a folder `foo/`, that prefix is the "common prefix"
-   *   for everything underneath it: `foo/a.txt` becomes relative-suffix `a.txt`
-   *   and `foo/bar/a.txt` becomes `bar/a.txt`. Destination keys are then
-   *   `destPrefix + relative-suffix`, preserving the folder structure.
-   * - When the user selects a single object directly, the relative-suffix is
-   *   just its basename (matches the previous flat behavior for direct picks).
-   * - The folder's own marker key (`foo/`, empty suffix) is not copied.
-   */
-  const resolveSelectionWithRelativeKeys = useCallback(
-    async (currentBucket: string) =>
-      (await expandSelected(currentBucket)).filter((i) => i.relative !== ''),
-    [expandSelected],
-  );
-
-  /**
-   * Delete the selection: list its folders (a few at once), then send the keys
-   * in batches (deleteInBatches). The action bar shows `deleteProgress`; the
-   * listing reloads after each batch, so finished folders leave the page as
-   * the run goes on. Resolves with the outcome (also after a cancel); rejects
-   * with a session expiry as-is (the bar sends the user to sign-in), and with
-   * any other error plus how many keys were deleted before it.
-   */
-  const bulkDelete = useCallback(async (): Promise<BulkDeleteOutcome> => {
-    const run = new AbortController();
-    deleteRun.current = run;
+  /** Delete the selection (see runBulk). The run has no total limit. */
+  const bulkDelete = useCallback((): Promise<BulkDeleteOutcome> => {
     // Snapshot the bucket: a bucket switch mid-run must not move the deletes.
     const bucket = getBucket();
-    const stopping = () => run.signal.aborted;
-    let total = 0;
-    let deleted = 0;
-    setDeleteProgress({ phase: 'listing', listed: 0, folders: 0, keysFound: 0, stopping: false });
-    try {
-      const items = await expandSelected(bucket, {
-        signal: run.signal,
-        onProgress: (p) => setDeleteProgress({ phase: 'listing', ...p, stopping: stopping() }),
-      });
-      const keys = items.map((i) => i.source);
-      total = keys.length;
-      setDeleteProgress({ phase: 'deleting', done: 0, total, stopping: stopping() });
-      const outcome = await deleteInBatches(keys, (batch) => bulkDeleteObjects({ bucket, keys: batch }), {
-        signal: run.signal,
-        onBatch: (p) => {
-          deleted = p.deleted;
-          setDeleteProgress({ phase: 'deleting', done: p.done, total: p.total, stopping: stopping() });
-          refresh();
-        },
-      });
-      // A cancelled or partly failed run keeps the selection for a retry; the
-      // reloads already dropped the entries that are gone.
-      if (!outcome.cancelled && outcome.failed === 0) clearSelection();
-      return outcome;
-    } catch (e) {
-      if (run.signal.aborted && e === run.signal.reason) {
-        return { total, deleted: 0, failed: 0, failures: [], cancelled: true };
-      }
-      if (total > 0) refresh(); // the failed batch may have deleted some keys
-      if (isSessionExpired(e)) throw e;
-      throw new BulkDeleteFailed(e, deleted, total);
-    } finally {
-      deleteRun.current = null;
-      setDeleteProgress(null);
-      // The savings chip once for the whole run, not after each batch.
-      if (total > 0) setSavingsTrigger((k) => k + 1);
-    }
-  }, [clearSelection, refresh, expandSelected]);
+    return runBulk('delete', {
+      expand: (opts) => expandSelected(bucket, opts),
+      send: (items, signal, sent) =>
+        deleteInBatches(
+          items.map((i) => i.source),
+          (batch) => bulkDeleteObjects({ bucket, keys: batch }),
+          { signal, onBatch: (p) => sent(p.done, p.deleted) },
+        ),
+      cancelledWhileListing: () => ({ total: 0, deleted: 0, failed: 0, failures: [], cancelled: true }),
+      reloadPerBatch: true,
+    });
+  }, [runBulk, expandSelected]);
 
-  /** Stop the running bulk delete: the batch in flight finishes, no new one starts. */
-  const cancelBulkDelete = useCallback(() => {
-    deleteRun.current?.abort();
-    setDeleteProgress((p) => (p ? { ...p, stopping: true } : p));
+  /**
+   * Copy or move the selection to `destBucket`/`destPrefix` (see runBulk).
+   * A selected folder `foo/` keeps its own name under the destination
+   * (`foo/bar/a.txt` lands at `destPrefix + foo/bar/a.txt`); a selected object
+   * lands under its basename. The listing stops once the selection passes
+   * the server's cap (MAX_BULK_OBJECTS), and the whole plan is checked before
+   * the first batch: the server sees one batch at a time. For a move, the
+   * server removes a batch's sources only when every copy of that batch
+   * succeeded.
+   */
+  const bulkTransfer = useCallback(
+    (action: 'copy' | 'move', destBucket: string, destPrefix: string): Promise<BulkTransferOutcome> => {
+      // Snapshot the source bucket ONCE so the listing and the requests run
+      // against the same bucket even if the user switches buckets mid-run.
+      const sourceBucket = getBucket();
+      const request = action === 'copy' ? bulkCopyObjects : bulkMoveObjects;
+      return runBulk(action, {
+        expand: async (opts) => {
+          // The folder's own marker key (empty suffix) is not copied.
+          const items = (await expandSelected(sourceBucket, { ...opts, maxKeys: MAX_BULK_OBJECTS })).filter(
+            (i) => i.relative !== '',
+          );
+          const problem = transferPlanError(items, sourceBucket, destBucket, destPrefix);
+          if (problem) throw new Error(problem);
+          return items;
+        },
+        send: (items, signal, sent) =>
+          transferInBatches(
+            action,
+            items,
+            (batch) =>
+              request({
+                source_bucket: sourceBucket,
+                dest_bucket: destBucket,
+                dest_prefix: destPrefix,
+                items: batch.map(({ source, relative }) => ({ source_key: source, relative })),
+              }),
+            { signal, onBatch: (p) => sent(p.done, p.went) },
+          ),
+        cancelledWhileListing: () => ({
+          action,
+          total: 0,
+          succeeded: 0,
+          failed: 0,
+          deleted: 0,
+          failures: [],
+          cancelled: true,
+        }),
+        reloadPerBatch: action === 'move',
+      });
+    },
+    [runBulk, expandSelected],
+  );
+  const bulkCopy = useCallback(
+    (destBucket: string, destPrefix: string) => bulkTransfer('copy', destBucket, destPrefix),
+    [bulkTransfer],
+  );
+  const bulkMove = useCallback(
+    (destBucket: string, destPrefix: string) => bulkTransfer('move', destBucket, destPrefix),
+    [bulkTransfer],
+  );
+
+  /** Stop the running bulk action: the batch in flight finishes, no new one starts. */
+  const cancelBulk = useCallback(() => {
+    bulkRun.current?.abort();
+    setBulkProgress((p) => (p ? { ...p, stopping: true } : p));
   }, []);
 
   // Leaving the page stops the run after the batch in flight: ask first.
+  const runningAction = bulkProgress?.action;
   useEffect(() => {
-    if (!deleting) return;
+    if (!runningAction) return;
     const warn = (e: BeforeUnloadEvent) => {
       e.preventDefault();
-      e.returnValue = 'A bulk delete is running. Leaving the page stops it.';
+      e.returnValue = `A bulk ${runningAction} is running. Leaving the page stops it.`;
       return e.returnValue;
     };
     window.addEventListener('beforeunload', warn);
     return () => window.removeEventListener('beforeunload', warn);
-  }, [deleting]);
-
-  const bulkCopy = useCallback(async (destBucket: string, destPrefix: string) => {
-    // Phase B: server-side orchestration. The proxy's engine handles
-    // the per-key retrieve+store loop, collision detection, and atomic
-    // bookkeeping. Pre-migration the browser ran this loop itself via
-    // @aws-sdk/client-s3, with no atomicity and ~250 KB of SDK code
-    // shipped down the wire.
-    // Snapshot the source bucket ONCE so the folder-expansion listing and the
-    // copy execute against the same bucket even if the user switches buckets
-    // mid-operation (selection clears on switch, but an in-flight op kept its
-    // own closure + re-read getBucket(), which could straddle two buckets).
-    const sourceBucket = getBucket();
-    const items = await resolveSelectionWithRelativeKeys(sourceBucket);
-    if (items.length === 0) return { succeeded: 0, failed: 0 };
-    const result = await bulkCopyObjects({
-      source_bucket: sourceBucket,
-      dest_bucket: destBucket,
-      dest_prefix: destPrefix,
-      items: items.map(({ source, relative }) => ({ source_key: source, relative })),
-    });
-    // Clear selection only on the post-await success path (matches bulkMove /
-    // bulkDelete): a thrown/rejected bulkCopyObjects above preserves the
-    // selection so the user can retry.
-    clearSelection();
-    mutate();
-    return { succeeded: result.succeeded, failed: result.failed };
-  }, [clearSelection, resolveSelectionWithRelativeKeys, mutate]);
-
-  const bulkMove = useCallback(async (destBucket: string, destPrefix: string) => {
-    // Server-side move with the same atomicity rule as before:
-    // sources are deleted ONLY when every copy succeeded. Difference
-    // is now the policy is enforced inside one engine call instead of
-    // a client-side loop that could be interrupted mid-flight.
-    // Snapshot the source bucket once (see bulkCopy) so listing + move can't
-    // straddle a mid-operation bucket switch.
-    const sourceBucket = getBucket();
-    const items = await resolveSelectionWithRelativeKeys(sourceBucket);
-    if (items.length === 0) return { succeeded: 0, failed: 0 };
-    const result = await bulkMoveObjects({
-      source_bucket: sourceBucket,
-      dest_bucket: destBucket,
-      dest_prefix: destPrefix,
-      items: items.map(({ source, relative }) => ({ source_key: source, relative })),
-    });
-    clearSelection();
-    mutate();
-    return { succeeded: result.succeeded, failed: result.failed };
-  }, [clearSelection, mutate, resolveSelectionWithRelativeKeys]);
+  }, [runningAction]);
 
   const downloadZip = useCallback(async () => {
     // The proxy builds the archive; the browser resolves the selection and
     // saves the response. See zipDownload.ts for how failures stay visible.
     const bucket = getBucket();
-    const keys = await resolveSelectedKeys(bucket);
+    // The listing stops once the selection passes what one ZIP takes.
+    const keys = (await expandSelected(bucket, { maxKeys: MAX_BULK_OBJECTS })).map((i) => i.source);
     const url = bulkZipDownloadUrl(bucket, keys);
     const blocked = zipPreflightError(keys.length, url.length);
     if (blocked) throw new Error(blocked);
@@ -607,7 +620,7 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
         8,
       );
     }
-  }, [resolveSelectedKeys]);
+  }, [expandSelected]);
 
   // Per-prefix delta savings, fetched from the server-side endpoint that
   // owns the canonical (reference-aware) math. Previously this was a
@@ -681,13 +694,13 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     mutate,
     enrichKeys,
     bulkDelete,
-    cancelBulkDelete,
     bulkCopy,
     bulkMove,
+    cancelBulk,
     downloadZip,
     // Status
-    deleting,
-    deleteProgress,
+    bulkRunning,
+    bulkProgress,
     // Search
     searchQuery,
     setSearchQuery,

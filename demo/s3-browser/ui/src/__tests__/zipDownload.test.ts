@@ -13,9 +13,12 @@ import { ApiError, isSessionExpired } from '../errorHandling';
 const ZIP_MAX_KEYS = 10_000;
 const ZIP_MAX_URL_LENGTH = 60_000;
 
-test('mirrored constants match src/zipDownload.ts and src/api/admin/objects.rs', async () => {
+test('mirrored constants match src/zipDownload.ts, src/bulkSelection.ts and src/api/admin/objects.rs', async () => {
   const src = await readFile(new URL('../zipDownload.ts', import.meta.url), 'utf8');
-  assert.match(src, /const ZIP_MAX_KEYS = 10_000;/);
+  // One key cap for every bulk action (copy, move, ZIP): bulkSelection's MAX_BULK_OBJECTS.
+  const selection = await readFile(new URL('../bulkSelection.ts', import.meta.url), 'utf8');
+  assert.match(selection, /export const MAX_BULK_OBJECTS = 10_000;/);
+  assert.match(src, /import \{ MAX_BULK_OBJECTS as ZIP_MAX_KEYS \} from '\.\/bulkSelection';/);
   assert.match(src, /const ZIP_MAX_URL_LENGTH = 60_000;/);
   const rust = await readFile(new URL('../../../../../src/api/admin/objects.rs', import.meta.url), 'utf8');
   assert.match(

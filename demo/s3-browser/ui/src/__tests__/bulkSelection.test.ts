@@ -211,3 +211,36 @@ test('abort: no new folder is listed and the expansion rejects with the abort re
   assert.equal(await outcome, ctl.signal.reason);
   assert.equal(l.started.length, 4, 'only the listings already in flight ran');
 });
+
+// A copy of 50 big folders listed every key (up to 500,000) before the server
+// refused anything over 10,000. With `maxKeys` the listing stops once the
+// distinct keys found pass the cap.
+test('maxKeys: past the cap no new folder is listed and the expansion rejects', async () => {
+  const l = manualLister((pfx) => ({ keys: [`${pfx}a`, `${pfx}b`, 'shared'], truncated: false }));
+  const outcome = expandSelection(['top.zip', ...tenFolders], l.list, { maxKeys: 6 }).then(
+    () => 'resolved',
+    (e: Error) => e.message,
+  );
+  await settle();
+  // top.zip + f0/a, f0/b, shared + f1/a, f1/b = 6: still within the cap.
+  l.pending.get('f0/')!();
+  l.pending.get('f1/')!();
+  await settle();
+  assert.deepEqual(l.started, ['f0/', 'f1/', 'f2/', 'f3/', 'f4/', 'f5/']);
+  l.pending.get('f2/')!(); // 8 distinct keys
+  await settle();
+  for (const release of [...l.pending.values()]) release();
+  await settle();
+  assert.equal(
+    await outcome,
+    'The selection has more than 6 objects, the most one copy, move or ZIP takes; narrow the selection.',
+  );
+  assert.equal(l.started.length, 6, 'the listings in flight finish; no new folder starts');
+});
+
+test('maxKeys counts distinct keys: overlapping folders within the cap pass', async () => {
+  const lister: PrefixLister = async (pfx) => ({ keys: ['same/1', 'same/2', pfx], truncated: false });
+  const items = await expandSelection(['folder:x/', 'folder:y/'], lister, { maxKeys: 4 });
+  assert.equal(items.length, 4);
+  await assert.rejects(expandSelection(['folder:x/', 'folder:y/'], lister, { maxKeys: 3 }), /more than 3 objects/);
+});

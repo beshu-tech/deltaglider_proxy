@@ -5,6 +5,12 @@
  * script can exercise it — see src/__tests__/bulkSelection.test.ts.
  */
 
+/**
+ * Mirrors `MAX_BULK_OBJECTS` in src/api/admin/objects.rs: the most keys one
+ * folder listing returns, and the most objects a copy, move or ZIP takes.
+ */
+export const MAX_BULK_OBJECTS = 10_000;
+
 /** Shape of `GET /api/admin/objects/list`: the server stops at 10,000 keys. */
 export type PrefixLister = (prefix: string) => Promise<{ keys: string[]; truncated: boolean }>;
 
@@ -43,6 +49,13 @@ interface ExpandOptions {
   onProgress?: (progress: ListingProgress) => void;
   /** When aborted, no new folder is listed and the expansion rejects with `signal.reason`. */
   signal?: AbortSignal;
+  /**
+   * The most distinct keys the selection may hold. Once the folders listed
+   * so far pass it, no new folder is listed and the expansion rejects: a
+   * copy of 50 big folders used to list 500,000 keys before the server
+   * refused anything over 10,000. Absent: no limit (a delete).
+   */
+  maxKeys?: number;
 }
 
 function truncatedFolderError(prefix: string, listed: number): Error {
@@ -51,21 +64,31 @@ function truncatedFolderError(prefix: string, listed: number): Error {
   );
 }
 
+function tooManyKeysError(maxKeys: number): Error {
+  return new Error(
+    `The selection has more than ${maxKeys.toLocaleString('en-US')} objects, the most one copy, move or ZIP takes; narrow the selection.`,
+  );
+}
+
 /**
  * List `prefixes` with at most `concurrency` requests in flight. A truncated
- * folder or a failed request stops new listings; the requests in flight
- * finish, then this rejects. Several truncated folders: the first in
- * `prefixes` order names the error, so the message does not depend on timing.
+ * folder, a failed request, or more distinct keys than `maxKeys` (counted
+ * with `directKeys`, the selected objects) stops new listings; the requests
+ * in flight finish, then this rejects. Several truncated folders: the first
+ * in `prefixes` order names the error, so the message does not depend on
+ * timing.
  */
 async function listFolders(
   prefixes: string[],
+  directKeys: string[],
   listPrefix: PrefixLister,
-  { concurrency = FOLDER_LIST_CONCURRENCY, onProgress, signal }: ExpandOptions,
+  { concurrency = FOLDER_LIST_CONCURRENCY, onProgress, signal, maxKeys }: ExpandOptions,
 ): Promise<Map<string, Listing>> {
   const listed = new Map<string, Listing>();
   let next = 0;
   let keysFound = 0;
   let stop = false;
+  const distinct = new Set(maxKeys === undefined ? [] : directKeys);
   let failure: { error: unknown } | undefined;
   onProgress?.({ listed: 0, folders: prefixes.length, keysFound: 0 });
   const worker = async () => {
@@ -77,6 +100,10 @@ async function listFolders(
         keysFound += listing.keys.length;
         onProgress?.({ listed: listed.size, folders: prefixes.length, keysFound });
         if (listing.truncated) stop = true;
+        if (maxKeys !== undefined) {
+          for (const k of listing.keys) distinct.add(k);
+          if (distinct.size > maxKeys) stop = true;
+        }
       } catch (error) {
         failure ??= { error };
         stop = true;
@@ -87,6 +114,7 @@ async function listFolders(
   await Promise.all(Array.from({ length: workers }, worker));
   const truncated = prefixes.find((p) => listed.get(p)?.truncated);
   if (truncated) throw truncatedFolderError(truncated, listed.get(truncated)!.keys.length);
+  if (maxKeys !== undefined && distinct.size > maxKeys) throw tooManyKeysError(maxKeys);
   if (failure) throw failure.error;
   signal?.throwIfAborted();
   return listed;
@@ -113,7 +141,8 @@ export async function expandSelection(
   const prefixes = [
     ...new Set(selection.filter((k) => k.startsWith('folder:')).map((k) => k.slice('folder:'.length)).filter(Boolean)),
   ];
-  const listings = await listFolders(prefixes, listPrefix, options);
+  const directKeys = selection.filter((k) => !k.startsWith('folder:'));
+  const listings = await listFolders(prefixes, directKeys, listPrefix, options);
   const seen = new Map<string, string>();
   for (const k of selection) {
     if (k.startsWith('folder:')) {

@@ -7,6 +7,7 @@ import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, test, vi } from 'vitest';
 import type { BulkDeleteOutcome } from '../bulkDelete';
+import type { BulkTransferOutcome } from '../bulkTransfer';
 import { ApiError } from '../errorHandling';
 import { renderWithQuery } from '../test/render';
 
@@ -17,7 +18,10 @@ vi.mock('../s3client', () => ({
 
 import BulkActionBar from '../components/BulkActionBar';
 
-type Op = (b: string, p: string) => Promise<{ succeeded: number; failed: number }>;
+type Op = (b: string, p: string) => Promise<BulkTransferOutcome>;
+const transferred = (action: 'copy' | 'move', over: Partial<BulkTransferOutcome> = {}): BulkTransferOutcome => ({
+  action, total: 2, succeeded: 2, failed: 0, deleted: action === 'move' ? 2 : 0, failures: [], cancelled: false, ...over,
+});
 const done = async (): Promise<BulkDeleteOutcome> => ({ total: 3, deleted: 3, failed: 0, failures: [], cancelled: false });
 
 function bar(props: Partial<Parameters<typeof BulkActionBar>[0]> = {}) {
@@ -65,12 +69,12 @@ describe('delete', () => {
 
   test('while a delete runs the bar shows its phase, a named progress bar and Cancel instead of the actions', async () => {
     const user = userEvent.setup();
-    const op: Op = async () => ({ succeeded: 0, failed: 0 });
-    const onCancelDelete = vi.fn();
-    const props = { onDelete: done, onCopy: op, onMove: op, onDownloadZip: async () => {}, onCancelDelete };
+    const op: Op = async () => transferred('copy');
+    const onCancel = vi.fn();
+    const props = { onDelete: done, onCopy: op, onMove: op, onDownloadZip: async () => {}, onCancel };
     const view = bar({
       ...props,
-      deleteProgress: { phase: 'listing', listed: 12, folders: 50, keysFound: 4310, stopping: false },
+      progress: { action: 'delete', phase: 'listing', listed: 12, folders: 50, keysFound: 4310, stopping: false },
     });
     const toolbar = screen.getByRole('toolbar', { name: 'Selection actions' });
     expect(within(toolbar).getByRole('status')).toHaveTextContent('Listing folders 12 of 50… 4,310 objects found');
@@ -78,15 +82,22 @@ describe('delete', () => {
     expect(progress).toHaveAttribute('aria-valuenow', '24');
     expect(within(toolbar).queryByRole('button', { name: /^(Copy|Move|Download|Delete) 2/ })).toBeNull();
     await user.click(within(toolbar).getByRole('button', { name: 'Cancel delete' }));
-    expect(onCancelDelete).toHaveBeenCalledTimes(1);
+    expect(onCancel).toHaveBeenCalledTimes(1);
 
-    view.rerender(<BulkActionBar selectedCount={2} {...props} deleteProgress={{ phase: 'deleting', done: 3400, total: 9800, stopping: false }} />);
+    view.rerender(<BulkActionBar selectedCount={2} {...props} progress={{ action: 'delete', phase: 'sending', done: 3400, total: 9800, stopping: false }} />);
     expect(within(toolbar).getByRole('status')).toHaveTextContent('Deleting 3,400 of 9,800…');
     expect(within(toolbar).getByRole('progressbar', { name: 'Bulk delete progress' })).toHaveAttribute('aria-valuenow', '34');
 
-    view.rerender(<BulkActionBar selectedCount={2} {...props} deleteProgress={{ phase: 'deleting', done: 3400, total: 9800, stopping: true }} />);
+    view.rerender(<BulkActionBar selectedCount={2} {...props} progress={{ action: 'delete', phase: 'sending', done: 3400, total: 9800, stopping: true }} />);
     expect(within(toolbar).getByRole('status')).toHaveTextContent('Stopping after this batch… 3,400 of 9,800 done');
     expect(within(toolbar).getByRole('button', { name: 'Cancel delete' })).toBeDisabled();
+
+    // A copy or move shows the same, with its own verb.
+    view.rerender(<BulkActionBar selectedCount={2} {...props} progress={{ action: 'move', phase: 'sending', done: 500, total: 1201, stopping: false }} />);
+    expect(within(toolbar).getByRole('status')).toHaveTextContent('Moving 500 of 1,201…');
+    expect(within(toolbar).getByRole('progressbar', { name: 'Bulk move progress' })).toHaveAttribute('aria-valuenow', '41');
+    await user.click(within(toolbar).getByRole('button', { name: 'Cancel move' }));
+    expect(onCancel).toHaveBeenCalledTimes(2);
   });
 
   async function confirmDeleteWith(onDelete: () => Promise<BulkDeleteOutcome>, extra: Parameters<typeof bar>[0] = {}) {
@@ -159,7 +170,7 @@ describe('copy / move destination', () => {
   });
 
   test('a valid path is normalized and sent; success is reported', async () => {
-    const handler = vi.fn<Op>(async () => ({ succeeded: 2, failed: 0 }));
+    const handler = vi.fn<Op>(async () => transferred('move'));
     const { user, dialog, path, ok } = await openPicker('Move', handler);
     expect(within(dialog).getByText('Source files will be deleted after successful copy.')).toBeInTheDocument();
     await user.clear(path);
@@ -172,11 +183,19 @@ describe('copy / move destination', () => {
   });
 
   test('a partial failure warns with the counts', async () => {
-    const { user, path, ok } = await openPicker('Copy', async () => ({ succeeded: 1, failed: 1 }));
+    const { user, path, ok } = await openPicker('Copy', async () =>
+      transferred('copy', {
+        succeeded: 1,
+        failed: 1,
+        failures: [{ source_key: 'builds/app.zip', dest_key: 'elsewhere/app.zip', error: 'AccessDenied' }],
+      }),
+    );
     await user.clear(path);
     await user.type(path, 'elsewhere');
     await user.click(ok);
-    expect(await screen.findByText('1 succeeded, 1 failed')).toBeInTheDocument();
+    expect(
+      await screen.findByText('1 of 2 items copied. 1 failed, for example builds/app.zip: AccessDenied.'),
+    ).toBeInTheDocument();
   });
 
   test('an expired admin session hands off instead of showing an error', async () => {

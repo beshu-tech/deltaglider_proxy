@@ -1,15 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'vitest';
-import {
-  DELETE_BATCH_SIZE,
-  MAX_REPORTED_FAILURES,
-  BulkDeleteFailed,
-  bulkDeleteOutcomeMessage,
-  bulkDeleteProgressPercent,
-  bulkDeleteProgressText,
-  deleteInBatches,
-  type DeleteBatchResult,
-} from '../bulkDelete';
+import { BULK_BATCH_SIZE, MAX_REPORTED_FAILURES } from '../bulkBatches';
+import { bulkDeleteOutcomeMessage, deleteInBatches, type DeleteBatchResult } from '../bulkDelete';
 
 // A page of ~50 folders went to the server as ONE delete request: no
 // progress, no cancel, and more than 10,000 keys failed at the very end.
@@ -18,8 +10,8 @@ import {
 const keys = (n: number) => Array.from({ length: n }, (_, i) => `k${i}`);
 const allDeleted = async (batch: string[]): Promise<DeleteBatchResult> => ({ deleted: batch.length, failed: 0, failures: [] });
 
-test(`keys go in batches of ${DELETE_BATCH_SIZE}, one request at a time, with progress after each`, async () => {
-  assert.equal(DELETE_BATCH_SIZE, 500);
+test(`keys go in batches of ${BULK_BATCH_SIZE}, one request at a time, with progress after each`, async () => {
+  assert.equal(BULK_BATCH_SIZE, 500);
   const sent: string[][] = [];
   let inFlight = 0;
   let maxInFlight = 0;
@@ -52,7 +44,7 @@ test('more than 10,000 keys is no longer one oversized request', async () => {
     sizes.push(b.length);
     return allDeleted(b);
   });
-  assert.equal(Math.max(...sizes), DELETE_BATCH_SIZE);
+  assert.equal(Math.max(...sizes), BULK_BATCH_SIZE);
   assert.equal(sizes.reduce((a, b) => a + b, 0), 12_345);
 });
 
@@ -102,21 +94,6 @@ test('a failed batch rejects with its own error; earlier batches were reported',
   assert.deepEqual(progress, [500]);
 });
 
-test('progress text and percent, per phase', () => {
-  const listing = { phase: 'listing', listed: 12, folders: 50, keysFound: 4310, stopping: false } as const;
-  assert.equal(bulkDeleteProgressText(listing), 'Listing folders 12 of 50… 4,310 objects found');
-  assert.equal(bulkDeleteProgressPercent(listing), 24);
-  assert.equal(bulkDeleteProgressText({ ...listing, listed: 0, keysFound: 0 }), 'Listing folders 0 of 50…');
-  assert.equal(bulkDeleteProgressText({ ...listing, folders: 0, listed: 0, keysFound: 0 }), 'Preparing…');
-  assert.equal(bulkDeleteProgressText({ ...listing, stopping: true }), 'Stopping…');
-
-  const deleting = { phase: 'deleting', done: 3400, total: 9800, stopping: false } as const;
-  assert.equal(bulkDeleteProgressText(deleting), 'Deleting 3,400 of 9,800…');
-  assert.equal(bulkDeleteProgressPercent(deleting), 34, 'rounds down: 100 only when done');
-  assert.equal(bulkDeleteProgressText({ ...deleting, stopping: true }), 'Stopping after this batch… 3,400 of 9,800 done');
-  assert.equal(bulkDeleteProgressPercent({ ...deleting, done: 0, total: 0 }), 100);
-});
-
 test('the report after a run', () => {
   const base = { total: 9800, deleted: 9800, failed: 0, failures: [], cancelled: false };
   assert.deepEqual(bulkDeleteOutcomeMessage(base), { type: 'success', text: '9,800 objects deleted' });
@@ -133,22 +110,5 @@ test('the report after a run', () => {
   assert.deepEqual(
     bulkDeleteOutcomeMessage({ ...base, deleted: 9700, failed: 100, failures: [{ key: 'a/b.zip', error: 'AccessDenied' }] }),
     { type: 'warning', text: '9,700 of 9,800 objects deleted. 100 failed, for example a/b.zip: AccessDenied' },
-  );
-});
-
-test('a failure names how many keys were deleted before it, and keeps its cause', () => {
-  const disk = new Error('Bulk delete failed (500): disk full');
-  const failed = new BulkDeleteFailed(disk, 3400, 9800);
-  assert.equal(failed.message, 'Bulk delete failed (500): disk full. 3,400 of 9,800 objects were deleted before the failure.');
-  assert.equal(failed.cause, disk);
-  // The first batch failed: none confirmed, but the run had started.
-  assert.equal(
-    new BulkDeleteFailed(new Error('Bulk delete failed (500): denied'), 0, 3).message,
-    'Bulk delete failed (500): denied. 0 of 3 objects were deleted before the failure.',
-  );
-  // The listing failed: no delete request was sent.
-  assert.equal(
-    new BulkDeleteFailed(new Error('Folder big/ has more than 10,000 objects; narrow the selection.'), 0, 0).message,
-    'Folder big/ has more than 10,000 objects; narrow the selection. Nothing was deleted.',
   );
 });
