@@ -93,6 +93,19 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.delete_inner(bucket, key, true, Some(still_ours)).await
     }
 
+    /// [`Self::delete_if`] for one member of a sweep: no reclamation check
+    /// (see [`Self::delete_in_sweep`]). The caller runs
+    /// [`Self::reclaim_empty_deltaspace`] once per deltaspace at the end.
+    pub async fn delete_if_in_sweep(
+        &self,
+        bucket: &str,
+        key: &str,
+        still_ours: &(dyn Fn(&FileMetadata) -> bool + Send + Sync),
+    ) -> Result<ConditionalDelete, EngineError> {
+        self.delete_inner(bucket, key, false, Some(still_ours))
+            .await
+    }
+
     fn deleted(key: &str, outcome: ConditionalDelete) -> Result<FileMetadata, EngineError> {
         match outcome {
             ConditionalDelete::Deleted(meta) => Ok(*meta),
@@ -162,18 +175,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         bucket: &str,
         deltaspace_id: &str,
     ) -> Result<Option<(ReferenceLockGuard, u64)>, EngineError> {
-        let only_reference = |remaining: &[FileMetadata]| -> Option<u64> {
-            let mut ref_bytes = None;
-            for m in remaining {
-                match m.storage_info {
-                    StorageInfo::Reference { .. } => ref_bytes = Some(m.file_size),
-                    _ => return None,
-                }
-            }
-            Some(ref_bytes.unwrap_or(0))
-        };
-        let remaining = self.storage.scan_deltaspace(bucket, deltaspace_id).await?;
-        let Some(mut ref_bytes) = only_reference(&remaining) else {
+        let Some(mut ref_bytes) = self.only_reference_left(bucket, deltaspace_id).await? else {
             return Ok(None);
         };
         if !self.storage.has_reference(bucket, deltaspace_id).await? {
@@ -181,8 +183,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
         let xnode = self.acquire_reference_lock(bucket, deltaspace_id).await?;
         if xnode.is_cross_instance() {
-            let remaining = self.storage.scan_deltaspace(bucket, deltaspace_id).await?;
-            match only_reference(&remaining) {
+            match self.only_reference_left(bucket, deltaspace_id).await? {
                 Some(b) if self.storage.has_reference(bucket, deltaspace_id).await? => {
                     ref_bytes = b
                 }
@@ -190,6 +191,32 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             }
         }
         Ok(Some((xnode, ref_bytes)))
+    }
+
+    /// The stored bytes of reference.bin (0 without one) when the deltaspace
+    /// holds nothing else; `None` while another object remains.
+    ///
+    /// The listing alone answers this: it has each object's kind and the
+    /// stored size of reference.bin. The full `scan_deltaspace` also HEADs
+    /// every delta on S3 to read its original size, which this check never
+    /// uses, so a folder of N deltas deleted key by key cost N²/2 HEADs.
+    async fn only_reference_left(
+        &self,
+        bucket: &str,
+        deltaspace_id: &str,
+    ) -> Result<Option<u64>, StorageError> {
+        let listed = self
+            .storage
+            .scan_deltaspace_lite(bucket, deltaspace_id)
+            .await?;
+        let mut ref_bytes = 0;
+        for m in &listed.metadata {
+            match m.storage_info {
+                StorageInfo::Reference { .. } => ref_bytes = m.file_size,
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(ref_bytes))
     }
 
     async fn delete_inner(

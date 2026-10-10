@@ -263,10 +263,12 @@ impl S3Backend {
     /// itself (not from subdirectories). Shared between
     /// [`scan_deltaspace`] and [`scan_deltaspace_lite`].
     ///
-    /// When `prefix` is non-empty, S3's LIST already restricts to the
-    /// `prefix/` subtree so we accept everything it returns. When
-    /// `prefix` is empty we're scanning the bucket root and have to
-    /// drop entries that live in subdirectories ourselves.
+    /// A LIST of `prefix/` returns the whole subtree, so the entries of
+    /// child deltaspaces are dropped here, as the filesystem backend skips
+    /// child directories. They are not this deltaspace's objects: a child's
+    /// deltas use the child's own reference.bin. (Kept, they stopped the
+    /// reclaim of the parent's reference.bin, and the delta-efficiency scan
+    /// counted a child's objects in the parent too.)
     pub(super) async fn list_deltaspace_eligible(
         &self,
         bucket: &str,
@@ -278,10 +280,13 @@ impl S3Backend {
             format!("{}/", prefix)
         };
         let listed = self.list_objects_full(bucket, &search_prefix).await?;
-        let scanning_root = prefix.is_empty();
         let eligible: Vec<S3ListedObject> = listed
             .into_iter()
-            .filter(|obj| !(scanning_root && obj.key.contains('/')))
+            .filter(|obj| {
+                obj.key
+                    .strip_prefix(&search_prefix)
+                    .is_some_and(|name| !name.contains('/'))
+            })
             .collect();
         Ok(eligible)
     }

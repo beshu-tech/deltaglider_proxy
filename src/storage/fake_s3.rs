@@ -3,7 +3,9 @@
 //! An in-process S3 for unit tests that count requests: it keeps objects
 //! with their `x-amz-meta-*` headers in memory and records every request as
 //! `"METHOD /bucket/key"` (a bucket-level LIST as `"GET /bucket?..."`).
-//! It answers PUT, GET, HEAD, DELETE and an empty ListObjectsV2.
+//! It answers PUT, GET, HEAD, DELETE and ListObjectsV2 (`prefix`,
+//! `delimiter`, `start-after`; every match on one page). Other
+//! bucket-level requests get an empty listing.
 
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use md5::Digest;
@@ -28,6 +30,10 @@ pub(crate) struct FakeS3 {
     put_delay_ms: std::sync::atomic::AtomicU64,
     puts_in_flight: std::sync::atomic::AtomicUsize,
     puts_peak: std::sync::atomic::AtomicUsize,
+    /// The same for object DELETEs.
+    delete_delay_ms: std::sync::atomic::AtomicU64,
+    deletes_in_flight: std::sync::atomic::AtomicUsize,
+    deletes_peak: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeS3 {
@@ -45,6 +51,17 @@ impl FakeS3 {
     /// The most object PUTs that were in flight at once.
     pub(crate) fn peak_puts_in_flight(&self) -> usize {
         self.puts_peak.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Make every object DELETE take `ms` milliseconds.
+    pub(crate) fn set_delete_delay_ms(&self, ms: u64) {
+        self.delete_delay_ms
+            .store(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The most object DELETEs that were in flight at once.
+    pub(crate) fn peak_deletes_in_flight(&self) -> usize {
+        self.deletes_peak.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Forget the requests so far.
@@ -76,6 +93,66 @@ impl FakeS3 {
     }
 }
 
+/// One ListObjectsV2 page over `objects` (keys `bucket/key`): every match,
+/// never truncated.
+fn list_page(
+    objects: &HashMap<String, Stored>,
+    bucket: &str,
+    query: &HashMap<String, String>,
+) -> String {
+    let prefix = query.get("prefix").map(String::as_str).unwrap_or("");
+    let delimiter = query.get("delimiter").map(String::as_str).unwrap_or("");
+    let after = query.get("start-after").map(String::as_str).unwrap_or("");
+    let mut keys: Vec<(&str, &Stored)> = objects
+        .iter()
+        .filter_map(|(path, o)| Some((path.strip_prefix(bucket)?.strip_prefix('/')?, o)))
+        .filter(|(k, _)| k.starts_with(prefix) && *k > after)
+        .collect();
+    keys.sort_by_key(|(k, _)| *k);
+    let mut contents = String::new();
+    let mut common = std::collections::BTreeSet::new();
+    for (k, o) in keys {
+        let rest = &k[prefix.len()..];
+        if let Some(i) = (!delimiter.is_empty())
+            .then(|| rest.find(delimiter))
+            .flatten()
+        {
+            common.insert(&k[..prefix.len() + i + delimiter.len()]);
+            continue;
+        }
+        contents.push_str(&format!(
+            "<Contents><Key>{}</Key><LastModified>2025-01-01T00:00:00.000Z</LastModified>\
+             <ETag>{}</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents>",
+            xml_escape(k),
+            xml_escape(&o.etag),
+            o.body.len()
+        ));
+    }
+    let common: String = common
+        .into_iter()
+        .map(|p| {
+            format!(
+                "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+                xml_escape(p)
+            )
+        })
+        .collect();
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Name>{bucket}</Name><Prefix>{}</Prefix><MaxKeys>1000</MaxKeys>\
+         <IsTruncated>false</IsTruncated>{contents}{common}</ListBucketResult>",
+        xml_escape(prefix)
+    )
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 const EMPTY_LIST: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
 <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
 <Name>b</Name><Prefix></Prefix><KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys>\
@@ -103,10 +180,23 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
     let fake = Arc::new(FakeS3::default());
     let on_object = fake.clone();
     let on_bucket = fake.clone();
-    let on_bucket_handler = move |method: Method, uri: Uri| {
+    let on_bucket_handler = move |method: Method,
+                                  uri: Uri,
+                                  axum::extract::Path(params): axum::extract::Path<
+        HashMap<String, String>,
+    >| {
         let f = on_bucket.clone();
         async move {
             f.record(&method, &uri);
+            let query: HashMap<String, String> =
+                serde_urlencoded::from_str(uri.query().unwrap_or("")).unwrap_or_default();
+            let bucket = params.get("bucket").cloned().unwrap_or_default();
+            if method == Method::GET && query.get("list-type").map(String::as_str) == Some("2") {
+                return (
+                    StatusCode::OK,
+                    list_page(&f.objects.lock(), &bucket, &query),
+                );
+            }
             (StatusCode::OK, EMPTY_LIST.to_string())
         }
     };
@@ -174,6 +264,15 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                                 ),
                             },
                             Method::DELETE => {
+                                use std::sync::atomic::Ordering::SeqCst;
+                                let now = f.deletes_in_flight.fetch_add(1, SeqCst) + 1;
+                                f.deletes_peak.fetch_max(now, SeqCst);
+                                let delay = f.delete_delay_ms.load(SeqCst);
+                                if delay > 0 {
+                                    tokio::time::sleep(std::time::Duration::from_millis(delay))
+                                        .await;
+                                }
+                                f.deletes_in_flight.fetch_sub(1, SeqCst);
                                 f.objects.lock().remove(&path);
                                 (StatusCode::NO_CONTENT, HeaderMap::new(), Vec::new())
                             }
@@ -189,4 +288,11 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (format!("http://{addr}"), fake)
+}
+
+/// A fake S3 and an S3 backend on it (no retries, no SSRF guard).
+pub(crate) async fn backend() -> (crate::storage::S3Backend, Arc<FakeS3>) {
+    let (endpoint, fake) = start().await;
+    let s3 = crate::storage::s3::test_support::for_test_endpoint(&endpoint);
+    (s3, fake)
 }

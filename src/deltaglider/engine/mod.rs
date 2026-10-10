@@ -248,6 +248,12 @@ mod folder_marker_tests;
 #[cfg(test)]
 mod tests;
 
+/// What a delete costs in backend requests, and what it reclaims.
+#[cfg(test)]
+mod delete_cost_tests;
+#[cfg(test)]
+pub(crate) use delete_cost_tests::{s3_engine, store_deltas};
+
 /// The store decision, pinned for the buffered and the streaming PUT.
 #[cfg(test)]
 mod store_plan_tests;

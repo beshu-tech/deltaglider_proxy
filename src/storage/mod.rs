@@ -6,6 +6,8 @@ pub mod encrypting;
 mod facts_cleanup;
 #[cfg(test)]
 mod fake_s3;
+#[cfg(test)]
+pub(crate) use fake_s3::{backend as fake_s3_backend, FakeS3};
 mod filesystem;
 pub mod list_size_cache;
 pub mod listing_facts;
