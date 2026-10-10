@@ -1542,9 +1542,9 @@ mod source_guards {
     /// a reference calls `list_deltaspaces`.
     #[test]
     fn a_reference_walk_lists_only_the_reference_prefixes() {
-        // Classifies every deltaspace, the ones without a reference too, and
-        // sends no HEAD (`scan_deltaspace_lite`).
-        const ALLOWED: &[&str] = &["src/api/admin/delta_efficiency.rs"];
+        // (The delta-efficiency scan was the one caller; it now groups one
+        // listing of the bucket by directory.)
+        const ALLOWED: &[&str] = &[];
         let mut offenders = Vec::new();
         for (file, text) in crate::source_scan::prod_sources("src") {
             // The trait, its implementations and their forwarders.
@@ -1561,6 +1561,119 @@ mod source_guards {
             offenders.is_empty(),
             "list the deltaspaces that hold a reference with \
              list_reference_prefixes, not every directory:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// The last argument of every `list_objects(` call in `src`, with its
+    /// 1-based line. Calls span lines; `//` comments inside them are
+    /// dropped. A definition (`fn list_objects(`) and a mention in a comment
+    /// are no call.
+    fn list_objects_last_args(src: &str) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(at) = src[from..].find("list_objects(") {
+            let start = from + at;
+            let open = start + "list_objects".len();
+            from = open + 1;
+            let before = &src[..start];
+            let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+            // `fn list_objects(` is the definition; `bulk_list_objects(` is
+            // another method.
+            if before[line_start..].contains("//")
+                || before.ends_with("fn ")
+                || before
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            {
+                continue;
+            }
+            let mut depth = 0i32;
+            let Some(close) = src[open..].char_indices().find_map(|(i, c)| {
+                depth += match c {
+                    '(' | '[' | '{' => 1,
+                    ')' | ']' | '}' => -1,
+                    _ => 0,
+                };
+                (depth == 0).then_some(open + i)
+            }) else {
+                continue;
+            };
+            let args: String = src[open + 1..close]
+                .lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut depth = 0i32;
+            let mut parts = vec![String::new()];
+            for c in args.chars() {
+                match c {
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' => depth -= 1,
+                    ',' if depth == 0 => {
+                        parts.push(String::new());
+                        continue;
+                    }
+                    _ => {}
+                }
+                parts.last_mut().unwrap().push(c);
+            }
+            let last = parts
+                .iter()
+                .map(|p| p.trim())
+                .rfind(|p| !p.is_empty())
+                .unwrap_or("")
+                .to_string();
+            let line = src[..open].lines().count();
+            out.push((line, last));
+        }
+        out
+    }
+
+    #[test]
+    fn the_metadata_listing_guard_reads_multiline_calls() {
+        let src = "fn list_objects(a: u32, metadata: bool) {}\n\
+                   //! Cost: walks `engine.list_objects(prefix)` paginated.\n\
+                   let p = engine.list_objects(\n    b,\n    p,\n    None,\n    1000,\n    \
+                   None,\n    true, // metadata=true\n);\n\
+                   let q = engine.list_objects(&b, \"\", None, 10, t.as_deref(), false).await;\n\
+                   let r = engine.list_objects(b, &f(x, y), None, n, None, metadata);\n\
+                   let s = storage.bulk_list_objects(b, p).await;";
+        let got: Vec<String> = list_objects_last_args(src)
+            .into_iter()
+            .map(|(_, a)| a)
+            .collect();
+        assert_eq!(got, ["true", "false", "metadata"]);
+    }
+
+    /// Cockroach scan (ui.md A, limits #5): the savings chip listed with
+    /// `metadata=true`, so every folder view sent one HEAD per delta the
+    /// metadata cache did not hold. An admin scan reads the sizes from the
+    /// listing (the listing-size cache and the listing facts) and HEADs only
+    /// what neither knows, through a call that says so. A handler that truly
+    /// needs a HEAD per listed object goes in `ALLOWED` with its reason.
+    #[test]
+    fn admin_scans_never_list_with_metadata() {
+        const SCOPE: &[&str] = &["src/api/admin", "src/usage_scanner.rs"];
+        const ALLOWED: &[(&str, &str)] = &[];
+        let mut offenders = Vec::new();
+        for (file, text) in crate::source_scan::prod_sources("src") {
+            if !SCOPE.iter().any(|s| file.starts_with(s)) || ALLOWED.iter().any(|(f, _)| *f == file)
+            {
+                continue;
+            }
+            let prod = crate::source_scan::prod_text(&text);
+            for (line, last) in list_objects_last_args(&prod) {
+                if last != "false" {
+                    offenders.push(format!("{file} (production line {line}): {last}"));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "an admin scan lists with metadata (a HEAD per object); read the \
+             sizes from the listing instead:\n{}",
             offenders.join("\n")
         );
     }
