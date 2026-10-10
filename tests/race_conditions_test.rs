@@ -590,6 +590,9 @@ async fn spool_budget_under_concurrent_streaming_ops_returns_to_zero() {
         .env("DGP_SPOOL_MAX_BYTES", &(24 * MIB).to_string())
         .env("DGP_SPOOL_THRESHOLD_BYTES", &MIB.to_string())
         .env("DGP_SPOOL_ACQUIRE_TIMEOUT_SECS", "5")
+        // A large delta GET keeps its checked reconstruction for reuse;
+        // this test counts the spool as empty once the storm ends.
+        .env("DGP_RANGE_SPOOL_TTL_SECS", "0")
         .build()
         .await;
     let http = server.http();
