@@ -100,7 +100,7 @@ Always preview a rule before you enable it. The preview lists the objects that a
 
    ![The Preview tab of the expire-nightly-dumps rule lists three dumps that the rule would delete, with their total size; the arrow points at Refresh preview.](/_/screenshots/lifecycle-preview.webp)
 
-The list stays on the tab until you close the drawer. The same preview with the admin API:
+The admin UI keeps a preview for 5 minutes and shows when it computed it. A preview reads the metadata of every object in the scope of the rule, so the UI does not compute it again each time you open the tab. **Refresh preview** computes a new one, and a run or a change to the lifecycle rules discards the old one. The same preview with the admin API:
 
 ```bash
 curl -b cookies -X POST \
@@ -119,7 +119,7 @@ In the admin UI:
    ![The Jobs page with the switch Run lifecycle rules on schedule, which is on; the arrow points at the switch.](/_/screenshots/lifecycle-scheduler-switch.webp)
 
 3. Click **Review & apply**, and then click **Apply and Persist**. The scheduler now runs the rule when it is due. It checks for due rules every hour (`storage.lifecycle.tick_interval`).
-4. To run the rule at once, click **Run now** in its row. The run does not start yet: the proxy first computes a preview, and a dialog shows the objects that the run would delete or move, with their count and total size.
+4. To run the rule at once, click **Run now** in its row. The run does not start yet: a dialog shows the objects that the run would delete or move, with their count and total size. The dialog uses the preview of the last 5 minutes when there is one; otherwise the proxy computes a new preview first.
 5. Click the button that names the count, for example **Run: delete 3 objects**. The run acts on the objects that match the rule when it starts, so the result can differ slightly from the preview.
 
    ![The dialog Run lifecycle rule "expire-nightly-dumps" now? lists the three dumps that the run would delete; the arrow points at the button Run: delete 3 objects.](/_/screenshots/lifecycle-run-confirm.webp)

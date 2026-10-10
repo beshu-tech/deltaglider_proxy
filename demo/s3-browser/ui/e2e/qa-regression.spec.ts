@@ -354,11 +354,12 @@ test('3. bulk copy, move, ZIP, delete; refusals for move-into-source and path es
   expect(afterMove).not.toContain('nested/deep/inner.txt');
 
   // Move INTO a subfolder of a selected source: mv/a.txt would land on
-  // mv/sub/a.txt, which is itself selected (inside mv/sub/). Server: 409.
+  // mv/sub/a.txt, which is itself selected (inside mv/sub/). The browser
+  // checks the whole plan before the first batch and sends no request; a
+  // 409 from the server would mean it did not, and fails the watch.
   await openBucket(BUCKET);
   await page.getByRole('button', { name: 'mv/', exact: true }).click();
   await select('a.txt', 'sub/');
-  watch.expectFailure(409, /\/_\/api\/admin\/objects\/move$/, 'POST');
   await bulkTo('Move', BUCKET, 'mv/sub/');
   await expect(page.locator('.ant-message-notice-error')).toContainText(/selected source/, { timeout: 30_000 });
   expect(await getText(BUCKET, 'mv/sub/a.txt')).toBe('SUB-A');
