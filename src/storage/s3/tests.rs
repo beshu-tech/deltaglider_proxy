@@ -2355,3 +2355,33 @@ mod body_resume_tests {
         assert_eq!(fake.gets().len(), BODY_RESUMES as usize + 1);
     }
 }
+
+#[cfg(test)]
+mod reference_key_tests {
+    use super::*;
+
+    /// `deltaspace_of_reference_key` is the inverse of `reference_key`, and
+    /// names no deltaspace for any other key.
+    #[tokio::test]
+    async fn a_reference_key_names_its_deltaspace_and_no_other_key_does() {
+        let s3 = test_support::for_test_endpoint("http://127.0.0.1:1");
+        for prefix in ["", "a", "a/b", "ror/e2e_reports/builds"] {
+            let key = s3.reference_key(prefix);
+            assert_eq!(
+                S3Backend::deltaspace_of_reference_key(&key),
+                Some(prefix),
+                "{key}"
+            );
+        }
+        for key in [
+            "a/app.zip.delta",
+            "a/reference.bin.delta",
+            "a/xreference.bin",
+            "reference.bin/x",
+            "a/shots/a.png",
+            "",
+        ] {
+            assert_eq!(S3Backend::deltaspace_of_reference_key(key), None, "{key}");
+        }
+    }
+}

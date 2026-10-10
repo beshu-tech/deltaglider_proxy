@@ -1275,6 +1275,14 @@ impl StorageBackend for RoutingBackend {
         route_existing!(self, bucket, list_deltaspaces)
     }
 
+    async fn list_reference_prefixes(
+        &self,
+        bucket: &str,
+        scope: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        route_existing!(self, bucket, list_reference_prefixes, scope)
+    }
+
     /// When bucket is None, sum total_size across all backends.
     async fn total_size(&self, bucket: Option<&str>) -> Result<u64, StorageError> {
         match bucket {
@@ -1639,6 +1647,14 @@ mod tests {
         }
 
         async fn list_deltaspaces(&self, _: &str) -> Result<Vec<String>, StorageError> {
+            Ok(Vec::new())
+        }
+
+        async fn list_reference_prefixes(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<String>, StorageError> {
             Ok(Vec::new())
         }
 

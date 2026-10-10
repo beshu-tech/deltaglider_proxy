@@ -592,6 +592,34 @@ impl FilesystemBackend {
         })
     }
 
+    /// Recursively find the directories that hold a `reference.bin`, as
+    /// prefixes relative to `base_dir`. Reads no metadata. A directory that
+    /// is gone (a concurrent delete) or is a file holds none.
+    fn find_references_recursive<'a>(
+        base_dir: &'a Path,
+        current_dir: &'a Path,
+        prefixes: &'a mut Vec<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), StorageError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut entries = match fs::read_dir(current_dir).await {
+                Ok(entries) => entries,
+                Err(e) if fsio::absent(&e) => return Ok(()),
+                Err(e) => return Err(io_to_storage_error(e)),
+            };
+            while let Some(entry) = entries.next_entry().await? {
+                if entry.file_type().await?.is_dir() {
+                    Self::find_references_recursive(base_dir, &entry.path(), prefixes).await?;
+                } else if entry.file_name() == "reference.bin" {
+                    if let Ok(relative) = current_dir.strip_prefix(base_dir) {
+                        prefixes.push(relative.to_string_lossy().into_owned());
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// Recursively walk directories, reading xattr metadata for each data file
     /// and producing (user_visible_key, FileMetadata) pairs in a single pass.
     fn bulk_walk_recursive<'a>(
@@ -1450,6 +1478,28 @@ impl StorageBackend for FilesystemBackend {
         Self::find_deltaspaces_recursive(&deltaspaces_dir, &deltaspaces_dir, &mut prefixes).await?;
 
         Ok(prefixes.into_iter().collect())
+    }
+
+    #[instrument(skip(self))]
+    async fn list_reference_prefixes(
+        &self,
+        bucket: &str,
+        scope: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        // A `.`, `..` or empty segment names no directory of this backend:
+        // no key is stored under one.
+        if check_path_segments(scope, "").is_err() {
+            return Ok(Vec::new());
+        }
+        let deltaspaces_dir = self.bucket_dir(bucket).join("deltaspaces");
+        let scope_dir = self.deltaspace_dir(bucket, scope)?;
+        // A stat error is an error (B11), never "no references".
+        if !fsio::dir_exists(&scope_dir).await? {
+            return Ok(Vec::new());
+        }
+        let mut prefixes = Vec::new();
+        Self::find_references_recursive(&deltaspaces_dir, &scope_dir, &mut prefixes).await?;
+        Ok(prefixes)
     }
 
     async fn put_directory_marker(&self, bucket: &str, key: &str) -> Result<(), StorageError> {

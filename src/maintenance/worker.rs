@@ -316,9 +316,9 @@ async fn execute_phases(
         let engine = state.engine.load().clone();
         let deltaspaces = engine
             .storage()
-            .list_deltaspaces(bucket)
+            .list_reference_prefixes(bucket, "")
             .await
-            .map_err(|e| format!("list deltaspaces failed: {e}"))?;
+            .map_err(|e| format!("list references failed: {e}"))?;
         for prefix in deltaspaces {
             // A graceful stop waits for the end of the current object only.
             stop_if_shutting_down()?;

@@ -2454,6 +2454,13 @@ mod multipart_abort_tests {
         async fn list_deltaspaces(&self, _: &str) -> Result<Vec<String>, StorageError> {
             Err(nope())
         }
+        async fn list_reference_prefixes(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<String>, StorageError> {
+            Err(nope())
+        }
         async fn total_size(&self, _: Option<&str>) -> Result<u64, StorageError> {
             Err(nope())
         }
@@ -2682,6 +2689,13 @@ mod multipart_abort_tests {
         }
         async fn list_deltaspaces(&self, b: &str) -> Result<Vec<String>, StorageError> {
             self.0.list_deltaspaces(b).await
+        }
+        async fn list_reference_prefixes(
+            &self,
+            b: &str,
+            s: &str,
+        ) -> Result<Vec<String>, StorageError> {
+            self.0.list_reference_prefixes(b, s).await
         }
         async fn total_size(&self, b: Option<&str>) -> Result<u64, StorageError> {
             self.0.total_size(b).await

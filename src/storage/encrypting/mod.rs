@@ -1296,6 +1296,9 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     async fn list_deltaspaces(&self, b: &str) -> Result<Vec<String>, StorageError> {
         self.inner.list_deltaspaces(b).await
     }
+    async fn list_reference_prefixes(&self, b: &str, s: &str) -> Result<Vec<String>, StorageError> {
+        self.inner.list_reference_prefixes(b, s).await
+    }
     async fn total_size(&self, b: Option<&str>) -> Result<u64, StorageError> {
         self.inner.total_size(b).await
     }

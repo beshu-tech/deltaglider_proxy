@@ -797,14 +797,14 @@ mod tests {
             .store("b", "a.txt", b"x", None, Default::default())
             .await
             .unwrap();
-        faults.arm(FaultPoint::ListDeltaspaces, "b//", Fault::Io);
+        faults.arm(FaultPoint::ListReferencePrefixes, "b//", Fault::Io);
         let scanner = BucketScanner::load(dir.path().join("scans"));
         let mut rx = scanner.start("b".into(), AppState::for_tests(engine));
         let mut last = rx.borrow().clone();
         while rx.changed().await.is_ok() {
             last = rx.borrow().clone();
         }
-        assert!(faults.fired(FaultPoint::ListDeltaspaces, "b//") > 0);
+        assert!(faults.fired(FaultPoint::ListReferencePrefixes, "b//") > 0);
         assert!(
             last.finished,
             "the stream ended without a terminal frame: {last:?}"

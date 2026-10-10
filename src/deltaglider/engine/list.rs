@@ -4,6 +4,12 @@
 //! deltaspace reference scan.
 
 use super::*;
+use futures::StreamExt;
+
+/// Reference-metadata reads (HEADs on S3) in flight at once in
+/// [`DeltaGliderEngine::list_deltaspace_references`]: below the S3
+/// backend's own HEAD bound, so one savings scan never bursts a backend.
+const REFERENCE_HEAD_CONCURRENCY: usize = 8;
 
 /// Apply continuation-token filtering and max-keys truncation to a sorted list.
 /// Returns `(is_truncated, next_continuation_token)`.
@@ -286,8 +292,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// Return the `reference.bin` metadata for every deltaspace whose
     /// prefix begins with `scope_prefix` in the given bucket, plus a
-    /// `truncated` flag set when the scan hit `limit` matching
-    /// deltaspaces.
+    /// `truncated` flag set when the scan hit `limit` references and more
+    /// remain.
     ///
     /// `list_objects` deliberately hides references from S3-compatible
     /// callers (a `reference.bin` is an implementation detail, not a
@@ -298,12 +304,20 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// without re-implementing per-backend listing details at the call
     /// sites.
     ///
+    /// Cost: one listing of the scope
+    /// ([`StorageBackend::list_reference_prefixes`]), then one
+    /// `get_reference_metadata` (a HEAD on S3) per reference found,
+    /// `REFERENCE_HEAD_CONCURRENCY` at a time. A directory without a
+    /// reference costs no request. (It once listed the whole bucket and
+    /// sent a HEAD to every directory in scope, one at a time: a folder of
+    /// screenshots sent hundreds of 404 HEADs per savings request.)
+    ///
     /// `scope_prefix == ""` returns every reference in the bucket
     /// (bounded by `limit`).
     /// `limit: None` means "no cap"; `limit: Some(n)` stops after n
-    /// matches and sets `truncated: true`. The constant
-    /// [`REFERENCE_SCAN_LIMIT`](super::REFERENCE_SCAN_LIMIT) is the recommended cap for
-    /// latency-sensitive paths.
+    /// references, in prefix order, and sets `truncated: true` when more
+    /// remain. The constant [`REFERENCE_SCAN_LIMIT`](super::REFERENCE_SCAN_LIMIT)
+    /// is the recommended cap for latency-sensitive paths.
     ///
     /// Errors from `get_reference_metadata` for individual deltaspaces
     /// are logged and skipped — a missing or unreadable reference for
@@ -314,37 +328,49 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         scope_prefix: &str,
         limit: Option<usize>,
     ) -> Result<ReferenceScan, EngineError> {
-        let all = self.storage.list_deltaspaces(bucket).await?;
-        // Normalise `scope_prefix` for the starts_with check below.
-        // Storage backends return deltaspace prefixes WITHOUT trailing
-        // slashes (e.g. `releases/v1`), but callers using the S3
-        // convention pass `releases/v1/` here. Strip the trailing
-        // slash so `releases/v1/`-shaped scopes match `releases/v1` and
-        // `releases/v1/sub`. An empty scope means "everything".
-        let scope_norm = scope_prefix.trim_end_matches('/');
+        // Storage backends name deltaspaces WITHOUT a trailing slash (e.g.
+        // `releases/v1`), but callers using the S3 convention pass
+        // `releases/v1/` here: the scope is `releases/v1` and everything
+        // below it. An empty scope means "everything".
+        let scope = scope_prefix.trim_end_matches('/');
+        let mut prefixes = self.storage.list_reference_prefixes(bucket, scope).await?;
+        prefixes.sort();
+        let candidates = prefixes.len();
+        let storage = &self.storage;
+        let mut heads = futures::stream::iter(prefixes)
+            .map(|prefix| async move {
+                let meta = storage.get_reference_metadata(bucket, &prefix).await;
+                (prefix, meta)
+            })
+            .buffered(REFERENCE_HEAD_CONCURRENCY);
         let mut references = Vec::new();
         let mut truncated = false;
-        let prefix_match = |p: &str| -> bool {
-            if scope_norm.is_empty() {
-                return true;
-            }
-            p == scope_norm || p.starts_with(&format!("{scope_norm}/"))
-        };
-        for prefix in all {
-            if !prefix_match(&prefix) {
-                continue;
-            }
+        let mut consumed = 0usize;
+        loop {
             if limit.is_some_and(|n| references.len() >= n) {
-                truncated = true;
-                tracing::info!(
-                    "list_deltaspace_references: hit cap {:?} for bucket={bucket} scope={scope_prefix} \
-                     — caller should treat totals as a lower bound and surface `truncated` to the UI.",
-                    limit,
-                );
+                truncated = consumed < candidates;
+                if truncated {
+                    tracing::info!(
+                        "list_deltaspace_references: hit cap {:?} for bucket={bucket} scope={scope_prefix} \
+                         — caller should treat totals as a lower bound and surface `truncated` to the UI.",
+                        limit,
+                    );
+                }
                 break;
             }
-            match self.storage.get_reference_metadata(bucket, &prefix).await {
-                Ok(meta) => references.push((prefix.clone(), meta)),
+            let Some((prefix, meta)) = heads.next().await else {
+                break;
+            };
+            consumed += 1;
+            match meta {
+                Ok(meta) => references.push((prefix, meta)),
+                // Listed, then deleted before its HEAD: a concurrent delete
+                // reclaimed it, so there is nothing to count.
+                Err(StorageError::NotFound(_)) => {
+                    tracing::debug!(
+                        "list_deltaspace_references: {bucket}/{prefix} reference gone since the listing"
+                    );
+                }
                 Err(e) => {
                     tracing::warn!(
                         "list_deltaspace_references: skipping {}/{} ({}). \

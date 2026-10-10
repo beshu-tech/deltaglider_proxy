@@ -964,10 +964,23 @@ pub trait StorageBackend: Send + Sync {
         }
     }
 
-    /// List all deltaspace prefixes within a bucket
+    /// List all deltaspace prefixes within a bucket: every directory, with
+    /// or without a reference. A caller that wants the references uses
+    /// [`Self::list_reference_prefixes`].
     fn list_deltaspaces(
         &self,
         bucket: &str,
+    ) -> impl Future<Output = Result<Vec<String>, StorageError>> + Send;
+
+    /// The deltaspaces that hold a `reference.bin`: `scope` itself and every
+    /// deltaspace below it (`scope/...`), in no order. `scope` has no
+    /// trailing `/`; `""` is the whole bucket. One listing of the scope
+    /// finds them, with no request per deltaspace: a folder of screenshots
+    /// costs no HEAD. No default: every wrapper must forward it.
+    fn list_reference_prefixes(
+        &self,
+        bucket: &str,
+        scope: &str,
     ) -> impl Future<Output = Result<Vec<String>, StorageError>> + Send;
 
     /// Get total storage size used (for metrics), optionally scoped to a bucket

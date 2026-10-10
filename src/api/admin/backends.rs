@@ -813,7 +813,7 @@ pub async fn legacy_key_usage(
     'buckets: for bucket in usage.buckets.clone() {
         // Delta references first: one legacy reference breaks every delta
         // in its deltaspace, so they count even when the object budget ends.
-        match engine.storage().list_deltaspaces(&bucket).await {
+        match engine.storage().list_reference_prefixes(&bucket, "").await {
             Ok(prefixes) => {
                 for prefix in prefixes {
                     let storage = engine.storage();

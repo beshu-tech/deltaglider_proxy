@@ -1306,6 +1306,7 @@ async fn a_stat_error_never_reads_as_absent() {
     let listing = fault::fail_io(&dir.path().join("b/deltaspaces"), libc::EIO);
     assert!(fs.bulk_list_objects("b", "").await.is_err());
     assert!(fs.list_deltaspaces("b").await.is_err());
+    assert!(fs.list_reference_prefixes("b", "").await.is_err());
     assert!(fs
         .list_objects_delegated("b", "", Some("/"), 1000, None)
         .await

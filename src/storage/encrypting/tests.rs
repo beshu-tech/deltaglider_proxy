@@ -984,6 +984,13 @@ mod wrapper_tests {
         async fn list_deltaspaces(&self, _: &str) -> Result<Vec<String>, StorageError> {
             Err(cb_err())
         }
+        async fn list_reference_prefixes(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<String>, StorageError> {
+            Err(cb_err())
+        }
         async fn total_size(&self, _: Option<&str>) -> Result<u64, StorageError> {
             Err(cb_err())
         }

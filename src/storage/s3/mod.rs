@@ -260,6 +260,16 @@ impl S3Backend {
         Self::prefixed_key(prefix, "reference.bin")
     }
 
+    /// The deltaspace whose reference is stored at `key`: the inverse of
+    /// [`Self::reference_key`]. `None` for any other key.
+    fn deltaspace_of_reference_key(key: &str) -> Option<&str> {
+        if key == "reference.bin" {
+            Some("")
+        } else {
+            key.strip_suffix("/reference.bin")
+        }
+    }
+
     /// Get the S3 key for a delta file
     fn delta_key(&self, prefix: &str, filename: &str) -> String {
         Self::prefixed_key(prefix, &format!("{}.delta", filename))
@@ -1185,6 +1195,35 @@ impl StorageBackend for S3Backend {
         let result: Vec<String> = prefixes.into_iter().collect();
         debug!("Found {} deltaspaces in bucket {}", result.len(), bucket);
         Ok(result)
+    }
+
+    /// One LIST of `scope/` (paged); the reference keys in it name the
+    /// deltaspaces. No HEAD.
+    #[instrument(skip(self))]
+    async fn list_reference_prefixes(
+        &self,
+        bucket: &str,
+        scope: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        let list_prefix = if scope.is_empty() {
+            String::new()
+        } else {
+            format!("{scope}/")
+        };
+        let keys = self.list_objects_with_prefix(bucket, &list_prefix).await?;
+        let prefixes: Vec<String> = keys
+            .iter()
+            .filter_map(|k| Self::deltaspace_of_reference_key(k))
+            .map(str::to_string)
+            .collect();
+        debug!(
+            "Found {} references among {} keys under {}/{}",
+            prefixes.len(),
+            keys.len(),
+            bucket,
+            list_prefix
+        );
+        Ok(prefixes)
     }
 
     #[instrument(skip(self))]

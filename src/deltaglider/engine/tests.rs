@@ -216,6 +216,13 @@ impl crate::storage::StorageBackend for NullInner {
     async fn list_deltaspaces(&self, _: &str) -> Result<Vec<String>, crate::storage::StorageError> {
         Ok(vec![])
     }
+    async fn list_reference_prefixes(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<Vec<String>, crate::storage::StorageError> {
+        Ok(vec![])
+    }
     async fn total_size(&self, _: Option<&str>) -> Result<u64, crate::storage::StorageError> {
         Ok(0)
     }

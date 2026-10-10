@@ -40,6 +40,8 @@ pub(crate) enum FaultPoint {
     DeleteVariantIf,
     /// The key is `"bucket//"`: the call names no prefix and no file.
     ListDeltaspaces,
+    /// The key is `"bucket/scope/"`.
+    ListReferencePrefixes,
 }
 
 /// Work a test runs inside a storage call, before the call goes on: a
@@ -582,6 +584,16 @@ impl StorageBackend for FaultyFs {
         self.armed(FaultPoint::ListDeltaspaces, bucket, "", "")
             .await?;
         self.inner.list_deltaspaces(bucket).await
+    }
+
+    async fn list_reference_prefixes(
+        &self,
+        bucket: &str,
+        scope: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        self.armed(FaultPoint::ListReferencePrefixes, bucket, scope, "")
+            .await?;
+        self.inner.list_reference_prefixes(bucket, scope).await
     }
 
     async fn put_directory_marker(&self, bucket: &str, key: &str) -> Result<(), StorageError> {

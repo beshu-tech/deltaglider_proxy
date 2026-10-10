@@ -264,6 +264,11 @@ mod store_plan_tests;
 #[cfg(test)]
 mod reference_lock_hold_tests;
 
+/// The reference walk of the savings scans: a listing of the scope, and a
+/// HEAD only where a reference is.
+#[cfg(test)]
+mod reference_scan_tests;
+
 /// Model test of the cross-instance reference-lock protocol: the pure
 /// planners (`plan_lock_acquire`, `plan_lock_renew`), the CAS store they
 /// drive (create-if-absent, If-Match replace/delete) and the guard's trust

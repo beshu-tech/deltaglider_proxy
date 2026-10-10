@@ -1783,13 +1783,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Ok(true)
     }
 
-    /// Batch-migrate all legacy reference objects in a bucket.
+    /// Batch-migrate all legacy reference objects in a bucket. Visits only
+    /// the deltaspaces that hold a reference.
     /// Returns (migrated_count, skipped_count, error_count).
     pub async fn migrate_legacy_references(
         &self,
         bucket: &str,
     ) -> Result<(u32, u32, u32), EngineError> {
-        let deltaspaces = self.storage.list_deltaspaces(bucket).await?;
+        let deltaspaces = self.storage.list_reference_prefixes(bucket, "").await?;
         let mut migrated = 0u32;
         let mut skipped = 0u32;
         let mut errors = 0u32;

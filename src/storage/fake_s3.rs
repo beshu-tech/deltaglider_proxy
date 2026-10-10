@@ -146,6 +146,17 @@ fn list_page(
     )
 }
 
+/// The `prefix` query parameter of a LIST request (`""` when absent).
+pub(crate) fn list_prefix(uri_or_request: &str) -> String {
+    let query = uri_or_request.split_once('?').map_or("", |(_, q)| q);
+    serde_urlencoded::from_str::<Vec<(String, String)>>(query)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(k, _)| k == "prefix")
+        .map(|(_, v)| v)
+        .unwrap_or_default()
+}
+
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")

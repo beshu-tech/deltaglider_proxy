@@ -5,7 +5,7 @@
 pub mod encrypting;
 mod facts_cleanup;
 #[cfg(test)]
-mod fake_s3;
+pub(crate) mod fake_s3;
 #[cfg(test)]
 pub(crate) use fake_s3::{backend as fake_s3_backend, FakeS3};
 mod filesystem;
@@ -29,6 +29,8 @@ pub use encrypting::{EncryptingBackend, EncryptionConfig, EncryptionKey, WriteMo
 pub(crate) use filesystem::fault::{fail_io, Fault, FaultPoint, Faults, FaultyFs, Hook};
 pub use filesystem::FilesystemBackend;
 pub use routing::RoutingBackend;
+#[cfg(test)]
+pub(crate) use s3::test_support as s3_test_support;
 pub(crate) use s3::{check_s3_endpoint, guard_s3_endpoint};
 pub use s3::{
     NativeEncryptionConfig, S3Backend, BACKEND_GET_BODY_RESUMES, BACKEND_HEAD_REQUESTS,

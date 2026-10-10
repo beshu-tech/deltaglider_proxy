@@ -1534,6 +1534,37 @@ mod source_guards {
         assert!(reconcilers >= 2, "the scan found the reconcile call sites");
     }
 
+    /// A walk of every directory with one request per directory is the HEAD
+    /// flood that the savings chip sent on prod: one 404 HEAD per folder of
+    /// screenshots. A caller that wants the deltaspaces WITH a reference
+    /// lists them with `StorageBackend::list_reference_prefixes` (one listing
+    /// of the scope). Only a caller that also needs the directories WITHOUT
+    /// a reference calls `list_deltaspaces`.
+    #[test]
+    fn a_reference_walk_lists_only_the_reference_prefixes() {
+        // Classifies every deltaspace, the ones without a reference too, and
+        // sends no HEAD (`scan_deltaspace_lite`).
+        const ALLOWED: &[&str] = &["src/api/admin/delta_efficiency.rs"];
+        let mut offenders = Vec::new();
+        for (file, text) in crate::source_scan::prod_sources("src") {
+            // The trait, its implementations and their forwarders.
+            if file.starts_with("src/storage/") || ALLOWED.contains(&file.as_str()) {
+                continue;
+            }
+            for (n, line) in crate::source_scan::prod_lines(&text) {
+                if line.contains(".list_deltaspaces(") && !line.trim_start().starts_with("//") {
+                    offenders.push(format!("{file}:{n}"));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "list the deltaspaces that hold a reference with \
+             list_reference_prefixes, not every directory:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     /// The request path reads no environment variable: a request reads the
     /// config snapshot (`config::RuntimeTuning`, copied into the engine at
     /// build) or a value its owner parsed at construction. `clippy.toml`
