@@ -1678,6 +1678,103 @@ mod source_guards {
         );
     }
 
+    /// The production files outside the engine with a per-key engine
+    /// delete (`.delete(` / `.delete_if(` whose receiver, on the line or on
+    /// the three lines above a chained call, names an engine), and the
+    /// sites of the files not in `allowed` (`file:line: code`).
+    fn per_key_engine_deletes(
+        allowed: &[&str],
+    ) -> (std::collections::BTreeSet<String>, Vec<String>) {
+        let mut files = std::collections::BTreeSet::new();
+        let mut offenders = Vec::new();
+        for (file, text) in crate::source_scan::prod_sources("src") {
+            if file.starts_with("src/deltaglider/engine/") {
+                continue;
+            }
+            let lines = crate::source_scan::prod_lines(&text);
+            for (i, (n, line)) in lines.iter().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                for call in [".delete(", ".delete_if("] {
+                    let Some(at) = line.find(call) else {
+                        continue;
+                    };
+                    let receiver = if line[..at].trim().is_empty() {
+                        lines[i.saturating_sub(3)..i]
+                            .iter()
+                            .map(|(_, l)| *l)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    } else {
+                        line[..at].to_string()
+                    };
+                    if !receiver.contains("engine") {
+                        continue;
+                    }
+                    files.insert(file.clone());
+                    if !allowed.contains(&file.as_str()) {
+                        offenders.push(format!("{file}:{n}: {}", line.trim()));
+                    }
+                }
+            }
+        }
+        (files, offenders)
+    }
+
+    /// More than one key goes through `DeltaGliderEngine::delete_batch`: it
+    /// checks each folder ONCE for a reference.bin to reclaim, runs the
+    /// folders in parallel and reports each key as it ends. A per-key
+    /// `delete` / `delete_if` in a loop, or in a helper that a loop calls,
+    /// lists the folder after every key (one LIST per key, and a cut loop
+    /// leaves a folder holding its reference.bin alone). So outside the
+    /// engine a per-key engine delete stands only where a request names
+    /// one key. (The engine's sweep calls are private to it, so the
+    /// compiler refuses them elsewhere.)
+    #[test]
+    fn deletes_of_many_keys_go_through_delete_batch() {
+        // A request that names one key: S3 DeleteObject.
+        const SINGLE_KEY: &[&str] = &["src/s3_adapter_s3s/object.rs"];
+        // wave 2: move to delete_batch (each agent removes its entries; the
+        // single-object `rm s3://b/k` keeps cli/rm.rs, under SINGLE_KEY).
+        const WAVE_2: &[&str] = &[
+            "src/cli/rm.rs",
+            "src/cli/sync.rs",
+            "src/lifecycle/worker.rs",
+            "src/maintenance/migrate.rs",
+            "src/replication/event_consumer.rs",
+            "src/replication/worker.rs",
+        ];
+        let allowed: Vec<&str> = SINGLE_KEY.iter().chain(WAVE_2).copied().collect();
+        let (files, offenders) = per_key_engine_deletes(&allowed);
+        assert!(
+            offenders.is_empty(),
+            "delete more than one key with DeltaGliderEngine::delete_batch, not a \
+             per-key delete:\n{}",
+            offenders.join("\n")
+        );
+        let stale: Vec<&&str> = allowed.iter().filter(|f| !files.contains(**f)).collect();
+        assert!(
+            stale.is_empty(),
+            "these files no longer delete per key; remove them from the allow-list: {stale:?}"
+        );
+        // The scan sees a real loop site: the `sync --delete` loop, as long
+        // as it is there.
+        if files.contains("src/cli/sync.rs") {
+            let without_sync: Vec<&str> = allowed
+                .iter()
+                .copied()
+                .filter(|f| *f != "src/cli/sync.rs")
+                .collect();
+            let (_, caught) = per_key_engine_deletes(&without_sync);
+            eprintln!("without its allow-list entry:\n{}", caught.join("\n"));
+            assert!(
+                !caught.is_empty() && caught.iter().all(|o| o.starts_with("src/cli/sync.rs:")),
+                "{caught:?}"
+            );
+        }
+    }
+
     /// The request path reads no environment variable: a request reads the
     /// config snapshot (`config::RuntimeTuning`, copied into the engine at
     /// build) or a value its owner parsed at construction. `clippy.toml`

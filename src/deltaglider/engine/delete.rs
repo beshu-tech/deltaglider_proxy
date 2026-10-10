@@ -325,10 +325,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
     }
 
-    /// Delete one member of a prefix sweep with no reclaim check: the
-    /// caller runs [`Self::reclaim_empty_deltaspace`] once per folder at
-    /// the end, as [`Self::delete_batch`] does.
-    pub async fn delete_in_sweep(
+    /// Delete one key with no reclaim check, as a batch cut before its
+    /// reclaim leaves it (tests make folders that hold their reference.bin
+    /// alone with it).
+    #[cfg(test)]
+    pub(super) async fn delete_in_sweep(
         &self,
         bucket: &str,
         key: &str,
@@ -341,20 +342,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
     }
 
-    /// [`Self::delete_in_sweep`] with a condition, as [`Self::delete_if`].
-    pub async fn delete_if_in_sweep(
-        &self,
-        bucket: &str,
-        key: &str,
-        still_ours: &(dyn Fn(&FileMetadata) -> bool + Send + Sync),
-    ) -> Result<ConditionalDelete, EngineError> {
-        self.delete_inner(bucket, key, Some(still_ours)).await
-    }
-
     /// Reclaim a deltaspace's `reference.bin` if no non-reference object remains.
-    /// [`Self::delete_batch`] runs it after the last key of each folder.
+    /// [`Self::delete_batch`] runs it after the last key of each folder; no
+    /// caller outside the engine reclaims on its own.
     /// Idempotent and safe when the deltaspace still holds objects (no-op).
-    pub async fn reclaim_empty_deltaspace(
+    pub(super) async fn reclaim_empty_deltaspace(
         &self,
         bucket: &str,
         deltaspace_id: &str,
