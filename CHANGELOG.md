@@ -2,6 +2,77 @@
 
 ## Unreleased
 
+### Fixed — One slow request no longer closes every bucket of its backend
+
+When a request to an S3 backend timed out or found no connection, the proxy
+marked the whole backend unreachable at once. Every bucket on that backend
+then answered `503 ServiceUnavailable` until the next health probe, up to 30
+seconds later. On a busy backend where one request among thousands is slow,
+this closed the backend again and again. Now a failed request only starts a
+health probe of its backend. The proxy closes the buckets only when that probe
+fails too, so a backend that is really down is still closed within one probe
+(about 10 seconds for a hung backend). When the probe succeeds, the buckets
+stay open, and the proxy logs one warning that names the failed request. When
+`DGP_BACKEND_HEALTH_INTERVAL_SECS=0` or `DGP_BOOT_BACKEND_PROBE=off` turns the
+health loop off, a failed request no longer closes the backend, because
+nothing would open it again.
+
+### Fixed — A folder's savings figure no longer sends a HEAD request per folder
+
+To find the delta references under a folder, the savings figure of the file
+browser listed every object of the bucket. Then it sent a HEAD request for a
+`reference.bin` in each folder under the selected one, one at a time. It did
+this also in folders that never held a delta, such as folders of screenshots.
+Each of these requests answered "not found" and logged a warning. The cap of
+1000 counted only the references that it found, so it did not stop these
+requests. On a bucket with many folders, one savings request sent thousands of
+HEAD requests, and a slow backend timed out on them and on every other
+request too. Now the proxy lists only the objects under the selected folder
+and takes the references from that listing. It sends a HEAD request only for
+a folder that holds a reference, 8 at a time. The figure shows `+` only when
+more references remain than the cap. The dashboard scan, the usage refresh,
+the CLI `stats` command, the re-encryption job, the legacy-reference migration
+and the legacy-key report of the Backends page use the same listing.
+
+### Fixed — Deleting folders on S3 no longer reads every remaining object again
+
+After each object that a delete removed, the proxy checked whether the folder
+still held anything other than its delta reference (`reference.bin`), so that
+it could delete the reference too. On S3 this check listed the folder and also
+sent a HEAD request for every delta still in it, to read sizes that the check
+did not use. A bulk delete from the file browser removed one object at a time,
+so a folder of N deltas cost N listings and about N²/2 HEAD requests. Now the
+check reads the listing only. A bulk delete and a bulk move check each folder
+once, after its last object, and a bulk delete works on 8 folders at the same
+time. The objects of one folder still go one after another, because each
+folder has one lock.
+
+The check also counted the objects of subfolders on S3, but not on the
+filesystem backend. A delta always uses the reference of its own folder, so
+those objects did not need the parent's reference. But while one remained, the
+parent's reference stayed in the bucket after the parent's last object was
+deleted. Now S3 counts only the folder's own objects, as the filesystem
+backend does. For the same reason, the delta-efficiency report no longer
+counts a subfolder's objects in its parent folder too.
+
+### Fixed — A bulk delete of many folders shows its progress and can be cancelled
+
+When you deleted a page of selected folders in the file browser, the browser
+first listed the folders one at a time. Then it sent every key in one delete
+request. The page did not change until that request ended, and for 50 folders
+that took many minutes. A selection of more than 10,000 objects failed at the
+end, because the server takes at most 10,000 keys in one request. A tab that
+was closed during the request stopped the delete partway, and objects that
+could not be deleted were not reported. Now the browser lists four folders at
+a time and then sends the keys in batches of 500. The selection bar shows the
+phase ("Listing folders 12 of 50…", then "Deleting 3,400 of 9,800…"), a
+progress bar and a Cancel button. Cancel lets the current batch finish, sends
+no more batches, and reports how many objects were deleted. The listing
+reloads after each batch, so the deleted folders leave the page as the delete
+goes on. A selection of any size can be deleted. The browser asks before you
+leave the page while a delete runs. When some objects fail, a warning says how
+many. An error message says how many objects were deleted before the error.
+
 ### Fixed — An expired session sends the file browser to the sign-in screen
 
 When the session expired while the file browser was open (for example
