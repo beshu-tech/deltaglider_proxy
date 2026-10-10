@@ -187,29 +187,39 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         let (obj_key, deltaspace_id) = self.validated_key(bucket, key)?;
 
-        let meta = match self
+        // The lookup's passthrough read returns fallback metadata for an
+        // object without DG metadata (both backends), so `None` means both
+        // forms are absent. (A second passthrough HEAD here cost a missing
+        // key 3 requests instead of 2.)
+        let meta = self
             .resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
             .await?
-        {
-            Some(meta) => meta,
-            None => {
-                // No DG metadata — try reading passthrough metadata (lightweight HEAD).
-                // If that also fails (unmanaged file with no DG headers), return NotFound.
-                // Both S3 and filesystem backends now return fallback metadata for files
-                // that exist without DG metadata, so this should succeed for any existing file.
-                self.storage
-                    .get_passthrough_metadata(bucket, &deltaspace_id, &obj_key.filename)
-                    .await
-                    .map_err(|e| match e {
-                        StorageError::NotFound(_) => EngineError::NotFound(obj_key.full_key()),
-                        other => EngineError::Storage(other),
-                    })?
-            }
-        };
+            .ok_or_else(|| EngineError::NotFound(obj_key.full_key()))?;
 
         // Populate metadata cache on successful backend lookup
         self.metadata_cache.insert(bucket, key, meta.clone());
         Ok(meta)
+    }
+
+    /// The metadata of the deltaspace's reference.bin from ONE read (a HEAD
+    /// on S3). `None` only when the backend says it is absent: a failed read
+    /// is an error, because a caller that writes on "no reference" would
+    /// overwrite a live baseline. (`has_reference` then
+    /// `get_reference_metadata` sent two HEADs of one object.)
+    pub(super) async fn reference_metadata_if_present(
+        &self,
+        bucket: &str,
+        deltaspace_id: &str,
+    ) -> Result<Option<FileMetadata>, StorageError> {
+        match self
+            .storage
+            .get_reference_metadata(bucket, deltaspace_id)
+            .await
+        {
+            Ok(meta) => Ok(Some(meta)),
+            Err(StorageError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Get reference with caching. Returns `Bytes` for zero-copy sharing.
@@ -337,5 +347,58 @@ mod reference_eviction_tests {
         assert!(!reference_suspect_after_mismatch(&delta("abc")));
         let plain = FileMetadata::new_passthrough("a.bin".into(), "s".into(), "m".into(), 1, None);
         assert!(!reference_suspect_after_mismatch(&plain));
+    }
+}
+
+/// Fixed request costs of a HEAD.
+#[cfg(test)]
+mod head_cost_tests {
+    use super::*;
+
+    /// A HEAD of a missing key costs the two variant HEADs. It sent a third:
+    /// the passthrough HEAD of the lookup, again.
+    #[tokio::test]
+    async fn a_head_of_a_missing_key_sends_two_requests() {
+        let (engine, fake) = s3_engine().await;
+        fake.clear();
+        let err = engine.head("b", "dir/missing.zip").await.unwrap_err();
+        assert!(err.is_not_found(), "{err}");
+        assert_eq!(fake.requests().len(), 2, "{:?}", fake.requests());
+    }
+
+    /// One read answers whether a deltaspace has a reference and what it is
+    /// (`reference_metadata_if_present`): engine code does not ask
+    /// `has_reference` and then read the metadata (two HEADs on S3).
+    #[test]
+    fn engine_code_reads_a_reference_once() {
+        // Two sites keep both reads for now: a filesystem fault test
+        // (`fault_tests::a_reference_stat_error_is_not_absent`) and a
+        // transfer test (`delta_fast_path_never_seeds_over_an_unreadable_dest_reference`)
+        // inject their fault into the `has_reference` call.
+        const ALLOWED: [&str; 2] = [
+            "src/deltaglider/engine/raw.rs",
+            "src/deltaglider/engine/store.rs",
+        ];
+        let mut sites = Vec::new();
+        for (file, text) in crate::source_scan::prod_sources("src/deltaglider/engine") {
+            let lines = crate::source_scan::prod_lines(&text);
+            for (i, (n, line)) in lines.iter().enumerate() {
+                if !line.contains(".has_reference(") {
+                    continue;
+                }
+                let then_reads = lines[i..lines.len().min(i + 15)]
+                    .iter()
+                    .any(|(_, l)| l.contains(".get_reference_metadata("));
+                if then_reads {
+                    sites.push((file.clone(), *n));
+                }
+            }
+        }
+        let files: Vec<&str> = sites.iter().map(|(f, _)| f.as_str()).collect();
+        assert_eq!(
+            files, ALLOWED,
+            "has_reference then get_reference_metadata ({sites:?}): use \
+             reference_metadata_if_present"
+        );
     }
 }

@@ -1728,14 +1728,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         filename: &str,
         xnode: &super::ReferenceLockGuard,
     ) -> Result<bool, EngineError> {
-        if !self.storage.has_reference(bucket, deltaspace_id).await? {
+        let Some(mut ref_meta) = self
+            .reference_metadata_if_present(bucket, deltaspace_id)
+            .await?
+        else {
             return Ok(false);
-        }
-
-        let mut ref_meta = self
-            .storage
-            .get_reference_metadata(bucket, deltaspace_id)
-            .await?;
+        };
         if ref_meta.original_name == Self::INTERNAL_REFERENCE_NAME {
             return Ok(false);
         }
@@ -1827,18 +1825,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let mut errors = 0u32;
 
         for ds in &deltaspaces {
-            // Check if reference exists and needs migration
-            if !self.storage.has_reference(bucket, ds).await? {
+            // One read: is there a reference, and does it need migration?
+            // (The migration reads it again under the deltaspace lock.)
+            let Some(ref_meta) = self.reference_metadata_if_present(bucket, ds).await? else {
                 skipped += 1;
                 continue;
-            }
-
-            let ref_meta = match self.storage.get_reference_metadata(bucket, ds).await {
-                Ok(m) => m,
-                Err(_) => {
-                    skipped += 1;
-                    continue;
-                }
             };
 
             if ref_meta.original_name == Self::INTERNAL_REFERENCE_NAME {

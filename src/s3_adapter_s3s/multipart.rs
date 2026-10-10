@@ -46,7 +46,8 @@ pub(super) async fn upload_part(
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::UploadPartOutput>> {
     let chunked_headers = headers_if_still_aws_chunked(&req);
     let input = req.input;
-    ensure_bucket_exists_s3s(&svc.state, &input.bucket).await?;
+    // Cached briefly per bucket: one HeadBucket per upload, not per part.
+    crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
     let max_object_size = svc.state.engine.load().max_object_size();
     // Review C9: the store's per-upload cap follows the live config.
     svc.state.multipart.set_max_object_size(max_object_size);
@@ -435,4 +436,74 @@ pub(super) fn completed_parts_to_request(
             Ok((part_number as u32, etag))
         })
         .collect()
+}
+
+#[cfg(test)]
+pub(super) mod adapter_test_support {
+    use super::*;
+
+    /// An s3s request around `input`, as the router hands it over.
+    pub(in crate::s3_adapter_s3s) fn request<T>(input: T) -> s3s::S3Request<T> {
+        s3s::S3Request {
+            input,
+            method: axum::http::Method::PUT,
+            uri: "/".parse().unwrap(),
+            headers: Default::default(),
+            extensions: Default::default(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    /// The adapter over `state`, with the default config.
+    pub(in crate::s3_adapter_s3s) fn service(state: Arc<AppState>) -> DeltaGliderS3Service {
+        DeltaGliderS3Service::new(
+            state,
+            Arc::new(tokio::sync::RwLock::new(crate::config::Config::default())),
+        )
+    }
+}
+
+#[cfg(test)]
+mod multipart_cost_tests {
+    use super::adapter_test_support::{request, service};
+    use super::*;
+
+    fn part(upload_id: &str, n: i32) -> s3s::dto::UploadPartInput {
+        s3s::dto::UploadPartInput::builder()
+            .bucket("b".into())
+            .key("a/photo.jpg".into())
+            .upload_id(upload_id.into())
+            .part_number(n)
+            .body(Some(s3s::dto::StreamingBlob::from(s3s::Body::from(
+                vec![n as u8; 1024],
+            ))))
+            .build()
+            .unwrap()
+    }
+
+    /// UploadPart checks its bucket with one HeadBucket per bucket per short
+    /// interval: a 1,000-part upload sent 1,000.
+    #[tokio::test]
+    async fn upload_parts_check_their_bucket_once() {
+        let (engine, fake) = crate::deltaglider::s3_engine().await;
+        let state = AppState::for_tests(engine);
+        let svc = service(state.clone());
+        let id = state
+            .multipart
+            .create("b", "a/photo.jpg", None, Default::default())
+            .unwrap();
+        fake.clear();
+        for n in 1..=3 {
+            upload_part(&svc, request(part(&id, n))).await.unwrap();
+        }
+        let head_buckets = fake
+            .requests()
+            .iter()
+            .filter(|r| *r == "HEAD /b/" || r.starts_with("HEAD /b/?"))
+            .count();
+        assert_eq!(head_buckets, 1, "{:?}", fake.requests());
+    }
 }

@@ -135,14 +135,99 @@ pub struct AppState {
 /// existing `From<EngineError> for S3Error` conversion so a missing
 /// underlying backend surfaces as a meaningful error instead of a
 /// mysterious 500.
+///
+/// For WRITE paths only (form POST, UploadPart, the destination of a copy):
+/// a bucket found is trusted for [`BUCKET_SEEN_TTL`] per engine, so a
+/// 1,000-part upload sends one HeadBucket, not 1,000. A write into a bucket
+/// deleted meanwhile still fails at the backend (`require_bucket_exists` on
+/// the filesystem, `NoSuchBucket` on S3). A missing bucket is asked again
+/// every time: one created a moment later is usable at once.
 pub(crate) async fn ensure_bucket_exists(
     state: &Arc<AppState>,
     bucket: &str,
 ) -> Result<(), S3Error> {
-    let engine = state.engine.load();
+    let engine = state.engine.load_full();
+    if bucket_seen(&engine, bucket) {
+        return Ok(());
+    }
     match engine.head_bucket(bucket).await {
-        Ok(true) => Ok(()),
+        Ok(true) => {
+            remember_bucket(&engine, bucket);
+            Ok(())
+        }
         Ok(false) => Err(S3Error::NoSuchBucket(bucket.to_string())),
         Err(e) => Err(S3Error::from(e)),
+    }
+}
+
+/// How long a write path trusts a bucket that it found.
+const BUCKET_SEEN_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One bucket a write path found on one engine.
+struct SeenBucket {
+    /// Pins the engine's allocation, so its address (the key) is not reused
+    /// by a later engine while this entry lives.
+    engine: std::sync::Weak<DynEngine>,
+    at: std::time::Instant,
+}
+
+/// Buckets the write paths found, by (engine address, bucket). A rebuilt
+/// engine (a config apply can route a bucket elsewhere) asks again.
+static BUCKETS_SEEN: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<(usize, String), SeenBucket>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn bucket_seen(engine: &Arc<DynEngine>, bucket: &str) -> bool {
+    let key = (Arc::as_ptr(engine) as usize, bucket.to_string());
+    BUCKETS_SEEN
+        .lock()
+        .get(&key)
+        .is_some_and(|seen| seen.at.elapsed() < BUCKET_SEEN_TTL && seen.engine.strong_count() > 0)
+}
+
+fn remember_bucket(engine: &Arc<DynEngine>, bucket: &str) {
+    let mut seen = BUCKETS_SEEN.lock();
+    // Drop stale entries (and those of dropped engines) as new ones come.
+    seen.retain(|_, s| s.at.elapsed() < BUCKET_SEEN_TTL && s.engine.strong_count() > 0);
+    seen.insert(
+        (Arc::as_ptr(engine) as usize, bucket.to_string()),
+        SeenBucket {
+            engine: Arc::downgrade(engine),
+            at: std::time::Instant::now(),
+        },
+    );
+}
+
+#[cfg(test)]
+mod bucket_exists_tests {
+    use super::*;
+
+    fn head_buckets(fake: &crate::storage::FakeS3, bucket: &str) -> usize {
+        // The SDK sends HeadBucket as `HEAD /b/`.
+        let line = format!("HEAD /{bucket}/");
+        fake.requests()
+            .iter()
+            .filter(|r| **r == line || r.starts_with(&format!("{line}?")))
+            .count()
+    }
+
+    /// The write paths check a bucket with one HeadBucket per bucket per
+    /// short interval, not one per PUT or UploadPart. A missing bucket is
+    /// asked again every time (a bucket created a moment later is usable).
+    #[tokio::test]
+    async fn a_write_checks_its_bucket_once_per_interval() {
+        let (engine, fake) = crate::deltaglider::s3_engine().await;
+        let state = AppState::for_tests(engine);
+        fake.clear();
+        for _ in 0..3 {
+            ensure_bucket_exists(&state, "b").await.unwrap();
+        }
+        assert_eq!(head_buckets(&fake, "b"), 1, "{:?}", fake.requests());
+        fake.fail("HEAD_BUCKET", "/nope", 404, "NoSuchBucket", u32::MAX);
+        for _ in 0..2 {
+            let err = ensure_bucket_exists(&state, "nope").await.unwrap_err();
+            assert!(matches!(err, S3Error::NoSuchBucket(_)), "{err:?}");
+        }
+        assert_eq!(head_buckets(&fake, "nope"), 2);
     }
 }

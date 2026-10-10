@@ -50,7 +50,8 @@ pub(super) async fn copy_object(
         ));
     }
     ensure_bucket_exists_s3s(&svc.state, &source_bucket).await?;
-    ensure_bucket_exists_s3s(&svc.state, &input.bucket).await?;
+    // The destination is written: the write paths' brief bucket cache.
+    crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
     let engine = svc.state.engine.load();
     let source_meta = engine.head(&source_bucket, &source_key).await?;
     evaluate_copy_source_conditionals_s3s(
@@ -234,7 +235,8 @@ pub(super) async fn upload_part_copy(
     // (403-before-404, no backend I/O for a doomed request).
     crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)?;
     ensure_bucket_exists_s3s(&svc.state, &source_bucket).await?;
-    ensure_bucket_exists_s3s(&svc.state, &input.bucket).await?;
+    // A part of the destination upload: the write paths' brief bucket cache.
+    crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
     let engine = svc.state.engine.load();
     let source_meta = engine.head(&source_bucket, &source_key).await?;
     evaluate_copy_source_conditionals_s3s(
