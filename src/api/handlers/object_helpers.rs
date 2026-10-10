@@ -13,7 +13,7 @@
 //!   gate, conditional store under the object's write lock, event.
 //! * [`store_client_multipart_admit`] / [`store_client_multipart_commit`]
 //!   — the same quota gate, write lock and event for a multipart completion.
-//! * [`check_quota`] — pre-write quota gate.
+//! * [`check_quota_for_write`] / [`check_quota`] — pre-write quota gate.
 //! * [`enqueue_object_event`] / [`enqueue_object_events`] — best-
 //!   effort event-outbox append for notification dispatch.
 //!
@@ -84,7 +84,7 @@ pub(crate) async fn store_client_write(
     state: &Arc<AppState>,
     write: ClientWrite<'_>,
 ) -> Result<crate::types::StoreResult, S3Error> {
-    check_quota(state, write.bucket, write.data.len() as u64)?;
+    check_quota_for_write(state, write.bucket, write.key, write.data.len() as u64).await?;
     let result = state
         .engine
         .load()
@@ -127,7 +127,7 @@ pub(crate) async fn store_client_write_spooled(
     state: &Arc<AppState>,
     write: SpooledClientWrite<'_>,
 ) -> Result<crate::types::StoreResult, S3Error> {
-    check_quota(state, write.bucket, write.size)?;
+    check_quota_for_write(state, write.bucket, write.key, write.size).await?;
     let engine = state.engine.load();
     let result = {
         let _guard = engine
@@ -176,7 +176,7 @@ pub(crate) async fn store_client_multipart_admit(
     total_size: u64,
     precondition: &crate::deltaglider::Precondition,
 ) -> Result<crate::deltaglider::ObjectWriteGuard, S3Error> {
-    check_quota(state, bucket, total_size)?;
+    check_quota_for_write(state, bucket, key, total_size).await?;
     Ok(state
         .engine
         .load()
@@ -244,15 +244,9 @@ pub(crate) fn check_client_write_allowed(
 
 /// Pre-write quota gate. Returns `Err` when the write would push the
 /// bucket past its `quota_bytes` policy, or when quota is set to 0
-/// (the "freeze the bucket" override).
-///
-/// "Used" is the bucket's STORED footprint from the O(1) running counter
-/// (`bucket_usage`, updated inline on every write/delete and including the
-/// delta baselines). The usage scanner is only a fallback when no counter row
-/// exists yet: its `stored_size` counts the same stored bytes, delta
-/// baselines included (its `total_size` is the LOGICAL size, which is the
-/// wrong figure for a storage quota). With neither source warm the write is
-/// let through optimistically.
+/// (the "freeze the bucket" override). "Used" is [`quota_used`]. This
+/// variant does not know the key, so an overwrite is judged as a new
+/// object; a client write uses [`check_quota_for_write`].
 pub(crate) fn check_quota(
     state: &Arc<AppState>,
     bucket: &str,
@@ -262,18 +256,77 @@ pub(crate) fn check_quota(
     let Some(quota) = engine.bucket_policy_registry().quota_bytes(bucket) else {
         return Ok(());
     };
-    let used = state
+    quota_decision(quota, quota_used(state, bucket), incoming_bytes)
+        .map_err(S3Error::AccessDeniedReason)
+}
+
+/// [`check_quota`] for a write of `key`: an overwrite replaces the stored
+/// bytes of the object it replaces, so a write that the gate refuses as a
+/// new object is judged again with the prior object's stored size netted
+/// out. Only that refusal pays the HEAD of the prior object. Before, an
+/// overwrite at the limit was refused even when it added nothing.
+pub(crate) async fn check_quota_for_write(
+    state: &Arc<AppState>,
+    bucket: &str,
+    key: &str,
+    incoming_bytes: u64,
+) -> Result<(), S3Error> {
+    let engine = state.engine.load();
+    let Some(quota) = engine.bucket_policy_registry().quota_bytes(bucket) else {
+        return Ok(());
+    };
+    let used = quota_used(state, bucket);
+    let Err(reason) = quota_decision(quota, used, incoming_bytes) else {
+        return Ok(());
+    };
+    if quota == 0 {
+        // Frozen: no overwrite gets through either.
+        return Err(S3Error::AccessDeniedReason(reason));
+    }
+    let prior_stored = match engine.head(bucket, key).await {
+        Ok(meta) => crate::bucket_usage::usage_delta_for(&meta, 1).2.max(0) as u64,
+        // Absent, or unknown: judged as a new object.
+        Err(_) => 0,
+    };
+    if prior_stored > 0
+        && quota_decision(
+            quota,
+            used.map(|u| u.saturating_sub(prior_stored)),
+            incoming_bytes,
+        )
+        .is_ok()
+    {
+        return Ok(());
+    }
+    Err(S3Error::AccessDeniedReason(reason))
+}
+
+/// The STORED bytes a quota check counts (delta baselines included; the
+/// LOGICAL size is the wrong figure for a storage quota).
+///
+/// The O(1) running counter (`bucket_usage`) is trusted only after a full
+/// scan stamped its row (`last_scan_at`). A never-scanned row holds only
+/// the writes since the counter started: data that was in the bucket before
+/// (a bucket adopted in place, data from before the counter, writes through
+/// another instance) is missing, and the bucket could grow past its quota
+/// by all of it. Then the usage scanner's size counts too (a cached scan,
+/// up to 5 minutes old; a missing one starts a background scan), and the
+/// larger of the two wins. With neither source warm the write is let
+/// through optimistically.
+fn quota_used(state: &Arc<AppState>, bucket: &str) -> Option<u64> {
+    let row = state
         .bucket_usage
         .as_ref()
-        .and_then(|u| u.read(bucket).ok().flatten())
-        .map(|row| row.stored_bytes)
-        .or_else(|| {
-            state
-                .usage_scanner
-                .get_or_scan(state, bucket, "")
-                .map(|u| u.stored_size)
-        });
-    quota_decision(quota, used, incoming_bytes).map_err(S3Error::AccessDeniedReason)
+        .and_then(|u| u.read(bucket).ok().flatten());
+    if let Some(row) = row.filter(|r| r.last_scan_at.is_some()) {
+        return Some(row.stored_bytes);
+    }
+    let counted = row.map(|r| r.stored_bytes);
+    let scanned = state
+        .usage_scanner
+        .get_or_scan(state, bucket, "")
+        .map(|u| u.stored_size);
+    counted.max(scanned)
 }
 
 /// 1024-based, so IEC labels: the quota field in the admin GUI says GiB.
@@ -394,5 +447,135 @@ mod quota_tests {
             quota_decision(10 * gib, Some(10 * gib), 1000).unwrap_err(),
             "Bucket quota exceeded: 10.0 GiB used + 1 KiB upload > 10.0 GiB limit"
         );
+    }
+}
+
+/// The quota gate against a real engine and counter.
+#[cfg(test)]
+mod write_path_tests {
+    use super::*;
+    use crate::bucket_usage::BucketUsage;
+    use crate::deltaglider::savings::SavingsTotals;
+    use crate::storage::{DynStorageBackend, FilesystemBackend, StorageBackend};
+    use crate::types::FileMetadata;
+    use std::time::Duration;
+
+    struct Fixture {
+        _tmp: tempfile::TempDir,
+        state: Arc<AppState>,
+        usage: Arc<BucketUsage>,
+        /// The same storage as the engine's, for out-of-band writes.
+        raw: FilesystemBackend,
+    }
+
+    async fn fixture(quota: u64) -> Fixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.buckets.insert(
+            "b".into(),
+            crate::bucket_policy::BucketPolicyConfig {
+                quota_bytes: Some(quota),
+                ..Default::default()
+            },
+        );
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(
+            FilesystemBackend::new(tmp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let usage = Arc::new(BucketUsage::in_memory().unwrap());
+        let engine = crate::deltaglider::DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &config,
+            None,
+        )
+        .with_bucket_usage(Some(usage.clone()));
+        engine.create_bucket("b").await.unwrap();
+        let mut state = Arc::try_unwrap(AppState::for_tests(engine)).ok().unwrap();
+        state.bucket_usage = Some(usage.clone());
+        state.config_db = Some(Arc::new(tokio::sync::Mutex::new(
+            crate::config_db::ConfigDb::in_memory("pw").unwrap(),
+        )));
+        let raw = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        Fixture {
+            _tmp: tmp,
+            state: Arc::new(state),
+            usage,
+            raw,
+        }
+    }
+
+    async fn put(state: &Arc<AppState>, key: &str, size: usize) -> Result<(), S3Error> {
+        let data = vec![7u8; size];
+        store_client_write(
+            state,
+            ClientWrite {
+                bucket: "b",
+                key,
+                data: &data,
+                content_type: None,
+                user_metadata: Default::default(),
+                precondition: &crate::deltaglider::Precondition::none(),
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Data that the counter never saw (a bucket adopted in place, data from
+    /// before the counter) is not in a never-scanned row. Trusting that row
+    /// let the bucket grow past its quota by the whole adopted size.
+    #[tokio::test]
+    async fn a_never_scanned_counter_is_not_trusted_for_quota() {
+        let f = fixture(100).await;
+        let meta = FileMetadata::new_passthrough(
+            "old.jpg".into(),
+            "0".repeat(64),
+            "0".repeat(32),
+            90,
+            None,
+        );
+        f.raw
+            .put_passthrough("b", "", "old.jpg", &[0u8; 90], &meta)
+            .await
+            .unwrap();
+        put(&f.state, "a.jpg", 20)
+            .await
+            .expect("no usage known yet");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while f.state.usage_scanner.get("b", "").is_none() {
+            assert!(tokio::time::Instant::now() < deadline, "no usage scan");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            put(&f.state, "c.jpg", 20).await.is_err(),
+            "the never-scanned counter (20 B) hid the 90 B the counter never saw"
+        );
+    }
+
+    /// An overwrite nets the size of the object it replaces: at the limit,
+    /// replacing 10 B with 10 B changes nothing and is allowed.
+    #[tokio::test]
+    async fn an_overwrite_at_the_quota_nets_the_prior_size() {
+        let f = fixture(100).await;
+        put(&f.state, "k.jpg", 10).await.unwrap();
+        put(&f.state, "big.jpg", 90).await.unwrap();
+        // A Refresh: the counter row is ground truth now.
+        let engine = f.state.engine.load();
+        let mut totals = SavingsTotals::default();
+        for k in ["k.jpg", "big.jpg"] {
+            totals.accumulate(&engine.head("b", k).await.unwrap());
+        }
+        f.usage
+            .overwrite_from_scan(f.usage.begin_scan("b"), &totals, 1)
+            .unwrap();
+        assert!(
+            put(&f.state, "k.jpg", 10).await.is_ok(),
+            "an overwrite that adds nothing was refused"
+        );
+        assert!(put(&f.state, "k.jpg", 11).await.is_err(), "net +1 B");
+        assert!(put(&f.state, "new.jpg", 1).await.is_err(), "a new object");
     }
 }
