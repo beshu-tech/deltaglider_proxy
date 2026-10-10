@@ -266,6 +266,10 @@ pub fn resolve_backend_readiness(
     hard_failure
 }
 
+/// How long `/_/ready` waits for the config DB mutex before it reports the
+/// DB `locked`. Holders keep it for milliseconds; a wedged one for ever.
+const CONFIG_DB_READY_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Is this backend verdict good enough to serve traffic?
 fn backend_verdict_is_ready(verdict: &str) -> bool {
     matches!(verdict, "ready" | "degraded" | "cached")
@@ -346,10 +350,12 @@ pub async fn readiness_check(
     if list_ok || cheap_ok == Some(true) {
         record_backend_ok(now);
     }
-    // config DB: if configured, confirm we can take the lock (a poisoned/wedged
-    // mutex would mean the control plane is stuck). `None` = legacy/open mode.
+    // config DB: if configured, confirm we can take the lock (a wedged mutex
+    // means the control plane is stuck). Every S3 mutation holds it for a
+    // moment (the event outbox), so the probe waits briefly: a busy mutex
+    // is ready, only one held past the wait is not. `None` = legacy/open mode.
     let config_db = match &state.config_db {
-        Some(db) => match db.try_lock() {
+        Some(db) => match tokio::time::timeout(CONFIG_DB_READY_WAIT, db.lock()).await {
             Ok(_) => "ready",
             Err(_) => "locked",
         },
@@ -389,6 +395,43 @@ pub async fn readiness_check(
 #[cfg(test)]
 mod readiness_tests {
     use super::*;
+
+    /// Every S3 mutation holds the config DB mutex for a moment (the event
+    /// outbox append), and so do replication, event delivery and the IAM
+    /// sync. A readiness probe that met such a holder answered 503, so a
+    /// load balancer ejected a busy, healthy node.
+    #[tokio::test]
+    async fn a_config_db_held_for_a_moment_is_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Box<crate::storage::DynStorageBackend<'static>> =
+            crate::storage::DynStorageBackend::new_box(
+                crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            );
+        let engine = crate::deltaglider::DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &crate::config::Config::default(),
+            None,
+        );
+        let mut state = AppState::for_tests(engine);
+        let db = Arc::new(tokio::sync::Mutex::new(
+            crate::config_db::ConfigDb::in_memory("readiness-test-key").unwrap(),
+        ));
+        Arc::get_mut(&mut state).unwrap().config_db = Some(db.clone());
+        let held = db.clone().lock_owned().await;
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            drop(held);
+        });
+        let (code, Json(body)) = readiness_check(State(state)).await;
+        release.await.unwrap();
+        assert_eq!(
+            (code, body.config_db),
+            (StatusCode::OK, "ready"),
+            "a config DB held for 200 ms made the node not ready"
+        );
+    }
 
     #[test]
     fn live_backends_gate_readiness_only_when_all_are_gated() {

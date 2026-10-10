@@ -49,16 +49,39 @@ pub use list::{ListMetadataXmlExtensions, LEGACY_V2_TOKENS};
 pub struct DeltaGliderS3Service {
     state: Arc<AppState>,
     config: crate::config::SharedConfig,
+    /// The last filtered-LIST budget read from the config: what a LIST uses
+    /// while a config apply holds the write lock.
+    last_list_budget: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl DeltaGliderS3Service {
     pub fn new(state: Arc<AppState>, config: crate::config::SharedConfig) -> Self {
-        Self { state, config }
+        let budget = config.try_read().map_or_else(
+            |_| crate::config::default_filtered_list_max_engine_pages(),
+            |c| c.filtered_list_max_engine_pages,
+        );
+        Self {
+            state,
+            config,
+            last_list_budget: Arc::new(budget.into()),
+        }
     }
 
     /// The live filtered-LIST scan budget (`advanced.filtered_list_max_engine_pages`).
+    /// Never waits for the config lock: a config apply holds the write lock
+    /// while it probes the backends it changes, and a LIST that waited for
+    /// it stalled every bucket for the probes. While the lock is held, the
+    /// last value read is used.
     async fn list_budget(&self) -> usize {
-        self.config.read().await.filtered_list_max_engine_pages
+        use std::sync::atomic::Ordering::Relaxed;
+        match self.config.try_read() {
+            Ok(cfg) => {
+                let budget = cfg.filtered_list_max_engine_pages;
+                self.last_list_budget.store(budget, Relaxed);
+                budget
+            }
+            Err(_) => self.last_list_budget.load(Relaxed),
+        }
     }
 
     /// Exposed for adapter tests and for the future router builder.
@@ -635,3 +658,78 @@ mod delete_bucket_tests;
 
 #[cfg(test)]
 mod token_and_csp_proptests;
+
+#[cfg(test)]
+mod list_budget_tests {
+    use super::*;
+
+    /// A config apply holds the config write lock while it probes the
+    /// backends it changes. Every ListObjects and ListObjectsV2 read its
+    /// page budget through that lock, so every LIST on every bucket waited
+    /// for the probes.
+    #[tokio::test]
+    async fn the_list_budget_does_not_wait_for_a_config_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Box<crate::storage::DynStorageBackend<'static>> =
+            crate::storage::DynStorageBackend::new_box(
+                crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            );
+        let cfg = crate::config::Config {
+            filtered_list_max_engine_pages: 7,
+            ..Default::default()
+        };
+        let engine =
+            crate::deltaglider::DeltaGliderEngine::new_with_backend(Arc::new(backend), &cfg, None);
+        let config = cfg.into_shared();
+        let svc = DeltaGliderS3Service::new(AppState::for_tests(engine), config.clone());
+        assert_eq!(svc.list_budget().await, 7);
+
+        let apply = config.write().await;
+        let got =
+            tokio::time::timeout(std::time::Duration::from_millis(100), svc.list_budget()).await;
+        drop(apply);
+        assert_eq!(got.ok(), Some(7), "a LIST waited for the config write lock");
+    }
+
+    /// Source guard: the S3 request path never awaits the config lock. A
+    /// config apply holds the write lock while it probes the backends it
+    /// changes, so a request that waited for it stalled every bucket for
+    /// the probes. Read the config with `try_read` (and a fallback), or
+    /// from a snapshot that the engine was built with.
+    #[test]
+    fn the_s3_request_path_never_awaits_the_config_lock() {
+        let mut offenders = Vec::new();
+        for dir in [
+            "src/s3_adapter_s3s",
+            "src/api/handlers",
+            "src/admission",
+            "src/api/auth.rs",
+            "src/api/s3_router.rs",
+            "src/api/s3s_hooks.rs",
+            "src/iam/middleware.rs",
+            "src/maintenance/gate.rs",
+        ] {
+            let sources: Vec<(String, String)> = if dir.ends_with(".rs") {
+                vec![(dir.to_string(), crate::source_scan::read(dir))]
+            } else {
+                crate::source_scan::prod_sources(dir)
+            };
+            for (rel, text) in sources {
+                for (n, line) in crate::source_scan::prod_lines(&text) {
+                    let code = line.split("//").next().unwrap_or("");
+                    if code.contains("config.read().await") || code.contains("config.write().await")
+                    {
+                        offenders.push(format!("{rel}:{n}: {}", line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "the S3 request path awaits the config lock:\n{}",
+            offenders.join("\n")
+        );
+    }
+}

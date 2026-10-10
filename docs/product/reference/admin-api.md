@@ -316,6 +316,8 @@ These endpoints need no authentication, because load-balancer probes and Prometh
 
 `/_/ready` probes the backend with a bounded, retried `ListBuckets` so a brief provider latency spike doesn't flip readiness to a paging `503`: it reports not-ready only if every attempt fails. Tune it with `DGP_READY_TIMEOUT_SECS` (per attempt, default 3) and `DGP_READY_RETRIES` (extra attempts, default 2). Raise the timeout for a storage provider with a long tail latency. Raise the retries to ride out short blips.
 
+The config DB part of the probe takes the lock of the config DB. Every S3 write holds that lock for a moment, because it appends an event to the outbox, and replication, event delivery and the IAM sync hold it too. So the probe waits up to one second for the lock. A node whose lock is only busy stays ready, and only a lock that stays held for longer than that wait reports `config_db: "locked"` and `503 not_ready`.
+
 The response also carries `backends`, a map from each backend name to its live health (`healthy`, `unreachable`, `auth-rejected` or `erroring`). The proxy keeps this map current with the periodic health probe (`DGP_BACKEND_HEALTH_INTERVAL_SECS`) and with requests that find a backend unavailable. When every backend in the map is `unreachable` or `auth-rejected`, the node reports `503 not_ready`, because it cannot serve any bucket. When only some backends are down, the node stays ready: the other backends' buckets still work, and every node sees the same outage.
 
 Admin-session-protected (reveals per-bucket sizes; `401` without a live session, `403` for a browser-lift session):
