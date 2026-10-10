@@ -1323,8 +1323,12 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         &self,
         b: &str,
         p: &str,
+        start_after: Option<&str>,
+        max_listed: Option<usize>,
     ) -> Result<BulkListing, StorageError> {
-        self.inner.bulk_list_objects_with_baselines(b, p).await
+        self.inner
+            .bulk_list_objects_with_baselines(b, p, start_after, max_listed)
+            .await
     }
     async fn resolve_listed_sizes(
         &self,

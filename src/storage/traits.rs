@@ -1016,15 +1016,26 @@ pub trait StorageBackend: Send + Sync {
     /// baselines at no extra request, from the same prefix listing, so objects
     /// and baselines always follow the same prefix rule. The default lists no
     /// baselines; every production backend overrides it.
+    ///
+    /// `start_after` and `max_listed` page a long listing: list the keys
+    /// after `start_after`, and stop once `max_listed` keys are listed
+    /// (objects, baselines and folder markers all count; the S3 backend
+    /// sends no request past that number). The answer's `next_start_after`
+    /// is where the next page starts, `None` at the end of the prefix. A
+    /// backend that lists the whole prefix in one pass (filesystem) may
+    /// ignore both and answer everything, so a caller with a cap checks the
+    /// number of keys it got.
     fn bulk_list_objects_with_baselines(
         &self,
         bucket: &str,
         prefix: &str,
+        _start_after: Option<&str>,
+        _max_listed: Option<usize>,
     ) -> impl Future<Output = Result<BulkListing, StorageError>> + Send {
         async move {
             Ok(BulkListing {
                 objects: self.bulk_list_objects(bucket, prefix).await?,
-                baselines: Vec::new(),
+                ..Default::default()
             })
         }
     }
@@ -1138,6 +1149,9 @@ pub struct BulkListing {
     pub objects: Vec<(String, FileMetadata)>,
     /// `(stored key, stored size)` of every `reference.bin` in the listing.
     pub baselines: Vec<(String, u64)>,
+    /// The `start_after` of the next page when the listing stopped at
+    /// `max_listed` keys; `None` when it reached the end of the prefix.
+    pub next_start_after: Option<String>,
 }
 
 /// Result from [`StorageBackend::scan_deltaspace_lite`].

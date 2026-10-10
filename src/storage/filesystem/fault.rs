@@ -616,9 +616,11 @@ impl StorageBackend for FaultyFs {
         &self,
         bucket: &str,
         prefix: &str,
+        start_after: Option<&str>,
+        max_listed: Option<usize>,
     ) -> Result<BulkListing, StorageError> {
         self.inner
-            .bulk_list_objects_with_baselines(bucket, prefix)
+            .bulk_list_objects_with_baselines(bucket, prefix, start_after, max_listed)
             .await
     }
 

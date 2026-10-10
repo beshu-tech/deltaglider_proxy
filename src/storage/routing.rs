@@ -1338,8 +1338,17 @@ impl StorageBackend for RoutingBackend {
         &self,
         bucket: &str,
         prefix: &str,
+        start_after: Option<&str>,
+        max_listed: Option<usize>,
     ) -> Result<BulkListing, StorageError> {
-        route_existing!(self, bucket, bulk_list_objects_with_baselines, prefix)
+        route_existing!(
+            self,
+            bucket,
+            bulk_list_objects_with_baselines,
+            prefix,
+            start_after,
+            max_listed
+        )
     }
 
     async fn resolve_listed_sizes(

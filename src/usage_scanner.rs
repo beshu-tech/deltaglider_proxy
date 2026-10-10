@@ -52,8 +52,14 @@ const MAX_CACHE_ENTRIES: usize = 1000;
 
 /// Maximum number of objects to process in a single scan. If the prefix
 /// contains more objects than this, the result is truncated and marked
-/// accordingly to prevent OOM on large prefixes.
+/// accordingly. The listing itself stops one key past the cap, so the cap
+/// bounds the LIST requests and the memory of a scan, not only its result.
 const MAX_SCAN_OBJECTS: usize = 100_000;
+
+/// Usage scans that list at once, across every bucket and prefix. A
+/// "Compute size" click per folder (or the quota fallback) waits for a slot
+/// instead of starting one more recursive walk next to the others.
+const MAX_CONCURRENT_SCANS: usize = 2;
 
 /// Result of a prefix usage scan — sizes grouped by immediate child prefix.
 ///
@@ -191,6 +197,8 @@ pub struct UsageScanner {
     scanning: Arc<RwLock<HashSet<String>>>,
     /// `DGP_USAGE_CACHE_TTL_SECS`.
     ttl_secs: i64,
+    /// [`MAX_CONCURRENT_SCANS`] permits; a scan lists only while it holds one.
+    scan_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl Default for UsageScanner {
@@ -221,6 +229,7 @@ impl UsageScanner {
             cache: Arc::new(RwLock::new(HashMap::new())),
             scanning: Arc::new(RwLock::new(HashSet::new())),
             ttl_secs: cache_ttl_secs(),
+            scan_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SCANS)),
         }
     }
 
@@ -338,6 +347,10 @@ impl UsageScanner {
                 scanner: scanner.clone(),
                 key: key.clone(),
             };
+            // Queued scans stay "scanning" (deduplicated) while they wait.
+            let Ok(_slot) = scanner.scan_slots.clone().acquire_owned().await else {
+                return; // the semaphore is never closed
+            };
 
             let result = Self::do_scan(&s3_state, &bucket, &prefix).await;
             match result {
@@ -374,9 +387,10 @@ impl UsageScanner {
         true
     }
 
-    /// Perform the actual scan: list all objects under the prefix and group by
-    /// immediate child prefix. Limits processing to `MAX_SCAN_OBJECTS` to
-    /// prevent OOM on very large prefixes.
+    /// Perform the actual scan: list the objects under the prefix and group by
+    /// immediate child prefix. The listing stops one key past
+    /// `MAX_SCAN_OBJECTS` (requests and memory stay bounded), and the result
+    /// is then `truncated`.
     ///
     /// One lite listing of the prefix and nothing else: no request per
     /// object, no request per folder. The listing carries the baselines too.
@@ -388,24 +402,35 @@ impl UsageScanner {
         bucket: &str,
         prefix: &str,
     ) -> Result<UsageEntry, String> {
+        Self::do_scan_capped(s3_state, bucket, prefix, MAX_SCAN_OBJECTS).await
+    }
+
+    /// [`Self::do_scan`] with the object cap as a parameter (tests lower it).
+    async fn do_scan_capped(
+        s3_state: &AppState,
+        bucket: &str,
+        prefix: &str,
+        max_objects: usize,
+    ) -> Result<UsageEntry, String> {
         let engine = s3_state.engine.load();
+        // One key past the cap tells whether the prefix goes on.
         let listing = engine
             .storage()
-            .bulk_list_objects_with_baselines(bucket, prefix)
+            .bulk_list_objects_with_baselines(bucket, prefix, None, Some(max_objects + 1))
             .await
             .map_err(|e| format!("bulk_list_objects failed: {e}"))?;
         let mut objects = listing.objects;
 
-        let truncated = objects.len() > MAX_SCAN_OBJECTS;
+        let truncated = objects.len() > max_objects || listing.next_start_after.is_some();
         if truncated {
             warn!(
                 bucket = %bucket,
                 prefix = %prefix,
                 total = objects.len(),
-                limit = MAX_SCAN_OBJECTS,
+                limit = max_objects,
                 "Scan truncated: prefix contains more objects than MAX_SCAN_OBJECTS"
             );
-            objects.truncate(MAX_SCAN_OBJECTS);
+            objects.truncate(max_objects);
         }
         // Stored sizes as listed, before the cache swaps in logical sizes.
         let stored: Vec<u64> = objects.iter().map(|(_, m)| m.stored_size()).collect();
@@ -428,6 +453,83 @@ impl UsageScanner {
             truncated,
             sizes_estimated: totals.sizes_estimated,
         })
+    }
+}
+
+/// Request-count fixtures for the admin scans: an engine on a fake S3, and
+/// raw objects written straight into the fake (no proxy metadata, no
+/// listing facts, unknown to the listing-size cache).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::deltaglider::{DeltaGliderEngine, DynEngine};
+    use crate::storage::{DynStorageBackend, FakeS3};
+    use futures::StreamExt;
+    use std::sync::Arc;
+
+    /// An engine on a new fake S3 with bucket `b`, and the fake's endpoint.
+    pub(crate) async fn fake_s3_engine() -> (DynEngine, Arc<FakeS3>, String) {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let s3 = crate::storage::s3_test_support::for_test_endpoint(&endpoint);
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(s3);
+        let engine = DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &crate::config::Config::default(),
+            None,
+        );
+        engine.create_bucket("b").await.unwrap();
+        (engine, fake, endpoint)
+    }
+
+    /// PUT `b/<key>` straight into the fake, past the proxy write path.
+    pub(crate) async fn put_raw(endpoint: &str, key: &str, body: &[u8]) {
+        let status = reqwest::Client::new()
+            .put(format!("{endpoint}/b/{key}"))
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert!(status.is_success(), "raw PUT {key}: {status}");
+    }
+
+    /// [`put_raw`] for many keys, 32 at a time, each with a 10-byte body.
+    pub(crate) async fn put_raw_many(endpoint: &str, keys: impl IntoIterator<Item = String>) {
+        futures::stream::iter(keys)
+            .map(|key| async move { put_raw(endpoint, &key, b"0123456789").await })
+            .buffer_unordered(32)
+            .collect::<Vec<()>>()
+            .await;
+    }
+
+    /// The LIST requests outside the listing-facts namespace.
+    pub(crate) fn scope_lists(fake: &FakeS3) -> Vec<String> {
+        fake.requests()
+            .into_iter()
+            .filter(|r| {
+                r.starts_with("GET ")
+                    && r.contains("list-type=2")
+                    && !crate::storage::fake_s3::list_prefix(r).starts_with(".dg/")
+            })
+            .collect()
+    }
+
+    /// The LIST requests that read listing facts.
+    pub(crate) fn facts_lists(fake: &FakeS3) -> usize {
+        fake.requests()
+            .iter()
+            .filter(|r| {
+                r.contains("list-type=2")
+                    && crate::storage::fake_s3::list_prefix(r).starts_with(".dg/")
+            })
+            .count()
+    }
+
+    /// The object HEAD requests in bucket `b`.
+    pub(crate) fn heads(fake: &FakeS3) -> usize {
+        fake.requests()
+            .iter()
+            .filter(|r| r.starts_with("HEAD /b/"))
+            .count()
     }
 }
 
@@ -786,5 +888,58 @@ mod tests {
             !scanner.scanning.read().contains(&key),
             "ScanInProgressGuard must clear dedup key on panic unwind"
         );
+    }
+
+    use super::test_support::{fake_s3_engine, put_raw, put_raw_many, scope_lists};
+
+    /// Cockroach scan (limits #7): the cap applied after the whole prefix
+    /// was listed into memory, so it bounded neither requests nor memory.
+    #[tokio::test]
+    async fn the_usage_scan_stops_listing_at_its_cap() {
+        let (engine, fake, endpoint) = fake_s3_engine().await;
+        put_raw_many(&endpoint, (0..3000).map(|i| format!("p/k-{i:05}.bin"))).await;
+        let state = AppState::for_tests(engine);
+        fake.clear();
+        let entry = UsageScanner::do_scan_capped(&state, "b", "p/", 1000)
+            .await
+            .unwrap();
+        let lists = scope_lists(&fake);
+        assert!(
+            lists.len() <= 2,
+            "{} LIST requests for a cap of 1000 keys: {lists:?}",
+            lists.len()
+        );
+        assert!(entry.truncated);
+        assert_eq!(entry.total_objects, 1000);
+    }
+
+    /// Cockroach scan (ui.md G): every "Compute size" click started its own
+    /// recursive walk, with no bound across prefixes.
+    #[tokio::test]
+    async fn usage_scans_run_a_bounded_number_at_once() {
+        let (engine, fake, endpoint) = fake_s3_engine().await;
+        for d in 0..6 {
+            put_raw(&endpoint, &format!("d{d}/a.bin"), b"x").await;
+        }
+        fake.set_delay_ms("LIST", 200);
+        let state = AppState::for_tests(engine);
+        let scanner = Arc::new(UsageScanner::new());
+        for d in 0..6 {
+            assert!(scanner.enqueue_scan("b".into(), format!("d{d}/"), state.clone()));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while (0..6).any(|d| scanner.is_scanning("b", &format!("d{d}/"))) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the scans never ended"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            fake.peak_in_flight("LIST") <= 2,
+            "{} usage scans listed at once",
+            fake.peak_in_flight("LIST")
+        );
+        assert!((0..6).all(|d| scanner.get("b", &format!("d{d}/")).is_some()));
     }
 }

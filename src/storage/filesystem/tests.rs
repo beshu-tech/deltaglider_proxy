@@ -434,7 +434,7 @@ mod backend_tests {
                 .expect("put reference");
         }
         let listing = backend
-            .bulk_list_objects_with_baselines("bucket", "fw")
+            .bulk_list_objects_with_baselines("bucket", "fw", None, None)
             .await
             .expect("list");
         let mut keys: Vec<(String, u64)> = listing.baselines;

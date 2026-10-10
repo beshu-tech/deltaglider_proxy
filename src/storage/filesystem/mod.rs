@@ -1542,15 +1542,19 @@ impl StorageBackend for FilesystemBackend {
         prefix: &str,
     ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
         Ok(self
-            .bulk_list_objects_with_baselines(bucket, prefix)
+            .bulk_list_objects_with_baselines(bucket, prefix, None, None)
             .await?
             .objects)
     }
 
+    /// One local walk of the whole prefix: `start_after` and `max_listed`
+    /// are ignored (no request to bound), so the answer is complete.
     async fn bulk_list_objects_with_baselines(
         &self,
         bucket: &str,
         prefix: &str,
+        _start_after: Option<&str>,
+        _max_listed: Option<usize>,
     ) -> Result<BulkListing, StorageError> {
         let deltaspaces_dir = self.bucket_dir(bucket).join("deltaspaces");
         // An S3 prefix is a string, not a directory: `nightly/pg` must match
@@ -1588,6 +1592,7 @@ impl StorageBackend for FilesystemBackend {
         Ok(BulkListing {
             objects: results,
             baselines,
+            next_start_after: None,
         })
     }
 

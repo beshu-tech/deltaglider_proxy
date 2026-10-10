@@ -1324,17 +1324,68 @@ impl StorageBackend for S3Backend {
         prefix: &str,
     ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
         Ok(self
-            .bulk_list_objects_with_baselines(bucket, prefix)
+            .bulk_list_objects_with_baselines(bucket, prefix, None, None)
             .await?
             .objects)
     }
 
+    /// One LIST request per 1000 keys, and none past `max_listed` keys: the
+    /// last request asks only for the keys still allowed (`max-keys`), so a
+    /// capped scan reads neither more requests nor more memory than its cap.
+    /// The listing-facts namespace is skipped, and its keys do not count.
+    /// Each request continues after the last key of the previous one
+    /// (`start-after`), so a page boundary is a key a caller can resume at.
     async fn bulk_list_objects_with_baselines(
         &self,
         bucket: &str,
         prefix: &str,
+        start_after: Option<&str>,
+        max_listed: Option<usize>,
     ) -> Result<BulkListing, StorageError> {
-        let listed = self.list_objects_full(bucket, prefix).await?;
+        let mut listed: Vec<S3ListedObject> = Vec::new();
+        let mut after: Option<String> = start_after.map(str::to_string);
+        let mut next_start_after = None;
+        loop {
+            let mut request = self.client.list_objects_v2().bucket(bucket).prefix(prefix);
+            if let Some(max) = max_listed {
+                let room = max.saturating_sub(listed.len()).clamp(1, 1000);
+                request = request.max_keys(room as i32);
+            }
+            if let Some(after) = &after {
+                request = request.start_after(after);
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|e| self.classify(bucket, &e, S3Op::ListObjects))?;
+            let page_last = last_listed_key(response.contents.as_deref());
+            let truncated = response.is_truncated.unwrap_or(false);
+            listed.extend(
+                response
+                    .contents
+                    .into_iter()
+                    .flatten()
+                    .filter_map(S3ListedObject::from_s3_object),
+            );
+            if !truncated {
+                break;
+            }
+            // A truncated page names the key to continue after; without one
+            // the loop would read the same page for ever.
+            let last = page_last.ok_or_else(|| {
+                StorageError::S3(format!(
+                    "LIST of {bucket}/{prefix} is truncated but returned no key"
+                ))
+            })?;
+            let resume = listing_facts::skip_past_facts(&last)
+                .map(str::to_string)
+                .unwrap_or(last);
+            after = Some(resume);
+            if max_listed.is_some_and(|max| listed.len() >= max) {
+                next_start_after = after;
+                break;
+            }
+        }
         let listing = Self::classify_listed_objects(listed);
 
         // Build FileMetadata from LIST data only — no HEAD calls. A delta
@@ -1355,6 +1406,7 @@ impl StorageBackend for S3Backend {
         Ok(BulkListing {
             objects,
             baselines: listing.baselines,
+            next_start_after,
         })
     }
 
