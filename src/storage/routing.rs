@@ -97,10 +97,19 @@ pub struct RoutingBackend {
     /// when the bucket is created; an error must re-probe). Cleared on
     /// create/delete bucket; a peer's change is seen within RESOLVE_TTL.
     resolved: parking_lot::Mutex<HashMap<String, (String, std::time::Instant)>>,
+    /// Unrouted bucket → when every backend answered "absent" (it routes to
+    /// the default backend). Kept for `MISS_TTL`, so a request for a bucket
+    /// that no backend holds does not send a HeadBucket to each backend
+    /// every time. Cleared on create/delete bucket.
+    missed: parking_lot::Mutex<HashMap<String, std::time::Instant>>,
 }
 
 /// How long a found unrouted bucket stays resolved without a new probe.
 const RESOLVE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long an unrouted bucket that no backend holds stays a miss. Short:
+/// a bucket that a peer creates on a non-default backend is seen this late.
+const MISS_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl RoutingBackend {
     /// Create a new routing backend.
@@ -187,6 +196,7 @@ impl RoutingBackend {
             list_timeout,
             list_fresh,
             resolved: Default::default(),
+            missed: Default::default(),
         })
     }
 
@@ -404,6 +414,27 @@ impl RoutingBackend {
             .map(|(name, _)| name.clone())
     }
 
+    /// Did every backend answer "absent" for this bucket less than
+    /// `MISS_TTL` ago?
+    fn cached_miss(&self, virtual_bucket: &str) -> bool {
+        self.missed
+            .lock()
+            .get(virtual_bucket)
+            .is_some_and(|at| at.elapsed() < MISS_TTL)
+    }
+
+    fn remember_miss(&self, virtual_bucket: &str) {
+        let mut map = self.missed.lock();
+        // Bound the map: a bucket-name scan must not grow it without limit.
+        if map.len() >= 10_000 {
+            map.retain(|_, at| at.elapsed() < MISS_TTL);
+            if map.len() >= 10_000 {
+                map.clear();
+            }
+        }
+        map.insert(virtual_bucket.to_string(), std::time::Instant::now());
+    }
+
     fn remember_resolution(&self, virtual_bucket: &str, backend_name: &str) {
         let mut map = self.resolved.lock();
         // Bound the map: a bucket-name scan must not grow it without limit.
@@ -418,6 +449,7 @@ impl RoutingBackend {
 
     fn invalidate_listing_freshness(&self) {
         self.resolved.lock().clear();
+        self.missed.lock().clear();
         let mut h = self.health.lock();
         h.freshness_epoch = h.freshness_epoch.wrapping_add(1);
         for entry in h.last_known.values_mut() {
@@ -471,6 +503,13 @@ impl RoutingBackend {
         if let Some(name) = self.cached_resolution(virtual_bucket) {
             let backend = self.backends[&name].as_ref().as_ref();
             return (name, backend, Cow::Borrowed(virtual_bucket));
+        }
+        if self.cached_miss(virtual_bucket) {
+            return (
+                self.default_backend.clone(),
+                self.default_backend(),
+                Cow::Borrowed(virtual_bucket),
+            );
         }
         // A head_bucket ERROR (503/timeout) is NOT "bucket absent" — same
         // hazard as `resolve_existing`: collapsing the error to `false` with
@@ -550,11 +589,38 @@ impl RoutingBackend {
                 Ok(false) => {}
             }
         }
+        // Every backend answered "absent": remember it briefly.
+        self.remember_miss(virtual_bucket);
         (
             self.default_backend.clone(),
             default,
             Cow::Borrowed(virtual_bucket),
         )
+    }
+
+    /// A backend whose listing failed, or that is in failure cooldown, keeps
+    /// its last known roster in the bucket list: one slow ListBuckets must
+    /// not drop its buckets from every client's list for the cooldown (or,
+    /// with one backend, fail every ListBuckets). A backend with no roster
+    /// yet stays an error.
+    fn with_last_known_rosters(&self, results: Vec<BackendListing>) -> Vec<BackendListing> {
+        let h = self.health.lock();
+        results
+            .into_iter()
+            .map(|(name, res)| match res {
+                Err(e) => match h.last_known.get(&name) {
+                    Some((_, roster)) => {
+                        tracing::warn!(
+                            "Listing buckets from backend '{name}' failed ({e}); serving its \
+                             last known bucket list"
+                        );
+                        (name, Ok(roster.clone()))
+                    }
+                    None => (name, Err(e)),
+                },
+                ok => (name, ok),
+            })
+            .collect()
     }
 }
 
@@ -587,7 +653,7 @@ impl StorageBackend for RoutingBackend {
     async fn list_buckets(&self) -> Result<Vec<String>, StorageError> {
         // Parallel fan-out; a failing backend is logged but doesn't drop the
         // reachable ones. Total failure → Err (see `total_failure_error`).
-        let results = self.gather_listings().await;
+        let results = self.with_last_known_rosters(self.gather_listings().await);
         if let Some(e) = Self::total_failure_error(&results) {
             return Err(e);
         }
@@ -620,7 +686,7 @@ impl StorageBackend for RoutingBackend {
     async fn list_buckets_with_dates(
         &self,
     ) -> Result<Vec<(String, chrono::DateTime<chrono::Utc>)>, StorageError> {
-        let results = self.gather_listings().await;
+        let results = self.with_last_known_rosters(self.gather_listings().await);
         if let Some(e) = Self::total_failure_error(&results) {
             return Err(e);
         }
@@ -1749,6 +1815,7 @@ mod tests {
             list_timeout: std::time::Duration::from_secs(5),
             list_fresh: std::time::Duration::ZERO,
             resolved: Default::default(),
+            missed: Default::default(),
         };
 
         assert_eq!(
@@ -1904,10 +1971,14 @@ mod tests {
         let (name, _, _) = routing.resolve_existing_named("shared").await;
         assert_eq!(name, "primary", "deleted bucket falls back to default");
         assert!(heads() > before, "delete_bucket must invalidate");
-        // A miss is not cached either.
+        // A miss is cached only briefly.
         let before = heads();
         routing.resolve_existing_named("shared").await;
-        assert!(heads() > before);
+        assert_eq!(heads(), before, "a miss is cached for MISS_TTL");
+        *routing.missed.lock().get_mut("shared").unwrap() =
+            std::time::Instant::now() - MISS_TTL - std::time::Duration::from_secs(1);
+        routing.resolve_existing_named("shared").await;
+        assert!(heads() > before, "an old miss is probed again");
     }
 
     /// Regression: a transient head_bucket error on the bucket's real home must
@@ -2282,6 +2353,93 @@ mod tests {
         // (no unavailable placeholder here because 'dead' has no routes/roster;
         //  the reachable bucket is still returned — the point is zero re-probe.)
         assert!(origins.iter().any(|b| b.name == "alive"));
+    }
+
+    /// One slow ListBuckets (past `DGP_BACKEND_LIST_TIMEOUT_SECS`) put the
+    /// backend in cooldown, and every S3 ListBuckets dropped its buckets
+    /// for the cooldown, with a 200: `aws s3 ls`, rclone and the UI showed
+    /// a partial bucket list. With one backend, ListBuckets failed.
+    #[tokio::test]
+    async fn a_cooling_backend_keeps_its_last_known_buckets() {
+        let flaky = TestBackend::with_buckets(&["data"]);
+        let flip = flaky.fail_list.clone();
+        let mut backends = HashMap::new();
+        backends.insert(
+            "up".to_string(),
+            Arc::new(DynStorageBackend::new_box(TestBackend::with_buckets(&[
+                "alive",
+            ]))),
+        );
+        backends.insert(
+            "flaky".to_string(),
+            Arc::new(DynStorageBackend::new_box(flaky)),
+        );
+        let routing = routing_with_cooldown(backends, "up", std::time::Duration::from_secs(300));
+        routing.list_buckets().await.expect("seed the roster");
+        *flip.lock().unwrap() = true;
+        for _ in 0..2 {
+            // The failing listing, then one in cooldown.
+            let names = routing.list_buckets().await.expect("ok");
+            assert_eq!(names, vec!["alive".to_string(), "data".to_string()]);
+            let dated: Vec<String> = routing
+                .list_buckets_with_dates()
+                .await
+                .expect("ok")
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect();
+            assert_eq!(dated, vec!["alive".to_string(), "data".to_string()]);
+        }
+
+        // One backend: its last known roster, not an error.
+        let only = TestBackend::with_buckets(&["data"]);
+        let flip = only.fail_list.clone();
+        let mut backends = HashMap::new();
+        backends.insert(
+            "only".to_string(),
+            Arc::new(DynStorageBackend::new_box(only)),
+        );
+        let routing = routing_with_cooldown(backends, "only", std::time::Duration::from_secs(300));
+        routing.list_buckets().await.expect("seed the roster");
+        *flip.lock().unwrap() = true;
+        assert_eq!(
+            routing.list_buckets().await.expect("last known roster"),
+            vec!["data".to_string()]
+        );
+    }
+
+    /// An unrouted bucket that no backend holds sent a HeadBucket to each
+    /// backend in turn on every request (B sequential HEADs per request,
+    /// plus the HEAD the request itself sends).
+    #[tokio::test]
+    async fn a_bucket_miss_is_cached_briefly() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let primary = TestBackend::with_buckets(&[]);
+        let archive = TestBackend::with_buckets(&[]);
+        let heads = {
+            let (p, a) = (primary.head_calls.clone(), archive.head_calls.clone());
+            move || p.load(SeqCst) + a.load(SeqCst)
+        };
+        let mut backends = HashMap::new();
+        backends.insert(
+            "primary".to_string(),
+            Arc::new(DynStorageBackend::new_box(primary)),
+        );
+        backends.insert(
+            "archive".to_string(),
+            Arc::new(DynStorageBackend::new_box(archive.clone())),
+        );
+        let routing = RoutingBackend::new(backends, HashMap::new(), "primary".to_string())
+            .expect("routing backend");
+        for _ in 0..5 {
+            assert_eq!(routing.resolve_existing_named("ghost").await.0, "primary");
+        }
+        assert_eq!(heads(), 2, "a miss must not be probed again at once");
+
+        // A bucket created through the proxy is seen at once.
+        archive.buckets.lock().unwrap().insert("ghost".into());
+        routing.invalidate_listing_freshness();
+        assert_eq!(routing.resolve_existing_named("ghost").await.0, "archive");
     }
 
     #[tokio::test]

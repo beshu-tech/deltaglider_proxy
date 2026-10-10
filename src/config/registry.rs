@@ -198,7 +198,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     EnvVarEntry {
         name: "DGP_BACKEND_LIST_COOLDOWN_SECS",
         description: "How long a backend that fails a bucket listing is skipped \
-                      (served from last-known-good) before the next re-probe",
+                      (its last known buckets are still listed) before the next re-probe",
         example: "30",
         category: "Storage",
     },
