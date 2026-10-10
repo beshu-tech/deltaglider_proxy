@@ -99,7 +99,48 @@ pub(crate) fn backend_request_timeout() -> Option<std::time::Duration> {
     }
 }
 
+/// The slowest body rate that an upload's deadline allows for.
+const UPLOAD_FLOOR_BYTES_PER_SEC: u64 = 1024 * 1024;
+
+/// Pure: the whole-operation deadline (all SDK attempts included) of an
+/// upload of `bytes`: the request deadline `base`, plus one second per MiB
+/// of body (`UPLOAD_FLOOR_BYTES_PER_SEC`). `None` (the request deadline is
+/// off) leaves uploads without one.
+pub(super) fn upload_deadline(
+    base: Option<std::time::Duration>,
+    bytes: u64,
+) -> Option<std::time::Duration> {
+    base.map(|b| {
+        b.saturating_add(std::time::Duration::from_secs(
+            bytes.div_ceil(UPLOAD_FLOOR_BYTES_PER_SEC),
+        ))
+    })
+}
+
+/// A retry partition of its own for one backend definition. The SDK's
+/// default partition is process-wide per region (`s3-<region>`): its retry
+/// token bucket and its adaptive rate limiter were shared by every backend
+/// in the region, so SlowDowns from one backend slowed the others and
+/// emptied their retry quota. A custom partition owns its token bucket and
+/// rate limiter; the two clients of one backend share it (a clone). Named
+/// by a hash of the definition (the definition holds the secret).
+pub(super) fn backend_retry_partition(
+    config: &BackendConfig,
+) -> aws_sdk_s3::config::retry::RetryPartition {
+    use sha2::Digest;
+    let fp = crate::coordination::capability::fingerprint(config);
+    let hash = hex::encode(sha2::Sha256::digest(fp.as_bytes()));
+    aws_sdk_s3::config::retry::RetryPartition::custom(format!("dgp-backend-{}", &hash[..12]))
+        .build()
+}
+
 impl S3Backend {
+    /// `DGP_BACKEND_REQUEST_TIMEOUT_SECS` as a duration; `None` when off.
+    /// The deadline of one backend request without a large body.
+    pub fn request_timeout() -> Option<std::time::Duration> {
+        backend_request_timeout()
+    }
+
     /// Build an S3 client from a BackendConfig without creating an S3Backend.
     /// Useful for one-off operations like testing connectivity.
     pub async fn build_client(config: &BackendConfig) -> Result<Client, StorageError> {
@@ -111,6 +152,15 @@ impl S3Backend {
     pub(super) async fn build_client_with(
         config: &BackendConfig,
         operation_timeout: Option<std::time::Duration>,
+    ) -> Result<Client, StorageError> {
+        Self::build_client_in(config, operation_timeout, backend_retry_partition(config)).await
+    }
+
+    /// [`Self::build_client_with`] in the retry partition `partition`.
+    pub(super) async fn build_client_in(
+        config: &BackendConfig,
+        operation_timeout: Option<std::time::Duration>,
+        partition: aws_sdk_s3::config::retry::RetryPartition,
     ) -> Result<Client, StorageError> {
         let (
             endpoint,
@@ -196,11 +246,15 @@ impl S3Backend {
             .credentials_provider(credentials)
             .force_path_style(force_path_style)
             .timeout_config(timeout_config)
-            // Adaptive retry = the SDK's client-wide rate limiter: a 503
-            // SlowDown from the backend throttles EVERY subsequent request on
-            // this client (HEAD bursts, listings, replication reads) instead
-            // of each call site independently hammering a struggling backend.
+            // Adaptive retry = the SDK's rate limiter: a 503 SlowDown from
+            // the backend throttles every later request in the partition
+            // (HEAD bursts, listings, replication reads) instead of each
+            // call site hammering a struggling backend. THE retry layer for
+            // throttles, 5xx and timeouts: the application loops retry only
+            // what the SDK does not (`objects::is_unidentified_400`). The
+            // partition is this backend's own (`backend_retry_partition`).
             .retry_config(aws_sdk_s3::config::retry::RetryConfig::adaptive())
+            .retry_partition(partition)
             .stalled_stream_protection(stalled_stream_protection)
             .request_checksum_calculation(
                 aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,

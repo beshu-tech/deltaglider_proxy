@@ -24,7 +24,43 @@ pub(super) fn encode_copy_source_key(key: &str) -> String {
         .join("/")
 }
 
+/// Waits before the retries of a Hetzner 400 ([`is_unidentified_400`]).
+pub(super) const UNIDENTIFIED_400_BACKOFF_MS: [u64; 3] = [100, 200, 400];
+
+/// Pure: a 400 with no `x-amz-request-id`. Hetzner answers about 1-2 % of
+/// requests with it (and `connection: close`), and a retry clears it. A 400
+/// that carries a request id is the backend's answer to the request
+/// (EntityTooLarge, InvalidArgument): a retry gets it again. The SDK
+/// retries no 400, so the upload loops retry this one; every other error
+/// (throttle, 5xx, timeout, a broken connection) has the SDK's retries
+/// only, never a second loop on top (4 × 3 PUTs per write before).
+pub(super) fn is_unidentified_400<E>(e: &SdkError<E>) -> bool {
+    matches!(e, SdkError::ServiceError(svc)
+        if svc.raw().status().as_u16() == 400
+            && svc.raw().headers().get("x-amz-request-id").is_none())
+}
+
 impl S3Backend {
+    /// The per-request config of an upload of `bytes`: an operation
+    /// deadline sized for the body ([`upload_deadline`] over the request
+    /// deadline of `client`). The upload client has no deadline of its own,
+    /// so a stalled backend held a PUT for minutes. `None` when the request
+    /// deadline is off.
+    pub(super) fn upload_config(&self, bytes: u64) -> Option<aws_sdk_s3::config::Builder> {
+        let base = self
+            .client
+            .config()
+            .timeout_config()
+            .and_then(|t| t.operation_timeout());
+        super::client::upload_deadline(base, bytes).map(|t| {
+            aws_sdk_s3::config::Builder::new().timeout_config(
+                aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                    .operation_timeout(t)
+                    .build(),
+            )
+        })
+    }
+
     /// Rewrite an object's metadata WITHOUT moving its bytes: a server-side
     /// self-copy with `MetadataDirective: REPLACE`. Shared by
     /// `put_reference_metadata` and `put_object_metadata`.
@@ -215,9 +251,9 @@ impl S3Backend {
         }
     }
 
-    /// Put an object to S3 with metadata headers.
-    /// Retries on transient errors (400 BadRequest from Hetzner, 503 SlowDown)
-    /// with exponential backoff. Data is already fully buffered — retry is safe.
+    /// Put an object to S3 with metadata headers. The SDK retries throttles,
+    /// 5xx and timeouts; the Hetzner 400 is retried here
+    /// ([`is_unidentified_400`]). Data is already fully buffered — retry is safe.
     pub(super) async fn put_object_with_metadata(
         &self,
         bucket: &str,
@@ -254,9 +290,8 @@ impl S3Backend {
 
         check_metadata_size(&headers, bucket, key)?;
 
-        let backoff_ms = [100, 200, 400];
-
-        for attempt in 0..=backoff_ms.len() {
+        let mut backoff = UNIDENTIFIED_400_BACKOFF_MS.iter();
+        for attempt in 0.. {
             let mut request = self
                 .bulk_client
                 .put_object()
@@ -270,8 +305,12 @@ impl S3Backend {
             }
             request = apply_native_encryption(request, &self.native_encryption);
             request = apply_put_fence(request, &fence);
+            let sent = match self.upload_config(data.len() as u64) {
+                Some(c) => request.customize().config_override(c).send().await,
+                None => request.send().await,
+            };
 
-            match request.send().await {
+            match sent {
                 Ok(resp) => {
                     self.remember_listed_facts(
                         bucket,
@@ -319,44 +358,28 @@ impl S3Backend {
                             self.persist_listing_facts(bucket, key, &etag, stored, metadata);
                             return Ok(Some(etag));
                         }
-                        // Retry at once without the condition (the last
-                        // attempt reports the 501 instead of falling out of
-                        // the loop).
-                        FencedWriteVerdict::Unsupported if attempt < backoff_ms.len() => {
+                        // Retry at once without the condition. Unfenced,
+                        // the write cannot get this verdict again.
+                        FencedWriteVerdict::Unsupported => {
                             warn!("S3 PUT {bucket}/{key}: the backend has no conditional writes (501); writing without the fence");
                             fence = RefFence::Unfenced;
                             continue;
                         }
-                        FencedWriteVerdict::Unsupported => {}
                         FencedWriteVerdict::Other => {}
                     }
-                    let is_retryable = if let SdkError::ServiceError(ref svc) = e {
-                        let status = svc.raw().status().as_u16();
-                        // Hetzner returns transient 400s with connection:close and no
-                        // request-id (~1-2% of requests). 503 is standard SlowDown.
-                        status == 400 || status == 503
-                    } else {
-                        // Network/dispatch errors are retryable
-                        matches!(e, SdkError::DispatchFailure(_) | SdkError::TimeoutError(_))
-                    };
-
-                    if is_retryable && attempt < backoff_ms.len() {
+                    if let Some(ms) = is_unidentified_400(&e).then(|| backoff.next()).flatten() {
                         warn!(
-                            "S3 PUT {}/{} ({} bytes) failed (attempt {}), retrying in {}ms: {:?}",
+                            "S3 PUT {}/{} ({} bytes): a 400 without a request id (attempt {}), retrying in {}ms: {:?}",
                             bucket,
                             key,
                             data.len(),
                             attempt + 1,
-                            backoff_ms[attempt],
+                            ms,
                             e,
                         );
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            backoff_ms[attempt] as u64,
-                        ))
-                        .await;
+                        tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
                         continue;
                     }
-
                     return Err(self.classify(bucket, &e, S3Op::PutObject));
                 }
             }
@@ -435,8 +458,8 @@ impl S3Backend {
 
         // The stored size for the listing-size cache: what this PUT sends.
         let stored_size = tokio::fs::metadata(source_path).await.ok().map(|m| m.len());
-        let backoff_ms = [100, 200, 400];
-        for attempt in 0..=backoff_ms.len() {
+        let mut backoff = UNIDENTIFIED_400_BACKOFF_MS.iter();
+        loop {
             let body = ByteStream::from_path(source_path.to_path_buf())
                 .await
                 .map_err(|e| {
@@ -454,8 +477,12 @@ impl S3Backend {
             }
             request = apply_native_encryption(request, &self.native_encryption);
             request = apply_put_fence(request, &fence);
+            let sent = match self.upload_config(stored_size.unwrap_or(0)) {
+                Some(c) => request.customize().config_override(c).send().await,
+                None => request.send().await,
+            };
 
-            match request.send().await {
+            match sent {
                 Ok(resp) => {
                     if let Some(size) = stored_size {
                         self.remember_listed_facts(
@@ -491,35 +518,26 @@ impl S3Backend {
                             }
                             return Ok(Some(etag));
                         }
-                        // Retry at once without the condition (the last
-                        // attempt reports the 501 instead of falling out of
-                        // the loop).
-                        FencedWriteVerdict::Unsupported if attempt < backoff_ms.len() => {
+                        // Retry at once without the condition. Unfenced,
+                        // the write cannot get this verdict again.
+                        FencedWriteVerdict::Unsupported => {
                             warn!("S3 PUT {bucket}/{key}: the backend has no conditional writes (501); writing without the fence");
                             fence = RefFence::Unfenced;
                             continue;
                         }
-                        FencedWriteVerdict::Unsupported => {}
                         FencedWriteVerdict::Other => {}
                     }
-                    let is_retryable = if let SdkError::ServiceError(ref svc) = e {
-                        let status = svc.raw().status().as_u16();
-                        status == 400 || status == 503
-                    } else {
-                        matches!(e, SdkError::DispatchFailure(_) | SdkError::TimeoutError(_))
-                    };
-                    if is_retryable && attempt < backoff_ms.len() {
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            backoff_ms[attempt] as u64,
-                        ))
-                        .await;
+                    if let Some(ms) = is_unidentified_400(&e).then(|| backoff.next()).flatten() {
+                        warn!(
+                            "S3 PUT {bucket}/{key}: a 400 without a request id, retrying in {ms}ms: {e:?}"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
                         continue;
                     }
                     return Err(self.classify(bucket, &e, S3Op::PutObject));
                 }
             }
         }
-        unreachable!("retry loop must return on every path")
     }
 
     /// Get an object from S3
@@ -699,5 +717,194 @@ pub(super) fn fence_from_head_etag(etag: Option<&str>, bucket: &str, key: &str) 
             warn!("HEAD {bucket}/{key} returned no ETag: reference writes are unfenced");
             RefFence::Unfenced
         }
+    }
+}
+
+#[cfg(test)]
+mod one_retry_layer_tests {
+    //! One retry layer per error: the SDK retries throttles, 5xx and
+    //! timeouts; the application loop retries only the Hetzner 400.
+
+    use super::*;
+    use crate::storage::DynStorageBackend;
+
+    fn s3_config(endpoint: &str) -> BackendConfig {
+        BackendConfig::S3 {
+            endpoint: Some(endpoint.to_string()),
+            region: "us-east-1".into(),
+            force_path_style: true,
+            access_key_id: Some("k".into()),
+            secret_access_key: Some("s".into()),
+            allow_local: true,
+            session_token: None,
+        }
+    }
+
+    fn meta() -> FileMetadata {
+        FileMetadata::new_passthrough("k".into(), "0".repeat(64), "0".repeat(32), 1, None)
+    }
+
+    fn puts(fake: &crate::storage::FakeS3, prefix: &str) -> usize {
+        fake.requests()
+            .iter()
+            .filter(|r| r.starts_with(&format!("PUT {prefix}")))
+            .count()
+    }
+
+    /// Prod: a backend that answers 503 SlowDown got up to 4 application
+    /// attempts of 3 SDK attempts each: 12 PUTs, each sending the body
+    /// again, to a backend that asked to slow down.
+    #[tokio::test]
+    async fn a_put_the_backend_throttles_is_sent_at_most_three_times() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let s3 = S3Backend::new(&s3_config(&endpoint), NativeEncryptionConfig::None)
+            .await
+            .unwrap();
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(s3);
+        let engine = crate::deltaglider::DeltaGliderEngine::new_with_backend(
+            std::sync::Arc::new(backend),
+            &crate::config::Config::default(),
+            None,
+        );
+        engine.create_bucket("b").await.unwrap();
+        fake.fail("PUT", "b/", 503, "SlowDown", u32::MAX);
+        fake.clear();
+        let stored = engine
+            .store("b", "photo.jpg", b"x", None, Default::default())
+            .await;
+        assert!(stored.is_err());
+        let sent = puts(&fake, "/b/");
+        assert!(sent <= 3, "{sent} PUTs for one store");
+    }
+
+    /// A 400 that carries a request id is the backend's answer to this
+    /// request (EntityTooLarge, InvalidArgument): sending it again gives
+    /// the same 400. It was sent 4 times.
+    #[tokio::test]
+    async fn a_deterministic_400_is_not_sent_again() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = hits.clone();
+        let app = axum::Router::new().fallback(move || {
+            let counted = counted.clone();
+            async move {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    [("x-amz-request-id", "R1")],
+                    "<Error><Code>EntityTooLarge</Code><Message>too large</Message></Error>",
+                )
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let s3 = super::super::test_support::for_test_endpoint(&endpoint);
+        let meta = meta();
+        let res = s3.put_object_with_metadata("b", "k", b"x", &meta).await;
+        assert!(res.is_err());
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// The Hetzner 400 (no request id, `connection: close`, about 1 % of
+    /// requests) clears on a retry: it is still retried.
+    #[tokio::test]
+    async fn a_400_without_a_request_id_is_retried() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let s3 = super::super::test_support::for_test_endpoint(&endpoint);
+        fake.fail("PUT", "b/k", 400, "BadRequest", 1);
+        let meta = meta();
+        s3.put_object_with_metadata("b", "k", b"x", &meta)
+            .await
+            .expect("the retry succeeds");
+        assert_eq!(puts(&fake, "/b/k"), 2);
+    }
+
+    /// Source guard: an application retry in the S3 backend retries only
+    /// the Hetzner 400 ([`is_unidentified_400`]). Every other error has the
+    /// SDK's retries only; a loop on top of them multiplied the requests
+    /// to a backend that asked to slow down (4 x 3 PUTs per write). Every
+    /// retry wait must follow an `is_unidentified_400` check (within 15 lines). The body
+    /// resume (`body.rs`) re-reads a broken GET body and is no retry of a
+    /// request.
+    #[test]
+    fn s3_backend_retries_only_the_unidentified_400() {
+        let mut offenders = Vec::new();
+        for (rel, text) in crate::source_scan::prod_sources("src/storage/s3") {
+            if rel.ends_with("/body.rs") || rel.ends_with("/tests.rs") {
+                continue;
+            }
+            let lines = crate::source_scan::prod_lines(&text);
+            for (i, (n, line)) in lines.iter().enumerate() {
+                if !line.contains("time::sleep(") {
+                    continue;
+                }
+                let gated = lines[i.saturating_sub(15)..i]
+                    .iter()
+                    .any(|(_, l)| l.contains("is_unidentified_400("));
+                if !gated {
+                    offenders.push(format!("{rel}:{n}: {}", line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "an application retry on top of the SDK's retries:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// Each backend has its own SDK retry partition, shared by its two
+    /// clients: the token bucket and the adaptive rate limiter were
+    /// process-wide per region, so SlowDowns from one backend slowed every
+    /// other backend in the same region.
+    #[tokio::test]
+    async fn each_backend_has_its_own_retry_partition() {
+        let a = S3Backend::new(
+            &s3_config("http://127.0.0.1:1"),
+            NativeEncryptionConfig::None,
+        )
+        .await
+        .unwrap();
+        let b = S3Backend::new(
+            &s3_config("http://127.0.0.2:1"),
+            NativeEncryptionConfig::None,
+        )
+        .await
+        .unwrap();
+        let name = |c: &Client| c.config().retry_partition().map(|p| p.to_string());
+        let pa = name(&a.client);
+        assert!(
+            pa.as_deref().is_some_and(|n| n.starts_with("dgp-backend-")),
+            "{pa:?}"
+        );
+        assert_eq!(pa, name(&a.bulk_client), "one partition per backend");
+        assert_ne!(pa, name(&b.client), "backends share a partition");
+    }
+
+    /// The upload client had no operation deadline: a tiny `.sha512` PUT
+    /// to a stalled backend answered after 196 s (a 504 from Hetzner), and
+    /// the CI upload failed. An upload now has the request deadline plus
+    /// time for its body.
+    #[tokio::test]
+    async fn an_upload_has_a_deadline_sized_for_its_body() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        fake.set_put_delay_ms(5_000);
+        let config = s3_config(&endpoint);
+        let mut s3 = S3Backend::new(&config, NativeEncryptionConfig::None)
+            .await
+            .unwrap();
+        // The request deadline (`DGP_BACKEND_REQUEST_TIMEOUT_SECS`) at 1 s.
+        s3.client = S3Backend::build_client_with(&config, Some(std::time::Duration::from_secs(1)))
+            .await
+            .unwrap();
+        let meta = meta();
+        let started = std::time::Instant::now();
+        let res = s3.put_object_with_metadata("b", "k", b"x", &meta).await;
+        assert!(matches!(res, Err(StorageError::Unavailable(_))), "{res:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "a 1-byte PUT ran {:?}",
+            started.elapsed()
+        );
     }
 }

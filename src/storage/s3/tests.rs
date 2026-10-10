@@ -1729,7 +1729,13 @@ mod lost_response_tests {
     #[tokio::test]
     async fn a_fenced_put_whose_response_was_lost_is_not_a_lost_fence() {
         let (ep, fake) = fake_s3().await;
-        let s3 = backend(&ep);
+        // The SDK retries the timed-out attempt (the one retry layer).
+        let s3 = backend_with(
+            &ep,
+            aws_sdk_s3::config::retry::RetryConfig::standard()
+                .with_max_attempts(3)
+                .with_initial_backoff(std::time::Duration::from_millis(1)),
+        );
         let data = b"the baseline".to_vec();
         let got = s3
             .write_reference_fenced(

@@ -183,7 +183,9 @@ pub struct S3Backend {
     client: Client,
     /// Client for uploads and server-side copies (PutObject, UploadPart,
     /// CopyObject, CompleteMultipartUpload): their duration grows with the
-    /// object size, so only the per-attempt and read timeouts apply.
+    /// object size, so the client has only the per-attempt and read
+    /// timeouts. A PutObject or UploadPart gets a deadline sized for its
+    /// body per request ([`S3Backend::upload_config`]).
     bulk_client: Client,
     /// `(backend name, definition fingerprint)` for the passive health signal
     /// (`coordination::health::note_unavailable`). `None` for a backend that
@@ -208,8 +210,11 @@ impl S3Backend {
         config: &BackendConfig,
         native_encryption: NativeEncryptionConfig,
     ) -> Result<Self, StorageError> {
-        let client = Self::build_client_with(config, backend_request_timeout()).await?;
-        let bulk_client = Self::build_client(config).await?;
+        // One retry partition for both clients of this backend.
+        let partition = client::backend_retry_partition(config);
+        let client =
+            Self::build_client_in(config, backend_request_timeout(), partition.clone()).await?;
+        let bulk_client = Self::build_client_in(config, None, partition).await?;
         debug!(
             "S3Backend initialized (multi-bucket mode, native encryption: {:?})",
             native_encryption
@@ -993,45 +998,40 @@ impl StorageBackend for S3Backend {
         data: Bytes,
     ) -> Result<UploadedPart, StorageError> {
         let key = self.passthrough_key(prefix, filename);
-        let backoff_ms = [100u64, 200, 400];
-        for attempt in 0..=backoff_ms.len() {
-            let body = ByteStream::from(data.clone());
-            let result = self
+        // The SDK retries throttles, 5xx and timeouts; this loop only the
+        // Hetzner 400 (see `is_unidentified_400`).
+        let mut backoff = UNIDENTIFIED_400_BACKOFF_MS.iter();
+        loop {
+            let request = self
                 .bulk_client
                 .upload_part()
                 .bucket(&upload.bucket)
                 .key(&key)
                 .upload_id(&upload.upload_id)
                 .part_number(part_number)
-                .body(body)
-                .send()
-                .await;
+                .body(ByteStream::from(data.clone()));
+            let result = match self.upload_config(data.len() as u64) {
+                Some(c) => request.customize().config_override(c).send().await,
+                None => request.send().await,
+            };
             match result {
                 Ok(resp) => {
                     let etag = resp.e_tag().unwrap_or_default().to_string();
                     return Ok(UploadedPart { part_number, etag });
                 }
                 Err(e) => {
-                    let is_retryable = if let SdkError::ServiceError(ref svc) = e {
-                        let status = svc.raw().status().as_u16();
-                        status == 400 || status == 500 || status == 503
-                    } else {
-                        matches!(e, SdkError::DispatchFailure(_) | SdkError::TimeoutError(_))
-                    };
-                    if is_retryable && attempt < backoff_ms.len() {
+                    if let Some(ms) = is_unidentified_400(&e).then(|| backoff.next()).flatten() {
                         warn!(
-                            "S3 upload_part {}/{} part {} failed (attempt {}), retrying in {}ms: {:?}",
-                            upload.bucket, key, part_number, attempt + 1, backoff_ms[attempt], e
+                            "S3 upload_part {}/{} part {}: a 400 without a request id, retrying in {ms}ms: {e:?}",
+                            upload.bucket, key, part_number
                         );
-                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms[attempt]))
-                            .await;
+                        tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
                         continue;
                     }
                     return Err(self.classify(&upload.bucket, &e, S3Op::UploadPart));
                 }
             }
         }
-        unreachable!("retry loop must return on every path")
     }
 
     #[instrument(skip(self, upload, parts, _assembled, _metadata))]
