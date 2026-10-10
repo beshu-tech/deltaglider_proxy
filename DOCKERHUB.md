@@ -160,7 +160,7 @@ The Docker image includes a built-in healthcheck on port 9000 (15s interval).
 | Tag | Description |
 |-----|-------------|
 | `latest` | Latest stable release |
-| `2.0.3` | Specific version |
+| `2.0.4` | Specific version |
 | `2.0` | Latest patch in 2.0.x |
 | `2` | Latest minor in 2.x.x |
 

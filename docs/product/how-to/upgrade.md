@@ -23,12 +23,12 @@ The proxy is a single stateful binary. Every upgrade has three steps: back up, s
 2. **Roll the image/binary.** For Docker:
 
    ```bash
-   docker pull beshultd/deltaglider_proxy:2.0.3
+   docker pull beshultd/deltaglider_proxy:2.0.4
    docker stop dgp && docker rm dgp
    docker run -d --name dgp -p 9000:9000 \
      -v dgp-data:/data \
      -e DGP_BOOTSTRAP_PASSWORD_HASH=... \
-     beshultd/deltaglider_proxy:2.0.3
+     beshultd/deltaglider_proxy:2.0.4
    ```
 
    Coolify, Kubernetes, and systemd have their own commands to pull and restart. The only requirement is that `/data` persists across the swap.

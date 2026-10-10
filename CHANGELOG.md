@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.4 — 2026-10-10
+
 ### Fixed — One slow request no longer closes every bucket of its backend
 
 When a request to an S3 backend timed out or found no connection, the proxy
