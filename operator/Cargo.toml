@@ -1,6 +1,6 @@
 [package]
 name = "deltaglider-operator"
-version = "0.3.3"
+version = "0.3.4"
 description = "Kubernetes operator for DeltaGlider Proxy"
 license = "BUSL-1.1"
 edition = "2021"
