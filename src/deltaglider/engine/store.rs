@@ -2,6 +2,7 @@
 
 //! Store pipeline — delta encoding, passthrough, and baseline management.
 
+use super::usage::CounterPrior;
 use super::*;
 use crate::deltaglider::spool::SpoolBudget;
 use crate::storage::{MultipartUpload, StorageBackend, UploadedPart};
@@ -155,6 +156,8 @@ struct PutObject<'a> {
     /// CompleteMultipartUpload response gave (H1). A single PUT passes
     /// `None` and gets the full-body-MD5 ETag.
     multipart_etag: Option<String>,
+    /// What the key held before: the commit records the counter against it.
+    prior: &'a CounterPrior,
 }
 
 impl PutObject<'_> {
@@ -163,6 +166,7 @@ impl PutObject<'_> {
             bucket: self.bucket,
             key: self.key,
             deltaspace_id: self.deltaspace_id,
+            prior: self.prior,
             metadata: passthrough_metadata(
                 &self.obj_key.filename,
                 self.sha256.clone(),
@@ -217,6 +221,8 @@ struct PassthroughWrite<'a> {
     bucket: &'a str,
     key: &'a str,
     deltaspace_id: &'a str,
+    /// What the key held before (see [`PutObject::prior`]).
+    prior: &'a CounterPrior,
     metadata: FileMetadata,
     source: PassthroughSource<'a>,
 }
@@ -259,11 +265,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         content_type: Option<String>,
         user_metadata: std::collections::HashMap<String, String>,
     ) -> Result<StoreResult, EngineError> {
-        let result = self
-            .store_inner(bucket, key, data, content_type, user_metadata, None)
-            .await?;
-        self.record_store(bucket, &result);
-        Ok(result)
+        // The counter is recorded where the object commits (`record_commit`).
+        self.store_inner(bucket, key, data, content_type, user_metadata, None)
+            .await
     }
 
     /// Multipart-aware variant of [`Self::store`]. The `multipart_etag` is
@@ -280,18 +284,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         user_metadata: std::collections::HashMap<String, String>,
         multipart_etag: String,
     ) -> Result<StoreResult, EngineError> {
-        let result = self
-            .store_inner(
-                bucket,
-                key,
-                data,
-                content_type,
-                user_metadata,
-                Some(multipart_etag),
-            )
-            .await?;
-        self.record_store(bucket, &result);
-        Ok(result)
+        self.store_inner(
+            bucket,
+            key,
+            data,
+            content_type,
+            user_metadata,
+            Some(multipart_etag),
+        )
+        .await
     }
 
     /// `PUT photos/` with an empty body (review D3): a zero-byte folder
@@ -310,14 +311,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .validate_ingest()
             .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
         let deltaspace_id = obj_key.deltaspace_id();
-        let prior_for_counter = self.prior_for_counter(bucket, key).await;
+        let prior = self.prior_for_counter(bucket, key).await;
         let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
         self.storage
             .put_directory_marker(bucket, &obj_key.full_key())
             .await?;
         let metadata = FileMetadata::directory_marker(&obj_key.full_key());
+        self.record_commit(bucket, &prior, &metadata);
         self.metadata_cache.insert(bucket, key, metadata.clone());
-        Ok(StoreResult::new(metadata, 0).with_accounting(prior_for_counter, 0))
+        Ok(StoreResult::new(metadata, 0).with_accounting(prior.replaced(), 0))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -351,7 +353,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // an upsert) so the counter nets an overwrite to +0 instead of double-
         // counting. Small TOCTOU window vs the write below is acceptable — the
         // counter is best-effort and reconciled by Refresh.
-        let prior_for_counter = self.prior_for_counter(bucket, key).await;
+        let prior = self.prior_for_counter(bucket, key).await;
 
         // Calculate hashes
         let sha256 = hex::encode(Sha256::digest(data));
@@ -377,19 +379,18 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             content_type,
             user_metadata,
             multipart_etag,
+            prior: &prior,
         };
         if !self.tries_delta(bucket, &obj_key, &put.user_metadata) {
             let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
             let result = self
                 .write_passthrough_locked(put.passthrough_write(), None)
                 .await?;
+            self.count_decision("passthrough");
             // Passthrough creates no reference baseline; only overwrite-net.
-            return Ok(result.with_accounting(prior_for_counter, 0));
+            return Ok(result.with_accounting(prior.replaced(), 0));
         }
-        // NB: the COUNTER is recorded in the public delegators (store /
-        // store_with_multipart_etag), not here — store_inner is shared, so
-        // recording here would double-count.
-        self.store_delta_eligible(put, prior_for_counter).await
+        self.store_delta_eligible(put).await
     }
 
     /// Whether a write of `key` into `bucket` with `user_metadata` tries a
@@ -408,8 +409,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         )
     }
 
-    /// [`StorePlan::tries_delta`] for this bucket and key, counting a
-    /// passthrough decision.
+    /// [`StorePlan::tries_delta`] for this bucket and key. The caller counts
+    /// the passthrough decision once the write commits.
     fn tries_delta(
         &self,
         bucket: &str,
@@ -429,7 +430,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         } else {
             debug!("Compression disabled for bucket '{bucket}', storing as passthrough");
         }
-        self.count_decision("passthrough");
         false
     }
 
@@ -461,23 +461,20 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         user_metadata: std::collections::HashMap<String, String>,
         multipart_etag: Option<String>,
     ) -> Result<StoreResult, EngineError> {
-        let result = self
-            .store_spooled_delta_inner(
-                bucket,
-                key,
-                body,
-                size,
-                content_type,
-                user_metadata,
-                multipart_etag,
-            )
-            .await?;
-        self.record_store(bucket, &result);
-        Ok(result)
+        self.store_spooled_delta_inner(
+            bucket,
+            key,
+            body,
+            size,
+            content_type,
+            user_metadata,
+            multipart_etag,
+        )
+        .await
     }
 
-    /// Body of [`Self::store_spooled_delta`]. Does NOT record the counter (the
-    /// public entry point does, exactly once); it attaches the accounting.
+    /// Body of [`Self::store_spooled_delta`]. The commit records the counter;
+    /// this attaches the accounting to the result.
     #[allow(clippy::too_many_arguments)]
     async fn store_spooled_delta_inner(
         &self,
@@ -510,7 +507,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         if size > ceiling {
             return Err(EngineError::TooLarge { size, max: ceiling });
         }
-        let prior_for_counter = self.prior_for_counter(bucket, key).await;
+        let prior = self.prior_for_counter(bucket, key).await;
 
         // (1) Hash the body by streaming the spool — bounded memory. Also count
         // the observed bytes and reject a spool that doesn't match the declared
@@ -540,9 +537,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     content_type,
                     user_metadata,
                     multipart_etag,
+                    &prior,
                 )
                 .await?;
-            return Ok(result.with_accounting(prior_for_counter, 0));
+            self.count_decision("passthrough");
+            return Ok(result.with_accounting(prior.replaced(), 0));
         }
 
         // (3) The pipeline the buffered PUT uses, reading the body spool.
@@ -558,8 +557,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             content_type,
             user_metadata,
             multipart_etag,
+            prior: &prior,
         };
-        self.store_delta_eligible(put, prior_for_counter).await
+        self.store_delta_eligible(put).await
     }
 
     /// THE delta-eligible PUT, for both body forms: under both deltaspace
@@ -568,12 +568,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// that this PUT created (S-P1-2): it stays only when the PUT commits a
     /// delta against it. A lost ratio or a failure removes it, under the
     /// same locks, so no other PUT can have used it in between.
-    async fn store_delta_eligible(
-        &self,
-        put: PutObject<'_>,
-        prior_for_counter: Option<FileMetadata>,
-    ) -> Result<StoreResult, EngineError> {
-        let (bucket, deltaspace_id) = (put.bucket, put.deltaspace_id);
+    async fn store_delta_eligible(&self, put: PutObject<'_>) -> Result<StoreResult, EngineError> {
+        let (bucket, deltaspace_id, prior) = (put.bucket, put.deltaspace_id, put.prior);
         // The critical section: has_reference check → set_reference → store_delta
         // must be atomic per-prefix to avoid two writers both creating a reference.
         // The in-process mutex serializes same-node threads; the cross-instance
@@ -612,19 +608,24 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         {
             Ok((result, baseline_kept)) => {
                 // A seeded reference's bytes count (symmetric with delete's
-                // reclamation subtraction); a removed one does not.
+                // reclamation subtraction); a removed one does not. The
+                // counter has both already: each write recorded its own.
                 let created = if fresh_baseline && baseline_kept {
                     ref_meta.file_size
                 } else {
                     0
                 };
-                Ok(result.with_accounting(prior_for_counter, created))
+                Ok(result.with_accounting(prior.replaced(), created))
             }
             Err(e) => {
                 if fresh_baseline {
                     debug!("S-P1-2: store failed ({e}); removing the fresh baseline");
-                    self.remove_fresh_baseline(bucket, deltaspace_id, &xnode)
-                        .await;
+                    if self
+                        .remove_fresh_baseline(bucket, deltaspace_id, &xnode)
+                        .await
+                    {
+                        self.record_reference(bucket, -(ref_meta.file_size as i64));
+                    }
                 }
                 Err(e)
             }
@@ -661,7 +662,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         match StorePlan::decide(put.size, outcome, max_ratio, fresh_baseline) {
             StorePlan::Delta => {
                 let delta = delta.into_bytes().await?;
-                let result = self.commit_delta(&put, ref_meta, delta, xnode).await?;
+                let result = self
+                    .commit_delta(&put, ref_meta, delta, fresh_baseline, xnode)
+                    .await?;
                 Ok((result, true))
             }
             StorePlan::Passthrough {
@@ -671,7 +674,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     "Delta for {}/{} not kept ({outcome:?}, max ratio {max_ratio:.2}); storing as passthrough",
                     put.bucket, put.key
                 );
-                self.count_decision("passthrough");
                 // Free the (ref, delta) spools before the write reserves its own.
                 drop(delta);
                 // The streaming PUT holds its body spool, so this reservation
@@ -689,10 +691,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 let result = self
                     .write_passthrough_locked(put.passthrough_write(), reserved.as_ref())
                     .await?;
+                self.count_decision("passthrough");
                 let removed = remove_fresh_baseline
                     && self
                         .remove_fresh_baseline(put.bucket, put.deltaspace_id, xnode)
                         .await;
+                if removed {
+                    self.record_reference(put.bucket, -(ref_meta.file_size as i64));
+                }
                 Ok((result, !removed))
             }
         }
@@ -881,6 +887,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                         &metadata,
                     )
                     .await?;
+                self.record_reference(put.bucket, put.size as i64);
                 self.cache
                     .put(&cache_key, Bytes::copy_from_slice(data), &put.sha256);
             }
@@ -895,11 +902,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                         &metadata,
                     )
                     .await?;
+                self.record_reference(put.bucket, put.size as i64);
                 // Not pre-cached; the next GET loads it fresh.
                 self.cache.invalidate(&cache_key);
             }
         }
-        self.count_decision("reference");
+        // The `reference` decision counts when a delta commits against it.
         Ok(metadata)
     }
 
@@ -927,18 +935,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// Commit the encoded delta: write it (only valid against the reference
     /// we locked), then drop an older passthrough variant of the key.
+    /// `fresh_baseline`: this PUT created the reference the delta uses.
     async fn commit_delta(
         &self,
         put: &PutObject<'_>,
         ref_meta: &FileMetadata,
         delta: Vec<u8>,
+        fresh_baseline: bool,
         xnode: &super::ReferenceLockGuard,
     ) -> Result<StoreResult, EngineError> {
-        self.with_metrics(|m| {
-            m.delta_decisions_total.with_label_values(&["delta"]).inc();
-            m.delta_bytes_saved_total
-                .inc_by(put.size.saturating_sub(delta.len() as u64));
-        });
         let mut metadata = FileMetadata::new_delta(
             put.obj_key.filename.clone(),
             put.sha256.clone(),
@@ -961,6 +966,19 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 &metadata,
             )
             .await?;
+        // Committed: count it before the next await. The metrics count only
+        // a delta that committed (a failed commit counted its savings).
+        self.record_commit(put.bucket, put.prior, &metadata);
+        self.with_metrics(|m| {
+            m.delta_decisions_total.with_label_values(&["delta"]).inc();
+            if fresh_baseline {
+                m.delta_decisions_total
+                    .with_label_values(&["reference"])
+                    .inc();
+            }
+            m.delta_bytes_saved_total
+                .inc_by(put.size.saturating_sub(delta.len() as u64));
+        });
         if let Err(e) = self
             .delete_passthrough_idempotent(put.bucket, put.deltaspace_id, &put.obj_key.filename)
             .await
@@ -989,6 +1007,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             bucket,
             key,
             deltaspace_id,
+            prior,
             metadata,
             source,
         } = write;
@@ -1012,6 +1031,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     .await?
             }
         }
+        // Committed: count it before the next await.
+        self.record_commit(bucket, prior, &metadata);
         if let Err(e) = self
             .delete_delta_idempotent(bucket, deltaspace_id, &filename)
             .await
@@ -1086,6 +1107,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             size,
             ref_meta.content_type.clone(),
         );
+        // counter: unchanged (the same bytes under repaired metadata).
         xnode
             .put_reference_from_file(&*self.storage, bucket, deltaspace_id, spool.path(), &healed)
             .await?;
@@ -1143,10 +1165,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
     ) -> Result<StoreResult, EngineError> {
-        self.store_recorded(
-            bucket,
-            key,
-            self.store_passthrough_chunked_inner(
+        let prior = self.prior_for_counter(bucket, key).await;
+        let result = self
+            .store_passthrough_chunked_inner(
                 bucket,
                 key,
                 chunks,
@@ -1154,9 +1175,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 content_type,
                 user_metadata,
                 None,
-            ),
-        )
-        .await
+                &prior,
+            )
+            .await?;
+        Ok(result.with_accounting(prior.replaced(), 0))
     }
 
     /// Multipart-aware variant of [`Self::store_passthrough_chunked`]. The
@@ -1174,10 +1196,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         user_metadata: HashMap<String, String>,
         multipart_etag: String,
     ) -> Result<StoreResult, EngineError> {
-        self.store_recorded(
-            bucket,
-            key,
-            self.store_passthrough_chunked_inner(
+        let prior = self.prior_for_counter(bucket, key).await;
+        let result = self
+            .store_passthrough_chunked_inner(
                 bucket,
                 key,
                 chunks,
@@ -1185,24 +1206,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 content_type,
                 user_metadata,
                 Some(multipart_etag),
-            ),
-        )
-        .await
-    }
-
-    /// Run a non-recording passthrough store and record it in the usage
-    /// counter exactly once. The prior object is resolved BEFORE `store` is
-    /// polled (futures are lazy), so an overwrite nets to +0 objects.
-    async fn store_recorded(
-        &self,
-        bucket: &str,
-        key: &str,
-        store: impl std::future::Future<Output = Result<StoreResult, EngineError>>,
-    ) -> Result<StoreResult, EngineError> {
-        let prior = self.prior_for_counter(bucket, key).await;
-        let result = store.await?.with_accounting(prior, 0);
-        self.record_store(bucket, &result);
-        Ok(result)
+                &prior,
+            )
+            .await?;
+        Ok(result.with_accounting(prior.replaced(), 0))
     }
 
     /// Guard a PASSTHROUGH store against the passthrough ceiling (64 GiB
@@ -1230,6 +1237,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
         multipart_etag: Option<String>,
+        prior: &CounterPrior,
     ) -> Result<StoreResult, EngineError> {
         self.ensure_within_passthrough_ceiling(total_size)?;
 
@@ -1272,6 +1280,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.storage
             .put_passthrough_chunked(bucket, &deltaspace_id, &obj_key.filename, chunks, &metadata)
             .await?;
+        // Committed: count it before the next await.
+        self.record_commit(bucket, prior, &metadata);
         // Write succeeded — now safe to clean up old delta variant
         if let Err(e) = self
             .delete_delta_idempotent(bucket, &deltaspace_id, &obj_key.filename)
@@ -1286,7 +1296,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let result = StoreResult::new(metadata, total_size);
         self.metadata_cache
             .insert(bucket, key, result.metadata.clone());
-        // NB: recorded in the public delegators, not here (shared inner).
         Ok(result)
     }
 
@@ -1304,10 +1313,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         user_metadata: HashMap<String, String>,
         multipart_etag: String,
     ) -> Result<StoreResult, EngineError> {
-        self.store_recorded(
-            bucket,
-            key,
-            self.store_passthrough_relayed_parts_inner(
+        let prior = self.prior_for_counter(bucket, key).await;
+        let result = self
+            .store_passthrough_relayed_parts_inner(
                 bucket,
                 key,
                 part_paths,
@@ -1315,12 +1323,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 content_type,
                 user_metadata,
                 multipart_etag,
-            ),
-        )
-        .await
+                &prior,
+            )
+            .await?;
+        Ok(result.with_accounting(prior.replaced(), 0))
     }
 
-    /// Body of [`Self::store_passthrough_relayed_parts_with_multipart_etag`]; does not record the counter.
+    /// Body of [`Self::store_passthrough_relayed_parts_with_multipart_etag`]; its commit records the counter.
     #[allow(clippy::too_many_arguments)]
     async fn store_passthrough_relayed_parts_inner(
         &self,
@@ -1331,6 +1340,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
         multipart_etag: String,
+        prior: &CounterPrior,
     ) -> Result<StoreResult, EngineError> {
         self.ensure_within_passthrough_ceiling(total_size)?;
 
@@ -1391,6 +1401,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 SpoolBudget::new(&self.spool, None, reserved.as_ref()),
             )
             .await?;
+        // Committed: count it before the next await.
+        self.record_commit(bucket, prior, &metadata);
         if let Err(e) = self
             .delete_delta_idempotent(bucket, &deltaspace_id, &obj_key.filename)
             .await
@@ -1404,7 +1416,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let result = StoreResult::new(metadata, total_size);
         self.metadata_cache
             .insert(bucket, key, result.metadata.clone());
-        // NB: recorded in the public wrapper, not here (shared inner).
         Ok(result)
     }
 
@@ -1422,10 +1433,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         user_metadata: HashMap<String, String>,
         multipart_etag: String,
     ) -> Result<StoreResult, EngineError> {
-        self.store_recorded(
-            bucket,
-            key,
-            self.store_passthrough_file_inner(
+        let prior = self.prior_for_counter(bucket, key).await;
+        let result = self
+            .store_passthrough_file_inner(
                 bucket,
                 key,
                 source_path,
@@ -1434,12 +1444,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 content_type,
                 user_metadata,
                 Some(multipart_etag),
-            ),
-        )
-        .await
+                &prior,
+            )
+            .await?;
+        Ok(result.with_accounting(prior.replaced(), 0))
     }
 
-    /// Body of [`Self::store_passthrough_file_with_multipart_etag`]; does not record the counter.
+    /// Body of [`Self::store_passthrough_file_with_multipart_etag`]; its commit records the counter.
     #[allow(clippy::too_many_arguments)]
     async fn store_passthrough_file_inner(
         &self,
@@ -1452,6 +1463,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
         multipart_etag: Option<String>,
+        prior: &CounterPrior,
     ) -> Result<StoreResult, EngineError> {
         self.ensure_within_passthrough_ceiling(total_size)?;
 
@@ -1486,6 +1498,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             bucket,
             key,
             deltaspace_id: &deltaspace_id,
+            prior,
             metadata: passthrough_metadata(
                 &obj_key.filename,
                 sha256,
@@ -1500,7 +1513,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 held,
             },
         };
-        // NB: recorded in the public wrapper, not here (shared inner).
         self.write_passthrough_locked(write, reserved.as_ref())
             .await
     }
@@ -1596,7 +1608,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         // Overwrite-net accounting for the usage counter (see store_inner). The
         // handle already holds the per-deltaspace lock, so this is race-safe.
-        let prior_for_counter = self.prior_for_counter(&handle.bucket, &handle.key).await;
+        let prior = self.prior_for_counter(&handle.bucket, &handle.key).await;
 
         let metadata = handle.metadata.clone();
 
@@ -1617,6 +1629,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             self.abort_passthrough_multipart_ref(&handle).await;
             return Err(e.into());
         }
+        // Committed: count it before the next await.
+        self.record_commit(&handle.bucket, &prior, &metadata);
 
         if let Err(e) = self
             .delete_delta_idempotent(&handle.bucket, &handle.deltaspace_id, &handle.filename)
@@ -1628,14 +1642,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             );
         }
 
+        // Streaming multipart (large replication/lifecycle copies). Every
+        // store entry point records exactly once, at its commit;
+        // `counter_tests` pins the accounting against the buffered `store()`
+        // oracle.
         let result =
-            StoreResult::new(metadata, handle.total_size).with_accounting(prior_for_counter, 0);
+            StoreResult::new(metadata, handle.total_size).with_accounting(prior.replaced(), 0);
         self.metadata_cache
             .insert(&handle.bucket, &handle.key, result.metadata.clone());
-        // Streaming multipart (large replication/lifecycle copies). Every
-        // public store entry point records exactly once; `counter_tests`
-        // pins the accounting against the buffered `store()` oracle.
-        self.record_store(&handle.bucket, &result);
         Ok(result)
     }
 
@@ -1767,6 +1781,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 &delta_meta,
             )
             .await?;
+        // A new user-visible object (the reference stays, already counted or
+        // out of band): no variant of `filename` existed (checked above).
+        self.record_commit(bucket, &CounterPrior::Absent, &delta_meta);
         self.delete_passthrough_idempotent(bucket, deltaspace_id, filename)
             .await?;
 

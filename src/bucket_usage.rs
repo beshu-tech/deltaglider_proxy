@@ -134,10 +134,22 @@ fn add(t: &mut Triple, (c, l, s): Triple) {
 struct Pending {
     /// Not yet flushed to SQLite.
     delta: Triple,
-    /// Per running scan (ticket id): every delta since that scan started,
-    /// flushed or not. One shard lock guards both fields, so a delta can
+    /// A write with an unknown net change skipped its delta: the row needs
+    /// a Refresh. Not yet flushed (the flush clears `last_scan_at`).
+    recount: bool,
+    /// Per running scan (ticket id): every change since that scan started,
+    /// flushed or not. One shard lock guards all fields, so a change can
     /// never reach one and miss the other.
-    scans: Vec<(u64, Triple)>,
+    scans: Vec<(u64, Journal)>,
+}
+
+/// The changes of a bucket since one Refresh scan started.
+#[derive(Debug, Default, Clone, Copy)]
+struct Journal {
+    delta: Triple,
+    /// A write during the scan skipped its delta: the scan result cannot
+    /// be stamped as a full count.
+    recount: bool,
 }
 
 /// A Refresh scan in flight, from [`BucketUsage::begin_scan`]. Consumed by
@@ -237,7 +249,23 @@ impl BucketUsage {
         let mut e = self.pending.entry(bucket.to_string()).or_default();
         add(&mut e.delta, d);
         for (_, journal) in e.scans.iter_mut() {
-            add(journal, d);
+            add(&mut journal.delta, d);
+        }
+    }
+
+    /// Mark a bucket's row for a Refresh: a write changed the bucket by an
+    /// unknown amount (its prior-object read failed) and recorded no delta.
+    /// The flush clears `last_scan_at`, so the row reads as not scanned: the
+    /// UI asks for a Refresh and the quota gate stops trusting the row.
+    /// Like `apply_delta`, never touches SQLite.
+    pub fn mark_for_recount(&self, bucket: &str) {
+        if is_transient_bucket(bucket) {
+            return;
+        }
+        let mut e = self.pending.entry(bucket.to_string()).or_default();
+        e.recount = true;
+        for (_, journal) in e.scans.iter_mut() {
+            journal.recount = true;
         }
     }
 
@@ -271,18 +299,57 @@ impl BucketUsage {
         // each — a delta folded in between phases is simply flushed early,
         // which is harmless (flush is only the point deltas become durable).
         let keys: Vec<String> = self.pending.iter().map(|e| e.key().clone()).collect();
-        let drained: Vec<(String, Triple)> = keys
+        let drained: Vec<(String, Triple, bool)> = keys
             .into_iter()
-            .filter_map(|k| self.take_delta(&k).map(|d| (k, d)))
-            .filter(|(_, d)| *d != (0, 0, 0))
+            .filter_map(|k| self.take_delta(&k).map(|(d, recount)| (k, d, recount)))
+            .filter(|(_, d, recount)| *d != (0, 0, 0) || *recount)
             .collect();
         if drained.is_empty() {
             return;
         }
         let drained_len = drained.len();
         let mut flushed_ok = 0usize;
-        for (bucket, (d_count, d_logical, d_stored)) in drained {
-            let upsert = conn.query_row(
+        for (bucket, delta, recount) in drained {
+            match Self::flush_one(&conn, &bucket, delta, recount) {
+                Ok(()) => flushed_ok += 1,
+                Err(e) => {
+                    // Re-queue: the caller's apply_delta already "succeeded"
+                    // in-memory; dropping here would silently lose it.
+                    warn!(
+                        "bucket_usage: flush failed for '{}': {} (re-queued)",
+                        bucket, e
+                    );
+                    // Not through apply_delta: the scan journals hold
+                    // this delta already.
+                    let mut e = self.pending.entry(bucket).or_default();
+                    add(&mut e.delta, delta);
+                    e.recount |= recount;
+                }
+            }
+        }
+        debug!(
+            "bucket_usage: flush drained {} bucket delta(s), {} re-queued on failure, {} still pending",
+            drained_len, drained_len - flushed_ok, self.pending.len()
+        );
+    }
+
+    /// One drained bucket: the recount mark, then the delta upsert (with
+    /// the negative-detection WARN). In this order a failure re-queues
+    /// nothing that landed: the mark is idempotent, and the upsert is last.
+    fn flush_one(
+        conn: &Connection,
+        bucket: &str,
+        (d_count, d_logical, d_stored): Triple,
+        recount: bool,
+    ) -> Result<(), rusqlite::Error> {
+        if recount {
+            conn.execute(
+                "UPDATE bucket_usage SET last_scan_at = NULL WHERE bucket = ?1",
+                params![bucket],
+            )?;
+        }
+        if (d_count, d_logical, d_stored) != (0, 0, 0) {
+            let (oc, lb, sb) = conn.query_row(
                 "INSERT INTO bucket_usage (bucket, object_count, logical_bytes, stored_bytes)
                      VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(bucket) DO UPDATE SET
@@ -298,76 +365,55 @@ impl BucketUsage {
                         r.get::<_, i64>(2)?,
                     ))
                 },
-            );
-            match upsert {
-                Ok((oc, lb, sb)) => {
-                    flushed_ok += 1;
-                    // A negative column is ALWAYS a real accounting bug (a
-                    // missed-count upstream), never a steady state — warn
-                    // loudly. The read path still clamps at 0 for display;
-                    // this surfaces the drift instead of hiding it.
-                    if oc < 0 || lb < 0 || sb < 0 {
-                        warn!(
-                            "bucket_usage: counter for '{}' went negative (count={}, logical={}, stored={}) — \
-                             an upstream mutation was miscounted; run Refresh to reconcile",
-                            bucket, oc, lb, sb
-                        );
-                    }
-                }
-                Err(e) => {
-                    // Re-queue: the caller's apply_delta already "succeeded"
-                    // in-memory; dropping here would silently lose it.
-                    warn!(
-                        "bucket_usage: flush failed for '{}': {} (re-queued)",
-                        bucket, e
-                    );
-                    // Not through apply_delta: the scan journals hold
-                    // this delta already.
-                    add(
-                        &mut self.pending.entry(bucket).or_default().delta,
-                        (d_count, d_logical, d_stored),
-                    );
-                }
+            )?;
+            // A negative column is ALWAYS a real accounting bug (a
+            // missed-count upstream), never a steady state — warn
+            // loudly. The read path still clamps at 0 for display;
+            // this surfaces the drift instead of hiding it.
+            if oc < 0 || lb < 0 || sb < 0 {
+                warn!(
+                    "bucket_usage: counter for '{}' went negative (count={}, logical={}, stored={}) — \
+                     an upstream mutation was miscounted; run Refresh to reconcile",
+                    bucket, oc, lb, sb
+                );
             }
         }
-        debug!(
-            "bucket_usage: flush drained {} bucket delta(s), {} re-queued on failure, {} still pending",
-            drained_len, drained_len - flushed_ok, self.pending.len()
-        );
+        Ok(())
     }
 
-    /// Pending (un-flushed) net delta for one bucket, if any.
-    fn pending_for(&self, bucket: &str) -> Triple {
+    /// Pending (un-flushed) net delta and recount mark for one bucket.
+    fn pending_for(&self, bucket: &str) -> (Triple, bool) {
         self.pending
             .get(bucket)
-            .map(|e| e.delta)
-            .unwrap_or((0, 0, 0))
+            .map(|e| (e.delta, e.recount))
+            .unwrap_or(((0, 0, 0), false))
     }
 
-    /// Move one bucket's un-flushed delta out; the entry stays while a scan
-    /// journal needs it.
-    fn take_delta(&self, bucket: &str) -> Option<Triple> {
+    /// Move one bucket's un-flushed delta and recount mark out; the entry
+    /// stays while a scan journal needs it.
+    fn take_delta(&self, bucket: &str) -> Option<(Triple, bool)> {
         let removed = self
             .pending
             .remove_if(bucket, |_, p| p.scans.is_empty())
-            .map(|(_, p)| p.delta);
+            .map(|(_, p)| (p.delta, p.recount));
         removed.or_else(|| {
             self.pending
                 .get_mut(bucket)
-                .map(|mut p| std::mem::take(&mut p.delta))
+                .map(|mut p| (std::mem::take(&mut p.delta), std::mem::take(&mut p.recount)))
         })
     }
 
     /// Remove one scan's journal and return it; drop the entry when nothing
     /// is left in it.
-    fn end_scan(&self, bucket: &str, id: u64) -> Option<Triple> {
+    fn end_scan(&self, bucket: &str, id: u64) -> Option<Journal> {
         let journal = {
             let mut p = self.pending.get_mut(bucket)?;
             let i = p.scans.iter().position(|(sid, _)| *sid == id)?;
             p.scans.swap_remove(i).1
         };
-        self.pending
-            .remove_if(bucket, |_, p| p.scans.is_empty() && p.delta == (0, 0, 0));
+        self.pending.remove_if(bucket, |_, p| {
+            p.scans.is_empty() && p.delta == (0, 0, 0) && !p.recount
+        });
         Some(journal)
     }
 
@@ -381,7 +427,7 @@ impl BucketUsage {
             .entry(bucket.to_string())
             .or_default()
             .scans
-            .push((id, (0, 0, 0)));
+            .push((id, Journal::default()));
         ScanTicket {
             db: self,
             bucket: bucket.to_string(),
@@ -413,7 +459,7 @@ impl BucketUsage {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(other),
             })?;
-        let (dc, dl, ds) = self.pending_for(bucket);
+        let ((dc, dl, ds), recount) = self.pending_for(bucket);
         drop(conn);
         let Some(mut row) = stored else {
             if dc == 0 && dl == 0 && ds == 0 {
@@ -430,6 +476,9 @@ impl BucketUsage {
         row.object_count = row.object_count.saturating_add_signed(dc);
         row.logical_bytes = row.logical_bytes.saturating_add_signed(dl);
         row.stored_bytes = row.stored_bytes.saturating_add_signed(ds);
+        if recount {
+            row.last_scan_at = None;
+        }
         Ok(Some(row))
     }
 
@@ -450,10 +499,13 @@ impl BucketUsage {
         drop(stmt);
         // Merge pending while still holding `conn` (see `read`).
         for (bucket, row) in rows.iter_mut() {
-            let (dc, dl, ds) = self.pending_for(bucket);
+            let ((dc, dl, ds), recount) = self.pending_for(bucket);
             row.object_count = row.object_count.saturating_add_signed(dc);
             row.logical_bytes = row.logical_bytes.saturating_add_signed(dl);
             row.stored_bytes = row.stored_bytes.saturating_add_signed(ds);
+            if recount {
+                row.last_scan_at = None;
+            }
         }
         // Buckets pending-only (no stored row yet — flush hasn't run): surface
         // them so a freshly-written bucket shows up immediately.
@@ -480,7 +532,8 @@ impl BucketUsage {
     }
 
     /// Overwrite a bucket's row with full-scan ground truth + stamp
-    /// `last_scan_at`.
+    /// `last_scan_at` (left empty when a write during the scan has an
+    /// unknown change: see [`Self::mark_for_recount`]).
     ///
     /// The row becomes the scan totals PLUS every delta since the scan
     /// started (the ticket's journal): a PUT or DELETE that lands while the
@@ -500,11 +553,13 @@ impl BucketUsage {
         // between the journal take and the REPLACE.
         let conn = self.conn.lock().unwrap();
         let bucket = std::mem::take(&mut ticket.bucket);
-        let (jc, jl, js) = self.end_scan(&bucket, ticket.id).unwrap_or_default();
+        let journal = self.end_scan(&bucket, ticket.id).unwrap_or_default();
+        let (jc, jl, js) = journal.delta;
         ticket.consumed = true;
         let _ = self.take_delta(&bucket);
         self.pending
             .remove_if(&bucket, |_, p| p.scans.is_empty() && p.delta == (0, 0, 0));
+        let scanned_at = (!journal.recount).then_some(now);
         // object_count = user-visible only (delta + passthrough); logical =
         // original_bytes; stored = stored_bytes (incl references). Same
         // interpretation as usage_delta_for, so inline + scan agree.
@@ -518,8 +573,25 @@ impl BucketUsage {
                 object_count + jc,
                 totals.original_bytes as i64 + jl,
                 totals.stored_bytes as i64 + js,
-                now
+                scanned_at
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Forget a bucket (DeleteBucket): its row and its un-flushed changes
+    /// go. `/_/stats` sums every row, and a bucket created again under the
+    /// same name must start at zero, not scanned. A Refresh still running
+    /// on the bucket keeps its journal.
+    pub fn forget(&self, bucket: &str) -> Result<(), rusqlite::Error> {
+        // conn → pending, the lock order of flush and read: no flush can
+        // write the dropped delta back.
+        let conn = self.conn.lock().unwrap();
+        let _ = self.take_delta(bucket);
+        self.pending.remove_if(bucket, |_, p| p.scans.is_empty());
+        conn.execute(
+            "DELETE FROM bucket_usage WHERE bucket = ?1",
+            params![bucket],
         )?;
         Ok(())
     }
@@ -848,5 +920,69 @@ mod tests {
         db.flush_pending();
         let row = db.read("b").unwrap().unwrap();
         assert_eq!(row.object_count, 1 + 4 * 250);
+    }
+
+    // ── recount marks and forget ─────────────────────────────────────
+    /// A write with an unknown net change marks the row: read and flush
+    /// both show it as not scanned until the next Refresh stamps it.
+    #[test]
+    fn a_recount_mark_clears_the_scan_stamp() {
+        let db = BucketUsage::in_memory().unwrap();
+        let mut totals = SavingsTotals::default();
+        totals.accumulate(&meta_passthrough(10));
+        db.overwrite_from_scan(db.begin_scan("b"), &totals, 7)
+            .unwrap();
+        db.mark_for_recount("b");
+        assert_eq!(db.read("b").unwrap().unwrap().last_scan_at, None);
+        assert_eq!(db.read_all().unwrap()[0].1.last_scan_at, None);
+        db.flush_pending();
+        assert!(db.pending.is_empty());
+        let row = db.read("b").unwrap().unwrap();
+        assert_eq!((row.object_count, row.last_scan_at), (1, None));
+        db.overwrite_from_scan(db.begin_scan("b"), &totals, 8)
+            .unwrap();
+        assert_eq!(db.read("b").unwrap().unwrap().last_scan_at, Some(8));
+        // Migration staging is never counted, so never marked.
+        db.mark_for_recount("__dgmigrate_x__src");
+        assert!(db.pending.is_empty());
+    }
+
+    /// A mark that arrives while a Refresh scans the bucket: the scan may
+    /// have missed that write's change, so its result is not stamped.
+    #[test]
+    fn a_recount_mark_during_a_scan_leaves_the_row_unstamped() {
+        let db = BucketUsage::in_memory().unwrap();
+        db.mark_for_recount("b"); // before the scan: superseded
+        let ticket = db.begin_scan("b");
+        let mut totals = SavingsTotals::default();
+        totals.accumulate(&meta_passthrough(10));
+        let clean = db.begin_scan("b");
+        db.overwrite_from_scan(clean, &totals, 1).unwrap();
+        assert_eq!(db.read("b").unwrap().unwrap().last_scan_at, Some(1));
+        db.mark_for_recount("b");
+        db.flush_pending();
+        db.overwrite_from_scan(ticket, &totals, 2).unwrap();
+        assert_eq!(db.read("b").unwrap().unwrap().last_scan_at, None);
+        assert!(db.pending.is_empty(), "no journal left behind");
+    }
+
+    /// DeleteBucket: the row and the un-flushed delta go, other buckets
+    /// keep theirs, and a later write starts from zero.
+    #[test]
+    fn forget_drops_the_row_and_its_pending_delta() {
+        let db = BucketUsage::in_memory().unwrap();
+        db.apply_object("b", &meta_passthrough(10), 1);
+        db.apply_object("other", &meta_passthrough(3), 1);
+        db.flush_pending();
+        db.apply_object("b", &meta_passthrough(5), 1);
+        db.mark_for_recount("b");
+        db.forget("b").unwrap();
+        assert_eq!(db.read("b").unwrap(), None);
+        db.flush_pending();
+        assert_eq!(db.read("b").unwrap(), None, "the flush wrote it back");
+        assert_eq!(db.read_all().unwrap().len(), 1);
+        db.apply_object("b", &meta_passthrough(1), 1);
+        db.flush_pending();
+        assert_eq!(db.read("b").unwrap().unwrap().logical_bytes, 1);
     }
 }

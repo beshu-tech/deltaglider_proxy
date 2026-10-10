@@ -181,6 +181,13 @@ pub(super) async fn delete_bucket(
     }
 
     engine.delete_bucket(&bucket).await?;
+    // The usage row goes with the bucket: `/_/stats` sums every row, and a
+    // bucket created again under this name must start at zero.
+    if let Some(usage) = &svc.state.bucket_usage {
+        if let Err(e) = usage.forget(&bucket) {
+            tracing::warn!("DELETE bucket {bucket}: its usage row stays: {e}");
+        }
+    }
     Ok(s3s::S3Response::new(s3s::dto::DeleteBucketOutput::default()))
 }
 
@@ -281,5 +288,70 @@ pub(super) fn list_buckets_output_from_rows(
             id: Some("deltaglider_proxy".to_string()),
         }),
         prefix: prefix.map(str::to_string),
+    }
+}
+
+#[cfg(test)]
+mod delete_bucket_usage_tests {
+    use super::*;
+    use crate::bucket_usage::BucketUsage;
+    use crate::storage::DynStorageBackend;
+
+    /// DeleteBucket forgets the bucket's usage row: `/_/stats` sums every
+    /// row, and a bucket created again under the same name started with the
+    /// old row (its drift and its "scanned" stamp).
+    #[tokio::test]
+    async fn delete_bucket_forgets_the_usage_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(
+            crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let usage = Arc::new(BucketUsage::in_memory().unwrap());
+        let engine: crate::deltaglider::DynEngine =
+            crate::deltaglider::DeltaGliderEngine::new_with_backend(
+                Arc::new(backend),
+                &crate::config::Config::default(),
+                None,
+            )
+            .with_bucket_usage(Some(usage.clone()));
+        engine.create_bucket("b").await.unwrap();
+        engine
+            .store("b", "k.txt", b"hello", None, Default::default())
+            .await
+            .unwrap();
+        engine.delete("b", "k.txt").await.unwrap();
+        // Residual drift (e.g. an orphan baseline): the row stays non-zero.
+        usage.apply_delta("b", 0, 0, 28);
+        usage.flush_pending();
+        assert!(usage.read("b").unwrap().is_some());
+
+        let mut state = Arc::try_unwrap(AppState::for_tests(engine)).ok().unwrap();
+        state.bucket_usage = Some(usage.clone());
+        let svc = DeltaGliderS3Service::new(
+            Arc::new(state),
+            Arc::new(tokio::sync::RwLock::new(crate::config::Config::default())),
+        );
+        let req = s3s::S3Request {
+            input: s3s::dto::DeleteBucketInput {
+                bucket: "b".to_string(),
+                expected_bucket_owner: None,
+            },
+            method: http::Method::DELETE,
+            uri: "/b".parse().unwrap(),
+            headers: Default::default(),
+            extensions: Default::default(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        delete_bucket(&svc, req).await.unwrap();
+
+        assert_eq!(usage.read("b").unwrap(), None, "the row survived");
+        assert!(usage.read_all().unwrap().iter().all(|(b, _)| b != "b"));
+        usage.flush_pending();
+        assert_eq!(usage.read("b").unwrap(), None, "a flush brought it back");
     }
 }
