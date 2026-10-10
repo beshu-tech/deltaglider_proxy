@@ -704,24 +704,43 @@ mod tests {
 
 /// Objects the legacy-key scan HEADs when the request names no `limit`.
 const LEGACY_SCAN_DEFAULT_LIMIT: u64 = 10_000;
-/// Upper bound on `limit`: one request must stay inside the request timeout.
+/// Upper bound on `limit`.
 const LEGACY_SCAN_MAX_LIMIT: u64 = 1_000_000;
-/// HEADs in flight at once during the scan.
+/// Object HEADs in flight at once during the scan.
 const LEGACY_SCAN_CONCURRENCY: usize = 16;
+/// Reference HEADs in flight at once.
+const LEGACY_REFERENCE_CONCURRENCY: usize = 8;
 /// Keys listed per page, and object keys reported as examples.
 const LEGACY_SCAN_PAGE: u32 = 1000;
 const LEGACY_SCAN_EXAMPLES: usize = 10;
+/// How long a scan result answers from the server cache. Short: an
+/// operator checks again after a re-encrypt job, and `fresh=true` skips it.
+const LEGACY_SCAN_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Legacy-key scans by `(backend, limit, key id, buckets)`: a result lives
+/// [`LEGACY_SCAN_CACHE_TTL`], and concurrent requests for one key share one
+/// scan (the Backends page of every open tab asked for its own).
+static LEGACY_SCANS: std::sync::LazyLock<moka::future::Cache<String, Arc<LegacyKeyUsage>>> =
+    std::sync::LazyLock::new(|| {
+        moka::future::Cache::builder()
+            .max_capacity(256)
+            .time_to_live(LEGACY_SCAN_CACHE_TTL)
+            .build()
+    });
 
 #[derive(Deserialize)]
 pub struct LegacyKeyUsageQuery {
     pub limit: Option<u64>,
+    /// Scan again instead of answering from the server cache.
+    #[serde(default)]
+    pub fresh: bool,
 }
 
 /// `GET /backends/:name/legacy-key-usage` — how many objects and delta
 /// references of this backend still carry the legacy key id. The count is
-/// EXACT (every object and reference is HEADed) until `limit` objects are
-/// scanned; then the scan stops and `complete` is false.
-#[derive(Serialize, Debug, Default, PartialEq)]
+/// EXACT (every object and reference is HEADed once) until `limit` objects
+/// are scanned; then the scan stops and `complete` is false.
+#[derive(Serialize, Debug, Default, PartialEq, Clone)]
 pub struct LegacyKeyUsage {
     pub backend: String,
     /// The id the legacy key stamps (`None`: no legacy key configured).
@@ -739,6 +758,8 @@ pub struct LegacyKeyUsage {
     pub complete: bool,
     pub limit: u64,
     pub safe_to_clear: bool,
+    /// When the scan ran: an answer can come from the server cache.
+    pub computed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl LegacyKeyUsage {
@@ -767,8 +788,6 @@ pub async fn legacy_key_usage(
         LegacyKeyUsageQuery,
     >,
 ) -> Result<Json<LegacyKeyUsage>, AdminError> {
-    use futures::StreamExt;
-
     let limit = q
         .limit
         .unwrap_or(LEGACY_SCAN_DEFAULT_LIMIT)
@@ -809,29 +828,90 @@ pub async fn legacy_key_usage(
         usage.complete = true;
         return Ok(Json(usage));
     };
+    let key = format!("{name}\0{limit}\0{kid}\0{}", usage.buckets.join("\0"));
+    let usage = legacy_usage_single_flight(key, q.fresh, || {
+        scan_legacy_usage(engine.clone(), usage, kid)
+    })
+    .await;
+    Ok(Json((*usage).clone()))
+}
 
+/// The cached scan of `key`, or `init` run once for every concurrent caller
+/// of `key` (moka coalesces them). `fresh` drops the cached result first.
+async fn legacy_usage_single_flight<F, Fut>(
+    key: String,
+    fresh: bool,
+    init: F,
+) -> Arc<LegacyKeyUsage>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = LegacyKeyUsage>,
+{
+    if fresh {
+        LEGACY_SCANS.invalidate(&key).await;
+    }
+    LEGACY_SCANS
+        .get_with(key, async move { Arc::new(init().await) })
+        .await
+}
+
+/// One HEAD of a listed object, of the form the listing names (a delta or a
+/// passthrough object). `engine.head` sends two, one per form.
+async fn head_listed(
+    engine: &crate::deltaglider::DynEngine,
+    bucket: &str,
+    key: &str,
+    listed: &crate::types::FileMetadata,
+) -> Result<crate::types::FileMetadata, crate::storage::StorageError> {
+    let obj = crate::types::ObjectKey::parse(bucket, key);
+    let storage = engine.storage();
+    if listed.is_delta() {
+        storage
+            .get_delta_metadata(bucket, &obj.prefix, &obj.filename)
+            .await
+    } else {
+        storage
+            .get_passthrough_metadata(bucket, &obj.prefix, &obj.filename)
+            .await
+    }
+}
+
+/// The legacy-key scan of `usage.buckets`: every delta reference (one HEAD
+/// each, [`LEGACY_REFERENCE_CONCURRENCY`] at once), then up to `usage.limit`
+/// objects (one HEAD each, of the form the listing names).
+async fn scan_legacy_usage(
+    engine: Arc<crate::deltaglider::DynEngine>,
+    mut usage: LegacyKeyUsage,
+    kid: String,
+) -> LegacyKeyUsage {
+    use futures::StreamExt;
+    let limit = usage.limit;
     'buckets: for bucket in usage.buckets.clone() {
         // Delta references first: one legacy reference breaks every delta
         // in its deltaspace, so they count even when the object budget ends.
+        // The listing names each one, so no `has_reference` HEAD first.
         match engine.storage().list_reference_prefixes(&bucket, "").await {
             Ok(prefixes) => {
-                for prefix in prefixes {
-                    let storage = engine.storage();
-                    match storage.has_reference(&bucket, &prefix).await {
-                        Ok(false) => continue,
-                        Ok(true) => {}
-                        Err(e) => {
-                            usage.error(format!("{bucket}/{prefix}/.dg/reference.bin: {e}"));
-                            continue;
-                        }
-                    }
-                    usage.references_scanned += 1;
-                    match storage.get_reference_metadata(&bucket, &prefix).await {
+                let storage = engine.storage();
+                let bucket = bucket.as_str();
+                let metas: Vec<_> = futures::stream::iter(prefixes)
+                    .map(|prefix| async move {
+                        let meta = storage.get_reference_metadata(bucket, &prefix).await;
+                        (prefix, meta)
+                    })
+                    .buffer_unordered(LEGACY_REFERENCE_CONCURRENCY)
+                    .collect()
+                    .await;
+                for (prefix, meta) in metas {
+                    match meta {
                         Ok(m) => {
+                            usage.references_scanned += 1;
                             if crate::maintenance::stamped_with_key_id(&m.user_metadata, &kid) {
                                 usage.references_under_legacy_key += 1;
                             }
                         }
+                        // Listed, then reclaimed by a delete: nothing to count.
+                        Err(crate::storage::StorageError::NotFound(_)) => {}
                         Err(e) => usage.error(format!("{bucket}/{prefix}/.dg/reference.bin: {e}")),
                     }
                 }
@@ -841,8 +921,10 @@ pub async fn legacy_key_usage(
 
         let mut token: Option<String> = None;
         loop {
+            // Lite: the object HEADs read the metadata; the listing needs
+            // no logical size.
             let page = match engine
-                .list_objects(&bucket, "", None, LEGACY_SCAN_PAGE, token.as_deref(), false)
+                .list_objects_lite(&bucket, "", None, LEGACY_SCAN_PAGE, token.as_deref())
                 .await
             {
                 Ok(p) => p,
@@ -852,19 +934,18 @@ pub async fn legacy_key_usage(
                 }
             };
             let budget = (limit - usage.objects_scanned) as usize;
-            let keys: Vec<String> = page
+            let objects: Vec<_> = page
                 .objects
                 .into_iter()
-                .map(|(k, _)| k)
-                .filter(|k| !k.ends_with('/'))
+                .filter(|(k, _)| !k.ends_with('/'))
                 .collect();
-            let over_budget = keys.len() > budget;
-            let heads: Vec<_> = futures::stream::iter(keys.into_iter().take(budget))
-                .map(|key| {
+            let over_budget = objects.len() > budget;
+            let heads: Vec<_> = futures::stream::iter(objects.into_iter().take(budget))
+                .map(|(key, listed)| {
                     let engine = engine.clone();
                     let bucket = bucket.clone();
                     async move {
-                        let r = engine.head(&bucket, &key).await;
+                        let r = head_listed(&engine, &bucket, &key, &listed).await;
                         (key, r)
                     }
                 })
@@ -881,6 +962,8 @@ pub async fn legacy_key_usage(
                         }
                     }
                     Ok(_) => {}
+                    // Listed, then deleted: no object left to read.
+                    Err(crate::storage::StorageError::NotFound(_)) => {}
                     Err(e) => usage.error(format!("{bucket}/{key}: {e}")),
                 }
             }
@@ -888,7 +971,8 @@ pub async fn legacy_key_usage(
                 // Budget spent with objects left: the count is a lower bound.
                 usage.complete = false;
                 usage.safe_to_clear = false;
-                return Ok(Json(usage));
+                usage.computed_at = Some(chrono::Utc::now());
+                return usage;
             }
             match (page.is_truncated, page.next_continuation_token) {
                 (true, Some(t)) => token = Some(t),
@@ -898,7 +982,8 @@ pub async fn legacy_key_usage(
     }
     usage.complete = true;
     usage.safe_to_clear = usage.safe_to_clear();
-    Ok(Json(usage))
+    usage.computed_at = Some(chrono::Utc::now());
+    usage
 }
 
 #[cfg(test)]
@@ -946,5 +1031,95 @@ mod legacy_usage_tests {
             complete: u.complete,
             ..Default::default()
         }
+    }
+
+    use super::{legacy_usage_single_flight, scan_legacy_usage};
+    use crate::usage_scanner::test_support::{fake_s3_engine, heads, put_raw};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn scan_of_b() -> LegacyKeyUsage {
+        LegacyKeyUsage {
+            backend: "hetzner-fsn1".into(),
+            legacy_key_id: Some("hetzner-2026-06".into()),
+            buckets: vec!["b".into()],
+            limit: 10_000,
+            ..Default::default()
+        }
+    }
+
+    /// Cockroach scan (ui.md F, limits #10): each reference cost a
+    /// `has_reference` HEAD and a metadata HEAD, one reference at a time.
+    #[tokio::test]
+    async fn the_legacy_key_check_heads_each_reference_once() {
+        let (engine, fake, endpoint) = fake_s3_engine().await;
+        for d in 0..20 {
+            put_raw(&endpoint, &format!("d{d:02}/reference.bin"), b"ref").await;
+        }
+        fake.set_delay_ms("HEAD", 20);
+        fake.clear();
+        let out = scan_legacy_usage(Arc::new(engine), scan_of_b(), "hetzner-2026-06".into()).await;
+        assert_eq!(heads(&fake), 20, "20 references");
+        assert!(
+            fake.peak_in_flight("HEAD") <= 8,
+            "{} reference HEADs at once",
+            fake.peak_in_flight("HEAD")
+        );
+        assert_eq!(out.references_scanned, 20);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+    }
+
+    /// Cockroach scan (ui.md F): `engine.head` sends two HEADs per object
+    /// (the delta and the passthrough form).
+    #[tokio::test]
+    async fn the_legacy_key_check_heads_each_object_once() {
+        let (engine, fake, _) = fake_s3_engine().await;
+        crate::deltaglider::store_deltas(&engine, "o", 5).await;
+        for i in 0..5 {
+            engine
+                .store(
+                    "b",
+                    &format!("o/pic-{i}.jpg"),
+                    b"x",
+                    None,
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        fake.clear();
+        let out = scan_legacy_usage(Arc::new(engine), scan_of_b(), "hetzner-2026-06".into()).await;
+        assert_eq!((out.objects_scanned, out.references_scanned), (10, 1));
+        assert!(
+            heads(&fake) <= 11,
+            "{} HEADs for 10 objects and 1 reference",
+            heads(&fake)
+        );
+        assert!(out.complete && out.errors.is_empty(), "{out:?}");
+    }
+
+    /// Cockroach scan (ui.md F): every mount of the Backends page started a
+    /// new scan, with no server cache and no single-flight.
+    #[tokio::test]
+    async fn concurrent_legacy_key_checks_share_one_scan() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let key = format!("test-{}", uuid::Uuid::new_v4());
+        let run = || {
+            let runs = runs.clone();
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                LegacyKeyUsage::default()
+            }
+        };
+        tokio::join!(
+            legacy_usage_single_flight(key.clone(), false, run),
+            legacy_usage_single_flight(key.clone(), false, run)
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "two checks at once");
+        legacy_usage_single_flight(key.clone(), false, run).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "a check within the TTL");
+        legacy_usage_single_flight(key.clone(), true, run).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "a fresh check scans again");
     }
 }
