@@ -442,8 +442,14 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_MAX_CONCURRENT_REQUESTS",
-        description: "Max concurrent HTTP requests (tower ConcurrencyLimit, default: 1024)",
+        description: "Max concurrent S3 API requests (default: 1024). A request that finds every slot taken waits for one, up to DGP_REQUEST_TIMEOUT_SECS",
         example: "1024",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_BACKEND_SHARE_PERCENT",
+        description: "With more than one storage backend: the most of DGP_MAX_CONCURRENT_REQUESTS, and of DGP_SPOOL_MAX_BYTES, that the requests to one backend may hold (1-100, default: 75). A request to a backend whose share of request slots is full gets 503 SlowDown at once; one whose share of spool is full waits for that backend's own spool. A slow backend then cannot stall the others",
+        example: "75",
         category: "Server",
     },
     EnvVarEntry {

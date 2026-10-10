@@ -44,6 +44,9 @@ pub struct ReadyProbe {
     pub cache_ttl_secs: i64,
 }
 
+/// The default of `DGP_BACKEND_SHARE_PERCENT`.
+pub const DEFAULT_BACKEND_SHARE_PERCENT: u8 = 75;
+
 /// Env-only settings of one config snapshot. See the module docs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeTuning {
@@ -52,6 +55,10 @@ pub struct RuntimeTuning {
     pub request_timeout_secs: u64,
     /// `DGP_MAX_CONCURRENT_REQUESTS`.
     pub max_concurrent_requests: usize,
+    /// `DGP_BACKEND_SHARE_PERCENT` (1-100): the most of the request slots
+    /// that the requests to one backend may hold when several backends are
+    /// configured. The spool reads the same variable for its budget.
+    pub backend_share_percent: u8,
     /// `DGP_CORS_PERMISSIVE` (dev mode).
     pub cors_permissive: bool,
     /// `DGP_DEBUG_HEADERS`.
@@ -113,6 +120,9 @@ impl RuntimeTuning {
             request_timeout_secs: parse_or("DGP_REQUEST_TIMEOUT_SECS", 300),
             max_concurrent_requests: lookup_parse(env, "DGP_MAX_CONCURRENT_REQUESTS")
                 .unwrap_or(1024),
+            backend_share_percent: lookup_parse::<u8>(env, "DGP_BACKEND_SHARE_PERCENT")
+                .unwrap_or(DEFAULT_BACKEND_SHARE_PERCENT)
+                .clamp(1, 100),
             cors_permissive: lookup_bool(env, "DGP_CORS_PERMISSIVE", false),
             debug_headers: lookup_bool(env, "DGP_DEBUG_HEADERS", false),
             trust_proxy_headers: lookup_bool(env, "DGP_TRUST_PROXY_HEADERS", false),

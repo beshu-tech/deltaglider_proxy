@@ -23,12 +23,33 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 
+tokio::task_local! {
+    /// The backend whose share of the budget a request's spool counts
+    /// against (see [`scoped`]).
+    static SPOOL_SCOPE: Arc<str>;
+}
+
+/// Run `fut` with its spool reservations counted against `backend`'s share
+/// of the budget as well (`DGP_BACKEND_SHARE_PERCENT`, see
+/// [`SpoolDir::with_backend_share`]). The S3 router runs every request to a
+/// bucket in the scope of its backend when several backends are
+/// configured. A reservation outside a scope (background jobs) counts
+/// against the whole budget only.
+pub async fn scoped<F: std::future::Future>(backend: &str, fut: F) -> F::Output {
+    SPOOL_SCOPE.scope(Arc::from(backend), fut).await
+}
+
 /// A byte-budget-gated pool of temp spool bytes.
 #[derive(Clone)]
 pub struct SpoolDir {
     dir: PathBuf,
     budget: Arc<Budget>,
     max_bytes: u64,
+    /// The most of the budget (MiB) that the reservations made in one
+    /// backend's scope may hold together.
+    share_mib: usize,
+    /// The share budgets, one per backend scope.
+    shares: Arc<parking_lot::Mutex<std::collections::HashMap<Arc<str>, Arc<Budget>>>>,
     /// Holders of optional spool files (the range-read reconstruction
     /// cache) that give budget back when an acquire finds it short.
     evictors: Arc<parking_lot::Mutex<Vec<std::sync::Weak<dyn SpoolEvictor>>>>,
@@ -82,7 +103,11 @@ impl SpoolDir {
             .unwrap_or_else(|| std::env::temp_dir().join("dgp-spool"));
         let max_bytes: u64 =
             crate::config::env_parse_with_default("DGP_SPOOL_MAX_BYTES", 16 * 1024 * 1024 * 1024);
-        let pool = Self::new(dir, max_bytes)?;
+        let share: u8 = crate::config::env_parse_with_default(
+            "DGP_BACKEND_SHARE_PERCENT",
+            crate::config::tuning::DEFAULT_BACKEND_SHARE_PERCENT,
+        );
+        let pool = Self::new(dir, max_bytes)?.with_backend_share(share);
         pool.sweep_orphans();
         Ok(pool)
     }
@@ -111,8 +136,38 @@ impl SpoolDir {
             dir,
             budget: Budget::new(max_mib),
             max_bytes,
+            share_mib: backend_share_mib(
+                max_mib,
+                crate::config::tuning::DEFAULT_BACKEND_SHARE_PERCENT,
+            ),
+            shares: Default::default(),
             evictors: Default::default(),
         })
+    }
+
+    /// Let the reservations made in one backend's scope ([`scoped`]) hold
+    /// at most `percent` of the budget together. One slow backend's large
+    /// GETs held the whole budget, and every large request on the other
+    /// backends waited for it, then got 503 SlowDown. 100 turns it off.
+    pub fn with_backend_share(mut self, percent: u8) -> Self {
+        self.share_mib = backend_share_mib(self.budget.max, percent);
+        self
+    }
+
+    /// The share budget of the current backend scope; `None` outside a
+    /// scope or without a share.
+    fn scope_share(&self) -> Option<Arc<Budget>> {
+        if self.share_mib >= self.budget.max {
+            return None;
+        }
+        let scope = SPOOL_SCOPE.try_with(Arc::clone).ok()?;
+        Some(
+            self.shares
+                .lock()
+                .entry(scope)
+                .or_insert_with(|| Budget::new(self.share_mib))
+                .clone(),
+        )
     }
 
     /// Let `evictor` give budget back when an acquire finds it short. A
@@ -126,7 +181,14 @@ impl SpoolDir {
     /// Evict optional spool files until `want_mib` is free or none is left.
     /// Runs outside the budget lock (a dropped file releases into it).
     fn make_room(&self, want_mib: usize) {
-        if self.budget.free() >= want_mib {
+        self.make_room_in(&self.budget, want_mib);
+    }
+
+    /// [`Self::make_room`] in `budget` (the whole budget, or a backend's
+    /// share of it: a cached file holds the share of the backend that made
+    /// it).
+    fn make_room_in(&self, budget: &Budget, want_mib: usize) {
+        if budget.free() >= want_mib {
             return;
         }
         let evictors: Vec<_> = self
@@ -136,7 +198,7 @@ impl SpoolDir {
             .filter_map(std::sync::Weak::upgrade)
             .collect();
         for evictor in evictors {
-            while self.budget.free() < want_mib && evictor.evict_one() {}
+            while budget.free() < want_mib && evictor.evict_one() {}
         }
     }
 
@@ -211,8 +273,20 @@ impl SpoolDir {
     async fn reserve_within(&self, bytes: u64, held_mib: usize) -> std::io::Result<BudgetPermit> {
         if held_mib == 0 {
             let want = self.want_mib(bytes, 0);
+            // The backend's share first: a request over its backend's share
+            // waits for that backend's own spool, and never queues for the
+            // whole budget ahead of the other backends' requests.
+            let share = match self.scope_share() {
+                Some(share) => {
+                    self.make_room_in(&share, want.min(share.max));
+                    Some(share.acquire(want).await)
+                }
+                None => None,
+            };
             self.make_room(want);
-            return Ok(self.budget.acquire(want).await);
+            let mut permit = self.budget.acquire(want).await;
+            permit.share = share.map(Box::new);
+            return Ok(permit);
         }
         self.try_permit(bytes, held_mib)
     }
@@ -227,15 +301,23 @@ impl SpoolDir {
     /// [`CONTENDED`]. Sync, so a sync caller under a lock can use it.
     fn try_permit(&self, bytes: u64, held_mib: usize) -> std::io::Result<BudgetPermit> {
         let want = self.want_mib(bytes, held_mib);
+        let contended = || {
+            std::io::Error::new(
+                CONTENDED,
+                "spool budget contended: an op that holds a spool, or a storage write, does not wait for more",
+            )
+        };
+        let share = match self.scope_share() {
+            Some(share) => {
+                self.make_room_in(&share, want.min(share.max));
+                Some(share.try_acquire(want).ok_or_else(contended)?)
+            }
+            None => None,
+        };
         self.make_room(want);
-        self.budget
-            .try_acquire(want)
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    CONTENDED,
-                    "spool budget contended: an op that holds a spool, or a storage write, does not wait for more",
-                )
-            })
+        let mut permit = self.budget.try_acquire(want).ok_or_else(contended)?;
+        permit.share = share.map(Box::new);
+        Ok(permit)
     }
 
     /// Reserve `bytes` of spool budget and create a temp file for it. Awaits if
@@ -501,6 +583,12 @@ pub enum SpoolFillError {
     Overrun { cap: u64, written: u64 },
 }
 
+/// Pure: one backend's share of a `max_mib` budget at `percent` (at least
+/// 1 MiB; 100 % or more is the whole budget).
+fn backend_share_mib(max_mib: usize, percent: u8) -> usize {
+    (max_mib.saturating_mul(usize::from(percent.min(100))) / 100).max(1)
+}
+
 /// Bytes → MiB, rounded up. Budget accounting unit.
 pub(crate) fn mib_ceil(bytes: u64) -> usize {
     const MIB: u64 = 1024 * 1024;
@@ -540,6 +628,9 @@ struct Waiter {
 pub(crate) struct BudgetPermit {
     budget: Arc<Budget>,
     n: usize,
+    /// The same reservation in the backend's share budget, if any
+    /// (released with this one).
+    share: Option<Box<BudgetPermit>>,
 }
 
 impl BudgetPermit {
@@ -573,6 +664,7 @@ impl Budget {
         BudgetPermit {
             budget: self.clone(),
             n,
+            share: None,
         }
     }
 
@@ -745,6 +837,28 @@ mod tests {
         ]);
         let err = spool.fill_from_stream(&mut failing, 10).await;
         assert!(matches!(err, Err(SpoolFillError::Source(_))), "{err:?}");
+    }
+
+    /// The budget was global: the large GETs of one slow backend could
+    /// hold all of it, and a large GET on any other backend waited the
+    /// acquire timeout (120 s) and got 503 SlowDown.
+    #[tokio::test]
+    async fn one_backend_cannot_hold_the_whole_spool_budget() {
+        const MIB: u64 = 1024 * 1024;
+        let wait = std::time::Duration::from_millis(200);
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = SpoolDir::new(tmp.path().to_path_buf(), 64 * MIB).unwrap();
+        let _first = scoped("hetzner-fsn1", pool.acquire(32 * MIB))
+            .await
+            .unwrap();
+        let second =
+            tokio::time::timeout(wait, scoped("hetzner-fsn1", pool.acquire(32 * MIB))).await;
+        let other = tokio::time::timeout(wait, scoped("local-disk", pool.acquire(32 * MIB))).await;
+        assert!(
+            other.is_ok(),
+            "a GET on another backend waited for the slow backend's spool"
+        );
+        assert!(second.is_err(), "one backend held the whole budget");
     }
 
     #[tokio::test]
