@@ -1285,9 +1285,68 @@ pub async fn reopen_and_rebuild_iam(
         }
     }
 
+    // Read the providers before anything changes: a read error keeps the
+    // current IAM index and providers (see `rebuild_iam_index`).
+    let providers = match external_auth {
+        Some(_) => Some(db.load_auth_providers().map_err(|e| {
+            let why = format!("the OAuth providers could not be read from the merged DB: {e}");
+            warn!("Config DB S3 sync ({context}): IAM state kept as it was: {why}");
+            why
+        })?),
+        None => None,
+    };
     // Rebuild IAM index from the new DB
-    let users = db.load_users().unwrap_or_default();
-    let groups = db.load_groups().unwrap_or_default();
+    rebuild_iam_index(&db, iam_state, context)?;
+
+    // Refresh the session-revocation snapshot from the just-merged table so a
+    // revoke performed on another instance takes effect here (the cross-instance
+    // stolen-cookie escape hatch).
+    if let Some(sessions) = sessions {
+        if let Ok(rows) = db.load_session_revocations() {
+            sessions.set_revocations(rows);
+        }
+    }
+
+    // Rebuild ExternalAuthManager from the new DB. Release the DB
+    // lock before the async discovery round — it can take seconds
+    // against real OIDC providers.
+    if let (Some(ext_auth), Some(providers)) = (external_auth.as_ref(), providers) {
+        // ALWAYS rebuild — an EMPTY list means every provider was deleted on the
+        // peer, and skipping the rebuild would leave the deleted provider's live
+        // discovery/client config in memory, so OAuth logins through it keep
+        // succeeding here indefinitely. Only the async discovery round is skipped
+        // when empty (nothing to discover).
+        let is_empty = providers.is_empty();
+        ext_auth.rebuild(&providers);
+        drop(db);
+        if !is_empty {
+            ext_auth.discover_all().await;
+        }
+        info!(
+            "External auth providers rebuilt from S3-synced DB ({} providers) [{}]",
+            ext_auth.provider_names().len(),
+            context
+        );
+    }
+    Ok(())
+}
+
+/// Rebuild the in-memory IAM index from `db` (after a sync merge). A read
+/// error keeps the current index: an empty read is not "no users", and an
+/// index with nobody in it refuses every IAM client. The `Err` keeps the
+/// downloaded ETag uncommitted, so the next poll merges and rebuilds again.
+fn rebuild_iam_index(
+    db: &ConfigDb,
+    iam_state: &SharedIamState,
+    context: &str,
+) -> Result<(), String> {
+    let read = |what: &str, e: crate::config_db::ConfigDbError| {
+        let why = format!("the {what} could not be read from the merged DB: {e}");
+        warn!("Config DB S3 sync ({context}): IAM index kept as it was: {why}");
+        why
+    };
+    let users = db.load_users().map_err(|e| read("IAM users", e))?;
+    let groups = db.load_groups().map_err(|e| read("IAM groups", e))?;
     let count = users.len();
     let group_count = groups.len();
     // An empty synced DB applies THIS node's empty-set outcome (its own
@@ -1319,39 +1378,38 @@ pub async fn reopen_and_rebuild_iam(
         );
     }
     iam_state.store(Arc::new(state));
-
-    // Refresh the session-revocation snapshot from the just-merged table so a
-    // revoke performed on another instance takes effect here (the cross-instance
-    // stolen-cookie escape hatch).
-    if let Some(sessions) = sessions {
-        if let Ok(rows) = db.load_session_revocations() {
-            sessions.set_revocations(rows);
-        }
-    }
-
-    // Rebuild ExternalAuthManager from the new DB. Release the DB
-    // lock before the async discovery round — it can take seconds
-    // against real OIDC providers.
-    if let Some(ref ext_auth) = external_auth {
-        let providers = db.load_auth_providers().unwrap_or_default();
-        // ALWAYS rebuild — an EMPTY list means every provider was deleted on the
-        // peer, and skipping the rebuild would leave the deleted provider's live
-        // discovery/client config in memory, so OAuth logins through it keep
-        // succeeding here indefinitely. Only the async discovery round is skipped
-        // when empty (nothing to discover).
-        let is_empty = providers.is_empty();
-        ext_auth.rebuild(&providers);
-        drop(db);
-        if !is_empty {
-            ext_auth.discover_all().await;
-        }
-        info!(
-            "External auth providers rebuilt from S3-synced DB ({} providers) [{}]",
-            ext_auth.provider_names().len(),
-            context
-        );
-    }
     Ok(())
+}
+
+#[cfg(test)]
+mod iam_rebuild_tests {
+    use super::*;
+
+    /// A DB read error during the rebuild after a sync merge (a locked or
+    /// damaged table) was read as "no users": the node stored an IAM index
+    /// with nobody in it, and every IAM client got 403 until the next
+    /// change on a peer.
+    #[test]
+    fn a_db_read_error_keeps_the_current_iam_state() {
+        let db = ConfigDb::in_memory("iam-rebuild-test-key").unwrap();
+        db.create_user("alice", "AKALICE0000000000001", "alice-secret", true, &[])
+            .unwrap();
+        let iam_state: SharedIamState =
+            Arc::new(arc_swap::ArcSwap::from_pointee(IamIndex::build_iam_state(
+                db.load_users().unwrap(),
+                db.load_groups().unwrap(),
+                crate::iam::EmptyIamOutcome::DenyAll,
+            )));
+        assert!(iam_state.load().has_iam_users());
+        db.conn.execute_batch("DROP TABLE group_members").unwrap();
+
+        let rebuilt = rebuild_iam_index(&db, &iam_state, "test");
+        assert!(
+            iam_state.load().has_iam_users(),
+            "a read error emptied the IAM index"
+        );
+        assert!(rebuilt.is_err(), "the caller must not commit the ETag");
+    }
 }
 
 #[cfg(test)]
