@@ -219,6 +219,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// GET; empty = cannot verify). A cached copy with another sha is stale:
     /// a peer node reseeded the deltaspace. Encoding against it wrote deltas
     /// that no other node could decode.
+    ///
+    /// Single flight: concurrent cold reads of one deltaspace wait for one
+    /// download (`ReferenceCache::get_or_load`) instead of each sending its
+    /// own GET of the whole reference.
     pub(super) async fn get_reference_cached(
         &self,
         bucket: &str,
@@ -226,15 +230,29 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         expected_sha256: &str,
     ) -> Result<(bytes::Bytes, bool), EngineError> {
         let cache_key = self.cache_key(bucket, deltaspace_id);
+        let (data, hit) = self
+            .cache
+            .get_or_load(&cache_key, expected_sha256, || {
+                self.load_verified_reference(bucket, deltaspace_id)
+            })
+            .await?;
+        self.with_metrics(|m| {
+            if hit {
+                m.cache_hits_total.inc()
+            } else {
+                m.cache_misses_total.inc()
+            }
+        });
+        Ok((data, hit))
+    }
 
-        // Check cache first (Bytes clone is a cheap refcount increment)
-        if let Some(data) = self.cache.get_matching(&cache_key, expected_sha256) {
-            self.with_metrics(|m| m.cache_hits_total.inc());
-            return Ok((data, true));
-        }
-
-        self.with_metrics(|m| m.cache_misses_total.inc());
-
+    /// Load a reference and check it against its own recorded SHA-256.
+    /// Returns the bytes and their SHA-256, for the cache.
+    async fn load_verified_reference(
+        &self,
+        bucket: &str,
+        deltaspace_id: &str,
+    ) -> Result<(bytes::Bytes, String), EngineError> {
         // Load the reference data and its recorded metadata together. The
         // metadata read is cheap (xattr / S3 HEAD) and runs in parallel so it
         // doesn't add a serial round-trip to the miss path. We use the
@@ -275,13 +293,49 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             }
         }
 
-        // PERF: Convert Vec→Bytes once (zero-copy ownership transfer), then
-        // clone the Bytes for the cache (refcount increment, no memcpy).
-        // The old code did data.clone() (full 80MB memcpy) + Bytes::from — this
-        // saves one memcpy per cache miss.
-        let bytes = Bytes::from(data);
-        self.cache.put(&cache_key, bytes.clone(), &actual);
+        // PERF: Convert Vec→Bytes once (zero-copy ownership transfer); the
+        // cache keeps a clone (refcount increment, no memcpy).
+        Ok((Bytes::from(data), actual))
+    }
+}
 
-        Ok((bytes, false))
+/// Pure: after the reconstruction of a delta failed its checksum, can the
+/// cached reference of its deltaspace be the cause? Only when the delta
+/// names no reference checksum: then nothing tied that reference to this
+/// delta. A delta that names one was decoded against the reference the
+/// cache holds under that checksum, or against the stored reference, read
+/// and checked against its own recorded checksum. Either way the reference
+/// is good and the delta is bad: evicting the reference made each GET of
+/// the bad object (and the next GET of every good one) download it again.
+pub(super) fn reference_suspect_after_mismatch(metadata: &FileMetadata) -> bool {
+    match &metadata.storage_info {
+        StorageInfo::Delta { ref_sha256, .. } => ref_sha256.is_empty(),
+        _ => false,
+    }
+}
+
+/// Which checksum failure evicts the cached reference.
+#[cfg(test)]
+mod reference_eviction_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_delta_without_a_reference_sha_suspects_the_reference() {
+        let delta = |ref_sha: &str| {
+            FileMetadata::new_delta(
+                "a.zip".into(),
+                "s".into(),
+                "m".into(),
+                10,
+                "reference.bin".into(),
+                ref_sha.into(),
+                3,
+                None,
+            )
+        };
+        assert!(reference_suspect_after_mismatch(&delta("")));
+        assert!(!reference_suspect_after_mismatch(&delta("abc")));
+        let plain = FileMetadata::new_passthrough("a.bin".into(), "s".into(), "m".into(), 1, None);
+        assert!(!reference_suspect_after_mismatch(&plain));
     }
 }

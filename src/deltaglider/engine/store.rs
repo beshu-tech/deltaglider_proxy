@@ -760,7 +760,19 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // The ref spool holds the REFERENCE, which can be larger than this object
         // — reserve it at the reference's actual size so the byte-budget isn't
         // under-accounted under concurrency (→ ENOSPC).
-        let ref_size = if fresh_baseline {
+        // A verified copy of the reference that a large delta GET of this
+        // deltaspace downloaded lately (`range_spools`) saves the download.
+        let shared_reference = (!fresh_baseline && !ref_meta.file_sha256.is_empty())
+            .then(|| {
+                self.range_spools.get_fresh(
+                    &crate::deltaglider::range_spool::RangeSpoolKey::reference(
+                        self.cache_key(put.bucket, put.deltaspace_id),
+                        ref_meta.file_sha256.clone(),
+                    ),
+                )
+            })
+            .flatten();
+        let ref_size = if fresh_baseline || shared_reference.is_some() {
             1
         } else {
             ref_meta.file_size
@@ -780,6 +792,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             // Reading the reference back would cost a second transfer of
             // the object on S3.
             body.path().to_path_buf()
+        } else if let Some(shared) = &shared_reference {
+            shared.path().to_path_buf()
         } else {
             self.storage
                 .get_reference_to_file(put.bucket, put.deltaspace_id, ref_spool.path())
@@ -1119,7 +1133,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Stream-hash a spool file → (sha256_hex, md5_hex, byte_len). Bounded
     /// memory (256KiB chunks). Shared by the store hash path and the reference
     /// heal.
-    async fn hash_spool_file(path: &Path) -> Result<(String, String, u64), EngineError> {
+    pub(super) async fn hash_spool_file(path: &Path) -> Result<(String, String, u64), EngineError> {
         let path = path.to_path_buf();
         tokio::task::spawn_blocking(move || -> std::io::Result<(String, String, u64)> {
             use std::io::Read;

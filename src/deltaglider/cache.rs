@@ -19,6 +19,8 @@
 
 use bytes::Bytes;
 use moka::sync::Cache;
+use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::debug;
 
 /// Concurrent LRU cache for frequently accessed reference files.
@@ -36,6 +38,10 @@ use tracing::debug;
 pub struct ReferenceCache {
     cache: Cache<String, CachedReference>,
     max_capacity_bytes: u64,
+    /// One load per key at a time ([`Self::get_or_load`]): K concurrent
+    /// cold reads of one deltaspace download its reference once, not K
+    /// times.
+    loads: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// Cached reference bytes plus their SHA-256, so a reader can tell that the
@@ -67,7 +73,53 @@ impl ReferenceCache {
         Self {
             cache,
             max_capacity_bytes: max_size_bytes,
+            loads: Default::default(),
         }
+    }
+
+    /// The cached reference of `prefix` with `expected_sha256` (as
+    /// [`Self::get_matching`]), else the result of `load`, which returns the
+    /// bytes and their SHA-256. Only a successful load is cached. Single
+    /// flight: a concurrent caller of the same key waits for the running
+    /// load and then reads the cache; when that load failed, it runs its
+    /// own. Returns `(data, cache_hit)`; a read that waited for another
+    /// caller's load is a hit.
+    pub async fn get_or_load<F, Fut, E>(
+        &self,
+        prefix: &str,
+        expected_sha256: &str,
+        load: F,
+    ) -> Result<(Bytes, bool), E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(Bytes, String), E>>,
+    {
+        if let Some(data) = self.get_matching(prefix, expected_sha256) {
+            return Ok((data, true));
+        }
+        let slot = self
+            .loads
+            .lock()
+            .entry(prefix.to_string())
+            .or_default()
+            .clone();
+        let result = {
+            let _one = slot.lock().await;
+            match self.get_matching(prefix, expected_sha256) {
+                Some(data) => Ok((data, true)),
+                None => load().await.map(|(data, sha256)| {
+                    self.put(prefix, data.clone(), &sha256);
+                    (data, false)
+                }),
+            }
+        };
+        // Forget the slot when no other caller holds it. A caller clones it
+        // under the map lock, so the count cannot grow behind this check.
+        let mut loads = self.loads.lock();
+        if Arc::strong_count(&slot) == 2 {
+            loads.remove(prefix);
+        }
+        result
     }
 
     /// Return the configured maximum cache capacity in bytes.
@@ -152,6 +204,38 @@ mod tests {
         fn put_test(&self, prefix: &str, data: Bytes) {
             self.put(prefix, data, "");
         }
+    }
+
+    /// Eight concurrent cold reads of one key run one load; a failed load
+    /// is not cached, and the next caller runs its own.
+    #[tokio::test]
+    async fn concurrent_cold_reads_share_one_load() {
+        let cache = ReferenceCache::new(10);
+        let loads = std::sync::atomic::AtomicUsize::new(0);
+        let load = || async {
+            loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok::<_, ()>((Bytes::from_static(b"ref"), "s1".to_string()))
+        };
+        let got =
+            futures::future::join_all((0..8).map(|_| cache.get_or_load("k", "s1", load))).await;
+        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(got.iter().all(|r| r.as_ref().unwrap().0 == "ref"));
+        assert_eq!(got.iter().filter(|r| !r.as_ref().unwrap().1).count(), 1);
+        assert!(cache.loads.lock().is_empty(), "the slot is forgotten");
+
+        let failed = cache
+            .get_or_load("f", "", || async { Err::<(Bytes, String), _>("boom") })
+            .await;
+        assert!(failed.is_err());
+        assert!(cache.get("f").is_none(), "a failed load is not cached");
+        let (data, hit) = cache
+            .get_or_load("f", "", || async {
+                Ok::<_, &str>((Bytes::from_static(b"x"), "s".to_string()))
+            })
+            .await
+            .unwrap();
+        assert_eq!((&data[..], hit), (&b"x"[..], false));
     }
 
     #[test]

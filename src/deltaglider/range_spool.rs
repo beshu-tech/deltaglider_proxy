@@ -18,6 +18,12 @@
 //!   ([`SpoolEvictor`]), and an entry expires after its TTL.
 //! - An overwrite changes the content sha, so a new version never matches an
 //!   old entry.
+//!
+//! The same cache keeps the verified REFERENCE of a deltaspace that a large
+//! delta GET downloaded ([`RangeSpoolKey::reference`]): the other deltas of
+//! the deltaspace decode against that file instead of downloading the
+//! reference again. A full GET of a large delta shares its reconstruction
+//! here too, so concurrent GETs of one object decode it once.
 
 use crate::deltaglider::spool::{Spool, SpoolEvictor};
 use std::collections::HashMap;
@@ -34,6 +40,28 @@ pub(crate) struct RangeSpoolKey {
     pub bucket: String,
     pub key: String,
     pub sha256: String,
+}
+
+impl RangeSpoolKey {
+    /// The reconstruction of the object `bucket/key` with content `sha256`.
+    pub(crate) fn object(bucket: &str, key: String, sha256: String) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            key,
+            sha256,
+        }
+    }
+
+    /// The reference of a deltaspace (`deltaspace`: the engine's cache key
+    /// of it) with content `sha256`. Its bucket is empty, so no object key
+    /// can name it.
+    pub(crate) fn reference(deltaspace: String, sha256: String) -> Self {
+        Self {
+            bucket: String::new(),
+            key: deltaspace,
+            sha256,
+        }
+    }
 }
 
 struct Entry {
@@ -65,6 +93,22 @@ impl RangeSpoolCache {
             fills: AtomicU64::new(0),
             me: me.clone(),
         })
+    }
+
+    /// Whether entries are kept at all (`ttl > 0`).
+    pub(crate) fn caches(&self) -> bool {
+        !self.ttl.is_zero()
+    }
+
+    /// The fresh cached spool of `key`, without waiting: `None` when there
+    /// is none, or while a fill of it runs.
+    pub(crate) fn get_fresh(&self, key: &RangeSpoolKey) -> Option<Arc<Spool>> {
+        let slot = self.slots.lock().get(key)?.clone();
+        let entry = slot.entry.try_lock().ok()?;
+        entry
+            .as_ref()
+            .filter(|e| e.created.elapsed() < self.ttl)
+            .map(|e| e.spool.clone())
     }
 
     /// How many times `fill` ran (decodes), for the tests.
