@@ -216,7 +216,7 @@ pub(crate) fn prune_failure_ring(
     max_retained: u32,
 ) -> Result<(), ConfigDbError> {
     check_idents(&[table, key_col])?;
-    conn.execute(
+    let deleted = conn.execute(
         &format!(
             "DELETE FROM {table}
               WHERE {key_col} = ?1
@@ -229,6 +229,9 @@ pub(crate) fn prune_failure_ring(
         ),
         params![key, key, max_retained],
     )?;
+    if deleted > 0 {
+        super::reclaim_free_pages(conn);
+    }
     Ok(())
 }
 

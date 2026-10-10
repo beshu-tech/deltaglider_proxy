@@ -2,6 +2,10 @@
 
 After each successful S3 mutation, the proxy writes a durable object event to the encrypted config DB. The outbox is append-first: PUT/COPY/DELETE, successful replication copies, and successful lifecycle deletes and transitions do not send requests to external systems directly. So object operations do not wait for webhook latency or failures.
 
+A client PUT, COPY or DELETE request also never waits for the config DB itself. When the database is free, the proxy writes the event before it answers the request. When other work holds the database (a parity audit, or the copy of the database for the sync bucket), the proxy puts the event in an in-memory queue and answers at once. A background writer then writes the queued events in the order in which they arrived, and a graceful shutdown waits for it. A crash of the process loses the events that are still in the queue.
+
+The proxy gives the space of deleted outbox rows back to the disk after each cleanup of the outbox. The first start of this release converts an existing config DB once for this purpose; the log line `converting to incremental auto-vacuum` reports it, together with its duration. The conversion needs free disk space of about the size of the live data in the database.
+
 ## Semantics
 
 - Rows are stored in `event_outbox` with status `pending`, `in_progress`, `delivered`, or `failed`.

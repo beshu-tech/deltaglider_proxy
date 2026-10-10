@@ -15,7 +15,8 @@
 //!   — the same quota gate, write lock and event for a multipart completion.
 //! * [`check_quota_for_write`] / [`check_quota`] — pre-write quota gate.
 //! * [`enqueue_object_event`] / [`enqueue_object_events`] — best-
-//!   effort event-outbox append for notification dispatch.
+//!   effort event-outbox append for notification dispatch; never waits
+//!   for the config DB mutex.
 //!
 //! Everything else moved into the s3s adapter or was already
 //! axum-handler-specific and went away with `object.rs` /
@@ -25,11 +26,12 @@ use super::AppState;
 use crate::api::errors::S3Error;
 use crate::event_outbox::NewEvent;
 use std::sync::Arc;
-use tracing::warn;
 
 /// Append a single object event to the outbox. Silently noops when
 /// no config DB is attached (open-mode dev runs). Errors are
 /// warn-logged and dropped — notifications are best-effort by design.
+/// Never waits for the config DB mutex (see
+/// [`crate::event_outbox::append_events`]).
 pub(crate) async fn enqueue_object_event(state: &Arc<AppState>, event: NewEvent) {
     enqueue_object_events(state, &[event]).await;
 }
@@ -45,24 +47,10 @@ pub(crate) async fn enqueue_object_events(state: &Arc<AppState>, events: &[NewEv
         .filter(|e| crate::replication::event_consumer::is_user_object_key(&e.key))
         .cloned()
         .collect();
-    if filtered.is_empty() {
-        return;
-    }
-    let events = filtered.as_slice();
     let Some(config_db) = state.config_db.as_ref() else {
         return;
     };
-    let db = config_db.lock().await;
-    if let Err(err) = db.event_outbox_insert_many(events) {
-        warn!(
-            "failed to append {} object event(s), first kind={} bucket={} key={:?}: {}",
-            events.len(),
-            events[0].kind.as_str(),
-            events[0].bucket,
-            events[0].key,
-            err
-        );
-    }
+    crate::event_outbox::append_events(config_db, filtered);
 }
 
 /// One client write of a whole body (PutObject, CopyObject, form POST).
@@ -450,7 +438,8 @@ mod quota_tests {
     }
 }
 
-/// The quota gate against a real engine and counter.
+/// The quota gate and the outbox enqueue against a real engine, counter and
+/// config DB.
 #[cfg(test)]
 mod write_path_tests {
     use super::*;
@@ -577,5 +566,53 @@ mod write_path_tests {
         );
         assert!(put(&f.state, "k.jpg", 11).await.is_err(), "net +1 B");
         assert!(put(&f.state, "new.jpg", 1).await.is_err(), "a new object");
+    }
+
+    fn event(key: &str) -> NewEvent {
+        NewEvent::new(
+            crate::event_outbox::EventKind::ObjectCreated,
+            "b",
+            key,
+            crate::event_outbox::EventSource::S3Api,
+            1,
+            serde_json::json!({}),
+        )
+    }
+
+    async fn outbox_keys(state: &Arc<AppState>) -> Vec<String> {
+        let db = state.config_db.as_ref().unwrap().lock().await;
+        db.event_outbox_since(0, 100)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.key)
+            .collect()
+    }
+
+    /// A client PUT/DELETE never waits for the config DB mutex: a long holder
+    /// (a parity verify, the sync snapshot) used to stall every write
+    /// request on its event append. The events still land, in order.
+    #[tokio::test]
+    async fn an_object_event_never_waits_for_the_config_db() {
+        let f = fixture(u64::MAX).await;
+        let db = f.state.config_db.clone().unwrap();
+        let held = db.lock().await;
+        for key in ["a.zip", "b.zip"] {
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                enqueue_object_events(&f.state, &[event(key)]),
+            )
+            .await
+            .expect("the event append waited for the config DB mutex");
+        }
+        drop(held);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while outbox_keys(&f.state).await.len() < 2 {
+            assert!(tokio::time::Instant::now() < deadline, "events lost");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // An idle DB with nothing queued: the event is written before the
+        // append returns, after the queued ones.
+        enqueue_object_events(&f.state, &[event("c.zip")]).await;
+        assert_eq!(outbox_keys(&f.state).await, ["a.zip", "b.zip", "c.zip"]);
     }
 }

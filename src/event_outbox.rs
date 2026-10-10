@@ -680,6 +680,7 @@ impl ConfigDb {
               )",
             params![before, min_keep_id, limit as i64],
         )?;
+        crate::config_db::reclaim_free_pages(&self.conn);
         Ok(deleted)
     }
 
@@ -713,6 +714,7 @@ impl ConfigDb {
               )",
             params![min_keep_id, max_delivered_rows as i64, limit as i64],
         )?;
+        crate::config_db::reclaim_free_pages(&self.conn);
         Ok(deleted)
     }
 
@@ -745,6 +747,7 @@ impl ConfigDb {
               )",
             params![before, min_keep_id, limit as i64],
         )?;
+        crate::config_db::reclaim_free_pages(&self.conn);
         Ok(deleted)
     }
 
@@ -772,6 +775,7 @@ impl ConfigDb {
             "DELETE FROM event_outbox WHERE status = 'failed' AND id <= ?",
             params![min_keep_id],
         )?;
+        crate::config_db::reclaim_free_pages(&self.conn);
         Ok(deleted)
     }
 
@@ -814,6 +818,7 @@ impl ConfigDb {
               )",
             params![min_keep_id, limit as i64],
         )?;
+        crate::config_db::reclaim_free_pages(&self.conn);
         Ok(deleted)
     }
 
@@ -1051,6 +1056,146 @@ fn validate_status(status: &str) -> Result<(), ConfigDbError> {
         Err(ConfigDbError::Other(format!(
             "invalid event_outbox status: {status}"
         )))
+    }
+}
+
+/// Most events one write of the [`append_events`] writer task commits.
+const APPEND_BATCH: usize = 1000;
+
+/// The writer task of one config DB (see [`append_events`]).
+struct Appender {
+    db: std::sync::Weak<tokio::sync::Mutex<ConfigDb>>,
+    tx: tokio::sync::mpsc::UnboundedSender<Vec<NewEvent>>,
+    /// Events handed to the writer and not written yet. Changed under the
+    /// DB lock by the writer, read under it by `append_events`.
+    queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Wakes [`flush_appends`] after each write.
+    written: std::sync::Arc<tokio::sync::Notify>,
+}
+
+/// One writer per config DB, found by the DB's `Arc` (`AppState` has no
+/// field for it: the request path reaches the DB only through the state).
+static APPENDERS: std::sync::LazyLock<parking_lot::Mutex<Vec<Appender>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The writer of `db`, started on first use.
+fn appender(
+    db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>,
+) -> (
+    tokio::sync::mpsc::UnboundedSender<Vec<NewEvent>>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<tokio::sync::Notify>,
+) {
+    let mut all = APPENDERS.lock();
+    all.retain(|a| a.db.strong_count() > 0);
+    let weak = std::sync::Arc::downgrade(db);
+    if let Some(a) = all.iter().find(|a| a.db.ptr_eq(&weak)) {
+        return (a.tx.clone(), a.queued.clone(), a.written.clone());
+    }
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let written = std::sync::Arc::new(tokio::sync::Notify::new());
+    tokio::spawn(write_appended(
+        weak.clone(),
+        rx,
+        queued.clone(),
+        written.clone(),
+    ));
+    all.push(Appender {
+        db: weak,
+        tx: tx.clone(),
+        queued: queued.clone(),
+        written: written.clone(),
+    });
+    (tx, queued, written)
+}
+
+/// The writer task: drains the queue in order, many events per transaction.
+async fn write_appended(
+    db: std::sync::Weak<tokio::sync::Mutex<ConfigDb>>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<Vec<NewEvent>>,
+    queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    written: std::sync::Arc<tokio::sync::Notify>,
+) {
+    use std::sync::atomic::Ordering::SeqCst;
+    while let Some(mut batch) = rx.recv().await {
+        while batch.len() < APPEND_BATCH {
+            match rx.try_recv() {
+                Ok(more) => batch.extend(more),
+                Err(_) => break,
+            }
+        }
+        let Some(db) = db.upgrade() else {
+            tracing::warn!(
+                "event outbox: the config DB is gone; {} queued event(s) dropped",
+                batch.len()
+            );
+            return;
+        };
+        let guard = db.lock().await;
+        insert_logged(&guard, &batch);
+        queued.fetch_sub(batch.len(), SeqCst);
+        drop(guard);
+        written.notify_waiters();
+    }
+}
+
+/// Insert `events`; a failure is logged and the events dropped
+/// (notifications are best-effort by design).
+fn insert_logged(db: &ConfigDb, events: &[NewEvent]) {
+    if let Err(err) = db.event_outbox_insert_many(events) {
+        tracing::warn!(
+            "failed to append {} object event(s), first kind={} bucket={} key={:?}: {}",
+            events.len(),
+            events[0].kind.as_str(),
+            events[0].bucket,
+            events[0].key,
+            err
+        );
+    }
+}
+
+/// Append object events without waiting for the config DB mutex: a client
+/// PUT/DELETE calls this after its write, and a long holder of the mutex
+/// (a parity verify, the sync snapshot) used to stall every such request.
+///
+/// With the DB free and nothing queued, the rows are written at once (in
+/// the outbox before the response, as before). Otherwise the events go to
+/// a queue that one writer task drains in order. The "nothing queued"
+/// check runs under the DB lock, and the writer counts its events out under
+/// the same lock, so outbox ids keep the order of the appends. A crash
+/// loses the queued events; [`flush_appends`] writes them at shutdown.
+pub fn append_events(db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>, events: Vec<NewEvent>) {
+    use std::sync::atomic::Ordering::SeqCst;
+    if events.is_empty() {
+        return;
+    }
+    let (tx, queued, _) = appender(db);
+    if let Ok(guard) = db.try_lock() {
+        if queued.load(SeqCst) == 0 {
+            insert_logged(&guard, &events);
+            return;
+        }
+    }
+    let n = events.len();
+    queued.fetch_add(n, SeqCst);
+    if tx.send(events).is_err() {
+        queued.fetch_sub(n, SeqCst);
+        tracing::warn!("event outbox: the writer has stopped; {n} event(s) dropped");
+    }
+}
+
+/// Wait until every event queued by [`append_events`] for `db` is written
+/// (graceful shutdown).
+pub async fn flush_appends(db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (_, queued, written) = appender(db);
+    loop {
+        let wake = written.notified();
+        if queued.load(SeqCst) == 0 {
+            return;
+        }
+        wake.await;
     }
 }
 
@@ -1515,5 +1660,99 @@ mod tests {
         assert_eq!(db.event_outbox_prune_below_floor(fresh, 100).unwrap(), 1);
         assert!(db.event_outbox_load(tried).unwrap().is_some());
         assert!(db.event_outbox_load(fresh).unwrap().is_none());
+    }
+
+    fn pragma_i64(db: &ConfigDb, name: &str) -> i64 {
+        db.conn
+            .pragma_query_value(None, name, |r| r.get(0))
+            .unwrap()
+    }
+
+    /// The outbox churns (rows deleted after 24 h): without a vacuum the
+    /// file stayed at its peak size, its pages on the freelist (prod: 58,308
+    /// of 82,512 pages free). A prune now gives the pages back to the disk.
+    #[test]
+    fn pruning_outbox_rows_gives_their_pages_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ConfigDb::open_or_create(&dir.path().join("c.db"), "pw").unwrap();
+        let pad = "x".repeat(200);
+        let events: Vec<NewEvent> = (0..10_000)
+            .map(|i| {
+                NewEvent::new(
+                    EventKind::ObjectCreated,
+                    "bucket",
+                    format!("dir/key-{i:05}"),
+                    EventSource::S3Api,
+                    i,
+                    json!({ "pad": pad }),
+                )
+            })
+            .collect();
+        db.event_outbox_insert_many(&events).unwrap();
+        let full = pragma_i64(&db, "page_count");
+        let max_id = db.event_outbox_max_id().unwrap().unwrap();
+        assert_eq!(
+            db.event_outbox_prune_below_floor(max_id, 10_000).unwrap(),
+            10_000
+        );
+        let free = pragma_i64(&db, "freelist_count");
+        assert!(
+            free < 16,
+            "{free} free pages stay in the file after the prune"
+        );
+        let after = pragma_i64(&db, "page_count");
+        assert!(after * 2 < full, "the file kept {after} of {full} pages");
+    }
+
+    /// Events queued while the DB was busy are written by the flush that
+    /// a graceful shutdown awaits, in order.
+    #[tokio::test]
+    async fn flush_appends_writes_the_queued_events_in_order() {
+        let db = std::sync::Arc::new(tokio::sync::Mutex::new(
+            ConfigDb::in_memory("test-pass").unwrap(),
+        ));
+        let held = db.lock().await;
+        for k in ["a", "b", "c"] {
+            append_events(&db, vec![event_at(1, k)]);
+        }
+        let flush = tokio::spawn({
+            let db = db.clone();
+            async move { flush_appends(&db).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !flush.is_finished(),
+            "the flush returned with events queued"
+        );
+        drop(held);
+        flush.await.unwrap();
+        let keys: Vec<String> = db
+            .lock()
+            .await
+            .event_outbox_since(0, 10)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.key)
+            .collect();
+        assert_eq!(keys, ["a", "b", "c"]);
+    }
+
+    /// A failure-ring prune inside a transaction gives its pages back too.
+    #[test]
+    fn a_failure_ring_prune_in_a_transaction_reclaims_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ConfigDb::open_or_create(&dir.path().join("c.db"), "pw").unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TABLE fails (id INTEGER PRIMARY KEY, rule_name TEXT, b BLOB);
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 300)
+                 INSERT INTO fails (rule_name, b) SELECT 'r', randomblob(4000) FROM n;",
+            )
+            .unwrap();
+        let tx = db.conn.unchecked_transaction().unwrap();
+        crate::config_db::job_store::prune_failure_ring(&tx, "fails", "rule_name", &"r", 1)
+            .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(pragma_i64(&db, "freelist_count"), 0);
     }
 }

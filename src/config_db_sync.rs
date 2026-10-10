@@ -918,25 +918,66 @@ fn classify_upload_error(err_str: &str) -> UploadError {
     }
 }
 
-/// Read the DB file for an upload while holding the DB lock. Every write goes
-/// through the one locked connection, so no commit can be half-written while
-/// we read. First takes the next `sync_generation`, so the copy outranks
-/// every copy this node merged (peers order copies by it).
+/// Read the DB file for an upload. First takes the next `sync_generation`,
+/// so the copy outranks every copy this node merged (peers order copies by
+/// it).
+///
+/// The file is read WITHOUT the DB lock: reading 338 MB (prod) under it
+/// stalled every request that needs the config DB for seconds. Every write
+/// goes through the one locked connection, so the bytes are a whole DB when
+/// no write landed during the read: the [`ConfigDb::change_token`] taken
+/// under the lock before the read must equal the one taken after it.
+/// Otherwise the read is repeated; after [`SNAPSHOT_TRIES`] the last try
+/// reads under the lock, as before.
 async fn read_db_snapshot(
     sync: &ConfigDbSync,
     config_db: &Option<Arc<Mutex<ConfigDb>>>,
 ) -> Result<Vec<u8>, String> {
-    let guard = match config_db {
-        Some(db) => Some(db.lock().await),
-        None => None,
+    read_db_snapshot_with(sync, config_db, tokio::fs::read).await
+}
+
+/// Reads of the DB file without the lock before [`read_db_snapshot`] reads
+/// it under the lock.
+const SNAPSHOT_TRIES: usize = 3;
+
+/// [`read_db_snapshot`] with the file read injected (a test watches the
+/// DB lock while the file is read, or writes during the read).
+async fn read_db_snapshot_with<R, F>(
+    sync: &ConfigDbSync,
+    config_db: &Option<Arc<Mutex<ConfigDb>>>,
+    mut read: R,
+) -> Result<Vec<u8>, String>
+where
+    R: FnMut(PathBuf) -> F,
+    F: std::future::Future<Output = std::io::Result<Vec<u8>>>,
+{
+    let read_err = |e: std::io::Error| format!("Failed to read local config DB: {e}");
+    let token_err = |e: crate::config_db::ConfigDbError| {
+        format!("Failed to read the config DB change token: {e}")
     };
-    if let Some(db) = &guard {
-        db.next_sync_generation(Some(&sync_base_path(&sync.local_path)), sync.db_key())
+    let Some(db) = config_db else {
+        return read(sync.local_path.clone()).await.map_err(read_err);
+    };
+    let before = {
+        let guard = db.lock().await;
+        guard
+            .next_sync_generation(Some(&sync_base_path(&sync.local_path)), sync.db_key())
             .map_err(|e| format!("Failed to take the next sync generation: {e}"))?;
+        guard.change_token().map_err(token_err)?
+    };
+    let mut before = before;
+    for _ in 0..SNAPSHOT_TRIES {
+        let data = read(sync.local_path.clone()).await.map_err(read_err)?;
+        let guard = db.lock().await;
+        let after = guard.change_token().map_err(token_err)?;
+        if after == before {
+            return Ok(data);
+        }
+        debug!("Config DB sync: a write landed while the DB was read; reading it again");
+        before = after;
     }
-    tokio::fs::read(&sync.local_path)
-        .await
-        .map_err(|e| format!("Failed to read local config DB: {e}"))
+    let _guard = db.lock().await;
+    read(sync.local_path.clone()).await.map_err(read_err)
 }
 
 /// On-disk park of an upload that exhausted its retries.
@@ -1328,6 +1369,96 @@ mod tests {
             allow_local: true,
             session_token: None,
         }
+    }
+
+    /// The upload snapshot reads the DB file without the DB lock: reading a
+    /// 338 MB file under it stalled every request that needs the config DB
+    /// (the outbox append of each client PUT/DELETE among them). The bytes
+    /// still are one consistent DB.
+    #[tokio::test]
+    async fn the_upload_snapshot_reads_the_file_without_the_db_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("deltaglider_config.db");
+        let key = "k".repeat(40);
+        let db = ConfigDb::open_or_create(&db_path, &key).unwrap();
+        db.create_user("u1", "AKU1000000001", "s1", true, &[])
+            .unwrap();
+        let sync = ConfigDbSync::new(
+            &dead_s3_backend(),
+            "sync".into(),
+            "k.db".into(),
+            db_path.clone(),
+            crate::config_db::ConfigDbKeys::primary_only(&key),
+            false,
+        )
+        .await
+        .unwrap();
+        let config_db = Some(Arc::new(Mutex::new(db)));
+        let lock = config_db.clone().unwrap();
+        let data = read_db_snapshot_with(&sync, &config_db, |path| {
+            let free = lock.try_lock().is_ok();
+            async move {
+                assert!(free, "the DB lock is held while the file is read");
+                tokio::fs::read(path).await
+            }
+        })
+        .await
+        .unwrap();
+        let copy = dir.path().join("uploaded.db");
+        std::fs::write(&copy, &data).unwrap();
+        let opened = ConfigDb::open_or_create(&copy, &key).unwrap();
+        assert_eq!(opened.load_users().unwrap().len(), 1);
+        assert_eq!(opened.sync_generation().unwrap(), 1);
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            ["deltaglider_config.db", "uploaded.db"],
+            "a snapshot file was left behind"
+        );
+    }
+
+    /// A write that lands while the file is read could tear the bytes: the
+    /// read is repeated, and the upload carries the write.
+    #[tokio::test]
+    async fn a_write_during_the_snapshot_read_reads_the_file_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("deltaglider_config.db");
+        let key = "k".repeat(40);
+        let db = ConfigDb::open_or_create(&db_path, &key).unwrap();
+        let sync = ConfigDbSync::new(
+            &dead_s3_backend(),
+            "sync".into(),
+            "k.db".into(),
+            db_path.clone(),
+            crate::config_db::ConfigDbKeys::primary_only(&key),
+            false,
+        )
+        .await
+        .unwrap();
+        let config_db = Some(Arc::new(Mutex::new(db)));
+        let lock = config_db.clone().unwrap();
+        let mut reads = 0;
+        let data = read_db_snapshot_with(&sync, &config_db, |path| {
+            reads += 1;
+            if reads == 1 {
+                lock.try_lock()
+                    .unwrap()
+                    .create_user("u1", "AKU1000000001", "s1", true, &[])
+                    .unwrap();
+            }
+            tokio::fs::read(path)
+        })
+        .await
+        .unwrap();
+        assert_eq!(reads, 2, "the torn read was kept");
+        let copy = dir.path().join("uploaded.db");
+        std::fs::write(&copy, &data).unwrap();
+        let opened = ConfigDb::open_or_create(&copy, &key).unwrap();
+        assert_eq!(opened.load_users().unwrap().len(), 1);
     }
 
     /// D16: the schema version of a peer copy is read before the download

@@ -23,6 +23,28 @@ pub struct ConfigDb {
     local_path: PathBuf,
     /// ETag from last S3 download (for change detection during polling)
     s3_etag: Option<String>,
+    /// Which connection `conn` is: a new one on every open and reopen (see
+    /// [`ConfigDb::change_token`]).
+    connection_id: u64,
+}
+
+/// Source of [`ConfigDb::connection_id`].
+static NEXT_CONNECTION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_connection_id() -> u64 {
+    NEXT_CONNECTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A value that changes whenever the DB file changes; see
+/// [`ConfigDb::change_token`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChangeToken {
+    connection_id: u64,
+    total_changes: u64,
+    schema_version: i64,
+    page_count: i64,
+    freelist_count: i64,
+    data_version: i64,
 }
 
 /// Schema version — bump when adding migrations.
@@ -50,6 +72,89 @@ pub enum OpenedWith {
     /// The file opened with a fallback key and is now re-encrypted with the
     /// primary key.
     Migrated(FallbackKind),
+}
+
+/// Free pages one [`reclaim_free_pages`] call gives back at most (4 MiB at
+/// the default page size): the vacuum runs under the DB lock, so each call
+/// stays short, and a backlog drains over the next prunes.
+const RECLAIM_PAGES_PER_CALL: u32 = 1024;
+
+/// Give free pages back to the disk after a prune. The outbox churns (rows
+/// deleted after 24 h) and the parity cache is rewritten: without this the
+/// file stayed at its peak size (prod: 338 MB, 58,308 of 82,512 pages
+/// free). Needs `auto_vacuum = INCREMENTAL` (see
+/// [`convert_to_incremental_vacuum`]); a no-op before. `freelist_count`
+/// reads the DB header, so a call without free pages costs nothing.
+/// Best-effort: a failure is logged, never returned.
+pub(crate) fn reclaim_free_pages(conn: &Connection) {
+    let free: i64 = match conn.pragma_query_value(None, "freelist_count", |r| r.get(0)) {
+        Ok(n) => n,
+        Err(e) => {
+            warn!("Config DB: cannot read the free page count: {e}");
+            return;
+        }
+    };
+    if free == 0 {
+        return;
+    }
+    // The pragma frees one page per step (one result row each), so it runs
+    // to its end here; `execute_batch` would step it once.
+    let vacuum = || -> rusqlite::Result<()> {
+        let mut stmt = conn.prepare(&format!(
+            "PRAGMA incremental_vacuum({RECLAIM_PAGES_PER_CALL})"
+        ))?;
+        let mut rows = stmt.query([])?;
+        while rows.next()?.is_some() {}
+        Ok(())
+    };
+    if let Err(e) = vacuum() {
+        warn!("Config DB: incremental vacuum of {free} free pages failed: {e}");
+    }
+}
+
+/// Whether opening `path` converts it to incremental auto-vacuum: only a
+/// `.db` file. The copies that the sync keeps beside the DB
+/// (`.db.tmp.<id>`, `.db.sync-base`, `.db.bak`, `.db.rekey.tmp`) are
+/// replaced or deleted soon; a VACUUM of each would only cost time.
+fn converts_on_open(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == "db")
+}
+
+/// Convert a DB from an older binary (`auto_vacuum = NONE`, which never
+/// gives a page back) to incremental auto-vacuum. That takes one VACUUM:
+/// it rewrites the live pages to a temporary file (about the size of the
+/// live data, not of the file) and copies them back in one transaction, so
+/// a failure (a full disk) leaves the DB as it was, and the next boot
+/// tries again. Runs once per DB; the duration is logged.
+fn convert_to_incremental_vacuum(conn: &Connection, path: &Path) {
+    let pragma = |name: &str| -> i64 {
+        conn.pragma_query_value(None, name, |r| r.get(0))
+            .unwrap_or(-1)
+    };
+    if pragma("auto_vacuum") == 2 {
+        return;
+    }
+    let (pages, free) = (pragma("page_count"), pragma("freelist_count"));
+    info!(
+        "Config DB {}: converting to incremental auto-vacuum ({pages} pages, {free} free); \
+         this runs once",
+        path.display()
+    );
+    let started = std::time::Instant::now();
+    match conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;") {
+        Ok(()) => info!(
+            "Config DB {}: converted to incremental auto-vacuum in {:.1?} ({pages} -> {} pages)",
+            path.display(),
+            started.elapsed(),
+            pragma("page_count")
+        ),
+        Err(e) => warn!(
+            "Config DB {}: conversion to incremental auto-vacuum failed after {:.1?} (the DB \
+             is unchanged; the next start tries again): {e}",
+            path.display(),
+            started.elapsed()
+        ),
+    }
 }
 
 /// Compute the path to the IAM config database file.
@@ -153,21 +258,29 @@ impl ConfigDb {
         conn.pragma_update(None, "busy_timeout", "5000")?;
 
         // Test that the key is correct by reading the schema
-        conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
-            r.get::<_, i32>(0)
-        })
-        .map_err(|e| {
-            key_check_error(
-                e,
-                "Cannot decrypt config database (wrong DGP_CONFIG_DB_KEY or key file?)",
-            )
-        })?;
+        let schema_objects = conn
+            .query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+                r.get::<_, i32>(0)
+            })
+            .map_err(|e| {
+                key_check_error(
+                    e,
+                    "Cannot decrypt config database (wrong DGP_CONFIG_DB_KEY or key file?)",
+                )
+            })?;
 
         // Enable foreign keys (per-connection setting, not persisted)
         conn.pragma_update(None, "foreign_keys", "ON")?;
 
-        // Run migrations
+        // A new DB takes incremental auto-vacuum before its first table; an
+        // older one converts after its migration (one VACUUM).
+        if schema_objects == 0 {
+            conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+        }
         Self::migrate(&conn)?;
+        if schema_objects > 0 && converts_on_open(local_path) {
+            convert_to_incremental_vacuum(&conn, local_path);
+        }
 
         info!("Config database opened: {}", local_path.display());
 
@@ -175,6 +288,7 @@ impl ConfigDb {
             conn,
             local_path: local_path.to_path_buf(),
             s3_etag: None,
+            connection_id: next_connection_id(),
         })
     }
 
@@ -234,11 +348,13 @@ impl ConfigDb {
         let conn = crate::sqlite_open::open_in_memory()?;
         conn.pragma_update(None, "key", passphrase)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
         Self::migrate(&conn)?;
         Ok(Self {
             conn,
             local_path: PathBuf::from(":memory:"),
             s3_etag: None,
+            connection_id: next_connection_id(),
         })
     }
 
@@ -1108,8 +1224,29 @@ impl ConfigDb {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "busy_timeout", "5000")?;
         self.conn = conn;
+        self.connection_id = next_connection_id();
         info!("Config database re-opened after S3 sync");
         Ok(())
+    }
+
+    /// A value that changes whenever the DB file changes, read under the
+    /// DB lock. Every write goes through `conn`: a row change moves
+    /// `total_changes`, DDL the schema cookie, a vacuum the page and free
+    /// counts, a commit by another connection `data_version`, and a reopen
+    /// the connection id. The sync upload reads the file without the lock
+    /// and keeps the bytes only when the token did not move meanwhile.
+    pub(crate) fn change_token(&self) -> Result<ChangeToken, ConfigDbError> {
+        let pragma = |name: &str| -> Result<i64, ConfigDbError> {
+            Ok(self.conn.pragma_query_value(None, name, |r| r.get(0))?)
+        };
+        Ok(ChangeToken {
+            connection_id: self.connection_id,
+            total_changes: self.conn.total_changes(),
+            schema_version: pragma("schema_version")?,
+            page_count: pragma("page_count")?,
+            freelist_count: pragma("freelist_count")?,
+            data_version: pragma("data_version")?,
+        })
     }
 
     /// Revoke every session of `identity` (access_key_id or `provider:user_id`)
@@ -1867,6 +2004,57 @@ mod tests {
         assert_eq!(db.sync_generation().unwrap(), 0);
         assert_eq!(db.load_users().unwrap().len(), 1);
         assert_eq!(db.next_sync_generation(None, "pw").unwrap(), 1);
+    }
+
+    fn auto_vacuum_mode(conn: &Connection) -> i64 {
+        conn.pragma_query_value(None, "auto_vacuum", |r| r.get(0))
+            .unwrap()
+    }
+
+    /// A new DB is created with incremental auto-vacuum, so a prune can
+    /// give pages back without a full VACUUM.
+    #[test]
+    fn a_new_db_has_incremental_auto_vacuum() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ConfigDb::open_or_create(&dir.path().join("new.db"), "pw").unwrap();
+        assert_eq!(auto_vacuum_mode(&db.conn), 2, "auto_vacuum=INCREMENTAL");
+    }
+
+    /// A DB from an older binary (auto_vacuum=NONE, its free pages never
+    /// returned) is converted once when it opens: one VACUUM, which also
+    /// drops the free pages it collected.
+    #[test]
+    fn an_old_db_converts_to_incremental_auto_vacuum_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            let db = ConfigDb::open_or_create(&path, "pw").unwrap();
+            db.conn
+                .execute_batch(
+                    "PRAGMA auto_vacuum = NONE; VACUUM;
+                     CREATE TABLE junk (b BLOB);
+                     WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 500)
+                     INSERT INTO junk SELECT randomblob(4000) FROM n;
+                     DROP TABLE junk;",
+                )
+                .unwrap();
+            assert_eq!(auto_vacuum_mode(&db.conn), 0);
+            let free: i64 = db
+                .conn
+                .pragma_query_value(None, "freelist_count", |r| r.get(0))
+                .unwrap();
+            assert!(free >= 500, "{free}");
+            db.create_user("u1", "AKU1000000001", "s1", true, &[])
+                .unwrap();
+        }
+        let db = ConfigDb::open_or_create(&path, "pw").unwrap();
+        assert_eq!(auto_vacuum_mode(&db.conn), 2, "not converted");
+        let free: i64 = db
+            .conn
+            .pragma_query_value(None, "freelist_count", |r| r.get(0))
+            .unwrap();
+        assert_eq!(free, 0, "the conversion VACUUM keeps no free page");
+        assert_eq!(db.load_users().unwrap().len(), 1, "rows survive");
     }
 
     /// D14: only "not a database" (wrong key / not SQLCipher) is a passphrase
