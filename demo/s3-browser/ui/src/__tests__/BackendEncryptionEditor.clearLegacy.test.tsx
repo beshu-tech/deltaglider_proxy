@@ -1,8 +1,9 @@
 /**
  * U3: the decrypt-only shim banner offers "Clear legacy key". The button is
- * enabled only when the server's scan (`GET /backends/:name/legacy-key-usage`)
- * says that no object and no delta reference still carries the legacy key id
- * (`safe_to_clear`). The confirm dialog names the consequence.
+ * enabled only when the server's scan (`GET /backends/:name/legacy-key-usage`,
+ * started by "Check usage") says that no object and no delta reference still
+ * carries the legacy key id (`safe_to_clear`). The confirm dialog names the
+ * consequence.
  */
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -38,10 +39,12 @@ beforeEach(() => {
 });
 afterEach(() => vi.unstubAllGlobals());
 
-function renderEditor(onClearLegacy = vi.fn(async () => {})) {
+/** Render the editor and run the check (it never runs on mount). */
+async function renderEditor(onClearLegacy = vi.fn(async () => {})) {
   renderWithQuery(
     <BackendEncryptionEditor backendName="local-disk" current={CURRENT} onApply={async () => {}} onClearLegacy={onClearLegacy} />,
   );
+  await userEvent.setup().click(await screen.findByRole('button', { name: 'Check usage' }));
   return onClearLegacy;
 }
 
@@ -52,7 +55,7 @@ test('objects still under the legacy key keep the button disabled and say how ma
     examples: ['releases/builds/app.zip'],
     safe_to_clear: false,
   })));
-  renderEditor();
+  await renderEditor();
   expect(await screen.findByText(/7 objects and 1 delta reference still use the legacy key id k-2025/)).toBeInTheDocument();
   expect(screen.getByText(/releases\/builds\/app\.zip/)).toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Clear legacy key' })).toBeDisabled();
@@ -60,14 +63,14 @@ test('objects still under the legacy key keep the button disabled and say how ma
 
 test('a scan stopped by its limit keeps the button disabled', async () => {
   http.on('GET', USAGE, json(usage({ complete: false, objects_scanned: 10000, safe_to_clear: false })));
-  renderEditor();
+  await renderEditor();
   expect(await screen.findByText(/stopped after 10,000 objects/)).toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Clear legacy key' })).toBeDisabled();
 });
 
 test('a clean scan enables the button; the confirm dialog explains the consequence', async () => {
   http.on('GET', USAGE, json(usage({})));
-  const onClear = renderEditor();
+  const onClear = await renderEditor();
   const user = userEvent.setup();
   expect(await screen.findByText(/No object uses the legacy key id k-2025/)).toBeInTheDocument();
   const button = screen.getByRole('button', { name: 'Clear legacy key' });

@@ -48,14 +48,15 @@ export function useBucketNames(): string[] {
 
 /**
  * Objects and delta references that still carry a backend's legacy key id.
- * Each fetch HEADs every object, so it runs only while the shim is active
- * and never on an interval; the banner has a "Check again" button.
+ * Each fetch HEADs every object of the backend, so it never runs on its own
+ * (not on mount, not on an interval): the shim banner's "Check usage" button
+ * calls `refetch()`. A result stays in the cache until the next check.
  */
-export function useLegacyKeyUsage(name: string, enabled: boolean) {
+export function useLegacyKeyUsage(name: string) {
   return useQuery({
     queryKey: qk.backends.legacyKeyUsage(name),
     queryFn: () => getLegacyKeyUsage(name),
-    enabled,
+    enabled: false,
     staleTime: Infinity,
   });
 }

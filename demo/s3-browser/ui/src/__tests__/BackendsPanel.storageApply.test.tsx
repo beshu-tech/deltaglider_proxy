@@ -36,6 +36,8 @@ afterEach(() => vi.unstubAllGlobals());
 async function clearLegacy() {
   const user = userEvent.setup();
   renderWithQuery(<BackendsPanel />);
+  // The legacy-key check runs only on a click; Clear needs its clean result.
+  await user.click(await screen.findByRole('button', { name: 'Check usage' }));
   const button = await screen.findByRole('button', { name: 'Clear legacy key' });
   await waitFor(() => expect(button).toBeEnabled());
   await user.click(button);

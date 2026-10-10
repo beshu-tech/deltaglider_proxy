@@ -480,7 +480,8 @@ function LegacyShimBanner({
   readOnly?: boolean;
   onClearLegacy?: () => Promise<void>;
 }) {
-  const usage = useLegacyKeyUsage(backendName, true);
+  // The check HEADs every object of the backend: it runs only on a click.
+  const usage = useLegacyKeyUsage(backendName);
   const [clearing, setClearing] = useState(false);
   const u = usage.data;
 
@@ -521,7 +522,13 @@ function LegacyShimBanner({
             A legacy key is configured on this backend. Objects written under that key still
             decrypt; new writes use the current mode. Clear the legacy key once no object uses it.
           </span>
-          {usage.isLoading && <span>Checking which objects still use the legacy key…</span>}
+          {!u && !usage.isFetching && !usage.error && (
+            <span>
+              Check usage reads the metadata of every object on this backend, which can take
+              several minutes on a large or slow backend.
+            </span>
+          )}
+          {usage.isFetching && <span>Checking which objects still use the legacy key…</span>}
           {usage.error && <span>{normalizeUiError(usage.error, 'The check failed')}</span>}
           {u && <span>{usageSummary(u)}</span>}
           {u && u.examples.length > 0 && (
@@ -536,7 +543,7 @@ function LegacyShimBanner({
           )}
           <Space wrap>
             <Button size="small" onClick={() => void usage.refetch()} loading={usage.isFetching}>
-              Check again
+              {u || usage.error ? 'Check again' : 'Check usage'}
             </Button>
             {onClearLegacy && !readOnly && (
               <Button
