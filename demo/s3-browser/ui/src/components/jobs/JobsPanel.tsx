@@ -364,8 +364,9 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
       return;
     }
     // Preview is a view, not a toast: the drawer's Preview tab lists the keys.
+    // It shows the cached preview while it is fresh (each one walks the rule's
+    // scope); the tab's "Refresh preview" computes a new one.
     if (action === 'preview') {
-      void qc.invalidateQueries({ queryKey: qk.jobs.preview(row.id) });
       openDrawer(row.id, 'preview');
       return;
     }
@@ -387,6 +388,8 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
       qc.invalidateQueries({ queryKey: qk.jobs.list() });
       qc.invalidateQueries({ queryKey: qk.jobs.runs(row.id) });
       qc.invalidateQueries({ queryKey: qk.jobs.failures(row.id) });
+      // A run changes the objects that the cached preview lists.
+      if (action === 'run-now') qc.invalidateQueries({ queryKey: qk.jobs.preview(row.id) });
     } catch (e) {
       messageApi.error(normalizeUiError(e, `${action} failed`));
     } finally {

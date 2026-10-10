@@ -5,8 +5,8 @@ import { qk } from '../queries/keys';
 // TanStack Query invalidation matches by key PREFIX. If `list()` is a prefix
 // of a sibling key, invalidating the list also refetches the sibling (canned
 // policies after every user edit; every open drawer's runs/failures after
-// every jobs-list poll trigger). `all()` is the explicit root for a broad
-// invalidation.
+// every jobs-list poll trigger). `all()` and other `all…()` keys are the
+// explicit roots for a broad invalidation.
 const isPrefix = (a: readonly unknown[], b: readonly unknown[]): boolean =>
   a.length < b.length && a.every((v, i) => v === b[i]);
 
@@ -15,7 +15,7 @@ type Family = Record<string, KeyFn>;
 
 function familyKeys(family: Family): Array<[string, readonly unknown[]]> {
   return Object.entries(family)
-    .filter(([name]) => name !== 'all')
+    .filter(([name]) => !name.startsWith('all'))
     .map(([name, fn]) => [name, fn('x')]);
 }
 

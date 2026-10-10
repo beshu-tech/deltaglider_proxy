@@ -10,6 +10,8 @@ interface Props {
   loading: boolean;
   error: unknown;
   errorText: string;
+  /** When the proxy computed the preview (ms since the epoch): a preview is reused for a few minutes. */
+  computedAt?: number;
 }
 
 /**
@@ -17,7 +19,7 @@ interface Props {
  * then the candidate keys in a paged table. The server caps the candidate
  * list, so the table says when it shows fewer keys than the total.
  */
-export default function LifecyclePreviewList({ preview, loading, error, errorText }: Props) {
+export default function LifecyclePreviewList({ preview, loading, error, errorText, computedAt }: Props) {
   if (error) return <Alert type="error" showIcon title={errorText} />;
   if (loading || !preview) return <LoadingState label="Computing the preview…" />;
   const shown = preview.candidates.length;
@@ -27,6 +29,11 @@ export default function LifecyclePreviewList({ preview, loading, error, errorTex
         <strong>{preview.objects_affected.toLocaleString()}</strong> of {preview.objects_scanned.toLocaleString()} scanned
         objects would be affected, <strong>{formatBytes(preview.bytes_affected)}</strong> in total.
       </Text>
+      {computedAt ? (
+        <Text type="secondary" style={{ display: 'block', marginBottom: 8, fontSize: 12 }}>
+          Computed at {new Date(computedAt).toLocaleTimeString()}.
+        </Text>
+      ) : null}
       {shown < preview.objects_affected && (
         <Text type="secondary" style={{ display: 'block', marginBottom: 8, fontSize: 12 }}>
           Showing the first {shown.toLocaleString()} keys.

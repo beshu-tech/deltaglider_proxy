@@ -33,6 +33,9 @@ export async function applySection<Wire>(
   // Other panels read the full config through the cached `qk.config()`
   // query; a section PUT changed server truth.
   void queryClient.invalidateQueries({ queryKey: qk.config() });
+  // The lifecycle rules live in the storage section: a cached preview may
+  // describe a rule that just changed.
+  if (section === 'storage') void queryClient.invalidateQueries({ queryKey: qk.jobs.allPreviews() });
   return resp;
 }
 

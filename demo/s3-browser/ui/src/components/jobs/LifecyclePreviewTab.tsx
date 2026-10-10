@@ -4,7 +4,10 @@ import { useLifecyclePreview } from '../../queries/jobs';
 import { normalizeUiError } from '../../errorHandling';
 import LifecyclePreviewList from './LifecyclePreviewList';
 
-/** Drawer tab: the saved rule's dry run, with a refresh. Mounts lazily (on tab open). */
+/**
+ * Drawer tab: the saved rule's dry run, with a refresh. Mounts lazily (on tab
+ * open) and shows the cached preview while it is fresh (useLifecyclePreview).
+ */
 export default function LifecyclePreviewTab({ jobId }: { jobId: string }) {
   const preview = useLifecyclePreview(jobId);
   return (
@@ -19,6 +22,7 @@ export default function LifecyclePreviewTab({ jobId }: { jobId: string }) {
         loading={preview.isLoading}
         error={preview.error}
         errorText={normalizeUiError(preview.error, 'Preview failed')}
+        computedAt={preview.dataUpdatedAt}
       />
     </div>
   );

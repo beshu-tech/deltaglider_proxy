@@ -54,16 +54,27 @@ export function useJobFailures(id: string | null) {
 }
 
 /**
+ * How long a lifecycle preview is reused. The proxy computes one by walking
+ * the rule's whole scope with a HEAD per object, so each open of the Preview
+ * tab or of the run-now confirmation must not compute a new one.
+ */
+const LIFECYCLE_PREVIEW_STALE_MS = 5 * 60_000;
+
+/**
  * What a lifecycle rule would do now (a dry run: POST, but no writes). Shared
- * by the run-now confirmation and the drawer's Preview tab. No polling and no
- * background refetch: each open of either view computes a fresh plan.
+ * by the run-now confirmation and the drawer's Preview tab, so the
+ * confirmation reuses the preview the tab computed. No polling and no
+ * background refetch. A preview stays fresh for LIFECYCLE_PREVIEW_STALE_MS,
+ * also while no view shows it; "Refresh preview" recomputes it, and a run
+ * or an apply of the storage section drops it.
  */
 export function useLifecyclePreview(id: string | null) {
   return useQuery({
     queryKey: qk.jobs.preview(id ?? ''),
     queryFn: () => previewLifecycleJob(id as string),
     enabled: !!id,
-    staleTime: 0,
+    staleTime: LIFECYCLE_PREVIEW_STALE_MS,
+    gcTime: LIFECYCLE_PREVIEW_STALE_MS,
     refetchOnWindowFocus: false,
   });
 }
