@@ -1270,8 +1270,15 @@ pub async fn boot_backend_health_gate(
     let targets = probe_targets(config);
     let total = targets.len();
     let mut gating = 0usize; // AuthRejected / Unreachable — definitive faults
-    for (name, backend, fallback) in targets {
-        let verdict = probe_backend_health(&backend, fallback.as_deref()).await;
+                             // Every backend at once: a probe may wait the request deadline, and one
+                             // backend after another added those waits up before the proxy served.
+    let probes = targets
+        .into_iter()
+        .map(|(name, backend, fallback)| async move {
+            let verdict = probe_backend_health(&backend, fallback.as_deref()).await;
+            (name, backend, verdict)
+        });
+    for (name, backend, verdict) in futures::future::join_all(probes).await {
         health.set(&name, &backend, verdict.clone());
         if verdict.is_healthy() {
             info!("backend health: '{name}' — connection healthy");

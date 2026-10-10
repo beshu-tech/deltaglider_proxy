@@ -129,7 +129,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_BACKEND_REQUEST_TIMEOUT_SECS",
-        description: "Deadline in seconds for one S3-backend request without a large body (HEAD, GET until the first byte, LIST, DELETE), retries included. A backend that does not answer in time gets a 503 naming it, and a health probe of it starts at once; only a failed probe marks it unhealthy. Uploads and server-side copies are not capped. 0 turns it off (default: 30)",
+        description: "Deadline in seconds for one S3-backend request without a large body (HEAD, GET until the first byte, LIST, DELETE), retries included; also the deadline of a health probe. A backend that does not answer in time gets a 503 naming it, and a health probe of it starts at once; only a probe that cannot connect or whose credentials are refused marks it unhealthy. An upload (PutObject, UploadPart) gets this deadline plus one second per MiB of body; server-side copies are not capped. 0 turns it off (default: 30)",
         example: "30",
         category: "Storage",
     },

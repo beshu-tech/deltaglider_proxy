@@ -10,8 +10,8 @@ In the sidebar of the admin UI, open **Storage → Backends** (`/_/admin/storage
 |---|---|---|
 | **Connected** | An authenticated request succeeded. | Nothing to do. |
 | **CREDENTIALS REJECTED** | The backend answered and refused the access key or the secret. | Check `access_key_id` and `secret_access_key`: a typo, a rotated key, or an unset `${env:...}` variable. |
-| **UNREACHABLE** | The request failed at DNS, connect, TLS, or a timeout. | Check `endpoint`, the network egress and the firewall. |
-| **ERRORING** | The backend is reachable, but it answers with 5xx errors. | The provider is degraded. Wait, or check the status page of the provider. The proxy does **not** block requests in this state, because the backend still serves some of them. Only **CREDENTIALS REJECTED** and **UNREACHABLE** block requests. |
+| **UNREACHABLE** | The probe could not connect: DNS, a refused connection, TLS, or the connect timeout. | Check `endpoint`, the network egress and the firewall. |
+| **ERRORING** | The backend is reachable, but it answers with 5xx errors, or it did not answer the probe within the request deadline. | The provider is degraded or slow. Wait, or check the status page of the provider. The proxy does **not** block requests in this state, because the backend still serves some of them. Only **CREDENTIALS REJECTED** and **UNREACHABLE** block requests. |
 
 When the badge is not **Connected**, the card also shows an alert with the cause: **Backend unavailable** for the two states that block requests, and **Backend degraded** for **ERRORING**. The same cause string appears in the ERROR line of the boot log, in the body of the `503` that clients receive, and in a rejected config apply, so these places always agree.
 
@@ -31,7 +31,11 @@ Buckets that an unhealthy verdict blocks reopen by themselves within about 30 se
 
 ## What happens when a backend hangs
 
-A backend can accept connections and then never answer, for example when its process is paused. The proxy does not wait for such a backend for minutes. Each backend request that carries no large body (HEAD, GET until the first byte, LIST, DELETE) has a deadline of 30 seconds, retries included (`DGP_BACKEND_REQUEST_TIMEOUT_SECS`). When the deadline passes, the client gets `503 ServiceUnavailable` with the backend's name, and the proxy probes the backend at once. The probe makes up to two attempts of 5 seconds each. When the probe fails too, the proxy marks the backend **Unreachable**, and the next requests to the backend's buckets get the 503 immediately, without a wait. When the probe succeeds, the buckets stay open, because one slow request among many does not prove that the backend is down. The proxy then logs one warning that names the failed request. The health probe also finds a hang on its own, because it probes healthy backends too. When the backend answers a probe again, its buckets reopen. `GET /_/ready` lists each backend's live state in its `backends` field.
+A backend can accept connections and then never answer, for example when its process is paused. The proxy does not wait for such a backend for minutes. Each backend request that carries no large body (HEAD, GET until the first byte, LIST, DELETE) has a deadline of 30 seconds, retries included (`DGP_BACKEND_REQUEST_TIMEOUT_SECS`). An upload (PutObject, UploadPart) has the same deadline plus one second for each MiB of its body. When the deadline passes, the client gets `503 ServiceUnavailable` with the backend's name, and the proxy probes the backend at once.
+
+The probe measures whether the backend can be reached, not how fast it answers. It sends a `HeadBucket` request for a bucket that is routed to the backend, or a `ListBuckets` request when no bucket is routed to it, and it waits as long as a data request does (`DGP_BACKEND_REQUEST_TIMEOUT_SECS`). The probe uses one long-lived connection for each backend definition, so a probe does not pay a new TLS handshake. Only two kinds of result block the buckets of the backend: the probe could not connect at all (DNS, a refused connection, TLS, or the connect timeout), or the backend refused the credentials. A backend that answers, even slowly or with a `5xx` error, is reachable: its buckets stay open, and the badge shows **ERRORING**. A probe that fails fast is tried once more before the proxy decides.
+
+When the probe cannot connect, the proxy marks the backend **Unreachable**, and the next requests to the backend's buckets get the 503 immediately, without a wait. When the probe gets an answer, the buckets stay open, because one slow request among many does not prove that the backend is down. The proxy then logs one warning that names the failed request. The health probe also finds a dead backend on its own, because it probes healthy backends too. When the backend answers a probe again, its buckets reopen. `GET /_/ready` lists each backend's live state in its `backends` field.
 
 ## Boot behaviour
 
@@ -46,7 +50,7 @@ DGP_BOOT_BACKEND_PROBE=warn   # probe + log, never exit
 DGP_BOOT_BACKEND_PROBE=off    # skip probing entirely
 ```
 
-The probe handles scoped keys. A key restricted to one bucket (e.g. a Backblaze B2 application key) legitimately cannot list buckets, so the probe falls back to a `HeadBucket` on a bucket routed to that backend before concluding anything about the credentials.
+The probe handles scoped keys. A key restricted to one bucket (e.g. a Backblaze B2 application key) legitimately cannot list buckets, so the probe sends a `HeadBucket` on a bucket routed to that backend. The answer to a `HeadBucket` has no body, so a `403` cannot say why the backend refused the request. After a `403`, the probe therefore sends a `ListBuckets` request: only an error code that names bad credentials (for example `InvalidAccessKeyId` or `SignatureDoesNotMatch`) marks the credentials as rejected. A plain `AccessDenied` is not proof of bad credentials, so the backend stays open.
 
 ## Config changes are probed too
 

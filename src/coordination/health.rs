@@ -9,6 +9,13 @@
 //! unhealthy backend answer an honest 503 naming the backend and cause,
 //! instead of per-request timeout storms or misleading 404s).
 //!
+//! The probe measures reachability, not latency: a HeadBucket on a bucket
+//! routed to the backend (ListBuckets when none is routed), with the data
+//! path's request deadline, on one long-lived client per definition. Only
+//! a connect-level fault (DNS, refused connection, TLS, connect timeout) or
+//! an auth rejection gates. A backend that answers slowly, or with 5xx, is
+//! reachable and stays open.
+//!
 //! Only an ACTIVE probe sets a verdict that gates. A failed client request
 //! (a timeout, a refused connection) is a PASSIVE signal: it makes the
 //! backend "suspect" and starts one confirmation probe of that backend
@@ -33,12 +40,24 @@ use crate::api::errors::S3Error;
 use super::capability::fingerprint;
 use crate::config::BackendConfig;
 
-/// How long one health-probe call may run before it counts as Unreachable.
-const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// The probe deadline when `DGP_BACKEND_REQUEST_TIMEOUT_SECS` is off.
+const DEFAULT_HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Attempts per probe (transport/5xx failures retry once; an auth rejection
-/// is definitive and never retried).
+/// The deadline of one probe attempt: the data path's request deadline
+/// (`DGP_BACKEND_REQUEST_TIMEOUT_SECS`, 30 s by default). A backend whose
+/// requests answer in time answers its probe in time. The 5 s deadline
+/// before read a slow backend (Hetzner ListBuckets) as down, and gated it.
+fn health_probe_timeout() -> std::time::Duration {
+    crate::storage::S3Backend::request_timeout().unwrap_or(DEFAULT_HEALTH_PROBE_TIMEOUT)
+}
+
+/// Attempts per probe. A fast failure (refused, 5xx) is retried once; an
+/// attempt that ran out its deadline is not (it waited the full deadline
+/// already); an auth rejection is definitive.
 const HEALTH_PROBE_ATTEMPTS: u32 = 2;
+
+/// At most this many long-lived probe clients (one per definition).
+const MAX_PROBE_CLIENTS: usize = 64;
 
 /// After a confirmation probe finds a suspect backend answering, failed
 /// requests start no new probe for this long. This bounds the probe rate
@@ -201,10 +220,19 @@ pub struct HealthEntry {
 /// backend under the same name misses and re-probes.
 #[derive(Debug, Default)]
 pub struct BackendHealthCache {
-    entries: parking_lot::RwLock<HashMap<String, (String, HealthEntry)>>,
+    entries: parking_lot::RwLock<HashMap<String, Stored>>,
     /// Backend name → passive suspicion. Drives the confirmation probe,
     /// never the gate.
     suspects: parking_lot::Mutex<HashMap<String, Suspicion>>,
+}
+
+/// One backend's verdict: the definition it is for, and when the probe
+/// that established it started (a verdict never replaces a newer one).
+#[derive(Debug, Clone)]
+struct Stored {
+    fp: String,
+    entry: HealthEntry,
+    started: std::time::Instant,
 }
 
 /// State of the confirmation probe of one suspect backend.
@@ -221,19 +249,23 @@ impl BackendHealthCache {
     /// wake on transitions, not on every steady-state re-probe. Returns
     /// whether the verdict changed.
     pub fn set(&self, backend: &str, config: &BackendConfig, verdict: HealthVerdict) -> bool {
-        self.record(backend, fingerprint(config), verdict, false) == Some(true)
+        let now = std::time::Instant::now();
+        self.record(backend, fingerprint(config), verdict, now, false) == Some(true)
     }
 
-    /// Store `verdict` for definition `fp`. With `same_definition_only`, an
-    /// entry of ANOTHER definition stays (a probe of a definition that an
-    /// apply replaced while the probe ran must not paint the new one).
-    /// Returns `None` when the verdict was not stored, else whether it
-    /// changed (and bumped the health version).
+    /// Store `verdict` for definition `fp`, from a probe that started at
+    /// `started`. A verdict of a probe that started later stays: a slow
+    /// probe that ends last does not overwrite a newer answer. With
+    /// `same_definition_only`, an entry of ANOTHER definition stays (a
+    /// probe of a definition that an apply replaced while the probe ran
+    /// must not paint the new one). Returns `None` when the verdict was not
+    /// stored, else whether it changed (and bumped the health version).
     fn record(
         &self,
         backend: &str,
         fp: String,
         verdict: HealthVerdict,
+        started: std::time::Instant,
         same_definition_only: bool,
     ) -> Option<bool> {
         let entry = HealthEntry {
@@ -242,11 +274,12 @@ impl BackendHealthCache {
         };
         let mut map = self.entries.write();
         let changed = match map.get(backend) {
-            Some((old_fp, _)) if same_definition_only && *old_fp != fp => return None,
-            Some((old_fp, old)) => *old_fp != fp || old.verdict != entry.verdict,
+            Some(old) if same_definition_only && old.fp != fp => return None,
+            Some(old) if old.started > started => return None,
+            Some(old) => old.fp != fp || old.entry.verdict != entry.verdict,
             None => true,
         };
-        map.insert(backend.to_string(), (fp, entry));
+        map.insert(backend.to_string(), Stored { fp, entry, started });
         drop(map);
         if changed {
             bump_backend_health_version();
@@ -260,8 +293,8 @@ impl BackendHealthCache {
         self.entries
             .read()
             .get(backend)
-            .filter(|(fp, _)| *fp == fingerprint(config))
-            .map(|(_, e)| e.verdict.clone())
+            .filter(|s| s.fp == fingerprint(config))
+            .map(|s| s.entry.verdict.clone())
     }
 
     /// Snapshot for the admin backends API (name → entry).
@@ -269,7 +302,7 @@ impl BackendHealthCache {
         self.entries
             .read()
             .iter()
-            .map(|(k, (_, e))| (k.clone(), e.clone()))
+            .map(|(k, s)| (k.clone(), s.entry.clone()))
             .collect()
     }
 
@@ -279,7 +312,7 @@ impl BackendHealthCache {
         self.entries
             .read()
             .iter()
-            .filter(|(_, (_, e))| !e.verdict.is_healthy())
+            .filter(|(_, s)| !s.entry.verdict.is_healthy())
             .map(|(k, _)| k.clone())
             .collect()
     }
@@ -289,7 +322,7 @@ impl BackendHealthCache {
         self.entries
             .read()
             .get(backend)
-            .map(|(_, e)| e.verdict.clone())
+            .map(|s| s.entry.verdict.clone())
             .filter(|v| !v.is_healthy())
     }
 
@@ -305,8 +338,8 @@ impl BackendHealthCache {
     /// `SUSPECT_PROBE_COOLDOWN` ago.
     #[must_use]
     pub fn mark_unavailable(&self, backend: &str, fp: &str, detail: &str) -> bool {
-        if let Some((old_fp, old)) = self.entries.read().get(backend) {
-            if old_fp != fp || old.verdict.is_gating() {
+        if let Some(old) = self.entries.read().get(backend) {
+            if old.fp != fp || old.entry.verdict.is_gating() {
                 return false;
             }
         }
@@ -323,23 +356,24 @@ impl BackendHealthCache {
     }
 
     /// End the suspicion of `backend` with the confirmation probe's
-    /// `outcome`: the probed definition's fingerprint and its verdict.
-    /// `None` = no probe ran, because the definition was replaced or
-    /// removed. A gating verdict closes the buckets at once. A verdict that
-    /// does not gate leaves them open and starts the cooldown.
+    /// `outcome`: the probed definition's fingerprint, its verdict and when
+    /// the probe started. `None` = no probe ran, because the definition was
+    /// replaced or removed. A gating verdict closes the buckets at once. A
+    /// verdict that does not gate leaves them open and starts the cooldown.
     fn settle_suspect(
         &self,
         backend: &str,
-        outcome: Option<(String, HealthVerdict)>,
+        outcome: Option<(String, HealthVerdict, std::time::Instant)>,
         detail: &str,
     ) {
         let mut cooldown = false;
-        if let Some((fp, verdict)) = outcome {
+        if let Some((fp, verdict, started)) = outcome {
             let cause = verdict.cause();
             let (healthy, gating) = (verdict.is_healthy(), verdict.is_gating());
             // Not recorded = an apply replaced the definition while the
-            // probe ran; the verdict says nothing about the new one.
-            if self.record(backend, fp, verdict, true).is_some() {
+            // probe ran (the verdict says nothing about the new one), or a
+            // newer probe answered first.
+            if self.record(backend, fp, verdict, started, true).is_some() {
                 cooldown = !gating;
                 if healthy {
                     tracing::warn!(
@@ -444,8 +478,9 @@ pub async fn confirm_suspect(
         .find(|(n, backend, _)| n == name && fingerprint(backend) == fp);
     let outcome = match target {
         Some((_, backend, fallback)) => {
+            let started = std::time::Instant::now();
             let verdict = probe_backend_health(&backend, fallback.as_deref()).await;
-            Some((fp.to_string(), verdict))
+            Some((fp.to_string(), verdict, started))
         }
         None => None,
     };
@@ -466,39 +501,67 @@ pub fn health_probe_interval() -> Option<std::time::Duration> {
 }
 
 /// One round of the health loop: probe EVERY configured backend, at the
-/// same time, and record the verdicts. A healthy backend that hangs or goes
-/// down turns unhealthy within one interval, with no request needed; an
-/// unhealthy one recovers the same way.
+/// same time, and record each verdict as its probe ends (a slow backend
+/// does not hold back the others' verdicts). A healthy backend that hangs
+/// or goes down turns unhealthy within one interval, with no request
+/// needed; an unhealthy one recovers the same way.
+///
+/// A verdict is recorded only for the definition that is current when its
+/// probe ends (an apply may replace or remove a backend while the round
+/// runs), and never over a verdict of a probe that started later.
 pub async fn reprobe_all(health: &BackendHealthCache, config: &crate::config::SharedConfig) {
-    let targets = probe_targets(&*config.read().await);
+    use futures::StreamExt;
     // Hygiene FIRST: drop entries for backends no longer in the config. A
-    // stale unhealthy entry would pin the gate's slow path forever.
-    let current: std::collections::BTreeSet<String> =
-        targets.iter().map(|(n, _, _)| n.clone()).collect();
-    health.retain_backends(&current);
-    let probes = targets
+    // stale unhealthy entry would pin the gate's slow path forever. Under
+    // the read lock: an apply cannot record a new backend in between.
+    let targets = {
+        let cfg = config.read().await;
+        let targets = probe_targets(&cfg);
+        let current: std::collections::BTreeSet<String> =
+            targets.iter().map(|(n, _, _)| n.clone()).collect();
+        health.retain_backends(&current);
+        targets
+    };
+    let mut probes: futures::stream::FuturesUnordered<_> = targets
         .into_iter()
         .map(|(name, backend, fallback)| async move {
+            let started = std::time::Instant::now();
             let verdict = probe_backend_health(&backend, fallback.as_deref()).await;
-            (name, backend, verdict)
-        });
-    for (name, backend, verdict) in futures::future::join_all(probes).await {
-        let was_unhealthy = health.unhealthy_verdict(&name).is_some();
-        if was_unhealthy && verdict.is_healthy() {
-            tracing::info!("backend health: '{name}' RECOVERED — gated buckets reopen");
-        } else if !was_unhealthy && !verdict.is_healthy() {
-            tracing::warn!("backend health: '{name}' is unhealthy: {}", verdict.cause());
+            (name, fingerprint(&backend), verdict, started)
+        })
+        .collect();
+    while let Some((name, fp, verdict, started)) = probes.next().await {
+        let current = probe_targets(&*config.read().await)
+            .into_iter()
+            .find(|(n, _, _)| *n == name)
+            .map(|(_, backend, _)| fingerprint(&backend));
+        if current.as_deref() != Some(fp.as_str()) {
+            continue; // replaced or removed while the probe ran
         }
-        health.set(&name, &backend, verdict);
+        let was_unhealthy = health.unhealthy_verdict(&name).is_some();
+        let (healthy, cause) = (verdict.is_healthy(), verdict.cause());
+        if health.record(&name, fp, verdict, started, false).is_none() {
+            continue; // a newer verdict is in place
+        }
+        if was_unhealthy && healthy {
+            tracing::info!("backend health: '{name}' RECOVERED — gated buckets reopen");
+        } else if !was_unhealthy && !healthy {
+            tracing::warn!("backend health: '{name}' is unhealthy: {cause}");
+        }
     }
 }
 
 /// Probe one backend definition's connectivity + auth.
 ///
-/// S3: an authenticated `ListBuckets` under `HEALTH_PROBE_TIMEOUT`. If it is
-/// DENIED, fall back to `HeadBucket` on `fallback_bucket` — bucket-scoped
-/// application keys (Backblaze B2) legitimately cannot ListBuckets, and a 404
-/// there still proves the credentials work (authenticated + bucket absent).
+/// S3: an authenticated `HeadBucket` on `fallback_bucket` (a bucket routed
+/// to the backend), or `ListBuckets` when no bucket is routed, under
+/// `health_probe_timeout`, on the definition's long-lived probe client
+/// (`probe_client`). A 404 proves the credentials work (authenticated,
+/// bucket absent). A HEAD answer carries no error body, so a 403 is
+/// ambiguous (a scoped key, or a Ceph-family backend hiding the bucket): a
+/// `ListBuckets` then tells a rejected credential (a hard auth code) from a
+/// soft denial (fail open). Only a connect-level fault or a rejected
+/// credential gates; a slow answer or a 5xx is `Erroring`, which does not.
 /// Filesystem: the root path must exist and be a directory.
 /// ponytail: fs probe is exists+is_dir; add a write test if silent read-only
 /// mounts ever bite.
@@ -518,7 +581,7 @@ pub async fn probe_backend_health(
             },
         },
         BackendConfig::S3 { .. } => {
-            let client = match crate::config_db_sync::ConfigDbSync::build_client(config).await {
+            let client = match probe_client(config).await {
                 Ok(c) => c,
                 Err(e) => {
                     return HealthVerdict::Unreachable {
@@ -533,13 +596,15 @@ pub async fn probe_backend_health(
                 if attempt > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
-                last = probe_s3_once(&client, fallback_bucket).await;
-                match &last {
-                    // Definitive either way — no retry.
-                    HealthVerdict::Healthy | HealthVerdict::AuthRejected { .. } => break,
-                    // Transport/5xx: retry once — a single blip must not
-                    // gate a backend for the next 30s.
-                    _ => {}
+                let outcome = match fallback_bucket {
+                    Some(bucket) => probe_head_bucket(&client, bucket).await,
+                    None => probe_list_buckets(&client).await,
+                };
+                last = outcome.verdict;
+                // A fast failure (refused, 5xx) is retried once — a single
+                // blip must not gate a backend for the next 30s.
+                if !outcome.retry {
+                    break;
                 }
             }
             last
@@ -547,86 +612,196 @@ pub async fn probe_backend_health(
     }
 }
 
-async fn probe_s3_once(
-    client: &aws_sdk_s3::Client,
-    fallback_bucket: Option<&str>,
-) -> HealthVerdict {
-    match tokio::time::timeout(HEALTH_PROBE_TIMEOUT, client.list_buckets().send()).await {
-        Err(_) => HealthVerdict::Unreachable {
-            detail: format!("probe timed out ({}s)", HEALTH_PROBE_TIMEOUT.as_secs()),
-        },
-        Ok(Ok(_)) => HealthVerdict::Healthy,
-        Ok(Err(e)) => {
-            let (transport, status, code) = sdk_probe_signal(&e);
-            let failure = classify_probe_signal(transport, status, code.as_deref());
-            let detail = format!(
-                "status={} code={}",
-                status.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
-                code.as_deref().unwrap_or("-")
-            );
-            if failure == ProbeFailure::AuthRejected {
-                // A HARD auth code on ListBuckets is definitive — no fallback.
-                if is_hard_auth_code(code.as_deref()) {
-                    return failure_verdict(failure, detail);
-                }
-                // Soft denial (AccessDenied / bare 403): could be a
-                // bucket-SCOPED key (B2 app keys can't ListBuckets). HeadBucket
-                // on a routed bucket disambiguates.
-                if let Some(bucket) = fallback_bucket {
-                    match tokio::time::timeout(
-                        HEALTH_PROBE_TIMEOUT,
-                        client.head_bucket().bucket(bucket).send(),
-                    )
-                    .await
-                    {
-                        // Answered (even 404 = authenticated, bucket absent).
-                        Ok(Ok(_)) => return HealthVerdict::Healthy,
-                        Ok(Err(he)) => {
-                            let (t, s, c) = sdk_probe_signal(&he);
-                            if t {
-                                return HealthVerdict::Unreachable {
-                                    detail: "transport error on fallback probe".into(),
-                                };
-                            }
-                            if is_hard_auth_code(c.as_deref()) {
-                                return failure_verdict(
-                                    ProbeFailure::AuthRejected,
-                                    format!(
-                                        "status={} code={}",
-                                        s.map(|x| x.to_string()).unwrap_or_else(|| "-".into()),
-                                        c.as_deref().unwrap_or("-")
-                                    ),
-                                );
-                            }
-                            if matches!(s, Some(x) if x >= 500) {
-                                return HealthVerdict::Erroring {
-                                    detail: format!("status={} on fallback probe", s.unwrap()),
-                                };
-                            }
-                            // 404 = authenticated + bucket absent. A soft 403
-                            // is ALSO not proof of broken creds: Ceph-family
-                            // backends answer 403 for buckets that simply
-                            // don't exist (anti-enumeration), and scoped keys
-                            // legally get AccessDenied out of scope. FAIL OPEN
-                            // — never 503 a backend on ambiguous evidence.
-                            return HealthVerdict::Healthy;
-                        }
-                        Err(_) => {
-                            return HealthVerdict::Unreachable {
-                                detail: format!(
-                                    "probe timed out ({}s)",
-                                    HEALTH_PROBE_TIMEOUT.as_secs()
-                                ),
-                            }
-                        }
-                    }
-                }
-                // No routed bucket to disambiguate with — a soft denial is
-                // not proof of broken creds. Fail open.
-                return HealthVerdict::Healthy;
-            }
-            failure_verdict(failure, detail)
+/// The long-lived probe clients, one per backend definition (fingerprint).
+/// A client per probe paid a new TCP and TLS handshake on every probe.
+static PROBE_CLIENTS: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, aws_sdk_s3::Client>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The probe client of `config`'s definition, built on first use: the
+/// SSRF-guarded client of `ConfigDbSync::build_client`, with one SDK
+/// attempt (the probe makes its own), the data path's connect timeout, the
+/// probe deadline, and a retry partition of its own (the probe never
+/// spends a data path's retry quota, and never feeds its rate limiter).
+async fn probe_client(config: &BackendConfig) -> Result<aws_sdk_s3::Client, String> {
+    use aws_sdk_s3::config::retry::{RetryConfig, RetryPartition};
+    use sha2::Digest;
+    let fp = fingerprint(config);
+    if let Some(client) = PROBE_CLIENTS.lock().get(&fp) {
+        return Ok(client.clone());
+    }
+    let built = crate::config_db_sync::ConfigDbSync::build_client(config).await?;
+    let connect = std::time::Duration::from_secs(crate::config::env_parse_with_default(
+        "DGP_S3_CONNECT_TIMEOUT_SECS",
+        10u64,
+    ));
+    // Named by a hash: the fingerprint holds the secret.
+    let hash = hex::encode(sha2::Sha256::digest(fp.as_bytes()));
+    let conf = built
+        .config()
+        .to_builder()
+        .retry_config(RetryConfig::standard().with_max_attempts(1))
+        .retry_partition(RetryPartition::custom(format!("dgp-health-{}", &hash[..12])).build())
+        .timeout_config(
+            aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                .connect_timeout(connect)
+                .disable_read_timeout()
+                .operation_timeout(health_probe_timeout())
+                .build(),
+        )
+        .build();
+    let client = aws_sdk_s3::Client::from_conf(conf);
+    let mut clients = PROBE_CLIENTS.lock();
+    if clients.len() >= MAX_PROBE_CLIENTS {
+        clients.clear();
+    }
+    clients.insert(fp, client.clone());
+    Ok(client)
+}
+
+/// One probe attempt: its verdict, and whether a second attempt may
+/// change it (a fast failure; not an answer, not a run-out deadline).
+struct ProbeAttempt {
+    verdict: HealthVerdict,
+    retry: bool,
+}
+
+impl ProbeAttempt {
+    fn done(verdict: HealthVerdict) -> Self {
+        Self {
+            verdict,
+            retry: false,
         }
+    }
+
+    /// No answer within the deadline. The connect timeout is shorter and
+    /// fails as a dispatch failure, so the backend accepted the connection
+    /// and answers slowly: it is reachable, and does not gate.
+    fn slow() -> Self {
+        Self::done(HealthVerdict::Erroring {
+            detail: format!(
+                "no answer within {}s: the backend is slow; requests are not blocked",
+                health_probe_timeout().as_secs()
+            ),
+        })
+    }
+}
+
+/// The attempt of a request that got no HTTP answer; `None` when it got
+/// one. Only a dispatch failure (DNS, refused connection, TLS, the connect
+/// timeout: the probe client sets no read timeout) is connect-level.
+fn unanswered<E>(e: &aws_sdk_s3::error::SdkError<E>) -> Option<ProbeAttempt> {
+    use aws_sdk_s3::error::SdkError;
+    match e {
+        SdkError::ServiceError(_) => None,
+        SdkError::TimeoutError(_) => Some(ProbeAttempt::slow()),
+        SdkError::ResponseError(_) => Some(ProbeAttempt {
+            verdict: HealthVerdict::Erroring {
+                detail: "the response broke off".into(),
+            },
+            retry: true,
+        }),
+        _ => Some(ProbeAttempt {
+            verdict: HealthVerdict::Unreachable {
+                detail: format!("no connection: {}", e),
+            },
+            retry: true,
+        }),
+    }
+}
+
+/// `status=… code=…` of a service error, for the verdict detail.
+fn signal_detail(status: Option<u16>, code: Option<&str>) -> String {
+    format!(
+        "status={} code={}",
+        status.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
+        code.unwrap_or("-")
+    )
+}
+
+/// The HeadBucket probe of a backend with a routed bucket.
+async fn probe_head_bucket(client: &aws_sdk_s3::Client, bucket: &str) -> ProbeAttempt {
+    let request = client.head_bucket().bucket(bucket).send();
+    let Ok(result) = tokio::time::timeout(health_probe_timeout(), request).await else {
+        return ProbeAttempt::slow();
+    };
+    let e = match result {
+        Ok(_) => return ProbeAttempt::done(HealthVerdict::Healthy),
+        Err(e) => e,
+    };
+    if let Some(attempt) = unanswered(&e) {
+        return attempt;
+    }
+    let (_, status, code) = sdk_probe_signal(&e);
+    if is_hard_auth_code(code.as_deref()) {
+        return ProbeAttempt::done(HealthVerdict::AuthRejected {
+            detail: signal_detail(status, code.as_deref()),
+        });
+    }
+    match status {
+        // A HEAD carries no error body: ask ListBuckets why.
+        Some(401 | 403) => ProbeAttempt::done(list_buckets_names_bad_credentials(client).await),
+        Some(s) if s >= 500 || s == 429 => ProbeAttempt {
+            verdict: HealthVerdict::Erroring {
+                detail: signal_detail(status, code.as_deref()),
+            },
+            retry: true,
+        },
+        // The bucket lives behind another endpoint or region.
+        Some(301) => ProbeAttempt::done(HealthVerdict::Erroring {
+            detail: signal_detail(status, code.as_deref()),
+        }),
+        // 404 = authenticated, bucket absent; any other answer proves the
+        // backend is reachable.
+        _ => ProbeAttempt::done(HealthVerdict::Healthy),
+    }
+}
+
+/// After an ambiguous 403: `AuthRejected` when ListBuckets names a hard
+/// auth code, else `Healthy`. A soft 403 is not proof of broken creds:
+/// Ceph-family backends answer 403 for buckets that do not exist
+/// (anti-enumeration), and scoped keys legally get AccessDenied out of
+/// scope. FAIL OPEN — never 503 a backend on ambiguous evidence.
+async fn list_buckets_names_bad_credentials(client: &aws_sdk_s3::Client) -> HealthVerdict {
+    let request = client.list_buckets().send();
+    if let Ok(Err(e)) = tokio::time::timeout(health_probe_timeout(), request).await {
+        let (transport, status, code) = sdk_probe_signal(&e);
+        if !transport && is_hard_auth_code(code.as_deref()) {
+            return HealthVerdict::AuthRejected {
+                detail: signal_detail(status, code.as_deref()),
+            };
+        }
+    }
+    HealthVerdict::Healthy
+}
+
+/// The ListBuckets probe of a backend with no routed bucket.
+async fn probe_list_buckets(client: &aws_sdk_s3::Client) -> ProbeAttempt {
+    let request = client.list_buckets().send();
+    let Ok(result) = tokio::time::timeout(health_probe_timeout(), request).await else {
+        return ProbeAttempt::slow();
+    };
+    let e = match result {
+        Ok(_) => return ProbeAttempt::done(HealthVerdict::Healthy),
+        Err(e) => e,
+    };
+    if let Some(attempt) = unanswered(&e) {
+        return attempt;
+    }
+    let (_, status, code) = sdk_probe_signal(&e);
+    let detail = signal_detail(status, code.as_deref());
+    match classify_probe_signal(false, status, code.as_deref()) {
+        // A HARD auth code is definitive.
+        ProbeFailure::AuthRejected if is_hard_auth_code(code.as_deref()) => {
+            ProbeAttempt::done(HealthVerdict::AuthRejected { detail })
+        }
+        // A soft denial (AccessDenied / bare 403) with no routed bucket to
+        // disambiguate: a bucket-SCOPED key (B2 app keys) cannot
+        // ListBuckets. Fail open.
+        ProbeFailure::AuthRejected => ProbeAttempt::done(HealthVerdict::Healthy),
+        failure => ProbeAttempt {
+            retry: matches!(status, Some(s) if s >= 500 || s == 429),
+            verdict: failure_verdict(failure, detail),
+        },
     }
 }
 
@@ -1153,6 +1328,130 @@ storage:
             detail: "dns".into(),
         };
         assert!(v.cause().contains("endpoint unreachable"));
+    }
+}
+
+#[cfg(test)]
+mod slow_backend_tests {
+    //! A backend that answers slowly is reachable: it never gates. And a
+    //! probe round never overwrites a newer verdict, or the verdict of a
+    //! definition that replaced the one it probed.
+
+    use super::*;
+
+    const TIMED_OUT: &str = "head_object on bucket 'releases': request has timed out";
+
+    /// `hetzner-fsn1` on the fake S3 at `endpoint`, with `secret`; the
+    /// bucket `releases` routes to it when `routed`.
+    fn fake_backend(
+        endpoint: &str,
+        secret: &str,
+        routed: bool,
+    ) -> (crate::config::SharedConfig, BackendConfig) {
+        let buckets = if routed {
+            "  buckets:\n    releases: { backend: hetzner-fsn1 }\n"
+        } else {
+            ""
+        };
+        let cfg = crate::config::Config::from_yaml_str(&format!(
+            "storage:\n  backends:\n    - name: hetzner-fsn1\n      type: s3\n      \
+             endpoint: \"{endpoint}\"\n      region: eu-central\n      force_path_style: true\n      \
+             access_key_id: k\n      secret_access_key: {secret}\n      allow_local: true\n{buckets}"
+        ))
+        .expect("fixture parses");
+        let backend = cfg.backend_by_name("hetzner-fsn1").unwrap().clone();
+        (cfg.into_shared(), backend)
+    }
+
+    /// Prod (Hetzner hel1): ListBuckets and HeadBucket answer in more than
+    /// 5 s now and then, and the probe gave up at 5 s (twice), so a backend
+    /// whose data requests still worked answered 503 for every bucket.
+    #[tokio::test]
+    async fn a_slow_backend_that_answers_is_never_gated() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        fake.set_delay_ms("LIST_BUCKETS", 6_000);
+        fake.set_delay_ms("HEAD_BUCKET", 6_000);
+        let (config, cfg) = fake_backend(&endpoint, "s", true);
+        let fp = fingerprint(&cfg);
+        let cache = Arc::new(BackendHealthCache::default());
+        cache.set("hetzner-fsn1", &cfg, HealthVerdict::Healthy);
+
+        report_unavailable(&cache, &config, "hetzner-fsn1", &fp, TIMED_OUT)
+            .expect("a confirmation probe")
+            .await
+            .unwrap();
+        let v = cache.get("hetzner-fsn1", &cfg).unwrap();
+        assert!(!v.is_gating(), "the confirmation probe gated: {v:?}");
+
+        reprobe_all(&cache, &config).await;
+        let v = cache.get("hetzner-fsn1", &cfg).unwrap();
+        assert!(!v.is_gating(), "the probe round gated: {v:?}");
+    }
+
+    /// Interleaving A of the blast scan: a round probes definition D1, an
+    /// apply rotates the secret to D2 and records D2 healthy, then the
+    /// round's D1 verdict lands on top. The GUI and `/_/ready` showed the
+    /// stale red verdict, and passive signals for D2 were absorbed.
+    #[tokio::test]
+    async fn a_round_never_overwrites_a_newer_definitions_verdict() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        fake.set_delay_ms("LIST_BUCKETS", 1_000);
+        fake.fail("LIST_BUCKETS", "/", 403, "InvalidAccessKeyId", u32::MAX);
+        let (config, _d1) = fake_backend(&endpoint, "s", false);
+        let cache = Arc::new(BackendHealthCache::default());
+        let round = tokio::spawn({
+            let (cache, config) = (cache.clone(), config.clone());
+            async move { reprobe_all(&cache, &config).await }
+        });
+        assert!(
+            fake.wait_for(|r| r == "GET /" || r.starts_with("GET /?"))
+                .await,
+            "the round probes"
+        );
+
+        // The apply: a rotated secret, probed healthy, then the swap.
+        let (_, d2) = fake_backend(&endpoint, "s2", false);
+        cache.set("hetzner-fsn1", &d2, HealthVerdict::Healthy);
+        config.write().await.backends[0].backend = d2.clone();
+        round.await.unwrap();
+
+        assert_eq!(
+            cache.snapshot()["hetzner-fsn1"].verdict,
+            HealthVerdict::Healthy,
+            "the old definition's verdict replaced the new one's"
+        );
+        assert!(
+            cache.mark_unavailable("hetzner-fsn1", &fingerprint(&d2), TIMED_OUT),
+            "a failed request of the new definition was absorbed"
+        );
+    }
+
+    /// Interleaving C: a verdict recorded while a round's probe ran (a
+    /// confirmation probe, or Probe now) is newer than the round's; the
+    /// round must not replace it when its slow probe ends.
+    #[tokio::test]
+    async fn a_round_never_overwrites_a_verdict_newer_than_its_probe() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        fake.set_delay_ms("LIST_BUCKETS", 1_000);
+        fake.fail("LIST_BUCKETS", "/", 403, "InvalidAccessKeyId", u32::MAX);
+        let (config, d1) = fake_backend(&endpoint, "s", false);
+        let cache = Arc::new(BackendHealthCache::default());
+        let round = tokio::spawn({
+            let (cache, config) = (cache.clone(), config.clone());
+            async move { reprobe_all(&cache, &config).await }
+        });
+        assert!(
+            fake.wait_for(|r| r == "GET /" || r.starts_with("GET /?"))
+                .await,
+            "the round probes"
+        );
+        cache.set("hetzner-fsn1", &d1, HealthVerdict::Healthy);
+        round.await.unwrap();
+        assert_eq!(
+            cache.get("hetzner-fsn1", &d1),
+            Some(HealthVerdict::Healthy),
+            "an older probe replaced a newer verdict"
+        );
     }
 }
 
