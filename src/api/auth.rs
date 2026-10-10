@@ -793,28 +793,55 @@ pub async fn sigv4_auth_middleware(
         let log_auth_failure = log_auth_failure.clone();
         let rate_limiter = rate_limiter.clone();
         let audit_ua = audit_ua.clone();
-        move |reason: &str| {
+        move |reason: &str, access_key: &str| {
             log_auth_failure(reason);
-            // `bucket_key` is the IP the rate limiter buckets on;
-            // `trust_proxy` reveals whether that's the real client or a
-            // shared proxy IP — the field that makes "all clients collapsed
-            // onto one bucket" diagnosable at a glance.
+            // The limiter counts per (IP, access key): `key` names the key,
+            // and `trust_proxy` tells whether `ip` is the real client or a
+            // shared proxy address.
             if let (Some(rl), Some(ip)) = (&rate_limiter, &client_ip) {
-                let locked = rl.record_failure(ip);
-                let count = rl.failure_count(ip);
+                let locked = rl.record_key_failure(ip, access_key);
+                let count = rl.key_failure_count(ip, access_key);
                 let trust_proxy = crate::rate_limiter::trust_proxy_headers();
+                let key = crate::rate_limiter::account_log_label(access_key, true);
                 if locked {
                     warn!(
-                        "SECURITY | event=brute_force_lockout | ip={} | bucket_key={} | trust_proxy={} | attempts={} | reason={} | ua={}",
-                        ip, ip, trust_proxy, count, reason, audit_ua
+                        "SECURITY | event=brute_force_lockout | ip={} | key={} | trust_proxy={} | attempts={} | reason={} | ua={}",
+                        ip, key, trust_proxy, count, reason, audit_ua
                     );
                 } else if count >= 3 {
                     warn!(
-                        "SECURITY | event=repeated_auth_failure | ip={} | bucket_key={} | trust_proxy={} | attempts={} | reason={} | ua={}",
-                        ip, ip, trust_proxy, count, reason, audit_ua
+                        "SECURITY | event=repeated_auth_failure | ip={} | key={} | trust_proxy={} | attempts={} | reason={} | ua={}",
+                        ip, key, trust_proxy, count, reason, audit_ua
                     );
                 }
             }
+        }
+    };
+    // The lockout answer for a key that is locked out at this address.
+    let lockout_refusal = {
+        let rate_limiter = rate_limiter.clone();
+        move |access_key: &str| -> Option<Response> {
+            let (rl, ip) = (rate_limiter.as_ref()?, client_ip.as_ref()?);
+            let left = rl.key_lockout_remaining(ip, access_key)?;
+            warn!(
+                "SECURITY | event=brute_force_blocked | ip={} | key={} | trust_proxy={} | attempts={} | action=blocked",
+                ip,
+                crate::rate_limiter::account_log_label(access_key, true),
+                crate::rate_limiter::trust_proxy_headers(),
+                rl.key_failure_count(ip, access_key)
+            );
+            // S3 clients understand SlowDown; the message and Retry-After
+            // say how long the lockout lasts.
+            let (secs, message) = crate::rate_limiter::lockout_message(left);
+            let mut resp = S3Error::SlowDown(format!(
+                "Rate limited due to repeated auth failures. {message}"
+            ))
+            .into_response();
+            if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                resp.headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, v);
+            }
+            Some(resp)
         }
     };
 
@@ -931,36 +958,15 @@ pub async fn sigv4_auth_middleware(
             return Ok(next.run(request).await);
         }
     }
-    // Lockout + progressive delay, AFTER the anonymous branch: a public
-    // read needs no credential, so a locked-out peer IP (every client
-    // behind a load balancer without DGP_TRUSTED_PROXY_CIDRS) still gets
-    // it. Before the form-POST deferral: that surface feeds the limiter too.
-    if let (Some(rl), Some(ip)) = (&rate_limiter, &client_ip) {
-        if let Some(left) = rl.lockout_remaining(ip) {
-            let count = rl.failure_count(ip);
-            warn!(
-                "SECURITY | event=brute_force_blocked | ip={} | bucket_key={} | trust_proxy={} | attempts={} | action=blocked",
-                ip, ip, crate::rate_limiter::trust_proxy_headers(), count
-            );
-            // S3 clients understand SlowDown; the message and Retry-After
-            // say how long the lockout lasts.
-            let (secs, message) = crate::rate_limiter::lockout_message(left);
-            let mut resp = S3Error::SlowDown(format!(
-                "Rate limited due to repeated auth failures. {message}"
-            ))
-            .into_response();
-            if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
-                resp.headers_mut()
-                    .insert(axum::http::header::RETRY_AFTER, v);
-            }
-            return Err(resp);
-        }
-    }
-
+    // The lockouts apply AFTER the anonymous branch: a public read needs
+    // no credential. They are per (client IP, access key): another key's
+    // failures at the same address (every client behind a reverse proxy
+    // has the proxy's address) never refuse a key.
     let query_string = request.uri().query().unwrap_or("");
     // A browser form POST carries its signature in the policy fields; the
     // form handler checks it. One predicate decides both this deferral and
-    // the router's interception (`form_post_bucket`).
+    // the router's interception (`form_post_bucket`). Its failures count
+    // under one key per address (`FORM_POST_KEY`).
     if crate::api::handlers::form_post::form_post_bucket(
         request.method(),
         request.uri(),
@@ -968,6 +974,9 @@ pub async fn sigv4_auth_middleware(
     )
     .is_some()
     {
+        if let Some(refusal) = lockout_refusal(crate::rate_limiter::FORM_POST_KEY) {
+            return Err(refusal);
+        }
         debug!("SigV4: deferring POST form policy auth to object handler");
         return Ok(next.run(request).await);
     }
@@ -981,6 +990,10 @@ pub async fn sigv4_auth_middleware(
             log_auth_failure("missing_header");
         })?
     };
+    if let Some(refusal) = lockout_refusal(&params.access_key) {
+        return Err(refusal);
+    }
+    let access_key = params.access_key.clone();
 
     // Look up the user's secret key and build the authenticated identity.
     // `auth_config` is already narrowed to Bootstrap | Iam by the gate match
@@ -1151,12 +1164,12 @@ pub async fn sigv4_auth_middleware(
             }
         }
         LimiterVerdict::Failure => {
-            record_auth_failure("signature_rejected");
+            record_auth_failure("signature_rejected", &access_key);
             // Progressive delay on the REFUSED response only: a verified
             // request from a shared address is never slowed by another
             // client's failures.
             if let (Some(rl), Some(ip)) = (&rate_limiter, &client_ip) {
-                let delay = rl.progressive_delay(ip);
+                let delay = rl.key_progressive_delay(ip, &access_key);
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
                 }
@@ -1839,6 +1852,132 @@ mod review3_tests {
         assert!(
             !cache.contains_key("S"),
             "a seal must not extend the window"
+        );
+    }
+}
+
+#[cfg(test)]
+mod per_key_lockout_tests {
+    use super::*;
+    use crate::iam::{IamIndex, IamUser};
+    use axum::http::StatusCode;
+    use tower::ServiceExt;
+
+    const ALICE: &str = "AKALICE0000000000001";
+    const BOB: &str = "AKBOB000000000000002";
+
+    fn user(id: i64, name: &str, ak: &str) -> IamUser {
+        IamUser {
+            id,
+            name: name.into(),
+            access_key_id: ak.into(),
+            secret_access_key: format!("{name}-secret"),
+            enabled: true,
+            created_at: String::new(),
+            permissions: vec![],
+            group_ids: vec![],
+            auth_source: "local".into(),
+            iam_policies: vec![],
+        }
+    }
+
+    /// Stands in for s3s: it verifies Alice's signature and refuses Bob's
+    /// (a rotated secret).
+    async fn s3s_stand_in(req: Request<Body>) -> StatusCode {
+        let key = req
+            .extensions()
+            .get::<AuthenticatedUser>()
+            .map(|u| u.access_key_id.clone());
+        if key.as_deref() == Some(ALICE) {
+            if let Some(outcome) = req.extensions().get::<AuthOutcome>() {
+                outcome.mark_verified();
+            }
+            StatusCode::OK
+        } else {
+            StatusCode::FORBIDDEN
+        }
+    }
+
+    fn signed(access_key: &str, peer: std::net::SocketAddr) -> Request<Body> {
+        let mut req = Request::get("/releases/v1.zip")
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential={access_key}/20260101/us-east-1/s3/aws4_request, \
+                     SignedHeaders=host, Signature={}",
+                    "ab".repeat(32)
+                ),
+            )
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+        req
+    }
+
+    /// Behind a reverse proxy every client has the proxy's address. One
+    /// client with a rotated secret locked that address out, and every
+    /// other client behind the proxy got 503 SlowDown for 10 minutes,
+    /// although their own signatures verified.
+    #[tokio::test]
+    async fn another_keys_failures_never_refuse_a_verified_key() {
+        let iam: SharedIamState = Arc::new(arc_swap::ArcSwap::from_pointee(IamState::Iam(
+            IamIndex::from_users(vec![user(1, "alice", ALICE), user(2, "bob", BOB)]),
+        )));
+        let limiter = RateLimiter::new(3, Duration::from_secs(300), Duration::from_secs(600));
+        let app = axum::Router::new()
+            .fallback(s3s_stand_in)
+            .layer(axum::middleware::from_fn(sigv4_auth_middleware))
+            .layer(axum::Extension(iam))
+            .layer(axum::Extension(limiter));
+        let proxy: std::net::SocketAddr = "10.0.1.5:40000".parse().unwrap();
+        let status = |req: Request<Body>| {
+            let app = app.clone();
+            async move { app.oneshot(req).await.unwrap().status() }
+        };
+        for _ in 0..3 {
+            assert_eq!(status(signed(BOB, proxy)).await, StatusCode::FORBIDDEN);
+        }
+        assert_eq!(
+            status(signed(BOB, proxy)).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the failing key is locked out"
+        );
+        assert_eq!(
+            status(signed(ALICE, proxy)).await,
+            StatusCode::OK,
+            "a verified key was refused because of another key's failures"
+        );
+    }
+
+    /// Source guard: the S3 surfaces (the SigV4 middleware, the form-POST
+    /// interceptor) count and check failures per (IP, access key), never
+    /// per address alone: behind a reverse proxy one address is every
+    /// client.
+    #[test]
+    fn the_s3_surfaces_never_lock_out_an_address() {
+        let mut offenders = Vec::new();
+        for rel in ["src/api/auth.rs", "src/api/s3_router.rs"] {
+            let text = crate::source_scan::read(rel);
+            for (n, line) in crate::source_scan::prod_lines(&text) {
+                let code = line.split("//").next().unwrap_or("");
+                for call in [
+                    ".record_failure(",
+                    ".lockout_remaining(",
+                    ".is_limited(",
+                    ".progressive_delay(",
+                    ".failure_count(",
+                ] {
+                    if code.contains(call) {
+                        offenders.push(format!("{rel}:{n}: {}", line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "use the per-key limiter methods (record_key_failure, key_lockout_remaining, ...):\n{}",
+            offenders.join("\n")
         );
     }
 }

@@ -4,7 +4,7 @@ This page lists the limits that protect the proxy against overload, abuse, and r
 
 ## Auth rate limiter
 
-The auth rate limiter protects SigV4 authentication and the admin login endpoints against brute-force guessing. It counts failures for each client IP address.
+The auth rate limiter protects SigV4 authentication and the admin login endpoints against brute-force guessing. The admin login endpoints count failures for each client IP address. The S3 API counts failures for each pair of client IP address and access key id: a key that keeps failing at an address is locked out at that address, and the other keys at the same address are not. Behind a reverse proxy every client has the address of the proxy, so a lockout of the whole address would refuse every client because of one client with a wrong secret.
 
 | Setting | Default | Env var |
 |---------|---------|---------|
@@ -12,7 +12,7 @@ The auth rate limiter protects SigV4 authentication and the admin login endpoint
 | Rolling window | 300 s (5 min) | `DGP_RATE_LIMIT_WINDOW_SECS` |
 | Lockout duration | 600 s (10 min) | `DGP_RATE_LIMIT_LOCKOUT_SECS` |
 
-After a lockout expires, the failure counter resets and the IP can authenticate again. A successful request does not reset the counter of its IP address: the counter holds the guesses at every secret that the address tried, and one success proves only one secret. The counter ends when its window ends or when the lockout ends. A successful admin sign-in (the bootstrap password, `login-as`, `recover-db`) clears the per-account counter of the account it proved.
+After a lockout expires, the failure counter resets and the IP (or the key at that IP) can authenticate again. A successful request does not reset the counter of its IP address: the counter holds the guesses at every secret that the address tried, and one success proves only one secret. The counter ends when its window ends or when the lockout ends. A successful admin sign-in (the bootstrap password, `login-as`, `recover-db`) clears the per-account counter of the account it proved.
 
 ### Per-account lockout
 
@@ -26,7 +26,7 @@ The admin sign-in endpoints also count failures for each account, from every IP 
 
 A locked account still admits two kinds of caller, so that the attacker cannot lock the operator out. The first is an IP address that signed in to that account successfully within the last 30 days. The second is a direct request from the host itself: its TCP peer is a loopback address and it carries no forwarding header, for example a request through an SSH tunnel. The per-IP limit still applies to both.
 
-Only a failed credential counts toward the lockout. On the S3 API, a failure is a request whose signature the proxy checked and refused: a wrong secret for a known access key, or a signature that is too old. Some requests are refused but not counted: a request with no credentials, a malformed `Authorization` header, an expired presigned link, and an unknown access key. These requests never reach a signature check, so they teach the sender nothing about a secret. If they counted, any anonymous client could lock out every client that shares its IP address, for example all clients behind one load balancer. On a browser form upload (a `POST` with `multipart/form-data`), only a signature that does not match counts. A read of a public prefix needs no credentials, so the proxy serves it to a locked-out IP too.
+Only a failed credential counts toward the lockout. On the S3 API, a failure is a request whose signature the proxy checked and refused: a wrong secret for a known access key, or a signature that is too old. Some requests are refused but not counted: a request with no credentials, a malformed `Authorization` header, an expired presigned link, and an unknown access key. These requests never reach a signature check, so they teach the sender nothing about a secret. If they counted, any anonymous client could lock out every client that shares its IP address, for example all clients behind one load balancer. On a browser form upload (a `POST` with `multipart/form-data`), only a signature that does not match counts. The access key of a form upload is in the form body, which the proxy reads after the lockout check, so the form uploads from one address count together as one key. A read of a public prefix needs no credentials, so the proxy serves it to a locked-out IP too.
 
 A locked-out request gets a response that names the lockout and says how long it lasts. The correct password is refused too while the lockout lasts.
 
@@ -36,7 +36,7 @@ A locked-out request gets a response that names the lockout and says how long it
 
 ### Progressive delay
 
-Before an IP address reaches the lockout threshold, each failed auth attempt adds an artificial delay to its own refused response. A request that succeeds is not delayed, so a client that shares an address with a failing client keeps its speed:
+Before an IP address (on the S3 API, a key at an IP address) reaches the lockout threshold, each failed auth attempt adds an artificial delay to its own refused response. A request that succeeds is not delayed, so a client that shares an address with a failing client keeps its speed:
 
 | Failures | Delay |
 |----------|-------|
@@ -56,7 +56,7 @@ With `DGP_TRUST_PROXY_HEADERS=true`, `DGP_TRUSTED_PROXY_CIDRS` must list the net
 
 The proxy refuses to start when `DGP_TRUST_PROXY_HEADERS=true` and `DGP_TRUSTED_PROXY_CIDRS` is unset or holds no valid network. Without the list, the proxy cannot tell a header that a reverse proxy wrote from a header that the client forged. If the proxy used the first `X-Forwarded-For` address, any client could choose the address that the rate limiter locks out.
 
-> **Failure mode behind a proxy.** If the proxy sits behind a reverse proxy and `DGP_TRUST_PROXY_HEADERS` stays `false`, every request appears to come from the IP address of the reverse proxy. All clients then share one rate-limit bucket, so a single client that keeps sending a wrong secret locks out every client with `503 SlowDown`, even while the other clients succeed. Set `DGP_TRUST_PROXY_HEADERS=true` and `DGP_TRUSTED_PROXY_CIDRS` behind any trusted proxy. When you save a config that enables the rate limiter and does not trust the proxy headers, a config advisory flags that combination.
+> **Failure mode behind a proxy.** If the proxy sits behind a reverse proxy and `DGP_TRUST_PROXY_HEADERS` stays `false`, every request appears to come from the IP address of the reverse proxy. On the S3 API, a client that keeps sending a wrong secret then locks out its access key for every client behind the proxy, and the clients with other keys are not affected. The admin login endpoints count by address only, so failed admin logins lock out the admin logins of every client behind the proxy. Set `DGP_TRUST_PROXY_HEADERS=true` and `DGP_TRUSTED_PROXY_CIDRS` behind any trusted proxy. When you save a config that enables the rate limiter and does not trust the proxy headers, a config advisory flags that combination.
 
 Without trusted headers, the rate limiter keys on the address of the TCP connection. So it always has an IP: in a direct-to-internet deployment that address is the client, and behind a reverse proxy that is not trusted it is the reverse proxy. The admission chain's `source_ip_list` predicates and IAM `aws:SourceIp` conditions use the same client address.
 

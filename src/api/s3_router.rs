@@ -244,10 +244,11 @@ where
             .cloned();
 
         // Pull the rate limiter + client IP so a failed form-POST signature
-        // feeds the SAME per-IP brute-force lockout as a failed SigV4 header
-        // request. The SigV4 middleware defers form-POSTs to this handler, so
-        // WITHOUT this the form-POST endpoint would be the one auth surface with
-        // no rate limiting. Extracted here (before the body is consumed) because
+        // feeds the brute-force lockout, under the form-POST key of the
+        // address (`rate_limiter::FORM_POST_KEY`; the SigV4 middleware checks
+        // that lockout before it defers form-POSTs to this handler). WITHOUT
+        // this the form-POST endpoint would be the one auth surface with no
+        // rate limiting. Extracted here (before the body is consumed) because
         // `into_parts` moves the extensions.
         let rate_limiter = request
             .extensions()
@@ -327,7 +328,8 @@ where
                             Some(*ip),
                         );
                         if let Some(ip) = ip {
-                            let locked = rl.record_failure(&ip);
+                            let locked =
+                                rl.record_key_failure(&ip, crate::rate_limiter::FORM_POST_KEY);
                             if locked {
                                 tracing::warn!(
                                     "SECURITY | event=brute_force_lockout | surface=form_post | ip={ip} | bucket={bucket}"

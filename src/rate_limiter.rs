@@ -28,6 +28,11 @@ use std::time::{Duration, Instant};
 pub struct RateLimiter {
     /// Map from IP to (failure_count, first_failure_time, lockout_start).
     entries: Arc<DashMap<IpAddr, RateLimitEntry>>,
+    /// Failed S3 signatures per (client IP, access key id), under the
+    /// per-IP policy. The S3 API locks out a key at an address, never the
+    /// address: behind a reverse proxy every client has the proxy's
+    /// address, and one client with a wrong secret locked out all of them.
+    key_entries: Arc<DashMap<(IpAddr, String), RateLimitEntry>>,
     /// Per-account/subject bucket. Keys are caller-supplied strings:
     /// the bootstrap password endpoint uses `"bootstrap"`; `login_as`
     /// uses the access-key-id. Empty string means "no account
@@ -59,6 +64,65 @@ struct RateLimitEntry {
     lockout_start: Option<Instant>,
 }
 
+impl RateLimitEntry {
+    fn new(now: Instant) -> Self {
+        Self {
+            count: 0,
+            window_start: now,
+            lockout_start: None,
+        }
+    }
+
+    /// Count one failure under the policy (`max` failures in `window`, then
+    /// a `lockout`). Returns `true` when the entry is locked out now. THE
+    /// counting rule of every bucket (per IP, per key, per account).
+    fn count_failure(
+        &mut self,
+        now: Instant,
+        max: u32,
+        window: Duration,
+        lockout: Duration,
+    ) -> bool {
+        // An expired lockout resets the entry; a live one stays.
+        if let Some(lockout_start) = self.lockout_start {
+            if now.duration_since(lockout_start) >= lockout {
+                *self = Self::new(now);
+            } else {
+                return true;
+            }
+        }
+        // An expired window resets the counter.
+        if now.duration_since(self.window_start) >= window {
+            self.count = 0;
+            self.window_start = now;
+        }
+        self.count += 1;
+        if self.count >= max {
+            self.lockout_start = Some(now);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// The delay before answering a refused request, from the failure count:
+/// none for the first 10 failures (typos, misconfiguration), then doubling
+/// from 200 ms, capped at 5 s.
+fn progressive_delay_for(count: u32) -> Duration {
+    if count <= 10 {
+        return Duration::ZERO;
+    }
+    let excess = count - 10;
+    let delay_ms = 100u64.saturating_mul(1u64 << excess.min(6));
+    Duration::from_millis(delay_ms.min(5000))
+}
+
+/// The key the browser form-POST upload counts its failed signatures
+/// under. Its access key is in the form body, which the SigV4 middleware
+/// does not read, so every form POST from one address counts as one key.
+pub const FORM_POST_KEY: &str = "form-post";
+
 impl RateLimiter {
     /// Create a new rate limiter.
     ///
@@ -74,6 +138,7 @@ impl RateLimiter {
     pub fn new(max_attempts: u32, window: Duration, lockout: Duration) -> Self {
         Self {
             entries: Arc::new(DashMap::new()),
+            key_entries: Arc::new(DashMap::new()),
             account_entries: Arc::new(DashMap::new()),
             account_known_good: Arc::new(DashMap::new()),
             max_attempts,
@@ -173,16 +238,7 @@ impl RateLimiter {
     /// 800ms (13), 1.6s (14), 3.2s (15), then capped at 5s (16+).
     /// Capped at 5 seconds to avoid tying up connections forever.
     pub fn progressive_delay(&self, ip: &IpAddr) -> Duration {
-        let entry = match self.entries.get(ip) {
-            Some(e) => e,
-            None => return Duration::ZERO,
-        };
-        if entry.count <= 10 {
-            return Duration::ZERO;
-        }
-        let excess = entry.count - 10;
-        let delay_ms = 100u64.saturating_mul(1u64 << excess.min(6));
-        Duration::from_millis(delay_ms.min(5000))
+        progressive_delay_for(self.failure_count(ip))
     }
 
     /// Get the current failure count for an IP (for logging).
@@ -194,38 +250,38 @@ impl RateLimiter {
     /// Returns `true` if the IP is now rate-limited (should block further attempts).
     pub fn record_failure(&self, ip: &IpAddr) -> bool {
         let now = Instant::now();
+        let mut entry = self.entries.entry(*ip).or_insert(RateLimitEntry::new(now));
+        entry.count_failure(now, self.max_attempts, self.window, self.lockout)
+    }
 
-        let mut entry = self.entries.entry(*ip).or_insert(RateLimitEntry {
-            count: 0,
-            window_start: now,
-            lockout_start: None,
-        });
+    /// Record a failed S3 signature of `access_key` from `ip` (the per-IP
+    /// policy, counted per pair). Returns `true` when the pair is locked out
+    /// now. Another key at the same address is not affected.
+    pub fn record_key_failure(&self, ip: &IpAddr, access_key: &str) -> bool {
+        let now = Instant::now();
+        let mut entry = self
+            .key_entries
+            .entry((*ip, access_key.to_string()))
+            .or_insert(RateLimitEntry::new(now));
+        entry.count_failure(now, self.max_attempts, self.window, self.lockout)
+    }
 
-        // If lockout has expired, reset the entry
-        if let Some(lockout_start) = entry.lockout_start {
-            if now.duration_since(lockout_start) >= self.lockout {
-                entry.count = 0;
-                entry.window_start = now;
-                entry.lockout_start = None;
-            } else {
-                return true; // Still locked out
-            }
-        }
+    /// How long `access_key` stays locked out at `ip`; `None` when it is not.
+    pub fn key_lockout_remaining(&self, ip: &IpAddr, access_key: &str) -> Option<Duration> {
+        let entry = self.key_entries.get(&(*ip, access_key.to_string()))?;
+        remaining(entry.lockout_start?, self.lockout, Instant::now())
+    }
 
-        // If window has expired, reset the counter
-        if now.duration_since(entry.window_start) >= self.window {
-            entry.count = 0;
-            entry.window_start = now;
-        }
+    /// Failed signatures of `access_key` from `ip` in the current window.
+    pub fn key_failure_count(&self, ip: &IpAddr, access_key: &str) -> u32 {
+        self.key_entries
+            .get(&(*ip, access_key.to_string()))
+            .map_or(0, |e| e.count)
+    }
 
-        entry.count += 1;
-
-        if entry.count >= self.max_attempts {
-            entry.lockout_start = Some(now);
-            true
-        } else {
-            false
-        }
+    /// [`Self::progressive_delay`] for the pair.
+    pub fn key_progressive_delay(&self, ip: &IpAddr, access_key: &str) -> Duration {
+        progressive_delay_for(self.key_failure_count(ip, access_key))
     }
 
     /// Per-account variant: is this subject (bootstrap / AKID /
@@ -245,32 +301,13 @@ impl RateLimiter {
         let mut entry = self
             .account_entries
             .entry(subject.to_string())
-            .or_insert(RateLimitEntry {
-                count: 0,
-                window_start: now,
-                lockout_start: None,
-            });
-
-        if let Some(lockout_start) = entry.lockout_start {
-            if now.duration_since(lockout_start) >= self.account_lockout {
-                entry.count = 0;
-                entry.window_start = now;
-                entry.lockout_start = None;
-            } else {
-                return true;
-            }
-        }
-        if now.duration_since(entry.window_start) >= self.account_window {
-            entry.count = 0;
-            entry.window_start = now;
-        }
-        entry.count += 1;
-        if entry.count >= self.account_max_attempts {
-            entry.lockout_start = Some(now);
-            true
-        } else {
-            false
-        }
+            .or_insert(RateLimitEntry::new(now));
+        entry.count_failure(
+            now,
+            self.account_max_attempts,
+            self.account_window,
+            self.account_lockout,
+        )
     }
 
     /// Per-account variant: clear the failure counter for this subject.
@@ -324,6 +361,8 @@ impl RateLimiter {
 
         self.entries
             .retain(|_ip, entry| should_keep_entry(entry, now, self.lockout, self.window));
+        self.key_entries
+            .retain(|_, entry| should_keep_entry(entry, now, self.lockout, self.window));
 
         self.account_entries.retain(|_subj, entry| {
             should_keep_entry(entry, now, self.account_lockout, self.account_window)
