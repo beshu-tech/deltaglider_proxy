@@ -39,10 +39,9 @@ use crate::api::admin::extract::{AdminJson, AdminQuery};
 use crate::storage::StorageBackend;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, warn};
 
@@ -232,11 +231,23 @@ pub struct EfficiencyResponse {
     pub cached: bool,
 }
 
+impl EfficiencyResponse {
+    /// The cached scan as a caller with `min_deltas` sees it: only the
+    /// deltaspaces with at least that many deltas. The scan itself reports
+    /// every deltaspace with a delta, so one scan serves every value.
+    fn with_min_deltas(mut self, min_deltas: usize) -> Self {
+        self.reports.retain(|r| r.deltas >= min_deltas);
+        self.reported_deltaspaces = self.reports.len();
+        self.min_deltas = min_deltas;
+        self
+    }
+}
+
 // ─── Background scanner with cache + dedup ──────────────────────────
 
 /// Background scanner. Same `Arc<RwLock<...>>` shape as
 /// [`UsageScanner`](crate::usage_scanner::UsageScanner) — one cache
-/// (`bucket|min_deltas` → `EfficiencyResponse`), one dedup set.
+/// (`bucket` → `EfficiencyResponse`), one dedup set.
 pub struct DeltaEfficiencyScanner {
     cache: Arc<RwLock<HashMap<String, EfficiencyResponse>>>,
     scanning: Arc<RwLock<HashSet<String>>>,
@@ -271,17 +282,13 @@ impl DeltaEfficiencyScanner {
         }
     }
 
-    fn cache_key(bucket: &str, min_deltas: usize) -> String {
-        format!("{bucket}|{min_deltas}")
-    }
-
-    /// Read the cached entry for this `(bucket, min_deltas)` pair if
-    /// present AND younger than `CACHE_TTL_SECS`. Stale entries are
+    /// Read the cached scan of `bucket` if present AND younger than
+    /// `CACHE_TTL_SECS`, filtered to `min_deltas` (the filter applies on
+    /// read, so another value never repeats the scan). Stale entries are
     /// ignored on read; they get overwritten by the next scan.
     pub fn get(&self, bucket: &str, min_deltas: usize) -> Option<EfficiencyResponse> {
-        let key = Self::cache_key(bucket, min_deltas);
         let cache = self.cache.read();
-        let entry = cache.get(&key)?.clone();
+        let entry = cache.get(bucket)?.clone();
         let age = Utc::now()
             .signed_duration_since(entry.computed_at)
             .num_seconds();
@@ -290,49 +297,33 @@ impl DeltaEfficiencyScanner {
         }
         Some(EfficiencyResponse {
             cached: true,
-            ..entry
+            ..entry.with_min_deltas(min_deltas)
         })
     }
 
-    pub fn is_scanning(&self, bucket: &str, min_deltas: usize) -> bool {
-        let key = Self::cache_key(bucket, min_deltas);
-        self.scanning.read().contains(&key)
+    pub fn is_scanning(&self, bucket: &str) -> bool {
+        self.scanning.read().contains(bucket)
     }
 
-    /// Spawn a background scan if not already running. Returns true
-    /// if a new scan was started, false if one was already in flight
-    /// (or cache is fresh).
-    pub fn enqueue_scan(
-        self: &Arc<Self>,
-        bucket: String,
-        min_deltas: usize,
-        s3_state: Arc<AppState>,
-    ) -> bool {
-        let key = Self::cache_key(&bucket, min_deltas);
-
-        // Dedup: skip if already scanning this (bucket, min_deltas).
-        {
-            let mut scanning = self.scanning.write();
-            if !scanning.insert(key.clone()) {
-                debug!(
-                    bucket = %bucket,
-                    min_deltas,
-                    "Delta-efficiency scan already in progress, skipping"
-                );
-                return false;
-            }
+    /// Spawn a background scan of `bucket` if none is running. Returns
+    /// true if a new scan was started, false if one was already in flight.
+    pub fn enqueue_scan(self: &Arc<Self>, bucket: String, s3_state: Arc<AppState>) -> bool {
+        // Dedup: skip if already scanning this bucket.
+        if !self.scanning.write().insert(bucket.clone()) {
+            debug!(bucket = %bucket, "Delta-efficiency scan already in progress, skipping");
+            return false;
         }
 
         let scanner = Arc::clone(self);
         tokio::spawn(async move {
-            debug!(bucket = %bucket, min_deltas, "Starting delta-efficiency scan");
+            debug!(bucket = %bucket, "Starting delta-efficiency scan");
 
             let _scan_guard = ScanInProgressGuard {
                 scanner: scanner.clone(),
-                key: key.clone(),
+                key: bucket.clone(),
             };
 
-            match Self::do_scan(&s3_state, &bucket, min_deltas).await {
+            match Self::scan_bucket(&s3_state, &bucket).await {
                 Ok(entry) => {
                     debug!(
                         bucket = %bucket,
@@ -340,15 +331,10 @@ impl DeltaEfficiencyScanner {
                         reported = entry.reported_deltaspaces,
                         "Delta-efficiency scan complete"
                     );
-                    scanner.cache.write().insert(key.clone(), entry);
+                    scanner.cache.write().insert(bucket.clone(), entry);
                 }
                 Err(e) => {
-                    warn!(
-                        bucket = %bucket,
-                        min_deltas,
-                        error = %e,
-                        "Delta-efficiency scan failed"
-                    );
+                    warn!(bucket = %bucket, error = %e, "Delta-efficiency scan failed");
                 }
             }
             // _scan_guard drops here, removing the dedup key.
@@ -358,91 +344,60 @@ impl DeltaEfficiencyScanner {
     }
 
     /// Walk every deltaspace in `bucket` and build the efficiency
-    /// response.
+    /// response, with a report for every deltaspace that holds a delta
+    /// (`min_deltas` filters on read, [`Self::get`]).
     ///
     /// ## Cost model
     ///
-    /// One `list_deltaspaces` (single bucket-wide LIST) + one
-    /// `scan_deltaspace_lite` per prefix, fanned out
-    /// `PARALLEL_PREFIX_SCANS`-at-a-time. **No HEAD calls** —
-    /// `scan_deltaspace_lite` reads everything we need from listing
-    /// data alone (see `StorageBackend::scan_deltaspace_lite` docs).
-    ///
-    /// On the migration bucket (141 prefixes × ~500 deltas), the
-    /// previous serial + HEAD-storm shape took ~60s+ and blew the
-    /// frontend timeout. This shape lands in ~3-5s.
-    async fn do_scan(
-        s3_state: &AppState,
-        bucket: &str,
-        min_deltas: usize,
-    ) -> Result<EfficiencyResponse, String> {
-        let engine = s3_state.engine.load_full();
-        let prefixes = engine
-            .storage()
-            .list_deltaspaces(bucket)
-            .await
-            .map_err(|e| format!("list_deltaspaces failed: {e}"))?;
-        let scanned = prefixes.len();
-
-        // Fan out per-prefix scans. `buffer_unordered` bounds the in-
-        // flight count — too low and we leave throughput on the table,
-        // too high and we risk S3 SlowDown (or process FD pressure on
-        // filesystem backends). 8 is conservative and works well across
-        // both backends.
-        //
-        // We clone `Arc<DynEngine>` into each future so the engine
-        // stays alive across the awaits even if a hot-reload swaps the
-        // ArcSwap mid-scan.
-        let bucket_owned = bucket.to_string();
-        let mut scan_stream = futures::stream::iter(prefixes.into_iter().map(|prefix| {
-            let engine = engine.clone();
-            let bucket = bucket_owned.clone();
-            async move {
-                let scan = engine
-                    .storage()
-                    .scan_deltaspace_lite(&bucket, &prefix)
-                    .await;
-                (prefix, scan)
-            }
-        }))
-        .buffer_unordered(PARALLEL_PREFIX_SCANS);
-
-        let mut reports: Vec<DeltaspaceReport> = Vec::new();
-        while let Some((prefix, scan_result)) = scan_stream.next().await {
-            let lite = match scan_result {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(
-                        "delta-efficiency: scan_deltaspace_lite failed for {}/{}: {}",
-                        bucket, prefix, e
-                    );
-                    continue;
+    /// ONE lite listing of the bucket, paged by [`LIST_PAGE_KEYS`] keys
+    /// (one LIST request each on S3), grouped by directory in memory. **No
+    /// HEAD** and no listing per directory: the listing carries the delta
+    /// sizes and the `reference.bin` baselines. (It once listed the whole
+    /// bucket for the directory names, then each directory's subtree again,
+    /// about N × depth / 1000 requests.) Memory per directory is one size
+    /// per delta, not the listed entries.
+    async fn scan_bucket(s3_state: &AppState, bucket: &str) -> Result<EfficiencyResponse, String> {
+        let mut dirs: BTreeMap<String, DeltaspaceStats> = BTreeMap::new();
+        let mut start_after: Option<String> = None;
+        loop {
+            let engine = s3_state.engine.load_full();
+            let page = engine
+                .storage()
+                .bulk_list_objects_with_baselines(
+                    bucket,
+                    "",
+                    start_after.as_deref(),
+                    Some(LIST_PAGE_KEYS),
+                )
+                .await
+                .map_err(|e| format!("listing {bucket} failed: {e}"))?;
+            for (key, meta) in &page.objects {
+                // A folder marker is no object of its folder.
+                if !key.ends_with('/') {
+                    dirs.entry(parent_dir(key)).or_default().add(meta);
                 }
-            };
-            // The backend tells us whether `file_size` on deltas is
-            // the true original (filesystem default path with xattr)
-            // or just the on-disk delta size (S3 override skips
-            // HEAD). We pass that through so the report can honestly
-            // mark `original_size_estimated` for the UI.
-            if let Some(report) = build_report_for_prefix(
-                bucket,
-                prefix,
-                &lite.metadata,
-                min_deltas,
-                lite.originals_estimated,
-            ) {
-                reports.push(report);
+            }
+            for (key, size) in &page.baselines {
+                dirs.entry(parent_dir(key))
+                    .or_default()
+                    .add(&super::savings::reference_metadata(key, *size));
+            }
+            match page.next_start_after {
+                Some(next) => start_after = Some(next),
+                None => break,
             }
         }
-
+        let scanned = dirs.len();
+        let mut reports: Vec<DeltaspaceReport> = dirs
+            .into_iter()
+            .filter_map(|(prefix, stats)| stats.report(bucket, prefix, 1))
+            .collect();
         sort_reports_worst_first(&mut reports);
-
-        let reported = reports.len();
         Ok(EfficiencyResponse {
             bucket: bucket.to_string(),
             scanned_deltaspaces: scanned,
-            reported_deltaspaces: reported,
-            min_deltas,
+            reported_deltaspaces: reports.len(),
+            min_deltas: 1,
             reports,
             computed_at: Utc::now(),
             cached: false,
@@ -450,11 +405,15 @@ impl DeltaEfficiencyScanner {
     }
 }
 
-/// How many per-prefix scans to run concurrently. Balanced against the
-/// S3 client connection pool and FD limits on filesystem backends. 8
-/// is conservative — moving up gives diminishing returns on bandwidth-
-/// bound LISTs and risks SlowDown on S3.
-const PARALLEL_PREFIX_SCANS: usize = 8;
+/// Keys per page of the bucket listing (one LIST request on S3).
+const LIST_PAGE_KEYS: usize = 1000;
+
+/// The deltaspace of a key: its directory, without the trailing slash
+/// (`""` at the bucket root), as the storage names deltaspaces.
+fn parent_dir(key: &str) -> String {
+    key.rfind('/')
+        .map_or(String::new(), |i| key[..i].to_string())
+}
 
 /// Stable severity ordering: NoReference (broken — investigate first),
 /// then Poor → Fair → Good → Excellent. Lower number = surface earlier.
@@ -469,9 +428,7 @@ fn efficiency_severity(e: Efficiency) -> u8 {
 }
 
 /// Sort reports for the UI: worst severity first, then biggest waste,
-/// then prefix ASC as a deterministic tiebreaker (without it,
-/// `buffer_unordered` completion order would make tied rows flip
-/// positions across reloads).
+/// then prefix ASC as a deterministic tiebreaker.
 fn sort_reports_worst_first(reports: &mut [DeltaspaceReport]) {
     reports.sort_by(|a, b| {
         efficiency_severity(a.efficiency)
@@ -484,16 +441,11 @@ fn sort_reports_worst_first(reports: &mut [DeltaspaceReport]) {
 /// Pure aggregator: from a single deltaspace's scan, build a
 /// `DeltaspaceReport` if it meets the `min_deltas` floor, else None.
 ///
-/// Separated from `do_scan` so it stays unit-testable without
-/// spinning up a storage backend.
-///
-/// `originals_estimated` mirrors the field in
-/// [`StorageBackend::scan_deltaspace_lite`]'s result: when true, the
-/// `file_size` on every `Delta` entry is the on-disk delta size rather
-/// than the original-file size. In that case we can't honestly compute
-/// `total_original_bytes` or `savings_bytes` — both are reported as
-/// `0` and the flag propagates to the report so the UI can suppress
-/// the corresponding columns.
+/// `originals_estimated`: when true, the `file_size` on every `Delta`
+/// entry is the on-disk delta size rather than the original-file size, so
+/// `total_original_bytes` and `savings_bytes` cannot be computed (see
+/// [`DeltaspaceStats::report`]).
+#[cfg(test)]
 fn build_report_for_prefix(
     bucket: &str,
     prefix: String,
@@ -501,91 +453,80 @@ fn build_report_for_prefix(
     min_deltas: usize,
     originals_estimated: bool,
 ) -> Option<DeltaspaceReport> {
-    let partition = partition_deltaspace_scan(scan);
-    let efficiency = classify_deltaspace(
-        partition.reference_bytes,
-        &partition.delta_sizes,
-        min_deltas,
-    )?;
-
-    let median = median_u64(&partition.delta_sizes);
-    let max_delta = partition.delta_sizes.iter().copied().max().unwrap_or(0);
-    // Route the byte totals through the canonical accumulator so the
-    // sums here stay in lockstep with bucket_scan, cli stats, and the
-    // SPA chip. We pass the scan slice in directly — `SavingsTotals`
-    // handles passthrough / reference / delta bookkeeping the same way
-    // it does for every other consumer, and we crucially do NOT double-
-    // count delta `file_size` as "original" under lite mode (where
-    // `file_size == delta_size` for deltas). That special case is
-    // expressed by clearing original_bytes here, not by another inline
-    // formula.
-    let mut totals = crate::deltaglider::SavingsTotals::default();
+    let mut stats = DeltaspaceStats::default();
     for m in scan {
-        totals.accumulate(m);
+        stats.add(m);
     }
-    if originals_estimated {
-        // Lite mode: delta `file_size` is actually on-disk size, not
-        // the original. The accumulator adds it to original_bytes —
-        // strip the contribution so the savings figure isn't a lie.
-        // Passthrough originals stay (their file_size IS the original).
-        totals.original_bytes = totals
-            .original_bytes
-            .saturating_sub(totals.delta_stored_bytes);
-    }
-    let savings_bytes = if originals_estimated {
-        // Without true originals, savings is unknowable. Sentinel "0"
-        // (not negative) is what the UI expects to suppress the cell.
-        0
-    } else {
-        totals.saved_bytes_signed()
-    };
-    let total_delta = totals.delta_stored_bytes;
-    let ratio_median = ratio_or_none(median, partition.reference_bytes);
-
-    Some(DeltaspaceReport {
-        bucket: bucket.to_string(),
-        prefix,
-        deltas: partition.delta_sizes.len(),
-        passthrough: partition.passthrough_count,
-        reference_bytes: partition.reference_bytes,
-        total_delta_bytes: total_delta,
-        total_original_bytes: totals.original_bytes,
-        median_delta_bytes: median,
-        max_delta_bytes: max_delta,
-        savings_bytes,
-        efficiency,
-        ratio_median,
-        original_size_estimated: originals_estimated,
-        explanation: efficiency.explanation().to_string(),
-    })
+    stats.originals_estimated = originals_estimated;
+    stats.report(bucket, prefix, min_deltas)
 }
 
-/// Sums collected from a single deltaspace's scan, prior to verdict
-/// computation. Kept separate from `build_report_for_prefix` so the
-/// partition loop has its own name and unit-test surface.
-struct DeltaspacePartition {
+/// What one deltaspace's listed entries add up to, kept small: one size per
+/// delta, counts and totals otherwise.
+#[derive(Default)]
+struct DeltaspaceStats {
     reference_bytes: Option<u64>,
     delta_sizes: Vec<u64>,
     passthrough_count: usize,
+    /// Byte totals: `SavingsTotals` owns that math.
+    totals: crate::deltaglider::SavingsTotals,
+    /// Some delta lists only its stored size (no HEAD), so its `file_size`
+    /// is not the original size.
+    originals_estimated: bool,
 }
 
-/// Byte totals are NOT summed here: `SavingsTotals` owns that math.
-fn partition_deltaspace_scan(scan: &[FileMetadata]) -> DeltaspacePartition {
-    let mut p = DeltaspacePartition {
-        reference_bytes: None,
-        delta_sizes: Vec::new(),
-        passthrough_count: 0,
-    };
-    for m in scan {
+impl DeltaspaceStats {
+    fn add(&mut self, m: &FileMetadata) {
         match &m.storage_info {
-            StorageInfo::Reference { .. } => {
-                p.reference_bytes = Some(m.file_size);
+            StorageInfo::Reference { .. } => self.reference_bytes = Some(m.file_size),
+            StorageInfo::Delta { delta_size, .. } => {
+                self.delta_sizes.push(*delta_size);
+                self.originals_estimated |= m.is_unresolved_delta_stub();
             }
-            StorageInfo::Delta { delta_size, .. } => p.delta_sizes.push(*delta_size),
-            StorageInfo::Passthrough => p.passthrough_count += 1,
+            StorageInfo::Passthrough => self.passthrough_count += 1,
         }
+        self.totals.accumulate(m);
     }
-    p
+
+    /// The report of this deltaspace, or `None` below `min_deltas`.
+    fn report(self, bucket: &str, prefix: String, min_deltas: usize) -> Option<DeltaspaceReport> {
+        let efficiency = classify_deltaspace(self.reference_bytes, &self.delta_sizes, min_deltas)?;
+        let median = median_u64(&self.delta_sizes);
+        let max_delta = self.delta_sizes.iter().copied().max().unwrap_or(0);
+        let mut totals = self.totals;
+        if self.originals_estimated {
+            // Lite mode: delta `file_size` is actually on-disk size, not
+            // the original. The accumulator adds it to original_bytes —
+            // strip the contribution so the savings figure isn't a lie.
+            // Passthrough originals stay (their file_size IS the original).
+            totals.original_bytes = totals
+                .original_bytes
+                .saturating_sub(totals.delta_stored_bytes);
+        }
+        let savings_bytes = if self.originals_estimated {
+            // Without true originals, savings is unknowable. Sentinel "0"
+            // (not negative) is what the UI expects to suppress the cell.
+            0
+        } else {
+            totals.saved_bytes_signed()
+        };
+        Some(DeltaspaceReport {
+            bucket: bucket.to_string(),
+            prefix,
+            deltas: self.delta_sizes.len(),
+            passthrough: self.passthrough_count,
+            reference_bytes: self.reference_bytes,
+            total_delta_bytes: totals.delta_stored_bytes,
+            total_original_bytes: totals.original_bytes,
+            median_delta_bytes: median,
+            max_delta_bytes: max_delta,
+            savings_bytes,
+            efficiency,
+            ratio_median: ratio_or_none(median, self.reference_bytes),
+            original_size_estimated: self.originals_estimated,
+            explanation: efficiency.explanation().to_string(),
+        })
+    }
 }
 
 // ─── Admin API handlers ─────────────────────────────────────────────
@@ -634,15 +575,10 @@ pub async fn get_delta_efficiency(
     // `get_usage`'s 404+`scanning: true` shape, but we use 202 here
     // because "the work has been accepted" is the more accurate
     // semantic than "not found".
-    let started = state.delta_efficiency_scanner.enqueue_scan(
-        bucket.to_string(),
-        min_deltas,
-        state.s3_state.clone(),
-    );
-    let scanning = started
-        || state
-            .delta_efficiency_scanner
-            .is_scanning(&bucket, min_deltas);
+    let started = state
+        .delta_efficiency_scanner
+        .enqueue_scan(bucket.to_string(), state.s3_state.clone());
+    let scanning = started || state.delta_efficiency_scanner.is_scanning(&bucket);
 
     (
         StatusCode::ACCEPTED,
@@ -676,11 +612,9 @@ pub async fn post_delta_efficiency_scan(
         Err(e) => return e.into_response(),
     };
     let min_deltas = clamp_min_deltas(req.min_deltas);
-    let started = state.delta_efficiency_scanner.enqueue_scan(
-        bucket.to_string(),
-        min_deltas,
-        state.s3_state.clone(),
-    );
+    let started = state
+        .delta_efficiency_scanner
+        .enqueue_scan(bucket.to_string(), state.s3_state.clone());
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({
@@ -990,9 +924,8 @@ mod tests {
     #[test]
     fn get_returns_cached_with_flag_set() {
         let scanner = DeltaEfficiencyScanner::new();
-        let key = DeltaEfficiencyScanner::cache_key("bucket", 3);
         scanner.cache.write().insert(
-            key,
+            "bucket".into(),
             EfficiencyResponse {
                 bucket: "bucket".into(),
                 scanned_deltaspaces: 0,
@@ -1011,9 +944,8 @@ mod tests {
     #[test]
     fn get_returns_none_when_entry_is_stale() {
         let scanner = DeltaEfficiencyScanner::new();
-        let key = DeltaEfficiencyScanner::cache_key("bucket", 3);
         scanner.cache.write().insert(
-            key,
+            "bucket".into(),
             EfficiencyResponse {
                 bucket: "bucket".into(),
                 scanned_deltaspaces: 0,
@@ -1030,36 +962,32 @@ mod tests {
         );
     }
 
-    /// `is_scanning` reflects the dedup set.
+    /// `is_scanning` reflects the dedup set, one entry per bucket.
     #[test]
     fn is_scanning_tracks_dedup() {
         let scanner = DeltaEfficiencyScanner::new();
-        assert!(!scanner.is_scanning("bucket", 3));
-        let key = DeltaEfficiencyScanner::cache_key("bucket", 3);
-        scanner.scanning.write().insert(key);
-        assert!(scanner.is_scanning("bucket", 3));
-        // Different (bucket, min_deltas) combos are independent.
-        assert!(!scanner.is_scanning("bucket", 5));
-        assert!(!scanner.is_scanning("other", 3));
+        assert!(!scanner.is_scanning("bucket"));
+        scanner.scanning.write().insert("bucket".into());
+        assert!(scanner.is_scanning("bucket"));
+        assert!(!scanner.is_scanning("other"));
     }
 
     /// RAII guard removes its key on drop.
     #[test]
     fn scan_guard_clears_dedup_on_drop() {
         let scanner = Arc::new(DeltaEfficiencyScanner::new());
-        let key = DeltaEfficiencyScanner::cache_key("bucket", 3);
-        scanner.scanning.write().insert(key.clone());
-        assert!(scanner.is_scanning("bucket", 3));
+        scanner.scanning.write().insert("bucket".into());
+        assert!(scanner.is_scanning("bucket"));
         {
             let _g = ScanInProgressGuard {
                 scanner: scanner.clone(),
-                key: key.clone(),
+                key: "bucket".into(),
             };
             // Still in set during guard's lifetime.
-            assert!(scanner.is_scanning("bucket", 3));
+            assert!(scanner.is_scanning("bucket"));
         }
         // Cleared on drop.
-        assert!(!scanner.is_scanning("bucket", 3));
+        assert!(!scanner.is_scanning("bucket"));
     }
 
     // ── build_report_for_prefix ────────────────────────────────────
@@ -1471,5 +1399,63 @@ mod tests {
         let r = build_verify_response("bk", "p", &scan);
         assert_eq!(r.total_original_bytes, 0);
         assert!(r.compression_ratio.is_none());
+    }
+
+    use crate::usage_scanner::test_support::{fake_s3_engine, put_raw_many, scope_lists};
+
+    /// `dir/reference.bin` plus `deltas` deltas in each of `dirs` folders.
+    fn delta_folders(dirs: usize, deltas: usize) -> Vec<String> {
+        (0..dirs)
+            .flat_map(|d| {
+                std::iter::once(format!("dir{d:02}/reference.bin"))
+                    .chain((0..deltas).map(move |i| format!("dir{d:02}/f{i}.zip.delta")))
+            })
+            .collect()
+    }
+
+    /// Cockroach scan (ui.md I): the scan listed the whole bucket, then
+    /// listed each folder's subtree again (51 LIST requests here).
+    #[tokio::test]
+    async fn the_efficiency_scan_lists_the_bucket_once() {
+        let (engine, fake, endpoint) = fake_s3_engine().await;
+        put_raw_many(&endpoint, delta_folders(50, 9)).await;
+        let state = AppState::for_tests(engine);
+        fake.clear();
+        let r = DeltaEfficiencyScanner::scan_bucket(&state, "b")
+            .await
+            .unwrap();
+        let lists = scope_lists(&fake);
+        assert!(
+            lists.len() <= 2,
+            "50 folders of 10 keys sent {} LIST requests",
+            lists.len()
+        );
+        assert_eq!((r.scanned_deltaspaces, r.reported_deltaspaces), (50, 50));
+        assert!(r.reports.iter().all(|x| x.deltas == 9));
+    }
+
+    /// Cockroach scan (ui.md I): `min_deltas` was part of the cache key, so
+    /// each value repeated the same walk.
+    #[tokio::test]
+    async fn one_scan_serves_every_min_deltas() {
+        let (engine, _fake, endpoint) = fake_s3_engine().await;
+        let mut keys = delta_folders(1, 5);
+        keys.extend(["two/reference.bin".into(), "two/a.zip.delta".into()]);
+        keys.push("two/b.zip.delta".into());
+        put_raw_many(&endpoint, keys).await;
+        let state = AppState::for_tests(engine);
+        let scanner = Arc::new(DeltaEfficiencyScanner::new());
+        assert!(scanner.enqueue_scan("b".into(), state.clone()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while scanner.is_scanning("b") {
+            assert!(std::time::Instant::now() < deadline, "the scan never ended");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let three = scanner.get("b", 3).expect("the scan result is cached");
+        assert_eq!(three.reported_deltaspaces, 1);
+        let one = scanner
+            .get("b", 1)
+            .expect("another min_deltas reads the same cached scan");
+        assert_eq!((one.reported_deltaspaces, one.min_deltas), (2, 1));
     }
 }
