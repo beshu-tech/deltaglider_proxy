@@ -7,7 +7,7 @@
  * else that reads backends. Mutations invalidate this key + `qk.config()` after
  * a write so the list and the cached config both refresh.
  */
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { getBackends, getBucketOrigins, getLegacyKeyUsage } from '../adminApi';
 import { qk } from './keys';
 
@@ -50,12 +50,16 @@ export function useBucketNames(): string[] {
  * Objects and delta references that still carry a backend's legacy key id.
  * Each fetch HEADs every object of the backend, so it never runs on its own
  * (not on mount, not on an interval): the shim banner's "Check usage" button
- * calls `refetch()`. A result stays in the cache until the next check.
+ * calls `refetch()`. A result stays in the cache until the next check. The
+ * proxy keeps a check for 60 s; a check after the first ("Check again")
+ * asks for a fresh one.
  */
 export function useLegacyKeyUsage(name: string) {
+  const qc = useQueryClient();
+  const key = qk.backends.legacyKeyUsage(name);
   return useQuery({
-    queryKey: qk.backends.legacyKeyUsage(name),
-    queryFn: () => getLegacyKeyUsage(name),
+    queryKey: key,
+    queryFn: () => getLegacyKeyUsage(name, qc.getQueryData(key) !== undefined),
     enabled: false,
     staleTime: Infinity,
   });

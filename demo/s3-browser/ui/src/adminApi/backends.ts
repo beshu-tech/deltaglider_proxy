@@ -96,8 +96,10 @@ export interface LegacyKeyUsage {
   safe_to_clear: boolean;
 }
 
-export async function getLegacyKeyUsage(name: string): Promise<LegacyKeyUsage> {
-  return adminJson(`/api/admin/backends/${encodeURIComponent(name)}/legacy-key-usage`, {
+/** `fresh` skips the proxy's 60 s cache of the last check. */
+export async function getLegacyKeyUsage(name: string, fresh = false): Promise<LegacyKeyUsage> {
+  const query = fresh ? '?fresh=true' : '';
+  return adminJson(`/api/admin/backends/${encodeURIComponent(name)}/legacy-key-usage${query}`, {
     context: `Check the legacy key of ${name}`,
   });
 }

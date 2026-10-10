@@ -47,4 +47,9 @@ test('the banner does not scan on mount; "Check usage" runs the check once', asy
 
   await user.click(screen.getByRole('button', { name: 'Check again' }));
   await waitFor(() => expect(http.callsTo('GET', USAGE)).toHaveLength(2));
+  // The proxy keeps a check for 60 s; the first click may reuse it, but
+  // "Check again" (after a re-encrypt job) must scan again.
+  const [first, again] = http.callsTo('GET', USAGE);
+  expect(first.path).not.toContain('fresh=true');
+  expect(again.path).toContain('fresh=true');
 });
