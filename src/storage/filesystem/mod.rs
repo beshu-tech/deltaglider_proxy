@@ -83,6 +83,104 @@ fn stored_name(name: &str) -> StoredName<'_> {
     }
 }
 
+/// One directory of the flat listing walk
+/// ([`FilesystemBackend::list_flat_page`]), its entries in key order.
+struct SortedDir {
+    path: PathBuf,
+    /// The key of the directory (`a/b`; empty at the bucket root).
+    key: String,
+    entries: Vec<WalkEntry>,
+    /// The next entry to visit.
+    next: usize,
+}
+
+#[derive(Clone)]
+struct WalkEntry {
+    /// The name on disk.
+    name: String,
+    /// The name in the key: a file's key name (`x` for `x.delta`, empty for
+    /// the folder marker), a directory's own name.
+    key_name: String,
+    is_dir: bool,
+}
+
+impl WalkEntry {
+    /// Where the entry sorts among its siblings: every key below a
+    /// directory starts with `name/`.
+    fn sort_name(&self) -> std::borrow::Cow<'_, str> {
+        if self.is_dir {
+            format!("{}/", self.key_name).into()
+        } else {
+            self.key_name.as_str().into()
+        }
+    }
+}
+
+impl SortedDir {
+    /// The object entries of the directory at `path`, sorted. Reads names
+    /// and types only (no metadata). `None` when no directory is there.
+    async fn read(path: &Path, key: String) -> Result<Option<Self>, StorageError> {
+        let mut dir = match fs::read_dir(path).await {
+            Ok(dir) => dir,
+            Err(e) if fsio::absent(&e) => return Ok(None),
+            Err(e) => return Err(io_to_storage_error(e)),
+        };
+        let mut entries = Vec::new();
+        while let Some(entry) = dir.next_entry().await? {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let is_dir = match entry.file_type().await {
+                Ok(ft) => ft.is_dir(),
+                Err(e) if fsio::absent(&e) => continue, // deleted during the walk
+                Err(e) => return Err(io_to_storage_error(e)),
+            };
+            let key_name = if is_dir {
+                name.clone()
+            } else {
+                match stored_name(&name) {
+                    StoredName::Object { key_filename, .. } => key_filename.to_string(),
+                    StoredName::Internal | StoredName::Reference => continue,
+                }
+            };
+            entries.push(WalkEntry {
+                name,
+                key_name,
+                is_dir,
+            });
+        }
+        entries.sort_by(|a, b| {
+            a.sort_name()
+                .cmp(&b.sort_name())
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        Ok(Some(Self {
+            path: path.to_path_buf(),
+            key,
+            entries,
+            next: 0,
+        }))
+    }
+}
+
+/// Pure: can a subtree whose keys all start with `below` (`a/b/`) hold a
+/// key that starts with `prefix` and sorts after `token`? A key below it
+/// sorts before `token` when `token` sorts after `below` and does not start
+/// with it: they differ inside `below`, where the key is smaller.
+fn flat_subtree_may_match(below: &str, prefix: &str, token: &str) -> bool {
+    let in_prefix = below.starts_with(prefix) || prefix.starts_with(below);
+    let after_token = token <= below || token.starts_with(below);
+    in_prefix && after_token
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Metadata reads of listed files ([`FilesystemBackend::listed_entry`])
+    /// on this thread, for the listing cost tests (a `#[tokio::test]` runs
+    /// on one thread).
+    static LISTED_ENTRY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Is `name` one of this backend's temp files, and so never a user object?
 /// `.dg-tmp.*` (current) or tempfile's default `.tmpXXXXXX` (older
 /// releases). Every other `.`-name (`.env`, `.gitignore`) is a user object:
@@ -317,6 +415,8 @@ impl FilesystemBackend {
     ) -> Result<Option<(String, FileMetadata)>, StorageError> {
         use super::traits::ObjectVariant;
         use crate::types::StorageInfo;
+        #[cfg(test)]
+        LISTED_ENTRY_READS.with(|n| n.set(n.get() + 1));
         let StoredName::Object {
             key_filename,
             variant,
@@ -681,6 +781,117 @@ impl FilesystemBackend {
                 results.push((user_key, meta));
             }
             Ok(())
+        })
+    }
+
+    /// One page of a delimiter-less listing, from a walk of the subtree in
+    /// key order that stops after the page: it reads the metadata of the
+    /// page's files and of one more key (which proves `is_truncated`), not of
+    /// every file under the prefix. The same keys, metadata and pages as
+    /// `bulk_list_objects` + `dedup_keep_latest` + paging.
+    ///
+    /// Key order: inside one directory every key starts with the same
+    /// `dir/`, so the entries sort by their name in the key, a file by its
+    /// key name (`x` for both `x` and `x.delta`; empty for the folder
+    /// marker) and a directory by `name/`, because every key below it starts
+    /// with that. The walk visits the entries in that order and a directory's
+    /// whole subtree at its place.
+    async fn list_flat_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        max_keys: u32,
+        continuation_token: Option<&str>,
+    ) -> Result<DelegatedListResult, StorageError> {
+        let empty = DelegatedListResult {
+            objects: Vec::new(),
+            common_prefixes: Vec::new(),
+            is_truncated: false,
+            next_continuation_token: None,
+        };
+        // As `bulk_list_objects_with_baselines`: walk the deepest directory
+        // the prefix names completely, keep the keys that start with it.
+        let dir_part = prefix.rfind('/').map_or("", |i| &prefix[..i]);
+        check_path_segments(dir_part, "")?;
+        let deltaspaces_dir = self.bucket_dir(bucket).join("deltaspaces");
+        let walk_root = if dir_part.is_empty() {
+            deltaspaces_dir
+        } else {
+            deltaspaces_dir.join(dir_part)
+        };
+        let Some(root) = SortedDir::read(&walk_root, dir_part.to_string()).await? else {
+            return Ok(empty);
+        };
+        let token = continuation_token.unwrap_or("");
+        let max = max_keys as usize;
+        // Distinct keys in order; one more than the page proves truncation.
+        let mut found: Vec<(String, FileMetadata)> = Vec::new();
+        let mut stack = vec![root];
+        'walk: while let Some(dir) = stack.last_mut() {
+            let Some(entry) = dir.entries.get(dir.next).cloned() else {
+                stack.pop();
+                continue;
+            };
+            dir.next += 1;
+            let key = if dir.key.is_empty() {
+                entry.key_name.clone()
+            } else {
+                format!("{}/{}", dir.key, entry.key_name)
+            };
+            if entry.is_dir {
+                // Every key below starts with `key/`.
+                let below = format!("{key}/");
+                if flat_subtree_may_match(&below, prefix, token) {
+                    let path = dir.path.join(&entry.name);
+                    if let Some(sub) = SortedDir::read(&path, key).await? {
+                        stack.push(sub);
+                    }
+                }
+                continue;
+            }
+            // A marker file at the bucket root names no key.
+            if key.is_empty() || !key.starts_with(prefix) || key.as_str() <= token {
+                continue;
+            }
+            let path = dir.path.join(&entry.name);
+            let Some((_, meta)) = Self::listed_entry(&path, &entry.name).await? else {
+                continue; // not an object file, or deleted during the walk
+            };
+            // The forms of one key (`x`, `x.delta`) are neighbours: the
+            // newest wins, as in `dedup_keep_latest`.
+            match found.last_mut() {
+                Some((k, m)) if *k == key => {
+                    if meta.created_at > m.created_at {
+                        *m = meta;
+                    }
+                }
+                _ => {
+                    found.push((key, meta));
+                    if found.len() > max {
+                        break 'walk;
+                    }
+                }
+            }
+        }
+        let is_truncated = found.len() > max;
+        found.truncate(max);
+        let next_continuation_token = if is_truncated {
+            found.last().map(|(k, _)| k.clone())
+        } else {
+            None
+        };
+        debug!(
+            "Flat page (fs): {} objects in {}/{}, truncated={}",
+            found.len(),
+            bucket,
+            prefix,
+            is_truncated
+        );
+        Ok(DelegatedListResult {
+            objects: found,
+            common_prefixes: Vec::new(),
+            is_truncated,
+            next_continuation_token,
         })
     }
 
@@ -1596,11 +1807,13 @@ impl StorageBackend for FilesystemBackend {
         })
     }
 
-    /// Optimised single-level listing for `delimiter = "/"`.
+    /// Paged listing without a delimiter (`list_flat_page`), and the
+    /// optimised single-level listing for `delimiter = "/"`.
     ///
-    /// Instead of recursively walking every subdirectory and then collapsing
-    /// results in-memory, we do a single `read_dir` at the directory implied
-    /// by `prefix` and classify entries into objects vs common-prefixes.
+    /// With `/`, instead of recursively walking every subdirectory and then
+    /// collapsing results in-memory, we do a single `read_dir` at the
+    /// directory implied by `prefix` and classify entries into objects vs
+    /// common-prefixes.
     #[instrument(skip(self))]
     async fn list_objects_delegated(
         &self,
@@ -1610,9 +1823,14 @@ impl StorageBackend for FilesystemBackend {
         max_keys: u32,
         continuation_token: Option<&str>,
     ) -> Result<Option<DelegatedListResult>, StorageError> {
-        // Only handle the "/" delimiter; fall back for anything else —
-        // including delimiter-less listings, which stay on the bulk path
-        // (a local-disk walk; the S3 backend is where paging pays off).
+        // No delimiter: a sorted walk that stops after the page. Another
+        // delimiter than "/" falls back to the bulk path.
+        if delimiter.is_none() {
+            return self
+                .list_flat_page(bucket, prefix, max_keys, continuation_token)
+                .await
+                .map(Some);
+        }
         if delimiter != Some("/") {
             return Ok(None);
         }
@@ -1779,5 +1997,183 @@ impl StorageBackend for FilesystemBackend {
             is_truncated: page.is_truncated,
             next_continuation_token: page.next_continuation_token,
         }))
+    }
+}
+
+/// A delimiter-less listing of the filesystem backend pages through a
+/// sorted walk that stops after the page. It walked the whole subtree and
+/// read the metadata of every file for every page: paging through N keys
+/// read N²/1000 metadata entries.
+#[cfg(test)]
+mod paged_listing_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::deltaglider::{DeltaGliderEngine, DynEngine as Engine, ListObjectsPage};
+    use std::sync::Arc;
+
+    async fn engine() -> (tempfile::TempDir, Engine) {
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let engine: Engine = DeltaGliderEngine::new_with_backend(
+            Arc::new(super::super::DynStorageBackend::new_box(fs)),
+            &Config::default(),
+            None,
+        );
+        engine.create_bucket("b").await.unwrap();
+        (tmp, engine)
+    }
+
+    async fn page(
+        engine: &Engine,
+        prefix: &str,
+        max_keys: u32,
+        token: Option<&str>,
+    ) -> ListObjectsPage {
+        engine
+            .list_objects("b", prefix, None, max_keys, token, false)
+            .await
+            .unwrap()
+    }
+
+    /// 5,000 keys in 5 pages read about 5,000 entries' metadata (it was
+    /// 25,000: every page walked all of them).
+    #[tokio::test]
+    async fn a_paged_flat_listing_reads_each_entry_about_once() {
+        let (tmp, engine) = engine().await;
+        // Files without metadata (foreign objects, listed from their stat):
+        // 5,000 engine PUTs take a minute.
+        let ds = tmp.path().join("b").join("deltaspaces");
+        let mut want = Vec::new();
+        for i in 0..5000 {
+            let key = format!("d{}/k-{i:05}.jpg", i % 7);
+            let path = ds.join(&key);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"x").unwrap();
+            want.push(key);
+        }
+        want.sort();
+        LISTED_ENTRY_READS.with(|n| n.set(0));
+        let mut got = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let p = page(&engine, "", 1000, token.as_deref()).await;
+            pages += 1;
+            got.extend(p.objects.into_iter().map(|(k, _)| k));
+            if !p.is_truncated {
+                break;
+            }
+            token = p.next_continuation_token;
+        }
+        assert_eq!(got, want);
+        assert_eq!(pages, 5);
+        let reads = LISTED_ENTRY_READS.with(|n| n.get());
+        assert!(reads <= 5_100, "{reads} metadata reads for 5,000 keys");
+    }
+
+    #[test]
+    fn a_subtree_is_walked_only_when_it_can_hold_a_key_of_the_page() {
+        // (below, prefix, token)
+        assert!(flat_subtree_may_match("a/", "", ""));
+        assert!(flat_subtree_may_match("a/", "a", ""));
+        assert!(
+            flat_subtree_may_match("a/b/", "a/b/c", ""),
+            "narrower prefix"
+        );
+        assert!(!flat_subtree_may_match("x/", "a", ""));
+        assert!(flat_subtree_may_match("a/", "a/b/", ""), "prefix inside");
+        assert!(
+            !flat_subtree_may_match("a/c/", "a/b/", ""),
+            "prefix in a sibling"
+        );
+        assert!(flat_subtree_may_match("a/", "", "a/"), "token == below");
+        assert!(flat_subtree_may_match("a/", "", "a/k"), "token inside");
+        assert!(flat_subtree_may_match("b/", "", "a/z"), "token before");
+        assert!(!flat_subtree_may_match("a/", "", "a0"), "token after");
+        assert!(!flat_subtree_may_match("a/", "", "b"));
+    }
+
+    /// The paged walk lists exactly what the full walk did, page by page:
+    /// key order across directories (`a-b` < `a.b` < `a/` < `a0`), name
+    /// prefixes, folder markers, and a key stored in both forms.
+    #[tokio::test]
+    async fn the_paged_walk_matches_the_full_walk() {
+        let (tmp, engine) = engine().await;
+        let no_delta = std::collections::HashMap::from([(
+            crate::types::meta_keys::NO_DELTA.to_string(),
+            "true".to_string(),
+        )]);
+        for key in [
+            "a-b",
+            "a.b",
+            "a/b-c",
+            "a/b/c",
+            "a/b.c",
+            "a/bb",
+            "a0",
+            "ab",
+            "dir/",
+            "dir/x",
+            "x/y-1.txt",
+            "x/y.txt",
+            "x/y/z.txt",
+            "x/y0",
+            ".env",
+            "é.txt",
+            "z",
+            "dup.zip",
+        ] {
+            let body: &[u8] = if key.ends_with('/') { b"" } else { b"body" };
+            engine
+                .store("b", key, body, None, no_delta.clone())
+                .await
+                .unwrap();
+        }
+        // Two deltas of one deltaspace (each with its `.delta` file).
+        crate::deltaglider::store_deltas(&engine, "rel", 3).await;
+        // `dup.zip` in both forms: a `.delta` file without metadata beside
+        // the passthrough one (a stub, newer: it wins in both walks).
+        let ds = tmp.path().join("b").join("deltaspaces");
+        std::fs::copy(ds.join("dup.zip"), ds.join("dup.zip.delta")).unwrap();
+
+        let bulk = engine.storage().bulk_list_objects("b", "").await.unwrap();
+        let all = crate::types::dedup_keep_latest(bulk);
+        for prefix in [
+            "", "a", "a/", "a/b", "x/y", "x/y/", "dir/", "rel/", "é", "none",
+        ] {
+            let want: Vec<(String, FileMetadata)> = all
+                .iter()
+                .filter(|(k, _)| k.starts_with(prefix))
+                .cloned()
+                .collect();
+            for max_keys in [1, 2, 3, 1000] {
+                let mut got: Vec<(String, FileMetadata)> = Vec::new();
+                let mut token: Option<String> = None;
+                loop {
+                    let p = page(&engine, prefix, max_keys, token.as_deref()).await;
+                    assert!(p.common_prefixes.is_empty());
+                    assert!(p.objects.len() <= max_keys as usize);
+                    let full = p.objects.len() == max_keys as usize;
+                    got.extend(p.objects);
+                    if !p.is_truncated {
+                        break;
+                    }
+                    assert!(full, "{prefix:?}/{max_keys}: a short truncated page");
+                    assert_eq!(
+                        p.next_continuation_token.as_ref(),
+                        got.last().map(|(k, _)| k)
+                    );
+                    token = p.next_continuation_token;
+                }
+                let names = |v: &[(String, FileMetadata)]| {
+                    v.iter()
+                        .map(|(k, m)| (k.clone(), m.file_size, m.created_at, m.md5.clone()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(names(&got), names(&want), "prefix {prefix:?}, {max_keys}");
+            }
+        }
     }
 }
