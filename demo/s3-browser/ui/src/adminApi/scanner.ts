@@ -99,10 +99,11 @@ export interface PrefixSavingsResponse {
 export async function getPrefixSavings(
   bucket: string,
   prefix: string,
+  signal?: AbortSignal,
 ): Promise<PrefixSavingsResponse | null> {
   const params = new URLSearchParams({ bucket, prefix });
   return nullWithoutAdminSession(
-    adminJson(`/api/admin/deltaspace/savings?${params}`, { context: 'Prefix savings query' }),
+    adminJson(`/api/admin/deltaspace/savings?${params}`, { context: 'Prefix savings query', signal }),
   );
 }
 

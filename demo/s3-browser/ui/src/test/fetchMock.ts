@@ -8,6 +8,8 @@ export interface RecordedRequest {
   body: unknown;
   /** Request headers, names lower-cased. */
   headers: Record<string, string>;
+  /** The caller's AbortSignal, if it passed one. */
+  signal?: AbortSignal;
 }
 
 type Reply = Response | (() => Response | Promise<Response>);
@@ -15,6 +17,16 @@ type Route = { method: string; path: string | RegExp; reply: (req: RecordedReque
 
 export function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+}
+
+/** Like a real fetch: an abort rejects the pending request with the signal's reason. */
+function abortable(response: Response | Promise<Response>, signal: AbortSignal | undefined): Promise<Response> {
+  if (!signal) return Promise.resolve(response);
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    Promise.resolve(response).then(resolve, reject);
+  });
 }
 
 export function mockFetch() {
@@ -36,7 +48,7 @@ export function mockFetch() {
     new Headers(init.headers).forEach((v, k) => {
       headers[k] = v;
     });
-    const req = { method, path, body, headers };
+    const req: RecordedRequest = { method, path, body, headers, signal: init.signal ?? undefined };
     calls.push(req);
     // Newest route first, so a test can override a default.
     for (let i = routes.length - 1; i >= 0; i--) {
@@ -44,7 +56,7 @@ export function mockFetch() {
       const hit = typeof r.path === 'string' ? r.path === path.split('?')[0] : r.path.test(path);
       if (r.method === method && hit) {
         const reply = r.reply(req);
-        return typeof reply === 'function' ? reply() : reply.clone();
+        return abortable(typeof reply === 'function' ? reply() : reply.clone(), req.signal);
       }
     }
     throw new Error(`unmocked fetch: ${method} ${path}`);

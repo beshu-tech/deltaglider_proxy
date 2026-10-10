@@ -61,8 +61,9 @@ export async function adminFetch(
   body?: unknown,
   rawBody?: RawBody,
   extraHeaders?: Record<string, string>,
+  signal?: AbortSignal,
 ): Promise<Response> {
-  const opts: RequestInit = { method, credentials: 'include' };
+  const opts: RequestInit = { method, credentials: 'include', signal };
   const headers: Record<string, string> = { ...extraHeaders };
   if (rawBody) {
     headers['Content-Type'] = rawBody.contentType;
@@ -82,6 +83,8 @@ interface AdminRequestOptions {
   /** Operator-facing prefix of the error message ("Delete user 4 failed (409): …").
    *  Defaults to `API <path>`, the shape `safeJson` always produced. */
   context?: string;
+  /** Aborts the request (the promise rejects with the signal's reason). */
+  signal?: AbortSignal;
 }
 
 function defaultContext(path: string): string {
@@ -95,9 +98,9 @@ function defaultContext(path: string): string {
  */
 export async function adminRequest(
   path: string,
-  { method = 'GET', body, context }: AdminRequestOptions = {},
+  { method = 'GET', body, context, signal }: AdminRequestOptions = {},
 ): Promise<Response> {
-  const res = await adminFetch(path, method, body);
+  const res = await adminFetch(path, method, body, undefined, undefined, signal);
   if (!res.ok) await throwApiError(res, context ?? defaultContext(path));
   return res;
 }

@@ -133,6 +133,8 @@ export default function App() {
     q: browser.q,
     object: browser.object,
     navigateUrl: navigate,
+    // Settings, Upload and the docs keep the hook mounted: it lists nothing there.
+    active: view === 'browser',
   });
 
   // --- FilePreview deep-link (?object=…&preview=1) ---

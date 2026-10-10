@@ -146,9 +146,9 @@ function getClient(): S3Client {
   return cachedClient;
 }
 
-async function sendCommand<T>(command: object, context: string): Promise<T> {
+async function sendCommand<T>(command: object, context: string, abortSignal?: AbortSignal): Promise<T> {
   try {
-    return await getClient().send(command as never) as T;
+    return await getClient().send(command as never, abortSignal ? { abortSignal } : undefined) as T;
   } catch (err) {
     throw normalizeS3Error(err, context);
   }
@@ -270,10 +270,12 @@ function formatHeadObjectResponse(resp: HeadObjectCommandOutput): HeadObjectShap
 
 /** Fetch HEAD metadata for a single object (called lazily by InspectorPanel). */
 /** `bucket` defaults to the active one; pass it when the caller captured it earlier. */
-export async function headObject(key: string, bucket = activeBucket): Promise<HeadObjectShape> {
+/** `signal` aborts the request (the browser's table drops a folder's HEADs when the user leaves it). */
+export async function headObject(key: string, bucket = activeBucket, signal?: AbortSignal): Promise<HeadObjectShape> {
   const headResp = await sendCommand<HeadObjectCommandOutput>(
     new HeadObjectCommand({ Bucket: bucket, Key: key }),
     `Read object metadata for ${key}`,
+    signal,
   );
   return formatHeadObjectResponse(headResp);
 }

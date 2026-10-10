@@ -31,6 +31,12 @@ import type { S3Object } from './types';
 import { readStorage, writeStorage } from './safeStorage';
 
 const MAX_HEAD_CACHE_SIZE = 5000;
+/**
+ * Table HEADs in flight at once. Each costs the proxy two backend HEADs; a
+ * page of 500 rows used to send them all at once (1,000 backend HEADs behind
+ * an HTTP/2 front), and the folder's listing waited behind them.
+ */
+const HEAD_CONCURRENCY = 6;
 // A stable default: `load` depends on writablePrefixes, so a fresh `[]` per
 // render re-ran the list effect on every render (an infinite update loop).
 const NO_PREFIXES: string[] = [];
@@ -53,6 +59,12 @@ interface UseS3BrowserOptions {
   object: string;
   /** Low-level URL navigation from the router (push by default, {replace} to swap). */
   navigateUrl: (url: string, opts?: { replace?: boolean }) => void;
+  /**
+   * False while App shows another view (admin, upload, docs): the hook then
+   * neither lists nor auto-refreshes, and the savings chip stays idle. The
+   * listing reloads when the browser view comes back. Default true.
+   */
+  active?: boolean;
 }
 
 export default function useS3Browser(options: UseS3BrowserOptions) {
@@ -64,8 +76,13 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     q,
     object,
     navigateUrl,
+    active = true,
   } = options;
   const [refreshTrigger, setRefreshTrigger] = useState(0);
+  // The savings chip walks the folder's whole subtree on the proxy: it
+  // reloads on a folder change and after a user's change (mutate, the end of
+  // a bulk action), never on the auto-refresh tick or after each batch.
+  const [savingsTrigger, setSavingsTrigger] = useState(0);
   const [objects, setObjects] = useState<S3Object[]>([]);
   const [folders, setFolders] = useState<string[]>([]);
   const [virtualFolders, setVirtualFolders] = useState<string[]>([]);
@@ -97,10 +114,18 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
   const [error, setError] = useState<string | null>(null);
   const headCacheRef = useRef(headCache);
   headCacheRef.current = headCache;
-  const headInflight = useRef(new Set<string>());
-  // Bumped by resetBrowseState (bucket/prefix change). HEADs started under an
-  // older generation drop their results instead of writing the previous
-  // bucket's metadata into the freshly reset cache (same pattern as loadSeq).
+  // HEAD enrichment queue: keys waiting for a slot, keys whose HEAD started
+  // (until its result is in the cache), finished results not yet rendered,
+  // and the abort of the current generation.
+  const headQueue = useRef<string[]>([]);
+  const headStarted = useRef(new Set<string>());
+  const headResults = useRef<{ key: string; storageType?: string; storedSize?: number; error: boolean }[]>([]);
+  const headRunning = useRef(0);
+  const headAbort = useRef(new AbortController());
+  // Bumped by resetBrowseState (bucket/prefix change), which also aborts the
+  // HEADs in flight and drops the queued ones. A HEAD of an older generation
+  // drops its result instead of writing the previous folder's metadata into
+  // the freshly reset cache (same pattern as loadSeq).
   const headGen = useRef(0);
   const prefixRef = useRef(prefix);
   prefixRef.current = prefix;
@@ -145,7 +170,12 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     setVirtualFolders([]);
     setHeadCache({});
     setError(null);
-    headInflight.current.clear();
+    headAbort.current.abort();
+    headAbort.current = new AbortController();
+    headQueue.current = [];
+    headStarted.current.clear();
+    headResults.current = [];
+    headRunning.current = 0;
     headGen.current += 1;
     isInitialLoad.current = true;
     clearSelection();
@@ -159,6 +189,7 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     resetBrowseState();
   }, [bucket, prefix, resetBrowseState]);
 
+  /** Reload the listing only (the auto-refresh tick, each bulk batch). */
   const refresh = useCallback(() => {
     setRefreshTrigger((k) => k + 1);
   }, []);
@@ -174,6 +205,14 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     if (!hasCredentials()) {
       setConnected(false);
       setLoading(false);
+      return;
+    }
+    // Another view is shown: list nothing. The URL bucket is '' there, so
+    // the fallback below used to list the last bucket's root every 60 s on
+    // Settings. The listing reloads when the browser view comes back.
+    if (!active) {
+      setLoading(false);
+      setRefreshing(false);
       return;
     }
     // Don't load if no bucket is selected yet — the Sidebar will set the initial
@@ -232,57 +271,79 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
         setLoading(false);
         setRefreshing(false);
       });
-  }, [bucket, prefix, reconcile, writablePrefixes, queryClient]);
+  }, [active, bucket, prefix, reconcile, writablePrefixes, queryClient]);
 
   useEffect(load, [load, refreshTrigger]);
 
-  // Smart auto-refresh: 60s interval, skip when tab is hidden
+  // Smart auto-refresh: 60s interval, only on the browser view, skip when tab is hidden
   useEffect(() => {
+    if (!active) return;
     const id = setInterval(() => {
       if (!document.hidden) refresh();
     }, 60000);
     return () => clearInterval(id);
-  }, [refresh]);
+  }, [refresh, active]);
 
-  // HEAD enrichment. Results keep the per-key error flag (a hardcoded
-  // error:false once masked HEAD failures). Results from an older generation
-  // (a bucket/prefix change reset the cache while they were in flight) are
-  // dropped: they belong to the previous listing.
-  const enrichKeys = useCallback((keys: string[]) => {
-    const gen = headGen.current;
-    const cache = headCacheRef.current;
-    const toFetch = keys.filter((k) => !(k in cache) && !headInflight.current.has(k));
-    if (toFetch.length === 0) return;
-    for (const k of toFetch) headInflight.current.add(k);
-    Promise.all(
-      toFetch.map((key) =>
-        headObject(key)
-          .then(({ storageType, storedSize }) => ({ key, storageType, storedSize, error: false as const }))
-          .catch(() => ({ key, storageType: undefined, storedSize: undefined, error: true as const }))
-      )
-    ).then((results) => {
-      if (gen !== headGen.current) return; // reset since — inflight set already cleared
-      setHeadCache((prev) => {
-        const next = { ...prev };
-        for (const r of results) {
-          next[r.key] = r.error
-            ? { error: true }
-            : { storageType: r.storageType, storedSize: r.storedSize, error: false };
-          headInflight.current.delete(r.key);
-        }
-        // Evict oldest entries if cache exceeds max size
-        const keys = Object.keys(next);
-        if (keys.length > MAX_HEAD_CACHE_SIZE) {
-          const toRemove = keys.slice(0, keys.length - MAX_HEAD_CACHE_SIZE);
-          for (const k of toRemove) delete next[k];
-        }
-        return next;
-      });
+  // HEAD enrichment: at most HEAD_CONCURRENCY HEADs in flight, the rest
+  // queued. Results keep the per-key error flag (a hardcoded error:false once
+  // masked HEAD failures) and render a few at a time, not one render per
+  // HEAD. A bucket/prefix change aborts the generation (resetBrowseState).
+  const flushHeadResults = useCallback(() => {
+    const results = headResults.current;
+    if (results.length === 0) return;
+    headResults.current = [];
+    setHeadCache((prev) => {
+      const next = { ...prev };
+      for (const r of results) {
+        next[r.key] = r.error ? { error: true } : { storageType: r.storageType, storedSize: r.storedSize, error: false };
+        headStarted.current.delete(r.key);
+      }
+      // Evict oldest entries if cache exceeds max size
+      const keys = Object.keys(next);
+      if (keys.length > MAX_HEAD_CACHE_SIZE) {
+        const toRemove = keys.slice(0, keys.length - MAX_HEAD_CACHE_SIZE);
+        for (const k of toRemove) delete next[k];
+      }
+      return next;
     });
   }, []);
 
+  const pumpHeads = useCallback(() => {
+    const gen = headGen.current;
+    const { signal } = headAbort.current;
+    while (headRunning.current < HEAD_CONCURRENCY && headQueue.current.length > 0) {
+      const key = headQueue.current.shift()!;
+      headStarted.current.add(key);
+      headRunning.current += 1;
+      headObject(key, undefined, signal)
+        .then(({ storageType, storedSize }) => ({ key, storageType, storedSize, error: false }))
+        .catch(() => ({ key, storageType: undefined, storedSize: undefined, error: true }))
+        .then((result) => {
+          if (gen !== headGen.current) return; // reset since: the counters belong to the new generation
+          headRunning.current -= 1;
+          headResults.current.push(result);
+          const idle = headRunning.current === 0 && headQueue.current.length === 0;
+          if (idle || headResults.current.length >= HEAD_CONCURRENCY) flushHeadResults();
+          pumpHeads();
+        });
+    }
+  }, [flushHeadResults]);
+
+  /**
+   * HEAD the visible page's files that have no metadata yet. The keys of
+   * this call replace the keys still queued from an earlier call: the table
+   * asks for the page on screen, and an older page's keys are off screen.
+   */
+  const enrichKeys = useCallback((keys: string[]) => {
+    const cache = headCacheRef.current;
+    headQueue.current = keys.filter((k) => !(k in cache) && !headStarted.current.has(k));
+    pumpHeads();
+  }, [pumpHeads]);
+
+  /** After a user's change: reload the listing and the savings chip. */
   const mutate = useCallback(() => {
     refresh();
+    setSavingsTrigger((k) => k + 1);
   }, [refresh]);
 
   // ── Inspector deep-link (?object=<key>) ──────────────────────────────────
@@ -458,6 +519,8 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     } finally {
       deleteRun.current = null;
       setDeleteProgress(null);
+      // The savings chip once for the whole run, not after each batch.
+      if (total > 0) setSavingsTrigger((k) => k + 1);
     }
   }, [clearSelection, refresh, expandSelected]);
 
@@ -502,9 +565,9 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     // bulkDelete): a thrown/rejected bulkCopyObjects above preserves the
     // selection so the user can retry.
     clearSelection();
-    refresh();
+    mutate();
     return { succeeded: result.succeeded, failed: result.failed };
-  }, [clearSelection, resolveSelectionWithRelativeKeys, refresh]);
+  }, [clearSelection, resolveSelectionWithRelativeKeys, mutate]);
 
   const bulkMove = useCallback(async (destBucket: string, destPrefix: string) => {
     // Server-side move with the same atomicity rule as before:
@@ -523,9 +586,9 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
       items: items.map(({ source, relative }) => ({ source_key: source, relative })),
     });
     clearSelection();
-    refresh();
+    mutate();
     return { succeeded: result.succeeded, failed: result.failed };
-  }, [clearSelection, refresh, resolveSelectionWithRelativeKeys]);
+  }, [clearSelection, mutate, resolveSelectionWithRelativeKeys]);
 
   const downloadZip = useCallback(async () => {
     // The proxy builds the archive; the browser resolves the selection and
@@ -554,7 +617,7 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
   // renders. See `src/api/admin/savings.rs` for the wire shape.
   const [deltaSummary, setDeltaSummary] = useState<DeltaSummary | null>(null);
   useEffect(() => {
-    if (!connected) return;
+    if (!connected || !active) return;
     // Use the URL-derived `bucket` prop (not the module-level getBucket()) so the
     // fetched savings always match the bucket the URL is showing. Reading global
     // state here raced the setBucket() sync effect: switching bucket A→B without
@@ -564,11 +627,13 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
       setDeltaSummary(null);
       return;
     }
-    let cancelled = false;
+    // Leaving the folder aborts the request: a walk the user no longer
+    // looks at must not keep running beside the next folder's walk.
+    const request = new AbortController();
     setDeltaSummary((prev) => (prev ? { ...prev, loading: true } : null));
-    getPrefixSavings(bucket, prefix)
+    getPrefixSavings(bucket, prefix, request.signal)
       .then((resp) => {
-        if (cancelled) return;
+        if (request.signal.aborted) return;
         if (!resp) {
           // Admin endpoint refused (no admin session) — keep the chip
           // hidden rather than guessing client-side.
@@ -578,13 +643,11 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
         setDeltaSummary(summaryFromResponse(resp));
       })
       .catch(() => {
-        if (cancelled) return;
+        if (request.signal.aborted) return;
         setDeltaSummary(null);
       });
-    return () => {
-      cancelled = true;
-    };
-  }, [connected, bucket, prefix, refreshTrigger, adminSession]);
+    return () => request.abort();
+  }, [connected, active, bucket, prefix, savingsTrigger, adminSession]);
 
   return {
     // Data
