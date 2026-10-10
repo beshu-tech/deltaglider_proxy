@@ -37,6 +37,8 @@ use errors::*;
 pub(in crate::storage) use facts::put_facts_object;
 #[cfg(test)]
 use listing::*;
+#[cfg(not(test))]
+use listing::{last_listed_key, S3ListedObject};
 use metadata::*;
 use objects::*;
 
