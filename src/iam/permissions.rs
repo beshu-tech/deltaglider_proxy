@@ -359,9 +359,34 @@ pub(crate) fn parse_conditions(c: &serde_json::Value) -> Result<iam_rs::Conditio
     Ok(block)
 }
 
-/// Ask iam-rs whether it can read `value` for `op`: one Allow statement
-/// with only this condition, evaluated against an empty context.
+/// Ask iam-rs whether it can read `value` for `op`, each value of a list
+/// alone. iam-rs reads a list one value at a time and stops at the first
+/// that matches, so a probe of the whole list read only the values before
+/// the first match: `BoolIfExists` on `aws:SourceIp` with
+/// `["true", "10.0.0.0/8"]` matches the empty context at `"true"`, passed,
+/// and erred on every request that carries a source IP.
 fn probe_condition_value(
+    op: &iam_rs::IAMOperator,
+    key: &str,
+    value: &iam_rs::ConditionValue,
+    templated: bool,
+) -> Result<(), String> {
+    match value {
+        iam_rs::ConditionValue::StringList(values) => values.iter().try_for_each(|one| {
+            probe_one_condition_value(
+                op,
+                key,
+                &iam_rs::ConditionValue::String(one.clone()),
+                templated && one.contains("${"),
+            )
+        }),
+        one => probe_one_condition_value(op, key, one, templated),
+    }
+}
+
+/// [`probe_condition_value`] of one value: one Allow statement with only
+/// this condition, evaluated against an empty context.
+fn probe_one_condition_value(
     op: &iam_rs::IAMOperator,
     key: &str,
     value: &iam_rs::ConditionValue,
@@ -3145,6 +3170,76 @@ mod review_b5_tests {
                 );
             }
         }
+    }
+
+    /// The class of the proptest above, walked whole: every operator (with
+    /// each set qualifier, with and without `IfExists`) on every key the
+    /// proptest draws, with each value shape it draws (a bool, a number,
+    /// each text, each pair of texts). A condition that the save-time rule
+    /// accepts never errs an evaluation, whether the request carries the
+    /// key or not.
+    #[test]
+    fn an_accepted_condition_never_errs_on_any_request() {
+        let mut values: Vec<serde_json::Value> = [true, false]
+            .into_iter()
+            .map(|b| serde_json::json!(b))
+            .chain([-1i64, 5, 100].into_iter().map(|n| serde_json::json!(n)))
+            .chain(TEXTS.iter().map(|t| serde_json::json!(t)))
+            .collect();
+        for a in TEXTS {
+            for b in TEXTS {
+                values.push(serde_json::json!([a, b]));
+            }
+        }
+        let mut get = Context::new();
+        insert_source_ip(&mut get, Some("10.1.2.3".parse().unwrap()));
+        let mut list = get.clone();
+        list.insert(
+            "s3:prefix".to_string(),
+            iam_rs::ContextValue::String("a/b".into()),
+        );
+        list.insert(
+            "s3:delimiter".to_string(),
+            iam_rs::ContextValue::String("/".into()),
+        );
+        list.insert(
+            "s3:max-keys".to_string(),
+            iam_rs::ContextValue::Number(100.0),
+        );
+        let requests = [
+            (S3Action::Read, get),
+            (S3Action::List, list),
+            (S3Action::Read, Context::new()),
+        ];
+        let mut accepted = 0;
+        for op in OPS {
+            for qualifier in ["", "ForAllValues:", "ForAnyValue:"] {
+                for suffix in ["", "IfExists"] {
+                    let name = format!("{qualifier}{op}{suffix}");
+                    for key in KEYS {
+                        for value in &values {
+                            let cond = serde_json::json!({ name.as_str(): { *key: value } });
+                            if parse_conditions(&cond).is_err() {
+                                continue;
+                            }
+                            accepted += 1;
+                            let rule =
+                                perm("Allow", &["read", "list"], &["b/*"], Some(cond.clone()));
+                            let policies = vec![permission_to_iam_policy(&rule)];
+                            for (action, ctx) in &requests {
+                                let (request, evaluator, _) =
+                                    build_iam_evaluator(&policies, *action, "b", "k", ctx).unwrap();
+                                assert!(
+                                    evaluator.evaluate(&request).is_ok(),
+                                    "{cond} errs on {action:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(accepted > 1000, "only {accepted} conditions accepted");
     }
 
     /// A Deny whose condition iam-rs cannot read applies without it, every
