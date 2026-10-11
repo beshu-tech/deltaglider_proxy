@@ -906,7 +906,7 @@ pub async fn bulk_delete(
     State(state): State<Arc<crate::api::admin::AdminState>>,
     headers: axum::http::HeaderMap,
     AdminJson(req): AdminJson<DeleteRequest>,
-) -> Result<Json<DeleteResponse>, AdminError> {
+) -> Result<axum::response::Response, AdminError> {
     let bucket = req.bucket.admit(&state)?;
     let req = DeletePlan {
         bucket,
@@ -926,21 +926,158 @@ pub async fn bulk_delete(
     }
 
     let actor = BulkActor::for_session(&state, &session)?;
-    let res = run_bulk_delete(&state.s3_state, &req.bucket, &req.keys, &actor).await;
-    info!(
-        "bulk delete: bucket={} deleted={} failed={}",
-        req.bucket, res.deleted, res.failed
-    );
-    super::audit_log(
-        "bulk_delete",
-        actor.label(),
-        &format!(
-            "{} deleted={} failed={}",
+    Ok(answer_bulk_delete(state.s3_state.clone(), req, actor, headers).await)
+}
+
+/// The media type of the streamed answer of a bulk delete.
+const NDJSON: &str = "application/x-ndjson";
+
+/// Run an admitted bulk delete and answer it.
+///
+/// The batch runs in a spawned task, so a client disconnect, a closed tab
+/// or the request timeout drops this future and never the batch: every
+/// key it deletes gets its `ObjectDeleted` event, each folder gets its
+/// reference reclaim, and the audit entry is written when the batch ends
+/// (the reason S3 DeleteObjects runs in its own task too). The admin
+/// router's `run_to_completion` keeps a plain request running already; a
+/// streamed answer returns before the batch ends, so it needs this task.
+///
+/// A request with `Accept: application/x-ndjson` gets the answer as a
+/// stream: one line of [`DeleteProgress`] per finished key, then one line
+/// with the [`DeleteResponse`] that a plain request gets as its body. The
+/// stream only reports: dropping it does not stop the task.
+async fn answer_bulk_delete(
+    s3: Arc<AppState>,
+    req: DeletePlan,
+    actor: BulkActor,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let (progress, lines) = if accepts_ndjson(&headers) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    // With the request's audit scope: a plain spawn loses the session
+    // principal and the peer IP of the audit entry.
+    let task = crate::audit::spawn_in_request_scope(async move {
+        // A send fails only when the client is gone: the batch goes on.
+        let on_progress = |p: DeleteProgress| {
+            if let Some(tx) = &progress {
+                let _ = tx.send(p);
+            }
+        };
+        let res = run_bulk_delete(&s3, &req.bucket, &req.keys, &actor, &on_progress).await;
+        info!(
+            "bulk delete: bucket={} deleted={} failed={}",
             req.bucket, res.deleted, res.failed
-        ),
-        &headers,
+        );
+        super::audit_log(
+            "bulk_delete",
+            actor.label(),
+            &format!(
+                "{} deleted={} failed={}",
+                req.bucket, res.deleted, res.failed
+            ),
+            &headers,
+        );
+        res
+    });
+    match lines {
+        Some(lines) => ndjson_answer(lines, task),
+        None => match task.await {
+            Ok(res) => Json(res).into_response(),
+            Err(e) => {
+                let err: AdminError = AdminError::internal(format!("bulk delete task failed: {e}"));
+                err.into_response()
+            }
+        },
+    }
+}
+
+/// Whether the request asks for the streamed answer: its `Accept` header
+/// names `application/x-ndjson` (any case, any parameters) without `q=0`.
+/// A wildcard does not count, so a client that does not know the stream
+/// gets the plain answer.
+fn accepts_ndjson(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get_all(axum::http::header::ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|range| {
+            let mut parts = range.split(';').map(str::trim);
+            let named = parts
+                .next()
+                .is_some_and(|media| media.eq_ignore_ascii_case(NDJSON));
+            let refused = parts.any(|param| {
+                param.split_once('=').is_some_and(|(k, v)| {
+                    k.trim().eq_ignore_ascii_case("q") && v.trim().parse::<f32>() == Ok(0.0)
+                })
+            });
+            named && !refused
+        })
+}
+
+/// The streamed answer: the totals from `lines` as they come, then the
+/// task's answer. An `{"error": ..}` line takes the answer's place when the
+/// task failed: the status line is gone by then.
+fn ndjson_answer(
+    lines: tokio::sync::mpsc::UnboundedReceiver<DeleteProgress>,
+    task: tokio::task::JoinHandle<DeleteResponse>,
+) -> axum::response::Response {
+    use futures::StreamExt;
+    fn line(value: &impl Serialize) -> Vec<u8> {
+        let mut line = serde_json::to_vec(value).unwrap_or_default();
+        line.push(b'\n');
+        line
+    }
+    let progress = futures::stream::unfold(lines, |mut lines| async move {
+        let mut chunk = line(&lines.recv().await?);
+        // Lines that are already waiting go out in the same chunk.
+        while let Ok(more) = lines.try_recv() {
+            chunk.extend(line(&more));
+        }
+        Some((chunk, lines))
+    });
+    let answer = futures::stream::once(async move {
+        match task.await {
+            Ok(res) => line(&res),
+            Err(e) => {
+                line(&serde_json::json!({ "error": format!("bulk delete task failed: {e}") }))
+            }
+        }
+    });
+    let body = progress
+        .chain(answer)
+        .map(|chunk| Ok::<_, std::convert::Infallible>(bytes::Bytes::from(chunk)));
+    let mut resp = axum::response::Response::new(axum::body::Body::from_stream(body));
+    let headers = resp.headers_mut();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(NDJSON),
     );
-    Ok(Json(res))
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    // A buffering reverse proxy (nginx) would hold the lines until the end.
+    headers.insert(
+        "x-accel-buffering",
+        axum::http::HeaderValue::from_static("no"),
+    );
+    resp
+}
+
+/// The running totals of a bulk delete after one more key: one line of
+/// the streamed answer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct DeleteProgress {
+    /// Keys finished so far, deleted or failed.
+    pub done: usize,
+    pub deleted: usize,
+    pub failed: usize,
 }
 
 /// What happened to one key of a bulk delete.
@@ -952,10 +1089,23 @@ enum KeyOutcome {
     Skipped,
 }
 
+/// Whether the response counts a key with this outcome as deleted (a key
+/// already gone is deleted: the delete is idempotent). Every other
+/// outcome counts as failed. The progress totals use it; the streaming
+/// tests check that the last totals equal the response's counts.
+fn counts_as_deleted(outcome: &crate::deltaglider::DeleteOutcome) -> bool {
+    use crate::deltaglider::DeleteOutcome;
+    matches!(outcome, DeleteOutcome::Deleted(_) | DeleteOutcome::NotFound)
+}
+
 /// Delete `keys` from `bucket` in one [`DynEngine::delete_batch`]: each
 /// folder is checked once for a reference.bin to reclaim, after its last
 /// key, and the folders run in parallel. A key the actor may not delete
 /// is not tried.
+///
+/// `on_progress` gets the running totals after each key, in the order the
+/// keys end: `done` goes 1, 2, … up to the number of keys, and the last
+/// totals are the counts of the response.
 ///
 /// [`DynEngine::delete_batch`]: crate::deltaglider::DynEngine::delete_batch
 async fn run_bulk_delete(
@@ -963,6 +1113,7 @@ async fn run_bulk_delete(
     bucket: &str,
     keys: &[AdminObjectPath],
     actor: &BulkActor,
+    on_progress: &(dyn Fn(DeleteProgress) + Send + Sync),
 ) -> DeleteResponse {
     use crate::deltaglider::{DeleteHooks, DeleteItem, DeleteOutcome};
     let engine = s3.engine.load_full();
@@ -972,16 +1123,37 @@ async fn run_bulk_delete(
     // RAII drain slot — released on drop even if the handler future is
     // cancelled mid-loop (H12).
     let _write = gate.begin_write(bucket);
+    // Counted and reported under one lock, so the totals go out in order.
+    let totals = std::sync::Mutex::new(DeleteProgress::default());
+    let tally = |deleted: bool| {
+        let mut t = totals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        t.done += 1;
+        if deleted {
+            t.deleted += 1;
+        } else {
+            t.failed += 1;
+        }
+        on_progress(*t);
+    };
     let mut outcomes = Vec::with_capacity(keys.len());
     let mut batch = Vec::new();
     for (i, key) in keys.iter().enumerate() {
         match actor.check(S3Action::Delete, bucket, key) {
             Ok(()) => batch.push(i),
-            Err(denied) => outcomes.push((i, KeyOutcome::Failed(denied))),
+            Err(denied) => {
+                tally(false);
+                outcomes.push((i, KeyOutcome::Failed(denied)));
+            }
         }
     }
     let proceed = || !gate.is_busy(bucket);
-    let emit = deleted_event_emitter(s3, bucket);
+    let emit_event = deleted_event_emitter(s3, bucket);
+    let emit = |key: &str, outcome: &DeleteOutcome| {
+        tally(counts_as_deleted(outcome));
+        emit_event(key, outcome)
+    };
     let done = engine
         .delete_batch(
             bucket,
@@ -1000,7 +1172,8 @@ async fn run_bulk_delete(
         outcomes.push((
             i,
             match outcome {
-                // Not-found is treated as deleted (idempotent).
+                // Not-found is treated as deleted (idempotent). The same
+                // rule as `counts_as_deleted`, which the progress uses.
                 DeleteOutcome::Deleted(_) | DeleteOutcome::NotFound => KeyOutcome::Deleted,
                 DeleteOutcome::Skipped => KeyOutcome::Skipped,
                 DeleteOutcome::Failed(e) => {
@@ -1595,6 +1768,70 @@ mod tests {
         assert!(body.contains("listing::list_keys_for_caller("));
     }
 
+    /// The `tokio::spawn(..)` calls in `src` whose body writes an audit
+    /// entry (parentheses matched, strings not parsed: a guard, not a parser).
+    fn spawned_audits(src: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for (start, _) in src.match_indices("tokio::spawn(") {
+            let body = &src[start + "tokio::spawn".len()..];
+            let mut depth = 0usize;
+            let end = body
+                .char_indices()
+                .find(|&(_, c)| {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        _ => {}
+                    }
+                    depth == 0
+                })
+                .map_or(body.len(), |(i, _)| i);
+            if body[..end].contains("audit_log(") {
+                found.push(body[..end].chars().take(80).collect());
+            }
+        }
+        found
+    }
+
+    /// A spawned task does not inherit the request's audit scope: its
+    /// audit entry names "admin" instead of the session's principal and
+    /// loses the peer IP. A handler that audits from a task spawns it with
+    /// `crate::audit::spawn_in_request_scope`.
+    #[test]
+    fn handler_tasks_that_audit_keep_the_request_scope() {
+        assert_eq!(
+            spawned_audits("tokio::spawn(async move { f(g()); super::audit_log(\"x\") });").len(),
+            1,
+            "the guard sees an audit in a spawned task"
+        );
+        assert!(spawned_audits("tokio::spawn(async { f() }); audit_log(\"x\");").is_empty());
+        fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        sources(std::path::Path::new("src/api"), &mut files);
+        assert!(files.len() > 10, "src/api has its sources");
+        let mut offenders = Vec::new();
+        for file in files {
+            let src = std::fs::read_to_string(&file).unwrap();
+            let body = src.split("#[cfg(test)]").next().unwrap();
+            for hit in spawned_audits(body) {
+                offenders.push(format!("{}: {hit}", file.display()));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "use crate::audit::spawn_in_request_scope: {offenders:#?}"
+        );
+    }
+
     /// Review E12: an entry name comes from an object key, which a writer
     /// chooses. An extractor must never place it outside its folder: no
     /// absolute name (a trimmed `a//etc/passwd`), no `\\` separator, no drive.
@@ -1929,7 +2166,14 @@ mod tests {
             let state = AppState::for_tests(engine);
             fake.clear();
 
-            let res = run_bulk_delete(&state, "b", &paths(&keys), &BulkActor::Unrestricted).await;
+            let res = run_bulk_delete(
+                &state,
+                "b",
+                &paths(&keys),
+                &BulkActor::Unrestricted,
+                &|_| {},
+            )
+            .await;
 
             assert_eq!(
                 (res.deleted, res.failed),
@@ -1974,7 +2218,14 @@ mod tests {
             let state = AppState::for_tests(engine);
             fake.set_delete_delay_ms(50);
 
-            let res = run_bulk_delete(&state, "b", &paths(&keys), &BulkActor::Unrestricted).await;
+            let res = run_bulk_delete(
+                &state,
+                "b",
+                &paths(&keys),
+                &BulkActor::Unrestricted,
+                &|_| {},
+            )
+            .await;
 
             assert_eq!(
                 (res.deleted, res.failed),
@@ -1997,7 +2248,14 @@ mod tests {
             let state = AppState::for_tests(engine);
             state.maintenance_gate.set_busy("b");
 
-            let res = run_bulk_delete(&state, "b", &paths(&keys), &BulkActor::Unrestricted).await;
+            let res = run_bulk_delete(
+                &state,
+                "b",
+                &paths(&keys),
+                &BulkActor::Unrestricted,
+                &|_| {},
+            )
+            .await;
 
             assert_eq!((res.deleted, res.failed, res.failures.len()), (0, 5, 1));
             assert_eq!(res.failures[0].key, keys[0]);
@@ -2138,6 +2396,247 @@ mod tests {
                 "{}",
                 res.failures[0].error
             );
+        }
+    }
+
+    /// The streamed answer of a bulk delete (`Accept: application/x-ndjson`):
+    /// one line per key as it ends, then the answer of a plain request.
+    mod bulk_delete_stream {
+        use super::super::{
+            accepts_ndjson, answer_bulk_delete, AdminObjectPath, BulkActor, DeletePlan,
+        };
+        use crate::api::handlers::AppState;
+        use crate::deltaglider::{s3_engine, store_deltas};
+        use axum::http::{header, HeaderMap, HeaderValue};
+        use futures::StreamExt;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        fn plan(state: &AppState, keys: &[String]) -> DeletePlan {
+            DeletePlan {
+                bucket: state
+                    .engine
+                    .load()
+                    .bucket_policy_registry()
+                    .client_bucket("b")
+                    .unwrap(),
+                keys: keys
+                    .iter()
+                    .map(|k| AdminObjectPath::try_from(k.clone()).unwrap())
+                    .collect(),
+            }
+        }
+
+        fn accept(value: Option<&'static str>) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = value {
+                headers.insert(header::ACCEPT, HeaderValue::from_static(value));
+            }
+            headers
+        }
+
+        const STREAM: Option<&str> = Some("application/x-ndjson");
+
+        /// Run the request and read the whole answer: its content type and
+        /// its body.
+        async fn answer(
+            state: &Arc<AppState>,
+            keys: &[String],
+            headers: HeaderMap,
+        ) -> (String, Vec<u8>) {
+            let resp = answer_bulk_delete(
+                state.clone(),
+                plan(state, keys),
+                BulkActor::Unrestricted,
+                headers,
+            )
+            .await;
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            let content_type = resp.headers()[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .to_string();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (content_type, body.to_vec())
+        }
+
+        fn lines(body: &[u8]) -> Vec<serde_json::Value> {
+            assert!(body.ends_with(b"\n"), "every line ends with a newline");
+            body.split(|b| *b == b'\n')
+                .filter(|l| !l.is_empty())
+                .map(|l| serde_json::from_slice(l).unwrap())
+                .collect()
+        }
+
+        /// The bar showed "Deleting 0 of 2…" until the whole request
+        /// answered: the answer came once, after the last key. Streamed,
+        /// each key gives a line with the running totals as it ends, and
+        /// the last line is the answer of the same request without the
+        /// stream.
+        #[tokio::test]
+        async fn a_streamed_bulk_delete_reports_each_key_then_the_answer() {
+            let (engine, _fake) = s3_engine().await;
+            let mut keys = store_deltas(&engine, "e2e/run-1", 3).await;
+            keys.extend(store_deltas(&engine, "e2e/run-2", 2).await);
+            keys.push("e2e/run-2/never-stored.zip".to_string());
+            let state = AppState::for_tests(engine);
+
+            let (content_type, body) = answer(&state, &keys, accept(STREAM)).await;
+
+            assert_eq!(content_type, "application/x-ndjson");
+            let lines = lines(&body);
+            assert_eq!(lines.len(), keys.len() + 1, "{lines:?}");
+            let (progress, last) = lines.split_at(keys.len());
+            for (i, line) in progress.iter().enumerate() {
+                assert_eq!(line["done"], i + 1, "line {i}: {line}");
+                assert_eq!(line["deleted"], i + 1, "line {i}: {line}");
+                assert_eq!(line["failed"], 0, "line {i}: {line}");
+            }
+            // The same keys again, without the stream: the same answer.
+            store_deltas(&state.engine.load(), "e2e/run-1", 3).await;
+            store_deltas(&state.engine.load(), "e2e/run-2", 2).await;
+            let (plain_type, plain) = answer(&state, &keys, accept(None)).await;
+            assert_eq!(plain_type, "application/json");
+            let plain: serde_json::Value = serde_json::from_slice(&plain).unwrap();
+            assert_eq!(last[0], plain);
+            assert_eq!(plain["deleted"], keys.len());
+            let engine = state.engine.load();
+            for key in &keys {
+                assert!(engine.head("b", key).await.is_err(), "{key} is gone");
+            }
+        }
+
+        /// A key that is not tried counts as failed, line by line, and the
+        /// last line still carries the failure entry.
+        #[tokio::test]
+        async fn a_streamed_bulk_delete_counts_skipped_keys_as_failed() {
+            let (engine, _fake) = s3_engine().await;
+            let keys = store_deltas(&engine, "e2e/run-1", 3).await;
+            let state = AppState::for_tests(engine);
+            state.maintenance_gate.set_busy("b");
+
+            let (_, body) = answer(&state, &keys, accept(STREAM)).await;
+
+            let lines = lines(&body);
+            assert_eq!(lines.len(), keys.len() + 1, "{lines:?}");
+            for (i, line) in lines[..keys.len()].iter().enumerate() {
+                assert_eq!(
+                    (&line["done"], &line["deleted"], &line["failed"]),
+                    (&(i + 1).into(), &0.into(), &(i + 1).into()),
+                    "line {i}: {line}"
+                );
+            }
+            let last = &lines[keys.len()];
+            assert_eq!((&last["deleted"], &last["failed"]), (&0.into(), &3.into()));
+            assert_eq!(last["failures"].as_array().unwrap().len(), 1, "{last}");
+        }
+
+        /// Wait until every key is gone; false after a few seconds.
+        async fn all_gone(state: &AppState, keys: &[String]) -> bool {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while tokio::time::Instant::now() < deadline {
+                let engine = state.engine.load();
+                let mut left = 0;
+                for key in keys {
+                    left += usize::from(engine.head("b", key).await.is_ok());
+                }
+                if left == 0 {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            false
+        }
+
+        /// A closed tab or a client that goes away mid-request dropped the
+        /// handler, and the batch stopped part-way. The batch runs in its
+        /// own task: it finishes whatever the request does.
+        #[tokio::test]
+        async fn a_bulk_delete_finishes_when_the_client_goes_away() {
+            for streamed in [false, true] {
+                let (engine, fake) = s3_engine().await;
+                let mut keys = store_deltas(&engine, "e2e/run-1", 3).await;
+                keys.extend(store_deltas(&engine, "e2e/run-2", 3).await);
+                let state = AppState::for_tests(engine);
+                fake.set_delete_delay_ms(30);
+                let headers = accept(if streamed { STREAM } else { None });
+                let request = answer_bulk_delete(
+                    state.clone(),
+                    plan(&state, &keys),
+                    BulkActor::Unrestricted,
+                    headers,
+                );
+
+                if streamed {
+                    let mut body = request.await.into_body().into_data_stream();
+                    let first = body.next().await.unwrap().unwrap();
+                    assert!(first.starts_with(b"{\"done\":1,"), "{first:?}");
+                    drop(body);
+                } else {
+                    let cut = tokio::time::timeout(Duration::from_millis(40), request).await;
+                    assert!(cut.is_err(), "the request answered before the cut");
+                }
+
+                assert!(
+                    all_gone(&state, &keys).await,
+                    "streamed={streamed}: the batch stopped when its request went away"
+                );
+            }
+        }
+
+        /// The batch's task writes the audit entry. A plain spawned task
+        /// does not inherit the request's audit scope, so the entry named
+        /// "admin" instead of the session's principal (and lost the peer IP).
+        #[tokio::test]
+        async fn the_audit_entry_keeps_the_session_principal() {
+            let (engine, _fake) = s3_engine().await;
+            let keys = store_deltas(&engine, "e2e/run-1", 1).await;
+            let state = AppState::for_tests(engine);
+            let actor = "bulk-delete-stream-audit-actor";
+            for streamed in [false, true] {
+                let headers = accept(if streamed { STREAM } else { None });
+                let resp = crate::audit::with_actor(
+                    actor.to_string(),
+                    answer_bulk_delete(
+                        state.clone(),
+                        plan(&state, &keys),
+                        BulkActor::Unrestricted,
+                        headers,
+                    ),
+                )
+                .await;
+                axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let entries = crate::audit::recent_audit(usize::MAX);
+                let ours = entries
+                    .iter()
+                    .filter(|e| e.action == "bulk_delete" && e.user == actor)
+                    .count();
+                assert_eq!(
+                    ours,
+                    1 + usize::from(streamed),
+                    "streamed={streamed}: the bulk_delete entry lost the session principal"
+                );
+            }
+        }
+
+        #[test]
+        fn the_stream_is_asked_for_with_the_accept_header() {
+            for (value, wanted) in [
+                (None, false),
+                (Some("application/json"), false),
+                (Some("*/*"), false),
+                (Some("application/x-ndjson"), true),
+                (Some("Application/X-NDJSON"), true),
+                (Some("application/json, application/x-ndjson;q=0.9"), true),
+                (Some("application/x-ndjsonx"), false),
+                (Some("application/x-ndjson;q=0"), false),
+            ] {
+                assert_eq!(accepts_ndjson(&accept(value)), wanted, "{value:?}");
+            }
         }
     }
 }

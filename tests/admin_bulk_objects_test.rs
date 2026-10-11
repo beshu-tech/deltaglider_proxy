@@ -178,6 +178,97 @@ async fn test_bulk_delete_idempotent_on_missing() {
     assert_eq!(r["failed"].as_u64(), Some(0));
 }
 
+/// A bulk delete that asks for `application/x-ndjson` gets one line of
+/// running totals per key, then the answer that a plain request gets, and
+/// each deleted key still has its `ObjectDeleted` event. The file browser
+/// showed "Deleting 0 of 2…" until the whole request answered.
+#[tokio::test]
+async fn test_bulk_delete_streams_a_line_per_key() {
+    let server = TestServer::builder().build().await;
+    let http = server.http();
+    let admin = admin_http_client(&server.endpoint()).await;
+    let ep = server.endpoint();
+    let bucket = server.bucket();
+    let keys = ["run/a.txt", "run/b.txt", "other/c.txt"];
+    for key in keys {
+        let r = http
+            .put(format!("{ep}/{bucket}/{key}"))
+            .body("payload")
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success(), "PUT {key}: {}", r.status());
+    }
+
+    let resp = admin
+        .post(format!("{ep}/_/api/admin/objects/delete"))
+        .header("accept", "application/x-ndjson")
+        .json(&json!({ "bucket": bucket, "keys": keys }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(
+        resp.headers()["content-type"].to_str().unwrap(),
+        "application/x-ndjson"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(body.ends_with('\n'), "{body}");
+    let lines: Vec<Value> = body
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), keys.len() + 1, "{body}");
+    for (i, line) in lines[..keys.len()].iter().enumerate() {
+        assert_eq!(
+            line,
+            &json!({ "done": i + 1, "deleted": i + 1, "failed": 0 })
+        );
+    }
+    assert_eq!(
+        lines[keys.len()],
+        json!({ "deleted": 3, "failed": 0, "failures": [] })
+    );
+
+    // Without the header: the same answer as one JSON body.
+    let plain = admin
+        .post(format!("{ep}/_/api/admin/objects/delete"))
+        .json(&json!({ "bucket": bucket, "keys": keys }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        plain.headers()["content-type"].to_str().unwrap(),
+        "application/json"
+    );
+    assert_eq!(plain.json::<Value>().await.unwrap(), lines[keys.len()]);
+
+    for key in keys {
+        let r = http
+            .get(format!("{ep}/{bucket}/{key}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 404, "{key} is gone");
+    }
+    let outbox: Value = admin
+        .get(format!("{ep}/_/api/admin/event-outbox?limit=100"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = outbox["rows"].as_array().expect("outbox rows");
+    for key in keys {
+        assert!(
+            rows.iter()
+                .any(|e| e["kind"] == "ObjectDeleted" && e["key"] == key),
+            "no ObjectDeleted for {key}: {outbox}"
+        );
+    }
+}
+
 /// Zip download bundles requested objects, returns application/zip
 /// with the right Content-Disposition.
 #[tokio::test]

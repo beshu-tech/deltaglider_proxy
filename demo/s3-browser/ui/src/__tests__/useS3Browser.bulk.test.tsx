@@ -182,6 +182,68 @@ describe('bulkDelete', () => {
     expect(result.current.bulkRunning).toBe(false);
   });
 
+  // Prod: a folder of 2 files showed "Deleting 0 of 2…" for 14 seconds,
+  // then the bar went away; it never showed 1 of 2. The server now streams a
+  // line per key, and the bar counts each one without another request.
+  test('the bar counts each key as the server deletes it', async () => {
+    const enc = new TextEncoder();
+    let push!: (line: string | null) => void;
+    http.on(
+      'POST',
+      DELETE,
+      () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(c) {
+              push = (line) => (line === null ? c.close() : c.enqueue(enc.encode(line)));
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'application/x-ndjson' } },
+        ),
+    );
+    function Harness() {
+      const s3 = useS3Browser({ bucket: 'releases', prefix: 'builds/', q: '', object: '', navigateUrl: () => {} });
+      return (
+        <>
+          <button onClick={() => s3.toggleKey('folder:builds/nightly/')}>pick</button>
+          {(s3.selectedKeys.size > 0 || s3.bulkRunning) && (
+            <BulkActionBar
+              selectedCount={s3.selectedKeys.size}
+              selectedFolderCount={1}
+              onDelete={s3.bulkDelete}
+              progress={s3.bulkProgress}
+              onCancel={s3.cancelBulk}
+            />
+          )}
+        </>
+      );
+    }
+    const user = userEvent.setup();
+    renderWithQuery(<Harness />);
+    await user.click(await screen.findByRole('button', { name: 'pick' }));
+    await user.click(screen.getByRole('button', { name: 'Delete 1 selected items' }));
+    await user.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Delete' }));
+
+    const toolbar = screen.getByRole('toolbar', { name: 'Selection actions' });
+    await waitFor(() => expect(http.callsTo('POST', DELETE)).toHaveLength(1));
+    await waitFor(() => expect(within(toolbar).getByRole('status')).toHaveTextContent('Deleting 0 of 2…'));
+    const [loads, requests] = [listing.loads, http.calls.length];
+
+    act(() => push('{"done":1,"deleted":1,"failed":0}\n'));
+    await waitFor(() => expect(within(toolbar).getByRole('status')).toHaveTextContent('Deleting 1 of 2…'));
+    expect(within(toolbar).getByRole('progressbar', { name: 'Bulk delete progress' })).toHaveAttribute('aria-valuenow', '50');
+    // A key's line costs no request: no reload, no poll.
+    expect([listing.loads, http.calls.length]).toEqual([loads, requests]);
+
+    act(() => {
+      push('{"done":2,"deleted":2,"failed":0}\n');
+      push('{"deleted":2,"failed":0,"failures":[]}\n');
+      push(null);
+    });
+    expect(await screen.findByText('2 objects deleted')).toBeInTheDocument();
+    expect(http.callsTo('POST', DELETE)).toHaveLength(1);
+  });
+
   test('a truncated folder aborts before any delete request', async () => {
     http.on('GET', LIST, json({ keys: ['builds/nightly/a.zip'], truncated: true }));
     const { result } = await mountBrowser();

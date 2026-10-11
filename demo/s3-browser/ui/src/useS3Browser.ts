@@ -459,8 +459,16 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
       run: {
         /** List the selection; `opts` carries the abort and the listing progress. */
         expand: (opts: NonNullable<Parameters<typeof expandSelection>[2]>) => Promise<ExpandedItem[]>;
-        /** Send the items in batches; `sent(done, went)` after each one. */
-        send: (items: ExpandedItem[], signal: AbortSignal, sent: (done: number, went: number) => void) => Promise<O>;
+        /**
+         * Send the items in batches; `sent(done, went)` after each one, and
+         * `progress(done, went)` as the items of a batch end (no reload).
+         */
+        send: (
+          items: ExpandedItem[],
+          signal: AbortSignal,
+          sent: (done: number, went: number) => void,
+          progress: (done: number, went: number) => void,
+        ) => Promise<O>;
         /** The outcome of a run cancelled while it listed. */
         cancelledWhileListing: () => O;
         /** Reload the listing after each batch: the sources leave the page as the run goes on. */
@@ -480,11 +488,19 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
         });
         total = items.length;
         setBulkProgress({ action, phase: 'sending', done: 0, total, stopping: stopping() });
-        const outcome = await run.send(items, ctl.signal, (done, n) => {
+        const show = (done: number, n: number) => {
           went = n;
           setBulkProgress({ action, phase: 'sending', done, total, stopping: stopping() });
-          if (run.reloadPerBatch) refresh();
-        });
+        };
+        const outcome = await run.send(
+          items,
+          ctl.signal,
+          (done, n) => {
+            show(done, n);
+            if (run.reloadPerBatch) refresh();
+          },
+          show,
+        );
         // A cancelled or partly failed run keeps the selection for a retry; the
         // reloads already dropped the entries that are gone.
         if (!outcome.cancelled && outcome.failed === 0) clearSelection();
@@ -510,11 +526,11 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     const bucket = getBucket();
     return runBulk('delete', {
       expand: (opts) => expandSelected(bucket, opts),
-      send: (items, signal, sent) =>
+      send: (items, signal, sent, progress) =>
         deleteInBatches(
           items.map((i) => i.source),
-          (batch) => bulkDeleteObjects({ bucket, keys: batch }),
-          { signal, onBatch: (p) => sent(p.done, p.deleted) },
+          (batch, onKey) => bulkDeleteObjects({ bucket, keys: batch }, onKey),
+          { signal, onBatch: (p) => sent(p.done, p.deleted), onProgress: (p) => progress(p.done, p.deleted) },
         ),
       cancelledWhileListing: () => ({ total: 0, deleted: 0, failed: 0, failures: [], cancelled: true }),
       reloadPerBatch: true,

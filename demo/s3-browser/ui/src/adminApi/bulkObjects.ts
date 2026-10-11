@@ -10,13 +10,14 @@
 // - bulkCopyObjects / bulkMoveObjects: previously per-key for-loops with
 //   silent partial-failure recovery. Now atomic on the server.
 // - bulkDeleteObjects: replaces the SDK's batch delete; same idempotent
-//   semantics (NoSuchKey counts as deleted).
+//   semantics (NoSuchKey counts as deleted). Streams a progress line per key.
 // - listAllUnderPrefix: replaces in-browser folder expansion that would
 //   spin a recursive listObjectsV2.
 // - bulkZipDownloadUrl: returns a same-origin URL the browser can use
 //   directly with `<a href download>` — server streams the archive.
 // =============================================================================
-import { BASE, adminJson } from './core';
+import { NDJSON, readNdjson } from '../ndjson';
+import { BASE, adminJson, adminRequest, safeJson } from './core';
 
 interface BulkCopyItem {
   source_key: string;
@@ -68,9 +69,49 @@ interface BulkDeleteResponse {
   failures: { key: string; error: string }[];
 }
 
-/** Admin GUI session required. */
-export async function bulkDeleteObjects(req: BulkDeleteRequest): Promise<BulkDeleteResponse> {
-  return adminJson('/api/admin/objects/delete', { method: 'POST', body: req, context: 'Bulk delete' });
+/** The running totals of a streamed bulk delete after one more key. */
+export interface BulkDeleteProgress {
+  /** Keys finished so far, deleted or failed. */
+  done: number;
+  deleted: number;
+  failed: number;
+}
+
+/**
+ * Delete `req.keys`. The request asks for the streamed answer: one JSON
+ * line of totals per finished key, which go to `onProgress` as they
+ * arrive, then a line with the answer. An older proxy answers once, in
+ * JSON, and `onProgress` is not called. A failure before the batch starts
+ * (a bad bucket, a maintenance job, an expired session) keeps its status,
+ * as with `adminJson`. Admin GUI session required.
+ */
+export async function bulkDeleteObjects(
+  req: BulkDeleteRequest,
+  onProgress?: (progress: BulkDeleteProgress) => void,
+): Promise<BulkDeleteResponse> {
+  const context = 'Bulk delete';
+  const res = await adminRequest('/api/admin/objects/delete', {
+    method: 'POST',
+    body: req,
+    context,
+    headers: { Accept: NDJSON },
+  });
+  if (!res.body || !(res.headers.get('content-type') ?? '').includes(NDJSON)) return safeJson(res);
+  let answer: BulkDeleteResponse | undefined;
+  await readNdjson(res.body, (line) => {
+    const l = (line ?? {}) as Record<string, unknown>;
+    // The status line is gone when the proxy fails mid-batch: it says so in a line.
+    if (typeof l.error === 'string') throw new Error(`${context} failed: ${l.error}`);
+    if (Array.isArray(l.failures)) answer = l as unknown as BulkDeleteResponse;
+    else if (typeof l.done === 'number') onProgress?.(l as unknown as BulkDeleteProgress);
+    else throw new Error(`${context}: unexpected line in the answer: ${JSON.stringify(line).slice(0, 120)}`);
+  });
+  if (!answer) {
+    throw new Error(
+      `${context}: the answer ended before the last line. The proxy finishes the delete on its own; reload the folder to see what is left.`,
+    );
+  }
+  return answer;
 }
 
 interface ListAllResponse {

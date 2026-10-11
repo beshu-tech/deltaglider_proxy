@@ -13,10 +13,10 @@ import { noun } from './utils';
 export type BulkAction = 'delete' | 'copy' | 'move';
 
 /**
- * Items per request. The server takes up to 10,000, but one request that
- * size shows no progress, cannot be cancelled, and a closed tab stops it
- * partway. Small batches give frequent progress and a short wait after
- * Cancel.
+ * Items per request. The server takes up to 10,000, but Cancel waits for
+ * the request in flight, which the server finishes in any case. Small
+ * batches give a short wait after Cancel, and copy and move show progress
+ * only per batch (a delete also streams progress per key).
  */
 export const BULK_BATCH_SIZE = 500;
 

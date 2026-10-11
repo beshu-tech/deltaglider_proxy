@@ -7,6 +7,7 @@
  * (bulkBatches.ts). The hook (useS3Browser.bulkDelete) owns the run;
  * BulkActionBar shows it.
  */
+import type { BulkDeleteProgress } from './adminApi/bulkObjects';
 import { count, keepFailures, sendInBatches } from './bulkBatches';
 import { noun } from './utils';
 
@@ -35,24 +36,57 @@ interface BatchProgress {
 /**
  * Send `keys` to `deleteBatch` in batches (see `sendInBatches`) and add up
  * the answers. The run has no total limit.
+ *
+ * `deleteBatch` may report the keys of its batch as they end (the
+ * server's streamed totals, counted from the start of the batch);
+ * `onProgress` then gets the totals of the whole run after each key, and
+ * `onBatch` after each answer.
  */
 export async function deleteInBatches(
   keys: string[],
-  deleteBatch: (batch: string[]) => Promise<DeleteBatchResult>,
-  { batchSize, signal, onBatch }: { batchSize?: number; signal?: AbortSignal; onBatch?: (progress: BatchProgress) => void } = {},
+  deleteBatch: (batch: string[], onKey: (progress: BulkDeleteProgress) => void) => Promise<DeleteBatchResult>,
+  {
+    batchSize,
+    signal,
+    onBatch,
+    onProgress,
+  }: {
+    batchSize?: number;
+    signal?: AbortSignal;
+    onBatch?: (progress: BatchProgress) => void;
+    onProgress?: (progress: BatchProgress) => void;
+  } = {},
 ): Promise<BulkDeleteOutcome> {
   const total = keys.length;
   const outcome: BulkDeleteOutcome = { total, deleted: 0, failed: 0, failures: [], cancelled: false };
-  const { cancelled } = await sendInBatches(keys, deleteBatch, {
-    batchSize,
-    signal,
-    onAnswer: (answer, done) => {
-      outcome.deleted += answer.deleted;
-      outcome.failed += answer.failed;
-      keepFailures(outcome.failures, answer.failures);
-      onBatch?.({ done, total, deleted: outcome.deleted, failed: outcome.failed });
+  let sent = 0;
+  const { cancelled } = await sendInBatches(
+    keys,
+    (batch) => {
+      // The batches before this one, which the server's totals start after.
+      const before = { done: sent, deleted: outcome.deleted, failed: outcome.failed };
+      const within = (n: number) => Math.min(Math.max(0, n), batch.length);
+      return deleteBatch(batch, (p) =>
+        onProgress?.({
+          done: before.done + within(p.done),
+          total,
+          deleted: before.deleted + within(p.deleted),
+          failed: before.failed + within(p.failed),
+        }),
+      );
     },
-  });
+    {
+      batchSize,
+      signal,
+      onAnswer: (answer, done) => {
+        sent = done;
+        outcome.deleted += answer.deleted;
+        outcome.failed += answer.failed;
+        keepFailures(outcome.failures, answer.failures);
+        onBatch?.({ done, total, deleted: outcome.deleted, failed: outcome.failed });
+      },
+    },
+  );
   return { ...outcome, cancelled };
 }
 

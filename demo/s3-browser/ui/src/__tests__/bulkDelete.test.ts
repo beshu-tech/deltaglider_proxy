@@ -38,6 +38,47 @@ test(`keys go in batches of ${BULK_BATCH_SIZE}, one request at a time, with prog
   assert.deepEqual(outcome, { total: 1201, deleted: 1201, failed: 0, failures: [], cancelled: false });
 });
 
+// The bar moved only when a whole batch answered: a folder of 2 files showed
+// "Deleting 0 of 2…" until the end. The server reports each key of a batch
+// as it ends; the run adds the batches before it.
+test('progress moves with each key inside a batch, added to the batches before it', async () => {
+  const progress: unknown[] = [];
+  const batches: unknown[] = [];
+  const outcome = await deleteInBatches(
+    keys(3),
+    async (batch, onKey) => {
+      // The second key of the first batch fails.
+      batch.forEach((_, i) => onKey({ done: i + 1, deleted: i + 1 - Number(batch[i] === 'k1'), failed: Number(batch[i] === 'k1') }));
+      const failed = batch.includes('k1') ? 1 : 0;
+      return { deleted: batch.length - failed, failed, failures: failed ? [{ key: 'k1', error: 'AccessDenied' }] : [] };
+    },
+    { batchSize: 2, onProgress: (p) => progress.push({ ...p }), onBatch: (p) => batches.push({ ...p }) },
+  );
+  assert.deepEqual(progress, [
+    { done: 1, total: 3, deleted: 1, failed: 0 },
+    { done: 2, total: 3, deleted: 1, failed: 1 },
+    { done: 3, total: 3, deleted: 2, failed: 1 },
+  ]);
+  assert.deepEqual(batches, [
+    { done: 2, total: 3, deleted: 1, failed: 1 },
+    { done: 3, total: 3, deleted: 2, failed: 1 },
+  ]);
+  assert.equal(outcome.deleted, 2);
+});
+
+test('a key report never counts past its own batch', async () => {
+  const progress: number[] = [];
+  await deleteInBatches(
+    keys(3),
+    async (batch, onKey) => {
+      onKey({ done: 99, deleted: 99, failed: 0 });
+      return allDeleted(batch);
+    },
+    { batchSize: 2, onProgress: (p) => progress.push(p.done) },
+  );
+  assert.deepEqual(progress, [2, 3]);
+});
+
 test('more than 10,000 keys is no longer one oversized request', async () => {
   const sizes: number[] = [];
   await deleteInBatches(keys(12_345), async (b) => {

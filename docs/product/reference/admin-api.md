@@ -205,6 +205,38 @@ Server-side helpers behind the embedded S3 browser's bulk actions.
 
 These endpoints accept an admin GUI session and also the browser session of a user without admin rights (the session that an access-key sign-in in the file browser creates). For an admin session, the session is the authorization boundary. For a user without admin rights, the proxy checks every key against that user's own IAM permissions before it touches the key, with the same rules as the S3 API, including `aws:SourceIp` conditions. A copy needs `read` on the source key and `write` on the destination key; a move needs `delete` on the source key too; a delete needs `delete`; a ZIP needs `read`. A key that the user may not use is not touched: the response lists it under `failures` with an `AccessDenied` error, and the other keys are processed. A ZIP leaves such a key out and names it in the skip report inside the archive; when no selected key may be read, the ZIP answers `403`. A folder listing (`objects/list`) returns only the keys that the user can see, like an S3 `LIST`. It reads the backend in the same way as an S3 `LIST`: the proxy reads only the prefixes that the user's policy can reach, and when it must skip hidden keys, the whole folder listing sends at most `advanced.filtered_list_max_engine_pages` backend requests. A folder that holds more hidden keys than that limit can read makes the request fail with `400`, because a partial folder must not become the selection of a copy, move or delete; select a narrower folder instead. Because a move deletes its sources only when every copy of the request succeeded, one denied key keeps all the sources of that request in place. The file browser sends a copy or a move in requests of at most 500 objects, so a denied key keeps only the sources of its own batch in place. The file browser also stops listing the selected folders as soon as the selection passes 10,000 objects, the limit of one request. In open mode (`authentication: none`) an open browser session may use the endpoints without checks, like the S3 API in open mode.
 
+### `POST /_/api/admin/objects/delete`
+
+The request body names one bucket and at most 10,000 keys in that bucket:
+
+```json
+{ "bucket": "releases", "keys": ["builds/v1/app.zip", "builds/v1/notes.txt"] }
+```
+
+Before the proxy deletes anything, it checks the request. The request fails with `400` when the body is not valid (for example, an invalid bucket name or a key that starts with `/`), names no key, or names more than 10,000 keys. It fails with `403` when the bucket is the coordination bucket or accepts only replication writes, and with `409` when a maintenance job holds the bucket. These errors keep their status codes in both forms of the answer that are described below.
+
+The proxy deletes the keys folder by folder, and it works on several folders at the same time. A key that does not exist counts as deleted, because the outcome is the same: the key is absent. When a maintenance job starts on the bucket during the delete, the proxy stops before the next key, counts the remaining keys as failed, and reports them in one entry of `failures`. The delete runs in a task of its own on the proxy. When the client closes the connection, for example because the user closes the browser tab, the task does not stop: it deletes the remaining keys, records an `ObjectDeleted` event for each key that it deletes, and writes the `bulk_delete` audit entry when it ends.
+
+Without an `Accept: application/x-ndjson` header, the proxy answers once, after the last key, with `200` and a JSON body:
+
+```json
+{ "deleted": 2, "failed": 0, "failures": [] }
+```
+
+The `failures` list holds at most 100 entries, each with the `key` and its `error`.
+
+**Streamed answer.** A request with the header `Accept: application/x-ndjson` gets its answer while the delete runs, as newline-delimited JSON with `Content-Type: application/x-ndjson`. The proxy sends one line each time a key is finished. The line holds the running totals of the request: `done` is the number of finished keys, and `deleted` and `failed` divide that number. A line does not name its key. The keys of different folders finish in no fixed order, but the value of `done` grows by one with each line. After the last key, the proxy sends one more line, which holds the same JSON object that a request without the header gets as its body:
+
+```
+{"done":1,"deleted":1,"failed":0}
+{"done":2,"deleted":2,"failed":0}
+{"deleted":2,"failed":0,"failures":[]}
+```
+
+The proxy sends the status `200` and the headers when the delete starts, so a failure after that point cannot change the status. When the delete task fails on the proxy, the last line is `{"error": "<message>"}` instead of the answer. When the stream ends without its last line, the connection broke; the delete still finishes on the proxy. The response carries `Cache-Control: no-store` and `X-Accel-Buffering: no`, so that nginx passes each line on as it arrives. Another reverse proxy that buffers response bodies delivers all the lines together at the end, which still gives a correct answer but no progress.
+
+The file browser asks for the streamed answer, so its progress bar counts each deleted key. It sends a delete in requests of at most 500 keys, one request at a time, and Cancel stops the run after the request in flight. A client that does not send the header, such as a script or an older file browser, gets the single JSON answer.
+
 ### `GET /_/api/admin/objects/zip`
 
 | Parameter | Value |

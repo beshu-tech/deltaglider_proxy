@@ -85,6 +85,8 @@ interface AdminRequestOptions {
   context?: string;
   /** Aborts the request (the promise rejects with the signal's reason). */
   signal?: AbortSignal;
+  /** Extra request headers, for example `Accept` for a streamed answer. */
+  headers?: Record<string, string>;
 }
 
 function defaultContext(path: string): string {
@@ -98,9 +100,9 @@ function defaultContext(path: string): string {
  */
 export async function adminRequest(
   path: string,
-  { method = 'GET', body, context, signal }: AdminRequestOptions = {},
+  { method = 'GET', body, context, signal, headers }: AdminRequestOptions = {},
 ): Promise<Response> {
-  const res = await adminFetch(path, method, body, undefined, undefined, signal);
+  const res = await adminFetch(path, method, body, undefined, headers, signal);
   if (!res.ok) await throwApiError(res, context ?? defaultContext(path));
   return res;
 }
