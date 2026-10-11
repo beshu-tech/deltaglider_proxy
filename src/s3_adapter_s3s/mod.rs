@@ -471,16 +471,22 @@ async fn ensure_bucket_on(
 
 /// S3 answers any request to a missing bucket with `NoSuchBucket`; the
 /// proxy answered `NoSuchKey` (GET, HEAD) or success (DELETE) (s3surface-5).
-/// Asked only after a miss, so a hit pays no extra bucket request.
+/// Asked only after a miss, so a hit pays no extra bucket request. The
+/// check is the write paths' cached one: a bucket found in the last 5
+/// seconds costs no HeadBucket, so a miss costs the key's two HEADs alone.
+/// A bucket deleted in those seconds then answers `NoSuchKey`.
 async fn no_such_key_or_bucket(
-    engine: &crate::deltaglider::DynEngine,
+    state: &Arc<AppState>,
     bucket: &str,
     err: s3s::S3Error,
 ) -> s3s::S3Error {
     if *err.code() != s3s::S3ErrorCode::NoSuchKey {
         return err;
     }
-    ensure_bucket_on(engine, bucket).await.err().unwrap_or(err)
+    match crate::api::handlers::ensure_bucket_exists(state, bucket).await {
+        Ok(()) => err,
+        Err(e) => s3s::S3Error::from(e),
+    }
 }
 
 /// Policy context for the per-key checks the adapter runs itself (batch

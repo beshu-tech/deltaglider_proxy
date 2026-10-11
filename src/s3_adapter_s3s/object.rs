@@ -16,7 +16,9 @@ pub(super) async fn head_object(
     let meta = match engine.head(&input.bucket, &input.key).await {
         Ok(meta) => meta,
         Err(e) => {
-            return Err(no_such_key_or_bucket(&engine, &input.bucket, s3s::S3Error::from(e)).await)
+            return Err(
+                no_such_key_or_bucket(&svc.state, &input.bucket, s3s::S3Error::from(e)).await,
+            )
         }
     };
     evaluate_read_conditionals_s3s(
@@ -67,7 +69,9 @@ pub(super) async fn get_object(
     let head = match engine.head(&input.bucket, &input.key).await {
         Ok(head) => head,
         Err(e) => {
-            return Err(no_such_key_or_bucket(&engine, &input.bucket, s3s::S3Error::from(e)).await)
+            return Err(
+                no_such_key_or_bucket(&svc.state, &input.bucket, s3s::S3Error::from(e)).await,
+            )
         }
     };
     evaluate_read_conditionals_s3s(
@@ -130,7 +134,9 @@ pub(super) async fn get_object(
     let response = match engine.retrieve_stream(&input.bucket, &input.key).await {
         Ok(r) => r,
         Err(e) => {
-            return Err(no_such_key_or_bucket(&engine, &input.bucket, s3s::S3Error::from(e)).await)
+            return Err(
+                no_such_key_or_bucket(&svc.state, &input.bucket, s3s::S3Error::from(e)).await,
+            )
         }
     };
     let (body, metadata) = match response {
@@ -262,7 +268,7 @@ pub(super) async fn delete_object(
             Ok(s3s::S3Response::new(s3s::dto::DeleteObjectOutput::default()))
         }
         Err(crate::deltaglider::EngineError::NotFound(_)) => {
-            ensure_bucket_exists_s3s(&svc.state, &input.bucket).await?;
+            crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
             Ok(s3s::S3Response::new(s3s::dto::DeleteObjectOutput::default()))
         }
         Err(e) => Err(s3s::S3Error::from(e)),
@@ -279,7 +285,7 @@ pub(super) async fn delete_objects(
     crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)?;
     validate_delete_objects_count(input.delete.objects.len())?;
     // Per-key misses are successes, so a missing bucket is asked here.
-    ensure_bucket_exists_s3s(&svc.state, &input.bucket).await?;
+    crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
     let quiet = input.delete.quiet.unwrap_or(false);
     // Per-key IAM authorization. The middleware only authorized the
     // bucket-level POST ?delete; each key in the batch body must be
@@ -408,14 +414,13 @@ pub(super) async fn put_object(
         .cloned();
     let input = req.input;
     let engine = svc.state.engine.load();
-    // Gate BEFORE head_bucket: a marked bucket refuses client bytes
+    // Gate BEFORE the bucket check: a marked bucket refuses client bytes
     // regardless of backend reachability (403-before-404, no backend I/O
     // for a doomed request).
     crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)?;
     check_user_metadata_size_s3s(input.metadata.as_ref())?;
-    if !engine.head_bucket(&input.bucket).await? {
-        return Err(s3s::s3_error!(NoSuchBucket));
-    }
+    // One HeadBucket per bucket per 5 seconds, not one per PUT.
+    crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
 
     let data = collect_blob_limited(
         input.body,
@@ -894,5 +899,102 @@ mod delete_objects_tests {
         assert_eq!(out.deleted.map_or(0, |d| d.len()), keys.len());
         assert!(!engine.storage().has_reference("b", "run").await.unwrap());
         assert_eq!(deleted_events(&svc).await, 0, "nothing was deleted now");
+    }
+}
+
+/// What a PUT, and a read that misses its key, send to check the bucket.
+#[cfg(test)]
+mod bucket_check_cost_tests {
+    use super::*;
+    use crate::api::handlers::AppState;
+    use crate::s3_adapter_s3s::multipart::adapter_test_support::{request, service};
+    use crate::storage::FakeS3;
+
+    fn head_buckets(fake: &FakeS3) -> usize {
+        // The SDK sends HeadBucket as `HEAD /b/`.
+        fake.requests()
+            .iter()
+            .filter(|r| *r == "HEAD /b/" || r.starts_with("HEAD /b/?"))
+            .count()
+    }
+
+    fn get(key: &str) -> s3s::dto::GetObjectInput {
+        s3s::dto::GetObjectInput::builder()
+            .bucket("b".into())
+            .key(key.into())
+            .build()
+            .unwrap()
+    }
+
+    fn put(key: &str) -> s3s::dto::PutObjectInput {
+        s3s::dto::PutObjectInput::builder()
+            .bucket("b".into())
+            .key(key.into())
+            .body(Some(s3s::dto::StreamingBlob::from(s3s::Body::from(
+                b"x".to_vec(),
+            ))))
+            .build()
+            .unwrap()
+    }
+
+    /// A GET or HEAD of a missing key costs the two HEADs of the key in a
+    /// bucket found in the last 5 seconds: the bucket check that tells
+    /// `NoSuchKey` from `NoSuchBucket` uses the write paths' cache. It sent
+    /// a HeadBucket after every miss.
+    #[tokio::test]
+    async fn a_get_of_a_missing_key_in_a_known_bucket_sends_two_requests() {
+        let (engine, fake) = crate::deltaglider::s3_engine().await;
+        let svc = service(AppState::for_tests(engine));
+        let first = get_object(&svc, request(get("dir/missing.zip")))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(*first.code(), s3s::S3ErrorCode::NoSuchKey);
+        fake.clear();
+        let again = get_object(&svc, request(get("dir/missing.zip")))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(*again.code(), s3s::S3ErrorCode::NoSuchKey);
+        let n = fake.requests().len();
+        eprintln!("GET of a missing key in a known bucket: {n} requests");
+        assert_eq!(n, 2, "{:?}", fake.requests());
+
+        // A missing bucket is still asked every time.
+        fake.fail("HEAD_BUCKET", "/nope", 404, "NoSuchBucket", u32::MAX);
+        let input = s3s::dto::GetObjectInput::builder()
+            .bucket("nope".into())
+            .key("k".into())
+            .build()
+            .unwrap();
+        let err = get_object(&svc, request(input)).await.err().unwrap();
+        assert_eq!(*err.code(), s3s::S3ErrorCode::NoSuchBucket);
+    }
+
+    /// PutObject checks its bucket with the write paths' cache: one
+    /// HeadBucket per bucket per 5 seconds, not one per PUT.
+    #[tokio::test]
+    async fn puts_check_their_bucket_once() {
+        let (engine, fake) = crate::deltaglider::s3_engine().await;
+        let svc = service(AppState::for_tests(engine));
+        fake.clear();
+        for key in ["a/1.jpg", "a/2.jpg", "a/3.jpg"] {
+            put_object(&svc, request(put(key))).await.unwrap();
+        }
+        assert_eq!(head_buckets(&fake), 1, "{:?}", fake.requests());
+    }
+
+    /// The object verbs check a bucket through the cached check
+    /// (`crate::api::handlers::ensure_bucket_exists`), never with a
+    /// HeadBucket of their own.
+    #[test]
+    fn object_verbs_check_buckets_through_the_cache() {
+        let text = std::fs::read_to_string("src/s3_adapter_s3s/object.rs").unwrap();
+        let sites: Vec<usize> = crate::source_scan::prod_lines(&text)
+            .into_iter()
+            .filter(|(_, l)| l.contains("ensure_bucket_exists_s3s(") || l.contains(".head_bucket("))
+            .map(|(n, _)| n)
+            .collect();
+        assert!(sites.is_empty(), "object.rs lines {sites:?}");
     }
 }
