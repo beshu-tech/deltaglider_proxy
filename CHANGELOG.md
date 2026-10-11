@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.6 — 2026-10-11
+
 ### Fixed — A proxy no longer removes the multipart uploads of another proxy on the same host
 
 Each proxy keeps the parts of its multipart uploads in a relay folder named by

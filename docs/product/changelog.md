@@ -10,6 +10,64 @@ follow [semantic versioning](https://semver.org/); the Docker image
 
 _Last updated: 2026-10-11_
 
+## v2.0.6 — 2026-10-11
+
+### Fixed — A proxy no longer removes the multipart uploads of another proxy on the same host
+
+Each proxy keeps the parts of its multipart uploads in a relay folder named by
+its process id, and at startup it removed the relay folders of other processes
+that were older than `DGP_RELAY_FOREIGN_MIN_AGE_SECS` (1 hour). It did not check
+whether the other process was still running, so an upload that a sibling proxy
+had kept open for more than an hour lost its parts, and its
+`CompleteMultipartUpload` failed with `500`. Now a proxy removes such a folder
+only when the process that made it is gone.
+
+### Fixed — Replication no longer copies the same object again on every run
+
+Since v2.0.5, the reconcile walk answers a pair from the parity cache when the
+listing shows the same stored ETag and size as when the cache row was written.
+A copy over an older copy of the same bytes keeps that ETag and size, so the
+cache row kept the older copy's creation time. The newer-wins rule then saw the
+source as newer on every run, and copied the object again each time. Now the
+cache also compares the stored object's Last-Modified time, which every write
+moves, so the next run reads such an object again and skips it.
+
+### Fixed — The file browser counts each key of a bulk delete
+
+The file browser sends a bulk delete in requests of 500 keys, and the proxy
+answered each request once, after its last key. The progress bar moved only
+when a whole request finished, so a delete of a folder of 2 files showed
+"Deleting 0 of 2…" until the end and never "1 of 2". Now the browser asks for
+a streamed answer (`Accept: application/x-ndjson`): the proxy sends a line with
+the running totals as each key is deleted, then the usual answer, so the bar
+counts each key without an extra request. The delete runs in a task of its
+own, so a closed tab does not cut it, and a client that does not ask for the
+stream gets the same JSON answer as before.
+
+### Fixed — A folder of plain files is checked for its reference with one HEAD request
+
+After a batch delete, the proxy checks each folder for a `reference.bin` that
+is left alone, so that it can remove it. The check listed the folder first. A
+folder of plain files, such as videos or images, never has a reference, so the
+LIST request was wasted, and a LIST is the slower request on S3 backends. Now a
+batch that deleted no delta sends one HEAD request for `reference.bin` and
+lists the folder only when the reference exists.
+
+### Added — Every backend request is timed, and a slow one says where its time went
+
+The proxy timed only the requests of its clients. On production, a folder
+delete spent 12.9 seconds in three backend requests and logged nothing, so
+nobody could tell whether the backend answered slowly, the S3 client retried,
+or the request waited in the client's rate limiter. Now every S3 request to a
+storage backend, to the coordination bucket and from the health and capability
+probes is timed in `deltaglider_backend_request_duration_seconds` (labels
+`backend`, `operation`, `outcome`), and `deltaglider_backend_request_attempts_total`
+counts its attempts, so retries show too. A request that takes 5 seconds or
+longer (`DGP_BACKEND_SLOW_REQUEST_SECS`, plus one second for each MiB of an
+upload's body) logs one `slow backend request` warning with the backend, the
+operation, the bucket, the key or prefix, the status of each attempt, and the
+time before the first attempt was sent.
+
 ## v2.0.5 — 2026-10-11
 
 ### Fixed — A delete lists one level of its folder, and stops at the first object
