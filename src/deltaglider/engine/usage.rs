@@ -235,12 +235,18 @@ mod tests {
     /// The counter is recorded where the object commits. Before, it was
     /// recorded after the cleanup DELETE that follows the commit: a request
     /// timeout or a client disconnect there dropped the future and the
-    /// stored object was never counted.
+    /// stored object was never counted. The write is an overwrite (of a
+    /// shorter version): a write of a new key sends no cleanup DELETE.
     #[tokio::test]
     async fn a_put_dropped_after_its_commit_is_still_counted() {
         for key in ["img/k.jpg", "rel/app.zip"] {
             let (engine, fake, usage) = counted_s3_engine(None).await;
             let data = noise(7, 64 * 1024);
+            let first = &data[..data.len() - 4096];
+            engine
+                .store("b", key, first, None, Default::default())
+                .await
+                .unwrap();
             fake.set_delete_delay_ms(30_000);
             let task = {
                 let (engine, data) = (engine.clone(), data.clone());
@@ -259,8 +265,9 @@ mod tests {
             fake.set_delete_delay_ms(0);
 
             let head = engine.head("b", key).await.expect("the object committed");
+            // The first version is the folder's baseline.
             let reference = if key.ends_with(".zip") {
-                data.len() as i64
+                first.len() as i64
             } else {
                 0
             };

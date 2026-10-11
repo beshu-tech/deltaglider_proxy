@@ -5,7 +5,7 @@
 use super::usage::CounterPrior;
 use super::*;
 use crate::deltaglider::spool::SpoolBudget;
-use crate::storage::{MultipartUpload, StorageBackend, UploadedPart};
+use crate::storage::{MultipartUpload, ObjectVariant, StorageBackend, UploadedPart};
 use md5::{Digest, Md5};
 use sha2::Sha256;
 use std::path::{Path, PathBuf};
@@ -993,15 +993,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             m.delta_bytes_saved_total
                 .inc_by(put.size.saturating_sub(delta.len() as u64));
         });
-        if let Err(e) = self
-            .delete_passthrough_idempotent(put.bucket, put.deltaspace_id, &put.obj_key.filename)
-            .await
-        {
-            warn!(
-                "Failed to clean up old passthrough after delta write: {}",
-                e
-            );
-        }
+        self.drop_other_form(
+            put.bucket,
+            put.deltaspace_id,
+            &put.obj_key.filename,
+            ObjectVariant::Delta,
+            put.prior,
+        )
+        .await;
         self.metadata_cache
             .insert(put.bucket, put.key, metadata.clone());
         Ok(StoreResult::new(metadata, delta.len() as u64))
@@ -1047,12 +1046,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
         // Committed: count it before the next await.
         self.record_commit(bucket, prior, &metadata);
-        if let Err(e) = self
-            .delete_delta_idempotent(bucket, deltaspace_id, &filename)
-            .await
-        {
-            warn!("Failed to clean up old delta after passthrough write: {e}");
-        }
+        self.drop_other_form(
+            bucket,
+            deltaspace_id,
+            &filename,
+            ObjectVariant::Passthrough,
+            prior,
+        )
+        .await;
         let size = metadata.file_size;
         self.metadata_cache.insert(bucket, key, metadata.clone());
         Ok(StoreResult::new(metadata, size))
@@ -1296,16 +1297,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .await?;
         // Committed: count it before the next await.
         self.record_commit(bucket, prior, &metadata);
-        // Write succeeded — now safe to clean up old delta variant
-        if let Err(e) = self
-            .delete_delta_idempotent(bucket, &deltaspace_id, &obj_key.filename)
-            .await
-        {
-            warn!(
-                "Failed to clean up old delta after chunked passthrough write: {}",
-                e
-            );
-        }
+        self.drop_other_form(
+            bucket,
+            &deltaspace_id,
+            &obj_key.filename,
+            ObjectVariant::Passthrough,
+            prior,
+        )
+        .await;
 
         let result = StoreResult::new(metadata, total_size);
         self.metadata_cache
@@ -1417,15 +1416,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .await?;
         // Committed: count it before the next await.
         self.record_commit(bucket, prior, &metadata);
-        if let Err(e) = self
-            .delete_delta_idempotent(bucket, &deltaspace_id, &obj_key.filename)
-            .await
-        {
-            warn!(
-                "Failed to clean up old delta after relayed passthrough write: {}",
-                e
-            );
-        }
+        self.drop_other_form(
+            bucket,
+            &deltaspace_id,
+            &obj_key.filename,
+            ObjectVariant::Passthrough,
+            prior,
+        )
+        .await;
 
         let result = StoreResult::new(metadata, total_size);
         self.metadata_cache
@@ -1645,16 +1643,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
         // Committed: count it before the next await.
         self.record_commit(&handle.bucket, &prior, &metadata);
-
-        if let Err(e) = self
-            .delete_delta_idempotent(&handle.bucket, &handle.deltaspace_id, &handle.filename)
-            .await
-        {
-            warn!(
-                "Failed to clean up old delta after multipart passthrough write: {}",
-                e
-            );
-        }
+        self.drop_other_form(
+            &handle.bucket,
+            &handle.deltaspace_id,
+            &handle.filename,
+            ObjectVariant::Passthrough,
+            &prior,
+        )
+        .await;
 
         // Streaming multipart (large replication/lifecycle copies). Every
         // store entry point records exactly once, at its commit;
@@ -1681,6 +1677,45 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 "Failed to abort multipart upload {}/{}: {}",
                 handle.bucket, handle.key, e
             );
+        }
+    }
+
+    /// After a write of `written`, drop the other stored form of `filename`
+    /// (`k` after a delta write, `k.delta` after a passthrough write): an
+    /// overwrite of the other kind leaves it stale, and a later read could
+    /// resolve it (H33). Best effort: a failure is logged.
+    ///
+    /// No request when `prior` says the key held nothing: the read before
+    /// the write found neither form. Each write sent this DELETE for a form
+    /// that read had just found absent. A form that a writer without the
+    /// object's write lock (a peer instance, a replication copy) adds after
+    /// that read stays beside the new object; a read resolves the newer of
+    /// the two, and the key's next write or delete drops the older one.
+    async fn drop_other_form(
+        &self,
+        bucket: &str,
+        deltaspace_id: &str,
+        filename: &str,
+        written: ObjectVariant,
+        prior: &CounterPrior,
+    ) {
+        if matches!(prior, CounterPrior::Absent) {
+            return;
+        }
+        let (other, result) = match written {
+            ObjectVariant::Delta => (
+                "passthrough",
+                self.delete_passthrough_idempotent(bucket, deltaspace_id, filename)
+                    .await,
+            ),
+            ObjectVariant::Passthrough => (
+                "delta",
+                self.delete_delta_idempotent(bucket, deltaspace_id, filename)
+                    .await,
+            ),
+        };
+        if let Err(e) = result {
+            warn!("Failed to clean up the old {other} form of {bucket}/{deltaspace_id}/{filename} after a write: {e}");
         }
     }
 
@@ -2654,6 +2689,146 @@ storage:
             .await
             .is_err(),
             "the same real deltaspace through two names must serialise"
+        );
+    }
+}
+
+/// What a write sends to drop the other stored form of its key (`k` for a
+/// delta, `k.delta` for a passthrough object).
+#[cfg(test)]
+mod other_form_tests {
+    use super::counter_tests::versions;
+    use super::*;
+    use crate::bucket_usage::BucketUsage;
+    use crate::storage::{DynStorageBackend, FakeS3};
+
+    /// An engine on a fake S3 with bucket `b` and a usage counter, so each
+    /// write reads the object it replaces.
+    async fn counted_s3_engine() -> (DynEngine, Arc<FakeS3>) {
+        let (s3, fake) = crate::storage::fake_s3_backend().await;
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(s3);
+        let engine =
+            DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None)
+                .with_bucket_usage(Some(Arc::new(BucketUsage::in_memory().unwrap())));
+        engine.create_bucket("b").await.unwrap();
+        (engine, fake)
+    }
+
+    fn deletes(fake: &FakeS3) -> Vec<String> {
+        fake.requests()
+            .into_iter()
+            .filter(|r| r.starts_with("DELETE "))
+            .collect()
+    }
+
+    /// A write of a key that held nothing sends no DELETE: the read of the
+    /// object it replaces found no form of it. Each write sent one, for the
+    /// other form that the read had just found absent. An overwrite still
+    /// drops the other form.
+    #[tokio::test]
+    async fn a_write_of_an_absent_key_sends_no_delete() {
+        let (engine, fake) = counted_s3_engine().await;
+        let (v1, v2) = versions();
+        fake.clear();
+        // Passthrough, the first delta (with its baseline), a sibling delta.
+        for (key, data) in [("img/a.jpg", &v1), ("rel/a.zip", &v1), ("rel/b.zip", &v2)] {
+            engine
+                .store("b", key, data, None, HashMap::new())
+                .await
+                .unwrap();
+        }
+        // The streaming store, and the passthrough sinks of multipart.
+        let spool = engine.spool_acquire(v2.len() as u64).await.unwrap();
+        tokio::fs::write(spool.path(), &v2).await.unwrap();
+        engine
+            .store_spooled_delta(
+                "b",
+                "img/s.jpg",
+                &spool,
+                v2.len() as u64,
+                None,
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let chunks: Vec<Bytes> = v1.chunks(64 * 1024).map(Bytes::copy_from_slice).collect();
+        engine
+            .store_passthrough_chunked(
+                "b",
+                "img/c.jpg",
+                &chunks,
+                v1.len() as u64,
+                None,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let f = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(f.path(), &v1).await.unwrap();
+        engine
+            .store_passthrough_file_with_multipart_etag(
+                "b",
+                "img/f.jpg",
+                f.path(),
+                v1.len() as u64,
+                None,
+                HashMap::new(),
+                "\"0123456789abcdef0123456789abcdef-1\"".to_string(),
+            )
+            .await
+            .unwrap();
+        let d = deletes(&fake);
+        eprintln!("6 writes of absent keys: {} DELETEs: {d:?}", d.len());
+        assert!(d.is_empty(), "{} DELETEs for absent keys: {d:?}", d.len());
+
+        // An overwrite of the delta as a passthrough object drops the delta.
+        let no_delta = HashMap::from([("dg-no-delta".to_string(), "true".to_string())]);
+        engine
+            .store("b", "rel/b.zip", &v2, None, no_delta)
+            .await
+            .unwrap();
+        let d = deletes(&fake);
+        assert!(
+            d.len() == 1 && d[0].starts_with("DELETE /b/rel/b.zip.delta"),
+            "{d:?}"
+        );
+        let got = engine.head("b", "rel/b.zip").await.unwrap();
+        assert_eq!(got.storage_info.label(), "passthrough");
+    }
+
+    /// Every write drops the other form through `drop_other_form`, which
+    /// skips the DELETE when the prior read found the key absent.
+    #[test]
+    fn writes_drop_the_other_form_through_one_helper() {
+        let text = std::fs::read_to_string("src/deltaglider/engine/store.rs").unwrap();
+        let lines = crate::source_scan::prod_lines(&text);
+        let mut inside_helper = false;
+        let mut sites = Vec::new();
+        for (n, line) in &lines {
+            let trimmed = line.trim_start();
+            if line.contains("async fn drop_other_form(") {
+                inside_helper = true;
+            } else if inside_helper && (trimmed.starts_with("///") || trimmed.contains("fn ")) {
+                // The next item.
+                inside_helper = false;
+            }
+            let calls = [
+                ".delete_delta_idempotent(",
+                ".delete_passthrough_idempotent(",
+            ]
+            .iter()
+            .any(|c| line.contains(c));
+            if calls && !inside_helper {
+                sites.push(*n);
+            }
+        }
+        // The legacy-reference migration deletes the passthrough form that
+        // it has just converted to a delta.
+        assert_eq!(
+            sites.len(),
+            1,
+            "store.rs deletes another form outside drop_other_form at lines {sites:?}"
         );
     }
 }
