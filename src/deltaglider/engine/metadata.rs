@@ -31,6 +31,22 @@ pub(super) fn reference_integrity_ok(
     }
 }
 
+/// Which stored forms of an object exist ([`DeltaGliderEngine::resolve_stored_forms`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct StoredForms {
+    pub(super) delta: bool,
+    pub(super) passthrough: bool,
+}
+
+impl StoredForms {
+    pub(super) fn has(self, form: crate::storage::ObjectVariant) -> bool {
+        match form {
+            crate::storage::ObjectVariant::Delta => self.delta,
+            crate::storage::ObjectVariant::Passthrough => self.passthrough,
+        }
+    }
+}
+
 impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Build the cache key for a deltaspace's reference.
     /// THE per-deltaspace key: the reference cache and the in-process
@@ -93,7 +109,22 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         original_name: &str,
     ) -> Result<Option<FileMetadata>, StorageError> {
         let filename = original_name.rsplit('/').next().unwrap_or(original_name);
+        Ok(self
+            .resolve_stored_forms(bucket, prefix, filename)
+            .await?
+            .map(|(meta, _)| meta))
+    }
 
+    /// THE lookup of an object's two stored forms (`filename.delta` and
+    /// `filename`), with one HEAD each, in parallel: the object's metadata
+    /// (the newest form when both exist) and which forms exist (a delete
+    /// sends no DELETE for a form that is not there). `None`: neither.
+    pub(super) async fn resolve_stored_forms(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<Option<(FileMetadata, StoredForms)>, StorageError> {
         // Fetch delta and passthrough metadata in parallel — saves one S3 round-trip
         let (delta_result, passthrough_result) = tokio::join!(
             self.storage.get_delta_metadata(bucket, prefix, filename),
@@ -105,21 +136,21 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // error: read as absent, HEAD answered 404 for a live object, DELETE
         // reported success without deleting, and `If-None-Match: *`
         // overwrote it.
-        let delta = match delta_result {
-            Ok(meta) => Some(meta),
-            Err(StorageError::NotFound(_)) => None,
-            Err(e) => return Err(e),
+        let found = |r: Result<FileMetadata, StorageError>| match r {
+            Ok(meta) => Ok(Some(meta)),
+            Err(StorageError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
         };
-        let passthrough = match passthrough_result {
-            Ok(meta) => Some(meta),
-            Err(StorageError::NotFound(_)) => None,
-            Err(e) => return Err(e),
+        let (delta, passthrough) = (found(delta_result)?, found(passthrough_result)?);
+        let forms = StoredForms {
+            delta: delta.is_some(),
+            passthrough: passthrough.is_some(),
         };
-        match (delta, passthrough) {
-            (Some(d), Some(p)) => Ok(Some(if d.created_at >= p.created_at { d } else { p })),
-            (Some(meta), None) | (None, Some(meta)) => Ok(Some(meta)),
-            (None, None) => Ok(None),
-        }
+        let newest = match (delta, passthrough) {
+            (Some(d), Some(p)) => Some(if d.created_at >= p.created_at { d } else { p }),
+            (one, None) | (None, one) => one,
+        };
+        Ok(newest.map(|meta| (meta, forms)))
     }
 
     /// Resolve metadata for an object key, with no migration attempt.
@@ -364,6 +395,34 @@ mod head_cost_tests {
         let err = engine.head("b", "dir/missing.zip").await.unwrap_err();
         assert!(err.is_not_found(), "{err}");
         assert_eq!(fake.requests().len(), 2, "{:?}", fake.requests());
+    }
+
+    /// Both stored forms of an object are read together in one place
+    /// (`resolve_stored_forms`): `delete.rs` kept its own copy of the
+    /// parallel HEADs and the newest-wins rule.
+    #[test]
+    fn the_two_stored_forms_are_read_together_in_one_place() {
+        let mut sites = Vec::new();
+        for (file, text) in crate::source_scan::prod_sources("src/deltaglider/engine") {
+            let lines = crate::source_scan::prod_lines(&text);
+            for (i, (n, line)) in lines.iter().enumerate() {
+                if !line.contains(".get_delta_metadata(") {
+                    continue;
+                }
+                let both = lines[i.saturating_sub(6)..lines.len().min(i + 6)]
+                    .iter()
+                    .any(|(_, l)| l.contains(".get_passthrough_metadata("));
+                if both {
+                    sites.push((file.clone(), *n));
+                }
+            }
+        }
+        let files: Vec<&str> = sites.iter().map(|(f, _)| f.as_str()).collect();
+        assert_eq!(
+            files,
+            ["src/deltaglider/engine/metadata.rs"],
+            "both forms read at {sites:?}: use resolve_stored_forms"
+        );
     }
 
     /// One read answers whether a deltaspace has a reference and what it is

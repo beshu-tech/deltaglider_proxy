@@ -428,42 +428,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
     }
 
-    /// The object's metadata (the newest variant when both exist, as
-    /// `resolve_object_metadata` picks it) and which variants the two
-    /// parallel HEADs found, so a delete skips the DELETE of a variant that
-    /// is not there. `None`: neither exists.
-    async fn resolve_variants(
-        &self,
-        bucket: &str,
-        deltaspace_id: &str,
-        filename: &str,
-    ) -> Result<Option<(FileMetadata, impl Fn(ObjectVariant) -> bool)>, StorageError> {
-        let (delta, passthrough) = tokio::join!(
-            self.storage
-                .get_delta_metadata(bucket, deltaspace_id, filename),
-            self.storage
-                .get_passthrough_metadata(bucket, deltaspace_id, filename),
-        );
-        // Only NotFound means absent: an I/O error is an error.
-        let found = |r: Result<FileMetadata, StorageError>| match r {
-            Ok(meta) => Ok(Some(meta)),
-            Err(StorageError::NotFound(_)) => Ok(None),
-            Err(e) => Err(e),
-        };
-        let (delta, passthrough) = (found(delta)?, found(passthrough)?);
-        let (has_delta, has_passthrough) = (delta.is_some(), passthrough.is_some());
-        let newest = match (delta, passthrough) {
-            (Some(d), Some(p)) => Some(if d.created_at >= p.created_at { d } else { p }),
-            (one, None) | (None, one) => one,
-        };
-        Ok(newest.map(|meta| {
-            (meta, move |v: ObjectVariant| match v {
-                ObjectVariant::Delta => has_delta,
-                ObjectVariant::Passthrough => has_passthrough,
-            })
-        }))
-    }
-
     /// Delete one object, with no reclaim check: `Gone` when there is no
     /// such object. The counter forgets the object before this returns.
     async fn delete_inner(
@@ -484,8 +448,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // tokio::sync::Mutex is not reentrant, so resolve_metadata_with_migration
         // here would deadlock. Legacy objects that haven't been migrated yet will appear
         // as NotFound; a prior GET/HEAD on the key will have triggered migration.
-        let Some((metadata, found)) = self
-            .resolve_variants(bucket, &deltaspace_id, &obj_key.filename)
+        let Some((metadata, forms)) = self
+            .resolve_stored_forms(bucket, &deltaspace_id, &obj_key.filename)
             .await?
         else {
             return Ok(ConditionalDelete::Gone);
@@ -494,7 +458,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             StorageInfo::Delta { .. } => (ObjectVariant::Delta, ObjectVariant::Passthrough),
             _ => (ObjectVariant::Passthrough, ObjectVariant::Delta),
         };
-        let sibling_found = found(sibling);
+        let sibling_found = forms.has(sibling);
         // A conditional delete also pins the stored versions where the
         // backend can (S3 If-Match): a peer INSTANCE's PUT does not take our
         // in-process lock. Both versions are read BEFORE the check's read, so
