@@ -322,7 +322,26 @@ impl ConfigDbSync {
     /// Build an S3 client from BackendConfig, reusing the same credentials.
     /// `pub` so the coordination-lease builder (in the binary crate's startup)
     /// shares the exact same client construction as the config sync.
+    ///
+    /// THE coordination client: config sync, leases, reference locks and
+    /// the capability probes. Each request has the data path's request
+    /// deadline (`DGP_BACKEND_REQUEST_TIMEOUT_SECS`, retries included), so a
+    /// coordination bucket that never answers fails a request instead of
+    /// holding it (a sync, a lock request) for ever. An upload of the config
+    /// DB adds time for its body (`db_upload_deadline`). The SDK retry
+    /// partition is the backend definition's own coordination partition:
+    /// the coordination clients no longer spend the retry quota (and feed
+    /// the rate limiter) of the region's default partition.
     pub async fn build_client(config: &BackendConfig) -> Result<Client, String> {
+        Self::build_client_with(config, crate::storage::S3Backend::request_timeout()).await
+    }
+
+    /// [`Self::build_client`] with the deadline `operation_timeout` (`None`:
+    /// no deadline).
+    pub(crate) async fn build_client_with(
+        config: &BackendConfig,
+        operation_timeout: Option<std::time::Duration>,
+    ) -> Result<Client, String> {
         let (endpoint, region, force_path_style, access_key_id, secret_access_key, allow_local) =
             match config {
                 BackendConfig::S3 {
@@ -364,12 +383,21 @@ impl ConfigDbSync {
             .region(aws_sdk_s3::config::Region::new(region))
             .credentials_provider(credentials)
             .force_path_style(force_path_style)
+            .retry_partition(coordination_retry_partition(config))
             .request_checksum_calculation(
                 aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
             )
             .response_checksum_validation(
                 aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
             );
+        if let Some(t) = operation_timeout {
+            // The SDK merges this into its defaults (the connect timeout).
+            builder = builder.timeout_config(
+                aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                    .operation_timeout(t)
+                    .build(),
+            );
+        }
 
         if let Some(ref ep) = endpoint {
             // The same SSRF guard as the engine's backends: this client
@@ -620,8 +648,31 @@ impl ConfigDbSync {
             Some(etag) => put.if_match(etag),
             None => put.if_none_match("*"),
         };
+        // The client's request deadline, plus time for the DB's bytes.
+        let deadline = db_upload_deadline(
+            self.s3_client
+                .config()
+                .timeout_config()
+                .and_then(|t| t.operation_timeout()),
+            data.len() as u64,
+        );
+        let sent = match deadline {
+            Some(t) => {
+                put.customize()
+                    .config_override(
+                        aws_sdk_s3::config::Builder::new().timeout_config(
+                            aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                                .operation_timeout(t)
+                                .build(),
+                        ),
+                    )
+                    .send()
+                    .await
+            }
+            None => put.send().await,
+        };
 
-        let put_result = match put.send().await {
+        let put_result = match sent {
             Ok(result) => result,
             Err(e) => {
                 match classify_upload_error(&sdk_error_signal(&e)) {
@@ -871,6 +922,36 @@ struct Witness {
 /// Pure freshness check — extracted so the TTL decision is unit-testable.
 fn witness_is_fresh(validated_at: i64, now: i64, max_age: i64) -> bool {
     now >= validated_at && now - validated_at < max_age
+}
+
+/// The SDK retry partition of the coordination clients of one backend
+/// definition, named by a hash (the definition holds the secret). Apart
+/// from the data clients' (`dgp-backend-…`) and the health probe's
+/// (`dgp-health-…`).
+fn coordination_retry_partition(
+    config: &BackendConfig,
+) -> aws_sdk_s3::config::retry::RetryPartition {
+    use sha2::Digest;
+    let fp = crate::coordination::capability::fingerprint(config);
+    let hash = hex::encode(sha2::Sha256::digest(fp.as_bytes()));
+    aws_sdk_s3::config::retry::RetryPartition::custom(format!("dgp-coordination-{}", &hash[..12]))
+        .build()
+}
+
+/// Pure: the deadline of a config DB upload of `bytes`: the request
+/// deadline `base`, plus one second per MiB of body (the floor of the data
+/// path's uploads). `None` (no request deadline) leaves the upload without
+/// one.
+fn db_upload_deadline(
+    base: Option<std::time::Duration>,
+    bytes: u64,
+) -> Option<std::time::Duration> {
+    const FLOOR_BYTES_PER_SEC: u64 = 1024 * 1024;
+    base.map(|b| {
+        b.saturating_add(std::time::Duration::from_secs(
+            bytes.div_ceil(FLOOR_BYTES_PER_SEC),
+        ))
+    })
 }
 
 /// Node identifier for witness provenance: THE durable node id the leases
@@ -1427,6 +1508,66 @@ mod tests {
             allow_local: true,
             session_token: None,
         }
+    }
+
+    /// The coordination clients (config sync, leases, reference locks,
+    /// capability probes) have the request deadline and an SDK retry
+    /// partition of their own. They had no deadline (a hung coordination
+    /// bucket held a sync or a lock request for ever) and shared the
+    /// region's default partition, so its throttles spent one retry quota.
+    #[tokio::test]
+    async fn coordination_clients_have_a_deadline_and_their_own_retry_partition() {
+        let client = ConfigDbSync::build_client(&dead_s3_backend())
+            .await
+            .unwrap();
+        let deadline = client
+            .config()
+            .timeout_config()
+            .and_then(|t| t.operation_timeout());
+        assert_eq!(deadline, crate::storage::S3Backend::request_timeout());
+        let partition = client.config().retry_partition().map(|p| p.to_string());
+        assert!(
+            partition
+                .as_deref()
+                .is_some_and(|p| p.starts_with("dgp-coordination-")),
+            "{partition:?}"
+        );
+    }
+
+    /// A coordination request to a bucket that does not answer ends at
+    /// its deadline.
+    #[tokio::test]
+    async fn a_coordination_request_to_a_hung_bucket_ends() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        fake.set_delay_ms("GET", 10_000);
+        let config = BackendConfig::S3 {
+            endpoint: Some(endpoint),
+            region: "us-east-1".into(),
+            force_path_style: true,
+            access_key_id: Some("k".into()),
+            secret_access_key: Some("s".into()),
+            allow_local: true,
+            session_token: None,
+        };
+        let client =
+            ConfigDbSync::build_client_with(&config, Some(std::time::Duration::from_millis(300)))
+                .await
+                .unwrap();
+        let get = client.get_object().bucket("b").key("k").send();
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), get).await;
+        assert!(
+            matches!(ended, Ok(Err(_))),
+            "the request did not end at its deadline"
+        );
+    }
+
+    #[test]
+    fn a_db_upload_deadline_adds_a_second_per_mib() {
+        let s = std::time::Duration::from_secs;
+        assert_eq!(db_upload_deadline(None, 1 << 30), None);
+        assert_eq!(db_upload_deadline(Some(s(30)), 0), Some(s(30)));
+        assert_eq!(db_upload_deadline(Some(s(30)), 1), Some(s(31)));
+        assert_eq!(db_upload_deadline(Some(s(30)), 300 << 20), Some(s(330)));
     }
 
     /// The upload snapshot reads the DB file without the DB lock: reading a
