@@ -126,21 +126,21 @@ async fn rm_recursive(engine: &DynEngine, args: &RmArgs, bucket: &str, prefix: &
         };
 
         let keys: Vec<&str> = page.objects.iter().map(|(k, _)| k.as_str()).collect();
-        for key in rm_targets(&keys, &dir, &filter) {
-            if !args.quiet {
-                println!("delete: s3://{bucket}/{key}");
-            }
-            if args.dryrun {
-                succeeded += 1;
-                continue;
-            }
-            match engine.delete(bucket, key).await {
-                Ok(_) => succeeded += 1,
-                Err(e) => {
-                    eprintln!("warning: delete s3://{bucket}/{key} failed: {e}");
-                    failed += 1;
+        let targets = rm_targets(&keys, &dir, &filter);
+        if args.dryrun {
+            for key in &targets {
+                if !args.quiet {
+                    println!("delete: s3://{bucket}/{key}");
                 }
             }
+            succeeded += targets.len() as u64;
+        } else {
+            // The page in one batch: one reclaim check per folder, several
+            // folders at once (a per-key delete listed the folder after
+            // every key). Tokens are keys, so the deletes skip no key.
+            let (ok, bad) = delete_keys(engine, bucket, &targets, args.quiet).await;
+            succeeded += ok;
+            failed += bad;
         }
 
         if !page.is_truncated {
@@ -159,6 +159,39 @@ async fn rm_recursive(engine: &DynEngine, args: &RmArgs, bucket: &str, prefix: &
     } else {
         cli_exit::EXIT_OK
     }
+}
+
+/// Delete `keys` of `bucket` through the engine's batch, printing
+/// `delete: s3://…` for each key that went (unless `quiet`) and a warning
+/// for each failure. Returns (deleted, failed). A key already gone counts
+/// as deleted, as for `aws s3 rm`.
+pub(crate) async fn delete_keys(
+    engine: &DynEngine,
+    bucket: &str,
+    keys: &[&str],
+    quiet: bool,
+) -> (u64, u64) {
+    use crate::deltaglider::{DeleteHooks, DeleteItem, DeleteOutcome};
+    let items = keys.iter().map(|k| DeleteItem::new(*k)).collect();
+    let outcomes = engine
+        .delete_batch(bucket, items, DeleteHooks::default())
+        .await;
+    let (mut ok, mut bad) = (0, 0);
+    for (key, outcome) in keys.iter().zip(outcomes) {
+        match outcome {
+            DeleteOutcome::Failed(e) => {
+                eprintln!("warning: delete s3://{bucket}/{key} failed: {e}");
+                bad += 1;
+            }
+            _ => {
+                if !quiet {
+                    println!("delete: s3://{bucket}/{key}");
+                }
+                ok += 1;
+            }
+        }
+    }
+    (ok, bad)
 }
 
 /// Pure: the keys of one listing page that `rm -r` deletes. Globs see
@@ -242,6 +275,42 @@ mod tests {
             rm_targets(keys, "releases/", &filter(&[], &["tmp/"])),
             vec!["releases/v1.zip"]
         );
+    }
+
+    /// jobs-16: `rm -r` deleted key by key, and each delete listed the
+    /// key's folder to reclaim its reference.bin: one LIST per key, one key
+    /// at a time. A page of keys goes in one batch: one check per folder.
+    #[tokio::test]
+    async fn rm_r_checks_each_folder_once() {
+        let (engine, fake) = crate::deltaglider::s3_engine().await;
+        crate::deltaglider::store_deltas(&engine, "run", 50).await;
+        fake.clear();
+        let args = RmArgs {
+            url: "s3://b/run".into(),
+            recursive: true,
+            include: vec![],
+            exclude: vec![],
+            dryrun: false,
+            quiet: true,
+            aws: Default::default(),
+        };
+        assert_eq!(
+            rm_recursive(&engine, &args, "b", "run").await,
+            cli_exit::EXIT_OK
+        );
+        let checks = fake
+            .requests()
+            .iter()
+            .filter(|r| {
+                r.contains("delimiter=%2F") && crate::storage::fake_s3::list_prefix(r) == "run/"
+            })
+            .count();
+        assert_eq!(checks, 1, "{:#?}", fake.requests());
+        let left = engine
+            .list_objects("b", "run/", None, 10, None, false)
+            .await
+            .unwrap();
+        assert!(left.objects.is_empty(), "{:?}", left.objects);
     }
 
     /// Single-key rm without `--recursive` requires a non-empty key —

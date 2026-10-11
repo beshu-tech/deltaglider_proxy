@@ -105,15 +105,24 @@ pub fn detect_direction(src: &str, dst: &str) -> Direction {
 }
 
 /// One entry in a sync inventory, keyed in its map by the path relative
-/// to the synced root. Holds the byte size and a unix-ms mtime (None
-/// when the source can't supply one).
+/// to the synced root. Holds the byte size (None when the listing knows
+/// only the stored size) and a unix-ms mtime (None when the source can't
+/// supply one).
 #[derive(Debug, Clone)]
 pub struct Entry {
     /// Where the entry really lives: the full on-disk path for a local
     /// entry, the full object key for an S3 entry. NOT relative.
     pub rel: String,
-    pub size: u64,
+    pub size: Option<u64>,
     pub mtime_ms: Option<i64>,
+}
+
+/// Pure: the size a listing entry tells. A delta whose metadata the
+/// listing could not read (its HEAD was throttled) holds the STORED delta
+/// size, not the object's: that size is unknown, and comparing it re-sent
+/// an unchanged object.
+fn listed_size(meta: &crate::types::FileMetadata) -> Option<u64> {
+    (!meta.is_unresolved_delta_stub()).then_some(meta.file_size)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -124,19 +133,21 @@ pub struct SyncDecisionOpts {
 
 /// Pure: does this source entry need to be copied to the destination?
 /// Returns true if dst is absent or the (size, mtime) comparison says
-/// the source is newer / different.
+/// the source is newer / different. An unknown size on either side is
+/// not a difference: only the mtime can decide then.
 pub fn should_sync(src: &Entry, dst: Option<&Entry>, opts: SyncDecisionOpts) -> bool {
     let dst = match dst {
         Some(d) => d,
         None => return true, // dst absent → copy
     };
+    let sizes_differ = matches!((src.size, dst.size), (Some(s), Some(d)) if s != d);
 
     if opts.size_only {
-        return src.size != dst.size;
+        return sizes_differ;
     }
 
     // Size mismatch is always reason enough.
-    if src.size != dst.size {
+    if sizes_differ {
         return true;
     }
 
@@ -251,23 +262,14 @@ async fn sync_local_to_s3(args: &SyncArgs, filter: &Filter, opts: SyncDecisionOp
                  which could not be read"
             );
         }
-        for rel in plan.delete {
-            let key = join_prefix(&dst_loc.key, rel);
-            if !args.quiet {
-                println!("delete: s3://{}/{}", dst_loc.bucket, key);
-            }
-            if args.dryrun {
-                deleted += 1;
-                continue;
-            }
-            match engine.delete(&dst_loc.bucket, &key).await {
-                Ok(_) => deleted += 1,
-                Err(e) => {
-                    eprintln!("error: delete s3://{}/{} failed: {e}", dst_loc.bucket, key);
-                    failed += 1;
-                }
-            }
-        }
+        let keys: Vec<String> = plan
+            .delete
+            .into_iter()
+            .map(|rel| join_prefix(&dst_loc.key, rel))
+            .collect();
+        let (ok, bad) = delete_remote(&engine, &dst_loc.bucket, &keys, args).await;
+        deleted += ok;
+        failed += bad;
     }
 
     summarize(args, succeeded, failed, deleted)
@@ -436,29 +438,39 @@ async fn sync_s3_to_s3(args: &SyncArgs, filter: &Filter, opts: SyncDecisionOpts)
     }
 
     if args.delete {
-        for rel in dst_entries.keys() {
-            if src_entries.contains_key(rel) {
-                continue;
-            }
-            let key = join_prefix(&dst_loc.key, rel);
-            if !args.quiet {
-                println!("delete: s3://{}/{}", dst_loc.bucket, key);
-            }
-            if args.dryrun {
-                deleted += 1;
-                continue;
-            }
-            match engine.delete(&dst_loc.bucket, &key).await {
-                Ok(_) => deleted += 1,
-                Err(e) => {
-                    eprintln!("error: delete s3://{}/{} failed: {e}", dst_loc.bucket, key);
-                    failed += 1;
-                }
-            }
-        }
+        let mut keys: Vec<String> = dst_entries
+            .keys()
+            .filter(|rel| !src_entries.contains_key(*rel))
+            .map(|rel| join_prefix(&dst_loc.key, rel))
+            .collect();
+        keys.sort();
+        let (ok, bad) = delete_remote(&engine, &dst_loc.bucket, &keys, args).await;
+        deleted += ok;
+        failed += bad;
     }
 
     summarize(args, succeeded, failed, deleted)
+}
+
+/// `--delete` on an S3 destination: the keys go in one engine batch (one
+/// reclaim check per folder, several folders at once); a per-key delete
+/// listed the folder after every key. Returns (deleted, failed).
+async fn delete_remote(
+    engine: &DynEngine,
+    bucket: &str,
+    keys: &[String],
+    args: &SyncArgs,
+) -> (u64, u64) {
+    if args.dryrun {
+        for key in keys {
+            if !args.quiet {
+                println!("delete: s3://{bucket}/{key}");
+            }
+        }
+        return (keys.len() as u64, 0);
+    }
+    let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+    super::rm::delete_keys(engine, bucket, &keys, args.quiet).await
 }
 
 /// The local side of a sync. `unreadable` holds the paths (relative to the
@@ -562,7 +574,7 @@ fn collect_local_entries(root: &Path, filter: &Filter) -> LocalListing {
             rel,
             Entry {
                 rel: entry.path().to_string_lossy().to_string(),
-                size: metadata.len(),
+                size: Some(metadata.len()),
                 mtime_ms,
             },
         );
@@ -608,7 +620,7 @@ async fn collect_s3_entries(
                 rel,
                 Entry {
                     rel: key,
-                    size: meta.file_size,
+                    size: listed_size(&meta),
                     mtime_ms: Some(meta.created_at.timestamp_millis()),
                 },
             );
@@ -746,9 +758,57 @@ mod tests {
     fn entry(rel: &str, size: u64, mtime_ms: Option<i64>) -> Entry {
         Entry {
             rel: rel.into(),
-            size,
+            size: Some(size),
             mtime_ms,
         }
+    }
+
+    /// jobs-16: a delta whose listing HEAD was throttled is a stub that
+    /// holds the stored delta size. Sync compared that size with the
+    /// source's and re-sent the unchanged object. Its size is unknown,
+    /// which is not a change.
+    #[test]
+    fn a_delta_stub_is_unknown_not_changed() {
+        let stub = crate::types::FileMetadata::fallback(
+            "a.zip".into(),
+            120,
+            "e".into(),
+            chrono::Utc::now(),
+            None,
+            crate::types::StorageInfo::delta_stub(120),
+        );
+        let dst = Entry {
+            rel: "a.zip".into(),
+            size: listed_size(&stub),
+            mtime_ms: Some(1_000),
+        };
+        let src = entry("a.zip", 65_536, Some(1_000));
+        for size_only in [false, true] {
+            let opts = SyncDecisionOpts {
+                size_only,
+                exact_timestamps: false,
+            };
+            assert!(
+                !should_sync(&src, Some(&dst), opts),
+                "size_only={size_only}"
+            );
+        }
+        // A newer source still syncs; a resolved size still compares.
+        let newer = entry("a.zip", 65_536, Some(9_000));
+        let opts = SyncDecisionOpts {
+            size_only: false,
+            exact_timestamps: false,
+        };
+        assert!(should_sync(&newer, Some(&dst), opts));
+        let resolved = crate::types::FileMetadata::fallback(
+            "a.zip".into(),
+            65_000,
+            "e".into(),
+            chrono::Utc::now(),
+            None,
+            crate::types::StorageInfo::Passthrough,
+        );
+        assert_eq!(listed_size(&resolved), Some(65_000));
     }
 
     /// Review A7: an unreadable local path hides only the remote keys at

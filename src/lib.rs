@@ -1733,13 +1733,11 @@ mod source_guards {
     /// compiler refuses them elsewhere.)
     #[test]
     fn deletes_of_many_keys_go_through_delete_batch() {
-        // A request that names one key: S3 DeleteObject.
-        const SINGLE_KEY: &[&str] = &["src/s3_adapter_s3s/object.rs"];
-        // wave 2: move to delete_batch (each agent removes its entries; the
-        // single-object `rm s3://b/k` keeps cli/rm.rs, under SINGLE_KEY).
+        // A request that names one key: S3 DeleteObject, and the CLI's
+        // `rm s3://b/k` without `-r`.
+        const SINGLE_KEY: &[&str] = &["src/s3_adapter_s3s/object.rs", "src/cli/rm.rs"];
+        // wave 2: move to delete_batch (each agent removes its entries).
         const WAVE_2: &[&str] = &[
-            "src/cli/rm.rs",
-            "src/cli/sync.rs",
             "src/lifecycle/worker.rs",
             "src/maintenance/migrate.rs",
         ];
@@ -1756,21 +1754,18 @@ mod source_guards {
             stale.is_empty(),
             "these files no longer delete per key; remove them from the allow-list: {stale:?}"
         );
-        // The scan sees a real loop site: the `sync --delete` loop, as long
-        // as it is there.
-        if files.contains("src/cli/sync.rs") {
-            let without_sync: Vec<&str> = allowed
-                .iter()
-                .copied()
-                .filter(|f| *f != "src/cli/sync.rs")
-                .collect();
-            let (_, caught) = per_key_engine_deletes(&without_sync);
-            eprintln!("without its allow-list entry:\n{}", caught.join("\n"));
-            assert!(
-                !caught.is_empty() && caught.iter().all(|o| o.starts_with("src/cli/sync.rs:")),
-                "{caught:?}"
-            );
-        }
+        // The scan sees a real site: the single-key `rm s3://b/k`.
+        let without_rm: Vec<&str> = allowed
+            .iter()
+            .copied()
+            .filter(|f| *f != "src/cli/rm.rs")
+            .collect();
+        let (_, caught) = per_key_engine_deletes(&without_rm);
+        eprintln!("without its allow-list entry:\n{}", caught.join("\n"));
+        assert!(
+            !caught.is_empty() && caught.iter().all(|o| o.starts_with("src/cli/rm.rs:")),
+            "{caught:?}"
+        );
     }
 
     /// A replication run checks the backend health gate: it goes through
