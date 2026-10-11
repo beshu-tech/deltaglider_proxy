@@ -724,6 +724,9 @@ fn init_config_db_attempt(
                     warn!("Failed to reconcile parity audit state on boot: {err}");
                 }
             }
+            // Rows of rules the YAML no longer names (removed or renamed
+            // while the proxy was down, or by an apply that predates this).
+            deltaglider_proxy::config_apply::reconcile_job_rules(&db, config);
             match db.lifecycle_reconcile_on_boot(config.lifecycle.max_failures_retained) {
                 Ok(count) if count > 0 => {
                     warn!("Reconciled {count} lifecycle run(s) left running by a previous process");

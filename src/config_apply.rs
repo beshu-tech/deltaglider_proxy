@@ -37,6 +37,32 @@ pub async fn build_engine(app: &AppState, cfg: &Config) -> Result<DynEngine, Str
         .with_reference_lock(app.reference_lock.clone()))
 }
 
+/// Drop the runtime rows (state, cursor, lease, run history, failures,
+/// parity) of every replication and lifecycle rule that `cfg` does not
+/// name. A rule removed or renamed in the YAML (an apply, IaC) kept its
+/// rows forever: only a rule delete through the admin API dropped them.
+/// Runs after every config apply and at boot. Never fails the caller: a
+/// failed purge leaves rows that the next apply or boot drops.
+pub fn reconcile_job_rules(db: &crate::config_db::ConfigDb, cfg: &Config) {
+    let replication: Vec<String> = cfg
+        .replication
+        .rules
+        .iter()
+        .map(|r| r.name.clone())
+        .collect();
+    let lifecycle: Vec<String> = cfg.lifecycle.rules.iter().map(|r| r.name.clone()).collect();
+    for (what, result) in [
+        ("replication", db.replication_reconcile_rules(&replication)),
+        ("lifecycle", db.lifecycle_reconcile_rules(&lifecycle)),
+    ] {
+        match result {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("dropped the runtime rows of {n} removed {what} rule(s)"),
+            Err(e) => tracing::warn!("could not drop the rows of removed {what} rules: {e}"),
+        }
+    }
+}
+
 /// Hot-swap an engine built by [`build_engine`] into `app.engine`.
 pub fn install_engine(app: &AppState, engine: DynEngine, context: &str) {
     app.engine.store(Arc::new(engine));
@@ -142,6 +168,13 @@ impl ConfigMutator {
                 e
             );
         }
+        if let Some(db) = &self.app.config_db {
+            // Not under the config write lock: a task that holds the DB
+            // mutex may wait for the config.
+            let live = cfg.clone();
+            drop(cfg);
+            reconcile_job_rules(&*db.lock().await, &live);
+        }
         Ok(())
     }
 
@@ -155,6 +188,59 @@ impl ConfigMutator {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// jobs-12: a rule removed from the YAML kept its rows (state, run
+    /// history, failures) forever: only a rule delete through the admin
+    /// API dropped them. An apply without the rule drops them.
+    #[tokio::test]
+    async fn an_apply_drops_the_rows_of_removed_rules() {
+        let data = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            "storage:\n  backends:\n  - name: local\n    type: filesystem\n    path: {}\n  default_backend: local\n  lifecycle:\n    rules:\n    - name: keep\n      bucket: b\n      expire_after: 30d\n    - name: old\n      bucket: b\n      expire_after: 30d\n",
+            data.path().display()
+        );
+        let cfg = Config::from_yaml_str(&yaml).unwrap();
+        assert_eq!(cfg.lifecycle.rules.len(), 2, "{:?}", cfg.lifecycle);
+        let db = crate::config_db::ConfigDb::in_memory("k").unwrap();
+        for rule in ["keep", "old"] {
+            db.lifecycle_ensure_state(rule, 1).unwrap();
+            let run = db.lifecycle_begin_run(rule, 1, "test").unwrap();
+            db.lifecycle_record_failure(
+                rule,
+                crate::lifecycle::state_store::LifecycleFailureInsert {
+                    run_id: Some(run),
+                    occurred_at: 1,
+                    bucket: "b",
+                    object_key: "k",
+                    error_message: "boom",
+                },
+                10,
+            )
+            .unwrap();
+        }
+        db.replication_ensure_state("gone-repl", 1).unwrap();
+        let engine = DynEngine::new(&cfg, None).await.unwrap();
+        let app = Arc::new(AppState {
+            config_db: Some(Arc::new(tokio::sync::Mutex::new(db))),
+            ..Arc::into_inner(AppState::for_tests(engine)).unwrap()
+        });
+        let mutator = ConfigMutator {
+            config: cfg.into_shared(),
+            app: app.clone(),
+            persist_path: data.path().join("c.yaml").display().to_string(),
+        };
+        mutator
+            .mutate_and_apply("test", |c| c.lifecycle.rules.retain(|r| r.name != "old"))
+            .await
+            .unwrap();
+        let db = app.config_db.as_ref().unwrap().lock().await;
+        assert!(db.lifecycle_load_state("old").unwrap().is_none());
+        assert!(db.lifecycle_recent_runs("old", 10).unwrap().is_empty());
+        assert!(db.lifecycle_recent_failures("old", 10).unwrap().is_empty());
+        assert!(db.lifecycle_load_state("keep").unwrap().is_some());
+        assert_eq!(db.lifecycle_recent_failures("keep", 10).unwrap().len(), 1);
+        assert!(db.replication_load_state("gone-repl").unwrap().is_none());
+    }
 
     fn app_with(engine: DynEngine) -> Arc<AppState> {
         AppState::for_tests(engine)
