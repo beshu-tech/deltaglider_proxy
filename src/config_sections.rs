@@ -2141,6 +2141,13 @@ pub fn validate_replication(cfg: &ReplicationConfig) -> Vec<String> {
             ));
             continue;
         }
+        if crate::replication::state_store::RESERVED_STATE_KEYS.contains(&rule.name.as_str()) {
+            warnings.push(format!(
+                "replication rule name '{}' is reserved for the proxy's own state — rename the rule",
+                rule.name
+            ));
+            continue;
+        }
         if !seen_names.insert(rule.name.clone()) {
             warnings.push(format!(
                 "replication rule name '{}' is duplicated — the first entry wins",
@@ -3139,6 +3146,21 @@ mod tests {
         };
         let warnings = validate_replication(&cfg);
         assert!(warnings.iter().any(|w| w.contains("below minimum")));
+    }
+
+    #[test]
+    fn replication_validation_flags_a_reserved_rule_name() {
+        let cfg = ReplicationConfig {
+            rules: vec![rule("__event_consumer__", ("a", ""), ("b", ""), "1h")],
+            ..Default::default()
+        };
+        let warnings = validate_replication(&cfg);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("'__event_consumer__' is reserved")),
+            "{warnings:?}"
+        );
     }
 
     #[test]

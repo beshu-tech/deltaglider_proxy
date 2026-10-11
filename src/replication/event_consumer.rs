@@ -57,10 +57,10 @@ use super::planner::{
 /// cursor (independent of the webhook dispatcher).
 pub const REPLICATION_LISTENER: &str = "replication";
 
-/// The sentinel "rule name" the consumer's single-flight lease is keyed under,
-/// so only one consumer drains+advances this node's cursor at a time (the
-/// outbox, cursor and this lease are all in the node's own database).
-const CONSUMER_LEASE_KEY: &str = "__event_consumer__";
+// The consumer's single-flight lease lives in this state row, so only one
+// consumer drains+advances this node's cursor at a time (the outbox, cursor
+// and this lease are all in the node's own database).
+use super::state_store::CONSUMER_LEASE_KEY;
 
 /// Max events drained per tick.
 const DRAIN_BATCH: u32 = 500;

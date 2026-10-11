@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed — A config apply no longer deletes the lease of the replication event consumer
+
+The replication event consumer keeps its lease in a `replication_state` row
+named `__event_consumer__`. Since v2.0.5, every config apply and every start
+deletes the rows of replication rules that the config no longer has (before
+that, only a rule delete did). That row is not a rule, so it was deleted each
+time. The consumer lost a lease that
+it held, and the log showed "dropped the runtime rows of 1 removed replication
+rule(s)" although no rule was removed. Now the row is kept, and a replication
+rule named `__event_consumer__` gets a warning, because it would share that row.
+
 ### Fixed — A bucket check sends one `HeadBucket` request, not two
 
 A bucket that has no `backend` in its bucket policy is looked up on the

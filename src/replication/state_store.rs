@@ -102,6 +102,14 @@ pub struct RunTotals {
     pub reconstructed: i64,
 }
 
+/// The state row under which the replication event consumer keeps its
+/// single-flight lease. It belongs to no rule.
+pub(crate) const CONSUMER_LEASE_KEY: &str = "__event_consumer__";
+
+/// State rows that belong to no rule: the orphan reconcile keeps them, and
+/// no rule may take their names.
+pub(crate) const RESERVED_STATE_KEYS: &[&str] = &[CONSUMER_LEASE_KEY];
+
 /// Rule-keyed tables besides `replication_state` that a rule delete purges.
 /// Must list every `replication_*` table with a `rule_name` column (test
 /// `reconcile_rules_purges_every_rule_keyed_table` checks the schema).
@@ -179,8 +187,11 @@ impl ConfigDb {
             .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
 
-        let known: std::collections::HashSet<&str> =
-            known_rule_names.iter().map(|s| s.as_str()).collect();
+        let known: std::collections::HashSet<&str> = known_rule_names
+            .iter()
+            .map(|s| s.as_str())
+            .chain(RESERVED_STATE_KEYS.iter().copied())
+            .collect();
         let mut removed = 0usize;
         // One transaction for all orphans' multi-table deletes: a crash mid-purge
         // must not leak the run_history/failures rows this is meant to clear.
@@ -1726,6 +1737,34 @@ mod tests {
             .unwrap();
         assert_eq!(removed, 1);
         assert!(db.replication_load_state("r3").unwrap().is_none());
+    }
+
+    /// The event consumer keeps its lease in a state row of its own name.
+    /// The reconcile after every config apply and at boot deleted it as an
+    /// orphan rule ("dropped the runtime rows of 1 removed replication
+    /// rule(s)" on prod, every time), and cut a lease that was held.
+    #[test]
+    fn reconcile_rules_keeps_the_event_consumer_lease() {
+        let db = db();
+        db.replication_ensure_state("r1", 100).unwrap();
+        db.replication_ensure_state("gone", 100).unwrap();
+        db.replication_ensure_state(CONSUMER_LEASE_KEY, 100)
+            .unwrap();
+        assert!(db
+            .replication_try_acquire_lease(CONSUMER_LEASE_KEY, "consumer-1", 100, 60)
+            .unwrap());
+        let removed = db.replication_reconcile_rules(&["r1".to_string()]).unwrap();
+        assert_eq!(removed, 1, "only the removed rule");
+        assert!(db.replication_load_state("gone").unwrap().is_none());
+        assert!(db
+            .replication_load_state(CONSUMER_LEASE_KEY)
+            .unwrap()
+            .is_some());
+        assert!(
+            !db.replication_try_acquire_lease(CONSUMER_LEASE_KEY, "consumer-2", 101, 60)
+                .unwrap(),
+            "the held lease survives the reconcile"
+        );
     }
 
     #[test]

@@ -58,7 +58,7 @@ storage:
         exclude_globs: [".deltaglider/**"]
 ```
 
-Rule-name grammar: `[A-Za-z0-9_.-]{1,64}`. The name is also the primary key in the `replication_state` DB table and the suffix of the job id (`replication:mirror-releases-to-dr`); see [Jobs](jobs.md) for the unified jobs API (run-now, pause/resume, runs, failures).
+Rule-name grammar: `[A-Za-z0-9_.-]{1,64}`. The name `__event_consumer__` is reserved: the event consumer keeps its lease in a `replication_state` row of that name. The name is also the primary key in the `replication_state` DB table and the suffix of the job id (`replication:mirror-releases-to-dr`); see [Jobs](jobs.md) for the unified jobs API (run-now, pause/resume, runs, failures).
 
 ## Conflict policies
 
@@ -99,6 +99,7 @@ Warnings (surfaced at startup; do not block config load):
 
 - Invalid rule name (regex violation, >64 chars).
 - Duplicate rule names (first wins).
+- The reserved rule name `__event_consumer__`.
 - Interval unparseable or below 30s.
 - `tick_interval` below 5s (scheduler anti-thrash).
 - `batch_size` outside `[1, 10_000]`.
