@@ -664,7 +664,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_RELAY_FOREIGN_MIN_AGE_SECS",
-        description: "Min age before startup removes another process's multipart relay dir (default: 3600)",
+        description: "Min age before startup removes the multipart relay dir of another process that is gone (default: 3600)",
         example: "3600",
         category: "Server",
     },

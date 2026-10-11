@@ -1353,7 +1353,9 @@ impl MultipartStore {
             cleanup_orphan_relay_entries_at(&self.relay_root_dir(), &active_relay_dirs, min_age);
 
         // Foreign per-process roots (crashed/finished proxies): reap only STALE
-        // leftovers — a young dir may belong to a live sibling process's upload.
+        // leftovers of a process that is gone. A root named by a LIVE pid is a
+        // sibling proxy's (its upload may run for hours), never ours to sweep;
+        // the age bound still guards a dead pid's root that is young.
         let foreign_min_age = std::time::Duration::from_secs(
             crate::config::env_parse_with_default("DGP_RELAY_FOREIGN_MIN_AGE_SECS", 3600),
         );
@@ -1365,7 +1367,7 @@ impl MultipartStore {
             .flat_map(|entries| entries.flatten())
         {
             let path = entry.path();
-            if path == mine || !path.is_dir() {
+            if path == mine || !path.is_dir() || relay_root_owner_is_alive(&path) {
                 continue;
             }
             let (fd, ff) = cleanup_orphan_relay_entries_at(
@@ -1595,6 +1597,35 @@ fn take_upload_for_cleanup(upload: &mut MultipartUpload) -> MultipartUpload {
 /// would destroy an active upload's parts. Only entries whose mtime is older than
 /// `min_age` are eligible, so a just-created dir is always spared. Startup passes
 /// `Duration::ZERO` (no concurrent uploads exist yet).
+/// Whether the per-process relay root `root` (named by its owner's pid)
+/// belongs to a process that is still running. `false` for a name that is
+/// not a pid (it is swept by age only, as before).
+fn relay_root_owner_is_alive(root: &Path) -> bool {
+    let Some(pid) = root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.parse::<i32>().ok())
+        .filter(|pid| *pid > 0)
+    else {
+        return false;
+    };
+    process_is_alive(pid)
+}
+
+/// Signal 0 checks that `pid` exists without touching it: `EPERM` means it
+/// exists under another user.
+#[cfg(unix)]
+fn process_is_alive(pid: i32) -> bool {
+    // SAFETY: kill with signal 0 sends nothing; it only checks the pid.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: i32) -> bool {
+    false
+}
+
 fn cleanup_orphan_relay_entries_at(
     relay_root: &Path,
     active_relay_dirs: &HashSet<PathBuf>,

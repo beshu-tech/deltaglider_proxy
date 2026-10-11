@@ -1083,7 +1083,7 @@ The server reads these variables when it starts, and again when an admin apply r
 | `DGP_METRICS_BEARER_TOKEN` | unset | When set, `/_/metrics` answers only to `Authorization: Bearer <token>` (the Prometheus `authorization:` scrape setting) or to an admin session. Unset keeps the scrape endpoint public. See [Monitor with Prometheus](../how-to/monitor-with-prometheus.md) |
 | `DGP_USAGE_CACHE_TTL_SECS` | 300 | Lifetime of a cached prefix-usage scan result, in seconds |
 | `DGP_REFERENCE_SCAN_LIMIT` | 1000 | Maximum number of reference baselines (`reference.bin`) that one savings figure of the file browser counts. The figure finds the baselines in its listing of the folder, so a baseline costs no extra request. A folder with more baselines shows a lower bound |
-| `DGP_RELAY_FOREIGN_MIN_AGE_SECS` | 3600 | Minimum age, in seconds, before startup removes a multipart relay directory that another process left behind. The relay directories are in `DGP_SPOOL_DIR`; startup also sweeps the relay directory of earlier releases in the system temp dir |
+| `DGP_RELAY_FOREIGN_MIN_AGE_SECS` | 3600 | Minimum age, in seconds, before startup removes a multipart relay directory that another process left behind. The proxy removes such a directory only when the process that made it is no longer running, so the uploads of another live proxy on the same host are never removed. The relay directories are in `DGP_SPOOL_DIR`; startup also sweeps the relay directory of earlier releases in the system temp dir |
 
 ### Delta engine variables
 

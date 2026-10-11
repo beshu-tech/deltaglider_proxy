@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed — A proxy no longer removes the multipart uploads of another proxy on the same host
+
+Each proxy keeps the parts of its multipart uploads in a relay folder named by
+its process id, and at startup it removed the relay folders of other processes
+that were older than `DGP_RELAY_FOREIGN_MIN_AGE_SECS` (1 hour). It did not check
+whether the other process was still running, so an upload that a sibling proxy
+had kept open for more than an hour lost its parts, and its
+`CompleteMultipartUpload` failed with `500`. Now a proxy removes such a folder
+only when the process that made it is gone.
+
 ### Fixed — Replication no longer copies the same object again on every run
 
 Since v2.0.5, the reconcile walk answers a pair from the parity cache when the

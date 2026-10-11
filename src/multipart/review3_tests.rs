@@ -70,3 +70,42 @@ fn no_per_upload_cap_leaves_only_the_global_budget() {
     let err = store.upload_part(&id, "b", "k", 2, mib(1)).unwrap_err();
     assert!(matches!(err, S3Error::SlowDown(_)), "{err:?}");
 }
+
+/// The relay root of another LIVE process is never swept, however old its
+/// entries are: a booting proxy (or the periodic sweep) removed the relay
+/// parts of a sibling proxy's upload that ran longer than
+/// `DGP_RELAY_FOREIGN_MIN_AGE_SECS`, and its CompleteMultipartUpload then
+/// failed with "No such file or directory". A dead process's root is still
+/// reaped once stale.
+#[test]
+fn a_live_processs_relay_root_is_never_swept() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool = SpoolDir::new(dir.path().join("spool"), 8 << 20).unwrap();
+    let store = MultipartStore::new(64 << 20).with_spool(spool.clone());
+    let parent = spool.dir().join(RELAY_ROOT_DIR);
+    let mut live = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+    let mut uploads = Vec::new();
+    for pid in [live.id(), 999_999_999] {
+        let upload = parent.join(pid.to_string()).join("upload-1");
+        std::fs::create_dir_all(&upload).unwrap();
+        std::fs::write(upload.join("part-00001.bin"), b"part").unwrap();
+        std::fs::File::open(&upload)
+            .unwrap()
+            .set_modified(two_hours_ago)
+            .unwrap();
+        uploads.push(upload);
+    }
+
+    store.sweep_orphan_relay_artifacts(std::time::Duration::ZERO);
+
+    let live_upload_kept = uploads[0].join("part-00001.bin").exists();
+    let dead_upload_kept = uploads[1].exists();
+    let _ = live.kill();
+    let _ = live.wait();
+    assert!(live_upload_kept, "a live process's relay part was swept");
+    assert!(!dead_upload_kept, "a dead process's stale relay dir stays");
+}
