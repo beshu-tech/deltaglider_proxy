@@ -1340,8 +1340,6 @@ async fn delta_passthrough_copy(
                     "{src_bucket}/{src_prefix2}/{src_filename2} was overwritten after HEAD"
                 )));
             }
-            // Bytes of a reference this copy SEEDED (0: the dest had one).
-            let mut seeded_ref_bytes = 0u64;
             if decision == DeltaPassthroughDecision::SeedThenShip {
                 // Seed the dest reference verbatim, asserting it matches
                 // src.ref_sha256 before writing (defense layer 2).
@@ -1356,10 +1354,11 @@ async fn delta_passthrough_copy(
                 // (encrypt) or leaves plaintext (passthrough); a surviving
                 // source marker would corrupt the reference read.
                 strip_encryption_markers(&mut ref_meta.user_metadata);
-                seeded_ref_bytes = ref_meta.file_size;
                 engine2
                     .put_reference_raw(&dest_bucket, &dest_prefix2, &ref_data, &ref_meta)
                     .await?;
+                // Counted at its write: a ship that fails below leaves it.
+                engine2.record_seeded_reference(&dest_bucket, ref_meta.file_size);
             }
             engine2
                 .put_delta_raw(
@@ -1372,8 +1371,8 @@ async fn delta_passthrough_copy(
                 .await?;
             // The fast path bypasses the engine's store, so it records its
             // commit itself, at the commit (before the next await): the
-            // delta, overwrite-aware, and a reference it seeded.
-            engine2.record_fast_path_copy(&dest_bucket, &counter_prior, &meta, seeded_ref_bytes);
+            // delta, overwrite-aware.
+            engine2.record_fast_path_copy(&dest_bucket, &counter_prior, &meta, 0);
             Ok(true)
         })
         .await;
@@ -3020,6 +3019,14 @@ mod request_count_tests {
     #[tokio::test]
     async fn a_seeded_reference_is_counted_when_the_ship_after_it_fails() {
         seeded_reference_counted_despite("GET", "src/p/b.zip.delta").await;
+    }
+
+    /// The same, with the failure after the seed: the PUT of the delta.
+    /// The seeded reference.bin stays at the destination, so the counter
+    /// records it as soon as its write returns.
+    #[tokio::test]
+    async fn a_seeded_reference_is_counted_when_the_delta_put_after_it_fails() {
+        seeded_reference_counted_despite("PUT", "dst/p/b.zip.delta").await;
     }
 
     /// Blast finding 6: the SDK already sends a throttled PUT three times;

@@ -116,6 +116,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.prior_for_counter(bucket, dest_key).await
     }
 
+    /// Counter update of a reference.bin that a fast-path copy seeded. Call
+    /// it right after the reference write returns, before the delta ships:
+    /// a ship that fails leaves the reference in place.
+    pub fn record_seeded_reference(&self, bucket: &str, bytes: u64) {
+        self.record_reference(bucket, bytes as i64);
+    }
+
     /// Counter update of a fast-path copy: overwrite-aware, plus any
     /// reference the copy seeded.
     pub fn record_fast_path_copy(
