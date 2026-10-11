@@ -124,7 +124,10 @@ key** stays disabled until a check finds no such object.
 For a user whose policy hides most keys, each page of the internal scan read
 the listing facts, and with `metadata=true` sent a HEAD request, for keys that
 the filter then dropped. The proxy now reads sizes and metadata only for the
-entries of the page that it returns.
+entries of the page that it returns. The scan limit
+`advanced.filtered_list_max_engine_pages` counted pages, but one page can send
+a second backend LIST request or a confirmation request; now it counts the
+backend requests themselves, so a limit of 50 sends about 50 requests.
 
 ### Fixed — Bulk copy and move run in batches, show their progress, can be cancelled, and run in parallel
 
@@ -190,6 +193,18 @@ through the facts queue, at most 32 at a time, instead of one background task
 per object, which could put about 200 PUT requests in flight against a slow
 backend. Legacy reference migration reads each reference once.
 
+A write of a new key no longer sends a DELETE request for the key's other
+stored form (`k.delta` after a plain write, `k` after a delta write) when the
+read before the write found no object; an overwrite still removes the stale
+form. A conditional PUT (`If-None-Match: *` or `If-Match`) sends 2 HEAD
+requests instead of 4, because the write uses what the precondition check
+read. PutObject, DeleteObject, and a GetObject or HeadObject request that does
+not find its key now use the cached bucket check too, so they send no
+HeadBucket request for a bucket that the proxy found in the last 5 seconds. A
+DeleteBucket request through the same instance clears that cache at once; a
+bucket deleted in another way can answer `NoSuchKey` or `204` until the 5
+seconds end.
+
 ### Fixed — The bucket size counter stays right when requests fail or are cut
 
 Before a write, the proxy reads the object that the write replaces, so that an
@@ -212,7 +227,8 @@ started. Data already in the bucket was missing from it, so a bucket could
 grow past its quota by all of that data. Now the counter counts for the quota
 only after a Refresh. Until then, the proxy also uses the size from its usage
 scanner and takes the larger number. An overwrite at the limit that adds no
-bytes is now accepted.
+bytes is now accepted, also when it comes from the bulk copy of the file
+browser, which judged each copied object as a new object.
 
 ### Fixed — The config database gives space back, and client writes no longer wait for it
 
@@ -251,10 +267,23 @@ capability probe's final `If-Match` write landed but its response was lost,
 the backend was marked unable to do conditional writes until restart; now the
 probe reads the key back and counts its own write. With `config_sync_bucket`
 set, a reference-lock request that never answered held a delta write until the
-300-second request timeout; now each lock request has a deadline. The
+300-second request timeout; now every request of the coordination client
+(config sync, leases, reference locks, capability probes) ends after
+`DGP_BACKEND_REQUEST_TIMEOUT_SECS` (a config database upload gets one more
+second per MiB), uses an SDK retry partition of its own, and an unanswered
+reference-lock request fails the write with a retryable `503`, not `500`. The
 bootstrap password is one session principal for every admin, so the 11th admin
 login logged another admin out; the cap is now 100, and each open-mode browser
 session counts on its own.
+
+### Fixed — A condition list with a wrong value no longer breaks a user's other grants
+
+When the proxy checked a condition at save time, it read a value list only up
+to the first value that matched. A condition such as `BoolIfExists` on
+`aws:SourceIp` with `["true", "10.0.0.0/8"]` passed the check, and then failed
+on every request that carries a source IP. That failure denied the user's
+other grants too. Now the proxy checks each value of the list and refuses such
+a condition when the rule is saved.
 
 ## v2.0.4 — 2026-10-10
 
