@@ -2975,3 +2975,74 @@ async fn test_replication_keeps_source_created_at() {
         "event-driven copy"
     );
 }
+
+/// A config apply through the admin API drops the runtime rows (run
+/// history, state, failures) of a rule that it removes. They stayed until
+/// the next boot, so a rule added again under the same name showed the old
+/// rule's runs.
+#[tokio::test]
+async fn an_admin_apply_drops_the_rows_of_a_removed_rule() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(
+            "
+replication:
+  enabled: true
+  rules:
+    - name: gone-rule
+      enabled: false
+      source: { bucket: gone-src, prefix: \"\" }
+      destination: { bucket: gone-dst, prefix: \"\" }
+      interval: \"1h\"
+",
+        )
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    for b in ["gone-src", "gone-dst"] {
+        client.create_bucket().bucket(b).send().await.ok();
+    }
+    let admin = admin_http_client(&server.endpoint()).await;
+    let run = fire_run_now(&admin, &server.endpoint(), "gone-rule").await;
+    assert_eq!(run["status"].as_str(), Some("succeeded"), "{run}");
+
+    let rule = serde_json::json!({
+        "name": "gone-rule",
+        "enabled": false,
+        "source": { "bucket": "gone-src", "prefix": "" },
+        "destination": { "bucket": "gone-dst", "prefix": "" },
+        "interval": "1h",
+    });
+    let section = format!("{}/_/api/admin/config/section/storage", server.endpoint());
+    for rules in [serde_json::json!([]), serde_json::json!([rule])] {
+        let r = admin
+            .put(&section)
+            .json(&serde_json::json!({ "replication": { "rules": rules } }))
+            .send()
+            .await
+            .unwrap();
+        let status = r.status();
+        assert!(
+            status.is_success(),
+            "{status}: {}",
+            r.text().await.unwrap_or_default()
+        );
+    }
+
+    let history: Value = admin
+        .get(format!(
+            "{}/_/api/admin/jobs/replication:gone-rule/runs",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        history["runs"].as_array().map(Vec::len),
+        Some(0),
+        "the removed rule's runs survived the apply: {history}"
+    );
+}
