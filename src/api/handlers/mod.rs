@@ -139,8 +139,8 @@ pub struct AppState {
 /// A bucket found is trusted for [`BUCKET_SEEN_TTL`] per engine, so a
 /// 1,000-part upload sends one HeadBucket, not 1,000. The users are the
 /// write paths (PutObject, form POST, UploadPart, the destination of a
-/// copy), DeleteObject(s), and the `NoSuchKey`-or-`NoSuchBucket` check of a
-/// read miss. DeleteBucket on this instance forgets the bucket
+/// copy), DeleteObject(s), the `NoSuchKey`-or-`NoSuchBucket` check of a
+/// read miss, and a LIST that finds nothing. DeleteBucket on this instance forgets the bucket
 /// ([`forget_bucket`]); a bucket deleted elsewhere can pass for up to
 /// [`BUCKET_SEEN_TTL`], and a write into it still fails at the backend
 /// (`require_bucket_exists` on the filesystem, `NoSuchBucket` on S3). A
@@ -150,13 +150,20 @@ pub(crate) async fn ensure_bucket_exists(
     state: &Arc<AppState>,
     bucket: &str,
 ) -> Result<(), S3Error> {
-    let engine = state.engine.load_full();
-    if bucket_seen(&engine, bucket) {
+    ensure_bucket_exists_on(&state.engine.load_full(), bucket).await
+}
+
+/// [`ensure_bucket_exists`] on one engine.
+pub(crate) async fn ensure_bucket_exists_on(
+    engine: &Arc<DynEngine>,
+    bucket: &str,
+) -> Result<(), S3Error> {
+    if bucket_seen(engine, bucket) {
         return Ok(());
     }
     match engine.head_bucket(bucket).await {
         Ok(true) => {
-            remember_bucket(&engine, bucket);
+            remember_bucket(engine, bucket);
             Ok(())
         }
         Ok(false) => Err(S3Error::NoSuchBucket(bucket.to_string())),

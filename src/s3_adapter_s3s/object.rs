@@ -984,6 +984,44 @@ mod bucket_check_cost_tests {
         assert_eq!(head_buckets(&fake), 1, "{:?}", fake.requests());
     }
 
+    /// A LIST that finds nothing checks the bucket (S3 answers NoSuchBucket
+    /// there), through the same cache: the file browser lists a folder again
+    /// after it deletes it, and on prod that HeadBucket was the one in ~30
+    /// that took 7-10 s.
+    #[tokio::test]
+    async fn an_empty_list_uses_the_cached_bucket_check() {
+        let (engine, fake) = crate::deltaglider::s3_engine().await;
+        let svc = service(AppState::for_tests(engine));
+        fake.clear();
+        put_object(&svc, request(put("a/1.jpg"))).await.unwrap();
+        for _ in 0..2 {
+            let input = s3s::dto::ListObjectsV2Input::builder()
+                .bucket("b".into())
+                .prefix(Some("none/".into()))
+                .build()
+                .unwrap();
+            let out = crate::s3_adapter_s3s::list::list_objects_v2(&svc, request(input))
+                .await
+                .unwrap();
+            assert!(out.output.contents.unwrap_or_default().is_empty());
+        }
+        assert_eq!(head_buckets(&fake), 1, "{:?}", fake.requests());
+    }
+
+    /// The LIST path checks a bucket through the cached check
+    /// (`crate::api::handlers::ensure_bucket_exists_on`), never with a
+    /// HeadBucket of its own.
+    #[test]
+    fn lists_check_buckets_through_the_cache() {
+        let text = std::fs::read_to_string("src/s3_adapter_s3s/list.rs").unwrap();
+        let sites: Vec<usize> = crate::source_scan::prod_lines(&text)
+            .into_iter()
+            .filter(|(_, l)| l.contains("ensure_bucket_on(") || l.contains(".head_bucket("))
+            .map(|(n, _)| n)
+            .collect();
+        assert!(sites.is_empty(), "list.rs lines {sites:?}");
+    }
+
     /// The object verbs check a bucket through the cached check
     /// (`crate::api::handlers::ensure_bucket_exists`), never with a
     /// HeadBucket of their own.

@@ -320,7 +320,7 @@ pub(super) fn client_max_keys(max_keys: Option<i32>) -> u32 {
 /// (s3surface-5).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn client_list_page(
-    engine: &crate::deltaglider::DynEngine,
+    engine: &std::sync::Arc<crate::deltaglider::DynEngine>,
     bucket: &str,
     prefix: &str,
     delimiter: Option<&str>,
@@ -331,7 +331,7 @@ pub(super) async fn client_list_page(
     budget: usize,
 ) -> s3s::S3Result<crate::deltaglider::ListObjectsPage> {
     if max_keys == 0 {
-        ensure_bucket_on(engine, bucket).await?;
+        ensure_listed_bucket(engine, bucket).await?;
         return Ok(crate::deltaglider::ListObjectsPage {
             objects: Vec::new(),
             common_prefixes: Vec::new(),
@@ -341,7 +341,7 @@ pub(super) async fn client_list_page(
         });
     }
     let page = crate::iam::listing::list_page_for_caller(
-        engine, bucket, prefix, delimiter, max_keys, cursor, metadata, scope, budget,
+        &**engine, bucket, prefix, delimiter, max_keys, cursor, metadata, scope, budget,
     )
     .await
     .map_err(|e| match e {
@@ -352,9 +352,21 @@ pub(super) async fn client_list_page(
         crate::iam::listing::ListingError::Engine(e) => s3s::S3Error::from(e),
     })?;
     if page.objects.is_empty() && page.common_prefixes.is_empty() {
-        ensure_bucket_on(engine, bucket).await?;
+        ensure_listed_bucket(engine, bucket).await?;
     }
     Ok(page)
+}
+
+/// The bucket check of a LIST that finds nothing: the write paths' cached
+/// one. The file browser lists a folder again after it deletes it, so a
+/// HeadBucket on every empty list came at the end of every folder delete.
+async fn ensure_listed_bucket(
+    engine: &std::sync::Arc<crate::deltaglider::DynEngine>,
+    bucket: &str,
+) -> s3s::S3Result<()> {
+    crate::api::handlers::ensure_bucket_exists_on(engine, bucket)
+        .await
+        .map_err(s3s::S3Error::from)
 }
 
 /// The `metadata=true` LIST map: the HEAD map (`response_metadata_map`) under

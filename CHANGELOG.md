@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed — A list that finds nothing no longer sends a `HeadBucket` request every time
+
+S3 answers a list of a missing bucket with `NoSuchBucket`, so when a
+`ListObjects` request finds no keys, the proxy checks that the bucket exists.
+This check sent a `HeadBucket` request every time, and did not use the 5-second
+memory of the write paths. The file browser lists a folder again after it
+deletes the folder's files, so this request came at the end of every folder
+delete. On production, about 1 `HeadBucket` request in 30 to Hetzner Object
+Storage takes 7 to 10 seconds. Now an empty list uses the same 5-second memory.
+
 ## v2.0.7 — 2026-10-11
 
 ### Fixed — A config apply no longer deletes the lease of the replication event consumer
