@@ -24,7 +24,7 @@ Status legend:
 
 ### A request to a missing bucket
 
-Every object and list request to a bucket that does not exist gets `404 NoSuchBucket`, as on S3. This includes a `ListObjects` request (it does not get an empty `200`), a `GetObject` or `HeadObject` request (it does not get `NoSuchKey`), and a `DeleteObject` request (it does not get `204`). The proxy checks the bucket only after the object is not found, so a request that finds its object costs no extra backend request.
+Every object and list request to a bucket that does not exist gets `404 NoSuchBucket`, as on S3. This includes a `ListObjects` request (it does not get an empty `200`), a `GetObject` or `HeadObject` request (it does not get `NoSuchKey`), and a `DeleteObject` request (it does not get `204`). The proxy checks the bucket only after the object is not found, so a request that finds its object costs no extra backend request. When the proxy finds that a bucket exists, it remembers this for 5 seconds, so in that time a `PutObject` request, or a request that does not find its object, sends no `HeadBucket` request. Because of this, a bucket that is deleted within those 5 seconds can still answer `NoSuchKey` to a `GetObject` or `HeadObject` request, and `204` to a `DeleteObject` request, until the 5 seconds end. A `PutObject` request into such a bucket still fails, because the backend refuses the write.
 
 ### Maximum key length
 
