@@ -104,6 +104,18 @@ pub struct RoutingBackend {
     missed: parking_lot::Mutex<HashMap<String, std::time::Instant>>,
 }
 
+/// What a bucket resolution's own HeadBuckets learned about the bucket on
+/// the backend it chose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Probed {
+    /// A route or a cached answer chose the backend, or its probe failed.
+    No,
+    /// The chosen backend answered just now that it has the bucket.
+    Found,
+    /// Every backend answered just now that it does not have the bucket.
+    Absent,
+}
+
 /// How long a found unrouted bucket stays resolved without a new probe.
 const RESOLVE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -492,23 +504,34 @@ impl RoutingBackend {
         &'a self,
         virtual_bucket: &'a str,
     ) -> (String, &'a DynStorageBackend<'a>, Cow<'a, str>) {
+        let (name, backend, real, _) = self.resolve_existing_probed(virtual_bucket).await;
+        (name, backend, real)
+    }
+
+    /// [`Self::resolve_existing_named`], plus what its own HeadBuckets
+    /// learned, so `head_bucket` does not ask the chosen backend again.
+    async fn resolve_existing_probed<'a>(
+        &'a self,
+        virtual_bucket: &'a str,
+    ) -> (String, &'a DynStorageBackend<'a>, Cow<'a, str>, Probed) {
         if let Some(route) = self.routes.get(virtual_bucket) {
             let backend = self.backends[&route.backend_name].as_ref().as_ref();
             let real = match &route.real_bucket {
                 Some(alias) => Cow::Borrowed(alias.as_str()),
                 None => Cow::Borrowed(virtual_bucket),
             };
-            return (route.backend_name.clone(), backend, real);
+            return (route.backend_name.clone(), backend, real, Probed::No);
         }
         if let Some(name) = self.cached_resolution(virtual_bucket) {
             let backend = self.backends[&name].as_ref().as_ref();
-            return (name, backend, Cow::Borrowed(virtual_bucket));
+            return (name, backend, Cow::Borrowed(virtual_bucket), Probed::No);
         }
         if self.cached_miss(virtual_bucket) {
             return (
                 self.default_backend.clone(),
                 self.default_backend(),
                 Cow::Borrowed(virtual_bucket),
+                Probed::No,
             );
         }
         // A head_bucket ERROR (503/timeout) is NOT "bucket absent" — same
@@ -534,6 +557,7 @@ impl RoutingBackend {
                     self.default_backend.clone(),
                     default,
                     Cow::Borrowed(virtual_bucket),
+                    Probed::Found,
                 );
             }
             Err(e) => {
@@ -547,7 +571,7 @@ impl RoutingBackend {
                     let backend = self.backends[&name].as_ref().as_ref();
                     if matches!(backend.head_bucket(virtual_bucket).await, Ok(true)) {
                         self.remember_resolution(virtual_bucket, &name);
-                        return (name, backend, Cow::Borrowed(virtual_bucket));
+                        return (name, backend, Cow::Borrowed(virtual_bucket), Probed::Found);
                     }
                 }
                 warn!(
@@ -558,6 +582,7 @@ impl RoutingBackend {
                     self.default_backend.clone(),
                     default,
                     Cow::Borrowed(virtual_bucket),
+                    Probed::No,
                 );
             }
             Ok(false) => {}
@@ -577,14 +602,24 @@ impl RoutingBackend {
             match backend.head_bucket(virtual_bucket).await {
                 Ok(true) => {
                     self.remember_resolution(virtual_bucket, name);
-                    return (name.clone(), backend, Cow::Borrowed(virtual_bucket));
+                    return (
+                        name.clone(),
+                        backend,
+                        Cow::Borrowed(virtual_bucket),
+                        Probed::Found,
+                    );
                 }
                 Err(e) => {
                     warn!(
                         "resolve_existing_named: backend '{name}' head_bucket({virtual_bucket}) \
                          failed transiently ({e}); routing here rather than mis-routing to default"
                     );
-                    return (name.clone(), backend, Cow::Borrowed(virtual_bucket));
+                    return (
+                        name.clone(),
+                        backend,
+                        Cow::Borrowed(virtual_bucket),
+                        Probed::No,
+                    );
                 }
                 Ok(false) => {}
             }
@@ -595,6 +630,7 @@ impl RoutingBackend {
             self.default_backend.clone(),
             default,
             Cow::Borrowed(virtual_bucket),
+            Probed::Absent,
         )
     }
 
@@ -833,14 +869,20 @@ impl StorageBackend for RoutingBackend {
     }
 
     async fn head_bucket(&self, bucket: &str) -> Result<bool, StorageError> {
-        let (name, backend, real_bucket) = self.resolve_existing_named(bucket).await;
+        let (name, backend, real_bucket, probed) = self.resolve_existing_probed(bucket).await;
         // Unrouted, and resolved to storage an alias owns (the fallback to
         // the default backend): the alias's storage is not reachable under
         // its real name. Every S3 op checks head_bucket first.
         if !self.routes.contains_key(bucket) && self.alias_owns_real_bucket(&name, &real_bucket) {
             return Ok(false);
         }
-        backend.head_bucket(&real_bucket).await
+        // The resolution's own HeadBucket answered just now: a second one to
+        // the same backend only doubles the exposure to a slow backend.
+        match probed {
+            Probed::Found => Ok(true),
+            Probed::Absent => Ok(false),
+            Probed::No => backend.head_bucket(&real_bucket).await,
+        }
     }
 
     // === Reference file operations ===
@@ -1983,6 +2025,53 @@ mod tests {
             std::time::Instant::now() - MISS_TTL - std::time::Duration::from_secs(1);
         routing.resolve_existing_named("shared").await;
         assert!(heads() > before, "an old miss is probed again");
+    }
+
+    /// An unrouted bucket with no fresh resolution cost two HeadBuckets per
+    /// head_bucket: the resolution's own probe, then the same question to the
+    /// backend it found. On prod (Hetzner) one HeadBucket in about 30 stalls
+    /// for 7-10 s, and a write path checks its bucket after every 30 s idle.
+    /// The answer of the resolution's probe is the answer now.
+    #[tokio::test]
+    async fn head_bucket_asks_each_backend_once() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let primary = TestBackend::with_buckets(&["on-default"]);
+        let archive = TestBackend::with_buckets(&["shared"]);
+        let mut backends = HashMap::new();
+        backends.insert(
+            "primary".to_string(),
+            Arc::new(DynStorageBackend::new_box(primary.clone())),
+        );
+        backends.insert(
+            "archive".to_string(),
+            Arc::new(DynStorageBackend::new_box(archive.clone())),
+        );
+        let routing = RoutingBackend::new(backends, HashMap::new(), "primary".to_string())
+            .expect("routing backend");
+        let heads = || {
+            (
+                primary.head_calls.load(SeqCst),
+                archive.head_calls.load(SeqCst),
+            )
+        };
+
+        assert!(routing.head_bucket("on-default").await.unwrap());
+        assert_eq!(heads(), (1, 0), "found on the default by the resolution");
+        assert!(routing.head_bucket("shared").await.unwrap());
+        assert_eq!(heads(), (2, 1), "absent on the default, found on archive");
+        assert!(!routing.head_bucket("ghost").await.unwrap());
+        assert_eq!(heads(), (3, 2), "absent everywhere");
+
+        // A cached resolution proves nothing about now: ask the backend.
+        assert!(routing.head_bucket("on-default").await.unwrap());
+        assert_eq!(heads(), (4, 2));
+        primary.buckets.lock().unwrap().remove("on-default");
+        assert!(!routing.head_bucket("on-default").await.unwrap());
+        assert_eq!(heads(), (5, 2));
+        // So does a cached miss: a bucket created a moment later is found.
+        primary.buckets.lock().unwrap().insert("ghost".to_string());
+        assert!(routing.head_bucket("ghost").await.unwrap());
+        assert_eq!(heads(), (6, 2));
     }
 
     /// Regression: a transient head_bucket error on the bucket's real home must

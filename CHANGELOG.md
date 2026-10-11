@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Fixed — A bucket check sends one `HeadBucket` request, not two
+
+A bucket that has no `backend` in its bucket policy is looked up on the
+backends with a `HeadBucket` request, and the proxy remembers the answer for 30
+seconds. When that answer was older, a check of the bucket (which every write
+makes) sent one `HeadBucket` request to find the backend, and then a second one
+to the same backend to ask the same question. Now the check uses the answer of
+the first request. On a backend where some `HeadBucket` requests take seconds,
+an upload after a quiet period waited for two of them. On production, about 1
+`HeadBucket` request in 30 to Hetzner Object Storage took 7 to 10 seconds, and
+one upload spent 16 seconds in two of them.
+
 ## v2.0.6 — 2026-10-11
 
 ### Fixed — A proxy no longer removes the multipart uploads of another proxy on the same host
