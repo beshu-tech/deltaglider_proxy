@@ -1736,10 +1736,7 @@ mod source_guards {
         // A request that names one key: S3 DeleteObject, and the CLI's
         // `rm s3://b/k` without `-r`.
         const SINGLE_KEY: &[&str] = &["src/s3_adapter_s3s/object.rs", "src/cli/rm.rs"];
-        // wave 2: move to delete_batch (each agent removes its entries).
-        const WAVE_2: &[&str] = &[
-        ];
-        let allowed: Vec<&str> = SINGLE_KEY.iter().chain(WAVE_2).copied().collect();
+        let allowed: Vec<&str> = SINGLE_KEY.to_vec();
         let (files, offenders) = per_key_engine_deletes(&allowed);
         assert!(
             offenders.is_empty(),
