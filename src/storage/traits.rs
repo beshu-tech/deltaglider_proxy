@@ -1167,6 +1167,10 @@ pub struct DelegatedListResult {
     pub common_prefixes: Vec<String>,
     pub is_truncated: bool,
     pub next_continuation_token: Option<String>,
+    /// The requests this call sent to the backend: its LIST pages and its
+    /// probes. A backend that sends none (the filesystem) reports 0. The
+    /// scan budget of a filtered LIST counts them.
+    pub upstream_requests: u32,
 }
 
 /// Result of [`StorageBackend::bulk_list_objects_with_baselines`].

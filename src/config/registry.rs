@@ -93,7 +93,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_FILTERED_LIST_MAX_ENGINE_PAGES",
-        description: "Backend pages one filtered LIST may scan for a visible key before it fails with InvalidRequest (default: 50)",
+        description: "Backend requests one filtered LIST may send to find a visible key before it fails with InvalidRequest (default: 50)",
         example: "50",
         category: "Delta Engine",
     },

@@ -31,7 +31,9 @@ pub(crate) trait Lister: Sync {
 
     /// One page as the storage lists it, before [`Self::finish`]: the scan
     /// of a filtered LIST reads hidden keys that need no logical size and no
-    /// HEAD. The default is a complete page without metadata.
+    /// HEAD. Also returns the requests the page sent to the backend, which
+    /// the scan budget counts. The default is a complete page without
+    /// metadata, counted as one request.
     fn list_lite(
         &self,
         bucket: &str,
@@ -39,8 +41,13 @@ pub(crate) trait Lister: Sync {
         delimiter: Option<&str>,
         max_keys: u32,
         cursor: Option<&str>,
-    ) -> impl Future<Output = Result<ListObjectsPage, EngineError>> + Send {
-        self.list(bucket, prefix, delimiter, max_keys, cursor, false)
+    ) -> impl Future<Output = Result<(ListObjectsPage, u32), EngineError>> + Send {
+        async move {
+            let page = self
+                .list(bucket, prefix, delimiter, max_keys, cursor, false)
+                .await?;
+            Ok((page, 1))
+        }
     }
 
     /// Complete the page a filtered LIST returns, built from
@@ -80,8 +87,8 @@ impl<S: crate::storage::StorageBackend> Lister for crate::deltaglider::DeltaGlid
         delimiter: Option<&str>,
         max_keys: u32,
         cursor: Option<&str>,
-    ) -> Result<ListObjectsPage, EngineError> {
-        self.list_objects_lite(bucket, prefix, delimiter, max_keys, cursor)
+    ) -> Result<(ListObjectsPage, u32), EngineError> {
+        self.list_objects_lite_counted(bucket, prefix, delimiter, max_keys, cursor)
             .await
     }
 
@@ -182,9 +189,12 @@ fn list_targets(prefix: &str, delimiter: Option<&str>, visible: &[String]) -> Ve
 /// (`list_targets`), so hidden keys outside them cost nothing and every
 /// visible key stays reachable. Only a policy that cannot be narrowed to
 /// prefixes (a bucket-wide Allow with Deny carve-outs) scans hidden keys,
-/// under `budget` engine pages (`advanced.filtered_list_max_engine_pages`):
-/// a prefix-scoped user can ask for a prefix where every key is hidden, and
-/// the scan must end. The scan reads lite pages ([`Lister::list_lite`]):
+/// under a budget of `budget` backend requests
+/// (`advanced.filtered_list_max_engine_pages`): a prefix-scoped user can
+/// ask for a prefix where every key is hidden, and the scan must end. Each
+/// engine page spends the requests it sent ([`scan_cost`]), so a page that
+/// needs a second backend page or a probe costs more than one. The scan
+/// reads lite pages ([`Lister::list_lite`]):
 /// an engine page of the scan costs its LIST requests only, never a
 /// listing-facts request or a HEAD for a key the filter then drops. The
 /// logical sizes, and with `metadata` the HEADs, are read once, for the
@@ -219,7 +229,8 @@ pub(crate) async fn list_page_for_caller<L: Lister>(
 /// Every visible key under `prefix` (no delimiter), at most `max_keys`, and
 /// whether a visible key past them exists (review D7: the admin folder
 /// listing walked a whole prefix of hidden keys with no budget). For a
-/// filtered caller the walk reads at most `budget` engine pages IN ALL; a
+/// filtered caller the walk spends at most `budget` backend requests IN
+/// ALL (see [`list_page_for_caller`]); a
 /// walk that spends it before the end is `NoVisibleKeyInBudget`, because a
 /// partial folder must never be acted on. An unrestricted caller is bounded
 /// by `max_keys`.
@@ -270,7 +281,16 @@ pub(crate) fn push_listed_key(keys: &mut Vec<String>, key: String, max: usize) -
     false
 }
 
-/// [`list_page_for_caller`] spending a caller-owned engine-page budget, so a
+/// Pure: what one engine page of the scan spends of its budget: the
+/// requests it sent to the backend, at least one. A backend that sends no
+/// request (the filesystem) still spends one per page, so the scan ends.
+/// The page that spends the last of the budget can go past it by its own
+/// extra requests (a second backend page, the probes), never by a page.
+fn scan_cost(requests: u32) -> usize {
+    (requests as usize).max(1)
+}
+
+/// [`list_page_for_caller`] spending a caller-owned request budget, so a
 /// multi-page walk shares one budget.
 #[allow(clippy::too_many_arguments)]
 async fn list_page_within<L: Lister>(
@@ -311,7 +331,7 @@ async fn list_page_within<L: Lister>(
     let mut prefixes = std::collections::BTreeSet::new();
     let mut facts_missing = std::collections::HashSet::new();
     let mut more = false;
-    // ONE engine-page budget for the whole request, shared by every target
+    // ONE request budget for the whole request, shared by every target
     // (scans and roll-up probes): per target, N visible prefixes read N
     // budgets for one LIST.
     for target in targets {
@@ -339,8 +359,9 @@ async fn list_page_within<L: Lister>(
                         more = true;
                         break;
                     }
-                    *budget -= 1;
-                    let page = lister.list_lite(bucket, &probe, delimiter, 1, None).await?;
+                    let (page, requests) =
+                        lister.list_lite(bucket, &probe, delimiter, 1, None).await?;
+                    *budget = budget.saturating_sub(scan_cost(requests));
                     if !page.objects.is_empty() || !page.common_prefixes.is_empty() {
                         prefixes.insert(common_prefix);
                         break;
@@ -351,9 +372,8 @@ async fn list_page_within<L: Lister>(
                 let need = want - objects.len() - prefixes.len();
                 let mut scan_cursor = cursor.map(str::to_string);
                 while *budget > 0 {
-                    *budget -= 1;
                     // Lite: no listing facts and no HEAD for the hidden keys.
-                    let page = lister
+                    let (page, requests) = lister
                         .list_lite(
                             bucket,
                             &scan_prefix,
@@ -362,6 +382,7 @@ async fn list_page_within<L: Lister>(
                             scan_cursor.as_deref(),
                         )
                         .await?;
+                    *budget = budget.saturating_sub(scan_cost(requests));
                     facts_missing.extend(page.facts_missing_keys);
                     objects.extend(
                         page.objects
@@ -1024,6 +1045,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((keys.len(), truncated), (4, true));
+    }
+
+    /// The scan budget counts the backend requests of the scan, not its
+    /// engine pages: a page that costs a LIST and a probe (for a `.delta`
+    /// form that sorts after the page) spends two. A budget of 4 engine
+    /// pages sent 5 requests.
+    #[tokio::test]
+    async fn the_scan_budget_counts_backend_requests() {
+        use crate::usage_scanner::test_support::{fake_s3_engine, put_raw_many, scope_lists};
+        let (engine, fake, endpoint) = fake_s3_engine().await;
+        // Hidden keys whose first page probes for `h/a.delta`.
+        put_raw_many(&endpoint, (0..300).map(|i| format!("h/a-{i:04}"))).await;
+        put_raw_many(&endpoint, ["v/x".to_string()]).await;
+        let scope = scoped(vec![rule("Allow", &["b/*"]), rule("Deny", &["b/h/*"])]);
+        fake.clear();
+        let budget = 4;
+        let err =
+            list_page_for_caller(&engine, "b", "", None, 1, None, false, Some(&scope), budget)
+                .await
+                .unwrap_err();
+        assert!(matches!(err, ListingError::NoVisibleKeyInBudget), "{err:?}");
+        let lists = scope_lists(&fake);
+        eprintln!(
+            "a budget of {budget}: {} backend LISTs: {lists:?}",
+            lists.len()
+        );
+        assert!(
+            lists.len() <= budget,
+            "a budget of {budget} sent {} backend LISTs: {lists:?}",
+            lists.len()
+        );
     }
 
     /// Cockroach scan (engine.md "filtered-LIST budget"): the scan loop

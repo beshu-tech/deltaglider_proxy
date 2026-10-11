@@ -190,6 +190,23 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         max_keys_raw: u32,
         continuation_token: Option<&str>,
     ) -> Result<ListObjectsPage, EngineError> {
+        Ok(self
+            .list_objects_lite_counted(bucket, prefix, delimiter, max_keys_raw, continuation_token)
+            .await?
+            .0)
+    }
+
+    /// [`Self::list_objects_lite`], and the requests that the page sent to
+    /// the backend (`DelegatedListResult::upstream_requests`; 0 from a
+    /// backend that sends none, and from the in-memory paging fallback).
+    pub(crate) async fn list_objects_lite_counted(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        max_keys_raw: u32,
+        continuation_token: Option<&str>,
+    ) -> Result<(ListObjectsPage, u32), EngineError> {
         // S3 requires max-keys >= 1; clamp to prevent pagination invariant violations.
         let max_keys = max_keys_raw.max(1);
         // `delimiter=` (mc, rclone, restic send it) is no delimiter, as on
@@ -208,18 +225,21 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .list_objects_delegated(bucket, prefix, delimiter, max_keys, continuation_token)
             .await?
         {
-            ListObjectsPage {
+            let page = ListObjectsPage {
                 objects: result.objects,
                 common_prefixes: result.common_prefixes,
                 is_truncated: result.is_truncated,
                 next_continuation_token: result.next_continuation_token,
                 facts_missing_keys: Vec::new(),
-            }
+            };
+            (page, result.upstream_requests)
         } else {
             // Backend doesn't support delegated listing for this shape — fall
             // through to the generic bulk_list + in-memory paging path.
-            self.list_objects_bulk(bucket, prefix, delimiter, max_keys, continuation_token)
-                .await?
+            let page = self
+                .list_objects_bulk(bucket, prefix, delimiter, max_keys, continuation_token)
+                .await?;
+            (page, 0)
         };
         Ok(page)
     }

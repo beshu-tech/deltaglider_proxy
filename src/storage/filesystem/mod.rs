@@ -808,6 +808,7 @@ impl FilesystemBackend {
             common_prefixes: Vec::new(),
             is_truncated: false,
             next_continuation_token: None,
+            upstream_requests: 0,
         };
         // As `bulk_list_objects_with_baselines`: walk the deepest directory
         // the prefix names completely, keep the keys that start with it.
@@ -892,6 +893,7 @@ impl FilesystemBackend {
             common_prefixes: Vec::new(),
             is_truncated,
             next_continuation_token,
+            upstream_requests: 0,
         })
     }
 
@@ -1898,6 +1900,7 @@ impl StorageBackend for FilesystemBackend {
                 common_prefixes: Vec::new(),
                 is_truncated: false,
                 next_continuation_token: None,
+                upstream_requests: 0,
             }));
         }
 
@@ -2028,6 +2031,7 @@ impl StorageBackend for FilesystemBackend {
             common_prefixes: page.common_prefixes,
             is_truncated: page.is_truncated,
             next_continuation_token: page.next_continuation_token,
+            upstream_requests: 0,
         }))
     }
 }

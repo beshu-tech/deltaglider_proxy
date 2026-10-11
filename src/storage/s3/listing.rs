@@ -658,6 +658,8 @@ impl S3Backend {
         let mut settled_anchor: Option<String> = None;
         let mut short = false;
         let mut skip_to: Option<&'static str> = None;
+        // Every request this call sends: its pages and its probes.
+        let mut upstream_requests = 0u32;
         let upstream_max_keys = max_keys
             .saturating_add(1 + UPSTREAM_SLACK)
             .min(UPSTREAM_MAX_KEYS);
@@ -685,6 +687,7 @@ impl S3Backend {
                 request = request.continuation_token(token);
             }
 
+            upstream_requests += 1;
             let response = request
                 .send()
                 .await
@@ -771,6 +774,7 @@ impl S3Backend {
                     .into_iter()
                     .filter(|c| c.strip_suffix(".delta").unwrap_or(c) > token)
                     .collect();
+            upstream_requests += candidates.len() as u32;
             // Probes are independent; run them concurrently (bounded, same
             // doctrine as `bounded_head_calls` — never blast the backend).
             // A probe error fails the listing closed, deliberately: silently
@@ -864,6 +868,7 @@ impl S3Backend {
             common_prefixes: page.common_prefixes,
             is_truncated: page.is_truncated,
             next_continuation_token: page.next_continuation_token,
+            upstream_requests,
         })
     }
 }
@@ -970,6 +975,32 @@ mod delegated_cost_tests {
             per_page.iter().all(|n| *n <= 2),
             "upstream LISTs per client page: {per_page:?}"
         );
+    }
+
+    /// A page reports the requests it sent (its pages and its probes), so
+    /// the scan budget of a filtered LIST can count them.
+    #[tokio::test]
+    async fn a_page_reports_the_requests_it_sent() {
+        // `d/a.delta` sorts after every `d/a-…` key: the first page probes it.
+        let mut keys: Vec<String> = (0..300).map(|i| format!("d/a-{i:04}")).collect();
+        keys.extend((0..3000).map(|i| format!("d/img-{i:05}.jpg")));
+        let (s3, fake) = backend_with_keys(&keys).await;
+        let mut token: Option<String> = None;
+        let mut reported = Vec::new();
+        let mut sent = Vec::new();
+        for max_keys in [2, 1000, 1000, 1000, 1000] {
+            let before = lists(&fake);
+            let page = s3
+                .list_objects_delegated("b", "d/", None, max_keys, token.as_deref())
+                .await
+                .unwrap()
+                .unwrap();
+            reported.push(page.upstream_requests as usize);
+            sent.push(lists(&fake) - before);
+            token = page.next_continuation_token;
+        }
+        assert_eq!(reported, sent);
+        assert_eq!(sent[0], 2, "the first page probes `d/a.delta`");
     }
 
     /// A page of a few keys is served from one upstream LIST.
