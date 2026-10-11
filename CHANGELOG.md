@@ -2,6 +2,260 @@
 
 ## Unreleased
 
+### Fixed — A delete lists one level of its folder, and stops at the first object
+
+After each delete, the proxy checks whether the folder still holds an object
+besides its delta reference (`reference.bin`), so that it can delete the
+reference too. On S3 this check listed every object under the folder,
+sub-folders included, and read every page before it decided; for a key at the
+root of a bucket it listed the whole bucket. Now the check lists only the
+folder's own level and stops at the first object, so it costs one small
+listing request in the common case. A delete also no longer sends a DELETE
+request for the other stored form of the key (`key` or `key.delta`) when its
+HEAD request did not find it.
+
+### Fixed — DeleteObjects finishes when the client disconnects, and records each deleted key
+
+DeleteObjects deleted its keys one after another inside the request and stored
+the deletion events only after the last key. A client disconnect or the
+300-second request timeout cut it part-way: the deleted keys had no event, so
+replication and webhooks never saw them, and the folder kept a `reference.bin`
+that no request could remove. Now the proxy runs the batch in its own task,
+records each key's event as soon as it is deleted, and works on 8 folders at a
+time with one DELETE request per key. A delete that finds a key already gone
+also removes a `reference.bin` that is left alone in that key's folder.
+
+### Fixed — A slow backend stays open; only an unreachable or hung backend is closed
+
+The health probe sent `ListBuckets` with a 5-second deadline, on a new
+connection each time. A provider with slow listings, such as Hetzner, failed
+the probe, and every bucket on it answered `503` although its requests still
+worked. Now the probe sends `HeadBucket` on a bucket routed to the backend
+(`ListBuckets` when none is), waits as long as a data request
+(`DGP_BACKEND_REQUEST_TIMEOUT_SECS`), and keeps one connection per backend.
+Only three results close the buckets: the probe cannot connect, the backend
+refuses the credentials, or the backend gives no answer within the deadline on
+two attempts in a row (it hangs). A periodic probe round also no longer
+overwrites a newer verdict, or the verdict of a changed backend definition,
+with its own older one.
+
+### Fixed — One slow backend can no longer starve the other backends
+
+All buckets shared one cap of 1024 request slots, and the wait for a slot had
+no deadline, so requests to a slow backend stalled every other backend and the
+admin UI. The spool budget for large reads and writes was shared in the same
+way. Now, with more than one backend, the requests to one backend hold at most
+75 % of the slots and of the spool budget (`DGP_BACKEND_SHARE_PERCENT`), and a
+request over the share gets `503 SlowDown` at once. The wait for a slot now
+counts against the request deadline.
+
+### Fixed — A throttled upload is sent at most three times, and has a deadline
+
+An upload that the backend answered with `503 SlowDown` was sent up to 12
+times: four proxy attempts of three SDK attempts each. With no deadline, a
+small upload to a stalled backend answered after 196 seconds (seen on
+production). Now only the SDK retries (the proxy still retries Hetzner's `400`
+that carries no request id), and an upload has the request deadline plus one
+second per MiB of body. Each backend now has its own SDK retry budget and rate
+limiter instead of one per region.
+
+### Fixed — A config apply no longer stalls every bucket listing
+
+Every ListObjects request read its page budget through the config lock, which
+an apply holds while it probes the backends it changes. Now a listing never
+waits for that lock. `/_/ready` also waits up to one second for a busy config
+DB, instead of reporting `503` at once.
+
+### Fixed — A slow `ListBuckets` no longer hides a backend's buckets
+
+After one failed or slow bucket listing, S3 `ListBuckets` left the backend's
+buckets out for 30 seconds, and with one backend it failed. Now the backend's
+last known buckets stay in the list. A bucket that no backend holds is
+remembered for 5 seconds, so requests for it no longer probe every backend.
+
+### Fixed — One client with a wrong secret no longer locks out every client behind a proxy
+
+The S3 lockout counted failed signatures per client address. Behind a reverse
+proxy, every client has the proxy's address, so one CI job with a rotated
+secret locked every S3 client out for 10 minutes. Now the S3 API counts
+failures per address and access key, and a request whose signature verifies is
+never refused because of another key.
+
+### Fixed — The savings figure of a folder is cheap, and no longer refreshes every minute
+
+The savings figure listed the folder with full metadata, so each delta that
+the metadata cache did not hold cost one HEAD request, and it listed the whole
+folder a second time, with no cap, to find the `reference.bin` baselines. The
+file browser fetched it again on every 60-second refresh and after every batch
+of a bulk delete, and a walk kept running after the user left the folder. Now
+the figure comes from one listing of the folder: the original sizes come from
+the proxy's size cache and the listing facts, and the baselines come from the
+same pages. The proxy keeps the answer for 5 minutes and marks it as an
+estimate when it does not know some original sizes. The browser fetches it
+once per folder visit and once when a bulk action ends, and cancels it when
+the user leaves the folder.
+
+### Fixed — Admin scans list each object once, run once, and stop at their caps
+
+A usage Refresh ran its own full scan inside the request, so a second click or
+a second admin listed the whole bucket again, and when its HEAD requests
+failed it wrote the stored sizes of the deltas into the counter as their
+original sizes. A Refresh is now the bucket scan of the dashboard: a second
+request waits for the scan that runs, the scan can be stopped, and a scan that
+could not read every size keeps the counter and reports an estimate. The
+"Compute size" scan now stops listing one key past its cap of 100,000 objects,
+and at most two such scans list at the same time. The delta-efficiency scan
+groups one listing of the bucket by folder instead of listing each folder's
+subtree again, and a different `min_deltas` value filters the cached report.
+
+### Fixed — The legacy-key check runs on request, once, with one HEAD per object
+
+During a key rotation, the banner of the decrypt-only shim checked which
+objects still use the legacy key each time the Backends page opened, with two
+HEAD requests per object and two per delta reference, one reference at a time.
+Now the check runs only when you click **Check usage**, sends one HEAD request
+per object and per reference (at most 8 reference requests at a time), and the
+proxy keeps a result for 60 seconds; requests that arrive during a scan wait
+for it. **Check again** asks for a fresh count (`fresh=true`). **Clear legacy
+key** stays disabled until a check finds no such object.
+
+### Fixed — A filtered LIST reads sizes and metadata only for the page it returns
+
+For a user whose policy hides most keys, each page of the internal scan read
+the listing facts, and with `metadata=true` sent a HEAD request, for keys that
+the filter then dropped. The proxy now reads sizes and metadata only for the
+entries of the page that it returns.
+
+### Fixed — Bulk copy and move run in batches, show their progress, can be cancelled, and run in parallel
+
+A bulk copy or move sent the whole selection in one request, which the proxy
+ran one object at a time, so the browser showed a spinner for minutes or hours
+with no way to stop it, and a selection of many folders was listed in full
+before the proxy refused more than 10,000 objects. Now copy and move work like
+the bulk delete: batches of at most 500 objects, a progress bar, a Cancel
+button that stops after the current batch, and a warning before the page
+closes. The browser checks the whole plan before the first batch and stops
+listing folders as soon as the selection passes 10,000 objects (also for a
+ZIP). A move removes the sources of a batch only when every copy of that batch
+succeeded. On the server, a batch works on 4 destination folders at the same
+time.
+
+### Fixed — The object table sends at most 6 HEAD requests at the same time
+
+To show the storage type and stored size of each file on a page, the object
+table sent one HEAD request per row at once, up to 500, and each one costs the
+proxy two backend HEAD requests. These requests kept running after the user
+left the folder. Now the table keeps at most 6 requests in flight and queues
+the rest, and leaving the folder cancels them.
+
+### Fixed — Other views no longer list the last bucket every minute; a lifecycle preview is reused
+
+The file browser stayed active behind Settings, Upload and the docs and listed
+the root of the last bucket every 60 seconds. Now it lists only while the
+browser view is shown. Each open of a lifecycle rule's Preview tab and of its
+Run-now confirmation computed a new preview, which reads the metadata of every
+object in the rule's scope; now the browser reuses a preview for 5 minutes,
+**Refresh preview** computes a new one, and a run or a change to the lifecycle
+rules discards the old one.
+
+### Fixed — Concurrent reads of deltas download their reference once
+
+Every cold GET of a delta downloaded the reference of its folder, also while
+other GETs of the same folder were downloading it. A GET of a delta above the
+spool threshold (16 MiB) downloaded the whole reference on every request, so
+20 CI runners that fetched one 500 MB artifact pulled 10 GB from the backend.
+Now concurrent cold GETs wait for one download. A large delta GET keeps the
+reference in the spool after it checks it against the delta's SHA-256, and the
+other large reads of the folder use that file for `range_spool_ttl_secs`. A
+delta that fails its checksum no longer evicts a good cached reference.
+
+### Fixed — Listings send fewer backend requests
+
+On S3, a full page of 1000 keys needed a second backend page, and most pages
+also sent a probe for a key of an earlier page. Now a page holds the keys that
+one backend page proves complete; it can hold fewer than `max-keys` while
+`IsTruncated` stays true, as S3 allows. A backend that answers
+`IsTruncated=true` without a continuation token now fails the listing instead
+of looping. On a filesystem bucket, a listing without a delimiter (`aws s3 ls
+--recursive`, sync, rclone) walked and read the metadata of every file under
+the prefix for every page; now it walks the folders in key order and stops
+after the page.
+
+### Fixed — Fewer fixed requests per operation
+
+A HEAD of a missing key now costs 2 backend requests, not 3. UploadPart and
+the copy destination check send one HeadBucket per bucket per 5 seconds
+instead of one per request. Listing facts that a HEAD learns are written
+through the facts queue, at most 32 at a time, instead of one background task
+per object, which could put about 200 PUT requests in flight against a slow
+backend. Legacy reference migration reads each reference once.
+
+### Fixed — The bucket size counter stays right when requests fail or are cut
+
+Before a write, the proxy reads the object that the write replaces, so that an
+overwrite does not change the object count. When that read failed with a
+timeout or a `503`, the proxy counted the write as a new object. Now the proxy
+stores the object, leaves the counter unchanged and marks the bucket for a
+Refresh. Each write and each delete now records its change right after the
+backend request that makes it, so a request timeout or a client disconnect
+later in the request no longer leaves the counter wrong. Removing a reference
+on an encrypted S3 backend subtracts the size that the store added, not the
+encrypted size. DeleteBucket removes the bucket's counter, so `/_/stats` and a
+bucket created again under the same name start clean. The metrics
+`deltaglider_delta_bytes_saved_total` and `delta_decisions_total` count only a
+delta that was stored.
+
+### Fixed — Quotas count the data that was in the bucket before the proxy counted it
+
+The quota trusted the running counter, which only sees writes since it
+started. Data already in the bucket was missing from it, so a bucket could
+grow past its quota by all of that data. Now the counter counts for the quota
+only after a Refresh. Until then, the proxy also uses the size from its usage
+scanner and takes the larger number. An overwrite at the limit that adds no
+bytes is now accepted.
+
+### Fixed — The config database gives space back, and client writes no longer wait for it
+
+The proxy deletes outbox rows after 24 hours, but the database file kept their
+pages (the production file was 70 % free pages), and the sync uploaded the
+whole file. The first start of this release converts the database once and
+logs how long that took; after that, every cleanup gives the free pages back.
+Each client PUT and DELETE also waited for the config database to record its
+event, and the sync upload held the database while it read the whole file. Now
+an event is written at once when the database is free and otherwise waits in
+an ordered queue, which a graceful shutdown writes before exit. The sync reads
+the file without holding the database and reads it again if a write happened
+during the read.
+
+### Fixed — CopyObject copies large plain objects up to 5 GiB
+
+CopyObject refused sources larger than `max_object_size` (100 MiB by default),
+so rclone and mc copies of larger objects failed. A destination that stores
+the object as it is now accepts a source up to 5 GiB, streamed through the
+spool. A destination that can become a delta keeps the `max_object_size`
+limit. The config check now warns when `max_object_size` is above 5 GiB,
+because S3 accepts at most 5 GiB in one PUT.
+
+### Fixed — A CompleteMultipartUpload that outlives its request delays maintenance jobs
+
+The store of a CompleteMultipartUpload continues after a client disconnect or
+a request timeout. The maintenance gate stopped counting it when the request
+ended, so a migrate or re-encrypt job could start while the object was still
+being written. Now the store counts as a write until it ends.
+
+### Fixed — Rare failures no longer escalate
+
+A config DB read error during an IAM sync no longer empties the IAM state; the
+node keeps its users and providers and retries at the next poll. When the
+capability probe's final `If-Match` write landed but its response was lost,
+the backend was marked unable to do conditional writes until restart; now the
+probe reads the key back and counts its own write. With `config_sync_bucket`
+set, a reference-lock request that never answered held a delta write until the
+300-second request timeout; now each lock request has a deadline. The
+bootstrap password is one session principal for every admin, so the 11th admin
+login logged another admin out; the cap is now 100, and each open-mode browser
+session counts on its own.
+
 ## v2.0.4 — 2026-10-10
 
 ### Fixed — One slow request no longer closes every bucket of its backend
