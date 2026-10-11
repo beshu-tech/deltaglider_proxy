@@ -121,16 +121,16 @@ pub struct ReferenceScan {
     pub truncated: bool,
 }
 
-/// Default maximum number of deltaspaces whose `reference.bin`
-/// metadata we will fold into a single lightweight savings scan.
+/// Default of `DGP_REFERENCE_SCAN_LIMIT`: the most `reference.bin`
+/// baselines that one savings chip (the file browser's figure for a
+/// folder) counts. The chip finds the baselines on the pages of its
+/// listing of the folder, so a baseline costs no request of its own; past
+/// the cap the figure is a lower bound (`truncated`). The admin dashboard
+/// scan and the Refresh count every baseline.
 ///
-/// Rationale: each match performs one `get_reference_metadata` —
-/// for the S3 backend that's a HEAD; without a cap a chip refresh
-/// on a 50k-deltaspace bucket fires 50k HEADs every cache miss.
-/// Lightweight callers (the SPA chip's per-prefix endpoint) pass
-/// `Some(REFERENCE_SCAN_LIMIT)`; the operator-triggered admin
-/// dashboard scan + the CLI `stats` command pass `None` to get
-/// the exhaustive answer regardless of cost.
+/// [`DeltaGliderEngine::list_deltaspace_references`] takes it as its
+/// recommended cap: that walk sends one `get_reference_metadata` (a HEAD
+/// on S3) per baseline. The CLI `stats` command passes no cap.
 ///
 /// Module-level (rather than associated const on `DeltaGliderEngine`)
 /// so callers can refer to it without specifying the storage backend

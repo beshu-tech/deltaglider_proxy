@@ -93,7 +93,8 @@ pub struct RuntimeTuning {
     /// sets no value of its own (at least 1).
     pub upload_concurrency: usize,
     pub ready: ReadyProbe,
-    /// `DGP_REFERENCE_SCAN_LIMIT`: reference HEADs of one savings chip.
+    /// `DGP_REFERENCE_SCAN_LIMIT`: the most references one savings chip
+    /// counts. It finds them on its listing pages, with no HEAD.
     pub reference_scan_limit: usize,
     /// The variable that pins the bootstrap hash ([`env_pinned_hash_var`]).
     pub bootstrap_hash_env: Option<&'static str>,

@@ -646,7 +646,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_REFERENCE_SCAN_LIMIT",
-        description: "Max reference baselines the savings panel reads per request (default: built-in cap)",
+        description: "Max reference baselines one savings figure counts, from its listing (default: 1000)",
         example: "10000",
         category: "Server",
     },
