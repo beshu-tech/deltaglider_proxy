@@ -430,14 +430,10 @@ mod head_cost_tests {
     /// `has_reference` and then read the metadata (two HEADs on S3).
     #[test]
     fn engine_code_reads_a_reference_once() {
-        // Two sites keep both reads for now: a filesystem fault test
-        // (`fault_tests::a_reference_stat_error_is_not_absent`) and a
-        // transfer test (`delta_fast_path_never_seeds_over_an_unreadable_dest_reference`)
-        // inject their fault into the `has_reference` call.
-        const ALLOWED: [&str; 2] = [
-            "src/deltaglider/engine/raw.rs",
-            "src/deltaglider/engine/store.rs",
-        ];
+        // One site keeps both reads for now: a transfer test
+        // (`delta_fast_path_never_seeds_over_an_unreadable_dest_reference`)
+        // injects its fault into the `has_reference` call.
+        const ALLOWED: [&str; 1] = ["src/deltaglider/engine/raw.rs"];
         let mut sites = Vec::new();
         for (file, text) in crate::source_scan::prod_sources("src/deltaglider/engine") {
             let lines = crate::source_scan::prod_lines(&text);

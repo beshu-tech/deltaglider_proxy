@@ -604,26 +604,35 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         // A backend error here must ABORT the PUT — never fall through to the
         // "create baseline" branch, which would overwrite a reference.bin that
-        // may exist and orphan every sibling delta.
-        let has_existing_reference = match xnode.observed_reference() {
-            Some(seen) => seen,
-            None => self.storage.has_reference(bucket, deltaspace_id).await?,
+        // may exist and orphan every sibling delta. One read (a HEAD on S3)
+        // answers both "is there one" and "which": the fence of a
+        // cross-instance hold already answered the first.
+        let existing = match xnode.observed_reference() {
+            Some(false) => None,
+            Some(true) => Some(
+                self.storage
+                    .get_reference_metadata(bucket, deltaspace_id)
+                    .await?,
+            ),
+            None => {
+                self.reference_metadata_if_present(bucket, deltaspace_id)
+                    .await?
+            }
         };
-        let ref_meta = if has_existing_reference {
-            let read = self
-                .storage
-                .get_reference_metadata(bucket, deltaspace_id)
-                .await?;
+        let fresh_baseline = existing.is_none();
+        let ref_meta = match existing {
             // Heal a stripped-metadata reference in place (same bytes) so the
             // delta we write next carries a valid ref_sha256 and replication
             // stops re-copying this deltaspace. No-op (zero I/O) when healthy.
-            self.heal_reference_if_corrupt(bucket, deltaspace_id, read, put.body.held(), &xnode)
-                .await?
-        } else {
-            debug!("No reference in deltaspace, creating baseline");
-            self.write_baseline(&put, &xnode).await?
+            Some(read) => {
+                self.heal_reference_if_corrupt(bucket, deltaspace_id, read, put.body.held(), &xnode)
+                    .await?
+            }
+            None => {
+                debug!("No reference in deltaspace, creating baseline");
+                self.write_baseline(&put, &xnode).await?
+            }
         };
-        let fresh_baseline = !has_existing_reference;
 
         match self
             .encode_and_commit(put, &ref_meta, fresh_baseline, &xnode)
@@ -2852,6 +2861,35 @@ mod other_form_tests {
             sites.len(),
             1,
             "store.rs deletes another form outside drop_other_form at lines {sites:?}"
+        );
+    }
+}
+
+/// Fixed request costs of a PUT.
+#[cfg(test)]
+mod put_cost_tests {
+    use super::*;
+
+    fn count(fake: &crate::storage::FakeS3, request: &str) -> usize {
+        fake.requests()
+            .iter()
+            .filter(|r| r.as_str() == request || r.starts_with(&format!("{request}?")))
+            .count()
+    }
+
+    /// A delta PUT reads the deltaspace reference with one HEAD. It sent
+    /// two: one to see that reference.bin exists, one for its metadata.
+    #[tokio::test]
+    async fn a_delta_put_heads_the_reference_once() {
+        let (engine, fake) = s3_engine().await;
+        store_deltas(&engine, "run", 1).await;
+        fake.clear();
+        store_deltas(&engine, "run", 2).await;
+        assert_eq!(
+            count(&fake, "HEAD /b/run/reference.bin"),
+            2,
+            "two delta PUTs: {:?}",
+            fake.requests()
         );
     }
 }

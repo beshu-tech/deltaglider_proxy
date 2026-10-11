@@ -319,9 +319,10 @@ async fn legacy_reference_migration_keeps_a_live_object() {
     );
 }
 
-/// Review B11: a stat error on reference.bin is not "no reference". Read as
+/// Review B11: a read error on reference.bin is not "no reference". Read as
 /// absent, the PUT wrote a new baseline over the live one, and the deltas
-/// against it stopped decoding.
+/// against it stopped decoding. The PUT reads the reference once (its
+/// metadata, no separate stat): that read fails here.
 #[tokio::test]
 async fn a_reference_stat_error_is_not_absent() {
     let (dir, engine, _) = faulty_engine().await;
@@ -337,17 +338,19 @@ async fn a_reference_stat_error_is_not_absent() {
         .await
         .unwrap()
         .file_sha256;
-    let fault = fail_io(
-        &dir.path().join("b/deltaspaces/rel/reference.bin"),
-        libc::EIO,
-    );
+    let path = dir.path().join("b/deltaspaces/rel/reference.bin");
+    let fault = fail_io(&path, libc::EIO);
     assert!(engine.storage().has_reference("b", "rel").await.is_err());
+    drop(fault);
+    // An unreadable metadata attribute fails the one read of the PUT.
+    let name = "user.dg.metadata";
+    let saved = xattr::get(&path, name).unwrap().unwrap();
+    xattr::set(&path, name, b"{unreadable").unwrap();
     let put = engine
         .store("b", "rel/c.zip", &noise(6, 200_000), None, HashMap::new())
         .await;
-    assert!(fault.fired() > 0);
-    drop(fault);
-    assert!(put.is_err(), "the PUT went on past a failed reference stat");
+    xattr::set(&path, name, &saved).unwrap();
+    assert!(put.is_err(), "the PUT went on past a failed reference read");
     let fresh = DeltaGliderEngine::new_with_backend(
         Arc::new(
             FilesystemBackend::new(dir.path().to_path_buf())
