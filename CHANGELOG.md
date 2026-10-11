@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.5 — 2026-10-11
+
 ### Fixed — A delete lists one level of its folder, and stops at the first object
 
 After each delete, the proxy checks whether the folder still holds an object
