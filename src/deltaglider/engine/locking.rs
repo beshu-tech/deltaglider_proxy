@@ -232,10 +232,10 @@ impl ReferenceLockGuard {
                         k.state.lost.store(true, Ordering::SeqCst);
                         Err(lost_err())
                     }
-                    Err(e) => Err(EngineError::Storage(StorageError::Other(format!(
+                    Err(e) => Err(coordination_unavailable(format!(
                         "reference lock {} could not be confirmed before the write: {e}",
                         k.key
-                    )))),
+                    ))),
                 }
             }
         }
@@ -487,6 +487,15 @@ impl<T, E: From<EngineError>> ReferenceLockFailure for Result<T, E> {
     }
 }
 
+/// A reference-lock request that failed in the coordination bucket (no
+/// answer before the deadline, a refused connection, an error answer):
+/// 503 ServiceUnavailable, which a client retries. It was a 500
+/// InternalError. A peer that holds the lock is `Contended`, and a lock
+/// that lapsed is not this error.
+fn coordination_unavailable(detail: String) -> EngineError {
+    EngineError::Storage(StorageError::Unavailable(detail))
+}
+
 /// The raw accessors speak `StorageError`; keep a storage error as-is.
 pub(super) fn engine_to_storage(e: EngineError) -> StorageError {
     match e {
@@ -562,9 +571,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     ))))
                 }
                 Err(e) => {
-                    return Err(EngineError::Storage(StorageError::Other(format!(
+                    return Err(coordination_unavailable(format!(
                         "reference lock acquire failed for deltaspace '{bucket}/{deltaspace}': {e}"
-                    ))))
+                    )))
                 }
             }
         }
@@ -635,5 +644,86 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             Err(e) => return R::reference_lock_failed(e),
         };
         HELD_REFERENCE_LOCK.scope(xnode, f()).await
+    }
+}
+
+/// What a write answers when the coordination bucket does not answer.
+#[cfg(test)]
+mod unavailable_tests {
+    use super::*;
+    use crate::coordination::{DynReferenceLock, LeaseError};
+    use crate::storage::FilesystemBackend;
+
+    /// How the coordination bucket fails.
+    #[derive(Clone, Copy, Debug)]
+    enum Dead {
+        /// No answer to a lock request.
+        Hangs,
+        /// The connection is refused.
+        Refuses,
+        /// The lock is granted, but the confirm before the commit fails.
+        ConfirmFails,
+    }
+
+    struct DeadLock(Dead);
+
+    impl crate::coordination::ReferenceLock for DeadLock {
+        async fn try_acquire(&self, _: &str, _: &str, _: i64) -> Result<bool, LeaseError> {
+            match self.0 {
+                Dead::Hangs => std::future::pending().await,
+                Dead::Refuses => Err(LeaseError::Backend(
+                    "dispatch failure: connection refused".into(),
+                )),
+                Dead::ConfirmFails => Ok(true),
+            }
+        }
+        async fn release(&self, _: &str, _: &str) -> Result<(), LeaseError> {
+            Ok(())
+        }
+        async fn renew(&self, _: &str, _: &str, _: i64) -> Result<(), LeaseError> {
+            Err(LeaseError::Backend("operation timeout".into()))
+        }
+        fn renew_interval(&self) -> Duration {
+            // Every commit confirms the lock.
+            Duration::ZERO
+        }
+        fn acquire_timeout(&self) -> Duration {
+            Duration::from_millis(100)
+        }
+    }
+
+    /// A delta write whose reference lock the coordination bucket cannot
+    /// grant or confirm (no answer, a refused connection) answers 503: a
+    /// retry can succeed. It answered 500 InternalError.
+    #[tokio::test]
+    async fn a_dead_coordination_bucket_answers_503() {
+        for dead in [Dead::Hangs, Dead::Refuses, Dead::ConfirmFails] {
+            let tmp = tempfile::tempdir().unwrap();
+            let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+                .await
+                .unwrap();
+            backend.create_bucket("releases").await.unwrap();
+            let engine =
+                DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None)
+                    .with_reference_lock(Some(DynReferenceLock::from_arc(Arc::new(DeadLock(
+                        dead,
+                    )))));
+            let err = tokio::time::timeout(
+                Duration::from_secs(5),
+                engine.store("releases", "v1/app.zip", &[7u8; 4096], None, HashMap::new()),
+            )
+            .await
+            .expect("the write waited past the acquire timeout")
+            .expect_err("no lock, no delta write");
+            assert!(
+                matches!(err, EngineError::Storage(StorageError::Unavailable(_))),
+                "{dead:?}: {err:?}"
+            );
+            let s3 = crate::api::S3Error::from(err);
+            assert_eq!(
+                s3.status_code(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
     }
 }
