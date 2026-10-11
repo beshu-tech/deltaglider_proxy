@@ -57,17 +57,20 @@ use tracing::info;
 use crate::api::handlers::AppState;
 use crate::config_apply::ConfigMutator;
 use crate::config_db::ConfigDb;
-use crate::job_loop::{Pager, MAX_JOB_PAGES};
+use crate::deltaglider::{DeleteHooks, DeleteItem, DeleteOutcome, DynEngine, ListObjectsPage};
+use crate::job_loop::{list_retry_delay, ListFailure, Pager, MAX_JOB_PAGES};
 use crate::transfer::{
     content_verdict, copy_object_with_retries, ContentVerdict, ObjectTransferRequest,
     TransferProvenance,
 };
 
-use super::paged::{paged_phase, JobCtx, KeyPage, PageStep, PhaseSpec};
+use super::paged::{
+    paged_phase, JobCtx, KeyPage, ListError, PageStep, PhaseSpec, PAGE_CONCURRENCY,
+};
 use super::store::MaintenanceJob;
 use super::worker::{
-    after_run, check_cancel, drain_inflight_writes, heartbeat, persist_flushed, record_failure,
-    resumable_in, stop_if_shutting_down, AfterRun, Counters, Holder, PhaseStop,
+    after_run, check_cancel, current_row, drain_inflight_writes, heartbeat, persist_flushed,
+    record_failure, resumable_in, AfterRun, Counters, Holder, PhaseStop,
 };
 
 pub const TRANSIENT_PREFIX: &str = "__dgmigrate_";
@@ -312,19 +315,156 @@ impl RecopyScope {
     }
 }
 
+/// HEADs of one key that a migrate sends before it gives up on a
+/// transient error.
+const HEAD_ATTEMPTS: u32 = 3;
+
+/// A HEAD that did not answer: its object is neither there nor missing.
+#[derive(Debug)]
+struct HeadFailed {
+    /// A timeout, a 5xx or a throttle (after [`HEAD_ATTEMPTS`]).
+    transient: bool,
+    message: String,
+}
+
+impl HeadFailed {
+    /// The phase stop: a transient failure keeps the staged copies.
+    fn stop(self) -> PhaseStop {
+        if self.transient {
+            PhaseStop::FailedTransient(self.message)
+        } else {
+            PhaseStop::Failed(self.message)
+        }
+    }
+}
+
+/// HEAD `bucket/key`: `Ok(None)` only when the object does not exist. A
+/// transient error is sent again ([`HEAD_ATTEMPTS`] in all).
+async fn head_retrying(
+    engine: &DynEngine,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<crate::types::FileMetadata>, HeadFailed> {
+    let mut attempt = 0u32;
+    loop {
+        let e = match engine.head(bucket, key).await {
+            Ok(meta) => return Ok(Some(meta)),
+            Err(e) if e.is_not_found() => return Ok(None),
+            Err(e) => e,
+        };
+        attempt += 1;
+        let transient = ListFailure::of(&e) == ListFailure::Transient;
+        if transient && attempt < HEAD_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(250 * u64::from(attempt))).await;
+            continue;
+        }
+        return Err(HeadFailed {
+            transient,
+            message: format!("could not check '{key}' in '{bucket}': {e}"),
+        });
+    }
+}
+
+/// Does the target hold the source's version of `key`? Only a target
+/// that answers "not found" is `Missing`: a target HEAD that times out
+/// (or answers 5xx) is retried, then an error. Any HEAD error read as
+/// `Missing`, so one timeout in verify failed the job and deleted every
+/// staged copy.
 async fn copy_verdict_for(
-    engine: &crate::deltaglider::DynEngine,
+    engine: &DynEngine,
     source_bucket: &str,
     target_bucket: &str,
     key: &str,
-) -> ContentVerdict {
-    let Ok(dst) = engine.head(target_bucket, key).await else {
-        return ContentVerdict::Missing;
+) -> Result<ContentVerdict, HeadFailed> {
+    let Some(dst) = head_retrying(engine, target_bucket, key).await? else {
+        return Ok(ContentVerdict::Missing);
     };
-    match engine.head(source_bucket, key).await {
+    Ok(match engine.head(source_bucket, key).await {
         Ok(src) => content_verdict(&src, Some(&dst)),
         // The copy (or verify) reports the source error itself.
         Err(_) => ContentVerdict::Unknown,
+    })
+}
+
+/// One page of `bucket` (all keys, no metadata), a transient error retried
+/// with the same token like `paged_phase` does.
+async fn list_page_retrying(
+    engine: &DynEngine,
+    bucket: &str,
+    token: Option<&str>,
+    context: &str,
+) -> Result<ListObjectsPage, ListError> {
+    let mut attempt = 0u32;
+    loop {
+        let e = match engine
+            .list_objects(bucket, "", None, PAGE_SIZE, token, false)
+            .await
+        {
+            Ok(page) => return Ok(page),
+            Err(e) => ListError::engine(context, &e),
+        };
+        attempt += 1;
+        match list_retry_delay(e.failure, attempt) {
+            Some(pause) => tokio::time::sleep(pause).await,
+            None => return Err(e),
+        }
+    }
+}
+
+/// Delete `keys` of `bucket` through the engine's batch: one reclaim check
+/// per folder, several folders at once (a per-key delete listed the folder
+/// after every key). `proceed` stops the batch between keys (cancel,
+/// shutdown). Returns each key's outcome, in order.
+async fn delete_keys<'a>(
+    engine: &DynEngine,
+    bucket: &str,
+    items: Vec<DeleteItem<'a>>,
+    proceed: &(dyn Fn() -> bool + Send + Sync),
+) -> Vec<DeleteOutcome> {
+    engine
+        .delete_batch(
+            bucket,
+            items,
+            DeleteHooks {
+                proceed: Some(proceed),
+                on_outcome: None,
+            },
+        )
+        .await
+}
+
+/// A cancel request seen while a batch runs: a task polls the job row
+/// once a second and sets the flag that the batch's `proceed` hook reads
+/// (the hook cannot wait for the DB). Stops polling when dropped.
+struct CancelWatch {
+    requested: Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl CancelWatch {
+    fn spawn(db: &Arc<Mutex<ConfigDb>>, job_id: i64) -> Self {
+        let requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (flag, db) = (requested.clone(), db.clone());
+        let task = tokio::spawn(async move {
+            loop {
+                if check_cancel(&db, job_id).await.is_err() {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
+        Self { requested, task }
+    }
+
+    fn requested(&self) -> bool {
+        self.requested.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Drop for CancelWatch {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -420,17 +560,13 @@ async fn remove_routes(mutator: &ConfigMutator, keys: &[String], context: &str) 
 
 /// Count the objects in `bucket` (a route), up to [`DEST_COUNT_MAX_PAGES`]
 /// pages. Returns `(count, more)`.
-async fn count_objects(
-    engine: &crate::deltaglider::DynEngine,
-    bucket: &str,
-) -> Result<(u64, bool), String> {
+async fn count_objects(engine: &DynEngine, bucket: &str) -> Result<(u64, bool), String> {
     let mut count = 0u64;
     let mut token: Option<String> = None;
     for _ in 0..DEST_COUNT_MAX_PAGES {
-        let page = engine
-            .list_objects(bucket, "", None, PAGE_SIZE, token.as_deref(), false)
+        let page = list_page_retrying(engine, bucket, token.as_deref(), "list destination failed")
             .await
-            .map_err(|e| format!("list destination failed: {e}"))?;
+            .map_err(|e| e.message)?;
         count += page
             .objects
             .iter()
@@ -446,7 +582,9 @@ async fn count_objects(
 
 /// Pre-flip unwind: delete the destination objects THIS job copied (their
 /// `dg-migration` value carries the job id), and nothing else — objects
-/// this job did not write stay. Best effort: a
+/// this job did not write stay. Each page goes to the engine's batch as
+/// conditional items: the engine reads each object under its folder lock
+/// and deletes it only while it carries this job's value. Best effort: a
 /// failure is recorded on the job and the unwind goes on.
 async fn remove_staged_copies(
     mutator: &ConfigMutator,
@@ -476,35 +614,42 @@ async fn remove_staged_copies(
         return;
     }
     let ours = provenance_value(params, job.id);
+    let ours =
+        |meta: &crate::types::FileMetadata| meta.user_metadata.get("dg-migration") == Some(&ours);
     let mut pager = Pager::resuming(None);
     let mut removed = 0u64;
     while pager.begin_page().is_some() {
         let engine = state.engine.load().clone();
-        let page = match engine
-            .list_objects(
-                &params.transient_key,
-                "",
-                None,
-                PAGE_SIZE,
-                pager.token(),
-                false,
-            )
-            .await
+        let page = match list_page_retrying(
+            &engine,
+            &params.transient_key,
+            pager.token(),
+            "list destination failed",
+        )
+        .await
         {
             Ok(p) => p,
-            Err(e) => return fail(format!("list destination failed: {e}")).await,
+            Err(e) => return fail(e.message).await,
         };
         // Tokens are key-based, so deleting listed keys never skips one.
-        for (key, _) in page.objects.iter().filter(|(k, _)| !k.ends_with('/')) {
-            let Ok(meta) = engine.head(&params.transient_key, key).await else {
-                continue;
-            };
-            if meta.user_metadata.get("dg-migration") != Some(&ours) {
-                continue;
-            }
-            match engine.delete(&params.transient_key, key).await {
-                Ok(_) => removed += 1,
-                Err(e) => fail(format!("delete of staged copy '{key}' failed: {e}")).await,
+        let keys: Vec<&str> = page
+            .objects
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .filter(|k| !k.ends_with('/'))
+            .collect();
+        let items = keys.iter().map(|k| DeleteItem::only_if(*k, ours)).collect();
+        let outcomes = delete_keys(&engine, &params.transient_key, items, &|| {
+            !crate::shutdown::is_shutting_down()
+        })
+        .await;
+        for (key, outcome) in keys.iter().zip(outcomes) {
+            match outcome {
+                DeleteOutcome::Deleted(_) => removed += 1,
+                DeleteOutcome::Failed(e) => {
+                    fail(format!("delete of staged copy '{key}' failed: {e}")).await
+                }
+                DeleteOutcome::NotFound | DeleteOutcome::Changed | DeleteOutcome::Skipped => {}
             }
         }
         if !pager.advance(page.is_truncated, page.next_continuation_token) {
@@ -535,7 +680,16 @@ pub(crate) async fn execute_migrate_phases(
     // staging route (and re-asserts it per page anyway). A shutdown is not
     // one either: the next boot resumes the copy, so deleting the staged
     // copies would throw that work away and fail a healthy migration.
-    let settles = after_run(&result, crate::shutdown::is_shutting_down()) == AfterRun::Settle;
+    // A transient failure (a backend that timed out or answered 5xx after
+    // the in-place retries) says nothing about the copies: they stay on the
+    // target, and so does the job's cursor. While it has retries left the
+    // worker queues the job again (route and gate stay); after the last it
+    // settles `failed` and only the route goes. Only a cancel or a
+    // definitive failure deletes the copies.
+    let transient = matches!(result, Err(PhaseStop::FailedTransient(_)));
+    let retry = transient && super::worker::transient_retry_left(&current_row(db, job).await);
+    let settles =
+        after_run(&result, crate::shutdown::is_shutting_down(), retry) == AfterRun::Settle;
     if result.is_err() && settles {
         // Determine the phase we died in (re-read — phases persist it).
         let db_guard = db.lock().await;
@@ -554,7 +708,7 @@ pub(crate) async fn execute_migrate_phases(
         drop(db_guard);
         if unwinds {
             // Stage copies nothing, so there is nothing to remove.
-            if phase != "stage" {
+            if phase != "stage" && !transient {
                 remove_staged_copies(mutator, db, state, job, &params).await;
             }
             // Remove the staging route.
@@ -564,6 +718,16 @@ pub(crate) async fn execute_migrate_phases(
                 "Migration aborted — staging route removed",
             )
             .await;
+        }
+        if unwinds && transient && phase != "stage" {
+            if let Err(PhaseStop::FailedTransient(e)) = result {
+                return Err(PhaseStop::FailedTransient(format!(
+                    "{e} — the copies made so far stay on backend '{}'. Start the migrate \
+                     again with \"target\": \"mirror\" to reuse them (it copies only what \
+                     differs), or empty the destination bucket",
+                    params.target_backend
+                )));
+            }
         }
     }
     result
@@ -706,6 +870,7 @@ impl MigrateRun<'_> {
             c,
             recopy: RecopyScope::on_resume(self.job.phase == "copy"),
             engine: None,
+            page_token: None,
         };
         paged_phase(
             self.ctx(),
@@ -720,6 +885,7 @@ impl MigrateRun<'_> {
                 budget_exhausted: "copy stopped at the page budget with more source pages \
                      pending — bucket too large for one pass; job left resumable \
                      in phase 'copy' (cursor persisted, source authoritative)",
+                concurrency: PAGE_CONCURRENCY,
             },
             &mut step,
         )
@@ -743,6 +909,7 @@ impl MigrateRun<'_> {
                 budget_exhausted: "verify stopped at the page budget with more source pages \
                      pending — refusing to flip over an incompletely verified \
                      listing; job left resumable in phase 'verify'",
+                concurrency: PAGE_CONCURRENCY,
             },
             &mut step,
         )
@@ -763,6 +930,7 @@ impl MigrateRun<'_> {
             m: self,
             engine: None,
             pruned: 0,
+            absent: Vec::new(),
         };
         paged_phase(
             self.ctx(),
@@ -772,6 +940,7 @@ impl MigrateRun<'_> {
                 cancel_every: Some(CANCEL_CHECK_EVERY),
                 budget_exhausted: "mirror: destination listing stopped at the page budget — \
                      refusing to flip over an incompletely mirrored destination",
+                concurrency: PAGE_CONCURRENCY,
             },
             &mut step,
         )
@@ -812,6 +981,12 @@ impl MigrateRun<'_> {
             "migrate: bucket '{}' flipped to backend '{}'",
             bucket, params.target_backend
         );
+        // The usage counter still holds the source's layout (deltas are
+        // encoded again against new references on the target): its row is
+        // marked for a recount.
+        if let Some(usage) = &self.state.bucket_usage {
+            usage.mark_for_recount(bucket);
+        }
         self.checkpoint("cleanup", c, None).await?;
         // Destination is authoritative — client writes resume NOW, not at
         // job settle: the row is in `cleanup`, which gates neither the
@@ -889,45 +1064,61 @@ impl MigrateRun<'_> {
                 ));
                 break 'cleanup;
             }
+            // The source backend is gated: wait (the job resumes in
+            // cleanup) instead of sending deletes it cannot answer.
+            holder.check_backend()?;
             let engine = state.engine.load().clone();
-            let page = match engine
-                .list_objects(
-                    &cleanup_key,
-                    "",
-                    None,
-                    PAGE_SIZE,
-                    cleanup_token.as_deref(),
-                    false,
-                )
-                .await
+            let page = match list_page_retrying(
+                &engine,
+                &cleanup_key,
+                cleanup_token.as_deref(),
+                "cleanup list failed",
+            )
+            .await
             {
                 Ok(p) => p,
                 Err(e) => {
-                    record_failure(db, job.id, "", &format!("cleanup list failed: {e}")).await?;
+                    record_failure(db, job.id, "", &e.message).await?;
                     delete_failures += 1;
                     break 'cleanup;
                 }
             };
-            let mut deleted_this_sweep = 0u32;
-            for (i, (key, _)) in page
+            // The whole page in one batch: one reclaim check per folder,
+            // several folders at once. A cancel or a shutdown stops it
+            // between keys.
+            let keys: Vec<&str> = page
                 .objects
                 .iter()
-                .filter(|(k, _)| !k.ends_with('/'))
-                .enumerate()
-            {
-                stop_if_shutting_down()?;
-                if i > 0 && i % CANCEL_CHECK_EVERY == 0 && check_cancel(db, job.id).await.is_err() {
-                    cancelled_mid_cleanup = true;
-                    break 'cleanup;
-                }
-                match engine.delete(&cleanup_key, key).await {
-                    Ok(_) => deleted_this_sweep += 1,
-                    Err(e) => {
+                .map(|(k, _)| k.as_str())
+                .filter(|k| !k.ends_with('/'))
+                .collect();
+            let watch = CancelWatch::spawn(db, job.id);
+            let outcomes = delete_keys(
+                &engine,
+                &cleanup_key,
+                keys.iter().map(|k| DeleteItem::new(*k)).collect(),
+                &|| !watch.requested() && !crate::shutdown::is_shutting_down(),
+            )
+            .await;
+            drop(watch);
+            let mut deleted_this_sweep = 0u32;
+            for (key, outcome) in keys.iter().zip(outcomes) {
+                match outcome {
+                    DeleteOutcome::Deleted(_) | DeleteOutcome::NotFound => deleted_this_sweep += 1,
+                    DeleteOutcome::Failed(e) => {
                         record_failure(db, job.id, key, &format!("source delete failed: {e}"))
                             .await?;
                         delete_failures += 1;
                     }
+                    DeleteOutcome::Changed | DeleteOutcome::Skipped => {}
                 }
+            }
+            if crate::shutdown::is_shutting_down() {
+                return Err(PhaseStop::ShuttingDown);
+            }
+            if check_cancel(db, job.id).await.is_err() {
+                cancelled_mid_cleanup = true;
+                break 'cleanup;
             }
             // No more pages → done.
             if page.next_continuation_token.is_none() {
@@ -972,10 +1163,27 @@ struct CopyStep<'a, 'r> {
     m: &'a MigrateRun<'r>,
     c: &'a mut Counters,
     recopy: RecopyScope,
-    engine: Option<Arc<crate::deltaglider::DynEngine>>,
+    engine: Option<Arc<DynEngine>>,
+    /// The cursor of the page in progress (where a failed page resumes).
+    page_token: Option<String>,
+}
+
+/// What the copy of one object ended in.
+enum CopyDone {
+    /// The target already holds this version.
+    Skipped,
+    Copied {
+        bytes: i64,
+    },
+    Failed {
+        transient: bool,
+        message: String,
+    },
 }
 
 impl PageStep for CopyStep<'_, '_> {
+    type Done = CopyDone;
+
     async fn begin_page(&mut self) -> Result<(), PhaseStop> {
         self.m
             .ensure_staging_route("Migration staging route re-asserted after config change")
@@ -984,13 +1192,14 @@ impl PageStep for CopyStep<'_, '_> {
         Ok(())
     }
 
-    async fn list(&mut self, token: Option<&str>) -> Result<KeyPage, String> {
+    async fn list(&mut self, token: Option<&str>) -> Result<KeyPage, ListError> {
+        self.page_token = token.map(str::to_string);
         let engine = self.engine.as_ref().expect("begin_page runs first");
         engine
             .list_objects(&self.m.job.bucket, "", None, PAGE_SIZE, token, false)
             .await
             .map(KeyPage::from)
-            .map_err(|e| format!("list source failed: {e}"))
+            .map_err(|e| ListError::engine("list source failed", &e))
     }
 
     /// Restart from page 0: the verdict skip makes the re-list idempotent.
@@ -1010,18 +1219,20 @@ impl PageStep for CopyStep<'_, '_> {
         self.m.checkpoint("copy", self.c, page_token).await
     }
 
-    async fn object(&mut self, key: &str) -> Result<(), PhaseStop> {
-        let (m, engine) = (self.m, self.engine.clone().expect("begin_page runs first"));
+    async fn object(&self, key: &str) -> CopyDone {
+        let (m, engine) = (self.m, self.engine.as_ref().expect("begin_page runs first"));
         let (bucket, params) = (&m.job.bucket, m.params);
         // Skip only a target copy that PROVABLY matches the source: a
         // cancelled earlier attempt leaves copies that the source has
-        // since outgrown.
+        // since outgrown. A target HEAD that keeps failing proves nothing:
+        // the object is copied (the copy is idempotent).
         if !self.recopy.recopies()
-            && copy_verdict_for(&engine, bucket, &params.transient_key, key).await
-                == ContentVerdict::Same
+            && matches!(
+                copy_verdict_for(engine, bucket, &params.transient_key, key).await,
+                Ok(ContentVerdict::Same)
+            )
         {
-            self.c.skipped += 1;
-            return Ok(());
+            return CopyDone::Skipped;
         }
         let req = ObjectTransferRequest {
             source_bucket: bucket,
@@ -1039,25 +1250,51 @@ impl PageStep for CopyStep<'_, '_> {
         };
         // No per-object fsync: `checkpoint` flushes the copies before any
         // progress that counts on them is saved.
-        match crate::storage::with_deferred_fsync(copy_object_with_retries(&engine, req)).await {
-            Ok(outcome) => {
-                self.c.done += 1;
-                self.c.bytes += outcome.bytes_copied as i64;
-                Ok(())
-            }
-            Err(e) => {
-                record_failure(m.db, m.job.id, key, &e.to_string()).await?;
-                self.c.failed += 1;
-                m.checkpoint("copy", self.c, None).await?;
-                Err(PhaseStop::from(format!(
-                    "copy of '{key}' failed — source remains authoritative: {e}"
-                )))
-            }
+        match crate::storage::with_deferred_fsync(copy_object_with_retries(engine, req)).await {
+            Ok(outcome) => CopyDone::Copied {
+                bytes: outcome.bytes_copied as i64,
+            },
+            Err(e) => CopyDone::Failed {
+                transient: e.class.retryable(),
+                message: e.to_string(),
+            },
         }
     }
 
-    fn end_page(&mut self) {
+    fn stops(done: &CopyDone) -> bool {
+        matches!(done, CopyDone::Failed { .. })
+    }
+
+    async fn settle(&mut self, key: &str, done: CopyDone) -> Result<(), PhaseStop> {
+        let m = self.m;
+        match done {
+            CopyDone::Skipped => self.c.skipped += 1,
+            CopyDone::Copied { bytes } => {
+                self.c.done += 1;
+                self.c.bytes += bytes;
+            }
+            CopyDone::Failed { transient, message } => {
+                record_failure(m.db, m.job.id, key, &message).await?;
+                self.c.failed += 1;
+                // The cursor stays at this page: the copies before it are
+                // durable, and a resumed job redoes this page.
+                m.checkpoint("copy", self.c, self.page_token.as_deref())
+                    .await?;
+                let message =
+                    format!("copy of '{key}' failed — source remains authoritative: {message}");
+                return Err(if transient {
+                    PhaseStop::FailedTransient(message)
+                } else {
+                    PhaseStop::Failed(message)
+                });
+            }
+        }
+        Ok(())
+    }
+
+    async fn end_page(&mut self) -> Result<(), PhaseStop> {
         self.recopy = self.recopy.after_page();
+        Ok(())
     }
 }
 
@@ -1065,29 +1302,31 @@ impl PageStep for CopyStep<'_, '_> {
 struct VerifyStep<'a, 'r> {
     m: &'a MigrateRun<'r>,
     c: &'a Counters,
-    engine: Option<Arc<crate::deltaglider::DynEngine>>,
+    engine: Option<Arc<DynEngine>>,
 }
 
 impl PageStep for VerifyStep<'_, '_> {
+    type Done = Result<(), PhaseStop>;
+
     async fn begin_page(&mut self) -> Result<(), PhaseStop> {
         self.engine = Some(self.m.state.engine.load().clone());
         Ok(())
     }
 
-    async fn list(&mut self, token: Option<&str>) -> Result<KeyPage, String> {
+    async fn list(&mut self, token: Option<&str>) -> Result<KeyPage, ListError> {
         let engine = self.engine.as_ref().expect("begin_page runs first");
         engine
             .list_objects(&self.m.job.bucket, "", None, PAGE_SIZE, token, false)
             .await
             .map(KeyPage::from)
-            .map_err(|e| format!("verify list failed: {e}"))
+            .map_err(|e| ListError::engine("verify list failed", &e))
     }
 
     async fn save(&mut self, token: Option<&str>) -> Result<(), PhaseStop> {
         self.m.checkpoint("verify", self.c, token).await
     }
 
-    async fn object(&mut self, key: &str) -> Result<(), PhaseStop> {
+    async fn object(&self, key: &str) -> Result<(), PhaseStop> {
         let engine = self.engine.as_ref().expect("begin_page runs first");
         match copy_verdict_for(
             engine,
@@ -1097,33 +1336,47 @@ impl PageStep for VerifyStep<'_, '_> {
         )
         .await
         {
-            ContentVerdict::Missing => Err(PhaseStop::from(format!(
+            Ok(ContentVerdict::Missing) => Err(PhaseStop::from(format!(
                 "verification failed: '{key}' missing on target"
             ))),
-            ContentVerdict::Differs => Err(PhaseStop::from(format!(
+            Ok(ContentVerdict::Differs) => Err(PhaseStop::from(format!(
                 "verification failed: '{key}' on target differs from the source"
             ))),
             // Unknown = no common fingerprint (foreign object); the copy
             // phase re-copied it, so it is current.
-            ContentVerdict::Same | ContentVerdict::Unknown => Ok(()),
+            Ok(ContentVerdict::Same | ContentVerdict::Unknown) => Ok(()),
+            Err(e) => Err(e.stop()),
         }
+    }
+
+    fn stops(done: &Result<(), PhaseStop>) -> bool {
+        done.is_err()
+    }
+
+    async fn settle(&mut self, _key: &str, done: Result<(), PhaseStop>) -> Result<(), PhaseStop> {
+        done
     }
 }
 
 /// The mirror prune: list the destination, delete what the source lacks.
 struct PruneStep<'a, 'r> {
     m: &'a MigrateRun<'r>,
-    engine: Option<Arc<crate::deltaglider::DynEngine>>,
+    engine: Option<Arc<DynEngine>>,
     pruned: u64,
+    /// The page's destination keys that the source lacks.
+    absent: Vec<String>,
 }
 
 impl PageStep for PruneStep<'_, '_> {
+    /// `Ok(true)`: the source lacks the key.
+    type Done = Result<bool, PhaseStop>;
+
     async fn begin_page(&mut self) -> Result<(), PhaseStop> {
         self.engine = Some(self.m.state.engine.load().clone());
         Ok(())
     }
 
-    async fn list(&mut self, token: Option<&str>) -> Result<KeyPage, String> {
+    async fn list(&mut self, token: Option<&str>) -> Result<KeyPage, ListError> {
         let engine = self.engine.as_ref().expect("begin_page runs first");
         engine
             .list_objects(
@@ -1136,7 +1389,7 @@ impl PageStep for PruneStep<'_, '_> {
             )
             .await
             .map(KeyPage::from)
-            .map_err(|e| format!("mirror: list destination failed: {e}"))
+            .map_err(|e| ListError::engine("mirror: list destination failed", &e))
     }
 
     /// No cursor: a resumed job re-runs the prune from the top.
@@ -1144,34 +1397,76 @@ impl PageStep for PruneStep<'_, '_> {
         Ok(())
     }
 
-    async fn object(&mut self, key: &str) -> Result<(), PhaseStop> {
-        let (m, engine) = (self.m, self.engine.as_ref().expect("begin_page runs first"));
-        let bucket = &m.job.bucket;
-        match engine.head(bucket, key).await {
-            Ok(_) => return Ok(()),
-            Err(e) if e.is_not_found() => {}
-            Err(e) => {
-                return Err(PhaseStop::from(format!(
-                    "mirror: could not check '{key}' at the source ({e}) — nothing deleted                      for it; source remains authoritative"
-                )))
+    async fn object(&self, key: &str) -> Result<bool, PhaseStop> {
+        let engine = self.engine.as_ref().expect("begin_page runs first");
+        match head_retrying(engine, &self.m.job.bucket, key).await {
+            Ok(found) => Ok(found.is_none()),
+            Err(e) => Err(HeadFailed {
+                message: format!(
+                    "mirror: {} — nothing deleted for it; source remains authoritative",
+                    e.message
+                ),
+                ..e
+            }
+            .stop()),
+        }
+    }
+
+    fn stops(done: &Result<bool, PhaseStop>) -> bool {
+        done.is_err()
+    }
+
+    async fn settle(&mut self, key: &str, done: Result<bool, PhaseStop>) -> Result<(), PhaseStop> {
+        if done? {
+            self.absent.push(key.to_string());
+        }
+        Ok(())
+    }
+
+    /// The page's extras in one batch (one reclaim check per folder), each
+    /// deleted one audited.
+    async fn end_page(&mut self) -> Result<(), PhaseStop> {
+        let m = self.m;
+        let engine = self.engine.as_ref().expect("begin_page runs first");
+        let keys = std::mem::take(&mut self.absent);
+        let items = keys.iter().map(|k| DeleteItem::new(k.as_str())).collect();
+        let outcomes = delete_keys(engine, &m.params.transient_key, items, &|| {
+            !crate::shutdown::is_shutting_down()
+        })
+        .await;
+        for (key, outcome) in keys.iter().zip(outcomes) {
+            match outcome {
+                DeleteOutcome::Deleted(_) => {
+                    self.pruned += 1;
+                    crate::audit::audit_log(
+                        "maintenance_migrate_mirror_delete",
+                        m.job.triggered_by.as_deref().unwrap_or("system"),
+                        &format!("job:{}", m.job.id),
+                        &axum::http::HeaderMap::new(),
+                        &m.job.bucket,
+                        key,
+                    );
+                }
+                DeleteOutcome::NotFound | DeleteOutcome::Changed => {}
+                DeleteOutcome::Skipped => return Err(PhaseStop::ShuttingDown),
+                DeleteOutcome::Failed(e) => {
+                    let message =
+                        format!("mirror: delete of destination extra '{key}' failed: {e}");
+                    return Err(if ListFailure::of(&e) == ListFailure::Transient {
+                        PhaseStop::FailedTransient(message)
+                    } else {
+                        PhaseStop::Failed(message)
+                    });
+                }
             }
         }
-        engine
-            .delete(&m.params.transient_key, key)
-            .await
-            .map_err(|e| format!("mirror: delete of destination extra '{key}' failed: {e}"))?;
-        self.pruned += 1;
-        crate::audit::audit_log(
-            "maintenance_migrate_mirror_delete",
-            m.job.triggered_by.as_deref().unwrap_or("system"),
-            &format!("job:{}", m.job.id),
-            &axum::http::HeaderMap::new(),
-            bucket,
-            key,
-        );
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "migrate_cost_tests.rs"]
+mod cost_tests;
 
 #[cfg(test)]
 mod tests {

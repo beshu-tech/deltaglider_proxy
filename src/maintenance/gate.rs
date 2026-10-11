@@ -286,6 +286,70 @@ pub fn check_verified_request(
     Ok(())
 }
 
+/// The backend-health check of background work (lifecycle, maintenance).
+/// Client requests to a bucket whose backend is gated (unreachable, or its
+/// credentials refused) get a fast 503. A background job sent its whole
+/// volume to that backend anyway: every request waited out its timeout,
+/// fed the passive health signal, and kept the backend gated. Each job
+/// asks this check before it starts and before each page, and defers while
+/// the answer is `Some`.
+pub(crate) struct BackendCheck {
+    state: Arc<crate::api::handlers::AppState>,
+    config: crate::config::SharedConfig,
+    /// Buckets whose backend the job uses (resolved at each check: a
+    /// config apply can move a bucket).
+    buckets: Vec<String>,
+    /// Backends the job uses by name (a migrate's source and target).
+    backends: Vec<String>,
+}
+
+impl BackendCheck {
+    pub(crate) fn new(
+        state: Arc<crate::api::handlers::AppState>,
+        config: crate::config::SharedConfig,
+        buckets: Vec<String>,
+        backends: Vec<String>,
+    ) -> Self {
+        Self {
+            state,
+            config,
+            buckets,
+            backends,
+        }
+    }
+
+    /// Why the job must wait: the first gated backend and its cause, or
+    /// `None`. Fail-open like the request gate: no unhealthy backend, a
+    /// config that an apply holds, an unknown backend or no verdict.
+    pub(crate) fn gated(&self) -> Option<String> {
+        let health = &self.state.backend_health;
+        if health.unhealthy_names().is_empty() {
+            return None;
+        }
+        let cfg = self.config.try_read().ok()?;
+        let by_bucket = self.buckets.iter().filter_map(|bucket| {
+            use crate::storage::StorageBackend;
+            let routed = self
+                .state
+                .engine
+                .load()
+                .storage()
+                .resolved_backend_name(bucket);
+            crate::coordination::health::gated_backend(&cfg, bucket, routed)
+        });
+        let by_name = self
+            .backends
+            .iter()
+            .filter_map(|name| Some((name.clone(), cfg.backend_by_name(name)?.clone())));
+        by_bucket.chain(by_name).find_map(|(name, def)| {
+            let verdict = health.get(&name, &def)?;
+            verdict
+                .is_gating()
+                .then(|| format!("backend '{name}' is unavailable: {}", verdict.cause()))
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

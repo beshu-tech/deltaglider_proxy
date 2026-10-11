@@ -34,6 +34,53 @@
 /// One bound for every job pagination loop (was four private copies).
 pub const MAX_JOB_PAGES: u32 = 10_000;
 
+/// Attempts of one page listing before the loop gives up on a transient
+/// error (the parity scan's budget).
+pub const LIST_ATTEMPTS: u32 = 5;
+
+/// What a failed page listing means for the loop that sent it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListFailure {
+    /// The backend was slow, broke off, answered a 5xx or throttled: list
+    /// the SAME token again after a pause.
+    Transient,
+    /// The request itself was refused as invalid (InvalidArgument, or a
+    /// not-found class): on the first page of a resumed loop the persisted
+    /// token is the suspect, and only this restarts the loop.
+    Token,
+    /// Anything else (the bucket is gone, access is refused): the loop
+    /// stops and keeps its cursor.
+    Fatal,
+}
+
+impl ListFailure {
+    /// Classify an engine listing error. Engine continuation tokens are
+    /// keys (a start-after on S3), so a backend cannot invalidate one: a
+    /// timeout on the first resumed page says nothing about the token.
+    pub fn of(e: &crate::deltaglider::EngineError) -> Self {
+        use crate::deltaglider::EngineError as E;
+        use crate::storage::StorageError as S;
+        if crate::transfer::CopyClass::of_engine(e).retryable() {
+            return ListFailure::Transient;
+        }
+        match e {
+            E::InvalidArgument(_)
+            | E::NotFound(_)
+            | E::Storage(S::NotFound(_))
+            | E::Storage(S::InvalidKey(_)) => ListFailure::Token,
+            _ => ListFailure::Fatal,
+        }
+    }
+}
+
+/// The pause before listing attempt `attempt + 1` of the same page, or
+/// `None` once [`LIST_ATTEMPTS`] are used up or `failure` is not
+/// transient.
+pub fn list_retry_delay(failure: ListFailure, attempt: u32) -> Option<std::time::Duration> {
+    (failure == ListFailure::Transient && attempt < LIST_ATTEMPTS)
+        .then(|| std::time::Duration::from_millis(250 * u64::from(attempt)))
+}
+
 #[derive(Debug)]
 pub struct Pager {
     token: Option<String>,
@@ -105,6 +152,14 @@ impl Pager {
     /// [`restart_fresh`]: Self::restart_fresh
     pub fn poisoned_resume_token(&self) -> bool {
         self.resumed && self.pages_started == 1
+    }
+
+    /// Restart the loop from page 0 for a listing that failed with
+    /// `failure`? Only a refused token on the first page of a resumed
+    /// loop: a transient error is retried with the same token, and any
+    /// other error stops the loop with its cursor kept.
+    pub fn restarts_on(&self, failure: ListFailure) -> bool {
+        self.poisoned_resume_token() && failure == ListFailure::Token
     }
 
     /// Drop the (poisoned) token and rewind to a fresh first page. After

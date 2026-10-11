@@ -516,6 +516,32 @@ impl ConfigDb {
         Ok(n > 0)
     }
 
+    /// Hand back a job whose backend is gated: a `running` row goes back to
+    /// `queued` with phase and cursor kept, `last_error` says why, and no
+    /// worker claims it before `not_before` (the lease columns hold the
+    /// wait, which the claim honours). The row stays active, so its write
+    /// gate stays armed. Returns whether a row changed.
+    pub fn maintenance_defer(
+        &self,
+        job_id: i64,
+        instance_id: &str,
+        not_before: i64,
+        why: &str,
+    ) -> Result<bool, ConfigDbError> {
+        let now = current_unix_seconds();
+        let n = self.conn.execute(
+            "UPDATE maintenance_jobs
+                SET status = CASE status WHEN 'running' THEN 'queued' ELSE status END,
+                    leader_instance_id = 'deferred', leader_expires_at = ?,
+                    last_error = ?, updated_at = ?
+              WHERE id = ?
+                AND status IN ('running','cancelling')
+                AND leader_instance_id = ?",
+            params![not_before, why, now, job_id, instance_id],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Record a per-object failure, ring-bounded to `max_retained` rows
     /// per job (oldest evicted first).
     pub fn maintenance_record_failure(

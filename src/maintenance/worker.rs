@@ -42,11 +42,23 @@ use crate::coordination::LeaseError;
 use crate::storage::encrypting::{ENCRYPTION_KEY_ID_KEY, ENCRYPTION_MARKER_KEY};
 use crate::transfer::{copy_object_with_retries, ObjectTransferRequest};
 
-use super::paged::{paged_phase, JobCtx, KeyPage, PageStep, PhaseSpec};
+use super::paged::{
+    paged_phase, JobCtx, KeyPage, ListError, PageStep, PhaseSpec, PAGE_CONCURRENCY,
+};
 use super::store::{current_unix_seconds, MaintenanceJob};
 use super::{needs_rewrite, resolve_desired, strip_encryption_markers, DesiredEncryption};
 
 const POLL_INTERVAL_SECS: u64 = 3;
+/// How long a job whose backend is gated waits before a worker claims it
+/// again (about one health re-probe interval).
+const BACKEND_DEFER_SECS: i64 = 30;
+/// How many times a job that a backend's transient failure stopped (a
+/// timeout, a 5xx or a throttle, after the in-place retries) goes back to
+/// the queue with its cursor, without progress in between, before it
+/// settles `failed`.
+pub(crate) const TRANSIENT_RETRIES: u32 = 5;
+/// The wait before the first such retry; it doubles each time.
+const TRANSIENT_RETRY_SECS: i64 = 60;
 pub(crate) const PAGE_SIZE: u32 = 1000;
 const MAX_FAILURES_RETAINED: usize = 200;
 const DRAIN_POLL_MS: u64 = 250;
@@ -54,10 +66,23 @@ const DRAIN_POLL_MS: u64 = 250;
 /// Who holds a job's lease, and its timing (`advanced.jobs`, read at
 /// claim). The claim, the keeper and the per-page heartbeat all renew
 /// with the same TTL.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub(crate) struct Holder<'a> {
     pub id: &'a str,
     pub lease: LeaseTiming,
+    /// The job's backend-health check (`None`: never gated).
+    pub backend: Option<&'a super::gate::BackendCheck>,
+}
+
+impl Holder<'_> {
+    /// `Err(Deferred)` while a backend of the job is gated: the job waits
+    /// instead of sending its requests to a backend that cannot answer.
+    pub(crate) fn check_backend(&self) -> Result<(), PhaseStop> {
+        match self.backend.and_then(super::gate::BackendCheck::gated) {
+            Some(why) => Err(PhaseStop::Deferred(why)),
+            None => Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -66,6 +91,7 @@ impl<'a> Holder<'a> {
         Self {
             id,
             lease: LeaseTiming::MAINTENANCE,
+            backend: None,
         }
     }
 }
@@ -122,6 +148,7 @@ pub fn spawn_worker(
                         let holder = Holder {
                             id: &instance_id,
                             lease,
+                            backend: None,
                         };
                         run_job(&mutator, &config, &db, &state, holder, job).await;
                     }
@@ -174,6 +201,11 @@ async fn run_job(
         holder.lease.ttl_secs,
         std::time::Duration::from_secs(holder.lease.heartbeat_secs.max(1) as u64),
     );
+    let check = backend_check(config, state, &job);
+    let holder = Holder {
+        backend: Some(&check),
+        ..holder
+    };
     // A row on the coordination bucket (queued by an older release, which
     // admitted it) fails before any phase touches that bucket (review B3).
     let reserved = state
@@ -182,8 +214,11 @@ async fn run_job(
         .bucket_policy_registry()
         .client_bucket(&bucket)
         .err();
+    // A gated backend: wait before any phase sends a request.
+    let gated = holder.check_backend();
     let outcome = match job.kind.as_str() {
         _ if reserved.is_some() => Err(reserved.unwrap_or_default().into()),
+        _ if gated.is_err() => gated,
         "reencrypt" => execute_phases(config, db, state, holder, &job).await,
         "migrate" => super::migrate::execute_migrate_phases(mutator, db, state, holder, &job).await,
         super::backfill::KIND => {
@@ -193,7 +228,54 @@ async fn run_job(
     };
     drop(keeper);
 
-    let action = after_run(&outcome, crate::shutdown::is_shutting_down());
+    let row = current_row(db, &job).await;
+    let action = after_run(
+        &outcome,
+        crate::shutdown::is_shutting_down(),
+        transient_retry_left(&row),
+    );
+    if action == AfterRun::Defer {
+        // A backend of the job is gated, or did not answer. The row goes
+        // back to `queued` with its cursor, and no worker claims it for a
+        // while: the job sends nothing to the backend meanwhile. The row
+        // stays active, so its write gate stays armed.
+        let (wait, why) = match &outcome {
+            Err(PhaseStop::FailedTransient(e)) => {
+                let n = note_transient_stop(&row);
+                (
+                    TRANSIENT_RETRY_SECS << (n - 1).min(6),
+                    format!(
+                        "{e} — the job runs again from its cursor (retry {n} of \
+                         {TRANSIENT_RETRIES})"
+                    ),
+                )
+            }
+            other => (
+                BACKEND_DEFER_SECS,
+                other
+                    .as_ref()
+                    .err()
+                    .map(PhaseStop::to_string)
+                    .unwrap_or_default(),
+            ),
+        };
+        let deferred = {
+            let db = db.lock().await;
+            let deferred = db.maintenance_defer(
+                job.id,
+                holder.id,
+                current_unix_seconds().saturating_add(wait),
+                &why,
+            );
+            state.maintenance_gate.sync_from(&db);
+            deferred
+        };
+        info!(
+            "maintenance: job #{} on '{}' waits {wait}s ({why}) (deferred: {:?})",
+            job.id, bucket, deferred
+        );
+        return;
+    }
     if action == AfterRun::ReleaseForResume {
         // A graceful shutdown (SIGTERM on every rolling deploy) stopped the
         // job, or made its work fail. Neither says anything about the data:
@@ -237,6 +319,7 @@ async fn run_job(
         return;
     }
 
+    forget_transient_stops(&job);
     let (status, last_error) = match &outcome {
         Ok(()) => {
             // Per-object failures do not stop a job; they decide its status.
@@ -277,6 +360,107 @@ async fn run_job(
         &bucket,
         "",
     );
+}
+
+/// The row of `job` as the DB holds it now (the claimed row when the DB
+/// cannot answer).
+pub(crate) async fn current_row(db: &Arc<Mutex<ConfigDb>>, job: &MaintenanceJob) -> MaintenanceJob {
+    db.lock()
+        .await
+        .maintenance_job_by_id(job.id)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| job.clone())
+}
+
+/// What a job's row shows of its progress.
+type ProgressMark = (String, Option<String>, i64);
+
+fn progress_mark(row: &MaintenanceJob) -> ProgressMark {
+    (
+        row.phase.clone(),
+        row.continuation_token.clone(),
+        row.objects_done + row.objects_skipped,
+    )
+}
+
+/// A job, as the transient-stop count knows it: the id, and what makes a
+/// row with a reused id (a restored DB, the in-memory DBs of tests) another
+/// job.
+type JobIdentity = (i64, String, String, i64);
+
+fn identity(row: &MaintenanceJob) -> JobIdentity {
+    (row.id, row.kind.clone(), row.bucket.clone(), row.created_at)
+}
+
+/// The transient stops of each job in this process: how many since the
+/// job last made progress, and its progress at the last one.
+type TransientStops = std::collections::BTreeMap<JobIdentity, (u32, ProgressMark)>;
+
+static TRANSIENT_STOPS: std::sync::Mutex<TransientStops> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn transient_stops() -> std::sync::MutexGuard<'static, TransientStops> {
+    TRANSIENT_STOPS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// May a transient stop of the job whose row is now `row` send the job
+/// back to the queue? Yes for the first [`TRANSIENT_RETRIES`] stops
+/// without progress in between: a backend that times out now and then
+/// must not end a long job, and one that never answers must not keep it
+/// (and its write gate) forever.
+pub(crate) fn transient_retry_left(row: &MaintenanceJob) -> bool {
+    match transient_stops().get(&identity(row)) {
+        Some((n, mark)) if *mark == progress_mark(row) => *n < TRANSIENT_RETRIES,
+        _ => true,
+    }
+}
+
+/// Count a transient stop of the job whose row is now `row`; returns the
+/// stops since its last progress.
+fn note_transient_stop(row: &MaintenanceJob) -> u32 {
+    let mark = progress_mark(row);
+    let mut stops = transient_stops();
+    let entry = stops.entry(identity(row)).or_insert((0, mark.clone()));
+    if entry.1 != mark {
+        *entry = (0, mark);
+    }
+    entry.0 += 1;
+    entry.0
+}
+
+fn forget_transient_stops(row: &MaintenanceJob) {
+    transient_stops().remove(&identity(row));
+}
+
+/// Record `n` transient stops of `row` without progress (tests).
+#[cfg(test)]
+pub(crate) fn set_transient_stops(row: &MaintenanceJob, n: u32) {
+    transient_stops().insert(identity(row), (n, progress_mark(row)));
+}
+
+/// The backend-health check of `job`: its bucket's backend, and for a
+/// migrate the source and target backends by name.
+fn backend_check(
+    config: &SharedConfig,
+    state: &Arc<AppState>,
+    job: &MaintenanceJob,
+) -> super::gate::BackendCheck {
+    let backends = match job.kind.as_str() {
+        "migrate" => job
+            .params
+            .as_deref()
+            .and_then(|p| super::migrate::parse_params(p).ok())
+            .map(|p| vec![p.from_backend, p.target_backend])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    super::gate::BackendCheck::new(
+        state.clone(),
+        config.clone(),
+        vec![job.bucket.clone()],
+        backends,
+    )
 }
 
 /// The three phases, resumable at page granularity. Returns Err(reason)
@@ -361,14 +545,14 @@ impl ObjectVisitor for Reencrypt<'_> {
     }
 
     async fn visit(
-        &mut self,
+        &self,
         engine: &Arc<crate::deltaglider::DynEngine>,
         key: &str,
         meta: &crate::types::FileMetadata,
-    ) -> Result<Visit, PhaseStop> {
+    ) -> Visit {
         let desired = self.desired.as_ref().expect("begin_page runs first");
         if !needs_rewrite(&meta.user_metadata, desired) {
-            return Ok(Visit::Skipped);
+            return Visit::Skipped;
         }
         let req = ObjectTransferRequest {
             source_bucket: self.bucket,
@@ -383,12 +567,12 @@ impl ObjectVisitor for Reencrypt<'_> {
             upload_concurrency: None,
             keep_created_at: true,
         };
-        Ok(match copy_object_with_retries(engine, req).await {
+        match copy_object_with_retries(engine, req).await {
             Ok(outcome) => Visit::Done {
                 bytes: outcome.bytes_copied as i64,
             },
             Err(e) => Visit::Failed(e.to_string()),
-        })
+        }
     }
 }
 
@@ -409,13 +593,14 @@ pub(crate) trait ObjectVisitor {
     async fn begin_page(&mut self) -> Result<(), PhaseStop> {
         Ok(())
     }
-    /// One user object, with the metadata the driver read for it.
+    /// One user object, with the metadata the driver read for it. Up to
+    /// [`super::paged::PAGE_CONCURRENCY`] objects run at once.
     async fn visit(
-        &mut self,
+        &self,
         engine: &Arc<crate::deltaglider::DynEngine>,
         key: &str,
         meta: &crate::types::FileMetadata,
-    ) -> Result<Visit, PhaseStop>;
+    ) -> Visit;
 }
 
 /// A job's counters, as its row stores them.
@@ -494,6 +679,7 @@ pub(crate) async fn run_count_then_walk<V: ObjectVisitor>(
             resume: resumable_in(job, "objects"),
             cancel_every: None,
             budget_exhausted: &budget,
+            concurrency: PAGE_CONCURRENCY,
         },
         &mut step,
     )
@@ -522,19 +708,21 @@ struct ObjectsStep<'a, V> {
 }
 
 impl<V: ObjectVisitor> PageStep for ObjectsStep<'_, V> {
+    type Done = Visit;
+
     async fn begin_page(&mut self) -> Result<(), PhaseStop> {
         self.visitor.begin_page().await?;
         self.engine = Some(self.state.engine.load().clone());
         Ok(())
     }
 
-    async fn list(&mut self, token: Option<&str>) -> Result<KeyPage, String> {
+    async fn list(&mut self, token: Option<&str>) -> Result<KeyPage, ListError> {
         let engine = self.engine.as_ref().expect("begin_page runs first");
         engine
             .list_objects(&self.job.bucket, "", None, PAGE_SIZE, token, false)
             .await
             .map(KeyPage::from)
-            .map_err(|e| format!("object list failed: {e}"))
+            .map_err(|e| ListError::engine("object list failed", &e))
     }
 
     // A restart re-scans from page 0: the visitor skips objects already
@@ -547,12 +735,15 @@ impl<V: ObjectVisitor> PageStep for ObjectsStep<'_, V> {
         Ok(())
     }
 
-    async fn object(&mut self, key: &str) -> Result<(), PhaseStop> {
-        let engine = self.engine.clone().expect("begin_page runs first");
-        let visit = match engine.head(&self.job.bucket, key).await {
-            Ok(meta) => self.visitor.visit(&engine, key, &meta).await?,
+    async fn object(&self, key: &str) -> Visit {
+        let engine = self.engine.as_ref().expect("begin_page runs first");
+        match engine.head(&self.job.bucket, key).await {
+            Ok(meta) => self.visitor.visit(engine, key, &meta).await,
             Err(e) => Visit::Failed(format!("could not read object metadata: {e}")),
-        };
+        }
+    }
+
+    async fn settle(&mut self, key: &str, visit: Visit) -> Result<(), PhaseStop> {
         match visit {
             Visit::Done { bytes } => {
                 self.c.done += 1;
@@ -599,6 +790,7 @@ pub(crate) async fn counting_phase(
             cancel_every: None,
             budget_exhausted: "counting stopped at the page budget with more pages \
                  pending — bucket too large for one pass; job left resumable",
+            concurrency: 1,
         },
         &mut step,
     )
@@ -615,13 +807,15 @@ struct CountStep<'a> {
 }
 
 impl PageStep for CountStep<'_> {
-    async fn list(&mut self, token: Option<&str>) -> Result<KeyPage, String> {
+    type Done = ();
+
+    async fn list(&mut self, token: Option<&str>) -> Result<KeyPage, ListError> {
         let engine = self.state.engine.load().clone();
         engine
             .list_objects(&self.job.bucket, "", None, PAGE_SIZE, token, false)
             .await
             .map(KeyPage::from)
-            .map_err(|e| format!("counting list failed: {e}"))
+            .map_err(|e| ListError::engine("counting list failed", &e))
     }
 
     /// Recount from page 0 (idempotent).
@@ -638,7 +832,9 @@ impl PageStep for CountStep<'_> {
         Ok(())
     }
 
-    async fn object(&mut self, _key: &str) -> Result<(), PhaseStop> {
+    async fn object(&self, _key: &str) {}
+
+    async fn settle(&mut self, _key: &str, _done: ()) -> Result<(), PhaseStop> {
         self.count += 1;
         Ok(())
     }
@@ -726,8 +922,16 @@ pub(crate) enum PhaseStop {
     /// The process shuts down. Like `LeaseLost`, the row is not settled;
     /// the worker hands it back for the next boot to resume.
     ShuttingDown,
+    /// A backend of the job is gated (unreachable, or its credentials are
+    /// refused). The row goes back to `queued` with its cursor, and the job
+    /// waits before a worker claims it again.
+    Deferred(String),
     /// A job-fatal error.
     Failed(String),
+    /// A job-fatal error that a backend that did not answer caused (a
+    /// timeout, a 5xx, a throttle) after the in-place retries. The job
+    /// settles `failed`, but a migrate keeps the copies it made.
+    FailedTransient(String),
 }
 
 impl std::fmt::Display for PhaseStop {
@@ -736,7 +940,8 @@ impl std::fmt::Display for PhaseStop {
             PhaseStop::Cancelled => f.write_str("cancelled"),
             PhaseStop::LeaseLost => f.write_str("lease lost"),
             PhaseStop::ShuttingDown => f.write_str("shutting down"),
-            PhaseStop::Failed(e) => f.write_str(e),
+            PhaseStop::Deferred(why) => write!(f, "deferred: {why}"),
+            PhaseStop::Failed(e) | PhaseStop::FailedTransient(e) => f.write_str(e),
         }
     }
 }
@@ -771,20 +976,31 @@ pub(crate) enum AfterRun {
     LeaveToLeaseHolder,
     /// Shutdown: never settle, never unwind; hand the row back to resume.
     ReleaseForResume,
+    /// A backend of the job is gated, or a transient failure stopped it
+    /// with retries left: hand the row back, claimable later.
+    Defer,
 }
 
 /// The decision for [`AfterRun`]. Any error while the process shuts down
 /// counts as the shutdown: the runtime teardown makes healthy work fail
 /// (a refused `spawn_blocking`), and settling on it leaves a half-done
 /// bucket marked finished. An operator cancel stays a cancel.
-pub(crate) fn after_run(outcome: &Result<(), PhaseStop>, shutting_down: bool) -> AfterRun {
+pub(crate) fn after_run(
+    outcome: &Result<(), PhaseStop>,
+    shutting_down: bool,
+    retry_transient: bool,
+) -> AfterRun {
     match outcome {
         Ok(()) => AfterRun::Settle,
         Err(PhaseStop::LeaseLost) => AfterRun::LeaveToLeaseHolder,
         Err(PhaseStop::ShuttingDown) => AfterRun::ReleaseForResume,
         Err(PhaseStop::Cancelled) => AfterRun::Settle,
-        Err(PhaseStop::Failed(_)) if shutting_down => AfterRun::ReleaseForResume,
-        Err(PhaseStop::Failed(_)) => AfterRun::Settle,
+        Err(PhaseStop::Deferred(_)) => AfterRun::Defer,
+        Err(PhaseStop::Failed(_) | PhaseStop::FailedTransient(_)) if shutting_down => {
+            AfterRun::ReleaseForResume
+        }
+        Err(PhaseStop::FailedTransient(_)) if retry_transient => AfterRun::Defer,
+        Err(PhaseStop::Failed(_) | PhaseStop::FailedTransient(_)) => AfterRun::Settle,
     }
 }
 
@@ -919,6 +1135,10 @@ pub(crate) async fn record_failure(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "worker_cost_tests.rs"]
+mod cost_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1178,6 +1398,22 @@ mod tests {
     fn after_run_never_settles_on_a_shutdown() {
         use AfterRun::*;
         let failed = || Err(PhaseStop::Failed("object list failed: x".into()));
+        let transient = || Err(PhaseStop::FailedTransient("list timed out".into()));
+        // A transient failure goes back to the queue while it has retries
+        // left; then it settles. A shutdown releases it either way.
+        for (shutting_down, retry, want) in [
+            (false, true, Defer),
+            (false, false, Settle),
+            (true, true, ReleaseForResume),
+            (true, false, ReleaseForResume),
+        ] {
+            assert_eq!(after_run(&transient(), shutting_down, retry), want);
+            assert_eq!(
+                after_run(&failed(), shutting_down, retry),
+                after_run(&failed(), shutting_down, false),
+                "a definitive failure never retries"
+            );
+        }
         let cases: [(Result<(), PhaseStop>, bool, AfterRun); 10] = [
             (Ok(()), false, Settle),
             (Ok(()), true, Settle),
@@ -1192,7 +1428,7 @@ mod tests {
         ];
         for (outcome, shutting_down, want) in cases {
             assert_eq!(
-                after_run(&outcome, shutting_down),
+                after_run(&outcome, shutting_down, false),
                 want,
                 "{outcome:?} shutting_down={shutting_down}"
             );

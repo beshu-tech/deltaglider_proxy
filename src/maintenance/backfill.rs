@@ -183,20 +183,20 @@ struct Backfill<'a> {
 
 impl super::worker::ObjectVisitor for Backfill<'_> {
     async fn visit(
-        &mut self,
+        &self,
         engine: &std::sync::Arc<crate::deltaglider::DynEngine>,
         key: &str,
         meta: &FileMetadata,
-    ) -> Result<super::worker::Visit, super::worker::PhaseStop> {
+    ) -> super::worker::Visit {
         use super::worker::Visit;
         if !needs_metadata_backfill(meta) {
-            return Ok(Visit::Skipped);
+            return Visit::Skipped;
         }
         // The one bytes-read of the job: hash the logical content.
         let (sha256, md5, size) = match hash_object_content(engine.as_ref(), self.bucket, key).await
         {
             Ok(h) => h,
-            Err(e) => return Ok(Visit::Failed(e)),
+            Err(e) => return Visit::Failed(e),
         };
         let new_meta = backfilled_metadata(
             meta,
@@ -212,12 +212,12 @@ impl super::worker::ObjectVisitor for Backfill<'_> {
             .put_passthrough_metadata(self.bucket, prefix, filename, &new_meta)
             .await
         {
-            return Ok(Visit::Failed(format!("metadata write failed: {e}")));
+            return Visit::Failed(format!("metadata write failed: {e}"));
         }
         // The 10-minute metadata cache would otherwise keep serving the
         // pre-backfill fallback shape on LIST.
         engine.invalidate_metadata_cache(self.bucket, key);
-        Ok(Visit::Done { bytes: size as i64 })
+        Visit::Done { bytes: size as i64 }
     }
 }
 
