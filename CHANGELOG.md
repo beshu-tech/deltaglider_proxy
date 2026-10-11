@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.7 — 2026-10-11
+
 ### Fixed — A config apply no longer deletes the lease of the replication event consumer
 
 The replication event consumer keeps its lease in a `replication_state` row
