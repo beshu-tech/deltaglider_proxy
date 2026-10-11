@@ -160,6 +160,24 @@ pub async fn run_now(
         )));
     }
 
+    // A backend of the rule that the health check closed: the run would
+    // send its whole scan to a backend that cannot answer.
+    let check = crate::maintenance::gate::BackendCheck::new(
+        state.s3_state.clone(),
+        state.config.clone(),
+        lifecycle::planner::rule_write_buckets(&rule)
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        Vec::new(),
+    );
+    if let Some(why) = check.gated() {
+        return Err(AdminError::status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("{why} — run the rule again when the backend recovers"),
+        ));
+    }
+
     let Some(guard) = lifecycle::try_acquire_rule(&rule.name) else {
         return Err(AdminError::conflict(
             "rule is already running; wait for the current run to finish",

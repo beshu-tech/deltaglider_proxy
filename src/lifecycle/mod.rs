@@ -6,7 +6,10 @@
 //! disabled by default, previewable through the admin API, and execution
 //! deletes through the DeltaGlider engine rather than raw storage.
 
+#[cfg(test)]
+mod cost_tests;
 pub mod planner;
+mod scan_cache;
 pub mod scheduler;
 pub mod state_store;
 pub mod worker;

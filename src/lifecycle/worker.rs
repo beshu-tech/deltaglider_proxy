@@ -11,9 +11,9 @@ use crate::background::{LeaseAlive, LeaseKeeper, RunLease};
 use crate::config_db::ConfigDb;
 use crate::config_sections::{LifecycleAction, LifecycleRetainNewestAction, LifecycleRule};
 use crate::coordination::LeaseError;
-use crate::deltaglider::DynEngine;
+use crate::deltaglider::{DeleteHooks, DeleteItem, DeleteOutcome, DynEngine, ListObjectsPage};
 use crate::event_outbox::{EventKind, EventSource, NewEvent};
-use crate::job_loop::Pager;
+use crate::job_loop::{list_retry_delay, ListFailure, Pager};
 use crate::transfer::{
     copy_object_with_retries, ObjectTransferRequest, TransferProvenance,
     LIFECYCLE_RULE_METADATA_KEY,
@@ -70,13 +70,73 @@ fn is_zero_i64(v: &i64) -> bool {
     *v == 0
 }
 
+/// How long a preview answers again without a new walk of the rule's
+/// scope.
+const PREVIEW_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// One preview: the walk (shared by every caller that asks while it runs)
+/// and, once it ended, when.
+type PreviewCell =
+    Arc<tokio::sync::OnceCell<(std::time::Instant, Result<LifecycleRunOutcome, String>)>>;
+
+/// What a preview answers for: rule name, rule definition, candidate cap
+/// and engine.
+type PreviewKey = (String, String, usize, usize);
+
+/// The previews of the last [`PREVIEW_TTL`].
+static PREVIEWS: std::sync::Mutex<Vec<(PreviewKey, PreviewCell)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The read-only estimate of a run of `rule`. The Jobs drawer asks for it
+/// when it opens the Preview tab and again in the Run-now confirmation,
+/// and each request walked the whole scope (a HEAD per delta). A preview
+/// of the same definition on the same engine now answers from the last
+/// walk for a minute (`PREVIEW_TTL`), and callers that ask while a walk runs wait
+/// for that walk instead of starting another. A run of the rule drops its
+/// previews. The run itself reuses the preview's metadata (the scan
+/// cache), so Run-now right after a preview sends no HEAD for an object
+/// that did not change.
 pub async fn preview_rule(
     engine: &Arc<DynEngine>,
     rule: &LifecycleRule,
     max_candidates: usize,
 ) -> Result<LifecycleRunOutcome, String> {
-    // Preview never writes → no maintenance gate needed.
-    run_or_preview(None, engine, rule, max_candidates, false, None, None).await
+    let key = (
+        rule.name.clone(),
+        serde_json::to_string(rule).unwrap_or_default(),
+        max_candidates,
+        Arc::as_ptr(engine) as usize,
+    );
+    let cell = {
+        let mut previews = PREVIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        previews.retain(|(_, cell)| {
+            cell.get()
+                .is_none_or(|(at, result)| result.is_ok() && at.elapsed() < PREVIEW_TTL)
+        });
+        match previews.iter().find(|(k, _)| *k == key) {
+            Some((_, cell)) => cell.clone(),
+            None => {
+                let cell = PreviewCell::default();
+                previews.push((key, cell.clone()));
+                cell
+            }
+        }
+    };
+    let (_, result) = cell
+        .get_or_init(|| async {
+            // Preview never writes → no maintenance gate needed.
+            let result =
+                run_or_preview(None, engine, rule, max_candidates, false, None, None).await;
+            (std::time::Instant::now(), result)
+        })
+        .await;
+    result.clone()
+}
+
+/// Drop the previews of `rule_name`: a run changed what they show.
+fn forget_previews(rule_name: &str) {
+    let mut previews = PREVIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    previews.retain(|((name, ..), _)| name != rule_name);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -163,6 +223,7 @@ pub async fn run_begun_rule(
     .await;
     // Normal exit: stop renewing. The caller releases the lease it took.
     heartbeat.finish();
+    forget_previews(&rule.name);
 
     let mut outcome = match outcome_result {
         Ok(outcome) => outcome,
@@ -348,6 +409,15 @@ async fn run_or_preview(
         status: if execute { "succeeded" } else { "preview" }.to_string(),
         ..LifecycleRunOutcome::default()
     };
+    let scan = super::scan_cache::ScanCache::of(engine);
+    let lease_alive = ctx
+        .as_ref()
+        .map_or_else(LeaseAlive::always, |c| c.lease_alive.clone());
+    // Asked before each key of a delete batch: a lost lease or a bucket
+    // that a maintenance job gates stops the batch between keys.
+    let proceed = || {
+        lease_alive.is_alive() && !maintenance_write_bucket_busy(rule, maintenance_gate.as_ref())
+    };
 
     'pages: while let Some(page_idx) = pager.begin_page() {
         // Acquire the gate write-window BEFORE the busy check (acquire-then-
@@ -376,18 +446,22 @@ async fn run_or_preview(
             break 'pages;
         }
 
-        let page = engine
-            .list_objects(&rule.bucket, &prefix, None, page_size, pager.token(), true)
+        let page = list_lifecycle_page(&scan, engine, rule, &prefix, page_size, pager.token())
             .await
-            .map_err(|err| format!("list lifecycle page {page_idx} failed: {err}"));
+            .map_err(|(failure, err)| {
+                (
+                    failure,
+                    format!("list lifecycle page {page_idx} failed: {err}"),
+                )
+            });
         let page = match page {
             Ok(page) => page,
-            Err(err) if execute => {
-                // Poison-token guard: if the FIRST page of a RESUMED run
-                // fails to list, the persisted cursor itself is the prime
-                // suspect (backends invalidate tokens). Clear it so the
-                // next run starts fresh instead of failing forever.
-                if pager.poisoned_resume_token() {
+            Err((failure, err)) if execute => {
+                // Poison-token guard: only a REFUSED token on the first page
+                // of a resumed run is the cursor's fault; clear it so the
+                // next run starts fresh. A transient error was retried with
+                // the same token, and keeps the cursor.
+                if pager.restarts_on(failure) {
                     if let Some(db) = db.as_ref() {
                         let db = db.lock().await;
                         let _ =
@@ -395,16 +469,17 @@ async fn run_or_preview(
                     }
                 }
                 out.errors += 1;
-                let msg = err.to_string();
-                push_failure(&mut out.failures, response_cap, String::new(), msg.clone());
-                record_failure(&db, rule, ctx.as_ref(), "", &msg).await?;
+                push_failure(&mut out.failures, response_cap, String::new(), err.clone());
+                record_failure(&db, rule, ctx.as_ref(), "", &err).await?;
                 break 'pages;
             }
-            Err(err) => return Err(err),
+            Err((_, err)) => return Err(err),
         };
 
         out.objects_scanned += page.objects.len() as i64;
 
+        // This page's deletes, run as ONE engine batch after the plan.
+        let mut deletes: Vec<PlannedDelete> = Vec::new();
         for (key, meta) in page.objects {
             match plan_object(
                 rule,
@@ -447,13 +522,14 @@ async fn run_or_preview(
                         });
                     }
                     if execute {
-                        match execute_action(db.as_ref(), engine, rule, &key, &meta, &action).await
-                        {
-                            Ok(ActionOutcome::Acted(bytes_actioned)) => {
+                        match plan_action(db.as_ref(), engine, rule, &key, &meta, &action).await {
+                            Ok(Planned::Delete(delete)) => deletes.push(delete),
+                            Ok(Planned::Copied { bytes, delete }) => {
                                 out.objects_affected += 1;
-                                out.bytes_affected += bytes_actioned as i64;
+                                out.bytes_affected += bytes as i64;
+                                deletes.extend(delete);
                             }
-                            Ok(ActionOutcome::Skipped) => {
+                            Ok(Planned::Skipped) => {
                                 out.objects_skipped += 1;
                             }
                             Err(err) => {
@@ -473,6 +549,25 @@ async fn run_or_preview(
                         out.bytes_affected += meta.file_size as i64;
                     }
                 }
+            }
+        }
+
+        if !deletes.is_empty() {
+            let stopped = delete_planned(
+                db.as_ref(),
+                engine,
+                rule,
+                deletes,
+                &proceed,
+                ctx.as_ref(),
+                &mut out,
+                response_cap,
+            )
+            .await?;
+            if stopped {
+                // The page is not done: the cursor stays where it was, so
+                // the next run plans this page again.
+                break 'pages;
             }
         }
 
@@ -553,6 +648,7 @@ async fn run_or_preview_retain_newest(
         status: if execute { "succeeded" } else { "preview" }.to_string(),
         ..LifecycleRunOutcome::default()
     };
+    let scan = super::scan_cache::ScanCache::of(engine);
 
     // ── Collect phase (read-only): the full candidate set, structurally filtered ──
     // Keep the FileMetadata alongside each candidate so the act phase can emit the
@@ -586,10 +682,9 @@ async fn run_or_preview_retain_newest(
             incomplete_collect = Some("replication lease lost");
             break 'pages;
         }
-        let page = engine
-            .list_objects(&rule.bucket, &prefix, None, page_size, pager.token(), true)
+        let page = list_lifecycle_page(&scan, engine, rule, &prefix, page_size, pager.token())
             .await
-            .map_err(|err| format!("list lifecycle page {page_idx} failed: {err}"))?;
+            .map_err(|(_, err)| format!("list lifecycle page {page_idx} failed: {err}"))?;
 
         out.objects_scanned += page.objects.len() as i64;
         for (key, meta) in page.objects {
@@ -732,45 +827,45 @@ async fn run_or_preview_retain_newest(
         return Ok(out);
     }
 
-    for c in &plan.delete {
-        // TOCTOU guard: the ranking used a snapshot taken during collect. An
-        // overwrite since then is a new object that might rank in the KEEP set.
-        let snapshot = match metas.get(&c.key) {
-            Some(meta) => Snapshot::of(meta),
-            None => Snapshot {
-                created_at: c.created_at,
-                etag: String::new(),
-                size: c.size,
+    // TOCTOU guard: the ranking used a snapshot taken during collect. An
+    // overwrite since then is a new object that might rank in the KEEP set,
+    // so each delete is conditional on the snapshot. One batch: one
+    // reclaim check per folder, several folders at once.
+    let deletes = plan
+        .delete
+        .iter()
+        .map(|c| PlannedDelete {
+            key: c.key.clone(),
+            snapshot: match metas.get(&c.key) {
+                Some(meta) => Snapshot::of(meta),
+                None => Snapshot {
+                    created_at: c.created_at,
+                    etag: String::new(),
+                    size: c.size,
+                },
             },
-        };
-        let meta = metas.get(&c.key);
-        let failed = match delete_if_unchanged(engine, &rule.bucket, &c.key, &snapshot).await {
-            Ok(DeleteCheck::Proceed) => {
-                out.objects_affected += 1;
-                out.bytes_affected += c.size as i64;
-                if let Some(meta) = meta {
-                    append_lifecycle_delete_event(db.as_ref(), rule, &c.key, meta, "retain-newest")
-                        .await;
-                }
-                None
-            }
-            Ok(DeleteCheck::Changed | DeleteCheck::Gone) => {
-                out.objects_skipped += 1;
-                debug!(
-                    "lifecycle rule '{}': retain-newest skipping {:?} — changed or gone since collect",
-                    rule.name, c.key
-                );
-                None
-            }
-            Ok(DeleteCheck::HeadFailed(msg)) => Some(msg),
-            Err(err) => Some(err.to_string()),
-        };
-        if let Some(msg) = failed {
-            out.errors += 1;
-            push_failure(&mut out.failures, response_cap, c.key.clone(), msg.clone());
-            record_failure(&db, rule, ctx.as_ref(), &c.key, &msg).await?;
-        }
-    }
+            size: c.size,
+            action: "retain-newest",
+            counted: true,
+        })
+        .collect();
+    let lease_alive = ctx
+        .as_ref()
+        .map_or_else(LeaseAlive::always, |c| c.lease_alive.clone());
+    let proceed = || {
+        lease_alive.is_alive() && !maintenance_write_bucket_busy(rule, maintenance_gate.as_ref())
+    };
+    delete_planned(
+        db.as_ref(),
+        engine,
+        rule,
+        deletes,
+        &proceed,
+        ctx.as_ref(),
+        &mut out,
+        response_cap,
+    )
+    .await?;
 
     if out.errors > 0 {
         out.status = "failed".to_string();
@@ -910,55 +1005,71 @@ fn same_generation(a: chrono::DateTime<Utc>, b: chrono::DateTime<Utc>) -> bool {
     trunc(a) == trunc(b)
 }
 
-/// Every lifecycle delete is conditional: the plan was made on a listing
-/// snapshot, and a delete by key would remove a newer overwrite. The engine
-/// checks the object under the deltaspace lock that every PUT holds, so no
-/// overwrite lands between the check and the delete (a HEAD, then a delete
-/// by key, lost one). `Ok(Proceed)`: checked and deleted.
-async fn delete_if_unchanged(
-    engine: &DynEngine,
-    bucket: &str,
-    key: &str,
-    snapshot: &Snapshot,
-) -> Result<DeleteCheck, crate::deltaglider::EngineError> {
-    use crate::deltaglider::ConditionalDelete;
-    let still_ours = |current: &crate::types::FileMetadata| {
-        classify_delete_check(snapshot, Ok(current)) == DeleteCheck::Proceed
-    };
-    Ok(match engine.delete_if(bucket, key, &still_ours).await? {
-        ConditionalDelete::Deleted(_) => DeleteCheck::Proceed,
-        ConditionalDelete::Changed => DeleteCheck::Changed,
-        ConditionalDelete::Gone => DeleteCheck::Gone,
-    })
+/// One planned delete of a lifecycle run. Every lifecycle delete is
+/// conditional: the plan was made on a listing snapshot, and a delete by
+/// key would remove a newer overwrite. The engine checks the object under
+/// the deltaspace lock that every PUT holds, so no overwrite lands between
+/// the check and the delete (a HEAD, then a delete by key, lost one).
+#[derive(Debug)]
+struct PlannedDelete {
+    key: String,
+    /// What the listing saw: the delete goes only while the object is
+    /// still this one.
+    snapshot: Snapshot,
+    /// The size the run reports for it.
+    size: u64,
+    /// The `action` of its delete event.
+    action: &'static str,
+    /// Counted as an affected object. A transition's source delete is not:
+    /// its copy was.
+    counted: bool,
 }
 
-/// What `execute_action` did with one planned object.
-#[derive(Debug, PartialEq, Eq)]
-enum ActionOutcome {
-    /// Deleted and/or copied this many bytes.
-    Acted(u64),
-    /// The object changed or vanished since the listing: nothing done.
+impl PlannedDelete {
+    fn of(
+        key: &str,
+        meta: &crate::types::FileMetadata,
+        action: &'static str,
+        counted: bool,
+    ) -> Self {
+        Self {
+            key: key.to_string(),
+            snapshot: Snapshot::of(meta),
+            size: meta.file_size,
+            action,
+            counted,
+        }
+    }
+}
+
+/// What a run does with one planned object before its page's deletes.
+#[derive(Debug)]
+enum Planned {
+    /// Delete it in the page's batch.
+    Delete(PlannedDelete),
+    /// Transitioned (copied this many bytes); `delete` is its source
+    /// delete, for the page's batch.
+    Copied {
+        bytes: u64,
+        delete: Option<PlannedDelete>,
+    },
+    /// Nothing to do: the destination of a copy-mode transition already
+    /// holds the object.
     Skipped,
 }
 
-async fn execute_action(
+async fn plan_action(
     db: Option<&Arc<Mutex<ConfigDb>>>,
     engine: &Arc<DynEngine>,
     rule: &LifecycleRule,
     key: &str,
     meta: &crate::types::FileMetadata,
     action: &PlannedLifecycleAction,
-) -> Result<ActionOutcome, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Planned, Box<dyn std::error::Error + Send + Sync>> {
     match action {
-        PlannedLifecycleAction::Delete => {
-            match delete_if_unchanged(engine, &rule.bucket, key, &Snapshot::of(meta)).await? {
-                DeleteCheck::Proceed => {}
-                DeleteCheck::Changed | DeleteCheck::Gone => return Ok(ActionOutcome::Skipped),
-                DeleteCheck::HeadFailed(msg) => return Err(msg.into()),
-            }
-            append_lifecycle_delete_event(db, rule, key, meta, "delete").await;
-            Ok(ActionOutcome::Acted(meta.file_size))
-        }
+        PlannedLifecycleAction::Delete => Ok(Planned::Delete(PlannedDelete::of(
+            key, meta, "delete", true,
+        ))),
         PlannedLifecycleAction::Transition {
             destination_bucket,
             destination_key,
@@ -971,7 +1082,7 @@ async fn execute_action(
                     if crate::transfer::content_verdict(meta, Some(&dest))
                         == crate::transfer::ContentVerdict::Same
                     {
-                        return Ok(ActionOutcome::Skipped);
+                        return Ok(Planned::Skipped);
                     }
                 }
             }
@@ -1004,29 +1115,224 @@ async fn execute_action(
                 *delete_source_after_success,
             )
             .await;
-
-            if *delete_source_after_success {
-                match delete_if_unchanged(engine, &rule.bucket, key, &Snapshot::of(meta)).await? {
-                    DeleteCheck::Proceed => {
-                        append_lifecycle_delete_event(
-                            db,
-                            rule,
-                            key,
-                            meta,
-                            "transition-source-delete",
-                        )
-                        .await;
-                    }
-                    // Overwritten since the listing: the copy is done, but the
-                    // new source is not ours to delete.
-                    DeleteCheck::Changed | DeleteCheck::Gone => {}
-                    DeleteCheck::HeadFailed(msg) => return Err(msg.into()),
-                }
-            }
-
-            Ok(ActionOutcome::Acted(copied.bytes_copied as u64))
+            // Overwritten since the listing: the copy is done, but the new
+            // source is not ours to delete (the batch's condition).
+            Ok(Planned::Copied {
+                bytes: copied.bytes_copied as u64,
+                delete: delete_source_after_success
+                    .then(|| PlannedDelete::of(key, meta, "transition-source-delete", false)),
+            })
         }
     }
+}
+
+/// Run `deletes` as ONE engine batch (`DeltaGliderEngine::delete_batch`):
+/// each one conditional on its snapshot, one reclaim check per folder,
+/// several folders at once. A per-key delete paid 7 HEAD requests and a
+/// LIST of its folder per key, one key at a time. Each deleted key's event
+/// is stored as soon as the key ends. `proceed` stops the batch between
+/// keys; the result is `true` when it did (the caller stops the run).
+#[allow(clippy::too_many_arguments)]
+async fn delete_planned(
+    db: Option<&Arc<Mutex<ConfigDb>>>,
+    engine: &DynEngine,
+    rule: &LifecycleRule,
+    deletes: Vec<PlannedDelete>,
+    proceed: &(dyn Fn() -> bool + Send + Sync),
+    ctx: Option<&RunContext>,
+    out: &mut LifecycleRunOutcome,
+    response_cap: usize,
+) -> Result<bool, String> {
+    let events = Arc::new(DeleteEvents {
+        db: db.cloned(),
+        rule_name: rule.name.clone(),
+        bucket: rule.bucket.clone(),
+        expire_after: rule.expire_after.clone(),
+        actions: deletes.iter().map(|d| (d.key.clone(), d.action)).collect(),
+    });
+    let on_outcome = move |key: &str, outcome: &DeleteOutcome| events.publish(key, outcome);
+    let items = deletes
+        .iter()
+        .map(|d| {
+            let snapshot = &d.snapshot;
+            DeleteItem::only_if(
+                d.key.as_str(),
+                move |current: &crate::types::FileMetadata| {
+                    classify_delete_check(snapshot, Ok(current)) == DeleteCheck::Proceed
+                },
+            )
+        })
+        .collect();
+    let outcomes = engine
+        .delete_batch(
+            &rule.bucket,
+            items,
+            DeleteHooks {
+                proceed: Some(proceed),
+                on_outcome: Some(&on_outcome),
+            },
+        )
+        .await;
+    let mut stopped = false;
+    for (d, outcome) in deletes.iter().zip(outcomes) {
+        match outcome {
+            DeleteOutcome::Deleted(_) if d.counted => {
+                out.objects_affected += 1;
+                out.bytes_affected += d.size as i64;
+            }
+            DeleteOutcome::Deleted(_) => {}
+            DeleteOutcome::Changed | DeleteOutcome::NotFound | DeleteOutcome::Skipped => {
+                stopped |= matches!(outcome, DeleteOutcome::Skipped);
+                if d.counted {
+                    out.objects_skipped += 1;
+                }
+                debug!(
+                    "lifecycle rule '{}' did not delete {:?}: {outcome:?}",
+                    rule.name, d.key
+                );
+            }
+            DeleteOutcome::Failed(err) => {
+                out.errors += 1;
+                let msg = err.to_string();
+                push_failure(&mut out.failures, response_cap, d.key.clone(), msg.clone());
+                record_failure(&db.cloned(), rule, ctx, &d.key, &msg).await?;
+            }
+        }
+    }
+    if stopped && !ctx.is_none_or(|c| c.lease_alive.is_alive()) {
+        let msg = "lost lifecycle lease; stopping run before more work";
+        out.errors += 1;
+        push_failure(
+            &mut out.failures,
+            response_cap,
+            String::new(),
+            msg.to_string(),
+        );
+        record_failure(&db.cloned(), rule, ctx, "", msg).await?;
+    } else if stopped {
+        info!(
+            "lifecycle rule '{}' deferring mid-run — a write bucket is under maintenance",
+            rule.name
+        );
+    }
+    Ok(stopped)
+}
+
+/// The delete events of one batch, stored by its `on_outcome` hook.
+struct DeleteEvents {
+    db: Option<Arc<Mutex<ConfigDb>>>,
+    rule_name: String,
+    bucket: String,
+    expire_after: Option<String>,
+    /// key → the event's `action`.
+    actions: std::collections::HashMap<String, &'static str>,
+}
+
+impl DeleteEvents {
+    fn publish(
+        &self,
+        key: &str,
+        outcome: &DeleteOutcome,
+    ) -> futures::future::BoxFuture<'static, ()> {
+        let (Some(db), DeleteOutcome::Deleted(meta)) = (&self.db, outcome) else {
+            return Box::pin(async {});
+        };
+        let event = NewEvent::new(
+            EventKind::LifecycleExpired,
+            self.bucket.as_str(),
+            key,
+            EventSource::Lifecycle,
+            super::current_unix_seconds(),
+            serde_json::json!({
+                "rule_name": &self.rule_name,
+                "action": self.actions.get(key).copied().unwrap_or("delete"),
+                "expire_after": &self.expire_after,
+                "created_at": meta.created_at.to_rfc3339(),
+                "content_length": meta.file_size,
+            }),
+        );
+        let (db, rule, key) = (db.clone(), self.rule_name.clone(), key.to_string());
+        Box::pin(async move {
+            if let Err(err) = db.lock().await.event_outbox_insert(&event) {
+                warn!("lifecycle rule '{rule}' could not append delete event for {key:?}: {err}");
+            }
+        })
+    }
+}
+
+/// One page of the rule's scope, each object with its logical metadata
+/// (from the scan cache while its stored object is unchanged). A
+/// transient error is retried with the same token; `Err` carries what the
+/// failure means for the cursor.
+async fn list_lifecycle_page(
+    scan: &super::scan_cache::ScanCache,
+    engine: &DynEngine,
+    rule: &LifecycleRule,
+    prefix: &str,
+    page_size: u32,
+    token: Option<&str>,
+) -> Result<ListObjectsPage, (ListFailure, crate::deltaglider::EngineError)> {
+    let mut attempt = 0u32;
+    loop {
+        let err = match scan
+            .list_page(engine, &rule.bucket, prefix, page_size, token)
+            .await
+        {
+            Ok(page) => return Ok(page),
+            Err(err) => err,
+        };
+        attempt += 1;
+        let failure = ListFailure::of(&err);
+        let Some(pause) = list_retry_delay(failure, attempt) else {
+            return Err((failure, err));
+        };
+        warn!(
+            "lifecycle rule '{}' listing failed ({err}); listing the same page again",
+            rule.name
+        );
+        tokio::time::sleep(pause).await;
+    }
+}
+
+/// One planned action, its delete run as a batch of one (tests).
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+enum ActionOutcome {
+    /// Deleted and/or copied this many bytes.
+    Acted(u64),
+    /// The object changed or vanished since the listing: nothing done.
+    Skipped,
+}
+
+#[cfg(test)]
+async fn execute_action(
+    db: Option<&Arc<Mutex<ConfigDb>>>,
+    engine: &Arc<DynEngine>,
+    rule: &LifecycleRule,
+    key: &str,
+    meta: &crate::types::FileMetadata,
+    action: &PlannedLifecycleAction,
+) -> Result<ActionOutcome, Box<dyn std::error::Error + Send + Sync>> {
+    let mut out = LifecycleRunOutcome::default();
+    let delete = match plan_action(db, engine, rule, key, meta, action).await? {
+        Planned::Skipped => return Ok(ActionOutcome::Skipped),
+        Planned::Delete(d) => Some(d),
+        Planned::Copied { bytes, delete } => {
+            out.objects_affected = 1;
+            out.bytes_affected = bytes as i64;
+            delete
+        }
+    };
+    if let Some(d) = delete {
+        delete_planned(db, engine, rule, vec![d], &|| true, None, &mut out, 10).await?;
+    }
+    if let Some(f) = out.failures.first() {
+        return Err(f.error.clone().into());
+    }
+    Ok(match out.objects_affected {
+        0 => ActionOutcome::Skipped,
+        _ => ActionOutcome::Acted(out.bytes_affected as u64),
+    })
 }
 
 /// The run's lease keeper (`None` without a DB or a lease: nothing to renew).
@@ -1182,39 +1488,6 @@ async fn record_failure(
         ctx.max_failures_retained,
     )
     .map_err(|err| err.to_string())
-}
-
-async fn append_lifecycle_delete_event(
-    db: Option<&Arc<Mutex<ConfigDb>>>,
-    rule: &LifecycleRule,
-    key: &str,
-    meta: &crate::types::FileMetadata,
-    action: &str,
-) {
-    let Some(db) = db else {
-        return;
-    };
-    let event = NewEvent::new(
-        EventKind::LifecycleExpired,
-        rule.bucket.as_str(),
-        key,
-        EventSource::Lifecycle,
-        super::current_unix_seconds(),
-        serde_json::json!({
-            "rule_name": &rule.name,
-            "action": action,
-            "expire_after": &rule.expire_after,
-            "created_at": meta.created_at.to_rfc3339(),
-            "content_length": meta.file_size,
-        }),
-    );
-    let db = db.lock().await;
-    if let Err(err) = db.event_outbox_insert(&event) {
-        warn!(
-            "lifecycle rule '{}' could not append delete event for {:?}: {}",
-            rule.name, key, err
-        );
-    }
 }
 
 #[allow(clippy::too_many_arguments)]

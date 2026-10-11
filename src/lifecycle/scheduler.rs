@@ -195,6 +195,27 @@ async fn run_due_rules(
             }
             continue;
         }
+        // A backend of the rule is gated (unreachable, or its credentials
+        // are refused): the run would send its whole scan to a backend that
+        // cannot answer, and keep it gated. The rule stays due and runs
+        // on a tick after the backend recovers.
+        let check = crate::maintenance::gate::BackendCheck::new(
+            state.clone(),
+            live.clone(),
+            super::planner::rule_write_buckets(rule)
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            Vec::new(),
+        );
+        if let Some(why) = check.gated() {
+            info!("Lifecycle scheduler deferring rule '{}': {why}", rule.name);
+            if let Some(db) = db.as_ref() {
+                let db = db.lock().await;
+                let _ = db.lifecycle_release_lease(&rule.name, instance_id);
+            }
+            continue;
+        }
 
         info!("Lifecycle scheduler running rule '{}'", rule.name);
         let engine = state.engine.load().clone();
@@ -500,6 +521,49 @@ mod tests {
         assert!(
             !exists(&env, "sched-gated").await,
             "runs once the gate clears"
+        );
+    }
+
+    /// jobs-13: a rule whose bucket's backend the health gate closed (an
+    /// unreachable backend) ran its whole scan against that backend. It is
+    /// deferred like a maintenance-gated rule, and runs once the backend is
+    /// healthy again.
+    #[tokio::test]
+    async fn a_health_gated_backend_defers_the_rule() {
+        use crate::coordination::health::HealthVerdict;
+        let env = env().await;
+        seed(&env, "sched-health").await;
+        let cfg = lifecycle(&[("sched-health-rule", "sched-health")]);
+        let full = crate::config::Config {
+            lifecycle: cfg.clone(),
+            ..Default::default()
+        };
+        let (name, def) = full.effective_backend_for_bucket("sched-health").unwrap();
+        let verdict = |v| env.state.backend_health.set(&name, def, v);
+        verdict(HealthVerdict::Unreachable {
+            detail: "connection refused".into(),
+        });
+        run(&env, &cfg).await;
+        assert!(
+            exists(&env, "sched-health").await,
+            "deferred: nothing deleted"
+        );
+        {
+            let db = env.db.lock().await;
+            let now = crate::lifecycle::current_unix_seconds();
+            assert!(
+                db.lifecycle_try_acquire_lease("sched-health-rule", "other", now, 60)
+                    .unwrap(),
+                "the deferred rule's lease is free"
+            );
+            db.lifecycle_release_lease("sched-health-rule", "other")
+                .unwrap();
+        }
+        verdict(HealthVerdict::Healthy);
+        run(&env, &cfg).await;
+        assert!(
+            !exists(&env, "sched-health").await,
+            "runs once the backend is healthy"
         );
     }
 

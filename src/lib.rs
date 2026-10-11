@@ -1738,7 +1738,6 @@ mod source_guards {
         const SINGLE_KEY: &[&str] = &["src/s3_adapter_s3s/object.rs", "src/cli/rm.rs"];
         // wave 2: move to delete_batch (each agent removes its entries).
         const WAVE_2: &[&str] = &[
-            "src/lifecycle/worker.rs",
         ];
         let allowed: Vec<&str> = SINGLE_KEY.iter().chain(WAVE_2).copied().collect();
         let (files, offenders) = per_key_engine_deletes(&allowed);
