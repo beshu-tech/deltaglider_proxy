@@ -618,8 +618,16 @@ async fn copy_one(
         .head(src_bucket, src_key)
         .await
         .map_err(|e| format!("head {}/{}: {}", src_bucket, src_key, e))?;
-    crate::api::handlers::object_helpers::check_quota(s3, dst_bucket, head.file_size)
-        .map_err(|e| e.to_string())?;
+    // An overwrite nets the size of the object it replaces, as a client
+    // PUT does.
+    crate::api::handlers::object_helpers::check_quota_for_write(
+        s3,
+        dst_bucket,
+        dst_key,
+        head.file_size,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     // The destination's object write lock, as every client write takes it,
     // so the copy never lands inside a conditional PUT's check-then-store.
     let _write_lock = engine.lock_object_write(dst_bucket, dst_key).await;
@@ -1807,6 +1815,79 @@ mod tests {
             "ror/staging/app.zip",
             "app.zip",
         ));
+    }
+
+    /// The quota gate of a bulk copy.
+    mod bulk_copy_quota {
+        use super::super::{run_copy_loop, AdminObjectPath, BulkActor, BulkPlan, CopyItem};
+        use crate::api::handlers::AppState;
+        use crate::bucket_usage::BucketUsage;
+        use crate::deltaglider::savings::SavingsTotals;
+        use crate::storage::{DynStorageBackend, FilesystemBackend};
+        use std::sync::Arc;
+
+        /// A copy over an object nets the size of the object it replaces,
+        /// as a client PUT does: at the quota, replacing 10 B with 10 B adds
+        /// nothing and is allowed. The bulk copy judged it as a new object.
+        #[tokio::test]
+        async fn a_bulk_copy_over_an_object_nets_its_size() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut config = crate::config::Config::default();
+            config.buckets.insert(
+                "b".into(),
+                crate::bucket_policy::BucketPolicyConfig {
+                    quota_bytes: Some(100),
+                    ..Default::default()
+                },
+            );
+            let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(
+                FilesystemBackend::new(tmp.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            );
+            let usage = Arc::new(BucketUsage::in_memory().unwrap());
+            let engine = crate::deltaglider::DeltaGliderEngine::new_with_backend(
+                Arc::new(backend),
+                &config,
+                None,
+            )
+            .with_bucket_usage(Some(usage.clone()));
+            engine.create_bucket("b").await.unwrap();
+            let mut totals = SavingsTotals::default();
+            for (key, size) in [("src/k.jpg", 10), ("copy/k.jpg", 10), ("big.jpg", 80)] {
+                let stored = engine
+                    .store("b", key, &vec![7u8; size], None, Default::default())
+                    .await
+                    .unwrap();
+                totals.accumulate(&stored.metadata);
+            }
+            // A Refresh: the counter row is ground truth now (100 of 100 B).
+            usage
+                .overwrite_from_scan(usage.begin_scan("b"), &totals, 1)
+                .unwrap();
+            let registry = engine.bucket_policy_registry();
+            let plan = BulkPlan {
+                source_bucket: registry.client_bucket("b").unwrap(),
+                dest_bucket: registry.client_bucket("b").unwrap(),
+                dest_prefix: AdminObjectPath::try_from("copy/".to_string()).unwrap(),
+                items: vec![CopyItem {
+                    source_key: AdminObjectPath::try_from("src/k.jpg".to_string()).unwrap(),
+                    relative: AdminObjectPath::try_from("k.jpg".to_string()).unwrap(),
+                }],
+            };
+            let mut state = Arc::try_unwrap(AppState::for_tests(engine)).ok().unwrap();
+            state.bucket_usage = Some(usage);
+            let state = Arc::new(state);
+
+            let (res, _) = run_copy_loop(&state, &plan, &BulkActor::Unrestricted, false).await;
+
+            assert_eq!(
+                (res.succeeded, res.failed),
+                (1, 0),
+                "a copy that adds nothing was refused: {:?}",
+                res.failures
+            );
+        }
     }
 
     /// Bulk delete and move on S3: the folders of the request and the

@@ -13,7 +13,7 @@
 //!   gate, conditional store under the object's write lock, event.
 //! * [`store_client_multipart_admit`] / [`store_client_multipart_commit`]
 //!   — the same quota gate, write lock and event for a multipart completion.
-//! * [`check_quota_for_write`] / [`check_quota`] — pre-write quota gate.
+//! * [`check_quota_for_write`] — pre-write quota gate.
 //! * [`enqueue_object_event`] / [`enqueue_object_events`] — best-
 //!   effort event-outbox append for notification dispatch; never waits
 //!   for the config DB mutex.
@@ -230,29 +230,14 @@ pub(crate) fn check_client_write_allowed(
     Ok(())
 }
 
-/// Pre-write quota gate. Returns `Err` when the write would push the
-/// bucket past its `quota_bytes` policy, or when quota is set to 0
-/// (the "freeze the bucket" override). "Used" is [`quota_used`]. This
-/// variant does not know the key, so an overwrite is judged as a new
-/// object; a client write uses [`check_quota_for_write`].
-pub(crate) fn check_quota(
-    state: &Arc<AppState>,
-    bucket: &str,
-    incoming_bytes: u64,
-) -> Result<(), S3Error> {
-    let engine = state.engine.load();
-    let Some(quota) = engine.bucket_policy_registry().quota_bytes(bucket) else {
-        return Ok(());
-    };
-    quota_decision(quota, quota_used(state, bucket), incoming_bytes)
-        .map_err(S3Error::AccessDeniedReason)
-}
-
-/// [`check_quota`] for a write of `key`: an overwrite replaces the stored
-/// bytes of the object it replaces, so a write that the gate refuses as a
-/// new object is judged again with the prior object's stored size netted
-/// out. Only that refusal pays the HEAD of the prior object. Before, an
-/// overwrite at the limit was refused even when it added nothing.
+/// Pre-write quota gate of a write of `key`. Returns `Err` when the write
+/// would push the bucket past its `quota_bytes` policy, or when quota is
+/// set to 0 (the "freeze the bucket" override). "Used" is [`quota_used`].
+/// An overwrite replaces the stored bytes of the object it replaces, so a
+/// write that the gate refuses as a new object is judged again with the
+/// prior object's stored size netted out. Only that refusal pays the HEAD
+/// of the prior object. Before, an overwrite at the limit was refused even
+/// when it added nothing.
 pub(crate) async fn check_quota_for_write(
     state: &Arc<AppState>,
     bucket: &str,
