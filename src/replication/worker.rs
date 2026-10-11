@@ -39,9 +39,10 @@ use crate::event_outbox::{EventKind, EventSource, NewEvent};
 use crate::job_loop::MAX_JOB_PAGES;
 use crate::metrics::{bump_peak, Metrics};
 use crate::transfer::{
-    copy_object_with_retries, CopyStrategy, ObjectTransferRequest, TransferProvenance,
+    copy_object_from, CopyStrategy, ObjectTransferRequest, TransferProvenance,
     REPLICATION_RULE_METADATA_KEY,
 };
+use crate::types::FileMetadata;
 use futures::stream::StreamExt;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -150,17 +151,20 @@ enum DriverDone {
     },
     Heads {
         req_id: u64,
+        side: walk::Side,
         results: Vec<(String, walk::HeadResult)>,
+        /// Fresh HEADs to remember in the parity cache: (rel key, stored
+        /// version of its listing, metadata).
+        fresh: Vec<(String, String, FileMetadata)>,
     },
     Copy {
         item_id: u64,
         rel_key: String,
         res: Box<PerObjectResult>,
     },
-    Delete {
-        item_id: u64,
-        deleted: bool,
-        error: Option<String>,
+    /// One batch of deletes: per item, (item, deleted, error).
+    Deletes {
+        results: Vec<(u64, bool, Option<String>)>,
     },
 }
 
@@ -228,56 +232,42 @@ fn to_rel_listing(
     })
 }
 
-/// The delete pipeline (faithful mirror): source-absence HEAD (delete ONLY on
-/// NoSuchKey; any other error → preserve + failure ring), then the destination
-/// delete. No provenance check — the destination is dedicated to this rule, so
-/// any key absent at source is removed regardless of who wrote it.
+/// The delete pipeline (faithful mirror) for a batch of destination-only
+/// keys: their source keys are re-checked absent, folder by folder (one
+/// listing each, not one HEAD per key; delete ONLY when absent, preserve on
+/// any error), then the destination deletes go through
+/// `DeltaGliderEngine::delete_batch` (one reclaim check per folder, not per
+/// key). No provenance check — the destination is dedicated to this rule,
+/// so any key absent at source is removed regardless of who wrote it.
 /// DB-FREE by contract (see `copy_one_object`) — failure text rides back in
-/// `DriverDone::Delete.error` for the driver to persist.
-async fn execute_delete(
+/// `DriverDone::Deletes` for the driver to persist.
+async fn execute_deletes(
     engine: &Arc<DynEngine>,
     src_bucket: &str,
     dst_bucket: &str,
-    abs_src: &str,
-    abs_dest: &str,
-    item_id: u64,
+    items: Vec<(u64, super::mirror_delete::MirrorDelete)>,
 ) -> DriverDone {
-    if let Some(m) = engine.metrics() {
-        m.replication_head_calls_total.inc();
-    }
-    match engine.head(src_bucket, abs_src).await {
-        Ok(_) => DriverDone::Delete {
-            item_id,
-            deleted: false,
-            error: None, // source reappeared — nothing to replicate
-        },
-        Err(e) => {
-            let s3e: crate::api::S3Error = e.into();
-            if matches!(s3e, crate::api::S3Error::NoSuchKey(_)) {
-                // Same test-only stall as the copy path: lets a kill land
-                // deterministically mid-delete (inert in prod).
-                maybe_pass_stall().await;
-                match engine.delete(dst_bucket, abs_dest).await {
-                    Ok(_) => DriverDone::Delete {
-                        item_id,
-                        deleted: true,
-                        error: None,
-                    },
-                    Err(de) => DriverDone::Delete {
-                        item_id,
-                        deleted: false,
-                        error: Some(format!("destination delete failed: {de}")),
-                    },
-                }
-            } else {
-                DriverDone::Delete {
-                    item_id,
-                    deleted: false,
-                    error: Some(format!("delete-pass head source failed: {s3e}")),
-                }
+    // Same test-only stall as the copy path: lets a kill land
+    // deterministically mid-delete (inert in prod).
+    maybe_pass_stall().await;
+    let deletes: Vec<super::mirror_delete::MirrorDelete> =
+        items.iter().map(|(_, d)| d.clone()).collect();
+    let outcomes =
+        super::mirror_delete::delete_mirrored(engine, src_bucket, dst_bucket, &deletes).await;
+    let results = items
+        .iter()
+        .zip(outcomes)
+        .map(|((item_id, _), outcome)| {
+            use super::mirror_delete::MirrorOutcome;
+            match outcome {
+                MirrorOutcome::Deleted { existed } => (*item_id, existed, None),
+                // The source reappeared — nothing to replicate.
+                MirrorOutcome::SourceBack => (*item_id, false, None),
+                MirrorOutcome::Failed(f) => (*item_id, false, Some(f.message)),
             }
-        }
-    }
+        })
+        .collect();
+    DriverDone::Deletes { results }
 }
 
 /// RAII guard for one in-flight replication object. Increments
@@ -363,6 +353,7 @@ impl Default for RunConcurrency {
     }
 }
 
+/// [`run_rule_gated`] without the backend health gate.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_rule(
     db: Arc<Mutex<ConfigDb>>,
@@ -376,6 +367,41 @@ pub async fn run_rule(
     concurrency: RunConcurrency,
     maintenance_gate: Option<Arc<crate::maintenance::gate::MaintenanceGate>>,
     coordination_lease: Arc<crate::coordination::DynCoordinationLease<'static>>,
+) -> Result<(i64, RunOutcome), crate::config_db::ConfigDbError> {
+    run_rule_gated(
+        db,
+        engine,
+        rule,
+        max_failures_retained,
+        object_timeout,
+        object_skip_after_failures,
+        triggered_by,
+        lease,
+        concurrency,
+        maintenance_gate,
+        coordination_lease,
+        None,
+    )
+    .await
+}
+
+/// One run of `rule`. With `health`, the run defers (stops, cursor kept)
+/// at a control boundary where the backend of its source or destination is
+/// gated, as for a maintenance job on its destination.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_rule_gated(
+    db: Arc<Mutex<ConfigDb>>,
+    engine: &Arc<DynEngine>,
+    rule: &ReplicationRule,
+    max_failures_retained: u32,
+    object_timeout: Option<std::time::Duration>,
+    object_skip_after_failures: u32,
+    triggered_by: &str,
+    lease: Option<RunLease>,
+    concurrency: RunConcurrency,
+    maintenance_gate: Option<Arc<crate::maintenance::gate::MaintenanceGate>>,
+    coordination_lease: Arc<crate::coordination::DynCoordinationLease<'static>>,
+    health: Option<super::backend_gate::RunHealthGate>,
 ) -> Result<(i64, RunOutcome), crate::config_db::ConfigDbError> {
     let transfers = concurrency.transfers.clamp(1, 64) as usize;
     let upload_concurrency = concurrency.upload_concurrency.clamp(1, 16) as usize;
@@ -433,6 +459,7 @@ pub async fn run_rule(
         max_failures_retained,
         dest_bucket: rule.destination.bucket.clone(),
         maintenance_gate,
+        health: health.map(|gate| (gate, engine.clone(), rule.clone())),
     };
     let events_sink: EventSink = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
 
@@ -481,6 +508,7 @@ pub async fn run_rule(
                 regime,
                 page_size: cap,
                 max_pages,
+                max_requests: walk::MAX_RUN_REQUESTS,
                 dir_workers,
                 head_batch: 100,
                 max_child_dirs_per_dir: 10_000,
@@ -685,6 +713,7 @@ async fn copy_one_object(
     object_timeout: Option<std::time::Duration>,
     upload_concurrency: usize,
     events: &EventSink,
+    src_meta: Option<&FileMetadata>,
 ) -> PerObjectResult {
     let mut out = PerObjectResult::default();
 
@@ -711,7 +740,7 @@ async fn copy_one_object(
         // Test-only stall INSIDE the timeout scope (inert in prod) so the
         // object-timeout Elapsed arm is deterministically exercisable.
         maybe_pass_stall().await;
-        copy_object_with_retries(engine, transfer).await
+        copy_object_from(engine, transfer, src_meta).await
     };
     let copy_result = match object_timeout {
         Some(timeout) => match tokio::time::timeout(timeout, copy_fut).await {
@@ -974,6 +1003,14 @@ struct RunControl {
     /// writing into a bucket being migrated/re-encrypted (finding #12).
     dest_bucket: String,
     maintenance_gate: Option<Arc<crate::maintenance::gate::MaintenanceGate>>,
+    /// The backend health gate, with the engine and rule it judges: a
+    /// gated source or destination backend defers the run like the
+    /// maintenance gate.
+    health: Option<(
+        super::backend_gate::RunHealthGate,
+        Arc<DynEngine>,
+        ReplicationRule,
+    )>,
 }
 
 impl RunControl {
@@ -1008,12 +1045,22 @@ impl RunControl {
             .as_ref()
             .map(|g| g.is_busy(&self.dest_bucket))
             .unwrap_or(false);
+        let health_gated = match &self.health {
+            Some((gate, engine, rule)) => match gate.gated(engine, rule).await {
+                Some(cause) => {
+                    info!("replication rule '{}' defers: {cause}", self.rule_name);
+                    true
+                }
+                None => false,
+            },
+            None => false,
+        };
         let verdict = control_verdict_with_maintenance(
             cancel_requested,
             paused,
             self.one_off,
             lease_ok,
-            maint_busy,
+            maint_busy || health_gated,
         );
         if verdict == ControlVerdict::LeaseLost && renew {
             log_failure(
@@ -1628,5 +1675,225 @@ mod tests {
         assert_eq!(runs[0].objects_scanned, 10);
         assert_eq!(runs[0].objects_copied, 4);
         assert_eq!(runs[0].errors, 2);
+    }
+}
+
+/// The reconcile run's requests on a fake S3: the delete pass, converged
+/// pairs, and HEAD concurrency.
+#[cfg(test)]
+mod request_count_tests {
+    use super::*;
+    use crate::config_sections::{ConflictPolicy, ReplicationEndpoint};
+    use crate::coordination::DynCoordinationLease;
+    use crate::storage::{DynStorageBackend, FakeS3};
+
+    struct FreeLease;
+
+    impl crate::coordination::CoordinationLease for FreeLease {
+        async fn try_acquire(
+            &self,
+            _: crate::coordination::LeaseSubsystem,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: i64,
+        ) -> Result<bool, crate::coordination::LeaseError> {
+            Ok(true)
+        }
+        async fn renew(
+            &self,
+            _: crate::coordination::LeaseSubsystem,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: i64,
+        ) -> Result<(), crate::coordination::LeaseError> {
+            Ok(())
+        }
+        async fn release(
+            &self,
+            _: crate::coordination::LeaseSubsystem,
+            _: &str,
+            _: &str,
+        ) -> Result<(), crate::coordination::LeaseError> {
+            Ok(())
+        }
+        async fn is_held(
+            &self,
+            _: crate::coordination::LeaseSubsystem,
+            _: &str,
+            _: i64,
+        ) -> Result<bool, crate::coordination::LeaseError> {
+            Ok(false)
+        }
+    }
+
+    async fn s3_engine() -> (Arc<DynEngine>, Arc<FakeS3>) {
+        let (s3, fake) = crate::storage::fake_s3_backend().await;
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(s3);
+        let engine = Arc::new(crate::deltaglider::DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &crate::config::Config::default(),
+            None,
+        ));
+        for b in ["src", "dst"] {
+            engine.create_bucket(b).await.unwrap();
+        }
+        (engine, fake)
+    }
+
+    fn rule(replicate_deletes: bool) -> ReplicationRule {
+        ReplicationRule {
+            name: "r".to_string(),
+            enabled: true,
+            source: ReplicationEndpoint {
+                bucket: "src".into(),
+                prefix: String::new(),
+            },
+            destination: ReplicationEndpoint {
+                bucket: "dst".into(),
+                prefix: String::new(),
+            },
+            interval: "1h".into(),
+            batch_size: 1000,
+            replicate_deletes,
+            conflict: ConflictPolicy::NewerWins,
+            strict_content_diff: false,
+            include_globs: Vec::new(),
+            exclude_globs: Vec::new(),
+        }
+    }
+
+    async fn run(
+        db: &Arc<Mutex<ConfigDb>>,
+        engine: &Arc<DynEngine>,
+        rule: &ReplicationRule,
+    ) -> RunOutcome {
+        run_rule(
+            db.clone(),
+            engine,
+            rule,
+            10,
+            None,
+            0,
+            "scheduler",
+            None,
+            RunConcurrency::default(),
+            None,
+            DynCoordinationLease::from_arc(Arc::new(FreeLease)),
+        )
+        .await
+        .unwrap()
+        .1
+    }
+
+    fn count(fake: &FakeS3, pred: impl Fn(&str) -> bool) -> usize {
+        fake.requests().iter().filter(|r| pred(r)).count()
+    }
+
+    fn is_list(r: &str, bucket: &str) -> bool {
+        r.starts_with(&format!("GET /{bucket}")) && r.contains("list-type=2")
+    }
+
+    /// Jobs finding 6: the delete pass HEADed the source once per key and
+    /// deleted each key alone, each delete listing the destination folder
+    /// again. A finished folder now costs one source listing and one
+    /// destination folder check.
+    #[tokio::test]
+    async fn a_reconcile_deletes_a_folder_with_one_source_listing() {
+        let (engine, fake) = s3_engine().await;
+        engine
+            .store("src", "other.bin", b"x", None, Default::default())
+            .await
+            .unwrap();
+        for i in 0..50 {
+            engine
+                .store(
+                    "dst",
+                    &format!("f/k{i:02}.bin"),
+                    b"x",
+                    None,
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let db = Arc::new(Mutex::new(ConfigDb::in_memory("t").unwrap()));
+        fake.clear();
+        let outcome = run(&db, &engine, &rule(true)).await;
+        assert_eq!(outcome.totals.objects_deleted, 50, "{outcome:?}");
+        let src_heads = count(&fake, |r| r.starts_with("HEAD /src/f/"));
+        let dst_lists = count(&fake, |r| is_list(r, "dst"));
+        let src_lists = count(&fake, |r| is_list(r, "src"));
+        assert_eq!(src_heads, 0, "the source was HEADed per deleted key");
+        // The walk lists the root and f/ once each; then one folder check.
+        assert!(
+            dst_lists <= 3,
+            "{dst_lists} destination listings: {:?}",
+            fake.requests()
+        );
+        // The walk's root listing, then one re-check of f/.
+        assert!(src_lists <= 3, "{src_lists} source listings");
+    }
+
+    /// Jobs finding 8: on S3 every converged pair cost two engine HEADs
+    /// (four requests) on every run, though the parity cache already held
+    /// its logical facts. A pair whose stored ETag and size did not change
+    /// now resolves from the cache.
+    #[tokio::test]
+    async fn a_converged_walk_sends_no_heads_on_its_next_run() {
+        let (engine, fake) = s3_engine().await;
+        for i in 0..100 {
+            engine
+                .store(
+                    "src",
+                    &format!("d/k{i:03}.bin"),
+                    b"x",
+                    None,
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let db = Arc::new(Mutex::new(ConfigDb::in_memory("t").unwrap()));
+        let r = rule(false);
+        assert_eq!(run(&db, &engine, &r).await.totals.objects_copied, 100);
+        // The first converged walk resolves (and remembers) each pair.
+        assert_eq!(run(&db, &engine, &r).await.totals.objects_copied, 0);
+        fake.clear();
+        let outcome = run(&db, &engine, &r).await;
+        assert_eq!(outcome.totals.objects_copied, 0, "{outcome:?}");
+        let heads = count(&fake, |r| r.starts_with("HEAD "));
+        assert_eq!(heads, 0, "{heads} HEADs for 100 converged pairs");
+    }
+
+    /// Jobs finding 8: HEAD batches ran two at a time, each batch one key
+    /// after another. The walk now HEADs `dir_workers` keys at a time.
+    #[tokio::test]
+    async fn the_walk_heads_dir_workers_keys_at_a_time() {
+        let (engine, fake) = s3_engine().await;
+        // Both sides hold each key (the destination's newer): every pair
+        // needs its HEADs, and nothing copies.
+        for bucket in ["src", "dst"] {
+            for i in 0..100 {
+                engine
+                    .store(
+                        bucket,
+                        &format!("d/k{i:03}.bin"),
+                        b"x",
+                        None,
+                        Default::default(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        let db = Arc::new(Mutex::new(ConfigDb::in_memory("t").unwrap()));
+        fake.set_delay_ms("HEAD", 20);
+        let outcome = run(&db, &engine, &rule(false)).await;
+        assert_eq!(outcome.totals.objects_copied, 0, "{outcome:?}");
+        let peak = fake.peak_in_flight("HEAD");
+        // dir_workers (4) engine HEADs, two requests each.
+        assert!(peak >= 6, "HEAD requests in flight peaked at {peak}");
     }
 }

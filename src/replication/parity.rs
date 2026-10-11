@@ -234,25 +234,7 @@ impl ObjState {
             .as_deref()
             .and_then(|e| e.rsplit_once('-'))
             .and_then(|(_, n)| n.parse::<u32>().ok());
-        // Stored-blob content-version for the parity cache.
-        //  - DELTA with a resolved ref_sha256 (filesystem HEAD): the
-        //    (delta_size, ref_sha256) pair — changes on any re-encode, unlike
-        //    the logical md5 (stable across re-deltas → the stale-cache bug).
-        //  - DELTA stub from an S3 lite list (ref_sha256 empty): fold delta_size
-        //    together with the S3 object ETag (which the lite list already put in
-        //    `md5`) so we never DROP the strongest S3 content-version.
-        //  - Passthrough: the logical etag (stored verbatim).
-        let stored_version = match &m.storage_info {
-            crate::types::StorageInfo::Delta {
-                delta_size,
-                ref_sha256,
-                ..
-            } if !ref_sha256.is_empty() => Some(format!("d:{delta_size}:{ref_sha256}")),
-            crate::types::StorageInfo::Delta { delta_size, .. } => {
-                Some(format!("d:{delta_size}:{}", etag.as_deref().unwrap_or("")))
-            }
-            _ => etag.clone(),
-        };
+        let stored_version = stored_version(m);
         ObjState {
             sha256,
             size: m.file_size,
@@ -263,6 +245,55 @@ impl ObjState {
             stored_version,
         }
     }
+}
+
+/// The STORED-blob content-version token of a listing entry: the parity
+/// cache's key to "unchanged" (a row is used only while its token still
+/// equals the listing's). Shared with the reconcile walk, which resolves
+/// converged pairs from the same rows.
+///  - DELTA with a resolved ref_sha256 (filesystem HEAD): the
+///    (delta_size, ref_sha256) pair — changes on any re-encode, unlike the
+///    logical md5 (stable across re-deltas → the stale-cache bug).
+///  - DELTA stub from an S3 lite list (ref_sha256 empty): the stored delta
+///    size with the S3 object ETag (which the lite list puts in `md5`), so
+///    the strongest S3 content-version is never dropped.
+///  - Passthrough: the stored ETag (the object is stored verbatim).
+pub(crate) fn stored_version(m: &FileMetadata) -> Option<String> {
+    let etag = m
+        .multipart_etag
+        .clone()
+        .or_else(|| (!m.md5.is_empty()).then(|| m.md5.clone()));
+    match &m.storage_info {
+        crate::types::StorageInfo::Delta {
+            delta_size,
+            ref_sha256,
+            ..
+        } if !ref_sha256.is_empty() => Some(format!("d:{delta_size}:{ref_sha256}")),
+        crate::types::StorageInfo::Delta { delta_size, .. } => {
+            Some(format!("d:{delta_size}:{}", etag.as_deref().unwrap_or("")))
+        }
+        _ => etag,
+    }
+}
+
+/// The logical facts of a cache row as metadata a replication decision
+/// reads (`should_replicate`: size, SHA-256, ETag, created-at in ms). NOT
+/// the object's whole metadata: no user metadata, no storage info. `None`
+/// for a row without a created-at (an older row): newer-wins compares it,
+/// so the key needs a HEAD.
+pub(crate) fn cached_logical_meta(name: &str, e: &ParityCacheEntry) -> Option<FileMetadata> {
+    let created_at = e
+        .created_at
+        .and_then(chrono::DateTime::from_timestamp_millis)?;
+    let mut m = FileMetadata::new_passthrough(
+        name.to_string(),
+        e.sha256.clone().unwrap_or_default(),
+        e.etag.clone().unwrap_or_default(),
+        e.size,
+        None,
+    );
+    m.created_at = created_at;
+    Some(m)
 }
 
 /// Which evidence proved a `Match` (or failed to, for a mismatch).
@@ -825,7 +856,10 @@ fn apply_logical(map: &mut BTreeMap<String, ObjState>, map_key: &str, e: &Parity
 /// CONTENT-VERSION token — the etag of the STORED blob (delta-blob for a delta
 /// object, the object etag for passthrough), captured from the lite list at
 /// resolve time and stamped here so the next verify can detect an overwrite.
-fn cache_entry_from_meta(m: &FileMetadata, stored_etag: Option<String>) -> ParityCacheEntry {
+pub(crate) fn cache_entry_from_meta(
+    m: &FileMetadata,
+    stored_etag: Option<String>,
+) -> ParityCacheEntry {
     let sha256 = (!m.file_sha256.is_empty()).then(|| m.file_sha256.clone());
     let etag = m
         .multipart_etag
@@ -852,7 +886,10 @@ fn lite_stored_version(map: &BTreeMap<String, ObjState>, map_key: &str) -> Optio
 /// cached: the cached `stored_etag` must equal the current lite `stored_etag`.
 /// A `None`/`None` pair (no etag either side) is treated as a MISS — we can't
 /// prove the object is unchanged, so we re-read rather than risk a stale verdict.
-fn cache_hit_fresh(cached: &ParityCacheEntry, lite_stored_version: &Option<String>) -> bool {
+pub(crate) fn cache_hit_fresh(
+    cached: &ParityCacheEntry,
+    lite_stored_version: &Option<String>,
+) -> bool {
     matches!((&cached.stored_etag, lite_stored_version), (Some(a), Some(b)) if a == b)
 }
 
@@ -945,6 +982,7 @@ async fn resolve_logical_dest(
     bucket: &str,
     raw_keys: &[String],
     dest: &mut BTreeMap<String, ObjState>,
+    on_source: impl Fn(&str) -> bool,
     failures: Option<&tokio::sync::Mutex<ConfigDb>>,
     progress: Option<&ParityProgress<'_>>,
     progress_base: u64,
@@ -952,21 +990,17 @@ async fn resolve_logical_dest(
     if raw_keys.is_empty() {
         return Vec::new();
     }
-    let keys: Vec<String> = raw_keys.to_vec();
-    // When the lite list can't carry provenance (S3 / encrypting dest),
-    // ownership was left provisional in the scan and must be overlaid from a
-    // FRESH HEAD. The parity cache stores logical facts (size/etag/sha) but NOT
-    // ownership, and ownership isn't stored-etag-stable (it depends on the
-    // source still existing), so a cache hit would leave the provisional
-    // not-owned in place — re-misdiagnosing a rule-owned orphan as foreign on
-    // every verify after the first. So on a non-authoritative dest, bypass the
-    // cache entirely: every key gets a fresh HEAD.
+    // Only a key on BOTH sides uses a cache row. A destination-only key
+    // (an orphan) on a backend whose lite list carries no provenance (S3,
+    // encrypting) needs its OWNERSHIP from a fresh HEAD, which the cache
+    // does not keep: it is HEADed every verify, and its row would be read by
+    // nothing. A key on both sides needs only logical facts (ownership
+    // shows only for orphans): its row answers this verify and the
+    // reconcile walk. Before, a non-authoritative destination bypassed the
+    // cache entirely and still wrote a row for every key.
     let lite_authoritative = engine.lite_list_carries_logical_facts(bucket);
-    let cached = if lite_authoritative {
-        cache_get(failures, &rule.name, ParitySide::Dest, &keys).await
-    } else {
-        std::collections::HashMap::new()
-    };
+    let keys: Vec<String> = raw_keys.iter().filter(|k| on_source(k)).cloned().collect();
+    let cached = cache_get(failures, &rule.name, ParitySide::Dest, &keys).await;
     let mut miss: Vec<&String> = Vec::new();
     for k in raw_keys {
         let lite = lite_stored_version(dest, k);
@@ -994,7 +1028,9 @@ async fn resolve_logical_dest(
                 let stored = lite_stored_version(dest, &k);
                 let e = cache_entry_from_meta(&meta, stored);
                 apply_logical(dest, &k, &e);
-                to_cache.push((k, e));
+                if on_source(&k) {
+                    to_cache.push((k, e));
+                }
             }
             HeadOutcome::Gone => {
                 dest.remove(&k);
@@ -1134,7 +1170,12 @@ async fn head_burst(
     out
 }
 
-async fn cache_get(
+/// Rows one hold of the config DB lock reads, writes or deletes at most.
+/// Every client PUT and DELETE awaits that lock (its event append), so a
+/// verify of 140k objects in one transaction stalled them all.
+pub(crate) const PARITY_DB_CHUNK: usize = 1000;
+
+pub(crate) async fn cache_get(
     failures: Option<&tokio::sync::Mutex<ConfigDb>>,
     rule: &str,
     side: ParitySide,
@@ -1143,28 +1184,34 @@ async fn cache_get(
     let Some(mutex) = failures else {
         return HashMap::new();
     };
-    let refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-    let db = mutex.lock().await;
-    db.parity_cache_get_many(rule, side, &refs)
-        .unwrap_or_default()
+    let mut out = HashMap::new();
+    for chunk in keys.chunks(PARITY_DB_CHUNK) {
+        let refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
+        let db = mutex.lock().await;
+        out.extend(
+            db.parity_cache_get_many(rule, side, &refs)
+                .unwrap_or_default(),
+        );
+    }
+    out
 }
 
-async fn cache_put(
+pub(crate) async fn cache_put(
     failures: Option<&tokio::sync::Mutex<ConfigDb>>,
     rule: &str,
     side: ParitySide,
     entries: &[(String, ParityCacheEntry)],
 ) {
-    if entries.is_empty() {
-        return;
-    }
     let Some(mutex) = failures else {
         return;
     };
     let now = super::current_unix_seconds();
-    let mut db = mutex.lock().await;
-    if let Err(e) = db.parity_cache_put_many(rule, side, entries, now) {
-        warn!("parity cache write failed for rule '{rule}': {e}");
+    for chunk in entries.chunks(PARITY_DB_CHUNK) {
+        let mut db = mutex.lock().await;
+        if let Err(e) = db.parity_cache_put_many(rule, side, chunk, now) {
+            warn!("parity cache write failed for rule '{rule}': {e}");
+            return;
+        }
     }
 }
 
@@ -1176,9 +1223,10 @@ async fn cache_put(
 /// not the source globs — an excluded-but-present dest object is a genuine
 /// orphan). Caps total scanned at `MAX_PARITY_OBJECTS`; `truncated=true`
 /// rather than hang for huge buckets.
-/// Paginate one bucket+prefix, feeding each object to `keep`. `keep` inserts
-/// (and returns `Ok(true)` if it consumed a slot, `Ok(false)` to skip). Caps
-/// at `max` kept objects. Returns `Ok(truncated)`.
+/// Paginate one bucket+prefix, feeding each object to `keep` (which inserts,
+/// or skips it). Caps at `max` VISITED objects: a cap on the kept ones let a
+/// rule whose globs keep few keys list the whole bucket whatever the cap
+/// said. Returns `Ok((truncated, visited))`.
 #[allow(clippy::too_many_arguments)]
 async fn scan_prefix(
     engine: &DynEngine,
@@ -1191,7 +1239,6 @@ async fn scan_prefix(
     base_scanned: usize,
     mut keep: impl FnMut(&str, &FileMetadata) -> Result<bool, String>,
 ) -> Result<(bool, usize), String> {
-    let mut kept = 0usize;
     let mut seen = 0usize;
     let mut page_idx = 0usize;
     let mut truncated = false;
@@ -1248,16 +1295,19 @@ async fn scan_prefix(
             }
         };
         for (key, meta) in &page.objects {
-            if kept >= max {
+            if seen >= max {
                 truncated = true;
                 break 'pages;
             }
             seen += 1;
-            if keep(key, meta)? {
-                kept += 1;
-            }
+            keep(key, meta)?;
         }
         if !pager.advance(page.is_truncated, page.next_continuation_token) {
+            break;
+        }
+        // More pages, and the cap is reached: stop before listing them.
+        if seen >= max {
+            truncated = true;
             break;
         }
     }
@@ -1268,31 +1318,82 @@ async fn scan_prefix(
     Ok((truncated || pager.truncated_by_page_budget(), seen))
 }
 
-/// Evict cache rows for objects no longer present (deleted since last scan) —
-/// bounds growth + drops stale rows. ONLY runs after a COMPLETE scan: a
-/// truncated scan didn't see every key, so it can't tell deleted from unscanned.
-/// Each side is pruned against ITS OWN live key set. Best-effort (logs on error).
+/// Evict cache rows that no verify and no walk will read: objects deleted
+/// since the last scan, and destination-only keys. Each side is pruned
+/// after its own COMPLETE scan (a capped scan did not see every key, so it
+/// cannot tell deleted from unscanned); the destination side needs the
+/// source scan too, since it keeps only keys on both sides. The keys a HEAD
+/// left unresolved keep their rows (one transient error used to skip the
+/// whole prune, so on a flaky backend the rows of deleted objects piled
+/// up). At most [`PARITY_DB_CHUNK`] rows per hold of the DB lock, and the
+/// freed pages go back to the disk. Best-effort (logs on error).
 async fn prune_parity_cache(
     rule: &ReplicationRule,
     failures: Option<&tokio::sync::Mutex<ConfigDb>>,
-    truncated: bool,
+    src_complete: bool,
+    dst_complete: bool,
     source: &BTreeMap<String, ObjState>,
     dest: &BTreeMap<String, ObjState>,
+    unresolved: &[String],
 ) {
-    if truncated {
-        return;
-    }
     let Some(mutex) = failures else { return };
-    let src_live: Vec<String> = source.keys().cloned().collect();
-    let dst_live: Vec<String> = dest.keys().cloned().collect();
-    let mut db = mutex.lock().await;
-    for (side, live) in [
-        (ParitySide::Source, &src_live),
-        (ParitySide::Dest, &dst_live),
-    ] {
-        if let Err(e) = db.parity_cache_retain(&rule.name, side, live) {
-            warn!("parity cache prune failed for rule '{}': {e}", rule.name);
+    let unresolved = unresolved.iter().map(String::as_str);
+    if src_complete {
+        let keep: std::collections::HashSet<&str> = source
+            .keys()
+            .map(String::as_str)
+            .chain(unresolved.clone())
+            .collect();
+        prune_side(mutex, &rule.name, ParitySide::Source, &keep).await;
+    }
+    if src_complete && dst_complete {
+        let keep: std::collections::HashSet<&str> = dest
+            .keys()
+            .filter(|k| source.contains_key(*k))
+            .map(String::as_str)
+            .chain(unresolved)
+            .collect();
+        prune_side(mutex, &rule.name, ParitySide::Dest, &keep).await;
+    }
+}
+
+/// Delete `rule`'s rows on `side` whose key is not in `keep`, a page of
+/// keys at a time.
+async fn prune_side(
+    mutex: &tokio::sync::Mutex<ConfigDb>,
+    rule: &str,
+    side: ParitySide,
+    keep: &std::collections::HashSet<&str>,
+) {
+    let mut after: Option<String> = None;
+    loop {
+        let page = {
+            let db = mutex.lock().await;
+            db.parity_cache_keys_after(rule, side, after.as_deref(), PARITY_DB_CHUNK)
+        };
+        let page = match page {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("parity cache prune failed for rule '{rule}': {e}");
+                return;
+            }
+        };
+        let stale: Vec<&str> = page
+            .iter()
+            .map(String::as_str)
+            .filter(|k| !keep.contains(k))
+            .collect();
+        if !stale.is_empty() {
+            let mut db = mutex.lock().await;
+            if let Err(e) = db.parity_cache_delete(rule, side, &stale) {
+                warn!("parity cache prune failed for rule '{rule}': {e}");
+                return;
+            }
         }
+        if page.len() < PARITY_DB_CHUNK {
+            return;
+        }
+        after = page.last().cloned();
     }
 }
 
@@ -1493,6 +1594,7 @@ pub async fn parity_audit(
         &rule.destination.bucket,
         &dst_needs_logical,
         &mut dest,
+        |k| source.contains_key(k),
         failures,
         progress,
         listed + src_needs_logical.len() as u64,
@@ -1533,7 +1635,21 @@ pub async fn parity_audit(
     }
 
     // Phase 5: prune stale cache rows, then diff + annotate into the outcome.
-    prune_parity_cache(rule, failures, truncated, &source, &dest).await;
+    let unresolved_keys: Vec<String> = src_unresolved_keys
+        .iter()
+        .chain(&dst_unresolved_keys)
+        .cloned()
+        .collect();
+    prune_parity_cache(
+        rule,
+        failures,
+        !src_truncated,
+        !dst_truncated,
+        &source,
+        &dest,
+        &unresolved_keys,
+    )
+    .await;
 
     let source_objects = source.len() as u64;
     let dest_objects = dest.len() as u64;
@@ -2421,5 +2537,316 @@ mod tests {
         assert_eq!(kind, FindingKind::Match, "must not false-mismatch");
         assert_eq!(v, Some(Verifier::SizeOnly));
         assert!(unver);
+    }
+}
+
+/// Parity's requests and cache rows, on a fake S3.
+#[cfg(test)]
+mod request_count_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::deltaglider::DeltaGliderEngine;
+    use crate::storage::{DynStorageBackend, FakeS3};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    async fn engine_on(endpoint: &str) -> Arc<DynEngine> {
+        let s3 = crate::storage::s3_test_support::for_test_endpoint(endpoint);
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(s3);
+        let engine = Arc::new(DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &Config::default(),
+            None,
+        ));
+        for b in ["src", "dst"] {
+            engine.create_bucket(b).await.unwrap();
+        }
+        engine
+    }
+
+    async fn s3_engine() -> (Arc<DynEngine>, Arc<FakeS3>) {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        (engine_on(&endpoint).await, fake)
+    }
+
+    fn rule(include: &[&str]) -> ReplicationRule {
+        let mut r: ReplicationRule = serde_yaml::from_str(
+            "name: r\nenabled: true\nsource: {bucket: src}\ndestination: {bucket: dst}\n",
+        )
+        .unwrap();
+        r.include_globs = include.iter().map(|g| g.to_string()).collect();
+        r
+    }
+
+    fn count(fake: &FakeS3, pred: impl Fn(&str) -> bool) -> usize {
+        fake.requests().iter().filter(|r| pred(r)).count()
+    }
+
+    fn is_list(r: &str, bucket: &str) -> bool {
+        r.starts_with(&format!("GET /{bucket}")) && r.contains("list-type=2")
+    }
+
+    fn rows(db: &ConfigDb, side: &str) -> Vec<String> {
+        let mut stmt = db
+            .conn
+            .prepare(
+                "SELECT dest_key FROM replication_parity_objects
+                 WHERE rule_name = 'r' AND side = ? ORDER BY dest_key",
+            )
+            .unwrap();
+        stmt.query_map([side], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// Copy `key` src → dst as the rule does (provenance marker on).
+    async fn replicate(engine: &Arc<DynEngine>, key: &str) {
+        crate::transfer::copy_object_with_retries(
+            engine,
+            crate::transfer::ObjectTransferRequest {
+                source_bucket: "src",
+                source_key: key,
+                destination_bucket: "dst",
+                destination_key: key,
+                provenance: Some(crate::transfer::TransferProvenance {
+                    metadata_key: crate::transfer::REPLICATION_RULE_METADATA_KEY,
+                    metadata_value: "r",
+                }),
+                strip_user_metadata_keys: &[],
+                operation: "replication",
+                upload_concurrency: None,
+                keep_created_at: true,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Jobs finding 18: the cap counted objects KEPT by the rule's globs,
+    /// so a rule whose globs keep few keys listed the whole bucket whatever
+    /// the cap said. It counts visited objects now.
+    #[tokio::test]
+    async fn the_scan_cap_counts_visited_objects() {
+        use futures::StreamExt;
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let client = reqwest::Client::new();
+        let keys: Vec<String> = (0..4_000)
+            .map(|i| format!("skip-{i:05}.bin"))
+            .chain((0..10).map(|i| format!("keep-{i}.bin")))
+            .collect();
+        futures::stream::iter(keys)
+            .for_each_concurrent(32, |k| {
+                let client = client.clone();
+                let url = format!("{endpoint}/src/{k}");
+                async move {
+                    client.put(url).body("x").send().await.unwrap();
+                }
+            })
+            .await;
+        let engine = engine_on(&endpoint).await;
+        fake.clear();
+        let outcome = parity_audit(&engine, &rule(&["keep-*"]), 1_000, None, None)
+            .await
+            .unwrap();
+        // The listing pages of the scan, not the `.delta` probes of a page.
+        let src_lists: Vec<String> = fake
+            .requests()
+            .into_iter()
+            .filter(|r| is_list(r, "src") && r.contains("max-keys=1000"))
+            .collect();
+        let src_pages = src_lists.len();
+        // The page that reaches the cap is the last one: an engine page
+        // holds a little less than 1,000 objects, so two pages.
+        assert!(
+            src_pages <= 2,
+            "{src_pages} source pages on a cap of 1,000 objects: {src_lists:?}"
+        );
+        assert!(outcome.cap_hit, "the cap must show");
+    }
+
+    /// Jobs finding 9: on an S3 destination every verify HEADed every
+    /// destination key and wrote its cache row, though no verify read
+    /// those rows. Rows of destination-only keys (read by nothing) are no
+    /// longer written, and a key on both sides resolves from its row.
+    #[tokio::test]
+    async fn a_verify_heads_only_destination_only_keys_on_its_next_run() {
+        let (engine, fake) = s3_engine().await;
+        for i in 0..10 {
+            let key = format!("k{i}.bin");
+            engine
+                .store("src", &key, b"payload", None, Default::default())
+                .await
+                .unwrap();
+            replicate(&engine, &key).await;
+        }
+        for i in 0..3 {
+            engine
+                .store(
+                    "dst",
+                    &format!("orphan{i}.bin"),
+                    b"o",
+                    None,
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let db = Mutex::new(ConfigDb::in_memory("pw").unwrap());
+        parity_audit(&engine, &rule(&[]), 1_000, Some(&db), None)
+            .await
+            .unwrap();
+        let dst_rows = rows(&*db.lock().await, "dst");
+        assert!(
+            dst_rows.iter().all(|k| k.starts_with('k')),
+            "rows for destination-only keys: {dst_rows:?}"
+        );
+        fake.clear();
+        parity_audit(&engine, &rule(&[]), 1_000, Some(&db), None)
+            .await
+            .unwrap();
+        let dst_heads = count(&fake, |r| r.starts_with("HEAD /dst/k"));
+        let src_heads = count(&fake, |r| r.starts_with("HEAD /src/"));
+        assert_eq!(
+            (dst_heads, src_heads),
+            (0, 0),
+            "converged keys were HEADed again: {:?}",
+            fake.requests()
+        );
+    }
+
+    /// Jobs finding 10: a verify wrote all its cache rows in one
+    /// transaction under the config DB lock, which every client PUT and
+    /// DELETE awaits. It writes at most 1,000 rows per lock now.
+    #[tokio::test]
+    async fn parity_cache_writes_take_the_db_lock_per_1000_rows() {
+        let db = Arc::new(Mutex::new(ConfigDb::in_memory("pw").unwrap()));
+        let entries: Vec<(String, ParityCacheEntry)> = (0..2_500)
+            .map(|i| {
+                (
+                    format!("k{i:05}"),
+                    ParityCacheEntry {
+                        sha256: None,
+                        size: 1,
+                        etag: Some("e".into()),
+                        stored_etag: Some("e".into()),
+                        created_at: None,
+                    },
+                )
+            })
+            .collect();
+        let held = db.lock().await;
+        let writer = {
+            let db = db.clone();
+            tokio::spawn(
+                async move { cache_put(Some(&db), "r", ParitySide::Source, &entries).await },
+            )
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let probe = {
+            let db = db.clone();
+            tokio::spawn(async move { rows(&*db.lock().await, "src").len() })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(held);
+        let seen = probe.await.unwrap();
+        writer.await.unwrap();
+        assert!(seen <= 1_000, "the writer held the DB lock for {seen} rows");
+        assert_eq!(rows(&*db.lock().await, "src").len(), 2_500);
+    }
+
+    /// Jobs finding 9: one HEAD that failed (a transient 503) skipped the
+    /// whole prune, so on a flaky backend the rows of deleted objects piled
+    /// up. Each side prunes now, and keeps the rows of the keys it could not
+    /// resolve.
+    #[tokio::test]
+    async fn a_verify_prunes_deleted_keys_even_when_a_head_failed() {
+        let (engine, fake) = s3_engine().await;
+        for key in ["a.bin", "b.bin", "c.bin"] {
+            engine
+                .store("src", key, b"v1", None, Default::default())
+                .await
+                .unwrap();
+            replicate(&engine, key).await;
+        }
+        let db = Mutex::new(ConfigDb::in_memory("pw").unwrap());
+        parity_audit(&engine, &rule(&[]), 1_000, Some(&db), None)
+            .await
+            .unwrap();
+        assert_eq!(rows(&*db.lock().await, "src"), ["a.bin", "b.bin", "c.bin"]);
+        for bucket in ["src", "dst"] {
+            engine
+                .delete_batch(
+                    bucket,
+                    vec![crate::deltaglider::DeleteItem::new("c.bin")],
+                    Default::default(),
+                )
+                .await;
+        }
+        // b changes: its stored ETag moves, so the verify must HEAD it.
+        engine
+            .store("src", "b.bin", b"v2-longer", None, Default::default())
+            .await
+            .unwrap();
+        replicate(&engine, "b.bin").await;
+        fake.fail("HEAD", "src/b.bin", 503, "SlowDown", u32::MAX);
+        let outcome = parity_audit(&engine, &rule(&[]), 1_000, Some(&db), None)
+            .await
+            .unwrap();
+        assert!(outcome.unresolved > 0, "b must stay unresolved");
+        assert_eq!(
+            rows(&*db.lock().await, "src"),
+            ["a.bin", "b.bin"],
+            "the row of the deleted c.bin must go; b.bin's stays"
+        );
+    }
+
+    /// From the accounting work (agent F): a parity prune deleted its rows
+    /// but left their pages in the file, which the sync uploads whole.
+    #[tokio::test]
+    async fn a_parity_prune_gives_its_pages_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut db = ConfigDb::open_or_create(&dir.path().join("c.db"), "pw").unwrap();
+        let entries: Vec<(String, ParityCacheEntry)> = (0..20_000)
+            .map(|i| {
+                (
+                    format!("gone/key-{i:06}-{}", "x".repeat(64)),
+                    ParityCacheEntry {
+                        sha256: Some("s".repeat(64)),
+                        size: 1,
+                        etag: Some("e".repeat(32)),
+                        stored_etag: Some("e".repeat(32)),
+                        created_at: None,
+                    },
+                )
+            })
+            .collect();
+        db.parity_cache_put_many("r", ParitySide::Source, &entries, 1)
+            .unwrap();
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(
+            crate::storage::FilesystemBackend::new(data.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let engine =
+            DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None);
+        for b in ["src", "dst"] {
+            engine.create_bucket(b).await.unwrap();
+        }
+        let db = Mutex::new(db);
+        parity_audit(&engine, &rule(&[]), 1_000, Some(&db), None)
+            .await
+            .unwrap();
+        let db = db.into_inner();
+        assert!(rows(&db, "src").is_empty());
+        let free: i64 = db
+            .conn
+            .pragma_query_value(None, "freelist_count", |r| r.get(0))
+            .unwrap();
+        assert!(
+            free < 16,
+            "{free} free pages stay in the file after the prune"
+        );
     }
 }

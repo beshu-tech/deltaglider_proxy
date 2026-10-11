@@ -17,7 +17,9 @@
 //! each rule's persisted `next_due_at`, skips paused/disabled rules, and
 //! executes due rules via the same worker used by "Run now".
 
+pub mod backend_gate;
 pub mod event_consumer;
+mod mirror_delete;
 pub mod parity;
 pub mod planner;
 pub mod remediation;
@@ -27,6 +29,7 @@ pub mod walk;
 pub mod worker;
 
 pub use crate::background::RunLease;
+pub use backend_gate::RunHealthGate;
 pub use parity::{parity_audit, ParityOutcome};
 pub use planner::{
     normalize_prefix, plan_batch, rewrite_key, should_replicate, BatchPlan, Decision,
@@ -39,4 +42,4 @@ pub use state_store::{
     current_unix_seconds, FailureRecord, ObjectFailure, ParityResultRow, ReplicationState,
     RunRecord, RunTotals,
 };
-pub use worker::{run_rule, RunConcurrency, RunOutcome};
+pub use worker::{run_rule, run_rule_gated, RunConcurrency, RunOutcome};

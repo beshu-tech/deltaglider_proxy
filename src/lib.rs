@@ -1742,8 +1742,6 @@ mod source_guards {
             "src/cli/sync.rs",
             "src/lifecycle/worker.rs",
             "src/maintenance/migrate.rs",
-            "src/replication/event_consumer.rs",
-            "src/replication/worker.rs",
         ];
         let allowed: Vec<&str> = SINGLE_KEY.iter().chain(WAVE_2).copied().collect();
         let (files, offenders) = per_key_engine_deletes(&allowed);
@@ -1773,6 +1771,54 @@ mod source_guards {
                 "{caught:?}"
             );
         }
+    }
+
+    /// A replication run checks the backend health gate: it goes through
+    /// `replication::run_rule_gated` with a `RunHealthGate`, and defers when
+    /// the backend of its source or destination is gated. An ungated run
+    /// (`replication::run_rule`) sent its whole volume to a backend that the
+    /// health check had closed, which kept the probe failing and the gate
+    /// closed for every client (jobs finding 13).
+    #[test]
+    fn replication_runs_check_the_backend_health_gate() {
+        // To move to `run_rule_gated` (run-now; the admin API, not D1's).
+        const UNGATED: &[&str] = &["src/api/admin/replication.rs"];
+        let mut files = std::collections::BTreeSet::new();
+        let mut offenders = Vec::new();
+        for (file, text) in crate::source_scan::prod_sources("src") {
+            // The definition and its gated twin.
+            if file == "src/replication/worker.rs" {
+                continue;
+            }
+            let in_replication = file.starts_with("src/replication/");
+            for (n, line) in crate::source_scan::prod_lines(&text) {
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue;
+                }
+                let ungated = code.contains("replication::run_rule(")
+                    || (in_replication
+                        && code.contains("run_rule(")
+                        && !code.contains("fn run_rule("));
+                if !ungated {
+                    continue;
+                }
+                files.insert(file.clone());
+                if !UNGATED.contains(&file.as_str()) {
+                    offenders.push(format!("{file}:{n}: {code}"));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "start a replication run with run_rule_gated and a RunHealthGate:\n{}",
+            offenders.join("\n")
+        );
+        let stale: Vec<&&str> = UNGATED.iter().filter(|f| !files.contains(**f)).collect();
+        assert!(
+            stale.is_empty(),
+            "these files no longer start an ungated run; remove them from the list: {stale:?}"
+        );
     }
 
     /// The request path reads no environment variable: a request reads the

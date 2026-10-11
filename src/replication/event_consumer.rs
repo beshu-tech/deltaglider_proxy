@@ -45,7 +45,7 @@ use crate::event_outbox::{
     current_unix_seconds, EventKind, EventOutboxRecord, EventSource, NewEvent,
 };
 use crate::transfer::{
-    copy_object_with_retries, CopyClass, ObjectTransferRequest, TransferProvenance,
+    copy_object_from, CopyClass, ObjectTransferRequest, TransferProvenance,
     REPLICATION_RULE_METADATA_KEY,
 };
 
@@ -281,6 +281,7 @@ pub fn spawn_event_consumer(
             "Replication event consumer started: instance_id={}",
             instance_id
         );
+        let mut backoff = RuleBackoff::default();
         loop {
             let replication = { config.read().await.replication.clone() };
             let tick = super::scheduler::scheduler_tick(&replication);
@@ -333,6 +334,8 @@ pub fn spawn_event_consumer(
                 &db,
                 &engine,
                 &state.maintenance_gate,
+                Some(&state.backend_health),
+                &mut backoff,
                 &replication,
                 lease.as_ref(),
                 &instance_id,
@@ -521,6 +524,8 @@ async fn drain_once(
     db: &Arc<Mutex<ConfigDb>>,
     engine: &Arc<crate::deltaglider::DynEngine>,
     gate: &crate::maintenance::gate::MaintenanceGate,
+    health: Option<&crate::coordination::BackendHealthCache>,
+    backoff: &mut RuleBackoff,
     replication: &crate::config_sections::ReplicationConfig,
     lease: &(impl CoordinationLease + ?Sized),
     instance_id: &str,
@@ -532,6 +537,8 @@ async fn drain_once(
         db,
         engine,
         gate,
+        health,
+        backoff,
         replication,
         lease,
         &mut claims,
@@ -544,6 +551,55 @@ async fn drain_once(
             let _ = lease
                 .release(LeaseSubsystem::Replication, rule, instance_id)
                 .await;
+        }
+    }
+}
+
+/// The first wait of a rule whose drain stopped ([`drain_must_stop`]).
+const BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(30);
+/// The longest wait.
+const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Pure: the wait after `stops` drains in a row that stopped: 30 s, 60 s,
+/// 120 s, ... at most 10 min.
+fn backoff_delay(stops: u32) -> std::time::Duration {
+    let doublings = stops.saturating_sub(1).min(16);
+    BACKOFF_BASE
+        .saturating_mul(1u32 << doublings)
+        .min(BACKOFF_CAP)
+}
+
+/// The consumer's per-rule backoff. A rule whose drain stopped on a dead or
+/// throttling destination sends nothing until its wait ends, and the wait
+/// doubles with each such drain in a row. A drain in which something worked
+/// ends it. Node-local and in memory: a restart starts without waits.
+#[derive(Debug, Default)]
+pub(crate) struct RuleBackoff {
+    /// Rule → (drains in a row that stopped, no drain before this instant).
+    rules: std::collections::HashMap<String, (u32, std::time::Instant)>,
+}
+
+impl RuleBackoff {
+    /// Is the rule still waiting?
+    fn waiting(&self, rule: &str) -> bool {
+        self.rules
+            .get(rule)
+            .is_some_and(|(_, until)| std::time::Instant::now() < *until)
+    }
+
+    /// Fold one drain of the rule into its backoff.
+    fn after_drain(&mut self, rule: &str, window: &DrainWindow) {
+        if drain_must_stop(window) {
+            let stops = self.rules.get(rule).map_or(0, |(n, _)| *n) + 1;
+            let wait = backoff_delay(stops);
+            warn!(
+                "event consumer: rule '{rule}' backs off for {}s (stopped drains in a row: {stops})",
+                wait.as_secs()
+            );
+            self.rules
+                .insert(rule.to_string(), (stops, std::time::Instant::now() + wait));
+        } else if window.ok > 0 {
+            self.rules.remove(rule);
         }
     }
 }
@@ -622,6 +678,8 @@ async fn drain_rules(
     db: &Arc<Mutex<ConfigDb>>,
     engine: &Arc<crate::deltaglider::DynEngine>,
     gate: &crate::maintenance::gate::MaintenanceGate,
+    health: Option<&crate::coordination::BackendHealthCache>,
+    backoff: &mut RuleBackoff,
     replication: &crate::config_sections::ReplicationConfig,
     lease: &(impl CoordinationLease + ?Sized),
     claims: &mut std::collections::HashMap<String, RuleClaim>,
@@ -687,6 +745,26 @@ async fn drain_rules(
     // failing key) fill every batch with rows the other rules had already
     // handled: they stalled too, one batch later.
     for rule_name in &rule_names {
+        // A rule backing off, or whose source or destination backend the
+        // health gate closed, sends nothing: its events wait (its cursor
+        // holds), as for a maintenance job on its destination.
+        if backoff.waiting(rule_name) {
+            debug!("event consumer: rule '{rule_name}' backs off — its events wait");
+            continue;
+        }
+        if let Some(health) = health {
+            let rule = replication.rules.iter().find(|r| r.name == *rule_name);
+            let cause = match rule {
+                Some(rule) => {
+                    super::backend_gate::gated_rule(health, &*config.read().await, engine, rule)
+                }
+                None => None,
+            };
+            if let Some(cause) = cause {
+                debug!("event consumer: rule '{rule_name}' deferred — {cause}");
+                continue;
+            }
+        }
         let rule_cursor = cursors.get(*rule_name).copied().unwrap_or(global);
         let rows = {
             let dbg = db.lock().await;
@@ -704,7 +782,7 @@ async fn drain_rules(
         // The ids whose key-action failed (the rule's cursor stops there).
         let mut failed_ids: BTreeMap<String, std::collections::BTreeSet<i64>> = BTreeMap::new();
         let groups = group_events_by_key(&rows);
-        if drain_rule_rows(
+        match drain_rule_rows(
             config,
             db,
             engine,
@@ -722,10 +800,12 @@ async fn drain_rules(
             &mut failed_ids,
         )
         .await
-        .is_break()
         {
-            warn!("event consumer: aborting drain, cursors held");
-            break;
+            std::ops::ControlFlow::Break(()) => {
+                warn!("event consumer: aborting drain, cursors held");
+                break;
+            }
+            std::ops::ControlFlow::Continue(window) => backoff.after_drain(rule_name, &window),
         }
         // Advance the rule's cursor to its highest CONTIGUOUS handled id
         // (anything at or past its first failed id is left for next tick).
@@ -766,8 +846,146 @@ async fn drain_rules(
     }
 }
 
+/// What the consumer may do with one key of a rule now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyClaim {
+    /// We hold the rule's lease: act on the key.
+    Act,
+    /// Another worker holds the rule, or the renewal failed: hold the key.
+    Hold,
+    /// Paused or deleted: the key counts as handled.
+    Skip,
+    /// The lease or state read failed: abort the drain, cursors held.
+    Abort,
+}
+
+/// The rule's claim for its next key. The per-rule lease is the one the
+/// scheduler, run-now and other instances take (the coordination lease
+/// chosen at startup), so they and this consumer exclude each other.
+#[allow(clippy::too_many_arguments)]
+async fn claim_key(
+    config: &crate::config::SharedConfig,
+    db: &Arc<Mutex<ConfigDb>>,
+    lease: &(impl CoordinationLease + ?Sized),
+    claims: &mut std::collections::HashMap<String, RuleClaim>,
+    rule_name: &str,
+    instance_id: &str,
+    lease_ttl: i64,
+) -> KeyClaim {
+    let claim = match claims.get(rule_name) {
+        Some(RuleClaim::Held { since }) => {
+            // Pause/delete since the claim: stop at this key.
+            let since = *since;
+            match live_rule_gate(db, config, rule_name).await {
+                RuleClaim::Held { .. } => RuleClaim::Held { since },
+                other => {
+                    let _ = lease
+                        .release(LeaseSubsystem::Replication, rule_name, instance_id)
+                        .await;
+                    claims.insert(rule_name.to_string(), other);
+                    other
+                }
+            }
+        }
+        Some(claim) => *claim,
+        None => {
+            let claim = claim_rule(lease, db, config, rule_name, instance_id, lease_ttl).await;
+            claims.insert(rule_name.to_string(), claim);
+            claim
+        }
+    };
+    match claim {
+        RuleClaim::Held { since } => {
+            // A long drain must not outlive the lease: renew at half the
+            // TTL, and stop acting for the rule if it was lost.
+            let t = current_unix_seconds();
+            if t - since >= lease_ttl / 2 {
+                match lease
+                    .renew(
+                        LeaseSubsystem::Replication,
+                        rule_name,
+                        instance_id,
+                        t,
+                        lease_ttl,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        claims.insert(rule_name.to_string(), RuleClaim::Held { since: t });
+                    }
+                    Err(e) => {
+                        // Lost: nothing to release. Backend: the lease may
+                        // still be ours — release it, so it does not block
+                        // the rule for a whole TTL.
+                        if matches!(e, crate::coordination::LeaseError::Backend(_)) {
+                            let _ = lease
+                                .release(LeaseSubsystem::Replication, rule_name, instance_id)
+                                .await;
+                        }
+                        claims.insert(rule_name.to_string(), RuleClaim::Busy);
+                        return KeyClaim::Hold;
+                    }
+                }
+            }
+            KeyClaim::Act
+        }
+        // Busy on another worker — leave for next tick (holds only this
+        // rule's cursor).
+        RuleClaim::Busy => KeyClaim::Hold,
+        RuleClaim::Skip => KeyClaim::Skip,
+        RuleClaim::Abort => KeyClaim::Abort,
+    }
+}
+
+/// One key of a rule's batch: its net action and its highest event id.
+struct KeyWork<'a> {
+    bucket: &'a str,
+    key: &'a str,
+    rule: &'a ReplicationRule,
+    action: KeyAction,
+    max_id: i64,
+}
+
+/// What a rule's drain met so far: actions that worked, and backend-wide
+/// failures ([`drain_must_stop`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DrainWindow {
+    /// Actions that worked (a copy, a skip, a delete).
+    pub ok: u32,
+    /// Throttles, 5xx and timeouts.
+    pub throttled: u32,
+    /// The destination can take no object (bucket gone, access refused,
+    /// a storage cap used up).
+    pub dest_fatal: bool,
+}
+
+/// Throttles (or 5xx, timeouts) with nothing done that stop a rule's drain.
+const DRAIN_THROTTLE_LIMIT: u32 = 3;
+
+impl DrainWindow {
+    fn record(&mut self, class: Option<CopyClass>) {
+        match class {
+            None => self.ok += 1,
+            Some(CopyClass::DestinationFatal) => self.dest_fatal = true,
+            Some(CopyClass::Throttled | CopyClass::Transient) => self.throttled += 1,
+            Some(_) => {}
+        }
+    }
+}
+
+/// Pure: must the rule's drain stop here (and the rule back off)? On the
+/// first dead destination, or after [`DRAIN_THROTTLE_LIMIT`] throttles with
+/// nothing done. Before, nothing stopped a drain: a dead or throttling
+/// destination got the whole batch every tick, each copy a full source GET.
+pub(crate) fn drain_must_stop(w: &DrainWindow) -> bool {
+    w.dest_fatal || (w.ok == 0 && w.throttled >= DRAIN_THROTTLE_LIMIT)
+}
+
 /// One rule's pass over its own batch (`groups`, already past its cursor).
-/// `Break` = abort the drain (a lease or state read failed): hold the cursor.
+/// `Break` = abort the drain (a lease or state read failed): hold the
+/// cursor. `Continue` carries what the drain met, for the rule's backoff.
+/// Copies run key by key; the deletes run at the end, in one batch
+/// ([`super::mirror_delete`]).
 #[allow(clippy::too_many_arguments)]
 async fn drain_rule_rows(
     config: &crate::config::SharedConfig,
@@ -785,7 +1003,8 @@ async fn drain_rule_rows(
     rule_cursor: i64,
     groups: &BTreeMap<(&str, &str), Vec<&EventOutboxRecord>>,
     failed_ids: &mut BTreeMap<String, std::collections::BTreeSet<i64>>,
-) -> std::ops::ControlFlow<()> {
+) -> std::ops::ControlFlow<(), DrainWindow> {
+    let mut work: Vec<KeyWork<'_>> = Vec::new();
     for ((bucket, key), recs) in groups {
         let (bucket, key) = (*bucket, *key);
         let matched = match_rules(&replication.rules, bucket, key);
@@ -800,171 +1019,244 @@ async fn drain_rule_rows(
             if action == KeyAction::Noop {
                 continue;
             }
-            let max_id_for_key = sub.iter().map(|r| r.id).max().unwrap_or(0);
-            let mut hold = || {
-                failed_ids
-                    .entry(rule.name.clone())
-                    .or_default()
-                    .insert(max_id_for_key);
-            };
-            // Maintenance gate: the destination bucket is being rewritten in
-            // place (re-encryption). Stall this key's events — the cursor
-            // does not advance past them, so they replay after the job ends.
-            if gate.is_busy(&rule.destination.bucket) {
-                debug!(
-                    "event consumer: rule '{}' deferred — destination '{}' under maintenance",
-                    rule.name, rule.destination.bucket
-                );
-                hold();
-                continue;
-            }
-            // The per-rule lease is the one the scheduler, run-now and other
-            // instances take (the coordination lease chosen at startup), so
-            // they and this consumer exclude each other.
-            let claim = match claims.get(&rule.name) {
-                Some(RuleClaim::Held { since }) => {
-                    // Pause/delete since the claim: stop at this key.
-                    let since = *since;
-                    match live_rule_gate(db, config, &rule.name).await {
-                        RuleClaim::Held { .. } => RuleClaim::Held { since },
-                        other => {
-                            let _ = lease
-                                .release(LeaseSubsystem::Replication, &rule.name, instance_id)
-                                .await;
-                            claims.insert(rule.name.clone(), other);
-                            other
-                        }
-                    }
-                }
-                Some(claim) => *claim,
-                None => {
-                    let claim =
-                        claim_rule(lease, db, config, &rule.name, instance_id, lease_ttl).await;
-                    claims.insert(rule.name.clone(), claim);
-                    claim
-                }
-            };
-            match claim {
-                RuleClaim::Held { since } => {
-                    // A long drain must not outlive the lease: renew at half
-                    // the TTL, and stop acting for the rule if it was lost.
-                    let t = current_unix_seconds();
-                    if t - since >= lease_ttl / 2 {
-                        let renewed = lease
-                            .renew(
-                                LeaseSubsystem::Replication,
-                                &rule.name,
-                                instance_id,
-                                t,
-                                lease_ttl,
-                            )
-                            .await;
-                        match renewed {
-                            Ok(()) => {
-                                claims.insert(rule.name.clone(), RuleClaim::Held { since: t });
-                            }
-                            Err(e) => {
-                                // Lost: nothing to release. Backend: the
-                                // lease may still be ours — release it, so it
-                                // does not block the rule for a whole TTL.
-                                if matches!(e, crate::coordination::LeaseError::Backend(_)) {
-                                    let _ = lease
-                                        .release(
-                                            LeaseSubsystem::Replication,
-                                            &rule.name,
-                                            instance_id,
-                                        )
-                                        .await;
-                                }
-                                claims.insert(rule.name.clone(), RuleClaim::Busy);
-                                hold();
-                                continue;
-                            }
-                        }
-                    }
-                }
-                RuleClaim::Busy => {
-                    // Busy on another worker — leave for next tick (holds only
-                    // this rule's cursor).
-                    hold();
-                    continue;
-                }
-                RuleClaim::Skip => continue,
-                RuleClaim::Abort => return std::ops::ControlFlow::Break(()),
-            }
-
-            let outcome = apply_action(engine, db, rule, bucket, key, action).await;
-
-            let dbg = db.lock().await;
-            // Mid-drain heartbeat: a long drain (up to 500 engine copies)
-            // must keep pinning the background pruner's staleness floor.
-            let _ =
-                dbg.listener_cursor_advance(REPLICATION_LISTENER, global, current_unix_seconds());
-
-            match outcome {
-                Ok(()) => {
-                    let _ = dbg.replication_clear_object_failure(&rule.name, key);
-                }
-                Err(err) => {
-                    warn!(
-                        "event consumer: rule '{}' {:?} {}/{} failed: {}",
-                        rule.name, action, bucket, key, err
-                    );
-                    // The failure ring has a foreign key to the state row; a
-                    // rule the scheduler never ran has none yet.
-                    let _ = dbg.replication_ensure_state(&rule.name, now);
-                    let record = |msg: &str| {
-                        let _ = dbg.replication_record_failure(
-                            &rule.name,
-                            crate::replication::state_store::FailureInsert {
-                                run_id: None,
-                                occurred_at: now,
-                                source_key: key,
-                                dest_key: key,
-                                error_message: msg,
-                            },
-                            replication.max_failures_retained,
-                        );
-                    };
-                    record(&err.to_string());
-                    // A permanent key error is recorded and counts as handled:
-                    // holding it would stall the rule, forever.
-                    if err.downcast_ref::<PermanentKeyError>().is_some() {
-                        continue;
-                    }
-                    // A destination-wide or transient failure (bucket gone,
-                    // quota, throttle, 5xx, timeout) is not about THIS key:
-                    // it never counts toward giving up, or a short outage
-                    // gave up on every key and dropped its events.
-                    if !failure_counts_toward_give_up(failure_class(err.as_ref())) {
-                        hold();
-                        continue;
-                    }
-                    let attempts = dbg
-                        .replication_record_object_failure(&rule.name, key, &err.to_string(), now)
-                        .unwrap_or(0);
-                    if key_attempts_exhausted(attempts) {
-                        warn!(
-                            "event consumer: rule '{}' gives up on {}/{} after {} failed \
-                             attempts; the reconcile run retries it",
-                            rule.name, bucket, key, attempts
-                        );
-                        record(&format!(
-                            "event-driven replication gave up after {attempts} attempts; \
-                             the next reconcile run retries the object"
-                        ));
-                    } else {
-                        hold();
-                    }
-                }
-            }
+            let max_id = sub.iter().map(|r| r.id).max().unwrap_or(0);
+            work.push(KeyWork {
+                bucket,
+                key,
+                rule,
+                action,
+                max_id,
+            });
         }
     }
+    // A held key keeps its events: the rule's cursor stops before its id.
+    let hold = |failed_ids: &mut BTreeMap<String, std::collections::BTreeSet<i64>>,
+                w: &KeyWork<'_>| {
+        failed_ids
+            .entry(w.rule.name.clone())
+            .or_default()
+            .insert(w.max_id);
+    };
+    let mut window = DrainWindow::default();
+    let mut deletes: Vec<&KeyWork<'_>> = Vec::new();
+    for (i, w) in work.iter().enumerate() {
+        if drain_must_stop(&window) {
+            // The destination is dead or throttling: hold the rest of the
+            // batch (and the deletes not sent yet) for a later drain.
+            warn!(
+                "event consumer: rule '{}' stops its drain: {} — {} keys held",
+                w.rule.name,
+                if window.dest_fatal {
+                    "destination unusable".to_string()
+                } else {
+                    format!(
+                        "{} throttled or failed requests, none done",
+                        window.throttled
+                    )
+                },
+                work.len() - i + deletes.len()
+            );
+            for w in work[i..].iter().chain(deletes.iter().copied()) {
+                hold(failed_ids, w);
+            }
+            return std::ops::ControlFlow::Continue(window);
+        }
+        // Maintenance gate: the destination bucket is being rewritten in
+        // place (re-encryption). Stall this key's events — the cursor does
+        // not advance past them, so they replay after the job ends.
+        if gate.is_busy(&w.rule.destination.bucket) {
+            debug!(
+                "event consumer: rule '{}' deferred — destination '{}' under maintenance",
+                w.rule.name, w.rule.destination.bucket
+            );
+            hold(failed_ids, w);
+            continue;
+        }
+        match claim_key(
+            config,
+            db,
+            lease,
+            claims,
+            &w.rule.name,
+            instance_id,
+            lease_ttl,
+        )
+        .await
+        {
+            KeyClaim::Act => {}
+            KeyClaim::Hold => {
+                hold(failed_ids, w);
+                continue;
+            }
+            KeyClaim::Skip => continue,
+            KeyClaim::Abort => return std::ops::ControlFlow::Break(()),
+        }
+        let outcome = match w.action {
+            KeyAction::Delete if w.rule.replicate_deletes => {
+                deletes.push(w);
+                continue;
+            }
+            // Deletes are not replicated: handled.
+            KeyAction::Delete | KeyAction::Noop => Ok(()),
+            KeyAction::Copy => apply_copy(engine, db, w.rule, w.bucket, w.key).await,
+        };
+        let dbg = db.lock().await;
+        // Mid-drain heartbeat: a long drain (up to 500 engine copies) must
+        // keep pinning the background pruner's staleness floor.
+        let _ = dbg.listener_cursor_advance(REPLICATION_LISTENER, global, current_unix_seconds());
+        settle_key(&dbg, replication, w, outcome, now, &mut window, failed_ids);
+    }
 
-    std::ops::ControlFlow::Continue(())
+    if deletes.is_empty() {
+        return std::ops::ControlFlow::Continue(window);
+    }
+    // The claim once more before the batch (a pause, a lost lease).
+    match claim_key(config, db, lease, claims, rule_name, instance_id, lease_ttl).await {
+        KeyClaim::Act => {}
+        KeyClaim::Hold => {
+            for w in &deletes {
+                hold(failed_ids, w);
+            }
+            return std::ops::ControlFlow::Continue(window);
+        }
+        KeyClaim::Skip => return std::ops::ControlFlow::Continue(window),
+        KeyClaim::Abort => return std::ops::ControlFlow::Break(()),
+    }
+    let mut items = Vec::with_capacity(deletes.len());
+    let mut batched: Vec<&KeyWork<'_>> = Vec::with_capacity(deletes.len());
+    let mut unmappable = Vec::new();
+    for w in deletes {
+        match rewrite_key(&w.rule.source.prefix, &w.rule.destination.prefix, w.key) {
+            Ok(dest_key) => {
+                items.push(super::mirror_delete::MirrorDelete {
+                    src_key: w.key.to_string(),
+                    dest_key,
+                });
+                batched.push(w);
+            }
+            Err(e) => unmappable.push((w, e.to_string())),
+        }
+    }
+    // Every key of the batch is of this rule, so one source and one
+    // destination bucket.
+    let rule = batched.first().map(|w| w.rule);
+    let outcomes = match rule {
+        Some(rule) => {
+            super::mirror_delete::delete_mirrored(
+                engine,
+                &rule.source.bucket,
+                &rule.destination.bucket,
+                &items,
+            )
+            .await
+        }
+        None => Vec::new(),
+    };
+    let dbg = db.lock().await;
+    let _ = dbg.listener_cursor_advance(REPLICATION_LISTENER, global, current_unix_seconds());
+    for (w, msg) in unmappable {
+        let err: Box<dyn std::error::Error + Send + Sync> = msg.into();
+        settle_key(&dbg, replication, w, Err(err), now, &mut window, failed_ids);
+    }
+    for (w, outcome) in batched.into_iter().zip(outcomes) {
+        use super::mirror_delete::MirrorOutcome;
+        let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = match outcome {
+            // Deleted, already gone, or the source holds the key again (the
+            // copy path re-syncs it).
+            MirrorOutcome::Deleted { .. } | MirrorOutcome::SourceBack => Ok(()),
+            MirrorOutcome::Failed(f) if f.key_unusable => {
+                Err(Box::new(PermanentKeyError(f.message)))
+            }
+            MirrorOutcome::Failed(f) => Err(Box::new(crate::transfer::CopyError::new(
+                f.class, f.message,
+            ))),
+        };
+        settle_key(&dbg, replication, w, result, now, &mut window, failed_ids);
+    }
+    std::ops::ControlFlow::Continue(window)
 }
 
-/// The class of an `apply_action` failure: a copy carries its own, an
+/// Record one key's outcome: clear or record its failure, and hold its
+/// events unless the failure is about the key and its attempts are used up.
+fn settle_key(
+    dbg: &ConfigDb,
+    replication: &crate::config_sections::ReplicationConfig,
+    w: &KeyWork<'_>,
+    outcome: Result<(), Box<dyn std::error::Error + Send + Sync>>,
+    now: i64,
+    window: &mut DrainWindow,
+    failed_ids: &mut BTreeMap<String, std::collections::BTreeSet<i64>>,
+) {
+    let (rule, bucket, key) = (w.rule, w.bucket, w.key);
+    let err = match outcome {
+        Ok(()) => {
+            window.record(None);
+            let _ = dbg.replication_clear_object_failure(&rule.name, key);
+            return;
+        }
+        Err(err) => err,
+    };
+    let class = failure_class(err.as_ref());
+    window.record(Some(class));
+    warn!(
+        "event consumer: rule '{}' {:?} {}/{} failed: {}",
+        rule.name, w.action, bucket, key, err
+    );
+    // The failure ring has a foreign key to the state row; a rule the
+    // scheduler never ran has none yet.
+    let _ = dbg.replication_ensure_state(&rule.name, now);
+    let record = |msg: &str| {
+        let _ = dbg.replication_record_failure(
+            &rule.name,
+            crate::replication::state_store::FailureInsert {
+                run_id: None,
+                occurred_at: now,
+                source_key: key,
+                dest_key: key,
+                error_message: msg,
+            },
+            replication.max_failures_retained,
+        );
+    };
+    record(&err.to_string());
+    // A permanent key error is recorded and counts as handled: holding it
+    // would stall the rule, forever.
+    if err.downcast_ref::<PermanentKeyError>().is_some() {
+        return;
+    }
+    let mut hold = || {
+        failed_ids
+            .entry(rule.name.clone())
+            .or_default()
+            .insert(w.max_id);
+    };
+    // A destination-wide or transient failure (bucket gone, quota,
+    // throttle, 5xx, timeout) is not about THIS key: it never counts toward
+    // giving up, or a short outage gave up on every key and dropped its
+    // events.
+    if !failure_counts_toward_give_up(class) {
+        hold();
+        return;
+    }
+    let attempts = dbg
+        .replication_record_object_failure(&rule.name, key, &err.to_string(), now)
+        .unwrap_or(0);
+    if key_attempts_exhausted(attempts) {
+        warn!(
+            "event consumer: rule '{}' gives up on {}/{} after {} failed \
+             attempts; the reconcile run retries it",
+            rule.name, bucket, key, attempts
+        );
+        record(&format!(
+            "event-driven replication gave up after {attempts} attempts; \
+             the next reconcile run retries the object"
+        ));
+    } else {
+        hold();
+    }
+}
+
+/// The class of a key's failure: a copy carries its own, an
 /// engine error (HEAD, delete) is classed by its variant, anything else
 /// (a bad rule glob, a key the rewrite refuses) is about this key.
 fn failure_class(err: &(dyn std::error::Error + Send + Sync + 'static)) -> CopyClass {
@@ -989,108 +1281,72 @@ fn key_attempts_exhausted(consecutive_failures: u32) -> bool {
     consecutive_failures >= MAX_EVENT_KEY_ATTEMPTS
 }
 
-/// Apply one compacted action for one (rule, key): the planner + dest HEAD
-/// decide whether it actually copies/deletes (idempotency lives here, shared
+/// Apply a Copy action for one (rule, key): the planner + a destination
+/// HEAD decide whether it actually copies (idempotency lives here, shared
 /// with reconcile).
-async fn apply_action(
+async fn apply_copy(
     engine: &Arc<crate::deltaglider::DynEngine>,
     db: &Arc<Mutex<ConfigDb>>,
     rule: &ReplicationRule,
     bucket: &str,
     key: &str,
-    action: KeyAction,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let dest_key = rewrite_key(&rule.source.prefix, &rule.destination.prefix, key)?;
-
-    match action {
-        KeyAction::Noop => Ok(()),
-        KeyAction::Copy => {
-            // Source may have been deleted after the event landed — HEAD it.
-            let src_meta = match engine.head(bucket, key).await {
-                Ok(m) => m,
-                Err(crate::deltaglider::EngineError::NotFound(_)) => {
-                    // Source gone — nothing to copy; reconcile/the delete event
-                    // will handle removal. Treat as handled.
-                    return Ok(());
-                }
-                Err(e) => return Err(classify_engine_error(e)),
-            };
-            let dest_meta = match engine.head(&rule.destination.bucket, &dest_key).await {
-                Ok(meta) => Some(meta),
-                Err(crate::deltaglider::EngineError::NotFound(_)) => None,
-                // The destination can never hold this key (for example a `.`
-                // segment on a filesystem destination): do not try the copy.
-                Err(e @ crate::deltaglider::EngineError::InvalidArgument(_))
-                | Err(
-                    e @ crate::deltaglider::EngineError::Storage(
-                        crate::storage::StorageError::InvalidKey(_),
-                    ),
-                ) => return Err(classify_engine_error(e)),
-                Err(_) => None,
-            };
-            let (include_globs, exclude_globs) = compile_rule_globs(rule)?;
-            let decision = should_replicate(
-                key,
-                &src_meta,
-                dest_meta.as_ref(),
-                rule.conflict,
-                rule.strict_content_diff,
-                &include_globs,
-                &exclude_globs,
-            );
-            match decision {
-                // `should_replicate` echoes the SOURCE key in `dest_key` (it
-                // never rewrites), so we always use the prefix-rewritten
-                // `dest_key` computed above — same as the reconcile worker.
-                Decision::Copy { .. } => {
-                    let transfer = ObjectTransferRequest {
-                        source_bucket: &rule.source.bucket,
-                        source_key: key,
-                        destination_bucket: &rule.destination.bucket,
-                        destination_key: &dest_key,
-                        provenance: Some(TransferProvenance {
-                            metadata_key: REPLICATION_RULE_METADATA_KEY,
-                            metadata_value: &rule.name,
-                        }),
-                        strip_user_metadata_keys: &[],
-                        operation: "replication-event",
-                        upload_concurrency: None,
-                        keep_created_at: true,
-                    };
-                    let outcome = copy_object_with_retries(engine, transfer).await?;
-                    // Emit ReplicationObjectCopied so the chain is observable
-                    // (mirrors the reconcile worker).
-                    emit_replication_copied(db, rule, key, &dest_key, outcome.content_length())
-                        .await;
-                    Ok(())
-                }
-                Decision::Skip { .. } => Ok(()),
-            }
+    // Source may have been deleted after the event landed — HEAD it.
+    let src_meta = match engine.head(bucket, key).await {
+        Ok(m) => m,
+        Err(crate::deltaglider::EngineError::NotFound(_)) => {
+            // Source gone — nothing to copy; reconcile/the delete event
+            // will handle removal. Treat as handled.
+            return Ok(());
         }
-        KeyAction::Delete => {
-            if !rule.replicate_deletes {
-                return Ok(());
-            }
-            // Faithful mirror (matches the reconcile worker's execute_delete): a
-            // source-absent dest key is removed regardless of provenance — the
-            // destination is dedicated to the rule. The delete EVENT is the
-            // source-absence signal, but re-confirm it (a re-create may have
-            // landed after the event) so we never delete a dest whose source
-            // came back. Delete ONLY on a confirmed source NoSuchKey.
-            match engine.head(bucket, key).await {
-                // Source reappeared → do NOT delete; the copy path will re-sync.
-                Ok(_) => Ok(()),
-                Err(crate::deltaglider::EngineError::NotFound(_)) => {
-                    match engine.delete(&rule.destination.bucket, &dest_key).await {
-                        Ok(_) => Ok(()),
-                        // Dest already gone → nothing to delete.
-                        Err(crate::deltaglider::EngineError::NotFound(_)) => Ok(()),
-                        Err(e) => Err(classify_engine_error(e)),
-                    }
-                }
-                Err(e) => Err(classify_engine_error(e)),
-            }
+        Err(e) => return Err(classify_engine_error(e)),
+    };
+    // Only NotFound is "absent". A HEAD that failed (a throttle, a 5xx, a
+    // timeout) says nothing: copying on it sent a full copy to a failing
+    // destination. The key holds; an invalid key is about the key.
+    let dest_meta = match engine.head(&rule.destination.bucket, &dest_key).await {
+        Ok(meta) => Some(meta),
+        Err(crate::deltaglider::EngineError::NotFound(_)) => None,
+        Err(e) => return Err(classify_engine_error(e)),
+    };
+    let (include_globs, exclude_globs) = compile_rule_globs(rule)?;
+    let decision = should_replicate(
+        key,
+        &src_meta,
+        dest_meta.as_ref(),
+        rule.conflict,
+        rule.strict_content_diff,
+        &include_globs,
+        &exclude_globs,
+    );
+    match decision {
+        // `should_replicate` echoes the SOURCE key in `dest_key` (it never
+        // rewrites), so we always use the prefix-rewritten `dest_key`
+        // computed above — same as the reconcile worker.
+        Decision::Copy { .. } => {
+            let transfer = ObjectTransferRequest {
+                source_bucket: &rule.source.bucket,
+                source_key: key,
+                destination_bucket: &rule.destination.bucket,
+                destination_key: &dest_key,
+                provenance: Some(TransferProvenance {
+                    metadata_key: REPLICATION_RULE_METADATA_KEY,
+                    metadata_value: &rule.name,
+                }),
+                strip_user_metadata_keys: &[],
+                operation: "replication-event",
+                upload_concurrency: None,
+                keep_created_at: true,
+            };
+            // The copy starts from the HEAD above: no second source HEAD.
+            let outcome = copy_object_from(engine, transfer, Some(&src_meta)).await?;
+            // Emit ReplicationObjectCopied so the chain is observable
+            // (mirrors the reconcile worker).
+            emit_replication_copied(db, rule, key, &dest_key, outcome.content_length()).await;
+            Ok(())
         }
+        Decision::Skip { .. } => Ok(()),
     }
 }
 
@@ -1788,7 +2044,20 @@ mod per_rule_cursor_tests {
     ) {
         let replication = config.read().await.replication.clone();
         let gate = crate::maintenance::gate::MaintenanceGate::default();
-        drain_once(config, db, engine, &gate, &replication, lease, "c", 100).await;
+        let mut backoff = RuleBackoff::default();
+        drain_once(
+            config,
+            db,
+            engine,
+            &gate,
+            None,
+            &mut backoff,
+            &replication,
+            lease,
+            "c",
+            100,
+        )
+        .await;
     }
 
     async fn cursor(db: &Arc<Mutex<ConfigDb>>, listener: &str) -> i64 {
@@ -1998,5 +2267,334 @@ mod per_rule_cursor_tests {
             engine.head("dst-late", "k.bin").await.is_ok(),
             "the event was dropped: only the 24 h reconcile copies it now"
         );
+    }
+}
+
+/// The consumer's requests on a fake S3: deletes in a batch, a failing
+/// destination, and a gated backend.
+#[cfg(test)]
+mod request_count_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::deltaglider::{DeltaGliderEngine, DynEngine};
+    use crate::storage::{DynStorageBackend, FakeS3};
+
+    /// A lease no other worker holds.
+    struct FreeLease;
+
+    impl CoordinationLease for FreeLease {
+        async fn try_acquire(
+            &self,
+            _: LeaseSubsystem,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: i64,
+        ) -> Result<bool, crate::coordination::LeaseError> {
+            Ok(true)
+        }
+        async fn renew(
+            &self,
+            _: LeaseSubsystem,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: i64,
+        ) -> Result<(), crate::coordination::LeaseError> {
+            Ok(())
+        }
+        async fn release(
+            &self,
+            _: LeaseSubsystem,
+            _: &str,
+            _: &str,
+        ) -> Result<(), crate::coordination::LeaseError> {
+            Ok(())
+        }
+        async fn is_held(
+            &self,
+            _: LeaseSubsystem,
+            _: &str,
+            _: i64,
+        ) -> Result<bool, crate::coordination::LeaseError> {
+            Ok(false)
+        }
+    }
+
+    /// Buckets `src` and `dst` on one fake S3; `dst` lives on backend
+    /// `dst-be` in the config (so a test can gate it alone).
+    struct Fixture {
+        db: Arc<Mutex<ConfigDb>>,
+        config: crate::config::SharedConfig,
+        engine: Arc<DynEngine>,
+        fake: Arc<FakeS3>,
+        backoff: RuleBackoff,
+    }
+
+    fn gated_config(deletes: bool) -> Config {
+        let mut cfg = Config::from_yaml_str(
+            r#"
+storage:
+  backends:
+    - name: src-be
+      type: filesystem
+      path: /tmp/dgp-d1-src-be
+    - name: dst-be
+      type: filesystem
+      path: /tmp/dgp-d1-dst-be
+  buckets:
+    dst:
+      backend: dst-be
+"#,
+        )
+        .unwrap();
+        cfg.replication.enabled = true;
+        cfg.replication.rules = vec![serde_yaml::from_str(&format!(
+            "name: r\nenabled: true\nreplicate_deletes: {deletes}\n\
+             source: {{bucket: src}}\ndestination: {{bucket: dst}}\n"
+        ))
+        .unwrap()];
+        cfg
+    }
+
+    /// `health` with backend `dst-be` unreachable.
+    pub(crate) fn gate_dst(cfg: &Config, health: &crate::coordination::BackendHealthCache) {
+        let def = cfg.backend_by_name("dst-be").unwrap().clone();
+        health.set(
+            "dst-be",
+            &def,
+            crate::coordination::HealthVerdict::Unreachable {
+                detail: "test".into(),
+            },
+        );
+    }
+
+    async fn fixture(deletes: bool) -> Fixture {
+        let (s3, fake) = crate::storage::fake_s3_backend().await;
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(s3);
+        let engine: Arc<DynEngine> = Arc::new(DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &Config::default(),
+            None,
+        ));
+        for b in ["src", "dst"] {
+            engine.create_bucket(b).await.unwrap();
+        }
+        Fixture {
+            db: Arc::new(Mutex::new(ConfigDb::in_memory("pw").unwrap())),
+            config: Arc::new(tokio::sync::RwLock::new(gated_config(deletes))),
+            engine,
+            fake,
+            backoff: RuleBackoff::default(),
+        }
+    }
+
+    impl Fixture {
+        async fn event(&self, kind: EventKind, key: &str) -> i64 {
+            self.db
+                .lock()
+                .await
+                .event_outbox_insert(&NewEvent::new(
+                    kind,
+                    "src",
+                    key,
+                    EventSource::S3Api,
+                    1,
+                    serde_json::json!({}),
+                ))
+                .unwrap()
+        }
+
+        async fn put(&self, key: &str) -> i64 {
+            self.engine
+                .store("src", key, b"data", None, Default::default())
+                .await
+                .unwrap();
+            self.event(EventKind::ObjectCreated, key).await
+        }
+
+        async fn drain(&mut self, health: Option<&crate::coordination::BackendHealthCache>) {
+            let replication = self.config.read().await.replication.clone();
+            let gate = crate::maintenance::gate::MaintenanceGate::default();
+            drain_once(
+                &self.config,
+                &self.db,
+                &self.engine,
+                &gate,
+                health,
+                &mut self.backoff,
+                &replication,
+                &FreeLease,
+                "c",
+                100,
+            )
+            .await;
+        }
+
+        fn count(&self, pred: impl Fn(&str) -> bool) -> usize {
+            self.fake.requests().iter().filter(|r| pred(r)).count()
+        }
+
+        async fn cursor(&self) -> i64 {
+            self.db
+                .lock()
+                .await
+                .listener_cursor_load(&rule_listener("r"))
+                .unwrap()
+        }
+    }
+
+    fn is_list(r: &str, bucket: &str) -> bool {
+        r.starts_with(&format!("GET /{bucket}")) && r.contains("list-type=2")
+    }
+
+    #[test]
+    fn a_rule_backs_off_longer_after_each_stopped_drain() {
+        assert_eq!(backoff_delay(1).as_secs(), 30);
+        assert_eq!(backoff_delay(2).as_secs(), 60);
+        assert_eq!(backoff_delay(3).as_secs(), 120);
+        assert_eq!(backoff_delay(10).as_secs(), 600, "capped");
+        assert_eq!(backoff_delay(u32::MAX).as_secs(), 600, "capped");
+        let stop = |ok, throttled, dest_fatal| {
+            drain_must_stop(&DrainWindow {
+                ok,
+                throttled,
+                dest_fatal,
+            })
+        };
+        assert!(stop(5, 0, true), "a dead destination stops at once");
+        assert!(stop(0, 3, false));
+        assert!(!stop(0, 2, false), "two stray throttles do not stop");
+        assert!(!stop(1, 9, false), "the destination took something");
+        let mut b = RuleBackoff::default();
+        b.after_drain(
+            "r",
+            &DrainWindow {
+                ok: 0,
+                throttled: 3,
+                dest_fatal: false,
+            },
+        );
+        assert!(b.waiting("r") && !b.waiting("other"));
+        b.after_drain(
+            "r",
+            &DrainWindow {
+                ok: 1,
+                throttled: 0,
+                dest_fatal: false,
+            },
+        );
+        assert!(!b.waiting("r"), "a drain that worked ends the wait");
+    }
+
+    /// Jobs finding 1: the consumer replayed each source delete as one
+    /// `engine.head` of the source and one `engine.delete` of the
+    /// destination, one key after another; each delete listed the
+    /// destination folder again. A batch of deletes now costs one source
+    /// listing of the folder and one destination folder check, and a source
+    /// key that came back is not deleted.
+    #[tokio::test]
+    async fn a_drained_batch_of_deletes_lists_each_folder_once() {
+        let mut f = fixture(true).await;
+        for i in 0..50 {
+            f.put(&format!("f/k{i:02}.bin")).await;
+        }
+        f.drain(None).await;
+        assert!(f.engine.head("dst", "f/k49.bin").await.is_ok(), "copied");
+        let keys: Vec<String> = (0..50).map(|i| format!("f/k{i:02}.bin")).collect();
+        let items = keys
+            .iter()
+            .map(|k| crate::deltaglider::DeleteItem::new(k.clone()))
+            .collect();
+        f.engine
+            .delete_batch("src", items, Default::default())
+            .await;
+        for k in &keys {
+            f.event(EventKind::ObjectDeleted, k).await;
+        }
+        // k00 comes back at the source after its delete event.
+        f.engine
+            .store("src", "f/k00.bin", b"again", None, Default::default())
+            .await
+            .unwrap();
+        f.fake.clear();
+        f.drain(None).await;
+        let dst_lists = f.count(|r| is_list(r, "dst"));
+        let src_heads = f.count(|r| r.starts_with("HEAD /src/"));
+        let src_lists = f.count(|r| is_list(r, "src"));
+        assert!(
+            dst_lists <= 2,
+            "{dst_lists} destination listings for one folder of deletes"
+        );
+        assert_eq!(src_heads, 0, "the source was HEADed per deleted key");
+        assert!(src_lists <= 2, "{src_lists} source listings for one folder");
+        assert!(
+            f.engine.head("dst", "f/k00.bin").await.is_ok(),
+            "a key that came back at the source was deleted"
+        );
+        for k in &keys[1..] {
+            assert!(f.engine.head("dst", k).await.is_err(), "{k} not deleted");
+        }
+    }
+
+    /// Jobs finding 2: a destination that refused every PUT got the whole
+    /// batch each tick, each copy retried, each attempt a full source GET.
+    /// The drain now stops after a few throttles with no success, and the
+    /// rule waits out a backoff before the next drain.
+    #[tokio::test]
+    async fn a_destination_that_refuses_every_put_holds_the_rule_and_backs_off() {
+        let mut f = fixture(false).await;
+        for i in 0..20 {
+            f.put(&format!("k{i:02}.bin")).await;
+        }
+        f.fake.fail("PUT", "dst/", 503, "SlowDown", u32::MAX);
+        f.fake.clear();
+        f.drain(None).await;
+        let first = f.count(|r| r.starts_with("GET /src/"));
+        f.fake.clear();
+        f.drain(None).await;
+        let second = f.count(|r| r.starts_with("GET /src/"));
+        assert!(first <= 20, "{first} source GETs on the first drain");
+        assert_eq!(second, 0, "{second} source GETs while the rule backs off");
+        assert_eq!(f.cursor().await, 0, "the events stay for a later drain");
+    }
+
+    /// Jobs finding 2: a destination HEAD that failed read as "absent", so
+    /// the copy went ahead against a failing destination. It is "unknown":
+    /// the key holds.
+    #[tokio::test]
+    async fn a_failed_destination_head_holds_the_key_instead_of_copying() {
+        let mut f = fixture(false).await;
+        f.put("k.bin").await;
+        f.fake.fail("HEAD", "dst/k.bin", 503, "SlowDown", u32::MAX);
+        f.fake.clear();
+        f.drain(None).await;
+        assert_eq!(
+            f.count(|r| r.starts_with("PUT /dst/") || r.starts_with("GET /src/")),
+            0,
+            "copied on a failed destination HEAD: {:?}",
+            f.fake.requests()
+        );
+        assert_eq!(f.cursor().await, 0, "the event must stay");
+    }
+
+    /// Jobs finding 13: the consumer ignored the backend health gate and
+    /// sent its full volume to a backend already marked unreachable.
+    #[tokio::test]
+    async fn a_rule_whose_destination_backend_is_gated_sends_it_nothing() {
+        let mut f = fixture(false).await;
+        f.put("k.bin").await;
+        let health = crate::coordination::BackendHealthCache::default();
+        gate_dst(&*f.config.read().await, &health);
+        f.fake.clear();
+        f.drain(Some(&health)).await;
+        let to_dst = f.count(|r| r.contains(" /dst"));
+        assert_eq!(
+            to_dst,
+            0,
+            "requests to a gated backend: {:?}",
+            f.fake.requests()
+        );
+        assert_eq!(f.cursor().await, 0, "the event must stay");
     }
 }

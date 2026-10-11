@@ -161,21 +161,30 @@ impl ObjectTransferOutcome {
     }
 }
 
-pub(crate) async fn copy_object_with_retries(
+/// Copy one object; the source HEAD comes from `source` when the caller
+/// holds one (its listing or HEAD), else from one HEAD here. The copy keeps
+/// the source's created-at from that same metadata
+/// ([`ObjectTransferRequest::keep_created_at`]).
+///
+/// Retries only what the SDK does not retry itself
+/// ([`CopyClass::copy_retry_helps`]): the source changed under the copy (the
+/// retry HEADs it again), or the proxy itself was busy. A throttle, a 5xx
+/// or a timeout already went through the SDK's own attempts; sending the
+/// whole copy again multiplied them (3 copy attempts of 3 SDK attempts).
+pub(crate) async fn copy_object_from(
     engine: &Arc<DynEngine>,
     request: ObjectTransferRequest<'_>,
+    source: Option<&crate::types::FileMetadata>,
 ) -> Result<ObjectTransferOutcome, CopyError> {
+    let mut source = source.cloned();
     let mut attempt = 1;
     loop {
-        let attempt_result = match request.keep_created_at {
-            true => keep_source_created_at(engine, request).await,
-            false => copy_object_once(engine, request).await,
-        };
+        let attempt_result = copy_attempt(engine, request, source.take()).await;
         let err = match attempt_result {
             Ok(outcome) => return Ok(outcome),
             Err(err) => err,
         };
-        if !err.class.retryable() || attempt == DEFAULT_COPY_MAX_ATTEMPTS {
+        if !err.class.copy_retry_helps() || attempt == DEFAULT_COPY_MAX_ATTEMPTS {
             return Err(if attempt > 1 {
                 let class = err.class;
                 CopyError::new(class, format!("{err} (after {attempt} attempts)"))
@@ -184,7 +193,7 @@ pub(crate) async fn copy_object_with_retries(
             });
         }
         warn!(
-            "{} transient copy failure attempt {}/{} src={}/{} dst={}/{}: {}",
+            "{} copy attempt {}/{} failed, retrying src={}/{} dst={}/{}: {}",
             request.operation,
             attempt,
             DEFAULT_COPY_MAX_ATTEMPTS,
@@ -199,30 +208,46 @@ pub(crate) async fn copy_object_with_retries(
     }
 }
 
-/// [`copy_object_once`] with the destination stamped the source's
-/// created-at ([`crate::types::with_created_at`]).
-async fn keep_source_created_at(
+/// [`copy_object_from`] for a caller without the source's metadata.
+pub(crate) async fn copy_object_with_retries(
     engine: &Arc<DynEngine>,
     request: ObjectTransferRequest<'_>,
 ) -> Result<ObjectTransferOutcome, CopyError> {
-    let at = engine
-        .head(request.source_bucket, request.source_key)
+    copy_object_from(engine, request, None).await
+}
+
+/// One copy attempt: HEAD the source unless `source` is given, then copy,
+/// stamping the source's created-at on the destination when the request
+/// keeps it ([`crate::types::with_created_at`]).
+async fn copy_attempt(
+    engine: &Arc<DynEngine>,
+    request: ObjectTransferRequest<'_>,
+    source: Option<crate::types::FileMetadata>,
+) -> Result<ObjectTransferOutcome, CopyError> {
+    // A HEAD first so callers get a crisp source-disappeared failure row.
+    let source_head = match source {
+        Some(meta) => meta,
+        None => engine
+            .head(request.source_bucket, request.source_key)
+            .await
+            .map_err(|e| CopyError::engine("source head failed", e))?,
+    };
+    if request.keep_created_at {
+        crate::types::with_created_at(
+            source_head.created_at,
+            copy_object_once(engine, request, &source_head),
+        )
         .await
-        .map_err(|e| CopyError::engine("source head failed", e))?
-        .created_at;
-    crate::types::with_created_at(at, copy_object_once(engine, request)).await
+    } else {
+        copy_object_once(engine, request, &source_head).await
+    }
 }
 
 async fn copy_object_once(
     engine: &Arc<DynEngine>,
     request: ObjectTransferRequest<'_>,
+    source_head: &crate::types::FileMetadata,
 ) -> Result<ObjectTransferOutcome, CopyError> {
-    // HEAD first so callers get a crisp source-disappeared failure row.
-    let source_head = engine
-        .head(request.source_bucket, request.source_key)
-        .await
-        .map_err(|e| CopyError::engine("source head failed", e))?;
-
     // Large passthrough on a native-multipart destination → stream via
     // multipart with per-part range-resume (bounded memory). Delta /
     // reference / small / proxy-AES-destination objects keep the buffered
@@ -232,7 +257,7 @@ async fn copy_object_once(
     if transfer_plan::should_stream_copy(source_head.file_size, label, threshold)
         && engine.destination_supports_native_multipart(request.destination_bucket)
     {
-        return stream_copy_passthrough(engine, request, &source_head).await;
+        return stream_copy_passthrough(engine, request, source_head).await;
     }
 
     // Delta fast path: when the source is delta-stored, try shipping the
@@ -243,7 +268,7 @@ async fn copy_object_once(
         source_head.storage_info,
         crate::types::StorageInfo::Delta { .. }
     ) {
-        if let Some(outcome) = delta_passthrough_copy(engine, request, &source_head).await? {
+        if let Some(outcome) = delta_passthrough_copy(engine, request, source_head).await? {
             return Ok(outcome);
         }
     }
@@ -254,7 +279,7 @@ async fn copy_object_once(
     // deltas; this closes it now that the store side streams (Phase 4).
     let source_size = source_head.file_size;
     if source_size > engine.spool_threshold() {
-        if let Some(outcome) = spooled_copy(engine, &request, &source_head, source_size).await? {
+        if let Some(outcome) = spooled_copy(engine, &request, source_head, source_size).await? {
             return Ok(outcome);
         }
     }
@@ -263,6 +288,17 @@ async fn copy_object_once(
         .retrieve(request.source_bucket, request.source_key)
         .await
         .map_err(|e| CopyError::engine("source retrieve failed", e))?;
+    // The HEAD may be the caller's, taken a while ago: bytes of another
+    // generation would land under its multipart ETag and created-at.
+    if !source_head.file_sha256.is_empty()
+        && !meta.file_sha256.is_empty()
+        && source_head.file_sha256 != meta.file_sha256
+    {
+        return Err(CopyError::source_changed(format_args!(
+            "{}/{} was overwritten after HEAD",
+            request.source_bucket, request.source_key
+        )));
+    }
 
     let content_type = meta.content_type.clone();
     let mut user_metadata = meta.user_metadata.clone();
@@ -569,8 +605,8 @@ impl Drop for MultipartAbortGuard {
     }
 }
 
-/// Fetch one part via a native ranged GET, retrying transient failures by
-/// re-issuing the GET (the range-resume). Returns the collected bytes.
+/// Fetch one part via a native ranged GET; a body that broke off part-way
+/// is fetched again (the range-resume). Returns the collected bytes.
 async fn fetch_part_with_resume(
     engine: &Arc<DynEngine>,
     bucket: &str,
@@ -586,12 +622,12 @@ async fn fetch_part_with_resume(
             Ok(bytes) => return Ok(bytes),
             Err(err) => err,
         };
-        // A generation-pin failure can never heal at the PART level (the pin
-        // is fixed): `retryable` says yes for the whole copy, which re-HEADs
-        // and copies the NEW generation cleanly.
-        if err.class == CopyClass::SourceChanged
-            || !err.class.retryable()
-            || attempt == MAX_PART_ATTEMPTS
+        // Only a body that broke off part-way is fetched again: the SDK
+        // already retried the GET request itself (a throttle, a 5xx, a
+        // timeout), so another GET multiplied its attempts. A
+        // generation-pin failure never heals at the PART level (the pin is
+        // fixed); the whole copy re-HEADs and copies the new generation.
+        if !err.body_broke || err.class == CopyClass::SourceChanged || attempt == MAX_PART_ATTEMPTS
         {
             return Err(err);
         }
@@ -648,7 +684,7 @@ async fn fetch_part_once(
     let mut buf = BytesMut::with_capacity(expected.min(64 * 1024 * 1024) as usize);
     let mut stream = stream;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| CopyError::storage("part body stream error", e))?;
+        let chunk = chunk.map_err(|e| CopyError::body("part body stream error", e))?;
         buf.extend_from_slice(&chunk);
     }
     let got = buf.len() as u64;
@@ -786,10 +822,10 @@ fn maybe_inject_part_failure(part_number: i32) -> Option<CopyError> {
         .compare_exchange(-1, part_number, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
     {
-        return Some(CopyError::new(
-            CopyClass::Transient,
-            "connection reset (injected)",
-        ));
+        return Some(CopyError {
+            body_broke: true,
+            ..CopyError::new(CopyClass::Transient, "connection reset (injected)")
+        });
     }
     None
 }
@@ -822,6 +858,10 @@ pub(crate) enum CopyClass {
     /// The source changed under the copy's generation pin. Fatal for one
     /// part (the pin is fixed); the whole-copy retry re-HEADs.
     SourceChanged,
+    /// The proxy itself was busy: a peer held the reference lock, or the
+    /// codec slots or the spool budget were used up. No backend request
+    /// failed, so the SDK retried nothing.
+    Busy,
     /// No object can land: the bucket is gone, access is refused, or a
     /// storage cap is used up.
     DestinationFatal,
@@ -830,19 +870,32 @@ pub(crate) enum CopyClass {
 }
 
 impl CopyClass {
-    /// May the whole-copy retry loop try again?
+    /// May a later attempt succeed (the caller holds the object for a later
+    /// run or drain)?
     pub(crate) fn retryable(self) -> bool {
         matches!(
             self,
-            CopyClass::Transient | CopyClass::Throttled | CopyClass::SourceChanged
+            CopyClass::Transient
+                | CopyClass::Throttled
+                | CopyClass::SourceChanged
+                | CopyClass::Busy
         )
+    }
+
+    /// May the copy try again AT ONCE ([`copy_object_from`])? Only for what
+    /// the SDK does not retry itself: a source that changed under the copy,
+    /// or a proxy that was busy. A throttle, a 5xx or a timeout already had
+    /// the SDK's attempts; another copy attempt multiplied them.
+    pub(crate) fn copy_retry_helps(self) -> bool {
+        matches!(self, CopyClass::SourceChanged | CopyClass::Busy)
     }
 
     pub(crate) fn of_storage(e: &crate::storage::StorageError) -> Self {
         use crate::storage::StorageError as S;
         match e {
             S::Throttled(_) => CopyClass::Throttled,
-            S::Unavailable(_) | S::Transient(_) | S::Contended(_) => CopyClass::Transient,
+            S::Unavailable(_) | S::Transient(_) => CopyClass::Transient,
+            S::Contended(_) => CopyClass::Busy,
             S::PreconditionFailed(_) => CopyClass::SourceChanged,
             S::BucketNotFound(_) | S::AccessDenied(_) | S::QuotaExceeded(_) | S::DiskFull => {
                 CopyClass::DestinationFatal
@@ -858,7 +911,7 @@ impl CopyClass {
             E::Storage(s) => Self::of_storage(s),
             // Out of codec slots or spool budget: contention, not a fault of
             // the object (finding #14).
-            E::Overloaded(_) | E::Codec(CodecError::TimedOut(_)) => CopyClass::Transient,
+            E::Overloaded(_) | E::Codec(CodecError::TimedOut(_)) => CopyClass::Busy,
             E::Codec(CodecError::Io(io)) => Self::of_io(io),
             _ => CopyClass::Permanent,
         }
@@ -885,6 +938,10 @@ impl CopyClass {
 pub(crate) struct CopyError {
     pub class: CopyClass,
     message: String,
+    /// A response body broke off part-way (a reset, a stall): the SDK
+    /// retries a request, never a body it already began to read, so the
+    /// part fetch resumes it ([`fetch_part_with_resume`]).
+    body_broke: bool,
 }
 
 impl std::fmt::Display for CopyError {
@@ -900,6 +957,16 @@ impl CopyError {
         Self {
             class,
             message: message.into(),
+            body_broke: false,
+        }
+    }
+
+    /// A body that broke off part-way: `"{context}: {e}"`, classed by the
+    /// storage error.
+    fn body(context: &str, e: crate::storage::StorageError) -> Self {
+        Self {
+            body_broke: true,
+            ..Self::storage(context, e)
         }
     }
 
@@ -921,9 +988,12 @@ impl CopyError {
         )
     }
 
-    /// The same class, the message behind `context`.
+    /// The same error, the message behind `context`.
     fn context(self, context: std::fmt::Arguments<'_>) -> Self {
-        Self::new(self.class, format!("{context}: {}", self.message))
+        Self {
+            message: format!("{context}: {}", self.message),
+            ..self
+        }
     }
 }
 
@@ -1222,10 +1292,8 @@ async fn delta_passthrough_copy(
     let dest_prefix2 = dest_prefix.clone();
     let dest_filename2 = dest_filename.clone();
     let engine2 = engine.clone();
-    // Keep a copy of the shipped delta's metadata + dest bucket for the usage
-    // counter after the lock is released (the originals are moved into the
-    // closure). The counter must see this fast-path store too — it bypasses the
-    // engine store() choke point via put_delta_raw.
+    // The shipped delta's metadata, for the heal after the lock (the
+    // original moves into the closure).
     let counter_meta = meta.clone();
     let meta_generation = source_head.clone();
     let counter_dest_bucket = dest_bucket.clone();
@@ -1234,9 +1302,8 @@ async fn delta_passthrough_copy(
     let counter_prior = engine
         .fast_path_prior(&counter_dest_bucket, request.destination_key)
         .await;
-    // `Some(ref_bytes)` = shipped (ref_bytes = bytes of a reference we SEEDED on
-    // this copy, 0 if the dest already had one); `None` = fell back.
-    let shipped: Result<Option<u64>, CopyError> = engine
+    // `true` = shipped; `false` = fell back.
+    let shipped: Result<bool, CopyError> = engine
         .with_dest_prefix_lock(&counter_dest_bucket, &dest_prefix, || async move {
             // Re-read the dest reference UNDER the lock and re-run the SAME pure
             // gate — identical sha + enc precedence to the first read. A read
@@ -1248,33 +1315,15 @@ async fn delta_passthrough_copy(
                     file_sha256: m.file_sha256.clone(),
                     enc: enc_fingerprint(&m),
                 }),
-                Err(_) => return Ok(None),
+                Err(_) => return Ok(false),
             };
-            let mut seeded_ref_bytes = 0u64;
-            match can_delta_passthrough(&src, dest_ref.as_ref()) {
-                DeltaPassthroughDecision::Fallback { .. } => return Ok(None),
-                DeltaPassthroughDecision::ShipVerbatim => {}
-                DeltaPassthroughDecision::SeedThenShip => {
-                    // Seed the dest reference verbatim, asserting it matches
-                    // src.ref_sha256 before writing (defense layer 2).
-                    let ref_data = engine2.get_reference_raw(&src_bucket, &src_prefix2).await?;
-                    let mut ref_meta = engine2
-                        .reference_metadata_raw(&src_bucket, &src_prefix2)
-                        .await?;
-                    if ref_meta.file_sha256 != src.ref_sha256 {
-                        return Ok(None);
-                    }
-                    // Same marker strip as the delta: the dest write re-stamps
-                    // (encrypt) or leaves plaintext (passthrough); a surviving
-                    // source marker would corrupt the reference read.
-                    strip_encryption_markers(&mut ref_meta.user_metadata);
-                    seeded_ref_bytes = ref_meta.file_size;
-                    engine2
-                        .put_reference_raw(&dest_bucket, &dest_prefix2, &ref_data, &ref_meta)
-                        .await?;
-                }
+            let decision = can_delta_passthrough(&src, dest_ref.as_ref());
+            if matches!(decision, DeltaPassthroughDecision::Fallback { .. }) {
+                return Ok(false);
             }
-            // Ship the delta blob verbatim — still under the lock.
+            // Read the source delta BEFORE any destination write: a failed
+            // read then leaves no seeded reference.bin behind (its bytes
+            // were added to no counter).
             let delta_bytes = engine2
                 .get_delta_raw(&src_bucket, &src_prefix2, &src_filename2)
                 .await?;
@@ -1291,6 +1340,27 @@ async fn delta_passthrough_copy(
                     "{src_bucket}/{src_prefix2}/{src_filename2} was overwritten after HEAD"
                 )));
             }
+            // Bytes of a reference this copy SEEDED (0: the dest had one).
+            let mut seeded_ref_bytes = 0u64;
+            if decision == DeltaPassthroughDecision::SeedThenShip {
+                // Seed the dest reference verbatim, asserting it matches
+                // src.ref_sha256 before writing (defense layer 2).
+                let ref_data = engine2.get_reference_raw(&src_bucket, &src_prefix2).await?;
+                let mut ref_meta = engine2
+                    .reference_metadata_raw(&src_bucket, &src_prefix2)
+                    .await?;
+                if ref_meta.file_sha256 != src.ref_sha256 {
+                    return Ok(false);
+                }
+                // Same marker strip as the delta: the dest write re-stamps
+                // (encrypt) or leaves plaintext (passthrough); a surviving
+                // source marker would corrupt the reference read.
+                strip_encryption_markers(&mut ref_meta.user_metadata);
+                seeded_ref_bytes = ref_meta.file_size;
+                engine2
+                    .put_reference_raw(&dest_bucket, &dest_prefix2, &ref_data, &ref_meta)
+                    .await?;
+            }
             engine2
                 .put_delta_raw(
                     &dest_bucket,
@@ -1300,22 +1370,16 @@ async fn delta_passthrough_copy(
                     &meta,
                 )
                 .await?;
-            Ok(Some(seeded_ref_bytes))
+            // The fast path bypasses the engine's store, so it records its
+            // commit itself, at the commit (before the next await): the
+            // delta, overwrite-aware, and a reference it seeded.
+            engine2.record_fast_path_copy(&dest_bucket, &counter_prior, &meta, seeded_ref_bytes);
+            Ok(true)
         })
         .await;
-    let Some(seeded_ref_bytes) = shipped? else {
+    if !shipped? {
         return Ok(None);
-    };
-
-    // Record the destination contribution into the usage counter — the fast
-    // path bypasses the engine store() choke point, so do it explicitly here.
-    // Overwrite-aware (the dest key may already exist) + add a seeded reference.
-    engine.record_fast_path_copy(
-        &counter_dest_bucket,
-        counter_prior.as_ref(),
-        &counter_meta,
-        seeded_ref_bytes,
-    );
+    }
 
     // HEAD reports the LOGICAL size when the dest delta's DG metadata is intact.
     // If the backend stripped that metadata, HEAD falls back to the raw delta
@@ -1898,13 +1962,10 @@ mod tests {
             (E::Storage(S::Throttled("SlowDown".into())), Throttled),
             (E::Storage(S::Unavailable("timed out".into())), Transient),
             (E::Storage(S::Transient("status=502".into())), Transient),
-            (E::Storage(S::Contended("reference lock".into())), Transient),
-            (E::Overloaded("spool budget exhausted".into()), Transient),
-            (
-                E::Overloaded("all delta codec slots busy".into()),
-                Transient,
-            ),
-            (E::Codec(CodecError::TimedOut("xdelta3".into())), Transient),
+            (E::Storage(S::Contended("reference lock".into())), Busy),
+            (E::Overloaded("spool budget exhausted".into()), Busy),
+            (E::Overloaded("all delta codec slots busy".into()), Busy),
+            (E::Codec(CodecError::TimedOut("xdelta3".into())), Busy),
             (
                 E::Storage(io(std::io::ErrorKind::ConnectionReset)),
                 Transient,
@@ -1943,7 +2004,13 @@ mod tests {
             assert_eq!(err.to_string(), format!("source retrieve failed: {msg}"));
         }
         assert!(Transient.retryable() && Throttled.retryable() && SourceChanged.retryable());
+        assert!(Busy.retryable());
         assert!(!DestinationFatal.retryable() && !Permanent.retryable());
+        // The copy itself tries again only for what the SDK did not retry.
+        assert!(SourceChanged.copy_retry_helps() && Busy.copy_retry_helps());
+        for sdk_retried in [Transient, Throttled, DestinationFatal, Permanent] {
+            assert!(!sdk_retried.copy_retry_helps(), "{sdk_retried:?}");
+        }
         // The generation-pin text reads as before.
         let changed = CopyError::source_changed(format_args!("b/k was overwritten after HEAD"));
         assert_eq!(
@@ -2782,5 +2849,209 @@ mod multipart_abort_tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+}
+
+/// Requests one copy sends, on a fake S3: the source HEADs, the retries on
+/// top of the SDK's, and the counter of a reference the fast path seeds.
+#[cfg(test)]
+mod request_count_tests {
+    use super::*;
+    use crate::bucket_usage::BucketUsage;
+    use crate::config::Config;
+    use crate::deltaglider::DeltaGliderEngine;
+    use crate::storage::{DynStorageBackend, FakeS3};
+
+    async fn engine_on(
+        backend: crate::storage::S3Backend,
+        usage: Option<Arc<BucketUsage>>,
+        buckets: &[&str],
+    ) -> Arc<DynEngine> {
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(backend);
+        let engine =
+            DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None)
+                .with_bucket_usage(usage);
+        for b in buckets {
+            engine.create_bucket(b).await.unwrap();
+        }
+        Arc::new(engine)
+    }
+
+    async fn s3_engine(usage: Option<Arc<BucketUsage>>) -> (Arc<DynEngine>, Arc<FakeS3>) {
+        let (s3, fake) = crate::storage::fake_s3_backend().await;
+        (engine_on(s3, usage, &["src", "dst", "dst2"]).await, fake)
+    }
+
+    fn request(key: &str) -> ObjectTransferRequest<'_> {
+        ObjectTransferRequest {
+            source_bucket: "src",
+            source_key: key,
+            destination_bucket: "dst",
+            destination_key: key,
+            provenance: None,
+            strip_user_metadata_keys: &[],
+            operation: "replication",
+            upload_concurrency: None,
+            keep_created_at: true,
+        }
+    }
+
+    fn count(fake: &FakeS3, prefix: &str) -> usize {
+        fake.requests()
+            .iter()
+            .filter(|r| r.starts_with(prefix))
+            .count()
+    }
+
+    /// Poorly compressible bytes with a per-version head, so a second
+    /// version stores as a delta against the first.
+    fn versioned(seed: u8, n: usize) -> Vec<u8> {
+        let mut x: u32 = 0x9E37_79B9;
+        let mut v: Vec<u8> = (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
+        for b in v.iter_mut().take(64) {
+            *b = seed;
+        }
+        v
+    }
+
+    /// Jobs finding 15: each copy attempt HEADed the source twice (once for
+    /// its created-at, once more in the copy), though the caller held the
+    /// source's metadata from its own HEAD: 8 HEAD requests or more for one
+    /// object. With the caller's metadata the copy sends no source HEAD;
+    /// without it, one source HEAD (two requests on S3).
+    #[tokio::test]
+    async fn a_copy_heads_the_source_only_when_the_caller_has_no_metadata() {
+        let (engine, fake) = s3_engine(None).await;
+        for key in ["k.bin", "j.bin"] {
+            engine
+                .store("src", key, b"payload", None, Default::default())
+                .await
+                .unwrap();
+        }
+        let meta = engine.head("src", "k.bin").await.unwrap();
+        fake.clear();
+        copy_object_from(&engine, request("k.bin"), Some(&meta))
+            .await
+            .unwrap();
+        let heads = count(&fake, "HEAD ");
+        assert!(
+            heads <= 4,
+            "{heads} HEAD requests for one copy: {:?}",
+            fake.requests()
+        );
+        assert_eq!(
+            count(&fake, "HEAD /src/"),
+            0,
+            "the copy HEADed a source the caller had read: {:?}",
+            fake.requests()
+        );
+        fake.clear();
+        copy_object_from(&engine, request("j.bin"), None)
+            .await
+            .unwrap();
+        assert!(
+            count(&fake, "HEAD /src/") <= 2,
+            "one source HEAD per copy: {:?}",
+            fake.requests()
+        );
+    }
+
+    /// Copy `p/b.zip` (a delta) into `dst` while `op` requests whose path
+    /// holds `path` fail once, retry the copy once if it failed, and compare
+    /// the counter of `dst` with a clean copy into `dst2`.
+    async fn seeded_reference_counted_despite(op: &str, path: &str) {
+        let usage = Arc::new(BucketUsage::in_memory().unwrap());
+        let (engine, fake) = s3_engine(Some(usage.clone())).await;
+        let n = 256 * 1024;
+        for (key, seed) in [("p/a.zip", 1u8), ("p/b.zip", 2u8)] {
+            engine
+                .store("src", key, &versioned(seed, n), None, Default::default())
+                .await
+                .unwrap();
+        }
+        let head = engine.head("src", "p/b.zip").await.unwrap();
+        assert!(
+            matches!(head.storage_info, crate::types::StorageInfo::Delta { .. }),
+            "fixture must store b.zip as a delta"
+        );
+        // A clean copy into dst2 gives the numbers dst must end with.
+        let clean = ObjectTransferRequest {
+            destination_bucket: "dst2",
+            ..request("p/b.zip")
+        };
+        copy_object_with_retries(&engine, clean).await.unwrap();
+        fake.fail(op, path, 503, "SlowDown", 1);
+        if copy_object_with_retries(&engine, request("p/b.zip"))
+            .await
+            .is_err()
+        {
+            copy_object_with_retries(&engine, request("p/b.zip"))
+                .await
+                .unwrap();
+        }
+        assert!(
+            fake.requests()
+                .iter()
+                .any(|r| r.starts_with(&format!("{op} /{path}"))),
+            "the fault never fired: {:?}",
+            fake.requests()
+        );
+        usage.flush_pending();
+        let dst = usage.read("dst").unwrap().unwrap();
+        let dst2 = usage.read("dst2").unwrap().unwrap();
+        assert_eq!(
+            (dst.object_count, dst.stored_bytes),
+            (dst2.object_count, dst2.stored_bytes),
+            "the seeded reference.bin is missing from the counter"
+        );
+    }
+
+    /// Accounting finding: the fast path seeded the destination's
+    /// reference.bin, then the ship failed (here: a 503 on the GET of the
+    /// source delta). The retry found the seeded reference and shipped the
+    /// delta alone, so the counter never got the reference's bytes.
+    #[tokio::test]
+    async fn a_seeded_reference_is_counted_when_the_ship_after_it_fails() {
+        seeded_reference_counted_despite("GET", "src/p/b.zip.delta").await;
+    }
+
+    /// Blast finding 6: the SDK already sends a throttled PUT three times;
+    /// the copy loop sent the whole copy three times on top: 9 PUTs of the
+    /// body to a backend that asked to slow down.
+    #[tokio::test]
+    async fn a_throttled_copy_sends_its_put_at_most_three_times() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let config = crate::config::BackendConfig::S3 {
+            endpoint: Some(endpoint),
+            region: "us-east-1".into(),
+            force_path_style: true,
+            access_key_id: Some("k".into()),
+            secret_access_key: Some("s".into()),
+            allow_local: true,
+            session_token: None,
+        };
+        let s3 =
+            crate::storage::S3Backend::new(&config, crate::storage::NativeEncryptionConfig::None)
+                .await
+                .unwrap();
+        let engine = engine_on(s3, None, &["src", "dst"]).await;
+        engine
+            .store("src", "k.bin", b"payload", None, Default::default())
+            .await
+            .unwrap();
+        fake.fail("PUT", "dst/", 503, "SlowDown", u32::MAX);
+        fake.clear();
+        assert!(copy_object_with_retries(&engine, request("k.bin"))
+            .await
+            .is_err());
+        let puts = count(&fake, "PUT /dst/");
+        assert!(puts <= 3, "{puts} PUTs for one throttled copy");
     }
 }

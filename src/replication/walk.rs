@@ -239,6 +239,10 @@ pub struct FactRegime {
     pub dest_lite_authoritative: bool,
 }
 
+/// Requests one run may send (listing pages, HEADs, copies, deletes)
+/// before it stops and leaves the rest to the next run, from its cursor.
+pub const MAX_RUN_REQUESTS: u64 = 1_000_000;
+
 /// Does deciding a src∩dest pair need a HEAD on this side?
 /// SkipIfDestExists is existence-only — the listing always suffices.
 pub fn side_facts_need_head(conflict: ConflictPolicy, lite_authoritative: bool) -> bool {
@@ -270,16 +274,21 @@ pub enum Cmd {
         delimited: bool,
     },
     /// Batched HEADs (bounded burst); answer per key with `HeadResult`.
+    /// The driver answers a key from the parity cache when the key's
+    /// stored version (its listing's stored ETag and size) is unchanged.
     Head {
         req_id: u64,
         side: Side,
-        rel_keys: Vec<String>,
+        keys: Vec<HeadKey>,
     },
     /// Copy src→dest at the same relative key (existing copy_one_object).
+    /// `src_meta`: the source's metadata from a HEAD of this walk, so the
+    /// copy sends no HEAD of its own.
     Copy {
         item_id: u64,
         rel_key: String,
         src_size: u64,
+        src_meta: Option<Box<FileMetadata>>,
     },
     /// Delete pipeline (faithful mirror): src-absence HEAD confirm (delete only
     /// on NoSuchKey) → engine.delete. No provenance check — any source-absent
@@ -310,9 +319,23 @@ pub struct RelListing {
     pub next_token: Option<String>,
 }
 
+/// One key of a [`Cmd::Head`].
+#[derive(Debug, Clone)]
+pub struct HeadKey {
+    pub rel: String,
+    /// The stored version its listing showed (`parity::stored_version`):
+    /// a parity-cache row with this version answers the key with no HEAD.
+    pub stored_version: Option<String>,
+}
+
 #[derive(Debug)]
 pub enum HeadResult {
+    /// A HEAD answered: the object's whole metadata.
     Resolved(Box<FileMetadata>),
+    /// The parity cache answered (stored version unchanged): the logical
+    /// facts a decision needs (size, SHA-256, ETag, created-at in ms), not
+    /// the whole metadata. No request was sent.
+    Cached(Box<FileMetadata>),
     /// NotFound — the object vanished (or never existed on this side).
     Gone,
     /// Transient failure. Copies fall back to the safe direction; deletes
@@ -366,6 +389,9 @@ pub struct WalkStats {
     pub objects_skipped: u64,
     pub dirs_completed: u64,
     pub pages_used: u32,
+    /// Requests sent or emitted: listing pages, HEADed keys, copies and
+    /// deletes (a key the cache answered is refunded).
+    pub requests_used: u64,
     pub truncated_by_budget: bool,
 }
 
@@ -391,6 +417,8 @@ pub struct WalkConfig {
     pub page_size: u32,
     /// Run-global listing budget (all sides, all dirs, flat or delimited).
     pub max_pages: u32,
+    /// Run-global request budget: listing pages, HEADs, copies and deletes.
+    pub max_requests: u64,
     pub dir_workers: usize,
     pub head_batch: usize,
     /// Per-dir child-count threshold: beyond it the dir degrades to a flat
@@ -468,6 +496,11 @@ struct PendingPair {
     dest_lite: Box<FileMetadata>,
     src_resolved: Option<Option<Box<FileMetadata>>>,
     dest_resolved: Option<Option<Box<FileMetadata>>>,
+    /// The source came from a HEAD (whole metadata): a copy can use it.
+    src_headed: bool,
+    /// A side came from the parity cache: created-at compares in ms, the
+    /// precision the cache keeps.
+    cached: bool,
 }
 
 struct DirTask {
@@ -483,7 +516,7 @@ struct DirTask {
     /// Buffered until the dir completes cleanly (AfterDirClean gate).
     delete_candidates: Vec<String>,
     pending_pairs: BTreeMap<String, PendingPair>,
-    head_batch: [Vec<String>; 2], // [Src, Dest] keys awaiting batch emission
+    head_batch: [Vec<HeadKey>; 2], // [Src, Dest] keys awaiting batch emission
     deletes_flushed: bool,
     /// Bumped on flatten (streams replaced) — stale marker advances and
     /// stale listing pages check this before touching the new streams.
@@ -512,6 +545,10 @@ struct PendingDir {
     guard: String,
 }
 
+/// A decided copy awaiting a driver slot: (item, rel key, source size,
+/// source metadata from a HEAD).
+type ReadyCopy = (u64, String, u64, Option<Box<FileMetadata>>);
+
 pub struct WalkMachine {
     cfg: WalkConfig,
     /// Resume watermark from the loaded cursor (positions ≤ it are settled).
@@ -519,9 +556,9 @@ pub struct WalkMachine {
     tracker: ContiguousTracker,
     pending: BTreeMap<String, PendingDir>,
     active: BTreeMap<String, DirTask>,
-    ready_copies: VecDeque<(u64, String, u64)>,
+    ready_copies: VecDeque<ReadyCopy>,
     ready_deletes: VecDeque<(u64, String)>,
-    ready_heads: VecDeque<(u64, Side, Vec<String>)>,
+    ready_heads: VecDeque<(u64, Side, Vec<HeadKey>)>,
     routes: HashMap<u64, CmdRoute>,
     next_id: u64,
     stats: WalkStats,
@@ -571,7 +608,8 @@ impl WalkMachine {
                     break 'lists;
                 }
                 let backpressured = self.actions_backpressured();
-                let over_budget = self.stats.pages_used >= self.cfg.max_pages;
+                let over_budget = self.stats.pages_used >= self.cfg.max_pages
+                    || self.stats.requests_used >= self.cfg.max_requests;
                 let Some(task) = self.active.get_mut(key) else {
                     continue 'lists;
                 };
@@ -607,42 +645,42 @@ impl WalkMachine {
                     },
                 );
                 self.stats.pages_used += 1;
+                self.stats.requests_used += 1;
                 list_slots -= 1;
             }
         }
 
-        // Head bursts.
+        // Head bursts, copies and deletes: each is requests the run's
+        // budget counts. Work the budget cannot pay waits for the next run
+        // (the cursor stays before it).
         let mut head_slots = caps.head;
         while head_slots > 0 {
-            let Some((req_id, side, keys)) = self.ready_heads.pop_front() else {
+            let Some((_, _, keys)) = self.ready_heads.front() else {
                 break;
             };
-            out.push(Cmd::Head {
-                req_id,
-                side,
-                rel_keys: keys,
-            });
+            if !self.spend(keys.len() as u64) {
+                break;
+            }
+            let (req_id, side, keys) = self.ready_heads.pop_front().expect("front");
+            out.push(Cmd::Head { req_id, side, keys });
             head_slots -= 1;
         }
 
-        // Copies / deletes.
         let mut copy_slots = caps.copy;
-        while copy_slots > 0 {
-            let Some((item_id, rel_key, src_size)) = self.ready_copies.pop_front() else {
-                break;
-            };
+        while copy_slots > 0 && !self.ready_copies.is_empty() && self.spend(1) {
+            let (item_id, rel_key, src_size, src_meta) =
+                self.ready_copies.pop_front().expect("non-empty");
             out.push(Cmd::Copy {
                 item_id,
                 rel_key,
                 src_size,
+                src_meta,
             });
             copy_slots -= 1;
         }
         let mut delete_slots = caps.delete;
-        while delete_slots > 0 {
-            let Some((item_id, rel_key)) = self.ready_deletes.pop_front() else {
-                break;
-            };
+        while delete_slots > 0 && !self.ready_deletes.is_empty() && self.spend(1) {
+            let (item_id, rel_key) = self.ready_deletes.pop_front().expect("non-empty");
             out.push(Cmd::Delete { item_id, rel_key });
             delete_slots -= 1;
         }
@@ -693,6 +731,17 @@ impl WalkMachine {
                 self.maybe_complete_dir(&dir);
             }
         }
+    }
+
+    /// Take `n` requests from the run's budget. `false` (and the run
+    /// truncated) when the budget cannot pay them.
+    fn spend(&mut self, n: u64) -> bool {
+        if self.stats.requests_used.saturating_add(n) > self.cfg.max_requests {
+            self.stats.truncated_by_budget = true;
+            return false;
+        }
+        self.stats.requests_used += n;
+        true
     }
 
     /// Stop issuing new work. In-flight commands may still settle via
@@ -1202,6 +1251,16 @@ impl WalkMachine {
             return;
         };
         task.outstanding += 1;
+        let head_key = |lite: &FileMetadata| HeadKey {
+            rel: rel.clone(),
+            stored_version: super::parity::stored_version(lite),
+        };
+        if need_src {
+            task.head_batch[0].push(head_key(&src_lite));
+        }
+        if need_dest {
+            task.head_batch[1].push(head_key(&dest_lite));
+        }
         task.pending_pairs.insert(
             rel.clone(),
             PendingPair {
@@ -1209,14 +1268,10 @@ impl WalkMachine {
                 dest_lite,
                 src_resolved: (!need_src).then_some(None),
                 dest_resolved: (!need_dest).then_some(None),
+                src_headed: false,
+                cached: false,
             },
         );
-        if need_src {
-            task.head_batch[0].push(rel.clone());
-        }
-        if need_dest {
-            task.head_batch[1].push(rel.clone());
-        }
         self.flush_head_batches(key, false);
     }
 
@@ -1291,7 +1346,7 @@ impl WalkMachine {
                     task.outstanding += 1;
                 }
                 self.ready_copies
-                    .push_back((item_id, rel, src_lite.file_size));
+                    .push_back((item_id, rel, src_lite.file_size, None));
             }
             Decision::Skip { .. } => {
                 self.stats.objects_skipped += 1;
@@ -1347,14 +1402,23 @@ impl WalkMachine {
                 self.tracker.settle(&rel);
                 continue;
             }
+            let pair = task.pending_pairs.get_mut(&rel).expect("checked");
             let resolved = match res {
-                HeadResult::Resolved(m) => Some(m),
+                HeadResult::Resolved(m) => {
+                    pair.src_headed |= side == Side::Src;
+                    Some(m)
+                }
+                HeadResult::Cached(m) => {
+                    pair.cached = true;
+                    // No request was sent for it.
+                    self.stats.requests_used = self.stats.requests_used.saturating_sub(1);
+                    Some(m)
+                }
                 // Src Unresolved → lite fallback (over-copy is safe);
                 // dest Gone/Unresolved → treated absent (copy, old `.ok()`
                 // semantics). Both encode as `Some(None)` = "no HEAD facts".
                 HeadResult::Gone | HeadResult::Unresolved => None,
             };
-            let pair = task.pending_pairs.get_mut(&rel).expect("checked");
             match side {
                 Side::Src => pair.src_resolved = Some(resolved),
                 Side::Dest => pair.dest_resolved = Some(resolved),
@@ -1395,10 +1459,30 @@ impl WalkMachine {
             None => Some(&pair.dest_lite),
         };
         let abs_src = format!("{}{}", self.cfg.src_prefix, rel);
+        // The cache keeps created-at in ms; a HEAD gives µs. Compare both
+        // sides at the cache's precision when one came from it, or a pair
+        // that converged compares "newer" forever.
+        let in_ms = |m: &FileMetadata| -> FileMetadata {
+            let mut m = m.clone();
+            if let Some(t) =
+                chrono::DateTime::from_timestamp_millis(m.created_at.timestamp_millis())
+            {
+                m.created_at = t;
+            }
+            m
+        };
+        let (src_ms, dest_ms);
+        let (src_cmp, dest_cmp) = if pair.cached {
+            src_ms = in_ms(src_meta);
+            dest_ms = dest_meta.map(in_ms);
+            (&src_ms, dest_ms.as_ref())
+        } else {
+            (src_meta, dest_meta)
+        };
         let d = should_replicate(
             &abs_src,
-            src_meta,
-            dest_meta,
+            src_cmp,
+            dest_cmp,
             self.cfg.conflict,
             self.cfg.strict_content_diff,
             &self.cfg.include_globs,
@@ -1408,6 +1492,9 @@ impl WalkMachine {
         // The pair's tracker entry transfers to the emitted decision.
         match d {
             Decision::Copy { .. } => {
+                // The source's whole metadata from this walk's HEAD rides
+                // into the copy, which then sends no source HEAD of its own.
+                let copy_meta = pair.src_headed.then(|| Box::new(src_meta.clone()));
                 let item_id = self.next_id;
                 self.next_id += 1;
                 self.routes.insert(
@@ -1421,7 +1508,7 @@ impl WalkMachine {
                     task.outstanding += 1;
                 }
                 self.ready_copies
-                    .push_back((item_id, rel.to_string(), src_size));
+                    .push_back((item_id, rel.to_string(), src_size, copy_meta));
             }
             Decision::Skip { .. } => {
                 self.stats.objects_skipped += 1;
@@ -2075,6 +2162,8 @@ mod machine_tests {
         trace: Trace,
         queue: Vec<Event>,
         last_cursor: Option<String>,
+        /// Keys HEADed so far.
+        head_keys: usize,
     }
 
     impl Sim {
@@ -2100,15 +2189,13 @@ mod machine_tests {
                     );
                     self.queue.push(Event::ListPage { req_id, page });
                 }
-                Cmd::Head {
-                    req_id,
-                    side,
-                    rel_keys,
-                } => {
+                Cmd::Head { req_id, side, keys } => {
+                    let rel_keys: Vec<String> = keys.into_iter().map(|k| k.rel).collect();
                     let map = match side {
                         Side::Src => &self.world.src,
                         Side::Dest => &self.world.dest,
                     };
+                    self.head_keys += rel_keys.len();
                     let results = rel_keys
                         .into_iter()
                         .map(|k| {
@@ -2248,6 +2335,7 @@ mod machine_tests {
                 regime: world.regime,
                 page_size,
                 max_pages,
+                max_requests: u64::MAX,
                 dir_workers,
                 head_batch,
                 max_child_dirs_per_dir: max_child_dirs,
@@ -2296,10 +2384,66 @@ mod machine_tests {
             trace: Trace::default(),
             queue: Vec::new(),
             last_cursor: None,
+            head_keys: 0,
         };
         drive(&mut machine, &mut sim, &[0], None);
         assert!(machine.is_done(), "expected clean completion");
         (sim.trace, machine.stats().clone())
+    }
+
+    /// Jobs finding 19: the run budget counted listing pages only. One run
+    /// could send up to 4 HEADs per listed object across 10,000 pages, and
+    /// its copies and deletes, with no bound. HEADs count now.
+    #[test]
+    fn the_run_budget_counts_heads_not_only_listing_pages() {
+        let mut world = simple_world(UNTRUSTED);
+        for i in 0..200 {
+            let src = world_obj(mk_meta(10, "sha", "etag", 1_000 + i, false), false);
+            let dest = copied_from(&src, false);
+            world.src.insert(format!("k{i:03}"), src);
+            world.dest.insert(format!("k{i:03}"), dest);
+        }
+        let mut machine = WalkMachine::new(
+            WalkConfig {
+                scope: "s|/|d|/".to_string(),
+                rule_name: RULE.to_string(),
+                src_prefix: String::new(),
+                dest_prefix: String::new(),
+                conflict: ConflictPolicy::NewerWins,
+                strict_content_diff: false,
+                replicate_deletes: false,
+                include_globs: GlobSet::empty(),
+                exclude_globs: GlobSet::empty(),
+                regime: world.regime,
+                page_size: 100,
+                max_pages: 10_000,
+                max_requests: 50,
+                dir_workers: 2,
+                head_batch: 10,
+                max_child_dirs_per_dir: usize::MAX,
+                max_pending_dirs: 100_000,
+                action_buffer: 6,
+            },
+            None,
+        );
+        let mut sim = Sim {
+            world: world.clone(),
+            page_size: 100,
+            trace: Trace::default(),
+            queue: Vec::new(),
+            last_cursor: None,
+            head_keys: 0,
+        };
+        drive(&mut machine, &mut sim, &[0], None);
+        assert!(
+            sim.head_keys <= 50,
+            "{} keys HEADed on a budget of 50 requests",
+            sim.head_keys
+        );
+        assert!(
+            machine.truncated_by_budget(),
+            "the run must stop, cursor kept"
+        );
     }
 
     #[test]
@@ -2529,6 +2673,7 @@ mod machine_tests {
             trace: Trace::default(),
             queue: Vec::new(),
             last_cursor: None,
+            head_keys: 0,
         };
         drive(&mut machine, &mut sim, &[0], None);
         assert!(machine.truncated_by_budget());
@@ -2574,6 +2719,7 @@ mod machine_tests {
             trace: Trace::default(),
             queue: Vec::new(),
             last_cursor: None,
+            head_keys: 0,
         };
         drive(&mut machine, &mut sim, &[0], None);
         let (ref_copies, _) = reference_diff(&w, ConflictPolicy::SkipIfDestExists, false, false);
@@ -2639,6 +2785,7 @@ mod machine_tests {
                 trace: Trace::default(),
                 queue: Vec::new(),
                 last_cursor: None,
+                head_keys: 0,
             };
             drive(&mut machine, &mut sim, &[0], None);
             world_now = sim.world;
@@ -2784,6 +2931,7 @@ mod machine_tests {
                 trace: Trace::default(),
                 queue: Vec::new(),
                 last_cursor: None,
+                head_keys: 0,
             };
             drive(&mut machine, &mut sim, &seed, None);
             prop_assert!(machine.is_done(), "walk must complete");
@@ -2813,6 +2961,7 @@ mod machine_tests {
                     trace: Trace::default(),
                     queue: Vec::new(),
                     last_cursor: None,
+                    head_keys: 0,
                 };
                 drive(&mut machine, &mut sim, &[0], None);
                 results.push((sim.trace.copies, sim.trace.deletes));
@@ -2840,6 +2989,7 @@ mod machine_tests {
                 trace: Trace::default(),
                 queue: Vec::new(),
                 last_cursor: None,
+                head_keys: 0,
             };
             drive(&mut machine, &mut sim, &seed, Some(cut));
             let cursor = machine.cursor();
@@ -2852,6 +3002,7 @@ mod machine_tests {
                 trace: Trace::default(),
                 queue: Vec::new(),
                 last_cursor: None,
+                head_keys: 0,
             };
             drive(&mut resumed, &mut sim2, &seed, None);
             prop_assert!(resumed.is_done(), "resumed walk must complete");
@@ -2895,6 +3046,7 @@ mod machine_tests {
                     trace: Trace::default(),
                     queue: Vec::new(),
                     last_cursor: None,
+                    head_keys: 0,
                 };
                 drive(&mut machine, &mut sim, &[0], None);
                 world_now = sim.world;
@@ -2934,6 +3086,7 @@ mod machine_tests {
                 trace: Trace::default(),
                 queue: Vec::new(),
                 last_cursor: None,
+                head_keys: 0,
             };
             drive(&mut machine, &mut sim, &[3, 1, 4], Some(cut));
             let cursor = machine.cursor();
@@ -2945,6 +3098,7 @@ mod machine_tests {
                 trace: Trace::default(),
                 queue: Vec::new(),
                 last_cursor: None,
+                head_keys: 0,
             };
             drive(&mut resumed, &mut sim2, &[2, 5], None);
             prop_assert!(resumed.is_done());

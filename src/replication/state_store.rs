@@ -956,38 +956,56 @@ impl ConfigDb {
         Ok(())
     }
 
-    /// Prune cache rows for a rule whose `dest_key` was NOT seen in the last
-    /// (complete) scan — bounds growth to the live object set and evicts
-    /// stale rows for deleted objects. Called only after a NON-truncated scan
-    /// (a truncated scan didn't see every key, so it can't safely prune).
-    /// `ponytail`: local diagnostic cache — keep it bounded; a future move to a
-    /// separate local-only DB would also keep it out of the HA config-sync blob.
-    pub fn parity_cache_retain(
+    /// One page of a rule's cached keys on `side`, in key order, after
+    /// `after` (from the start when `None`): the read half of a prune that
+    /// holds the DB lock for at most `limit` rows at a time.
+    pub fn parity_cache_keys_after(
+        &self,
+        rule: &str,
+        side: ParitySide,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, ConfigDbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT dest_key FROM replication_parity_objects
+             WHERE rule_name = ? AND side = ? AND dest_key > ?
+             ORDER BY dest_key LIMIT ?",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![rule, side.as_str(), after.unwrap_or(""), limit as i64],
+            |r| r.get::<_, String>(0),
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Delete a rule's cached rows of `keys` on `side`, then give the freed
+    /// pages back to the disk (the sync uploads the whole file). Returns
+    /// the rows deleted.
+    pub fn parity_cache_delete(
         &mut self,
         rule: &str,
         side: ParitySide,
-        live_dest_keys: &[String],
+        keys: &[&str],
     ) -> Result<usize, ConfigDbError> {
         let side = side.as_str();
-        // Build a temp set of live keys, delete everything else for (rule, side).
         let tx = self.conn.transaction()?;
-        tx.execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS _parity_live (k TEXT PRIMARY KEY);
-             DELETE FROM _parity_live;",
-        )?;
-        {
-            let mut ins = tx.prepare("INSERT OR IGNORE INTO _parity_live (k) VALUES (?)")?;
-            for k in live_dest_keys {
-                ins.execute([k])?;
+        let mut removed = 0;
+        for chunk in keys.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "DELETE FROM replication_parity_objects
+                 WHERE rule_name = ? AND side = ? AND dest_key IN ({placeholders})"
+            );
+            let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() + 2);
+            binds.push(&rule);
+            binds.push(&side);
+            for k in chunk {
+                binds.push(k);
             }
+            removed += tx.execute(&sql, binds.as_slice())?;
         }
-        let removed = tx.execute(
-            "DELETE FROM replication_parity_objects
-             WHERE rule_name = ? AND side = ?
-               AND dest_key NOT IN (SELECT k FROM _parity_live)",
-            rusqlite::params![rule, side],
-        )?;
         tx.commit()?;
+        crate::config_db::reclaim_free_pages(&self.conn);
         Ok(removed)
     }
 
@@ -2015,7 +2033,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_cache_retain_prunes_deleted_and_respects_side() {
+    fn parity_cache_delete_respects_side_and_pages_in_key_order() {
         let mut db = db();
         let mk = ParityCacheEntry {
             sha256: None,
@@ -2028,31 +2046,35 @@ mod tests {
         db.parity_cache_put_many(
             "r",
             s,
-            &[("keep".into(), mk.clone()), ("gone".into(), mk.clone())],
+            &[
+                ("a".into(), mk.clone()),
+                ("b".into(), mk.clone()),
+                ("gone".into(), mk.clone()),
+            ],
             1,
         )
         .unwrap();
-        // Dest side has its own "gone" — must NOT be pruned by a source retain.
+        // Dest side has its own "gone" — must NOT be deleted by a source delete.
         db.parity_cache_put_many("r", ParitySide::Dest, &[("gone".into(), mk.clone())], 1)
             .unwrap();
-
-        let removed = db
-            .parity_cache_retain("r", s, &["keep".to_string()])
-            .unwrap();
-        assert_eq!(removed, 1, "only the source 'gone' row is pruned");
+        assert_eq!(
+            db.parity_cache_keys_after("r", s, None, 2).unwrap(),
+            ["a", "b"]
+        );
+        assert_eq!(
+            db.parity_cache_keys_after("r", s, Some("b"), 2).unwrap(),
+            ["gone"]
+        );
+        assert_eq!(db.parity_cache_delete("r", s, &["gone"]).unwrap(), 1);
         assert!(db
             .parity_cache_get_many("r", s, &["gone"])
-            .unwrap()
-            .is_empty());
-        assert!(!db
-            .parity_cache_get_many("r", s, &["keep"])
             .unwrap()
             .is_empty());
         assert!(
             !db.parity_cache_get_many("r", ParitySide::Dest, &["gone"])
                 .unwrap()
                 .is_empty(),
-            "dest side untouched by a source-side retain"
+            "dest side untouched by a source-side delete"
         );
     }
 

@@ -13,7 +13,7 @@ use crate::config_db::ConfigDb;
 use crate::config_sections::ReplicationConfig;
 use crate::coordination::DynCoordinationLease;
 use crate::coordination::{CoordinationLease, LeaseSubsystem};
-use crate::replication::{current_unix_seconds, run_rule, RunLease};
+use crate::replication::{current_unix_seconds, run_rule_gated, RunLease};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -154,9 +154,28 @@ async fn run_due_rules(
             continue;
         }
 
-        info!("Replication scheduler running due rule '{}'", rule.name);
         let engine = state.engine.load().clone();
-        if let Err(err) = run_rule(
+        // The backend health gate: a rule whose source or destination
+        // backend is gated (unreachable, credentials refused) defers like a
+        // maintenance job — its run would send that backend its whole
+        // volume, and keep its probe failing.
+        let health = crate::replication::RunHealthGate {
+            health: state.backend_health.clone(),
+            config: config.clone(),
+        };
+        if let Some(cause) = health.gated(&engine, rule).await {
+            info!(
+                "Replication scheduler deferring rule '{}': {}",
+                rule.name, cause
+            );
+            let _ = lease
+                .release(LeaseSubsystem::Replication, &rule.name, instance_id)
+                .await;
+            continue;
+        }
+
+        info!("Replication scheduler running due rule '{}'", rule.name);
+        if let Err(err) = run_rule_gated(
             db.clone(),
             &engine,
             rule,
@@ -176,6 +195,7 @@ async fn run_due_rules(
             },
             Some(state.maintenance_gate.clone()),
             lease.clone(),
+            Some(health),
         )
         .await
         {
@@ -291,5 +311,116 @@ mod tests {
             ..ReplicationConfig::default()
         };
         assert_eq!(heartbeat_secs(&cfg), 5);
+    }
+}
+
+/// The scheduler and the backend health gate, on a fake S3.
+#[cfg(test)]
+mod health_gate_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::deltaglider::DeltaGliderEngine;
+    use crate::storage::DynStorageBackend;
+
+    struct FreeLease;
+
+    impl CoordinationLease for FreeLease {
+        async fn try_acquire(
+            &self,
+            _: LeaseSubsystem,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: i64,
+        ) -> Result<bool, crate::coordination::LeaseError> {
+            Ok(true)
+        }
+        async fn renew(
+            &self,
+            _: LeaseSubsystem,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: i64,
+        ) -> Result<(), crate::coordination::LeaseError> {
+            Ok(())
+        }
+        async fn release(
+            &self,
+            _: LeaseSubsystem,
+            _: &str,
+            _: &str,
+        ) -> Result<(), crate::coordination::LeaseError> {
+            Ok(())
+        }
+        async fn is_held(
+            &self,
+            _: LeaseSubsystem,
+            _: &str,
+            _: i64,
+        ) -> Result<bool, crate::coordination::LeaseError> {
+            Ok(false)
+        }
+    }
+
+    /// Jobs finding 13: the scheduler ran a rule against a destination
+    /// whose backend the health gate had closed: the whole run's requests
+    /// went to an unreachable backend. It defers the rule, as for a
+    /// maintenance job.
+    #[tokio::test]
+    async fn the_scheduler_defers_a_rule_whose_destination_backend_is_gated() {
+        let (s3, fake) = crate::storage::fake_s3_backend().await;
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(s3);
+        let engine =
+            DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None);
+        for b in ["src", "dst"] {
+            engine.create_bucket(b).await.unwrap();
+        }
+        engine
+            .store("src", "k.bin", b"data", None, Default::default())
+            .await
+            .unwrap();
+        let state = AppState::for_tests(engine);
+        let mut cfg = Config::from_yaml_str(
+            r#"
+storage:
+  backends:
+    - name: src-be
+      type: filesystem
+      path: /tmp/dgp-d1-src-be
+    - name: dst-be
+      type: filesystem
+      path: /tmp/dgp-d1-dst-be
+  buckets:
+    dst:
+      backend: dst-be
+"#,
+        )
+        .unwrap();
+        cfg.replication.enabled = true;
+        cfg.replication.rules = vec![serde_yaml::from_str(
+            "name: r\nenabled: true\nsource: {bucket: src}\ndestination: {bucket: dst}\n",
+        )
+        .unwrap()];
+        let def = cfg.backend_by_name("dst-be").unwrap().clone();
+        state.backend_health.set(
+            "dst-be",
+            &def,
+            crate::coordination::HealthVerdict::Unreachable {
+                detail: "test".into(),
+            },
+        );
+        let replication = cfg.replication.clone();
+        let config: SharedConfig = Arc::new(tokio::sync::RwLock::new(cfg));
+        let db = Arc::new(Mutex::new(ConfigDb::in_memory("pw").unwrap()));
+        let lease = DynCoordinationLease::from_arc(Arc::new(FreeLease));
+        fake.clear();
+        run_due_rules(&replication, &config, &db, &state, "i", &lease).await;
+        let to_dst: Vec<String> = fake
+            .requests()
+            .into_iter()
+            .filter(|r| r.contains(" /dst"))
+            .collect();
+        assert!(to_dst.is_empty(), "requests to a gated backend: {to_dst:?}");
     }
 }

@@ -7,6 +7,7 @@
 //! `settle_run` in the parent module.
 
 use super::*;
+use crate::replication::state_store::{ParityCacheEntry, ParitySide};
 
 /// What one run needs, fixed for the whole walk.
 pub(super) struct RunScope<'a> {
@@ -52,7 +53,14 @@ pub(super) struct RunFlags {
     pub poison_cleared_any: bool,
 }
 
-/// Pure: how many commands of each kind the machine may issue now.
+/// Delete keys in flight at most: the driver sends the deletes of one poll
+/// as one batch (one source listing per folder, one reclaim check per
+/// destination folder).
+pub(super) const DELETE_BATCH_KEYS: usize = 1000;
+
+/// Pure: how many commands of each kind the machine may issue now. HEAD
+/// batches: `dir_workers` at once (their HEADs share `dir_workers`
+/// permits, see [`WalkDriver::head_permits`]).
 pub(super) fn driver_caps(
     dir_workers: usize,
     transfers: usize,
@@ -60,9 +68,9 @@ pub(super) fn driver_caps(
 ) -> walk::DriverCaps {
     walk::DriverCaps {
         list: (dir_workers * 2).saturating_sub(inflight.lists),
-        head: 2usize.saturating_sub(inflight.heads),
+        head: dir_workers.saturating_sub(inflight.heads),
         copy: transfers.saturating_sub(inflight.copies),
-        delete: 2usize.saturating_sub(inflight.deletes),
+        delete: DELETE_BATCH_KEYS.saturating_sub(inflight.deletes),
     }
 }
 
@@ -72,6 +80,7 @@ pub(super) struct InflightCounts {
     pub lists: usize,
     pub heads: usize,
     pub copies: usize,
+    /// Delete KEYS in flight (in batches).
     pub deletes: usize,
 }
 
@@ -101,6 +110,10 @@ struct WalkDriver<'a> {
     poison_skipped: i64,
     /// Failure-ledger clears the next checkpoint writes.
     clear_failure_keys: Vec<String>,
+    /// HEADs in flight across every batch: `dir_workers` at most.
+    head_permits: Arc<tokio::sync::Semaphore>,
+    /// Delete commands of the current poll, sent as one batch.
+    pending_deletes: Vec<(u64, String)>,
 }
 
 impl<'a> WalkDriver<'a> {
@@ -113,7 +126,38 @@ impl<'a> WalkDriver<'a> {
             first_list_done: false,
             poison_skipped: 0,
             clear_failure_keys: Vec::new(),
+            head_permits: Arc::new(tokio::sync::Semaphore::new(s.dir_workers.max(1))),
+            pending_deletes: Vec::new(),
         }
+    }
+
+    /// Send the deletes of this poll as one batch.
+    fn flush_deletes(&mut self) {
+        if self.pending_deletes.is_empty() {
+            return;
+        }
+        let s = self.s;
+        let rule = s.rule;
+        let items: Vec<(u64, super::super::mirror_delete::MirrorDelete)> = self
+            .pending_deletes
+            .drain(..)
+            .map(|(item_id, rel_key)| {
+                (
+                    item_id,
+                    super::super::mirror_delete::MirrorDelete {
+                        src_key: format!("{}{rel_key}", s.source_prefix),
+                        dest_key: format!("{}{rel_key}", s.dest_prefix),
+                    },
+                )
+            })
+            .collect();
+        self.counts.deletes += items.len();
+        let engine = s.engine.clone();
+        let src_bucket = rule.source.bucket.clone();
+        let dst_bucket = rule.destination.bucket.clone();
+        self.inflight.push(Box::pin(async move {
+            execute_deletes(&engine, &src_bucket, &dst_bucket, items).await
+        }));
     }
 
     /// Start one machine command.
@@ -153,41 +197,104 @@ impl<'a> WalkDriver<'a> {
                     DriverDone::List { req_id, result }
                 }));
             }
-            walk::Cmd::Head {
-                req_id,
-                side,
-                rel_keys,
-            } => {
+            walk::Cmd::Head { req_id, side, keys } => {
                 self.counts.heads += 1;
                 let engine = s.engine.clone();
                 let (bucket, side_prefix) = side_target(rule, s.source_prefix, s.dest_prefix, side);
-                self.inflight.push(Box::pin(async move {
-                    let mut results = Vec::with_capacity(rel_keys.len());
-                    for rel in rel_keys {
-                        let abs = format!("{side_prefix}{rel}");
-                        if let Some(m) = engine.metrics() {
-                            m.replication_head_calls_total.inc();
+                // Converged pairs resolve from the parity cache: a row whose
+                // stored version equals the listing's answers the key, with
+                // no request. Rows are keyed by the DESTINATION key on both
+                // sides (as parity writes them). Read here, in the main task:
+                // the future below is DB-free by contract.
+                let cache_side = match side {
+                    walk::Side::Src => ParitySide::Source,
+                    walk::Side::Dest => ParitySide::Dest,
+                };
+                let cache_keys: Vec<String> = keys
+                    .iter()
+                    .filter(|k| k.stored_version.is_some())
+                    .map(|k| format!("{}{}", s.dest_prefix, k.rel))
+                    .collect();
+                let cached = super::super::parity::cache_get(
+                    Some(s.db.as_ref()),
+                    &rule.name,
+                    cache_side,
+                    &cache_keys,
+                )
+                .await;
+                let mut results = Vec::with_capacity(keys.len());
+                let mut misses = Vec::new();
+                for key in keys {
+                    let meta = cached
+                        .get(&format!("{}{}", s.dest_prefix, key.rel))
+                        .filter(|row| {
+                            super::super::parity::cache_hit_fresh(row, &key.stored_version)
+                        })
+                        .and_then(|row| super::super::parity::cached_logical_meta(&key.rel, row));
+                    match meta {
+                        Some(meta) => {
+                            results.push((key.rel, walk::HeadResult::Cached(Box::new(meta))))
                         }
-                        let r = match engine.head(&bucket, &abs).await {
-                            Ok(meta) => walk::HeadResult::Resolved(Box::new(meta)),
-                            Err(e) => {
-                                let s3e: crate::api::S3Error = e.into();
-                                if matches!(s3e, crate::api::S3Error::NoSuchKey(_)) {
-                                    walk::HeadResult::Gone
-                                } else {
-                                    walk::HeadResult::Unresolved
-                                }
-                            }
-                        };
-                        results.push((rel, r));
+                        None => misses.push(key),
                     }
-                    DriverDone::Heads { req_id, results }
+                }
+                let concurrency = s.dir_workers.max(1);
+                // The HEAD futures are made here: a closure inside the
+                // stream made the boxed future fail rustc's `Send` check.
+                let heads: Vec<_> = misses
+                    .into_iter()
+                    .map(|key| {
+                        let (engine, permits) = (engine.clone(), self.head_permits.clone());
+                        let abs = format!("{side_prefix}{}", key.rel);
+                        let bucket = bucket.clone();
+                        async move {
+                            let _permit = permits.acquire_owned().await;
+                            if let Some(m) = engine.metrics() {
+                                m.replication_head_calls_total.inc();
+                            }
+                            let r = match engine.head(&bucket, &abs).await {
+                                Ok(meta) => walk::HeadResult::Resolved(Box::new(meta)),
+                                Err(e) => {
+                                    let s3e: crate::api::S3Error = e.into();
+                                    if matches!(s3e, crate::api::S3Error::NoSuchKey(_)) {
+                                        walk::HeadResult::Gone
+                                    } else {
+                                        walk::HeadResult::Unresolved
+                                    }
+                                }
+                            };
+                            (key, r)
+                        }
+                    })
+                    .collect();
+                self.inflight.push(Box::pin(async move {
+                    let headed: Vec<(walk::HeadKey, walk::HeadResult)> =
+                        futures::stream::iter(heads)
+                            .buffer_unordered(concurrency)
+                            .collect()
+                            .await;
+                    let mut fresh = Vec::new();
+                    for (key, r) in headed {
+                        if let (walk::HeadResult::Resolved(meta), Some(version)) =
+                            (&r, &key.stored_version)
+                        {
+                            fresh.push((key.rel.clone(), version.clone(), (**meta).clone()));
+                        }
+                        results.push((key.rel, r));
+                    }
+                    DriverDone::Heads {
+                        req_id,
+                        side,
+                        results,
+                        fresh,
+                    }
                 }));
             }
             walk::Cmd::Copy {
                 item_id,
                 rel_key,
                 src_size,
+                src_meta,
             } => {
                 // Poison-object guard, INLINE (main task — the copy future
                 // itself is DB-free by contract): skip an object that failed
@@ -250,6 +357,7 @@ impl<'a> WalkDriver<'a> {
                         object_timeout,
                         upload_concurrency,
                         &events,
+                        src_meta.as_deref(),
                     )
                     .await;
                     DriverDone::Copy {
@@ -260,23 +368,8 @@ impl<'a> WalkDriver<'a> {
                 }));
             }
             walk::Cmd::Delete { item_id, rel_key } => {
-                self.counts.deletes += 1;
-                let engine = s.engine.clone();
-                let src_bucket = rule.source.bucket.clone();
-                let dst_bucket = rule.destination.bucket.clone();
-                let abs_src = format!("{}{rel_key}", s.source_prefix);
-                let abs_dest = format!("{}{rel_key}", s.dest_prefix);
-                self.inflight.push(Box::pin(async move {
-                    execute_delete(
-                        &engine,
-                        &src_bucket,
-                        &dst_bucket,
-                        &abs_src,
-                        &abs_dest,
-                        item_id,
-                    )
-                    .await
-                }));
+                // Sent with the poll's other deletes (`flush_deletes`).
+                self.pending_deletes.push((item_id, rel_key));
             }
         }
     }
@@ -317,8 +410,37 @@ impl<'a> WalkDriver<'a> {
                     }
                 }
             }
-            DriverDone::Heads { req_id, results } => {
+            DriverDone::Heads {
+                req_id,
+                side,
+                results,
+                fresh,
+            } => {
                 self.counts.heads -= 1;
+                // Remember what the HEADs said, so the next run resolves the
+                // pairs that stay converged with no request.
+                if !fresh.is_empty() {
+                    let cache_side = match side {
+                        walk::Side::Src => ParitySide::Source,
+                        walk::Side::Dest => ParitySide::Dest,
+                    };
+                    let rows: Vec<(String, ParityCacheEntry)> = fresh
+                        .into_iter()
+                        .map(|(rel, version, meta)| {
+                            (
+                                format!("{}{rel}", s.dest_prefix),
+                                super::super::parity::cache_entry_from_meta(&meta, Some(version)),
+                            )
+                        })
+                        .collect();
+                    super::super::parity::cache_put(
+                        Some(s.db.as_ref()),
+                        &rule.name,
+                        cache_side,
+                        &rows,
+                    )
+                    .await;
+                }
                 machine.on_event(walk::Event::HeadDone { req_id, results });
             }
             DriverDone::Copy {
@@ -405,26 +527,24 @@ impl<'a> WalkDriver<'a> {
                     machine.drain(walk::DrainReason::Fatal);
                 }
             }
-            DriverDone::Delete {
-                item_id,
-                deleted,
-                error,
-            } => {
-                self.counts.deletes -= 1;
-                if deleted {
-                    totals.objects_deleted += 1;
+            DriverDone::Deletes { results } => {
+                self.counts.deletes -= results.len();
+                for (item_id, deleted, error) in results {
+                    if deleted {
+                        totals.objects_deleted += 1;
+                    }
+                    let errored = error.is_some();
+                    if let Some(msg) = error {
+                        totals.errors += 1;
+                        flags.had_any_error = true;
+                        // Delete futures are DB-free; persist the failure here.
+                        ring_failure(s, "", "", &msg).await;
+                    }
+                    machine.on_event(walk::Event::DeleteSettled {
+                        item_id,
+                        ok: !errored,
+                    });
                 }
-                let errored = error.is_some();
-                if let Some(msg) = error {
-                    totals.errors += 1;
-                    flags.had_any_error = true;
-                    // Delete futures are DB-free; persist the failure here.
-                    ring_failure(s, "", "", &msg).await;
-                }
-                machine.on_event(walk::Event::DeleteSettled {
-                    item_id,
-                    ok: !errored,
-                });
             }
         }
     }
@@ -636,6 +756,7 @@ pub(super) async fn drive_walk(
         for cmd in cmds {
             driver.dispatch(machine, cmd).await;
         }
+        driver.flush_deletes();
 
         if driver.inflight.is_empty() {
             if !dispatched {
@@ -694,15 +815,18 @@ mod tests {
     fn caps_leave_room_for_what_is_in_flight() {
         let none = InflightCounts::default();
         let c = driver_caps(4, 8, &none);
-        assert_eq!((c.list, c.head, c.copy, c.delete), (8, 2, 8, 2));
+        assert_eq!(
+            (c.list, c.head, c.copy, c.delete),
+            (8, 4, 8, DELETE_BATCH_KEYS)
+        );
         let busy = InflightCounts {
             lists: 9,
             heads: 1,
             copies: 3,
-            deletes: 2,
+            deletes: DELETE_BATCH_KEYS,
         };
         let c = driver_caps(4, 8, &busy);
-        assert_eq!((c.list, c.head, c.copy, c.delete), (0, 1, 5, 0));
+        assert_eq!((c.list, c.head, c.copy, c.delete), (0, 3, 5, 0));
     }
 
     #[test]
