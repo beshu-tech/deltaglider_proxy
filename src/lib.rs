@@ -1771,9 +1771,6 @@ mod source_guards {
     /// closed for every client (jobs finding 13).
     #[test]
     fn replication_runs_check_the_backend_health_gate() {
-        // To move to `run_rule_gated` (run-now; the admin API, not D1's).
-        const UNGATED: &[&str] = &["src/api/admin/replication.rs"];
-        let mut files = std::collections::BTreeSet::new();
         let mut offenders = Vec::new();
         for (file, text) in crate::source_scan::prod_sources("src") {
             // The definition and its gated twin.
@@ -1790,11 +1787,7 @@ mod source_guards {
                     || (in_replication
                         && code.contains("run_rule(")
                         && !code.contains("fn run_rule("));
-                if !ungated {
-                    continue;
-                }
-                files.insert(file.clone());
-                if !UNGATED.contains(&file.as_str()) {
+                if ungated {
                     offenders.push(format!("{file}:{n}: {code}"));
                 }
             }
@@ -1803,11 +1796,6 @@ mod source_guards {
             offenders.is_empty(),
             "start a replication run with run_rule_gated and a RunHealthGate:\n{}",
             offenders.join("\n")
-        );
-        let stale: Vec<&&str> = UNGATED.iter().filter(|f| !files.contains(**f)).collect();
-        assert!(
-            stale.is_empty(),
-            "these files no longer start an ungated run; remove them from the list: {stale:?}"
         );
     }
 

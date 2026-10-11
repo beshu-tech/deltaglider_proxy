@@ -76,6 +76,22 @@ pub async fn run_now(
         )));
     }
 
+    // A backend of the rule that the health check closed: the run would
+    // send its whole volume to a backend that cannot answer, and keep its
+    // probe failing. The run re-checks the gate at its control boundaries.
+    let health = replication::RunHealthGate {
+        health: state.s3_state.backend_health.clone(),
+        config: state.config.clone(),
+    };
+    if let Some(why) = health
+        .gated(&state.s3_state.engine.load_full(), &rule)
+        .await
+    {
+        return Err(AdminError::unavailable(format!(
+            "{why} — run the rule again when the backend recovers"
+        )));
+    }
+
     // The run takes the SAME per-rule lease as the scheduler and the event
     // consumer (the job plane's), so a run-now never overlaps a scheduled run
     // or a consumer drain on any instance.
@@ -165,7 +181,7 @@ pub async fn run_now(
     };
     let rule_owned = rule.clone();
     tokio::spawn(async move {
-        let result = replication::run_rule(
+        let result = replication::run_rule_gated(
             db_arc.clone(),
             &engine,
             &rule_owned,
@@ -181,6 +197,7 @@ pub async fn run_now(
             concurrency,
             Some(maintenance_gate),
             lease.clone(),
+            Some(health),
         )
         .await;
         let _ = lease

@@ -43,6 +43,26 @@ buckets:
     backend: deadb2
   alive:
     backend: gooddisk
+replication:
+  enabled: true
+  rules:
+  - name: into-doomed
+    enabled: false
+    source:
+      bucket: alive
+      prefix: ""
+    destination:
+      bucket: doomed
+      prefix: ""
+lifecycle:
+  enabled: true
+  rules:
+  - name: expire-doomed
+    enabled: true
+    bucket: doomed
+    prefix: ""
+    action: delete
+    expire_after: 30d
 "#,
             good_dir.path().display()
         ))
@@ -145,6 +165,25 @@ buckets:
         .await
         .expect("probe json");
     assert_eq!(probe["status"], "unreachable", "probe verdict: {probe}");
+
+    // Run-now of a job whose backend is gated answers 503 and starts no
+    // run: the run would send its whole volume to a backend that cannot
+    // answer, and keep its probe failing.
+    for job in ["replication:into-doomed", "lifecycle:expire-doomed"] {
+        let resp = http
+            .post(format!(
+                "{}/_/api/admin/jobs/{job}/run-now",
+                server.endpoint()
+            ))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .expect("POST run-now");
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        assert_eq!(status, 503, "{job} run-now: {body}");
+        assert!(body.contains("deadb2"), "{job} names the backend: {body}");
+    }
 }
 
 /// ALL backends dead + `enforce` (the default) → the proxy refuses to start.
