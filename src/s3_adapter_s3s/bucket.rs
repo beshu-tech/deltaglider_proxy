@@ -181,6 +181,7 @@ pub(super) async fn delete_bucket(
     }
 
     engine.delete_bucket(&bucket).await?;
+    crate::api::handlers::forget_bucket(&bucket);
     // The usage row goes with the bucket: `/_/stats` sums every row, and a
     // bucket created again under this name must start at zero.
     if let Some(usage) = &svc.state.bucket_usage {
@@ -353,5 +354,56 @@ mod delete_bucket_usage_tests {
         assert!(usage.read_all().unwrap().iter().all(|(b, _)| b != "b"));
         usage.flush_pending();
         assert_eq!(usage.read("b").unwrap(), None, "a flush brought it back");
+    }
+
+    /// DeleteBucket forgets that the write paths found the bucket: without
+    /// that, for 5 s a PUT check passes and a missing-key GET answers
+    /// `NoSuchKey`, not `NoSuchBucket`.
+    #[tokio::test]
+    async fn delete_bucket_forgets_the_bucket_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(
+            crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let engine: crate::deltaglider::DynEngine =
+            crate::deltaglider::DeltaGliderEngine::new_with_backend(
+                Arc::new(backend),
+                &crate::config::Config::default(),
+                None,
+            );
+        engine.create_bucket("b").await.unwrap();
+        let state = AppState::for_tests(engine);
+        crate::api::handlers::ensure_bucket_exists(&state, "b")
+            .await
+            .unwrap();
+        let svc = DeltaGliderS3Service::new(
+            state.clone(),
+            Arc::new(tokio::sync::RwLock::new(crate::config::Config::default())),
+        );
+        let req = s3s::S3Request {
+            input: s3s::dto::DeleteBucketInput {
+                bucket: "b".to_string(),
+                expected_bucket_owner: None,
+            },
+            method: http::Method::DELETE,
+            uri: "/b".parse().unwrap(),
+            headers: Default::default(),
+            extensions: Default::default(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        delete_bucket(&svc, req).await.unwrap();
+
+        let err = crate::api::handlers::ensure_bucket_exists(&state, "b")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::api::S3Error::NoSuchBucket(_)),
+            "{err:?}"
+        );
     }
 }

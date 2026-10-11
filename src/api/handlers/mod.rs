@@ -136,12 +136,16 @@ pub struct AppState {
 /// underlying backend surfaces as a meaningful error instead of a
 /// mysterious 500.
 ///
-/// For WRITE paths only (form POST, UploadPart, the destination of a copy):
-/// a bucket found is trusted for [`BUCKET_SEEN_TTL`] per engine, so a
-/// 1,000-part upload sends one HeadBucket, not 1,000. A write into a bucket
-/// deleted meanwhile still fails at the backend (`require_bucket_exists` on
-/// the filesystem, `NoSuchBucket` on S3). A missing bucket is asked again
-/// every time: one created a moment later is usable at once.
+/// A bucket found is trusted for [`BUCKET_SEEN_TTL`] per engine, so a
+/// 1,000-part upload sends one HeadBucket, not 1,000. The users are the
+/// write paths (PutObject, form POST, UploadPart, the destination of a
+/// copy), DeleteObject(s), and the `NoSuchKey`-or-`NoSuchBucket` check of a
+/// read miss. DeleteBucket on this instance forgets the bucket
+/// ([`forget_bucket`]); a bucket deleted elsewhere can pass for up to
+/// [`BUCKET_SEEN_TTL`], and a write into it still fails at the backend
+/// (`require_bucket_exists` on the filesystem, `NoSuchBucket` on S3). A
+/// missing bucket is asked again every time: one created a moment later is
+/// usable at once.
 pub(crate) async fn ensure_bucket_exists(
     state: &Arc<AppState>,
     bucket: &str,
@@ -183,6 +187,12 @@ fn bucket_seen(engine: &Arc<DynEngine>, bucket: &str) -> bool {
         .lock()
         .get(&key)
         .is_some_and(|seen| seen.at.elapsed() < BUCKET_SEEN_TTL && seen.engine.strong_count() > 0)
+}
+
+/// Forget that `bucket` was found, on every engine: DeleteBucket calls it,
+/// so the next check asks the backend again.
+pub(crate) fn forget_bucket(bucket: &str) {
+    BUCKETS_SEEN.lock().retain(|(_, b), _| b != bucket);
 }
 
 fn remember_bucket(engine: &Arc<DynEngine>, bucket: &str) {
