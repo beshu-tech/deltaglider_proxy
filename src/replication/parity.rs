@@ -258,22 +258,29 @@ impl ObjState {
 ///    size with the S3 object ETag (which the lite list puts in `md5`), so
 ///    the strongest S3 content-version is never dropped.
 ///  - Passthrough: the stored ETag (the object is stored verbatim).
+///
+/// Each token ends with the entry's `created_at` in ms, which a lite S3
+/// listing fills with the stored object's Last-Modified time: a write of
+/// identical bytes (a replication copy over an older copy, a metadata
+/// backfill) keeps the ETag and the size but moves that time, and a row
+/// cached before it holds the replaced object's created-at.
 pub(crate) fn stored_version(m: &FileMetadata) -> Option<String> {
     let etag = m
         .multipart_etag
         .clone()
         .or_else(|| (!m.md5.is_empty()).then(|| m.md5.clone()));
-    match &m.storage_info {
+    let content = match &m.storage_info {
         crate::types::StorageInfo::Delta {
             delta_size,
             ref_sha256,
             ..
-        } if !ref_sha256.is_empty() => Some(format!("d:{delta_size}:{ref_sha256}")),
+        } if !ref_sha256.is_empty() => format!("d:{delta_size}:{ref_sha256}"),
         crate::types::StorageInfo::Delta { delta_size, .. } => {
-            Some(format!("d:{delta_size}:{}", etag.as_deref().unwrap_or("")))
+            format!("d:{delta_size}:{}", etag.as_deref().unwrap_or(""))
         }
-        _ => etag,
-    }
+        _ => etag?,
+    };
+    Some(format!("{content}@{}", m.created_at.timestamp_millis()))
 }
 
 /// The logical facts of a cache row as metadata a replication decision
@@ -2006,6 +2013,33 @@ mod tests {
             "S3 delta overwrite (new etag) must change the token"
         );
         assert!(v1.contains("30019443") && v1.contains("ETAG_V1"));
+    }
+
+    /// A rewrite of identical bytes keeps the ETag (and the delta size) but
+    /// moves the stored object's Last-Modified time, which a lite S3 listing
+    /// carries as `created_at`. The token must change with it: a parity row
+    /// that outlives a replication copy over an older identical object kept
+    /// the old object's created-at, so newer-wins copied that key again on
+    /// every run.
+    #[test]
+    fn a_rewrite_of_identical_bytes_changes_the_token() {
+        use crate::types::StorageInfo;
+        let at = |secs| chrono::DateTime::from_timestamp(secs, 0).unwrap();
+        let plain =
+            FileMetadata::new_passthrough("a.sha1".into(), "SHA".into(), "ETAG".into(), 41, None);
+        let mut delta = plain.clone();
+        delta.storage_info = StorageInfo::delta_stub(41);
+        for (name, m) in [("passthrough", plain), ("delta stub", delta)] {
+            let mut before = m.clone();
+            before.created_at = at(1_600_000_000);
+            let mut after = m;
+            after.created_at = at(1_600_000_100);
+            assert_ne!(
+                stored_version(&before),
+                stored_version(&after),
+                "{name}: a rewrite of the same bytes keeps the token"
+            );
+        }
     }
 
     #[test]

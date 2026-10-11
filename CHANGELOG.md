@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed — Replication no longer copies the same object again on every run
+
+Since v2.0.5, the reconcile walk answers a pair from the parity cache when the
+listing shows the same stored ETag and size as when the cache row was written.
+A copy over an older copy of the same bytes keeps that ETag and size, so the
+cache row kept the older copy's creation time. The newer-wins rule then saw the
+source as newer on every run, and copied the object again each time. Now the
+cache also compares the stored object's Last-Modified time, which every write
+moves, so the next run reads such an object again and skips it.
+
 ### Fixed — The file browser counts each key of a bulk delete
 
 The file browser sends a bulk delete in requests of 500 keys, and the proxy

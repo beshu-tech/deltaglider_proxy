@@ -1670,6 +1670,68 @@ async fn test_replication_foreign_object_missing_created_at_converges_on_second_
     );
 }
 
+/// A destination that already holds an OLDER copy of the same bytes (an
+/// earlier run of the rule, or a copy made before the proxy): run 1 copies
+/// the newer source over it, run 2 must skip. The copy keeps the bytes, so
+/// the destination's stored ETag stays the same; the reconcile walk served
+/// the destination from its parity cache row (matched on that ETag), which
+/// still held the older copy's created-at, and newer-wins copied both keys
+/// again on every run. Requires MinIO.
+#[tokio::test]
+async fn test_replication_converges_over_an_older_identical_copy() {
+    skip_unless_minio!();
+    let server = TestServer::builder()
+        .s3_endpoint(&common::minio_endpoint_url())
+        .env("DGP_BACKEND_ALLOW_LOCAL", "true")
+        .bucket("oc-src")
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(&FOREIGN_RULE_YAML.replace("fk-", "oc-"))
+        .build()
+        .await;
+    let proxy = server.s3_client().await;
+    for b in ["oc-src", "oc-dst"] {
+        proxy.create_bucket().bucket(b).send().await.ok();
+    }
+    let raw = common::minio_client().await;
+    let sha = "a".repeat(64);
+    // The older copies first (dg-created-at in 2020), then the sources.
+    for (bucket, created) in [("oc-dst", Some("2020-01-01T00:00:00Z")), ("oc-src", None)] {
+        for key in ["artifact.zip", "artifact.sha1"] {
+            let mut put = raw
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from(format!("same-{key}").into_bytes()))
+                .metadata("dg-tool", "foreign-uploader")
+                .metadata("dg-original-name", key)
+                .metadata("dg-file-sha256", &sha);
+            if let Some(created) = created {
+                put = put.metadata("dg-created-at", created);
+            }
+            put.send().await.expect("plant object");
+        }
+    }
+
+    let admin = admin_http_client(&server.endpoint()).await;
+    let run = || async { fire_run_now(&admin, &server.endpoint(), "foreign-newerwins").await };
+    let r1 = run().await;
+    assert_eq!(r1["status"].as_str(), Some("succeeded"), "run1: {r1}");
+    assert_eq!(
+        r1["objects_processed"].as_i64(),
+        Some(2),
+        "run1 copies the newer sources over the older copies: {r1}"
+    );
+    for n in 2..=3 {
+        let r = run().await;
+        assert_eq!(r["status"].as_str(), Some("succeeded"), "run{n}: {r}");
+        assert_eq!(
+            r["objects_processed"].as_i64(),
+            Some(0),
+            "run{n} copied again what run 1 copied: {r}"
+        );
+    }
+}
+
 const CONTENT_DIFF_RULE_YAML: &str = "
 replication:
   enabled: true
