@@ -19,7 +19,8 @@ pub(crate) async fn s3_engine() -> (DynEngine, Arc<FakeS3>) {
     (engine, fake)
 }
 
-/// Store `n` close versions of one file under `dir/`, each as a delta
+/// Store `n` close versions of one file under `dir/` (`""`: the bucket
+/// root), each as a delta
 /// against the folder's reference.bin. Returns their keys.
 pub(crate) async fn store_deltas(engine: &DynEngine, dir: &str, n: usize) -> Vec<String> {
     let mut x = 0x9E37_79B9_7F4A_7C15u64;
@@ -35,7 +36,10 @@ pub(crate) async fn store_deltas(engine: &DynEngine, dir: &str, n: usize) -> Vec
     for i in 0..n {
         let mut data = base.clone();
         data[1000 + i * 16..1016 + i * 16].fill(i as u8);
-        let key = format!("{dir}/build-{i:03}.zip");
+        let key = match dir {
+            "" => format!("build-{i:03}.zip"),
+            dir => format!("{dir}/build-{i:03}.zip"),
+        };
         let stored = engine
             .store("b", &key, &data, None, Default::default())
             .await
@@ -84,14 +88,19 @@ pub(crate) async fn fill(engine: &DynEngine, dir: &str, n: usize) {
 /// still hold an object besides reference.bin? It lists the folder's own
 /// level (`delimiter=/`) and stops at the first object. It listed the
 /// whole subtree, every page of it, and for a root key the whole bucket:
-/// 3 pages for a key next to 2,500 objects in a sub-folder.
+/// 3 pages for a key next to 2,500 objects in a sub-folder. (A folder of
+/// plain files asks reference.bin first and sends no LIST at all: see
+/// `a_folder_of_plain_files_is_checked_with_one_head`.)
 #[tokio::test]
 async fn the_reclaim_check_reads_one_page_of_its_own_folder() {
     let (engine, fake) = s3_engine().await;
     let keys = store_deltas(&engine, "run", 3).await;
     fill(&engine, "run/sub", 2_500).await;
+    // A delta in each folder, so each has a reference.bin to check.
+    store_deltas(&engine, "big", 1).await;
     fill(&engine, "big", 2_500).await;
     fill(&engine, "", 2).await;
+    store_deltas(&engine, "", 1).await;
 
     for (key, folder) in [
         (keys[0].as_str(), "run/"),
@@ -109,6 +118,41 @@ async fn the_reclaim_check_reads_one_page_of_its_own_folder() {
             lists[0]
         );
     }
+}
+
+/// After a batch that deleted no delta, the reclaim check first asks
+/// whether the folder has a reference.bin at all (one HEAD) and lists the
+/// folder only when it has one. A folder of plain files (videos, images)
+/// never has one, so its check is one HEAD; it was one LIST, the slower
+/// request on S3 backends.
+#[tokio::test]
+async fn a_folder_of_plain_files_is_checked_with_one_head() {
+    let (engine, fake) = s3_engine().await;
+    fill(&engine, "clips", 2).await;
+    fake.clear();
+    let outcomes = engine
+        .delete_batch(
+            "b",
+            vec![
+                DeleteItem::new("clips/img-00000.jpg"),
+                DeleteItem::new("clips/img-00001.jpg"),
+            ],
+            DeleteHooks::default(),
+        )
+        .await;
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| matches!(o, DeleteOutcome::Deleted(_))),
+        "{outcomes:?}"
+    );
+    assert_eq!(folder_lists(&fake), Vec::<String>::new(), "no folder LIST");
+    let reference_heads = fake
+        .requests()
+        .iter()
+        .filter(|r| r.as_str() == "HEAD /b/clips/reference.bin")
+        .count();
+    assert_eq!(reference_heads, 1, "{:#?}", fake.requests());
 }
 
 /// A folder whose own level holds only sub-folders and reference.bin has

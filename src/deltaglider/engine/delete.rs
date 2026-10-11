@@ -50,6 +50,16 @@ impl<'a> DeleteItem<'a> {
     }
 }
 
+/// What a reclaim check knows about the folder's reference.bin.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum ReferenceHint {
+    /// The batch deleted a delta of the folder: it has a reference.
+    Present,
+    /// Nothing says so: the batch deleted only plain objects, or found
+    /// its keys gone.
+    Unknown,
+}
+
 /// What [`DeltaGliderEngine::delete_batch`] did with one key.
 #[derive(Debug)]
 pub enum DeleteOutcome {
@@ -287,6 +297,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ) -> Vec<(usize, DeleteOutcome)> {
         let mut out = Vec::with_capacity(indexes.len());
         let mut reclaim = false;
+        // A delta that this batch deleted was stored against the folder's
+        // reference.bin, so the folder has one: the check lists first.
+        let mut reference = ReferenceHint::Unknown;
         for i in indexes {
             let item = &items[i];
             let outcome = if hooks.proceeds() {
@@ -295,13 +308,23 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 DeleteOutcome::Skipped
             };
             reclaim |= matches!(outcome, DeleteOutcome::Deleted(_) | DeleteOutcome::NotFound);
+            let deleted_delta = matches!(
+                &outcome,
+                DeleteOutcome::Deleted(m) if matches!(m.storage_info, StorageInfo::Delta { .. })
+            );
+            if deleted_delta {
+                reference = ReferenceHint::Present;
+            }
             hooks.report(&item.key, &outcome).await;
             out.push((i, outcome));
         }
         // Best effort: the objects are gone already, and an orphan
         // reference.bin goes with a later delete in its folder.
         if reclaim && hooks.proceeds() {
-            match self.reclaim_empty_deltaspace(bucket, &deltaspace_id).await {
+            match self
+                .reclaim_empty_deltaspace(bucket, &deltaspace_id, reference)
+                .await
+            {
                 Ok(()) => {}
                 Err(e) if e.is_not_found() => {
                     debug!("reference reclaim skipped for {bucket}/{deltaspace_id}: {e}")
@@ -350,10 +373,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         &self,
         bucket: &str,
         deltaspace_id: &str,
+        reference: ReferenceHint,
     ) -> Result<(), EngineError> {
         let _guard = self.acquire_prefix_lock(bucket, deltaspace_id).await;
-        let Some((xnode, reclaimed_ref_bytes)) =
-            self.reclaimable_reference(bucket, deltaspace_id).await?
+        let Some((xnode, reclaimed_ref_bytes)) = self
+            .reclaimable_reference(bucket, deltaspace_id, reference)
+            .await?
         else {
             return Ok(());
         };
@@ -382,13 +407,21 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         &self,
         bucket: &str,
         deltaspace_id: &str,
+        reference: ReferenceHint,
     ) -> Result<Option<(ReferenceLockGuard, u64)>, EngineError> {
-        let Some(mut ref_bytes) = self.only_reference_left(bucket, deltaspace_id).await? else {
+        let Some(mut ref_bytes) = self
+            .only_reference_left(bucket, deltaspace_id, reference)
+            .await?
+        else {
             return Ok(None);
         };
         let xnode = self.acquire_reference_lock(bucket, deltaspace_id).await?;
         if xnode.is_cross_instance() {
-            match self.only_reference_left(bucket, deltaspace_id).await? {
+            // The first check just found the reference.
+            match self
+                .only_reference_left(bucket, deltaspace_id, ReferenceHint::Present)
+                .await?
+            {
                 Some(b) => ref_bytes = b,
                 None => return Ok(None),
             }
@@ -400,16 +433,37 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// plaintext size) when the deltaspace holds the reference and nothing
     /// else; `None` while an object remains or without a reference.
     ///
-    /// One listing of the deltaspace's own level, up to its first object
-    /// ([`StorageBackend::holds_only_reference`]), then one HEAD of the
-    /// reference only when it is alone. The LIST size of an encrypted
-    /// reference is its ciphertext size, 28 bytes more than the store
-    /// counted, so the size comes from the HEAD.
+    /// Two reads: one listing of the deltaspace's own level, up to its
+    /// first object ([`StorageBackend::holds_only_reference`]), and one HEAD
+    /// of the reference. The LIST size of an encrypted reference is its
+    /// ciphertext size, 28 bytes more than the store counted, so the size
+    /// comes from the HEAD. With [`ReferenceHint::Present`] the LIST goes
+    /// first (the folder has a reference; usually objects too, and the LIST
+    /// ends the check). Otherwise the HEAD goes first: a folder of plain
+    /// files has no reference, and its check is that one HEAD, cheaper than
+    /// a LIST on S3 backends.
     async fn only_reference_left(
         &self,
         bucket: &str,
         deltaspace_id: &str,
+        reference: ReferenceHint,
     ) -> Result<Option<u64>, StorageError> {
+        if reference == ReferenceHint::Unknown {
+            let size = match self
+                .storage
+                .get_reference_metadata(bucket, deltaspace_id)
+                .await
+            {
+                Ok(meta) => meta.file_size,
+                Err(StorageError::NotFound(_)) => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            let alone = self
+                .storage
+                .holds_only_reference(bucket, deltaspace_id)
+                .await?;
+            return Ok(alone.then_some(size));
+        }
         if !self
             .storage
             .holds_only_reference(bucket, deltaspace_id)

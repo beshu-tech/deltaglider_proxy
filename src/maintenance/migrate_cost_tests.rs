@@ -228,10 +228,13 @@ async fn a_definitive_failure_unwinds_in_one_batch() {
         .fake
         .requests()
         .into_iter()
+        // The check of a folder of plain files is one HEAD of its
+        // reference.bin; a folder with a reference adds one LIST.
         .filter(|r| {
-            r.starts_with("GET /t")
-                && r.contains("delimiter=%2F")
-                && crate::storage::fake_s3::list_prefix(r) == "run/"
+            r == "HEAD /t/run/reference.bin"
+                || (r.starts_with("GET /t")
+                    && r.contains("delimiter=%2F")
+                    && crate::storage::fake_s3::list_prefix(r) == "run/")
         })
         .collect();
     assert_eq!(checks.len(), 1, "{checks:#?}");

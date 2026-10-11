@@ -172,7 +172,7 @@ async fn delete_reclaim_and_sweep_reclaim_take_the_lock() {
         .unwrap();
     let before_sweep = lock.acquires.load(Ordering::SeqCst);
     engine
-        .reclaim_empty_deltaspace("releases", "v2")
+        .reclaim_empty_deltaspace("releases", "v2", super::delete::ReferenceHint::Unknown)
         .await
         .unwrap();
     assert!(lock.acquires.load(Ordering::SeqCst) > before_sweep);
