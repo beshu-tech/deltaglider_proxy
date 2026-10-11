@@ -95,6 +95,22 @@ impl From<ConditionalError> for crate::api::S3Error {
 /// Held for one client write of one object; see [`DeltaGliderEngine::lock_object_write`].
 pub struct ObjectWriteGuard {
     _guard: tokio::sync::OwnedMutexGuard<()>,
+    /// The object as the precondition check read it under this lock
+    /// (`Some(None)`: absent). `None`: no precondition, nothing read.
+    checked: Option<Option<FileMetadata>>,
+}
+
+impl ObjectWriteGuard {
+    /// What the key holds, for the store's usage counter, when the
+    /// precondition check read it: no PUT of this process can change it
+    /// while the lock is held, so the store needs no read of its own.
+    fn known_prior(&self) -> Option<super::usage::CounterPrior> {
+        use super::usage::CounterPrior;
+        self.checked.as_ref().map(|found| match found {
+            Some(meta) => CounterPrior::Present(Box::new(meta.clone())),
+            None => CounterPrior::Absent,
+        })
+    }
 }
 
 type ObjectWriteLocks = DashMap<String, Arc<tokio::sync::Mutex<()>>>;
@@ -129,6 +145,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .clone();
         ObjectWriteGuard {
             _guard: mutex.lock_owned().await,
+            checked: None,
         }
     }
 
@@ -140,7 +157,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         key: &str,
         precondition: &Precondition,
     ) -> Result<ObjectWriteGuard, ConditionalError> {
-        let guard = self.lock_object_write(bucket, key).await;
+        let mut guard = self.lock_object_write(bucket, key).await;
         if !precondition.is_empty() {
             // Fail closed (review C4): only NotFound means "absent". Any
             // other HEAD error used to read as absent, so `If-None-Match: *`
@@ -151,6 +168,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 Err(e) => return Err(e.into()),
             };
             precondition.check(existing.as_ref())?;
+            guard.checked = Some(existing);
         }
         Ok(guard)
     }
@@ -165,16 +183,23 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         user_metadata: HashMap<String, String>,
         precondition: &Precondition,
     ) -> Result<StoreResult, ConditionalError> {
-        let _guard = self.lock_and_check(bucket, key, precondition).await?;
+        let guard = self.lock_and_check(bucket, key, precondition).await?;
         Ok(self
-            .store_client_body(bucket, key, data, content_type, user_metadata)
+            .store_client_body(
+                bucket,
+                key,
+                data,
+                content_type,
+                user_metadata,
+                guard.known_prior(),
+            )
             .await?)
     }
 
     /// Store a client body that is already in memory. A large body that tries
     /// a delta goes through the streaming spool store, so the delta encode and
     /// the ratio decision run with bounded memory; the others are stored
-    /// buffered.
+    /// buffered. `known_prior`: what the precondition check read, if it ran.
     async fn store_client_body(
         &self,
         bucket: &str,
@@ -182,6 +207,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         data: &[u8],
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
+        known_prior: Option<super::usage::CounterPrior>,
     ) -> Result<StoreResult, EngineError> {
         let size = data.len() as u64;
         if size > self.spool_threshold() && self.write_tries_delta(bucket, key, &user_metadata) {
@@ -189,11 +215,28 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             tokio::fs::write(spool.path(), data)
                 .await
                 .map_err(|e| EngineError::Storage(StorageError::from(e)))?;
-            self.store_spooled_delta(bucket, key, &spool, size, content_type, user_metadata, None)
-                .await
+            self.store_spooled_delta_inner(
+                bucket,
+                key,
+                &spool,
+                size,
+                content_type,
+                user_metadata,
+                None,
+                known_prior,
+            )
+            .await
         } else {
-            self.store(bucket, key, data, content_type, user_metadata)
-                .await
+            self.store_inner(
+                bucket,
+                key,
+                data,
+                content_type,
+                user_metadata,
+                None,
+                known_prior,
+            )
+            .await
         }
     }
 }
@@ -264,6 +307,75 @@ mod tests {
                 "exists {exists}, If-Match {im:?}, If-None-Match {inm:?}"
             );
         }
+    }
+
+    /// An engine on a fake S3 with bucket `b` and a usage counter (each
+    /// write reads the object it replaces).
+    async fn counted_s3_engine() -> (
+        DynEngine,
+        Arc<crate::storage::FakeS3>,
+        Arc<crate::bucket_usage::BucketUsage>,
+    ) {
+        use crate::storage::DynStorageBackend;
+        let (s3, fake) = crate::storage::fake_s3_backend().await;
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(s3);
+        let usage = Arc::new(crate::bucket_usage::BucketUsage::in_memory().unwrap());
+        let engine =
+            DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None)
+                .with_bucket_usage(Some(usage.clone()));
+        engine.create_bucket("b").await.unwrap();
+        (engine, fake, usage)
+    }
+
+    /// Object HEADs (not HeadBucket, `HEAD /b/`).
+    fn object_heads(fake: &crate::storage::FakeS3) -> usize {
+        fake.requests()
+            .iter()
+            .filter(|r| {
+                r.starts_with("HEAD /b/") && !r.starts_with("HEAD /b/?") && *r != "HEAD /b/"
+            })
+            .count()
+    }
+
+    /// A conditional PUT reads the object once, under its write lock: the
+    /// precondition's HEAD also tells the usage counter what the write
+    /// replaces. It read the object twice (2 HEADs each read: the delta
+    /// and the passthrough form).
+    #[tokio::test]
+    async fn a_conditional_put_reads_the_object_once() {
+        let (engine, fake, usage) = counted_s3_engine().await;
+        let cond = |v: &str| ETagCondition::parse_http_header(v.as_bytes()).unwrap();
+        let create_only = Precondition {
+            if_match: None,
+            if_none_match: Some(cond("*")),
+        };
+        fake.clear();
+        let stored = engine
+            .store_conditional("b", "img/a.jpg", b"one", None, HashMap::new(), &create_only)
+            .await
+            .unwrap();
+        let heads = object_heads(&fake);
+        eprintln!("If-None-Match: * PUT of a new key: {heads} HEADs");
+        assert_eq!(heads, 2, "{:?}", fake.requests());
+
+        // An If-Match overwrite: the HEAD found the object it replaces.
+        let replace = Precondition {
+            if_match: Some(cond(&stored.metadata.etag())),
+            if_none_match: None,
+        };
+        fake.clear();
+        engine
+            .store_conditional("b", "img/a.jpg", b"two!", None, HashMap::new(), &replace)
+            .await
+            .unwrap();
+        assert_eq!(object_heads(&fake), 2, "{:?}", fake.requests());
+        usage.flush_pending();
+        let row = usage.read("b").unwrap().unwrap();
+        assert_eq!(
+            (row.object_count, row.logical_bytes),
+            (1, 4),
+            "the overwrite nets the object it replaced"
+        );
     }
 
     #[test]

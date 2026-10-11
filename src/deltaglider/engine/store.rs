@@ -266,7 +266,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         user_metadata: std::collections::HashMap<String, String>,
     ) -> Result<StoreResult, EngineError> {
         // The counter is recorded where the object commits (`record_commit`).
-        self.store_inner(bucket, key, data, content_type, user_metadata, None)
+        self.store_inner(bucket, key, data, content_type, user_metadata, None, None)
             .await
     }
 
@@ -291,6 +291,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             content_type,
             user_metadata,
             Some(multipart_etag),
+            None,
         )
         .await
     }
@@ -303,6 +304,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         &self,
         bucket: &str,
         key: &str,
+        known_prior: Option<CounterPrior>,
     ) -> Result<StoreResult, EngineError> {
         // The data PUT's ingest gate (reserved namespaces, `//`), minus its
         // refusal of marker keys.
@@ -311,7 +313,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .validate_ingest()
             .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
         let deltaspace_id = obj_key.deltaspace_id();
-        let prior = self.prior_for_counter(bucket, key).await;
+        let prior = self.prior_or_read(bucket, key, known_prior).await;
         let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
         self.storage
             .put_directory_marker(bucket, &obj_key.full_key())
@@ -322,8 +324,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Ok(StoreResult::new(metadata, 0).with_accounting(prior.replaced(), 0))
     }
 
+    /// The buffered store. `known_prior`: what the key holds, when the
+    /// caller read it already under the object's write lock (the
+    /// precondition check of a conditional write); `None` reads it here.
     #[allow(clippy::too_many_arguments)]
-    async fn store_inner(
+    pub(super) async fn store_inner(
         &self,
         bucket: &str,
         key: &str,
@@ -331,6 +336,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         content_type: Option<String>,
         user_metadata: std::collections::HashMap<String, String>,
         multipart_etag: Option<String>,
+        known_prior: Option<CounterPrior>,
     ) -> Result<StoreResult, EngineError> {
         // Invalidate stale metadata on overwrite (before the write, so concurrent
         // readers don't see outdated metadata during the write window).
@@ -345,7 +351,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
 
         if data.is_empty() && ObjectKey::parse(bucket, key).is_directory_marker() {
-            return self.store_directory_marker(bucket, key).await;
+            return self.store_directory_marker(bucket, key, known_prior).await;
         }
         let (obj_key, deltaspace_id) = self.validated_key_ingest(bucket, key)?;
 
@@ -353,7 +359,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // an upsert) so the counter nets an overwrite to +0 instead of double-
         // counting. Small TOCTOU window vs the write below is acceptable — the
         // counter is best-effort and reconciled by Refresh.
-        let prior = self.prior_for_counter(bucket, key).await;
+        let prior = self.prior_or_read(bucket, key, known_prior).await;
 
         // Calculate hashes
         let sha256 = hex::encode(Sha256::digest(data));
@@ -433,6 +439,20 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         false
     }
 
+    /// `known` when the caller read the key already, else the read of
+    /// [`Self::prior_for_counter`].
+    async fn prior_or_read(
+        &self,
+        bucket: &str,
+        key: &str,
+        known: Option<CounterPrior>,
+    ) -> CounterPrior {
+        match known {
+            Some(prior) => prior,
+            None => self.prior_for_counter(bucket, key).await,
+        }
+    }
+
     fn count_decision(&self, decision: &str) {
         self.with_metrics(|m| m.delta_decisions_total.with_label_values(&[decision]).inc());
     }
@@ -469,14 +489,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             content_type,
             user_metadata,
             multipart_etag,
+            None,
         )
         .await
     }
 
     /// Body of [`Self::store_spooled_delta`]. The commit records the counter;
-    /// this attaches the accounting to the result.
+    /// this attaches the accounting to the result. `known_prior`: as for
+    /// [`Self::store_inner`].
     #[allow(clippy::too_many_arguments)]
-    async fn store_spooled_delta_inner(
+    pub(super) async fn store_spooled_delta_inner(
         &self,
         bucket: &str,
         key: &str,
@@ -485,6 +507,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         content_type: Option<String>,
         user_metadata: std::collections::HashMap<String, String>,
         multipart_etag: Option<String>,
+        known_prior: Option<CounterPrior>,
     ) -> Result<StoreResult, EngineError> {
         self.metadata_cache.invalidate(bucket, key);
         let (obj_key, deltaspace_id) = self.validated_key_ingest(bucket, key)?;
@@ -507,7 +530,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         if size > ceiling {
             return Err(EngineError::TooLarge { size, max: ceiling });
         }
-        let prior = self.prior_for_counter(bucket, key).await;
+        let prior = self.prior_or_read(bucket, key, known_prior).await;
 
         // (1) Hash the body by streaming the spool — bounded memory. Also count
         // the observed bytes and reject a spool that doesn't match the declared
