@@ -68,7 +68,7 @@ curl -b cookies https://s3.acme.example/_/api/admin/jobs
 curl -b cookies https://s3.acme.example/_/api/admin/jobs/maintenance:7/failures
 ```
 
-If something looks wrong, click **Cancel** in the row of the job (or send `POST /_/api/admin/jobs/maintenance:7/cancel`). The job checks for a cancel every 20 objects. A cancel before the switch unwinds cleanly: writes to the source bucket resume at once, the job deletes the copies that it wrote to the destination, and the job never deletes the source on a failed or cancelled run.
+If something looks wrong, click **Cancel** in the row of the job (or send `POST /_/api/admin/jobs/maintenance:7/cancel`). The job checks for a cancel every 20 objects. A cancel before the switch unwinds cleanly: writes to the source bucket resume at once, the job deletes the copies that it wrote to the destination, and the job never deletes the source on a failed or cancelled run. When the job fails because a backend did not answer, it keeps the copies that it wrote. Start the migration again with **Mirror** as the destination mode (`"target": "mirror"`), and the new job copies only the objects that differ.
 
 A restart of the proxy in the middle of the job does not leave the bucket behind: the proxy puts the job back in the queue at startup, and the job resumes from its cursor ([details](../explanation/jobs-and-durability.md)).
 

@@ -83,8 +83,8 @@ All endpoints are session-gated. Lifecycle shares the unified Jobs API: the job 
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/_/api/admin/jobs` | All jobs, lifecycle rules included: status, pause flag, runtime state |
-| `POST` | `/_/api/admin/jobs/lifecycle:<name>/preview` | Dry-run a rule and return candidate keys. Read-only: no history rows, no leases |
-| `POST` | `/_/api/admin/jobs/lifecycle:<name>/run-now` | Start a run in the background: `202` with `run_id` and `status: "running"`; `409` if lifecycle or the rule is disabled, the rule is paused or already running, two rules share its name, or a maintenance job is active on a bucket that the rule writes to; `400` if the rule has a config error |
+| `POST` | `/_/api/admin/jobs/lifecycle:<name>/preview` | Dry-run a rule and return candidate keys. Read-only: no history rows, no leases. For 60 seconds, a preview of the same rule definition answers from the last walk, and previews that arrive while a walk runs wait for that walk. A run of the rule drops its saved previews |
+| `POST` | `/_/api/admin/jobs/lifecycle:<name>/run-now` | Start a run in the background: `202` with `run_id` and `status: "running"`; `409` if lifecycle or the rule is disabled, the rule is paused or already running, two rules share its name, or a maintenance job is active on a bucket that the rule writes to; `503` while the backend health check marks the backend of a bucket that the rule writes to as unavailable; `400` if the rule has a config error |
 | `POST` | `/_/api/admin/jobs/lifecycle:<name>/pause` / `/resume` | Pause controls. The pause persists across restarts, and both the scheduler and run-now skip a paused rule |
 | `GET` | `/_/api/admin/jobs/lifecycle:<name>/runs?limit=N` | Recent persisted executions, newest first |
 | `GET` | `/_/api/admin/jobs/lifecycle:<name>/failures?limit=N` | Recent per-object failures, newest first |
@@ -118,7 +118,11 @@ The config DB stores:
 
 The scheduler and run-now take a per-rule lease in the config DB, so two workers of one instance never run the same rule at the same time. The lease lasts 5 minutes and is renewed every 60 seconds; `advanced.jobs.lease_ttl` and `advanced.jobs.heartbeat_interval` change these values (see [Job leases](configuration.md#job-leases)). The lease is node-local, because the config sync does not carry it, so two instances can run the same rule at the same time. A boot-time reconciliation marks runs left in `running` by a dead process as `failed` and records an operator-visible failure row.
 
-Runs persist a continuation cursor: a run interrupted by a crash or restart resumes from the stored cursor instead of rescanning from the top. A poison-token guard restarts the listing fresh exactly once if the stored cursor is rejected. Pause/resume state lives in the same row and survives restarts, as in replication.
+Runs persist a continuation cursor: a run interrupted by a crash or restart resumes from the stored cursor instead of rescanning from the top. A listing that fails because the backend is slow or answers with a 5xx status is sent again with the same cursor, up to 5 times. Only a cursor that the backend refuses as invalid restarts the listing fresh, exactly once.
+
+A run reads the creation time and the logical size of each delta object with a `HEAD` request. The proxy keeps these answers from one run to the next, for each object, together with the ETag, the size and the Last-Modified time that the listing shows for the stored object. An object whose stored version did not change therefore costs no `HEAD` request on the hourly rescan, and a run right after a preview sends no `HEAD` request for it either. An overwrite changes the stored version, so the next run reads the object again. The deletes of one listing page go to the engine as one batch: each delete still happens only while the object is the one that the run planned on, and the proxy checks each folder once for a `reference.bin` to remove.
+
+While the backend health check marks the backend of a bucket that the rule writes to as unavailable, the scheduler does not start the rule. The rule stays due and runs on a tick after the backend recovers. Pause/resume state lives in the same row and survives restarts, as in replication.
 
 ## Events
 
