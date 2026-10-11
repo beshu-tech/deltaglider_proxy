@@ -344,6 +344,17 @@ impl ConfigDbSync {
         config: &BackendConfig,
         operation_timeout: Option<std::time::Duration>,
     ) -> Result<Client, String> {
+        Self::build_client_labelled(config, operation_timeout, crate::storage::COORDINATION).await
+    }
+
+    /// [`Self::build_client_with`], timed under the `backend` label
+    /// `label`: the health and capability probes build their clients here
+    /// and are not coordination requests.
+    pub(crate) async fn build_client_labelled(
+        config: &BackendConfig,
+        operation_timeout: Option<std::time::Duration>,
+        label: &'static str,
+    ) -> Result<Client, String> {
         let (endpoint, region, force_path_style, access_key_id, secret_access_key, allow_local) =
             match config {
                 BackendConfig::S3 {
@@ -407,10 +418,9 @@ impl ConfigDbSync {
             builder = crate::storage::guard_s3_endpoint(builder, ep, allow_local)?;
         }
 
-        // Timed like the engine's backends, under the label `coordination`.
-        let timer = crate::storage::RequestTimer::from_env(crate::storage::BackendLabel::named(
-            crate::storage::COORDINATION,
-        ));
+        // Timed like the engine's backends, under `label`.
+        let timer =
+            crate::storage::RequestTimer::from_env(crate::storage::BackendLabel::named(label));
         Ok(timer.client(builder))
     }
 

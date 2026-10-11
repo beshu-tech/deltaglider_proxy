@@ -30,9 +30,12 @@ pub(crate) use filesystem::fault::{fail_io, Fault, FaultPoint, Faults, FaultyFs,
 pub use filesystem::FilesystemBackend;
 pub use routing::RoutingBackend;
 #[cfg(test)]
+pub(crate) use s3::backend_request_samples;
+#[cfg(test)]
 pub(crate) use s3::test_support as s3_test_support;
 pub(crate) use s3::{
-    check_s3_endpoint, guard_s3_endpoint, BackendLabel, RequestTimer, COORDINATION,
+    check_s3_endpoint, guard_s3_endpoint, BackendLabel, RequestTimer, CAPABILITY_PROBE,
+    COORDINATION, HEALTH_PROBE,
 };
 pub use s3::{
     NativeEncryptionConfig, S3Backend, BACKEND_GET_BODY_RESUMES, BACKEND_HEAD_REQUESTS,

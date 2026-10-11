@@ -137,7 +137,7 @@ What the client sees when the last of these requests fails depends on when the p
 
 The labels have these values:
 
-- `backend` is the name of the backend definition (`default` for the single backend of `storage.backend`). The value `coordination` marks the requests to the coordination bucket: the config DB sync, the leases, the reference locks, and the health and capability probes. The value `unnamed` marks a request that no named backend sends, for example a connection test.
+- `backend` is the name of the backend definition (`default` for the single backend of `storage.backend`). The value `coordination` marks the requests to the coordination bucket: the config DB sync, the leases and the reference locks. The value `health` marks the requests of the backend health probes, and the value `capability` marks the requests of the conditional-write capability probes. The value `unnamed` marks a request that no named backend sends, for example a connection test.
 - `operation` is the name of the S3 operation, for example `HeadObject`, `GetObject`, `PutObject`, `ListObjectsV2`, `DeleteObject`, `DeleteObjects`, `CopyObject` or `UploadPart`.
 - `outcome` is `ok` when the backend answered with a success, or with an answer that the proxy reads as information: `404 Not Found` (the proxy checks whether an object exists), `304 Not Modified`, or `412 Precondition Failed` (a conditional write lost). It is `cancelled` when the proxy dropped the request before it ended, for example because the client disconnected. Every other end is `error`: another error status, a timeout, a failed connection, or a response that the proxy could not read.
 
@@ -250,7 +250,7 @@ All label sets are bounded:
 | `status` | ~15 HTTP status codes in practice |
 | `operation` | 16 (see table above) |
 | `operation` (backend requests) | One for each S3 operation that the proxy sends, about 25 |
-| `backend` | One for each backend definition, plus `coordination` and `unnamed` |
+| `backend` | One for each backend definition, plus `coordination`, `health`, `capability` and `unnamed` |
 | `outcome` | 3 (`ok`, `error` or `cancelled`) |
 | `decision` | 3 (delta, passthrough, reference) |
 | `result` | 2 (success or failure) |

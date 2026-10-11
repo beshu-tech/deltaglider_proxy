@@ -180,9 +180,13 @@ pub async fn default_backend_group(
     if forced_noncas.contains(&name) {
         return Some((name.clone(), group(String::new())));
     }
-    let client = crate::config_db_sync::ConfigDbSync::build_client(def)
-        .await
-        .ok()?;
+    let client = crate::config_db_sync::ConfigDbSync::build_client_labelled(
+        def,
+        crate::storage::S3Backend::request_timeout(),
+        crate::storage::CAPABILITY_PROBE,
+    )
+    .await
+    .ok()?;
     let listed = tokio::time::timeout(PROBE_TIMEOUT, client.list_buckets().send())
         .await
         .ok()?
@@ -237,7 +241,13 @@ pub async fn establish_backend_verdict(
     if forced_noncas.contains(name) {
         return CapabilityVerdict::NonCas;
     }
-    let client = match crate::config_db_sync::ConfigDbSync::build_client(&group.backend).await {
+    let client = match crate::config_db_sync::ConfigDbSync::build_client_labelled(
+        &group.backend,
+        crate::storage::S3Backend::request_timeout(),
+        crate::storage::CAPABILITY_PROBE,
+    )
+    .await
+    {
         Ok(c) => c,
         Err(e) => {
             return CapabilityVerdict::Unknown {

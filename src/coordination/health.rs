@@ -630,7 +630,12 @@ async fn probe_client(config: &BackendConfig) -> Result<aws_sdk_s3::Client, Stri
     if let Some(client) = PROBE_CLIENTS.lock().get(&fp) {
         return Ok(client.clone());
     }
-    let built = crate::config_db_sync::ConfigDbSync::build_client(config).await?;
+    let built = crate::config_db_sync::ConfigDbSync::build_client_labelled(
+        config,
+        crate::storage::S3Backend::request_timeout(),
+        crate::storage::HEALTH_PROBE,
+    )
+    .await?;
     let connect = std::time::Duration::from_secs(crate::config::env_parse_with_default(
         "DGP_S3_CONNECT_TIMEOUT_SECS",
         10u64,
@@ -1521,5 +1526,41 @@ mod review2_tests {
             !accepted.await.unwrap(),
             "the health probe reached an SSRF-refused endpoint"
         );
+    }
+}
+
+#[cfg(test)]
+mod probe_label_tests {
+    use super::*;
+
+    /// The health probe's requests are timed under the label `health`, not
+    /// `coordination`: a probe of a data backend is not a request to the
+    /// coordination bucket, and in that series it hid the coordination
+    /// bucket's own latency.
+    #[tokio::test]
+    async fn health_probe_requests_are_labelled_health() {
+        let (endpoint, _fake) = crate::storage::fake_s3::start().await;
+        let config = BackendConfig::S3 {
+            endpoint: Some(endpoint),
+            region: "us-east-1".into(),
+            force_path_style: true,
+            access_key_id: Some("a".into()),
+            secret_access_key: Some("b".into()),
+            allow_local: true,
+            session_token: None,
+        };
+        let client = probe_client(&config).await.unwrap();
+        let samples =
+            |backend: &str| crate::storage::backend_request_samples(backend, "GetObject", "ok");
+        // The counters are global and other tests run at the same time:
+        // only this label's growth is checked.
+        let health = samples("health");
+        let _ = client
+            .get_object()
+            .bucket("probe-label")
+            .key("k")
+            .send()
+            .await;
+        assert!(samples("health") > health);
     }
 }

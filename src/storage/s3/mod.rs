@@ -43,7 +43,9 @@ use listing::*;
 use listing::{last_listed_key, S3ListedObject};
 use metadata::*;
 use objects::*;
-pub(crate) use timing::{BackendLabel, RequestTimer, COORDINATION};
+#[cfg(test)]
+pub(crate) use timing::backend_request_samples;
+pub(crate) use timing::{BackendLabel, RequestTimer, CAPABILITY_PROBE, COORDINATION, HEALTH_PROBE};
 pub use timing::{BACKEND_REQUEST_ATTEMPTS, BACKEND_REQUEST_DURATION};
 
 use super::list_size_cache::{self, ListedSize, LogicalFacts, StoredObjectId};

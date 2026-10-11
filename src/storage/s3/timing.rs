@@ -72,6 +72,22 @@ pub static BACKEND_REQUEST_ATTEMPTS: LazyLock<prometheus::IntCounterVec> = LazyL
 /// The `backend` label of the coordination client.
 pub(crate) const COORDINATION: &str = "coordination";
 
+/// The `backend` label of the health probe clients (one per backend
+/// definition; the probe of a data backend is not a coordination request).
+pub(crate) const HEALTH_PROBE: &str = "health";
+
+/// The `backend` label of the conditional-write capability probe clients.
+pub(crate) const CAPABILITY_PROBE: &str = "capability";
+
+/// Requests timed under `backend`, `operation` and `outcome` so far (tests
+/// of the callers that pick a label).
+#[cfg(test)]
+pub(crate) fn backend_request_samples(backend: &str, operation: &str, outcome: &str) -> u64 {
+    BACKEND_REQUEST_DURATION
+        .with_label_values(&[backend, operation, outcome])
+        .get_sample_count()
+}
+
 /// The `backend` label of a client that has no backend name (the CLI, a
 /// connection test).
 const UNNAMED: &str = "unnamed";
