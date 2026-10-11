@@ -198,7 +198,8 @@ stored form (`k.delta` after a plain write, `k` after a delta write) when the
 read before the write found no object; an overwrite still removes the stale
 form. A conditional PUT (`If-None-Match: *` or `If-Match`) sends 2 HEAD
 requests instead of 4, because the write uses what the precondition check
-read. PutObject, DeleteObject, and a GetObject or HeadObject request that does
+read. A delta PUT reads its folder's `reference.bin` with one HEAD request
+instead of two. PutObject, DeleteObject, and a GetObject or HeadObject request that does
 not find its key now use the cached bucket check too, so they send no
 HeadBucket request for a bucket that the proxy found in the last 5 seconds. A
 DeleteBucket request through the same instance clears that cache at once; a
@@ -216,7 +217,9 @@ backend request that makes it, so a request timeout or a client disconnect
 later in the request no longer leaves the counter wrong. Removing a reference
 on an encrypted S3 backend subtracts the size that the store added, not the
 encrypted size. DeleteBucket removes the bucket's counter, so `/_/stats` and a
-bucket created again under the same name start clean. The metrics
+bucket created again under the same name start clean. A `reference.bin` that a
+replication copy seeds is counted as soon as it is written, also when the copy
+fails after it. The metrics
 `deltaglider_delta_bytes_saved_total` and `delta_decisions_total` count only a
 delta that was stored.
 
@@ -275,6 +278,96 @@ reference-lock request fails the write with a retryable `503`, not `500`. The
 bootstrap password is one session principal for every admin, so the 11th admin
 login logged another admin out; the cap is now 100, and each open-mode browser
 session counts on its own.
+
+### Fixed — Replication deletes, reconciles and copies send far fewer requests
+
+The event consumer replayed each source delete alone: one HEAD request to the
+source (two or three requests on S3), then a destination delete that listed
+the destination folder again. Now the consumer checks that the source keys are
+still gone with one listing of each source folder, and it sends the deletes of
+a batch together, so each destination folder is checked once for a reference
+to remove. A key that was created again since its delete keeps its destination
+copy. The reconcile run deletes the same way, one finished folder at a time.
+
+A converged reconcile sent two engine HEAD requests (four S3 requests) for
+every object present on both sides, on every run. Now a pair whose stored ETag
+and size did not change since the last HEAD gets its answer from the parity
+cache, and the walk sends HEAD requests only for the other pairs,
+`dir_concurrency` at a time. A run's budget of 1,000,000 requests now counts
+listing pages, HEAD requests, copies and deletes, not only listing pages.
+
+Each copy attempt sent two HEAD requests to the source, although the caller
+had just read the source's metadata, and the copy loop sent a throttled copy
+three times on top of the three attempts of the S3 client. Now a copy sends a
+source HEAD only when the caller has no metadata, and the copy loop tries again
+only when the source changed during the copy or the proxy itself was busy.
+
+Verify counted its cap in objects that the rule's globs kept, so a rule that
+keeps few keys listed the whole bucket. It also wrote a cache row for every
+destination key, which nothing read, in one transaction that held the config
+database lock. Now the cap counts the objects that Verify lists, Verify keeps
+rows only for keys on both sides, writes at most 1,000 rows each time it holds
+the lock, and gives the freed pages back to the disk.
+
+### Fixed — A failing or unavailable backend no longer receives the full volume of background jobs
+
+When the destination of a replication rule refused copies, the event consumer
+still tried every key of each batch every 30 seconds, and each attempt read the
+whole source object; a destination HEAD request that failed counted as "the
+object is absent", so the consumer copied on it. Now the consumer stops a
+rule's drain at the first error that no object can pass, or after 3 throttled
+requests with nothing done, and waits 30 seconds before the next drain,
+doubling up to 10 minutes. A failed destination HEAD request keeps the key's
+event for later.
+
+Background jobs also ignored the backend health gate, so they sent their full
+volume to a backend that the proxy had marked unavailable, and that load kept
+the health probe failing for every client. Now a replication rule whose source
+or destination backend is unavailable defers with its cursor and events, a
+lifecycle rule stays due, and a maintenance job waits in the queue, 30 seconds
+at a time. A run-now request for such a replication or lifecycle rule answers
+`503` and names the backend.
+
+### Fixed — Background jobs survive a backend that times out now and then
+
+A migration read any error from a HEAD request to the destination as a missing
+copy, so one timeout in the verify phase failed the job, and the job then
+deleted every copy that it had made. Now a failed HEAD or listing request is
+sent again, and only a "not found" answer counts as missing. When the backend
+still does not answer, the job goes back to the queue with its cursor and its
+copies and runs again after a pause; after 5 such stops without progress it
+fails, keeps the copies, and its message says how to reuse them.
+
+When the first listing of a resumed job failed for any reason, the job threw
+its cursor away and started again from the first page. Now a listing that
+fails because the backend is slow is sent again with the same cursor, up to 5
+times, and only a cursor that the backend refuses restarts the job.
+Re-encrypt, migrate and backfill jobs also work on 4 objects of a page at the
+same time instead of one.
+
+### Fixed — Lifecycle, `rm -r` and `sync --delete` send fewer requests
+
+Each hourly lifecycle run sent a HEAD request for every delta object, because
+the proxy kept these answers for 10 minutes only, so a bucket of 100,000 deltas
+where nothing expires cost about 100,000 HEAD requests an hour. Now the proxy
+keeps each object's creation time and size from one run to the next, matched to
+the ETag, size and Last-Modified time that the listing shows, so an object
+that did not change costs no HEAD request. A preview of the same rule answers
+from the last walk for 60 seconds, and a run after a preview uses it.
+
+Lifecycle, `rm -r` and `sync --delete` deleted one key at a time and listed the
+key's folder after each one to find a `reference.bin` to remove. Now each page
+of keys goes out as one batch, which checks each folder once. `sync` also no
+longer copies an unchanged delta again when the listing could not read its
+real size.
+
+### Fixed — Removed job rules leave no rows behind
+
+A replication or lifecycle rule that was removed or renamed kept its state, run
+history and failure rows in the config database, so a rule added again under
+the same name showed the old rule's runs. Now the proxy drops these rows at
+boot and after every config change, through the admin API or a background
+apply.
 
 ### Fixed — A condition list with a wrong value no longer breaks a user's other grants
 
