@@ -10,6 +10,31 @@ follow [semantic versioning](https://semver.org/); the Docker image
 
 _Last updated: 2026-10-11_
 
+## v2.0.7 — 2026-10-11
+
+### Fixed — A config apply no longer deletes the lease of the replication event consumer
+
+The replication event consumer keeps its lease in a `replication_state` row
+named `__event_consumer__`. Since v2.0.5, every config apply and every start
+deletes the rows of replication rules that the config no longer has (before
+that, only a rule delete did). That row is not a rule, so it was deleted each
+time. The consumer lost a lease that
+it held, and the log showed "dropped the runtime rows of 1 removed replication
+rule(s)" although no rule was removed. Now the row is kept, and a replication
+rule named `__event_consumer__` gets a warning, because it would share that row.
+
+### Fixed — A bucket check sends one `HeadBucket` request, not two
+
+A bucket that has no `backend` in its bucket policy is looked up on the
+backends with a `HeadBucket` request, and the proxy remembers the answer for 30
+seconds. When that answer was older, a check of the bucket (which every write
+makes) sent one `HeadBucket` request to find the backend, and then a second one
+to the same backend to ask the same question. Now the check uses the answer of
+the first request. On a backend where some `HeadBucket` requests take seconds,
+an upload after a quiet period waited for two of them. On production, about 1
+`HeadBucket` request in 30 to Hetzner Object Storage took 7 to 10 seconds, and
+one upload spent 16 seconds in two of them.
+
 ## v2.0.6 — 2026-10-11
 
 ### Fixed — A proxy no longer removes the multipart uploads of another proxy on the same host
