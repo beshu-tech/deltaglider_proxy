@@ -37,6 +37,10 @@ The probe measures whether the backend can be reached, not how fast it answers. 
 
 When the probe cannot connect, or the backend hangs, the proxy marks the backend **Unreachable**, and the next requests to the backend's buckets get the 503 immediately, without a wait. When the probe gets an answer, the buckets stay open, because one slow request among many does not prove that the backend is down. The proxy then logs one warning that names the failed request. The health probe also finds a dead backend on its own, because it probes healthy backends too. When the backend answers a probe again, its buckets reopen. `GET /_/ready` lists each backend's live state in its `backends` field.
 
+## When a backend is slow
+
+A backend can answer every request and still answer slowly. The proxy times every S3 request that it sends, and a request that takes 5 seconds or longer (`DGP_BACKEND_SLOW_REQUEST_SECS`, plus one second for each MiB of an upload's body) logs one WARN line `slow backend request`. The line names the backend, the S3 operation, the bucket and the key, and it splits the time: the number of attempts and the status of each one, and the time before the first attempt was sent. A request that waited in the S3 client's rate limiter after earlier `503 SlowDown` answers has a large `before_first_attempt_secs`. A request that the client retried has several attempts. A request that the backend answered slowly has one attempt and a small wait. The histogram `deltaglider_backend_request_duration_seconds` on `/_/metrics` shows the same times for every request, by backend and operation. See [Metrics](../reference/metrics.md#backend-request-timing) for each field of the line.
+
 ## Boot behaviour
 
 At startup the proxy probes every configured backend (the default plus each entry in `storage.backends`):
@@ -85,5 +89,5 @@ Two related states are fatal config errors, which the proxy refuses at boot and 
 
 - [Backend capability validation](backend-capability-validation.md): the other backend check, for conditional-write (CAS) support in multi-instance deployments.
 - [Route a bucket to a backend](route-a-bucket-to-a-backend.md)
-- [Configuration reference](../reference/configuration.md): `DGP_BOOT_BACKEND_PROBE`.
+- [Configuration reference](../reference/configuration.md): `DGP_BOOT_BACKEND_PROBE`, `DGP_BACKEND_SLOW_REQUEST_SECS`.
 - [Admin API reference](../reference/admin-api.md): the probe endpoint and `GET /_/ready`.

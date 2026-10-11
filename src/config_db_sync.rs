@@ -331,7 +331,9 @@ impl ConfigDbSync {
     /// DB adds time for its body (`db_upload_deadline`). The SDK retry
     /// partition is the backend definition's own coordination partition:
     /// the coordination clients no longer spend the retry quota (and feed
-    /// the rate limiter) of the region's default partition.
+    /// the rate limiter) of the region's default partition. Its requests
+    /// are timed under the backend label `coordination`
+    /// (`deltaglider_backend_request_duration_seconds`).
     pub async fn build_client(config: &BackendConfig) -> Result<Client, String> {
         Self::build_client_with(config, crate::storage::S3Backend::request_timeout()).await
     }
@@ -405,7 +407,11 @@ impl ConfigDbSync {
             builder = crate::storage::guard_s3_endpoint(builder, ep, allow_local)?;
         }
 
-        Ok(Client::from_conf(builder.build()))
+        // Timed like the engine's backends, under the label `coordination`.
+        let timer = crate::storage::RequestTimer::from_env(crate::storage::BackendLabel::named(
+            crate::storage::COORDINATION,
+        ));
+        Ok(timer.client(builder))
     }
 
     /// Check S3 for a newer config DB file and download it if the ETag differs.

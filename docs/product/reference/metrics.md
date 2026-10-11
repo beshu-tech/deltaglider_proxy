@@ -128,6 +128,63 @@ A response body breaks off when the backend stops sending bytes for longer than 
 
 What the client sees when the last of these requests fails depends on when the proxy answers. For a delta-stored object, the proxy reads the whole object before it sends the first byte, so the client gets `503 ServiceUnavailable`. For a passthrough object, the proxy sends the `200` headers first and then streams the bytes as they arrive, so the response ends before its last byte. A counter that rises steadily means that the backend often stalls.
 
+## Backend request timing
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `deltaglider_backend_request_duration_seconds` | Histogram | `backend`, `operation`, `outcome` | The time of each S3 request that the proxy sends to a storage backend or to the coordination bucket. The time starts when the proxy starts the request and ends when the response headers arrive. It includes every retry of the S3 client, the wait between the retries, and the wait in the client's rate limiter. The body of a download streams after the headers, so it is not part of the time |
+| `deltaglider_backend_request_attempts_total` | Counter | `backend`, `operation` | The attempts that these requests sent: the first attempt of each request and every retry |
+
+The labels have these values:
+
+- `backend` is the name of the backend definition (`default` for the single backend of `storage.backend`). The value `coordination` marks the requests to the coordination bucket: the config DB sync, the leases, the reference locks, and the health and capability probes. The value `unnamed` marks a request that no named backend sends, for example a connection test.
+- `operation` is the name of the S3 operation, for example `HeadObject`, `GetObject`, `PutObject`, `ListObjectsV2`, `DeleteObject`, `DeleteObjects`, `CopyObject` or `UploadPart`.
+- `outcome` is `ok` when the backend answered with a success, or with an answer that the proxy reads as information: `404 Not Found` (the proxy checks whether an object exists), `304 Not Modified`, or `412 Precondition Failed` (a conditional write lost). It is `cancelled` when the proxy dropped the request before it ended, for example because the client disconnected. Every other end is `error`: another error status, a timeout, a failed connection, or a response that the proxy could not read.
+
+The duration buckets are `[10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s, 30s, 60s]`.
+
+Each request adds its attempts to the counter, so the difference between the counter and the request count of the histogram is the number of retries. A request that the proxy dropped before its first attempt adds no attempts.
+
+```promql
+# Retries per second, by backend
+sum by (backend) (rate(deltaglider_backend_request_attempts_total[5m]))
+  - sum by (backend) (rate(deltaglider_backend_request_duration_seconds_count[5m]))
+
+# The 95th percentile of the HEAD requests, by backend
+histogram_quantile(0.95, sum by (backend, le) (
+  rate(deltaglider_backend_request_duration_seconds_bucket{operation="HeadObject"}[5m])))
+```
+
+### The slow-request log line
+
+A request that takes `DGP_BACKEND_SLOW_REQUEST_SECS` (5 seconds by default) or longer logs one WARN line. The time of an upload grows with the size of its body, so an upload (`PutObject`, `UploadPart`) gets one more second for each MiB of its body, as its deadline does. Without this allowance, every large upload would log a line. The line says where the time went:
+
+```text
+WARN deltaglider_proxy::storage::s3::timing: slow backend request backend="hetzner-fsn1" operation="DeleteObject" bucket="releases" key="v2.4/app.zip" prefix="" body_bytes=0 total_secs=6.212 attempts=3 before_first_attempt_secs=0.002 status=204 attempt_statuses=503,503,204 result=ok
+```
+
+| Field | Meaning |
+|---|---|
+| `backend`, `operation` | The same values as the labels of the histogram |
+| `bucket` | The bucket of the request. It is empty for a request without a bucket, such as `ListBuckets` |
+| `key` | The object key of the request, percent-decoded. It is empty for a listing |
+| `prefix` | The prefix of a listing, percent-decoded. It is empty for other requests |
+| `body_bytes` | The size of the request body: the bytes of an upload, `0` for a request without a body |
+| `total_secs` | The time of the request, measured like the histogram |
+| `attempts` | The attempts that the request sent |
+| `before_first_attempt_secs` | The time from the start of the request until its first attempt was sent. It holds the wait in the rate limiter of the S3 client and the time to sign the request. It is `not sent` when the request ended before its first attempt |
+| `status` | The HTTP status of the last attempt, or `none` when the last attempt got no response |
+| `attempt_statuses` | The HTTP status of each attempt, in order. A `-` marks an attempt without a response: its connection failed, or its attempt timeout ended it |
+| `result` | How the request ended: `ok`, `HTTP <status>` for an error status, `timeout`, `connection failure`, `response failure`, `cancelled`, or `failure` |
+
+The line holds no credentials and no signature, because the proxy reads only the key and the listing prefix from the request. With `DGP_LOG_FORMAT=json`, the fields are JSON fields of the log entry.
+
+Read the line in this order:
+
+- A large `before_first_attempt_secs` means that the request waited before the proxy sent it. The S3 client of each backend has an adaptive rate limiter. After the backend answers `503 SlowDown`, the rate limiter slows down the later requests to that backend, so the wait comes from earlier throttles and not from this request.
+- Several attempts with `503` or `500` statuses mean that the backend refused or failed the request, and the S3 client retried it. The wait between the retries grows with each retry, so most of `total_secs` is the wait and not the backend's answers.
+- One attempt and a small `before_first_attempt_secs` mean that the backend itself was slow to answer.
+
 ## Codec concurrency
 
 | Metric | Type | Labels | Description |
@@ -192,6 +249,9 @@ All label sets are bounded:
 | `method` | 8 (GET, PUT, HEAD, DELETE, POST, OPTIONS, PATCH, OTHER) |
 | `status` | ~15 HTTP status codes in practice |
 | `operation` | 16 (see table above) |
+| `operation` (backend requests) | One for each S3 operation that the proxy sends, about 25 |
+| `backend` | One for each backend definition, plus `coordination` and `unnamed` |
+| `outcome` | 3 (`ok`, `error` or `cancelled`) |
 | `decision` | 3 (delta, passthrough, reference) |
 | `result` | 2 (success or failure) |
 | `reason` | 7 (see the Auth table) |

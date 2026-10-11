@@ -12,6 +12,7 @@
 //!     `StorageBackend` impl, and the request counters
 //!   - `body.rs`     — GET bodies that resume after a read breaks off
 //!   - `client.rs`   — client construction and the SSRF endpoint guard
+//!   - `timing.rs`   — the request timer of every S3 client
 //!   - `errors.rs`   — SDK error classification and write/delete verdicts
 //!   - `metadata.rs` — DG metadata headers, self-copy plan, native SSE
 //!   - `objects.rs`  — object reads, writes and deletes (fenced and plain)
@@ -28,6 +29,7 @@ mod metadata;
 mod objects;
 #[cfg(test)]
 mod tests;
+mod timing;
 #[cfg(test)]
 pub(crate) use tests::test_support;
 
@@ -41,6 +43,8 @@ use listing::*;
 use listing::{last_listed_key, S3ListedObject};
 use metadata::*;
 use objects::*;
+pub(crate) use timing::{BackendLabel, RequestTimer, COORDINATION};
+pub use timing::{BACKEND_REQUEST_ATTEMPTS, BACKEND_REQUEST_DURATION};
 
 use super::list_size_cache::{self, ListedSize, LogicalFacts, StoredObjectId};
 use super::listing_facts;
@@ -191,6 +195,9 @@ pub struct S3Backend {
     /// (`coordination::health::note_unavailable`). `None` for a backend that
     /// the engine did not name (tests, CLI).
     health_key: Option<(String, String)>,
+    /// The `backend` label of both clients' request timing, set by
+    /// [`S3Backend::with_health_name`].
+    request_label: timing::BackendLabel,
     /// Per-backend native S3 server-side encryption mode. Applied to
     /// every `put_object`/`put_directory_marker` call.
     native_encryption: NativeEncryptionConfig,
@@ -210,11 +217,19 @@ impl S3Backend {
         config: &BackendConfig,
         native_encryption: NativeEncryptionConfig,
     ) -> Result<Self, StorageError> {
-        // One retry partition for both clients of this backend.
+        // One retry partition and one timing label for both clients of
+        // this backend.
         let partition = client::backend_retry_partition(config);
-        let client =
-            Self::build_client_in(config, backend_request_timeout(), partition.clone()).await?;
-        let bulk_client = Self::build_client_in(config, None, partition).await?;
+        let request_label = timing::BackendLabel::default();
+        let timer = timing::RequestTimer::from_env(request_label.clone());
+        let client = Self::build_client_in(
+            config,
+            backend_request_timeout(),
+            partition.clone(),
+            timer.clone(),
+        )
+        .await?;
+        let bulk_client = Self::build_client_in(config, None, partition, timer).await?;
         debug!(
             "S3Backend initialized (multi-bucket mode, native encryption: {:?})",
             native_encryption
@@ -235,6 +250,7 @@ impl S3Backend {
             client,
             bulk_client,
             health_key: None,
+            request_label,
             native_encryption,
             list_cache_scope,
             facts_cleanup,
@@ -244,7 +260,9 @@ impl S3Backend {
     /// Name this backend for the passive health signal: a request that
     /// finds it unavailable starts a health probe of it at once (a failed
     /// probe gates its buckets with a fast 503), and error messages name it.
+    /// The name is also the `backend` label of its request timing.
     pub fn with_health_name(mut self, name: &str, config: &BackendConfig) -> Self {
+        self.request_label.set(name);
         self.health_key = Some((
             name.to_string(),
             crate::coordination::capability::fingerprint(config),

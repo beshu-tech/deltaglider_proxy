@@ -567,6 +567,14 @@ impl Metrics {
         registry
             .register(Box::new(crate::storage::BACKEND_GET_BODY_RESUMES.clone()))
             .expect("duplicate metric name");
+        // The time and the attempts of every S3 request (storage backends
+        // and the coordination client), recorded by the SDK interceptor.
+        registry
+            .register(Box::new(crate::storage::BACKEND_REQUEST_DURATION.clone()))
+            .expect("duplicate metric name");
+        registry
+            .register(Box::new(crate::storage::BACKEND_REQUEST_ATTEMPTS.clone()))
+            .expect("duplicate metric name");
         registry
             .register(Box::new(crate::storage::LISTING_FACTS_REQUESTS.clone()))
             .expect("duplicate metric name");

@@ -134,6 +134,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Storage",
     },
     EnvVarEntry {
+        name: "DGP_BACKEND_SLOW_REQUEST_SECS",
+        description: "An S3 request (to a storage backend or the coordination bucket) that takes this many seconds or more, retries included, logs one WARN line 'slow backend request' with the backend, the operation, the bucket, the key or prefix, the total time, the attempts, the time before the first attempt was sent, and the final status. An upload (PutObject, UploadPart) gets one more second per MiB of body. 0 turns the log off (default: 5)",
+        example: "5",
+        category: "Storage",
+    },
+    EnvVarEntry {
         name: "DGP_BOOT_CREATE_DECLARED_BUCKETS",
         description: "At boot, create every bucket declared under storage.buckets that its backend does not have: a directory on a filesystem backend, a CreateBucket on an S3 backend (after a HeadBucket). false turns this off for every backend (default: true)",
         example: "false",

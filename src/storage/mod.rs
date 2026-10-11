@@ -31,11 +31,13 @@ pub use filesystem::FilesystemBackend;
 pub use routing::RoutingBackend;
 #[cfg(test)]
 pub(crate) use s3::test_support as s3_test_support;
-pub(crate) use s3::{check_s3_endpoint, guard_s3_endpoint};
+pub(crate) use s3::{
+    check_s3_endpoint, guard_s3_endpoint, BackendLabel, RequestTimer, COORDINATION,
+};
 pub use s3::{
     NativeEncryptionConfig, S3Backend, BACKEND_GET_BODY_RESUMES, BACKEND_HEAD_REQUESTS,
-    DELEGATED_LIST_PROBE_REQUESTS, DELEGATED_LIST_UPSTREAM_PAGES, LISTING_FACTS_MISSES,
-    LISTING_FACTS_REQUESTS,
+    BACKEND_REQUEST_ATTEMPTS, BACKEND_REQUEST_DURATION, DELEGATED_LIST_PROBE_REQUESTS,
+    DELEGATED_LIST_UPSTREAM_PAGES, LISTING_FACTS_MISSES, LISTING_FACTS_REQUESTS,
 };
 pub use traits::{
     clamp_range, io_error_is_name_too_long, io_error_is_path_type_conflict, open_object_by_parts,

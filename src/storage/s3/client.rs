@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! S3 client construction: the SSRF guard on custom endpoints and the
-//! request deadlines.
+//! S3 client construction: the SSRF guard on custom endpoints, the
+//! request deadlines and the request timer.
 
 use super::*;
 
@@ -142,7 +142,8 @@ impl S3Backend {
     }
 
     /// Build an S3 client from a BackendConfig without creating an S3Backend.
-    /// Useful for one-off operations like testing connectivity.
+    /// Useful for one-off operations like testing connectivity. Its
+    /// requests are timed under the backend label `unnamed`.
     pub async fn build_client(config: &BackendConfig) -> Result<Client, StorageError> {
         Self::build_client_with(config, None).await
     }
@@ -153,14 +154,23 @@ impl S3Backend {
         config: &BackendConfig,
         operation_timeout: Option<std::time::Duration>,
     ) -> Result<Client, StorageError> {
-        Self::build_client_in(config, operation_timeout, backend_retry_partition(config)).await
+        let timer = super::timing::RequestTimer::from_env(Default::default());
+        Self::build_client_in(
+            config,
+            operation_timeout,
+            backend_retry_partition(config),
+            timer,
+        )
+        .await
     }
 
-    /// [`Self::build_client_with`] in the retry partition `partition`.
+    /// [`Self::build_client_with`] in the retry partition `partition`,
+    /// timed by `timer` (`storage::s3::timing`).
     pub(super) async fn build_client_in(
         config: &BackendConfig,
         operation_timeout: Option<std::time::Duration>,
         partition: aws_sdk_s3::config::retry::RetryPartition,
+        timer: super::timing::RequestTimer,
     ) -> Result<Client, StorageError> {
         let (
             endpoint,
@@ -268,6 +278,6 @@ impl S3Backend {
                 .map_err(StorageError::Other)?;
         }
 
-        Ok(Client::from_conf(s3_config_builder.build()))
+        Ok(timer.client(s3_config_builder))
     }
 }
