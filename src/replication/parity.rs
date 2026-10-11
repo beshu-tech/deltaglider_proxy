@@ -2582,8 +2582,13 @@ mod request_count_tests {
         fake.requests().iter().filter(|r| pred(r)).count()
     }
 
+    /// A listing of `bucket`, not one of the listing-facts housekeeping
+    /// (`.dg/facts/`: a lookup for a copy, the cleanup a delete queues),
+    /// which runs in the background on its own schedule.
     fn is_list(r: &str, bucket: &str) -> bool {
-        r.starts_with(&format!("GET /{bucket}")) && r.contains("list-type=2")
+        r.starts_with(&format!("GET /{bucket}"))
+            && r.contains("list-type=2")
+            && !r.contains("prefix=.dg%2Ffacts%2F")
     }
 
     fn rows(db: &ConfigDb, side: &str) -> Vec<String> {
