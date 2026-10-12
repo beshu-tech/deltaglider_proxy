@@ -561,3 +561,25 @@ fn the_get_verb_opens_the_object_with_its_metadata() {
         "object.rs lines {sites:?}: use retrieve_stream_fresh"
     );
 }
+
+/// Routing: the two parallel reads of a cold GET share one bucket
+/// resolution (one HeadBucket), as do concurrent GETs.
+#[tokio::test]
+async fn a_cold_routed_get_resolves_its_bucket_once() {
+    let fx = fixture(Kind::Routed).await;
+    let fresh = backend_on(&fx.endpoint, Kind::Routed);
+    let svc = svc_on(engine_on(&fresh, None));
+    fx.fake.set_delay_ms("HEAD_BUCKET", 50);
+    fx.fake.clear();
+    let gets = (0..4).map(|_| run_get(&svc, get("pics/a.jpg")));
+    for (body, _) in futures::future::join_all(gets).await {
+        assert_eq!(body, fx.photo);
+    }
+    let heads = fx
+        .fake
+        .requests()
+        .iter()
+        .filter(|r| *r == "HEAD /b" || *r == "HEAD /b/")
+        .count();
+    assert_eq!(heads, 1, "{:?}", fx.fake.requests());
+}

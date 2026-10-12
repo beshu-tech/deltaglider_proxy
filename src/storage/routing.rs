@@ -46,6 +46,276 @@ fn previous_route_identity(bucket: &str, route: &BucketRoute) -> Option<String> 
     route.real_bucket.is_none().then(|| bucket.to_string())
 }
 
+/// Reverse-lookup over `routes`: the virtual name that maps to
+/// `(backend_name, real_bucket)`, if any.
+fn reverse_lookup(
+    routes: &HashMap<String, BucketRoute>,
+    backend_name: &str,
+    real_bucket: &str,
+) -> Option<String> {
+    for (virtual_name, route) in routes {
+        if route.backend_name == backend_name {
+            let route_real = route
+                .real_bucket
+                .as_deref()
+                .unwrap_or(virtual_name.as_str());
+            if route_real == real_bucket {
+                return Some(virtual_name.clone());
+            }
+        }
+    }
+    None
+}
+
+/// True when `real_bucket` on `backend_name` is the storage of a route
+/// under ANOTHER virtual name (an alias).
+fn alias_owns_real_bucket(
+    routes: &HashMap<String, BucketRoute>,
+    backend_name: &str,
+    real_bucket: &str,
+) -> bool {
+    reverse_lookup(routes, backend_name, real_bucket)
+        .is_some_and(|virtual_name| virtual_name != real_bucket)
+}
+
+/// Where an unrouted bucket lives: the HeadBucket probe and its caches.
+///
+/// Cold resolutions of one bucket are single-flight: requests that find no
+/// cached answer wait for one probe (`gates`) and read its answer. An
+/// error is not cached, so the next request probes again.
+///
+/// Staleness across nodes: a peer that creates or deletes a bucket is seen
+/// within `RESOLVE_TTL` (found) or `MISS_TTL` (absent). A config apply
+/// that changes routes or backends builds a new `RoutingBackend`, so a new
+/// `Resolver` with empty caches.
+struct Resolver {
+    backends: HashMap<String, Arc<Box<DynStorageBackend<'static>>>>,
+    routes: HashMap<String, BucketRoute>,
+    default_backend: String,
+    /// Unrouted bucket → backend name where head_bucket FOUND it, with the
+    /// time found. Only positive answers are kept (a miss may become a hit
+    /// when the bucket is created; an error must re-probe). Cleared on
+    /// create/delete bucket; a peer's change is seen within RESOLVE_TTL.
+    resolved: parking_lot::Mutex<HashMap<String, (String, std::time::Instant)>>,
+    /// Unrouted bucket → when every backend answered "absent" (it routes to
+    /// the default backend). Kept for `MISS_TTL`, so a request for a bucket
+    /// that no backend holds does not send a HeadBucket to each backend
+    /// every time. Cleared on create/delete bucket.
+    missed: parking_lot::Mutex<HashMap<String, std::time::Instant>>,
+    /// Unrouted bucket → the gate its cold resolution runs under. The entry
+    /// goes when the probe ends.
+    gates: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Bumped by `invalidate`: a probe that started before an invalidation
+    /// does not store its (possibly pre-mutation) answer.
+    generation: std::sync::atomic::AtomicU64,
+}
+
+impl Resolver {
+    fn new(
+        backends: HashMap<String, Arc<Box<DynStorageBackend<'static>>>>,
+        routes: HashMap<String, BucketRoute>,
+        default_backend: String,
+    ) -> Self {
+        Self {
+            backends,
+            routes,
+            default_backend,
+            resolved: Default::default(),
+            missed: Default::default(),
+            gates: Default::default(),
+            generation: Default::default(),
+        }
+    }
+
+    fn backend(&self, name: &str) -> &DynStorageBackend<'static> {
+        self.backends[name].as_ref().as_ref()
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn invalidate(&self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.resolved.lock().clear();
+        self.missed.lock().clear();
+    }
+
+    /// The backend an unrouted bucket was found on less than `RESOLVE_TTL`
+    /// ago.
+    fn cached_resolution(&self, virtual_bucket: &str) -> Option<String> {
+        let map = self.resolved.lock();
+        match map.get(virtual_bucket) {
+            // A stale entry stays: `last_known_resolution` uses it while
+            // the default backend errors. create/delete bucket clear it.
+            Some((name, at)) if at.elapsed() < RESOLVE_TTL => Some(name.clone()),
+            _ => None,
+        }
+    }
+
+    /// Where an unrouted bucket was last FOUND, however long ago. Evidence
+    /// that it is not on the default backend (a non-default entry is only
+    /// stored after the default answered "absent").
+    fn last_known_resolution(&self, virtual_bucket: &str) -> Option<String> {
+        self.resolved
+            .lock()
+            .get(virtual_bucket)
+            .map(|(name, _)| name.clone())
+    }
+
+    /// Did every backend answer "absent" for this bucket less than
+    /// `MISS_TTL` ago?
+    fn cached_miss(&self, virtual_bucket: &str) -> bool {
+        self.missed
+            .lock()
+            .get(virtual_bucket)
+            .is_some_and(|at| at.elapsed() < MISS_TTL)
+    }
+
+    fn remember_miss(&self, virtual_bucket: &str, generation: u64) {
+        let mut map = self.missed.lock();
+        if self.generation() != generation {
+            return;
+        }
+        // Bound the map: a bucket-name scan must not grow it without limit.
+        if map.len() >= 10_000 {
+            map.retain(|_, at| at.elapsed() < MISS_TTL);
+            if map.len() >= 10_000 {
+                map.clear();
+            }
+        }
+        map.insert(virtual_bucket.to_string(), std::time::Instant::now());
+    }
+
+    fn remember_resolution(&self, virtual_bucket: &str, backend_name: &str, generation: u64) {
+        let mut map = self.resolved.lock();
+        if self.generation() != generation {
+            return;
+        }
+        // Bound the map: a bucket-name scan must not grow it without limit.
+        if map.len() >= 10_000 {
+            map.clear();
+        }
+        map.insert(
+            virtual_bucket.to_string(),
+            (backend_name.to_string(), std::time::Instant::now()),
+        );
+    }
+
+    /// The cached answer for an unrouted bucket, if any: `(backend, Probed::No)`.
+    fn cached(&self, virtual_bucket: &str) -> Option<(String, Probed)> {
+        if let Some(name) = self.cached_resolution(virtual_bucket) {
+            return Some((name, Probed::No));
+        }
+        self.cached_miss(virtual_bucket)
+            .then(|| (self.default_backend.clone(), Probed::No))
+    }
+
+    /// Resolve an unrouted bucket: the cached answer, else one probe shared
+    /// by every request that arrives while it runs.
+    async fn resolve(&self, virtual_bucket: &str) -> (String, Probed) {
+        if let Some(hit) = self.cached(virtual_bucket) {
+            return hit;
+        }
+        let gate = self
+            .gates
+            .lock()
+            .entry(virtual_bucket.to_string())
+            .or_default()
+            .clone();
+        let _held = gate.lock().await;
+        // The probe that held the gate may have answered for us.
+        if let Some(hit) = self.cached(virtual_bucket) {
+            return hit;
+        }
+        let out = self.probe(virtual_bucket).await;
+        self.gates.lock().remove(virtual_bucket);
+        out
+    }
+
+    /// The HeadBucket round: the default backend first, then every other
+    /// backend in name order.
+    async fn probe(&self, virtual_bucket: &str) -> (String, Probed) {
+        let generation = self.generation();
+        // A head_bucket ERROR (503/timeout) is NOT "bucket absent" — same
+        // hazard as `resolve_existing`: collapsing the error to `false` with
+        // `unwrap_or(false)` silently reroutes the multipart operation to the
+        // WRONG backend, so a transient blip on the bucket's real home can
+        // split one deltaspace's reference.bin and deltas across two same-named
+        // buckets. On error, route to THIS backend (the op re-hits it and
+        // surfaces the real error to the client); only a clean Ok(false) means
+        // "genuinely not here, keep looking".
+        let default = self.backend(&self.default_backend);
+        // A real bucket that a policy's alias owns on the default backend is
+        // that policy's storage (the same rule as the scan below): skip it.
+        let default_head =
+            if alias_owns_real_bucket(&self.routes, &self.default_backend, virtual_bucket) {
+                Ok(false)
+            } else {
+                default.head_bucket(virtual_bucket).await
+            };
+        match default_head {
+            Ok(true) => {
+                self.remember_resolution(virtual_bucket, &self.default_backend, generation);
+                return (self.default_backend.clone(), Probed::Found);
+            }
+            Err(e) => {
+                // The default is down. If the bucket was last FOUND on
+                // another backend (so the default once said "absent") and
+                // is still there, keep serving it from there.
+                if let Some(name) = self
+                    .last_known_resolution(virtual_bucket)
+                    .filter(|n| n != &self.default_backend)
+                {
+                    if matches!(
+                        self.backend(&name).head_bucket(virtual_bucket).await,
+                        Ok(true)
+                    ) {
+                        self.remember_resolution(virtual_bucket, &name, generation);
+                        return (name, Probed::Found);
+                    }
+                }
+                warn!(
+                    "resolve_existing_named: default backend head_bucket({virtual_bucket}) failed \
+                     transiently ({e}); routing to default rather than mis-routing"
+                );
+                return (self.default_backend.clone(), Probed::No);
+            }
+            Ok(false) => {}
+        }
+        let mut names: Vec<&String> = self.backends.keys().collect();
+        names.sort();
+        for name in names {
+            if name == &self.default_backend {
+                continue;
+            }
+            // A real bucket that a policy's alias owns on this backend is that
+            // policy's storage, not an unconfigured bucket of the same name.
+            if alias_owns_real_bucket(&self.routes, name, virtual_bucket) {
+                continue;
+            }
+            match self.backend(name).head_bucket(virtual_bucket).await {
+                Ok(true) => {
+                    self.remember_resolution(virtual_bucket, name, generation);
+                    return (name.clone(), Probed::Found);
+                }
+                Err(e) => {
+                    warn!(
+                        "resolve_existing_named: backend '{name}' head_bucket({virtual_bucket}) \
+                         failed transiently ({e}); routing here rather than mis-routing to default"
+                    );
+                    return (name.clone(), Probed::No);
+                }
+                Ok(false) => {}
+            }
+        }
+        // Every backend answered "absent": remember it briefly.
+        self.remember_miss(virtual_bucket, generation);
+        (self.default_backend.clone(), Probed::Absent)
+    }
+}
+
 /// Multi-backend routing storage backend.
 ///
 /// Dispatches each storage operation to the correct underlying backend
@@ -92,16 +362,9 @@ pub struct RoutingBackend {
     /// How long a successful listing stays fresh enough to serve without
     /// re-probing upstream (coalesces near-simultaneous ListBuckets calls).
     list_fresh: std::time::Duration,
-    /// Unrouted bucket → backend name where head_bucket FOUND it, with the
-    /// time found. Only positive answers are kept (a miss may become a hit
-    /// when the bucket is created; an error must re-probe). Cleared on
-    /// create/delete bucket; a peer's change is seen within RESOLVE_TTL.
-    resolved: parking_lot::Mutex<HashMap<String, (String, std::time::Instant)>>,
-    /// Unrouted bucket → when every backend answered "absent" (it routes to
-    /// the default backend). Kept for `MISS_TTL`, so a request for a bucket
-    /// that no backend holds does not send a HeadBucket to each backend
-    /// every time. Cleared on create/delete bucket.
-    missed: parking_lot::Mutex<HashMap<String, std::time::Instant>>,
+    /// Where unrouted buckets live: the probe and its caches. Behind an
+    /// `Arc`, so a background refresh can outlive the request.
+    resolver: Arc<Resolver>,
 }
 
 /// What a bucket resolution's own HeadBuckets learned about the bucket on
@@ -186,7 +449,7 @@ impl RoutingBackend {
             }
         }
 
-        let routes = routes
+        let routes: HashMap<String, BucketRoute> = routes
             .into_iter()
             .map(|(bucket, (backend_name, real_bucket))| {
                 (
@@ -199,6 +462,11 @@ impl RoutingBackend {
             })
             .collect();
 
+        let resolver = Arc::new(Resolver::new(
+            backends.clone(),
+            routes.clone(),
+            default_backend.clone(),
+        ));
         Ok(Self {
             backends,
             routes,
@@ -207,33 +475,20 @@ impl RoutingBackend {
             list_cooldown,
             list_timeout,
             list_fresh,
-            resolved: Default::default(),
-            missed: Default::default(),
+            resolver,
         })
     }
 
     /// Reverse-lookup: given a backend name and real bucket, find the virtual name.
     /// Returns `None` if no route maps to this (backend, real_bucket) pair.
     fn reverse_lookup(&self, backend_name: &str, real_bucket: &str) -> Option<String> {
-        for (virtual_name, route) in &self.routes {
-            if route.backend_name == backend_name {
-                let route_real = route
-                    .real_bucket
-                    .as_deref()
-                    .unwrap_or(virtual_name.as_str());
-                if route_real == real_bucket {
-                    return Some(virtual_name.clone());
-                }
-            }
-        }
-        None
+        reverse_lookup(&self.routes, backend_name, real_bucket)
     }
 
     /// True when `real_bucket` on `backend_name` is the storage of a route
-    /// under ANOTHER virtual name (an alias).
+    /// under another (alias) name.
     fn alias_owns_real_bucket(&self, backend_name: &str, real_bucket: &str) -> bool {
-        self.reverse_lookup(backend_name, real_bucket)
-            .is_some_and(|virtual_name| virtual_name != real_bucket)
+        alias_owns_real_bucket(&self.routes, backend_name, real_bucket)
     }
 
     /// Convert a bucket discovered on a concrete backend into the virtual
@@ -406,62 +661,8 @@ impl RoutingBackend {
     /// they still back the unavailable-placeholder path) so the next listing
     /// re-probes upstream. Called after create/delete bucket: read-after-write
     /// must see the change immediately, not after the freshness window.
-    fn cached_resolution(&self, virtual_bucket: &str) -> Option<String> {
-        let map = self.resolved.lock();
-        match map.get(virtual_bucket) {
-            // A stale entry stays: `last_known_resolution` uses it while
-            // the default backend errors. create/delete bucket clear it.
-            Some((name, at)) if at.elapsed() < RESOLVE_TTL => Some(name.clone()),
-            _ => None,
-        }
-    }
-
-    /// Where an unrouted bucket was last FOUND, however long ago. Evidence
-    /// that it is not on the default backend (a non-default entry is only
-    /// stored after the default answered "absent").
-    fn last_known_resolution(&self, virtual_bucket: &str) -> Option<String> {
-        self.resolved
-            .lock()
-            .get(virtual_bucket)
-            .map(|(name, _)| name.clone())
-    }
-
-    /// Did every backend answer "absent" for this bucket less than
-    /// `MISS_TTL` ago?
-    fn cached_miss(&self, virtual_bucket: &str) -> bool {
-        self.missed
-            .lock()
-            .get(virtual_bucket)
-            .is_some_and(|at| at.elapsed() < MISS_TTL)
-    }
-
-    fn remember_miss(&self, virtual_bucket: &str) {
-        let mut map = self.missed.lock();
-        // Bound the map: a bucket-name scan must not grow it without limit.
-        if map.len() >= 10_000 {
-            map.retain(|_, at| at.elapsed() < MISS_TTL);
-            if map.len() >= 10_000 {
-                map.clear();
-            }
-        }
-        map.insert(virtual_bucket.to_string(), std::time::Instant::now());
-    }
-
-    fn remember_resolution(&self, virtual_bucket: &str, backend_name: &str) {
-        let mut map = self.resolved.lock();
-        // Bound the map: a bucket-name scan must not grow it without limit.
-        if map.len() >= 10_000 {
-            map.clear();
-        }
-        map.insert(
-            virtual_bucket.to_string(),
-            (backend_name.to_string(), std::time::Instant::now()),
-        );
-    }
-
     fn invalidate_listing_freshness(&self) {
-        self.resolved.lock().clear();
-        self.missed.lock().clear();
+        self.resolver.invalidate();
         let mut h = self.health.lock();
         h.freshness_epoch = h.freshness_epoch.wrapping_add(1);
         for entry in h.last_known.values_mut() {
@@ -522,116 +723,9 @@ impl RoutingBackend {
             };
             return (route.backend_name.clone(), backend, real, Probed::No);
         }
-        if let Some(name) = self.cached_resolution(virtual_bucket) {
-            let backend = self.backends[&name].as_ref().as_ref();
-            return (name, backend, Cow::Borrowed(virtual_bucket), Probed::No);
-        }
-        if self.cached_miss(virtual_bucket) {
-            return (
-                self.default_backend.clone(),
-                self.default_backend(),
-                Cow::Borrowed(virtual_bucket),
-                Probed::No,
-            );
-        }
-        // A head_bucket ERROR (503/timeout) is NOT "bucket absent" — same
-        // hazard as `resolve_existing`: collapsing the error to `false` with
-        // `unwrap_or(false)` silently reroutes the multipart operation to the
-        // WRONG backend, so a transient blip on the bucket's real home can
-        // split one deltaspace's reference.bin and deltas across two same-named
-        // buckets. On error, route to THIS backend (the op re-hits it and
-        // surfaces the real error to the client); only a clean Ok(false) means
-        // "genuinely not here, keep looking".
-        let default = self.default_backend();
-        // A real bucket that a policy's alias owns on the default backend is
-        // that policy's storage (the same rule as the scan below): skip it.
-        let default_head = if self.alias_owns_real_bucket(&self.default_backend, virtual_bucket) {
-            Ok(false)
-        } else {
-            default.head_bucket(virtual_bucket).await
-        };
-        match default_head {
-            Ok(true) => {
-                self.remember_resolution(virtual_bucket, &self.default_backend);
-                return (
-                    self.default_backend.clone(),
-                    default,
-                    Cow::Borrowed(virtual_bucket),
-                    Probed::Found,
-                );
-            }
-            Err(e) => {
-                // The default is down. If the bucket was last FOUND on
-                // another backend (so the default once said "absent") and
-                // is still there, keep serving it from there.
-                if let Some(name) = self
-                    .last_known_resolution(virtual_bucket)
-                    .filter(|n| n != &self.default_backend)
-                {
-                    let backend = self.backends[&name].as_ref().as_ref();
-                    if matches!(backend.head_bucket(virtual_bucket).await, Ok(true)) {
-                        self.remember_resolution(virtual_bucket, &name);
-                        return (name, backend, Cow::Borrowed(virtual_bucket), Probed::Found);
-                    }
-                }
-                warn!(
-                    "resolve_existing_named: default backend head_bucket({virtual_bucket}) failed \
-                     transiently ({e}); routing to default rather than mis-routing"
-                );
-                return (
-                    self.default_backend.clone(),
-                    default,
-                    Cow::Borrowed(virtual_bucket),
-                    Probed::No,
-                );
-            }
-            Ok(false) => {}
-        }
-        let mut names: Vec<&String> = self.backends.keys().collect();
-        names.sort();
-        for name in names {
-            if name == &self.default_backend {
-                continue;
-            }
-            // A real bucket that a policy's alias owns on this backend is that
-            // policy's storage, not an unconfigured bucket of the same name.
-            if self.alias_owns_real_bucket(name, virtual_bucket) {
-                continue;
-            }
-            let backend = self.backends[name].as_ref().as_ref();
-            match backend.head_bucket(virtual_bucket).await {
-                Ok(true) => {
-                    self.remember_resolution(virtual_bucket, name);
-                    return (
-                        name.clone(),
-                        backend,
-                        Cow::Borrowed(virtual_bucket),
-                        Probed::Found,
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "resolve_existing_named: backend '{name}' head_bucket({virtual_bucket}) \
-                         failed transiently ({e}); routing here rather than mis-routing to default"
-                    );
-                    return (
-                        name.clone(),
-                        backend,
-                        Cow::Borrowed(virtual_bucket),
-                        Probed::No,
-                    );
-                }
-                Ok(false) => {}
-            }
-        }
-        // Every backend answered "absent": remember it briefly.
-        self.remember_miss(virtual_bucket);
-        (
-            self.default_backend.clone(),
-            default,
-            Cow::Borrowed(virtual_bucket),
-            Probed::Absent,
-        )
+        let (name, probed) = self.resolver.resolve(virtual_bucket).await;
+        let backend = self.backends[&name].as_ref().as_ref();
+        (name, backend, Cow::Borrowed(virtual_bucket), probed)
     }
 
     /// A backend whose listing failed, or that is in failure cooldown, keeps
@@ -1355,7 +1449,7 @@ impl StorageBackend for RoutingBackend {
         if let Some(route) = self.routes.get(bucket) {
             return Some(route.backend_name.clone());
         }
-        self.last_known_resolution(bucket)
+        self.resolver.last_known_resolution(bucket)
     }
 
     fn lite_list_carries_logical_facts(&self, bucket: &str) -> bool {
@@ -1878,8 +1972,11 @@ mod tests {
             list_cooldown: std::time::Duration::from_secs(30),
             list_timeout: std::time::Duration::from_secs(5),
             list_fresh: std::time::Duration::ZERO,
-            resolved: Default::default(),
-            missed: Default::default(),
+            resolver: Arc::new(Resolver::new(
+                HashMap::new(),
+                HashMap::new(),
+                "primary".to_string(),
+            )),
         };
 
         assert_eq!(
@@ -2039,7 +2136,7 @@ mod tests {
         let before = heads();
         routing.resolve_existing_named("shared").await;
         assert_eq!(heads(), before, "a miss is cached for MISS_TTL");
-        *routing.missed.lock().get_mut("shared").unwrap() =
+        *routing.resolver.missed.lock().get_mut("shared").unwrap() =
             std::time::Instant::now() - MISS_TTL - std::time::Duration::from_secs(1);
         routing.resolve_existing_named("shared").await;
         assert!(heads() > before, "an old miss is probed again");
@@ -2155,8 +2252,13 @@ mod tests {
             Some("archive")
         );
         // Age the entry past the TTL, then take the default down.
-        routing.resolved.lock().get_mut("shared").unwrap().1 =
-            std::time::Instant::now() - RESOLVE_TTL - std::time::Duration::from_secs(1);
+        routing
+            .resolver
+            .resolved
+            .lock()
+            .get_mut("shared")
+            .unwrap()
+            .1 = std::time::Instant::now() - RESOLVE_TTL - std::time::Duration::from_secs(1);
         *primary_probe.fail_head.lock().unwrap() = true;
         assert_eq!(routing.resolve_existing_named("shared").await.0, "archive");
         // Unknown bucket: no evidence → default.
@@ -2843,5 +2945,54 @@ mod tests {
             !routing.head_bucket("realdr").await.unwrap(),
             "the alias's storage answers under its real, unconfigured name"
         );
+    }
+
+    /// A routing backend over one fake S3 (`primary`, the default) whose
+    /// bucket HEADs take `delay_ms`.
+    async fn fake_routing(delay_ms: u64) -> (RoutingBackend, Arc<crate::storage::FakeS3>) {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        fake.set_delay_ms("HEAD_BUCKET", delay_ms);
+        let mut backends = HashMap::new();
+        backends.insert(
+            "primary".to_string(),
+            Arc::new(DynStorageBackend::new_box(
+                crate::storage::s3_test_support::for_test_endpoint(&endpoint),
+            )),
+        );
+        let routing = RoutingBackend::new(backends, HashMap::new(), "primary".to_string())
+            .expect("routing backend");
+        (routing, fake)
+    }
+
+    fn bucket_heads(fake: &crate::storage::FakeS3) -> usize {
+        fake.requests()
+            .iter()
+            .filter(|r| *r == "HEAD /b" || *r == "HEAD /b/")
+            .count()
+    }
+
+    /// P3.3 step 1: requests that find no cached resolution at once wait for
+    /// ONE round of HeadBuckets (the two variant reads of one GET, and every
+    /// other request in that moment). Each sent its own: N requests, N
+    /// HeadBuckets, on the request that was the slowest on Hetzner.
+    #[tokio::test]
+    async fn concurrent_cold_resolutions_send_one_head_bucket() {
+        let (routing, fake) = fake_routing(100).await;
+        let all =
+            futures::future::join_all((0..8).map(|_| routing.resolve_existing_named("b"))).await;
+        assert!(all.iter().all(|(name, _, _)| name == "primary"));
+        assert_eq!(bucket_heads(&fake), 1, "{:?}", fake.requests());
+    }
+
+    /// An error is not cached: the next resolution probes again.
+    #[tokio::test]
+    async fn a_failed_resolution_is_not_cached() {
+        let (routing, fake) = fake_routing(0).await;
+        fake.fail("HEAD_BUCKET", "/b", 503, "SlowDown", 1);
+        assert_eq!(routing.resolve_existing_named("b").await.0, "primary");
+        assert_eq!(routing.resolve_existing_named("b").await.0, "primary");
+        assert_eq!(bucket_heads(&fake), 2, "{:?}", fake.requests());
+        routing.resolve_existing_named("b").await;
+        assert_eq!(bucket_heads(&fake), 2, "the success is cached");
     }
 }

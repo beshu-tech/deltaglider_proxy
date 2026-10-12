@@ -1141,6 +1141,30 @@ mod preserve_tests {
     }
 
     #[test]
+    fn a_route_change_rebuilds_the_engine_and_its_bucket_resolutions() {
+        // The routing backend caches where unrouted buckets live (and serves
+        // a stale answer while it refreshes). A route or backend change must
+        // build a new engine, so a new RoutingBackend with empty caches: an
+        // old resolution never outlives the config that produced it.
+        let base = crate::config::Config::default();
+        let mut routed = base.clone();
+        routed.buckets.insert(
+            "releases".to_string(),
+            crate::bucket_policy::BucketPolicyConfig {
+                backend: Some("hetzner-fsn1".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(engine_affecting_fields_changed(&base, &routed));
+        let mut aliased = routed.clone();
+        aliased.buckets.get_mut("releases").unwrap().alias = Some("releases-v2".to_string());
+        assert!(engine_affecting_fields_changed(&routed, &aliased));
+        let mut moved = base.clone();
+        moved.default_backend = Some("aws-dr".to_string());
+        assert!(engine_affecting_fields_changed(&base, &moved));
+    }
+
+    #[test]
     fn engine_affecting_includes_passthrough_size_and_codec_concurrency() {
         // These are engine-snapshotted at construction; a change must force a
         // rebuild or the new value is a silent no-op (X-ray M4).
