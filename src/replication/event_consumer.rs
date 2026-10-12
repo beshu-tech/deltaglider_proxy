@@ -45,7 +45,7 @@ use crate::event_outbox::{
     current_unix_seconds, EventKind, EventOutboxRecord, EventSource, NewEvent,
 };
 use crate::transfer::{
-    copy_object_from, CopyClass, ObjectTransferRequest, TransferProvenance,
+    copy_object_known, CopyClass, ObjectTransferRequest, TransferProvenance,
     REPLICATION_RULE_METADATA_KEY,
 };
 
@@ -1403,11 +1403,12 @@ async fn apply_copy(
     // Only NotFound is "absent". A HEAD that failed (a throttle, a 5xx, a
     // timeout) says nothing: copying on it sent a full copy to a failing
     // destination. The key holds; an invalid key is about the key.
-    let dest_meta = match engine.head(&rule.destination.bucket, &dest_key).await {
-        Ok(meta) => Some(meta),
-        Err(crate::deltaglider::EngineError::NotFound(_)) => None,
-        Err(e) => return Err(classify_engine_error(e)),
-    };
+    // The same read is the usage-counter prior of the copy below, so the
+    // copy does not HEAD the destination again.
+    let (dest_meta, dest_prior) = engine
+        .head_with_counter_prior(&rule.destination.bucket, &dest_key)
+        .await
+        .map_err(classify_engine_error)?;
     let (include_globs, exclude_globs) = compile_rule_globs(rule)?;
     let decision = should_replicate(
         key,
@@ -1438,7 +1439,8 @@ async fn apply_copy(
                 keep_created_at: true,
             };
             // The copy starts from the HEAD above: no second source HEAD.
-            let outcome = copy_object_from(engine, transfer, Some(&src_meta)).await?;
+            let outcome =
+                copy_object_known(engine, transfer, Some(&src_meta), Some(&dest_prior)).await?;
             // Emit ReplicationObjectCopied so the chain is observable
             // (mirrors the reconcile worker).
             emit_replication_copied(db, rule, key, &dest_key, outcome.content_length()).await;

@@ -25,6 +25,53 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.storage.get_delta(bucket, prefix, filename).await
     }
 
+    /// [`Self::get_delta_raw`] and the metadata stored with the blob, both
+    /// from ONE read (the GET response on S3, the file and its xattr on
+    /// the filesystem). The metadata names the generation of these exact
+    /// bytes, so a caller that pins a generation needs no HEAD after the
+    /// GET.
+    pub async fn get_delta_raw_with_metadata(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<(Vec<u8>, FileMetadata), StorageError> {
+        self.open_raw(
+            bucket,
+            prefix,
+            crate::storage::StoredObject::Delta(filename),
+        )
+        .await
+    }
+
+    /// The reference blob verbatim and its stored metadata, from ONE read
+    /// (see [`Self::get_delta_raw_with_metadata`]).
+    pub async fn get_reference_raw_with_metadata(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<(Vec<u8>, FileMetadata), StorageError> {
+        self.open_raw(bucket, prefix, crate::storage::StoredObject::Reference)
+            .await
+    }
+
+    async fn open_raw(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        object: crate::storage::StoredObject<'_>,
+    ) -> Result<(Vec<u8>, FileMetadata), StorageError> {
+        use futures::TryStreamExt;
+        let (stream, meta) = self.storage.open_object(bucket, prefix, object).await?;
+        let data = stream
+            .try_fold(Vec::new(), |mut acc, chunk| async move {
+                acc.extend_from_slice(&chunk);
+                Ok(acc)
+            })
+            .await?;
+        Ok((data, meta))
+    }
+
     /// Write a delta blob + metadata verbatim into a deltaspace. Call it
     /// inside [`Self::with_dest_prefix_lock`]; outside it, multi-instance
     /// refuses. `prior`: what the key held, read before the write

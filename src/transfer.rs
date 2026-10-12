@@ -181,9 +181,13 @@ pub(crate) async fn copy_object_from(
 
 /// [`copy_object_from`], and what the destination key holds when the
 /// caller read it already (`destination_prior`): the write then reads no
-/// prior and deletes no stored form that the read found absent. Only a
-/// caller whose destination no one else writes in between may pass it (a
-/// maintenance job behind its write gate). The first attempt alone uses
+/// prior and deletes no stored form that the read found absent. A caller
+/// whose destination no one else writes in between passes it (a
+/// maintenance job behind its write gate), and so does the replication
+/// event consumer, which HEADs the destination just before it copies
+/// ([`DynEngine::head_with_counter_prior`]): a write by someone else in that
+/// window skews only the usage counter (the next usage scan corrects it),
+/// the same window the copy's own prior read had. The first attempt alone uses
 /// the given source and prior: a retry follows a failed attempt that may
 /// have written the destination, so it reads both again.
 pub(crate) async fn copy_object_known(
@@ -758,6 +762,21 @@ async fn verify_destination_sized(
         .head(request.destination_bucket, request.destination_key)
         .await
         .map_err(|e| CopyError::engine("destination verify head failed", e))?;
+    verify_verdict(
+        &dest,
+        expected_bytes,
+        stored_delta_size,
+        expected_multipart_etag,
+    )
+}
+
+/// The verify decision on the destination's metadata, as a [`CopyError`].
+fn verify_verdict(
+    dest: &crate::types::FileMetadata,
+    expected_bytes: usize,
+    stored_delta_size: Option<u64>,
+    expected_multipart_etag: Option<&str>,
+) -> Result<VerifyAccepted, CopyError> {
     match verify_size_verdict(
         dest.file_size,
         expected_bytes as u64,
@@ -1340,18 +1359,15 @@ async fn delta_passthrough_copy(
             // Read the source delta BEFORE any destination write: a failed
             // read then leaves no seeded reference.bin behind (its bytes
             // were added to no counter).
-            let delta_bytes = engine2
-                .get_delta_raw(&src_bucket, &src_prefix2, &src_filename2)
-                .await?;
             // Generation pin: `meta` comes from the HEAD taken before this
-            // read. Re-read the source metadata AFTER the bytes; if it still
-            // names the HEAD's generation, the bytes are that generation too.
-            // Otherwise the dest would get new bytes with the old sha.
-            let fresh = engine2
-                .delta_meta(&src_bucket, &src_prefix2, &src_filename2)
-                .await
-                .ok();
-            if !same_delta_generation(&meta_generation, fresh.as_ref(), delta_bytes.len()) {
+            // read. The GET returns the metadata stored with the bytes it
+            // returns; if that still names the HEAD's generation, the bytes
+            // are that generation. Otherwise the dest would get new bytes
+            // with the old sha. (A HEAD after the GET pinned it before.)
+            let (delta_bytes, fresh) = engine2
+                .get_delta_raw_with_metadata(&src_bucket, &src_prefix2, &src_filename2)
+                .await?;
+            if !same_delta_generation(&meta_generation, Some(&fresh), delta_bytes.len()) {
                 return Err(CopyError::source_changed(format_args!(
                     "{src_bucket}/{src_prefix2}/{src_filename2} was overwritten after HEAD"
                 )));
@@ -1359,9 +1375,10 @@ async fn delta_passthrough_copy(
             if decision == DeltaPassthroughDecision::SeedThenShip {
                 // Seed the dest reference verbatim, asserting it matches
                 // src.ref_sha256 before writing (defense layer 2).
-                let ref_data = engine2.get_reference_raw(&src_bucket, &src_prefix2).await?;
-                let mut ref_meta = engine2
-                    .reference_metadata_raw(&src_bucket, &src_prefix2)
+                // The bytes and their metadata from one GET: a HEAD after
+                // the GET could describe a reference re-seeded in between.
+                let (ref_data, mut ref_meta) = engine2
+                    .get_reference_raw_with_metadata(&src_bucket, &src_prefix2)
                     .await?;
                 if ref_meta.file_sha256 != src.ref_sha256 {
                     return Ok(false);
@@ -1408,14 +1425,18 @@ async fn delta_passthrough_copy(
     // then heal the metadata so the object stays restorable + verifies cleanly.
     // Verify already HEADed the dest; its verdict tells us whether a heal is
     // needed, so heal only fires (and re-HEADs under the lock) on the stripped path.
-    let accepted = verify_destination_sized(
-        engine,
-        request,
+    // The fast path wrote the `.delta` form and deleted the other one (or
+    // knew it absent): HEAD that form alone, not both (`engine.head`).
+    let dest = engine
+        .delta_meta(request.destination_bucket, &dest_prefix, &dest_filename)
+        .await
+        .map_err(|e| CopyError::storage("destination verify head failed", e))?;
+    let accepted = verify_verdict(
+        &dest,
         source_head.file_size as usize,
         Some(src_delta_size),
         source_head.multipart_etag.as_deref(),
-    )
-    .await?;
+    )?;
     if accepted == VerifyAccepted::StrippedDelta {
         heal_stripped_dest_delta(engine, request, &counter_meta, src_delta_size).await;
     }
@@ -3132,6 +3153,90 @@ mod request_count_tests {
     #[tokio::test]
     async fn a_seeded_reference_is_counted_when_the_delta_put_after_it_fails() {
         seeded_reference_counted_despite("PUT", "dst/p/b.zip.delta").await;
+    }
+
+    /// Two delta versions under `src/p/`, and `dst/p/` seeded with their
+    /// reference by a first copy. Returns the HEAD of `src/p/b.zip`.
+    async fn seeded_delta_pair(engine: &Arc<DynEngine>) -> crate::types::FileMetadata {
+        for (key, seed) in [("p/a.zip", 1u8), ("p/b.zip", 2u8), ("p/c.zip", 3u8)] {
+            engine
+                .store(
+                    "src",
+                    key,
+                    &versioned(seed, 64 * 1024),
+                    None,
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let first = copy_object_with_retries(engine, request("p/c.zip"))
+            .await
+            .unwrap();
+        assert_eq!(first.strategy, CopyStrategy::DeltaPassthrough);
+        let head = engine.head("src", "p/b.zip").await.unwrap();
+        assert!(head.is_delta(), "fixture must store b.zip as a delta");
+        head
+    }
+
+    /// P5.4: the delta fast path HEADed the source delta again after its
+    /// GET (the generation pin; the GET response carries that metadata)
+    /// and verified the destination with both forms (2 HEADs) though it
+    /// wrote one. Into a folder that holds the reference, without a usage
+    /// counter: 4 HEADs -> 2 (reference + verify).
+    #[tokio::test]
+    async fn the_delta_fast_path_heads_only_what_no_response_told_it() {
+        let (engine, fake) = s3_engine(None).await;
+        let head = seeded_delta_pair(&engine).await;
+        fake.clear();
+        let outcome = copy_object_from(&engine, request("p/b.zip"), Some(&head))
+            .await
+            .unwrap();
+        assert_eq!(outcome.strategy, CopyStrategy::DeltaPassthrough);
+        let r = fake.requests();
+        assert_eq!(count(&fake, "HEAD /src/"), 0, "the pin is the GET: {r:#?}");
+        assert_eq!(count(&fake, "HEAD /dst/p/b.zip.delta"), 1, "{r:#?}");
+        assert!(!r.iter().any(|x| x == "HEAD /dst/p/b.zip"), "{r:#?}");
+        assert_eq!(count(&fake, "HEAD "), 2, "{r:#?}");
+        assert_eq!(count(&fake, "GET "), 1, "{r:#?}");
+        assert_eq!(count(&fake, "PUT "), 1, "{r:#?}");
+        // The delta moves verbatim: what comes down goes up, no reference.
+        let (down, up) = fake.bytes();
+        assert_eq!((down, up), (outcome.bytes_copied as u64, down));
+        assert_eq!(
+            engine.retrieve("dst", "p/b.zip").await.unwrap().0,
+            engine.retrieve("src", "p/b.zip").await.unwrap().0
+        );
+    }
+
+    /// P5.4: a caller that HEADed the destination (the replication event
+    /// consumer) hands that read in as the counter prior: the copy sends no
+    /// HEAD of the destination key before its write, and the usage counter
+    /// still nets an overwrite to +0 objects.
+    #[tokio::test]
+    async fn the_callers_destination_head_is_the_counter_prior() {
+        let usage = Arc::new(BucketUsage::in_memory().unwrap());
+        let (engine, fake) = s3_engine(Some(usage.clone())).await;
+        let head = seeded_delta_pair(&engine).await;
+        for round in 0..2 {
+            let (dest, prior) = engine
+                .head_with_counter_prior("dst", "p/b.zip")
+                .await
+                .unwrap();
+            assert_eq!(dest.is_some(), round == 1);
+            fake.clear();
+            copy_object_known(&engine, request("p/b.zip"), Some(&head), Some(&prior))
+                .await
+                .unwrap();
+            let r = fake.requests();
+            // Reference HEAD + the verify HEAD of the written form.
+            assert_eq!(count(&fake, "HEAD "), 2, "round {round}: {r:#?}");
+            assert!(!r.iter().any(|x| x == "HEAD /dst/p/b.zip"), "{r:#?}");
+            assert_eq!(count(&fake, "DELETE "), 0, "{r:#?}");
+        }
+        usage.flush_pending();
+        let row = usage.read("dst").unwrap().unwrap();
+        assert_eq!(row.object_count, 2, "c.zip + b.zip once");
     }
 
     /// Blast finding 6: the SDK already sends a throttled PUT three times;

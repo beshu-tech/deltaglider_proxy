@@ -138,6 +138,44 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.prior_for_counter(bucket, dest_key).await
     }
 
+    /// HEAD `bucket/key` for a caller that may write the key next (the
+    /// replication event consumer reads the destination before it
+    /// copies): the metadata (`None` = absent), and the same read as the
+    /// `CounterPrior` of that write, so the copy does not read the key a
+    /// second time. The prior is only as fresh as this read: a write by
+    /// someone else between this read and the copy skews the usage counter
+    /// (never the stored data), and the next usage scan corrects it.
+    pub async fn head_with_counter_prior(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(Option<FileMetadata>, CounterPrior), EngineError> {
+        let tracked =
+            self.bucket_usage.is_some() && !crate::bucket_usage::is_transient_bucket(bucket);
+        match self.head_with_forms(bucket, key).await {
+            Ok((meta, forms)) => {
+                let prior = if tracked {
+                    CounterPrior::Present {
+                        object: Box::new(meta.clone()),
+                        forms,
+                    }
+                } else {
+                    CounterPrior::Untracked
+                };
+                Ok((Some(meta), prior))
+            }
+            Err(EngineError::NotFound(_)) => Ok((
+                None,
+                if tracked {
+                    CounterPrior::Absent
+                } else {
+                    CounterPrior::Untracked
+                },
+            )),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Counter update of a reference.bin that a fast-path copy seeded. Call
     /// it right after the reference write returns, before the delta ships:
     /// a ship that fails leaves the reference in place.

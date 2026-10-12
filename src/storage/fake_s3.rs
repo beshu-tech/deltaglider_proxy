@@ -53,9 +53,18 @@ pub(crate) struct FakeS3 {
     /// Object ACL requests (`?acl`) answer 501 NotImplemented, as on a
     /// backend that does not serve ACLs ([`FakeS3::set_acl_unsupported`]).
     acl_unsupported: std::sync::atomic::AtomicBool,
+    /// Object body bytes since the last [`FakeS3::clear`]: (sent by GET,
+    /// received by PUT).
+    bytes: parking_lot::Mutex<(u64, u64)>,
 }
 
 impl FakeS3 {
+    /// Object body bytes since the last [`FakeS3::clear`]: (downloaded by
+    /// GET, uploaded by PUT). A server-side copy moves none.
+    pub(crate) fn bytes(&self) -> (u64, u64) {
+        *self.bytes.lock()
+    }
+
     /// Every request so far, in order.
     pub(crate) fn requests(&self) -> Vec<String> {
         self.requests.lock().clone()
@@ -172,6 +181,7 @@ impl FakeS3 {
     /// Forget the requests so far.
     pub(crate) fn clear(&self) {
         self.requests.lock().clear();
+        *self.bytes.lock() = (0, 0);
     }
 
     /// Wait until a request matches `pred` (up to 10 s).
@@ -524,6 +534,7 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                         }
                         match method {
                             Method::PUT => {
+                                f.bytes.lock().1 += body.len() as u64;
                                 let etag = format!("\"{}\"", hex::encode(md5::Md5::digest(&body)));
                                 let meta = headers
                                     .iter()
@@ -559,6 +570,7 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                                         .and_then(|v| v.strip_prefix("bytes="))
                                         .and_then(|v| v.split_once('-'));
                                     let Some((first, last)) = range else {
+                                        f.bytes.lock().0 += o.body.len() as u64;
                                         return (StatusCode::OK, h, o.body);
                                     };
                                     // `bytes=a-b` and `bytes=a-`, like S3: a
@@ -576,6 +588,7 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                                     }
                                     let last = last.min(len - 1);
                                     let part = o.body[first as usize..=last as usize].to_vec();
+                                    f.bytes.lock().0 += part.len() as u64;
                                     h.insert(
                                         "content-range",
                                         format!("bytes {first}-{last}/{len}").parse().unwrap(),
