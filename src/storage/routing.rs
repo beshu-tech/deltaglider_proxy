@@ -84,6 +84,12 @@ fn alias_owns_real_bucket(
 /// cached answer wait for one probe (`gates`) and read its answer. An
 /// error is not cached, so the next request probes again.
 ///
+/// Stale-while-revalidate: a resolution older than `RESOLVE_TTL` is still
+/// served at once while ONE background probe refreshes it; one older than
+/// `RESOLVE_HARD_EXPIRY` is not served, so a removed bucket never lives on.
+/// A bucket deleted on its backend meanwhile answers the backend's own
+/// `NoSuchBucket` to the requests that the stale resolution sends there.
+///
 /// Staleness across nodes: a peer that creates or deletes a bucket is seen
 /// within `RESOLVE_TTL` (found) or `MISS_TTL` (absent). A config apply
 /// that changes routes or backends builds a new `RoutingBackend`, so a new
@@ -105,6 +111,9 @@ struct Resolver {
     /// Unrouted bucket → the gate its cold resolution runs under. The entry
     /// goes when the probe ends.
     gates: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Buckets whose stale resolution a background probe is refreshing:
+    /// one refresher per bucket.
+    refreshing: Arc<parking_lot::Mutex<HashSet<String>>>,
     /// Bumped by `invalidate`: a probe that started before an invalidation
     /// does not store its (possibly pre-mutation) answer.
     generation: std::sync::atomic::AtomicU64,
@@ -123,6 +132,7 @@ impl Resolver {
             resolved: Default::default(),
             missed: Default::default(),
             gates: Default::default(),
+            refreshing: Default::default(),
             generation: Default::default(),
         }
     }
@@ -212,18 +222,36 @@ impl Resolver {
             .then(|| (self.default_backend.clone(), Probed::No))
     }
 
-    /// Resolve an unrouted bucket: the cached answer, else one probe shared
-    /// by every request that arrives while it runs.
-    async fn resolve(&self, virtual_bucket: &str) -> (String, Probed) {
-        if let Some(hit) = self.cached(virtual_bucket) {
-            return hit;
+    /// A resolution that is past `RESOLVE_TTL` but not past
+    /// `RESOLVE_HARD_EXPIRY`: served while a background probe refreshes it.
+    fn stale_resolution(&self, virtual_bucket: &str) -> Option<String> {
+        match self.resolved.lock().get(virtual_bucket) {
+            Some((name, at)) if at.elapsed() < RESOLVE_HARD_EXPIRY => Some(name.clone()),
+            _ => None,
         }
-        let gate = self
-            .gates
+    }
+
+    /// The gate a probe of `virtual_bucket` runs under.
+    fn gate(&self, virtual_bucket: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.gates
             .lock()
             .entry(virtual_bucket.to_string())
             .or_default()
-            .clone();
+            .clone()
+    }
+
+    /// Resolve an unrouted bucket: the cached answer, a stale one (and a
+    /// background refresh), else one probe shared by every request that
+    /// arrives while it runs.
+    async fn resolve(self: &Arc<Self>, virtual_bucket: &str) -> (String, Probed) {
+        if let Some(hit) = self.cached(virtual_bucket) {
+            return hit;
+        }
+        if let Some(name) = self.stale_resolution(virtual_bucket) {
+            self.refresh_in_background(virtual_bucket);
+            return (name, Probed::No);
+        }
+        let gate = self.gate(virtual_bucket);
         let _held = gate.lock().await;
         // The probe that held the gate may have answered for us.
         if let Some(hit) = self.cached(virtual_bucket) {
@@ -232,6 +260,37 @@ impl Resolver {
         let out = self.probe(virtual_bucket).await;
         self.gates.lock().remove(virtual_bucket);
         out
+    }
+
+    /// Start the one background probe of a stale resolution (none when one
+    /// runs, or outside a tokio runtime: the stale answer is then served
+    /// until the hard expiry makes a request probe).
+    fn refresh_in_background(self: &Arc<Self>, virtual_bucket: &str) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if !self.refreshing.lock().insert(virtual_bucket.to_string()) {
+            return;
+        }
+        /// Clears the bucket's refreshing mark however the task ends.
+        struct Refreshing(Arc<parking_lot::Mutex<HashSet<String>>>, String);
+        impl Drop for Refreshing {
+            fn drop(&mut self) {
+                self.0.lock().remove(&self.1);
+            }
+        }
+        let mark = Refreshing(self.refreshing.clone(), virtual_bucket.to_string());
+        let this = Arc::clone(self);
+        runtime.spawn(async move {
+            let bucket = mark.1.clone();
+            let gate = this.gate(&bucket);
+            let _held = gate.lock().await;
+            if this.cached_resolution(&bucket).is_none() {
+                this.probe(&bucket).await;
+            }
+            this.gates.lock().remove(&bucket);
+            drop(mark);
+        });
     }
 
     /// The HeadBucket round: the default backend first, then every other
@@ -381,6 +440,10 @@ enum Probed {
 
 /// How long a found unrouted bucket stays resolved without a new probe.
 const RESOLVE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a found unrouted bucket may be served stale (while one
+/// background probe refreshes it) before a request must probe again.
+const RESOLVE_HARD_EXPIRY: std::time::Duration = RESOLVE_TTL.saturating_mul(5);
 
 /// How long an unrouted bucket that no backend holds stays a miss. Short:
 /// a bucket that a peer creates on a non-default backend is seen this late.
@@ -2251,14 +2314,16 @@ mod tests {
             routing.resolved_backend_name("shared").as_deref(),
             Some("archive")
         );
-        // Age the entry past the TTL, then take the default down.
+        // Age the entry past its hard expiry (so the request probes), then
+        // take the default down.
         routing
             .resolver
             .resolved
             .lock()
             .get_mut("shared")
             .unwrap()
-            .1 = std::time::Instant::now() - RESOLVE_TTL - std::time::Duration::from_secs(1);
+            .1 =
+            std::time::Instant::now() - RESOLVE_HARD_EXPIRY - std::time::Duration::from_secs(1);
         *primary_probe.fail_head.lock().unwrap() = true;
         assert_eq!(routing.resolve_existing_named("shared").await.0, "archive");
         // Unknown bucket: no evidence → default.
@@ -2994,5 +3059,60 @@ mod tests {
         assert_eq!(bucket_heads(&fake), 2, "{:?}", fake.requests());
         routing.resolve_existing_named("b").await;
         assert_eq!(bucket_heads(&fake), 2, "the success is cached");
+    }
+
+    fn age_resolution(routing: &RoutingBackend, bucket: &str, age: std::time::Duration) {
+        routing.resolver.resolved.lock().get_mut(bucket).unwrap().1 =
+            std::time::Instant::now() - age;
+    }
+
+    /// P3.3 step 2: past RESOLVE_TTL the resolution is served stale at once
+    /// and ONE background probe refreshes it, however many requests read
+    /// it meanwhile. The request that found it stale paid the HeadBucket.
+    #[tokio::test]
+    async fn a_stale_resolution_is_served_while_one_probe_refreshes_it() {
+        let (routing, fake) = fake_routing(300).await;
+        routing.resolve_existing_named("b").await;
+        age_resolution(
+            &routing,
+            "b",
+            RESOLVE_TTL + std::time::Duration::from_secs(1),
+        );
+        fake.clear();
+        let started = std::time::Instant::now();
+        let all =
+            futures::future::join_all((0..8).map(|_| routing.resolve_existing_named("b"))).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "the stale answer waited for the probe ({:?})",
+            started.elapsed()
+        );
+        assert!(all.iter().all(|(name, _, _)| name == "primary"));
+        // The one refresh lands and makes the entry fresh again.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while routing.resolver.cached_resolution("b").is_none() {
+            assert!(std::time::Instant::now() < deadline, "no refresh");
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(bucket_heads(&fake), 1, "{:?}", fake.requests());
+    }
+
+    /// Hard expiry: a resolution older than 5 x RESOLVE_TTL is not served;
+    /// the request waits for a probe, so a removed route never lives on.
+    #[tokio::test]
+    async fn a_resolution_past_its_hard_expiry_is_probed_again() {
+        let (routing, fake) = fake_routing(300).await;
+        routing.resolve_existing_named("b").await;
+        age_resolution(
+            &routing,
+            "b",
+            5 * RESOLVE_TTL + std::time::Duration::from_secs(1),
+        );
+        fake.clear();
+        let started = std::time::Instant::now();
+        routing.resolve_existing_named("b").await;
+        assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+        assert_eq!(bucket_heads(&fake), 1, "{:?}", fake.requests());
     }
 }
