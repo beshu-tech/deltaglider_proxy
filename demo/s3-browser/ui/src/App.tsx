@@ -794,7 +794,7 @@ export default function App() {
       <InspectorPanel
         object={s3.inspectorObject}
         onClose={s3.closeInspector}
-        onDeleted={s3.mutate}
+        onDeleted={s3.removeObject}
         onPreview={openPreview}
         isMobile={isMobile}
         canDelete={canDeleteSelectedObject}

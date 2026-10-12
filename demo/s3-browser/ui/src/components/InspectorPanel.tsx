@@ -41,7 +41,8 @@ interface BucketPolicyInfo {
 interface Props {
   object: S3Object | null;
   onClose: () => void;
-  onDeleted: () => void;
+  /** The object `key` is gone (the caller drops its row). */
+  onDeleted: (key: string) => void;
   onPreview?: (obj: S3Object) => void;
   isMobile?: boolean;
   canDelete?: boolean;
@@ -406,11 +407,11 @@ export default function InspectorPanel({
     const reqKey = object.key;
     try {
       await deleteObject(reqKey);
-      // If the user switched to a different object mid-delete, still refresh the
-      // list (A really was deleted) but do NOT deselect the now-current object B.
-      if (latestKeyRef.current !== reqKey) { onDeleted(); return; }
+      // If the user switched to a different object mid-delete, still drop A's
+      // row (A really was deleted) but do NOT deselect the now-current object B.
+      if (latestKeyRef.current !== reqKey) { onDeleted(reqKey); return; }
       onClose();
-      onDeleted();
+      onDeleted(reqKey);
     } catch {
       messageApi.error('Failed to delete object');
     }

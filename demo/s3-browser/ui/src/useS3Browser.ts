@@ -11,6 +11,7 @@ import {
   bulkZipDownloadUrl,
   getPrefixSavings,
   listAllUnderPrefix,
+  type BucketUsage,
 } from './adminApi';
 import { type DeltaSummary, summaryFromResponse } from './deltaSummary';
 import { isSessionExpired, normalizeUiError } from './errorHandling';
@@ -268,6 +269,32 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     refresh();
     setSavingsTrigger((k) => k + 1);
   }, [refresh]);
+
+  /**
+   * After a single delete (the inspector): drop the row and take it off the
+   * bucket's size/count pill, with no new listing. The 60 s refresh
+   * reconciles both with the backend.
+   */
+  const objectsRef = useRef(objects);
+  objectsRef.current = objects;
+  const removeObject = useCallback((key: string) => {
+    const gone = objectsRef.current.find((o) => o.key === key);
+    if (!gone) return;
+    const rest = objectsRef.current.filter((o) => o.key !== key);
+    setObjects(rest);
+    reconcile(rest, folders);
+    const listBucket = bucket || getBucket();
+    queryClient.setQueryData<BucketUsage | null>(qk.bucketUsage(listBucket), (usage) =>
+      usage
+        ? {
+            ...usage,
+            object_count: Math.max(0, usage.object_count - 1),
+            logical_bytes: Math.max(0, usage.logical_bytes - gone.size),
+            stored_bytes: Math.max(0, usage.stored_bytes - (gone.storedSize ?? gone.size)),
+          }
+        : usage,
+    );
+  }, [bucket, folders, queryClient, reconcile]);
 
   // ── Inspector deep-link (?object=<key>) ──────────────────────────────────
   // The "which object is open in the inspector drawer" state lives in the URL
@@ -634,6 +661,7 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     changeBucket,
     reconnect,
     mutate,
+    removeObject,
     bulkDelete,
     bulkCopy,
     bulkMove,

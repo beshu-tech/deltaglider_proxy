@@ -67,6 +67,7 @@ test('confirming deletes that key, closes the drawer and refreshes the list', as
   const confirm = await openConfirm(user);
   await user.click(within(confirm).getByRole('button', { name: 'Delete' }));
   await waitFor(() => expect(onDeleted).toHaveBeenCalledTimes(1));
+  expect(onDeleted).toHaveBeenCalledWith('builds/app-1.0.zip');
   expect(s3.deleteObject).toHaveBeenCalledWith('builds/app-1.0.zip');
   expect(onClose).toHaveBeenCalledTimes(1);
 });
