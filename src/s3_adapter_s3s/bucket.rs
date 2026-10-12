@@ -195,31 +195,28 @@ pub(super) async fn delete_bucket(
 }
 
 /// The first visible key of `bucket` in key order, or `None` when it holds
-/// none. It descends one `/`-delimited level at a time: a listing without a
-/// delimiter walks the whole bucket on the filesystem backend just to find
-/// one key (s3surface-12). The first entry of each level is the prefix of
-/// the first key, so the result is the first key of the flat listing.
+/// none: one flat lite page of one key (no listing facts, no HEAD). Both
+/// backends list a flat page by a sorted walk that stops after the page, so
+/// this costs one LIST request on S3 and a short walk on the filesystem.
+/// Proxy internals (reference.bin, `.dg/`, temp files) are never listed, so
+/// a bucket that holds only them is empty. A page that the backend serves
+/// empty but truncated (its first upstream page held only internals) is
+/// followed by its token.
 pub(super) async fn first_visible_key<L: crate::iam::listing::Lister>(
     lister: &L,
     bucket: &str,
 ) -> Result<Option<String>, crate::deltaglider::EngineError> {
-    let mut prefix = String::new();
+    let mut cursor: Option<String> = None;
     loop {
-        let page = lister
-            .list(bucket, &prefix, Some("/"), 1, None, false)
+        let (page, _) = lister
+            .list_lite(bucket, "", None, 1, cursor.as_deref())
             .await?;
-        if let Some((key, _)) = page.objects.first() {
-            return Ok(Some(key.clone()));
+        if let Some((key, _)) = page.objects.into_iter().next() {
+            return Ok(Some(key));
         }
-        match page.common_prefixes.first() {
-            Some(next) => prefix = next.clone(),
-            None if prefix.is_empty() => return Ok(None),
-            // A prefix with nothing visible under it (on S3, one that holds
-            // only proxy-internal keys): the flat listing decides.
-            None => {
-                let flat = lister.list(bucket, "", None, 1, None, false).await?;
-                return Ok(flat.objects.first().map(|(key, _)| key.clone()));
-            }
+        match page.next_continuation_token.filter(|_| page.is_truncated) {
+            Some(token) => cursor = Some(token),
+            None => return Ok(None),
         }
     }
 }
