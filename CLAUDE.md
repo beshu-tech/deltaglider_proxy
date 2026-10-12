@@ -106,6 +106,7 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
       mod.rs                 IamState enum, auth mode detection, IAM_VERSION counter
       types.rs               IamUser, AuthenticatedUser, Permission types
       permissions.rs         ABAC evaluation, is_admin, action matching
+      compiled.rs            A principal's policies compiled once (action masks, resource matchers); iam-rs only for conditioned statements; differential proptest vs iam-rs
       middleware.rs          Per-request auth middleware
       keygen.rs              Secure key generation
       declarative.rs         Declarative-mode reconciler (diff_iam → apply_iam_reconcile)

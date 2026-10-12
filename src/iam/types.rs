@@ -154,9 +154,14 @@ pub const ANONYMOUS_USER_NAME: &str = "$anonymous";
 pub struct AuthenticatedUser {
     pub name: String,
     pub access_key_id: String,
-    pub permissions: Vec<Permission>,
-    /// Precomputed IAM policies for iam-rs evaluation (includes conditions support).
-    pub iam_policies: Vec<IAMPolicy>,
+    /// Read through [`Self::permissions`]. Private: the compiled policy is
+    /// built from these at construction and must not drift from them.
+    permissions: Vec<Permission>,
+    /// Precomputed IAM policies for iam-rs evaluation (includes conditions
+    /// support). Read through [`Self::iam_policies`].
+    iam_policies: Vec<IAMPolicy>,
+    /// `iam_policies`, compiled once ([`super::compiled::CompiledPolicy`]).
+    compiled: super::compiled::CompiledPolicy,
 }
 
 /// `$`-prefixed user names are reserved for synthetic principals
@@ -223,12 +228,24 @@ impl AuthenticatedUser {
         permissions: Vec<Permission>,
         iam_policies: Vec<IAMPolicy>,
     ) -> Self {
+        let compiled = super::compiled::CompiledPolicy::new(&iam_policies);
         Self {
             name,
             access_key_id,
             permissions,
             iam_policies,
+            compiled,
         }
+    }
+
+    /// The effective permissions (direct, group-inherited, templates expanded).
+    pub fn permissions(&self) -> &[Permission] {
+        &self.permissions
+    }
+
+    /// The IAM policies built from [`Self::permissions`].
+    pub fn iam_policies(&self) -> &[IAMPolicy] {
+        &self.iam_policies
     }
 
     /// The bootstrap principal: full access to everything. THE one definition,
@@ -283,7 +300,7 @@ impl AuthenticatedUser {
     #[cfg(test)]
     pub fn can(&self, action: S3Action, bucket: &str, key: &str) -> bool {
         if !self.iam_policies.is_empty() {
-            permissions::evaluate_iam(&self.iam_policies, action, bucket, key, &Default::default())
+            permissions::evaluate_compiled(&self.compiled, action, bucket, key, &Default::default())
         } else {
             permissions::evaluate(&self.permissions, action, bucket, key)
         }
@@ -299,7 +316,7 @@ impl AuthenticatedUser {
         context: &iam_rs::Context,
     ) -> bool {
         if !self.iam_policies.is_empty() {
-            permissions::evaluate_iam(&self.iam_policies, action, bucket, key, context)
+            permissions::evaluate_compiled(&self.compiled, action, bucket, key, context)
         } else {
             // Legacy path — no conditions support, ignore context
             permissions::evaluate(&self.permissions, action, bucket, key)
@@ -316,7 +333,7 @@ impl AuthenticatedUser {
         context: &iam_rs::Context,
     ) -> bool {
         if !self.iam_policies.is_empty() {
-            permissions::is_explicitly_denied_iam(&self.iam_policies, action, bucket, key, context)
+            permissions::is_explicitly_denied_compiled(&self.compiled, action, bucket, key, context)
         } else {
             // Legacy: check if any Deny rule matches
             permissions::has_matching_deny(&self.permissions, action, bucket, key)
@@ -400,11 +417,8 @@ mod principal_tests {
     /// user who is merely NAMED `$anonymous` keeps full signature checks.
     #[test]
     fn anonymous_is_structural_not_a_name() {
-        let named = |name: &str, ak: &str| AuthenticatedUser {
-            name: name.into(),
-            access_key_id: ak.into(),
-            permissions: vec![],
-            iam_policies: vec![],
+        let named = |name: &str, ak: &str| {
+            AuthenticatedUser::from_parts(name.into(), ak.into(), vec![], vec![])
         };
         assert!(named(ANONYMOUS_USER_NAME, "").is_anonymous());
         assert!(!named(ANONYMOUS_USER_NAME, "AKREAL").is_anonymous());

@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c080f815b10b15fd0eeb008470e4471c01e8c5d884b14376293de07060058b90 # shrinks to policies = [IAMPolicy { version: V20121017, id: None, statement: [IAMStatement { sid: None, effect: Allow, principal: None, not_principal: None, action: Some(Multiple(["s3:CreateBucket"])), not_action: None, resource: Some(Multiple(["arn:aws:s3:::"])), not_resource: None, condition: None }] }], action = Admin, (bucket, key) = ("b", ""), context = Context { data: {} }
+cc 2c6714e19612c240293afa799fbb2857ff3510894f4cdace45df8fc377a68fdd # shrinks to policies = [IAMPolicy { version: V20121017, id: None, statement: [IAMStatement { sid: None, effect: Allow, principal: None, not_principal: None, action: Some(Multiple(["s3:*"])), not_action: None, resource: Some(Multiple(["*"])), not_resource: None, condition: Some(ConditionBlock { conditions: {StringEquals: {"s3:prefix": String("")}} }) }] }], action = Read, (bucket, key) = ("b", ""), context = Context { data: {} }
+cc 5f6f5cf2f585770980b2fefcb46f5b195b0ab59ee95ffae59029eebf33ffc6a4 # shrinks to policies = [IAMPolicy { version: V20121017, id: None, statement: [IAMStatement { sid: None, effect: Deny, principal: None, not_principal: None, action: Some(Multiple(["s3:*"])), not_action: None, resource: Some(Multiple(["*"])), not_resource: None, condition: None }] }], action = Read, (bucket, key) = ("b", ""), context = Context { data: {} }
+cc 932bbe9a4da759018707fb1a230262769c96daf13ab5e3d301f5117e7bee6c96 # shrinks to policies = [IAMPolicy { version: V20121017, id: None, statement: [IAMStatement { sid: None, effect: Allow, principal: None, not_principal: None, action: Some(Single("s3:*")), not_action: None, resource: Some(Single("arn:aws:s3:::?/*")), not_resource: None, condition: None }] }], action = Read, (bucket, key) = ("b", ""), context = Context { data: {} }

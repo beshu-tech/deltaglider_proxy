@@ -61,7 +61,7 @@ fn authz(c: &mut Criterion) {
     insert_source_ip(&mut ctx, Some("10.1.2.3".parse().unwrap()));
     for extra in [0usize, 10] {
         let u = user(extra);
-        let rules = u.permissions.len();
+        let rules = u.permissions().len();
         c.bench_function(
             &format!("authz/get_allowed_by_last_rule/{rules}rules"),
             |b| {
@@ -116,7 +116,7 @@ fn authz(c: &mut Criterion) {
 fn principal(c: &mut Criterion) {
     for extra in [0usize, 10] {
         let u = std::sync::Arc::new(user(extra));
-        let rules = u.permissions.len();
+        let rules = u.permissions().len();
         c.bench_function(&format!("principal/handoff/{rules}rules"), |b| {
             b.iter(|| black_box(std::sync::Arc::clone(black_box(&u))))
         });

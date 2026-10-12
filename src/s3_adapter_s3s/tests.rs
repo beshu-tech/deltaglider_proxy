@@ -40,15 +40,15 @@ fn copy_source_access_honors_source_ip_condition() {
         resources: vec!["*".into()],
         conditions: Some(serde_json::json!({"IpAddress": {"aws:SourceIp": "10.0.0.0/8"}})),
     };
-    let user = AuthenticatedUser {
-        name: "u".into(),
-        access_key_id: "AKIA".into(),
-        permissions: vec![],
-        iam_policies: [allow, deny_ip]
+    let user = AuthenticatedUser::from_parts(
+        "u".into(),
+        "AKIA".into(),
+        vec![],
+        [allow, deny_ip]
             .iter()
             .map(permission_to_iam_policy)
             .collect(),
-    };
+    );
     // From a denied IP → AccessDenied (was silently allowed before the fix).
     assert!(
         check_copy_source_access_s3s(
@@ -247,12 +247,12 @@ fn anonymous_metadata_drops_the_tool_stamp() {
 
 #[test]
 fn reader_identity_from_request_extensions() {
-    let anon = AuthenticatedUser {
-        name: crate::iam::types::ANONYMOUS_USER_NAME.into(),
-        access_key_id: String::new(),
-        permissions: vec![],
-        iam_policies: vec![],
-    };
+    let anon = AuthenticatedUser::from_parts(
+        crate::iam::types::ANONYMOUS_USER_NAME.into(),
+        String::new(),
+        vec![],
+        vec![],
+    );
     let alice = AuthenticatedUser::from_parts("alice".into(), String::new(), vec![], vec![]);
 
     let mut ext = axum::http::Extensions::new();
@@ -1022,12 +1022,12 @@ fn write_fact_headers_per_form_and_writer() {
 
 #[test]
 fn a_form_post_writer_is_anonymous_only_as_the_anonymous_principal() {
-    let anon = AuthenticatedUser {
-        name: crate::iam::types::ANONYMOUS_USER_NAME.into(),
-        access_key_id: String::new(),
-        permissions: vec![],
-        iam_policies: vec![],
-    };
+    let anon = AuthenticatedUser::from_parts(
+        crate::iam::types::ANONYMOUS_USER_NAME.into(),
+        String::new(),
+        vec![],
+        vec![],
+    );
     let alice = AuthenticatedUser::from_parts("alice".into(), String::new(), vec![], vec![]);
     assert_eq!(Reader::of_principal(None), Reader::Authenticated);
     assert_eq!(Reader::of_principal(Some(&alice)), Reader::Authenticated);

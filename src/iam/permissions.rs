@@ -455,7 +455,73 @@ fn build_iam_evaluator(
     Some((request, evaluator, resource_str))
 }
 
-/// Evaluate permissions using iam-rs policy engine.
+/// The request resource ARN text after `arn:aws:s3:::`.
+fn request_resource(bucket: &str, key: &str) -> String {
+    if key.is_empty() {
+        bucket.to_string()
+    } else {
+        format!("{bucket}/{key}")
+    }
+}
+
+/// THE allow rule over one policy evaluator (`eval`: resource text after
+/// `arn:aws:s3:::` → iam-rs decision). An error fails closed. A
+/// bucket-level request that no rule matched is asked again as `bucket/`,
+/// so `bucket/*` can match a bucket-level LIST; an explicit Deny on the
+/// bucket itself is final.
+fn allowed_by(
+    eval: impl Fn(&str) -> Result<Decision, iam_rs::EvaluationError>,
+    action: S3Action,
+    bucket: &str,
+    key: &str,
+) -> bool {
+    let resource = request_resource(bucket, key);
+    match eval(&resource) {
+        Ok(Decision::Allow) => true,
+        Ok(Decision::Deny) => false,
+        Ok(Decision::NotApplicable) => {
+            key.is_empty() && matches!(eval(&format!("{bucket}/")), Ok(Decision::Allow))
+        }
+        Err(e) => {
+            tracing::warn!(
+                "IAM policy evaluation error: {} (action={}, resource=arn:aws:s3:::{})",
+                e,
+                action.to_iam_action(),
+                resource
+            );
+            false // fail closed
+        }
+    }
+}
+
+/// THE explicit-deny rule over one policy evaluator. An evaluation error (a
+/// condition value iam-rs cannot read) fails closed, as [`allowed_by`]
+/// does: "not denied" would show the keys a Deny hides in a LIST filter.
+fn denied_by(
+    eval: impl Fn(&str) -> Result<Decision, iam_rs::EvaluationError>,
+    bucket: &str,
+    key: &str,
+) -> bool {
+    !matches!(eval(&request_resource(bucket, key)), Ok(d) if d != Decision::Deny)
+}
+
+/// iam-rs itself over `policies`: the reference that the compiled
+/// evaluator must equal (differential test), and the evaluator of one-off
+/// policies that are not a principal's (the admin-condition check).
+fn iam_rs_eval<'a>(
+    policies: &[IAMPolicy],
+    action: S3Action,
+    context: &'a Context,
+) -> impl Fn(&str) -> Result<Decision, iam_rs::EvaluationError> + 'a {
+    let evaluator = PolicyEvaluator::with_policies(policies.to_vec());
+    move |resource| {
+        evaluator
+            .evaluate(&super::compiled::iam_request(action, resource, context))
+            .map(|r| r.decision)
+    }
+}
+
+/// Evaluate permissions using the iam-rs policy engine.
 /// Supports conditions (s3:prefix, aws:SourceIp, etc.) via the context parameter.
 pub(crate) fn evaluate_iam(
     policies: &[IAMPolicy],
@@ -464,53 +530,28 @@ pub(crate) fn evaluate_iam(
     key: &str,
     context: &Context,
 ) -> bool {
-    let (request, evaluator, resource_str) =
-        match build_iam_evaluator(policies, action, bucket, key, context) {
-            Some(t) => t,
-            None => return false, // fail closed
-        };
+    allowed_by(iam_rs_eval(policies, action, context), action, bucket, key)
+}
 
-    match evaluator.evaluate(&request) {
-        Ok(result) => {
-            if result.decision == Decision::Allow {
-                return true;
-            }
-            // Explicit Deny on the exact resource takes priority — don't try the alt path.
-            if result.decision == Decision::Deny {
-                return false;
-            }
-            // For bucket-level operations where no rule matched (implicit deny),
-            // also try with trailing slash so "bucket/*" can match bucket-level LIST.
-            if key.is_empty() {
-                let alt_str = format!("arn:aws:s3:::{}/", bucket);
-                if let Ok(alt_arn) = Arn::parse(&alt_str) {
-                    let alt_request = IAMRequest::new_with_context(
-                        Principal::Aws(PrincipalId::String("000000000000".into())),
-                        action.to_iam_action(),
-                        alt_arn,
-                        context.clone(),
-                    );
-                    if let Ok(alt_result) = evaluator.evaluate(&alt_request) {
-                        return alt_result.decision == Decision::Allow;
-                    }
-                }
-            }
-            false
-        }
-        Err(e) => {
-            tracing::warn!(
-                "IAM policy evaluation error: {} (action={}, resource={})",
-                e,
-                action.to_iam_action(),
-                resource_str
-            );
-            false // fail closed
-        }
-    }
+/// [`evaluate_iam`] through a principal's compiled policy: the request path.
+pub(crate) fn evaluate_compiled(
+    policy: &super::compiled::CompiledPolicy,
+    action: S3Action,
+    bucket: &str,
+    key: &str,
+    context: &Context,
+) -> bool {
+    allowed_by(
+        |resource| policy.evaluate(action, resource, context),
+        action,
+        bucket,
+        key,
+    )
 }
 
 /// Check if an explicit Deny rule matches (iam-rs path).
 /// Returns true if the decision is Deny (not NotApplicable).
+#[cfg(test)]
 pub(crate) fn is_explicitly_denied_iam(
     policies: &[IAMPolicy],
     action: S3Action,
@@ -518,18 +559,22 @@ pub(crate) fn is_explicitly_denied_iam(
     key: &str,
     context: &Context,
 ) -> bool {
-    let (request, evaluator, _) = match build_iam_evaluator(policies, action, bucket, key, context)
-    {
-        Some(t) => t,
-        None => return true, // fail closed: assume denied if ARN can't be parsed
-    };
+    denied_by(iam_rs_eval(policies, action, context), bucket, key)
+}
 
-    // An evaluation error (a condition value iam-rs cannot read) fails
-    // closed, as evaluate_iam does: "not denied" would show the keys a Deny
-    // hides in a LIST filter.
-    !matches!(
-        evaluator.evaluate(&request),
-        Ok(result) if result.decision != Decision::Deny
+/// The explicit-deny check of `is_explicitly_denied_iam`, through a
+/// principal's compiled policy: the request path.
+pub(crate) fn is_explicitly_denied_compiled(
+    policy: &super::compiled::CompiledPolicy,
+    action: S3Action,
+    bucket: &str,
+    key: &str,
+    context: &Context,
+) -> bool {
+    denied_by(
+        |resource| policy.evaluate(action, resource, context),
+        bucket,
+        key,
     )
 }
 
@@ -876,7 +921,7 @@ fn descendant_allow_reaches(
     context: &Context,
 ) -> bool {
     let read_denied = user.is_explicitly_denied(S3Action::Read, bucket, prefix, context);
-    user.permissions.iter().any(|perm| {
+    user.permissions().iter().any(|perm| {
         // Non-prefix request context cannot be proven here. Prefix-list
         // conditions are handled by can_list_prefix_with_context.
         perm.effect == "Allow"
@@ -976,7 +1021,7 @@ pub fn visible_key_prefixes(user: &super::AuthenticatedUser, bucket: &str) -> Ve
     // Only read/list grants show keys: a write-only prefix is no scan
     // target (its scan found nothing and spent the page budget).
     for perm in user
-        .permissions
+        .permissions()
         .iter()
         .filter(|p| p.effect == "Allow" && grants_discovery(p))
     {
@@ -1089,7 +1134,7 @@ pub fn may_attempt_batch_delete(
         return true;
     }
     !user.is_anonymous()
-        && user.permissions.iter().any(|perm| {
+        && user.permissions().iter().any(|perm| {
             perm.effect == "Allow"
                 && perm
                     .actions
@@ -1711,12 +1756,7 @@ mod tests {
             p("Allow", &["read", "list"], &["carve", "carve/*"]),
             p("Deny", &["read", "list"], &["carve/secret/*"]),
         ];
-        let user = crate::iam::AuthenticatedUser {
-            name: "u".into(),
-            access_key_id: "AK".into(),
-            iam_policies: perms.iter().map(permission_to_iam_policy).collect(),
-            permissions: perms,
-        };
+        let user = crate::iam::AuthenticatedUser::new("u", "AK", perms);
         let ctx = Context::new();
         assert!(user_can_see_listed_key(&user, "carve", "pub/a.txt", &ctx));
         assert!(!user_can_see_listed_key(
@@ -1728,12 +1768,7 @@ mod tests {
     }
 
     fn user_of(perms: Vec<Permission>) -> crate::iam::AuthenticatedUser {
-        crate::iam::AuthenticatedUser {
-            name: "u".into(),
-            access_key_id: "AK".into(),
-            iam_policies: perms.iter().map(permission_to_iam_policy).collect(),
-            permissions: perms,
-        }
+        crate::iam::AuthenticatedUser::new("u", "AK", perms)
     }
 
     fn with_cond(mut perm: Permission, cond: serde_json::Value) -> Permission {
@@ -1899,12 +1934,7 @@ mod tests {
             p("Allow", &["read", "list"], &["b/releases/*"]),
         ];
         assert!(!has_unrestricted_allow_for_bucket_prefix(&perms, "b", ""));
-        let user = crate::iam::AuthenticatedUser {
-            name: "u".into(),
-            access_key_id: "AK".into(),
-            iam_policies: perms.iter().map(permission_to_iam_policy).collect(),
-            permissions: perms,
-        };
+        let user = crate::iam::AuthenticatedUser::new("u", "AK", perms);
         assert_eq!(
             visible_key_prefixes(&user, "b"),
             vec!["releases/".to_string()]
@@ -2047,26 +2077,14 @@ mod tests {
             resources: resources.iter().map(|s| s.to_string()).collect(),
             conditions: None,
         }];
-        let iam_policies = permissions.iter().map(permission_to_iam_policy).collect();
-        super::super::AuthenticatedUser {
-            name: name.to_string(),
-            access_key_id: "AKIA".into(),
-            permissions,
-            iam_policies,
-        }
+        super::super::AuthenticatedUser::new(name, "AKIA", permissions)
     }
 
     fn make_user_with_permissions(
         name: &str,
         permissions: Vec<Permission>,
     ) -> super::super::AuthenticatedUser {
-        let iam_policies = permissions.iter().map(permission_to_iam_policy).collect();
-        super::super::AuthenticatedUser {
-            name: name.to_string(),
-            access_key_id: "AKIA".into(),
-            permissions,
-            iam_policies,
-        }
+        super::super::AuthenticatedUser::new(name, "AKIA", permissions)
     }
 
     /// A prefix-scoped delete grant may use DeleteObjects; the per-key check
@@ -2793,12 +2811,7 @@ mod tests {
             ..perm[0].clone()
         }];
         let expanded = expand_permission_templates(&read_perm, "dana@corp.com", "AK").unwrap();
-        let user = crate::iam::AuthenticatedUser {
-            name: "dana@corp.com".into(),
-            access_key_id: "AK".into(),
-            iam_policies: expanded.iter().map(permission_to_iam_policy).collect(),
-            permissions: expanded,
-        };
+        let user = crate::iam::AuthenticatedUser::new("dana@corp.com", "AK", expanded);
         assert!(user.can(S3Action::Read, "bucket", "home/dana@corp.com/f.txt"));
         assert!(!user.can(S3Action::Read, "bucket", "home/other/f.txt"));
     }

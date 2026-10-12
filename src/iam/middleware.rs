@@ -225,7 +225,7 @@ pub async fn authorization_middleware(
             // the coverage is unrestricted (user can see every key in the
             // prefix space) or prefix-scoped (handler must filter).
             let unrestricted = super::permissions::has_unrestricted_allow_for_bucket_prefix(
-                &user.permissions,
+                user.permissions(),
                 bucket,
                 &requested_prefix,
             );

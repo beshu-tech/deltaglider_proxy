@@ -14,6 +14,7 @@
 //! - `keygen` — Cryptographic key generation
 //! - `index` — `IamIndex` for O(1) user lookup and `IamState` enum
 
+pub(crate) mod compiled;
 pub mod declarative;
 pub mod external_auth;
 pub mod keygen;
@@ -596,12 +597,12 @@ mod tests {
         }];
         let index = IamIndex::from_users_and_groups(users, groups);
         let user = index.get("AK1").unwrap();
-        let auth = AuthenticatedUser {
-            name: user.name.clone(),
-            access_key_id: user.access_key_id.clone(),
-            iam_policies: user.iam_policies.clone(),
-            permissions: user.permissions.clone(),
-        };
+        let auth = AuthenticatedUser::from_parts(
+            user.name.clone(),
+            user.access_key_id.clone(),
+            user.permissions.clone(),
+            user.iam_policies.clone(),
+        );
         assert!(auth.can(S3Action::Read, "bucket", "key"));
         assert!(auth.can(S3Action::Write, "bucket", "key"));
         assert!(!auth.can(S3Action::Delete, "bucket", "key"));
@@ -643,12 +644,12 @@ mod tests {
         }];
         let index = IamIndex::from_users_and_groups(users, groups);
         let user = index.get("AK1").unwrap();
-        let auth = AuthenticatedUser {
-            name: user.name.clone(),
-            access_key_id: user.access_key_id.clone(),
-            iam_policies: user.iam_policies.clone(),
-            permissions: user.permissions.clone(),
-        };
+        let auth = AuthenticatedUser::from_parts(
+            user.name.clone(),
+            user.access_key_id.clone(),
+            user.permissions.clone(),
+            user.iam_policies.clone(),
+        );
         assert!(auth.can(S3Action::Read, "releases", "v1.zip"));
         assert!(!auth.can(S3Action::Delete, "releases", "v1.zip"));
         assert!(auth.can(S3Action::Delete, "uploads", "file.bin"));
@@ -700,12 +701,12 @@ mod tests {
         ];
         let index = IamIndex::from_users_and_groups(users, groups);
         let user = index.get("AK1").unwrap();
-        let auth = AuthenticatedUser {
-            name: user.name.clone(),
-            access_key_id: user.access_key_id.clone(),
-            iam_policies: user.iam_policies.clone(),
-            permissions: user.permissions.clone(),
-        };
+        let auth = AuthenticatedUser::from_parts(
+            user.name.clone(),
+            user.access_key_id.clone(),
+            user.permissions.clone(),
+            user.iam_policies.clone(),
+        );
         assert!(auth.can(S3Action::Read, "bucket", "key"));
         assert!(auth.can(S3Action::List, "bucket", ""));
         assert!(auth.can(S3Action::Write, "uploads", "file.bin"));

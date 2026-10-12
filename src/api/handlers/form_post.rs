@@ -863,15 +863,15 @@ mod tests {
                 "NotIpAddress": { "aws:SourceIp": ["10.0.0.0/8"] }
             })),
         };
-        let user = AuthenticatedUser {
-            name: "u".into(),
-            access_key_id: "AK".into(),
-            permissions: vec![],
-            iam_policies: vec![
+        let user = AuthenticatedUser::from_parts(
+            "u".into(),
+            "AK".into(),
+            vec![],
+            vec![
                 permission_to_iam_policy(&allow),
                 permission_to_iam_policy(&deny),
             ],
-        };
+        );
 
         // Context-free (the OLD, buggy path): the conditioned Deny doesn't fire
         // because aws:SourceIp is absent → the Allow wins. This is the bypass.

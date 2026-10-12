@@ -461,7 +461,6 @@ async fn list_page_within<L: Lister>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::iam::permissions::permission_to_iam_policy;
     use crate::iam::AuthenticatedUser;
     use crate::storage::DynStorageBackend;
     use std::sync::Arc;
@@ -645,12 +644,12 @@ mod tests {
             resources: vec!["b/d/a/*".into(), "b/d/z/*".into()],
             conditions: None,
         };
-        let user = AuthenticatedUser {
-            name: "u".into(),
-            access_key_id: "AK".into(),
-            permissions: vec![allow.clone()],
-            iam_policies: vec![permission_to_iam_policy(&allow)],
-        };
+        let user = AuthenticatedUser::from_parts(
+            "u".into(),
+            "AK".into(),
+            vec![allow.clone()],
+            vec![permission_to_iam_policy(&allow)],
+        );
         let scope = ListScope::Filtered {
             user: std::sync::Arc::new(user),
             context: Box::new(policy_context_for_ip(None)),
@@ -715,13 +714,7 @@ mod tests {
     }
 
     fn scoped(perms: Vec<crate::iam::Permission>) -> ListScope {
-        use crate::iam::permissions::permission_to_iam_policy;
-        let user = AuthenticatedUser {
-            name: "u".into(),
-            access_key_id: "AK".into(),
-            iam_policies: perms.iter().map(permission_to_iam_policy).collect(),
-            permissions: perms,
-        };
+        let user = crate::iam::AuthenticatedUser::new("u", "AK", perms);
         ListScope::Filtered {
             user: std::sync::Arc::new(user),
             context: Box::new(policy_context_for_ip(None)),
@@ -963,12 +956,7 @@ mod tests {
             perm(&["write"], &["b/incoming/*"]),
             perm(&["read", "list"], &["b/releases/*"]),
         ];
-        let user = AuthenticatedUser {
-            name: "u".into(),
-            access_key_id: "AK".into(),
-            iam_policies: perms.iter().map(permission_to_iam_policy).collect(),
-            permissions: perms,
-        };
+        let user = crate::iam::AuthenticatedUser::new("u", "AK", perms);
         let scope = ListScope::Filtered {
             user: std::sync::Arc::new(user),
             context: Box::new(policy_context_for_ip(None)),

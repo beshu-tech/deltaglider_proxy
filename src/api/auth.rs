@@ -1342,12 +1342,12 @@ mod tests {
         // Duplicate Authorization headers: s3s verified nothing.
         assert!(!resolved_identity_is_verified(Some(&alice), None));
         // A stored user NAMED `$anonymous` is not the anonymous principal.
-        let named_anon = AuthenticatedUser {
-            name: crate::iam::types::ANONYMOUS_USER_NAME.into(),
-            access_key_id: "AKREAL".into(),
-            permissions: vec![],
-            iam_policies: vec![],
-        };
+        let named_anon = AuthenticatedUser::from_parts(
+            crate::iam::types::ANONYMOUS_USER_NAME.into(),
+            "AKREAL".into(),
+            vec![],
+            vec![],
+        );
         assert!(!resolved_identity_is_verified(Some(&named_anon), None));
         // SigV2 query signed by another key.
         assert!(!resolved_identity_is_verified(
@@ -1580,7 +1580,7 @@ mod tests {
         let user = build_anonymous_user("beshu", &[public_prefix.to_string()], None);
         let ctx = Context::new().with_string("s3:prefix", requested_prefix);
         crate::iam::permissions::evaluate_iam(
-            &user.iam_policies,
+            user.iam_policies(),
             crate::iam::types::S3Action::List,
             "beshu",
             "",
@@ -1597,7 +1597,7 @@ mod tests {
         let user = build_anonymous_user("beshu", &[public_prefix.to_string()], None);
         let ctx = Context::new(); // no s3:prefix
         crate::iam::permissions::evaluate_iam(
-            &user.iam_policies,
+            user.iam_policies(),
             crate::iam::types::S3Action::List,
             "beshu",
             "",
