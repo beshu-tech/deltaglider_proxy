@@ -269,7 +269,7 @@ enum BulkActor {
     Unrestricted,
     /// A browser session's IAM user and the request's policy context.
     User {
-        user: Box<AuthenticatedUser>,
+        user: std::sync::Arc<AuthenticatedUser>,
         context: Box<iam_rs::Context>,
     },
 }
@@ -290,15 +290,14 @@ impl BulkActor {
         };
         let iam = state.iam_state.load();
         let user = match iam.as_ref() {
-            crate::iam::IamState::Iam(index) => index.get(access_key_id),
+            crate::iam::IamState::Iam(index) => index.principal(access_key_id).cloned(),
             _ => None,
         }
-        .filter(|u| u.enabled)
         .ok_or(AdminError::forbidden("AccessDenied: user disabled or gone"))?;
         let mut context = iam_rs::Context::new();
         crate::iam::permissions::insert_source_ip(&mut context, client_ip);
         Ok(Self::User {
-            user: Box::new(AuthenticatedUser::from(user)),
+            user,
             context: Box::new(context),
         })
     }

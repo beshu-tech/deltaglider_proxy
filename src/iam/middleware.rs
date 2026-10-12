@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use iam_rs::Context;
 use tracing::debug;
 
-use super::types::{AuthenticatedUser, ListScope, S3Action};
+use super::types::{ListScope, S3Action};
 use crate::metrics::{record_http_request_total, Metrics};
 
 /// Map an HTTP method + DECODED path to an S3 action. Bucket-level vs
@@ -110,7 +110,8 @@ pub async fn authorization_middleware(
     }
 
     // Only enforce if an AuthenticatedUser was inserted by SigV4 middleware
-    let user = match request.extensions().get::<AuthenticatedUser>() {
+    let user = match super::request_principal(request.extensions()) {
+        // An `Arc` clone: the principal is shared, never copied.
         Some(u) => u.clone(),
         None => return Ok(next.run(request).await),
     };
@@ -236,7 +237,7 @@ pub async fn authorization_middleware(
                 // Defence in depth: if we can't prove coverage is
                 // unrestricted, assume it isn't.
                 Some(ListScope::Filtered {
-                    user: Box::new(user.clone()),
+                    user: user.clone(),
                     context: Box::new(base_context.clone()),
                 })
             };
@@ -254,7 +255,7 @@ pub async fn authorization_middleware(
             (
                 true,
                 Some(ListScope::Filtered {
-                    user: Box::new(user.clone()),
+                    user: user.clone(),
                     context: Box::new(base_context.clone()),
                 }),
             )

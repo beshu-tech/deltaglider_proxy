@@ -652,7 +652,7 @@ mod tests {
             iam_policies: vec![permission_to_iam_policy(&allow)],
         };
         let scope = ListScope::Filtered {
-            user: Box::new(user),
+            user: std::sync::Arc::new(user),
             context: Box::new(policy_context_for_ip(None)),
         };
         let p1 = list_page_for_caller(
@@ -723,7 +723,7 @@ mod tests {
             permissions: perms,
         };
         ListScope::Filtered {
-            user: Box::new(user),
+            user: std::sync::Arc::new(user),
             context: Box::new(policy_context_for_ip(None)),
         }
     }
@@ -970,7 +970,7 @@ mod tests {
             permissions: perms,
         };
         let scope = ListScope::Filtered {
-            user: Box::new(user),
+            user: std::sync::Arc::new(user),
             context: Box::new(policy_context_for_ip(None)),
         };
         let page = list_page_for_caller(

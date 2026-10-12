@@ -33,7 +33,7 @@ use tower::ServiceExt;
 
 use crate::api::request_target::RequestTarget;
 use crate::api::s3s_hooks::{DeltaGliderS3sAuth, VerifiedIdentityS3sAccess};
-use crate::iam::{AuthenticatedUser, IamIndex, IamState, IamUser, Permission, S3Action};
+use crate::iam::{IamIndex, IamState, IamUser, Permission, S3Action};
 
 const HOST: &str = "localhost:9000";
 const PUBLIC_BUCKET: &str = "pub-bucket";
@@ -138,7 +138,7 @@ impl S3Access for RecordingAccess {
             false,
             None,
         );
-        let our_identity = cx.extensions_mut().get::<AuthenticatedUser>().map(|u| {
+        let our_identity = crate::iam::request_principal(cx.extensions_mut()).map(|u| {
             if u.is_anonymous() {
                 "$anonymous".to_string()
             } else {

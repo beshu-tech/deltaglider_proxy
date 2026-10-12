@@ -450,12 +450,14 @@ impl SignedPayloadHash {
 }
 
 /// Build an anonymous `AuthenticatedUser` with read+list permissions scoped
-/// to the given public prefixes. Used for unauthenticated public access.
-pub(crate) fn build_anonymous_user(bucket: &str, public_prefixes: &[String]) -> AuthenticatedUser {
-    use crate::iam::permissions::permission_to_iam_policy;
-
+/// to the given public prefixes, plus `grant` (an admission block's
+/// read-class grant). Used for unauthenticated public access.
+pub(crate) fn build_anonymous_user(
+    bucket: &str,
+    public_prefixes: &[String],
+    grant: Option<Permission>,
+) -> AuthenticatedUser {
     let mut permissions = Vec::new();
-    let mut iam_policies = Vec::new();
 
     for prefix in public_prefixes {
         // Read permission: scoped to bucket/prefix*
@@ -466,7 +468,6 @@ pub(crate) fn build_anonymous_user(bucket: &str, public_prefixes: &[String]) -> 
             resources: vec![format!("{}/{}*", bucket, prefix)],
             conditions: None,
         };
-        iam_policies.push(permission_to_iam_policy(&read_perm));
         permissions.push(read_perm);
 
         // List permission — three shapes:
@@ -513,16 +514,15 @@ pub(crate) fn build_anonymous_user(bucket: &str, public_prefixes: &[String]) -> 
                 })),
             }
         };
-        iam_policies.push(permission_to_iam_policy(&list_perm));
         permissions.push(list_perm);
     }
+    permissions.extend(grant);
 
-    AuthenticatedUser {
-        name: crate::iam::types::ANONYMOUS_USER_NAME.into(),
-        access_key_id: String::new(),
+    AuthenticatedUser::new(
+        crate::iam::types::ANONYMOUS_USER_NAME,
+        String::new(),
         permissions,
-        iam_policies,
-    }
+    )
 }
 
 /// Request-extension marker: this request was authenticated through a
@@ -937,14 +937,9 @@ pub async fn sigv4_auth_middleware(
             .map(|s| s.load_full());
         if let Some(snapshot) = snapshot {
             let public_prefixes = snapshot.public_prefixes_for_bucket(&admit.bucket);
-            let mut anon_user = build_anonymous_user(&admit.bucket, public_prefixes);
             // An operator block grants exactly this read-class request.
-            if let Some(perm) = admit.grant.as_ref().and_then(|g| g.permission()) {
-                anon_user
-                    .iam_policies
-                    .push(crate::iam::permissions::permission_to_iam_policy(&perm));
-                anon_user.permissions.push(perm);
-            }
+            let grant = admit.grant.as_ref().and_then(|g| g.permission());
+            let anon_user = build_anonymous_user(&admit.bucket, public_prefixes, grant);
 
             info!(
                 "AUDIT | action=public_read | user=$anonymous | bucket={} | matched_block={} | ip={} | method={}",
@@ -954,7 +949,7 @@ pub async fn sigv4_auth_middleware(
                 request.method()
             );
 
-            request.extensions_mut().insert(anon_user);
+            crate::iam::insert_request_principal(request.extensions_mut(), Arc::new(anon_user));
             return Ok(next.run(request).await);
         }
     }
@@ -1031,7 +1026,7 @@ pub async fn sigv4_auth_middleware(
                 return Err(S3Error::AccessDenied.into_response());
             }
             // Legacy user gets full access via wildcard permissions
-            Some(AuthenticatedUser::bootstrap(&auth.access_key_id))
+            Some(AuthenticatedUser::bootstrap_shared(&auth.access_key_id))
         }
         AuthGateDecision::Iam(index) => {
             let user = match index.get(&params.access_key) {
@@ -1050,7 +1045,8 @@ pub async fn sigv4_auth_middleware(
                 log_auth_failure("user_disabled");
                 return Err(S3Error::AccessDenied.into_response());
             }
-            Some(AuthenticatedUser::from(user))
+            // The index's shared principal: an `Arc` clone, no copy.
+            index.principal(&params.access_key).cloned()
         }
     };
 
@@ -1118,7 +1114,7 @@ pub async fn sigv4_auth_middleware(
     // Insert authenticated user into request extensions (for authorization middleware)
     if let Some(user) = authenticated_user {
         debug!("SigV4: authenticated user '{}'", user.name);
-        request.extensions_mut().insert(user);
+        crate::iam::insert_request_principal(request.extensions_mut(), user);
     }
     // A presigned URL authenticates as its SIGNER, but whoever holds the link
     // is an anonymous party (the docs recommend presigned links over public
@@ -1334,7 +1330,7 @@ mod tests {
     #[test]
     fn resolved_identity_must_match_verified_key() {
         let alice = AuthenticatedUser::bootstrap("AKALICE");
-        let anon = build_anonymous_user("b", &["pub/".to_string()]);
+        let anon = build_anonymous_user("b", &["pub/".to_string()], None);
 
         // Nothing resolved: nothing granted, allow.
         assert!(resolved_identity_is_verified(None, None));
@@ -1581,7 +1577,7 @@ mod tests {
 
     fn allow_anon_list(public_prefix: &str, requested_prefix: &str) -> bool {
         use iam_rs::Context;
-        let user = build_anonymous_user("beshu", &[public_prefix.to_string()]);
+        let user = build_anonymous_user("beshu", &[public_prefix.to_string()], None);
         let ctx = Context::new().with_string("s3:prefix", requested_prefix);
         crate::iam::permissions::evaluate_iam(
             &user.iam_policies,
@@ -1598,7 +1594,7 @@ mod tests {
     /// configs this must still allow LIST.
     fn allow_anon_list_no_prefix(public_prefix: &str) -> bool {
         use iam_rs::Context;
-        let user = build_anonymous_user("beshu", &[public_prefix.to_string()]);
+        let user = build_anonymous_user("beshu", &[public_prefix.to_string()], None);
         let ctx = Context::new(); // no s3:prefix
         crate::iam::permissions::evaluate_iam(
             &user.iam_policies,
@@ -1884,10 +1880,7 @@ mod per_key_lockout_tests {
     /// Stands in for s3s: it verifies Alice's signature and refuses Bob's
     /// (a rotated secret).
     async fn s3s_stand_in(req: Request<Body>) -> StatusCode {
-        let key = req
-            .extensions()
-            .get::<AuthenticatedUser>()
-            .map(|u| u.access_key_id.clone());
+        let key = crate::iam::request_principal(req.extensions()).map(|u| u.access_key_id.clone());
         if key.as_deref() == Some(ALICE) {
             if let Some(outcome) = req.extensions().get::<AuthOutcome>() {
                 outcome.mark_verified();

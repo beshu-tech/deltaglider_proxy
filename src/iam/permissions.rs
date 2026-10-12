@@ -2896,7 +2896,7 @@ mod tests {
     /// condition: the condition, not the bucket-wide resource, bounds it.
     #[test]
     fn visible_prefixes_use_the_s3_prefix_condition() {
-        let user = crate::api::auth::build_anonymous_user("b", &["rel/".to_string()]);
+        let user = crate::api::auth::build_anonymous_user("b", &["rel/".to_string()], None);
         assert_eq!(visible_key_prefixes(&user, "b"), vec!["rel"]);
         let user = make_user_with_permissions(
             "u",

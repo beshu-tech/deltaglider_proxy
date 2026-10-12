@@ -207,3 +207,7 @@ http = "1"
 name = "codec"
 harness = false
 
+# Per-request CPU: IAM authorization and the request principal. Local only.
+[[bench]]
+name = "hotpath"
+harness = false

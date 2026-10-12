@@ -200,10 +200,7 @@ mod tests {
         }
         .permission()
         .unwrap();
-        let mut anon = crate::api::auth::build_anonymous_user("releases", &[]);
-        anon.iam_policies
-            .push(crate::iam::permissions::permission_to_iam_policy(&wide));
-        anon.permissions.push(wide);
+        let anon = crate::api::auth::build_anonymous_user("releases", &[], Some(wide));
         assert!(anon.can(crate::iam::S3Action::Read, "releases", "abc.zip"));
         // Other characters are literal in a pattern: the grant stays.
         assert!(anonymous_grant(&allow(), &req("GET", Some("a[1]+b.zip"), None)).is_some());

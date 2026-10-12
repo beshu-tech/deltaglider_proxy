@@ -9,7 +9,7 @@ pub(super) async fn copy_object(
     svc: &DeltaGliderS3Service,
     req: s3s::S3Request<s3s::dto::CopyObjectInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::CopyObjectOutput>> {
-    let auth_user = req.extensions.get::<AuthenticatedUser>().cloned();
+    let auth_user = crate::iam::request_principal(&req.extensions).cloned();
     let writer = Reader::of(&req.extensions);
     let input = req.input;
     let (source_bucket, source_key) = copy_source_bucket_key(&input.copy_source)?;
@@ -19,7 +19,7 @@ pub(super) async fn copy_object(
         .map(|c| c.0);
     check_copy_source_access_s3s(
         svc.state.engine.load().bucket_policy_registry(),
-        auth_user.as_ref(),
+        auth_user.as_deref(),
         &source_bucket,
         &source_key,
         client_ip,
@@ -332,7 +332,7 @@ pub(super) async fn upload_part_copy(
     svc: &DeltaGliderS3Service,
     req: s3s::S3Request<s3s::dto::UploadPartCopyInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::UploadPartCopyOutput>> {
-    let auth_user = req.extensions.get::<AuthenticatedUser>().cloned();
+    let auth_user = crate::iam::request_principal(&req.extensions).cloned();
     let input = req.input;
     let (source_bucket, source_key) = copy_source_bucket_key(&input.copy_source)?;
     let client_ip = req
@@ -341,7 +341,7 @@ pub(super) async fn upload_part_copy(
         .map(|c| c.0);
     check_copy_source_access_s3s(
         svc.state.engine.load().bucket_policy_registry(),
-        auth_user.as_ref(),
+        auth_user.as_deref(),
         &source_bucket,
         &source_key,
         client_ip,

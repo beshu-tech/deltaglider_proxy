@@ -59,8 +59,9 @@ impl S3Access for VerifiedIdentityS3sAccess {
         // default "auth provider implies anonymous deny", which would
         // reject already-admitted public/open-mode requests.
         let verified = cx.credentials().map(|c| c.access_key.clone());
-        let resolved = cx.extensions_mut().get::<crate::iam::AuthenticatedUser>();
-        if crate::api::auth::resolved_identity_is_verified(resolved, verified.as_deref()) {
+        let resolved = crate::iam::request_principal(cx.extensions_mut()).cloned();
+        if crate::api::auth::resolved_identity_is_verified(resolved.as_deref(), verified.as_deref())
+        {
             // Only a real verified credential counts as an auth success
             // for the brute-force limiter; anonymous/open requests don't.
             if verified.is_some() {
@@ -80,7 +81,10 @@ impl S3Access for VerifiedIdentityS3sAccess {
         } else {
             tracing::warn!(
                 "SECURITY | event=identity_mismatch | resolved={} | verified={}",
-                resolved.map(|u| u.access_key_id.as_str()).unwrap_or(""),
+                resolved
+                    .as_ref()
+                    .map(|u| u.access_key_id.as_str())
+                    .unwrap_or(""),
                 verified.as_deref().unwrap_or("<none>")
             );
             Err(s3s::s3_error!(AccessDenied))

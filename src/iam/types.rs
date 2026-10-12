@@ -5,17 +5,21 @@
 use iam_rs::IAMPolicy;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use super::permissions;
 
 impl From<&IamUser> for AuthenticatedUser {
+    /// A deep copy of the user's identity and policies. Built once per user
+    /// at IAM index build ([`super::IamIndex::principal`]); a request takes
+    /// the index's shared copy and never builds one.
     fn from(user: &IamUser) -> Self {
-        Self {
-            name: user.name.clone(),
-            access_key_id: user.access_key_id.clone(),
-            permissions: user.permissions.clone(),
-            iam_policies: user.iam_policies.clone(),
-        }
+        Self::from_parts(
+            user.name.clone(),
+            user.access_key_id.clone(),
+            user.permissions.clone(),
+            user.iam_policies.clone(),
+        )
     }
 }
 
@@ -139,8 +143,14 @@ impl S3Action {
 pub const ANONYMOUS_USER_NAME: &str = "$anonymous";
 
 /// Resolved identity after SigV4 authentication.
-/// Inserted into request extensions by the SigV4 middleware.
-#[derive(Debug, Clone)]
+///
+/// Shared, never copied: the IAM index builds one per user, the bootstrap
+/// principal is built once per access key, and a request carries an
+/// `Arc` of it in its extensions ([`insert_request_principal`] /
+/// [`request_principal`]). It is deliberately not `Clone`: a deep copy per
+/// request cost 2-10 µs, and without `Clone` the type cannot be put into
+/// request extensions by value (`Extensions::insert` needs `Clone`).
+#[derive(Debug)]
 pub struct AuthenticatedUser {
     pub name: String,
     pub access_key_id: String,
@@ -178,28 +188,80 @@ pub fn strip_reserved_principal_prefix(name: &str) -> &str {
 /// Principal name of the bootstrap (single-credential, legacy-mode) user.
 pub const BOOTSTRAP_USER_NAME: &str = "$bootstrap";
 
+/// The principal the SigV4 middleware resolved for this request, if any.
+/// THE reader of the slot: a reader that asked for another type
+/// (`AuthenticatedUser` by value) would find nothing, and "no principal"
+/// means "not checked" to the authorization middleware.
+pub fn request_principal(ext: &axum::http::Extensions) -> Option<&Arc<AuthenticatedUser>> {
+    ext.get::<Arc<AuthenticatedUser>>()
+}
+
+/// Put the resolved principal into the request's extensions (one `Arc`
+/// clone, no copy). THE writer of the slot that [`request_principal`] reads.
+pub fn insert_request_principal(ext: &mut axum::http::Extensions, user: Arc<AuthenticatedUser>) {
+    ext.insert(user);
+}
+
 impl AuthenticatedUser {
-    /// The bootstrap principal: full access to everything. THE one definition,
-    /// shared by SigV4 auth and browser form-POST, so the two cannot drift
-    /// into different privileges.
-    pub fn bootstrap(access_key_id: &str) -> Self {
-        let permissions = vec![Permission {
-            id: 0,
-            effect: "Allow".to_string(),
-            actions: vec!["*".to_string()],
-            resources: vec!["*".to_string()],
-            conditions: None,
-        }];
+    /// A principal whose IAM policies are built from its permissions.
+    pub fn new(
+        name: impl Into<String>,
+        access_key_id: impl Into<String>,
+        permissions: Vec<Permission>,
+    ) -> Self {
         let iam_policies = permissions
             .iter()
             .map(permissions::permission_to_iam_policy)
             .collect();
+        Self::from_parts(name.into(), access_key_id.into(), permissions, iam_policies)
+    }
+
+    /// A principal from permissions and their already-built IAM policies.
+    pub fn from_parts(
+        name: String,
+        access_key_id: String,
+        permissions: Vec<Permission>,
+        iam_policies: Vec<IAMPolicy>,
+    ) -> Self {
         Self {
-            name: BOOTSTRAP_USER_NAME.to_string(),
-            access_key_id: access_key_id.to_string(),
+            name,
+            access_key_id,
             permissions,
             iam_policies,
         }
+    }
+
+    /// The bootstrap principal: full access to everything. THE one definition,
+    /// shared by SigV4 auth and browser form-POST, so the two cannot drift
+    /// into different privileges.
+    pub fn bootstrap(access_key_id: &str) -> Self {
+        Self::new(
+            BOOTSTRAP_USER_NAME,
+            access_key_id,
+            vec![Permission {
+                id: 0,
+                effect: "Allow".to_string(),
+                actions: vec!["*".to_string()],
+                resources: vec!["*".to_string()],
+                conditions: None,
+            }],
+        )
+    }
+
+    /// [`Self::bootstrap`], built once per bootstrap access key and shared:
+    /// a request takes an `Arc` clone. A changed key (config apply) builds
+    /// the next one.
+    pub fn bootstrap_shared(access_key_id: &str) -> Arc<Self> {
+        static CURRENT: arc_swap::ArcSwapOption<AuthenticatedUser> =
+            arc_swap::ArcSwapOption::const_empty();
+        if let Some(user) = CURRENT.load_full() {
+            if user.access_key_id == access_key_id {
+                return user;
+            }
+        }
+        let user = Arc::new(Self::bootstrap(access_key_id));
+        CURRENT.store(Some(user.clone()));
+        user
     }
 
     /// The synthesized public-prefix reader (`$anonymous`). Anonymous callers
@@ -312,7 +374,7 @@ pub enum ListScope {
     Filtered {
         /// The authenticated user, captured at authorization time so
         /// the filter uses the exact same policy set.
-        user: Box<AuthenticatedUser>,
+        user: Arc<AuthenticatedUser>,
         /// The request's policy context (`aws:SourceIp`, ...) WITHOUT
         /// `s3:prefix`, for the per-key checks. Without it an IP-conditioned
         /// Deny never fires in the filter.

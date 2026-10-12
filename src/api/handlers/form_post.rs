@@ -608,7 +608,7 @@ fn authenticate_form_post(
     bucket: &str,
     parsed: &ParsedFormPost,
     client_ip: Option<std::net::IpAddr>,
-) -> Result<Option<AuthenticatedUser>, S3Error> {
+) -> Result<Option<std::sync::Arc<AuthenticatedUser>>, S3Error> {
     let Some(iam_state) = iam_state else {
         return Ok(None);
     };
@@ -659,7 +659,7 @@ fn authenticate_form_post(
             }
             (
                 auth.secret_access_key.clone(),
-                AuthenticatedUser::bootstrap(&auth.access_key_id),
+                AuthenticatedUser::bootstrap_shared(&auth.access_key_id),
             )
         }
         IamState::Iam(index) => {
@@ -667,10 +667,8 @@ fn authenticate_form_post(
                 .get(access_key)
                 .filter(|u| u.enabled)
                 .ok_or(S3Error::AccessDenied)?;
-            (
-                user.secret_access_key.clone(),
-                AuthenticatedUser::from(user),
-            )
+            let principal = index.principal(access_key).ok_or(S3Error::AccessDenied)?;
+            (user.secret_access_key.clone(), principal.clone())
         }
     };
 
@@ -827,7 +825,7 @@ pub async fn handle_form_post_upload(
         "",
     )
         .into_response();
-    let writer = crate::s3_adapter_s3s::Reader::of_principal(auth_user.as_ref());
+    let writer = crate::s3_adapter_s3s::Reader::of_principal(auth_user.as_deref());
     for (name, value) in crate::s3_adapter_s3s::write_fact_headers(&result, writer) {
         response.headers_mut().insert(name, value);
     }

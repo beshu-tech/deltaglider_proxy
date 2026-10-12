@@ -258,9 +258,17 @@ impl IamState {
 /// Thread-safe, hot-swappable IAM state.
 pub type SharedIamState = Arc<ArcSwap<IamState>>;
 
+/// One user of the index and the request principal built from it.
+#[derive(Clone)]
+struct IndexedUser {
+    user: IamUser,
+    /// Built once per index build; every request of this user shares it.
+    principal: Arc<AuthenticatedUser>,
+}
+
 /// Fast O(1) user lookup index, rebuilt from the database on load/sync.
 pub struct IamIndex {
-    users: HashMap<String, IamUser>,
+    users: HashMap<String, IndexedUser>,
     groups: Vec<Group>,
     /// What S3 does once the users are gone; set from the live config.
     when_empty: EmptyIamOutcome,
@@ -317,7 +325,8 @@ impl IamIndex {
                     user.name, user.access_key_id
                 );
             }
-            map.insert(user.access_key_id.clone(), user);
+            let principal = Arc::new(AuthenticatedUser::from(&user));
+            map.insert(user.access_key_id.clone(), IndexedUser { user, principal });
         }
         Self {
             users: map,
@@ -328,13 +337,23 @@ impl IamIndex {
 
     /// Look up a user by access_key_id. O(1).
     pub fn get(&self, access_key_id: &str) -> Option<&IamUser> {
-        self.users.get(access_key_id)
+        self.users.get(access_key_id).map(|e| &e.user)
+    }
+
+    /// The request principal of an ENABLED user, shared: the caller takes an
+    /// `Arc` clone, never a copy of the policies. `None` for an unknown or
+    /// disabled key.
+    pub fn principal(&self, access_key_id: &str) -> Option<&Arc<AuthenticatedUser>> {
+        self.users
+            .get(access_key_id)
+            .filter(|e| e.user.enabled)
+            .map(|e| &e.principal)
     }
 
     /// Look up a user by database id. O(n); for per-request checks on the
     /// low-traffic admin surface, not for the S3 hot path.
     pub fn get_by_id(&self, id: i64) -> Option<&IamUser> {
-        self.users.values().find(|u| u.id == id)
+        self.users.values().map(|e| &e.user).find(|u| u.id == id)
     }
 
     /// Number of users in the index.

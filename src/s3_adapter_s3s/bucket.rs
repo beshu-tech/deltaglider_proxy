@@ -35,7 +35,7 @@ pub(super) async fn list_buckets(
     svc: &DeltaGliderS3Service,
     req: s3s::S3Request<s3s::dto::ListBucketsInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::ListBucketsOutput>> {
-    let auth_user = req.extensions.get::<AuthenticatedUser>().cloned();
+    let auth_user = crate::iam::request_principal(&req.extensions).cloned();
     let input = req.input;
     let engine = svc.state.engine.load();
     let mut buckets = engine.list_buckets_with_dates().await?;

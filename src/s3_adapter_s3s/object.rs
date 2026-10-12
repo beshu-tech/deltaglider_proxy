@@ -54,10 +54,8 @@ pub(super) async fn get_object(
     req: s3s::S3Request<s3s::dto::GetObjectInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::GetObjectOutput>> {
     let reader = Reader::of(&req.extensions);
-    let anonymous_principal = req
-        .extensions
-        .get::<AuthenticatedUser>()
-        .is_some_and(|u| u.is_anonymous());
+    let anonymous_principal =
+        crate::iam::request_principal(&req.extensions).is_some_and(|u| u.is_anonymous());
     let if_range = req.headers.get(axum::http::header::IF_RANGE).cloned();
     let input = req.input;
     check_response_overrides_allowed(&input, anonymous_principal)?;
@@ -389,7 +387,7 @@ pub(super) async fn delete_objects(
     // checked individually, or a `Deny delete bucket/protected/*`
     // carve-out (or a prefix-scoped Allow) is silently ignored and
     // protected objects get batch-deleted. (X-ray H6/H26.)
-    let auth_user = req.extensions.get::<AuthenticatedUser>().cloned();
+    let auth_user = crate::iam::request_principal(&req.extensions).cloned();
     let policy_context = request_policy_context(&req.extensions);
     let objects = input.delete.objects;
     let mut allowed = vec![true; objects.len()];

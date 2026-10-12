@@ -624,9 +624,8 @@ pub(crate) enum Reader {
 
 impl Reader {
     fn of(ext: &axum::http::Extensions) -> Self {
-        let anonymous_principal = ext
-            .get::<AuthenticatedUser>()
-            .is_some_and(|u| u.is_anonymous());
+        let anonymous_principal =
+            crate::iam::request_principal(ext).is_some_and(|u| u.is_anonymous());
         if anonymous_principal || ext.get::<crate::api::auth::PresignedRequest>().is_some() {
             Self::Anonymous
         } else {

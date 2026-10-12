@@ -253,10 +253,7 @@ fn reader_identity_from_request_extensions() {
         permissions: vec![],
         iam_policies: vec![],
     };
-    let alice = AuthenticatedUser {
-        name: "alice".into(),
-        ..anon.clone()
-    };
+    let alice = AuthenticatedUser::from_parts("alice".into(), String::new(), vec![], vec![]);
 
     let mut ext = axum::http::Extensions::new();
     assert_eq!(
@@ -264,11 +261,11 @@ fn reader_identity_from_request_extensions() {
         Reader::Authenticated,
         "open-access mode has no principal and keeps provenance"
     );
-    ext.insert(anon);
+    crate::iam::insert_request_principal(&mut ext, std::sync::Arc::new(anon));
     assert_eq!(Reader::of(&ext), Reader::Anonymous);
 
     let mut ext = axum::http::Extensions::new();
-    ext.insert(alice.clone());
+    crate::iam::insert_request_principal(&mut ext, std::sync::Arc::new(alice));
     assert_eq!(Reader::of(&ext), Reader::Authenticated);
     ext.insert(crate::api::auth::PresignedRequest);
     assert_eq!(
@@ -1031,10 +1028,7 @@ fn a_form_post_writer_is_anonymous_only_as_the_anonymous_principal() {
         permissions: vec![],
         iam_policies: vec![],
     };
-    let alice = AuthenticatedUser {
-        name: "alice".into(),
-        ..anon.clone()
-    };
+    let alice = AuthenticatedUser::from_parts("alice".into(), String::new(), vec![], vec![]);
     assert_eq!(Reader::of_principal(None), Reader::Authenticated);
     assert_eq!(Reader::of_principal(Some(&alice)), Reader::Authenticated);
     assert_eq!(Reader::of_principal(Some(&anon)), Reader::Anonymous);

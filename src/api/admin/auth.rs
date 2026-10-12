@@ -1432,9 +1432,8 @@ pub(crate) fn session_may_list_bucket(
         Some((BulkSession::Open | BulkSession::AdminGui, _)) => true,
         Some((BulkSession::IamUser { access_key_id, .. }, _)) => match iam.as_ref() {
             IamState::Iam(index) => index
-                .get(&access_key_id)
-                .filter(|u| u.enabled)
-                .is_some_and(|u| crate::iam::AuthenticatedUser::from(u).can_see_bucket(bucket)),
+                .principal(&access_key_id)
+                .is_some_and(|u| u.can_see_bucket(bucket)),
             _ => false,
         },
         None => false,

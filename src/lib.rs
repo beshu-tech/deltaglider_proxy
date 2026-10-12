@@ -1439,6 +1439,68 @@ mod source_guards {
         }
     }
 
+    /// P7.1: the request principal is an `Arc<AuthenticatedUser>` in the
+    /// request extensions, read and written only through
+    /// `iam::request_principal` / `iam::insert_request_principal`. A reader
+    /// that names another type (`get::<AuthenticatedUser>()`) finds nothing,
+    /// and "no principal" means "not checked" to the authorization
+    /// middleware and the s3s identity hook. Production and test code alike:
+    /// a test that read the wrong slot compared nothing.
+    #[test]
+    fn the_request_principal_slot_has_one_reader_and_one_writer() {
+        let typed = regex_lite::Regex::new(r"(get|get_mut|remove|insert)::<[^;]*AuthenticatedUser")
+            .unwrap();
+        // The shapes that read the wrong slot before P7.1.
+        assert!(typed.is_match("    let u = req.extensions.get::<AuthenticatedUser>().cloned();"));
+        assert!(typed.is_match("cx.extensions_mut().get::<crate::iam::AuthenticatedUser>();"));
+        assert!(!typed.is_match("    let u = crate::iam::request_principal(&req.extensions);"));
+        let mut bad = Vec::new();
+        for dir in ["src", "tests"] {
+            for path in rust_files(dir) {
+                let file = rel_path(&path);
+                if file == "src/iam/types.rs" || file == "src/lib.rs" {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                for (n, line) in text.lines().enumerate() {
+                    if typed.is_match(line) {
+                        bad.push(format!("{file}:{}: {}", n + 1, line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "read the principal through iam::request_principal:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// P7.1: a request never deep-copies a principal. The IAM index builds
+    /// one per user (`IamIndex::principal`) and the bootstrap principal is
+    /// built once per key (`AuthenticatedUser::bootstrap_shared`); only the
+    /// index build converts an `IamUser`.
+    #[test]
+    fn requests_share_principals_never_build_them() {
+        let mut bad = Vec::new();
+        for (file, text) in crate::source_scan::prod_sources("src") {
+            for (n, line) in crate::source_scan::prod_lines(&text) {
+                let builds = (line.contains("AuthenticatedUser::from(")
+                    && file != "src/iam/mod.rs")
+                    || (line.contains("AuthenticatedUser::bootstrap(")
+                        && file != "src/iam/types.rs");
+                if builds {
+                    bad.push(format!("{file}:{n}: {}", line.trim()));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "per-request principal build:\n{}",
+            bad.join("\n")
+        );
+    }
+
     /// Review B5: a permission's condition block is parsed in ONE place,
     /// `iam::permissions::parse_conditions`, which save-time validation and
     /// the policy build share; a second parser would drift from it.
