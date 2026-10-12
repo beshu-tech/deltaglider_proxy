@@ -1130,7 +1130,8 @@ async fn plan_action(
 /// each one conditional on its snapshot, one reclaim check per folder,
 /// several folders at once. A per-key delete paid 7 HEAD requests and a
 /// LIST of its folder per key, one key at a time. Each deleted key's event
-/// is stored as soon as the key ends. `proceed` stops the batch between
+/// is buffered as soon as the key ends, and the page's events are stored in
+/// one outbox insert after the batch. `proceed` stops the batch between
 /// keys; the result is `true` when it did (the caller stops the run).
 #[allow(clippy::too_many_arguments)]
 async fn delete_planned(
@@ -1149,8 +1150,10 @@ async fn delete_planned(
         bucket: rule.bucket.clone(),
         expire_after: rule.expire_after.clone(),
         actions: deletes.iter().map(|d| (d.key.clone(), d.action)).collect(),
+        pending: Default::default(),
     });
-    let on_outcome = move |key: &str, outcome: &DeleteOutcome| events.publish(key, outcome);
+    let publisher = events.clone();
+    let on_outcome = move |key: &str, outcome: &DeleteOutcome| publisher.publish(key, outcome);
     let items = deletes
         .iter()
         .map(|d| {
@@ -1173,6 +1176,7 @@ async fn delete_planned(
             },
         )
         .await;
+    events.flush().await;
     let mut stopped = false;
     for (d, outcome) in deletes.iter().zip(outcomes) {
         match outcome {
@@ -1218,7 +1222,9 @@ async fn delete_planned(
     Ok(stopped)
 }
 
-/// The delete events of one batch, stored by its `on_outcome` hook.
+/// The delete events of one batch: its `on_outcome` hook buffers each
+/// deleted key's event, and [`DeleteEvents::flush`] stores the page's
+/// events in one outbox insert (one commit, not one per key).
 struct DeleteEvents {
     db: Option<Arc<Mutex<ConfigDb>>>,
     rule_name: String,
@@ -1226,6 +1232,22 @@ struct DeleteEvents {
     expire_after: Option<String>,
     /// key → the event's `action`.
     actions: std::collections::HashMap<String, &'static str>,
+    /// Events of keys already deleted, not stored yet.
+    pending: parking_lot::Mutex<Vec<NewEvent>>,
+}
+
+impl Drop for DeleteEvents {
+    /// A run dropped in the middle of a batch (an abort) never reached
+    /// `flush`: the keys it deleted still get their events, through the
+    /// batched writer.
+    fn drop(&mut self) {
+        let pending = std::mem::take(&mut *self.pending.lock());
+        if let (Some(db), false) = (self.db.clone(), pending.is_empty()) {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(async move { crate::event_outbox::append_events(&db, pending).await });
+            }
+        }
+    }
 }
 
 impl DeleteEvents {
@@ -1254,12 +1276,23 @@ impl DeleteEvents {
                 "content_length": meta.file_size,
             }),
         );
-        let (db, rule, key) = (db.clone(), self.rule_name.clone(), key.to_string());
-        Box::pin(async move {
-            if let Err(err) = db.lock().await.event_outbox_insert(&event) {
-                warn!("lifecycle rule '{rule}' could not append delete event for {key:?}: {err}");
-            }
-        })
+        self.pending.lock().push(event);
+        Box::pin(async {})
+    }
+
+    /// Store the buffered events in one insert.
+    async fn flush(&self) {
+        let events = std::mem::take(&mut *self.pending.lock());
+        let (Some(db), false) = (&self.db, events.is_empty()) else {
+            return;
+        };
+        if let Err(err) = db.lock().await.event_outbox_insert_many(&events) {
+            warn!(
+                "lifecycle rule '{}' could not append {} delete event(s): {err}",
+                self.rule_name,
+                events.len()
+            );
+        }
     }
 }
 
@@ -1835,6 +1868,88 @@ mod tests {
     /// retain-newest may rank+delete ONLY over a complete, non-truncated
     /// collect — a partial set (early defer/lease break OR budget overrun)
     /// must never be acted on (set-relative, no resume cursor → data loss).
+    /// P4.3: the delete events of one page are one outbox insert (one
+    /// commit), not one per deleted object.
+    #[tokio::test]
+    async fn a_page_of_deletes_appends_its_events_in_one_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = fs_engine(dir.path()).await;
+        let dbdir = tempfile::tempdir().unwrap();
+        let db = Arc::new(tokio::sync::Mutex::new(
+            crate::config_db::ConfigDb::open_or_create(&dbdir.path().join("c.db"), "pw").unwrap(),
+        ));
+        let mut deletes = Vec::new();
+        for i in 0..20 {
+            let key = format!("k{i:02}.bin");
+            engine
+                .store("b", &key, b"x", None, Default::default())
+                .await
+                .unwrap();
+            let meta = engine.head("b", &key).await.unwrap();
+            deletes.push(super::PlannedDelete::of(&key, &meta, "delete", true));
+        }
+        let before = crate::event_outbox::pages_written(&*db.lock().await);
+        let mut out = super::LifecycleRunOutcome::default();
+        let stopped = super::delete_planned(
+            Some(&db),
+            &engine,
+            &rule(),
+            deletes,
+            &|| true,
+            None,
+            &mut out,
+            10,
+        )
+        .await
+        .unwrap();
+        assert!(!stopped);
+        assert_eq!(out.objects_affected, 20);
+        let pages = crate::event_outbox::pages_written(&*db.lock().await) - before;
+        let rows = db.lock().await.event_outbox_since(0, 100).unwrap();
+        assert_eq!(rows.len(), 20, "every deleted key has its event");
+        assert!(
+            rows.iter().all(|r| r.kind == "LifecycleExpired"),
+            "{rows:?}"
+        );
+        assert!(pages <= 10, "one commit for the page, wrote {pages} pages");
+    }
+
+    /// A run dropped after some keys were deleted and before the page's
+    /// flush still stores their events (through the batched writer).
+    #[tokio::test]
+    async fn a_dropped_batch_still_stores_its_buffered_events() {
+        let db = Arc::new(tokio::sync::Mutex::new(
+            crate::config_db::ConfigDb::in_memory("pw").unwrap(),
+        ));
+        let events = super::DeleteEvents {
+            db: Some(db.clone()),
+            rule_name: "r".into(),
+            bucket: "b".into(),
+            expire_after: None,
+            actions: Default::default(),
+            pending: Default::default(),
+        };
+        let meta = crate::types::FileMetadata::fallback(
+            "k".into(),
+            1,
+            "e".into(),
+            chrono::Utc::now(),
+            None,
+            crate::types::StorageInfo::Passthrough,
+        );
+        events
+            .publish(
+                "k",
+                &crate::deltaglider::DeleteOutcome::Deleted(Box::new(meta)),
+            )
+            .await;
+        drop(events);
+        tokio::task::yield_now().await; // the spawned append queues
+        crate::event_outbox::flush_appends(&db).await;
+        let rows = db.lock().await.event_outbox_since(0, 10).unwrap();
+        assert_eq!(rows.len(), 1, "the deleted key lost its event");
+    }
+
     #[test]
     fn retain_newest_delete_gate() {
         assert!(
