@@ -946,6 +946,8 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // sink); only a failed probe gates. Without the loop nothing would
     // reopen a gated backend, so the sink needs the loop.
     if let Some(every) = deltaglider_proxy::coordination::health::health_probe_interval() {
+        // `/_/ready` answers from the loop's verdicts while they are fresh.
+        backend_health.set_loop_interval(every);
         deltaglider_proxy::coordination::health::install_passive_sink(
             backend_health.clone(),
             shared_config.clone(),

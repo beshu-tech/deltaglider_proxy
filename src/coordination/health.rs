@@ -223,7 +223,23 @@ pub struct BackendHealthCache {
     /// Backend name → passive suspicion. Drives the confirmation probe,
     /// never the gate.
     suspects: parking_lot::Mutex<HashMap<String, Suspicion>>,
+    /// What the health loop probes, for `/_/ready` (see [`Self::loop_verdicts`]).
+    health_loop: parking_lot::Mutex<HealthLoopView>,
+    /// The last live `/_/ready` backend probe and when it ended. Behind an
+    /// async mutex: concurrent probes wait for the one that runs.
+    ready_probe: tokio::sync::Mutex<Option<(std::time::Instant, &'static str)>>,
 }
+
+/// The health loop's interval (set when the loop starts) and the backends
+/// of its last round (name, definition fingerprint).
+#[derive(Debug, Default)]
+struct HealthLoopView {
+    every: Option<std::time::Duration>,
+    targets: Option<Vec<(String, String)>>,
+}
+
+/// How long one live `/_/ready` backend probe answers every `/_/ready`.
+pub const READY_PROBE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// One backend's verdict: the definition it is for, and when the probe
 /// that established it started (a verdict never replaces a newer one).
@@ -402,6 +418,76 @@ impl BackendHealthCache {
         }
     }
 
+    /// The health loop runs every `every`. Call once, when it starts.
+    pub fn set_loop_interval(&self, every: std::time::Duration) {
+        self.health_loop.lock().every = Some(every);
+    }
+
+    /// The verdicts of every backend that the health loop probes, when the
+    /// loop runs and each verdict is for the backend's current definition
+    /// and younger than 2 x the loop interval. `None` otherwise: the loop
+    /// is off, its first round has not run, or a verdict is missing or
+    /// old (a hung round) — `/_/ready` then probes live.
+    pub fn loop_verdicts(&self) -> Option<Vec<HealthVerdict>> {
+        self.loop_verdicts_at(std::time::Instant::now())
+    }
+
+    fn loop_verdicts_at(&self, now: std::time::Instant) -> Option<Vec<HealthVerdict>> {
+        let (every, targets) = {
+            let view = self.health_loop.lock();
+            (view.every?, view.targets.clone()?)
+        };
+        let max_age = every.saturating_mul(2);
+        let entries = self.entries.read();
+        targets
+            .iter()
+            .map(|(name, fp)| {
+                entries
+                    .get(name)
+                    .filter(|s| s.fp == *fp && now.saturating_duration_since(s.started) < max_age)
+                    .map(|s| s.entry.verdict.clone())
+            })
+            .collect()
+    }
+
+    /// Test seam: a verdict whose probe started at `started`, and the
+    /// health loop's last round over `targets`.
+    #[cfg(test)]
+    pub(crate) fn set_for_test(
+        &self,
+        targets: &[(&str, &BackendConfig)],
+        verdict: HealthVerdict,
+        started: std::time::Instant,
+    ) {
+        for (name, config) in targets {
+            self.record(name, fingerprint(config), verdict.clone(), started, false);
+        }
+        self.health_loop.lock().targets = Some(
+            targets
+                .iter()
+                .map(|(n, c)| (n.to_string(), fingerprint(c)))
+                .collect(),
+        );
+    }
+
+    /// Single-flight live readiness probe: answers from the last result for
+    /// [`READY_PROBE_TTL`]; else runs `probe`, while concurrent callers
+    /// wait for its answer instead of probing too.
+    pub async fn ready_probe<F>(&self, probe: F) -> &'static str
+    where
+        F: std::future::Future<Output = &'static str>,
+    {
+        let mut last = self.ready_probe.lock().await;
+        if let Some((at, verdict)) = *last {
+            if at.elapsed() < READY_PROBE_TTL {
+                return verdict;
+            }
+        }
+        let verdict = probe.await;
+        *last = Some((std::time::Instant::now(), verdict));
+        verdict
+    }
+
     /// Drop entries for backends no longer in the config (post-apply hygiene).
     pub fn retain_backends(&self, names: &std::collections::BTreeSet<String>) {
         self.entries.write().retain(|k, _| names.contains(k));
@@ -519,6 +605,12 @@ pub async fn reprobe_all(health: &BackendHealthCache, config: &crate::config::Sh
         let current: std::collections::BTreeSet<String> =
             targets.iter().map(|(n, _, _)| n.clone()).collect();
         health.retain_backends(&current);
+        health.health_loop.lock().targets = Some(
+            targets
+                .iter()
+                .map(|(n, b, _)| (n.clone(), fingerprint(b)))
+                .collect(),
+        );
         targets
     };
     let mut probes: futures::stream::FuturesUnordered<_> = targets

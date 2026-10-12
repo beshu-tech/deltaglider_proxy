@@ -275,16 +275,26 @@ fn backend_verdict_is_ready(verdict: &str) -> bool {
     matches!(verdict, "ready" | "degraded" | "cached")
 }
 
-/// Readiness probe — actually exercises dependencies, so an LB can pull a node
-/// out of rotation when its backend is down (vs `/health` which only proves the
-/// process answers). Returns 503 when not ready. Bounded by a short timeout so a
-/// hung backend yields a fast "not ready" instead of blocking the probe.
-/// GET /ready
-pub async fn readiness_check(
-    State(state): State<Arc<AppState>>,
-) -> (StatusCode, Json<ReadinessResponse>) {
+/// Pure: the backend half of readiness from fresh health-loop verdicts.
+/// A healthy backend makes it `ready`; one that answers with errors
+/// (`Erroring`: 5xx, persistent throttle) `degraded`, which serves, as the
+/// request gate keeps its buckets open; only all-gating is `unreachable`.
+fn readiness_from_health_loop(verdicts: &[crate::coordination::HealthVerdict]) -> &'static str {
+    use crate::coordination::HealthVerdict as V;
+    if verdicts.is_empty() || verdicts.iter().any(V::is_healthy) {
+        "ready"
+    } else if verdicts.iter().any(|v| !v.is_gating()) {
+        "degraded"
+    } else {
+        "unreachable"
+    }
+}
+
+/// The live backend probe of `/_/ready`: ListBuckets with retries, then
+/// the cheap HEAD and the last-known-good window (#78). Bounded by short
+/// timeouts so a hung backend yields a fast "not ready".
+async fn live_backend_readiness(engine: &crate::deltaglider::DynEngine) -> &'static str {
     use std::time::Duration;
-    let engine = state.engine.load();
     // Cheapest real backend op: list buckets, capped so a dead/slow backend
     // fails the probe fast rather than hanging the LB health check.
     //
@@ -350,6 +360,33 @@ pub async fn readiness_check(
     if list_ok || cheap_ok == Some(true) {
         record_backend_ok(now);
     }
+    backend
+}
+
+/// Readiness probe — actually exercises dependencies, so an LB can pull a node
+/// out of rotation when its backend is down (vs `/health` which only proves the
+/// process answers). Returns 503 when not ready.
+///
+/// The backend half costs no upstream request while the health loop runs
+/// and its verdicts are younger than 2 x its interval: it answers from them.
+/// Otherwise (loop off, boot before the first round, a hung round) it
+/// probes live, through a single flight whose answer serves every probe for
+/// [`crate::coordination::health::READY_PROBE_TTL`]. The config-DB half is
+/// always live.
+/// GET /ready
+pub async fn readiness_check(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<ReadinessResponse>) {
+    let backend = match state.backend_health.loop_verdicts() {
+        Some(verdicts) => readiness_from_health_loop(&verdicts),
+        None => {
+            let engine = state.engine.load_full();
+            state
+                .backend_health
+                .ready_probe(live_backend_readiness(&engine))
+                .await
+        }
+    };
     // config DB: if configured, confirm we can take the lock (a wedged mutex
     // means the control plane is stuck). Every S3 mutation holds it for a
     // moment (the event outbox), so the probe waits briefly: a busy mutex
@@ -395,6 +432,145 @@ pub async fn readiness_check(
 #[cfg(test)]
 mod readiness_tests {
     use super::*;
+    use crate::coordination::HealthVerdict;
+    use std::time::Duration;
+
+    /// An app state on a fake S3, and the default backend's definition.
+    async fn s3_state() -> (
+        Arc<AppState>,
+        Arc<crate::storage::FakeS3>,
+        crate::config::BackendConfig,
+    ) {
+        let (engine, fake) = crate::deltaglider::s3_engine().await;
+        fake.clear();
+        let backend = crate::config::Config::default().backend;
+        (AppState::for_tests(engine), fake, backend)
+    }
+
+    async fn ready(state: &Arc<AppState>) -> (StatusCode, &'static str) {
+        let (code, Json(body)) = readiness_check(State(state.clone())).await;
+        (code, body.backend)
+    }
+
+    const EVERY: Duration = Duration::from_secs(30);
+
+    /// The health loop already probes every backend each interval; a
+    /// second probe per `/_/ready` (kubelet + every router check) only
+    /// repeated it.
+    #[tokio::test]
+    async fn ready_answers_from_a_fresh_health_loop_verdict() {
+        let (state, fake, backend) = s3_state().await;
+        let health = &state.backend_health;
+        health.set_loop_interval(EVERY);
+        let now = std::time::Instant::now();
+        health.set_for_test(&[("default", &backend)], HealthVerdict::Healthy, now);
+        for _ in 0..3 {
+            assert_eq!(ready(&state).await, (StatusCode::OK, "ready"));
+        }
+        assert_eq!(
+            fake.requests(),
+            Vec::<String>::new(),
+            "fresh verdict: 0 upstream"
+        );
+
+        let down = HealthVerdict::Unreachable { detail: "x".into() };
+        health.set_for_test(&[("default", &backend)], down, std::time::Instant::now());
+        assert_eq!(
+            ready(&state).await,
+            (StatusCode::SERVICE_UNAVAILABLE, "unreachable"),
+            "a fresh gating verdict is not ready"
+        );
+        let erroring = HealthVerdict::Erroring {
+            detail: "503".into(),
+        };
+        health.set_for_test(
+            &[("default", &backend)],
+            erroring,
+            std::time::Instant::now(),
+        );
+        assert_eq!(ready(&state).await, (StatusCode::OK, "degraded"));
+        assert_eq!(fake.requests(), Vec::<String>::new());
+    }
+
+    /// A verdict older than 2 x the interval (a hung round), a loop that
+    /// never ran its first round, and no loop at all: each probes live,
+    /// once per `READY_PROBE_TTL`.
+    #[tokio::test]
+    async fn ready_probes_live_when_the_loop_cannot_answer() {
+        // Stale verdict.
+        let (state, fake, backend) = s3_state().await;
+        state.backend_health.set_loop_interval(EVERY);
+        let old = std::time::Instant::now() - EVERY * 2;
+        state
+            .backend_health
+            .set_for_test(&[("default", &backend)], HealthVerdict::Healthy, old);
+        assert_eq!(ready(&state).await, (StatusCode::OK, "ready"));
+        assert_eq!(ready(&state).await, (StatusCode::OK, "ready"));
+        assert_eq!(
+            fake.requests().len(),
+            1,
+            "stale: 1 live probe, then its TTL"
+        );
+
+        // Loop started, first round not done: no verdict yet.
+        let (state, fake, _) = s3_state().await;
+        state.backend_health.set_loop_interval(EVERY);
+        assert_eq!(ready(&state).await, (StatusCode::OK, "ready"));
+        assert_eq!(fake.requests().len(), 1, "boot: live probe");
+
+        // Loop off (DGP_BACKEND_HEALTH_INTERVAL_SECS=0): a verdict alone
+        // (boot probe, admin test) is not enough.
+        let (state, fake, backend) = s3_state().await;
+        let now = std::time::Instant::now();
+        state
+            .backend_health
+            .set_for_test(&[("default", &backend)], HealthVerdict::Healthy, now);
+        assert_eq!(ready(&state).await, (StatusCode::OK, "ready"));
+        assert_eq!(fake.requests().len(), 1, "loop off: live probe");
+    }
+
+    /// N concurrent probes that find no fresh verdict send ONE request.
+    #[tokio::test]
+    async fn concurrent_live_probes_share_one_request() {
+        let (state, fake, _) = s3_state().await;
+        fake.set_delay_ms("LIST_BUCKETS", 100);
+        let probes = (0..8).map(|_| ready(&state));
+        for answer in futures::future::join_all(probes).await {
+            assert_eq!(answer, (StatusCode::OK, "ready"));
+        }
+        assert_eq!(fake.requests().len(), 1, "{:?}", fake.requests());
+    }
+
+    /// A backend that is down is not ready: the single flight caches the
+    /// failure too (for its TTL), and a fresh probe sees it.
+    #[tokio::test]
+    async fn a_failed_live_probe_is_not_ready() {
+        let (state, fake, _) = s3_state().await;
+        fake.fail("LIST_BUCKETS", "/", 500, "InternalError", 100);
+        let (code, _) = ready(&state).await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn health_loop_verdicts_map_to_readiness() {
+        let down = || HealthVerdict::Unreachable { detail: "x".into() };
+        let erroring = || HealthVerdict::Erroring { detail: "x".into() };
+        assert_eq!(
+            readiness_from_health_loop(&[HealthVerdict::Healthy]),
+            "ready"
+        );
+        assert_eq!(
+            readiness_from_health_loop(&[down(), HealthVerdict::Healthy]),
+            "ready"
+        );
+        assert_eq!(
+            readiness_from_health_loop(&[erroring(), down()]),
+            "degraded"
+        );
+        assert_eq!(readiness_from_health_loop(&[down(), down()]), "unreachable");
+        let rejected = HealthVerdict::AuthRejected { detail: "x".into() };
+        assert_eq!(readiness_from_health_loop(&[rejected]), "unreachable");
+    }
 
     /// Every S3 mutation holds the config DB mutex for a moment (the event
     /// outbox append), and so do replication, event delivery and the IAM

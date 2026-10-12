@@ -377,8 +377,10 @@ buckets, and overlapping replication destination prefixes.
 
 See `docs/plan/architecture-ha-audit-2026-06-28.md` for the full analysis and the
 roadmap (audit Tiers A→C) toward true round-robin HA. `/_/health` is liveness-only
-(fast, no I/O); `/_/ready` does a real backend + config-DB probe (503 when not
-ready) — point LB readiness checks at `/_/ready`.
+(fast, no I/O); `/_/ready` answers the backend half from the health loop's
+verdicts while they are younger than 2 x its interval (else one single-flight
+live probe per 5 s) and probes the config DB live (503 when not ready) —
+point LB readiness checks at `/_/ready`.
 
 ## Frontend (demo/s3-browser/ui)
 

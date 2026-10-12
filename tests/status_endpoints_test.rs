@@ -132,6 +132,21 @@ async fn ready(ep: &str) -> (u16, Value) {
     get_json(&reqwest::Client::new(), &format!("{ep}/_/ready")).await
 }
 
+/// `/_/ready` once its answer shows the backend's new state. One live
+/// probe answers every readiness check for 5 s (single flight), so a
+/// change shows within that time; give up after 15 s.
+async fn ready_after_change(ep: &str, backend: &[&str]) -> (u16, Value) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let (code, r) = ready(ep).await;
+        let seen = r["backend"].as_str().unwrap_or("");
+        if backend.contains(&seen) || std::time::Instant::now() >= deadline {
+            return (code, r);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
 /// Strict contract (no last-known-good window): the LIST must succeed.
 #[tokio::test]
 async fn ready_is_503_when_the_backend_is_down() {
@@ -148,7 +163,7 @@ async fn ready_is_503_when_the_backend_is_down() {
     assert_eq!(r["backend"], "ready");
 
     mode.store(2, Ordering::SeqCst);
-    let (code, r) = ready(&ep).await;
+    let (code, r) = ready_after_change(&ep, &["unreachable", "timeout"]).await;
     assert_eq!(code, 503, "a failing backend is not ready: {r}");
     assert_eq!(r["status"], "not_ready");
     // The SDK retries the 500s inside the per-attempt timeout, so the verdict
@@ -161,7 +176,7 @@ async fn ready_is_503_when_the_backend_is_down() {
     assert_eq!(code, 200, "liveness stays up: it does no I/O");
 
     mode.store(0, Ordering::SeqCst);
-    let (code, r) = ready(&ep).await;
+    let (code, r) = ready_after_change(&ep, &["ready"]).await;
     assert_eq!(code, 200, "ready again once the backend answers: {r}");
 }
 
@@ -183,7 +198,7 @@ async fn ready_rides_out_a_list_throttle_and_a_short_outage_with_a_window() {
     assert_eq!((code, r["backend"].as_str()), (200, Some("ready")), "{r}");
 
     mode.store(1, Ordering::SeqCst);
-    let (code, r) = ready(&ep).await;
+    let (code, r) = ready_after_change(&ep, &["degraded"]).await;
     assert_eq!(code, 200, "{r}");
     assert_eq!(
         r["backend"], "degraded",
@@ -191,7 +206,7 @@ async fn ready_rides_out_a_list_throttle_and_a_short_outage_with_a_window() {
     );
 
     mode.store(2, Ordering::SeqCst);
-    let (code, r) = ready(&ep).await;
+    let (code, r) = ready_after_change(&ep, &["cached"]).await;
     assert_eq!(code, 200, "{r}");
     assert_eq!(
         r["backend"], "cached",

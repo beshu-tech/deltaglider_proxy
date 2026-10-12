@@ -58,11 +58,17 @@ fn fnv1a_hex(s: &str) -> String {
 /// Admin UI traffic (/_/) is source-IP sticky because sessions are in-memory.
 pub fn haproxy_cfg(cr_name: &str, namespace: &str, proxy_replicas: i32) -> String {
     let mut servers = String::new();
+    let mut admin_servers = String::new();
     for i in 0..proxy_replicas {
         // StatefulSet stable DNS names keep the hash ring identical on every router.
         let host = format!("{cr_name}-{i}.{cr_name}-pods.{namespace}.svc.cluster.local");
         servers.push_str(&format!(
             "  server dgp{i} {host}:{PROXY_PORT} check resolvers kube init-addr none\n"
+        ));
+        // The admin backend reuses the s3 backend's check of the same pod:
+        // one readiness check per pod per router, not two.
+        admin_servers.push_str(&format!(
+            "  server dgp{i} {host}:{PROXY_PORT} track s3/dgp{i} resolvers kube init-addr none\n"
         ));
     }
     format!(
@@ -101,13 +107,11 @@ backend s3
   default-server inter 10s rise 2 fall 3
 {servers}
 # Admin UI sessions are in-memory and IP-bound: source-IP stickiness.
+# Each server tracks the s3 backend's check of the same pod.
 backend admin
   balance source
   hash-type consistent
-  option httpchk GET /_/ready
-  http-check expect status 200
-  default-server inter 10s rise 2 fall 3
-{servers}"#
+{admin_servers}"#
     )
 }
 
@@ -485,9 +489,18 @@ mod tests {
                 && cfg.contains("http-check expect status 200"),
             "ring membership must track real readiness, not liveness"
         );
+        assert_eq!(
+            cfg.matches("option httpchk").count(),
+            1,
+            "one readiness check per pod: the admin backend tracks the s3 one"
+        );
         for i in 0..3 {
             let host = format!("dgp-{i}.dgp-pods.dgp-ns.svc.cluster.local:9000");
             assert_eq!(cfg.matches(&host).count(), 2, "{host} in both backends");
+            assert!(
+                cfg.contains(&format!("{host} track s3/dgp{i} ")),
+                "admin dgp{i} tracks s3/dgp{i}"
+            );
         }
         assert!(!cfg.contains("dgp-3."), "no server beyond replica count");
     }
