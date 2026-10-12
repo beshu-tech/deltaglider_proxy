@@ -11,6 +11,27 @@ delay that acknowledgement by about 40 ms, so most requests on a reused
 (keep-alive) connection, which is what the AWS SDKs use, took at least 40 ms.
 Ten GET requests on one connection took 412 ms and now take about 31 ms.
 
+### Changed — Copies move far fewer bytes through the proxy
+
+- A CopyObject of an object that the proxy stores as a delta now copies the
+  stored delta. Before, the proxy downloaded the folder's reference, rebuilt the
+  whole object with xdelta3 and compressed it again. A copy into the same
+  folder now sends 7 requests instead of 12, runs no xdelta3, and moves only
+  the small delta.
+- A CopyObject of an object that is stored as it is, on one storage backend,
+  is now a server-side copy: the bytes do not pass through the proxy. Admin
+  bulk copy and move, replication, lifecycle transitions and bucket migration
+  use the same server-side copy when the source and the destination are on
+  one backend and use the same encryption key. A re-encrypt job still rewrites
+  the bytes, because its purpose is a new encryption key.
+- An UploadPartCopy from a delta object rebuilds the object once for all of
+  its parts, not once per part.
+- Every copy checks the object it wrote with one HEAD request of that stored
+  form. A migrate copy now sends 5 requests per object instead of 10.
+- An admin bulk copy now gives the copy the time of the copy as its creation
+  time, as a CopyObject request does. Before, a bulk copy kept the creation
+  time of the source.
+
 ### Added — Write responses carry the storage facts of the object
 
 PutObject, CompleteMultipartUpload, CopyObject and a browser form upload now
