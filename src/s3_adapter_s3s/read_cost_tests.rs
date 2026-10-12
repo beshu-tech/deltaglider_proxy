@@ -712,8 +712,11 @@ async fn run_range(
 /// P3.7: a ranged GET of a passthrough object (no If-Range, no
 /// conditionals) sends the ranged GET and the `.delta` HEAD in parallel:
 /// the metadata comes from the ranged response. Was HEAD x2 + ranged GET.
-/// Behind a wrapper with a key (objects are encrypted) the wrapper HEADs
-/// for the format first, as before: one request less (4 -> 3), not two.
+/// Behind a wrapper with a key the photo is v1 (single-shot) encrypted:
+/// the wrapper's first ranged GET gives the metadata and the start of the
+/// body, with no HEAD (P3.5), and one more GET reads the rest of the body
+/// unless the first one held it all: 4 -> 3 requests, or 2.
+/// (`encrypted_ranges_send_no_metadata_head` covers the chunked format.)
 #[tokio::test]
 async fn a_passthrough_range_is_one_round_trip() {
     for kind in KINDS {
@@ -749,16 +752,16 @@ async fn a_passthrough_range_is_one_round_trip() {
             let mut reqs = key_requests(&fx.fake);
             reqs.sort();
             if kind == Kind::Encrypted {
-                // The wrapper's format HEAD, then its read of the object.
-                assert_eq!(
-                    reqs,
-                    [
-                        "GET /b/pics/a.jpg",
-                        "HEAD /b/pics/a.jpg",
-                        "HEAD /b/pics/a.jpg.delta"
-                    ],
-                    "{kind:?}"
-                );
+                // The guessed read; the rest of the body unless the guess,
+                // which runs through the frame of the range's end, held it.
+                let gets = if last.is_some_and(|l| l >= size) {
+                    1
+                } else {
+                    2
+                };
+                let mut want = vec!["GET /b/pics/a.jpg"; gets];
+                want.push("HEAD /b/pics/a.jpg.delta");
+                assert_eq!(reqs, want, "{kind:?} {first}");
             } else {
                 assert_eq!(
                     reqs,

@@ -2286,6 +2286,136 @@ mod read_request_tests {
         }
     }
 
+    /// P3.5: a range read of a keyed backend takes the object's metadata
+    /// from its own ranged GET, not from a HEAD. A range in chunk 0
+    /// (`bytes=0-`, video players) is one GET of the header and the frames;
+    /// a range further in is a header GET and a body GET. Before: a
+    /// metadata HEAD, a header GET and a body GET, 3 for each.
+    #[tokio::test]
+    async fn encrypted_ranges_send_no_metadata_head() {
+        let (w, fake) = wrapped(Some(key())).await;
+        let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        w.put_passthrough_chunked(
+            "b",
+            "p",
+            "a.bin",
+            &[Bytes::from(body.clone())],
+            &meta(&body),
+        )
+        .await
+        .unwrap();
+        let last = body.len() as u64 - 1;
+        // The object reads, not the background listing-facts write.
+        let reads = || -> Vec<String> {
+            fake.requests()
+                .into_iter()
+                .filter(|r| !r.contains(".dg/facts"))
+                .collect()
+        };
+        for (start, end, want) in [
+            (0, u64::MAX - 1, 1),
+            (0, 9, 1),
+            (10, 70_000, 1),
+            (0, last, 1),
+            (70_000, 70_100, 2),
+            (150_000, u64::MAX - 1, 2),
+            (last, last, 2),
+        ] {
+            let e = end.min(last);
+            let expected = &body[start as usize..=e as usize];
+            fake.clear();
+            let (stream, len, m) = w
+                .open_passthrough_range("b", "p", "a.bin", start, end)
+                .await
+                .unwrap();
+            let got: Vec<Bytes> = stream.try_collect().await.unwrap();
+            assert_eq!(got.concat(), expected, "open {start}-{end}");
+            assert_eq!(len, expected.len() as u64);
+            assert_eq!(m.file_size, body.len() as u64);
+            let reqs = reads();
+            assert!(reqs.iter().all(|r| r.starts_with("GET ")), "{reqs:?}");
+            assert_eq!(reqs.len(), want, "open {start}-{end}: {reqs:?}");
+            fake.clear();
+            let (stream, len) = w
+                .get_passthrough_stream_range("b", "p", "a.bin", start, end)
+                .await
+                .unwrap();
+            let got: Vec<Bytes> = stream.try_collect().await.unwrap();
+            assert_eq!(got.concat(), expected, "range {start}-{end}");
+            assert_eq!(len, expected.len() as u64);
+            assert_eq!(reads().len(), want, "{:?}", reads());
+        }
+        // A range past the end is refused, as before.
+        assert!(matches!(
+            w.open_passthrough_range("b", "p", "a.bin", body.len() as u64, u64::MAX - 1)
+                .await,
+            Err(StorageError::InvalidRange(_))
+        ));
+    }
+
+    /// P3.5: the read that guessed the chunked format serves the other
+    /// stored forms right, from the metadata it read: a v1 (single-shot)
+    /// object and a plaintext object on a keyed backend, and a ciphertext
+    /// whose markers were stripped is refused, never served.
+    #[tokio::test]
+    async fn encrypted_range_reads_serve_every_stored_form() {
+        let (w, _fake) = wrapped(Some(key())).await;
+        let body: Vec<u8> = (0..1000u32).map(|i| (i % 7) as u8).collect();
+        // v1: the small buffered write.
+        w.put_passthrough("b", "p", "v1.bin", Bytes::from(body.clone()), &meta(&body))
+            .await
+            .unwrap();
+        // Plaintext: written by the inner backend directly.
+        w.inner
+            .put_passthrough(
+                "b",
+                "p",
+                "plain.bin",
+                Bytes::from(body.clone()),
+                &meta(&body),
+            )
+            .await
+            .unwrap();
+        for name in ["v1.bin", "plain.bin"] {
+            for (start, end) in [(0, u64::MAX - 1), (0, 9), (500, 600)] {
+                let (stream, len, _) = w
+                    .open_passthrough_range("b", "p", name, start, end)
+                    .await
+                    .unwrap();
+                let got: Vec<Bytes> = stream.try_collect().await.unwrap();
+                let e = end.min(body.len() as u64 - 1) as usize;
+                assert_eq!(
+                    got.concat(),
+                    &body[start as usize..=e],
+                    "{name} {start}-{end}"
+                );
+                assert_eq!(len, (e + 1 - start as usize) as u64);
+            }
+        }
+        // Ciphertext with its markers stripped (a foreign metadata rewrite).
+        let big: Vec<u8> = (0..100_000u32).map(|i| (i % 13) as u8).collect();
+        w.put_passthrough_chunked("b", "p", "c.bin", &[Bytes::from(big.clone())], &meta(&big))
+            .await
+            .unwrap();
+        let wire = w.inner.get_passthrough("b", "p", "c.bin").await.unwrap();
+        w.inner
+            .put_passthrough("b", "p", "c.bin", Bytes::from(wire), &meta(&big))
+            .await
+            .unwrap();
+        for (start, end) in [(0, 99), (70_000, 70_100)] {
+            let read = async {
+                let (stream, _, _) = w
+                    .open_passthrough_range("b", "p", "c.bin", start, end)
+                    .await?;
+                stream.try_collect::<Vec<Bytes>>().await
+            };
+            assert!(
+                read.await.is_err(),
+                "stripped ciphertext served {start}-{end}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn delta_and_reference_reads_are_one_get() {
         for k in [None, Some(key())] {

@@ -277,6 +277,63 @@ async fn fetch_chunked_header<B: StorageBackend + ?Sized>(
     Ok(base_iv)
 }
 
+/// `take` bytes of `stream` after its first `skip` bytes.
+fn slice_stream(stream: ByteStream, skip: u64, take: u64) -> ByteStream {
+    use futures::StreamExt;
+    let (mut skip, mut left) = (skip, take);
+    Box::pin(
+        stream
+            .map(move |chunk| {
+                chunk.map(|mut b| {
+                    let s = skip.min(b.len() as u64) as usize;
+                    skip -= s as u64;
+                    let b = b.split_off(s);
+                    let t = left.min(b.len() as u64) as usize;
+                    left -= t as u64;
+                    b.slice(..t)
+                })
+            })
+            .filter(|r| futures::future::ready(r.as_ref().map_or(true, |b| !b.is_empty()))),
+    )
+}
+
+/// Split the `[magic][base_iv]` header off the front of a chunked object's
+/// wire stream: the parsed `base_iv`, and the stream of the frames that
+/// follow it.
+async fn split_chunked_header(
+    mut stream: ByteStream,
+) -> Result<([u8; IV_LEN], ByteStream), StorageError> {
+    use futures::StreamExt;
+    let mut head: Vec<u8> = Vec::with_capacity(CHUNK_HEADER_LEN);
+    while head.len() < CHUNK_HEADER_LEN {
+        match stream.next().await {
+            Some(chunk) => head.extend_from_slice(&chunk?),
+            None => {
+                return Err(StorageError::Encryption(format!(
+                    "stream ended before encryption header (got {} of {} bytes)",
+                    head.len(),
+                    CHUNK_HEADER_LEN
+                )))
+            }
+        }
+    }
+    if head[..4] != CHUNK_MAGIC {
+        return Err(StorageError::Encryption(format!(
+            "bad chunked-encryption magic: {:02x?}",
+            &head[..4]
+        )));
+    }
+    let mut base_iv = [0u8; IV_LEN];
+    base_iv.copy_from_slice(&head[4..CHUNK_HEADER_LEN]);
+    let rest = Bytes::from(head.split_off(CHUNK_HEADER_LEN));
+    let frames = futures::stream::once(async move { Ok(rest) })
+        .filter(|b: &Result<Bytes, StorageError>| {
+            futures::future::ready(b.as_ref().map_or(true, |b| !b.is_empty()))
+        })
+        .chain(stream);
+    Ok((base_iv, Box::pin(frames)))
+}
+
 /// Transparent encryption wrapper around any `StorageBackend`.
 pub struct EncryptingBackend<B: StorageBackend> {
     inner: B,
@@ -376,6 +433,193 @@ impl<B: StorageBackend> EncryptingBackend<B> {
 
     /// True when this wrapper holds any key (primary or decrypt-only
     /// legacy), so the backend may hold proxy-encrypted bodies.
+    /// A range of a passthrough object on a backend with a key, and the
+    /// object's raw stored metadata, without a metadata HEAD (P3.5).
+    ///
+    /// The first read guesses the chunked format (what every large or
+    /// streamed write stores) and is a ranged GET from wire byte 0: its
+    /// response carries the metadata with the encryption markers. A range
+    /// that starts in chunk 0 (`bytes=0-`, a video player's first read)
+    /// reads the header and the frames it needs in that one GET: the
+    /// header and chunk 0 are contiguous. A range further in reads only
+    /// the 16-byte header first, then the frames. When the metadata names
+    /// another form, the guessed bytes still serve: a v1 (single-shot)
+    /// object reads only its rest (none when the guess held it all); a
+    /// plaintext object serves a chunk-0 range from them, and a later
+    /// range reads its bytes, with the magic check done on the guessed
+    /// header (no 4-byte probe).
+    async fn keyed_range(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<(ByteStream, u64, FileMetadata), StorageError> {
+        let (first_chunk, _) = chunk_index_for_plaintext_offset(start);
+        let guess_end = if first_chunk == 0 {
+            // Through the frame that holds `end` (or past the object's
+            // end: the backend clamps). The size is not known yet.
+            let last_chunk = (end / CHUNK_PLAINTEXT_SIZE as u64).min(u64::from(u32::MAX));
+            (CHUNK_HEADER_LEN as u64)
+                .saturating_add((last_chunk + 1).saturating_mul(CHUNK_FRAME_WIRE_LEN as u64))
+                .saturating_sub(1)
+                .min(u64::MAX - 1)
+        } else {
+            CHUNK_HEADER_LEN as u64 - 1
+        };
+        let (stream, got, meta) = self
+            .inner
+            .open_passthrough_range(bucket, prefix, filename, 0, guess_end)
+            .await?;
+        // The backend clamped the guess: the response holds the whole object.
+        let whole = got < guess_end + 1;
+        if is_encrypted(&meta) && !is_chunked_encrypted(&meta) {
+            // v1 single-shot (bounded by max_object_size): decrypt the
+            // whole body. The guessed bytes are its start; the rest, if
+            // any, is one more ranged GET.
+            let mut wire = collect_stream(stream).await?;
+            if !whole {
+                match self
+                    .inner
+                    .get_passthrough_stream_range(
+                        bucket,
+                        prefix,
+                        filename,
+                        guess_end + 1,
+                        u64::MAX - 1,
+                    )
+                    .await
+                {
+                    Ok((rest, _)) => wire.extend_from_slice(&collect_stream(rest).await?),
+                    Err(StorageError::InvalidRange(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            let plain = self.decrypt_if_needed(wire, &meta)?;
+            let (s, e) = super::clamp_range(start, end, plain.len() as u64)?;
+            let slice = Bytes::from(plain[s as usize..=e as usize].to_vec());
+            let len = slice.len() as u64;
+            return Ok((
+                Box::pin(futures::stream::once(async { Ok(slice) })),
+                len,
+                meta,
+            ));
+        }
+        if !is_chunked_encrypted(&meta) {
+            // Plaintext per its metadata. The guessed bytes start at 0, so
+            // they show the chunked magic of a ciphertext whose markers were
+            // stripped: refuse it, never serve ciphertext as plaintext.
+            if first_chunk == 0 {
+                // The guess holds the range: through `end`, or to the
+                // object's end when the backend clamped it.
+                let object_end = if whole { got.checked_sub(1) } else { Some(end) };
+                let Some(effective_end) = object_end.map(|o| o.min(end)).filter(|e| *e >= start)
+                else {
+                    return Err(StorageError::InvalidRange(format!(
+                        "range start {start} is past the end of {prefix}/{filename}"
+                    )));
+                };
+                let len = effective_end - start + 1;
+                return Ok((
+                    slice_stream(sniff_dge1_magic(stream), start, len),
+                    len,
+                    meta,
+                ));
+            }
+            let head = collect_stream(stream).await?;
+            if head.starts_with(&CHUNK_MAGIC) {
+                return Err(stripped_marker_error());
+            }
+            let (stream, len) = self
+                .inner
+                .get_passthrough_stream_range(bucket, prefix, filename, start, end)
+                .await?;
+            return Ok((stream, len, meta));
+        }
+        let key = self.pick_decrypt_key(stamped_key_id(&meta))?;
+        let final_idx = final_chunk_index_for_plaintext_size(meta.file_size);
+        let (start, effective_end) = super::clamp_range(start, end, meta.file_size)?;
+        let plaintext_len = effective_end - start + 1;
+        let (base_iv, frames) = split_chunked_header(stream).await?;
+        if first_chunk == 0 {
+            let plain = chunked_decrypt_stream_from_chunk(
+                frames,
+                key,
+                base_iv,
+                0,
+                final_idx,
+                start,
+                Some(plaintext_len),
+            );
+            return Ok((plain, plaintext_len, meta));
+        }
+        drop(frames);
+        let (plain, len) = self
+            .chunked_frames_range(
+                bucket,
+                prefix,
+                filename,
+                (start, effective_end),
+                key,
+                base_iv,
+                final_idx,
+            )
+            .await?;
+        Ok((plain, len, meta))
+    }
+
+    /// The plaintext `start..=end` (clamped already) of a chunked object
+    /// whose header is known: one ranged GET of the frames that hold it.
+    #[allow(clippy::too_many_arguments)]
+    async fn chunked_frames_range(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        (start, effective_end): (u64, u64),
+        key: EncryptionKey,
+        base_iv: [u8; IV_LEN],
+        final_idx: u32,
+    ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError> {
+        let (first_chunk, _) = chunk_index_for_plaintext_offset(start);
+        let (last_chunk, _) = chunk_index_for_plaintext_offset(effective_end);
+        let wire_start = wire_offset_of_chunk(first_chunk);
+        let wire_end = if last_chunk < final_idx {
+            wire_offset_of_chunk(last_chunk) + CHUNK_FRAME_WIRE_LEN as u64 - 1
+        } else {
+            // Last chunk IS the object's final chunk; it may be
+            // shorter than a full frame, so ask for EOF. The
+            // `u64::MAX - 1` sentinel works across both backends:
+            // S3 interprets it per RFC 7233 (clamp to resource
+            // length), filesystem `File::take` limits on actual
+            // EOF.
+            u64::MAX - 1
+        };
+        let (ct_stream, _) = self
+            .inner
+            .get_passthrough_stream_range(bucket, prefix, filename, wire_start, wire_end)
+            .await?;
+        // Skip any plaintext bytes before `start` within the
+        // first fetched chunk. E.g. for start=70000 and chunk
+        // size 65536, first_chunk=1 (starts at plaintext 65536)
+        // and we skip 70000 - 65536 = 4464 bytes of its
+        // plaintext. The preceding full chunks (index 0) are
+        // never fetched or decrypted.
+        let skip_bytes = start - (first_chunk as u64) * (CHUNK_PLAINTEXT_SIZE as u64);
+        let plaintext_len = effective_end - start + 1;
+        let plain = chunked_decrypt_stream_from_chunk(
+            ct_stream,
+            key,
+            base_iv,
+            first_chunk,
+            final_idx,
+            skip_bytes,
+            Some(plaintext_len),
+        );
+        Ok((plain, plaintext_len))
+    }
+
     /// A range of a passthrough object whose raw stored metadata is `meta`.
     async fn range_with_meta(
         &self,
@@ -414,50 +658,21 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             // Out-of-range for this object (the caller's size can be stale):
             // an error, never the pre-B3 `(empty, 0)` "not a range" signal.
             let (start, effective_end) = super::clamp_range(start, end, meta.file_size)?;
-            let (first_chunk, _) = chunk_index_for_plaintext_offset(start);
-            let (last_chunk, _) = chunk_index_for_plaintext_offset(effective_end);
 
             // Fetch #1: just the header. Size is tiny
-            // (CHUNK_HEADER_LEN = 16 bytes).
+            // (CHUNK_HEADER_LEN = 16 bytes). Fetch #2: the frames.
             let base_iv = fetch_chunked_header(&self.inner, bucket, prefix, filename).await?;
-
-            // Fetch #2: body covering `first_chunk..=last_chunk`.
-            let wire_start = wire_offset_of_chunk(first_chunk);
-            let wire_end = if last_chunk < final_idx {
-                wire_offset_of_chunk(last_chunk) + CHUNK_FRAME_WIRE_LEN as u64 - 1
-            } else {
-                // Last chunk IS the object's final chunk; it may be
-                // shorter than a full frame, so ask for EOF. The
-                // `u64::MAX - 1` sentinel works across both backends:
-                // S3 interprets it per RFC 7233 (clamp to resource
-                // length), filesystem `File::take` limits on actual
-                // EOF.
-                u64::MAX - 1
-            };
-            let (ct_stream, _) = self
-                .inner
-                .get_passthrough_stream_range(bucket, prefix, filename, wire_start, wire_end)
-                .await?;
-
-            // Skip any plaintext bytes before `start` within the
-            // first fetched chunk. E.g. for start=70000 and chunk
-            // size 65536, first_chunk=1 (starts at plaintext 65536)
-            // and we skip 70000 - 65536 = 4464 bytes of its
-            // plaintext. The preceding full chunks (index 0) are
-            // never fetched or decrypted.
-            let skip_bytes = start - (first_chunk as u64) * (CHUNK_PLAINTEXT_SIZE as u64);
-            let plaintext_len = effective_end - start + 1;
-
-            let plain = chunked_decrypt_stream_from_chunk(
-                ct_stream,
-                key,
-                base_iv,
-                first_chunk,
-                final_idx,
-                skip_bytes,
-                Some(plaintext_len),
-            );
-            return Ok((plain, plaintext_len));
+            return self
+                .chunked_frames_range(
+                    bucket,
+                    prefix,
+                    filename,
+                    (start, effective_end),
+                    key,
+                    base_iv,
+                    final_idx,
+                )
+                .await;
         }
 
         // v1 single-shot path (bounded by max_object_size). Same as
@@ -1152,18 +1367,16 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         start: u64,
         end: u64,
     ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError> {
-        let meta = self
-            .inner
-            .get_passthrough_metadata(bucket, prefix, filename)
+        let (stream, len, _) = self
+            .open_passthrough_range(bucket, prefix, filename, start, end)
             .await?;
-        self.range_with_meta(bucket, prefix, filename, start, end, &meta)
-            .await
+        Ok((stream, len))
     }
 
     /// Without a key, objects here are plaintext: the inner backend's one
     /// read gives the range and the metadata, with the same stripped-marker
-    /// checks as a range read. With a key, the format decides the reads, so
-    /// the metadata comes first (a HEAD), as on `get_passthrough_stream_range`.
+    /// checks as a range read. With a key, `keyed_range` takes the
+    /// metadata from its first ranged GET, never from a HEAD.
     async fn open_passthrough_range(
         &self,
         bucket: &str,
@@ -1173,14 +1386,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         end: u64,
     ) -> Result<(ByteStream, u64, FileMetadata), StorageError> {
         if self.has_any_key() {
-            let meta = self
-                .inner
-                .get_passthrough_metadata(bucket, prefix, filename)
-                .await?;
-            let (stream, len) = self
-                .range_with_meta(bucket, prefix, filename, start, end, &meta)
-                .await?;
-            return Ok((stream, len, meta));
+            return self.keyed_range(bucket, prefix, filename, start, end).await;
         }
         let (stream, len, meta) = self
             .inner
