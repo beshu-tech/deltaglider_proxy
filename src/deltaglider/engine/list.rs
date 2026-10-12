@@ -105,29 +105,20 @@ pub(crate) fn interleave_and_paginate<O>(
 }
 
 impl<S: StorageBackend> DeltaGliderEngine<S> {
-    /// Decide whether a LIST entry needs a per-object HEAD to report accurate
-    /// metadata, during `metadata=true` enrichment.
-    ///
-    /// A HEAD is needed only when the stored size could differ from the size the
-    /// lite LIST already reports:
-    ///   * the entry is already a delta (`meta.is_delta()`) — LIST shows the
-    ///     delta (stored) size, HEAD recovers the original; OR
-    ///   * the filename is delta-*eligible* by extension — it might be stored as
-    ///     a delta even if this LIST entry wasn't flagged, so HEAD to be sure.
-    ///
-    /// For everything else — a passthrough, non-delta-eligible object (checksum
-    /// sidecars, images, …) — the object is stored verbatim, so the LIST entry's
-    /// size/etag are authoritative and the HEAD is pure waste. Pure function on
-    /// the key + metadata; no I/O. Unit-tested.
-    pub(super) fn list_entry_needs_head(
-        router: &FileRouter,
-        key: &str,
-        meta: &FileMetadata,
-    ) -> bool {
-        if meta.is_delta() {
-            return true;
-        }
-        router.is_delta_eligible(key)
+    /// Does a `metadata=true` LIST entry need a HEAD? Only when the listing
+    /// does not know its logical size: a facts miss (`StoredOnly`: a delta
+    /// stub, or a ciphertext on an encrypted backend, whose durable listing
+    /// facts are missing). Every other entry lists its storage facts
+    /// (`dg-note`, `dg-delta-size`) from the listing alone: the stored form
+    /// is in the listed key (`k.delta` or `k`), and a delta's stored size is
+    /// the listed size of its `.delta` object. A delta-eligible key stored
+    /// as a passthrough object needs no HEAD either: the listing proves its
+    /// form. The one exception: a delta on a proxy-encrypted S3 backend
+    /// (`CachedEncryptedDelta`), whose listed size is the ciphertext's while
+    /// `dg-delta-size` is the plaintext delta size. Pure; unit-tested.
+    pub(super) fn list_entry_needs_head(size: crate::storage::list_size_cache::ListedSize) -> bool {
+        use crate::storage::list_size_cache::ListedSize;
+        !size.is_known() || size == ListedSize::CachedEncryptedDelta
     }
 
     /// A delta entry built from LIST data alone (no HEAD) — the `delta_stub`
@@ -244,13 +235,42 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Ok(page)
     }
 
-    /// Complete a page of `list_objects_lite`: the logical sizes,
-    /// and with `metadata` the HEAD enrichment of the entries that need it.
+    /// Complete a page of `list_objects_lite`: the logical sizes, and with
+    /// `metadata` the storage facts (a HEAD only where
+    /// [`Self::list_entry_needs_head`] says so).
     pub(crate) async fn finish_listed_page(
         &self,
         bucket: &str,
         page: &mut ListObjectsPage,
         metadata: bool,
+    ) -> Result<(), EngineError> {
+        let completion = if metadata {
+            Completion::StorageFacts
+        } else {
+            Completion::Sizes
+        };
+        self.complete_listed_page(bucket, page, completion).await
+    }
+
+    /// [`Self::finish_listed_page`] with the HEAD metadata of every delta
+    /// and delta-eligible entry (its `dg-created-at`, its user metadata),
+    /// as `metadata=true` gave it before D1. The lifecycle scan judges an
+    /// object's age by that creation time, which a migrate or a metadata
+    /// backfill keeps older than the backend's LastModified.
+    pub(crate) async fn finish_listed_page_with_heads(
+        &self,
+        bucket: &str,
+        page: &mut ListObjectsPage,
+    ) -> Result<(), EngineError> {
+        self.complete_listed_page(bucket, page, Completion::HeadMetadata)
+            .await
+    }
+
+    async fn complete_listed_page(
+        &self,
+        bucket: &str,
+        page: &mut ListObjectsPage,
+        completion: Completion,
     ) -> Result<(), EngineError> {
         // Transparency without a HEAD per key: a lite LIST on an S3 backend
         // reports the STORED object (a delta's `.delta`, a ciphertext). Swap
@@ -268,14 +288,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         };
         page.facts_missing_keys = stored_size_only_keys(&page.objects, &sizes);
 
-        // When metadata=true (MinIO extension), enrich objects with full
-        // metadata from HEAD calls. Use the metadata cache to avoid HEAD
-        // for objects we already know about — the biggest performance win
-        // (1000 objects → 1000 cache lookups instead of 1000 HEADs).
-        if metadata && !page.objects.is_empty() {
-            let mut cache_hits = Vec::new();
-            let mut cache_misses = Vec::new();
-
+        // `metadata=true` (D1): every entry lists its storage facts from the
+        // listing. Only a facts miss is HEADed, unless the metadata cache
+        // knows it.
+        if completion != Completion::Sizes && !page.objects.is_empty() {
+            let mut known = Vec::with_capacity(page.objects.len());
+            let mut misses = Vec::new();
             for ((key, meta), size) in
                 std::mem::take(&mut page.objects)
                     .into_iter()
@@ -283,35 +301,30 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                         crate::storage::list_size_cache::ListedSize::Listed,
                     )))
             {
-                if let Some(cached) = self.metadata_cache.get(bucket, &key) {
-                    cache_hits.push((key, cached));
-                } else if !size.is_known() {
-                    // Only the stored size is known (a ciphertext whose facts
-                    // are missing): a HEAD reads the logical one.
-                    cache_misses.push((key, meta));
-                } else if Self::list_entry_needs_head(&self.file_router, &key, &meta) {
-                    // Delta or delta-eligible: the LIST entry carries the stored
-                    // (delta) size; a HEAD is required to recover the original
-                    // size + storage type.
-                    cache_misses.push((key, meta));
+                let needs_head = match completion {
+                    Completion::HeadMetadata => {
+                        !size.is_known()
+                            || meta.is_delta()
+                            || self.file_router.is_delta_eligible(&key)
+                    }
+                    _ => Self::list_entry_needs_head(size),
+                };
+                // The lifecycle scan takes the cached HEAD metadata of any
+                // entry (its `dg-created-at`), as before D1.
+                let cached = (needs_head || completion == Completion::HeadMetadata)
+                    .then(|| self.metadata_cache.get(bucket, &key))
+                    .flatten();
+                if let Some(cached) = cached {
+                    known.push((key, cached));
+                } else if !needs_head {
+                    known.push((key, meta));
                 } else {
-                    // Passthrough, non-delta-eligible file (e.g. a `.sha1`/`.sha512`
-                    // checksum sidecar, an image). It is stored verbatim, so the
-                    // LIST entry's size/etag ARE the truth — a per-object HEAD
-                    // would return the same size and add nothing. Skipping it
-                    // avoids an upstream HEAD per object (the dominant cost on
-                    // build-artifact listings full of checksum sidecars, and the
-                    // source of the HEAD-burst throttling seen in prod). Use the
-                    // lite LIST metadata directly.
-                    cache_hits.push((key, meta));
+                    misses.push((key, meta));
                 }
             }
 
-            if !cache_misses.is_empty() {
-                let enriched = self
-                    .storage
-                    .enrich_list_metadata(bucket, cache_misses)
-                    .await?;
+            if !misses.is_empty() {
+                let enriched = self.storage.enrich_list_metadata(bucket, misses).await?;
                 // Cache ONLY genuinely HEAD-resolved metadata. When a HEAD
                 // sweep aborts under backend throttling, enrich_list_metadata
                 // returns unresolved delta STUBS (empty ref_sha256, delta_size
@@ -324,19 +337,19 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                         self.metadata_cache.insert(bucket, key, meta.clone());
                     }
                 }
-                cache_hits.extend(enriched);
+                known.extend(enriched);
             }
 
             // Re-sort by key to maintain S3 lexicographic ordering
-            cache_hits.sort_by(|a, b| a.0.cmp(&b.0));
+            known.sort_by(|a, b| a.0.cmp(&b.0));
             // A HEAD resolved the missing ones, except a stub that a
             // throttled HEAD sweep left.
             page.facts_missing_keys.retain(|k| {
-                cache_hits
+                known
                     .binary_search_by(|(key, _)| key.as_str().cmp(k))
-                    .is_ok_and(|i| Self::is_unresolved_delta_stub(&cache_hits[i].1))
+                    .is_ok_and(|i| Self::is_unresolved_delta_stub(&known[i].1))
             });
-            page.objects = cache_hits;
+            page.objects = known;
         }
         Ok(())
     }
@@ -511,6 +524,17 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             })
         }
     }
+}
+
+/// What [`DeltaGliderEngine::complete_listed_page`] adds to a lite page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Completion {
+    /// Logical sizes only.
+    Sizes,
+    /// Sizes and storage facts: a HEAD only for a facts miss (D1).
+    StorageFacts,
+    /// Sizes and the HEAD metadata of every delta and delta-eligible entry.
+    HeadMetadata,
 }
 
 /// Keys of a listing page whose entry shows only its stored size (see

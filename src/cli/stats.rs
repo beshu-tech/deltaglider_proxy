@@ -12,8 +12,9 @@
 //! - **sampled**: LIST + one HEAD per deltaspace, project the metadata
 //!   onto siblings. Catches buckets where the metadata cache is cold but
 //!   still cheap (~5-15s for ten-thousand-object buckets).
-//! - **detailed**: LIST with `metadata=true` — HEAD every object. Most
-//!   accurate, slowest. This was the MVP's single mode.
+//! - **detailed**: LIST with `metadata=true`: the logical size of every
+//!   object from the listing facts, and a HEAD only for an object whose
+//!   facts are missing. Most accurate.
 //!
 //! Results are cached at `s3://<bucket>/.deltaglider/stats_{mode}.json`
 //! (one file per mode). Cache validation re-runs a cheap LIST and compares
@@ -521,8 +522,9 @@ async fn sampled_from_listing(
     Ok(acc.into_result(bucket))
 }
 
-/// Detailed mode: the MVP's original behavior. LIST with metadata=true
-/// so every object's metadata is HEAD-ed (with cache de-dup).
+/// Detailed mode: LIST with metadata=true. It reads only the storage class,
+/// the logical size and the delta size of each object, which the listing
+/// carries; an object whose listing facts are missing gets one HEAD.
 async fn detailed_scan(engine: &DynEngine, bucket: &str) -> Result<StatsResult, i32> {
     let mut acc = StatsAcc::default();
     let mut continuation: Option<String> = None;

@@ -1350,6 +1350,11 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         if self.actively_encrypts() && !self.inner.lite_list_carries_logical_facts(b) {
             downgrade_ciphertext_listings(objects, &mut sizes);
         }
+        // A listed delta may be ciphertext whenever a key exists: its
+        // listed `.delta` size is not the delta size a HEAD shows.
+        if self.has_any_key() && !self.inner.lite_list_carries_logical_facts(b) {
+            mark_encrypted_deltas(objects, &mut sizes);
+        }
         sizes
     }
     async fn list_objects_delegated(
@@ -1367,6 +1372,14 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
 /// On a backend whose listing reports ciphertext, a passthrough entry the
 /// listing-size cache did not resolve carries the ciphertext size: mark it
 /// `StoredOnly`. Directory markers stay `Listed`. Pure; unit-tested.
+fn mark_encrypted_deltas(objects: &[(String, FileMetadata)], sizes: &mut [ListedSize]) {
+    for ((_, meta), size) in objects.iter().zip(sizes.iter_mut()) {
+        if *size == ListedSize::Cached && meta.is_delta() {
+            *size = ListedSize::CachedEncryptedDelta;
+        }
+    }
+}
+
 fn downgrade_ciphertext_listings(objects: &[(String, FileMetadata)], sizes: &mut [ListedSize]) {
     for ((key, _), size) in objects.iter().zip(sizes.iter_mut()) {
         if *size == ListedSize::Listed && !key.ends_with('/') {

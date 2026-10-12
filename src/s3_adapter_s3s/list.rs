@@ -369,27 +369,27 @@ async fn ensure_listed_bucket(
         .map_err(s3s::S3Error::from)
 }
 
-/// The `metadata=true` LIST map: the HEAD map (`response_metadata_map`) under
-/// `x-amz-meta-`, plus `content-type`. It used the storage map, which names user
-/// metadata `x-amz-meta-user-foo` where HEAD says `x-amz-meta-foo`
-/// (s3surface-8).
+/// The `metadata=true` LIST map of one entry (D1): its storage facts,
+/// named as HeadObject names them, `x-amz-meta-dg-note` (`delta`,
+/// `passthrough` or `reference`) and, for a delta, `x-amz-meta-dg-delta-size`
+/// (its stored size). Taken from the HEAD map (`response_metadata_map`), so
+/// a value never differs from what HeadObject shows. The object's user
+/// metadata and content type are not listed: HeadObject returns them. An
+/// anonymous reader (a public prefix, a presigned link) gets no storage
+/// facts, as it gets no `dg-tool` (`strip_fingerprint_metadata`).
 pub(super) fn list_metadata_map(
     meta: &FileMetadata,
     reader: Reader,
 ) -> std::collections::HashMap<String, String> {
-    let mut map: std::collections::HashMap<String, String> = response_metadata_map(meta, reader)
-        .into_iter()
-        .map(|(k, v)| {
-            (
-                format!("{}{k}", crate::types::meta_keys::AMZ_META_PREFIX),
-                v,
-            )
-        })
-        .collect();
-    if let Some(content_type) = meta.content_type.as_ref() {
-        map.insert("content-type".to_string(), content_type.clone());
+    use crate::types::meta_keys as mk;
+    if reader == Reader::Anonymous {
+        return std::collections::HashMap::new();
     }
-    map
+    response_metadata_map(meta, reader)
+        .into_iter()
+        .filter(|(k, _)| k == mk::NOTE || k == mk::DELTA_SIZE)
+        .map(|(k, v)| (format!("{}{k}", mk::AMZ_META_PREFIX), v))
+        .collect()
 }
 
 pub(super) fn list_objects_v2_output_from_page(

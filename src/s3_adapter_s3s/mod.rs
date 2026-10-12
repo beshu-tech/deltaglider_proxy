@@ -662,6 +662,9 @@ mod review2_tests;
 mod delete_bucket_tests;
 
 #[cfg(test)]
+mod list_facts_tests;
+
+#[cfg(test)]
 mod token_and_csp_proptests;
 
 #[cfg(test)]

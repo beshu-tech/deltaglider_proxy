@@ -727,76 +727,18 @@ fn test_local_prefix_could_match() {
     assert!(!DeltaGliderEngine::<FilesystemBackend>::local_prefix_could_match("", "releases/"));
 }
 
+/// `metadata=true` (D1): a listed entry needs a HEAD only when the listing
+/// does not know its logical size (a facts miss). A delta, or a
+/// delta-eligible key stored as passthrough, lists its facts as it is.
 #[test]
-fn list_entry_needs_head_skips_passthrough_non_eligible() {
-    use crate::types::StorageInfo;
-    let router = FileRouter::new();
-
-    let passthrough = |name: &str| {
-        FileMetadata::fallback(
-            name.to_string(),
-            42,
-            "md5".to_string(),
-            chrono::Utc::now(),
-            None,
-            StorageInfo::Passthrough,
-        )
-    };
-    let delta = || {
-        let mut m = passthrough("app.zip");
-        m.storage_info = StorageInfo::Delta {
-            ref_path: "reference.bin".to_string(),
-            ref_sha256: "sha".to_string(),
-            delta_size: 10,
-            delta_cmd: "xdelta3".to_string(),
-        };
-        m
-    };
-
-    // Passthrough + non-delta-eligible extension → NO head (the win):
-    // the LIST size is authoritative for a verbatim-stored object.
-    for key in [
-        "ror/builds/1.70.0/readonlyrest-1.70.0_es7.8.1.zip.sha1",
-        "ror/builds/1.70.0/readonlyrest-1.70.0_es7.8.1.zip.sha512",
-        "images/logo.png",
-        "ror/builds/1.70.0/checksums.txt",
-    ] {
-        assert!(
-            !DeltaGliderEngine::<FilesystemBackend>::list_entry_needs_head(
-                &router,
-                key,
-                &passthrough(key.rsplit('/').next().unwrap()),
-            ),
-            "{key} should skip HEAD"
-        );
-    }
-
-    // Delta-eligible extension (even if this LIST entry is passthrough) →
-    // HEAD, because it MIGHT be stored as a delta and need original-size.
-    for key in [
-        "ror/builds/1.70.0/readonlyrest-1.70.0_es7.8.1.zip",
-        "backups/db.sql",
-        "images/disk.iso",
-    ] {
-        assert!(
-            DeltaGliderEngine::<FilesystemBackend>::list_entry_needs_head(
-                &router,
-                key,
-                &passthrough(key.rsplit('/').next().unwrap()),
-            ),
-            "{key} should HEAD"
-        );
-    }
-
-    // An entry already flagged as a delta always needs the HEAD,
-    // regardless of extension.
-    assert!(
-        DeltaGliderEngine::<FilesystemBackend>::list_entry_needs_head(
-            &router,
-            "anything.bin",
-            &delta(),
-        )
-    );
+fn list_entry_needs_head_only_for_a_facts_miss() {
+    use crate::storage::list_size_cache::ListedSize;
+    let needs = DeltaGliderEngine::<FilesystemBackend>::list_entry_needs_head;
+    assert!(needs(ListedSize::StoredOnly));
+    assert!(!needs(ListedSize::Listed));
+    assert!(!needs(ListedSize::Cached));
+    // Its listed size is the ciphertext's; dg-delta-size is the plaintext.
+    assert!(needs(ListedSize::CachedEncryptedDelta));
 }
 
 /// X-ray H3: a throttle-aborted HEAD sweep returns delta STUBS (empty

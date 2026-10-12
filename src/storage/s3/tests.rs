@@ -1473,6 +1473,14 @@ pub(crate) mod test_support {
         with_client(endpoint, Client::from_conf(conf.build()))
     }
 
+    /// [`for_test_endpoint`] with its own listing-cache scope: a node that
+    /// shares the bucket but not this process's listing-size cache.
+    pub(crate) fn for_test_endpoint_as_node(endpoint: &str, node: &str) -> S3Backend {
+        let mut s3 = for_test_endpoint(endpoint);
+        s3.list_cache_scope = format!("{endpoint}/{node}");
+        s3
+    }
+
     /// A backend that sends its requests with `client`.
     pub(crate) fn with_client(endpoint: &str, client: Client) -> S3Backend {
         S3Backend {

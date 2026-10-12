@@ -179,6 +179,11 @@ pub enum ListedSize {
     Cached,
     /// Only the stored size is known.
     StoredOnly,
+    /// As `Cached` for a delta whose stored object is a proxy ciphertext:
+    /// the listed `.delta` size is the ciphertext size, while the delta size
+    /// that HeadObject shows (`dg-delta-size`) is the plaintext one, which
+    /// only a HEAD reads (a `metadata=true` LIST sends one).
+    CachedEncryptedDelta,
 }
 
 impl ListedSize {

@@ -1730,8 +1730,10 @@ async fn test_list_buckets_creation_date_not_now() {
 // ListObjectsV2 metadata=true extension
 // ============================================================================
 
+/// `metadata=true` (D1) lists the storage facts of each object, not its
+/// user metadata: HeadObject returns that.
 #[tokio::test]
-async fn test_list_v2_metadata_true_returns_user_metadata() {
+async fn test_list_v2_metadata_true_lists_storage_facts_not_user_metadata() {
     let server = TestServer::builder().build().await;
     let client = server.http();
     let endpoint = server.endpoint();
@@ -1743,14 +1745,12 @@ async fn test_list_v2_metadata_true_returns_user_metadata() {
         .put(&url)
         .header("content-type", "text/plain")
         .header("x-amz-meta-custom-key", "custom-value")
-        .header("x-amz-meta-another-key", "another-value")
         .body("hello metadata")
         .send()
         .await
         .unwrap();
     assert!(resp.status().is_success(), "PUT failed: {}", resp.status());
 
-    // List with metadata=true
     let list_url = format!(
         "{}/{}?list-type=2&metadata=true&prefix=metadir/",
         endpoint, bucket
@@ -1759,39 +1759,26 @@ async fn test_list_v2_metadata_true_returns_user_metadata() {
     assert!(resp.status().is_success(), "LIST failed: {}", resp.status());
     let body = resp.text().await.unwrap();
 
-    // Verify UserMetadata is present
+    // The exact shape: one item, inside the object's <Contents>.
     assert!(
-        body.contains("<UserMetadata>"),
-        "Response should contain <UserMetadata> when metadata=true, got:\n{}",
-        body
+        body.contains(
+            "<UserMetadata><Items><Key>x-amz-meta-dg-note</Key>\
+             <Value>passthrough</Value></Items></UserMetadata></Contents>"
+        ),
+        "storage facts missing:\n{body}"
+    );
+    assert!(
+        !body.contains("custom-value") && !body.contains("custom-key"),
+        "user metadata listed:\n{body}"
     );
 
-    // Custom metadata keys are named as HEAD names them (s3surface-8):
-    // `x-amz-meta-custom-key`, never the storage form `x-amz-meta-user-…`.
-    assert!(
-        !body.contains("x-amz-meta-user-"),
-        "LIST metadata leaked the storage namespace:\n{}",
-        body
-    );
-    assert!(
-        body.contains("<Key>x-amz-meta-custom-key</Key>"),
-        "Response should contain user custom metadata key, got:\n{}",
-        body
-    );
-    assert!(
-        body.contains("custom-value"),
-        "Response should contain user custom metadata value, got:\n{}",
-        body
-    );
-    assert!(
-        body.contains("<Key>x-amz-meta-another-key</Key>"),
-        "Response should contain second custom metadata key, got:\n{}",
-        body
-    );
-    assert!(
-        body.contains("another-value"),
-        "Response should contain second custom metadata value, got:\n{}",
-        body
+    // HeadObject still returns the user metadata.
+    let head = client.head(&url).send().await.unwrap();
+    assert_eq!(
+        head.headers()
+            .get("x-amz-meta-custom-key")
+            .and_then(|v| v.to_str().ok()),
+        Some("custom-value")
     );
 }
 
@@ -1855,27 +1842,20 @@ async fn test_list_v2_metadata_true_dg_metadata() {
     assert!(resp.status().is_success(), "LIST failed: {}", resp.status());
     let body = resp.text().await.unwrap();
 
-    // Verify DG-specific metadata keys appear
+    // Only the storage facts (D1): no other DG metadata.
     assert!(
         body.contains("x-amz-meta-dg-note"),
         "Response should contain dg-note metadata, got:\n{}",
         body
     );
-    assert!(
-        body.contains("x-amz-meta-dg-file-size"),
-        "Response should contain dg-file-size metadata, got:\n{}",
-        body
-    );
-    assert!(
-        body.contains("x-amz-meta-dg-tool"),
-        "Response should contain dg-tool metadata, got:\n{}",
-        body
-    );
-    assert!(
-        body.contains("x-amz-meta-dg-file-sha256"),
-        "Response should contain dg-file-sha256 metadata, got:\n{}",
-        body
-    );
+    for absent in [
+        "x-amz-meta-dg-file-size",
+        "x-amz-meta-dg-tool",
+        "x-amz-meta-dg-file-sha256",
+        "x-amz-meta-dg-delta-size",
+    ] {
+        assert!(!body.contains(absent), "{absent} listed:\n{body}");
+    }
 
     // Verify the note value is "passthrough" for a simple text file
     assert!(

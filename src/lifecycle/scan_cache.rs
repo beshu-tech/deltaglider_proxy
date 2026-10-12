@@ -102,7 +102,7 @@ impl ScanCache {
     }
 
     /// One page of `bucket` under `prefix`, with each object's logical
-    /// metadata, as `list_objects(.., metadata = true)` returns it. An
+    /// metadata (`finish_listed_page_with_heads`). An
     /// object whose stored identity is unchanged since a listing of this
     /// cache costs no request beyond the page's LIST; the others are
     /// completed as that listing completes them (the engine's metadata
@@ -139,7 +139,9 @@ impl ScanCache {
                 next_continuation_token: None,
                 facts_missing_keys: Vec::new(),
             };
-            engine.finish_listed_page(bucket, &mut rest, true).await?;
+            engine
+                .finish_listed_page_with_heads(bucket, &mut rest)
+                .await?;
             for (key, meta) in rest.objects {
                 // A stub that a throttled HEAD sweep left holds the stored
                 // size: never kept.

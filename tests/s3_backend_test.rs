@@ -535,12 +535,12 @@ async fn cold_list_of_an_encrypted_backend_reports_plaintext_facts() {
     }
 }
 
-/// Review C3, lazy backfill: an object stored without listing facts (before
-/// they existed) lists with its stored size until one HEAD of it on a node
-/// whose LIST found the facts missing; that node then writes them, and every
-/// node lists the original size.
+/// Review C3 + P1.6b: an object stored without listing facts (before they
+/// existed) lists with its stored size on the first LIST that finds the
+/// facts missing. That LIST queues one background HEAD, which writes the
+/// facts, and every node then lists the original size. No client HEAD.
 #[tokio::test]
-async fn a_head_backfills_missing_listing_facts() {
+async fn a_list_heals_missing_listing_facts() {
     skip_unless_minio!();
     let writer = TestServer::builder()
         .open_access()
@@ -581,8 +581,8 @@ async fn a_head_backfills_missing_listing_facts() {
             .await
             .unwrap();
     }
-    let key = format!("{prefix}/v1.zip");
-    let size_on = |server: &TestServer| {
+    // One LIST: its size, and the debug header's count of facts misses.
+    let list_on = |server: &TestServer| {
         let url = format!(
             "{}/{}?list-type=2&prefix={prefix}/v1",
             server.endpoint(),
@@ -590,15 +590,23 @@ async fn a_head_backfills_missing_listing_facts() {
         );
         let http = http.clone();
         async move {
-            let xml = http.get(url).send().await.unwrap().text().await.unwrap();
+            let resp = http.get(url).send().await.unwrap();
+            let misses = resp.headers()["x-deltaglider-listing-facts-misses"]
+                .to_str()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            let xml = resp.text().await.unwrap();
             let size = xml
                 .split("<Size>")
                 .nth(1)
                 .unwrap()
                 .split('<')
                 .next()
+                .unwrap()
+                .parse::<usize>()
                 .unwrap();
-            size.parse::<usize>().unwrap()
+            (size, misses)
         }
     };
     let node = TestServer::builder()
@@ -608,41 +616,14 @@ async fn a_head_backfills_missing_listing_facts() {
         .open_access()
         .build()
         .await;
-    assert!(
-        size_on(&node).await < variant.len(),
-        "no facts: stored size"
-    );
-    // The debug header and the metric name the miss.
-    let misses_on = |server: &TestServer| {
-        let url = format!(
-            "{}/{}?list-type=2&prefix={prefix}/v1",
-            server.endpoint(),
-            server.bucket()
-        );
-        let http = http.clone();
-        async move {
-            let resp = http.get(url).send().await.unwrap();
-            resp.headers()["x-deltaglider-listing-facts-misses"]
-                .to_str()
-                .unwrap()
-                .parse::<usize>()
-                .unwrap()
-        }
-    };
-    assert_eq!(misses_on(&node).await, 1, "one entry without facts");
+    let (size, misses) = list_on(&node).await;
+    assert!(size < variant.len(), "no facts: stored size");
+    assert_eq!(misses, 1, "one entry without facts");
     assert!(
         scrape_counter(&node.endpoint(), "deltaglider_listing_facts_misses_total").await >= 1,
         "the miss is counted"
     );
-    node.s3_client()
-        .await
-        .head_object()
-        .bucket(node.bucket())
-        .key(&key)
-        .send()
-        .await
-        .unwrap();
-    // The backfill runs in the background.
+    // The LIST's background HEAD writes the facts.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while facts_keys(raw.clone(), prefix.clone()).await.is_empty() {
         assert!(std::time::Instant::now() < deadline, "facts not backfilled");
@@ -655,8 +636,11 @@ async fn a_head_backfills_missing_listing_facts() {
         .open_access()
         .build()
         .await;
-    assert_eq!(size_on(&other).await, variant.len());
-    assert_eq!(misses_on(&other).await, 0, "the facts are there");
+    assert_eq!(
+        list_on(&other).await,
+        (variant.len(), 0),
+        "the facts are there"
+    );
 }
 
 /// A PUT writes its listing facts in the background (storage-8): wait until
@@ -804,13 +788,10 @@ async fn batch_delete_drops_listing_facts_in_a_few_requests() {
     assert!(deletes <= 20, "{deletes} facts deletes for a {N}-key batch");
 }
 
-/// Review C9: `metadata=true` must reach the engine. The adapter always
-/// listed in lite mode, so on an S3 backend (whose LIST carries no user
-/// metadata) the `<UserMetadata>` extension came back without the user's
-/// `x-amz-meta-*` pairs. The filesystem backend reads them during LIST
-/// anyway, so only an S3 backend shows the defect.
+/// `metadata=true` on an S3 backend lists the storage facts of each
+/// object (D1), and not its user metadata: HeadObject returns that.
 #[tokio::test]
-async fn test_s3_list_metadata_true_carries_user_metadata() {
+async fn test_s3_list_metadata_true_carries_storage_facts() {
     skip_unless_minio!();
     let server = TestServer::builder()
         .open_access()
@@ -843,8 +824,12 @@ async fn test_s3_list_metadata_true_carries_user_metadata() {
         .await
         .unwrap();
     assert!(
-        body.contains("teal-4711"),
-        "metadata=true LIST must carry the user's metadata: {body}"
+        body.contains("<Key>x-amz-meta-dg-note</Key><Value>passthrough</Value>"),
+        "metadata=true LIST must carry the storage facts: {body}"
+    );
+    assert!(
+        !body.contains("teal-4711"),
+        "metadata=true LIST must not carry the user's metadata: {body}"
     );
 }
 

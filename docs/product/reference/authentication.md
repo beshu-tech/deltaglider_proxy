@@ -158,7 +158,7 @@ Semantics for requests without credentials:
 - **Allowed**: GET and HEAD on objects under a public prefix; LIST with a `prefix` parameter inside the public prefix. LIST results stay inside the public prefix and do not show the rest of the bucket.
 - **Denied**: PUT, DELETE, COPY, and multipart uploads, always.
 - **Identity**: anonymous requests run as a built-in `$anonymous` user with scoped read+list permissions (including `s3:prefix` conditions for LIST). Each anonymous request writes a proxy log line with `action=public_read` and `user=$anonymous`. These lines do not go into the admin GUI's audit log.
-- **No build metadata**: a HEAD, GET, or `metadata=true` LIST from an anonymous caller does not return `x-amz-meta-dg-tool`, because that value names the proxy version. Authenticated callers, and every caller in open-access mode, still receive it.
+- **No build metadata**: a HEAD or GET from an anonymous caller does not return `x-amz-meta-dg-tool`, because that value names the proxy version. A `metadata=true` LIST from an anonymous caller lists no storage facts at all. Authenticated callers, and every caller in open-access mode, still receive them.
 - **Lockouts**: the failed-sign-in lockout does not block public reads. A client address that the proxy locked out still gets the objects under a public prefix.
 - **Credentials win**: a request carrying valid SigV4 credentials gets full IAM evaluation regardless of public-prefix configuration.
 - **Matching**: a trailing `/` is significant: `public/` matches `public/...` but not `publicity/`. The empty prefix `""` makes the entire bucket public (logged as a startup warning). Prefixes containing `..`, null bytes, or `//` are rejected.

@@ -271,9 +271,14 @@ async fn anonymous_object_metadata_has_no_tool_stamp() {
         .await
         .unwrap();
     assert_eq!(list.status(), StatusCode::OK);
+    let text = list.text().await.unwrap();
     assert!(
-        !list.text().await.unwrap().contains("dg-tool"),
+        !text.contains("dg-tool"),
         "metadata=true LIST leaked dg-tool to an anonymous caller"
+    );
+    assert!(
+        !text.contains("<UserMetadata>"),
+        "metadata=true LIST gave storage facts to an anonymous caller: {text}"
     );
 
     let signed = aws_sdk_s3::Client::from_conf(

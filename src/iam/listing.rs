@@ -17,7 +17,8 @@ use std::future::Future;
 /// the s3s handler futures that await them must be `Send`; impls still write
 /// `async fn`.
 pub(crate) trait Lister: Sync {
-    /// One complete page: logical sizes, and HEAD metadata with `metadata`.
+    /// One complete page: logical sizes, and with `metadata` the storage
+    /// facts (a HEAD only for an entry whose listing facts are missing).
     #[allow(clippy::too_many_arguments)]
     fn list(
         &self,
@@ -51,7 +52,7 @@ pub(crate) trait Lister: Sync {
     }
 
     /// Complete the page a filtered LIST returns, built from
-    /// [`Self::list_lite`] pages: logical sizes, and HEAD metadata with
+    /// [`Self::list_lite`] pages: logical sizes, and the facts-miss HEADs with
     /// `metadata`. The default returns the page as it is.
     fn finish(
         &self,

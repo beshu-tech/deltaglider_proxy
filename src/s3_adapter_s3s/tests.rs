@@ -653,25 +653,35 @@ fn not_modified_carries_the_validators() {
     assert!(headers.get("content-type").is_none());
 }
 
+/// `metadata=true` (D1): an entry lists only its storage facts, with the
+/// names and values HeadObject shows; its user metadata and content type
+/// are not listed, and an anonymous reader gets nothing.
 #[test]
-fn list_metadata_names_user_metadata_as_head_does() {
+fn list_metadata_is_the_storage_facts_of_the_head() {
     let mut meta = meta_at_subsecond();
     meta.content_type = Some("text/plain".to_string());
     meta.user_metadata
         .insert("foo".to_string(), "bar".to_string());
-    let list = list_metadata_map(&meta, Reader::Anonymous);
-    let head = response_metadata_map(&meta, Reader::Anonymous);
-    assert_eq!(list.get("x-amz-meta-foo").map(String::as_str), Some("bar"));
-    assert!(!list.contains_key("x-amz-meta-user-foo"));
+    let list = list_metadata_map(&meta, Reader::Authenticated);
+    let head = response_metadata_map(&meta, Reader::Authenticated);
     assert_eq!(
-        list.get("content-type").map(String::as_str),
-        Some("text/plain")
+        list,
+        std::collections::HashMap::from([(
+            "x-amz-meta-dg-note".to_string(),
+            head["dg-note"].clone()
+        )])
     );
-    assert!(!list.contains_key("x-amz-meta-dg-tool"), "anonymous strip");
-    for key in head.keys() {
-        assert!(list.contains_key(&format!("x-amz-meta-{key}")), "{key}");
-    }
-    assert_eq!(list.len(), head.len() + 1);
+    meta.storage_info = crate::types::StorageInfo::Delta {
+        ref_path: "reference.bin".into(),
+        ref_sha256: String::new(),
+        delta_size: 77,
+        delta_cmd: String::new(),
+    };
+    let list = list_metadata_map(&meta, Reader::Authenticated);
+    assert_eq!(list.len(), 2);
+    assert_eq!(list["x-amz-meta-dg-note"], "delta");
+    assert_eq!(list["x-amz-meta-dg-delta-size"], "77");
+    assert!(list_metadata_map(&meta, Reader::Anonymous).is_empty());
 }
 
 #[test]
