@@ -314,44 +314,49 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         bucket: &str,
         deltaspace_id: &str,
     ) -> Result<(bytes::Bytes, String), EngineError> {
-        // Load the reference data and its recorded metadata together. The
-        // metadata read is cheap (xattr / S3 HEAD) and runs in parallel so it
-        // doesn't add a serial round-trip to the miss path. We use the
-        // recorded checksum to verify the bytes BEFORE caching — a reference
-        // that's corrupt on disk would otherwise be cached on the first miss
-        // and poison every subsequent delta GET in the deltaspace.
-        let (data_result, meta_result) = tokio::join!(
-            self.storage.get_reference(bucket, deltaspace_id),
-            self.storage.get_reference_metadata(bucket, deltaspace_id),
-        );
-        let data = data_result.map_err(|e| match e {
-            StorageError::NotFound(_) => EngineError::MissingReference(deltaspace_id.to_string()),
-            other => EngineError::Storage(other),
-        })?;
+        // ONE read: the GET response carries the reference's recorded
+        // metadata in its headers (`open_object`). We use the recorded
+        // checksum to verify the bytes BEFORE caching — a reference that's
+        // corrupt on disk would otherwise be cached on the first miss and
+        // poison every subsequent delta GET in the deltaspace.
+        let (stream, recorded) = self
+            .storage
+            .open_object(
+                bucket,
+                deltaspace_id,
+                crate::storage::StoredObject::Reference,
+            )
+            .await
+            .map_err(|e| match e {
+                StorageError::NotFound(_) => {
+                    EngineError::MissingReference(deltaspace_id.to_string())
+                }
+                other => EngineError::Storage(other),
+            })?;
+        let data = {
+            use futures::TryStreamExt;
+            let chunks: Vec<Bytes> = stream.try_collect().await?;
+            chunks.concat()
+        };
 
         // Validate against the reference's own recorded checksum when present.
-        // A missing metadata read or empty checksum (out-of-band / CLI-uploaded
-        // references) is treated as "cannot verify" — we proceed and let the
-        // downstream per-object checksum in retrieve.rs catch any corruption.
+        // An empty checksum (out-of-band / CLI-uploaded references) is
+        // treated as "cannot verify" — we proceed and let the downstream
+        // per-object checksum in retrieve.rs catch any corruption.
         let actual = hex::encode(Sha256::digest(&data));
-        if let Ok(expected) = meta_result {
-            if !expected.file_sha256.is_empty() {
-                if let Err(expected_sha256) = reference_integrity_ok(&actual, &expected.file_sha256)
-                {
-                    // Do NOT cache corrupt bytes — fail fast so a single bad
-                    // reference doesn't fan out into repeated reconstruction
-                    // failures across the deltaspace.
-                    warn!(
-                        "Reference integrity check failed for {}/{}: expected {}, got {} — not caching",
-                        bucket, deltaspace_id, expected_sha256, actual
-                    );
-                    return Err(EngineError::ChecksumMismatch {
-                        key: format!("{}/.dg/reference.bin", deltaspace_id),
-                        expected: expected_sha256,
-                        actual,
-                    });
-                }
-            }
+        if let Err(expected_sha256) = reference_integrity_ok(&actual, &recorded.file_sha256) {
+            // Do NOT cache corrupt bytes — fail fast so a single bad
+            // reference doesn't fan out into repeated reconstruction
+            // failures across the deltaspace.
+            warn!(
+                "Reference integrity check failed for {}/{}: expected {}, got {} — not caching",
+                bucket, deltaspace_id, expected_sha256, actual
+            );
+            return Err(EngineError::ChecksumMismatch {
+                key: format!("{}/.dg/reference.bin", deltaspace_id),
+                expected: expected_sha256,
+                actual,
+            });
         }
 
         // PERF: Convert Vec→Bytes once (zero-copy ownership transfer); the

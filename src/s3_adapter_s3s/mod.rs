@@ -661,6 +661,10 @@ mod review2_tests;
 #[cfg(test)]
 mod delete_bucket_tests;
 
+/// What the read verbs send upstream, per backend and cache state.
+#[cfg(test)]
+mod read_cost_tests;
+
 #[cfg(test)]
 mod list_facts_tests;
 
