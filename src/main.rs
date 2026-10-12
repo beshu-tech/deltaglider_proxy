@@ -1085,33 +1085,26 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             shutdown_handle.graceful_shutdown(Some(Duration::from_secs(10)));
         });
 
+        let listener = TcpListener::bind(&config.listen_addr).await?;
         info!(
             "DeltaGlider Proxy listening on https://{}",
             config.listen_addr
         );
-        // `into_make_service_with_connect_info::<SocketAddr>` surfaces the
+        // `serve_tls` (like `serve_plain`) surfaces the
         // peer IP to middlewares via `axum::extract::ConnectInfo`. The
         // admission chain's source-ip predicates depend on this — without
         // it, operator-authored deny rules keyed on `source_ip_list` would
         // be silently inert in the default deployment (no reverse proxy
         // setting X-Forwarded-For). See adversarial review of Phase 3b.2.b
         // for the failure mode.
-        axum_server::bind_rustls(config.listen_addr, rustls_config)
-            .handle(handle)
-            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-            .await?;
+        deltaglider_proxy::serve::serve_tls(listener, rustls_config, handle, app).await?;
     } else {
         let listener = TcpListener::bind(&config.listen_addr).await?;
         info!(
             "DeltaGlider Proxy listening on http://{}",
             config.listen_addr
         );
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        deltaglider_proxy::serve::serve_plain(listener, app, shutdown_signal()).await?;
     }
 
     // Let a running maintenance job reach its stop point and hand its row

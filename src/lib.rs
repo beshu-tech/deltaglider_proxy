@@ -41,6 +41,7 @@ pub mod rate_limiter;
 pub mod replication;
 pub mod s3_adapter_s3s;
 pub mod security;
+pub mod serve;
 pub mod session;
 pub mod shutdown;
 pub mod slack_format;
@@ -179,6 +180,7 @@ pub(crate) mod source_scan {
             let lines: Vec<&str> = text.lines().collect();
             for w in lines.windows(2) {
                 let decl = w[1].trim();
+                let decl = decl.strip_prefix("pub(crate) ").unwrap_or(decl);
                 if w[0].trim() != "#[cfg(test)]"
                     || !decl.starts_with("mod ")
                     || !decl.ends_with(';')
