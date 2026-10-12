@@ -361,7 +361,7 @@ async fn migrate_verify_heads_the_listed_source_form() {
 /// target's prior (2; on a `__dgmigrate_` staging bucket it reads none
 /// but DELETEs the other form). The skip check's target HEAD is the
 /// store's prior, and the source HEAD reads the one form that the listing
-/// saw: 10 -> 7 requests.
+/// saw: 10 -> 7 requests; the verify HEADs only the written form: 6.
 #[tokio::test]
 async fn migrate_copy_reuses_the_skip_check_as_the_prior() {
     use super::super::worker::cost_tests::{object_ops, object_requests};
@@ -379,9 +379,9 @@ async fn migrate_copy_reuses_the_skip_check_as_the_prior() {
         );
         let total = object_requests(&e.fake, "b", &key) + object_requests(&e.fake, "t", &key);
         // Target: HEAD both forms (the check, then the prior), PUT, HEAD
-        // both forms (the copy's verify). Source: HEAD (the listed form),
-        // GET.
-        assert_eq!(total, 7, "{key}: source {src:?} target {dst:?}");
+        // of the written form (the copy's verify). Source: HEAD (the
+        // listed form), GET.
+        assert_eq!(total, 6, "{key}: source {src:?} target {dst:?}");
         assert_eq!(src.get("HEAD"), Some(&1), "{key}: source {src:?}");
         assert_eq!(dst.get("DELETE"), None, "{key}: target {dst:?}");
     }

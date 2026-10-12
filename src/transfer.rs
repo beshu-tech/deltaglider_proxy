@@ -351,7 +351,7 @@ async fn copy_object_once(
     // CopyObject handler and the delta fast path.
     crate::storage::encrypting::strip_encryption_markers(&mut user_metadata);
 
-    engine
+    let stored = engine
         .store_known_prior(
             request.destination_bucket,
             request.destination_key,
@@ -368,6 +368,7 @@ async fn copy_object_once(
     verify_destination(
         engine,
         request,
+        &stored.metadata,
         bytes,
         source_head.multipart_etag.as_deref(),
     )
@@ -572,6 +573,7 @@ async fn stream_copy_passthrough(
     verify_destination(
         engine,
         request,
+        &result.metadata,
         bytes,
         source_head.multipart_etag.as_deref(),
     )
@@ -719,24 +721,31 @@ async fn fetch_part_once(
     Ok(buf.freeze())
 }
 
+/// Verify the copy's destination with ONE HEAD: of the stored form that
+/// the write produced (`written`, its result), not both forms
+/// (`engine.head`): the write deleted the other form, or knew it absent.
 async fn verify_destination(
     engine: &Arc<DynEngine>,
     request: ObjectTransferRequest<'_>,
+    written: &crate::types::FileMetadata,
     expected_bytes: usize,
     expected_multipart_etag: Option<&str>,
 ) -> Result<(), CopyError> {
-    verify_destination_sized(
-        engine,
-        request,
-        expected_bytes,
-        None,
-        expected_multipart_etag,
-    )
-    .await
-    .map(|_| ())
+    let key = crate::types::ObjectKey::parse(request.destination_bucket, request.destination_key);
+    let dest = if written.is_delta() {
+        engine
+            .delta_meta(request.destination_bucket, &key.prefix, &key.filename)
+            .await
+    } else {
+        engine
+            .passthrough_meta(request.destination_bucket, &key.prefix, &key.filename)
+            .await
+    }
+    .map_err(|e| CopyError::storage("destination verify head failed", e))?;
+    verify_verdict(&dest, expected_bytes, None, expected_multipart_etag).map(|_| ())
 }
 
-/// Which way `verify_destination_sized` accepted the destination.
+/// Which way the verify accepted the destination.
 #[derive(Debug, PartialEq, Eq)]
 enum VerifyAccepted {
     /// HEAD returned the LOGICAL size — DG metadata intact, nothing to heal.
@@ -744,33 +753,6 @@ enum VerifyAccepted {
     /// HEAD returned the raw delta-blob size — the backend stripped the metadata;
     /// the object is present + correctly sized, but the caller must re-stamp it.
     StrippedDelta,
-}
-
-/// Like [`verify_destination`], but tolerant of a delta object whose DG
-/// metadata was stripped by the backend. On the delta-passthrough fast path the
-/// dest HEAD resolves to the LOGICAL size only while the object's `x-amz-meta-dg-*`
-/// headers are intact; if the backend dropped them, HEAD falls back to the raw
-/// stored (delta-blob) size and a logical-size compare would FALSELY report a
-/// truncation. When `stored_delta_size` is supplied and the HEAD came back at
-/// exactly that size, the object is present and correctly sized — accept it (the
-/// caller heals the stripped metadata separately).
-async fn verify_destination_sized(
-    engine: &Arc<DynEngine>,
-    request: ObjectTransferRequest<'_>,
-    expected_bytes: usize,
-    stored_delta_size: Option<u64>,
-    expected_multipart_etag: Option<&str>,
-) -> Result<VerifyAccepted, CopyError> {
-    let dest = engine
-        .head(request.destination_bucket, request.destination_key)
-        .await
-        .map_err(|e| CopyError::engine("destination verify head failed", e))?;
-    verify_verdict(
-        &dest,
-        expected_bytes,
-        stored_delta_size,
-        expected_multipart_etag,
-    )
 }
 
 /// The verify decision on the destination's metadata, as a [`CopyError`].
@@ -1660,7 +1642,7 @@ async fn delta_passthrough_copy(
 
 /// Heal a destination delta object whose DG metadata the backend stripped.
 ///
-/// Called ONLY when `verify_destination_sized` already accepted the dest via the
+/// Called ONLY when the fast path's verify already accepted the dest via the
 /// stripped-delta path (HEAD returned the raw delta size, not the logical size),
 /// so no redundant pre-check HEAD here — verify's verdict is the gate. A stripped
 /// object would make a client GET mis-detect it as passthrough and serve the raw
@@ -1792,7 +1774,7 @@ async fn spooled_copy(
     // non-encrypting destination yields an undecryptable replica.
     crate::storage::encrypting::strip_encryption_markers(&mut user_metadata);
 
-    engine
+    let stored = engine
         .store_spooled_delta(
             request.destination_bucket,
             request.destination_key,
@@ -1808,6 +1790,7 @@ async fn spooled_copy(
     verify_destination(
         engine,
         *request,
+        &stored.metadata,
         source_size as usize,
         source_head.multipart_etag.as_deref(),
     )

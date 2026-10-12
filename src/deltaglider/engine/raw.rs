@@ -180,6 +180,18 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .await
     }
 
+    /// Passthrough metadata for one object: one read of that stored form.
+    pub async fn passthrough_meta(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<FileMetadata, StorageError> {
+        self.storage
+            .get_passthrough_metadata(bucket, prefix, filename)
+            .await
+    }
+
     /// Delta metadata for one object (full Delta info incl. `ref_sha256`).
     pub async fn delta_meta(
         &self,

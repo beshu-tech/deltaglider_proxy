@@ -387,8 +387,8 @@ async fn reencrypt_rewrite_reuses_the_jobs_head() {
         let key = format!("k-{i:03}.txt");
         let ops = object_ops(&fake, "b", &key);
         // HEAD (the listed form), GET (the bytes), PUT (the rewrite), and
-        // the copy's verify of the destination (a HEAD of both forms).
-        assert_eq!(object_requests(&fake, "b", &key), 5, "{key}: {ops:?}");
+        // the copy's verify of the destination (a HEAD of the written form).
+        assert_eq!(object_requests(&fake, "b", &key), 4, "{key}: {ops:?}");
         assert_eq!(ops.get("DELETE"), None, "{key}: {ops:?}");
     }
 }
