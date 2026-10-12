@@ -370,6 +370,7 @@ async fn list_page_within<L: Lister>(
             }
             ListTarget::Scan(scan_prefix) => {
                 let need = want - objects.len() - prefixes.len();
+                let had = objects.len() + prefixes.len();
                 let mut scan_cursor = cursor.map(str::to_string);
                 while *budget > 0 {
                     // Lite: no listing facts and no HEAD for the hidden keys.
@@ -396,7 +397,14 @@ async fn list_page_within<L: Lister>(
                     );
                     more = page.is_truncated && page.next_continuation_token.is_some();
                     scan_cursor = page.next_continuation_token;
-                    if !more || objects.len() + prefixes.len() >= want {
+                    // A page with a visible entry is served short, like the
+                    // unfiltered listing (S3 allows a short truncated page):
+                    // reading the next engine page to fill it made the next
+                    // client page read that engine page again. A page with
+                    // no visible entry reads on (an empty truncated page
+                    // would carry no token, and a token on an earlier
+                    // target's entry would read these hidden keys again).
+                    if !more || objects.len() + prefixes.len() > had {
                         break;
                     }
                 }
@@ -1076,6 +1084,117 @@ mod tests {
             "a budget of {budget} sent {} backend LISTs: {lists:?}",
             lists.len()
         );
+    }
+
+    /// Walk a listing to its end with `max_keys=1000`; the backend LISTs
+    /// each page sent, and the entries.
+    async fn walk_counting_lists(
+        engine: &crate::deltaglider::DynEngine,
+        fake: &crate::storage::FakeS3,
+        prefix: &str,
+        scope: Option<&ListScope>,
+    ) -> (Vec<usize>, usize) {
+        let mut token: Option<String> = None;
+        let (mut per_page, mut entries) = (Vec::new(), 0);
+        for _ in 0..100 {
+            fake.clear();
+            let page = list_page_for_caller(
+                engine,
+                "b",
+                prefix,
+                None,
+                1000,
+                token.as_deref(),
+                false,
+                scope,
+                50,
+            )
+            .await
+            .unwrap();
+            per_page.push(crate::usage_scanner::test_support::scope_lists(fake).len());
+            entries += page.objects.len();
+            if !page.is_truncated {
+                return (per_page, entries);
+            }
+            token = page.next_continuation_token;
+        }
+        panic!("listing did not end");
+    }
+
+    /// A filtered scan serves a short page, like the unfiltered listing: it
+    /// read a second backend page to fill the client page, and the next
+    /// client page then read that backend page again. 2,500 keys cost 6
+    /// backend LISTs filtered and 4 unfiltered.
+    #[tokio::test]
+    async fn a_filtered_scan_costs_what_the_unfiltered_listing_costs() {
+        use crate::usage_scanner::test_support::{fake_s3_engine, put_raw_many};
+        let (engine, fake, endpoint) = fake_s3_engine().await;
+        put_raw_many(&endpoint, (0..2500).map(|i| format!("rel/img-{i:05}.jpg"))).await;
+        // A bucket-wide Allow with a carve-out: the budgeted scan.
+        let scope = scoped(vec![rule("Allow", &["b/*"]), rule("Deny", &["b/h/*"])]);
+        let (plain, n_plain) = walk_counting_lists(&engine, &fake, "rel/", None).await;
+        let (filtered, n_filtered) =
+            walk_counting_lists(&engine, &fake, "rel/", Some(&scope)).await;
+        assert_eq!((n_plain, n_filtered), (2500, 2500));
+        assert_eq!(
+            filtered.iter().sum::<usize>(),
+            plain.iter().sum::<usize>(),
+            "backend LISTs per page: filtered {filtered:?}, unfiltered {plain:?}"
+        );
+    }
+
+    /// Hidden keys interleaved with visible ones, around every page
+    /// boundary: each page is short or full, never empty while truncated,
+    /// its token is the last visible key it shows, and the walk returns
+    /// exactly the visible keys.
+    #[tokio::test]
+    async fn short_filtered_pages_never_anchor_on_a_hidden_key() {
+        // Hidden `a/1/` between visible `a/0/` and `a/2/`, and so on: the
+        // lister serves keys in this (sorted) order.
+        let keys: Vec<String> = (0..40)
+            .map(|i| match i % 3 {
+                0 => format!("a/{i:03}/h"),
+                _ => format!("a/{i:03}/v"),
+            })
+            .collect();
+        let visible: Vec<String> = keys.iter().filter(|k| k.ends_with("/v")).cloned().collect();
+        let read = |effect: &str, res: &str| crate::iam::Permission {
+            actions: vec!["read".into()],
+            ..rule(effect, &[res])
+        };
+        let scope = scoped(vec![read("Allow", "b/*"), read("Deny", "b/a/*/h")]);
+        for max_keys in 1..=6 {
+            let lister = counting(keys.clone());
+            let mut got = Vec::new();
+            let mut token: Option<String> = None;
+            for _ in 0..200 {
+                let page = list_page_for_caller(
+                    &lister,
+                    "b",
+                    "",
+                    None,
+                    max_keys,
+                    token.as_deref(),
+                    false,
+                    Some(&scope),
+                    TEST_BUDGET,
+                )
+                .await
+                .unwrap();
+                let shown: Vec<String> = page.objects.into_iter().map(|(k, _)| k).collect();
+                assert!(shown.len() <= max_keys as usize);
+                if page.is_truncated {
+                    assert!(!shown.is_empty(), "an empty truncated page");
+                    assert_eq!(page.next_continuation_token.as_ref(), shown.last());
+                }
+                got.extend(shown);
+                if !page.is_truncated {
+                    break;
+                }
+                token = page.next_continuation_token;
+            }
+            assert_eq!(got, visible, "max_keys={max_keys}");
+        }
     }
 
     /// Cockroach scan (engine.md "filtered-LIST budget"): the scan loop

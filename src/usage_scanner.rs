@@ -482,7 +482,11 @@ pub(crate) mod test_support {
 
     /// PUT `b/<key>` straight into the fake, past the proxy write path.
     pub(crate) async fn put_raw(endpoint: &str, key: &str, body: &[u8]) {
-        let status = reqwest::Client::new()
+        put_raw_with(&reqwest::Client::new(), endpoint, key, body).await
+    }
+
+    async fn put_raw_with(http: &reqwest::Client, endpoint: &str, key: &str, body: &[u8]) {
+        let status = http
             .put(format!("{endpoint}/b/{key}"))
             .body(body.to_vec())
             .send()
@@ -494,8 +498,11 @@ pub(crate) mod test_support {
 
     /// [`put_raw`] for many keys, 32 at a time, each with a 10-byte body.
     pub(crate) async fn put_raw_many(endpoint: &str, keys: impl IntoIterator<Item = String>) {
+        // One client for all: `Client::new()` loads the TLS roots, about
+        // 50 ms of CPU per PUT.
+        let http = &reqwest::Client::new();
         futures::stream::iter(keys)
-            .map(|key| async move { put_raw(endpoint, &key, b"0123456789").await })
+            .map(|key| async move { put_raw_with(http, endpoint, &key, b"0123456789").await })
             .buffer_unordered(32)
             .collect::<Vec<()>>()
             .await;
