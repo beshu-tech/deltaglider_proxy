@@ -22,10 +22,7 @@ impl S3Backend {
         stored_size: u64,
         meta: &FileMetadata,
     ) {
-        if key.rsplit('/').next() == Some("reference.bin") {
-            return;
-        }
-        list_size_cache::record(
+        remember_facts(
             &StoredObjectId {
                 scope: &self.list_cache_scope,
                 bucket,
@@ -33,7 +30,7 @@ impl S3Backend {
                 etag: stored_etag,
                 size: stored_size,
             },
-            LogicalFacts::of(meta),
+            meta,
         );
     }
 
@@ -81,15 +78,9 @@ impl S3Backend {
             etag: stored_etag,
             size: stored_size,
         };
-        if !list_size_cache::take_missing_facts(&id) {
-            return;
-        }
-        let Some(facts_key) =
-            listing_facts::facts_key(key, stored_etag, stored_size, &LogicalFacts::of(meta))
-        else {
-            return;
-        };
-        self.facts_cleanup.write(bucket, key, facts_key);
+        backfill_facts(&id, meta, |facts_key| {
+            self.facts_cleanup.write(bucket, key, facts_key)
+        });
     }
 
     /// Delete every listing-facts object of `bucket` when nothing else is
@@ -227,10 +218,48 @@ impl S3Backend {
                 None => {
                     LISTING_FACTS_MISSES.inc();
                     list_size_cache::mark_missing_facts(&id);
+                    // One background HEAD learns the facts for good.
+                    let _ = self.healer.queue(
+                        super::heal::Miss {
+                            scope: self.list_cache_scope.clone(),
+                            bucket: bucket.to_string(),
+                            stored_key: stored_key.clone(),
+                            etag: meta.md5.clone(),
+                            size: meta.stored_size(),
+                        },
+                        &self.facts_cleanup.writer(),
+                    );
                 }
             }
         }
         resolved
+    }
+}
+
+/// Record in the listing-size cache what a client must see for the stored
+/// object `id` (see [`S3Backend::remember_listed_facts`]). Baselines are
+/// never listed to clients, so they get no entry.
+pub(super) fn remember_facts(id: &StoredObjectId<'_>, meta: &FileMetadata) {
+    if id.key.rsplit('/').next() == Some("reference.bin") {
+        return;
+    }
+    list_size_cache::record(id, LogicalFacts::of(meta));
+}
+
+/// When a LIST marked the stored object `id` as missing its durable facts,
+/// take the mark and hand its facts key to `write` (the bounded drain).
+pub(super) fn backfill_facts(
+    id: &StoredObjectId<'_>,
+    meta: &FileMetadata,
+    write: impl FnOnce(String),
+) {
+    if !list_size_cache::take_missing_facts(id) {
+        return;
+    }
+    if let Some(facts_key) =
+        listing_facts::facts_key(id.key, id.etag, id.size, &LogicalFacts::of(meta))
+    {
+        write(facts_key);
     }
 }
 

@@ -241,7 +241,6 @@ impl S3Backend {
     /// `created_at`) re-copy the object every tick. See the RCA in
     /// docs/plan/rca-replication-recopy-2026-06-30.md.
     pub(super) fn headers_to_metadata(
-        &self,
         headers: &HashMap<String, String>,
         created_at_fallback: DateTime<Utc>,
     ) -> Result<FileMetadata, StorageError> {
@@ -443,7 +442,7 @@ impl S3Backend {
         // corrupted (missing required fields), fall back to passthrough metadata
         // from the HEAD response itself.
         if !headers.is_empty() {
-            match self.headers_to_metadata(&headers, s3_last_modified) {
+            match Self::headers_to_metadata(&headers, s3_last_modified) {
                 Ok(meta) => {
                     let stored_etag = response.e_tag.unwrap_or_default();
                     let stored_size = response.content_length.unwrap_or(0).max(0) as u64;

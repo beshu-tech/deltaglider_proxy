@@ -272,8 +272,7 @@ enum Queued {
 /// Queue of facts writes, and of deleted stored keys whose facts the
 /// background task removes.
 pub(super) struct FactsCleanupQueue {
-    tx: mpsc::UnboundedSender<Queued>,
-    rewritten: Rewritten,
+    writer: FactsWriter,
     /// The GC task never ends on its own: the queue owns it and aborts it
     /// on drop, else every engine rebuild leaked one with the old client.
     gc: Option<tokio::task::JoinHandle<()>>,
@@ -295,18 +294,28 @@ impl FactsCleanupQueue {
         let rewritten: Rewritten = Default::default();
         tokio::spawn(drain(client.clone(), native, rx, rewritten.clone()));
         let gc = crate::config::env_bool(GC_ENV, true).then(|| tokio::spawn(gc_loop(client)));
-        Self { tx, rewritten, gc }
+        Self {
+            writer: FactsWriter { tx, rewritten },
+            gc,
+        }
+    }
+
+    /// A handle that queues facts writes, for a task that outlives a
+    /// borrow of the backend (the facts healer).
+    pub(super) fn writer(&self) -> FactsWriter {
+        self.writer.clone()
     }
 
     /// The object `stored_key` is gone (deleted at `deleted_at` on the
     /// server clock, when known): drop its facts soon.
     pub(super) fn enqueue(&self, bucket: &str, stored_key: &str, deleted_at: Option<i64>) {
         let pair = (bucket.to_string(), stored_key.to_string());
-        if let Ok(mut st) = self.rewritten.lock() {
+        if let Ok(mut st) = self.writer.rewritten.lock() {
             st.rewritten.remove(&pair);
             st.pending.insert(pair.clone());
         }
         if self
+            .writer
             .tx
             .send(Queued::Deleted(pair.0, pair.1, deleted_at))
             .is_err()
@@ -319,6 +328,21 @@ impl FactsCleanupQueue {
     /// write it in the background, and a queued delete cleanup of the key
     /// keeps its newest entry. The drain sends the writes of a batch before
     /// its delete cleanup, so that entry exists when the cleanup lists.
+    pub(super) fn write(&self, bucket: &str, stored_key: &str, facts_key: String) {
+        self.writer.write(bucket, stored_key, facts_key)
+    }
+}
+
+/// The write side of a [`FactsCleanupQueue`]. The drain ends when the
+/// queue and every writer are dropped.
+#[derive(Clone)]
+pub(super) struct FactsWriter {
+    tx: mpsc::UnboundedSender<Queued>,
+    rewritten: Rewritten,
+}
+
+impl FactsWriter {
+    /// See [`FactsCleanupQueue::write`].
     pub(super) fn write(&self, bucket: &str, stored_key: &str, facts_key: String) {
         if let Ok(mut st) = self.rewritten.lock() {
             let pair = (bucket.to_string(), stored_key.to_string());

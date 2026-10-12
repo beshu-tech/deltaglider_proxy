@@ -209,6 +209,8 @@ pub struct S3Backend {
     list_cache_scope: String,
     /// Batched removal of deleted objects' listing facts.
     facts_cleanup: super::facts_cleanup::FactsCleanupQueue,
+    /// Background HEADs that heal the listing facts a LIST did not find.
+    healer: heal::FactsHealer,
 }
 
 impl S3Backend {
@@ -250,6 +252,7 @@ impl S3Backend {
             native_encryption.clone(),
         );
         Ok(Self {
+            healer: heal::FactsHealer::new(client.clone()),
             client,
             bulk_client,
             health_key: None,
