@@ -251,14 +251,12 @@ async fn test_bulk_delete_streams_a_line_per_key() {
             .unwrap();
         assert_eq!(r.status().as_u16(), 404, "{key} is gone");
     }
-    let outbox: Value = admin
-        .get(format!("{ep}/_/api/admin/event-outbox?limit=100"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let deleted = |rows: &[Value], key: &str| {
+        rows.iter()
+            .any(|e| e["kind"] == "ObjectDeleted" && e["key"] == key)
+    };
+    let outbox =
+        common::wait_for_outbox(&admin, &ep, |rows| keys.iter().all(|k| deleted(rows, k))).await;
     let rows = outbox["rows"].as_array().expect("outbox rows");
     for key in keys {
         assert!(
@@ -802,19 +800,16 @@ async fn test_bulk_ops_honour_quota_and_record_events_and_audit() {
         .await
         .unwrap();
     assert_eq!(r.status().as_u16(), 200);
-    let outbox: Value = admin
-        .get(format!("{ep}/_/api/admin/event-outbox?limit=100"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let rows = outbox["rows"].as_array().expect("outbox rows");
-    let has = |kind: &str| {
+    let has_in = |rows: &[Value], kind: &str| {
         rows.iter()
             .any(|e| e["kind"] == kind && e["key"] == "cp/src.txt")
     };
+    let outbox = common::wait_for_outbox(&admin, &ep, |rows| {
+        has_in(rows, "ObjectCopied") && has_in(rows, "ObjectDeleted")
+    })
+    .await;
+    let rows = outbox["rows"].as_array().expect("outbox rows");
+    let has = |kind: &str| has_in(rows, kind);
     assert!(has("ObjectCopied"), "no ObjectCopied: {outbox}");
     assert!(has("ObjectDeleted"), "no ObjectDeleted: {outbox}");
     // Each row carries its per-endpoint delivery state (none: delivery is off).

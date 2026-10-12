@@ -798,7 +798,9 @@ mod delete_objects_tests {
     }
 
     async fn deleted_events(svc: &DeltaGliderS3Service) -> i64 {
-        let db = svc.state().config_db.as_ref().unwrap().lock().await;
+        let db = svc.state().config_db.as_ref().unwrap();
+        crate::event_outbox::flush_appends(db).await;
+        let db = db.lock().await;
         db.event_outbox_count(None).unwrap()
     }
 

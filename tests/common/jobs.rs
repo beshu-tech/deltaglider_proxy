@@ -246,3 +246,33 @@ pub async fn lifecycle_run_now_and_wait(
     let run_id = body["run_id"].as_i64().expect("run-now returns run_id");
     wait_for_job_run(admin, endpoint, &format!("lifecycle:{rule}"), run_id).await
 }
+
+/// Poll `GET /_/api/admin/event-outbox?limit=500` until `done(rows)` holds,
+/// and return that response. The proxy answers a write before its event
+/// reaches the outbox (a background writer appends it a few ms later), so
+/// a test that reads the outbox after a write waits here. Panics after 10 s.
+pub async fn wait_for_outbox(
+    admin: &reqwest::Client,
+    endpoint: &str,
+    done: impl Fn(&[serde_json::Value]) -> bool,
+) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let v: serde_json::Value = admin
+            .get(format!("{endpoint}/_/api/admin/event-outbox?limit=500"))
+            .send()
+            .await
+            .expect("outbox GET")
+            .json()
+            .await
+            .expect("outbox JSON");
+        if done(v["rows"].as_array().map(Vec::as_slice).unwrap_or(&[])) {
+            return v;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the outbox never reached the expected state: {v}"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+}

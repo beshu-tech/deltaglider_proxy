@@ -1154,12 +1154,26 @@ fn validate_status(status: &str) -> Result<(), ConfigDbError> {
 /// Most events one write of the [`append_events`] writer task commits.
 const APPEND_BATCH: usize = 1000;
 
+/// Most appends (one per client write, usually one event each) that wait
+/// for the writer. A full queue makes the next append wait (backpressure);
+/// nothing is dropped.
+const APPEND_QUEUE_CAP: usize = 65_536;
+
+/// Appends that found the writer's queue full and had to wait for room.
+pub static OUTBOX_QUEUE_FULL: std::sync::LazyLock<prometheus::IntCounter> =
+    std::sync::LazyLock::new(|| {
+        prometheus::IntCounter::new(
+            "deltaglider_outbox_queue_full_total",
+            "Object-event appends that waited because the event outbox writer queue was full",
+        )
+        .expect("valid metric")
+    });
+
 /// The writer task of one config DB (see [`append_events`]).
 struct Appender {
     db: std::sync::Weak<tokio::sync::Mutex<ConfigDb>>,
-    tx: tokio::sync::mpsc::UnboundedSender<Vec<NewEvent>>,
-    /// Events handed to the writer and not written yet. Changed under the
-    /// DB lock by the writer, read under it by `append_events`.
+    tx: tokio::sync::mpsc::Sender<Vec<NewEvent>>,
+    /// Events handed to the writer and not written yet.
     queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Wakes [`flush_appends`] after each write.
     written: std::sync::Arc<tokio::sync::Notify>,
@@ -1170,21 +1184,21 @@ struct Appender {
 static APPENDERS: std::sync::LazyLock<parking_lot::Mutex<Vec<Appender>>> =
     std::sync::LazyLock::new(Default::default);
 
-/// The writer of `db`, started on first use.
-fn appender(
-    db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>,
-) -> (
-    tokio::sync::mpsc::UnboundedSender<Vec<NewEvent>>,
+type AppenderHandles = (
+    tokio::sync::mpsc::Sender<Vec<NewEvent>>,
     std::sync::Arc<std::sync::atomic::AtomicUsize>,
     std::sync::Arc<tokio::sync::Notify>,
-) {
+);
+
+/// The writer of `db`, started on first use with a queue of `cap` appends.
+fn appender(db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>, cap: usize) -> AppenderHandles {
     let mut all = APPENDERS.lock();
     all.retain(|a| a.db.strong_count() > 0);
     let weak = std::sync::Arc::downgrade(db);
     if let Some(a) = all.iter().find(|a| a.db.ptr_eq(&weak)) {
         return (a.tx.clone(), a.queued.clone(), a.written.clone());
     }
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(cap.max(1));
     let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let written = std::sync::Arc::new(tokio::sync::Notify::new());
     tokio::spawn(write_appended(
@@ -1203,9 +1217,11 @@ fn appender(
 }
 
 /// The writer task: drains the queue in order, many events per transaction.
+/// Each insert runs on a blocking thread (the commit fsyncs), and the next
+/// batch waits for it, so outbox ids keep the order of the appends.
 async fn write_appended(
     db: std::sync::Weak<tokio::sync::Mutex<ConfigDb>>,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<Vec<NewEvent>>,
+    mut rx: tokio::sync::mpsc::Receiver<Vec<NewEvent>>,
     queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     written: std::sync::Arc<tokio::sync::Notify>,
 ) {
@@ -1217,17 +1233,17 @@ async fn write_appended(
                 Err(_) => break,
             }
         }
+        let n = batch.len();
         let Some(db) = db.upgrade() else {
-            tracing::warn!(
-                "event outbox: the config DB is gone; {} queued event(s) dropped",
-                batch.len()
-            );
+            tracing::warn!("event outbox: the config DB is gone; {n} queued event(s) dropped");
             return;
         };
-        let guard = db.lock().await;
-        insert_logged(&guard, &batch);
-        queued.fetch_sub(batch.len(), SeqCst);
-        drop(guard);
+        let guard = db.lock_owned().await;
+        let done = tokio::task::spawn_blocking(move || insert_logged(&guard, &batch)).await;
+        if let Err(err) = done {
+            tracing::warn!("event outbox: the writer of {n} event(s) failed: {err}");
+        }
+        queued.fetch_sub(n, SeqCst);
         written.notify_waiters();
     }
 }
@@ -1247,41 +1263,57 @@ fn insert_logged(db: &ConfigDb, events: &[NewEvent]) {
     }
 }
 
-/// Append object events without waiting for the config DB mutex: a client
-/// PUT/DELETE calls this after its write, and a long holder of the mutex
-/// (a parity verify, the sync snapshot) used to stall every such request.
+/// Append object events. A client PUT/COPY/DELETE calls this after its
+/// write. The events go to a queue that one writer task drains in order,
+/// many events per transaction, on a blocking thread. So the request never
+/// takes the config DB mutex, never waits for a commit, and never runs an
+/// fsync on a runtime worker.
 ///
-/// With the DB free and nothing queued, the rows are written at once (in
-/// the outbox before the response, as before). Otherwise the events go to
-/// a queue that one writer task drains in order. The "nothing queued"
-/// check runs under the DB lock, and the writer counts its events out under
-/// the same lock, so outbox ids keep the order of the appends. A crash
-/// loses the queued events; [`flush_appends`] writes them at shutdown.
-pub fn append_events(db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>, events: Vec<NewEvent>) {
+/// The queue is bounded ([`APPEND_QUEUE_CAP`]). When it is full, the append
+/// waits for room (and counts [`OUTBOX_QUEUE_FULL`]); it never drops.
+///
+/// A crash loses the events still in the queue (owner decision D2: about
+/// the last milliseconds of writes); [`flush_appends`] writes them at a
+/// graceful shutdown.
+pub async fn append_events(
+    db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>,
+    events: Vec<NewEvent>,
+) {
+    append_events_capped(db, events, APPEND_QUEUE_CAP).await
+}
+
+async fn append_events_capped(
+    db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>,
+    events: Vec<NewEvent>,
+    cap: usize,
+) {
     use std::sync::atomic::Ordering::SeqCst;
+    use tokio::sync::mpsc::error::TrySendError;
     if events.is_empty() {
         return;
     }
-    let (tx, queued, _) = appender(db);
-    if let Ok(guard) = db.try_lock() {
-        if queued.load(SeqCst) == 0 {
-            insert_logged(&guard, &events);
-            return;
-        }
-    }
+    let (tx, queued, _) = appender(db, cap);
     let n = events.len();
     queued.fetch_add(n, SeqCst);
-    if tx.send(events).is_err() {
+    let sent = match tx.try_send(events) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(events)) => {
+            OUTBOX_QUEUE_FULL.inc();
+            tx.send(events).await.map_err(|_| ())
+        }
+        Err(TrySendError::Closed(_)) => Err(()),
+    };
+    if sent.is_err() {
         queued.fetch_sub(n, SeqCst);
         tracing::warn!("event outbox: the writer has stopped; {n} event(s) dropped");
     }
 }
 
 /// Wait until every event queued by [`append_events`] for `db` is written
-/// (graceful shutdown).
+/// (graceful shutdown; tests that read the outbox after a write).
 pub async fn flush_appends(db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>) {
     use std::sync::atomic::Ordering::SeqCst;
-    let (_, queued, written) = appender(db);
+    let (_, queued, written) = appender(db, APPEND_QUEUE_CAP);
     loop {
         let wake = written.notified();
         if queued.load(SeqCst) == 0 {
@@ -1825,7 +1857,7 @@ mod tests {
         ));
         let held = db.lock().await;
         for k in ["a", "b", "c"] {
-            append_events(&db, vec![event_at(1, k)]);
+            append_events(&db, vec![event_at(1, k)]).await;
         }
         let flush = tokio::spawn({
             let db = db.clone();
@@ -1885,5 +1917,61 @@ mod tests {
             "every claimed row is in progress"
         );
         assert!(pages <= 10, "one commit for the claim, wrote {pages} pages");
+    }
+
+    fn shared(db: ConfigDb) -> std::sync::Arc<tokio::sync::Mutex<ConfigDb>> {
+        std::sync::Arc::new(tokio::sync::Mutex::new(db))
+    }
+
+    fn outbox_keys(db: &ConfigDb) -> Vec<String> {
+        db.event_outbox_since(0, 1000)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.key)
+            .collect()
+    }
+
+    /// P4.1: an append never writes on the caller's task, even with the DB
+    /// free and nothing queued. Before, that case inserted (and committed,
+    /// with its fsync) inline on the request's runtime worker.
+    #[tokio::test]
+    async fn an_append_never_writes_on_the_request_task() {
+        let db = shared(ConfigDb::in_memory("pw").unwrap());
+        append_events(&db, vec![event_at(1, "a")]).await;
+        // Single-threaded runtime: the writer has not run yet.
+        assert!(
+            outbox_keys(&db.try_lock().unwrap()).is_empty(),
+            "the append wrote inline on the request task"
+        );
+        flush_appends(&db).await;
+        assert_eq!(outbox_keys(&*db.lock().await), ["a"]);
+    }
+
+    /// A full queue makes the append wait (and counts it); it drops
+    /// nothing, and the ids keep the order of the appends.
+    #[tokio::test]
+    async fn a_full_queue_waits_and_drops_nothing() {
+        let db = shared(ConfigDb::in_memory("pw").unwrap());
+        let held = db.lock().await; // the writer blocks on the DB
+        let full_before = OUTBOX_QUEUE_FULL.get();
+        append_events_capped(&db, vec![event_at(1, "k0")], 2).await;
+        tokio::task::yield_now().await; // the writer takes k0, then blocks
+        for i in 1..=2 {
+            append_events_capped(&db, vec![event_at(1, &format!("k{i}"))], 2).await;
+        }
+        let db2 = db.clone();
+        let waiting = tokio::spawn(async move {
+            append_events_capped(&db2, vec![event_at(1, "k3")], 2).await;
+        });
+        // Room appears only when the writer moves, and it waits for `held`.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!waiting.is_finished(), "the append did not wait for room");
+        assert!(OUTBOX_QUEUE_FULL.get() > full_before, "not counted");
+        drop(held);
+        waiting.await.unwrap();
+        flush_appends(&db).await;
+        assert_eq!(outbox_keys(&*db.lock().await), ["k0", "k1", "k2", "k3"]);
     }
 }

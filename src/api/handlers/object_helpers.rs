@@ -16,7 +16,7 @@
 //! * [`check_quota_for_write`] — pre-write quota gate.
 //! * [`enqueue_object_event`] / [`enqueue_object_events`] — best-
 //!   effort event-outbox append for notification dispatch; never waits
-//!   for the config DB mutex.
+//!   for the config DB mutex (a full writer queue makes it wait).
 //!
 //! Everything else moved into the s3s adapter or was already
 //! axum-handler-specific and went away with `object.rs` /
@@ -30,8 +30,8 @@ use std::sync::Arc;
 /// Append a single object event to the outbox. Silently noops when
 /// no config DB is attached (open-mode dev runs). Errors are
 /// warn-logged and dropped — notifications are best-effort by design.
-/// Never waits for the config DB mutex (see
-/// [`crate::event_outbox::append_events`]).
+/// Never waits for the config DB mutex; waits only when the writer's
+/// queue is full (see [`crate::event_outbox::append_events`]).
 pub(crate) async fn enqueue_object_event(state: &Arc<AppState>, event: NewEvent) {
     enqueue_object_events(state, &[event]).await;
 }
@@ -50,7 +50,7 @@ pub(crate) async fn enqueue_object_events(state: &Arc<AppState>, events: &[NewEv
     let Some(config_db) = state.config_db.as_ref() else {
         return;
     };
-    crate::event_outbox::append_events(config_db, filtered);
+    crate::event_outbox::append_events(config_db, filtered).await;
 }
 
 /// One client write of a whole body (PutObject, CopyObject, form POST).
@@ -595,9 +595,9 @@ mod write_path_tests {
             assert!(tokio::time::Instant::now() < deadline, "events lost");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        // An idle DB with nothing queued: the event is written before the
-        // append returns, after the queued ones.
+        // A later event lands after the queued ones.
         enqueue_object_events(&f.state, &[event("c.zip")]).await;
+        crate::event_outbox::flush_appends(&db).await;
         assert_eq!(outbox_keys(&f.state).await, ["a.zip", "b.zip", "c.zip"]);
     }
 }

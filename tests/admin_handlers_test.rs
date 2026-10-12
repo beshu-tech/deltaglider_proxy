@@ -1640,7 +1640,13 @@ async fn object_created_payload_is_the_same_for_put_and_multipart() {
         .send()
         .await
         .unwrap();
-    let (_, v) = outbox(&admin, &ep, "limit=100").await;
+    let v = common::wait_for_outbox(&admin, &ep, |rows| {
+        ["ev/put.bin", "ev/mpu.bin"].iter().all(|k| {
+            rows.iter()
+                .any(|r| r["kind"] == "ObjectCreated" && r["key"] == *k)
+        })
+    })
+    .await;
     let rows = v["rows"].as_array().expect("outbox rows");
     for (key, etag) in [
         ("ev/put.bin", put.e_tag().unwrap()),

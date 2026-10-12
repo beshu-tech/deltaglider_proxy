@@ -232,6 +232,12 @@ Auth metrics stay at zero when SigV4 is disabled.
 | `deltaglider_replication_head_calls_total` | Counter | — | Object HEAD requests that the replication reconcile walk sent |
 | `deltaglider_replication_dirs_completed_total` | Counter | — | Directories that the replication reconcile walk finished |
 
+## Event outbox
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `deltaglider_outbox_queue_full_total` | Counter | — | Object events that had to wait because the queue in front of the outbox writer was full. Each wait delays the response of one write request; no event is dropped. A rising value means that the config DB cannot keep up with the write traffic |
+
 ## Config DB sync
 
 | Metric | Type | Labels | Description |
