@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.8 — 2026-10-12
+
 ### Fixed — A list that finds nothing no longer sends a `HeadBucket` request every time
 
 S3 answers a list of a missing bucket with `NoSuchBucket`, so when a
