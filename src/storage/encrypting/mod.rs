@@ -64,8 +64,8 @@ pub use format::*;
 use super::io_to_storage_error;
 use super::list_size_cache::ListedSize;
 use super::traits::{
-    BulkListing, ByteStream, DelegatedListResult, LiteScanResult, MultipartUpload, StorageBackend,
-    StorageError, StoredObject, UploadedPart,
+    BulkListing, ByteStream, DelegatedListResult, LiteScanResult, MultipartUpload, ReferenceSource,
+    StorageBackend, StorageError, StoredObject, UploadedPart,
 };
 use crate::deltaglider::spool::SpoolBudget;
 use crate::types::FileMetadata;
@@ -798,6 +798,26 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     // The default decrypts to RAM then writes plaintext to the spool — correct, but
     // bounded by reference size for encrypted backends. Streaming decryption is a
     // separate future optimisation (chunked GCM / per-block nonce).
+
+    /// A plaintext reference passes through (the filesystem keeps its
+    /// hardlink). An encrypted one is decrypted whole, as `get_reference`
+    /// does, and its size is the decrypted length.
+    async fn open_reference_source(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<ReferenceSource, StorageError> {
+        let source = self.inner.open_reference_source(bucket, prefix).await?;
+        if !is_encrypted(&source.metadata) {
+            return Ok(source);
+        }
+        let meta = source.metadata.clone();
+        let data = source.read_all().await?;
+        let plain = self.decrypt_if_needed(data, &meta)?;
+        let size = plain.len() as u64;
+        let stream: ByteStream = Box::pin(futures::stream::once(async { Ok(Bytes::from(plain)) }));
+        Ok(ReferenceSource::stream(stream, size, meta))
+    }
 
     async fn get_delta(
         &self,

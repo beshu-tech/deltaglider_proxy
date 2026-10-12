@@ -551,6 +551,42 @@ impl StorageBackend for S3Backend {
         Ok(written)
     }
 
+    /// One GET: the size from its Content-Length, the metadata from its
+    /// headers, the body streamed by the caller.
+    async fn open_reference_source(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<super::ReferenceSource, StorageError> {
+        let key = self.reference_key(prefix);
+        let response = self
+            .client
+            .get_object()
+            .bucket(bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|e| self.classify_get(bucket, &key, &e))?;
+        let size = response.content_length().unwrap_or(0).max(0) as u64;
+        let meta = self.metadata_of_response(
+            bucket,
+            &key,
+            &ObjectHeaders {
+                user: response.metadata(),
+                last_modified: response.last_modified(),
+                e_tag: response.e_tag(),
+                content_length: response.content_length(),
+                content_type: response.content_type(),
+            },
+        );
+        debug!("S3 GET reference {}/{} ({} bytes)", bucket, key, size);
+        Ok(super::ReferenceSource::stream(
+            self.body_stream(bucket, &key, response),
+            size,
+            meta,
+        ))
+    }
+
     #[instrument(skip(self))]
     async fn get_reference_metadata(
         &self,

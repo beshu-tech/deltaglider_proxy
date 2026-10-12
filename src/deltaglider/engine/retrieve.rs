@@ -539,16 +539,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// one download, checked against that SHA-256, kept like a reconstruction
     /// (`range_spools`: same TTL, spool budget and eviction). Concurrent GETs
     /// wait for the one download, and later GETs of any delta of the
-    /// deltaspace read the file instead of downloading the reference again
-    /// (and sending a HEAD for its size). The output spool is reserved first,
+    /// deltaspace read the file instead of downloading the reference again. The output spool is reserved first,
     /// so a GET waits for budget holding nothing; the download then takes
     /// the reference's spool beside it, without waiting (on no room, the GET
     /// downloads its own copy as before).
     ///
     /// Without a `ref_sha256` (or with the cache off) nothing can verify a
-    /// shared copy: the GET downloads its own, with ONE reservation for both
-    /// spools (two concurrent GETs never hold one while waiting for the
-    /// other).
+    /// shared copy: the GET downloads its own. It waits for budget only
+    /// while it holds nothing but its output spool reservation, or for ONE
+    /// reservation of both spools (two concurrent GETs never hold one while
+    /// waiting for the other).
     async fn reference_file_and_out_spool(
         &self,
         bucket: &str,
@@ -568,13 +568,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             let shared = self
                 .range_spools
                 .get_or_fill(key, || {
-                    self.download_verified_reference(
-                        bucket,
-                        deltaspace_id,
-                        ref_sha256,
-                        metadata.file_size,
-                        &out,
-                    )
+                    self.download_verified_reference(bucket, deltaspace_id, ref_sha256, &out)
                 })
                 .await;
             match shared {
@@ -583,51 +577,65 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 Err(SharedReferenceError::Engine(e)) => return Err(e),
             }
         }
-        // The reference can be far larger than the object: reserve its spool
-        // at its own size (a HEAD), or the byte budget under-counts the disk.
-        let ref_size = self
+        // This GET's own copy. The reference can be far larger than the
+        // object: its spool is reserved at its own size, which the GET of
+        // the reference answers (no HEAD). The output spool first (a GET
+        // that waits for budget holds nothing), then the reference's beside
+        // it without waiting, so the open response is never held while
+        // waiting. No room beside it: drop both, take ONE reservation for
+        // the pair at the known size, and read the reference again.
+        let out = self.spool_acquire(metadata.file_size).await?;
+        let source = self
             .storage
-            .get_reference_metadata(bucket, deltaspace_id)
-            .await
-            .map(|m| m.file_size)
-            .unwrap_or(metadata.file_size);
-        let (ref_spool, out_spool) = self
-            .spool_acquire_pair(ref_size, metadata.file_size)
+            .open_reference_source(bucket, deltaspace_id)
             .await?;
-        // Materialise the reference as a seekable file WITHOUT heap-loading it
-        // (Phase 2: filesystem hardlink / S3 stream-to-file).
-        self.storage
-            .get_reference_to_file(bucket, deltaspace_id, ref_spool.path())
-            .await?;
-        Ok((ReferenceFile::Own(ref_spool), out_spool))
+        match self.spool.acquire_beside(Some(&out), source.size).await {
+            Ok(ref_spool) => {
+                source.write_to(ref_spool.path()).await?;
+                Ok((ReferenceFile::Own(ref_spool), out))
+            }
+            Err(e) if e.kind() == crate::deltaglider::spool::CONTENDED => {
+                let ref_size = source.size;
+                drop(source);
+                drop(out);
+                let (ref_spool, out_spool) = self
+                    .spool_acquire_pair(ref_size, metadata.file_size)
+                    .await?;
+                // Materialise the reference as a seekable file WITHOUT
+                // heap-loading it (filesystem hardlink / S3 stream-to-file).
+                self.storage
+                    .get_reference_to_file(bucket, deltaspace_id, ref_spool.path())
+                    .await?;
+                Ok((ReferenceFile::Own(ref_spool), out_spool))
+            }
+            Err(e) => Err(EngineError::Storage(StorageError::from(e))),
+        }
     }
 
     /// Download the reference to a spool file beside `held` (never waits for
-    /// budget) and check it against `ref_sha256`. Only a file that passes is
-    /// shared.
+    /// budget; the size comes from the reference's own GET) and check it
+    /// against `ref_sha256`. Only a file that passes is shared.
     async fn download_verified_reference(
         &self,
         bucket: &str,
         deltaspace_id: &str,
         ref_sha256: &str,
-        fallback_size: u64,
         held: &crate::deltaglider::spool::Spool,
     ) -> Result<crate::deltaglider::spool::Spool, SharedReferenceError> {
-        let ref_size = self
+        let source = self
             .storage
-            .get_reference_metadata(bucket, deltaspace_id)
+            .open_reference_source(bucket, deltaspace_id)
             .await
-            .map(|m| m.file_size)
-            .unwrap_or(fallback_size);
-        let spool = match self.spool.acquire_beside(Some(held), ref_size).await {
+            .map_err(EngineError::from)?;
+        let spool = match self.spool.acquire_beside(Some(held), source.size).await {
             Ok(spool) => spool,
             Err(e) if e.kind() == crate::deltaglider::spool::CONTENDED => {
                 return Err(SharedReferenceError::NoRoom)
             }
             Err(e) => return Err(EngineError::Storage(StorageError::from(e)).into()),
         };
-        self.storage
-            .get_reference_to_file(bucket, deltaspace_id, spool.path())
+        source
+            .write_to(spool.path())
             .await
             .map_err(EngineError::from)?;
         let (actual, _, _) = Self::hash_spool_file(spool.path()).await?;

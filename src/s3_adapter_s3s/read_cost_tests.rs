@@ -583,3 +583,84 @@ async fn a_cold_routed_get_resolves_its_bucket_once() {
         .count();
     assert_eq!(heads, 1, "{:?}", fx.fake.requests());
 }
+
+/// P3.4: a large delta GET downloads its reference to a spool file with
+/// ONE GET: the spool is reserved at the size from the GET response
+/// (its Content-Length; the decrypted length behind the encrypting
+/// wrapper). A HEAD for the size went first. Both the shared download
+/// (range-spool cache on) and the GET's own copy (cache off).
+#[tokio::test]
+async fn a_large_delta_downloads_its_reference_with_one_get() {
+    for kind in KINDS {
+        for shared in [true, false] {
+            let fx = fixture(kind).await;
+            let mut cfg = crate::config::Config::default();
+            cfg.tuning.spool_threshold_bytes = Some(1024);
+            if !shared {
+                cfg.range_spool_ttl_secs = 0;
+            }
+            let engine = DeltaGliderEngine::new_with_backend(fx.backend.clone(), &cfg, None);
+            engine.head("b", "dir/v1.zip").await.unwrap();
+            fx.fake.clear();
+            let (data, _) = engine.retrieve("b", "dir/v1.zip").await.unwrap();
+            assert_eq!(data, fx.versions[1], "{kind:?} shared={shared}");
+            let reqs = object_requests(&fx.fake);
+            let reference: Vec<&String> = reqs
+                .iter()
+                .filter(|r| r.ends_with("/dir/reference.bin"))
+                .collect();
+            assert_eq!(
+                reference,
+                ["GET /b/dir/reference.bin"],
+                "{kind:?} shared={shared}: {reqs:?}"
+            );
+        }
+    }
+}
+
+/// The filesystem keeps its hardlink: the reference source is the file
+/// itself, linked (not copied) into the spool.
+#[tokio::test]
+async fn the_filesystem_reference_source_hardlinks() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let fs = crate::storage::FilesystemBackend::new(dir.path().join("data"))
+        .await
+        .unwrap();
+    let backend: Backend = Arc::new(DynStorageBackend::new_box(fs));
+    let engine = engine_on(&backend, None);
+    engine.create_bucket("b").await.unwrap();
+    let base = rnd(64 * 1024, 21);
+    engine
+        .store("b", "dir/v0.zip", &base, None, Default::default())
+        .await
+        .unwrap();
+    let source = backend.open_reference_source("b", "dir").await.unwrap();
+    assert_eq!(source.size, 64 * 1024);
+    let dest = dir.path().join("spooled-reference");
+    assert_eq!(source.write_to(&dest).await.unwrap(), 64 * 1024);
+    let stored = std::fs::read_dir(dir.path().join("data")).unwrap().count();
+    assert!(stored > 0);
+    let linked = std::fs::metadata(&dest).unwrap();
+    assert_eq!(linked.nlink(), 2, "the reference is hardlinked, not copied");
+}
+
+/// A body longer than its declared size fails before it overruns the
+/// spool reservation.
+#[tokio::test]
+async fn a_reference_body_longer_than_its_size_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let stream: crate::storage::ByteStream = Box::pin(futures::stream::iter(vec![
+        Ok(bytes::Bytes::from_static(b"12345")),
+        Ok(bytes::Bytes::from_static(b"678")),
+    ]));
+    let meta = crate::types::FileMetadata::new_passthrough(
+        "reference.bin".into(),
+        String::new(),
+        String::new(),
+        6,
+        None,
+    );
+    let source = crate::storage::ReferenceSource::stream(stream, 6, meta);
+    assert!(source.write_to(&dir.path().join("r")).await.is_err());
+}

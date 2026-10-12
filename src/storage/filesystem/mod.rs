@@ -1143,6 +1143,22 @@ impl StorageBackend for FilesystemBackend {
         Ok(len)
     }
 
+    /// The reference file itself (the caller hardlinks it) and its xattr.
+    async fn open_reference_source(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<super::ReferenceSource, StorageError> {
+        let path = self.reference_path(bucket, prefix)?;
+        let file = fsio::open(&path)
+            .await
+            .map_err(|e| fsio::storage_error(e, || format!("reference: {prefix}/reference.bin")))?;
+        let size = file.metadata().await?.len();
+        drop(file);
+        let meta = self.get_reference_metadata(bucket, prefix).await?;
+        Ok(super::ReferenceSource::local(path, size, meta))
+    }
+
     #[instrument(skip(self, data, metadata))]
     async fn put_reference(
         &self,

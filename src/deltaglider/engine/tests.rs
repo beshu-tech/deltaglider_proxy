@@ -173,6 +173,14 @@ impl crate::storage::StorageBackend for NullInner {
     > {
         crate::storage::open_object_by_parts(self, b, p, o).await
     }
+
+    async fn open_reference_source(
+        &self,
+        b: &str,
+        p: &str,
+    ) -> Result<crate::storage::ReferenceSource, crate::storage::StorageError> {
+        crate::storage::open_reference_source_by_parts(self, b, p).await
+    }
     async fn get_passthrough_stream(
         &self,
         _: &str,

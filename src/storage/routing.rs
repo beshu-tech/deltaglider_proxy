@@ -1378,6 +1378,14 @@ impl StorageBackend for RoutingBackend {
         route_existing!(self, bucket, open_object, prefix, object)
     }
 
+    async fn open_reference_source(
+        &self,
+        b: &str,
+        p: &str,
+    ) -> Result<crate::storage::ReferenceSource, crate::storage::StorageError> {
+        route_existing!(self, b, open_reference_source, p)
+    }
+
     async fn get_passthrough_stream_range(
         &self,
         bucket: &str,
@@ -1886,6 +1894,14 @@ mod tests {
             crate::storage::StorageError,
         > {
             crate::storage::open_object_by_parts(self, b, p, o).await
+        }
+
+        async fn open_reference_source(
+            &self,
+            b: &str,
+            p: &str,
+        ) -> Result<crate::storage::ReferenceSource, crate::storage::StorageError> {
+            crate::storage::open_reference_source_by_parts(self, b, p).await
         }
         async fn get_passthrough_stream(
             &self,

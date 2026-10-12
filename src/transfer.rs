@@ -2521,6 +2521,14 @@ mod multipart_abort_tests {
             let _ = (b, p, o);
             Err(nope())
         }
+
+        async fn open_reference_source(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<crate::storage::ReferenceSource, crate::storage::StorageError> {
+            Err(nope())
+        }
         async fn get_passthrough_stream(
             &self,
             _: &str,
@@ -2766,6 +2774,14 @@ mod multipart_abort_tests {
             crate::storage::StorageError,
         > {
             self.0.open_object(b, p, o).await
+        }
+
+        async fn open_reference_source(
+            &self,
+            b: &str,
+            p: &str,
+        ) -> Result<crate::storage::ReferenceSource, crate::storage::StorageError> {
+            self.0.open_reference_source(b, p).await
         }
         async fn get_passthrough_stream(
             &self,

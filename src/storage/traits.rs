@@ -62,6 +62,107 @@ pub enum StoredObject<'a> {
 /// A stream of object bytes.
 pub type ByteStream = BoxStream<'static, Result<Bytes, StorageError>>;
 
+/// A deltaspace's `reference.bin`, opened for a copy to a local file
+/// ([`StorageBackend::open_reference_source`]): its plaintext size is
+/// known BEFORE a byte is written, so the caller reserves spool budget for
+/// it from the same read (no HEAD for the size).
+pub struct ReferenceSource {
+    /// The plaintext size: what [`Self::write_to`] writes.
+    pub size: u64,
+    /// The reference's stored metadata (raw, markers included).
+    pub metadata: FileMetadata,
+    content: ReferenceBody,
+}
+
+enum ReferenceBody {
+    /// Bytes to write (an S3 GET body, a decrypted buffer).
+    Stream(ByteStream),
+    /// A local file to hardlink, or copy where a hardlink fails (the
+    /// filesystem backend).
+    Local(PathBuf),
+}
+
+impl ReferenceSource {
+    /// A source that streams `size` bytes.
+    pub fn stream(stream: ByteStream, size: u64, metadata: FileMetadata) -> Self {
+        Self {
+            size,
+            metadata,
+            content: ReferenceBody::Stream(stream),
+        }
+    }
+
+    /// A source that is a local file of `size` bytes.
+    pub fn local(path: PathBuf, size: u64, metadata: FileMetadata) -> Self {
+        Self {
+            size,
+            metadata,
+            content: ReferenceBody::Local(path),
+        }
+    }
+
+    /// The whole body in memory (the encrypting wrapper decrypts it).
+    pub async fn read_all(self) -> Result<Vec<u8>, StorageError> {
+        use futures::TryStreamExt;
+        match self.content {
+            ReferenceBody::Stream(stream) => {
+                let chunks: Vec<Bytes> = stream.try_collect().await?;
+                Ok(chunks.concat())
+            }
+            ReferenceBody::Local(path) => Ok(tokio::fs::read(&path).await?),
+        }
+    }
+
+    /// Write the reference to `dest` (a hardlink for a local file). Never
+    /// writes more than `size` bytes: a body longer than its declared size
+    /// fails, so the spool reservation bounds the disk use. Returns the
+    /// bytes written.
+    pub async fn write_to(self, dest: &Path) -> Result<u64, StorageError> {
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+        match self.content {
+            ReferenceBody::Local(src) => {
+                let _ = tokio::fs::remove_file(dest).await;
+                if tokio::fs::hard_link(&src, dest).await.is_err() {
+                    tokio::fs::copy(&src, dest).await?;
+                }
+                Ok(tokio::fs::metadata(dest).await?.len())
+            }
+            ReferenceBody::Stream(mut stream) => {
+                let mut file = tokio::fs::File::create(dest).await?;
+                let mut written: u64 = 0;
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk?;
+                    written += chunk.len() as u64;
+                    if written > self.size {
+                        return Err(StorageError::Other(format!(
+                            "reference body is longer than its declared {} bytes",
+                            self.size
+                        )));
+                    }
+                    file.write_all(&chunk).await?;
+                }
+                file.flush().await?;
+                Ok(written)
+            }
+        }
+    }
+}
+
+/// `open_reference_source` from the metadata read and the data read, for a
+/// test double whose data read does not carry the metadata.
+pub async fn open_reference_source_by_parts<B: StorageBackend + ?Sized>(
+    backend: &B,
+    bucket: &str,
+    prefix: &str,
+) -> Result<ReferenceSource, StorageError> {
+    let metadata = backend.get_reference_metadata(bucket, prefix).await?;
+    let data = backend.get_reference(bucket, prefix).await?;
+    let size = data.len() as u64;
+    let stream: ByteStream = Box::pin(futures::stream::once(async move { Ok(Bytes::from(data)) }));
+    Ok(ReferenceSource::stream(stream, size, metadata))
+}
+
 /// One fenced write to `reference.bin` (see
 /// [`StorageBackend::write_reference_fenced`]).
 #[derive(Debug, Clone, Copy)]
@@ -427,6 +528,19 @@ pub trait StorageBackend: Send + Sync {
             Ok(data.len() as u64)
         }
     }
+
+    /// Open the reference for a copy to a local file, with its plaintext
+    /// size from the SAME read (S3: the GET response's Content-Length; the
+    /// encrypting wrapper: the decrypted length; filesystem: the file,
+    /// which [`ReferenceSource::write_to`] hardlinks). The caller reserves
+    /// spool budget for that size before it writes, with no HEAD. A missing
+    /// reference is `NotFound`. No default: a wrapper that forgot it would
+    /// hand out the inner backend's bytes without its own transform.
+    fn open_reference_source(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> impl Future<Output = Result<ReferenceSource, StorageError>> + Send;
 
     /// Store a reference file with its metadata
     fn put_reference(
