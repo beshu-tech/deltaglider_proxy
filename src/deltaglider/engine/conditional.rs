@@ -179,11 +179,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// A client write of a whole body: lock, judge the precondition, store.
     /// `data` is the body as the S3 adapter collected it: the store shares
     /// the buffer down to the storage write, it never copies it.
+    /// `known_sha256`: the body's SHA-256 when the caller proved it (a
+    /// verified SigV4 payload hash); `None` hashes the body here.
+    #[allow(clippy::too_many_arguments)]
     pub async fn store_conditional(
         &self,
         bucket: &str,
         key: &str,
         data: Bytes,
+        known_sha256: Option<super::store::KnownSha256>,
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
         precondition: &Precondition,
@@ -194,6 +198,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 bucket,
                 key,
                 data,
+                known_sha256,
                 content_type,
                 user_metadata,
                 guard.known_prior(),
@@ -205,11 +210,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// a delta goes through the streaming spool store, so the delta encode and
     /// the ratio decision run with bounded memory; the others are stored
     /// buffered. `known_prior`: what the precondition check read, if it ran.
+    #[allow(clippy::too_many_arguments)]
     async fn store_client_body(
         &self,
         bucket: &str,
         key: &str,
         data: Bytes,
+        known_sha256: Option<super::store::KnownSha256>,
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
         known_prior: Option<super::usage::CounterPrior>,
@@ -219,15 +226,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             let spool = self.spool_acquire(size).await?;
             // Hash from RAM while the spool is written: the spooled store
             // then does not read the body back to hash it.
-            let hashing = {
-                let data = data.clone();
-                tokio::task::spawn_blocking(move || super::store::BodyHashes::of(&data))
-            };
+            let hashing = super::store::BodyHashes::compute(&data, known_sha256);
             let (written, hashes) = tokio::join!(tokio::fs::write(spool.path(), &data), hashing);
             written.map_err(|e| EngineError::Storage(StorageError::from(e)))?;
-            let hashes = hashes.map_err(|e| {
-                EngineError::Storage(StorageError::Other(format!("hash task: {e}")))
-            })?;
+            let hashes = hashes?;
             self.store_spooled_delta_inner(
                 bucket,
                 key,
@@ -249,6 +251,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 user_metadata,
                 None,
                 known_prior,
+                known_sha256,
             )
             .await
         }
@@ -370,6 +373,7 @@ mod tests {
                 "img/a.jpg",
                 Bytes::from_static(b"one"),
                 None,
+                None,
                 HashMap::new(),
                 &create_only,
             )
@@ -390,6 +394,7 @@ mod tests {
                 "b",
                 "img/a.jpg",
                 Bytes::from_static(b"two!"),
+                None,
                 None,
                 HashMap::new(),
                 &replace,

@@ -379,6 +379,67 @@ fn headers_if_still_aws_chunked<T>(req: &s3s::S3Request<T>) -> Option<axum::http
     (!s3s_decoded_aws_chunked(&req.headers, req.credentials.is_some())).then(|| req.headers.clone())
 }
 
+/// The body SHA-256 that s3s verified for this request, or `None` when s3s
+/// did not verify one (then the caller hashes the body).
+///
+/// s3s 0.14 (`ops/signature.rs`) wraps the body in `UploadStream`, which
+/// fails the read when the bytes do not hash to `x-amz-content-sha256`,
+/// only on its SigV4 path with a single-chunk payload hash. It picks that
+/// path when the query has no SigV2 `Signature` (else it checks SigV2 and
+/// verifies no body) and the `Authorization` header is a unique SigV4 one.
+/// It parses the header as a single-chunk hash only when it is 64 LOWERCASE
+/// hex characters; any other non-sentinel value fails the signature
+/// (`SignatureDoesNotMatch`). So this returns the digest only when all of
+/// these hold, each one checked here, conservatively:
+///
+/// - s3s verified credentials;
+/// - no query parameter name (decoded as s3s decodes it) contains
+///   `signature` in any case (no SigV2 query; a SigV4 presigned query
+///   carries no payload hash in our middleware either);
+/// - exactly one `Authorization` header, and it starts with
+///   `AWS4-HMAC-SHA256 ` (so SigV2 header parsing does not match it);
+/// - exactly one `x-amz-content-sha256` header, 64 lowercase hex.
+///
+/// s3s hands over the de-framed body only for streaming payloads, which
+/// never match the last rule: the bytes the handler collects are the bytes
+/// s3s hashed. The contract test `s3s_verifies_the_payload_hash_we_trust`
+/// (`api/s3s_contract_tests.rs`) sends a wrong body in every shape and
+/// fails when this returns a digest that s3s did not enforce.
+pub(crate) fn s3s_verified_payload_sha256(
+    headers: &axum::http::HeaderMap,
+    uri: &axum::http::Uri,
+    has_credentials: bool,
+) -> Option<crate::deltaglider::KnownSha256> {
+    if !has_credentials {
+        return None;
+    }
+    let target = crate::api::request_target::RequestTarget::from_uri(uri).ok()?;
+    if target
+        .query
+        .iter()
+        .any(|(name, _)| name.to_ascii_lowercase().contains("signature"))
+    {
+        return None;
+    }
+    let unique = |name: &str| {
+        let mut values = headers.get_all(name).iter();
+        let first = values.next()?;
+        values.next().is_none().then_some(first)?.to_str().ok()
+    };
+    if !unique("authorization")?.starts_with("AWS4-HMAC-SHA256 ") {
+        return None;
+    }
+    let claimed = unique("x-amz-content-sha256")?;
+    let lowercase_hex = claimed.len() == 64
+        && claimed
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !lowercase_hex {
+        return None;
+    }
+    crate::deltaglider::KnownSha256::from_verified_hex(claimed)
+}
+
 async fn collect_blob_limited(
     body: Option<s3s::dto::StreamingBlob>,
     limit: u64,

@@ -78,6 +78,17 @@ pub(crate) async fn store_client_write(
     state: &Arc<AppState>,
     write: ClientWrite<'_>,
 ) -> Result<crate::types::StoreResult, S3Error> {
+    store_client_write_hashed(state, write, None).await
+}
+
+/// [`store_client_write`] of a body whose SHA-256 the caller proved
+/// (`known_sha256`): the engine stores that digest and does not hash the
+/// body for it again.
+pub(crate) async fn store_client_write_hashed(
+    state: &Arc<AppState>,
+    write: ClientWrite<'_>,
+    known_sha256: Option<crate::deltaglider::KnownSha256>,
+) -> Result<crate::types::StoreResult, S3Error> {
     let size = write.data.len() as u64;
     check_quota_for_write(state, write.bucket, write.key, size).await?;
     let result = state
@@ -87,6 +98,7 @@ pub(crate) async fn store_client_write(
             write.bucket,
             write.key,
             write.data,
+            known_sha256,
             write.content_type,
             write.user_metadata,
             write.precondition,

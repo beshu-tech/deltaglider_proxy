@@ -105,6 +105,18 @@ struct Seen {
     our_list_prefix: Option<String>,
     /// s3s's parsed `prefix` input, when the op reached a LIST handler.
     s3s_list_prefix: Option<Option<String>>,
+    /// When the op reached the PutObject handler.
+    put: Option<PutSeen>,
+}
+
+/// What the PutObject handler saw: the body read and the payload digest
+/// that the adapter trusts as verified by s3s.
+#[derive(Debug, Clone)]
+struct PutSeen {
+    /// `s3s_verified_payload_sha256` on this request (hex).
+    trusted_sha256: Option<String>,
+    /// The body bytes, or the read error s3s raised.
+    body: Result<Vec<u8>, String>,
 }
 
 /// Per-request slot, carried as a request extension to the hook.
@@ -147,6 +159,7 @@ impl S3Access for RecordingAccess {
             admission_prefix: admission.list_prefix.clone(),
             our_list_prefix: target.query_value("prefix").map(str::to_string),
             s3s_list_prefix: None,
+            put: None,
         };
         if let Some(slot) = cx.extensions_mut().get::<Slot>() {
             *slot.0.lock().unwrap() = Some(seen);
@@ -156,7 +169,8 @@ impl S3Access for RecordingAccess {
 }
 
 /// Every operation answers `NotImplemented`, except LIST, which first
-/// records the `prefix` s3s parsed.
+/// records the `prefix` s3s parsed, and PutObject, which first reads the
+/// body and records what it read.
 struct NopS3;
 
 fn record_prefix(ext: &axum::http::Extensions, prefix: Option<String>) {
@@ -169,6 +183,40 @@ fn record_prefix(ext: &axum::http::Extensions, prefix: Option<String>) {
 
 #[async_trait::async_trait]
 impl s3s::S3 for NopS3 {
+    async fn put_object(
+        &self,
+        req: S3Request<s3s::dto::PutObjectInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutObjectOutput>> {
+        use futures::StreamExt as _;
+        let trusted_sha256 = crate::s3_adapter_s3s::s3s_verified_payload_sha256(
+            &req.headers,
+            &req.uri,
+            req.credentials.is_some(),
+        )
+        .map(|d| d.to_hex());
+        let mut body = Ok(Vec::new());
+        if let Some(mut stream) = req.input.body {
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(bytes) => body.as_mut().unwrap().extend_from_slice(&bytes),
+                    Err(e) => {
+                        body = Err(e.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(slot) = req.extensions.get::<Slot>() {
+            if let Some(seen) = slot.0.lock().unwrap().as_mut() {
+                seen.put = Some(PutSeen {
+                    trusted_sha256,
+                    body,
+                });
+            }
+        }
+        Err(s3s::s3_error!(NotImplemented))
+    }
+
     async fn list_objects_v2(
         &self,
         req: S3Request<ListObjectsV2Input>,
@@ -655,6 +703,19 @@ fn violations(method: &Method, seen: &Seen) -> Vec<String> {
                 "unmapped s3s op {} on {:?}",
                 seen.op, seen.s3s_path
             )),
+        }
+    }
+    // A payload digest the adapter trusts must be one s3s enforced: s3s
+    // never hands over a body that hashes to anything else.
+    if let Some(put) = &seen.put {
+        if let (Some(trusted), Ok(body)) = (&put.trusted_sha256, &put.body) {
+            use sha2::Digest as _;
+            let actual = hex::encode(sha2::Sha256::digest(body));
+            if &actual != trusted {
+                v.push(format!(
+                    "payload: trusted sha256 {trusted}, s3s delivered a body hashing to {actual}"
+                ));
+            }
         }
     }
     if let Some(theirs) = &seen.s3s_list_prefix {
@@ -1188,6 +1249,142 @@ async fn table_cases_honour_the_contract() {
         "contract violations:\n{}",
         failures.join("\n")
     );
+}
+
+// ── the payload-hash shapes ─────────────────────────────────────────────
+
+const HELLO_SHA256: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+const HELLO_SHA256_UPPER: &str = "2CF24DBA5FB0A30E26E83B2AC5B9E29E1B161E5C1FA7425E73043362938B9824";
+
+/// What s3s does with a PutObject body of one signing shape.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BodyCheck {
+    /// The handler read the whole body.
+    Delivered,
+    /// The body read failed: s3s's hash check refused the bytes.
+    Refused,
+    /// s3s refused the request before the handler.
+    NotReached,
+}
+
+/// P2.4: the adapter stores the signed `x-amz-content-sha256` as the
+/// body's SHA-256, without hashing the body, exactly when
+/// `s3s_verified_payload_sha256` says s3s verified it. One row per body
+/// shape s3s 0.14 distinguishes (`ops/signature.rs`): the row states what
+/// s3s does with a right and a wrong body, and whether the adapter trusts
+/// the digest. The invariant in `violations` (a trusted digest always
+/// matches the delivered body) runs on every row and on the generated
+/// requests.
+#[tokio::test]
+async fn s3s_verifies_the_payload_hash_we_trust() {
+    use BodyCheck::*;
+    let h = harness().await;
+    let put = |auth: Auth, body: &[u8], headers: &[(&str, &str)]| {
+        let mut r = req(Method::PUT, "/alpha-bucket/k.bin", headers, auth);
+        r.body = body.to_vec();
+        r
+    };
+    // (name, request, the adapter trusts the digest, what s3s does)
+    let rows: Vec<(&str, RawRequest, bool, BodyCheck)> = vec![
+        (
+            "v4 header, lowercase hex, right body",
+            put(Auth::V4Header(ALICE, HELLO_SHA256), b"hello", &[]),
+            true,
+            Delivered,
+        ),
+        (
+            "v4 header, lowercase hex, wrong body",
+            put(Auth::V4Header(ALICE, HELLO_SHA256), b"jello", &[]),
+            true,
+            Refused,
+        ),
+        (
+            "v4 header, lowercase hex, longer body",
+            put(Auth::V4Header(ALICE, HELLO_SHA256), b"hello!", &[]),
+            true,
+            Refused,
+        ),
+        (
+            // s3s parses only lowercase hex as a payload hash.
+            "v4 header, uppercase hex",
+            put(Auth::V4Header(ALICE, HELLO_SHA256_UPPER), b"hello", &[]),
+            false,
+            NotReached,
+        ),
+        (
+            "v4 header, UNSIGNED-PAYLOAD, any body",
+            put(Auth::V4Header(ALICE, "UNSIGNED-PAYLOAD"), b"jello", &[]),
+            false,
+            Delivered,
+        ),
+        (
+            // s3s checks the chunk signatures; this body has none.
+            "v4 header, STREAMING signed",
+            put(
+                Auth::V4Header(ALICE, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"),
+                b"5\r\nhello\r\n0\r\n\r\n",
+                &[],
+            ),
+            false,
+            Refused,
+        ),
+        (
+            // A presigned v4 URL: our middleware carries no payload hash, so
+            // the engine hashes; s3s does check the header if one is sent.
+            "presigned v4, wrong body under a hex header",
+            put(
+                Auth::V4Presigned(ALICE),
+                b"jello",
+                &[("x-amz-content-sha256", HELLO_SHA256)],
+            ),
+            false,
+            Refused,
+        ),
+        (
+            // s3s would check the SigV2 query and verify no body while the
+            // SigV4 header claims a hash, so the adapter never trusts this
+            // shape (truth table `s3s_verified_payload_sha256_truth_table`).
+            // Here s3s refuses it before the handler: the SigV2
+            // string-to-sign covers the `x-amz-*` headers that the SigV4
+            // signature adds, which this harness does not sign.
+            "sigv2 presigned + v4 header, same user, wrong body",
+            put(Auth::V2PresignedAndV4Header(ALICE, ALICE), b"jello", &[]),
+            false,
+            NotReached,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (name, raw, want_trusted, want_body) in rows {
+        let out = run(&h, &raw)
+            .await
+            .unwrap_or_else(|| panic!("{name}: the harness could not build the request"));
+        let put_seen = out.seen.as_ref().and_then(|s| s.put.clone());
+        let got_body = match &put_seen {
+            None => NotReached,
+            Some(PutSeen { body: Ok(_), .. }) => Delivered,
+            Some(PutSeen { body: Err(_), .. }) => Refused,
+        };
+        if got_body != want_body {
+            failures.push(format!(
+                "{name}: s3s {got_body:?}, expected {want_body:?} ({}, {:?})",
+                out.status, put_seen
+            ));
+        }
+        if let Some(p) = &put_seen {
+            if p.trusted_sha256.is_some() != want_trusted {
+                failures.push(format!(
+                    "{name}: trusted digest {:?}, expected trusted = {want_trusted}",
+                    p.trusted_sha256
+                ));
+            }
+        }
+        if let Some(seen) = &out.seen {
+            for violation in violations(&raw.method, seen) {
+                failures.push(format!("{name}: {violation}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 // ── the generator ───────────────────────────────────────────────────────

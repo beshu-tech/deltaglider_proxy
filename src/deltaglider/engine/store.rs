@@ -128,13 +128,66 @@ pub(super) struct BodyHashes {
 }
 
 impl BodyHashes {
-    /// Hash `data` (CPU work: call it off the async runtime for a large
-    /// body).
-    pub(super) fn of(data: &[u8]) -> Self {
+    /// Hash `data`; a `known` SHA-256 is used as is, so only the MD5 pass
+    /// runs. CPU work: [`Self::compute`] moves a large body off the async
+    /// runtime.
+    fn of(data: &[u8], known: Option<KnownSha256>) -> Self {
         Self {
-            sha256: hex::encode(Sha256::digest(data)),
+            sha256: match known {
+                Some(k) => k.to_hex(),
+                None => hex::encode(Sha256::digest(data)),
+            },
             md5: hex::encode(Md5::digest(data)),
         }
+    }
+
+    /// [`Self::of`], on a blocking thread when the body is above
+    /// [`BLOCKING_HASH_THRESHOLD`]: a 16 MiB body takes about 10 ms per
+    /// pass, which a tokio worker must not spend.
+    pub(super) async fn compute(
+        data: &Bytes,
+        known: Option<KnownSha256>,
+    ) -> Result<Self, EngineError> {
+        if data.len() <= BLOCKING_HASH_THRESHOLD {
+            return Ok(Self::of(data, known));
+        }
+        let data = data.clone();
+        tokio::task::spawn_blocking(move || Self::of(&data, known))
+            .await
+            .map_err(|e| EngineError::Storage(StorageError::Other(format!("hash task: {e}"))))
+    }
+}
+
+/// Bodies above this size hash on a blocking thread, not on the runtime.
+pub const BLOCKING_HASH_THRESHOLD: usize = 1024 * 1024;
+
+/// The SHA-256 of a client body, proven for these exact bytes before the
+/// engine sees them. The engine then stores it as the body's `sha256` and
+/// does not hash the body again for it.
+///
+/// Only two things make one: the S3 adapter, from a signed
+/// `x-amz-content-sha256` that the SigV4 layer verified against the bytes
+/// it delivered, and [`KnownSha256::of`], which hashes the bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KnownSha256([u8; 32]);
+
+impl KnownSha256 {
+    /// Hash `data`.
+    pub fn of(data: &[u8]) -> Self {
+        Self(Sha256::digest(data).into())
+    }
+
+    /// A digest that the caller PROVED matches the body: a lowercase or
+    /// uppercase 64-character hex string. `None` for anything else.
+    pub fn from_verified_hex(hex_digest: &str) -> Option<Self> {
+        let mut out = [0u8; 32];
+        hex::decode_to_slice(hex_digest, &mut out).ok()?;
+        Some(Self(out))
+    }
+
+    /// The lowercase hex form, as stored in object metadata.
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.0)
     }
 }
 
@@ -292,8 +345,17 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // The counter is recorded where the object commits (`record_commit`).
         // One copy: the slice API. The client write passes its `Bytes`.
         let body = Bytes::copy_from_slice(data);
-        self.store_inner(bucket, key, &body, content_type, user_metadata, None, None)
-            .await
+        self.store_inner(
+            bucket,
+            key,
+            &body,
+            content_type,
+            user_metadata,
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     /// Multipart-aware variant of [`Self::store`]. The `multipart_etag` is
@@ -319,6 +381,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             content_type,
             user_metadata,
             Some(multipart_etag),
+            None,
             None,
         )
         .await
@@ -352,6 +415,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             user_metadata,
             multipart_etag,
             known_prior,
+            None,
         )
         .await
     }
@@ -397,6 +461,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         user_metadata: std::collections::HashMap<String, String>,
         multipart_etag: Option<String>,
         known_prior: Option<CounterPrior>,
+        known_sha256: Option<KnownSha256>,
     ) -> Result<StoreResult, EngineError> {
         // Invalidate stale metadata on overwrite (before the write, so concurrent
         // readers don't see outdated metadata during the write window).
@@ -421,9 +486,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // counter is best-effort and reconciled by Refresh.
         let prior = self.prior_or_read(bucket, key, known_prior).await;
 
-        // Calculate hashes
-        let sha256 = hex::encode(Sha256::digest(data));
-        let md5 = hex::encode(Md5::digest(data));
+        // Calculate hashes (the SHA-256 only when the caller does not know it).
+        let BodyHashes { sha256, md5 } = BodyHashes::compute(data, known_sha256).await?;
 
         info!(
             "Storing {}/{} ({} bytes, sha256={})",

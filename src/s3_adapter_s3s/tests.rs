@@ -759,22 +759,96 @@ proptest::proptest! {
     }
 }
 
-#[test]
-fn signed_payload_hash_validation_detects_mismatch() {
+#[tokio::test]
+async fn signed_payload_hash_validation_detects_mismatch() {
     use sha2::Digest as _;
-    let good = hex::encode(sha2::Sha256::digest(b"abc"));
-    assert!(verify_signed_payload_hash_s3s(
-        Some(&crate::api::auth::SignedPayloadHash(good)),
-        b"abc"
-    )
-    .is_ok());
-    let bad = "0".repeat(64);
+    let signed = |h: &str| crate::api::auth::SignedPayloadHash(h.to_string());
+    let small = bytes::Bytes::from_static(b"abc");
+    // Above the blocking threshold: hashed on a blocking thread.
+    let large = bytes::Bytes::from(vec![7u8; crate::deltaglider::BLOCKING_HASH_THRESHOLD + 1]);
+    for body in [small, large] {
+        let good = hex::encode(sha2::Sha256::digest(&body));
+        let verified = verify_signed_payload_hash_s3s(Some(&signed(&good)), &body)
+            .await
+            .unwrap();
+        assert_eq!(verified.map(|d| d.to_hex()), Some(good.clone()));
+        // Uppercase hex is the same digest.
+        let upper = verify_signed_payload_hash_s3s(Some(&signed(&good.to_uppercase())), &body)
+            .await
+            .unwrap();
+        assert_eq!(upper.map(|d| d.to_hex()), Some(good));
+        let bad = "0".repeat(64);
+        assert_eq!(
+            verify_signed_payload_hash_s3s(Some(&signed(&bad)), &body)
+                .await
+                .unwrap_err()
+                .code(),
+            &s3s::S3ErrorCode::BadDigest
+        );
+        // No hash to check: the engine hashes the body.
+        for unsigned in ["UNSIGNED-PAYLOAD", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"] {
+            assert!(
+                verify_signed_payload_hash_s3s(Some(&signed(unsigned)), &body)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(verify_signed_payload_hash_s3s(None, &body)
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
+/// Truth table of `s3s_verified_payload_sha256`: a digest only for a
+/// unique SigV4 header with a unique lowercase-hex payload hash and no
+/// SigV2 query signature.
+#[test]
+fn s3s_verified_payload_sha256_truth_table() {
+    let hex = "a".repeat(64);
+    let v4 = "AWS4-HMAC-SHA256 Credential=AK/20260101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=ab";
+    let case = |auth: &[&str], sha: &[&str], query: &str, creds: bool| {
+        let mut h = axum::http::HeaderMap::new();
+        for a in auth {
+            h.append("authorization", a.parse().unwrap());
+        }
+        for s in sha {
+            h.append("x-amz-content-sha256", s.parse().unwrap());
+        }
+        let uri: axum::http::Uri = format!("/b/k{query}").parse().unwrap();
+        s3s_verified_payload_sha256(&h, &uri, creds).map(|d| d.to_hex())
+    };
+    assert_eq!(case(&[v4], &[&hex], "", true), Some(hex.clone()));
     assert_eq!(
-        verify_signed_payload_hash_s3s(Some(&crate::api::auth::SignedPayloadHash(bad)), b"abc")
-            .unwrap_err()
-            .code(),
-        &s3s::S3ErrorCode::BadDigest
+        case(&[v4], &[&hex], "?x-id=PutObject", true),
+        Some(hex.clone())
     );
+    // s3s verified no credentials.
+    assert_eq!(case(&[v4], &[&hex], "", false), None);
+    // A SigV2 query (s3s checks it and verifies no body), in any spelling.
+    for q in [
+        "?Signature=x&AWSAccessKeyId=AK&Expires=1",
+        "?%53ignature=x",
+        "?signature=x",
+        "?X-Amz-Signature=x",
+    ] {
+        assert_eq!(case(&[v4], &[&hex], q, true), None, "{q}");
+    }
+    // Not a unique SigV4 header.
+    assert_eq!(case(&["AWS AK:sig"], &[&hex], "", true), None);
+    assert_eq!(case(&[v4, v4], &[&hex], "", true), None);
+    assert_eq!(case(&[], &[&hex], "", true), None);
+    // Not a unique lowercase-hex payload hash.
+    assert_eq!(case(&[v4], &[&hex.to_uppercase()], "", true), None);
+    assert_eq!(case(&[v4], &[&hex, &hex], "", true), None);
+    assert_eq!(case(&[v4], &["UNSIGNED-PAYLOAD"], "", true), None);
+    assert_eq!(
+        case(&[v4], &["STREAMING-AWS4-HMAC-SHA256-PAYLOAD"], "", true),
+        None
+    );
+    assert_eq!(case(&[v4], &[&"a".repeat(63)], "", true), None);
+    assert_eq!(case(&[v4], &[], "", true), None);
 }
 
 #[test]

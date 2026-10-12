@@ -265,6 +265,7 @@ async fn a_form_a_peer_adds_after_the_read_is_dropped_by_the_next_write() {
             no_delta(),
             None,
             Some(prior),
+            None,
         )
         .await
         .unwrap();
@@ -393,6 +394,7 @@ async fn the_baseline_in_the_reference_cache_is_the_client_buffer() {
             "rel/a.zip",
             body.clone(),
             None,
+            None,
             HashMap::new(),
             &crate::deltaglider::Precondition::none(),
         )
@@ -430,6 +432,7 @@ async fn a_large_client_put_hashes_from_ram_not_from_the_spool() {
                 key,
                 Bytes::from(body.clone()),
                 None,
+                None,
                 HashMap::new(),
                 &crate::deltaglider::Precondition::none(),
             )
@@ -448,4 +451,47 @@ async fn a_large_client_put_hashes_from_ram_not_from_the_spool() {
         0,
         "the spool was read back to hash"
     );
+}
+
+/// A client body whose SHA-256 the S3 adapter proved (s3s verified the
+/// signed `x-amz-content-sha256` while the body streamed in) is not hashed
+/// again for it: the engine stores the digest it was given. The test gives
+/// the digest of OTHER bytes, so a re-hash would show. Buffered and spooled
+/// stores, passthrough and delta-eligible.
+#[tokio::test]
+async fn a_proven_sha256_is_stored_not_recomputed() {
+    let (endpoint, _fake) = crate::storage::fake_s3::start().await;
+    let mut config = Config::default();
+    config.tuning.spool_threshold_bytes = Some(1024);
+    let s3 = crate::storage::s3_test_support::for_test_endpoint(&endpoint);
+    let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(s3);
+    let engine = DeltaGliderEngine::new_with_backend(Arc::new(backend), &config, None);
+    engine.create_bucket("b").await.unwrap();
+    let proven = crate::deltaglider::KnownSha256::of(b"not the body");
+    for (key, size) in [
+        ("small/a.jpg", 512),             // buffered passthrough
+        ("small/a.zip", 512),             // buffered, delta-eligible
+        ("large/a.zip", 64 * 1024),       // spooled, delta-eligible
+        ("large/a.jpg", 2 * 1024 * 1024), // above the blocking-hash threshold
+    ] {
+        let r = engine
+            .store_conditional(
+                "b",
+                key,
+                Bytes::from(noise(41, size)),
+                Some(proven),
+                None,
+                HashMap::new(),
+                &crate::deltaglider::Precondition::none(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.metadata.file_sha256, proven.to_hex(), "{key}");
+        // The MD5 (the ETag of a single-part PUT) is still the body's.
+        assert_eq!(
+            r.metadata.md5,
+            hex::encode(md5::Md5::digest(noise(41, size))),
+            "{key}"
+        );
+    }
 }
