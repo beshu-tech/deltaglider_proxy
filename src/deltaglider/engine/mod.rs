@@ -255,6 +255,10 @@ mod delete_cost_tests;
 #[cfg(test)]
 pub(crate) use delete_cost_tests::{s3_engine, store_deltas};
 
+/// What a PUT costs in backend requests.
+#[cfg(test)]
+mod write_cost_tests;
+
 /// `delete_batch`: request costs and the per-key contract.
 #[cfg(test)]
 mod delete_batch_tests;

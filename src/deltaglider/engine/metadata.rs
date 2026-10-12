@@ -125,9 +125,19 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         prefix: &str,
         filename: &str,
     ) -> Result<Option<(FileMetadata, StoredForms)>, StorageError> {
-        // Fetch delta and passthrough metadata in parallel — saves one S3 round-trip
+        // Fetch delta and passthrough metadata in parallel — saves one S3
+        // round-trip. A folder marker (`dir/`: no file name) has no `.delta`
+        // form: only `put_directory_marker` stores it. Its delta HEAD
+        // (`dir/.delta`) was a request that could only answer 404.
         let (delta_result, passthrough_result) = tokio::join!(
-            self.storage.get_delta_metadata(bucket, prefix, filename),
+            async {
+                if filename.is_empty() {
+                    return Err(StorageError::NotFound(format!("{prefix}/")));
+                }
+                self.storage
+                    .get_delta_metadata(bucket, prefix, filename)
+                    .await
+            },
             self.storage
                 .get_passthrough_metadata(bucket, prefix, filename),
         );
