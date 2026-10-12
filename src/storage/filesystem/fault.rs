@@ -583,6 +583,20 @@ impl StorageBackend for FaultyFs {
         self.inner.open_reference_source(b, p).await
     }
 
+    async fn open_passthrough_range(
+        &self,
+        b: &str,
+        p: &str,
+        f: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<
+        (crate::storage::ByteStream, u64, crate::types::FileMetadata),
+        crate::storage::StorageError,
+    > {
+        self.inner.open_passthrough_range(b, p, f, start, end).await
+    }
+
     async fn get_passthrough_stream_range(
         &self,
         bucket: &str,

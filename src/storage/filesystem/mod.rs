@@ -1626,6 +1626,18 @@ impl StorageBackend for FilesystemBackend {
         Ok((Box::pin(stream), meta))
     }
 
+    /// The metadata read (xattr), then the range read of the file.
+    async fn open_passthrough_range(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<(super::ByteStream, u64, FileMetadata), StorageError> {
+        super::open_passthrough_range_by_parts(self, bucket, prefix, filename, start, end).await
+    }
+
     #[instrument(skip(self))]
     async fn get_passthrough_stream_range(
         &self,

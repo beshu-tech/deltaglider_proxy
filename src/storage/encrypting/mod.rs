@@ -376,6 +376,125 @@ impl<B: StorageBackend> EncryptingBackend<B> {
 
     /// True when this wrapper holds any key (primary or decrypt-only
     /// legacy), so the backend may hold proxy-encrypted bodies.
+    /// A range of a passthrough object whose raw stored metadata is `meta`.
+    async fn range_with_meta(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        start: u64,
+        end: u64,
+        meta: &FileMetadata,
+    ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError> {
+        // Chunked path: fetch only the wire bytes covering the target
+        // chunks, using O(1) offset math — every non-final chunk is
+        // exactly `CHUNK_FRAME_WIRE_LEN` bytes. We issue TWO backend
+        // reads:
+        //
+        //   1. Header fetch: wire bytes `[0, CHUNK_HEADER_LEN)` — 16
+        //      bytes for the magic + base_iv. Tiny, always needed.
+        //   2. Body fetch: wire bytes from `wire_offset_of_chunk(
+        //      first_chunk)` through the end of `last_chunk`. For
+        //      non-final `last_chunk` this is a bounded window; for
+        //      `last_chunk == final_idx` we ask for EOF (the final
+        //      chunk may be shorter than a full frame).
+        //
+        // The alternative — fetching from wire-offset 0 through
+        // last_chunk and relying on the decoder to discard the
+        // leading chunks — is O(N) for reads near the end of large
+        // objects (before this fix: "last 100 bytes of a 10 GiB file"
+        // pulled all 10 GiB). The two-fetch approach trades one extra
+        // tiny request for bounded cost on every range shape.
+        if is_chunked_encrypted(meta) {
+            // Shim-aware key selection; same behaviour as the full-
+            // stream path. Surfaces the specific error before any
+            // backend range reads fire.
+            let key = self.pick_decrypt_key(stamped_key_id(meta))?;
+            let final_idx = final_chunk_index_for_plaintext_size(meta.file_size);
+            // Out-of-range for this object (the caller's size can be stale):
+            // an error, never the pre-B3 `(empty, 0)` "not a range" signal.
+            let (start, effective_end) = super::clamp_range(start, end, meta.file_size)?;
+            let (first_chunk, _) = chunk_index_for_plaintext_offset(start);
+            let (last_chunk, _) = chunk_index_for_plaintext_offset(effective_end);
+
+            // Fetch #1: just the header. Size is tiny
+            // (CHUNK_HEADER_LEN = 16 bytes).
+            let base_iv = fetch_chunked_header(&self.inner, bucket, prefix, filename).await?;
+
+            // Fetch #2: body covering `first_chunk..=last_chunk`.
+            let wire_start = wire_offset_of_chunk(first_chunk);
+            let wire_end = if last_chunk < final_idx {
+                wire_offset_of_chunk(last_chunk) + CHUNK_FRAME_WIRE_LEN as u64 - 1
+            } else {
+                // Last chunk IS the object's final chunk; it may be
+                // shorter than a full frame, so ask for EOF. The
+                // `u64::MAX - 1` sentinel works across both backends:
+                // S3 interprets it per RFC 7233 (clamp to resource
+                // length), filesystem `File::take` limits on actual
+                // EOF.
+                u64::MAX - 1
+            };
+            let (ct_stream, _) = self
+                .inner
+                .get_passthrough_stream_range(bucket, prefix, filename, wire_start, wire_end)
+                .await?;
+
+            // Skip any plaintext bytes before `start` within the
+            // first fetched chunk. E.g. for start=70000 and chunk
+            // size 65536, first_chunk=1 (starts at plaintext 65536)
+            // and we skip 70000 - 65536 = 4464 bytes of its
+            // plaintext. The preceding full chunks (index 0) are
+            // never fetched or decrypted.
+            let skip_bytes = start - (first_chunk as u64) * (CHUNK_PLAINTEXT_SIZE as u64);
+            let plaintext_len = effective_end - start + 1;
+
+            let plain = chunked_decrypt_stream_from_chunk(
+                ct_stream,
+                key,
+                base_iv,
+                first_chunk,
+                final_idx,
+                skip_bytes,
+                Some(plaintext_len),
+            );
+            return Ok((plain, plaintext_len));
+        }
+
+        // v1 single-shot path (bounded by max_object_size). Same as
+        // before — buffer-and-slice.
+        if is_encrypted(meta) {
+            let data = self.inner.get_passthrough(bucket, prefix, filename).await?;
+            let plain = self.decrypt_if_needed(data, meta)?;
+            // Clamp against the decrypted length, not a (maybe stale) size.
+            let (s, e) = super::clamp_range(start, end, plain.len() as u64)?;
+            let slice = Bytes::from(plain[s as usize..=e as usize].to_vec());
+            let len = slice.len() as u64;
+            return Ok((Box::pin(futures::stream::once(async { Ok(slice) })), len));
+        }
+
+        // Not encrypted per metadata. Same DGE1 belt-and-suspenders as the
+        // full-stream path (a stripped marker must not serve ciphertext).
+        // A range from 0 carries the magic itself: sniff it for free. A
+        // later range needs a 4-byte probe; only a backend with a key
+        // (primary or legacy) can hold such bodies, so a plain backend pays
+        // no extra request.
+        if start > 0 && self.has_any_key() {
+            let magic =
+                read_prefix(&self.inner, bucket, prefix, filename, CHUNK_MAGIC.len()).await?;
+            if magic == CHUNK_MAGIC {
+                return Err(stripped_marker_error());
+            }
+        }
+        let (stream, len) = self
+            .inner
+            .get_passthrough_stream_range(bucket, prefix, filename, start, end)
+            .await?;
+        if start == 0 {
+            return Ok((sniff_dge1_magic(stream), len));
+        }
+        Ok((stream, len))
+    }
+
     fn has_any_key(&self) -> bool {
         let cfg = self.config.load();
         cfg.key.is_some() || cfg.legacy_key.is_some()
@@ -1008,114 +1127,48 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
             .inner
             .get_passthrough_metadata(bucket, prefix, filename)
             .await?;
+        self.range_with_meta(bucket, prefix, filename, start, end, &meta)
+            .await
+    }
 
-        // Chunked path: fetch only the wire bytes covering the target
-        // chunks, using O(1) offset math — every non-final chunk is
-        // exactly `CHUNK_FRAME_WIRE_LEN` bytes. We issue TWO backend
-        // reads:
-        //
-        //   1. Header fetch: wire bytes `[0, CHUNK_HEADER_LEN)` — 16
-        //      bytes for the magic + base_iv. Tiny, always needed.
-        //   2. Body fetch: wire bytes from `wire_offset_of_chunk(
-        //      first_chunk)` through the end of `last_chunk`. For
-        //      non-final `last_chunk` this is a bounded window; for
-        //      `last_chunk == final_idx` we ask for EOF (the final
-        //      chunk may be shorter than a full frame).
-        //
-        // The alternative — fetching from wire-offset 0 through
-        // last_chunk and relying on the decoder to discard the
-        // leading chunks — is O(N) for reads near the end of large
-        // objects (before this fix: "last 100 bytes of a 10 GiB file"
-        // pulled all 10 GiB). The two-fetch approach trades one extra
-        // tiny request for bounded cost on every range shape.
-        if is_chunked_encrypted(&meta) {
-            // Shim-aware key selection; same behaviour as the full-
-            // stream path. Surfaces the specific error before any
-            // backend range reads fire.
-            let key = self.pick_decrypt_key(stamped_key_id(&meta))?;
-            let final_idx = final_chunk_index_for_plaintext_size(meta.file_size);
-            // Out-of-range for this object (the caller's size can be stale):
-            // an error, never the pre-B3 `(empty, 0)` "not a range" signal.
-            let (start, effective_end) = super::clamp_range(start, end, meta.file_size)?;
-            let (first_chunk, _) = chunk_index_for_plaintext_offset(start);
-            let (last_chunk, _) = chunk_index_for_plaintext_offset(effective_end);
-
-            // Fetch #1: just the header. Size is tiny
-            // (CHUNK_HEADER_LEN = 16 bytes).
-            let base_iv = fetch_chunked_header(&self.inner, bucket, prefix, filename).await?;
-
-            // Fetch #2: body covering `first_chunk..=last_chunk`.
-            let wire_start = wire_offset_of_chunk(first_chunk);
-            let wire_end = if last_chunk < final_idx {
-                wire_offset_of_chunk(last_chunk) + CHUNK_FRAME_WIRE_LEN as u64 - 1
-            } else {
-                // Last chunk IS the object's final chunk; it may be
-                // shorter than a full frame, so ask for EOF. The
-                // `u64::MAX - 1` sentinel works across both backends:
-                // S3 interprets it per RFC 7233 (clamp to resource
-                // length), filesystem `File::take` limits on actual
-                // EOF.
-                u64::MAX - 1
-            };
-            let (ct_stream, _) = self
+    /// Without a key, objects here are plaintext: the inner backend's one
+    /// read gives the range and the metadata, with the same stripped-marker
+    /// checks as a range read. With a key, the format decides the reads, so
+    /// the metadata comes first (a HEAD), as on `get_passthrough_stream_range`.
+    async fn open_passthrough_range(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<(ByteStream, u64, FileMetadata), StorageError> {
+        if self.has_any_key() {
+            let meta = self
                 .inner
-                .get_passthrough_stream_range(bucket, prefix, filename, wire_start, wire_end)
+                .get_passthrough_metadata(bucket, prefix, filename)
                 .await?;
-
-            // Skip any plaintext bytes before `start` within the
-            // first fetched chunk. E.g. for start=70000 and chunk
-            // size 65536, first_chunk=1 (starts at plaintext 65536)
-            // and we skip 70000 - 65536 = 4464 bytes of its
-            // plaintext. The preceding full chunks (index 0) are
-            // never fetched or decrypted.
-            let skip_bytes = start - (first_chunk as u64) * (CHUNK_PLAINTEXT_SIZE as u64);
-            let plaintext_len = effective_end - start + 1;
-
-            let plain = chunked_decrypt_stream_from_chunk(
-                ct_stream,
-                key,
-                base_iv,
-                first_chunk,
-                final_idx,
-                skip_bytes,
-                Some(plaintext_len),
-            );
-            return Ok((plain, plaintext_len));
+            let (stream, len) = self
+                .range_with_meta(bucket, prefix, filename, start, end, &meta)
+                .await?;
+            return Ok((stream, len, meta));
         }
-
-        // v1 single-shot path (bounded by max_object_size). Same as
-        // before — buffer-and-slice.
-        if is_encrypted(&meta) {
-            let data = self.inner.get_passthrough(bucket, prefix, filename).await?;
-            let plain = self.decrypt_if_needed(data, &meta)?;
-            // Clamp against the decrypted length, not a (maybe stale) size.
-            let (s, e) = super::clamp_range(start, end, plain.len() as u64)?;
-            let slice = Bytes::from(plain[s as usize..=e as usize].to_vec());
-            let len = slice.len() as u64;
-            return Ok((Box::pin(futures::stream::once(async { Ok(slice) })), len));
-        }
-
-        // Not encrypted per metadata. Same DGE1 belt-and-suspenders as the
-        // full-stream path (a stripped marker must not serve ciphertext).
-        // A range from 0 carries the magic itself: sniff it for free. A
-        // later range needs a 4-byte probe; only a backend with a key
-        // (primary or legacy) can hold such bodies, so a plain backend pays
-        // no extra request.
-        if start > 0 && self.has_any_key() {
-            let magic =
-                read_prefix(&self.inner, bucket, prefix, filename, CHUNK_MAGIC.len()).await?;
-            if magic == CHUNK_MAGIC {
-                return Err(stripped_marker_error());
-            }
-        }
-        let (stream, len) = self
+        let (stream, len, meta) = self
             .inner
-            .get_passthrough_stream_range(bucket, prefix, filename, start, end)
+            .open_passthrough_range(bucket, prefix, filename, start, end)
             .await?;
-        if start == 0 {
-            return Ok((sniff_dge1_magic(stream), len));
+        if is_chunked_encrypted(&meta) || is_encrypted(&meta) {
+            // Encrypted, and no key to read it: the range read names why.
+            drop(stream);
+            let (stream, len) = self
+                .range_with_meta(bucket, prefix, filename, start, end, &meta)
+                .await?;
+            return Ok((stream, len, meta));
         }
-        Ok((stream, len))
+        if start == 0 {
+            return Ok((sniff_dge1_magic(stream), len, meta));
+        }
+        Ok((stream, len, meta))
     }
 
     // ── Pass-through (no encryption) ──

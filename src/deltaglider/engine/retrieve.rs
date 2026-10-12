@@ -227,6 +227,61 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .await
     }
 
+    /// A ranged GET (no If-Range, no conditional headers) of a passthrough
+    /// object in one round trip: the ranged read of the plain object, whose
+    /// response carries its metadata, in parallel with the HEAD of the
+    /// `.delta` form. The backend answers a range past the end itself
+    /// (`InvalidRange`). `Ok(None)`: the HEAD-first path answers instead,
+    /// because the plain object is absent, a `.delta` form is newer (a
+    /// crash leftover), its metadata names another layout, or a 416 came
+    /// back while a `.delta` form exists. The ranged body is then dropped
+    /// unread.
+    #[instrument(skip(self))]
+    #[allow(clippy::type_complexity)]
+    pub async fn retrieve_range_fresh(
+        &self,
+        bucket: &str,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<
+        Option<(
+            BoxStream<'static, Result<Bytes, StorageError>>,
+            u64,
+            FileMetadata,
+        )>,
+        EngineError,
+    > {
+        let (obj_key, deltaspace_id) = self.validated_key(bucket, key)?;
+        if obj_key.is_directory_marker() {
+            return Ok(None);
+        }
+        let filename = obj_key.filename.as_str();
+        let (ranged, delta) = tokio::join!(
+            self.storage
+                .open_passthrough_range(bucket, &deltaspace_id, filename, start, end),
+            self.stored_form_metadata(bucket, &deltaspace_id, filename, ObjectVariant::Delta),
+        );
+        let delta = delta?;
+        match ranged {
+            Ok((stream, len, meta)) => {
+                let passthrough_wins = delta
+                    .as_ref()
+                    .is_none_or(|d| !super::metadata::delta_is_newest(d, &meta));
+                if !passthrough_wins
+                    || opened_form(filename, &meta) != Some(ObjectVariant::Passthrough)
+                {
+                    return Ok(None);
+                }
+                self.metadata_cache.insert(bucket, key, meta.clone());
+                Ok(Some((stream, len, meta)))
+            }
+            Err(StorageError::NotFound(_)) => Ok(None),
+            Err(StorageError::InvalidRange(_)) if delta.is_some() => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Serve the form that `retrieve_stream_fresh` opened, with the
     /// metadata from the same response.
     #[allow(clippy::too_many_arguments)]

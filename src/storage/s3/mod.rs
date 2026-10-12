@@ -70,6 +70,12 @@ use std::collections::{HashMap, HashSet};
 
 use tracing::{debug, instrument, warn};
 
+/// Pure: the total object size in a `Content-Range: bytes a-b/total`
+/// header (`None` for `*` or a malformed value).
+fn content_range_total(header: &str) -> Option<u64> {
+    header.rsplit_once('/')?.1.trim().parse().ok()
+}
+
 /// Upstream `ListObjectsV2` pages fetched by `list_objects_delegated`'s loop.
 /// Observable request-amplification counter (issue #82): a healthy anchored
 /// listing costs ~1 page per served page; a subtree drain costs O(subtree).
@@ -977,6 +983,71 @@ impl StorageBackend for S3Backend {
         );
         debug!("S3 GET stream {}/{} (with its metadata)", bucket, key);
         Ok((self.body_stream(bucket, &key, response), meta))
+    }
+
+    /// One ranged GET: the bytes, and the metadata from the response's
+    /// headers, with the object's total size from its Content-Range (the
+    /// ranged Content-Length is the size of the range, not of the object).
+    async fn open_passthrough_range(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<(super::ByteStream, u64, FileMetadata), StorageError> {
+        let key = self.passthrough_key(prefix, filename);
+        let range_header = if end >= u64::MAX - 1 {
+            format!("bytes={start}-")
+        } else {
+            format!("bytes={start}-{end}")
+        };
+        let response = self
+            .client
+            .get_object()
+            .bucket(bucket)
+            .key(&key)
+            .range(&range_header)
+            .send()
+            .await
+            .map_err(|e| match &e {
+                SdkError::ServiceError(svc) if svc.raw().status().as_u16() == 416 => {
+                    StorageError::InvalidRange(format!("{range_header} of {bucket}/{key}"))
+                }
+                _ => self.classify_get(bucket, &key, &e),
+            })?;
+        let content_length = response.content_length().unwrap_or(0).max(0) as u64;
+        let total = match response.content_range().and_then(content_range_total) {
+            Some(total) => total,
+            // No Content-Range: the backend sent the whole object. That is
+            // the range only when the range covers the whole object.
+            None if start == 0 && end.saturating_add(1) >= content_length => content_length,
+            None => {
+                return Err(StorageError::Other(format!(
+                    "backend ignored {range_header} for {bucket}/{key}"
+                )))
+            }
+        };
+        let meta = self.metadata_of_response(
+            bucket,
+            &key,
+            &ObjectHeaders {
+                user: response.metadata(),
+                last_modified: response.last_modified(),
+                e_tag: response.e_tag(),
+                content_length: Some(i64::try_from(total).unwrap_or(i64::MAX)),
+                content_type: response.content_type(),
+            },
+        );
+        debug!(
+            "S3 GET range {}/{} ({}, {} of {} bytes, with its metadata)",
+            bucket, key, range_header, content_length, total
+        );
+        Ok((
+            self.body_stream(bucket, &key, response),
+            content_length,
+            meta,
+        ))
     }
 
     #[instrument(skip(self))]

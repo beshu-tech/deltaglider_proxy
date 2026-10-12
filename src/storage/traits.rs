@@ -149,6 +149,24 @@ impl ReferenceSource {
     }
 }
 
+/// `open_passthrough_range` from the metadata read, then the range read.
+pub async fn open_passthrough_range_by_parts<B: StorageBackend + ?Sized>(
+    backend: &B,
+    bucket: &str,
+    prefix: &str,
+    filename: &str,
+    start: u64,
+    end: u64,
+) -> Result<(ByteStream, u64, FileMetadata), StorageError> {
+    let metadata = backend
+        .get_passthrough_metadata(bucket, prefix, filename)
+        .await?;
+    let (stream, len) = backend
+        .get_passthrough_stream_range(bucket, prefix, filename, start, end)
+        .await?;
+    Ok((stream, len, metadata))
+}
+
 /// `open_reference_source` from the metadata read and the data read, for a
 /// test double whose data read does not carry the metadata.
 pub async fn open_reference_source_by_parts<B: StorageBackend + ?Sized>(
@@ -869,6 +887,22 @@ pub trait StorageBackend: Send + Sync {
         prefix: &str,
         object: StoredObject<'_>,
     ) -> impl Future<Output = Result<(ByteStream, FileMetadata), StorageError>> + Send;
+
+    /// A byte range of a passthrough object and the metadata stored with
+    /// it, from ONE read where the backend can (S3: the ranged GET, whose
+    /// Content-Range gives the object's total size). Returns `(stream,
+    /// content_length, metadata)`. An `end` past the object is clamped; a
+    /// `start` at or past it is [`StorageError::InvalidRange`]; a missing
+    /// object is `NotFound`. No default: a wrapper that forgot it would
+    /// read the inner backend's bytes without its own transform.
+    fn open_passthrough_range(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        start: u64,
+        end: u64,
+    ) -> impl Future<Output = Result<(ByteStream, u64, FileMetadata), StorageError>> + Send;
 
     /// Stream a byte range of a passthrough file without buffering the entire
     /// object. REQUIRED (no default) — same memory-bound rationale as

@@ -2529,6 +2529,20 @@ mod multipart_abort_tests {
         ) -> Result<crate::storage::ReferenceSource, crate::storage::StorageError> {
             Err(nope())
         }
+
+        async fn open_passthrough_range(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: u64,
+            _: u64,
+        ) -> Result<
+            (crate::storage::ByteStream, u64, crate::types::FileMetadata),
+            crate::storage::StorageError,
+        > {
+            Err(nope())
+        }
         async fn get_passthrough_stream(
             &self,
             _: &str,
@@ -2782,6 +2796,20 @@ mod multipart_abort_tests {
             p: &str,
         ) -> Result<crate::storage::ReferenceSource, crate::storage::StorageError> {
             self.0.open_reference_source(b, p).await
+        }
+
+        async fn open_passthrough_range(
+            &self,
+            b: &str,
+            p: &str,
+            f: &str,
+            start: u64,
+            end: u64,
+        ) -> Result<
+            (crate::storage::ByteStream, u64, crate::types::FileMetadata),
+            crate::storage::StorageError,
+        > {
+            self.0.open_passthrough_range(b, p, f, start, end).await
         }
         async fn get_passthrough_stream(
             &self,

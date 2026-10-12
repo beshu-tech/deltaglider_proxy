@@ -3,7 +3,8 @@
 //! An in-process S3 for unit tests that count requests: it keeps objects
 //! with their `x-amz-meta-*` headers in memory and records every request as
 //! `"METHOD /bucket/key"` (a bucket-level LIST as `"GET /bucket?..."`).
-//! It answers PUT, GET, HEAD, DELETE and ListObjectsV2 (`prefix`,
+//! It answers PUT, GET (with `Range: bytes=a-b` / `bytes=a-`), HEAD, DELETE
+//! and ListObjectsV2 (`prefix`,
 //! `delimiter`, `start-after`, `max-keys` (up to 1000) and
 //! `continuation-token`, paged like S3) and ListBuckets. Other
 //! bucket-level requests get an empty listing. Tests can delay each
@@ -412,13 +413,42 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                             }
                             Method::GET | Method::HEAD => match current {
                                 Some(o) => {
-                                    let h = object_headers(&o);
-                                    let body = if method == Method::GET {
-                                        o.body
-                                    } else {
-                                        Vec::new()
+                                    let mut h = object_headers(&o);
+                                    if method == Method::HEAD {
+                                        return (StatusCode::OK, h, Vec::new());
+                                    }
+                                    let range = headers
+                                        .get("range")
+                                        .and_then(|v| v.to_str().ok())
+                                        .and_then(|v| v.strip_prefix("bytes="))
+                                        .and_then(|v| v.split_once('-'));
+                                    let Some((first, last)) = range else {
+                                        return (StatusCode::OK, h, o.body);
                                     };
-                                    (StatusCode::OK, h, body)
+                                    // `bytes=a-b` and `bytes=a-`, like S3: a
+                                    // last byte past the end is clamped, a
+                                    // first byte at or past it is 416.
+                                    let len = o.body.len() as u64;
+                                    let first: u64 = first.parse().unwrap_or(u64::MAX);
+                                    let last: u64 = last.parse().unwrap_or(u64::MAX);
+                                    if first >= len {
+                                        return (
+                                            StatusCode::RANGE_NOT_SATISFIABLE,
+                                            HeaderMap::new(),
+                                            b"<Error><Code>InvalidRange</Code></Error>".to_vec(),
+                                        );
+                                    }
+                                    let last = last.min(len - 1);
+                                    let part = o.body[first as usize..=last as usize].to_vec();
+                                    h.insert(
+                                        "content-range",
+                                        format!("bytes {first}-{last}/{len}").parse().unwrap(),
+                                    );
+                                    h.insert(
+                                        "content-length",
+                                        part.len().to_string().parse().unwrap(),
+                                    );
+                                    (StatusCode::PARTIAL_CONTENT, h, part)
                                 }
                                 None => (
                                     StatusCode::NOT_FOUND,

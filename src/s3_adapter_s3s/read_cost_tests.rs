@@ -539,6 +539,13 @@ async fn encrypted_filesystem_reads_in_one_open() {
                 assert_eq!(&got.0, want, "{key} {threshold:?}");
                 assert_eq!(got, headed_answer(&backend, key).await, "{key}");
             }
+            let size = want.len() as u64;
+            for (first, last) in [(1000, Some(1999)), (size - 10, None)] {
+                let (body, _, range) = run_range(&svc, ranged(key, first, last)).await.unwrap();
+                let end = last.unwrap_or(size - 1);
+                assert_eq!(body, want[first as usize..=end as usize], "{key} range");
+                assert_eq!(range, format!("bytes {first}-{end}/{size}"), "{key}");
+            }
         }
     }
 }
@@ -663,4 +670,184 @@ async fn a_reference_body_longer_than_its_size_fails() {
     );
     let source = crate::storage::ReferenceSource::stream(stream, 6, meta);
     assert!(source.write_to(&dir.path().join("r")).await.is_err());
+}
+
+fn ranged(key: &str, first: u64, last: Option<u64>) -> s3s::dto::GetObjectInput {
+    let mut g = get(key);
+    g.range = Some(s3s::dto::Range::Int { first, last });
+    g
+}
+
+/// A GET's body, ETag and Content-Range; the error code on failure.
+async fn run_range(
+    svc: &super::DeltaGliderS3Service,
+    input: s3s::dto::GetObjectInput,
+) -> Result<(Vec<u8>, String, String), String> {
+    use futures::StreamExt;
+    let resp = get_object(svc, request(input))
+        .await
+        .map_err(|e| e.code().as_str().to_string())?;
+    let etag = resp
+        .output
+        .e_tag
+        .as_ref()
+        .map(|e| e.value().to_string())
+        .unwrap_or_default();
+    let range = resp.output.content_range.clone().unwrap_or_default();
+    let mut out = Vec::new();
+    if let Some(mut body) = resp.output.body {
+        while let Some(c) = body.next().await {
+            out.extend_from_slice(&c.unwrap());
+        }
+    }
+    Ok((out, etag, range))
+}
+
+/// P3.7: a ranged GET of a passthrough object (no If-Range, no
+/// conditionals) sends the ranged GET and the `.delta` HEAD in parallel:
+/// the metadata comes from the ranged response. Was HEAD x2 + ranged GET.
+/// Behind a wrapper with a key (objects are encrypted) the wrapper HEADs
+/// for the format first, as before: one request less (4 -> 3), not two.
+#[tokio::test]
+async fn a_passthrough_range_is_one_round_trip() {
+    for kind in KINDS {
+        let fx = fixture(kind).await;
+        let size = fx.photo.len() as u64;
+        let etag = fx
+            .backend
+            .get_passthrough_metadata("b", "pics", "a.jpg")
+            .await
+            .unwrap()
+            .etag()
+            .trim_matches('"')
+            .to_string();
+        for (first, last) in [
+            (0, Some(99)),
+            (140_000, Some(140_099)),
+            (199_000, None),
+            (5, Some(size + 50)),
+        ] {
+            let svc = svc_on(engine_on(&fx.backend, None));
+            fx.fake.clear();
+            let (body, got_etag, range) = run_range(&svc, ranged("pics/a.jpg", first, last))
+                .await
+                .unwrap();
+            let end = last.unwrap_or(u64::MAX).min(size - 1);
+            assert_eq!(
+                body,
+                fx.photo[first as usize..=end as usize],
+                "{kind:?} {first}"
+            );
+            assert_eq!(range, format!("bytes {first}-{end}/{size}"), "{kind:?}");
+            assert_eq!(got_etag, etag, "{kind:?}");
+            let mut reqs = key_requests(&fx.fake);
+            reqs.sort();
+            if kind == Kind::Encrypted {
+                // The wrapper's format HEAD, then its read of the object.
+                assert_eq!(
+                    reqs,
+                    [
+                        "GET /b/pics/a.jpg",
+                        "HEAD /b/pics/a.jpg",
+                        "HEAD /b/pics/a.jpg.delta"
+                    ],
+                    "{kind:?}"
+                );
+            } else {
+                assert_eq!(
+                    reqs,
+                    ["GET /b/pics/a.jpg", "HEAD /b/pics/a.jpg.delta"],
+                    "{kind:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A range that starts past the end answers InvalidRange (416) from the
+/// backend's own answer, with no HEAD first.
+#[tokio::test]
+async fn a_passthrough_range_past_the_end_is_invalid_range() {
+    for kind in KINDS {
+        let fx = fixture(kind).await;
+        let svc = svc_on(engine_on(&fx.backend, None));
+        let size = fx.photo.len() as u64;
+        let err = run_range(&svc, ranged("pics/a.jpg", size, None))
+            .await
+            .unwrap_err();
+        assert_eq!(err, "InvalidRange", "{kind:?}");
+    }
+}
+
+/// The `.delta` form exists and is newer (a crash leftover): the ranged
+/// passthrough body is discarded and the delta path answers. An older
+/// `.delta` loses to the passthrough. A delta-only key reads the delta.
+#[tokio::test]
+async fn a_newer_delta_wins_over_the_ranged_passthrough() {
+    for newer_passthrough in [false, true] {
+        let fx = fixture(Kind::Plain).await;
+        let delta_meta = fx
+            .backend
+            .get_delta_metadata("b", "dir", "v1.zip")
+            .await
+            .unwrap();
+        let leftover = rnd(4096, 77);
+        let mut meta = crate::types::FileMetadata::new_passthrough(
+            "v1.zip".into(),
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&leftover)),
+            hex::encode(<md5::Md5 as md5::Digest>::digest(&leftover)),
+            leftover.len() as u64,
+            None,
+        );
+        let shift = chrono::Duration::seconds(60);
+        meta.created_at = if newer_passthrough {
+            delta_meta.created_at + shift
+        } else {
+            delta_meta.created_at - shift
+        };
+        fx.backend
+            .put_passthrough("b", "dir", "v1.zip", &leftover, &meta)
+            .await
+            .unwrap();
+        let svc = svc_on(engine_on(&fx.backend, None));
+        let (body, _, range) = run_range(&svc, ranged("dir/v1.zip", 10, Some(109)))
+            .await
+            .unwrap();
+        let (want, size) = if newer_passthrough {
+            (&leftover, leftover.len())
+        } else {
+            (&fx.versions[1], fx.versions[1].len())
+        };
+        assert_eq!(
+            body,
+            want[10..=109],
+            "newer passthrough: {newer_passthrough}"
+        );
+        assert_eq!(range, format!("bytes 10-109/{size}"));
+    }
+    let fx = fixture(Kind::Plain).await;
+    let svc = svc_on(engine_on(&fx.backend, None));
+    let (body, _, _) = run_range(&svc, ranged("dir/v0.zip", 0, Some(9)))
+        .await
+        .unwrap();
+    assert_eq!(body, fx.versions[0][..10]);
+}
+
+/// Shapes that keep HEAD-first: a suffix range (it needs the size) and a
+/// range with a conditional header.
+#[tokio::test]
+async fn suffix_and_conditional_ranges_keep_head_first() {
+    let fx = fixture(Kind::Plain).await;
+    let svc = svc_on(engine_on(&fx.backend, None));
+    let size = fx.photo.len();
+    let mut g = get("pics/a.jpg");
+    g.range = Some(s3s::dto::Range::Suffix { length: 100 });
+    let (body, _, _) = run_range(&svc, g).await.unwrap();
+    assert_eq!(body, fx.photo[size - 100..]);
+    let mut g = ranged("pics/a.jpg", 0, Some(9));
+    g.if_match = Some(s3s::dto::ETagCondition::Any);
+    fx.fake.clear();
+    let (body, _, _) = run_range(&svc, g).await.unwrap();
+    assert_eq!(body, fx.photo[..10]);
+    assert_eq!(count(&key_requests(&fx.fake), "HEAD"), 2);
 }

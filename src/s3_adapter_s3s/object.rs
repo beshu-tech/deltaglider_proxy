@@ -85,6 +85,47 @@ pub(super) async fn get_object(
         };
         return finish_get(svc, &input, reader, response);
     }
+    // A ranged GET with no conditional, no If-Range and no partNumber: the
+    // ranged read and the `.delta` HEAD in parallel; the backend answers a
+    // 416 itself. `None`: the HEAD-first path below answers.
+    let conditional_free = input.part_number.is_none()
+        && if_range.is_none()
+        && input.if_match.is_none()
+        && input.if_none_match.is_none()
+        && input.if_modified_since.is_none()
+        && input.if_unmodified_since.is_none();
+    if let (true, Some(s3s::dto::Range::Int { first, last })) = (conditional_free, &input.range) {
+        if last.is_none_or(|last| last >= *first) {
+            let end = last.unwrap_or(u64::MAX - 1);
+            let ranged = match engine
+                .retrieve_range_fresh(&input.bucket, &input.key, *first, end)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    return Err(no_such_key_or_bucket(
+                        &svc.state,
+                        &input.bucket,
+                        s3s::S3Error::from(e),
+                    )
+                    .await)
+                }
+            };
+            if let Some((stream, content_length, metadata)) = ranged {
+                let last_byte = first + content_length.saturating_sub(1);
+                let content_range = format!("bytes {first}-{last_byte}/{}", metadata.file_size);
+                return ranged_response(
+                    svc,
+                    &input,
+                    reader,
+                    stream,
+                    content_length,
+                    content_range,
+                    &metadata,
+                );
+            }
+        }
+    }
     // A conditional or ranged GET reads fresh metadata first, so a
     // 304/412/416 never opens a body. The HEAD also refreshes the cache,
     // so the full read below opens the form it names with one GET.
@@ -115,16 +156,15 @@ pub(super) async fn get_object(
             .retrieve_stream_range(&input.bucket, &input.key, start, end_inclusive, None)
             .await?
         {
-            let body = s3s::dto::StreamingBlob::new(SyncStorageStream::new(stream));
-            let mut output = get_object_output_from_metadata(&metadata, body, reader)?;
-            output.content_length = Some(i64::try_from(content_length).unwrap_or(i64::MAX));
-            output.content_range = Some(content_range);
-            apply_get_response_overrides(&input, &mut output);
-            // s3s answers 206 because `content_range` is set.
-            let mut resp = s3s::S3Response::new(output);
-            add_storage_debug_headers(svc, &mut resp.headers, &metadata);
-            add_get_object_security_headers(&mut resp);
-            return Ok(resp);
+            return ranged_response(
+                svc,
+                &input,
+                reader,
+                stream,
+                content_length,
+                content_range,
+                &metadata,
+            );
         }
 
         let (data, metadata) = engine.retrieve(&input.bucket, &input.key).await?;
@@ -165,6 +205,28 @@ pub(super) async fn get_object(
         }
     };
     finish_get(svc, &input, reader, response)
+}
+
+/// The 206 response of a ranged GET served from a backend range stream.
+fn ranged_response(
+    svc: &DeltaGliderS3Service,
+    input: &s3s::dto::GetObjectInput,
+    reader: Reader,
+    stream: BoxStream<'static, Result<bytes::Bytes, StorageError>>,
+    content_length: u64,
+    content_range: String,
+    metadata: &FileMetadata,
+) -> s3s::S3Result<s3s::S3Response<s3s::dto::GetObjectOutput>> {
+    let body = s3s::dto::StreamingBlob::new(SyncStorageStream::new(stream));
+    let mut output = get_object_output_from_metadata(metadata, body, reader)?;
+    output.content_length = Some(i64::try_from(content_length).unwrap_or(i64::MAX));
+    output.content_range = Some(content_range);
+    apply_get_response_overrides(input, &mut output);
+    // s3s answers 206 because `content_range` is set.
+    let mut resp = s3s::S3Response::new(output);
+    add_storage_debug_headers(svc, &mut resp.headers, metadata);
+    add_get_object_security_headers(&mut resp);
+    Ok(resp)
 }
 
 /// The response of a full (not ranged) GET.

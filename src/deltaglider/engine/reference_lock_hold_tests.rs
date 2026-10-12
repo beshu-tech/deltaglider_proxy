@@ -710,6 +710,20 @@ impl crate::storage::StorageBackend for FencingFs {
     ) -> Result<crate::storage::ReferenceSource, crate::storage::StorageError> {
         crate::storage::open_reference_source_by_parts(self, b, p).await
     }
+
+    async fn open_passthrough_range(
+        &self,
+        b: &str,
+        p: &str,
+        f: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<
+        (crate::storage::ByteStream, u64, crate::types::FileMetadata),
+        crate::storage::StorageError,
+    > {
+        crate::storage::open_passthrough_range_by_parts(self, b, p, f, start, end).await
+    }
     async fn get_passthrough_stream(
         &self,
         b: &str,
