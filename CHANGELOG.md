@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Fixed — A response on a reused connection no longer waits about 40 ms
+
+The proxy did not turn off Nagle's algorithm on its connections, on HTTP and
+on HTTPS. A response is written as a header and then a body, and Nagle's
+algorithm held the body back until the client acknowledged the header. Clients
+delay that acknowledgement by about 40 ms, so most requests on a reused
+(keep-alive) connection, which is what the AWS SDKs use, took at least 40 ms.
+Ten GET requests on one connection took 412 ms and now take about 31 ms.
+
+### Changed — `/_/ready` answers from the backend health checks
+
+Each `/_/ready` request sent a `ListBuckets` request to every storage backend.
+With the Kubernetes operator, the kubelet and the routers probe each pod every
+10 seconds, which made about 1,800 requests per hour per pod and backend. Now
+`/_/ready` uses the result of the background health check while that result
+is younger than twice the health interval, and sends no request. A backend that
+stops answering makes the node not ready within 2 × the health interval (60
+seconds by default). The operator's router also checks each pod once instead
+of twice.
+
 ### Fixed — The file browser no longer sends folder-size requests in a loop
 
 When a folder had a cached size scan, opening it made the browser send
