@@ -11,6 +11,26 @@ delay that acknowledgement by about 40 ms, so most requests on a reused
 (keep-alive) connection, which is what the AWS SDKs use, took at least 40 ms.
 Ten GET requests on one connection took 412 ms and now take about 31 ms.
 
+### Changed — Downloads send fewer requests
+
+- A plain GET (no `Range` and no conditional headers) reads the object's
+  metadata and its bytes with one request. Before, the proxy sent HEAD
+  requests for both stored forms of the key and then a GET: two round trips.
+  When the proxy already has the object's metadata in memory, a GET now costs
+  one request instead of three. The ETag and the body of the answer now always
+  come from the same stored version, also when another node overwrites the
+  object at the same moment.
+- A delta GET that loads its reference into memory sends one GET request
+  instead of a GET and a HEAD. A large delta GET takes the size of the
+  reference from the download itself, without a HEAD request.
+- A ranged GET of an object that is not stored as a delta sends the ranged
+  read and the check for a delta form at the same time: one round trip instead
+  of two.
+- Requests that arrive at the same time for a bucket whose backend location is
+  not known yet send one bucket check instead of one each. When the remembered
+  location is older than 30 seconds, the proxy uses it and refreshes it in the
+  background, so the request does not wait for the check.
+
 ### Changed — Uploads send fewer requests and copy their body less
 
 - An overwrite of an object in the same stored form no longer sends a DELETE
