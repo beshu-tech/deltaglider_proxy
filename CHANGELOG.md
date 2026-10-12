@@ -11,6 +11,30 @@ delay that acknowledgement by about 40 ms, so most requests on a reused
 (keep-alive) connection, which is what the AWS SDKs use, took at least 40 ms.
 Ten GET requests on one connection took 412 ms and now take about 31 ms.
 
+### Changed — Maintenance jobs and quota checks send fewer requests
+
+- A re-encrypt, metadata backfill or migrate job sends one HEAD request per
+  object instead of two. The job's listing already shows in which form the
+  proxy stores each key, and the job's write gate keeps that true until the
+  read.
+- A re-encrypt or migrate job gives the object's metadata that it already read
+  to the copy, instead of reading it again twice. A re-encrypt that rewrites
+  an object sends 5 requests instead of 11; a migrate copy sends 7 instead
+  of 10.
+- A metadata backfill sends 4 requests per object instead of 6, and 3 on a
+  backend that has no object ACLs. It also no longer rewrites an object that
+  changed after the job read it: the rewrite is conditional on the object's
+  ETag, and the job records such an object as failed.
+- A re-encrypt or backfill job lists the bucket once instead of two or three
+  times. It shows an exact total at once only when the bucket's usage counter
+  is known; otherwise the total appears when the walk ends.
+- A bucket with a quota needs one full scan to trust its usage counter.
+  Before, the quota check scanned the whole bucket every 5 minutes until an
+  operator pressed Refresh on the bucket's usage.
+- An idle proxy checks the maintenance job queue every 30 seconds instead of
+  every 3. A new job still starts at once, and a job that a restart left in
+  the queue resumes at once.
+
 ### Changed — Downloads send fewer requests
 
 - A plain GET (no `Range` and no conditional headers) reads the object's
