@@ -63,17 +63,19 @@ where
     }
 }
 
-/// PUT a JSON coordination object with a precondition: `None` →
-/// `If-None-Match: *` (create only), `Some(etag)` → `If-Match: etag`.
-/// `Ok(true)` = written, `Ok(false)` = a peer won the race, `Err` = any
-/// other failure. The one conditional PUT of the lease and the lock.
-pub(crate) async fn conditional_put(
+/// THE conditional PUT of the lease and the lock: PUT a JSON coordination
+/// object with a precondition: `None` → `If-None-Match: *` (create only),
+/// `Some(etag)` → `If-Match: etag`. Returns the ETag of the written object. `Ok(Some(etag))` = written
+/// (`etag` is empty when the response carries none), `Ok(None)` = a peer
+/// won the race. The writer keeps the ETag, so its next step (release,
+/// renew) can be conditional on it without a read first.
+pub(crate) async fn conditional_put_etag(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     key: &str,
     body: aws_sdk_s3::primitives::ByteStream,
     precondition: Option<&str>,
-) -> Result<bool, String> {
+) -> Result<Option<String>, String> {
     let put = client
         .put_object()
         .bucket(bucket)
@@ -85,9 +87,64 @@ pub(crate) async fn conditional_put(
         None => put.if_none_match("*"),
     };
     match put.send().await {
-        Ok(_) => Ok(true),
-        Err(e) if conditional_write_lost(&sdk_error_signal(&e)) => Ok(false),
+        Ok(out) => Ok(Some(out.e_tag().unwrap_or_default().to_string())),
+        Err(e) if conditional_write_lost(&sdk_error_signal(&e)) => Ok(None),
         Err(e) => Err(format!("{e:?}")),
+    }
+}
+
+/// The ETag of each coordination object that this process wrote last, by
+/// (key, owner): the lease and the lock keep it so that a release is one
+/// `DELETE If-Match` with no read first. An entry is dropped when a write
+/// of it lost or failed (the object may have moved): the caller then
+/// reads before it deletes, as before.
+#[derive(Debug, Default)]
+pub(crate) struct KeptEtags(
+    parking_lot::Mutex<std::collections::HashMap<(String, String), String>>,
+);
+
+impl KeptEtags {
+    /// Record the outcome of a conditional PUT of `key` by `owner`.
+    pub(crate) fn note<E>(&self, key: &str, owner: &str, outcome: &Result<Option<String>, E>) {
+        let id = (key.to_string(), owner.to_string());
+        let mut kept = self.0.lock();
+        match outcome {
+            Ok(Some(etag)) if !etag.is_empty() => {
+                kept.insert(id, etag.clone());
+            }
+            _ => {
+                kept.remove(&id);
+            }
+        }
+    }
+
+    /// Take the kept ETag of `key` by `owner` (the release forgets it).
+    pub(crate) fn take(&self, key: &str, owner: &str) -> Option<String> {
+        self.0.lock().remove(&(key.to_string(), owner.to_string()))
+    }
+}
+
+/// `DELETE If-Match: etag`. A 412 means that the object is no longer the
+/// one we wrote (a peer stole it after our hold lapsed): nothing of ours
+/// is left to delete. Best-effort; errors are logged at debug.
+pub(crate) async fn delete_if_match(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    etag: &str,
+) {
+    if let Err(e) = client
+        .delete_object()
+        .bucket(bucket)
+        .key(key)
+        .if_match(etag)
+        .send()
+        .await
+    {
+        tracing::debug!(
+            "coordination release of {key}: {} (the object is not ours any more, or the TTL frees it)",
+            sdk_error_signal(&e)
+        );
     }
 }
 

@@ -18,6 +18,15 @@
 //! `If-Match:<etag>` to steal an expired one, delete-if-owner to release) proven
 //! in `config_db_sync` and `s3_lease`.
 //!
+//! ## Cost: write first, read only on conflict
+//!
+//! The acquire sends the create-only PUT first and reads the lock only when
+//! that PUT answers 412 (a lock object exists). The holder keeps the ETag
+//! of its last write, and the release is one `DELETE If-Match` on it. A free
+//! lock therefore costs 2 requests per hold (it cost 4: GET + PUT, GET +
+//! DELETE). The body format is unchanged, so nodes of the previous release
+//! read these locks as before.
+//!
 //! ## Layering with the in-process lock
 //!
 //! This sits INSIDE the engine's in-process `prefix_locks` mutex, never replaces
@@ -267,6 +276,9 @@ pub struct S3ReferenceLock {
     /// lock: one request that hung held the write until the 300 s request
     /// timeout.
     request_timeout: Duration,
+    /// The ETag of each lock this process wrote last: the release deletes
+    /// on it without reading the lock first.
+    kept: super::cas::KeptEtags,
 }
 
 impl S3ReferenceLock {
@@ -279,6 +291,7 @@ impl S3ReferenceLock {
             ttl_secs: DEFAULT_LOCK_TTL_SECS,
             acquire_timeout,
             request_timeout: lock_request_timeout(acquire_timeout),
+            kept: Default::default(),
         }
     }
 
@@ -357,34 +370,56 @@ impl S3ReferenceLock {
         ByteStream::from(serde_json::to_vec(&lock).unwrap_or_default())
     }
 
+    /// One conditional PUT of the lock of `owner`; keeps the written ETag
+    /// for the release.
     async fn put_lock(
         &self,
         key: &str,
+        owner: &str,
         body: ByteStream,
         precondition: Option<&str>,
     ) -> Result<bool, LeaseError> {
-        self.bounded(async {
-            super::cas::conditional_put(&self.client, &self.bucket, key, body, precondition)
+        let outcome = self
+            .bounded(async {
+                super::cas::conditional_put_etag(
+                    &self.client,
+                    &self.bucket,
+                    key,
+                    body,
+                    precondition,
+                )
                 .await
                 .map_err(LeaseError::Backend)
-        })
-        .await
+            })
+            .await;
+        self.kept.note(key, owner, &outcome);
+        outcome.map(|written| written.is_some())
     }
 }
 
 impl ReferenceLock for S3ReferenceLock {
     async fn try_acquire(&self, key: &str, owner: &str, now: i64) -> Result<bool, LeaseError> {
-        let current = self.read_lock(key, now).await?;
         let expires_at = now.saturating_add(self.ttl_secs.max(1));
+        // Write first: a free lock (the common case) costs this one
+        // create-only PUT. Its 412 says that a lock object exists; only
+        // then read it, to judge it by the server clock.
+        if self
+            .put_lock(key, owner, self.body_for(owner, 1, expires_at), None)
+            .await?
+        {
+            return Ok(true);
+        }
+        let current = self.read_lock(key, now).await?;
         match plan_lock_acquire(&current, now) {
             LockAction::Blocked => Ok(false),
             LockAction::Create => {
-                self.put_lock(key, self.body_for(owner, 1, expires_at), None)
+                self.put_lock(key, owner, self.body_for(owner, 1, expires_at), None)
                     .await
             }
             LockAction::Steal { etag, next_epoch } => {
                 self.put_lock(
                     key,
+                    owner,
                     self.body_for(owner, next_epoch, expires_at),
                     Some(&etag),
                 )
@@ -394,6 +429,19 @@ impl ReferenceLock for S3ReferenceLock {
     }
 
     async fn release(&self, key: &str, owner: &str) -> Result<(), LeaseError> {
+        // Our last write of the lock: delete it only while it is still that
+        // write. A 412 = a peer stole it after our hold lapsed. No read.
+        if let Some(etag) = self.kept.take(key, owner) {
+            let delete = super::cas::delete_if_match(&self.client, &self.bucket, key, &etag);
+            let _ = self
+                .bounded(async {
+                    delete.await;
+                    Ok(())
+                })
+                .await;
+            return Ok(());
+        }
+        // No kept ETag (our last write of it lost or failed): read first.
         let now = crate::event_outbox::current_unix_seconds();
         if let Observed::Held { lock, etag } = self.read_lock(key, now).await? {
             if lock.owner == owner {
@@ -418,8 +466,13 @@ impl ReferenceLock for S3ReferenceLock {
             RenewLockAction::Renew { etag, epoch } => {
                 let expires_at = now.saturating_add(self.ttl_secs.max(1));
                 LeaseError::from_renewal(
-                    self.put_lock(key, self.body_for(owner, epoch, expires_at), Some(&etag))
-                        .await,
+                    self.put_lock(
+                        key,
+                        owner,
+                        self.body_for(owner, epoch, expires_at),
+                        Some(&etag),
+                    )
+                    .await,
                 )
             }
         }
@@ -830,11 +883,110 @@ mod tests {
         assert!(res.is_err(), "a hung call must fail the write closed");
     }
 
+    /// A lock on a fake S3 coordination bucket `coord`.
+    async fn fake_lock() -> (S3ReferenceLock, Arc<crate::storage::FakeS3>) {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let client =
+            crate::config_db_sync::ConfigDbSync::build_client(&crate::config::BackendConfig::S3 {
+                endpoint: Some(endpoint),
+                region: "us-east-1".into(),
+                force_path_style: true,
+                access_key_id: Some("k".into()),
+                secret_access_key: Some("s".into()),
+                allow_local: true,
+                session_token: None,
+            })
+            .await
+            .unwrap();
+        (
+            S3ReferenceLock::new(client, "coord".into(), "node".into()),
+            fake,
+        )
+    }
+
+    fn methods(fake: &crate::storage::FakeS3) -> Vec<String> {
+        fake.requests()
+            .iter()
+            .map(|r| r.split(' ').next().unwrap_or("").to_string())
+            .collect()
+    }
+
+    /// Every multi-instance delta PUT takes this lock. A free lock cost 4
+    /// requests per hold (GET + PUT to acquire, GET + DELETE to release);
+    /// write-first + the kept ETag make it 2.
+    #[tokio::test]
+    async fn a_free_lock_costs_one_put_and_one_delete() {
+        let (lock, fake) = fake_lock().await;
+        let now = crate::event_outbox::current_unix_seconds();
+        assert!(lock.try_acquire("k", "o1", now).await.unwrap());
+        lock.release("k", "o1").await.unwrap();
+        assert_eq!(methods(&fake), ["PUT", "DELETE"]);
+        // And the lock is free again: the next hold costs the same.
+        fake.clear();
+        assert!(lock.try_acquire("k", "o2", now).await.unwrap());
+        lock.release("k", "o2").await.unwrap();
+        assert_eq!(methods(&fake), ["PUT", "DELETE"]);
+    }
+
+    /// A held lock: the create 412s, the read judges it live → blocked (one
+    /// request more than before; contention is rare). A renew keeps the new
+    /// ETag, so the release still deletes without a read.
+    #[tokio::test]
+    async fn a_held_lock_is_read_only_on_conflict() {
+        let (lock, fake) = fake_lock().await;
+        let now = crate::event_outbox::current_unix_seconds();
+        assert!(lock.try_acquire("k", "holder", now).await.unwrap());
+        fake.clear();
+        assert!(!lock.try_acquire("k", "peer", now).await.unwrap());
+        assert_eq!(methods(&fake), ["PUT", "GET"]);
+        fake.clear();
+        lock.renew("k", "holder", now).await.unwrap();
+        lock.release("k", "holder").await.unwrap();
+        assert_eq!(methods(&fake), ["GET", "PUT", "DELETE"]);
+        fake.clear();
+        assert!(lock.try_acquire("k", "peer", now).await.unwrap());
+        assert_eq!(methods(&fake), ["PUT"], "the release freed the lock");
+    }
+
+    /// A holder whose lock a peer stole (its TTL lapsed) releases with its
+    /// kept ETag: the DELETE answers 412 and the peer's lock stays.
+    #[tokio::test]
+    async fn a_release_after_a_steal_leaves_the_peer_lock() {
+        let (lock, fake) = fake_lock().await;
+        let now = crate::event_outbox::current_unix_seconds();
+        assert!(lock.try_acquire("k", "holder", now).await.unwrap());
+        // The hold lapses (a body without `ttl_secs` is judged by its
+        // `expires_at`, the previous release's form): the holder's kept
+        // ETag is now stale, as after a lapse and a peer's write.
+        let lapsed = serde_json::json!({
+            "owner": "holder", "node_id": "node", "epoch": 1, "expires_at": now - 1
+        });
+        lock.client
+            .put_object()
+            .bucket("coord")
+            .key("k")
+            .body(ByteStream::from(serde_json::to_vec(&lapsed).unwrap()))
+            .send()
+            .await
+            .unwrap();
+        // The peer's PUT of a lapsed lock: a steal by ETag.
+        assert!(lock.try_acquire("k", "peer", now).await.unwrap());
+        fake.clear();
+        lock.release("k", "holder").await.unwrap();
+        assert_eq!(methods(&fake), ["DELETE"]);
+        assert!(
+            !lock.try_acquire("k", "third", now).await.unwrap(),
+            "the stale release deleted the peer's lock"
+        );
+    }
+
     /// The lock client had a connect timeout only: one lock request to a
     /// coordination bucket that never answers hung for minutes.
     #[tokio::test]
     async fn a_lock_request_to_a_hung_coordination_bucket_ends() {
         let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        // The acquire writes first: the PUT is the request that hangs.
+        fake.set_delay_ms("PUT", 30_000);
         fake.set_delay_ms("GET", 30_000);
         let client =
             crate::config_db_sync::ConfigDbSync::build_client(&crate::config::BackendConfig::S3 {

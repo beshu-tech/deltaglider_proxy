@@ -152,7 +152,7 @@ mod node_identity_tests {
 }
 
 #[cfg(test)]
-mod test_s3 {
+pub(crate) mod test_s3 {
     //! Test-only S3 client over a canned connector: a GET answers with a fixed
     //! body, `Date` and `Last-Modified`; every other request answers 200. The
     //! lock and lease tests use it to drive the real read path, including the
@@ -180,11 +180,15 @@ mod test_s3 {
         pub body: Vec<u8>,
         pub date: i64,
         pub last_modified: i64,
-        /// Methods of the requests seen, in order.
+        /// Methods of the requests seen, in order. A create-only PUT
+        /// (`If-None-Match: *`) is `PUT-CREATE`: the canned object exists,
+        /// so it answers 412.
         pub seen: Arc<Mutex<Vec<String>>>,
     }
 
     impl Canned {
+        /// PUTs that replaced the object (steal, renew): create-only PUTs
+        /// excluded, because they always fail here.
         pub fn puts(&self) -> usize {
             self.seen
                 .lock()
@@ -198,8 +202,22 @@ mod test_s3 {
     impl HttpConnector for Canned {
         fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
             let method = request.method().to_string();
-            self.seen.lock().unwrap().push(method.clone());
-            let mut resp = if method == "GET" {
+            let create_only = request.headers().get("if-none-match").is_some();
+            let seen = if method == "PUT" && create_only {
+                "PUT-CREATE".to_string()
+            } else {
+                method.clone()
+            };
+            self.seen.lock().unwrap().push(seen);
+            let mut resp = if method == "PUT" && create_only {
+                HttpResponse::new(
+                    412.try_into().unwrap(),
+                    SdkBody::from(
+                        "<Error><Code>PreconditionFailed</Code>\
+                         <Message>At least one of the pre-conditions you specified did not hold</Message></Error>",
+                    ),
+                )
+            } else if method == "GET" {
                 let mut r =
                     HttpResponse::new(200.try_into().unwrap(), SdkBody::from(self.body.clone()));
                 r.headers_mut()

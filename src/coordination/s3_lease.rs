@@ -18,6 +18,11 @@
 //! `Last-Modified` against the GET's `Date`, see `server_clock`), so node
 //! clocks do not matter. A body from the previous release (no `ttl_secs`) is
 //! still judged by its writer-clock `expires_at`.
+//!
+//! Cost: the acquire sends the create-only PUT first and reads the lease
+//! only when that PUT answers 412. The holder keeps the ETag of its last
+//! write, and the release is one `DELETE If-Match` on it. A free lease costs
+//! 2 requests per hold (it cost 4). The body format is unchanged.
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
@@ -176,6 +181,9 @@ pub struct S3Lease {
     /// The id of this node's previous process: self-reclaim applies only to
     /// a lease it wrote. `None` = no self-reclaim (a lease frees at its TTL).
     previous_boot_id: Option<String>,
+    /// The ETag of each lease this process wrote last: the release deletes
+    /// on it without reading the lease first.
+    kept: super::cas::KeptEtags,
 }
 
 impl S3Lease {
@@ -206,6 +214,7 @@ impl S3Lease {
             node_id,
             boot_id: boot.current,
             previous_boot_id: boot.previous,
+            kept: Default::default(),
         }
     }
 
@@ -264,15 +273,20 @@ impl S3Lease {
     /// PUT the lease object with a precondition. `precondition`:
     /// `None` → `If-None-Match:*` (create-only); `Some(etag)` → `If-Match(etag)`.
     /// Returns `Ok(true)` on success, `Ok(false)` on a 412 (lost the race),
-    /// `Err` on any other failure.
+    /// `Err` on any other failure. Keeps the written ETag for the release.
     async fn put_lease(
         &self,
         key: &str,
+        owner: &str,
         body: ByteStream,
         precondition: Option<&str>,
     ) -> Result<bool, LeaseError> {
-        super::cas::conditional_put(&self.client, &self.bucket, key, body, precondition)
-            .await
+        let outcome =
+            super::cas::conditional_put_etag(&self.client, &self.bucket, key, body, precondition)
+                .await;
+        self.kept.note(key, owner, &outcome);
+        outcome
+            .map(|written| written.is_some())
             .map_err(LeaseError::Backend)
     }
 }
@@ -287,8 +301,21 @@ impl CoordinationLease for S3Lease {
         ttl_secs: i64,
     ) -> Result<bool, LeaseError> {
         let key = Self::object_key(subsystem, rule);
-        let current = self.read_lease(&key, now).await?;
         let expires_at = now.saturating_add(ttl_secs.max(1));
+        // Write first: a free lease costs this one create-only PUT. Its 412
+        // says that a lease object exists; only then read it.
+        if self
+            .put_lease(
+                &key,
+                owner,
+                self.body_for(owner, 1, expires_at, ttl_secs),
+                None,
+            )
+            .await?
+        {
+            return Ok(true);
+        }
+        let current = self.read_lease(&key, now).await?;
         match plan_acquire_read(
             &current,
             now,
@@ -297,12 +324,18 @@ impl CoordinationLease for S3Lease {
         ) {
             AcquireAction::Blocked => Ok(false),
             AcquireAction::Create => {
-                self.put_lease(&key, self.body_for(owner, 1, expires_at, ttl_secs), None)
-                    .await
+                self.put_lease(
+                    &key,
+                    owner,
+                    self.body_for(owner, 1, expires_at, ttl_secs),
+                    None,
+                )
+                .await
             }
             AcquireAction::Steal { etag, next_epoch } => {
                 self.put_lease(
                     &key,
+                    owner,
                     self.body_for(owner, next_epoch, expires_at, ttl_secs),
                     Some(&etag),
                 )
@@ -350,6 +383,7 @@ impl CoordinationLease for S3Lease {
                     match self
                         .put_lease(
                             &key,
+                            owner,
                             self.body_for(owner, epoch, expires_at, ttl_secs),
                             Some(&etag),
                         )
@@ -383,7 +417,14 @@ impl CoordinationLease for S3Lease {
     ) -> Result<(), LeaseError> {
         let key = Self::object_key(subsystem, rule);
         // Owner-scoped release: only delete the object if WE still own it, so a
-        // release can't clobber a lease a peer legitimately stole.
+        // release can't clobber a lease a peer legitimately stole. Our last
+        // write of it: delete it only while it is still that write (a 412 =
+        // stolen). No read.
+        if let Some(etag) = self.kept.take(&key, owner) {
+            super::cas::delete_if_match(&self.client, &self.bucket, &key, &etag).await;
+            return Ok(());
+        }
+        // No kept ETag (our last write of it lost or failed): read first.
         let now = crate::event_outbox::current_unix_seconds();
         if let LeaseRead::Valid { lease, etag } = self.read_lease(&key, now).await? {
             if lease.owner == owner {
@@ -430,6 +471,54 @@ mod tests {
             boot_id: "boot-old".into(),
             ttl_secs: None,
         }
+    }
+
+    async fn fake_lease() -> (S3Lease, std::sync::Arc<crate::storage::FakeS3>) {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let client =
+            crate::config_db_sync::ConfigDbSync::build_client(&crate::config::BackendConfig::S3 {
+                endpoint: Some(endpoint),
+                region: "us-east-1".into(),
+                force_path_style: true,
+                access_key_id: Some("k".into()),
+                secret_access_key: Some("s".into()),
+                allow_local: true,
+                session_token: None,
+            })
+            .await
+            .unwrap();
+        (S3Lease::new(client, "coord".into(), "node".into()), fake)
+    }
+
+    fn methods(fake: &crate::storage::FakeS3) -> Vec<String> {
+        fake.requests()
+            .iter()
+            .map(|r| r.split(' ').next().unwrap_or("").to_string())
+            .collect()
+    }
+
+    /// A free lease cost 4 requests per hold (GET + PUT, GET + DELETE);
+    /// write-first + the kept ETag make it 2. A held lease is read only
+    /// after the create answers 412; a renew keeps the new ETag.
+    #[tokio::test]
+    async fn a_free_lease_costs_one_put_and_one_delete() {
+        let (lease, fake) = fake_lease().await;
+        let sub = LeaseSubsystem::Replication;
+        let now = crate::event_outbox::current_unix_seconds();
+        assert!(lease.try_acquire(sub, "r", "o1", now, 300).await.unwrap());
+        lease.release(sub, "r", "o1").await.unwrap();
+        assert_eq!(methods(&fake), ["PUT", "DELETE"]);
+
+        fake.clear();
+        assert!(lease.try_acquire(sub, "r", "o2", now, 300).await.unwrap());
+        assert!(!lease.try_acquire(sub, "r", "o3", now, 300).await.unwrap());
+        lease.renew(sub, "r", "o2", now, 300).await.unwrap();
+        lease.release(sub, "r", "o2").await.unwrap();
+        assert_eq!(
+            methods(&fake),
+            ["PUT", "PUT", "GET", "GET", "PUT", "DELETE"]
+        );
+        assert!(!lease.is_held(sub, "r", now).await.unwrap(), "released");
     }
 
     fn canned_lease(body: serde_json::Value, age: i64) -> crate::coordination::test_s3::Canned {

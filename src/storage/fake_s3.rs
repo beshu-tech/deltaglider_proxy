@@ -20,6 +20,9 @@ struct Stored {
     body: Vec<u8>,
     meta: Vec<(String, String)>,
     etag: String,
+    /// Unix seconds of the write: HEAD/GET `Last-Modified`, which the
+    /// lease and the lock read as the server-clock age.
+    modified: i64,
 }
 
 /// A fault rule: requests of operation `op` whose path contains
@@ -298,7 +301,9 @@ fn object_headers(o: &Stored) -> HeaderMap {
     h.insert("etag", o.etag.parse().unwrap());
     h.insert(
         "last-modified",
-        "Wed, 01 Jan 2025 00:00:00 GMT".parse().unwrap(),
+        crate::coordination::test_s3::http_date(o.modified)
+            .parse()
+            .unwrap(),
     );
     h.insert("content-length", o.body.len().to_string().parse().unwrap());
     h
@@ -360,6 +365,26 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                             return (status, HeaderMap::new(), body);
                         }
                         let current = f.objects.lock().get(&path).cloned();
+                        // Conditional writes (`If-None-Match: *`, `If-Match`)
+                        // answer 412 like S3 when the condition does not hold.
+                        let if_match = headers.get("if-match").and_then(|v| v.to_str().ok());
+                        let if_none = headers.get("if-none-match").is_some();
+                        let etag_now = current.as_ref().map(|o| o.etag.as_str());
+                        let failed = match method {
+                            Method::PUT => {
+                                (if_none && current.is_some())
+                                    || if_match.is_some_and(|m| Some(m) != etag_now)
+                            }
+                            Method::DELETE => if_match.is_some_and(|m| Some(m) != etag_now),
+                            _ => false,
+                        };
+                        if failed {
+                            return (
+                                StatusCode::PRECONDITION_FAILED,
+                                HeaderMap::new(),
+                                b"<Error><Code>PreconditionFailed</Code></Error>".to_vec(),
+                            );
+                        }
                         match method {
                             Method::PUT => {
                                 let etag = format!("\"{}\"", hex::encode(md5::Md5::digest(&body)));
@@ -378,6 +403,7 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                                         body: body.to_vec(),
                                         meta,
                                         etag: etag.clone(),
+                                        modified: chrono::Utc::now().timestamp(),
                                     },
                                 );
                                 let mut h = HeaderMap::new();

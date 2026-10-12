@@ -11,7 +11,9 @@ const CLIENTS: usize = 3;
 
 #[derive(Debug, Clone)]
 enum Op {
-    /// Read step of an acquire / renew / release, by client `c`.
+    /// First step of an acquire / renew by client `c`. An acquire writes
+    /// first (create-only PUT) and reads only when that PUT finds a lock
+    /// object; a renew reads.
     Read(usize),
     /// Conditional-write step of what `c` read for.
     Write(usize),
@@ -34,7 +36,10 @@ struct Stored {
 enum Step {
     Acquire,
     Renew,
+    /// Release by the read-then-delete path (no kept ETag).
     Release,
+    /// Release by `DELETE If-Match` on the kept ETag of our last write.
+    ReleaseKept(u64),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -45,6 +50,8 @@ struct Client {
     /// A read awaiting its write: (step, what it saw, when).
     in_flight: Option<(Step, Option<Stored>, i64)>,
     owner_seq: u64,
+    /// The ETag of this client's last successful write of the lock.
+    kept: Option<u64>,
 }
 
 struct World {
@@ -75,7 +82,7 @@ impl World {
         }
     }
 
-    fn put(&mut self, owner: String, epoch: u64) {
+    fn put(&mut self, owner: String, epoch: u64) -> u64 {
         self.etags += 1;
         self.obj = Some(Stored {
             lock: RefLock {
@@ -88,6 +95,7 @@ impl World {
             etag: self.etags,
             written_at: self.now,
         });
+        self.etags
     }
 
     fn etag_is(&self, etag: &str) -> bool {
@@ -122,6 +130,17 @@ impl World {
                     (Some(_), false) => Step::Renew,
                     (Some(_), true) => return,
                 };
+                if step == Step::Acquire && self.obj.is_none() {
+                    // Write first: the create-only PUT finds no object.
+                    let owner = self.owner(c);
+                    let etag = self.put(owner, 1);
+                    let cl = &mut self.clients[c];
+                    cl.confirmed_at = Some(self.now);
+                    cl.lost = false;
+                    cl.kept = Some(etag);
+                    return;
+                }
+                // The create answered 412 (or a renew): read the lock.
                 self.clients[c].in_flight = Some((step, self.obj.clone(), self.now));
             }
             Op::Write(c) => {
@@ -133,27 +152,25 @@ impl World {
                 match step {
                     Step::Acquire => {
                         let won = match plan_lock_acquire(&observed, read_at) {
-                            LockAction::Blocked => false,
-                            LockAction::Create if self.obj.is_none() => {
-                                self.put(owner, 1);
-                                true
-                            }
-                            LockAction::Create => false,
+                            LockAction::Blocked => None,
+                            LockAction::Create if self.obj.is_none() => Some(self.put(owner, 1)),
+                            LockAction::Create => None,
                             LockAction::Steal { etag, next_epoch } if self.etag_is(&etag) => {
-                                self.put(owner, next_epoch);
-                                true
+                                Some(self.put(owner, next_epoch))
                             }
-                            LockAction::Steal { .. } => false,
+                            LockAction::Steal { .. } => None,
                         };
-                        if won {
+                        if let Some(etag) = won {
                             self.clients[c].confirmed_at = Some(read_at);
                             self.clients[c].lost = false;
+                            self.clients[c].kept = Some(etag);
                         }
                     }
                     Step::Renew => match plan_lock_renew(&observed, read_at, &owner) {
                         RenewLockAction::Renew { etag, epoch } if self.etag_is(&etag) => {
-                            self.put(owner, epoch);
+                            let etag = self.put(owner, epoch);
                             self.clients[c].confirmed_at = Some(read_at);
+                            self.clients[c].kept = Some(etag);
                         }
                         _ => {
                             // "Lost" only when the lock truly is not ours
@@ -164,8 +181,21 @@ impl World {
                                 == self.obj.as_ref().map(|s| s.etag);
                             assert!(!ours_and_live, "renew reported a live lock as lost");
                             self.clients[c].lost = true;
+                            // A renew PUT that lost drops the kept ETag.
+                            if matches!(
+                                plan_lock_renew(&observed, read_at, &owner),
+                                RenewLockAction::Renew { .. }
+                            ) {
+                                self.clients[c].kept = None;
+                            }
                         }
                     },
+                    Step::ReleaseKept(etag) => {
+                        // DELETE If-Match: removes only our own last write.
+                        if self.etag_is(&etag.to_string()) {
+                            self.obj = None;
+                        }
+                    }
                     Step::Release => {
                         if let Some(s) = &seen {
                             if s.lock.owner == owner && self.etag_is(&s.etag.to_string()) {
@@ -199,13 +229,18 @@ impl World {
                 if self.clients[c].confirmed_at.is_none() || self.clients[c].in_flight.is_some() {
                     return;
                 }
-                // The guard stops the heartbeat, then releases: a fresh
-                // read, then an owner-scoped delete (next Write).
+                // The guard stops the heartbeat, then releases: a DELETE
+                // If-Match on the kept ETag, or (none kept) a fresh read and
+                // an owner-scoped delete (next Write).
                 let seen = self.obj.clone();
                 let cl = &mut self.clients[c];
                 cl.confirmed_at = None;
                 cl.lost = false;
-                cl.in_flight = Some((Step::Release, seen, self.now));
+                let step = match cl.kept.take() {
+                    Some(etag) => Step::ReleaseKept(etag),
+                    None => Step::Release,
+                };
+                cl.in_flight = Some((step, seen, self.now));
             }
         }
     }
