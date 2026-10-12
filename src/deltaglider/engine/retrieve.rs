@@ -3,7 +3,7 @@
 //! Retrieve pipeline — delta reconstruction, streaming, and range requests.
 
 use super::*;
-use crate::storage::StorageBackend;
+use crate::storage::{ObjectVariant, StorageBackend};
 use bytes::Bytes;
 use futures::stream::BoxStream;
 
@@ -91,7 +91,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         );
 
         match self
-            .retrieve_with_metadata(bucket, key, &deltaspace_id, &obj_key, metadata.clone())
+            .retrieve_with_metadata(bucket, &deltaspace_id, &obj_key, metadata.clone(), None)
             .await
         {
             Ok(response) => Ok(response),
@@ -117,7 +117,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 match fresh {
                     Some(m) => {
                         self.metadata_cache.insert(bucket, key, m.clone());
-                        self.retrieve_with_metadata(bucket, key, &deltaspace_id, &obj_key, m)
+                        self.retrieve_with_metadata(bucket, &deltaspace_id, &obj_key, m, None)
                             .await
                     }
                     None => {
@@ -130,14 +130,182 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
     }
 
-    /// Inner retrieve that uses pre-resolved metadata.
+    /// A plain GET (no range, no conditional headers, no `partNumber`): the
+    /// object's metadata and its bytes from ONE round trip, and both from
+    /// one response, so the ETag and the body describe one version.
+    ///
+    /// - Metadata cache warm: open the cached form only (1 request). Its
+    ///   GET response refreshes the cache; a 404 (the form changed) falls
+    ///   through to the cold path.
+    /// - Cold: open the form that the key's file type and the bucket's
+    ///   compression setting make likely, and in parallel HEAD the other
+    ///   form. Newest-wins decides as in `resolve_stored_forms`. A wrong
+    ///   guess (or a losing form) drops the opened stream unread and reads
+    ///   the winner: the cost of the HEAD-first path.
+    /// - Opened metadata that names another layout (a `.delta` copied in
+    ///   without its DG metadata, a passthrough object whose metadata says
+    ///   delta), a folder marker: the HEAD-first path.
+    ///
+    /// The conditional and ranged reads keep HEAD-first, so a 304/412/416
+    /// never opens a body.
+    #[instrument(skip(self))]
+    pub async fn retrieve_stream_fresh(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<RetrieveResponse, EngineError> {
+        let (obj_key, deltaspace_id) = self.validated_key(bucket, key)?;
+        if obj_key.is_directory_marker() {
+            return self.retrieve_stream_headed(bucket, key).await;
+        }
+        let filename = obj_key.filename.as_str();
+        if let Some(cached) = self.metadata_cache.get(bucket, key) {
+            if let Some(form) = opened_form(filename, &cached) {
+                match self
+                    .storage
+                    .open_object(bucket, &deltaspace_id, stored_object(form, filename))
+                    .await
+                {
+                    Ok((stream, meta)) => {
+                        return self
+                            .serve_opened(bucket, key, &deltaspace_id, &obj_key, form, stream, meta)
+                            .await;
+                    }
+                    Err(StorageError::NotFound(_)) => self.metadata_cache.invalidate(bucket, key),
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        let guess = if self.bucket_policies.compression_enabled(bucket)
+            && self.file_router.is_delta_eligible(filename)
+        {
+            ObjectVariant::Delta
+        } else {
+            ObjectVariant::Passthrough
+        };
+        let other_form = match guess {
+            ObjectVariant::Delta => ObjectVariant::Passthrough,
+            ObjectVariant::Passthrough => ObjectVariant::Delta,
+        };
+        let (opened, other) = tokio::join!(
+            self.storage
+                .open_object(bucket, &deltaspace_id, stored_object(guess, filename)),
+            self.stored_form_metadata(bucket, &deltaspace_id, filename, other_form),
+        );
+        let opened = match opened {
+            Ok(opened) => Some(opened),
+            Err(StorageError::NotFound(_)) => None,
+            Err(e) => return Err(e.into()),
+        };
+        let other = other?;
+        let opened_wins = match (&opened, &other) {
+            (None, _) => false,
+            (Some(_), None) => true,
+            (Some((_, o)), Some(x)) => match guess {
+                ObjectVariant::Delta => super::metadata::delta_is_newest(o, x),
+                ObjectVariant::Passthrough => !super::metadata::delta_is_newest(x, o),
+            },
+        };
+        if let (true, Some((stream, meta))) = (opened_wins, opened) {
+            return self
+                .serve_opened(bucket, key, &deltaspace_id, &obj_key, guess, stream, meta)
+                .await;
+        }
+        // The other form wins (or the guess is absent): the opened stream,
+        // if any, dropped unread above.
+        let Some(meta) = other else {
+            return Err(EngineError::NotFound(obj_key.full_key()));
+        };
+        info!(
+            "Retrieving {}/{} (stored as {})",
+            bucket,
+            key,
+            meta.storage_info.label()
+        );
+        self.metadata_cache.insert(bucket, key, meta.clone());
+        self.retrieve_with_metadata(bucket, &deltaspace_id, &obj_key, meta, None)
+            .await
+    }
+
+    /// Serve the form that `retrieve_stream_fresh` opened, with the
+    /// metadata from the same response.
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_opened(
+        &self,
+        bucket: &str,
+        key: &str,
+        deltaspace_id: &str,
+        obj_key: &super::ObjectKey,
+        form: ObjectVariant,
+        stream: crate::storage::ByteStream,
+        meta: FileMetadata,
+    ) -> Result<RetrieveResponse, EngineError> {
+        if opened_form(&obj_key.filename, &meta) != Some(form) {
+            // The stored metadata names another layout: read it the
+            // HEAD-first way, which knows every layout.
+            drop(stream);
+            return self.retrieve_stream_headed(bucket, key).await;
+        }
+        info!(
+            "Retrieving {}/{} (stored as {}, one read)",
+            bucket,
+            key,
+            meta.storage_info.label()
+        );
+        self.metadata_cache.insert(bucket, key, meta.clone());
+        match form {
+            ObjectVariant::Passthrough => Ok(RetrieveResponse::Streamed {
+                stream,
+                metadata: meta,
+                cache_hit: None,
+            }),
+            ObjectVariant::Delta => {
+                // A large delta whose verified reconstruction is in the
+                // range-spool cache does not need its delta body.
+                let spooled = meta.file_size > self.spool_threshold()
+                    && self
+                        .range_spools
+                        .get_fresh(&RangeSpoolKey::object(
+                            bucket,
+                            obj_key.full_key(),
+                            meta.file_sha256.clone(),
+                        ))
+                        .is_some();
+                let prefetched = if spooled {
+                    drop(stream);
+                    None
+                } else {
+                    use futures::TryStreamExt;
+                    let chunks: Vec<Bytes> = stream.try_collect().await?;
+                    Some(chunks.concat())
+                };
+                self.retrieve_with_metadata(bucket, deltaspace_id, obj_key, meta, prefetched)
+                    .await
+            }
+        }
+    }
+
+    /// The HEAD-first read: fresh metadata of both forms, then the bytes.
+    async fn retrieve_stream_headed(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<RetrieveResponse, EngineError> {
+        // `head` refreshes the cache that `retrieve_stream` reads.
+        self.head(bucket, key).await?;
+        self.retrieve_stream(bucket, key).await
+    }
+
+    /// Inner retrieve that uses pre-resolved metadata. `prefetched`: the
+    /// delta body, when the caller already read it with its metadata
+    /// (`retrieve_stream_fresh`), so it is not read again.
     async fn retrieve_with_metadata(
         &self,
         bucket: &str,
-        _key: &str,
         deltaspace_id: &str,
         obj_key: &super::ObjectKey,
         metadata: FileMetadata,
+        prefetched: Option<Vec<u8>>,
     ) -> Result<RetrieveResponse, EngineError> {
         match &metadata.storage_info {
             StorageInfo::Passthrough => {
@@ -157,12 +325,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 // Large delta: reconstruct to a spool file (bounded memory) and
                 // stream the file to the client. Integrity is verified BEFORE the
                 // first byte ships (see retrieve_delta_spooled).
-                self.retrieve_delta_spooled(bucket, deltaspace_id, obj_key, metadata)
+                self.retrieve_delta_spooled(bucket, deltaspace_id, obj_key, metadata, prefetched)
                     .await
             }
             StorageInfo::Reference { .. } | StorageInfo::Delta { .. } => {
                 let (data, cache_hit) = self
-                    .retrieve_buffered(bucket, deltaspace_id, obj_key, &metadata)
+                    .retrieve_buffered(bucket, deltaspace_id, obj_key, &metadata, prefetched)
                     .await?;
                 debug!(
                     "Retrieved (buffered) {} bytes for {}",
@@ -196,12 +364,19 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         deltaspace_id: &str,
         obj_key: &super::ObjectKey,
         metadata: FileMetadata,
+        prefetched: Option<Vec<u8>>,
     ) -> Result<RetrieveResponse, EngineError> {
         let key = RangeSpoolKey::object(bucket, obj_key.full_key(), metadata.file_sha256.clone());
         let out_spool = self
             .range_spools
             .get_or_fill(key, || {
-                self.reconstruct_delta_to_spool(bucket, deltaspace_id, obj_key, &metadata)
+                self.reconstruct_delta_to_spool(
+                    bucket,
+                    deltaspace_id,
+                    obj_key,
+                    &metadata,
+                    prefetched,
+                )
             })
             .await?;
 
@@ -247,6 +422,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         deltaspace_id: &str,
         obj_key: &super::ObjectKey,
         metadata: &FileMetadata,
+        prefetched: Option<Vec<u8>>,
     ) -> Result<crate::deltaglider::spool::Spool, EngineError> {
         use std::io::Write;
 
@@ -254,11 +430,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .reference_file_and_out_spool(bucket, deltaspace_id, metadata)
             .await?;
 
-        // Fetch the delta (small — it's a delta).
-        let delta = self
-            .storage
-            .get_delta(bucket, deltaspace_id, &obj_key.filename)
-            .await?;
+        // Fetch the delta (small — it's a delta), unless the caller has it.
+        let delta = match prefetched {
+            Some(delta) => delta,
+            None => {
+                self.storage
+                    .get_delta(bucket, deltaspace_id, &obj_key.filename)
+                    .await?
+            }
+        };
 
         let _permit = self
             .acquire_codec_timeout(std::time::Duration::from_secs(60))
@@ -487,7 +667,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let out_spool = self
             .range_spools
             .get_or_fill(key, || {
-                self.reconstruct_delta_to_spool(bucket, deltaspace_id, obj_key, metadata)
+                self.reconstruct_delta_to_spool(bucket, deltaspace_id, obj_key, metadata, None)
             })
             .await?;
 
@@ -694,6 +874,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         deltaspace_id: &str,
         obj_key: &ObjectKey,
         metadata: &FileMetadata,
+        prefetched: Option<Vec<u8>>,
     ) -> Result<(Vec<u8>, Option<bool>), EngineError> {
         let (data, cache_hit) = match &metadata.storage_info {
             StorageInfo::Reference { .. } => (
@@ -705,8 +886,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 // The reference is sibling to the delta: same parent directory + "reference.bin".
                 let (ref_result, delta_result) = tokio::join!(
                     self.get_reference_cached(bucket, deltaspace_id, ref_sha256),
-                    self.storage
-                        .get_delta(bucket, deltaspace_id, &obj_key.filename)
+                    async {
+                        match prefetched {
+                            Some(delta) => Ok(delta),
+                            None => {
+                                self.storage
+                                    .get_delta(bucket, deltaspace_id, &obj_key.filename)
+                                    .await
+                            }
+                        }
+                    }
                 );
 
                 // Fallback: if get_reference fails (uses internal deltaspace key),
@@ -942,6 +1131,26 @@ enum SharedReferenceError {
 impl From<EngineError> for SharedReferenceError {
     fn from(e: EngineError) -> Self {
         SharedReferenceError::Engine(e)
+    }
+}
+
+/// The stored form that `retrieve_stream_fresh` can serve from one read of
+/// it, given its metadata: a delta, or a passthrough stored under the
+/// request key. `None`: another layout (read HEAD-first).
+fn opened_form(filename: &str, metadata: &FileMetadata) -> Option<ObjectVariant> {
+    match &metadata.storage_info {
+        StorageInfo::Delta { .. } => Some(ObjectVariant::Delta),
+        StorageInfo::Passthrough if passthrough_stored_name(filename, metadata) == filename => {
+            Some(ObjectVariant::Passthrough)
+        }
+        _ => None,
+    }
+}
+
+fn stored_object(form: ObjectVariant, filename: &str) -> crate::storage::StoredObject<'_> {
+    match form {
+        ObjectVariant::Delta => crate::storage::StoredObject::Delta(filename),
+        ObjectVariant::Passthrough => crate::storage::StoredObject::Passthrough(filename),
     }
 }
 

@@ -167,7 +167,13 @@ correctness, but both change behaviour compared to a single instance:
   ring moves (a scale event), when a prefix's new owner may serve up to ten minutes
   of stale metadata for objects the old owner changed. A HEAD request reads
   the object's metadata from storage and not from the cache, so its answer is never
-  stale. A GET request and a listing can use the cached metadata.
+  stale. A GET request uses the cached metadata only to choose which stored form of
+  the object it reads (the delta or the plain object). The ETag, the size and the
+  body all come from that one storage response, so they always describe the same
+  version. When the cached form no longer exists, the GET reads both forms again.
+  One case can still serve an older version: a crash during an overwrite can leave
+  both forms in storage, and an instance whose cache names the older form serves it
+  until the cache entry expires. A listing can use the cached metadata.
 - **Rate limits.** The login rate limiter counts per instance, so with N instances the
   effective limit is up to N times the configured value. Size the configured limit
   accordingly, and remember that the admin GUI's source-IP stickiness concentrates

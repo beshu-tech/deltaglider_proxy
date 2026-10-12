@@ -62,10 +62,32 @@ pub(super) async fn get_object(
     let input = req.input;
     check_response_overrides_allowed(&input, anonymous_principal)?;
     let engine = svc.state.engine.load();
-    // Every GET reads fresh metadata: the cache can hold another node's
-    // older version, and `retrieve_stream` then streams the stored bytes,
-    // so a cached ETag or size would mix two versions in one answer. The
-    // HEAD also refreshes the cache that `retrieve_stream` reads.
+    // A plain GET (no range, no conditional, no partNumber) reads the
+    // metadata and the bytes from one response (`retrieve_stream_fresh`):
+    // one round trip, and the ETag and the body describe one version.
+    let plain = input.range.is_none()
+        && input.part_number.is_none()
+        && input.if_match.is_none()
+        && input.if_none_match.is_none()
+        && input.if_modified_since.is_none()
+        && input.if_unmodified_since.is_none();
+    if plain {
+        let response = match engine
+            .retrieve_stream_fresh(&input.bucket, &input.key)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(
+                    no_such_key_or_bucket(&svc.state, &input.bucket, s3s::S3Error::from(e)).await,
+                )
+            }
+        };
+        return finish_get(svc, &input, reader, response);
+    }
+    // A conditional or ranged GET reads fresh metadata first, so a
+    // 304/412/416 never opens a body. The HEAD also refreshes the cache,
+    // so the full read below opens the form it names with one GET.
     let head = match engine.head(&input.bucket, &input.key).await {
         Ok(head) => head,
         Err(e) => {
@@ -131,7 +153,10 @@ pub(super) async fn get_object(
         return Ok(resp);
     }
 
-    let response = match engine.retrieve_stream(&input.bucket, &input.key).await {
+    let response = match engine
+        .retrieve_stream_fresh(&input.bucket, &input.key)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             return Err(
@@ -139,6 +164,16 @@ pub(super) async fn get_object(
             )
         }
     };
+    finish_get(svc, &input, reader, response)
+}
+
+/// The response of a full (not ranged) GET.
+fn finish_get(
+    svc: &DeltaGliderS3Service,
+    input: &s3s::dto::GetObjectInput,
+    reader: Reader,
+    response: RetrieveResponse,
+) -> s3s::S3Result<s3s::S3Response<s3s::dto::GetObjectOutput>> {
     let (body, metadata) = match response {
         RetrieveResponse::Streamed {
             stream, metadata, ..
@@ -152,7 +187,7 @@ pub(super) async fn get_object(
         }
     };
     let mut output = get_object_output_from_metadata(&metadata, body, reader)?;
-    apply_get_response_overrides(&input, &mut output);
+    apply_get_response_overrides(input, &mut output);
     let mut resp = s3s::S3Response::new(output);
     add_storage_debug_headers(svc, &mut resp.headers, &metadata);
     add_get_object_security_headers(&mut resp);

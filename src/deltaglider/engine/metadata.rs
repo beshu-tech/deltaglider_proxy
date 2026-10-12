@@ -4,6 +4,7 @@
 //! reference cache.
 
 use super::*;
+use crate::storage::ObjectVariant;
 
 /// Pure integrity check for a freshly-loaded reference baseline.
 ///
@@ -39,12 +40,19 @@ pub struct StoredForms {
 }
 
 impl StoredForms {
-    pub(super) fn has(self, form: crate::storage::ObjectVariant) -> bool {
+    pub(super) fn has(self, form: ObjectVariant) -> bool {
         match form {
-            crate::storage::ObjectVariant::Delta => self.delta,
-            crate::storage::ObjectVariant::Passthrough => self.passthrough,
+            ObjectVariant::Delta => self.delta,
+            ObjectVariant::Passthrough => self.passthrough,
         }
     }
+}
+
+/// PURE: newest-wins between the two stored forms of one object (a crash
+/// between a write and its `drop_other_form` leaves both). A tie goes to
+/// the delta.
+pub(super) fn delta_is_newest(delta: &FileMetadata, passthrough: &FileMetadata) -> bool {
+    delta.created_at >= passthrough.created_at
 }
 
 impl<S: StorageBackend> DeltaGliderEngine<S> {
@@ -129,38 +137,57 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // round-trip. A folder marker (`dir/`: no file name) has no `.delta`
         // form: only `put_directory_marker` stores it. Its delta HEAD
         // (`dir/.delta`) was a request that could only answer 404.
-        let (delta_result, passthrough_result) = tokio::join!(
+        let (delta, passthrough) = tokio::join!(
             async {
                 if filename.is_empty() {
-                    return Err(StorageError::NotFound(format!("{prefix}/")));
+                    return Ok(None);
                 }
-                self.storage
-                    .get_delta_metadata(bucket, prefix, filename)
+                self.stored_form_metadata(bucket, prefix, filename, ObjectVariant::Delta)
                     .await
             },
-            self.storage
-                .get_passthrough_metadata(bucket, prefix, filename),
+            self.stored_form_metadata(bucket, prefix, filename, ObjectVariant::Passthrough),
         );
-
-        // Only NotFound means absent. An I/O error (EACCES, EIO) is an
-        // error: read as absent, HEAD answered 404 for a live object, DELETE
-        // reported success without deleting, and `If-None-Match: *`
-        // overwrote it.
-        let found = |r: Result<FileMetadata, StorageError>| match r {
-            Ok(meta) => Ok(Some(meta)),
-            Err(StorageError::NotFound(_)) => Ok(None),
-            Err(e) => Err(e),
-        };
-        let (delta, passthrough) = (found(delta_result)?, found(passthrough_result)?);
+        let (delta, passthrough) = (delta?, passthrough?);
         let forms = StoredForms {
             delta: delta.is_some(),
             passthrough: passthrough.is_some(),
         };
         let newest = match (delta, passthrough) {
-            (Some(d), Some(p)) => Some(if d.created_at >= p.created_at { d } else { p }),
+            (Some(d), Some(p)) => Some(if delta_is_newest(&d, &p) { d } else { p }),
             (one, None) | (None, one) => one,
         };
         Ok(newest.map(|meta| (meta, forms)))
+    }
+
+    /// The metadata of ONE stored form of an object (a HEAD on S3), `None`
+    /// when it is absent. Only NotFound means absent. An I/O error (EACCES,
+    /// EIO) is an error: read as absent, HEAD answered 404 for a live
+    /// object, DELETE reported success without deleting, and
+    /// `If-None-Match: *` overwrote it.
+    pub(super) async fn stored_form_metadata(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        form: ObjectVariant,
+    ) -> Result<Option<FileMetadata>, StorageError> {
+        let read = match form {
+            ObjectVariant::Delta => {
+                self.storage
+                    .get_delta_metadata(bucket, prefix, filename)
+                    .await
+            }
+            ObjectVariant::Passthrough => {
+                self.storage
+                    .get_passthrough_metadata(bucket, prefix, filename)
+                    .await
+            }
+        };
+        match read {
+            Ok(meta) => Ok(Some(meta)),
+            Err(StorageError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Resolve metadata for an object key, with no migration attempt.
