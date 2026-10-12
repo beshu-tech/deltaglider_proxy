@@ -2,7 +2,7 @@ import { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo } fr
 import { message } from 'antd';
 import { useQueryClient } from '@tanstack/react-query';
 import { qk } from './queries/keys';
-import { listObjects, getBucket, setBucket, headObject, hasCredentials } from './s3client';
+import { listObjects, getBucket, setBucket, hasCredentials } from './s3client';
 import { buildBrowserUrl } from './urlState';
 import {
   bulkCopyObjects,
@@ -27,13 +27,6 @@ import { downloadZip as saveZip, zipPreflightError } from './zipDownload';
 import type { S3Object } from './types';
 import { readStorage, writeStorage } from './safeStorage';
 
-const MAX_HEAD_CACHE_SIZE = 5000;
-/**
- * Table HEADs in flight at once. Each costs the proxy two backend HEADs; a
- * page of 500 rows used to send them all at once (1,000 backend HEADs behind
- * an HTTP/2 front), and the folder's listing waited behind them.
- */
-const HEAD_CONCURRENCY = 6;
 // A stable default: `load` depends on writablePrefixes, so a fresh `[]` per
 // render re-ran the list effect on every render (an infinite update loop).
 const NO_PREFIXES: string[] = [];
@@ -107,23 +100,7 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     setShowHiddenState(v);
     writeStorage('dg-show-hidden', String(v));
   }, []);
-  const [headCache, setHeadCache] = useState<Record<string, { storageType?: string; storedSize?: number; error?: boolean }>>({});
   const [error, setError] = useState<string | null>(null);
-  const headCacheRef = useRef(headCache);
-  headCacheRef.current = headCache;
-  // HEAD enrichment queue: keys waiting for a slot, keys whose HEAD started
-  // (until its result is in the cache), finished results not yet rendered,
-  // and the abort of the current generation.
-  const headQueue = useRef<string[]>([]);
-  const headStarted = useRef(new Set<string>());
-  const headResults = useRef<{ key: string; storageType?: string; storedSize?: number; error: boolean }[]>([]);
-  const headRunning = useRef(0);
-  const headAbort = useRef(new AbortController());
-  // Bumped by resetBrowseState (bucket/prefix change), which also aborts the
-  // HEADs in flight and drops the queued ones. A HEAD of an older generation
-  // drops its result instead of writing the previous folder's metadata into
-  // the freshly reset cache (same pattern as loadSeq).
-  const headGen = useRef(0);
   const prefixRef = useRef(prefix);
   prefixRef.current = prefix;
   // bucket/object tracked in refs too so the debounced search write reads the
@@ -169,15 +146,7 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     setObjects([]);
     setFolders([]);
     setVirtualFolders([]);
-    setHeadCache({});
     setError(null);
-    headAbort.current.abort();
-    headAbort.current = new AbortController();
-    headQueue.current = [];
-    headStarted.current.clear();
-    headResults.current = [];
-    headRunning.current = 0;
-    headGen.current += 1;
     isInitialLoad.current = true;
     clearSelection();
   }, [clearSelection]);
@@ -285,61 +254,14 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     return () => clearInterval(id);
   }, [refresh, active]);
 
-  // HEAD enrichment: at most HEAD_CONCURRENCY HEADs in flight, the rest
-  // queued. Results keep the per-key error flag (a hardcoded error:false once
-  // masked HEAD failures) and render a few at a time, not one render per
-  // HEAD. A bucket/prefix change aborts the generation (resetBrowseState).
-  const flushHeadResults = useCallback(() => {
-    const results = headResults.current;
-    if (results.length === 0) return;
-    headResults.current = [];
-    setHeadCache((prev) => {
-      const next = { ...prev };
-      for (const r of results) {
-        next[r.key] = r.error ? { error: true } : { storageType: r.storageType, storedSize: r.storedSize, error: false };
-        headStarted.current.delete(r.key);
-      }
-      // Evict oldest entries if cache exceeds max size
-      const keys = Object.keys(next);
-      if (keys.length > MAX_HEAD_CACHE_SIZE) {
-        const toRemove = keys.slice(0, keys.length - MAX_HEAD_CACHE_SIZE);
-        for (const k of toRemove) delete next[k];
-      }
-      return next;
-    });
-  }, []);
-
-  const pumpHeads = useCallback(() => {
-    const gen = headGen.current;
-    const { signal } = headAbort.current;
-    while (headRunning.current < HEAD_CONCURRENCY && headQueue.current.length > 0) {
-      const key = headQueue.current.shift()!;
-      headStarted.current.add(key);
-      headRunning.current += 1;
-      headObject(key, undefined, signal)
-        .then(({ storageType, storedSize }) => ({ key, storageType, storedSize, error: false }))
-        .catch(() => ({ key, storageType: undefined, storedSize: undefined, error: true }))
-        .then((result) => {
-          if (gen !== headGen.current) return; // reset since: the counters belong to the new generation
-          headRunning.current -= 1;
-          headResults.current.push(result);
-          const idle = headRunning.current === 0 && headQueue.current.length === 0;
-          if (idle || headResults.current.length >= HEAD_CONCURRENCY) flushHeadResults();
-          pumpHeads();
-        });
-    }
-  }, [flushHeadResults]);
-
-  /**
-   * HEAD the visible page's files that have no metadata yet. The keys of
-   * this call replace the keys still queued from an earlier call: the table
-   * asks for the page on screen, and an older page's keys are off screen.
-   */
-  const enrichKeys = useCallback((keys: string[]) => {
-    const cache = headCacheRef.current;
-    headQueue.current = keys.filter((k) => !(k in cache) && !headStarted.current.has(k));
-    pumpHeads();
-  }, [pumpHeads]);
+  // The storage facts of each row, from the listing (`metadata=true`): no
+  // HEAD per row. A row the listing has no facts for gets an empty entry, so
+  // the table shows the neutral tag instead of waiting for facts.
+  const headCache = useMemo(() => {
+    const cache: Record<string, { storageType?: string; storedSize?: number }> = {};
+    for (const o of objects) cache[o.key] = { storageType: o.storageType, storedSize: o.storedSize };
+    return cache;
+  }, [objects]);
 
   /** After a user's change: reload the listing and the savings chip. */
   const mutate = useCallback(() => {
@@ -712,7 +634,6 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     changeBucket,
     reconnect,
     mutate,
-    enrichKeys,
     bulkDelete,
     bulkCopy,
     bulkMove,

@@ -4,14 +4,12 @@
  * Covers:
  *   - describeVisibleRange: empty, single-page, plural, thousands
  *     grouping, partial last page, size-greater-than-total fallback.
- *   - clampPageToData: page past the end of a shrunken list clamps to
- *     the last real page; in-range pages pass through; empty list → 1.
  *   - coerceStoredPageSize: null / malformed / not-in-allow-list /
  *     valid pass-through.
  */
 import assert from 'node:assert/strict';
 import { test } from 'vitest';
-import { describeVisibleRange, clampPageToData } from '../paginationLabels';
+import { describeVisibleRange } from '../paginationLabels';
 import { coerceStoredPageSize } from '../persistedPageSize';
 
 const ALLOWED = [25, 50, 100, 250, 500];
@@ -57,28 +55,6 @@ test('describeVisibleRange', () => {
     '5 items',
     'when page size > total, falls back to single-page short form',
   );
-});
-
-test('clampPageToData (OBJ-TABLE-001)', () => {
-  // The bug: a search shrank the list from 500 rows to 50 while the table
-  // sat on page 3; enrichPage then computed start=200 against a 50-row list.
-  assert.equal(clampPageToData(3, 50, 100), 1, 'page 3 of a 50-row list (1 page) clamps to 1');
-
-  // In-range pages must pass through untouched (no S3 request-shape change
-  // for valid inputs).
-  assert.equal(clampPageToData(2, 250, 100), 2, 'page 2 of a 250-row list (3 pages) stays 2');
-  assert.equal(clampPageToData(1, 500, 100), 1, 'page 1 of a full list stays 1');
-  assert.equal(clampPageToData(5, 500, 100), 5, 'last in-range page stays put');
-
-  // Past-the-end clamps to the highest real page, not 1.
-  assert.equal(clampPageToData(9, 250, 100), 3, 'page 9 of a 3-page list clamps to last page');
-
-  // Edge cases.
-  assert.equal(clampPageToData(1, 0, 100), 1, 'empty list → page 1');
-  assert.equal(clampPageToData(0, 250, 100), 1, 'page 0 floors to 1');
-  assert.equal(clampPageToData(-4, 250, 100), 1, 'negative page floors to 1');
-  assert.equal(clampPageToData(NaN, 250, 100), 1, 'NaN page falls back to 1');
-  assert.equal(clampPageToData(2.9, 500, 100), 2, 'fractional page floors before clamping');
 });
 
 test('coerceStoredPageSize', () => {

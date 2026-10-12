@@ -165,6 +165,81 @@ function isValidCommonPrefix(prefix: string | undefined, currentPrefix: string):
 
 const MAX_LIST_PAGES = 10; // ~10,000 objects max
 
+/** The storage facts of one listed object, as HeadObject would show them. */
+interface ListFacts {
+  storageType?: string;
+  storedSize?: number;
+}
+
+/**
+ * The storage facts of each `<Contents>` of a `metadata=true` ListObjectsV2
+ * body, by key. The proxy lists them in `<UserMetadata>` with the names
+ * HeadObject uses: `x-amz-meta-dg-note` (the storage type) and, for a delta,
+ * `x-amz-meta-dg-delta-size` (the stored size). An entry without them (a
+ * facts miss, an anonymous reader) is absent from the map.
+ */
+export function parseListFacts(xml: string): Map<string, ListFacts> {
+  const facts = new Map<string, ListFacts>();
+  const doc = new DOMParser().parseFromString(xml, 'application/xml');
+  for (const contents of Array.from(doc.getElementsByTagName('Contents'))) {
+    const key = Array.from(contents.children).find((c) => c.tagName === 'Key')?.textContent;
+    const userMetadata = Array.from(contents.children).find((c) => c.tagName === 'UserMetadata');
+    if (key == null || !userMetadata) continue;
+    const meta: Record<string, string> = {};
+    for (const item of Array.from(userMetadata.getElementsByTagName('Items'))) {
+      const name = item.getElementsByTagName('Key')[0]?.textContent;
+      const value = item.getElementsByTagName('Value')[0]?.textContent;
+      if (name && value != null) meta[name.toLowerCase()] = value;
+    }
+    const storageType = meta['x-amz-meta-dg-note'] || undefined;
+    if (!storageType) continue;
+    const size = meta['x-amz-meta-dg-delta-size'];
+    facts.set(key, { storageType, storedSize: size ? parseInt(size, 10) : undefined });
+  }
+  return facts;
+}
+
+/**
+ * A ListObjectsV2 command that asks for the storage facts of every entry
+ * (`metadata=true`) and hands them to `onFacts`. The query parameter is added
+ * at the build step, before the signer signs the canonical query. The body
+ * is read before the SDK's deserializer, which drops unknown elements such
+ * as `<UserMetadata>`, and handed on as a fresh stream.
+ */
+// The SDK's middleware types live in @smithy/types (not a direct dependency):
+// the two handlers below are typed by the shape they use, and cast at `add`.
+interface HandlerArgs { input: unknown; request?: unknown }
+type Next = (args: HandlerArgs) => Promise<{ output: unknown; response: unknown }>;
+
+function listWithFacts(
+  input: ConstructorParameters<typeof ListObjectsV2Command>[0],
+  onFacts: (facts: Map<string, ListFacts>) => void,
+): ListObjectsV2Command {
+  const command = new ListObjectsV2Command(input);
+  const addQuery = (next: Next) => async (args: HandlerArgs) => {
+    const request = args.request as { query?: Record<string, string> };
+    request.query = { ...request.query, metadata: 'true' };
+    return next(args);
+  };
+  const readFacts = (next: Next) => async (args: HandlerArgs) => {
+    const result = await next(args);
+    const response = result.response as { statusCode?: number; body?: unknown };
+    if (response.statusCode === 200 && response.body != null) {
+      const text = await new Response(response.body as BodyInit).text();
+      onFacts(parseListFacts(text));
+      response.body = new Response(text).body;
+    }
+    return result;
+  };
+  command.middlewareStack.add(addQuery as never, { step: 'build', name: 'dgListMetadataQuery' });
+  command.middlewareStack.addRelativeTo(readFacts as never, {
+    relation: 'after',
+    toMiddleware: 'deserializerMiddleware',
+    name: 'dgListFacts',
+  });
+  return command;
+}
+
 export async function listObjects(prefix = ''): Promise<ListResult> {
   const allObjects: S3Object[] = [];
   const folderSet = new Set<string>();
@@ -172,13 +247,17 @@ export async function listObjects(prefix = ''): Promise<ListResult> {
   let isTruncated = false;
 
   for (let page = 0; page < MAX_LIST_PAGES; page++) {
+    let facts = new Map<string, ListFacts>();
     const resp: ListObjectsV2CommandOutput = await sendCommand<ListObjectsV2CommandOutput>(
-      new ListObjectsV2Command({
-        Bucket: activeBucket,
-        Prefix: prefix || undefined,
-        Delimiter: '/',
-        ContinuationToken: continuationToken,
-      }),
+      listWithFacts(
+        {
+          Bucket: activeBucket,
+          Prefix: prefix || undefined,
+          Delimiter: '/',
+          ContinuationToken: continuationToken,
+        },
+        (parsed) => { facts = parsed; },
+      ),
       `List objects in bucket ${activeBucket}`
     );
 
@@ -189,11 +268,15 @@ export async function listObjects(prefix = ''): Promise<ListResult> {
     }
 
     for (const o of resp.Contents || []) {
+      const key = o.Key || '';
+      const listed = facts.get(key);
       allObjects.push({
-        key: o.Key || '',
+        key,
         size: o.Size || 0,
         lastModified: o.LastModified?.toISOString() || '',
         etag: o.ETag || '',
+        storageType: listed?.storageType,
+        storedSize: listed?.storedSize,
         headers: {},
       });
     }

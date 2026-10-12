@@ -1,13 +1,10 @@
 /**
  * What the object browser sends while it sits on a folder (cockroach scan
  * 2026-10-10, UI findings A, C and J). Each request here costs the proxy a
- * walk of the backend: the savings chip walks the folder's whole subtree, and
- * a table HEAD is two backend HEADs.
+ * walk of the backend: the savings chip walks the folder's whole subtree.
  *
  * - The savings chip loads once per folder: not on the 60 s auto-refresh,
  *   not after each bulk-delete batch, and a folder change aborts it.
- * - The table's HEAD enrichment keeps at most 6 requests in flight; a folder
- *   change aborts them and drops the queued ones.
  * - On another view (admin, upload, docs) the hook neither lists nor refreshes.
  *
  * S3 calls are stubbed at the s3client boundary; admin requests at fetch.
@@ -17,18 +14,9 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { json, mockFetch } from '../test/fetchMock';
 import { renderHookWithQuery } from '../test/render';
 
-interface HeldHead {
-  key: string;
-  signal?: AbortSignal;
-  settled: boolean;
-  answer: () => void;
-}
-
 const s3 = vi.hoisted(() => ({
   /** ListObjectsV2 runs of the browsed folder. */
   lists: 0,
-  /** Every table HEAD, in start order; each answers when the test says so. */
-  heads: [] as HeldHead[],
 }));
 
 vi.mock('../s3client', () => ({
@@ -39,23 +27,6 @@ vi.mock('../s3client', () => ({
     s3.lists++;
     return { objects: [], folders: ['builds/nightly/'], isTruncated: false };
   },
-  headObject: (key: string, _bucket?: string, signal?: AbortSignal) =>
-    new Promise((resolve, reject) => {
-      const head: HeldHead = {
-        key,
-        signal,
-        settled: false,
-        answer: () => {
-          head.settled = true;
-          resolve({ storageType: 'delta', storedSize: 1 });
-        },
-      };
-      signal?.addEventListener('abort', () => {
-        head.settled = true;
-        reject(signal.reason);
-      });
-      s3.heads.push(head);
-    }),
 }));
 
 import useS3Browser from '../useS3Browser';
@@ -85,7 +56,6 @@ const savings = json({
 let http: ReturnType<typeof mockFetch>;
 beforeEach(() => {
   s3.lists = 0;
-  s3.heads = [];
   http = mockFetch();
   http.on('GET', SAVINGS, savings);
   Object.defineProperty(document, 'hidden', { configurable: true, value: false });
@@ -134,7 +104,6 @@ async function minutesPass(minutes: number) {
 
 const savingsCalls = () => http.callsTo('GET', SAVINGS);
 const keys = (n: number, folder = 'builds/') => Array.from({ length: n }, (_, i) => `${folder}app-${i}.zip`);
-const inFlight = () => s3.heads.filter((h) => !h.settled);
 
 describe('savings chip', () => {
   test('loads once per folder, not on the 60 s auto-refresh', async () => {
@@ -200,64 +169,6 @@ describe('savings chip', () => {
       await new Promise((r) => setTimeout(r, 50));
     });
     expect(savingsCalls()).toHaveLength(before + 1);
-  });
-});
-
-describe('table HEAD enrichment', () => {
-  test('keeps at most 6 HEADs in flight and queues the rest', async () => {
-    const { result } = mount();
-    await waitFor(() => expect(result.current.loading).toBe(false));
-    const page = keys(50);
-    act(() => result.current.enrichKeys(page));
-    expect(s3.heads).toHaveLength(6);
-
-    let peak = 0;
-    while (s3.heads.length < 50 || inFlight().length > 0) {
-      peak = Math.max(peak, inFlight().length);
-      const next = inFlight()[0];
-      await act(async () => {
-        next.answer();
-      });
-      await waitFor(() => expect(inFlight().length).toBe(Math.min(6, 50 - s3.heads.filter((h) => h.settled).length)));
-    }
-    expect(peak).toBe(6);
-    expect(s3.heads.map((h) => h.key)).toEqual(page);
-    await waitFor(() => expect(Object.keys(result.current.headCache)).toHaveLength(50));
-    expect(result.current.headCache[page[49]]).toEqual({ storageType: 'delta', storedSize: 1, error: false });
-  });
-
-  test('a folder change aborts the HEADs in flight and drops the queued ones', async () => {
-    const { result, setProps } = mount();
-    await waitFor(() => expect(result.current.loading).toBe(false));
-    act(() => result.current.enrichKeys(keys(50)));
-    expect(s3.heads).toHaveLength(6);
-    expect(s3.heads.every((h) => h.signal && !h.signal.aborted)).toBe(true);
-
-    setProps({ prefix: 'other/' });
-    await waitFor(() => expect(s3.heads.every((h) => h.signal?.aborted)).toBe(true));
-    await act(async () => {
-      await new Promise((r) => setTimeout(r, 50));
-    });
-    expect(s3.heads).toHaveLength(6);
-    expect(result.current.headCache).toEqual({});
-  });
-
-  test('a newer page replaces the keys still queued for the older one', async () => {
-    const { result } = mount();
-    await waitFor(() => expect(result.current.loading).toBe(false));
-    act(() => result.current.enrichKeys(keys(50)));
-    const page2 = keys(10, 'builds/page2/');
-    act(() => result.current.enrichKeys(page2));
-    // The six HEADs of page 1 already run; page 1's other 44 keys are no
-    // longer on screen, so page 2's keys go next.
-    while (inFlight().length > 0) {
-      const next = inFlight()[0];
-      await act(async () => {
-        next.answer();
-      });
-    }
-    await waitFor(() => expect(s3.heads).toHaveLength(16));
-    expect(s3.heads.slice(6).map((h) => h.key)).toEqual(page2);
   });
 });
 

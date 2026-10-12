@@ -35,7 +35,9 @@ export function mockFetch() {
   const spy = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
     const path = url.replace(/^https?:\/\/[^/]+/, '');
-    const method = (init.method ?? 'GET').toUpperCase();
+    // The AWS SDK's browser build passes a Request and no init.
+    const request = typeof input === 'object' && 'method' in input ? input : undefined;
+    const method = (init.method ?? request?.method ?? 'GET').toUpperCase();
     let body: unknown = init.body;
     if (typeof body === 'string') {
       try {
@@ -45,10 +47,10 @@ export function mockFetch() {
       }
     }
     const headers: Record<string, string> = {};
-    new Headers(init.headers).forEach((v, k) => {
+    new Headers(init.headers ?? request?.headers).forEach((v, k) => {
       headers[k] = v;
     });
-    const req: RecordedRequest = { method, path, body, headers, signal: init.signal ?? undefined };
+    const req: RecordedRequest = { method, path, body, headers, signal: init.signal ?? request?.signal ?? undefined };
     calls.push(req);
     // Newest route first, so a test can override a default.
     for (let i = routes.length - 1; i >= 0; i--) {

@@ -712,7 +712,6 @@ export default function App() {
               isTruncated={s3.isTruncated}
               refreshing={s3.refreshing}
               headCache={s3.headCache}
-              onEnrichKeys={s3.enrichKeys}
               folderSizes={folderSize.sizes}
               virtualFolders={s3.virtualFolders}
               hasAdminSession={hasAdminSession}

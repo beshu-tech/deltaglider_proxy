@@ -18,7 +18,6 @@ vi.mock('../s3client', () => ({
     folders: ['builds/', 'nightly/'],
     isTruncated: false,
   }),
-  headObject: async () => ({ storageType: 'delta', storedSize: 1 }),
 }));
 
 import useS3Browser from '../useS3Browser';
@@ -43,7 +42,6 @@ function Harness({ freshArray = false }: { freshArray?: boolean }) {
       isTruncated={false}
       refreshing={false}
       headCache={s3.headCache}
-      onEnrichKeys={s3.enrichKeys}
       folderSizes={folderSize.sizes}
       virtualFolders={[]}
       hasAdminSession

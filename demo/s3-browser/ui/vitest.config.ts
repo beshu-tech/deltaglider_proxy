@@ -15,11 +15,15 @@ export default mergeConfig(
         },
         {
           extends: true,
+          resolve: { conditions: ['browser'], mainFields: ['browser', 'module', 'main'] },
           test: {
             name: 'dom',
             environment: 'jsdom',
             include: ['src/**/*.test.tsx'],
             setupFiles: ['src/test/setup.ts'],
+            // The AWS SDK in its browser build, as the bundle ships it: it
+            // sends through fetch, so mockFetch sees every S3 request.
+            server: { deps: { inline: [/@aws-sdk\//, /@smithy\//, /@aws-crypto\//] } },
             // Full AntD panels take seconds to mount in jsdom; the 5 s
             // default times out on a loaded machine or a 4-vCPU runner.
             testTimeout: 15_000,

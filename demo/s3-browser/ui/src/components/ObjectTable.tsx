@@ -1,7 +1,7 @@
 import type { CSSProperties } from 'react';
 import { useState, useEffect, useCallback, useRef, useMemo, useId } from 'react';
 import { Table, Typography, Alert, Progress, Checkbox, theme, Button, Select } from 'antd';
-import { FolderOutlined, FileOutlined, LoadingOutlined, CalculatorOutlined, CloseCircleOutlined, WarningOutlined } from '@ant-design/icons';
+import { FolderOutlined, FileOutlined, LoadingOutlined, CalculatorOutlined, CloseCircleOutlined } from '@ant-design/icons';
 import type { S3Object } from '../types';
 import { formatBytes, relativeTime } from '../utils';
 import type { ColumnsType, TableProps } from 'antd/es/table';
@@ -13,7 +13,7 @@ import { folderSizeText, folderSizeTitle } from '../folderSize';
 import { getPreviewMode } from './filePreviewMode';
 import { canRequestPrefixUsageScan, isVirtualFolderPrefix } from '../permissions';
 import { usePersistedPageSize } from '../usePersistedPageSize';
-import { clampPageToData, describeVisibleRange } from '../paginationLabels';
+import { describeVisibleRange } from '../paginationLabels';
 import StorageTypeTag from './StorageTypeTag';
 import { buildRows, sortRows, type BrowserRow, type SortColumn, type SortState } from '../browserNav';
 
@@ -49,8 +49,7 @@ interface Props {
   isMobile: boolean;
   isTruncated: boolean;
   refreshing: boolean;
-  headCache: Record<string, { storageType?: string; storedSize?: number; error?: boolean }>;
-  onEnrichKeys: (keys: string[]) => void;
+  headCache: Record<string, { storageType?: string; storedSize?: number }>;
   folderSizes: Record<string, FolderSizeState>;
   virtualFolders: string[];
   hasAdminSession: boolean;
@@ -175,7 +174,6 @@ export default function ObjectTable({
   isTruncated,
   refreshing,
   headCache,
-  onEnrichKeys,
   folderSizes,
   virtualFolders,
   hasAdminSession,
@@ -201,7 +199,7 @@ export default function ObjectTable({
   // sorts); `sortedRows` below is the one displayed order.
   const [sortState, setSortState] = useState<SortState | null>(null);
 
-  // THE displayed row order, shared by the Table, HEAD enrichment, the cursor
+  // THE displayed row order, shared by the Table, the cursor
   // page and (via onRowOrderChange) keyboard navigation. Memoised so a 10k-row
   // listing is not rebuilt on every render.
   const rows = useMemo(() => buildRows(folders, objects, prefix), [folders, objects, prefix]);
@@ -226,30 +224,10 @@ export default function ObjectTable({
   // Reset to page 1 when the data set changes shape: prefix navigation OR a
   // search/filter that shrinks (or grows) the row count. Depending on
   // `objects.length` rather than `objects` avoids a spurious reset on
-  // identity-only re-renders (e.g. HEAD enrichment replaces the array but
-  // keeps the same count). Without this, a search that drops 500 rows to 50
-  // while sitting on page 3 left `currentPage` stale and `enrichPage`
-  // computing an out-of-range slice against the shrunken list.
+  // identity-only re-renders (e.g. a refresh replaces the array but keeps
+  // the same count). Without this, a search that drops 500 rows to 50 while
+  // sitting on page 3 left `currentPage` stale.
   useEffect(() => { setCurrentPage(1); }, [prefix, objects.length]);
-
-  // Compute visible file keys for the current page (in DISPLAYED order) and
-  // request HEAD enrichment.
-  const enrichPage = useCallback((page: number, size: number) => {
-    // Clamp to the page actually backed by data: when a search shrinks the
-    // list, the page-reset effect and this enrich effect run in the same
-    // render pass with `currentPage` still stale, so without clamping `start`
-    // could land past the end and request keys that no longer exist.
-    const safePage = clampPageToData(page, sortedRows.length, size);
-    const fileKeys = sortedRows
-      .slice((safePage - 1) * size, safePage * size)
-      .flatMap((r) => (r._isFolder ? [] : [r.key]));
-    if (fileKeys.length > 0) onEnrichKeys(fileKeys);
-  }, [sortedRows, onEnrichKeys]);
-
-  // Enrich when page, page-size, sort or objects change
-  useEffect(() => {
-    if (objects.length > 0) enrichPage(currentPage, pageSize);
-  }, [currentPage, pageSize, objects.length, enrichPage]);
 
   const handleTableChange = useCallback<NonNullable<TableProps<RowData>['onChange']>>(
     (_pagination, _filters, sorter, extra) => {
@@ -486,12 +464,10 @@ export default function ObjectTable({
       responsive: ['sm'] as const,
       render: (_: unknown, record: RowData) => {
         if (record._isFolder) return null;
-        const cached = headCache[record.key];
-        if (!cached) return <LoadingOutlined style={{ fontSize: 12, color: TEXT_MUTED }} />;
-        if (cached.error) return <WarningOutlined title="Failed to load metadata" style={{ fontSize: 12, color: ACCENT_AMBER }} />;
+        // From the listing; a row without facts shows the neutral tag.
         return (
           <StorageTypeTag
-            storageType={cached.storageType}
+            storageType={headCache[record.key]?.storageType}
             colors={STORAGE_TYPE_COLORS}
             fallback={STORAGE_TYPE_DEFAULT}
           />

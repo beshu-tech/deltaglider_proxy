@@ -54,7 +54,6 @@ function Harness({ spies, extra }: { spies: Spies; extra?: React.ReactNode }) {
         isTruncated={false}
         refreshing={false}
         headCache={{}}
-        onEnrichKeys={() => {}}
         folderSizes={{}}
         virtualFolders={[]}
         hasAdminSession={false}
