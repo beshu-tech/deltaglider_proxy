@@ -291,45 +291,8 @@ pub fn spawn_event_consumer(
                 debug!("Event consumer skipped: replication disabled");
                 continue;
             }
-            // Seed the cursor at the current MAX(id) on first ENABLED boot so a
-            // fresh consumer does NOT replay the entire historical outbox as
-            // "new" — reconcile covers pre-existing state. Deliberately done
-            // AFTER the `enabled` gate: a webhook-only deployment (replication
-            // disabled) must never create a `replication` cursor row, because
-            // that row pins the webhook pruner's delete floor
-            // (`event_outbox_min_listener_cursor`) and would otherwise let the
-            // outbox grow without bound while replication never advances it.
-            seed_cursor_if_absent(&db).await;
-            // Single-flight: only the consumer-lease holder drains+advances the
-            // cursor. The outbox and its cursor are node-local, so this lease
-            // is node-local too (SQLite): it stops two consumers in one node's
-            // database (for example across a fast restart) from overlapping.
-            //
-            // The lease is acquired once per tick and NOT renewed mid-drain
-            // (unlike the reconcile worker's heartbeat). A drain exceeding the
-            // TTL can therefore let a second consumer (a fast restart) steal
-            // the lease and overlap on the same cursor window. That is intentionally tolerated
-            // because every action is idempotent: a re-Copy is gated by a dest
-            // HEAD + `should_replicate` (a no-op when current), and a re-Delete
-            // re-confirms source-absence + HEADs an already-absent dest. The cursor
-            // advance is monotonic (`MAX`), so overlap costs duplicate WORK, not
-            // correctness. The per-rule leases in `drain_once` are what exclude
-            // the scheduler, run-now and other instances.
-            let lease_ttl = super::scheduler::lease_ttl_secs(&replication);
-            let now = current_unix_seconds();
-            let acquired = {
-                let dbg = db.lock().await;
-                let _ = dbg.replication_ensure_state(CONSUMER_LEASE_KEY, now);
-                dbg.replication_try_acquire_lease(CONSUMER_LEASE_KEY, &instance_id, now, lease_ttl)
-                    .unwrap_or(false)
-            };
-            if !acquired {
-                debug!("Event consumer tick skipped: another instance holds the lease");
-                continue;
-            }
-
             let engine = state.engine.load_full();
-            drain_once(
+            consumer_tick(
                 &config,
                 &db,
                 &engine,
@@ -339,14 +302,142 @@ pub fn spawn_event_consumer(
                 &replication,
                 lease.as_ref(),
                 &instance_id,
-                now,
             )
             .await;
-
-            let dbg = db.lock().await;
-            let _ = dbg.replication_release_lease(CONSUMER_LEASE_KEY, &instance_id);
         }
     })
+}
+
+/// One tick of the consumer (replication enabled): seed the cursor, take
+/// the consumer lease, drain, release.
+#[allow(clippy::too_many_arguments)]
+async fn consumer_tick(
+    config: &SharedConfig,
+    db: &Arc<Mutex<ConfigDb>>,
+    engine: &Arc<crate::deltaglider::DynEngine>,
+    gate: &crate::maintenance::gate::MaintenanceGate,
+    health: Option<&crate::coordination::BackendHealthCache>,
+    backoff: &mut RuleBackoff,
+    replication: &crate::config_sections::ReplicationConfig,
+    lease: &(impl CoordinationLease + ?Sized),
+    instance_id: &str,
+) {
+    // Seed the cursor at the current MAX(id) on first ENABLED boot so a
+    // fresh consumer does NOT replay the entire historical outbox as
+    // "new" — reconcile covers pre-existing state. Deliberately done
+    // AFTER the `enabled` gate: a webhook-only deployment (replication
+    // disabled) must never create a `replication` cursor row, because
+    // that row pins the webhook pruner's delete floor
+    // (`event_outbox_min_listener_cursor`) and would otherwise let the
+    // outbox grow without bound while replication never advances it.
+    seed_cursor_if_absent(db).await;
+    // Nothing for any rule to do: the tick writes nothing (no lease row, no
+    // cursor re-assert) and, with an S3 lease, sends no lease request.
+    // Read-only; a failed read runs the tick.
+    if !consumer_has_work(&*db.lock().await, replication) {
+        debug!("Event consumer tick skipped: no new event");
+        return;
+    }
+    // Single-flight: only the consumer-lease holder drains+advances the
+    // cursor. The outbox and its cursor are node-local, so this lease
+    // is node-local too (SQLite): it stops two consumers in one node's
+    // database (for example across a fast restart) from overlapping.
+    //
+    // The lease is acquired once per tick and NOT renewed mid-drain
+    // (unlike the reconcile worker's heartbeat). A drain exceeding the
+    // TTL can therefore let a second consumer (a fast restart) steal
+    // the lease and overlap on the same cursor window. That is intentionally tolerated
+    // because every action is idempotent: a re-Copy is gated by a dest
+    // HEAD + `should_replicate` (a no-op when current), and a re-Delete
+    // re-confirms source-absence + HEADs an already-absent dest. The cursor
+    // advance is monotonic (`MAX`), so overlap costs duplicate WORK, not
+    // correctness. The per-rule leases in `drain_once` are what exclude
+    // the scheduler, run-now and other instances.
+    let lease_ttl = super::scheduler::lease_ttl_secs(replication);
+    let now = current_unix_seconds();
+    let acquired = {
+        let dbg = db.lock().await;
+        let _ = dbg.replication_ensure_state(CONSUMER_LEASE_KEY, now);
+        dbg.replication_try_acquire_lease(CONSUMER_LEASE_KEY, instance_id, now, lease_ttl)
+            .unwrap_or(false)
+    };
+    if !acquired {
+        debug!("Event consumer tick skipped: another instance holds the lease");
+        return;
+    }
+
+    drain_once(
+        config,
+        db,
+        engine,
+        gate,
+        health,
+        backoff,
+        replication,
+        lease,
+        instance_id,
+        now,
+    )
+    .await;
+
+    let dbg = db.lock().await;
+    let _ = dbg.replication_release_lease(CONSUMER_LEASE_KEY, instance_id);
+}
+
+/// Does a drain have anything to do? Read-only. A failed read counts as
+/// work, so the tick runs as before.
+fn consumer_has_work(
+    dbg: &ConfigDb,
+    replication: &crate::config_sections::ReplicationConfig,
+) -> bool {
+    let read = || -> Result<bool, crate::config_db::ConfigDbError> {
+        let global = dbg
+            .listener_cursor_load_full(REPLICATION_LISTENER)?
+            .map(|c| c.last_event_id);
+        let enabled: std::collections::BTreeSet<String> = replication
+            .rules
+            .iter()
+            .filter(|r| r.enabled)
+            .map(|r| rule_listener(&r.name))
+            .collect();
+        let mut rule_cursors = Vec::with_capacity(enabled.len());
+        for listener in &enabled {
+            rule_cursors.push(
+                dbg.listener_cursor_load_full(listener)?
+                    .map(|c| c.last_event_id),
+            );
+        }
+        let stale_rows = dbg
+            .listener_cursor_names_with_prefix(&format!("{REPLICATION_LISTENER}:"))?
+            .into_iter()
+            .any(|name| !enabled.contains(&name));
+        let max_id = dbg.event_outbox_max_id()?;
+        Ok(has_work(max_id, global, &rule_cursors, stale_rows))
+    };
+    read().unwrap_or(true)
+}
+
+/// Pure: work = a missing cursor row (global or an enabled rule's), a
+/// cursor row of a rule that is gone (the drain drops it), or an outbox row
+/// past the slowest cursor.
+fn has_work(
+    max_id: Option<i64>,
+    global: Option<i64>,
+    rule_cursors: &[Option<i64>],
+    stale_rows: bool,
+) -> bool {
+    let Some(global) = global else {
+        return true;
+    };
+    if stale_rows || rule_cursors.iter().any(Option::is_none) {
+        return true;
+    }
+    let slowest = rule_cursors
+        .iter()
+        .flatten()
+        .copied()
+        .fold(global, i64::min);
+    max_id.unwrap_or(0) > slowest
 }
 
 /// Seed the replication cursor to `MAX(event_outbox.id)` if it has no cursor yet
@@ -2062,6 +2153,104 @@ mod per_rule_cursor_tests {
 
     async fn cursor(db: &Arc<Mutex<ConfigDb>>, listener: &str) -> i64 {
         db.lock().await.listener_cursor_load(listener).unwrap()
+    }
+
+    /// One full consumer tick (seed, lease, drain, release) as the loop runs it.
+    async fn tick(
+        config: &crate::config::SharedConfig,
+        db: &Arc<Mutex<ConfigDb>>,
+        engine: &Arc<DynEngine>,
+        lease: &(impl CoordinationLease + ?Sized),
+    ) -> u64 {
+        let replication = config.read().await.replication.clone();
+        let gate = crate::maintenance::gate::MaintenanceGate::default();
+        let mut backoff = RuleBackoff::default();
+        let before = db.lock().await.conn.total_changes();
+        consumer_tick(
+            config,
+            db,
+            engine,
+            &gate,
+            None,
+            &mut backoff,
+            &replication,
+            lease,
+            "c",
+        )
+        .await;
+        db.lock().await.conn.total_changes() - before
+    }
+
+    #[test]
+    fn has_work_truth_table() {
+        // Caught up everywhere: idle.
+        assert!(!has_work(Some(5), Some(5), &[Some(5), Some(5)], false));
+        assert!(!has_work(None, Some(0), &[], false));
+        // A newer event than the slowest cursor (global or a rule).
+        assert!(has_work(Some(6), Some(5), &[Some(6)], false));
+        assert!(has_work(Some(6), Some(6), &[Some(6), Some(4)], false));
+        // A missing global or rule cursor row.
+        assert!(has_work(Some(5), None, &[Some(5)], false));
+        assert!(has_work(Some(5), Some(5), &[Some(5), None], false));
+        // The row of a removed rule.
+        assert!(has_work(Some(5), Some(5), &[Some(5)], true));
+        // Outbox pruned below the cursors: nothing to read.
+        assert!(!has_work(Some(3), Some(5), &[Some(5)], false));
+    }
+
+    /// P1.10: an idle tick (every cursor at the newest event) writes nothing:
+    /// no consumer lease row, no cursor re-assert. Before: 4 row writes per
+    /// tick, every tick (240 commits per hour at the default tick).
+    #[tokio::test]
+    async fn an_idle_consumer_tick_writes_nothing() {
+        let (_dir, db, config, engine) = fixture(vec![rule("a", "dst-a")]).await;
+        let lease = crate::coordination::LocalLease::new(db.clone());
+        put(&db, &engine, "k1").await;
+        tick(&config, &db, &engine, &lease).await; // seeds past history
+        let id = put(&db, &engine, "k2").await;
+        assert!(
+            tick(&config, &db, &engine, &lease).await > 0,
+            "new event: work"
+        );
+        assert_eq!(cursor(&db, &rule_listener("a")).await, id);
+        // The copy appended its own ReplicationObjectCopied event: work.
+        let id = db.lock().await.event_outbox_max_id().unwrap().unwrap();
+        assert!(tick(&config, &db, &engine, &lease).await > 0, "copy event");
+        assert_eq!(tick(&config, &db, &engine, &lease).await, 0, "idle tick");
+
+        // A rule without a cursor row is work: its cursor is created.
+        config
+            .write()
+            .await
+            .replication
+            .rules
+            .push(rule("b", "dst-b"));
+        assert!(
+            tick(&config, &db, &engine, &lease).await > 0,
+            "new rule: work"
+        );
+        assert_eq!(cursor(&db, &rule_listener("b")).await, id);
+        assert_eq!(tick(&config, &db, &engine, &lease).await, 0, "idle again");
+
+        // A removed rule's cursor row is work: it is dropped (it would pin
+        // the prune floor).
+        config
+            .write()
+            .await
+            .replication
+            .rules
+            .retain(|r| r.name == "a");
+        assert!(
+            tick(&config, &db, &engine, &lease).await > 0,
+            "stale row: work"
+        );
+        assert!(db
+            .lock()
+            .await
+            .listener_cursor_load_full(&rule_listener("b"))
+            .unwrap()
+            .is_none());
+        assert_eq!(tick(&config, &db, &engine, &lease).await, 0, "idle again");
     }
 
     /// Rule "a" is busy on another worker. Before: one global cursor, so rule
