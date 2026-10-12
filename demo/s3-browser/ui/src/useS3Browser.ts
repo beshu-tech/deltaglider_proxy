@@ -150,11 +150,15 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
   const filteredObjects = query ? objects.filter((o) => o.key.toLowerCase().includes(query)) : objects;
 
   // Filter hidden DG system folders unless showHidden is on
-  const visibleFolders = showHidden ? folders : folders.filter(d => {
-    const name = d.replace(/\/$/, '').split('/').pop() ?? '';
-    return name !== '.deltaglider' && name !== '.dg';
-  });
-  const filteredFolders = query ? visibleFolders.filter((f) => f.toLowerCase().includes(query)) : visibleFolders;
+  // Memoized: ObjectTable's folder-size effect depends on this array, and a
+  // fresh array per render made that effect send GET /usage in a loop.
+  const filteredFolders = useMemo(() => {
+    const visibleFolders = showHidden ? folders : folders.filter(d => {
+      const name = d.replace(/\/$/, '').split('/').pop() ?? '';
+      return name !== '.deltaglider' && name !== '.dg';
+    });
+    return query ? visibleFolders.filter((f) => f.toLowerCase().includes(query)) : visibleFolders;
+  }, [folders, showHidden, query]);
   const filteredVirtualFolders = filteredFolders.filter((folder) => virtualFolders.includes(folder));
 
   const selection = useSelection(filteredObjects, filteredFolders);

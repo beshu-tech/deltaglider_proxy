@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed — The file browser no longer sends folder-size requests in a loop
+
+When a folder had a cached size scan, opening it made the browser send
+`GET /_/api/admin/usage` requests without end, hundreds per second, for as long
+as the folder stayed open. The table asked for the folder sizes each time its
+list of folders changed, and the browser built a new list on every render, so
+each answer started the next request. Now the browser sends one request per
+folder visit.
+
 ## v2.0.8 — 2026-10-12
 
 ### Fixed — A list that finds nothing no longer sends a `HeadBucket` request every time

@@ -275,12 +275,19 @@ export default function ObjectTable({
     [setPageSize],
   );
 
-  // Auto-populate folder sizes from cached scanner results
+  // Auto-populate folder sizes from cached scanner results: one request per
+  // distinct folder list. The effect matches on the list's content, not its
+  // identity, so a parent that rebuilds the array each render cannot turn it
+  // into a request loop.
+  const foldersKey = folders.join('\n');
+  const foldersRef = useRef(folders);
+  foldersRef.current = folders;
   useEffect(() => {
-    if (folders.length > 0 && onAutoPopulateSizes) {
-      onAutoPopulateSizes(prefix, folders);
+    const current = foldersRef.current;
+    if (current.length > 0 && onAutoPopulateSizes) {
+      onAutoPopulateSizes(prefix, current);
     }
-  }, [prefix, folders, onAutoPopulateSizes]);
+  }, [prefix, foldersKey, onAutoPopulateSizes]);
 
   // Scroll container for the keyboard-cursor scroll-into-view (effect below,
   // after `dataSource` is computed).
