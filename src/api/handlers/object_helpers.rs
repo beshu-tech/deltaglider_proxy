@@ -224,6 +224,7 @@ pub(crate) async fn store_client_server_copy(
                 (copy.bucket, copy.key),
                 copy.source_head,
                 metadata,
+                None,
             )
             .await
             .map_err(|e| match e {

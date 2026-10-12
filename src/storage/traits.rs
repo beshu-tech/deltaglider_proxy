@@ -201,6 +201,19 @@ pub enum CopyOutcome {
     Unsupported,
 }
 
+/// Pure: may a backend below every wrapper copy bytes stored with the
+/// metadata `source` under the metadata `metadata`? Only when both name the
+/// same at-rest encryption (the same marker and key id, or none): a
+/// ciphertext copied under metadata without its marker would be served as
+/// plaintext. The encrypting wrapper restates the source's markers when it
+/// forwards a copy, so a copy that no wrapper checked fails here.
+pub fn copy_keeps_encryption(source: &FileMetadata, metadata: &FileMetadata) -> bool {
+    use crate::storage::encrypting::{ENCRYPTION_KEY_ID_KEY, ENCRYPTION_MARKER_KEY};
+    [ENCRYPTION_MARKER_KEY, ENCRYPTION_KEY_ID_KEY]
+        .iter()
+        .all(|k| source.user_metadata.get(*k) == metadata.user_metadata.get(*k))
+}
+
 /// Pure: does `current` (the source as the backend holds it now) still
 /// hold the generation that `pin` (the caller's read of it) saw? The
 /// logical content must match (`DeltaGliderEngine::same_generation`),

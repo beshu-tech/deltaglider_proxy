@@ -43,13 +43,13 @@ pub use s3::{
     DELEGATED_LIST_UPSTREAM_PAGES, LISTING_FACTS_MISSES, LISTING_FACTS_REQUESTS,
 };
 pub use traits::{
-    clamp_range, io_error_is_name_too_long, io_error_is_path_type_conflict, open_object_by_parts,
-    open_passthrough_range_by_parts, open_reference_source_by_parts, reference_fence_lost,
-    same_stored_generation, unfenced_reference_fence, unfenced_reference_fence_with_metadata,
-    unfenced_reference_write, BucketListing, BulkListing, ByteStream, CopyOutcome,
-    DelegatedListResult, DynStorageBackend, ListedForms, MultipartUpload, ObjectAt, ObjectVariant,
-    RefFence, RefWrite, ReferenceSource, RewriteBasis, StorageBackend, StorageError, StoredObject,
-    UploadedPart,
+    clamp_range, copy_keeps_encryption, io_error_is_name_too_long, io_error_is_path_type_conflict,
+    open_object_by_parts, open_passthrough_range_by_parts, open_reference_source_by_parts,
+    reference_fence_lost, same_stored_generation, unfenced_reference_fence,
+    unfenced_reference_fence_with_metadata, unfenced_reference_write, BucketListing, BulkListing,
+    ByteStream, CopyOutcome, DelegatedListResult, DynStorageBackend, ListedForms, MultipartUpload,
+    ObjectAt, ObjectVariant, RefFence, RefWrite, ReferenceSource, RewriteBasis, StorageBackend,
+    StorageError, StoredObject, UploadedPart,
 };
 
 tokio::task_local! {

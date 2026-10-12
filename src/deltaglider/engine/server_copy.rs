@@ -5,6 +5,7 @@
 //! of the same object does around its write (the deltaspace lock, the
 //! usage counter, the other stored form, the metadata cache).
 
+use super::usage::CounterPrior;
 use super::*;
 use crate::storage::{CopyOutcome, ObjectAt, ObjectVariant};
 
@@ -18,13 +19,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// the bytes. A source that changed since `source` is
     /// `PreconditionFailed`. The caller decides that the destination stores
     /// the object as it is (no delta) and holds the object's write lock
-    /// when the write is a client's.
+    /// when the write is a client's. `prior`: what the destination key
+    /// holds, when the caller read it (`None`: read here).
     pub async fn copy_passthrough_within(
         &self,
         src: (&str, &str),
         dst: (&str, &str),
         source: &FileMetadata,
         metadata: FileMetadata,
+        prior: Option<CounterPrior>,
     ) -> Result<Option<StoreResult>, EngineError> {
         if !matches!(source.storage_info, StorageInfo::Passthrough)
             || !matches!(metadata.storage_info, StorageInfo::Passthrough)
@@ -39,9 +42,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
         self.ensure_within_passthrough_ceiling(source.file_size)?;
         let (dst_key, dst_ds) = self.validated_key_ingest(dst.0, dst.1)?;
-        self.metadata_cache.invalidate(dst.0, dst.1);
-        let prior = self.prior_for_counter(dst.0, dst.1).await;
+        let prior = match prior {
+            Some(prior) => prior,
+            None => self.prior_for_counter(dst.0, dst.1).await,
+        };
         let _guard = self.acquire_prefix_lock(dst.0, &dst_ds).await;
+        // The metadata cache keeps the destination's entry until the copy
+        // commits: a copy that is `Unsupported` falls back to a read of
+        // the same object (a self-copy), and that read uses the entry.
         let outcome = self
             .storage
             .copy_within(
@@ -59,7 +67,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 source,
                 &metadata,
             )
-            .await?;
+            .await
+            .inspect_err(|_| self.metadata_cache.invalidate(dst.0, dst.1))?;
         if outcome == CopyOutcome::Unsupported {
             return Ok(None);
         }

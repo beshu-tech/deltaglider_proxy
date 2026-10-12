@@ -2382,6 +2382,8 @@ mod tests {
             let plan = copy_plan(&engine, &keys);
             let state = AppState::for_tests(engine);
             fake.set_put_delay_ms(50);
+            // A server-side copy (CopyObject) writes as a PUT does.
+            fake.set_delay_ms("COPY", 50);
 
             let (res, copied) = run_copy_loop(&state, &plan, &BulkActor::Unrestricted, false).await;
 
@@ -2392,8 +2394,8 @@ mod tests {
                 res.failures
             );
             assert!(copied.iter().all(Option::is_some));
-            let peak = fake.peak_puts_in_flight();
-            eprintln!("peak PUTs in flight: {peak}");
+            let peak = fake.peak_puts_in_flight().max(fake.peak_in_flight("COPY"));
+            eprintln!("peak writes in flight: {peak}");
             assert!(peak > 1, "the folders were copied one after another");
             let engine = state.engine.load();
             for key in &keys {

@@ -74,6 +74,7 @@ impl S3Backend {
         if self
             .copy_unsupported
             .load(std::sync::atomic::Ordering::Relaxed)
+            || !crate::storage::copy_keeps_encryption(source, metadata)
         {
             return Ok(CopyOutcome::Unsupported);
         }

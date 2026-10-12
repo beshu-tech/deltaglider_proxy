@@ -125,6 +125,10 @@ pub(crate) enum CopyStrategy {
     StreamedPassthrough,
     /// A passthrough source was buffered then re-stored.
     BufferedPassthrough,
+    /// The backend copied a passthrough source itself
+    /// ([`crate::storage::StorageBackend::copy_within`]): no byte passed
+    /// through the proxy.
+    ServerSide,
 }
 
 impl CopyStrategy {
@@ -134,6 +138,7 @@ impl CopyStrategy {
             CopyStrategy::Reconstructed => "reconstructed",
             CopyStrategy::StreamedPassthrough => "streamed_passthrough",
             CopyStrategy::BufferedPassthrough => "buffered_passthrough",
+            CopyStrategy::ServerSide => "server_side",
         }
     }
 }
@@ -273,6 +278,18 @@ async fn copy_object_once(
     source_head: &crate::types::FileMetadata,
     prior: Option<&crate::deltaglider::CounterPrior>,
 ) -> Result<ObjectTransferOutcome, CopyError> {
+    // A passthrough source that the destination stores as it is: the
+    // backend copies it itself when it can (same backend instance, same
+    // encryption key); no byte passes through the proxy.
+    if matches!(
+        source_head.storage_info,
+        crate::types::StorageInfo::Passthrough
+    ) {
+        if let Some(outcome) = server_side_copy(engine, request, source_head, prior).await? {
+            return Ok(outcome);
+        }
+    }
+
     // Large passthrough on a native-multipart destination → stream via
     // multipart with per-part range-resume (bounded memory). Delta /
     // reference / small / proxy-AES-destination objects keep the buffered
@@ -1342,6 +1359,47 @@ pub(crate) fn destination_metadata(
     meta.multipart_etag = fields.multipart_etag;
     strip_encryption_markers(&mut meta.user_metadata);
     Some(meta)
+}
+
+/// Copy a passthrough source with [`DynEngine::copy_passthrough_within`]
+/// when the destination stores it as it is. `Ok(None)`: not possible here
+/// (a key that tries a delta, a foreign source, another backend or key, a
+/// provider without CopyObject); nothing was written.
+async fn server_side_copy(
+    engine: &Arc<DynEngine>,
+    request: ObjectTransferRequest<'_>,
+    source_head: &crate::types::FileMetadata,
+    prior: Option<&crate::deltaglider::CounterPrior>,
+) -> Result<Option<ObjectTransferOutcome>, CopyError> {
+    let fields = DestinationFields::of_transfer(&request, source_head);
+    if engine.write_tries_delta(
+        request.destination_bucket,
+        request.destination_key,
+        &fields.user_metadata,
+    ) {
+        return Ok(None);
+    }
+    let dest = crate::types::ObjectKey::parse(request.destination_bucket, request.destination_key);
+    let Some(metadata) = destination_metadata(source_head, &dest.filename, fields) else {
+        return Ok(None);
+    };
+    let copied = engine
+        .copy_passthrough_within(
+            (request.source_bucket, request.source_key),
+            (request.destination_bucket, request.destination_key),
+            source_head,
+            metadata,
+            prior.cloned(),
+        )
+        .await
+        .map_err(|e| CopyError::engine("server-side copy failed", e))?;
+    Ok(copied.map(|_| ObjectTransferOutcome {
+        bytes_copied: 0,
+        strategy: CopyStrategy::ServerSide,
+        source_storage_label: source_head.storage_info.label(),
+        source_file_size: source_head.file_size,
+        bytes_egress_saved: 0,
+    }))
 }
 
 /// A delta the fast path shipped.
@@ -3297,9 +3355,12 @@ mod request_count_tests {
             "{heads} HEAD requests for one copy: {:?}",
             fake.requests()
         );
+        // The one source HEAD is the server-side copy's generation pin,
+        // sent instead of a GET of the body; the caller's read is not
+        // repeated.
         assert_eq!(
-            count(&fake, "HEAD /src/"),
-            0,
+            (count(&fake, "HEAD /src/"), count(&fake, "GET /src/")),
+            (1, 0),
             "the copy HEADed a source the caller had read: {:?}",
             fake.requests()
         );
@@ -3308,8 +3369,8 @@ mod request_count_tests {
             .await
             .unwrap();
         assert!(
-            count(&fake, "HEAD /src/") <= 2,
-            "one source HEAD per copy: {:?}",
+            count(&fake, "HEAD /src/") <= 3,
+            "one source HEAD per copy, and the pin: {:?}",
             fake.requests()
         );
     }
@@ -3465,6 +3526,46 @@ mod request_count_tests {
         assert_eq!(row.object_count, 2, "c.zip + b.zip once");
     }
 
+    /// P5.2: a background copy of a passthrough object inside one backend
+    /// (replication, lifecycle, migrate, re-encrypt with the same key, the
+    /// admin bulk copy) is a server-side copy: no byte passes through the
+    /// proxy, and the destination is the object the store path writes
+    /// (here a replica: the same metadata as its source, created-at kept).
+    #[tokio::test]
+    async fn a_passthrough_copy_inside_one_backend_moves_no_bytes() {
+        let usage = Arc::new(BucketUsage::in_memory().unwrap());
+        let (engine, fake) = s3_engine(Some(usage.clone())).await;
+        let body = versioned(9, 128 * 1024);
+        engine
+            .store(
+                "src",
+                "pics/a.jpg",
+                &body,
+                Some("image/jpeg".into()),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let source = engine.head("src", "pics/a.jpg").await.unwrap();
+        fake.clear();
+        let outcome = copy_object_from(&engine, request("pics/a.jpg"), Some(&source))
+            .await
+            .unwrap();
+        assert_eq!(outcome.strategy, CopyStrategy::ServerSide);
+        assert_eq!(outcome.content_length(), body.len() as u64);
+        assert_eq!(fake.bytes(), (0, 0), "{:#?}", fake.requests());
+        let copied = engine.head("dst", "pics/a.jpg").await.unwrap();
+        let fields = |m: &crate::types::FileMetadata| serde_json::to_value(m).unwrap();
+        assert_eq!(fields(&copied), fields(&source));
+        assert_eq!(engine.retrieve("dst", "pics/a.jpg").await.unwrap().0, body);
+        usage.flush_pending();
+        let row = usage.read("dst").unwrap().unwrap();
+        assert_eq!(
+            (row.object_count, row.logical_bytes),
+            (1, body.len() as u64)
+        );
+    }
+
     /// Blast finding 6: the SDK already sends a throttled PUT three times;
     /// the copy loop sent the whole copy three times on top: 9 PUTs of the
     /// body to a backend that asked to slow down.
@@ -3490,11 +3591,13 @@ mod request_count_tests {
             .await
             .unwrap();
         fake.fail("PUT", "dst/", 503, "SlowDown", u32::MAX);
+        fake.fail("COPY", "dst/", 503, "SlowDown", u32::MAX);
         fake.clear();
         assert!(copy_object_with_retries(&engine, request("k.bin"))
             .await
             .is_err());
+        // A PUT or a server-side copy (also a PUT request).
         let puts = count(&fake, "PUT /dst/");
-        assert!(puts <= 3, "{puts} PUTs for one throttled copy");
+        assert!(puts <= 3, "{puts} writes for one throttled copy");
     }
 }

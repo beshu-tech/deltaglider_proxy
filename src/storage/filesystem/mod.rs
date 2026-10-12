@@ -1332,6 +1332,9 @@ impl StorageBackend for FilesystemBackend {
         source: &FileMetadata,
         metadata: &FileMetadata,
     ) -> Result<CopyOutcome, StorageError> {
+        if !crate::storage::copy_keeps_encryption(source, metadata) {
+            return Ok(CopyOutcome::Unsupported);
+        }
         self.require_bucket_exists(dst.bucket).await?;
         let path_of = |at: ObjectAt<'_>| match variant {
             ObjectVariant::Delta => self.delta_path(at.bucket, at.prefix, at.filename),

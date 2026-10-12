@@ -361,7 +361,8 @@ async fn migrate_verify_heads_the_listed_source_form() {
 /// target's prior (2; on a `__dgmigrate_` staging bucket it reads none
 /// but DELETEs the other form). The skip check's target HEAD is the
 /// store's prior, and the source HEAD reads the one form that the listing
-/// saw: 10 -> 7 requests; the verify HEADs only the written form: 6.
+/// saw: 10 -> 7 requests; the verify HEADs only the written form: 6;
+/// a server-side copy (one backend): 5, and no byte through the proxy.
 #[tokio::test]
 async fn migrate_copy_reuses_the_skip_check_as_the_prior() {
     use super::super::worker::cost_tests::{object_ops, object_requests};
@@ -378,11 +379,13 @@ async fn migrate_copy_reuses_the_skip_check_as_the_prior() {
             object_ops(&e.fake, "t", &key),
         );
         let total = object_requests(&e.fake, "b", &key) + object_requests(&e.fake, "t", &key);
-        // Target: HEAD both forms (the check, then the prior), PUT, HEAD
-        // of the written form (the copy's verify). Source: HEAD (the
-        // listed form), GET.
-        assert_eq!(total, 6, "{key}: source {src:?} target {dst:?}");
-        assert_eq!(src.get("HEAD"), Some(&1), "{key}: source {src:?}");
+        // Source and target on one backend: a server-side copy. Target:
+        // HEAD both forms (the check, then the prior), CopyObject. Source:
+        // HEAD (the listed form), HEAD (the copy's generation pin); no
+        // GET, no PUT: no byte passes through the proxy.
+        assert_eq!(total, 5, "{key}: source {src:?} target {dst:?}");
+        assert_eq!(src.get("HEAD"), Some(&2), "{key}: source {src:?}");
+        assert_eq!(dst.get("COPY"), Some(&1), "{key}: target {dst:?}");
         assert_eq!(dst.get("DELETE"), None, "{key}: target {dst:?}");
     }
 }

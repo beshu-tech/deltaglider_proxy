@@ -2754,6 +2754,7 @@ storage:
             f.put(&format!("k{i:02}.bin")).await;
         }
         f.fake.fail("PUT", "dst/", 503, "SlowDown", u32::MAX);
+        f.fake.fail("COPY", "dst/", 503, "SlowDown", u32::MAX);
         f.fake.clear();
         f.drain(None).await;
         let first = f.count(|r| r.starts_with("GET /src/"));
