@@ -10,8 +10,6 @@ import {
   movingAverageSpeedBps,
   uploadDisplayPath,
   uploadRetryAdvice,
-  startAfterProbe,
-  folderEmptyFromListing,
 } from '../uploadTelemetry';
 
 test('uploadRetryAdvice: never / retry / after-fix classification', () => {
@@ -42,53 +40,6 @@ test('uploadRetryAdvice: never / retry / after-fix classification', () => {
   assert.equal(A(503, 'SlowDown'), 'retry');
   assert.equal(A(429, undefined), 'retry');
   assert.equal(A(408, 'RequestTimeout'), 'retry');
-});
-
-test('startAfterProbe: cancel while the folder probe runs never starts the upload', async () => {
-  {
-    const ac = new AbortController();
-    let started = 0;
-    let release!: (v: boolean) => void;
-    const probe = new Promise<boolean>((r) => {
-      release = r;
-    });
-    const run = startAfterProbe(probe, ac.signal, async () => {
-      started++;
-      return 'done';
-    });
-    ac.abort();
-    release(true);
-    await assert.rejects(run, (e: unknown) => e instanceof Error && e.name === 'AbortError');
-    assert.equal(started, 0, 'aborted during the probe: no upload');
-  }
-  {
-    const ac = new AbortController();
-    ac.abort();
-    let started = 0;
-    await assert.rejects(
-      startAfterProbe(Promise.resolve(true), ac.signal, async () => {
-        started++;
-      }),
-      (e: unknown) => e instanceof Error && e.name === 'AbortError',
-    );
-    assert.equal(started, 0, 'aborted before: no upload');
-  }
-  {
-    const ac = new AbortController();
-    assert.equal(
-      await startAfterProbe(Promise.reject(new Error('list failed')), ac.signal, async () => 'done'),
-      'done',
-      'a failed probe does not block the upload',
-    );
-  }
-});
-
-test('folderEmptyFromListing: a baseline is per directory', () => {
-  // A baseline is per directory: only objects directly in the folder count.
-  assert.equal(folderEmptyFromListing({ objects: 0, truncated: false }), true, 'only subfolders, all listed');
-  assert.equal(folderEmptyFromListing({ objects: 2, truncated: false }), false);
-  assert.equal(folderEmptyFromListing({ objects: 1, truncated: true }), false);
-  assert.equal(folderEmptyFromListing({ objects: 0, truncated: true }), undefined, 'page full of subfolders: not known');
 });
 
 test('uploadDisplayPath: folder uploads show the path under the destination', () => {

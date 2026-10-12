@@ -133,6 +133,44 @@ export function disconnect() {
 
 let cachedClient: S3Client | null = null;
 
+/** The response headers in which the proxy tells a writer how it stored the object. */
+const WRITE_FACT_HEADERS = [
+  'x-amz-storage-type',
+  'x-deltaglider-stored-size',
+  'x-deltaglider-ref-sha256',
+  'x-deltaglider-baseline',
+] as const;
+/** The write-fact headers of a write, by lower-case name (absent = not sent). */
+export type WriteFacts = Partial<Record<(typeof WRITE_FACT_HEADERS)[number], string>>;
+const WRITE_FACTS = Symbol('dgWriteFacts');
+const WRITE_COMMANDS = new Set(['PutObjectCommand', 'CompleteMultipartUploadCommand']);
+
+/**
+ * Keep the write-fact response headers of PutObject and
+ * CompleteMultipartUpload on the command output (under a symbol, which the
+ * lib-storage `Upload` result keeps: it spreads the PutObject output). Runs
+ * outside the deserializer, which leaves the raw response next to the output.
+ */
+function captureWriteFacts(client: S3Client) {
+  client.middlewareStack.add(
+    ((next: (args: unknown) => Promise<{ output: object; response: unknown }>, context: { commandName?: string }) =>
+      async (args: unknown) => {
+        const result = await next(args);
+        if (WRITE_COMMANDS.has(context.commandName ?? '')) {
+          const headers = (result.response as { headers?: Record<string, string> }).headers ?? {};
+          const facts: WriteFacts = {};
+          for (const name of WRITE_FACT_HEADERS) {
+            const value = headers[name];
+            if (value !== undefined) facts[name] = value;
+          }
+          (result.output as Record<symbol, WriteFacts>)[WRITE_FACTS] = facts;
+        }
+        return result;
+      }) as never,
+    { step: 'deserialize', priority: 'high', name: 'dgWriteFacts' },
+  );
+}
+
 function getClient(): S3Client {
   if (!cachedClient) {
     const creds = getCredentials();
@@ -142,6 +180,7 @@ function getClient(): S3Client {
       credentials: { accessKeyId: creds.accessKeyId, secretAccessKey: creds.secretAccessKey },
       forcePathStyle: true,
     });
+    captureWriteFacts(cachedClient);
   }
   return cachedClient;
 }
@@ -410,11 +449,16 @@ function nowMs(): number {
   return Date.now();
 }
 
+/**
+ * Upload one object (multipart when large). Resolves with the storage facts
+ * the proxy sent on the PutObject or CompleteMultipartUpload response, or
+ * undefined when the upload was cancelled.
+ */
 export async function uploadObject(
   key: string,
   data: Blob | ArrayBuffer,
   options: UploadObjectOptions = {},
-): Promise<void> {
+): Promise<WriteFacts | undefined> {
   const body = data instanceof Blob ? data : new Uint8Array(data);
   const contentType = data instanceof Blob && data.type ? data.type : 'application/octet-stream';
   const totalBytes = data instanceof Blob ? data.size : data.byteLength;
@@ -501,7 +545,7 @@ export async function uploadObject(
       });
     });
 
-    await upload.done();
+    const output = await upload.done();
     const atMs = nowMs();
     lastTelemetry = emitTelemetry(options.onTelemetry, {
       ...lastTelemetry,
@@ -519,6 +563,7 @@ export async function uploadObject(
       elapsedMs: Math.max(0, atMs - startedAtMs),
       updatedAtMs: atMs,
     });
+    return (output as unknown as Record<symbol, WriteFacts | undefined>)[WRITE_FACTS] ?? {};
   } catch (err) {
     const atMs = nowMs();
     if (options.signal?.aborted) {
@@ -764,23 +809,6 @@ export async function countBucketObjects(
     `Count objects in bucket ${name}`,
   );
   return { count: resp.KeyCount ?? resp.Contents?.length ?? 0, truncated: Boolean(resp.IsTruncated) };
-}
-
-/**
- * Objects stored DIRECTLY in the folder `prefix` (one delimiter listing page
- * of at most `cap` entries; subfolders are not counted). Subfolder entries
- * share the page, so `truncated` with zero objects means "not known".
- */
-export async function listDirectObjects(
-  bucket: string,
-  prefix: string,
-  cap: number,
-): Promise<{ objects: number; truncated: boolean }> {
-  const resp = await sendCommand<ListObjectsV2CommandOutput>(
-    new ListObjectsV2Command({ Bucket: bucket, MaxKeys: cap, Delimiter: '/', ...(prefix ? { Prefix: prefix } : {}) }),
-    `List ${bucket}/${prefix}`,
-  );
-  return { objects: resp.Contents?.length ?? 0, truncated: Boolean(resp.IsTruncated) };
 }
 
 export async function deleteBucket(name: string): Promise<void> {

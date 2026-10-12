@@ -8,13 +8,13 @@ export interface UploadStatsInput {
   status: string;
   originalSize: number;
   /**
-   * Bytes the proxy stored, from a HEAD after the upload (`dg-delta-size`
-   * for a delta, else the original size). `undefined` = HEAD pending or failed.
+   * Bytes the proxy stored, from the write response
+   * (`x-deltaglider-stored-size`). `undefined` = pending, or not sent.
    */
   storedSize?: number;
   /**
-   * Set when this upload became its folder's baseline (see
-   * `isBaselineObject`): the proxy stored the whole file once more as the
+   * Set when this upload created its folder's baseline (see
+   * `uploadCreatedBaseline`): the proxy stored the whole file once more as the
    * folder's reference. One value per folder baseline, so two uploads that
    * report the same baseline count it once.
    */

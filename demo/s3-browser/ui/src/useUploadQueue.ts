@@ -1,11 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { getBucket, headObject, listDirectObjects, uploadObject, type UploadTelemetry } from './s3client';
+import { getBucket, uploadObject, type UploadTelemetry } from './s3client';
 import { uploadSessionStats } from './uploadStats';
 import { uploadCreatedBaseline } from './savings';
 import {
   clampPercent,
-  folderEmptyFromListing,
-  startAfterProbe,
   mergeTotalBytes,
   uploadRetryAdvice,
   type UploadRetryAdvice,
@@ -36,7 +34,7 @@ export interface UploadQueueItem {
   completingSinceMs: number | null;
   updatedAtMs: number | null;
   durationMs: number | null;
-  /** Bytes the proxy stored (HEAD after success); undefined = pending/unknown. */
+  /** Bytes the proxy stored (from the write response); undefined = pending/unknown. */
   storedSize?: number;
   /** Set when this upload became its folder's baseline (see uploadStats.ts). */
   baselineKey?: string;
@@ -100,9 +98,6 @@ export default function useUploadQueue(destination: string) {
   // until the root-cause investigation in the spawned task pins down
   // the timer; per-file 4-part queue still governs throughput.
   const maxConcurrentFiles = 1;
-  // `${bucket}|${folder}` -> "held no objects before this session's first
-  // upload into it". Probed once, before that first upload starts.
-  const folderWasEmptyRef = useRef(new Map<string, Promise<boolean | undefined>>());
 
   useEffect(
     () => () => {
@@ -162,49 +157,35 @@ export default function useUploadQueue(destination: string) {
 
     const folder = item.key.includes('/') ? item.key.slice(0, item.key.lastIndexOf('/')) : '';
     const folderKey = `${item.bucket}|${folder}`;
-    if (!folderWasEmptyRef.current.has(folderKey)) {
-      folderWasEmptyRef.current.set(
-        folderKey,
-        listDirectObjects(item.bucket, folder ? `${folder}/` : '', 100)
-          .then(folderEmptyFromListing)
-          .catch(() => undefined),
-      );
-    }
-    const folderWasEmpty = folderWasEmptyRef.current.get(folderKey)!;
 
-    // Cancel during the probe must stop the upload before it starts.
-    startAfterProbe(folderWasEmpty, controller.signal, () => uploadObject(item.key, item.file, {
+    uploadObject(item.key, item.file, {
       bucket: item.bucket,
       signal: controller.signal,
       onTelemetry: (telemetry) => patch(item.id, (entry) => withTelemetry(entry, telemetry)),
-    }))
-      .then(() => {
-        patch(item.id, (entry) => ({
-          ...entry,
-          status: entry.status === 'cancelled' ? 'cancelled' : 'success',
-          percent: 100,
-          transferredBytes: entry.totalBytes,
-          completedParts: entry.totalParts,
-          inFlightParts: 0,
-          activeConnections: 0,
-          completingSinceMs: null,
-        }));
+    })
+      .then((facts = {}) => {
         // The browser only knows logical bytes; the proxy decides delta vs
-        // passthrough. HEAD the object for the stored size the inspector shows
-        // (`dg-delta-size` for a delta, else the full object). A failed HEAD
-        // leaves it unknown, and the page shows "—" instead of a guess.
-        Promise.all([headObject(item.key, item.bucket), folderWasEmpty])
-          .then(([{ headers, storedSize }, wasEmpty]) => {
-            const baselineKey = uploadCreatedBaseline(headers, wasEmpty)
-              ? `${folderKey}|${headers['x-amz-meta-dg-ref-sha256']}`
-              : undefined;
-            patch(item.id, (entry) =>
-              entry.status === 'success'
-                ? { ...entry, storedSize: storedSize ?? entry.originalSize, baselineKey }
-                : entry,
-            );
-          })
-          .catch(() => {});
+        // passthrough and says how it stored the object on the write
+        // response. Without the header the size stays unknown, and the page
+        // shows "—" instead of a guess.
+        const stored = Number.parseInt(facts['x-deltaglider-stored-size'] ?? '', 10);
+        const baselineKey = uploadCreatedBaseline(facts)
+          ? `${folderKey}|${facts['x-deltaglider-ref-sha256'] ?? ''}`
+          : undefined;
+        patch(item.id, (entry) => {
+          const cancelled = entry.status === 'cancelled';
+          return {
+            ...entry,
+            status: cancelled ? 'cancelled' : 'success',
+            percent: 100,
+            transferredBytes: entry.totalBytes,
+            completedParts: entry.totalParts,
+            inFlightParts: 0,
+            activeConnections: 0,
+            completingSinceMs: null,
+            ...(cancelled ? {} : { storedSize: Number.isFinite(stored) ? stored : undefined, baselineKey }),
+          };
+        });
       })
       .catch((err) => {
         if (controller.signal.aborted) {
@@ -316,7 +297,7 @@ export default function useUploadQueue(destination: string) {
   ).length;
   const activeCount = queue.filter((i) => i.status === 'uploading' || i.status === 'completing').length;
 
-  // Stored size and savings come from the per-upload HEADs; both stay null
+  // Stored size and savings come from the write responses; both stay null
   // (shown as "—") until every completed upload has one. Savings % goes
   // through `src/savings.ts` (object view, decimal cap at 99.9).
   const stats = useMemo(() => uploadSessionStats(queue), [queue]);

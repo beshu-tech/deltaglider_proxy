@@ -90,7 +90,7 @@ export function summarizeScopeSavings(
  *     capped at 99.9 — for a single object users expect to see "99.9%
  *     saved" on tiny deltas; the chip-style integer cap is for
  *     aggregations across many objects.
- *   - `storedSize == null` (HEAD not yet resolved) returns `empty:true`
+ *   - `storedSize == null` (not known yet) returns `empty:true`
  *     so the UI can show a spinner.
  */
 interface ObjectSavingsView {
@@ -132,22 +132,13 @@ export function isBaselineObject(headers: Record<string, string>): boolean {
 }
 
 /**
- * True when THIS upload created its folder's baseline. The proxy's PUT
- * response does not say so (no storage-type header, verified against 1.19),
- * and `isBaselineObject` is also true for a later re-upload of the baseline
- * bytes, under the same or another name. So an upload counts as the creator
- * only when it matches the baseline AND its folder held no objects directly
- * in it (subfolders do not count: a baseline is per directory) before the
- * session's first upload into it. `folderWasEmpty` undefined = not known.
- * Known gaps: a folder that held only passthrough files (images, archives)
- * counts as not new, so that baseline is left out; a folder whose first
- * listing page is all subfolders counts as not known, also left out.
+ * True when THIS upload created its folder's baseline. The proxy says so on
+ * the write response (`x-deltaglider-baseline: created`); it knows, because
+ * it wrote the folder's reference for this upload. A later re-upload of the
+ * baseline bytes, under the same or another name, does not get the header.
  */
-export function uploadCreatedBaseline(
-  headers: Record<string, string>,
-  folderWasEmpty: boolean | undefined,
-): boolean {
-  return folderWasEmpty === true && isBaselineObject(headers);
+export function uploadCreatedBaseline(writeFacts: Record<string, string | undefined>): boolean {
+  return writeFacts['x-deltaglider-baseline'] === 'created';
 }
 
 /** Bytes in one GiB. The quota field labels it "GiB"; the analytics cost

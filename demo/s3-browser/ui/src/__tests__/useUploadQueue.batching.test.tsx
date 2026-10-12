@@ -9,8 +9,6 @@ import { expect, test, vi } from 'vitest';
 const uploadObject = vi.hoisted(() => vi.fn());
 vi.mock('../s3client', () => ({
   getBucket: () => 'releases',
-  listDirectObjects: async () => ({ objects: [], prefixes: [] }),
-  headObject: async () => ({ headers: {}, storedSize: 1 }),
   uploadObject,
 }));
 

@@ -72,15 +72,11 @@ test('parseCostRate: persisted $/GB/mo from localStorage', () => {
   }
 });
 
-test('uploadCreatedBaseline: an upload created its folder baseline only when it matches AND the folder was empty', () => {
-  // An upload created its folder's baseline only when it matches the baseline
-  // AND the folder was empty before: re-uploading v1 later, or the same bytes
-  // under a new name, also has file-sha256 == ref-sha256.
-  const sameAsRef = { 'x-amz-meta-dg-file-sha256': 'aaa', 'x-amz-meta-dg-ref-sha256': 'aaa' };
-  const delta = { 'x-amz-meta-dg-file-sha256': 'bbb', 'x-amz-meta-dg-ref-sha256': 'aaa' };
-  assert.equal(uploadCreatedBaseline(sameAsRef, true), true, 'first file into a new folder');
-  assert.equal(uploadCreatedBaseline(sameAsRef, false), false, 're-upload of the baseline bytes into an existing folder');
-  assert.equal(uploadCreatedBaseline(sameAsRef, undefined), false, 'unknown folder state: do not guess');
-  assert.equal(uploadCreatedBaseline(delta, true), false);
-  assert.equal(uploadCreatedBaseline({}, true), false, 'passthrough object');
+test('uploadCreatedBaseline: only the write response that says so', () => {
+  // The proxy sends `x-deltaglider-baseline: created` only on the write that
+  // created the folder's reference; a re-upload of the same bytes does not.
+  assert.equal(uploadCreatedBaseline({ 'x-deltaglider-baseline': 'created', 'x-amz-storage-type': 'delta' }), true);
+  assert.equal(uploadCreatedBaseline({ 'x-amz-storage-type': 'delta' }), false, 'a delta against an existing baseline');
+  assert.equal(uploadCreatedBaseline({ 'x-amz-storage-type': 'passthrough' }), false);
+  assert.equal(uploadCreatedBaseline({}), false, 'no facts: do not guess');
 });
