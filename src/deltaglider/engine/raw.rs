@@ -28,7 +28,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Write a delta blob + metadata verbatim into a deltaspace. Call it
     /// inside [`Self::with_dest_prefix_lock`]; outside it, multi-instance
     /// refuses. `prior`: what the key held, read before the write
-    /// ([`Self::fast_path_prior`]); [`CounterPrior::Unknown`] when the
+    /// ([`Self::fast_path_prior`]); `CounterPrior::Unknown` when the
     /// caller did not read it.
     pub async fn put_delta_raw(
         &self,
