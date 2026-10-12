@@ -276,3 +276,8 @@ pub async fn wait_for_outbox(
         sleep(Duration::from_millis(20)).await;
     }
 }
+
+/// Root YAML that gives the outbox a reader, so the proxy records object
+/// events (it skips them while nothing reads the outbox). Delivery is on,
+/// to an endpoint that the hour-long tick never reaches during a test.
+pub const OUTBOX_READER_YAML: &str = "event_delivery:\n  enabled: true\n  allow_local: true\n  webhook_urls:\n    - \"http://127.0.0.1:9/never\"\n  tick_interval: 1h\n";

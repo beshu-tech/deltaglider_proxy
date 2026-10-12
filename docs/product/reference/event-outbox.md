@@ -9,6 +9,7 @@ The proxy gives the space of deleted outbox rows back to the disk after each cle
 ## Semantics
 
 - Rows are stored in `event_outbox` with status `pending`, `in_progress`, `delivered`, or `failed`.
+- The proxy records events only while something reads the outbox: event delivery is enabled with a target, or replication is enabled with at least one enabled rule, or a replication cursor moved in the last hour (so that a quick re-enable of replication replays the events in between). In a default install neither feature is on, so a write records no event, and the Event log stays empty. The proxy checks this at startup and on every config apply. Events of the writes that happen before you turn on delivery or replication are therefore not recorded; scheduled replication still copies those objects.
 - Delivery is disabled by default. While delivery is off, the outbox does not keep events for later. The dispatcher still runs, and on every tick it deletes the rows that no reader needs any more:
   - When replication is enabled, event-driven replication also reads the outbox. The dispatcher deletes a row only after replication has read it, so replication never misses an event. While replication has no active reader (its cursor did not move for an hour), the dispatcher deletes nothing.
   - When replication is disabled, nothing reads the outbox, so the dispatcher deletes every row. A replication consumer that starts later begins at the newest event and never reads older rows.

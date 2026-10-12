@@ -184,7 +184,10 @@ async fn test_bulk_delete_idempotent_on_missing() {
 /// showed "Deleting 0 of 2…" until the whole request answered.
 #[tokio::test]
 async fn test_bulk_delete_streams_a_line_per_key() {
-    let server = TestServer::builder().build().await;
+    let server = TestServer::builder()
+        .extra_yaml_root(common::OUTBOX_READER_YAML)
+        .build()
+        .await;
     let http = server.http();
     let admin = admin_http_client(&server.endpoint()).await;
     let ep = server.endpoint();
@@ -752,6 +755,7 @@ async fn test_move_into_own_subfolder_is_refused() {
 async fn test_bulk_ops_honour_quota_and_record_events_and_audit() {
     let server = TestServer::builder()
         .bucket_policy("frozen-bkt", "quota_bytes: 0")
+        .extra_yaml_root(common::OUTBOX_READER_YAML)
         .build()
         .await;
     let http = server.http();

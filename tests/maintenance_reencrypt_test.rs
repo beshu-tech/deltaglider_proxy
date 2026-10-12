@@ -236,14 +236,11 @@ async fn test_gate_state_hidden_from_unauthenticated_writers() {
 #[tokio::test]
 async fn test_reencrypt_full_cycle() {
     let bucket = "maintbkt";
-    // Event delivery on (to an endpoint that the hour-long tick never
-    // reaches): the outbox has a reader, so it records object events and
-    // keeps them for the whole test.
+    // The outbox has a reader, so it records object events and keeps them
+    // for the whole test.
     let server = TestServer::builder()
         .bucket(bucket)
-        .extra_yaml_root(
-            "event_delivery:\n  enabled: true\n  allow_local: true\n  webhook_urls:\n    - \"http://127.0.0.1:9/never\"\n  tick_interval: 1h\n",
-        )
+        .extra_yaml_root(crate::common::OUTBOX_READER_YAML)
         .build()
         .await;
     let http = server.http();

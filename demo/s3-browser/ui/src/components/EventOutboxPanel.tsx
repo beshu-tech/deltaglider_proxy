@@ -472,7 +472,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
             emptyText: loading
               ? ' '
               : status === 'all' && !filter
-                ? 'No object events have been recorded yet.'
+                ? 'No object events have been recorded yet. The proxy records events only while event delivery or replication is on.'
                 : 'No events match this view.',
           }}
           pagination={{

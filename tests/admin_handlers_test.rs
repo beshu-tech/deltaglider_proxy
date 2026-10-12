@@ -1590,7 +1590,10 @@ async fn outbox(admin: &reqwest::Client, ep: &str, query: &str) -> (StatusCode, 
 #[tokio::test]
 async fn object_created_payload_is_the_same_for_put_and_multipart() {
     use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-    let server = TestServer::builder().build().await;
+    let server = TestServer::builder()
+        .extra_yaml_root(common::OUTBOX_READER_YAML)
+        .build()
+        .await;
     let ep = server.endpoint();
     let admin = admin_http_client(&ep).await;
     let s3 = server.s3_client().await;
@@ -1661,6 +1664,44 @@ async fn object_created_payload_is_the_same_for_put_and_multipart() {
         assert_eq!(p["etag"], etag, "{key}: {p}");
         assert_eq!(p["storage_type"], "passthrough", "{key}: {p}");
     }
+}
+
+/// P4.2: with nothing reading the outbox (the default: no delivery, no
+/// replication) a write records no event. Once delivery is on, the next
+/// write does. The writer appends in order, so when "on.txt" is in, an
+/// event of "off.txt" would be in too.
+#[tokio::test]
+async fn object_events_are_recorded_only_while_something_reads_them() {
+    let server = TestServer::builder().build().await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let http = server.http();
+    let bucket = server.bucket();
+    common::put_object(&http, &ep, bucket, "off.txt", b"x".to_vec(), "text/plain").await;
+    let r = admin
+        .put(format!("{ep}/_/api/admin/config/section/advanced"))
+        .json(&serde_json::json!({
+            "event_delivery": {
+                "enabled": true,
+                "allow_local": true,
+                "webhook_urls": ["http://127.0.0.1:9/never"],
+                "tick_interval": "1h"
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    common::put_object(&http, &ep, bucket, "on.txt", b"x".to_vec(), "text/plain").await;
+    let v = common::wait_for_outbox(&admin, &ep, |rows| {
+        rows.iter().any(|r| r["key"] == "on.txt")
+    })
+    .await;
+    let rows = v["rows"].as_array().unwrap();
+    assert!(
+        rows.iter().all(|r| r["key"] != "off.txt"),
+        "an event was recorded with no reader: {v}"
+    );
 }
 
 /// Two webhook endpoints that fail at once (one refused by the SSRF guard,

@@ -1088,6 +1088,15 @@ impl ConfigDb {
     ///
     /// `None` when no cursor is active (→ no floor; pruner may delete any
     /// delivered row).
+    /// The newest `updated_at` (last advance) of any listener cursor.
+    pub fn listener_cursor_last_advance(&self) -> Result<Option<i64>, ConfigDbError> {
+        Ok(self
+            .conn
+            .query_row("SELECT MAX(updated_at) FROM listener_cursors", [], |r| {
+                r.get::<_, Option<i64>>(0)
+            })?)
+    }
+
     pub fn event_outbox_min_active_listener_cursor(
         &self,
         now: i64,
@@ -1177,6 +1186,31 @@ struct Appender {
     queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Wakes [`flush_appends`] after each write.
     written: std::sync::Arc<tokio::sync::Notify>,
+    /// Whether anything reads this DB's outbox (see [`outbox_has_readers`]).
+    readers: std::sync::Arc<Readers>,
+}
+
+/// Who reads one DB's outbox. Without a reader, an appended event is only
+/// deleted again by the dispatcher's prune, so the append is skipped.
+#[derive(Debug)]
+struct Readers {
+    /// Event delivery is active, or replication has an enabled rule (both
+    /// consume events). Set at boot and on every config apply. Until the
+    /// first set, `true`: never lose an event to an unknown state.
+    config: std::sync::atomic::AtomicBool,
+    /// Unix seconds until which a listener cursor counts as active (its
+    /// last advance plus `LISTENER_CURSOR_STALE_SECS`). An active cursor
+    /// replays the events written while its consumer was off.
+    cursor_active_until: std::sync::atomic::AtomicI64,
+}
+
+impl Default for Readers {
+    fn default() -> Self {
+        Self {
+            config: std::sync::atomic::AtomicBool::new(true),
+            cursor_active_until: std::sync::atomic::AtomicI64::new(0),
+        }
+    }
 }
 
 /// One writer per config DB, found by the DB's `Arc` (`AppState` has no
@@ -1188,6 +1222,7 @@ type AppenderHandles = (
     tokio::sync::mpsc::Sender<Vec<NewEvent>>,
     std::sync::Arc<std::sync::atomic::AtomicUsize>,
     std::sync::Arc<tokio::sync::Notify>,
+    std::sync::Arc<Readers>,
 );
 
 /// The writer of `db`, started on first use with a queue of `cap` appends.
@@ -1196,11 +1231,17 @@ fn appender(db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>, cap: usize) -> Ap
     all.retain(|a| a.db.strong_count() > 0);
     let weak = std::sync::Arc::downgrade(db);
     if let Some(a) = all.iter().find(|a| a.db.ptr_eq(&weak)) {
-        return (a.tx.clone(), a.queued.clone(), a.written.clone());
+        return (
+            a.tx.clone(),
+            a.queued.clone(),
+            a.written.clone(),
+            a.readers.clone(),
+        );
     }
     let (tx, rx) = tokio::sync::mpsc::channel(cap.max(1));
     let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let written = std::sync::Arc::new(tokio::sync::Notify::new());
+    let readers = std::sync::Arc::new(Readers::default());
     tokio::spawn(write_appended(
         weak.clone(),
         rx,
@@ -1212,8 +1253,9 @@ fn appender(db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>, cap: usize) -> Ap
         tx: tx.clone(),
         queued: queued.clone(),
         written: written.clone(),
+        readers: readers.clone(),
     });
-    (tx, queued, written)
+    (tx, queued, written, readers)
 }
 
 /// The writer task: drains the queue in order, many events per transaction.
@@ -1292,7 +1334,10 @@ async fn append_events_capped(
     if events.is_empty() {
         return;
     }
-    let (tx, queued, _) = appender(db, cap);
+    let (tx, queued, _, readers) = appender(db, cap);
+    if !readers.any(current_unix_seconds()) {
+        return;
+    }
     let n = events.len();
     queued.fetch_add(n, SeqCst);
     let sent = match tx.try_send(events) {
@@ -1313,13 +1358,78 @@ async fn append_events_capped(
 /// (graceful shutdown; tests that read the outbox after a write).
 pub async fn flush_appends(db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>) {
     use std::sync::atomic::Ordering::SeqCst;
-    let (_, queued, written) = appender(db, APPEND_QUEUE_CAP);
+    let (_, queued, written, _) = appender(db, APPEND_QUEUE_CAP);
     loop {
         let wake = written.notified();
         if queued.load(SeqCst) == 0 {
             return;
         }
         wake.await;
+    }
+}
+
+impl Readers {
+    fn any(&self, now: i64) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.config.load(SeqCst) || now < self.cursor_active_until.load(SeqCst)
+    }
+}
+
+/// Pure: does `config` turn on a reader of the outbox? Event delivery
+/// (enabled with a target) and replication with an enabled rule (every
+/// rule consumes events) read it; nothing else does.
+pub fn config_has_outbox_readers(config: &crate::config::Config) -> bool {
+    config.event_delivery.is_active()
+        || (config.replication.enabled && config.replication.rules.iter().any(|r| r.enabled))
+}
+
+/// Does anything read `db`'s outbox now? Every emitter (client writes,
+/// replication, lifecycle) skips its append when nothing does: the row
+/// would only be pruned again.
+pub fn outbox_has_readers(db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>) -> bool {
+    appender(db, APPEND_QUEUE_CAP).3.any(current_unix_seconds())
+}
+
+/// Record the reader state of `config` for `db` (boot and every config
+/// apply). Takes no DB lock: an apply may run while the DB is held.
+pub fn set_config_readers(
+    db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>,
+    config: &crate::config::Config,
+) {
+    let on = config_has_outbox_readers(config);
+    appender(db, APPEND_QUEUE_CAP)
+        .3
+        .config
+        .store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// A listener cursor of `db` advanced (or was created) at `at`: it counts
+/// as an active reader for `LISTENER_CURSOR_STALE_SECS` after `at`.
+pub fn note_listener_cursor(db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>, at: i64) {
+    appender(db, APPEND_QUEUE_CAP)
+        .3
+        .cursor_active_until
+        .fetch_max(
+            at.saturating_add(crate::event_delivery::LISTENER_CURSOR_STALE_SECS),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+}
+
+/// Boot: the reader state of `config`, plus the newest listener-cursor
+/// advance in the DB (a cursor active before the restart still replays).
+pub async fn init_readers(
+    db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>,
+    config: &crate::config::Config,
+) {
+    set_config_readers(db, config);
+    match db.lock().await.listener_cursor_last_advance() {
+        Ok(Some(at)) => note_listener_cursor(db, at),
+        Ok(None) => {}
+        Err(err) => {
+            // Unknown: treat the cursor as active for its whole window.
+            tracing::warn!("event outbox: listener cursors unreadable: {err}");
+            note_listener_cursor(db, current_unix_seconds());
+        }
     }
 }
 
@@ -1973,5 +2083,71 @@ mod tests {
         waiting.await.unwrap();
         flush_appends(&db).await;
         assert_eq!(outbox_keys(&*db.lock().await), ["k0", "k1", "k2", "k3"]);
+    }
+
+    /// P4.2: with no reader the append writes nothing; a reader turns it on.
+    #[tokio::test]
+    async fn an_append_without_a_reader_writes_nothing() {
+        let db = shared(ConfigDb::in_memory("pw").unwrap());
+        let mut config = crate::config::Config::default();
+        set_config_readers(&db, &config);
+        assert!(!outbox_has_readers(&db));
+        append_events(&db, vec![event_at(1, "off")]).await;
+        flush_appends(&db).await;
+        assert!(outbox_keys(&*db.lock().await).is_empty());
+
+        config.event_delivery.enabled = true;
+        config.event_delivery.webhook_url = Some("https://hook.example/x".into());
+        set_config_readers(&db, &config);
+        append_events(&db, vec![event_at(1, "on")]).await;
+        flush_appends(&db).await;
+        assert_eq!(outbox_keys(&*db.lock().await), ["on"]);
+    }
+
+    /// A listener cursor that advanced within the stale window is a reader
+    /// (a quick re-enable of replication replays from it); an older one is
+    /// not. Boot reads it from the DB.
+    #[tokio::test]
+    async fn an_active_listener_cursor_is_a_reader() {
+        let db = shared(ConfigDb::in_memory("pw").unwrap());
+        let config = crate::config::Config::default();
+        let now = current_unix_seconds();
+        let stale = crate::event_delivery::LISTENER_CURSOR_STALE_SECS;
+        db.lock()
+            .await
+            .listener_cursor_advance("replication", 1, now - stale - 10)
+            .unwrap();
+        init_readers(&db, &config).await;
+        assert!(!outbox_has_readers(&db), "a stale cursor reads nothing");
+        db.lock()
+            .await
+            .listener_cursor_advance("replication", 2, now - 10)
+            .unwrap();
+        init_readers(&db, &config).await;
+        assert!(outbox_has_readers(&db), "a live cursor reads");
+    }
+
+    #[test]
+    fn config_has_outbox_readers_truth_table() {
+        use crate::config::Config;
+        let mut c = Config::default();
+        assert!(!config_has_outbox_readers(&c), "default install");
+        c.event_delivery.enabled = true;
+        assert!(!config_has_outbox_readers(&c), "delivery without a target");
+        c.event_delivery.webhook_url = Some("https://hook.example/x".into());
+        assert!(config_has_outbox_readers(&c));
+        let mut c = Config::default();
+        c.replication.enabled = true;
+        assert!(!config_has_outbox_readers(&c), "replication with no rule");
+        let rule: crate::config_sections::ReplicationRule =
+            serde_yaml::from_str("name: r\nsource: {bucket: a}\ndestination: {bucket: b}\n")
+                .unwrap();
+        c.replication.rules = vec![rule.clone()];
+        assert!(config_has_outbox_readers(&c));
+        c.replication.rules[0].enabled = false;
+        assert!(!config_has_outbox_readers(&c), "only a disabled rule");
+        c.replication.rules[0].enabled = true;
+        c.replication.enabled = false;
+        assert!(!config_has_outbox_readers(&c), "replication off");
     }
 }

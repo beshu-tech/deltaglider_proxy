@@ -379,6 +379,9 @@ async fn consumer_tick(
         now,
     )
     .await;
+    // The cursors may have moved: they stay active readers for a while
+    // after replication is turned off (a quick re-enable replays).
+    crate::event_outbox::note_listener_cursor(db, now);
 
     let dbg = db.lock().await;
     let _ = dbg.replication_release_lease(CONSUMER_LEASE_KEY, instance_id);
@@ -452,7 +455,11 @@ async fn seed_cursor_if_absent(db: &Arc<Mutex<ConfigDb>>) {
         Ok(None)
     ) {
         let max_id = dbg.event_outbox_max_id().ok().flatten().unwrap_or(0);
-        let _ = dbg.listener_cursor_advance(REPLICATION_LISTENER, max_id, current_unix_seconds());
+        let now = current_unix_seconds();
+        let _ = dbg.listener_cursor_advance(REPLICATION_LISTENER, max_id, now);
+        drop(dbg);
+        // A new cursor reads the outbox from now on.
+        crate::event_outbox::note_listener_cursor(db, now);
     }
 }
 
@@ -1450,6 +1457,9 @@ async fn emit_replication_copied(
     dest_key: &str,
     content_length: u64,
 ) {
+    if !crate::event_outbox::outbox_has_readers(db) {
+        return;
+    }
     let dbg = db.lock().await;
     let _ = dbg.event_outbox_insert(&NewEvent::new(
         EventKind::ReplicationObjectCopied,

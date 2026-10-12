@@ -1096,6 +1096,10 @@ async fn flush_page_events(db: &Arc<Mutex<ConfigDb>>, rule_name: &str, events: &
     if events.is_empty() {
         return;
     }
+    if !crate::event_outbox::outbox_has_readers(db) {
+        events.clear();
+        return;
+    }
     let guard = db.lock().await;
     flush_page_events_locked(&guard, rule_name, events);
 }

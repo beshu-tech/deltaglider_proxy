@@ -1237,6 +1237,9 @@ impl DeleteEvents {
         let (Some(db), DeleteOutcome::Deleted(meta)) = (&self.db, outcome) else {
             return Box::pin(async {});
         };
+        if !crate::event_outbox::outbox_has_readers(db) {
+            return Box::pin(async {});
+        }
         let event = NewEvent::new(
             EventKind::LifecycleExpired,
             self.bucket.as_str(),
@@ -1501,7 +1504,7 @@ async fn append_lifecycle_transition_event(
     content_length: u64,
     delete_source_after_success: bool,
 ) {
-    let Some(db) = db else {
+    let Some(db) = db.filter(|db| crate::event_outbox::outbox_has_readers(db)) else {
         return;
     };
     let event = NewEvent::new(

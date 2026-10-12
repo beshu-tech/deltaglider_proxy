@@ -640,6 +640,9 @@ pub fn spawn_dispatcher_with_client(
     let claimant = format!("event-delivery:{}", uuid::Uuid::new_v4());
     tokio::spawn(async move {
         info!("Event outbox dispatcher started: claimant={}", claimant);
+        // Boot: does anything read the outbox? Until this runs, every
+        // append is kept (the gate starts open).
+        crate::event_outbox::init_readers(&db, &*config.read().await).await;
         loop {
             let tick = dispatcher_tick(&config.read().await.event_delivery);
             tokio::time::sleep(tick).await;
