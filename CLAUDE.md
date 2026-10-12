@@ -433,7 +433,7 @@ grounds that another commit introduced it.
 
 - Clippy warnings are errors in CI (`-D warnings`)
 - The proxy is transparent: clients must not know delta compression is happening
-- `x-amz-storage-type` response header exposes storage strategy (delta/passthrough/reference) for debugging
+- Write responses (PutObject, CompleteMultipartUpload, CopyObject, form POST) always carry the storage facts — `x-amz-storage-type`, `x-deltaglider-stored-size`, `x-deltaglider-ref-sha256` (delta), `x-deltaglider-baseline: created` — through ONE helper (`s3_adapter_s3s::write_fact_headers`; none for an anonymous/presigned writer; open access counts as authenticated; the CORS expose list reads `WRITE_FACT_HEADERS`). `DGP_DEBUG_HEADERS` gates only the GET/HEAD/LIST debug headers
 - Delta-eligible file types are defined in `deltaglider/file_router.rs`
 - Passthrough files (images, video) skip delta entirely — already compressed
 - Streaming is preferred for large files; delta reconstruction requires buffering the reference

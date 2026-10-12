@@ -10,6 +10,7 @@ pub(super) async fn copy_object(
     req: s3s::S3Request<s3s::dto::CopyObjectInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::CopyObjectOutput>> {
     let auth_user = req.extensions.get::<AuthenticatedUser>().cloned();
+    let writer = Reader::of(&req.extensions);
     let input = req.input;
     let (source_bucket, source_key) = copy_source_bucket_key(&input.copy_source)?;
     let client_ip = req
@@ -140,14 +141,16 @@ pub(super) async fn copy_object(
             .await?
         }
     };
-    Ok(s3s::S3Response::new(s3s::dto::CopyObjectOutput {
+    let mut resp = s3s::S3Response::new(s3s::dto::CopyObjectOutput {
         copy_object_result: Some(s3s::dto::CopyObjectResult {
             e_tag: Some(parse_s3s_etag(&result.metadata.etag())?),
             last_modified: Some(SystemTime::from(result.metadata.created_at).into()),
             ..Default::default()
         }),
         ..Default::default()
-    }))
+    });
+    add_write_fact_headers(&mut resp.headers, &result, writer);
+    Ok(resp)
 }
 
 /// S3's limit on the source of one CopyObject request.

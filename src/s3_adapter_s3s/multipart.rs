@@ -120,6 +120,7 @@ pub(super) async fn complete_multipart_upload(
     svc: &DeltaGliderS3Service,
     req: s3s::S3Request<s3s::dto::CompleteMultipartUploadInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::CompleteMultipartUploadOutput>> {
+    let writer = Reader::of(&req.extensions);
     let input = req.input;
     // Defense-in-depth: the marker can be hot-applied mid-upload, so
     // Complete (the moment bytes reach the backend) re-checks.
@@ -141,7 +142,7 @@ pub(super) async fn complete_multipart_upload(
     )?;
     let complete_response =
         |etag: &str,
-         meta: Option<&crate::types::FileMetadata>|
+         stored: Option<&crate::types::StoreResult>|
          -> s3s::S3Result<s3s::S3Response<s3s::dto::CompleteMultipartUploadOutput>> {
             let location = format!("/{}/{}", input.bucket, input.key);
             let mut resp = s3s::S3Response::new(s3s::dto::CompleteMultipartUploadOutput {
@@ -151,10 +152,10 @@ pub(super) async fn complete_multipart_upload(
                 location: Some(location),
                 ..Default::default()
             });
-            // Parity with the legacy axum handler: `x-amz-storage-type` (+
-            // stored-size) so operators can observe how the multipart landed.
-            if let Some(meta) = meta {
-                add_storage_debug_headers(svc, &mut resp.headers, meta);
+            // The storage facts are known only to the request that ran the
+            // store; a joined retry or a tombstone hit answers without them.
+            if let Some(stored) = stored {
+                add_write_fact_headers(&mut resp.headers, stored, writer);
             }
             Ok(resp)
         };
@@ -231,7 +232,7 @@ pub(super) async fn complete_multipart_upload(
                 result
             });
             match handle.await {
-                Ok(Ok((etag, meta))) => complete_response(&etag, meta.as_ref()),
+                Ok(Ok((etag, stored))) => complete_response(&etag, Some(&stored)),
                 Ok(Err(e)) => Err(e),
                 Err(join_err) => Err(s3s::S3Error::from(
                     crate::api::errors::S3Error::InternalError(format!(
@@ -334,7 +335,7 @@ pub(super) async fn run_multipart_completion(
     upload_id: String,
     requested_parts: Vec<(u32, String)>,
     force_chunked_passthrough: bool,
-) -> Result<(String, Option<FileMetadata>), crate::api::S3Error> {
+) -> Result<(String, crate::types::StoreResult), crate::api::S3Error> {
     // Deterministic chaos hook for tests: hold the store window open.
     let stall_ms = crate::config::test_seams::test_seams().complete_stall_ms;
     if stall_ms > 0 {
@@ -414,7 +415,7 @@ pub(super) async fn run_multipart_completion(
         &state, &bucket, &key, &result,
     )
     .await;
-    Ok((etag, Some(result.metadata)))
+    Ok((etag, result))
 }
 
 pub(super) fn completed_parts_to_request(

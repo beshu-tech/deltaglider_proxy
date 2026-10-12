@@ -509,6 +509,7 @@ pub(super) async fn put_object(
         .extensions
         .get::<crate::api::auth::SignedPayloadHash>()
         .cloned();
+    let writer = Reader::of(&req.extensions);
     let input = req.input;
     let engine = svc.state.engine.load();
     // Gate BEFORE the bucket check: a marked bucket refuses client bytes
@@ -548,7 +549,7 @@ pub(super) async fn put_object(
         e_tag: Some(parse_s3s_etag(&result.metadata.etag())?),
         ..Default::default()
     });
-    add_storage_debug_headers(svc, &mut resp.headers, &result.metadata);
+    add_write_fact_headers(&mut resp.headers, &result, writer);
     Ok(resp)
 }
 

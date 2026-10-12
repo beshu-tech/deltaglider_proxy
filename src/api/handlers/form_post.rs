@@ -816,21 +816,22 @@ pub async fn handle_form_post_upload(
         },
     )
     .await?;
-    let storage_type = result.metadata.storage_info.label();
     let user_name = auth_user
         .as_ref()
         .map(|u| u.name.as_str())
         .unwrap_or("anonymous");
     audit_log_s3("s3_post", user_name, headers, bucket, &parsed.resolved_key);
-    Ok((
+    let mut response = (
         StatusCode::NO_CONTENT,
-        [
-            ("ETag", result.metadata.etag()),
-            ("x-amz-storage-type", storage_type.to_string()),
-        ],
+        [("ETag", result.metadata.etag())],
         "",
     )
-        .into_response())
+        .into_response();
+    let writer = crate::s3_adapter_s3s::Reader::of_principal(auth_user.as_ref());
+    for (name, value) in crate::s3_adapter_s3s::write_fact_headers(&result, writer) {
+        response.headers_mut().insert(name, value);
+    }
+    Ok(response)
 }
 
 #[cfg(test)]

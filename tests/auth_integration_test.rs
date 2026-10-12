@@ -1532,6 +1532,26 @@ async fn form_post_counts_only_wrong_signatures_toward_lockout() {
     assert_eq!(r.status().as_u16(), 503, "wrong secrets lock the IP out");
 }
 
+/// A signed form POST answers with the storage facts of the object, through
+/// the same rule as PutObject, also when debug headers are off.
+#[tokio::test]
+async fn form_post_answers_with_storage_facts() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .env("DGP_DEBUG_HEADERS", "false")
+        .build()
+        .await;
+    let r = form_post(&server.endpoint(), server.bucket(), Some("testsecret"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 204);
+    let h = r.headers();
+    assert_eq!(h["x-amz-storage-type"], "passthrough");
+    assert_eq!(h["x-deltaglider-stored-size"], "2");
+    assert!(h.get("x-deltaglider-baseline").is_none());
+}
+
 // ============================================================================
 // 8. IAM conditions at HTTP level
 // ============================================================================

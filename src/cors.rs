@@ -18,7 +18,8 @@ use tower_http::cors::{Any, CorsLayer};
 /// Build a [`CorsLayer`] reflecting the permissive flag.
 ///
 /// `permissive = true` → allows any origin, method, and header (dev mode,
-/// mirrors the admin router's `DGP_CORS_PERMISSIVE` branch in `demo.rs`).
+/// mirrors the admin router's `DGP_CORS_PERMISSIVE` branch in `demo.rs`),
+/// and exposes the write-fact response headers to the calling page.
 /// `permissive = false` → restrictive `CorsLayer::new()` (no CORS headers;
 /// same-origin requests work, cross-origin requests are blocked by the
 /// browser's same-origin policy).
@@ -37,6 +38,9 @@ pub fn cors_layer_for(permissive: bool) -> CorsLayer {
             .allow_origin(Any)
             .allow_methods(Any)
             .allow_headers(Any)
+            .expose_headers(
+                crate::s3_adapter_s3s::WRITE_FACT_HEADERS.map(axum::http::HeaderName::from_static),
+            )
     } else {
         CorsLayer::new()
     }
@@ -83,6 +87,30 @@ mod tests {
         // The security invariant: wildcard origin with NO credentials header, so
         // the browser never sends the session cookie cross-origin.
         assert_eq!(creds, None, "must NOT allow credentials in permissive mode");
+    }
+
+    /// A cross-origin page can read the write-fact headers of a PUT.
+    #[tokio::test]
+    async fn permissive_exposes_the_write_fact_headers() {
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(cors_layer_for(true));
+        let req = Request::builder()
+            .uri("/")
+            .header(header::ORIGIN, "https://app.example")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        let exposed = res
+            .headers()
+            .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+            .expect("expose header")
+            .to_str()
+            .unwrap()
+            .to_string();
+        for name in crate::s3_adapter_s3s::WRITE_FACT_HEADERS {
+            assert!(exposed.contains(name), "{name} not in {exposed}");
+        }
     }
 
     #[tokio::test]

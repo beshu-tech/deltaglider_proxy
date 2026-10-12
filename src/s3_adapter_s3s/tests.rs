@@ -896,3 +896,72 @@ async fn completion_assembles_only_a_delta_candidate() {
     assert!(parts("b", "a/app.zip", &hint, 1), "the hint");
     assert!(parts("plain", "a/app.zip", &none, 1), "compression off");
 }
+
+/// D3: the storage facts of a write, per storage form and writer.
+#[test]
+fn write_fact_headers_per_form_and_writer() {
+    let names = |h: &[(&'static str, axum::http::HeaderValue)]| -> Vec<(String, String)> {
+        h.iter()
+            .map(|(n, v)| (n.to_string(), v.to_str().unwrap().to_string()))
+            .collect()
+    };
+    let pass = crate::types::StoreResult::new(
+        FileMetadata::new_passthrough("a.txt".into(), "s".into(), "m".into(), 5, None),
+        5,
+    );
+    assert_eq!(
+        names(&write_fact_headers(&pass, Reader::Authenticated)),
+        vec![
+            ("x-amz-storage-type".into(), "passthrough".into()),
+            ("x-deltaglider-stored-size".into(), "5".into()),
+        ]
+    );
+    let delta_meta = FileMetadata::new_delta(
+        "a.zip".into(),
+        "s".into(),
+        "m".into(),
+        100,
+        "reference.bin".into(),
+        "ab".repeat(32),
+        7,
+        None,
+    );
+    let delta = crate::types::StoreResult::new(delta_meta.clone(), 7);
+    assert_eq!(
+        names(&write_fact_headers(&delta, Reader::Authenticated)),
+        vec![
+            ("x-amz-storage-type".into(), "delta".into()),
+            ("x-deltaglider-stored-size".into(), "7".into()),
+            ("x-deltaglider-ref-sha256".into(), "ab".repeat(32)),
+        ]
+    );
+    let first = crate::types::StoreResult::new(delta_meta, 7).with_baseline_created(true);
+    assert_eq!(
+        names(&write_fact_headers(&first, Reader::Authenticated)).last(),
+        Some(&("x-deltaglider-baseline".to_string(), "created".to_string()))
+    );
+    for result in [&pass, &delta, &first] {
+        assert!(write_fact_headers(result, Reader::Anonymous).is_empty());
+    }
+    // Every header the helper can send is in the one exposed list.
+    for (name, _) in write_fact_headers(&first, Reader::Authenticated) {
+        assert!(WRITE_FACT_HEADERS.contains(&name), "{name}");
+    }
+}
+
+#[test]
+fn a_form_post_writer_is_anonymous_only_as_the_anonymous_principal() {
+    let anon = AuthenticatedUser {
+        name: crate::iam::types::ANONYMOUS_USER_NAME.into(),
+        access_key_id: String::new(),
+        permissions: vec![],
+        iam_policies: vec![],
+    };
+    let alice = AuthenticatedUser {
+        name: "alice".into(),
+        ..anon.clone()
+    };
+    assert_eq!(Reader::of_principal(None), Reader::Authenticated);
+    assert_eq!(Reader::of_principal(Some(&alice)), Reader::Authenticated);
+    assert_eq!(Reader::of_principal(Some(&anon)), Reader::Anonymous);
+}

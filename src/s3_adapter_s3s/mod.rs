@@ -549,7 +549,7 @@ fn check_user_metadata_size_s3s(
 /// Who is reading an object's metadata, as far as provenance disclosure is
 /// concerned. Computed once per request from the request extensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Reader {
+pub(crate) enum Reader {
     /// A caller who holds credentials (SigV4 with a real principal), or
     /// open-access mode (`authentication: none`, no principal at all — a
     /// deliberate dev/test setting where every byte is public already and
@@ -607,6 +607,81 @@ fn response_metadata_map(
     }
     strip_fingerprint_metadata(&mut map, reader);
     map
+}
+
+impl Reader {
+    /// The writer of a form POST: the policy signer, or the `$anonymous`
+    /// principal. Open access (no principal) counts as authenticated.
+    pub(crate) fn of_principal(user: Option<&AuthenticatedUser>) -> Self {
+        if user.is_some_and(|u| u.is_anonymous()) {
+            Self::Anonymous
+        } else {
+            Self::Authenticated
+        }
+    }
+}
+
+/// The response headers that tell a writer how its object was stored.
+/// [`crate::cors`] exposes the same names to cross-origin browsers.
+pub const WRITE_FACT_HEADERS: [&str; 4] = [
+    "x-amz-storage-type",
+    "x-deltaglider-stored-size",
+    "x-deltaglider-ref-sha256",
+    "x-deltaglider-baseline",
+];
+
+/// The storage facts of a write, as response headers: the storage type,
+/// the stored size, the reference SHA-256 of a delta, and
+/// `x-deltaglider-baseline: created` when this write created the folder's
+/// `reference.bin`. Every write response (PutObject,
+/// CompleteMultipartUpload, CopyObject, form POST) goes through here.
+///
+/// An anonymous writer (the `$anonymous` principal, or the holder of a
+/// presigned URL) gets none. An authenticated writer, and open access, get
+/// them always: a HEAD already shows the same facts as `x-amz-meta-dg-*`.
+/// `DGP_DEBUG_HEADERS` does not gate them.
+pub(crate) fn write_fact_headers(
+    result: &crate::types::StoreResult,
+    writer: Reader,
+) -> Vec<(&'static str, axum::http::HeaderValue)> {
+    if writer == Reader::Anonymous {
+        return Vec::new();
+    }
+    let [storage_type, stored_size, ref_sha256, baseline] = WRITE_FACT_HEADERS;
+    let meta = &result.metadata;
+    let mut out = vec![
+        (
+            storage_type,
+            axum::http::HeaderValue::from_static(meta.storage_info.label()),
+        ),
+        (
+            stored_size,
+            axum::http::HeaderValue::from(meta.stored_size()),
+        ),
+    ];
+    if let crate::types::StorageInfo::Delta {
+        ref_sha256: sha, ..
+    } = &meta.storage_info
+    {
+        match axum::http::HeaderValue::from_str(sha) {
+            Ok(value) if !sha.is_empty() => out.push((ref_sha256, value)),
+            _ => {}
+        }
+    }
+    if result.baseline_created {
+        out.push((baseline, axum::http::HeaderValue::from_static("created")));
+    }
+    out
+}
+
+fn add_write_fact_headers(
+    headers: &mut axum::http::HeaderMap,
+    result: &crate::types::StoreResult,
+    writer: Reader,
+) {
+    for (name, value) in write_fact_headers(result, writer) {
+        headers.insert(name, value);
+    }
 }
 
 /// `DGP_DEBUG_HEADERS`, as the running engine was built with it.

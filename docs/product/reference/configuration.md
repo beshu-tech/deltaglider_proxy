@@ -220,7 +220,7 @@ Tokio blocking thread-pool size. It controls how many CPU-bound operations (xdel
 
 ### `debug_headers`
 
-Expose debug/fingerprinting headers: `x-amz-storage-type` and `x-deltaglider-stored-size` on an object response, and `x-deltaglider-listing-facts-misses` on a LIST. Disable in production to prevent server fingerprinting.
+Expose debug/fingerprinting headers: `x-amz-storage-type` and `x-deltaglider-stored-size` on the response to a `GetObject` or `HeadObject` request, and `x-deltaglider-listing-facts-misses` on a LIST. A write response carries its storage facts without this setting (see [Storage facts on write responses](s3-api-compatibility.md#storage-facts-on-write-responses)). Disable in production to prevent server fingerprinting.
 
 | | |
 |---|---|

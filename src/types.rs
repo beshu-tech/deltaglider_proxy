@@ -638,6 +638,10 @@ pub struct StoreResult {
     /// seeded (added to stored_bytes, symmetric with delete's reclamation).
     pub replaced: Option<Box<FileMetadata>>,
     pub reference_created_bytes: u64,
+    /// This write created its deltaspace's `reference.bin` and kept it (the
+    /// write committed a delta against it). Told to the writer in the
+    /// `x-deltaglider-baseline: created` response header.
+    pub baseline_created: bool,
 }
 
 impl StoreResult {
@@ -649,6 +653,7 @@ impl StoreResult {
             stored_size,
             replaced: None,
             reference_created_bytes: 0,
+            baseline_created: false,
         }
     }
 
@@ -660,6 +665,12 @@ impl StoreResult {
     ) -> Self {
         self.replaced = replaced.map(Box::new);
         self.reference_created_bytes = reference_created_bytes;
+        self
+    }
+
+    /// Mark that this write created and kept its deltaspace's baseline.
+    pub fn with_baseline_created(mut self, created: bool) -> Self {
+        self.baseline_created = created;
         self
     }
 }

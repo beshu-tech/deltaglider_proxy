@@ -717,7 +717,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 } else {
                     0
                 };
-                Ok(result.with_accounting(prior.replaced(), created))
+                Ok(result
+                    .with_accounting(prior.replaced(), created)
+                    .with_baseline_created(fresh_baseline && baseline_kept))
             }
             Err(e) => {
                 if fresh_baseline {

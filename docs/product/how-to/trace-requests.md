@@ -69,10 +69,10 @@ The prefix is the same and the outcomes are opposite. For each outcome, the trac
 For per-request visibility on real traffic, set `DGP_DEBUG_HEADERS=true` and read the response headers. The variable exists only in the environment; the YAML file and the admin UI cannot set it:
 
 - `x-amz-storage-type`: how the object is stored: `delta`, `passthrough`, or `reference`.
-- `x-deltaglider-stored-size`: on the responses to object requests, the number of bytes that the object takes on the backend, which is smaller than the object size for a delta.
+- `x-deltaglider-stored-size`: on the responses to `GetObject` and `HeadObject` requests, the number of bytes that the object takes on the backend, which is smaller than the object size for a delta.
 - `x-deltaglider-listing-facts-misses`: on every LIST, the number of entries on the page that show their stored size instead of their original size, because the proxy found no listing facts for them (see [how delta compression works](../explanation/delta-compression.md)).
 
-Turn this **off** in production when you are done, because it reveals storage internals to anyone who can send a request.
+A write response carries these facts without this variable (see [Storage facts on write responses](../reference/s3-api-compatibility.md#storage-facts-on-write-responses)). Turn this **off** in production when you are done, because it reveals storage internals to anyone who can send a request.
 
 ## Verify
 

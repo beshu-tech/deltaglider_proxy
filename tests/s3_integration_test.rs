@@ -2244,3 +2244,197 @@ async fn test_first_file_bad_delta_ratio_passthrough() {
         "Passthrough file should round-trip correctly"
     );
 }
+
+// ============================================================================
+// Write responses carry storage facts (D3)
+// ============================================================================
+
+/// The four storage-fact headers of a write response, by name.
+fn write_facts(resp: &reqwest::Response) -> HashMap<&'static str, String> {
+    [
+        "x-amz-storage-type",
+        "x-deltaglider-stored-size",
+        "x-deltaglider-ref-sha256",
+        "x-deltaglider-baseline",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| (name, v.to_string()))
+    })
+    .collect()
+}
+
+async fn put_raw(
+    http: &impl S3Requests,
+    server: &TestServer,
+    key: &str,
+    body: Vec<u8>,
+) -> reqwest::Response {
+    let url = format!("{}/{}/{}", server.endpoint(), server.bucket(), key);
+    let resp = http
+        .s3_request(reqwest::Method::PUT, &url)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "PUT {key}: {}", resp.status());
+    resp
+}
+
+/// Every write verb answers with the storage facts of the object it wrote,
+/// also when `DGP_DEBUG_HEADERS` is off.
+async fn write_responses_carry_storage_facts(server: &TestServer, http: &impl S3Requests) {
+    let prefix = unique_prefix();
+    let (endpoint, bucket) = (server.endpoint(), server.bucket().to_string());
+
+    // Passthrough: not delta-eligible.
+    let resp = put_raw(
+        http,
+        server,
+        &format!("{prefix}/a/readme.txt"),
+        b"hello".to_vec(),
+    )
+    .await;
+    let facts = write_facts(&resp);
+    assert_eq!(facts["x-amz-storage-type"], "passthrough", "{facts:?}");
+    assert_eq!(facts["x-deltaglider-stored-size"], "5");
+    assert!(!facts.contains_key("x-deltaglider-ref-sha256"), "{facts:?}");
+    assert!(!facts.contains_key("x-deltaglider-baseline"), "{facts:?}");
+
+    // The first delta-eligible write of a folder creates its baseline.
+    let base = generate_binary(100_000, 42);
+    let resp = put_raw(http, server, &format!("{prefix}/a/base.zip"), base.clone()).await;
+    let first = write_facts(&resp);
+    assert_eq!(first["x-amz-storage-type"], "delta", "{first:?}");
+    assert_eq!(first["x-deltaglider-baseline"], "created", "{first:?}");
+    let ref_sha = first["x-deltaglider-ref-sha256"].clone();
+    assert_eq!(ref_sha.len(), 64, "{first:?}");
+
+    // A delta against the existing baseline.
+    let variant = mutate_binary(&base, 0.01);
+    let resp = put_raw(http, server, &format!("{prefix}/a/v1.zip"), variant.clone()).await;
+    let facts = write_facts(&resp);
+    assert_eq!(facts["x-amz-storage-type"], "delta", "{facts:?}");
+    assert_eq!(facts["x-deltaglider-ref-sha256"], ref_sha);
+    assert!(!facts.contains_key("x-deltaglider-baseline"), "{facts:?}");
+    let stored: u64 = facts["x-deltaglider-stored-size"].parse().unwrap();
+    assert!(stored > 0 && stored < variant.len() as u64, "{facts:?}");
+
+    // A lost ratio lands passthrough.
+    let unrelated = generate_binary(100_000, 7);
+    let resp = put_raw(http, server, &format!("{prefix}/a/other.zip"), unrelated).await;
+    let facts = write_facts(&resp);
+    assert_eq!(facts["x-amz-storage-type"], "passthrough", "{facts:?}");
+    assert_eq!(facts["x-deltaglider-stored-size"], "100000");
+    assert!(!facts.contains_key("x-deltaglider-ref-sha256"), "{facts:?}");
+    assert!(!facts.contains_key("x-deltaglider-baseline"), "{facts:?}");
+
+    // CompleteMultipartUpload into a fresh folder creates its baseline.
+    let key = format!("{prefix}/b/mpu.zip");
+    let upload_id = create_multipart_upload(http, &endpoint, &bucket, &key).await;
+    let mid = variant.len() / 2;
+    let e1 = upload_part(
+        http,
+        &endpoint,
+        &bucket,
+        &key,
+        &upload_id,
+        1,
+        variant[..mid].to_vec(),
+    )
+    .await;
+    let e2 = upload_part(
+        http,
+        &endpoint,
+        &bucket,
+        &key,
+        &upload_id,
+        2,
+        variant[mid..].to_vec(),
+    )
+    .await;
+    let resp = complete_multipart_upload(
+        http,
+        &endpoint,
+        &bucket,
+        &key,
+        &upload_id,
+        &[(1, &e1), (2, &e2)],
+    )
+    .await;
+    assert!(resp.status().is_success(), "complete: {}", resp.status());
+    let facts = write_facts(&resp);
+    assert_eq!(facts["x-amz-storage-type"], "delta", "{facts:?}");
+    assert_eq!(facts["x-deltaglider-baseline"], "created", "{facts:?}");
+
+    // CopyObject into a third fresh folder.
+    let url = format!("{endpoint}/{bucket}/{prefix}/c/copy.zip");
+    let resp = http
+        .s3_request(reqwest::Method::PUT, &url)
+        .header("x-amz-copy-source", format!("/{bucket}/{prefix}/a/v1.zip"))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "copy: {}", resp.status());
+    let facts = write_facts(&resp);
+    assert_eq!(facts["x-amz-storage-type"], "delta", "{facts:?}");
+    assert_eq!(facts["x-deltaglider-baseline"], "created", "{facts:?}");
+    assert!(facts.contains_key("x-deltaglider-ref-sha256"), "{facts:?}");
+}
+
+/// Filesystem backend, SigV4 auth on.
+#[tokio::test]
+async fn write_responses_carry_storage_facts_filesystem() {
+    let server = TestServer::builder()
+        .env("DGP_DEBUG_HEADERS", "false")
+        .build()
+        .await;
+    write_responses_carry_storage_facts(&server, &server.http()).await;
+}
+
+/// S3 backend, open access: open access counts as an authenticated writer.
+#[tokio::test]
+async fn write_responses_carry_storage_facts_s3_open_access() {
+    skip_unless_minio!();
+    let endpoint = minio_endpoint();
+    ensure_bucket(&endpoint).await;
+    let server = TestServer::builder()
+        .s3_endpoint(&endpoint)
+        .bucket(TEST_BUCKET)
+        .open_access()
+        .env("DGP_DEBUG_HEADERS", "false")
+        .build()
+        .await;
+    write_responses_carry_storage_facts(&server, &reqwest::Client::new()).await;
+}
+
+/// The holder of a presigned PUT URL is an anonymous writer: no facts.
+#[tokio::test]
+async fn presigned_put_carries_no_storage_facts() {
+    let server = TestServer::builder().build().await;
+    let client = server.s3_client().await;
+    let presigned = client
+        .put_object()
+        .bucket(server.bucket())
+        .key("presigned/base.zip")
+        .presigned(
+            aws_sdk_s3::presigning::PresigningConfig::expires_in(Duration::from_secs(300)).unwrap(),
+        )
+        .await
+        .unwrap();
+    let resp = reqwest::Client::new()
+        .put(presigned.uri())
+        .body(generate_binary(10_000, 3))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "presigned PUT: {}",
+        resp.status()
+    );
+    assert!(write_facts(&resp).is_empty(), "{:?}", write_facts(&resp));
+}
