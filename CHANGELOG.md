@@ -11,6 +11,34 @@ delay that acknowledgement by about 40 ms, so most requests on a reused
 (keep-alive) connection, which is what the AWS SDKs use, took at least 40 ms.
 Ten GET requests on one connection took 412 ms and now take about 31 ms.
 
+### Changed — Write requests no longer wait for the config database
+
+After each successful write or delete, the proxy records an object event in
+the event outbox, which event delivery and replication read. When the config
+database was free, the request wrote this row itself, with four disk syncs,
+before it answered. Now every event goes to one background writer that
+records the events of many requests in one transaction. The request answers
+without waiting. A crash can lose the events of the writes from the last few
+milliseconds before it. Scheduled replication copies those objects at its next
+run, but a webhook receiver does not get those events.
+
+### Changed — The proxy records object events only while something reads them
+
+The outbox exists for event delivery and replication. A default install has
+neither, and it still wrote one outbox row per write request and deleted the
+row again a few seconds later. Now the proxy records events only while event
+delivery is on, a replication rule is enabled, or an event listener read the
+outbox in the last hour. Events from the time before you turn one of these on
+are not kept, as before.
+
+### Changed — Fewer database writes for event delivery and replication
+
+Event delivery now claims a batch of events and records the results of the
+whole batch in one transaction each. Before, it wrote each event on its own:
+100 events to 2 endpoints wrote 913 database pages and now write 17. An idle
+replication event consumer no longer writes to the database on every tick,
+and a lifecycle run records the delete events of one page in one write.
+
 ### Changed — `/_/ready` answers from the backend health checks
 
 Each `/_/ready` request sent a `ListBuckets` request to every storage backend.
