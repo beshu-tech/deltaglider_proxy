@@ -52,7 +52,6 @@ use super::paged::{
 use super::store::{current_unix_seconds, MaintenanceJob};
 use super::{needs_rewrite, resolve_desired, strip_encryption_markers, DesiredEncryption};
 
-const POLL_INTERVAL_SECS: u64 = 3;
 /// How long a job whose backend is gated waits before a worker claims it
 /// again (about one health re-probe interval).
 const BACKEND_DEFER_SECS: i64 = 30;
@@ -100,8 +99,11 @@ impl<'a> Holder<'a> {
     }
 }
 
-/// Spawn the maintenance worker loop. Wakes on `state.maintenance_notify`
-/// (job creation) or every few seconds (boot-requeued jobs, lease retry).
+/// Spawn the maintenance worker loop. It drains every claimable job, then
+/// waits for `state.maintenance_notify` (every job creation sends it), for
+/// the time at which a deferred, backed-off or abandoned row comes due, or
+/// at most half a lease TTL (`idle_wait_secs`). It drains at once on
+/// start: a job that the previous process left queued resumes at boot.
 pub fn spawn_worker(
     mutator: ConfigMutator,
     db: Arc<Mutex<ConfigDb>>,
@@ -112,13 +114,8 @@ pub fn spawn_worker(
     tokio::spawn(async move {
         info!("Maintenance worker started: instance_id={}", instance_id);
         loop {
-            tokio::select! {
-                _ = state.maintenance_notify.notified() => {}
-                _ = tokio::time::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECS)) => {}
-                _ = crate::shutdown::started() => {}
-            }
-            // Drain every claimable job before sleeping again.
-            loop {
+            // Drain every claimable job before waiting again.
+            let (lease, next_due) = loop {
                 if crate::shutdown::is_shutting_down() {
                     info!("Maintenance worker stopped: the process shuts down");
                     return;
@@ -128,7 +125,7 @@ pub fn spawn_worker(
                     .await
                     .jobs
                     .lease_timing(LeaseTiming::MAINTENANCE);
-                let claimed = {
+                let (claimed, next_due) = {
                     let db = db.lock().await;
                     // Re-queue abandoned rows first (lease-aware): a job
                     // whose runner died mid-run becomes claimable within
@@ -145,7 +142,14 @@ pub fn spawn_worker(
                     // resumed in `cleanup` gates nothing), the requeue, and
                     // any transition a crashed path did not sync.
                     state.maintenance_gate.sync_from(&db);
-                    claimed
+                    let next_due = match claimed {
+                        Ok(None) => db.maintenance_next_due_at().unwrap_or_else(|e| {
+                            warn!("maintenance: next due time unknown: {}", e);
+                            None
+                        }),
+                        _ => None,
+                    };
+                    (claimed, next_due)
                 };
                 match claimed {
                     Ok(Some(job)) => {
@@ -156,15 +160,37 @@ pub fn spawn_worker(
                         };
                         run_job(&mutator, &config, &db, &state, holder, job).await;
                     }
-                    Ok(None) => break,
+                    Ok(None) => break (lease, next_due),
                     Err(e) => {
                         warn!("maintenance: claim failed: {}", e);
-                        break;
+                        break (lease, None);
                     }
                 }
+            };
+            let wait = idle_wait_secs(lease.ttl_secs, next_due, current_unix_seconds());
+            tokio::select! {
+                _ = state.maintenance_notify.notified() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
+                _ = crate::shutdown::started() => {}
             }
         }
     })
+}
+
+/// Pure: how long the idle worker waits before it looks at the queue
+/// again without a notify. Half a lease TTL at most (an abandoned row of a
+/// peer becomes claimable within one TTL; a synced row that no notify
+/// announces is seen within half of one); until `next_due` (the earliest
+/// time at which a row comes due by time alone) when that is sooner; never
+/// below one second.
+pub(crate) fn idle_wait_secs(lease_ttl_secs: i64, next_due: Option<i64>, now: i64) -> u64 {
+    const MIN_WAIT_SECS: i64 = 1;
+    let poll = (lease_ttl_secs / 2).max(MIN_WAIT_SECS);
+    let wait = match next_due {
+        Some(at) => (at - now).clamp(MIN_WAIT_SECS, poll),
+        None => poll,
+    };
+    wait as u64
 }
 
 /// Execute one claimed job to a terminal state. Never panics the loop:

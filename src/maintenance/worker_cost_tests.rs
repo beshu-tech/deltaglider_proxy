@@ -658,3 +658,70 @@ async fn a_resumed_walk_lists_the_references() {
     // The walk from the cursor, then the reference listing.
     assert_eq!(bucket_lists(&fake, "b"), 2, "{:#?}", fake.requests());
 }
+
+/// P6.6: the idle worker waits for a notify, for the next due row, or at
+/// most half a lease TTL; never less than a second.
+#[test]
+fn the_idle_wait_is_half_a_ttl_or_the_next_due_row() {
+    assert_eq!(idle_wait_secs(60, None, 1_000), 30);
+    assert_eq!(idle_wait_secs(60, Some(1_010), 1_000), 10);
+    assert_eq!(idle_wait_secs(60, Some(5_000), 1_000), 30);
+    // A row already due (or due this second): one second, never a spin.
+    assert_eq!(idle_wait_secs(60, Some(900), 1_000), 1);
+    assert_eq!(idle_wait_secs(60, Some(1_000), 1_000), 1);
+    assert_eq!(idle_wait_secs(1, None, 1_000), 1);
+}
+
+/// Wait (up to `secs`) until job `id` settles; its row.
+async fn settled(db: &Arc<Mutex<ConfigDb>>, id: i64, secs: u64) -> MaintenanceJob {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        let row = db.lock().await.maintenance_job_by_id(id).unwrap().unwrap();
+        if row.status == "completed" || tokio::time::Instant::now() >= deadline {
+            return row;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// P6.6: the worker drains the queue when it starts (a job that the
+/// previous process left queued resumes at boot, with no notify), and a
+/// deferred job runs when it comes due, not at the next poll.
+#[tokio::test]
+async fn the_worker_drains_at_start_and_wakes_when_a_row_comes_due() {
+    let e = env(2).await;
+    let id = e.claim().await.unwrap().id;
+    // A deferred row (backend gated, transient retry): due in a second.
+    let not_before = current_unix_seconds() + 1;
+    assert!(e
+        .db
+        .lock()
+        .await
+        .maintenance_defer(id, "inst", not_before, "waiting")
+        .unwrap());
+    assert_eq!(
+        e.db.lock().await.maintenance_next_due_at().unwrap(),
+        Some(not_before)
+    );
+    // And one queued before the start, on another bucket.
+    e.state.engine.load().create_bucket("c").await.unwrap();
+    let queued =
+        e.db.lock()
+            .await
+            .maintenance_create_job(
+                "reencrypt",
+                "c",
+                "counting",
+                None,
+                "admin",
+                unique_created_at(),
+            )
+            .unwrap()
+            .unwrap();
+    let worker = spawn_worker(e.mutator.clone(), e.db.clone());
+    let row = settled(&e.db, queued, 2).await;
+    assert_eq!(row.status, "completed", "not drained at start: {row:?}");
+    let row = settled(&e.db, id, 4).await;
+    worker.abort();
+    assert_eq!(row.status, "completed", "not run when due: {row:?}");
+}

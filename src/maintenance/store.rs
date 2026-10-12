@@ -542,6 +542,20 @@ impl ConfigDb {
         Ok(n > 0)
     }
 
+    /// The earliest time (unix seconds) at which a row comes due by time
+    /// alone: a deferred or backed-off row's `not_before`, or a lease that
+    /// lapses (its row then re-queues). The idle worker wakes then.
+    /// `None`: no row waits for a time.
+    pub fn maintenance_next_due_at(&self) -> Result<Option<i64>, ConfigDbError> {
+        Ok(self.conn.query_row(
+            "SELECT MIN(leader_expires_at) FROM maintenance_jobs
+              WHERE status IN ('queued', 'running', 'cancelling')
+                AND leader_expires_at IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Record a per-object failure, ring-bounded to `max_retained` rows
     /// per job (oldest evicted first).
     pub fn maintenance_record_failure(
