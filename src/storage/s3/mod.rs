@@ -24,6 +24,7 @@ mod body;
 mod client;
 mod errors;
 mod facts;
+mod heal;
 mod listing;
 mod metadata;
 mod objects;
@@ -1448,7 +1449,8 @@ impl StorageBackend for S3Backend {
             .iter_mut()
             .map(|(key, meta)| Self::resolve_one_listed(&self.list_cache_scope, bucket, key, meta))
             .collect();
-        // What the process cache did not know, the durable facts may.
+        // What the process cache did not know, the durable facts may,
+        // unless a LIST found none for this exact stored object a moment ago.
         let candidates: Vec<(usize, String)> = objects
             .iter()
             .zip(&sizes)
@@ -1461,6 +1463,16 @@ impl StorageBackend for S3Backend {
                     Some((i, key.clone()))
                 }
                 _ => None,
+            })
+            .filter(|(i, stored_key)| {
+                let meta = &objects[*i].1;
+                !list_size_cache::missing_recently(&StoredObjectId {
+                    scope: &self.list_cache_scope,
+                    bucket,
+                    key: stored_key,
+                    etag: &meta.md5,
+                    size: meta.stored_size(),
+                })
             })
             .collect();
         if !candidates.is_empty() {

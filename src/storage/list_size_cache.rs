@@ -119,17 +119,33 @@ pub fn lookup(id: &StoredObjectId<'_>) -> Option<LogicalFacts> {
 }
 
 /// Stored objects that a LIST found without durable listing facts (see
-/// [`crate::storage::listing_facts`]). The next HEAD that learns their facts
-/// writes them (lazy backfill for objects stored before the facts existed).
-/// Bounded: an entry that falls out only waits for a later LIST to mark it.
-static MISSING: LazyLock<Cache<String, ()>> =
+/// [`crate::storage::listing_facts`]), and when. The next HEAD that learns
+/// their facts writes them (lazy backfill for objects stored before the
+/// facts existed), and for [`MISSING_FACTS_TTL`] a LIST does not read the
+/// facts of the object again. Bounded: an entry that falls out only waits
+/// for a later LIST to mark it.
+static MISSING: LazyLock<Cache<String, std::time::Instant>> =
     LazyLock::new(|| Cache::builder().max_capacity(100_000).build());
+
+/// How long a LIST trusts "no durable facts" for one stored object. Facts
+/// that another node writes in that time are seen at most this late; an
+/// overwrite is another stored object (new ETag), so it is read at once.
+pub const MISSING_FACTS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Note that a LIST found no durable facts for this stored object.
 pub fn mark_missing_facts(id: &StoredObjectId<'_>) {
     if !bare_etag(id.etag).is_empty() {
-        MISSING.insert(cache_key(id), ());
+        MISSING.insert(cache_key(id), std::time::Instant::now());
     }
+}
+
+/// Did a LIST find no durable facts for this stored object less than
+/// [`MISSING_FACTS_TTL`] ago? Then a LIST skips the facts read for it: the
+/// answer would be the same.
+pub fn missing_recently(id: &StoredObjectId<'_>) -> bool {
+    MISSING
+        .get(&cache_key(id))
+        .is_some_and(|at| at.elapsed() < MISSING_FACTS_TTL)
 }
 
 /// Was this stored object marked by [`mark_missing_facts`]? Clears the mark,
@@ -184,6 +200,24 @@ mod tests {
             etag,
             size,
         }
+    }
+
+    /// A facts miss is remembered for exactly the stored object it was
+    /// found for: an overwrite (new ETag or size) reads the facts again.
+    #[test]
+    fn a_facts_miss_is_remembered_per_stored_object() {
+        let key = "neg/fw.tar.delta";
+        assert!(!missing_recently(&id(key, "e1", 46)));
+        mark_missing_facts(&id(key, "\"e1\"", 46));
+        assert!(missing_recently(&id(key, "e1", 46)));
+        assert!(!missing_recently(&id(key, "e2", 46)), "overwritten");
+        assert!(!missing_recently(&id(key, "e1", 47)), "other size");
+        // An unknown stored ETag is never marked.
+        mark_missing_facts(&id("neg/x.delta", "", 1));
+        assert!(!missing_recently(&id("neg/x.delta", "", 1)));
+        // The HEAD that learns the facts takes the mark.
+        assert!(take_missing_facts(&id(key, "e1", 46)));
+        assert!(!missing_recently(&id(key, "e1", 46)));
     }
 
     #[test]
