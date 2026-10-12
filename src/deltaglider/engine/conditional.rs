@@ -217,9 +217,17 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let size = data.len() as u64;
         if size > self.spool_threshold() && self.write_tries_delta(bucket, key, &user_metadata) {
             let spool = self.spool_acquire(size).await?;
-            tokio::fs::write(spool.path(), &data)
-                .await
-                .map_err(|e| EngineError::Storage(StorageError::from(e)))?;
+            // Hash from RAM while the spool is written: the spooled store
+            // then does not read the body back to hash it.
+            let hashing = {
+                let data = data.clone();
+                tokio::task::spawn_blocking(move || super::store::BodyHashes::of(&data))
+            };
+            let (written, hashes) = tokio::join!(tokio::fs::write(spool.path(), &data), hashing);
+            written.map_err(|e| EngineError::Storage(StorageError::from(e)))?;
+            let hashes = hashes.map_err(|e| {
+                EngineError::Storage(StorageError::Other(format!("hash task: {e}")))
+            })?;
             self.store_spooled_delta_inner(
                 bucket,
                 key,
@@ -229,6 +237,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 user_metadata,
                 None,
                 known_prior,
+                Some(hashes),
             )
             .await
         } else {

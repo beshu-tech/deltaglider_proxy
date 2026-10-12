@@ -121,6 +121,30 @@ impl StorePlan {
     }
 }
 
+/// The hex SHA-256 and MD5 of a body, computed by a caller that held it.
+pub(super) struct BodyHashes {
+    pub(super) sha256: String,
+    pub(super) md5: String,
+}
+
+impl BodyHashes {
+    /// Hash `data` (CPU work: call it off the async runtime for a large
+    /// body).
+    pub(super) fn of(data: &[u8]) -> Self {
+        Self {
+            sha256: hex::encode(Sha256::digest(data)),
+            md5: hex::encode(Md5::digest(data)),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread hashed a body by reading its spool file
+    /// back (`hash_spool_file`), for the P2.6 cost test.
+    pub(super) static SPOOL_HASH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A PUT body: in RAM (the buffered PUT) or on a spool file that the caller
 /// holds (the streaming PUT).
 #[derive(Clone, Copy)]
@@ -494,6 +518,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             user_metadata,
             multipart_etag,
             None,
+            None,
         )
         .await
     }
@@ -512,6 +537,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         user_metadata: std::collections::HashMap<String, String>,
         multipart_etag: Option<String>,
         known_prior: Option<CounterPrior>,
+        known_hashes: Option<BodyHashes>,
     ) -> Result<StoreResult, EngineError> {
         self.metadata_cache.invalidate(bucket, key);
         let (obj_key, deltaspace_id) = self.validated_key_ingest(bucket, key)?;
@@ -541,7 +567,20 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // `size` (source overwritten mid-stream, or a stale/corrupt xattr
         // file_size on a filesystem source) — else we'd stamp file_size=declared
         // over a sha256 of DIFFERENT bytes. Matches the multipart-relay guard.
-        let (sha256, md5, observed) = Self::hash_spool_file(body.path()).await?;
+        // A caller that hashed the body from RAM while it wrote the spool
+        // passes the hashes: the spool is not read back (it was, in full,
+        // per PUT). The size check then reads the file's length.
+        let (sha256, md5, observed) = match known_hashes {
+            Some(h) => (
+                h.sha256,
+                h.md5,
+                tokio::fs::metadata(body.path())
+                    .await
+                    .map_err(|e| EngineError::Storage(StorageError::from(e)))?
+                    .len(),
+            ),
+            None => Self::hash_spool_file(body.path()).await?,
+        };
         if observed != size {
             return Err(EngineError::Storage(StorageError::Other(format!(
                 "Spooled object size mismatch: declared {size}, observed {observed}"
@@ -1168,6 +1207,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// memory (256KiB chunks). Shared by the store hash path and the reference
     /// heal.
     pub(super) async fn hash_spool_file(path: &Path) -> Result<(String, String, u64), EngineError> {
+        #[cfg(test)]
+        SPOOL_HASH_READS.with(|n| n.set(n.get() + 1));
         let path = path.to_path_buf();
         tokio::task::spawn_blocking(move || -> std::io::Result<(String, String, u64)> {
             use std::io::Read;

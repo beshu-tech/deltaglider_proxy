@@ -405,3 +405,47 @@ async fn the_baseline_in_the_reference_cache_is_the_client_buffer() {
         .expect("the baseline is cached");
     assert_eq!(cached.as_ptr(), body.as_ptr(), "the cache copied the body");
 }
+
+/// A client body above the spool threshold is in RAM already: the store
+/// hashes it from RAM while it writes the spool, and never reads the spool
+/// back to hash it (it read the whole body back, once per PUT).
+#[tokio::test]
+async fn a_large_client_put_hashes_from_ram_not_from_the_spool() {
+    let (endpoint, _fake) = crate::storage::fake_s3::start().await;
+    let mut config = Config::default();
+    config.tuning.spool_threshold_bytes = Some(1024);
+    let s3 = crate::storage::s3_test_support::for_test_endpoint(&endpoint);
+    let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(s3);
+    let engine = DeltaGliderEngine::new_with_backend(Arc::new(backend), &config, None)
+        .with_bucket_usage(Some(Arc::new(BucketUsage::in_memory().unwrap())));
+    engine.create_bucket("b").await.unwrap();
+    super::store::SPOOL_HASH_READS.with(|n| n.set(0));
+    let base = noise(31, 64 * 1024);
+    let mut v2 = base.clone();
+    v2[100..200].fill(9);
+    for (key, body) in [("rel/a.zip", &base), ("rel/b.zip", &v2)] {
+        let r = engine
+            .store_conditional(
+                "b",
+                key,
+                Bytes::from(body.clone()),
+                None,
+                HashMap::new(),
+                &crate::deltaglider::Precondition::none(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.metadata.storage_info.label(), "delta", "{key}");
+        assert_eq!(
+            r.metadata.file_sha256,
+            hex::encode(Sha256::digest(body)),
+            "{key}"
+        );
+        assert_eq!(r.metadata.file_size, body.len() as u64, "{key}");
+    }
+    assert_eq!(
+        super::store::SPOOL_HASH_READS.with(|n| n.get()),
+        0,
+        "the spool was read back to hash"
+    );
+}
