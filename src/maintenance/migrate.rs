@@ -65,7 +65,7 @@ use crate::transfer::{
 };
 
 use super::paged::{
-    paged_phase, JobCtx, KeyPage, ListError, PageStep, PhaseSpec, PAGE_CONCURRENCY,
+    list_job_keys, paged_phase, JobCtx, KeyPage, ListError, PageStep, PhaseSpec, PAGE_CONCURRENCY,
 };
 use super::store::MaintenanceJob;
 use super::worker::{
@@ -370,20 +370,26 @@ async fn head_retrying(
 /// (or answers 5xx) is retried, then an error. Any HEAD error read as
 /// `Missing`, so one timeout in verify failed the job and deleted every
 /// staged copy.
+///
+/// `source_form`: the one stored form of the source key that the source
+/// listing proved (the write gate freezes the source): one HEAD, not two.
 async fn copy_verdict_for(
     engine: &DynEngine,
     source_bucket: &str,
     target_bucket: &str,
     key: &str,
+    source_form: Option<crate::storage::ObjectVariant>,
 ) -> Result<ContentVerdict, HeadFailed> {
     let Some(dst) = head_retrying(engine, target_bucket, key).await? else {
         return Ok(ContentVerdict::Missing);
     };
-    Ok(match engine.head(source_bucket, key).await {
-        Ok(src) => content_verdict(&src, Some(&dst)),
-        // The copy (or verify) reports the source error itself.
-        Err(_) => ContentVerdict::Unknown,
-    })
+    Ok(
+        match engine.head_listed(source_bucket, key, source_form).await {
+            Ok((src, _)) => content_verdict(&src, Some(&dst)),
+            // The copy (or verify) reports the source error itself.
+            Err(_) => ContentVerdict::Unknown,
+        },
+    )
 }
 
 /// One page of `bucket` (all keys, no metadata), a transient error retried
@@ -870,6 +876,7 @@ impl MigrateRun<'_> {
             c,
             recopy: RecopyScope::on_resume(self.job.phase == "copy"),
             engine: None,
+            forms: Default::default(),
             page_token: None,
         };
         paged_phase(
@@ -899,6 +906,7 @@ impl MigrateRun<'_> {
             m: self,
             c,
             engine: None,
+            forms: Default::default(),
         };
         paged_phase(
             self.ctx(),
@@ -1164,6 +1172,8 @@ struct CopyStep<'a, 'r> {
     c: &'a mut Counters,
     recopy: RecopyScope,
     engine: Option<Arc<DynEngine>>,
+    /// The stored forms that the page's source listing proved.
+    forms: crate::deltaglider::ListedPageForms,
     /// The cursor of the page in progress (where a failed page resumes).
     page_token: Option<String>,
 }
@@ -1195,11 +1205,10 @@ impl PageStep for CopyStep<'_, '_> {
     async fn list(&mut self, token: Option<&str>) -> Result<KeyPage, ListError> {
         self.page_token = token.map(str::to_string);
         let engine = self.engine.as_ref().expect("begin_page runs first");
-        engine
-            .list_objects(&self.m.job.bucket, "", None, PAGE_SIZE, token, false)
-            .await
-            .map(KeyPage::from)
-            .map_err(|e| ListError::engine("list source failed", &e))
+        let (page, forms) =
+            list_job_keys(engine, &self.m.job.bucket, token, "list source failed").await?;
+        self.forms = forms;
+        Ok(page)
     }
 
     /// Restart from page 0: the verdict skip makes the re-list idempotent.
@@ -1228,7 +1237,14 @@ impl PageStep for CopyStep<'_, '_> {
         // the object is copied (the copy is idempotent).
         if !self.recopy.recopies()
             && matches!(
-                copy_verdict_for(engine, bucket, &params.transient_key, key).await,
+                copy_verdict_for(
+                    engine,
+                    bucket,
+                    &params.transient_key,
+                    key,
+                    self.forms.of(key)
+                )
+                .await,
                 Ok(ContentVerdict::Same)
             )
         {
@@ -1303,6 +1319,8 @@ struct VerifyStep<'a, 'r> {
     m: &'a MigrateRun<'r>,
     c: &'a Counters,
     engine: Option<Arc<DynEngine>>,
+    /// The stored forms that the page's source listing proved.
+    forms: crate::deltaglider::ListedPageForms,
 }
 
 impl PageStep for VerifyStep<'_, '_> {
@@ -1315,11 +1333,10 @@ impl PageStep for VerifyStep<'_, '_> {
 
     async fn list(&mut self, token: Option<&str>) -> Result<KeyPage, ListError> {
         let engine = self.engine.as_ref().expect("begin_page runs first");
-        engine
-            .list_objects(&self.m.job.bucket, "", None, PAGE_SIZE, token, false)
-            .await
-            .map(KeyPage::from)
-            .map_err(|e| ListError::engine("verify list failed", &e))
+        let (page, forms) =
+            list_job_keys(engine, &self.m.job.bucket, token, "verify list failed").await?;
+        self.forms = forms;
+        Ok(page)
     }
 
     async fn save(&mut self, token: Option<&str>) -> Result<(), PhaseStop> {
@@ -1333,6 +1350,7 @@ impl PageStep for VerifyStep<'_, '_> {
             &self.m.job.bucket,
             &self.m.params.transient_key,
             key,
+            self.forms.of(key),
         )
         .await
         {

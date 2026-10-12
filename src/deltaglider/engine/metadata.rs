@@ -32,7 +32,7 @@ pub(super) fn reference_integrity_ok(
     }
 }
 
-/// Which stored forms of an object exist ([`DeltaGliderEngine::resolve_stored_forms`]).
+/// Which stored forms of an object exist (`resolve_stored_forms`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoredForms {
     pub(super) delta: bool,
@@ -53,6 +53,47 @@ impl StoredForms {
 /// the delta.
 pub(super) fn delta_is_newest(delta: &FileMetadata, passthrough: &FileMetadata) -> bool {
     delta.created_at >= passthrough.created_at
+}
+
+impl StoredForms {
+    /// Exactly the one stored form `form`.
+    fn only(form: crate::storage::ObjectVariant) -> Self {
+        Self {
+            delta: form == crate::storage::ObjectVariant::Delta,
+            passthrough: form == crate::storage::ObjectVariant::Passthrough,
+        }
+    }
+}
+
+/// The one stored form of each key of a job's listing page, where the page
+/// proved it ([`crate::storage::ListedForms`]).
+///
+/// Only a maintenance job may HEAD one form on this proof: its bucket's
+/// write gate holds every client write (and defers replication and
+/// lifecycle writes) from before the listing until after the HEAD, so no
+/// form appears between the two. A client HEAD reads both forms (plan
+/// decision D4: a crash between a write and its other-form DELETE leaves
+/// both, and newest-wins needs both reads).
+#[derive(Debug, Clone, Default)]
+pub struct ListedPageForms(std::collections::HashMap<String, crate::storage::ObjectVariant>);
+
+impl ListedPageForms {
+    pub(super) fn of_page(
+        objects: &[(String, FileMetadata)],
+        forms: &crate::storage::ListedForms,
+    ) -> Self {
+        Self(
+            objects
+                .iter()
+                .filter_map(|(k, meta)| Some((k.clone(), forms.single_form(k, meta)?)))
+                .collect(),
+        )
+    }
+
+    /// The one stored form of `key`; `None`: not proved (HEAD both).
+    pub fn of(&self, key: &str) -> Option<crate::storage::ObjectVariant> {
+        self.0.get(key).copied()
+    }
 }
 
 impl<S: StorageBackend> DeltaGliderEngine<S> {
@@ -277,6 +318,44 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // Populate metadata cache on successful backend lookup
         self.metadata_cache.insert(bucket, key, meta.clone());
         Ok((meta, forms))
+    }
+
+    /// `head_with_forms` (a HEAD of both forms) for a key of a maintenance job's listing
+    /// page: one HEAD of `listed`, the one stored form that the page proved
+    /// ([`ListedPageForms`]), instead of one per form. `None`, or a form
+    /// that is gone (the object changed outside the proxy), reads both.
+    pub async fn head_listed(
+        &self,
+        bucket: &str,
+        key: &str,
+        listed: Option<crate::storage::ObjectVariant>,
+    ) -> Result<(FileMetadata, StoredForms), EngineError> {
+        use crate::storage::ObjectVariant;
+        let Some(form) = listed else {
+            return self.head_with_forms(bucket, key).await;
+        };
+        let (obj_key, deltaspace_id) = self.validated_key(bucket, key)?;
+        let read = match form {
+            ObjectVariant::Delta if !obj_key.filename.is_empty() => {
+                self.storage
+                    .get_delta_metadata(bucket, &deltaspace_id, &obj_key.filename)
+                    .await
+            }
+            ObjectVariant::Delta => return self.head_with_forms(bucket, key).await,
+            ObjectVariant::Passthrough => {
+                self.storage
+                    .get_passthrough_metadata(bucket, &deltaspace_id, &obj_key.filename)
+                    .await
+            }
+        };
+        match read {
+            Ok(meta) => {
+                self.metadata_cache.insert(bucket, key, meta.clone());
+                Ok((meta, StoredForms::only(form)))
+            }
+            Err(StorageError::NotFound(_)) => self.head_with_forms(bucket, key).await,
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// The metadata of the deltaspace's reference.bin from ONE read (a HEAD

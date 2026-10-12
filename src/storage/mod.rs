@@ -46,7 +46,7 @@ pub use traits::{
     clamp_range, io_error_is_name_too_long, io_error_is_path_type_conflict, open_object_by_parts,
     open_passthrough_range_by_parts, open_reference_source_by_parts, reference_fence_lost,
     unfenced_reference_fence, unfenced_reference_fence_with_metadata, unfenced_reference_write,
-    BucketListing, BulkListing, ByteStream, DelegatedListResult, DynStorageBackend,
+    BucketListing, BulkListing, ByteStream, DelegatedListResult, DynStorageBackend, ListedForms,
     MultipartUpload, ObjectVariant, RefFence, RefWrite, ReferenceSource, StorageBackend,
     StorageError, StoredObject, UploadedPart,
 };

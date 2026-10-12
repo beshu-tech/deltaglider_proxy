@@ -826,6 +826,7 @@ impl S3Backend {
 
         // Classify and build lite metadata (no HEAD calls — same as bulk_list_objects).
         let listing = Self::classify_listed_objects(raw_objects);
+        let ambiguous = ambiguous_forms(&listing);
         let mut objects: Vec<(String, FileMetadata)> =
             Self::resolve_classified_lite(listing.classified, listing.dir_markers);
         let mut common_prefixes: Vec<String> = all_common_prefixes.into_iter().collect();
@@ -869,8 +870,33 @@ impl S3Backend {
             is_truncated: page.is_truncated,
             next_continuation_token: page.next_continuation_token,
             upstream_requests,
+            forms: crate::storage::ListedForms::Reported { ambiguous },
         })
     }
+}
+
+/// Pure: the user keys of a classified page whose stored forms are not
+/// exactly one of `key` and `key.delta`: both forms (or a folder marker
+/// and a `.delta` under one key), or a stored name that maps to the key
+/// but is neither form (`a.delta.delta`). Sorted.
+pub(super) fn ambiguous_forms(listing: &ClassifiedListing) -> Vec<String> {
+    let mut seen: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
+    let mut odd = std::collections::BTreeSet::new();
+    for (key, _) in &listing.dir_markers {
+        *seen.entry(key.as_str()).or_default() += 1;
+    }
+    for c in &listing.classified {
+        *seen.entry(c.user_key.as_str()).or_default() += 1;
+        let exact =
+            c.s3_key == c.user_key || c.s3_key.strip_suffix(".delta") == Some(c.user_key.as_str());
+        if !exact {
+            odd.insert(c.user_key.as_str());
+        }
+    }
+    seen.into_iter()
+        .filter(|(k, n)| *n > 1 || odd.contains(k))
+        .map(|(k, _)| k.to_string())
+        .collect()
 }
 
 /// The last entry a listing read so far: its last key, or its last
@@ -975,6 +1001,57 @@ mod delegated_cost_tests {
             per_page.iter().all(|n| *n <= 2),
             "upstream LISTs per client page: {per_page:?}"
         );
+    }
+
+    /// P6.1: a page reports which keys it saw in more than one stored form
+    /// (or under a stored name that is neither form), also when the
+    /// `.delta` form sorts past the page and only the probe reads it.
+    #[tokio::test]
+    async fn a_page_reports_the_keys_it_saw_in_both_forms() {
+        let mut keys: Vec<String> = ["a", "a.delta", "b.delta", "c", "e.delta.delta"]
+            .iter()
+            .map(|k| format!("d/{k}"))
+            .collect();
+        // `d/k.delta` sorts after every `d/k-…` key: past a 3-key page.
+        keys.extend(["d/k".to_string(), "d/k.delta".to_string()]);
+        keys.extend((0..5).map(|i| format!("d/k-{i}")));
+        let (s3, _fake) = backend_with_keys(&keys).await;
+        let page = s3
+            .list_objects_delegated("b", "d/", None, 1000, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            page.forms,
+            crate::storage::ListedForms::Reported {
+                ambiguous: vec!["d/a".into(), "d/e".into(), "d/k".into()]
+            }
+        );
+        let page = s3
+            .list_objects_delegated("b", "d/", None, 6, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let listed: Vec<&str> = page.objects.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(listed.contains(&"d/k"), "{listed:?}");
+        assert_eq!(
+            page.forms,
+            crate::storage::ListedForms::Reported {
+                ambiguous: vec!["d/a".into(), "d/e".into(), "d/k".into()]
+            }
+        );
+        // The one form of a single-form key is the form of its entry.
+        let (_, b) = page.objects.iter().find(|(k, _)| k == "d/b").unwrap();
+        assert_eq!(
+            page.forms.single_form("d/b", b),
+            Some(crate::storage::ObjectVariant::Delta)
+        );
+        let (_, c) = page.objects.iter().find(|(k, _)| k == "d/c").unwrap();
+        assert_eq!(
+            page.forms.single_form("d/c", c),
+            Some(crate::storage::ObjectVariant::Passthrough)
+        );
+        assert_eq!(page.forms.single_form("d/a", c), None);
     }
 
     /// A page reports the requests it sent (its pages and its probes), so

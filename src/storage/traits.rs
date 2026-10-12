@@ -1347,6 +1347,43 @@ pub struct DelegatedListResult {
     /// probes. A backend that sends none (the filesystem) reports 0. The
     /// scan budget of a filtered LIST counts them.
     pub upstream_requests: u32,
+    /// The stored forms that the page saw for its objects.
+    pub forms: ListedForms,
+}
+
+/// The stored forms (`k`, `k.delta`) that a listing page saw for its
+/// objects ([`DelegatedListResult::forms`]). A page reads every stored
+/// form of each key that it lists (the S3 page confirms a late `.delta`
+/// with a probe), so a key that it saw in one form has no other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListedForms {
+    /// The listing did not track the forms: a reader HEADs both.
+    Unreported,
+    /// Every object of the page has exactly the stored form that its entry
+    /// names (`StorageInfo::Delta`: `k.delta`, else `k`), except the keys
+    /// in `ambiguous` (sorted): both forms, or a stored name that is
+    /// neither form of the key.
+    Reported { ambiguous: Vec<String> },
+}
+
+impl ListedForms {
+    /// The one stored form of `key`, listed with `meta`. `None` when the
+    /// page did not report it, or the key is ambiguous.
+    pub fn single_form(&self, key: &str, meta: &FileMetadata) -> Option<ObjectVariant> {
+        match self {
+            ListedForms::Unreported => None,
+            ListedForms::Reported { ambiguous } => {
+                if ambiguous.binary_search_by(|k| k.as_str().cmp(key)).is_ok() {
+                    return None;
+                }
+                Some(if meta.is_delta() {
+                    ObjectVariant::Delta
+                } else {
+                    ObjectVariant::Passthrough
+                })
+            }
+        }
+    }
 }
 
 /// Result of [`StorageBackend::bulk_list_objects_with_baselines`].

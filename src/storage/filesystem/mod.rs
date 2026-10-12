@@ -814,6 +814,9 @@ impl FilesystemBackend {
             is_truncated: false,
             next_continuation_token: None,
             upstream_requests: 0,
+            forms: super::traits::ListedForms::Reported {
+                ambiguous: Vec::new(),
+            },
         };
         // As `bulk_list_objects_with_baselines`: walk the deepest directory
         // the prefix names completely, keep the keys that start with it.
@@ -832,6 +835,8 @@ impl FilesystemBackend {
         let max = max_keys as usize;
         // Distinct keys in order; one more than the page proves truncation.
         let mut found: Vec<(String, FileMetadata)> = Vec::new();
+        // Keys seen in both forms (sorted: the walk is in key order).
+        let mut ambiguous: Vec<String> = Vec::new();
         let mut stack = vec![root];
         'walk: while let Some(dir) = stack.last_mut() {
             let Some(entry) = dir.entries.get(dir.next).cloned() else {
@@ -867,6 +872,9 @@ impl FilesystemBackend {
             // newest wins, as in `dedup_keep_latest`.
             match found.last_mut() {
                 Some((k, m)) if *k == key => {
+                    if ambiguous.last() != Some(k) {
+                        ambiguous.push(k.clone());
+                    }
                     if meta.created_at > m.created_at {
                         *m = meta;
                     }
@@ -899,6 +907,7 @@ impl FilesystemBackend {
             is_truncated,
             next_continuation_token,
             upstream_requests: 0,
+            forms: super::traits::ListedForms::Reported { ambiguous },
         })
     }
 
@@ -1943,6 +1952,7 @@ impl StorageBackend for FilesystemBackend {
                 is_truncated: false,
                 next_continuation_token: None,
                 upstream_requests: 0,
+                forms: super::traits::ListedForms::Unreported,
             }));
         }
 
@@ -2093,6 +2103,7 @@ impl StorageBackend for FilesystemBackend {
             is_truncated: page.is_truncated,
             next_continuation_token: page.next_continuation_token,
             upstream_requests: 0,
+            forms: super::traits::ListedForms::Unreported,
         }))
     }
 }

@@ -1493,3 +1493,32 @@ async fn list_keeps_an_object_whose_metadata_cannot_be_read() {
     names.sort();
     assert_eq!(names, ["", "a.txt", "app-2.zip", "app-3.zip", "app-4.zip"]);
 }
+
+/// P6.1: a flat page reports the keys it saw in both stored forms (a
+/// crash between a write and its other-form DELETE leaves both).
+#[tokio::test]
+async fn a_flat_page_reports_the_keys_it_saw_in_both_forms() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+        .await
+        .expect("new backend");
+    backend.create_bucket("bucket").await.expect("bucket");
+    let dir = tmp.path().join("bucket").join("deltaspaces").join("d");
+    std::fs::create_dir_all(&dir).unwrap();
+    for name in ["a", "a.delta", "b.delta", "c"] {
+        std::fs::write(dir.join(name), b"x").unwrap();
+    }
+    let listed = backend
+        .list_objects_delegated("bucket", "", None, 100, None)
+        .await
+        .expect("list")
+        .expect("delegated");
+    let keys: Vec<&str> = listed.objects.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, ["d/a", "d/b", "d/c"]);
+    assert_eq!(
+        listed.forms,
+        crate::storage::ListedForms::Reported {
+            ambiguous: vec!["d/a".into()]
+        }
+    );
+}

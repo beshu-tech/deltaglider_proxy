@@ -198,6 +198,39 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         max_keys_raw: u32,
         continuation_token: Option<&str>,
     ) -> Result<(ListObjectsPage, u32), EngineError> {
+        let (page, upstream, _) = self
+            .list_lite_with_forms(bucket, prefix, delimiter, max_keys_raw, continuation_token)
+            .await?;
+        Ok((page, upstream))
+    }
+
+    /// One page of every user object of `bucket` for a maintenance job:
+    /// the keys as the storage lists them (stored sizes, no HEAD, no
+    /// listing facts), and the one stored form of each key that the page
+    /// proved ([`ListedPageForms`]).
+    pub(crate) async fn list_job_page(
+        &self,
+        bucket: &str,
+        max_keys: u32,
+        continuation_token: Option<&str>,
+    ) -> Result<(ListObjectsPage, ListedPageForms), EngineError> {
+        let (page, _, forms) = self
+            .list_lite_with_forms(bucket, "", None, max_keys, continuation_token)
+            .await?;
+        let forms = ListedPageForms::of_page(&page.objects, &forms);
+        Ok((page, forms))
+    }
+
+    /// [`Self::list_objects_lite_counted`], and the stored forms that the
+    /// page saw (`Unreported` from the in-memory paging fallback).
+    async fn list_lite_with_forms(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        max_keys_raw: u32,
+        continuation_token: Option<&str>,
+    ) -> Result<(ListObjectsPage, u32, crate::storage::ListedForms), EngineError> {
         // S3 requires max-keys >= 1; clamp to prevent pagination invariant violations.
         let max_keys = max_keys_raw.max(1);
         // `delimiter=` (mc, rclone, restic send it) is no delimiter, as on
@@ -223,14 +256,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 next_continuation_token: result.next_continuation_token,
                 facts_missing_keys: Vec::new(),
             };
-            (page, result.upstream_requests)
+            (page, result.upstream_requests, result.forms)
         } else {
             // Backend doesn't support delegated listing for this shape — fall
             // through to the generic bulk_list + in-memory paging path.
             let page = self
                 .list_objects_bulk(bucket, prefix, delimiter, max_keys, continuation_token)
                 .await?;
-            (page, 0)
+            (page, 0, crate::storage::ListedForms::Unreported)
         };
         Ok(page)
     }

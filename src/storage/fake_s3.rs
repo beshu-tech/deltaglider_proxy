@@ -50,6 +50,9 @@ pub(crate) struct FakeS3 {
     /// whether a client sends requests concurrently.
     in_flight: parking_lot::Mutex<HashMap<String, (usize, usize)>>,
     faults: parking_lot::Mutex<Vec<Fault>>,
+    /// Object ACL requests (`?acl`) answer 501 NotImplemented, as on a
+    /// backend that does not serve ACLs ([`FakeS3::set_acl_unsupported`]).
+    acl_unsupported: std::sync::atomic::AtomicBool,
 }
 
 impl FakeS3 {
@@ -141,6 +144,23 @@ impl FakeS3 {
             )
             .into_bytes(),
         ))
+    }
+
+    /// Store `bucket/key` directly, as a foreign writer would, without a
+    /// request: `meta` are its `x-amz-meta-*` headers.
+    pub(crate) fn insert_object(&self, path: &str, body: &[u8], meta: &[(&str, &str)]) {
+        self.objects.lock().insert(
+            path.to_string(),
+            Stored {
+                body: body.to_vec(),
+                meta: meta
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                etag: format!("\"{}\"", hex::encode(md5::Md5::digest(body))),
+                modified: chrono::Utc::now().timestamp(),
+            },
+        );
     }
 
     /// Forget the requests so far.
@@ -291,6 +311,106 @@ const EMPTY_LIST: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
 <Name>b</Name><Prefix></Prefix><KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys>\
 <IsTruncated>false</IsTruncated></ListBucketResult>";
 
+/// GetObjectAcl / PutObjectAcl: the owner's full control, or 501 when the
+/// fake plays a backend without ACLs.
+fn object_acl(f: &FakeS3, method: &Method) -> (StatusCode, HeaderMap, Vec<u8>) {
+    if f.acl_unsupported.load(std::sync::atomic::Ordering::Relaxed) {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            HeaderMap::new(),
+            b"<Error><Code>NotImplemented</Code></Error>".to_vec(),
+        );
+    }
+    if *method != Method::GET {
+        return (StatusCode::OK, HeaderMap::new(), Vec::new());
+    }
+    let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+        <AccessControlPolicy><Owner><ID>fake</ID></Owner><AccessControlList>\
+        <Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" \
+        xsi:type=\"CanonicalUser\"><ID>fake</ID></Grantee>\
+        <Permission>FULL_CONTROL</Permission></Grant></AccessControlList>\
+        </AccessControlPolicy>";
+    (StatusCode::OK, HeaderMap::new(), body.as_bytes().to_vec())
+}
+
+/// CopyObject (`PUT` with `x-amz-copy-source`): the source's body under
+/// `path`, with the source's metadata (`COPY`) or the request's
+/// (`x-amz-metadata-directive: REPLACE`). `x-amz-copy-source-if-match`
+/// answers 412 when the source's ETag differs.
+fn copy_object(
+    f: &FakeS3,
+    path: &str,
+    source: &axum::http::HeaderValue,
+    headers: &HeaderMap,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let source = source.to_str().unwrap_or("");
+    let source = source.split('?').next().unwrap_or(source);
+    let source = urlencoding::decode(source.trim_start_matches('/'))
+        .map(std::borrow::Cow::into_owned)
+        .unwrap_or_else(|_| source.to_string());
+    let Some(src) = f.objects.lock().get(&source).cloned() else {
+        return (
+            StatusCode::NOT_FOUND,
+            HeaderMap::new(),
+            b"<Error><Code>NoSuchKey</Code></Error>".to_vec(),
+        );
+    };
+    if let Some(want) = headers
+        .get("x-amz-copy-source-if-match")
+        .and_then(|v| v.to_str().ok())
+    {
+        if want != src.etag {
+            return (
+                StatusCode::PRECONDITION_FAILED,
+                HeaderMap::new(),
+                b"<Error><Code>PreconditionFailed</Code></Error>".to_vec(),
+            );
+        }
+    }
+    let replace = headers
+        .get("x-amz-metadata-directive")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"));
+    let meta = if replace {
+        headers
+            .iter()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.as_str().strip_prefix("x-amz-meta-")?.to_string(),
+                    v.to_str().ok()?.to_string(),
+                ))
+            })
+            .collect()
+    } else {
+        src.meta.clone()
+    };
+    // A copy with new metadata has a new ETag on S3 (the fake: the
+    // metadata goes into the hash).
+    let mut h = md5::Md5::new();
+    h.update(&src.body);
+    for (k, v) in &meta {
+        h.update(k.as_bytes());
+        h.update(v.as_bytes());
+    }
+    let etag = format!("\"{}\"", hex::encode(h.finalize()));
+    f.objects.lock().insert(
+        path.to_string(),
+        Stored {
+            body: src.body,
+            meta,
+            etag: etag.clone(),
+            modified: chrono::Utc::now().timestamp(),
+        },
+    );
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><CopyObjectResult>\
+         <LastModified>2025-01-01T00:00:00.000Z</LastModified><ETag>{}</ETag>\
+         </CopyObjectResult>",
+        xml_escape(&etag)
+    );
+    (StatusCode::OK, HeaderMap::new(), body.into_bytes())
+}
+
 fn object_headers(o: &Stored) -> HeaderMap {
     let mut h = HeaderMap::new();
     for (k, v) in &o.meta {
@@ -364,6 +484,16 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                         let path = format!("{b}/{k}");
                         if let Some((status, body)) = f.enter(method.as_str(), &path).await {
                             return (status, HeaderMap::new(), body);
+                        }
+                        let query = uri.query().unwrap_or("");
+                        if query
+                            .split('&')
+                            .any(|q| q == "acl" || q.starts_with("acl="))
+                        {
+                            return object_acl(&f, &method);
+                        }
+                        if let Some(source) = headers.get("x-amz-copy-source") {
+                            return copy_object(&f, &path, source, &headers);
                         }
                         let current = f.objects.lock().get(&path).cloned();
                         // Conditional writes (`If-None-Match: *`, `If-Match`)

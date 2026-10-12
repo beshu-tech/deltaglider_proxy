@@ -10,7 +10,8 @@
 //! 2. **counting** — one LIST sweep for the exact object total. The
 //!    write set is frozen by the gate, so the total cannot drift and the
 //!    progress bar is honest.
-//! 3. **objects** — per object: `engine.head` → [`needs_rewrite`]? then
+//! 3. **objects** — per object: `engine.head_listed` (one HEAD of the
+//!    stored form that the page's listing proved) → [`needs_rewrite`]? then
 //!    rewrite in place via `transfer::copy_object_with_retries`
 //!    (source == destination; the engine's store path encrypts/decrypts
 //!    per the CURRENT backend mode; stale markers stripped). Failures are
@@ -43,7 +44,7 @@ use crate::storage::encrypting::{ENCRYPTION_KEY_ID_KEY, ENCRYPTION_MARKER_KEY};
 use crate::transfer::{copy_object_with_retries, ObjectTransferRequest};
 
 use super::paged::{
-    paged_phase, JobCtx, KeyPage, ListError, PageStep, PhaseSpec, PAGE_CONCURRENCY,
+    list_job_keys, paged_phase, JobCtx, KeyPage, ListError, PageStep, PhaseSpec, PAGE_CONCURRENCY,
 };
 use super::store::{current_unix_seconds, MaintenanceJob};
 use super::{needs_rewrite, resolve_desired, strip_encryption_markers, DesiredEncryption};
@@ -668,6 +669,7 @@ pub(crate) async fn run_count_then_walk<V: ObjectVisitor>(
         job,
         visitor,
         engine: None,
+        forms: Default::default(),
         c,
     };
     paged_phase(
@@ -704,6 +706,8 @@ struct ObjectsStep<'a, V> {
     visitor: &'a mut V,
     /// The page's engine (one per page: an apply mid-page swaps it).
     engine: Option<Arc<crate::deltaglider::DynEngine>>,
+    /// The stored forms that the page's listing proved.
+    forms: crate::deltaglider::ListedPageForms,
     c: Counters,
 }
 
@@ -718,11 +722,10 @@ impl<V: ObjectVisitor> PageStep for ObjectsStep<'_, V> {
 
     async fn list(&mut self, token: Option<&str>) -> Result<KeyPage, ListError> {
         let engine = self.engine.as_ref().expect("begin_page runs first");
-        engine
-            .list_objects(&self.job.bucket, "", None, PAGE_SIZE, token, false)
-            .await
-            .map(KeyPage::from)
-            .map_err(|e| ListError::engine("object list failed", &e))
+        let (page, forms) =
+            list_job_keys(engine, &self.job.bucket, token, "object list failed").await?;
+        self.forms = forms;
+        Ok(page)
     }
 
     // A restart re-scans from page 0: the visitor skips objects already
@@ -737,8 +740,13 @@ impl<V: ObjectVisitor> PageStep for ObjectsStep<'_, V> {
 
     async fn object(&self, key: &str) -> Visit {
         let engine = self.engine.as_ref().expect("begin_page runs first");
-        match engine.head(&self.job.bucket, key).await {
-            Ok(meta) => self.visitor.visit(engine, key, &meta).await,
+        // One HEAD of the form that the listing proved (the write gate
+        // freezes the bucket), not one per form.
+        match engine
+            .head_listed(&self.job.bucket, key, self.forms.of(key))
+            .await
+        {
+            Ok((meta, _)) => self.visitor.visit(engine, key, &meta).await,
             Err(e) => Visit::Failed(format!("could not read object metadata: {e}")),
         }
     }
@@ -1138,7 +1146,7 @@ pub(crate) async fn record_failure(
 
 #[cfg(test)]
 #[path = "worker_cost_tests.rs"]
-mod cost_tests;
+pub(crate) mod cost_tests;
 
 #[cfg(test)]
 mod tests {

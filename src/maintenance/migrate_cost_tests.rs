@@ -23,7 +23,16 @@ struct Env {
 /// Objects `k-000.txt` … in `b` (the source) and the same objects in `t`
 /// (the copies this job made), and a migrate job persisted in `phase`.
 async fn env(phase: &str, objects: usize) -> Env {
+    env_with(phase, objects, true).await
+}
+
+/// [`env`]; `in_target`: whether the target already holds the copies. The
+/// usage counter is on, as in production.
+async fn env_with(phase: &str, objects: usize, in_target: bool) -> Env {
     let (engine, fake) = s3_engine().await;
+    let engine = engine.with_bucket_usage(Some(Arc::new(
+        crate::bucket_usage::BucketUsage::in_memory().unwrap(),
+    )));
     engine.create_bucket("t").await.unwrap();
     let params = MigrateParams {
         target_backend: "dst".into(),
@@ -56,6 +65,9 @@ async fn env(phase: &str, objects: usize) -> Env {
             .store("b", &key, body.as_bytes(), None, Default::default())
             .await
             .unwrap();
+        if !in_target {
+            continue;
+        }
         let meta = std::collections::HashMap::from([("dg-migration".to_string(), ours.clone())]);
         engine
             .store("t", &key, body.as_bytes(), None, meta)
@@ -322,4 +334,25 @@ async fn the_flip_marks_the_usage_row_for_a_recount() {
     usage.flush_pending();
     let row = usage.read("b").unwrap().unwrap();
     assert_eq!(row.last_scan_at, None, "the row still reads as scanned");
+}
+
+/// P6.1: the verify of one object HEADed both forms on the source and on
+/// the target (4 requests). The source HEAD reads the listed form.
+#[tokio::test]
+async fn migrate_verify_heads_the_listed_source_form() {
+    use super::super::worker::cost_tests::{object_ops, object_requests};
+    let e = env("verify", 5).await;
+    e.run().verify(&Counters::default()).await.unwrap();
+    for i in 0..5 {
+        let key = format!("run/k-{i:03}.txt");
+        let (src, dst) = (
+            object_ops(&e.fake, "b", &key),
+            object_ops(&e.fake, "t", &key),
+        );
+        assert_eq!(
+            object_requests(&e.fake, "b", &key),
+            1,
+            "{key}: source {src:?} target {dst:?}"
+        );
+    }
 }

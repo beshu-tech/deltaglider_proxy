@@ -7,6 +7,14 @@ use super::*;
 use crate::deltaglider::s3_engine;
 use crate::storage::FakeS3;
 
+/// A `created_at` no other test job has: the transient-stop count of a
+/// job is process-global and matched on (id, kind, bucket, created_at),
+/// and every in-memory DB starts its ids at 1.
+fn unique_created_at() -> i64 {
+    static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1_000);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 struct Env {
     state: Arc<AppState>,
     fake: Arc<FakeS3>,
@@ -41,9 +49,16 @@ async fn env(objects: usize) -> Env {
         persist_path: dir.path().join("c.yaml").display().to_string(),
     };
     let db = ConfigDb::in_memory("k").unwrap();
-    db.maintenance_create_job("reencrypt", "b", "counting", None, "admin", 1)
-        .unwrap()
-        .unwrap();
+    db.maintenance_create_job(
+        "reencrypt",
+        "b",
+        "counting",
+        None,
+        "admin",
+        unique_created_at(),
+    )
+    .unwrap()
+    .unwrap();
     fake.clear();
     Env {
         state,
@@ -95,10 +110,10 @@ async fn a_page_reads_several_objects_at_once() {
             .unwrap();
     assert_eq!(row.status, "completed", "{row:?}");
     assert_eq!(row.objects_skipped, 16, "{row:?}");
-    // One engine HEAD of an object sends 2 requests at once (its two
-    // stored forms): one object at a time peaks at 2.
+    // One object sends one HEAD (the form that the listing proved): one
+    // object at a time peaks at 1.
     assert!(
-        e.fake.peak_in_flight("HEAD") >= 2 * super::super::paged::PAGE_CONCURRENCY,
+        e.fake.peak_in_flight("HEAD") >= super::super::paged::PAGE_CONCURRENCY,
         "peak {} HEAD requests in flight",
         e.fake.peak_in_flight("HEAD")
     );
@@ -196,4 +211,147 @@ async fn a_job_that_a_timeout_stops_goes_back_to_the_queue() {
             .unwrap()
             .unwrap();
     assert_eq!(row.status, "failed", "{row:?}");
+}
+
+/// The requests for one object (`/{bucket}/{key}` and its `.delta` form),
+/// by operation: `HEAD`, `GET`, `PUT`, `COPY` (CopyObject), `ACL` (object
+/// ACL), `DELETE`. Listings are not object requests.
+pub(crate) fn object_ops(
+    fake: &FakeS3,
+    bucket: &str,
+    key: &str,
+) -> std::collections::BTreeMap<String, usize> {
+    let path = format!("/{bucket}/{key}");
+    let mut ops = std::collections::BTreeMap::new();
+    for r in fake.requests() {
+        let (method, uri) = r.split_once(' ').unwrap_or((&r, ""));
+        let Some(rest) = uri.strip_prefix(&path) else {
+            continue;
+        };
+        if !(rest.is_empty() || rest.starts_with('?') || rest.starts_with(".delta")) {
+            continue;
+        }
+        let op = if uri.contains("?acl") || uri.contains("&acl") {
+            "ACL"
+        } else if method == "PUT" && uri.contains("x-id=CopyObject") {
+            "COPY"
+        } else {
+            method
+        };
+        *ops.entry(op.to_string()).or_insert(0) += 1;
+    }
+    ops
+}
+
+/// The total of [`object_ops`].
+pub(crate) fn object_requests(fake: &FakeS3, bucket: &str, key: &str) -> usize {
+    object_ops(fake, bucket, key).values().sum()
+}
+
+/// A job of `kind` on bucket `b` of `engine`, claimed and run to its end.
+/// Returns the row and the fake's requests during the run.
+async fn run_kind(
+    engine: crate::deltaglider::DynEngine,
+    fake: &FakeS3,
+    kind: &str,
+) -> MaintenanceJob {
+    let dir = tempfile::tempdir().unwrap();
+    let config: SharedConfig = crate::config::Config::default().into_shared();
+    let state = AppState::for_tests(engine);
+    let mutator = ConfigMutator {
+        config: config.clone(),
+        app: state.clone(),
+        persist_path: dir.path().join("c.yaml").display().to_string(),
+    };
+    let db = ConfigDb::in_memory("k").unwrap();
+    db.maintenance_create_job(kind, "b", "counting", None, "admin", unique_created_at())
+        .unwrap()
+        .unwrap();
+    let db = Arc::new(Mutex::new(db));
+    let job = db
+        .lock()
+        .await
+        .maintenance_claim_next_job("inst", current_unix_seconds(), 60)
+        .unwrap()
+        .unwrap();
+    let id = job.id;
+    fake.clear();
+    run_job(&mutator, &config, &db, &state, Holder::test("inst"), job).await;
+    let row = db.lock().await.maintenance_job_by_id(id).unwrap().unwrap();
+    row
+}
+
+/// An engine on a fake S3 with the usage counter on, as in production.
+async fn counted_engine() -> (crate::deltaglider::DynEngine, Arc<FakeS3>) {
+    let (engine, fake) = s3_engine().await;
+    let engine = engine.with_bucket_usage(Some(Arc::new(
+        crate::bucket_usage::BucketUsage::in_memory().unwrap(),
+    )));
+    (engine, fake)
+}
+
+/// P6.1: the listing of the job already saw which stored forms of each
+/// object exist. A re-encrypt that rewrites nothing HEADed both forms of
+/// every object (2 requests); it HEADs the one listed form.
+#[tokio::test]
+async fn reencrypt_heads_only_the_listed_form() {
+    let e = env(5).await;
+    let job = e.claim().await.unwrap();
+    let id = job.id;
+    e.run(job).await;
+    let row =
+        e.db.lock()
+            .await
+            .maintenance_job_by_id(id)
+            .unwrap()
+            .unwrap();
+    assert_eq!(row.status, "completed", "{row:?}");
+    assert_eq!(row.objects_skipped, 5, "{row:?}");
+    for i in 0..5 {
+        let key = format!("k-{i:03}.txt");
+        let ops = object_ops(&e.fake, "b", &key);
+        assert_eq!(object_requests(&e.fake, "b", &key), 1, "{key}: {ops:?}");
+    }
+}
+
+/// P6.1 edge: a key that the listing saw in both stored forms (a crash
+/// between a write and its other-form DELETE) is HEADed in both, so the
+/// newer form wins as on a client HEAD.
+#[tokio::test]
+async fn a_key_listed_in_both_forms_is_headed_in_both() {
+    let (engine, fake) = counted_engine().await;
+    let keys = crate::deltaglider::store_deltas(&engine, "d", 2).await;
+    fake.insert_object(&format!("b/{}", keys[1]), b"leftover", &[]);
+    engine.metadata_cache().invalidate_prefix("b", "");
+    let row = run_kind(engine, &fake, "reencrypt").await;
+    assert_eq!(row.status, "completed", "{row:?}");
+    assert_eq!(row.objects_failed, 0, "{row:?}");
+    let ops = |k: &str| object_ops(&fake, "b", k);
+    assert_eq!(ops(&keys[0]).get("HEAD"), Some(&1), "{:?}", ops(&keys[0]));
+    assert_eq!(ops(&keys[1]).get("HEAD"), Some(&2), "{:?}", ops(&keys[1]));
+}
+
+/// P6.1 edge: a listed form that is gone when the job HEADs it (changed
+/// outside the proxy) is read in both forms, as before.
+#[tokio::test]
+async fn a_listed_form_that_is_gone_is_read_in_both_forms() {
+    let (engine, fake) = counted_engine().await;
+    engine
+        .store("b", "k.txt", b"x", None, Default::default())
+        .await
+        .unwrap();
+    let (_, forms) = engine.list_job_page("b", 1000, None).await.unwrap();
+    let form = forms.of("k.txt");
+    assert_eq!(form, Some(crate::storage::ObjectVariant::Passthrough));
+    // Gone outside the proxy.
+    engine
+        .storage()
+        .delete_passthrough("b", "", "k.txt")
+        .await
+        .unwrap();
+    fake.clear();
+    let err = engine.head_listed("b", "k.txt", form).await.unwrap_err();
+    assert!(err.is_not_found(), "{err}");
+    // The listed form, then both.
+    assert_eq!(object_ops(&fake, "b", "k.txt").get("HEAD"), Some(&3));
 }
