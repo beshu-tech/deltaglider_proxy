@@ -2406,6 +2406,14 @@ mod multipart_abort_tests {
         ) -> Result<FileMetadata, StorageError> {
             Ok(self.src_meta.clone())
         }
+        async fn get_passthrough_metadata_for_rewrite(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(FileMetadata, crate::storage::RewriteBasis), StorageError> {
+            Ok((self.src_meta.clone(), crate::storage::RewriteBasis::none()))
+        }
         async fn get_delta_metadata(
             &self,
             _: &str,
@@ -2682,6 +2690,14 @@ mod multipart_abort_tests {
             f: &str,
         ) -> Result<FileMetadata, StorageError> {
             self.0.get_passthrough_metadata(b, p, f).await
+        }
+        async fn get_passthrough_metadata_for_rewrite(
+            &self,
+            b: &str,
+            p: &str,
+            f: &str,
+        ) -> Result<(FileMetadata, crate::storage::RewriteBasis), StorageError> {
+            self.0.get_passthrough_metadata_for_rewrite(b, p, f).await
         }
         async fn get_delta_metadata(
             &self,

@@ -24,6 +24,46 @@ pub(super) fn encode_copy_source_key(key: &str) -> String {
         .join("/")
 }
 
+/// Pure: does a GetObjectAcl error say that the backend does not serve
+/// object ACLs at all (501 / `NotImplemented`)? Only that answer is
+/// remembered per bucket: a 403 can be one key's policy, and a 5xx or a
+/// timeout says nothing about support.
+pub(super) fn acl_not_implemented(status: Option<u16>, code: Option<&str>) -> bool {
+    status == Some(501) || code == Some("NotImplemented")
+}
+
+/// How long a bucket whose backend refused an object ACL request with
+/// "not implemented" is not asked again. Node-local: another node asks
+/// once itself. A backend that starts to serve ACLs within the window
+/// gets the bucket default ACL on its self-copies until it ends (the
+/// behaviour of a refused read).
+pub(super) const ACL_REFUSAL_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// The buckets whose backend refused object ACLs ([`acl_not_implemented`]),
+/// with the time of the refusal.
+#[derive(Debug, Default)]
+pub(crate) struct AclSupport(parking_lot::Mutex<HashMap<String, std::time::Instant>>);
+
+impl AclSupport {
+    pub(super) fn refused(&self, bucket: &str) -> bool {
+        let mut m = self.0.lock();
+        match m.get(bucket) {
+            Some(at) if at.elapsed() < ACL_REFUSAL_TTL => true,
+            Some(_) => {
+                m.remove(bucket);
+                false
+            }
+            None => false,
+        }
+    }
+
+    pub(super) fn refuse(&self, bucket: &str) {
+        self.0
+            .lock()
+            .insert(bucket.to_string(), std::time::Instant::now());
+    }
+}
+
 /// Waits before the retries of a Hetzner 400 ([`is_unidentified_400`]).
 pub(super) const UNIDENTIFIED_400_BACKOFF_MS: [u64; 3] = [100, 200, 400];
 
@@ -83,7 +123,7 @@ impl S3Backend {
         key: &str,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        self.replace_metadata_in_place_fenced(bucket, key, metadata, &RefFence::Unfenced)
+        self.replace_metadata_in_place_fenced(bucket, key, metadata, &RefFence::Unfenced, None)
             .await
             .map(|_| ())
     }
@@ -91,53 +131,51 @@ impl S3Backend {
     /// `replace_metadata_in_place` fenced on the object's ETag: the self-copy
     /// carries `x-amz-copy-source-if-match`, a condition every S3 backend
     /// supports. Returns the new ETag.
+    ///
+    /// `known_head`: the caller's HEAD of the object (a backfill job's read,
+    /// [`super::super::RewriteBasis`]). The copy restates its headers and is
+    /// fenced on its ETag, and no HEAD is sent here.
     pub(super) async fn replace_metadata_in_place_fenced(
         &self,
         bucket: &str,
         key: &str,
         metadata: &FileMetadata,
         fence: &RefFence,
+        known_head: Option<&aws_sdk_s3::operation::head_object::HeadObjectOutput>,
     ) -> Result<Option<String>, StorageError> {
         let copy_source = format!("{}/{}", bucket, encode_copy_source_key(key));
         // HEAD first: REPLACE drops everything the request does not restate
         // (a foreign object's own metadata and headers, D17).
-        BACKEND_HEAD_REQUESTS.inc();
-        let head = self
-            .client
-            .head_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| self.classify(bucket, &e, S3Op::HeadObject))?;
+        let fetched;
+        let head = match known_head {
+            Some(head) => head,
+            None => {
+                BACKEND_HEAD_REQUESTS.inc();
+                fetched = self
+                    .client
+                    .head_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .send()
+                    .await
+                    .map_err(|e| self.classify(bucket, &e, S3Op::HeadObject))?;
+                &fetched
+            }
+        };
         let expect_etag = match fence {
             RefFence::ETag(e) if !e.is_empty() => Some(e.clone()),
-            _ => None,
+            // A HEAD that the caller took earlier fences the copy: the
+            // headers restated below are that version's.
+            _ => known_head.and_then(|h| h.e_tag()).map(str::to_string),
         };
         if let Some(e) = &expect_etag {
             if head.e_tag() != Some(e.as_str()) {
                 return Err(reference_fence_lost(bucket, key));
             }
         }
-        // The ACL is not on the HEAD. A backend that does not serve it (or a
-        // key without s3:GetObjectAcl) keeps the old behaviour: the copy
-        // gets the bucket default.
-        let acl = match self
-            .client
-            .get_object_acl()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await
-        {
-            Ok(acl) => Some(acl),
-            Err(e) => {
-                debug!("S3 metadata rewrite {bucket}/{key}: ACL not read, not restated: {e}");
-                None
-            }
-        };
+        let acl = self.object_acl_for_copy(bucket, key).await;
         let plan = self_copy_plan(
-            &head,
+            head,
             acl.as_ref(),
             self.metadata_to_headers(metadata),
             !matches!(self.native_encryption, NativeEncryptionConfig::None),
@@ -224,6 +262,41 @@ impl S3Backend {
             .copy_object_result()
             .and_then(|r| r.e_tag())
             .map(str::to_string))
+    }
+
+    /// The object's ACL, for a self-copy to restate. The ACL is not on the
+    /// HEAD. A backend that does not serve it (or a key without
+    /// s3:GetObjectAcl) keeps the old behaviour: the copy gets the bucket
+    /// default. A backend that answers that it does not implement object
+    /// ACLs is not asked again for that bucket for a while
+    /// ([`AclSupport`]): a backfill sent one refused ACL request per object.
+    async fn object_acl_for_copy(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Option<aws_sdk_s3::operation::get_object_acl::GetObjectAclOutput> {
+        if self.acl_support.refused(bucket) {
+            return None;
+        }
+        match self
+            .client
+            .get_object_acl()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(acl) => Some(acl),
+            Err(e) => {
+                let status = e.raw_response().map(|r| r.status().as_u16());
+                let code = aws_sdk_s3::error::ProvideErrorMetadata::code(&e);
+                if acl_not_implemented(status, code) {
+                    self.acl_support.refuse(bucket);
+                }
+                debug!("S3 metadata rewrite {bucket}/{key}: ACL not read, not restated: {e}");
+                None
+            }
+        }
     }
 
     /// See [`Self::own_write_or_lost`]; for a metadata-only rewrite the
@@ -911,5 +984,35 @@ mod one_retry_layer_tests {
             "a 1-byte PUT ran {:?}",
             started.elapsed()
         );
+    }
+}
+
+#[cfg(test)]
+mod acl_support_tests {
+    use super::*;
+
+    #[test]
+    fn only_not_implemented_is_remembered() {
+        assert!(acl_not_implemented(Some(501), None));
+        assert!(acl_not_implemented(Some(400), Some("NotImplemented")));
+        // One key's policy, an outage or a throttle says nothing about
+        // the backend.
+        for (status, code) in [
+            (Some(403), Some("AccessDenied")),
+            (Some(500), Some("InternalError")),
+            (Some(503), Some("SlowDown")),
+            (None, None),
+        ] {
+            assert!(!acl_not_implemented(status, code), "{status:?} {code:?}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_is_per_bucket() {
+        let s = AclSupport::default();
+        assert!(!s.refused("a"));
+        s.refuse("a");
+        assert!(s.refused("a"));
+        assert!(!s.refused("b"));
     }
 }

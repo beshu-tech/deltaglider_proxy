@@ -89,6 +89,17 @@ impl crate::storage::StorageBackend for NullInner {
     ) -> Result<crate::types::FileMetadata, crate::storage::StorageError> {
         Err(crate::storage::StorageError::Other("null".into()))
     }
+    async fn get_passthrough_metadata_for_rewrite(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<
+        (crate::types::FileMetadata, crate::storage::RewriteBasis),
+        crate::storage::StorageError,
+    > {
+        Err(crate::storage::StorageError::Other("null".into()))
+    }
     async fn put_reference_metadata(
         &self,
         _: &str,

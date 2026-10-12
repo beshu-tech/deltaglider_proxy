@@ -1215,12 +1215,24 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     ) -> Result<FileMetadata, StorageError> {
         self.inner.get_passthrough_metadata(b, p, f).await
     }
+    async fn get_passthrough_metadata_for_rewrite(
+        &self,
+        b: &str,
+        p: &str,
+        f: &str,
+    ) -> Result<(FileMetadata, super::RewriteBasis), StorageError> {
+        // As `get_passthrough_metadata`: the stored metadata as it is.
+        self.inner
+            .get_passthrough_metadata_for_rewrite(b, p, f)
+            .await
+    }
     async fn put_passthrough_metadata(
         &self,
         b: &str,
         p: &str,
         f: &str,
         m: &FileMetadata,
+        basis: &super::RewriteBasis,
     ) -> Result<(), StorageError> {
         // Metadata itself is not encrypted, but the RAW object carries the
         // encryption markers, and a caller-supplied FileMetadata built from a
@@ -1231,9 +1243,16 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         // dropped, so a rewrite can neither strip nor plant one.
         // Fail CLOSED: without the stored markers the rewrite would drop
         // them and make an encrypted body unreadable.
-        let raw = self.inner.get_passthrough_metadata(b, p, f).await?;
+        // A caller's earlier read of the stored object gives them without
+        // a HEAD (the rewrite is fenced on that read where the backend can).
+        let raw = match &basis.stored {
+            Some(raw) => raw.clone(),
+            None => self.inner.get_passthrough_metadata(b, p, f).await?,
+        };
         let meta = with_markers_of(m, &raw);
-        self.inner.put_passthrough_metadata(b, p, f, &meta).await
+        self.inner
+            .put_passthrough_metadata(b, p, f, &meta, basis)
+            .await
     }
     async fn put_reference_metadata(
         &self,

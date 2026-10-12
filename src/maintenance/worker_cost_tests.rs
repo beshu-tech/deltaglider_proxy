@@ -448,3 +448,99 @@ fn maintenance_jobs_reuse_their_reads() {
     }
     assert!(sites.is_empty(), "{sites:#?}");
 }
+
+/// Store `n` foreign objects `f-NNN.bin` (no DG metadata) in `b`.
+fn store_foreign(fake: &FakeS3, n: usize) {
+    for i in 0..n {
+        fake.insert_object(&format!("b/f-{i:03}.bin"), &[b'z'; 100], &[]);
+    }
+}
+
+/// P6.1 + P6.3: a backfill of a foreign object HEADed both forms, then
+/// GOT the bytes, then the self-copy HEADed the object again and read its
+/// ACL before the copy (6 requests). The job's one HEAD is the self-copy's
+/// read: HEAD, GET, ACL, COPY.
+#[tokio::test]
+async fn backfill_costs_get_and_fenced_copy_per_object() {
+    let (engine, fake) = counted_engine().await;
+    store_foreign(&fake, 5);
+    let row = run_kind(engine, &fake, super::super::backfill::KIND).await;
+    assert_eq!(row.status, "completed", "{row:?}");
+    assert_eq!(row.objects_done, 5, "{row:?}");
+    for i in 0..5 {
+        let key = format!("f-{i:03}.bin");
+        let ops = object_ops(&fake, "b", &key);
+        assert_eq!(object_requests(&fake, "b", &key), 4, "{key}: {ops:?}");
+        assert_eq!(ops.get("HEAD"), Some(&1), "{key}: {ops:?}");
+        assert_eq!(ops.get("COPY"), Some(&1), "{key}: {ops:?}");
+    }
+}
+
+/// P6.3: a backend without object ACLs answers the ACL read with 501;
+/// each self-copy asked again (one refused request per object). The
+/// refusal is kept per bucket: only the objects already in flight when
+/// it came ask.
+#[tokio::test]
+async fn backfill_asks_an_acl_less_backend_once() {
+    let (engine, fake) = counted_engine().await;
+    fake.set_acl_unsupported(true);
+    store_foreign(&fake, 12);
+    let row = run_kind(engine, &fake, super::super::backfill::KIND).await;
+    assert_eq!(row.status, "completed", "{row:?}");
+    assert_eq!(row.objects_done, 12, "{row:?}");
+    let acl: usize = (0..12)
+        .map(|i| {
+            object_ops(&fake, "b", &format!("f-{i:03}.bin"))
+                .get("ACL")
+                .copied()
+                .unwrap_or(0)
+        })
+        .sum();
+    assert!(
+        acl <= super::super::paged::PAGE_CONCURRENCY,
+        "{acl} ACL requests: {:#?}",
+        fake.requests()
+    );
+}
+
+/// P6.3: the self-copy is fenced on the ETag of the job's read: an object
+/// that changed after the read keeps its content and metadata, and the
+/// rewrite fails (the job records it per object).
+#[tokio::test]
+async fn a_rewrite_is_fenced_on_the_jobs_read() {
+    use crate::storage::StorageBackend;
+    let (engine, fake) = counted_engine().await;
+    store_foreign(&fake, 1);
+    let storage = engine.storage();
+    let (meta, basis) = storage
+        .get_passthrough_metadata_for_rewrite("b", "", "f-000.bin")
+        .await
+        .unwrap();
+    fake.insert_object("b/f-000.bin", b"changed", &[("owner", "bob")]);
+    fake.clear();
+    let err = storage
+        .put_passthrough_metadata("b", "", "f-000.bin", &meta, &basis)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::storage::StorageError::Throttled(_)),
+        "{err:?}"
+    );
+    // The read is the rewrite's: the copy is sent without a HEAD before
+    // it (a lost copy HEADs once after, to tell its own write from a
+    // peer's).
+    let requests = fake.requests();
+    let copy = requests
+        .iter()
+        .position(|r| r.contains("x-id=CopyObject"))
+        .expect("a copy");
+    assert!(
+        !requests[..copy].iter().any(|r| r.starts_with("HEAD")),
+        "{requests:#?}"
+    );
+    let now = storage
+        .get_passthrough_metadata("b", "", "f-000.bin")
+        .await
+        .unwrap();
+    assert_eq!(now.file_size, 7, "{now:?}");
+}

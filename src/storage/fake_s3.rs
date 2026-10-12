@@ -163,6 +163,12 @@ impl FakeS3 {
         );
     }
 
+    /// Answer object ACL requests (`?acl`) with 501 NotImplemented.
+    pub(crate) fn set_acl_unsupported(&self, unsupported: bool) {
+        self.acl_unsupported
+            .store(unsupported, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Forget the requests so far.
     pub(crate) fn clear(&self) {
         self.requests.lock().clear();

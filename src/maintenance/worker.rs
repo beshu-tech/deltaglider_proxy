@@ -551,10 +551,14 @@ impl ObjectVisitor for Reencrypt<'_> {
         &self,
         engine: &Arc<crate::deltaglider::DynEngine>,
         key: &str,
-        meta: &crate::types::FileMetadata,
-        forms: crate::deltaglider::StoredForms,
+        listed: Option<crate::storage::ObjectVariant>,
     ) -> Visit {
         let desired = self.desired.as_ref().expect("begin_page runs first");
+        let (meta, forms) = match read_listed(engine, self.bucket, key, listed).await {
+            Ok(read) => read,
+            Err(visit) => return visit,
+        };
+        let meta = &meta;
         if !needs_rewrite(&meta.user_metadata, desired) {
             return Visit::Skipped;
         }
@@ -604,16 +608,31 @@ pub(crate) trait ObjectVisitor {
     async fn begin_page(&mut self) -> Result<(), PhaseStop> {
         Ok(())
     }
-    /// One user object, with the metadata the driver read for it and the
-    /// stored forms that the read found. Up to
+    /// One user object, and the one stored form of it that the page's
+    /// listing proved (`None`: not proved). The visitor reads the object
+    /// ([`read_listed`], or a read that its write reuses). Up to
     /// [`super::paged::PAGE_CONCURRENCY`] objects run at once.
     async fn visit(
         &self,
         engine: &Arc<crate::deltaglider::DynEngine>,
         key: &str,
-        meta: &crate::types::FileMetadata,
-        forms: crate::deltaglider::StoredForms,
+        listed: Option<crate::storage::ObjectVariant>,
     ) -> Visit;
+}
+
+/// One HEAD of the stored form of `key` that the listing proved (the write
+/// gate freezes the bucket), not one per form; both forms when `listed` is
+/// `None`. Its error is the object's failed visit.
+pub(crate) async fn read_listed(
+    engine: &crate::deltaglider::DynEngine,
+    bucket: &str,
+    key: &str,
+    listed: Option<crate::storage::ObjectVariant>,
+) -> Result<(crate::types::FileMetadata, crate::deltaglider::StoredForms), Visit> {
+    engine
+        .head_listed(bucket, key, listed)
+        .await
+        .map_err(|e| Visit::Failed(format!("could not read object metadata: {e}")))
 }
 
 /// A job's counters, as its row stores them.
@@ -752,15 +771,7 @@ impl<V: ObjectVisitor> PageStep for ObjectsStep<'_, V> {
 
     async fn object(&self, key: &str) -> Visit {
         let engine = self.engine.as_ref().expect("begin_page runs first");
-        // One HEAD of the form that the listing proved (the write gate
-        // freezes the bucket), not one per form.
-        match engine
-            .head_listed(&self.job.bucket, key, self.forms.of(key))
-            .await
-        {
-            Ok((meta, forms)) => self.visitor.visit(engine, key, &meta, forms).await,
-            Err(e) => Visit::Failed(format!("could not read object metadata: {e}")),
-        }
+        self.visitor.visit(engine, key, self.forms.of(key)).await
     }
 
     async fn settle(&mut self, key: &str, visit: Visit) -> Result<(), PhaseStop> {

@@ -217,6 +217,8 @@ pub struct S3Backend {
     facts_cleanup: super::facts_cleanup::FactsCleanupQueue,
     /// Background HEADs that heal the listing facts a LIST did not find.
     healer: heal::FactsHealer,
+    /// Buckets whose backend refused object ACLs (self-copies skip the read).
+    acl_support: std::sync::Arc<objects::AclSupport>,
 }
 
 impl S3Backend {
@@ -259,6 +261,7 @@ impl S3Backend {
         );
         Ok(Self {
             healer: heal::FactsHealer::new(client.clone()),
+            acl_support: Default::default(),
             client,
             bulk_client,
             health_key: None,
@@ -501,17 +504,41 @@ impl StorageBackend for S3Backend {
         Ok(())
     }
 
-    #[instrument(skip(self, metadata))]
+    /// One HEAD: the metadata, and the response for the rewrite.
+    #[instrument(skip(self))]
+    async fn get_passthrough_metadata_for_rewrite(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<(FileMetadata, super::RewriteBasis), StorageError> {
+        let key = self.passthrough_key(prefix, filename);
+        let (meta, head) = self.head_object_response(bucket, &key).await?;
+        let basis = super::RewriteBasis {
+            stored: Some(meta.clone()),
+            s3_head: Some(std::sync::Arc::new(head)),
+        };
+        Ok((meta, basis))
+    }
+
+    #[instrument(skip(self, metadata, basis))]
     async fn put_passthrough_metadata(
         &self,
         bucket: &str,
         prefix: &str,
         filename: &str,
         metadata: &FileMetadata,
+        basis: &super::RewriteBasis,
     ) -> Result<(), StorageError> {
         let key = self.passthrough_key(prefix, filename);
-        self.replace_metadata_in_place(bucket, &key, metadata)
-            .await?;
+        self.replace_metadata_in_place_fenced(
+            bucket,
+            &key,
+            metadata,
+            &RefFence::Unfenced,
+            basis.s3_head.as_deref(),
+        )
+        .await?;
         debug!("Updated passthrough metadata for {}/{}", bucket, key);
         Ok(())
     }
@@ -702,7 +729,7 @@ impl StorageBackend for S3Backend {
                     .await?
             }
             RefWrite::Metadata { metadata } => {
-                self.replace_metadata_in_place_fenced(bucket, &key, metadata, fence)
+                self.replace_metadata_in_place_fenced(bucket, &key, metadata, fence, None)
                     .await?
             }
             RefWrite::Delete => {

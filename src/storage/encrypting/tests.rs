@@ -877,12 +877,23 @@ mod wrapper_tests {
             self.metadata.lock().unwrap().clone().ok_or_else(cb_err)
         }
 
+        async fn get_passthrough_metadata_for_rewrite(
+            &self,
+            b: &str,
+            p: &str,
+            f: &str,
+        ) -> Result<(FileMetadata, crate::storage::RewriteBasis), StorageError> {
+            let meta = self.get_passthrough_metadata(b, p, f).await?;
+            Ok((meta.clone(), crate::storage::RewriteBasis::stored(meta)))
+        }
+
         async fn put_passthrough_metadata(
             &self,
             _: &str,
             _: &str,
             _: &str,
             m: &FileMetadata,
+            _: &crate::storage::RewriteBasis,
         ) -> Result<(), StorageError> {
             *self.metadata.lock().unwrap() = Some(m.clone());
             Ok(())
@@ -1362,7 +1373,13 @@ mod wrapper_tests {
         let mut rewrite = stored.clone();
         strip_encryption_markers(&mut rewrite.user_metadata);
         assert!(wrapper
-            .put_passthrough_metadata("b", "p", "o", &rewrite)
+            .put_passthrough_metadata(
+                "b",
+                "p",
+                "o",
+                &rewrite,
+                &crate::storage::RewriteBasis::none()
+            )
             .await
             .is_err());
         let now = wrapper.inner.metadata.lock().unwrap().clone().unwrap();
@@ -1973,7 +1990,13 @@ mod wrapper_tests {
 
             // A metadata-only rewrite must not plant a marker either.
             wrapper
-                .put_passthrough_metadata("b", "p", "a", &meta)
+                .put_passthrough_metadata(
+                    "b",
+                    "p",
+                    "a",
+                    &meta,
+                    &crate::storage::RewriteBasis::none(),
+                )
                 .await
                 .unwrap();
             assert_eq!(

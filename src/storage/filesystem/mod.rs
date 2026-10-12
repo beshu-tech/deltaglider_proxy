@@ -1222,12 +1222,26 @@ impl StorageBackend for FilesystemBackend {
         xattr_meta::write_metadata(&self.reference_path(bucket, prefix)?, metadata).await
     }
 
+    /// One metadata read; the filesystem has no response headers to keep.
+    async fn get_passthrough_metadata_for_rewrite(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<(FileMetadata, crate::storage::RewriteBasis), StorageError> {
+        let meta = self
+            .get_passthrough_metadata(bucket, prefix, filename)
+            .await?;
+        Ok((meta.clone(), crate::storage::RewriteBasis::stored(meta)))
+    }
+
     async fn put_passthrough_metadata(
         &self,
         bucket: &str,
         prefix: &str,
         filename: &str,
         metadata: &FileMetadata,
+        _basis: &crate::storage::RewriteBasis,
     ) -> Result<(), StorageError> {
         self.require_bucket_exists(bucket).await?;
         let path = self.passthrough_path(bucket, prefix, filename)?;

@@ -181,15 +181,61 @@ struct Backfill<'a> {
     refresh_last_modified: bool,
 }
 
+impl Backfill<'_> {
+    /// Read `key` for its rewrite: an object listed as a passthrough (the
+    /// only kind that a backfill rewrites) is read once from the storage,
+    /// and that read is the [`crate::storage::RewriteBasis`] of its
+    /// rewrite. Any other key, or one gone from that form, is read as
+    /// [`super::worker::read_listed`] reads it.
+    async fn read(
+        &self,
+        engine: &crate::deltaglider::DynEngine,
+        key: &str,
+        listed: Option<crate::storage::ObjectVariant>,
+    ) -> Result<(FileMetadata, crate::storage::RewriteBasis), super::worker::Visit> {
+        use crate::storage::{ObjectVariant, RewriteBasis, StorageError};
+        if listed == Some(ObjectVariant::Passthrough) {
+            let (prefix, filename) = split_key(key);
+            match engine
+                .storage()
+                .get_passthrough_metadata_for_rewrite(self.bucket, prefix, filename)
+                .await
+            {
+                Ok(read) => {
+                    // As an engine HEAD does: the hash read below then
+                    // sends no HEAD of its own.
+                    engine
+                        .metadata_cache()
+                        .insert(self.bucket, key, read.0.clone());
+                    return Ok(read);
+                }
+                Err(StorageError::NotFound(_)) => {}
+                Err(e) => {
+                    return Err(super::worker::Visit::Failed(format!(
+                        "could not read object metadata: {e}"
+                    )))
+                }
+            }
+        }
+        let read = super::worker::read_listed(engine, self.bucket, key, None).await?;
+        Ok((read.0, RewriteBasis::none()))
+    }
+}
+
 impl super::worker::ObjectVisitor for Backfill<'_> {
     async fn visit(
         &self,
         engine: &std::sync::Arc<crate::deltaglider::DynEngine>,
         key: &str,
-        meta: &FileMetadata,
-        _forms: crate::deltaglider::StoredForms,
+        listed: Option<crate::storage::ObjectVariant>,
     ) -> super::worker::Visit {
         use super::worker::Visit;
+        let (prefix, filename) = split_key(key);
+        let (meta, basis) = match self.read(engine, key, listed).await {
+            Ok(read) => read,
+            Err(visit) => return visit,
+        };
+        let meta = &meta;
         if !needs_metadata_backfill(meta) {
             return Visit::Skipped;
         }
@@ -207,10 +253,11 @@ impl super::worker::ObjectVisitor for Backfill<'_> {
             self.refresh_last_modified,
             chrono::Utc::now(),
         );
-        let (prefix, filename) = split_key(key);
+        // The read above is the rewrite's: no second HEAD, and the
+        // self-copy is fenced on that read's ETag.
         if let Err(e) = engine
             .storage()
-            .put_passthrough_metadata(self.bucket, prefix, filename, &new_meta)
+            .put_passthrough_metadata(self.bucket, prefix, filename, &new_meta, &basis)
             .await
         {
             return Visit::Failed(format!("metadata write failed: {e}"));

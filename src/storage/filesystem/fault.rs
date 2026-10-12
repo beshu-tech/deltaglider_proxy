@@ -314,15 +314,29 @@ impl StorageBackend for FaultyFs {
             .await
     }
 
+    async fn get_passthrough_metadata_for_rewrite(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<(FileMetadata, crate::storage::RewriteBasis), StorageError> {
+        self.armed(FaultPoint::GetPassthroughMetadata, bucket, prefix, filename)
+            .await?;
+        self.inner
+            .get_passthrough_metadata_for_rewrite(bucket, prefix, filename)
+            .await
+    }
+
     async fn put_passthrough_metadata(
         &self,
         bucket: &str,
         prefix: &str,
         filename: &str,
         metadata: &FileMetadata,
+        basis: &crate::storage::RewriteBasis,
     ) -> Result<(), StorageError> {
         self.inner
-            .put_passthrough_metadata(bucket, prefix, filename, metadata)
+            .put_passthrough_metadata(bucket, prefix, filename, metadata, basis)
             .await
     }
 

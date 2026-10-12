@@ -688,6 +688,16 @@ impl crate::storage::StorageBackend for FencingFs {
     ) -> Result<Meta, StorageError> {
         self.inner.get_passthrough_metadata(b, p, f).await
     }
+    async fn get_passthrough_metadata_for_rewrite(
+        &self,
+        b: &str,
+        p: &str,
+        f: &str,
+    ) -> Result<(Meta, crate::storage::RewriteBasis), StorageError> {
+        self.inner
+            .get_passthrough_metadata_for_rewrite(b, p, f)
+            .await
+    }
     async fn delete_passthrough(&self, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
         self.inner.delete_passthrough(b, p, f).await
     }

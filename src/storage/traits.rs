@@ -599,11 +599,28 @@ pub trait StorageBackend: Send + Sync {
         proof: &crate::deltaglider::RefWriteProof,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
+    /// [`Self::get_passthrough_metadata`], and the [`RewriteBasis`] that a
+    /// later [`Self::put_passthrough_metadata`] of the same object takes
+    /// instead of reading the object again. One request (S3: one HEAD).
+    fn get_passthrough_metadata_for_rewrite(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> impl Future<Output = Result<(FileMetadata, RewriteBasis), StorageError>> + Send;
+
     /// Update a passthrough object's DG metadata IN PLACE, without
     /// transferring the object's bytes through the proxy (S3: server-side
     /// self-copy with `MetadataDirective: REPLACE`; filesystem: xattr
     /// rewrite). Same (bucket, prefix, filename) addressing as
     /// `get_passthrough_metadata`.
+    ///
+    /// `basis`: what [`Self::get_passthrough_metadata_for_rewrite`] read of
+    /// the object, or [`RewriteBasis::none`]. With a read, the rewrite
+    /// sends no read of its own, and on S3 it is fenced on the read's ETag
+    /// (`x-amz-copy-source-if-match`): an object that changed since the
+    /// read fails the rewrite instead of getting metadata of another
+    /// version.
     ///
     /// Used by the metadata-backfill maintenance job. Backends that cannot
     /// do this keep the default `Other` error; the job records it as a
@@ -614,9 +631,10 @@ pub trait StorageBackend: Send + Sync {
         prefix: &str,
         filename: &str,
         metadata: &FileMetadata,
+        basis: &RewriteBasis,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
-            let _ = (bucket, prefix, filename, metadata);
+            let _ = (bucket, prefix, filename, metadata, basis);
             Err(StorageError::Other(
                 "put_passthrough_metadata is not supported by this backend".to_string(),
             ))
@@ -1334,6 +1352,34 @@ pub struct MultipartUpload {
 pub struct UploadedPart {
     pub part_number: i32,
     pub etag: String,
+}
+
+/// What a read of an object for an in-place metadata rewrite returned
+/// ([`StorageBackend::get_passthrough_metadata_for_rewrite`]), for the
+/// rewrite of the same object ([`StorageBackend::put_passthrough_metadata`]):
+/// the metadata as the backend stores it (the encrypting wrapper takes its
+/// markers from it), and on S3 the HEAD response, whose headers the
+/// self-copy restates and whose ETag fences it.
+#[derive(Debug, Clone, Default)]
+pub struct RewriteBasis {
+    pub(crate) stored: Option<FileMetadata>,
+    pub(crate) s3_head:
+        Option<std::sync::Arc<aws_sdk_s3::operation::head_object::HeadObjectOutput>>,
+}
+
+impl RewriteBasis {
+    /// No earlier read: the rewrite reads the object itself.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// A read that returned `stored` (a backend without response headers).
+    pub(crate) fn stored(stored: FileMetadata) -> Self {
+        Self {
+            stored: Some(stored),
+            s3_head: None,
+        }
+    }
 }
 
 /// Result from `list_objects_delegated` when the backend handles delimiter

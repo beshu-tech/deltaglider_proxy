@@ -1303,12 +1303,28 @@ impl StorageBackend for RoutingBackend {
         route_existing!(self, bucket, get_passthrough_metadata, prefix, filename)
     }
 
+    async fn get_passthrough_metadata_for_rewrite(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<(FileMetadata, super::RewriteBasis), StorageError> {
+        route_existing!(
+            self,
+            bucket,
+            get_passthrough_metadata_for_rewrite,
+            prefix,
+            filename
+        )
+    }
+
     async fn put_passthrough_metadata(
         &self,
         bucket: &str,
         prefix: &str,
         filename: &str,
         metadata: &FileMetadata,
+        basis: &super::RewriteBasis,
     ) -> Result<(), StorageError> {
         route_existing!(
             self,
@@ -1316,7 +1332,8 @@ impl StorageBackend for RoutingBackend {
             put_passthrough_metadata,
             prefix,
             filename,
-            metadata
+            metadata,
+            basis
         )
     }
 
@@ -1971,6 +1988,15 @@ mod tests {
             _: &str,
             _: &str,
         ) -> Result<FileMetadata, StorageError> {
+            Err(StorageError::NotFound("object metadata".to_string()))
+        }
+
+        async fn get_passthrough_metadata_for_rewrite(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(FileMetadata, crate::storage::RewriteBasis), StorageError> {
             Err(StorageError::NotFound("object metadata".to_string()))
         }
 
