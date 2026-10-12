@@ -36,6 +36,8 @@ pub(crate) enum FaultPoint {
     DeletePassthrough,
     /// The key is `"bucket/prefix/"`: the call names no file.
     HasReference,
+    /// The key is `"bucket/prefix/"`: the reference.bin metadata read.
+    GetReferenceMetadata,
     /// A conditional delete of either variant (versioned [`FaultyFs`]).
     DeleteVariantIf,
     /// The key is `"bucket//"`: the call names no prefix and no file.
@@ -329,6 +331,8 @@ impl StorageBackend for FaultyFs {
         bucket: &str,
         prefix: &str,
     ) -> Result<FileMetadata, StorageError> {
+        self.armed(FaultPoint::GetReferenceMetadata, bucket, prefix, "")
+            .await?;
         self.inner.get_reference_metadata(bucket, prefix).await
     }
 

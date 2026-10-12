@@ -2,6 +2,7 @@
 
 //! Raw deltaspace blob accessors (replication delta-passthrough).
 
+use super::usage::CounterPrior;
 use super::*;
 
 impl<S: StorageBackend> DeltaGliderEngine<S> {
@@ -26,7 +27,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// Write a delta blob + metadata verbatim into a deltaspace. Call it
     /// inside [`Self::with_dest_prefix_lock`]; outside it, multi-instance
-    /// refuses.
+    /// refuses. `prior`: what the key held, read before the write
+    /// ([`Self::fast_path_prior`]); [`CounterPrior::Unknown`] when the
+    /// caller did not read it.
     pub async fn put_delta_raw(
         &self,
         bucket: &str,
@@ -34,6 +37,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         filename: &str,
         data: &[u8],
         metadata: &FileMetadata,
+        prior: &CounterPrior,
     ) -> Result<(), StorageError> {
         // Inside `with_dest_prefix_lock`: the delta is only valid against the
         // reference the held cross-instance lock protects.
@@ -44,18 +48,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // Mirror every engine store path: a delta write supersedes any stale
         // PASSTHROUGH variant of the same key — leaving it behind lets a
         // later delta delete resurrect old content. Cache must drop too.
-        if let Err(e) = self
-            .delete_passthrough_idempotent(bucket, prefix, filename)
-            .await
-        {
-            tracing::warn!(
-                "fast-path delta write {}/{}/{}: stale passthrough cleanup failed: {}",
-                bucket,
-                prefix,
-                filename,
-                e
-            );
-        }
+        self.drop_other_form(
+            bucket,
+            prefix,
+            filename,
+            crate::storage::ObjectVariant::Delta,
+            prior,
+        )
+        .await;
         let full_key = if prefix.is_empty() {
             filename.to_string()
         } else {
@@ -109,14 +109,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         bucket: &str,
         prefix: &str,
     ) -> Result<Option<FileMetadata>, StorageError> {
-        if !self.storage.has_reference(bucket, prefix).await? {
-            return Ok(None);
-        }
-        match self.storage.get_reference_metadata(bucket, prefix).await {
-            Ok(meta) => Ok(Some(meta)),
-            Err(StorageError::NotFound(_)) => Ok(None),
-            Err(e) => Err(e),
-        }
+        self.reference_metadata_if_present(bucket, prefix).await
     }
 
     /// Delta metadata for one object (full Delta info incl. `ref_sha256`).

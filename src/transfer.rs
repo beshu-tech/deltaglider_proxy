@@ -1367,6 +1367,7 @@ async fn delta_passthrough_copy(
                     &dest_filename2,
                     &delta_bytes,
                     &meta,
+                    &counter_prior,
                 )
                 .await?;
             // The fast path bypasses the engine's store, so it records its
@@ -1466,6 +1467,9 @@ async fn heal_stripped_dest_delta(
                     &dest_key.filename,
                     &delta_bytes,
                     meta,
+                    // A re-stamp of a stored delta: no read says the
+                    // passthrough form is absent.
+                    &crate::deltaglider::CounterPrior::Unknown,
                 )
                 .await
             {
@@ -1864,7 +1868,7 @@ mod tests {
             .unwrap()
             .file_sha256;
         faults.arm(
-            crate::storage::FaultPoint::HasReference,
+            crate::storage::FaultPoint::GetReferenceMetadata,
             "dst/p/",
             crate::storage::Fault::Throttled,
         );
@@ -1881,7 +1885,7 @@ mod tests {
         };
         let _ = delta_passthrough_copy(&engine, request, &head).await;
         faults.disarm_all();
-        assert!(faults.fired(crate::storage::FaultPoint::HasReference, "dst/p/") > 0);
+        assert!(faults.fired(crate::storage::FaultPoint::GetReferenceMetadata, "dst/p/") > 0);
         let after = engine
             .reference_metadata_raw("dst", "p")
             .await

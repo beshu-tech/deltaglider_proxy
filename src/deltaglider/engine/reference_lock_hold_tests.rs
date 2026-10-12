@@ -226,7 +226,14 @@ async fn fast_path_seed_holds_the_lock() {
         None,
     );
     let err = engine
-        .put_delta_raw("releases", "v1", "app.zip", b"abc", &delta_meta)
+        .put_delta_raw(
+            "releases",
+            "v1",
+            "app.zip",
+            b"abc",
+            &delta_meta,
+            &super::usage::CounterPrior::Unknown,
+        )
         .await
         .expect_err("a raw delta outside the deltaspace lock is refused");
     assert!(

@@ -1717,13 +1717,19 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// overwrite of the other kind leaves it stale, and a later read could
     /// resolve it (H33). Best effort: a failure is logged.
     ///
-    /// No request when `prior` says the key held nothing: the read before
-    /// the write found neither form. Each write sent this DELETE for a form
-    /// that read had just found absent. A form that a writer without the
-    /// object's write lock (a peer instance, a replication copy) adds after
-    /// that read stays beside the new object; a read resolves the newer of
-    /// the two, and the key's next write or delete drops the older one.
-    async fn drop_other_form(
+    /// No request when `prior` says the key did not hold the other form:
+    /// the read before the write found it absent
+    /// ([`CounterPrior::may_hold`]). Each write sent this DELETE for a form
+    /// that read had just found absent (a same-form overwrite too). No
+    /// read, or a failed one, still sends it. A form that a writer without
+    /// the object's write lock (a peer instance, a replication copy) adds
+    /// after that read stays beside the new object; a read resolves the
+    /// newer of the two, and the key's next write or delete drops the
+    /// older one (`a_form_a_peer_adds_after_the_read_is_dropped_by_the_next_write`).
+    ///
+    /// THE way an engine write drops the other form (source guard
+    /// `writes_drop_the_other_form_through_one_helper`).
+    pub(super) async fn drop_other_form(
         &self,
         bucket: &str,
         deltaspace_id: &str,
@@ -1731,7 +1737,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         written: ObjectVariant,
         prior: &CounterPrior,
     ) {
-        if matches!(prior, CounterPrior::Absent) {
+        let other_form = match written {
+            ObjectVariant::Delta => ObjectVariant::Passthrough,
+            ObjectVariant::Passthrough => ObjectVariant::Delta,
+        };
+        if !prior.may_hold(other_form) {
             return;
         }
         let (other, result) = match written {
@@ -2829,30 +2839,34 @@ mod other_form_tests {
         assert_eq!(got.storage_info.label(), "passthrough");
     }
 
-    /// Every write drops the other form through `drop_other_form`, which
-    /// skips the DELETE when the prior read found the key absent.
+    /// Every write in the engine (`src/deltaglider/engine/*.rs`, the
+    /// fast-path `put_delta_raw` included) drops the other form through
+    /// `drop_other_form`, which skips the DELETE when the prior read found
+    /// that form absent. `raw.rs` deleted the passthrough form on its own,
+    /// with no prior read.
     #[test]
     fn writes_drop_the_other_form_through_one_helper() {
-        let text = std::fs::read_to_string("src/deltaglider/engine/store.rs").unwrap();
-        let lines = crate::source_scan::prod_lines(&text);
-        let mut inside_helper = false;
         let mut sites = Vec::new();
-        for (n, line) in &lines {
-            let trimmed = line.trim_start();
-            if line.contains("async fn drop_other_form(") {
-                inside_helper = true;
-            } else if inside_helper && (trimmed.starts_with("///") || trimmed.contains("fn ")) {
-                // The next item.
-                inside_helper = false;
-            }
-            let calls = [
-                ".delete_delta_idempotent(",
-                ".delete_passthrough_idempotent(",
-            ]
-            .iter()
-            .any(|c| line.contains(c));
-            if calls && !inside_helper {
-                sites.push(*n);
+        for (file, text) in crate::source_scan::prod_sources("src/deltaglider/engine") {
+            let lines = crate::source_scan::prod_lines(&text);
+            let mut inside_helper = false;
+            for (n, line) in &lines {
+                let trimmed = line.trim_start();
+                if line.contains("async fn drop_other_form(") {
+                    inside_helper = true;
+                } else if inside_helper && (trimmed.starts_with("///") || trimmed.contains("fn ")) {
+                    // The next item.
+                    inside_helper = false;
+                }
+                let calls = [
+                    ".delete_delta_idempotent(",
+                    ".delete_passthrough_idempotent(",
+                ]
+                .iter()
+                .any(|c| line.contains(c));
+                if calls && !inside_helper {
+                    sites.push(format!("{file}:{n}"));
+                }
             }
         }
         // The legacy-reference migration deletes the passthrough form that
@@ -2860,8 +2874,9 @@ mod other_form_tests {
         assert_eq!(
             sites.len(),
             1,
-            "store.rs deletes another form outside drop_other_form at lines {sites:?}"
+            "the engine deletes another form outside drop_other_form at {sites:?}"
         );
+        assert!(sites[0].starts_with("src/deltaglider/engine/store.rs:"));
     }
 }
 

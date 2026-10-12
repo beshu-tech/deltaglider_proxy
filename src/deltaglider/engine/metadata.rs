@@ -33,7 +33,7 @@ pub(super) fn reference_integrity_ok(
 
 /// Which stored forms of an object exist ([`DeltaGliderEngine::resolve_stored_forms`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct StoredForms {
+pub struct StoredForms {
     pub(super) delta: bool,
     pub(super) passthrough: bool,
 }
@@ -221,6 +221,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     pub async fn head(&self, bucket: &str, key: &str) -> Result<FileMetadata, EngineError> {
+        Ok(self.head_with_forms(bucket, key).await?.0)
+    }
+
+    /// [`Self::head`], and which stored forms of the key exist (the
+    /// precondition check of a conditional write keeps them for the write).
+    pub(super) async fn head_with_forms(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(FileMetadata, StoredForms), EngineError> {
         // Note: we do NOT use the metadata cache for HEAD. The cache is used for
         // LIST enrichment and file_size correction, but HEAD must always verify
         // the object exists on storage to handle out-of-band deletions correctly.
@@ -232,14 +242,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // object without DG metadata (both backends), so `None` means both
         // forms are absent. (A second passthrough HEAD here cost a missing
         // key 3 requests instead of 2.)
-        let meta = self
-            .resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
+        let (meta, forms) = self
+            .resolve_stored_forms(bucket, &deltaspace_id, &obj_key.filename)
             .await?
             .ok_or_else(|| EngineError::NotFound(obj_key.full_key()))?;
 
         // Populate metadata cache on successful backend lookup
         self.metadata_cache.insert(bucket, key, meta.clone());
-        Ok(meta)
+        Ok((meta, forms))
     }
 
     /// The metadata of the deltaspace's reference.bin from ONE read (a HEAD
@@ -440,10 +450,7 @@ mod head_cost_tests {
     /// `has_reference` and then read the metadata (two HEADs on S3).
     #[test]
     fn engine_code_reads_a_reference_once() {
-        // One site keeps both reads for now: a transfer test
-        // (`delta_fast_path_never_seeds_over_an_unreadable_dest_reference`)
-        // injects its fault into the `has_reference` call.
-        const ALLOWED: [&str; 1] = ["src/deltaglider/engine/raw.rs"];
+        const ALLOWED: [&str; 0] = [];
         let mut sites = Vec::new();
         for (file, text) in crate::source_scan::prod_sources("src/deltaglider/engine") {
             let lines = crate::source_scan::prod_lines(&text);

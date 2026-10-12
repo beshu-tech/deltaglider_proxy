@@ -7,6 +7,7 @@
 //! commit (a request timeout, a client disconnect) then cannot leave a
 //! stored object uncounted.
 
+use super::metadata::StoredForms;
 use super::*;
 
 /// What the usage counter knows about the object a write replaces. Read
@@ -19,8 +20,13 @@ pub enum CounterPrior {
     Untracked,
     /// The key held no object.
     Absent,
-    /// The key held this object: the write subtracts it.
-    Present(Box<FileMetadata>),
+    /// The key held `object` (the newest stored form): the write
+    /// subtracts it. `forms`: which stored forms (`k`, `k.delta`) the read
+    /// found, so the write deletes only a form that is there.
+    Present {
+        object: Box<FileMetadata>,
+        forms: StoredForms,
+    },
     /// The read failed with an error other than NotFound (a timeout, 503):
     /// the net change of the write is unknown. The write records no object
     /// change and marks the bucket's row for a Refresh. Before, the error
@@ -32,8 +38,19 @@ impl CounterPrior {
     /// The replaced object, for [`StoreResult::replaced`].
     pub(super) fn replaced(&self) -> Option<FileMetadata> {
         match self {
-            CounterPrior::Present(meta) => Some(FileMetadata::clone(meta)),
+            CounterPrior::Present { object, .. } => Some(FileMetadata::clone(object)),
             _ => None,
+        }
+    }
+
+    /// Whether the key may hold the stored form `form`, as the read saw
+    /// it. Only a read that found the form absent says no. No read
+    /// (`Untracked`) or a failed one (`Unknown`) says yes.
+    pub(super) fn may_hold(&self, form: crate::storage::ObjectVariant) -> bool {
+        match self {
+            CounterPrior::Absent => false,
+            CounterPrior::Present { forms, .. } => forms.has(form),
+            CounterPrior::Untracked | CounterPrior::Unknown => true,
         }
     }
 }
@@ -55,7 +72,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         match prior {
             CounterPrior::Untracked => {}
             CounterPrior::Absent => u.apply_net(bucket, None, Some(added), 0),
-            CounterPrior::Present(old) => u.apply_net(bucket, Some(&**old), Some(added), 0),
+            CounterPrior::Present { object, .. } => {
+                u.apply_net(bucket, Some(&**object), Some(added), 0)
+            }
             CounterPrior::Unknown => u.mark_for_recount(bucket),
         }
     }
@@ -92,10 +111,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             return CounterPrior::Absent;
         };
         match self
-            .resolve_metadata(bucket, &deltaspace_id, &obj_key)
+            .resolve_stored_forms(bucket, &deltaspace_id, &obj_key.filename)
             .await
         {
-            Ok(Some(meta)) => CounterPrior::Present(Box::new(meta)),
+            Ok(Some((meta, forms))) => CounterPrior::Present {
+                object: Box::new(meta),
+                forms,
+            },
             Ok(None) => CounterPrior::Absent,
             Err(e) => {
                 warn!(
@@ -243,25 +265,29 @@ mod tests {
     /// recorded after the cleanup DELETE that follows the commit: a request
     /// timeout or a client disconnect there dropped the future and the
     /// stored object was never counted. The write is an overwrite (of a
-    /// shorter version): a write of a new key sends no cleanup DELETE.
+    /// shorter version) in the OTHER stored form: a write of a new key, or
+    /// an overwrite in the same form, sends no cleanup DELETE.
     #[tokio::test]
     async fn a_put_dropped_after_its_commit_is_still_counted() {
-        for key in ["img/k.jpg", "rel/app.zip"] {
+        let no_delta = || HashMap::from([("dg-no-delta".to_string(), "true".to_string())]);
+        // (key, the first write is passthrough on request; else the second)
+        for (key, first_passthrough) in [("rel/app.zip", false), ("rel/other.zip", true)] {
             let (engine, fake, usage) = counted_s3_engine(None).await;
             let data = noise(7, 64 * 1024);
             let first = &data[..data.len() - 4096];
+            let (first_meta, second_meta) = if first_passthrough {
+                (no_delta(), HashMap::new())
+            } else {
+                (HashMap::new(), no_delta())
+            };
             engine
-                .store("b", key, first, None, Default::default())
+                .store("b", key, first, None, first_meta)
                 .await
                 .unwrap();
             fake.set_delete_delay_ms(30_000);
             let task = {
                 let (engine, data) = (engine.clone(), data.clone());
-                tokio::spawn(async move {
-                    engine
-                        .store("b", key, &data, None, Default::default())
-                        .await
-                })
+                tokio::spawn(async move { engine.store("b", key, &data, None, second_meta).await })
             };
             assert!(
                 fake.wait_for(|r| r.starts_with("DELETE ")).await,
@@ -272,11 +298,11 @@ mod tests {
             fake.set_delete_delay_ms(0);
 
             let head = engine.head("b", key).await.expect("the object committed");
-            // The first version is the folder's baseline.
-            let reference = if key.ends_with(".zip") {
-                first.len() as i64
+            // The delta write's body is the folder's baseline.
+            let reference = if first_passthrough {
+                data.len() as i64
             } else {
-                0
+                first.len() as i64
             };
             let r = row(&usage);
             assert_eq!(

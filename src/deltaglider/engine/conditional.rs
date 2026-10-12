@@ -97,7 +97,7 @@ pub struct ObjectWriteGuard {
     _guard: tokio::sync::OwnedMutexGuard<()>,
     /// The object as the precondition check read it under this lock
     /// (`Some(None)`: absent). `None`: no precondition, nothing read.
-    checked: Option<Option<FileMetadata>>,
+    checked: Option<Option<(FileMetadata, super::metadata::StoredForms)>>,
 }
 
 impl ObjectWriteGuard {
@@ -107,7 +107,10 @@ impl ObjectWriteGuard {
     fn known_prior(&self) -> Option<super::usage::CounterPrior> {
         use super::usage::CounterPrior;
         self.checked.as_ref().map(|found| match found {
-            Some(meta) => CounterPrior::Present(Box::new(meta.clone())),
+            Some((meta, forms)) => CounterPrior::Present {
+                object: Box::new(meta.clone()),
+                forms: *forms,
+            },
             None => CounterPrior::Absent,
         })
     }
@@ -162,12 +165,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             // Fail closed (review C4): only NotFound means "absent". Any
             // other HEAD error used to read as absent, so `If-None-Match: *`
             // overwrote.
-            let existing = match self.head(bucket, key).await {
-                Ok(meta) => Some(meta),
+            let existing = match self.head_with_forms(bucket, key).await {
+                Ok(found) => Some(found),
                 Err(EngineError::NotFound(_)) => None,
                 Err(e) => return Err(e.into()),
             };
-            precondition.check(existing.as_ref())?;
+            precondition.check(existing.as_ref().map(|(meta, _)| meta))?;
             guard.checked = Some(existing);
         }
         Ok(guard)
