@@ -173,7 +173,7 @@ async fn a_corrupt_reference_is_refused_on_the_one_get() {
     bytes[10] ^= 0xff;
     let proof = crate::deltaglider::RefWriteProof::for_tests();
     fx.backend
-        .put_reference("b", "dir", &bytes, &meta, proof)
+        .put_reference("b", "dir", bytes::Bytes::from(bytes.clone()), &meta, proof)
         .await
         .unwrap();
     let engine = engine_on(&fx.backend, None);
@@ -379,7 +379,13 @@ async fn both_forms_newest_wins() {
             delta_meta.created_at - shift
         };
         fx.backend
-            .put_passthrough("b", "dir", "v1.zip", &leftover, &meta)
+            .put_passthrough(
+                "b",
+                "dir",
+                "v1.zip",
+                bytes::Bytes::from(leftover.clone()),
+                &meta,
+            )
             .await
             .unwrap();
         let svc = svc_on(engine_on(&fx.backend, None));
@@ -806,7 +812,13 @@ async fn a_newer_delta_wins_over_the_ranged_passthrough() {
             delta_meta.created_at - shift
         };
         fx.backend
-            .put_passthrough("b", "dir", "v1.zip", &leftover, &meta)
+            .put_passthrough(
+                "b",
+                "dir",
+                "v1.zip",
+                bytes::Bytes::from(leftover.clone()),
+                &meta,
+            )
             .await
             .unwrap();
         let svc = svc_on(engine_on(&fx.backend, None));
