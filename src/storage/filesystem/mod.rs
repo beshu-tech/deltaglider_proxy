@@ -179,6 +179,9 @@ thread_local! {
     /// on this thread, for the listing cost tests (a `#[tokio::test]` runs
     /// on one thread).
     static LISTED_ENTRY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Directory reads of [`FilesystemBackend::dir_has_visible_data_recursive`]
+    /// on this thread.
+    static VISIBILITY_DIR_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Is `name` one of this backend's temp files, and so never a user object?
@@ -541,6 +544,8 @@ impl FilesystemBackend {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, StorageError>> + Send + 'a>>
     {
         Box::pin(async move {
+            #[cfg(test)]
+            VISIBILITY_DIR_READS.with(|n| n.set(n.get() + 1));
             let mut entries = fs::read_dir(current_dir).await?;
             while let Some(entry) = entries.next_entry().await? {
                 let path = entry.path();
@@ -1910,7 +1915,9 @@ impl StorageBackend for FilesystemBackend {
         // Collect common prefixes and candidate object files.
         // Use BTreeMap for objects keyed by user-visible key so that
         // delta+passthrough duplicates are resolved (delta wins).
-        let mut common_prefixes = std::collections::BTreeSet::new();
+        // Folder key (`dir/`) → its directory; whether it holds a visible
+        // key is read later, only for the folders the page reaches.
+        let mut common_prefixes: BTreeMap<String, PathBuf> = BTreeMap::new();
         let mut object_map: BTreeMap<String, (PathBuf, bool)> = BTreeMap::new(); // key → (path, is_delta)
 
         while let Some(entry) = entries.next_entry().await? {
@@ -1929,7 +1936,8 @@ impl StorageBackend for FilesystemBackend {
                     continue;
                 }
 
-                if !Self::dir_has_visible_data_recursive(&entry.path()).await? {
+                // Apply name filter: the directory name must start with name_filter.
+                if !name_filter.is_empty() && !name.starts_with(name_filter) {
                     continue;
                 }
 
@@ -1940,12 +1948,7 @@ impl StorageBackend for FilesystemBackend {
                     format!("{}/{}/", dir_part, name)
                 };
 
-                // Apply name filter: the directory name must start with name_filter.
-                if !name_filter.is_empty() && !name.starts_with(name_filter) {
-                    continue;
-                }
-
-                common_prefixes.insert(cp);
+                common_prefixes.insert(cp, entry.path());
             } else {
                 // Temp files and reference.bin are internal, not objects.
                 let StoredName::Object {
@@ -1989,20 +1992,41 @@ impl StorageBackend for FilesystemBackend {
             }
         }
 
-        // Interleave objects and common prefixes for unified sort+pagination.
-        // S3 ListObjectsV2 counts both objects and common prefixes toward max_keys.
-        let obj_entries: Vec<(String, PathBuf)> = object_map
+        // Objects and folders after the token, in key order. A folder
+        // counts only when it holds a visible key, and that check walks the
+        // folder: run it in key order, only until the page holds max_keys
+        // entries plus the one that proves truncation. It ran for every
+        // folder of the directory, on every page.
+        let after = |k: &String| continuation_token.is_none_or(|t| k.as_str() > t);
+        let mut candidates: Vec<(String, PathBuf, bool)> = object_map
             .into_iter()
-            .map(|(key, (path, _))| (key, path))
+            .filter(|(k, _)| after(k))
+            .map(|(key, (path, _))| (key, path, false))
+            .chain(
+                common_prefixes
+                    .into_iter()
+                    .filter(|(k, _)| after(k))
+                    .map(|(cp, path)| (cp, path, true)),
+            )
             .collect();
-        let cp_entries: Vec<String> = common_prefixes.into_iter().collect();
+        candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        let want = max_keys as usize + 1;
+        let mut obj_entries: Vec<(String, PathBuf)> = Vec::new();
+        let mut cp_entries: Vec<String> = Vec::new();
+        for (key, path, is_dir) in candidates {
+            if obj_entries.len() + cp_entries.len() >= want {
+                break;
+            }
+            if !is_dir {
+                obj_entries.push((key, path));
+            } else if Self::dir_has_visible_data_recursive(&path).await? {
+                cp_entries.push(key);
+            }
+        }
 
-        let page = crate::deltaglider::interleave_and_paginate(
-            obj_entries,
-            cp_entries,
-            max_keys,
-            continuation_token,
-        );
+        // S3 ListObjectsV2 counts both objects and common prefixes toward max_keys.
+        let page =
+            crate::deltaglider::interleave_and_paginate(obj_entries, cp_entries, max_keys, None);
 
         // Resolve metadata for object entries (after pagination to minimize I/O).
         let mut final_objects: Vec<(String, FileMetadata)> = Vec::new();
@@ -2209,6 +2233,190 @@ mod paged_listing_tests {
                         .collect::<Vec<_>>()
                 };
                 assert_eq!(names(&got), names(&want), "prefix {prefix:?}, {max_keys}");
+            }
+        }
+    }
+
+    /// A root listing with a delimiter over 3,000 folders: the visibility
+    /// check walked every folder for every page (3 pages = 18,000 directory
+    /// reads), before the name filter and the page cut.
+    #[tokio::test]
+    async fn a_delimiter_listing_checks_only_the_folders_it_shows() {
+        let (tmp, engine) = engine().await;
+        let ds = tmp.path().join("b").join("deltaspaces");
+        for i in 0..3000 {
+            let p = ds.join(format!("f{i:05}/sub/a.txt"));
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"x").unwrap();
+        }
+        for (prefix, folders, max_reads) in [("", 3000, 6_100), ("f029", 100, 210)] {
+            VISIBILITY_DIR_READS.with(|n| n.set(0));
+            let mut token: Option<String> = None;
+            let mut got = 0;
+            loop {
+                let p = engine
+                    .list_objects("b", prefix, Some("/"), 1000, token.as_deref(), false)
+                    .await
+                    .unwrap();
+                got += p.common_prefixes.len();
+                if !p.is_truncated {
+                    break;
+                }
+                token = p.next_continuation_token;
+            }
+            assert_eq!(got, folders, "{prefix:?}");
+            let reads = VISIBILITY_DIR_READS.with(|n| n.get());
+            assert!(
+                reads <= max_reads,
+                "{reads} directory reads to list {folders} folders under {prefix:?}"
+            );
+        }
+    }
+
+    /// The delimiter listing over random trees equals a sorted model built
+    /// from the visible keys: folders with only `reference.bin`, temp files
+    /// or nothing stay hidden; paging with every page size and a start-after
+    /// token anywhere (inside a folder name too) matches.
+    mod delimiter_model {
+        use super::*;
+        use proptest::prelude::*;
+        use std::collections::BTreeSet;
+
+        const DIRS: [&str; 5] = ["a", "b", "a-b", "a.b", "a0"];
+        /// A file name and the key name it stores (`None`: not a key).
+        const FILES: [(&str, Option<&str>); 7] = [
+            ("x", Some("x")),
+            ("y.txt", Some("y.txt")),
+            ("x-1", Some("x-1")),
+            ("q.delta", Some("q")),
+            ("reference.bin", None),
+            (".dg-tmp.0", None),
+            ("", None), // an empty directory
+        ];
+        const PREFIXES: [&str; 10] = [
+            "", "a", "a/", "a-", "a/b", "a/b/", "a.b/", "a0", "b/a/", "zz",
+        ];
+
+        /// The entries a delimiter (`/`) listing of `prefix` shows: keys
+        /// directly under it, and one common prefix per folder below it.
+        fn model(keys: &BTreeSet<String>, prefix: &str) -> Vec<(String, bool)> {
+            let mut out = BTreeMap::new();
+            for k in keys.iter().filter(|k| k.starts_with(prefix)) {
+                let rest = &k[prefix.len()..];
+                match rest.find('/') {
+                    Some(i) => out.insert(format!("{prefix}{}", &rest[..=i]), true),
+                    None => out.insert(k.clone(), false),
+                };
+            }
+            out.into_iter().collect()
+        }
+
+        fn page_of(
+            model: &[(String, bool)],
+            max_keys: usize,
+            token: Option<&str>,
+        ) -> (Vec<(String, bool)>, bool) {
+            let after: Vec<_> = model
+                .iter()
+                .filter(|(k, _)| token.is_none_or(|t| k.as_str() > t))
+                .cloned()
+                .collect();
+            let truncated = after.len() > max_keys;
+            (after.into_iter().take(max_keys).collect(), truncated)
+        }
+
+        fn listed(r: &DelegatedListResult) -> Vec<(String, bool)> {
+            let mut v: Vec<(String, bool)> = r
+                .objects
+                .iter()
+                .map(|(k, _)| (k.clone(), false))
+                .chain(r.common_prefixes.iter().map(|p| (p.clone(), true)))
+                .collect();
+            v.sort();
+            v
+        }
+
+        fn tree() -> impl Strategy<Value = Vec<(Vec<usize>, usize)>> {
+            prop::collection::vec(
+                (prop::collection::vec(0..DIRS.len(), 0..3), 0..FILES.len()),
+                0..14,
+            )
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(96))]
+            #[test]
+            fn the_delimiter_listing_matches_the_sorted_model(
+                files in tree(),
+                prefix in 0..PREFIXES.len(),
+                token in prop::option::of(0..PREFIXES.len()),
+            ) {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let fs = FilesystemBackend::new(tmp.path().to_path_buf()).await.unwrap();
+                    fs.create_bucket("b").await.unwrap();
+                    let ds = tmp.path().join("b").join("deltaspaces");
+                    let mut keys = BTreeSet::new();
+                    for (dirs, file) in &files {
+                        let dir: Vec<&str> = dirs.iter().map(|&d| DIRS[d]).collect();
+                        let dir_path = ds.join(dir.join("/"));
+                        std::fs::create_dir_all(&dir_path).unwrap();
+                        let (name, key_name) = FILES[*file];
+                        if name.is_empty() {
+                            continue;
+                        }
+                        std::fs::write(dir_path.join(name), b"x").unwrap();
+                        if let Some(key_name) = key_name {
+                            let mut parts = dir.clone();
+                            parts.push(key_name);
+                            keys.insert(parts.join("/"));
+                        }
+                    }
+                    let prefix = PREFIXES[prefix];
+                    let model = model(&keys, prefix);
+                    // Start-after anywhere: one page from that token.
+                    let start = token.map(|t| format!("{}x", PREFIXES[t]));
+                    let r = fs
+                        .list_objects_delegated("b", prefix, Some("/"), 2, start.as_deref())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let (want, truncated) = page_of(&model, 2, start.as_deref());
+                    assert_eq!(listed(&r), want, "start-after {start:?}");
+                    assert_eq!(r.is_truncated, truncated);
+                    // Every page size, walked to the end.
+                    for max_keys in [1usize, 2, 3, 1000] {
+                        let mut got = Vec::new();
+                        let mut token: Option<String> = None;
+                        loop {
+                            let r = fs
+                                .list_objects_delegated(
+                                    "b",
+                                    prefix,
+                                    Some("/"),
+                                    max_keys as u32,
+                                    token.as_deref(),
+                                )
+                                .await
+                                .unwrap()
+                                .unwrap();
+                            let (want, truncated) = page_of(&model, max_keys, token.as_deref());
+                            assert_eq!(listed(&r), want, "{prefix:?} {max_keys} {token:?}");
+                            assert_eq!(r.is_truncated, truncated);
+                            got.extend(listed(&r));
+                            if !r.is_truncated {
+                                break;
+                            }
+                            token = r.next_continuation_token.clone();
+                            assert_eq!(token.as_ref(), got.last().map(|(k, _)| k));
+                        }
+                        assert_eq!(got, model, "{prefix:?} {max_keys}");
+                    }
+                });
             }
         }
     }
