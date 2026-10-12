@@ -57,11 +57,12 @@ use tracing::info;
 use crate::api::handlers::AppState;
 use crate::config_apply::ConfigMutator;
 use crate::config_db::ConfigDb;
-use crate::deltaglider::{DeleteHooks, DeleteItem, DeleteOutcome, DynEngine, ListObjectsPage};
+use crate::deltaglider::{
+    CounterPrior, DeleteHooks, DeleteItem, DeleteOutcome, DynEngine, ListObjectsPage, StoredForms,
+};
 use crate::job_loop::{list_retry_delay, ListFailure, Pager, MAX_JOB_PAGES};
 use crate::transfer::{
-    content_verdict, copy_object_with_retries, ContentVerdict, ObjectTransferRequest,
-    TransferProvenance,
+    content_verdict, copy_object_known, ContentVerdict, ObjectTransferRequest, TransferProvenance,
 };
 
 use super::paged::{
@@ -338,17 +339,18 @@ impl HeadFailed {
     }
 }
 
-/// HEAD `bucket/key`: `Ok(None)` only when the object does not exist. A
-/// transient error is sent again ([`HEAD_ATTEMPTS`] in all).
+/// HEAD `bucket/key` (both stored forms): `Ok(None)` only when the object
+/// does not exist. A transient error is sent again ([`HEAD_ATTEMPTS`] in
+/// all).
 async fn head_retrying(
     engine: &DynEngine,
     bucket: &str,
     key: &str,
-) -> Result<Option<crate::types::FileMetadata>, HeadFailed> {
+) -> Result<Option<(crate::types::FileMetadata, StoredForms)>, HeadFailed> {
     let mut attempt = 0u32;
     loop {
-        let e = match engine.head(bucket, key).await {
-            Ok(meta) => return Ok(Some(meta)),
+        let e = match engine.head_listed(bucket, key, None).await {
+            Ok(found) => return Ok(Some(found)),
             Err(e) if e.is_not_found() => return Ok(None),
             Err(e) => e,
         };
@@ -380,16 +382,50 @@ async fn copy_verdict_for(
     key: &str,
     source_form: Option<crate::storage::ObjectVariant>,
 ) -> Result<ContentVerdict, HeadFailed> {
-    let Some(dst) = head_retrying(engine, target_bucket, key).await? else {
-        return Ok(ContentVerdict::Missing);
+    copy_check(engine, source_bucket, target_bucket, key, source_form)
+        .await
+        .map(|check| check.verdict)
+}
+
+/// What the skip check of a copy read ([`copy_check`]).
+struct CopyCheck {
+    verdict: ContentVerdict,
+    /// What the target key holds: the copy's prior. Nothing else writes
+    /// the target (the staging route is gated from its creation), so it
+    /// stays true until the copy writes.
+    target: CounterPrior,
+    /// The source's metadata, when the check read it.
+    source: Option<crate::types::FileMetadata>,
+}
+
+/// [`copy_verdict_for`], and what it read.
+async fn copy_check(
+    engine: &DynEngine,
+    source_bucket: &str,
+    target_bucket: &str,
+    key: &str,
+    source_form: Option<crate::storage::ObjectVariant>,
+) -> Result<CopyCheck, HeadFailed> {
+    let Some((dst, forms)) = head_retrying(engine, target_bucket, key).await? else {
+        return Ok(CopyCheck {
+            verdict: ContentVerdict::Missing,
+            target: CounterPrior::Absent,
+            source: None,
+        });
     };
-    Ok(
-        match engine.head_listed(source_bucket, key, source_form).await {
-            Ok((src, _)) => content_verdict(&src, Some(&dst)),
-            // The copy (or verify) reports the source error itself.
-            Err(_) => ContentVerdict::Unknown,
+    let (verdict, source) = match engine.head_listed(source_bucket, key, source_form).await {
+        Ok((src, _)) => (content_verdict(&src, Some(&dst)), Some(src)),
+        // The copy (or verify) reports the source error itself.
+        Err(_) => (ContentVerdict::Unknown, None),
+    };
+    Ok(CopyCheck {
+        verdict,
+        target: CounterPrior::Present {
+            object: Box::new(dst),
+            forms,
         },
-    )
+        source,
+    })
 }
 
 /// One page of `bucket` (all keys, no metadata), a transient error retried
@@ -1235,21 +1271,37 @@ impl PageStep for CopyStep<'_, '_> {
         // cancelled earlier attempt leaves copies that the source has
         // since outgrown. A target HEAD that keeps failing proves nothing:
         // the object is copied (the copy is idempotent).
-        if !self.recopy.recopies()
-            && matches!(
-                copy_verdict_for(
-                    engine,
-                    bucket,
-                    &params.transient_key,
-                    key,
-                    self.forms.of(key)
-                )
-                .await,
-                Ok(ContentVerdict::Same)
+        let check = if self.recopy.recopies() {
+            None
+        } else {
+            copy_check(
+                engine,
+                bucket,
+                &params.transient_key,
+                key,
+                self.forms.of(key),
             )
-        {
-            return CopyDone::Skipped;
-        }
+            .await
+            .ok()
+        };
+        let (source, prior) = match check {
+            Some(CopyCheck {
+                verdict: ContentVerdict::Same,
+                ..
+            }) => return CopyDone::Skipped,
+            Some(check) => (check.source, Some(check.target)),
+            None => (None, None),
+        };
+        // The copy's source HEAD: the check's, else one of the listed form.
+        // A failed read leaves it to the copy, which reports the error.
+        let source = match source {
+            Some(meta) => Some(meta),
+            None => engine
+                .head_listed(bucket, key, self.forms.of(key))
+                .await
+                .ok()
+                .map(|(meta, _)| meta),
+        };
         let req = ObjectTransferRequest {
             source_bucket: bucket,
             source_key: key,
@@ -1266,7 +1318,8 @@ impl PageStep for CopyStep<'_, '_> {
         };
         // No per-object fsync: `checkpoint` flushes the copies before any
         // progress that counts on them is saved.
-        match crate::storage::with_deferred_fsync(copy_object_with_retries(engine, req)).await {
+        let copy = copy_object_known(engine, req, source.as_ref(), prior.as_ref());
+        match crate::storage::with_deferred_fsync(copy).await {
             Ok(outcome) => CopyDone::Copied {
                 bytes: outcome.bytes_copied as i64,
             },

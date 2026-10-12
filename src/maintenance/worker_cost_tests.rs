@@ -355,3 +355,96 @@ async fn a_listed_form_that_is_gone_is_read_in_both_forms() {
     // The listed form, then both.
     assert_eq!(object_ops(&fake, "b", "k.txt").get("HEAD"), Some(&3));
 }
+
+/// Store `n` objects `k-NNN.txt` that carry a stale "encrypted" marker on
+/// the plain backend: a re-encrypt rewrites each one.
+async fn store_marked(engine: &crate::deltaglider::DynEngine, n: usize) {
+    for i in 0..n {
+        let meta = std::collections::HashMap::from([(
+            ENCRYPTION_MARKER_KEY.to_string(),
+            crate::storage::encrypting::ENCRYPTION_MARKER_VALUE.to_string(),
+        )]);
+        engine
+            .store("b", &format!("k-{i:03}.txt"), b"x", None, meta)
+            .await
+            .unwrap();
+    }
+    engine.metadata_cache().invalidate_prefix("b", "");
+}
+
+/// P6.1 + P6.2: a re-encrypt that rewrites an object HEADed both forms,
+/// then the copy HEADed them again, the store read the prior (2 more),
+/// and the write DELETEd the other form that the job had seen absent.
+/// Now the job's one HEAD is the copy's source and the store's prior.
+#[tokio::test]
+async fn reencrypt_rewrite_reuses_the_jobs_head() {
+    let (engine, fake) = counted_engine().await;
+    store_marked(&engine, 5).await;
+    let row = run_kind(engine, &fake, "reencrypt").await;
+    assert_eq!(row.status, "completed", "{row:?}");
+    assert_eq!(row.objects_done, 5, "{row:?}");
+    for i in 0..5 {
+        let key = format!("k-{i:03}.txt");
+        let ops = object_ops(&fake, "b", &key);
+        // HEAD (the listed form), GET (the bytes), PUT (the rewrite), and
+        // the copy's verify of the destination (a HEAD of both forms).
+        assert_eq!(object_requests(&fake, "b", &key), 5, "{key}: {ops:?}");
+        assert_eq!(ops.get("DELETE"), None, "{key}: {ops:?}");
+    }
+}
+
+/// P6.2: with the job's HEAD as the prior, the counter still nets each
+/// rewrite (an overwrite of the same object) to zero.
+#[tokio::test]
+async fn a_rewrite_with_the_jobs_prior_keeps_the_counter() {
+    let (engine, fake) = s3_engine().await;
+    let usage = Arc::new(crate::bucket_usage::BucketUsage::in_memory().unwrap());
+    let engine = engine.with_bucket_usage(Some(usage.clone()));
+    store_marked(&engine, 3).await;
+    let before = usage.read("b").unwrap().unwrap();
+    assert_eq!(before.object_count, 3, "{before:?}");
+    let row = run_kind(engine, &fake, "reencrypt").await;
+    assert_eq!(row.objects_done, 3, "{row:?}");
+    let after = usage.read("b").unwrap().unwrap();
+    assert_eq!(after.object_count, 3, "{after:?}");
+    assert_eq!(after.logical_bytes, before.logical_bytes, "{after:?}");
+}
+
+/// P6.2 edge: without a usage counter the write reads no prior and sent a
+/// DELETE of the other form on every rewrite; the job's HEAD found it
+/// absent, so the rewrite sends none.
+#[tokio::test]
+async fn a_rewrite_without_a_counter_sends_no_delete() {
+    let (engine, fake) = s3_engine().await;
+    store_marked(&engine, 3).await;
+    let row = run_kind(engine, &fake, "reencrypt").await;
+    assert_eq!(row.objects_done, 3, "{row:?}");
+    for i in 0..3 {
+        let key = format!("k-{i:03}.txt");
+        let ops = object_ops(&fake, "b", &key);
+        assert_eq!(ops.get("DELETE"), None, "{key}: {ops:?}");
+    }
+}
+
+/// Source guard (P6.1, P6.2): a maintenance job reads an object with
+/// `head_listed` (one HEAD of the form that its listing proved) and hands
+/// that read to the copy (`copy_object_known`). A plain engine HEAD or a
+/// copy that reads the source and the prior again sends what the job
+/// already knows.
+#[test]
+fn maintenance_jobs_reuse_their_reads() {
+    let mut sites = Vec::new();
+    for (file, text) in crate::source_scan::prod_sources("src/maintenance") {
+        // `#[path]` test modules (this file) are not prod code.
+        if file.ends_with("_tests.rs") {
+            continue;
+        }
+        for (n, line) in crate::source_scan::prod_lines(&text) {
+            let banned = [".head(", "copy_object_with_retries(", "copy_object_from("];
+            if banned.iter().any(|b| line.contains(b)) {
+                sites.push(format!("{file}:{n}: {}", line.trim()));
+            }
+        }
+    }
+    assert!(sites.is_empty(), "{sites:#?}");
+}

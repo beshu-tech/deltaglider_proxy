@@ -12,7 +12,8 @@
 //!    progress bar is honest.
 //! 3. **objects** — per object: `engine.head_listed` (one HEAD of the
 //!    stored form that the page's listing proved) → [`needs_rewrite`]? then
-//!    rewrite in place via `transfer::copy_object_with_retries`
+//!    rewrite in place via `transfer::copy_object_known` (that HEAD is the
+//!    copy's source and the write's prior)
 //!    (source == destination; the engine's store path encrypts/decrypts
 //!    per the CURRENT backend mode; stale markers stripped). Failures are
 //!    recorded per object and the job continues.
@@ -40,8 +41,9 @@ use crate::config_apply::ConfigMutator;
 use crate::config_db::ConfigDb;
 use crate::config_sections::LeaseTiming;
 use crate::coordination::LeaseError;
+use crate::deltaglider::CounterPrior;
 use crate::storage::encrypting::{ENCRYPTION_KEY_ID_KEY, ENCRYPTION_MARKER_KEY};
-use crate::transfer::{copy_object_with_retries, ObjectTransferRequest};
+use crate::transfer::{copy_object_known, ObjectTransferRequest};
 
 use super::paged::{
     list_job_keys, paged_phase, JobCtx, KeyPage, ListError, PageStep, PhaseSpec, PAGE_CONCURRENCY,
@@ -550,6 +552,7 @@ impl ObjectVisitor for Reencrypt<'_> {
         engine: &Arc<crate::deltaglider::DynEngine>,
         key: &str,
         meta: &crate::types::FileMetadata,
+        forms: crate::deltaglider::StoredForms,
     ) -> Visit {
         let desired = self.desired.as_ref().expect("begin_page runs first");
         if !needs_rewrite(&meta.user_metadata, desired) {
@@ -568,7 +571,14 @@ impl ObjectVisitor for Reencrypt<'_> {
             upload_concurrency: None,
             keep_created_at: true,
         };
-        match copy_object_with_retries(engine, req).await {
+        // The visit's HEAD is the copy's source HEAD and the write's prior
+        // (source == destination): the write gate freezes the bucket, so a
+        // second read would find the same object in the same forms.
+        let prior = CounterPrior::Present {
+            object: Box::new(meta.clone()),
+            forms,
+        };
+        match copy_object_known(engine, req, Some(meta), Some(&prior)).await {
             Ok(outcome) => Visit::Done {
                 bytes: outcome.bytes_copied as i64,
             },
@@ -594,13 +604,15 @@ pub(crate) trait ObjectVisitor {
     async fn begin_page(&mut self) -> Result<(), PhaseStop> {
         Ok(())
     }
-    /// One user object, with the metadata the driver read for it. Up to
+    /// One user object, with the metadata the driver read for it and the
+    /// stored forms that the read found. Up to
     /// [`super::paged::PAGE_CONCURRENCY`] objects run at once.
     async fn visit(
         &self,
         engine: &Arc<crate::deltaglider::DynEngine>,
         key: &str,
         meta: &crate::types::FileMetadata,
+        forms: crate::deltaglider::StoredForms,
     ) -> Visit;
 }
 
@@ -746,7 +758,7 @@ impl<V: ObjectVisitor> PageStep for ObjectsStep<'_, V> {
             .head_listed(&self.job.bucket, key, self.forms.of(key))
             .await
         {
-            Ok((meta, _)) => self.visitor.visit(engine, key, &meta).await,
+            Ok((meta, forms)) => self.visitor.visit(engine, key, &meta, forms).await,
             Err(e) => Visit::Failed(format!("could not read object metadata: {e}")),
         }
     }

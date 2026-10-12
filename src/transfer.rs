@@ -176,10 +176,27 @@ pub(crate) async fn copy_object_from(
     request: ObjectTransferRequest<'_>,
     source: Option<&crate::types::FileMetadata>,
 ) -> Result<ObjectTransferOutcome, CopyError> {
+    copy_object_known(engine, request, source, None).await
+}
+
+/// [`copy_object_from`], and what the destination key holds when the
+/// caller read it already (`destination_prior`): the write then reads no
+/// prior and deletes no stored form that the read found absent. Only a
+/// caller whose destination no one else writes in between may pass it (a
+/// maintenance job behind its write gate). The first attempt alone uses
+/// the given source and prior: a retry follows a failed attempt that may
+/// have written the destination, so it reads both again.
+pub(crate) async fn copy_object_known(
+    engine: &Arc<DynEngine>,
+    request: ObjectTransferRequest<'_>,
+    source: Option<&crate::types::FileMetadata>,
+    destination_prior: Option<&crate::deltaglider::CounterPrior>,
+) -> Result<ObjectTransferOutcome, CopyError> {
     let mut source = source.cloned();
+    let mut prior = destination_prior;
     let mut attempt = 1;
     loop {
-        let attempt_result = copy_attempt(engine, request, source.take()).await;
+        let attempt_result = copy_attempt(engine, request, source.take(), prior.take()).await;
         let err = match attempt_result {
             Ok(outcome) => return Ok(outcome),
             Err(err) => err,
@@ -223,6 +240,7 @@ async fn copy_attempt(
     engine: &Arc<DynEngine>,
     request: ObjectTransferRequest<'_>,
     source: Option<crate::types::FileMetadata>,
+    prior: Option<&crate::deltaglider::CounterPrior>,
 ) -> Result<ObjectTransferOutcome, CopyError> {
     // A HEAD first so callers get a crisp source-disappeared failure row.
     let source_head = match source {
@@ -235,18 +253,21 @@ async fn copy_attempt(
     if request.keep_created_at {
         crate::types::with_created_at(
             source_head.created_at,
-            copy_object_once(engine, request, &source_head),
+            copy_object_once(engine, request, &source_head, prior),
         )
         .await
     } else {
-        copy_object_once(engine, request, &source_head).await
+        copy_object_once(engine, request, &source_head, prior).await
     }
 }
 
+/// `prior`: see [`copy_object_known`]; the buffered path and the delta
+/// fast path use it, the streamed paths read their own.
 async fn copy_object_once(
     engine: &Arc<DynEngine>,
     request: ObjectTransferRequest<'_>,
     source_head: &crate::types::FileMetadata,
+    prior: Option<&crate::deltaglider::CounterPrior>,
 ) -> Result<ObjectTransferOutcome, CopyError> {
     // Large passthrough on a native-multipart destination → stream via
     // multipart with per-part range-resume (bounded memory). Delta /
@@ -268,7 +289,7 @@ async fn copy_object_once(
         source_head.storage_info,
         crate::types::StorageInfo::Delta { .. }
     ) {
-        if let Some(outcome) = delta_passthrough_copy(engine, request, source_head).await? {
+        if let Some(outcome) = delta_passthrough_copy(engine, request, source_head, prior).await? {
             return Ok(outcome);
         }
     }
@@ -323,30 +344,19 @@ async fn copy_object_once(
     // CopyObject handler and the delta fast path.
     crate::storage::encrypting::strip_encryption_markers(&mut user_metadata);
 
-    if let Some(mp_etag) = meta.multipart_etag.clone() {
-        engine
-            .store_with_multipart_etag(
-                request.destination_bucket,
-                request.destination_key,
-                &data,
-                content_type,
-                user_metadata,
-                mp_etag,
-            )
-            .await
-            .map_err(|e| CopyError::engine("destination store failed", e))?;
-    } else {
-        engine
-            .store(
-                request.destination_bucket,
-                request.destination_key,
-                &data,
-                content_type,
-                user_metadata,
-            )
-            .await
-            .map_err(|e| CopyError::engine("destination store failed", e))?;
-    }
+    engine
+        .store_known_prior(
+            request.destination_bucket,
+            request.destination_key,
+            // The retrieved Vec moves into the body: no copy.
+            &Bytes::from(data),
+            content_type,
+            user_metadata,
+            meta.multipart_etag.clone(),
+            prior.cloned(),
+        )
+        .await
+        .map_err(|e| CopyError::engine("destination store failed", e))?;
 
     verify_destination(
         engine,
@@ -1195,6 +1205,7 @@ async fn delta_passthrough_copy(
     engine: &Arc<DynEngine>,
     request: ObjectTransferRequest<'_>,
     source_head: &crate::types::FileMetadata,
+    known_prior: Option<&crate::deltaglider::CounterPrior>,
 ) -> Result<Option<ObjectTransferOutcome>, CopyError> {
     use crate::types::{ObjectKey, StorageInfo};
 
@@ -1299,9 +1310,14 @@ async fn delta_passthrough_copy(
     let counter_dest_bucket = dest_bucket.clone();
     // Snapshot the dest's PRIOR metadata BEFORE the write — reading it after
     // returns the just-written delta and nets the overwrite to zero.
-    let counter_prior = engine
-        .fast_path_prior(&counter_dest_bucket, request.destination_key)
-        .await;
+    let counter_prior = match known_prior {
+        Some(prior) => prior.clone(),
+        None => {
+            engine
+                .fast_path_prior(&counter_dest_bucket, request.destination_key)
+                .await
+        }
+    };
     // `true` = shipped; `false` = fell back.
     let shipped: Result<bool, CopyError> = engine
         .with_dest_prefix_lock(&counter_dest_bucket, &dest_prefix, || async move {
@@ -1785,7 +1801,7 @@ mod tests {
             upload_concurrency: None,
             keep_created_at: false,
         };
-        let result = delta_passthrough_copy(&engine, request, &stale_head).await;
+        let result = delta_passthrough_copy(&engine, request, &stale_head, None).await;
         match result {
             Err(e) => assert_eq!(
                 e.class,
@@ -1807,7 +1823,7 @@ mod tests {
         }
         // With a current HEAD the fast path ships, and the dest reads back.
         let fresh_head = engine.head("src", "p/b.zip").await.unwrap();
-        let shipped = delta_passthrough_copy(&engine, request, &fresh_head)
+        let shipped = delta_passthrough_copy(&engine, request, &fresh_head, None)
             .await
             .expect("fresh HEAD must not error");
         assert!(
@@ -1888,7 +1904,7 @@ mod tests {
             upload_concurrency: None,
             keep_created_at: false,
         };
-        let _ = delta_passthrough_copy(&engine, request, &head).await;
+        let _ = delta_passthrough_copy(&engine, request, &head, None).await;
         faults.disarm_all();
         assert!(faults.fired(crate::storage::FaultPoint::GetReferenceMetadata, "dst/p/") > 0);
         let after = engine

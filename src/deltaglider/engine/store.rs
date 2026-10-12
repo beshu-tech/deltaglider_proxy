@@ -324,6 +324,38 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         .await
     }
 
+    /// [`Self::store`] (with `multipart_etag`: [`Self::store_with_multipart_etag`])
+    /// for a caller that read what the key holds already: `known_prior`
+    /// replaces the write's own prior read (`CounterPrior`), so the write
+    /// sends no HEAD for it and no DELETE for a stored form that the read
+    /// found absent. `None` reads it here. Only a caller whose key no one
+    /// else writes in between may pass one: a conditional write under the
+    /// object's write lock, or a maintenance job behind its bucket's write
+    /// gate.
+    #[instrument(skip(self, body, user_metadata, multipart_etag, known_prior))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn store_known_prior(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: &Bytes,
+        content_type: Option<String>,
+        user_metadata: std::collections::HashMap<String, String>,
+        multipart_etag: Option<String>,
+        known_prior: Option<CounterPrior>,
+    ) -> Result<StoreResult, EngineError> {
+        self.store_inner(
+            bucket,
+            key,
+            body,
+            content_type,
+            user_metadata,
+            multipart_etag,
+            known_prior,
+        )
+        .await
+    }
+
     /// `PUT photos/` with an empty body (review D3): a zero-byte folder
     /// marker, the object S3 clients create for an empty folder. The backend
     /// stores it as-is (never encrypted, never a delta), so an S3 listing

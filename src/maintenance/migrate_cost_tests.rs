@@ -356,3 +356,33 @@ async fn migrate_verify_heads_the_listed_source_form() {
         );
     }
 }
+/// P6.1 + P6.2: the copy of one object into an empty target HEADed the
+/// target (2 forms), HEADed the source (2), and the store read the
+/// target's prior (2; on a `__dgmigrate_` staging bucket it reads none
+/// but DELETEs the other form). The skip check's target HEAD is the
+/// store's prior, and the source HEAD reads the one form that the listing
+/// saw: 10 -> 7 requests.
+#[tokio::test]
+async fn migrate_copy_reuses_the_skip_check_as_the_prior() {
+    use super::super::worker::cost_tests::{object_ops, object_requests};
+    // Persisted in `stage`: a job resumed in `copy` re-copies its first
+    // page without the skip check.
+    let e = env_with("stage", 5, false).await;
+    let mut c = Counters::default();
+    e.run().copy(&mut c).await.unwrap();
+    assert_eq!(c.done, 5, "{c:?}");
+    for i in 0..5 {
+        let key = format!("run/k-{i:03}.txt");
+        let (src, dst) = (
+            object_ops(&e.fake, "b", &key),
+            object_ops(&e.fake, "t", &key),
+        );
+        let total = object_requests(&e.fake, "b", &key) + object_requests(&e.fake, "t", &key);
+        // Target: HEAD both forms (the check, then the prior), PUT, HEAD
+        // both forms (the copy's verify). Source: HEAD (the listed form),
+        // GET.
+        assert_eq!(total, 7, "{key}: source {src:?} target {dst:?}");
+        assert_eq!(src.get("HEAD"), Some(&1), "{key}: source {src:?}");
+        assert_eq!(dst.get("DELETE"), None, "{key}: target {dst:?}");
+    }
+}

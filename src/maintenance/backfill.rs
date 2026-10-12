@@ -187,6 +187,7 @@ impl super::worker::ObjectVisitor for Backfill<'_> {
         engine: &std::sync::Arc<crate::deltaglider::DynEngine>,
         key: &str,
         meta: &FileMetadata,
+        _forms: crate::deltaglider::StoredForms,
     ) -> super::worker::Visit {
         use super::worker::Visit;
         if !needs_metadata_backfill(meta) {
