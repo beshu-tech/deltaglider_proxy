@@ -174,6 +174,15 @@ impl FakeS3 {
         );
     }
 
+    /// Replace the bytes of the stored `bucket/key` and keep its metadata,
+    /// as bit rot or a foreign overwrite would. Panics when it is absent.
+    pub(crate) fn replace_body(&self, path: &str, body: &[u8]) {
+        let mut objects = self.objects.lock();
+        let stored = objects.get_mut(path).expect("the object exists");
+        stored.body = body.to_vec();
+        stored.etag = format!("\"{}\"", hex::encode(md5::Md5::digest(body)));
+    }
+
     /// Answer object ACL requests (`?acl`) with 501 NotImplemented.
     pub(crate) fn set_acl_unsupported(&self, unsupported: bool) {
         self.acl_unsupported
@@ -546,6 +555,19 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                         }
                         match method {
                             Method::PUT => {
+                                // S3 stores the payload, not the aws-chunked
+                                // framing the SDK streams a file upload in.
+                                let body = if crate::api::aws_chunked::is_aws_chunked(&headers) {
+                                    crate::api::aws_chunked::decode_aws_chunked(
+                                        &body,
+                                        crate::api::aws_chunked::get_decoded_content_length(
+                                            &headers,
+                                        ),
+                                    )
+                                    .expect("a well-formed aws-chunked body")
+                                } else {
+                                    body
+                                };
                                 if !path.contains("/.dg/") {
                                     f.bytes.lock().1 += body.len() as u64;
                                 }

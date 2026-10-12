@@ -623,7 +623,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             let shared = self
                 .range_spools
                 .get_or_fill(key, || {
-                    self.download_verified_reference(bucket, deltaspace_id, ref_sha256, &out)
+                    self.download_verified_reference(bucket, deltaspace_id, ref_sha256, Some(&out))
                 })
                 .await;
             match shared {
@@ -667,22 +667,31 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
     }
 
-    /// Download the reference to a spool file beside `held` (never waits for
-    /// budget; the size comes from the reference's own GET) and check it
-    /// against `ref_sha256`. Only a file that passes is shared.
-    async fn download_verified_reference(
+    /// Download the reference to a spool file beside `held`, or with none
+    /// held (never waits for budget; the size comes from the reference's
+    /// own GET) and check it
+    /// against `ref_sha256`. Only a file that passes is shared. The GET
+    /// path and the streaming PUT (`encode_spooled`) fill `range_spools`
+    /// with it.
+    pub(super) async fn download_verified_reference(
         &self,
         bucket: &str,
         deltaspace_id: &str,
         ref_sha256: &str,
-        held: &crate::deltaglider::spool::Spool,
+        held: Option<&crate::deltaglider::spool::Spool>,
     ) -> Result<crate::deltaglider::spool::Spool, SharedReferenceError> {
         let source = self
             .storage
             .open_reference_source(bucket, deltaspace_id)
             .await
             .map_err(EngineError::from)?;
-        let spool = match self.spool.acquire_beside(Some(held), source.size).await {
+        // Never waits: with the response open, and beside `held` when the
+        // op holds a spool already (no hold-and-wait).
+        let reserved = match held {
+            Some(held) => self.spool.acquire_beside(Some(held), source.size).await,
+            None => self.spool.try_acquire(source.size),
+        };
+        let spool = match reserved {
             Ok(spool) => spool,
             Err(e) if e.kind() == crate::deltaglider::spool::CONTENDED => {
                 return Err(SharedReferenceError::NoRoom)
@@ -1185,7 +1194,7 @@ impl ReferenceFile {
 }
 
 /// Why a shared reference download did not happen.
-enum SharedReferenceError {
+pub(super) enum SharedReferenceError {
     /// No spool budget beside the GET's own: it downloads its own copy.
     NoRoom,
     Engine(EngineError),

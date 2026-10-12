@@ -495,3 +495,137 @@ async fn a_proven_sha256_is_stored_not_recomputed() {
         );
     }
 }
+
+/// An engine on the fake S3 at `endpoint` whose PUTs above 1 KiB take the
+/// streaming (spooled) path.
+fn spooling_engine_at(endpoint: &str) -> DynEngine {
+    let mut config = Config::default();
+    config.tuning.spool_threshold_bytes = Some(1024);
+    let s3 = crate::storage::s3_test_support::for_test_endpoint(endpoint);
+    let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(s3);
+    DeltaGliderEngine::new_with_backend(Arc::new(backend), &config, None)
+}
+
+/// The reference downloads of a run (GETs of `reference.bin`).
+fn reference_gets(fake: &FakeS3) -> usize {
+    fake.requests()
+        .iter()
+        .filter(|r| r.starts_with("GET ") && r.contains("reference.bin"))
+        .count()
+}
+
+async fn put_large(engine: &DynEngine, key: &str, body: &[u8]) -> StoreResult {
+    engine
+        .store_conditional(
+            "b",
+            key,
+            Bytes::from(body.to_vec()),
+            None,
+            None,
+            HashMap::new(),
+            &crate::deltaglider::Precondition::none(),
+        )
+        .await
+        .unwrap()
+}
+
+/// Variant `n` of a 64 KiB base: a delta of it.
+fn variant(base: &[u8], n: u8) -> Vec<u8> {
+    let mut v = base.to_vec();
+    v[100 * n as usize..100 * n as usize + 50].fill(n);
+    v
+}
+
+/// P2.7: streaming delta PUTs into one folder share ONE verified download
+/// of the reference (the GET path's `range_spools` entry). Each PUT
+/// downloaded the whole reference.bin: 2 reference GETs for 2 PUTs, now 1.
+#[tokio::test]
+async fn back_to_back_large_puts_download_the_reference_once() {
+    let (endpoint, fake) = crate::storage::fake_s3::start().await;
+    let base = noise(51, 64 * 1024);
+    let seeder = spooling_engine_at(&endpoint);
+    seeder.create_bucket("b").await.unwrap();
+    put_large(&seeder, "rel/a.zip", &base).await;
+    // Another engine (another node, or after the cache TTL): nothing cached.
+    let engine = spooling_engine_at(&endpoint);
+    fake.clear();
+    for n in 1..=2 {
+        let r = put_large(&engine, &format!("rel/v{n}.zip"), &variant(&base, n)).await;
+        assert_eq!(r.metadata.storage_info.label(), "delta");
+    }
+    assert_eq!(reference_gets(&fake), 1, "{:#?}", fake.requests());
+    // The deltas decode against the reference they were encoded with.
+    for n in 1..=2u8 {
+        let (got, _) = engine
+            .retrieve("b", &format!("rel/v{n}.zip"))
+            .await
+            .unwrap();
+        assert_eq!(got, variant(&base, n));
+    }
+}
+
+/// P2.7: the PUT that creates a reference keeps its body as the folder's
+/// verified reference file, so the next large PUT downloads nothing: 1
+/// reference GET before, 0 now.
+#[tokio::test]
+async fn the_put_that_creates_the_reference_seeds_the_spool_cache() {
+    let (endpoint, fake) = crate::storage::fake_s3::start().await;
+    let engine = spooling_engine_at(&endpoint);
+    engine.create_bucket("b").await.unwrap();
+    let base = noise(52, 64 * 1024);
+    put_large(&engine, "rel/a.zip", &base).await;
+    fake.clear();
+    let r = put_large(&engine, "rel/v1.zip", &variant(&base, 1)).await;
+    assert_eq!(r.metadata.storage_info.label(), "delta");
+    assert_eq!(reference_gets(&fake), 0, "{:#?}", fake.requests());
+}
+
+/// P2.7 edge case: a reference whose bytes no longer match its sha256 is
+/// not encoded against. The large PUT fails (500, as a GET of a delta of
+/// it does) and stores nothing over the corrupt baseline.
+#[tokio::test]
+async fn a_large_put_refuses_a_corrupt_reference() {
+    let (endpoint, fake) = crate::storage::fake_s3::start().await;
+    let seeder = spooling_engine_at(&endpoint);
+    seeder.create_bucket("b").await.unwrap();
+    let base = noise(53, 64 * 1024);
+    put_large(&seeder, "rel/a.zip", &base).await;
+    let ref_path = fake
+        .requests()
+        .iter()
+        .find(|r| r.starts_with("PUT ") && r.contains("reference.bin"))
+        .map(|r| {
+            let path = r.split_whitespace().nth(1).unwrap();
+            path.split('?')
+                .next()
+                .unwrap()
+                .trim_start_matches('/')
+                .to_string()
+        })
+        .expect("the first PUT wrote the reference");
+    fake.replace_body(&ref_path, &noise(54, 64 * 1024));
+    let engine = spooling_engine_at(&endpoint);
+    let err = engine
+        .store_conditional(
+            "b",
+            "rel/v1.zip",
+            Bytes::from(variant(&base, 1)),
+            None,
+            None,
+            HashMap::new(),
+            &crate::deltaglider::Precondition::none(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::deltaglider::ConditionalError::Engine(EngineError::ChecksumMismatch { .. })
+        ),
+        "{err:?}"
+    );
+    assert!(
+        engine.head("b", "rel/v1.zip").await.is_err(),
+        "nothing stored"
+    );
+}

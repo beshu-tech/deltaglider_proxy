@@ -833,6 +833,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 let result = self
                     .commit_delta(&put, ref_meta, delta, fresh_baseline, xnode)
                     .await?;
+                if let (true, PutBody::Spooled(body)) = (fresh_baseline, &put.body) {
+                    self.seed_shared_reference(put.bucket, put.deltaspace_id, body, ref_meta)
+                        .await;
+                }
                 Ok((result, true))
             }
             StorePlan::Passthrough {
@@ -870,6 +874,51 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 Ok((result, !removed))
             }
         }
+    }
+
+    /// A streaming PUT that created the deltaspace's reference: its body
+    /// spool IS the reference (storage-9), and its sha256 is the one the
+    /// reference was stored with. Keep a hard link of it as the folder's
+    /// verified shared reference file (`range_spools`), so the next large
+    /// PUT or delta GET of the folder downloads nothing. Best effort and
+    /// never waits: no budget beside the body, a failed link, or the cache
+    /// off all skip it. The entry is matched on the content sha256, so a
+    /// later reference with other bytes never reads it.
+    async fn seed_shared_reference(
+        &self,
+        bucket: &str,
+        deltaspace_id: &str,
+        body: &crate::deltaglider::spool::Spool,
+        ref_meta: &FileMetadata,
+    ) {
+        if !self.range_spools.caches() || ref_meta.file_sha256.is_empty() {
+            return;
+        }
+        let Ok(seed) = self
+            .spool
+            .acquire_beside(Some(body), ref_meta.file_size)
+            .await
+        else {
+            return;
+        };
+        // The spool's own empty file makes way for a second name of the body.
+        let linked = async {
+            tokio::fs::remove_file(seed.path()).await?;
+            tokio::fs::hard_link(body.path(), seed.path()).await
+        }
+        .await;
+        if let Err(e) = linked {
+            debug!("reference seed for {bucket}/{deltaspace_id} skipped: {e}");
+            return;
+        }
+        let key = crate::deltaglider::range_spool::RangeSpoolKey::reference(
+            self.cache_key(bucket, deltaspace_id),
+            ref_meta.file_sha256.clone(),
+        );
+        let _ = self
+            .range_spools
+            .get_or_fill(key, || async { Ok::<_, std::convert::Infallible>(seed) })
+            .await;
     }
 
     /// The buffered encode: the reference from the cache, the body in RAM.
@@ -929,18 +978,46 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // The ref spool holds the REFERENCE, which can be larger than this object
         // — reserve it at the reference's actual size so the byte-budget isn't
         // under-accounted under concurrency (→ ENOSPC).
-        // A verified copy of the reference that a large delta GET of this
-        // deltaspace downloaded lately (`range_spools`) saves the download.
-        let shared_reference = (!fresh_baseline && !ref_meta.file_sha256.is_empty())
-            .then(|| {
-                self.range_spools.get_fresh(
-                    &crate::deltaglider::range_spool::RangeSpoolKey::reference(
-                        self.cache_key(put.bucket, put.deltaspace_id),
-                        ref_meta.file_sha256.clone(),
-                    ),
-                )
-            })
-            .flatten();
+        // The reference through the deltaspace's verified shared file
+        // (`range_spools`): one download, checked against the reference's
+        // sha256, serves this PUT, the next PUTs and the large delta GETs of
+        // the folder until the entry's TTL. The download takes its spool
+        // beside the body without waiting; on no room this PUT downloads
+        // its own copy below.
+        let shared_reference =
+            if !fresh_baseline && !ref_meta.file_sha256.is_empty() && self.range_spools.caches() {
+                let key = crate::deltaglider::range_spool::RangeSpoolKey::reference(
+                    self.cache_key(put.bucket, put.deltaspace_id),
+                    ref_meta.file_sha256.clone(),
+                );
+                match self
+                    .range_spools
+                    .get_or_fill(key, || {
+                        self.download_verified_reference(
+                            put.bucket,
+                            put.deltaspace_id,
+                            &ref_meta.file_sha256,
+                            Some(body),
+                        )
+                    })
+                    .await
+                {
+                    Ok(file) => Some(file),
+                    Err(super::retrieve::SharedReferenceError::NoRoom) => None,
+                    // A baseline that does not match its sha256 is never encoded
+                    // against: the PUT fails, as a GET of a delta of it does.
+                    Err(super::retrieve::SharedReferenceError::Engine(e)) => {
+                        tracing::error!(
+                            "streaming PUT {}/{}: reference not usable: {e}",
+                            put.bucket,
+                            put.key
+                        );
+                        return Err(e);
+                    }
+                }
+            } else {
+                None
+            };
         let ref_size = if fresh_baseline || shared_reference.is_some() {
             1
         } else {
