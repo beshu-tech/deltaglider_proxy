@@ -11,6 +11,34 @@ delay that acknowledgement by about 40 ms, so most requests on a reused
 (keep-alive) connection, which is what the AWS SDKs use, took at least 40 ms.
 Ten GET requests on one connection took 412 ms and now take about 31 ms.
 
+### Changed — `metadata=true` lists storage facts only, with no HEAD request
+
+The proxy accepts the non-standard ListObjectsV2 parameter `metadata=true`. It
+sent one HEAD request for every delta and every file type that can become a
+delta, to list the metadata that HeadObject returns. Now each listed object
+carries only its storage facts: `x-amz-meta-dg-note` (how the proxy stores the
+object), and `x-amz-meta-dg-delta-size` for a delta. The proxy takes these facts
+from the listing itself, so it sends no HEAD request for them. The user metadata
+and the content type of an object are no longer listed; a HeadObject request
+returns them. Before, objects of other file types never had them in the list
+either. The file browser will use this listing instead of one HEAD request per
+row.
+
+### Changed — Faster and cheaper listings
+
+- A LIST by a user who can see only some keys of a bucket sends fewer backend
+  requests. Its pages can hold fewer than `max-keys` entries while
+  `IsTruncated` is true, which S3 allows. Follow `NextContinuationToken`.
+- On the filesystem backend, a LIST with a delimiter checks only the folders
+  that its page shows. A folder with 3,000 sub-folders took 18,000 directory
+  reads for three pages and now takes about 6,000.
+- An object stored before the listing facts index existed lists with its
+  stored size until the proxy reads its metadata once. A LIST now reads that
+  metadata in the background, a few objects at a time, so the next LIST shows
+  the original size. A LIST also remembers for one minute which objects have no
+  facts, and does not look for them again in that minute.
+- DeleteBucket checks that the bucket is empty with one LIST request.
+
 ### Changed — Fewer `HeadBucket` requests
 
 S3 answers a request to a missing bucket with `NoSuchBucket`, so the proxy
