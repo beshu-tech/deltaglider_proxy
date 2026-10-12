@@ -186,6 +186,24 @@ pub(crate) fn aggregate_usage(
     t
 }
 
+/// The [`crate::deltaglider::SavingsTotals`] of a whole-bucket listing,
+/// folded as the Refresh's walk (`api::admin::savings::scan_totals`) folds
+/// them: every listed object (logical sizes resolved), and every
+/// `reference.bin` baseline as stored bytes.
+pub(crate) fn savings_totals(
+    objects: &[(String, crate::types::FileMetadata)],
+    baselines: &[(String, u64)],
+) -> crate::deltaglider::SavingsTotals {
+    let mut totals = crate::deltaglider::SavingsTotals::default();
+    for (_, meta) in objects {
+        totals.accumulate(meta);
+    }
+    for (key, size) in baselines {
+        totals.accumulate(&crate::api::admin::savings::reference_metadata(key, *size));
+    }
+    totals
+}
+
 /// Seconds past the TTL for an entry of age `age`: `0` while fresh.
 fn stale_seconds_for(age: i64, ttl: i64) -> i64 {
     (age - ttl).max(0)
@@ -413,6 +431,14 @@ impl UsageScanner {
         max_objects: usize,
     ) -> Result<UsageEntry, String> {
         let engine = s3_state.engine.load();
+        // A scan of the whole bucket can stamp the usage counter (below).
+        // The ticket marks the scan start: a write that lands while the
+        // scan runs is kept on top of the scan result.
+        let usage = s3_state
+            .bucket_usage
+            .as_deref()
+            .filter(|_| prefix.is_empty());
+        let ticket = usage.map(|u| u.begin_scan(bucket));
         // One key past the cap tells whether the prefix goes on.
         let listing = engine
             .storage()
@@ -440,6 +466,18 @@ impl UsageScanner {
             .await;
 
         let totals = aggregate_usage(prefix, &objects, &stored, &sizes, &listing.baselines);
+        if let (Some(usage), Some(ticket)) = (usage, ticket) {
+            // Only a complete, exact scan replaces the counter, as a
+            // Refresh does: the quota check then trusts the counter (O(1))
+            // instead of scanning the bucket again every TTL.
+            if !truncated && !totals.sizes_estimated {
+                let now = crate::replication::current_unix_seconds();
+                let savings = savings_totals(&objects, &listing.baselines);
+                if let Err(e) = usage.overwrite_from_scan(ticket, &savings, now) {
+                    warn!(bucket = %bucket, error = %e, "usage counter not stamped by the scan");
+                }
+            }
+        }
         Ok(UsageEntry {
             prefix: prefix.to_string(),
             bucket: bucket.to_string(),
@@ -948,5 +986,86 @@ mod tests {
             fake.peak_in_flight("LIST")
         );
         assert!((0..6).all(|d| scanner.get("b", &format!("d{d}/")).is_some()));
+    }
+}
+
+/// P6.5: the quota check's fallback scan of a bucket stamps the usage
+/// counter, as a Refresh does, so the check trusts the counter (O(1))
+/// afterwards instead of listing the bucket every TTL.
+#[cfg(test)]
+mod stamp_tests {
+    use super::*;
+    use crate::bucket_usage::BucketUsage;
+    use crate::storage::FakeS3;
+
+    async fn state(n: usize) -> (Arc<AppState>, Arc<BucketUsage>, Arc<FakeS3>) {
+        let (engine, fake, _) = test_support::fake_s3_engine().await;
+        let usage = Arc::new(BucketUsage::in_memory().unwrap());
+        let engine = engine.with_bucket_usage(Some(usage.clone()));
+        for i in 0..n {
+            engine
+                .store(
+                    "b",
+                    &format!("d/k-{i}.txt"),
+                    b"0123456789",
+                    None,
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let mut st = Arc::try_unwrap(AppState::for_tests(engine)).ok().unwrap();
+        st.bucket_usage = Some(usage.clone());
+        (Arc::new(st), usage, fake)
+    }
+
+    #[tokio::test]
+    async fn a_whole_bucket_scan_stamps_the_counter() {
+        let (st, usage, _fake) = state(3).await;
+        assert_eq!(usage.read("b").unwrap().unwrap().last_scan_at, None);
+        let entry = UsageScanner::do_scan(&st, "b", "").await.unwrap();
+        assert!(!entry.truncated && !entry.sizes_estimated);
+        let row = usage.read("b").unwrap().unwrap();
+        assert!(row.last_scan_at.is_some(), "{row:?}");
+        assert_eq!(row.object_count, 3, "{row:?}");
+        assert_eq!(row.logical_bytes, entry.total_size, "{row:?}");
+        assert_eq!(row.stored_bytes, entry.stored_size, "{row:?}");
+    }
+
+    /// A write that lands while the scan lists is kept on top of the
+    /// scan's totals (the scan may or may not have listed it).
+    #[tokio::test]
+    async fn a_write_during_the_scan_is_kept() {
+        let (st, usage, fake) = state(2).await;
+        fake.set_delay_ms("LIST", 300);
+        let scan = {
+            let st = st.clone();
+            tokio::spawn(async move { UsageScanner::do_scan(&st, "b", "").await })
+        };
+        // The scan holds its ticket before its LIST is answered.
+        fake.wait_for(|r| r.contains("list-type=2")).await;
+        st.engine
+            .load()
+            .store("b", "d/late.txt", b"0123456789", None, Default::default())
+            .await
+            .unwrap();
+        scan.await.unwrap().unwrap();
+        let row = usage.read("b").unwrap().unwrap();
+        assert!(row.last_scan_at.is_some(), "{row:?}");
+        assert!(
+            row.object_count >= 3,
+            "the write during the scan was lost: {row:?}"
+        );
+    }
+
+    /// A truncated scan, or one of a folder, never replaces the counter.
+    #[tokio::test]
+    async fn a_partial_scan_keeps_the_counter() {
+        let (st, usage, _fake) = state(3).await;
+        let entry = UsageScanner::do_scan_capped(&st, "b", "", 2).await.unwrap();
+        assert!(entry.truncated);
+        assert_eq!(usage.read("b").unwrap().unwrap().last_scan_at, None);
+        UsageScanner::do_scan(&st, "b", "d/").await.unwrap();
+        assert_eq!(usage.read("b").unwrap().unwrap().last_scan_at, None);
     }
 }

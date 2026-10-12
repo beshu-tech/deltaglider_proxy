@@ -22,7 +22,7 @@ pub(crate) mod maintenance;
 pub(crate) mod objects;
 mod path_guard;
 pub(crate) mod replication;
-mod savings;
+pub(crate) mod savings;
 mod scanner;
 mod sessions;
 pub(crate) mod users;
