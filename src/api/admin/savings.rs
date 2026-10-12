@@ -24,6 +24,13 @@
 //! a lower bound; the operator-facing path for that is the bucket-wide
 //! scan in `bucket_scan.rs`.
 //!
+//! While it walks prefix P, the chip also caches the totals of every folder
+//! under P whose keys the walk listed to the end (keys arrive sorted, so a
+//! folder is complete once a key after it is listed, or the walk ends
+//! untruncated): a drill-down into a sub-folder within the TTL sends no
+//! request. An admin bulk copy, move or delete drops the cached totals of
+//! every folder that holds a key it touched, and of their parents.
+//!
 //! HA caveat: the cache is per-instance. After a PUT routed to
 //! instance A, instance B can serve pre-PUT savings up to 5 min later.
 //! That window is intentional: the chip is a fingerprint, not an
@@ -164,14 +171,34 @@ impl SavingsCache {
             .map_err(|arc_err| (*arc_err).clone())
     }
 
-    /// Drop a single entry. Wired up if we ever add write-path
-    /// invalidation hooks; not exercised yet (the TTL is considered
-    /// acceptable lag for the savings display).
-    #[allow(dead_code)]
-    pub async fn invalidate(&self, bucket: &str, prefix: &str) {
-        self.inner
-            .invalidate(&Self::cache_key(bucket, prefix))
-            .await;
+    /// Drop the cached totals of every folder that holds one of `keys`,
+    /// and of its parents up to the bucket root: each prefix of a key that
+    /// ends in `/`, and the empty prefix. The admin bulk copy, move and
+    /// delete call it for the keys they wrote or deleted.
+    pub async fn invalidate_keys<'a>(&self, bucket: &str, keys: impl IntoIterator<Item = &'a str>) {
+        let mut prefixes = std::collections::BTreeSet::new();
+        for key in keys {
+            prefixes.insert("");
+            for (i, _) in key.match_indices('/') {
+                prefixes.insert(&key[..=i]);
+            }
+        }
+        for prefix in prefixes {
+            self.inner
+                .invalidate(&Self::cache_key(bucket, prefix))
+                .await;
+        }
+    }
+
+    /// Cache a folder's totals that a walk of one of its parents computed.
+    async fn insert(&self, response: SavingsResponse) {
+        let key = Self::cache_key(&response.bucket, &response.prefix);
+        self.inner.insert(key, Arc::new(response)).await;
+    }
+
+    #[cfg(test)]
+    async fn cached(&self, bucket: &str, prefix: &str) -> Option<Arc<SavingsResponse>> {
+        self.inner.get(&Self::cache_key(bucket, prefix)).await
     }
 }
 
@@ -189,20 +216,41 @@ pub async fn get_savings(
     // `AdminBucket` refuses an empty name at extraction (400
     // `invalid_bucket`), so the bucket is never empty here.
     let bucket = q.bucket.admit(&state)?;
-    let s3_state = state.s3_state.clone();
-    let bucket_for_compute = bucket.clone();
-    let prefix_for_compute = q.prefix.clone();
-
-    let arc = state
-        .savings_cache
-        .get_or_compute(&bucket, &q.prefix, move || async move {
-            compute_savings(&s3_state, &bucket_for_compute, &prefix_for_compute).await
-        })
-        .await
-        .map_err(AdminError::internal)?;
+    let arc = savings_for(
+        &state.savings_cache,
+        &state.s3_state,
+        &bucket,
+        &q.prefix,
+        MAX_LISTING_KEYS,
+    )
+    .await
+    .map_err(AdminError::internal)?;
     // moka returns `Arc<SavingsResponse>`. Serde will follow
     // the Arc transparently via the inner Serialize impl.
     Ok(Json((*arc).clone()))
+}
+
+/// The chip's totals of `bucket/prefix`: from the cache, or one capped
+/// walk that also caches the totals of each sub-folder it listed whole.
+async fn savings_for(
+    cache: &Arc<SavingsCache>,
+    s3_state: &Arc<AppState>,
+    bucket: &str,
+    prefix: &str,
+    cap: usize,
+) -> Result<Arc<SavingsResponse>, String> {
+    let (s3_state, cache_for_compute) = (s3_state.clone(), cache.clone());
+    let (bucket_owned, prefix_owned) = (bucket.to_string(), prefix.to_string());
+    cache
+        .get_or_compute(bucket, prefix, move || async move {
+            let (response, folders) =
+                compute_savings_capped(&s3_state, &bucket_owned, &prefix_owned, cap).await?;
+            for folder in folders {
+                cache_for_compute.insert(folder).await;
+            }
+            Ok(response)
+        })
+        .await
 }
 
 /// How a [`scan_totals`] walk ended early.
@@ -224,6 +272,9 @@ pub(crate) struct TotalsScanOpts<'a> {
     /// nor the listing facts know (and only those). Without it they count
     /// their stored size and the scan is `estimated`.
     pub head_unknown: bool,
+    /// Also return the totals of each sub-folder of `prefix` that the walk
+    /// listed to its end ([`TotalsScan::folders`]).
+    pub folder_totals: bool,
     pub cancel: Option<&'a tokio_util::sync::CancellationToken>,
 }
 
@@ -236,6 +287,78 @@ pub(crate) struct TotalsScan {
     /// known (and a HEAD, when asked for, did not answer). Such totals never
     /// replace the usage counter.
     pub estimated: bool,
+    /// With `folder_totals`: each sub-folder (a prefix of `prefix` + more,
+    /// ending in `/`) whose keys the walk listed to the end, with its
+    /// totals and whether they are estimated.
+    pub folders: Vec<(String, SavingsTotals, bool)>,
+}
+
+/// Most sub-folders one walk tallies (about 120 bytes each); the cache
+/// holds [`CACHE_MAX_ENTRIES`] in total.
+const MAX_FOLDER_TALLIES: usize = CACHE_MAX_ENTRIES as usize;
+
+/// The per-folder totals of one walk. Keys arrive sorted, so the keys of a
+/// folder are contiguous: a folder is complete once the walk listed a key
+/// that it does not hold, or the walk reached the end of the scope.
+struct FolderTally<'a> {
+    scope: &'a str,
+    folders: std::collections::BTreeMap<String, (SavingsTotals, bool)>,
+}
+
+impl<'a> FolderTally<'a> {
+    fn new(scope: &'a str) -> Self {
+        Self {
+            scope,
+            folders: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// The sub-folders of the scope that hold `key`, outermost first.
+    fn folders_of<'k>(scope: &str, key: &'k str) -> impl Iterator<Item = &'k str> + 'k {
+        let start = if key.starts_with(scope) {
+            scope.len()
+        } else {
+            key.len()
+        };
+        key[start..]
+            .match_indices('/')
+            .map(move |(i, _)| &key[..start + i + 1])
+    }
+
+    /// Apply `f` to each sub-folder that holds `key`. A walk that already
+    /// tallies [`MAX_FOLDER_TALLIES`] folders starts no new one: a folder
+    /// left out at its first key is never cached, so no partial tally is.
+    fn each(&mut self, key: &str, mut f: impl FnMut(&mut (SavingsTotals, bool))) {
+        for folder in Self::folders_of(self.scope, key) {
+            if let Some(entry) = self.folders.get_mut(folder) {
+                f(entry);
+            } else if self.folders.len() < MAX_FOLDER_TALLIES {
+                let entry = self
+                    .folders
+                    .entry(folder.to_string())
+                    .or_insert((SavingsTotals::default(), false));
+                f(entry);
+            }
+        }
+    }
+
+    fn add(&mut self, key: &str, meta: &FileMetadata) {
+        self.each(key, |(totals, _)| totals.accumulate(meta));
+    }
+
+    fn mark_estimated(&mut self, key: &str) {
+        self.each(key, |(_, estimated)| *estimated = true);
+    }
+
+    /// The complete folders: all of them after a walk to the end; after a
+    /// walk that stopped at `last_listed`, those that do not hold it.
+    fn complete(self, last_listed: Option<&str>) -> Vec<(String, SavingsTotals, bool)> {
+        self.folders
+            .into_iter()
+            .filter(|(folder, _)| last_listed.is_none_or(|last| !last.starts_with(folder.as_str())))
+            .map(|(folder, (totals, estimated))| (folder, totals, estimated))
+            .collect()
+    }
 }
 
 /// Listed objects: `(user key, metadata)`.
@@ -246,7 +369,7 @@ struct TotalsPage {
     objects: Listed,
     baselines: Vec<(String, u64)>,
     /// Objects whose logical size is still unknown.
-    unknown_sizes: usize,
+    unknown_keys: Vec<String>,
     next_start_after: Option<String>,
 }
 
@@ -292,10 +415,11 @@ async fn list_totals_page(
         // listing stub: still unknown.
         unknown.retain(|&i| objects[i].1.is_unresolved_delta_stub());
     }
+    let unknown_keys = unknown.iter().map(|&i| objects[i].0.clone()).collect();
     Ok(TotalsPage {
         objects,
         baselines: listing.baselines,
-        unknown_sizes: unknown.len(),
+        unknown_keys,
         next_start_after: listing.next_start_after,
     })
 }
@@ -359,6 +483,9 @@ pub(crate) async fn scan_totals(
     let mut start_after: Option<String> = None;
     let mut held: Listed = Vec::new();
     let mut pages_done: u32 = 0;
+    let mut tally = opts.folder_totals.then(|| FolderTally::new(opts.prefix));
+    let mut ref_limited = false;
+    let mut last_listed: Option<String> = None;
     loop {
         if cancelled() {
             return Err(TotalsScanError::Cancelled);
@@ -385,7 +512,12 @@ pub(crate) async fn scan_totals(
         }
         .map_err(TotalsScanError::Failed)?;
         listed += page.objects.len() + page.baselines.len();
-        estimated |= page.unknown_sizes > 0;
+        estimated |= !page.unknown_keys.is_empty();
+        if let Some(tally) = tally.as_mut() {
+            for key in &page.unknown_keys {
+                tally.mark_estimated(key);
+            }
+        }
         let mut objects = std::mem::take(&mut held);
         objects.extend(page.objects);
         let (counted, next_held) = split_at_page_end(
@@ -393,22 +525,31 @@ pub(crate) async fn scan_totals(
             page.next_start_after.as_deref(),
         );
         held = next_held;
-        for (_, meta) in &counted {
+        for (key, meta) in &counted {
             totals.accumulate(meta);
+            if let Some(tally) = tally.as_mut() {
+                tally.add(key, meta);
+            }
         }
         for (key, size) in &page.baselines {
             if opts.ref_limit.is_some_and(|limit| references >= limit) {
                 truncated = true;
+                ref_limited = true;
                 continue;
             }
             references += 1;
-            totals.accumulate(&reference_metadata(key, *size));
+            let meta = reference_metadata(key, *size);
+            totals.accumulate(&meta);
+            if let Some(tally) = tally.as_mut() {
+                tally.add(key, &meta);
+            }
         }
         pages_done += 1;
         let mut has_more = page.next_start_after.is_some();
         if has_more && opts.key_cap.is_some_and(|cap| listed > cap) {
             truncated = true;
             has_more = false;
+            last_listed = page.next_start_after.clone();
         }
         on_page(&totals, pages_done, has_more);
         if !has_more {
@@ -416,8 +557,11 @@ pub(crate) async fn scan_totals(
         }
         start_after = page.next_start_after;
     }
-    for (_, meta) in &held {
+    for (key, meta) in &held {
         totals.accumulate(meta);
+        if let Some(tally) = tally.as_mut() {
+            tally.add(key, meta);
+        }
     }
     if cancelled() {
         return Err(TotalsScanError::Cancelled);
@@ -428,31 +572,29 @@ pub(crate) async fn scan_totals(
             opts.prefix
         );
     }
+    // A reference past `ref_limit` can belong to any folder: none is whole.
+    let folders = match tally {
+        Some(tally) if !ref_limited => tally.complete(last_listed.as_deref()),
+        _ => Vec::new(),
+    };
     Ok(TotalsScan {
         totals,
         truncated,
         estimated,
+        folders,
     })
 }
 
-/// The savings chip: a capped [`scan_totals`] with no HEAD at all. A
-/// reference costs nothing extra (it is on the listed pages), but the chip
-/// still counts at most `DGP_REFERENCE_SCAN_LIMIT` of them.
-async fn compute_savings(
-    s3_state: &Arc<AppState>,
-    bucket: &str,
-    prefix: &str,
-) -> Result<SavingsResponse, String> {
-    compute_savings_capped(s3_state, bucket, prefix, MAX_LISTING_KEYS).await
-}
-
-/// [`compute_savings`] with the listing cap as a parameter (tests lower it).
+/// The savings chip: a [`scan_totals`] capped at `cap` listed keys, with no
+/// HEAD at all. A reference costs nothing extra (it is on the listed
+/// pages), but the chip still counts at most `DGP_REFERENCE_SCAN_LIMIT` of
+/// them. Also returns the answers for the sub-folders it listed whole.
 async fn compute_savings_capped(
     s3_state: &Arc<AppState>,
     bucket: &str,
     prefix: &str,
     cap: usize,
-) -> Result<SavingsResponse, String> {
+) -> Result<(SavingsResponse, Vec<SavingsResponse>), String> {
     let ref_limit = s3_state.engine.load().tuning().reference_scan_limit;
     let scan = scan_totals(
         s3_state,
@@ -462,6 +604,7 @@ async fn compute_savings_capped(
             key_cap: Some(cap),
             ref_limit: Some(ref_limit),
             head_unknown: false,
+            folder_totals: true,
             cancel: None,
         },
         |_, _, _| {},
@@ -472,16 +615,30 @@ async fn compute_savings_capped(
         TotalsScanError::Cancelled => "scan cancelled".to_string(),
     })?;
 
-    let savings_percentage = scan.totals.savings_percentage();
-    Ok(SavingsResponse {
+    let computed_at = Utc::now();
+    let response = |prefix: String, totals: SavingsTotals, truncated, estimated| SavingsResponse {
         bucket: bucket.to_string(),
-        prefix: prefix.to_string(),
-        totals: scan.totals,
-        savings_percentage,
-        truncated: scan.truncated,
-        estimated: scan.estimated,
-        computed_at: Utc::now(),
-    })
+        prefix,
+        totals,
+        savings_percentage: totals.savings_percentage(),
+        truncated,
+        estimated,
+        computed_at,
+    };
+    let folders = scan
+        .folders
+        .into_iter()
+        .map(|(folder, totals, estimated)| response(folder, totals, false, estimated))
+        .collect();
+    Ok((
+        response(
+            prefix.to_string(),
+            scan.totals,
+            scan.truncated,
+            scan.estimated,
+        ),
+        folders,
+    ))
 }
 
 #[cfg(test)]
@@ -517,7 +674,8 @@ mod tests {
         fake.clear();
         let r = compute_savings_capped(&state, "b", "f/", MAX_LISTING_KEYS)
             .await
-            .unwrap();
+            .unwrap()
+            .0;
         let heads = heads(&fake);
         assert!(heads <= 1, "{heads} HEADs for 200 deltas and 1 reference");
         assert_eq!((r.totals.delta_count, r.totals.reference_count), (200, 1));
@@ -539,7 +697,8 @@ mod tests {
         fake.clear();
         let r = compute_savings_capped(&state, "b", "e/", MAX_LISTING_KEYS)
             .await
-            .unwrap();
+            .unwrap()
+            .0;
         assert_eq!(heads(&fake), 0);
         assert!(r.estimated);
         assert_eq!((r.totals.delta_count, r.totals.reference_bytes), (1, 1000));
@@ -561,6 +720,7 @@ mod tests {
             key_cap: None,
             ref_limit: None,
             head_unknown: false,
+            folder_totals: false,
             cancel: None,
         };
         let mut pages = 0;
@@ -612,7 +772,8 @@ mod tests {
         fake.clear();
         let r = compute_savings_capped(&state, "b", "s/", 100)
             .await
-            .unwrap();
+            .unwrap()
+            .0;
         let lists = scope_lists(&fake);
         assert_eq!(
             lists.len(),
@@ -621,5 +782,172 @@ mod tests {
             lists.len()
         );
         assert!(r.truncated);
+    }
+
+    /// P8.5: a walk of `s/` caches the totals of each sub-folder it listed
+    /// whole, so a drill-down within the TTL sends no request, and the
+    /// cached answer equals a fresh walk of the sub-folder.
+    #[tokio::test]
+    async fn a_drill_down_within_the_ttl_costs_no_request() {
+        let (engine, fake, endpoint) = fake_s3_engine().await;
+        put_raw_many(
+            &endpoint,
+            (0..50).map(|i| format!("s/d{}/img-{i:03}.jpg", i % 5)),
+        )
+        .await;
+        put_raw_many(&endpoint, (0..3).map(|i| format!("s/d4/sub/x-{i}.jpg"))).await;
+        put_raw(&endpoint, "s/d4/reference.bin", b"baseline").await;
+        let state = AppState::for_tests(engine);
+        let cache = Arc::new(SavingsCache::new());
+        savings_for(&cache, &state, "b", "s/", MAX_LISTING_KEYS)
+            .await
+            .unwrap();
+        fake.clear();
+        let d1 = savings_for(&cache, &state, "b", "s/d1/", MAX_LISTING_KEYS)
+            .await
+            .unwrap();
+        let sub = savings_for(&cache, &state, "b", "s/d4/sub/", MAX_LISTING_KEYS)
+            .await
+            .unwrap();
+        let d4 = savings_for(&cache, &state, "b", "s/d4/", MAX_LISTING_KEYS)
+            .await
+            .unwrap();
+        let lists = scope_lists(&fake);
+        assert!(lists.is_empty(), "drill-down sent {lists:?}");
+        for (cached, prefix) in [(d1, "s/d1/"), (sub, "s/d4/sub/"), (d4, "s/d4/")] {
+            let fresh = compute_savings_capped(&state, "b", prefix, MAX_LISTING_KEYS)
+                .await
+                .unwrap()
+                .0;
+            assert_eq!(cached.totals, fresh.totals, "{prefix}");
+            assert_eq!(
+                (cached.truncated, cached.estimated),
+                (false, fresh.estimated)
+            );
+        }
+    }
+
+    /// A walk that stops at its cap caches only the folders it listed to
+    /// the end: the folder it stopped in is not whole.
+    #[tokio::test]
+    async fn a_truncated_walk_caches_only_the_folders_it_finished() {
+        let (engine, fake, endpoint) = fake_s3_engine().await;
+        put_raw_many(
+            &endpoint,
+            (0..30).map(|i| format!("t/d{}/img-{i:03}.jpg", i / 10)),
+        )
+        .await;
+        let state = AppState::for_tests(engine);
+        let cache = Arc::new(SavingsCache::new());
+        // 15 keys: d0 whole, d1 cut in the middle.
+        let top = savings_for(&cache, &state, "b", "t/", 15).await.unwrap();
+        assert!(top.truncated);
+        assert_eq!(
+            cache
+                .cached("b", "t/d0/")
+                .await
+                .map(|r| r.totals.user_visible_count()),
+            Some(10)
+        );
+        assert!(cache.cached("b", "t/d1/").await.is_none());
+        assert!(cache.cached("b", "t/d2/").await.is_none());
+        fake.clear();
+        savings_for(&cache, &state, "b", "t/d1/", 15).await.unwrap();
+        assert_eq!(
+            scope_lists(&fake).len(),
+            1,
+            "an unfinished folder is walked"
+        );
+    }
+
+    /// An admin bulk change drops the totals of each folder that holds a
+    /// touched key, and of its parents; other folders keep theirs.
+    #[tokio::test]
+    async fn invalidating_keys_drops_their_folders_and_parents() {
+        let cache = SavingsCache::new();
+        for prefix in ["", "s/", "s/d1/", "s/d1/x/", "s/d2/"] {
+            let p = prefix.to_string();
+            cache
+                .get_or_compute("b", prefix, || async move {
+                    Ok(SavingsResponse {
+                        bucket: "b".into(),
+                        prefix: p,
+                        totals: SavingsTotals::default(),
+                        savings_percentage: None,
+                        truncated: false,
+                        estimated: false,
+                        computed_at: Utc::now(),
+                    })
+                })
+                .await
+                .unwrap();
+        }
+        cache.invalidate_keys("b", ["s/d1/a.zip"]).await;
+        for (prefix, kept) in [
+            ("", false),
+            ("s/", false),
+            ("s/d1/", false),
+            ("s/d1/x/", true),
+            ("s/d2/", true),
+        ] {
+            assert_eq!(
+                cache.cached("b", prefix).await.is_some(),
+                kept,
+                "{prefix:?}"
+            );
+        }
+        assert!(cache.cached("other", "").await.is_none());
+    }
+
+    #[test]
+    fn the_folders_of_a_key_under_a_scope() {
+        let f = |scope, key| FolderTally::folders_of(scope, key).collect::<Vec<_>>();
+        assert_eq!(f("s/", "s/a/b/c.zip"), ["s/a/", "s/a/b/"]);
+        assert_eq!(f("s/", "s/c.zip"), Vec::<&str>::new());
+        assert_eq!(f("", "a/reference.bin"), ["a/"]);
+        assert_eq!(
+            f("s/", "s/a/"),
+            ["s/a/"],
+            "a folder marker is in its own folder"
+        );
+    }
+
+    /// Source guard (P8.5): every admin bulk handler that writes or deletes
+    /// objects drops the chip's cached totals of the folders it touched. A
+    /// new bulk handler that forgets it serves pre-change totals for 5 min.
+    #[test]
+    fn every_admin_bulk_mutation_invalidates_the_savings_cache() {
+        let src = include_str!("objects.rs");
+        let body = |head: &str| {
+            let start = src.find(head).unwrap_or_else(|| panic!("{head} not found"));
+            let end = start + src[start..].find("\n}\n").unwrap();
+            &src[start..end]
+        };
+        for (head, call) in [
+            (
+                "pub async fn copy_objects(",
+                "invalidate_savings(&state, &req, false)",
+            ),
+            (
+                "pub async fn move_objects(",
+                "invalidate_savings(&state, &req, true)",
+            ),
+            ("async fn answer_bulk_delete(", ".invalidate_keys("),
+        ] {
+            assert!(body(head).contains(call), "{head} must call {call}");
+        }
+        // The only mutating admin object handlers are the three above.
+        let handlers: Vec<&str> = src
+            .lines()
+            .filter(|l| l.starts_with("pub async fn "))
+            .collect();
+        for h in &handlers {
+            assert!(
+                ["copy_objects", "move_objects", "bulk_delete", "download_zip", "list_all"]
+                    .iter()
+                    .any(|name| h.contains(&format!("fn {name}("))),
+                "new admin object handler {h}: does it change objects? then invalidate the savings cache"
+            );
+        }
     }
 }

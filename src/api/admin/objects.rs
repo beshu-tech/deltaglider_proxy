@@ -112,6 +112,8 @@ pub struct DeleteRequest {
 struct DeletePlan {
     bucket: ClientBucket,
     keys: Vec<AdminObjectPath>,
+    /// The savings chip's cache: the batch drops the totals it changes.
+    savings: Arc<super::SavingsCache>,
 }
 
 #[derive(Debug, Serialize)]
@@ -440,6 +442,7 @@ pub async fn copy_objects(
     let actor = BulkActor::for_session(&state, &session)?;
     let s3 = state.s3_state.clone();
     let (res, _) = run_copy_loop(&s3, &req, &actor, false).await;
+    invalidate_savings(&state, &req, false).await;
     info!(
         "bulk copy: src={} dst={}/{} succeeded={} failed={}",
         req.source_bucket, req.dest_bucket, req.dest_prefix, res.succeeded, res.failed
@@ -454,6 +457,28 @@ pub async fn copy_objects(
         &headers,
     );
     Ok(Json(res))
+}
+
+/// Drop the savings chip's cached totals of every folder a bulk copy (or,
+/// with `sources`, a move) wrote into or deleted from, and of their parents.
+async fn invalidate_savings(state: &crate::api::admin::AdminState, req: &BulkPlan, sources: bool) {
+    let dest: Vec<String> = req
+        .items
+        .iter()
+        .map(|it| dest_key(&req.dest_prefix, &it.relative))
+        .collect();
+    let cache = &state.savings_cache;
+    cache
+        .invalidate_keys(&req.dest_bucket, dest.iter().map(String::as_str))
+        .await;
+    if sources {
+        cache
+            .invalidate_keys(
+                &req.source_bucket,
+                req.items.iter().map(|it| it.source_key.as_str()),
+            )
+            .await;
+    }
 }
 
 /// What happened to one item of a bulk copy.
@@ -744,6 +769,7 @@ pub async fn move_objects(
     } else {
         0
     };
+    invalidate_savings(&state, &req, true).await;
 
     info!(
         "bulk move: src={} dst={}/{} succeeded={} failed={} deleted={}",
@@ -911,6 +937,7 @@ pub async fn bulk_delete(
     let req = DeletePlan {
         bucket,
         keys: req.keys,
+        savings: state.savings_cache.clone(),
     };
     reject_if_under_maintenance(&state, &req.bucket)?;
     reject_if_replication_target_only(&state, &req.bucket)?;
@@ -969,6 +996,9 @@ async fn answer_bulk_delete(
             }
         };
         let res = run_bulk_delete(&s3, &req.bucket, &req.keys, &actor, &on_progress).await;
+        req.savings
+            .invalidate_keys(&req.bucket, req.keys.iter().map(|k| k.as_str()))
+            .await;
         info!(
             "bulk delete: bucket={} deleted={} failed={}",
             req.bucket, res.deleted, res.failed
@@ -2424,6 +2454,7 @@ mod tests {
                     .iter()
                     .map(|k| AdminObjectPath::try_from(k.clone()).unwrap())
                     .collect(),
+                savings: Arc::new(crate::api::admin::SavingsCache::new()),
             }
         }
 

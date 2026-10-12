@@ -562,6 +562,7 @@ async fn run_scan(
         key_cap: None,
         ref_limit: None,
         head_unknown: true,
+        folder_totals: false,
         cancel: Some(&cancel),
     };
     let scan = super::savings::scan_totals(&s3_state, bucket, opts, |totals, pages, has_more| {
