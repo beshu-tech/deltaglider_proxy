@@ -141,6 +141,20 @@ export function numericCompare(a: string, b: string): number {
   return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
 }
 
+/** S3 key order: UTF-8 byte order, which is code point order (a plain `<`
+ *  on JS strings compares UTF-16 units and puts astral characters first). */
+export function codePointCompare(a: string, b: string): number {
+  const ia = a[Symbol.iterator]();
+  const ib = b[Symbol.iterator]();
+  for (;;) {
+    const ca = ia.next();
+    const cb = ib.next();
+    if (ca.done || cb.done) return ca.done && cb.done ? 0 : ca.done ? -1 : 1;
+    const d = ca.value.codePointAt(0)! - cb.value.codePointAt(0)!;
+    if (d !== 0) return d;
+  }
+}
+
 /** The error shown for a path that `isAbsolutePath` rejects. */
 export const ABSOLUTE_PATH_ERROR =
   'Use an absolute path, such as /var/lib/deltaglider or C:\\deltaglider.';

@@ -26,6 +26,7 @@ import { downloadZip as saveZip, zipPreflightError } from './zipDownload';
 // Bulk actions → admin objects API; App gates them on `sessionCaps.canUseBulkActions`
 // (the server authorizes each key for a files-only session).
 import type { S3Object } from './types';
+import { mergeFirstPage } from './listingRefresh';
 import { readStorage, writeStorage } from './safeStorage';
 
 // A stable default: `load` depends on writablePrefixes, so a fresh `[]` per
@@ -80,6 +81,9 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [isTruncated, setIsTruncated] = useState(false);
+  // When the shown rows after the first page were listed (a full listing
+  // that went past page 1), or null: the status bar says how old they are.
+  const [restListedAt, setRestListedAt] = useState<number | null>(null);
   // A running bulk delete, copy or move (null = none): its phase and counts for the action bar.
   const [bulkProgress, setBulkProgress] = useState<BulkProgress | null>(null);
   const bulkRunning = bulkProgress !== null;
@@ -148,6 +152,7 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     setFolders([]);
     setVirtualFolders([]);
     setError(null);
+    setRestListedAt(null);
     isInitialLoad.current = true;
     clearSelection();
   }, [clearSelection]);
@@ -160,10 +165,17 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     resetBrowseState();
   }, [bucket, prefix, resetBrowseState]);
 
-  /** Reload the listing only (the auto-refresh tick, each bulk batch). */
+  /** Reload the listing only (each bulk batch; the tick lists page 1 only). */
   const refresh = useCallback(() => {
     setRefreshTrigger((k) => k + 1);
   }, []);
+  // The next load lists the first page only and keeps the later pages it
+  // already has (the 60 s auto-refresh). Every other load lists them all.
+  const firstPageOnly = useRef(false);
+  const objectsRef = useRef(objects);
+  objectsRef.current = objects;
+  const foldersRef = useRef(folders);
+  foldersRef.current = folders;
 
   // Sequence token for load(). Each call increments loadSeq; only the *latest*
   // load is allowed to commit results. This replaces the previous single-flight
@@ -203,6 +215,9 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
       return;
     }
     const seq = ++loadSeq.current;
+    // A first listing of the folder lists everything, also on a tick.
+    const pageOne = firstPageOnly.current && !isInitialLoad.current;
+    firstPageOnly.current = false;
 
     // On initial load or prefix/bucket change, show full loading spinner.
     // On background refresh, show subtle refreshing indicator.
@@ -212,15 +227,25 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
       setRefreshing(true);
     }
 
-    listObjects(prefix)
-      .then(({ objects: objs, folders: dirs, isTruncated: trunc }) => {
+    listObjects(prefix, pageOne ? 1 : undefined)
+      .then((listing) => {
         if (seq !== loadSeq.current) return; // stale response — newer load in flight
+        const { objects: objs, folders: dirs } = pageOne
+          ? mergeFirstPage({ objects: objectsRef.current, folders: foldersRef.current }, listing)
+          : listing;
+        if (!pageOne) {
+          setIsTruncated(listing.isTruncated);
+          setRestListedAt((listing.pages ?? 1) > 1 ? Date.now() : null);
+        } else if (listing.continuesAfter === undefined) {
+          // The folder fits one page now: the page replaced everything.
+          setIsTruncated(false);
+          setRestListedAt(null);
+        }
         const virtualFolders = virtualWritableChildren(prefix, dirs, writablePrefixes);
         const mergedFolders = virtualFolders.length > 0 ? Array.from(new Set([...dirs, ...virtualFolders])) : dirs;
         setObjects(objs);
         setFolders(mergedFolders);
         setVirtualFolders(virtualFolders);
-        setIsTruncated(trunc);
         setConnected(true);
         setError(null);
         reconcile(objs, mergedFolders);
@@ -250,7 +275,9 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
   useEffect(() => {
     if (!active) return;
     const id = setInterval(() => {
-      if (!document.hidden) refresh();
+      if (document.hidden) return;
+      firstPageOnly.current = true;
+      refresh();
     }, 60000);
     return () => clearInterval(id);
   }, [refresh, active]);
@@ -275,8 +302,6 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
    * bucket's size/count pill, with no new listing. The 60 s refresh
    * reconciles both with the backend.
    */
-  const objectsRef = useRef(objects);
-  objectsRef.current = objects;
   const removeObject = useCallback((key: string) => {
     const gone = objectsRef.current.find((o) => o.key === key);
     if (!gone) return;
@@ -641,6 +666,7 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     loading,
     refreshing,
     isTruncated,
+    restListedAt,
     headCache,
     deltaSummary,
     connected,

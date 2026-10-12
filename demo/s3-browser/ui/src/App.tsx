@@ -710,6 +710,7 @@ export default function App() {
               onToggleAll={s3.toggleAll}
               isMobile={isMobile}
               isTruncated={s3.isTruncated}
+              restListedAt={s3.restListedAt}
               refreshing={s3.refreshing}
               headCache={s3.headCache}
               folderSizes={folderSize.sizes}

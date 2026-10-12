@@ -18,7 +18,7 @@ import {
 import { Upload } from '@aws-sdk/lib-storage';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { S3Object, ListResult, BucketInfo } from './types';
-import { detectDefaultEndpoint, numericCompare } from './utils';
+import { codePointCompare, detectDefaultEndpoint, numericCompare } from './utils';
 import { createBucketOnBackend, getBucketOrigins } from './adminApi';
 import { normalizeS3Error } from './errorHandling';
 import {
@@ -279,13 +279,23 @@ function listWithFacts(
   return command;
 }
 
-export async function listObjects(prefix = ''): Promise<ListResult> {
+/**
+ * List the folder `prefix`: up to `maxPages` pages of 1,000 entries (files
+ * and sub-folders). `isTruncated` = the 10-page cap of a full listing cut
+ * it; `continuesAfter` = the listing stopped with more entries after this
+ * key (the cap, or `maxPages`).
+ */
+export async function listObjects(prefix = '', maxPages = MAX_LIST_PAGES): Promise<ListResult> {
   const allObjects: S3Object[] = [];
   const folderSet = new Set<string>();
   let continuationToken: string | undefined;
   let isTruncated = false;
+  let continuesAfter: string | undefined;
+  const pages = Math.min(maxPages, MAX_LIST_PAGES);
+  let listed = 0;
 
-  for (let page = 0; page < MAX_LIST_PAGES; page++) {
+  for (let page = 0; page < pages; page++) {
+    listed++;
     let facts = new Map<string, ListFacts>();
     const resp: ListObjectsV2CommandOutput = await sendCommand<ListObjectsV2CommandOutput>(
       listWithFacts(
@@ -300,7 +310,9 @@ export async function listObjects(prefix = ''): Promise<ListResult> {
       `List objects in bucket ${activeBucket}`
     );
 
+    let lastListed = '';
     for (const cp of resp.CommonPrefixes || []) {
+      if (cp.Prefix && codePointCompare(cp.Prefix, lastListed) > 0) lastListed = cp.Prefix;
       if (isValidCommonPrefix(cp.Prefix, prefix)) {
         folderSet.add(cp.Prefix);
       }
@@ -308,6 +320,7 @@ export async function listObjects(prefix = ''): Promise<ListResult> {
 
     for (const o of resp.Contents || []) {
       const key = o.Key || '';
+      if (codePointCompare(key, lastListed) > 0) lastListed = key;
       const listed = facts.get(key);
       allObjects.push({
         key,
@@ -323,14 +336,14 @@ export async function listObjects(prefix = ''): Promise<ListResult> {
     if (!resp.IsTruncated) break;
     continuationToken = resp.NextContinuationToken;
     if (!continuationToken) break;
-
-    // If we've reached the page cap, signal truncation
-    if (page === MAX_LIST_PAGES - 1) {
-      isTruncated = true;
+    if (page === pages - 1) {
+      continuesAfter = lastListed;
+      // The 10-page cap of a full listing: say so.
+      if (pages === MAX_LIST_PAGES) isTruncated = true;
     }
   }
 
-  return { objects: allObjects, folders: Array.from(folderSet), isTruncated };
+  return { objects: allObjects, folders: Array.from(folderSet), isTruncated, continuesAfter, pages: listed };
 }
 
 export async function listCommonPrefixes(bucket: string, prefix = ''): Promise<string[]> {

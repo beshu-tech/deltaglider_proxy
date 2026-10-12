@@ -48,6 +48,9 @@ interface Props {
   onToggleAll: () => void;
   isMobile: boolean;
   isTruncated: boolean;
+  /** When the rows after the first listing page were listed: the 60 s
+   *  auto-refresh reads page 1 only. Null = the folder fits one page. */
+  restListedAt?: number | null;
   refreshing: boolean;
   headCache: Record<string, { storageType?: string; storedSize?: number }>;
   folderSizes: Record<string, FolderSizeState>;
@@ -172,6 +175,7 @@ export default function ObjectTable({
   onToggleAll,
   isMobile,
   isTruncated,
+  restListedAt = null,
   refreshing,
   headCache,
   folderSizes,
@@ -579,6 +583,11 @@ export default function ObjectTable({
         <div role="status" aria-live="polite" style={{ flex: 1, minWidth: 0 }}>
           <Text style={{ fontSize: 12, color: TEXT_MUTED, fontFamily: 'var(--font-mono)' }}>
             {describeVisibleRange(totalItems, currentPage, pageSize)}
+            {restListedAt !== null && (
+              <span title="The automatic refresh updates the first 1,000 entries only. Refresh updates all of them.">
+                {` · entries after the first 1,000 as of ${new Date(restListedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`}
+              </span>
+            )}
           </Text>
         </div>
         <label

@@ -13,6 +13,10 @@ export interface ListResult {
   objects: S3Object[];
   folders: string[];
   isTruncated: boolean;
+  /** The listing stopped with more entries after this key. */
+  continuesAfter?: string;
+  /** How many LIST pages the listing read. */
+  pages?: number;
 }
 
 export interface BucketInfo {
