@@ -1605,6 +1605,12 @@ async fn delta_passthrough_copy(
             }
             let mut seeded = 0;
             if decision == DeltaPassthroughDecision::SeedThenShip {
+                // The seed moves the reference through the proxy and writes
+                // it with the fenced PUT. A server-side copy is NOT used:
+                // the seed must be create-only, and MinIO/silo ignores
+                // `If-None-Match: *` on CopyObject (verified 2026-10-13: the
+                // copy overwrote an existing key and answered 200), so a
+                // conditional copy cannot stand in for the fenced write.
                 // Seed the dest reference verbatim, asserting it matches
                 // src.ref_sha256 before writing (defense layer 2).
                 // The bytes and their metadata from one GET: a HEAD after
