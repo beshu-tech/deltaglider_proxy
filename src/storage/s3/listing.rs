@@ -827,6 +827,16 @@ impl S3Backend {
         // Classify and build lite metadata (no HEAD calls — same as bulk_list_objects).
         let listing = Self::classify_listed_objects(raw_objects);
         let ambiguous = ambiguous_forms(&listing);
+        // Every raw key from the token to the read horizon went through
+        // this page, so a delimiter-less walk reads every reference.bin.
+        let reference_prefixes = delimiter.is_none().then(|| {
+            listing
+                .baselines
+                .iter()
+                .filter_map(|(k, _)| Self::deltaspace_of_reference_key(k))
+                .map(str::to_string)
+                .collect()
+        });
         let mut objects: Vec<(String, FileMetadata)> =
             Self::resolve_classified_lite(listing.classified, listing.dir_markers);
         let mut common_prefixes: Vec<String> = all_common_prefixes.into_iter().collect();
@@ -871,6 +881,7 @@ impl S3Backend {
             next_continuation_token: page.next_continuation_token,
             upstream_requests,
             forms: crate::storage::ListedForms::Reported { ambiguous },
+            reference_prefixes,
         })
     }
 }
@@ -1052,6 +1063,53 @@ mod delegated_cost_tests {
             Some(crate::storage::ObjectVariant::Passthrough)
         );
         assert_eq!(page.forms.single_form("d/a", c), None);
+    }
+
+    /// P6.4: a walk of every page of a delimiter-less listing from its start
+    /// reads every reference.bin of the prefix, at any page size: the
+    /// pages' reports add up to `list_reference_prefixes`.
+    #[tokio::test]
+    async fn a_walk_reports_every_reference() {
+        let mut keys: Vec<String> = vec!["reference.bin".into(), "a.txt".into()];
+        for d in ["d", "d/e", "f", "z"] {
+            keys.push(format!("{d}/reference.bin"));
+            for i in 0..3 {
+                keys.push(format!("{d}/k-{i}.zip.delta"));
+            }
+        }
+        keys.push("g/only.txt".into());
+        let (s3, _fake) = backend_with_keys(&keys).await;
+        let want: std::collections::BTreeSet<String> = s3
+            .list_reference_prefixes("b", "")
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(want.len(), 5, "{want:?}");
+        for max_keys in [1, 2, 3, 1000] {
+            let mut seen = std::collections::BTreeSet::new();
+            let mut token: Option<String> = None;
+            loop {
+                let page = s3
+                    .list_objects_delegated("b", "", None, max_keys, token.as_deref())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                seen.extend(page.reference_prefixes.expect("reported"));
+                if !page.is_truncated {
+                    break;
+                }
+                token = page.next_continuation_token;
+            }
+            assert_eq!(seen, want, "max_keys {max_keys}");
+        }
+        // A delimiter page does not read the subtree: not reported.
+        let page = s3
+            .list_objects_delegated("b", "", Some("/"), 1000, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.reference_prefixes, None);
     }
 
     /// A page reports the requests it sent (its pages and its probes), so

@@ -1395,6 +1395,12 @@ pub struct DelegatedListResult {
     pub upstream_requests: u32,
     /// The stored forms that the page saw for its objects.
     pub forms: ListedForms,
+    /// The deltaspaces (`""`: the bucket root) whose `reference.bin` the
+    /// page read, possibly with ones of the neighbour pages. A walk of
+    /// every page of a delimiter-less listing from its start reads every
+    /// reference of the prefix. `None`: not reported (a delimiter listing,
+    /// or a backend that does not track them).
+    pub reference_prefixes: Option<Vec<String>>,
 }
 
 /// The stored forms (`k`, `k.delta`) that a listing page saw for its

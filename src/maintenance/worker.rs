@@ -7,9 +7,9 @@
 //! 1. **drain** — wait for the gated bucket's in-flight S3 writes to
 //!    reach zero (the gate rejects NEW writes, but one admitted moments
 //!    before it armed could otherwise land mid-rewrite and be lost).
-//! 2. **counting** — one LIST sweep for the exact object total. The
-//!    write set is frozen by the gate, so the total cannot drift and the
-//!    progress bar is honest.
+//! 2. **counting** — no listing: the total is the bucket's usage counter
+//!    when a full scan stamped it, else unknown (an indeterminate bar)
+//!    until the objects walk ends with the exact count.
 //! 3. **objects** — per object: `engine.head_listed` (one HEAD of the
 //!    stored form that the page's listing proved) → [`needs_rewrite`]? then
 //!    rewrite in place via `transfer::copy_object_known` (that HEAD is the
@@ -17,7 +17,8 @@
 //!    (source == destination; the engine's store path encrypts/decrypts
 //!    per the CURRENT backend mode; stale markers stripped). Failures are
 //!    recorded per object and the job continues.
-//! 4. **references** — deltaspace `reference.bin` blobs are shared
+//! 4. **references** — the deltaspaces whose `reference.bin` the objects
+//!    walk read (a resumed job lists them). These blobs are shared
 //!    storage-level artifacts the object sweep never rewrites; re-store
 //!    them through the (encrypting) storage wrapper when their state
 //!    doesn't match.
@@ -486,7 +487,8 @@ async fn execute_phases(
         bucket,
         desired: None,
     };
-    let mut c = run_count_then_walk(db, state, holder, job, "rewrite", &mut visitor).await?;
+    let walked = run_count_then_walk(db, state, holder, job, "rewrite", &mut visitor).await?;
+    let mut c = walked.c;
     let mut phase = job.phase.clone();
     if phase == "counting" || phase == "objects" {
         phase = "references".to_string();
@@ -501,11 +503,16 @@ async fn execute_phases(
             resolve_desired(&cfg, bucket).map_err(|e| format!("config changed mid-run: {e}"))?
         };
         let engine = state.engine.load().clone();
-        let deltaspaces = engine
-            .storage()
-            .list_reference_prefixes(bucket, "")
-            .await
-            .map_err(|e| format!("list references failed: {e}"))?;
+        // The objects walk read them (one listing of the bucket, not two);
+        // a resumed job lists them.
+        let deltaspaces: Vec<String> = match walked.references {
+            Some(seen) => seen.into_iter().collect(),
+            None => engine
+                .storage()
+                .list_reference_prefixes(bucket, "")
+                .await
+                .map_err(|e| format!("list references failed: {e}"))?,
+        };
         for prefix in deltaspaces {
             // A graceful stop waits for the end of the current object only.
             stop_if_shutting_down()?;
@@ -658,11 +665,25 @@ impl Counters {
     }
 }
 
-/// The `counting` → `objects` phases that the reencrypt and backfill kinds
-/// share, on [`paged_phase`]: per-object failures recorded and skipped
-/// over. Returns the counters at the end of `objects`; a job persisted in
-/// a later phase gets its row's counters back untouched. `what` names the
-/// job in the page-budget error.
+/// What [`run_count_then_walk`] ends with.
+pub(crate) struct Walked {
+    /// The counters at the end of `objects` (the row's, for a job
+    /// persisted in a later phase).
+    pub c: Counters,
+    /// The deltaspaces whose reference.bin the walk read, when it read
+    /// every page from the first one and each page reported them; `None`:
+    /// list them.
+    pub references: Option<std::collections::BTreeSet<String>>,
+}
+
+/// The `objects` phase that the reencrypt and backfill kinds share, on
+/// [`paged_phase`]: per-object failures recorded and skipped over. One
+/// listing of the bucket: the total comes from the bucket's usage counter
+/// when a full scan stamped it ([`trusted_object_count`]), else it stays
+/// unknown (the bar is indeterminate) until the walk ends; the walk ends
+/// with the exact total, and it collects the deltaspaces whose
+/// reference.bin it read. A job persisted in a later phase gets its row's
+/// counters back untouched. `what` names the job in the page-budget error.
 pub(crate) async fn run_count_then_walk<V: ObjectVisitor>(
     db: &Arc<Mutex<ConfigDb>>,
     state: &Arc<AppState>,
@@ -670,15 +691,15 @@ pub(crate) async fn run_count_then_walk<V: ObjectVisitor>(
     job: &MaintenanceJob,
     what: &str,
     visitor: &mut V,
-) -> Result<Counters, PhaseStop> {
+) -> Result<Walked, PhaseStop> {
     let mut phase = job.phase.clone();
     let mut c = Counters::of(job);
 
-    // ── Phase: counting ──
+    // ── Phase: counting ── (the initial phase of a job; a job that a
+    // previous release persisted mid-count drops its partial count)
     if phase == "counting" {
-        let count = counting_phase(db, state, holder, job, job.continuation_token.clone()).await?;
         c = Counters {
-            total: Some(count),
+            total: trusted_object_count(state, &job.bucket),
             ..Counters::default()
         };
         phase = "objects".to_string();
@@ -687,13 +708,19 @@ pub(crate) async fn run_count_then_walk<V: ObjectVisitor>(
 
     // ── Phase: objects ──
     if phase != "objects" {
-        return Ok(c);
+        return Ok(Walked {
+            c,
+            references: None,
+        });
     }
     let budget = format!(
         "{what} stopped at the page budget with more pages pending — bucket \
          too large for one pass; job left resumable in phase 'objects' \
          (cursor persisted)"
     );
+    // Resume only when the job was persisted IN this phase (a fresh
+    // transition from counting starts at page 0).
+    let resume = resumable_in(job, "objects");
     let mut step = ObjectsStep {
         db,
         state,
@@ -701,15 +728,15 @@ pub(crate) async fn run_count_then_walk<V: ObjectVisitor>(
         visitor,
         engine: None,
         forms: Default::default(),
+        // A resumed walk misses the pages before its cursor.
+        references: resume.is_none().then(Default::default),
         c,
     };
     paged_phase(
         JobCtx { db, holder, job },
         PhaseSpec {
             phase: "objects",
-            // Resume only when the job was persisted IN this phase (a fresh
-            // transition from counting starts at page 0).
-            resume: resumable_in(job, "objects"),
+            resume,
             cancel_every: None,
             budget_exhausted: &budget,
             concurrency: PAGE_CONCURRENCY,
@@ -717,7 +744,23 @@ pub(crate) async fn run_count_then_walk<V: ObjectVisitor>(
         &mut step,
     )
     .await?;
-    Ok(step.c)
+    let mut c = step.c;
+    // Every listed object ended done, skipped or failed: the exact total.
+    c.total = Some(c.done + c.skipped + c.failed);
+    persist(db, job, "objects", &c, None).await;
+    Ok(Walked {
+        c,
+        references: step.references,
+    })
+}
+
+/// The object count of `bucket` from the usage counter, when a full scan
+/// stamped its row (the quota gate's trust rule): the job's progress
+/// total without a counting listing. `None`: unknown until the walk ends.
+pub(crate) fn trusted_object_count(state: &AppState, bucket: &str) -> Option<i64> {
+    let row = state.bucket_usage.as_ref()?.read(bucket).ok().flatten()?;
+    row.last_scan_at?;
+    i64::try_from(row.object_count).ok()
 }
 
 /// The saved cursor of a job persisted IN `phase` (else a fresh start).
@@ -739,6 +782,9 @@ struct ObjectsStep<'a, V> {
     engine: Option<Arc<crate::deltaglider::DynEngine>>,
     /// The stored forms that the page's listing proved.
     forms: crate::deltaglider::ListedPageForms,
+    /// The deltaspaces whose reference.bin the pages read so far; `None`
+    /// once the walk cannot vouch for all of them ([`Walked::references`]).
+    references: Option<std::collections::BTreeSet<String>>,
     c: Counters,
 }
 
@@ -753,10 +799,21 @@ impl<V: ObjectVisitor> PageStep for ObjectsStep<'_, V> {
 
     async fn list(&mut self, token: Option<&str>) -> Result<KeyPage, ListError> {
         let engine = self.engine.as_ref().expect("begin_page runs first");
-        let (page, forms) =
+        let (page, forms, references) =
             list_job_keys(engine, &self.job.bucket, token, "object list failed").await?;
         self.forms = forms;
+        match (self.references.as_mut(), references) {
+            (Some(seen), Some(page_refs)) => seen.extend(page_refs),
+            // A page that does not report them: list them at the end.
+            (_, None) => self.references = None,
+            (None, Some(_)) => {}
+        }
         Ok(page)
+    }
+
+    /// The walk starts again at page 0: it reads every reference again.
+    fn on_restart(&mut self) {
+        self.references = Some(Default::default());
     }
 
     // A restart re-scans from page 0: the visitor skips objects already
@@ -786,87 +843,6 @@ impl<V: ObjectVisitor> PageStep for ObjectsStep<'_, V> {
                 self.c.failed += 1;
             }
         }
-        Ok(())
-    }
-}
-
-/// The shared `counting` phase: one LIST sweep for the exact object total
-/// (the write gate freezes the write set, so the total cannot drift and
-/// the progress bar is honest). Persists progress + cursor per page; used
-/// by the reencrypt AND backfill-metadata kinds.
-pub(crate) async fn counting_phase(
-    db: &Arc<Mutex<ConfigDb>>,
-    state: &Arc<AppState>,
-    holder: Holder<'_>,
-    job: &MaintenanceJob,
-    resume_token: Option<String>,
-) -> Result<i64, PhaseStop> {
-    // A resumed count keeps the pages before its cursor: the row's total
-    // is the count up to that cursor (persisted with it, page by page).
-    let count: i64 = match (&resume_token, job.phase.as_str()) {
-        (Some(_), "counting") => job.objects_total.unwrap_or(0),
-        _ => 0,
-    };
-    let mut step = CountStep {
-        db,
-        state,
-        job,
-        count,
-    };
-    paged_phase(
-        JobCtx { db, holder, job },
-        PhaseSpec {
-            phase: "counting",
-            resume: resume_token,
-            cancel_every: None,
-            budget_exhausted: "counting stopped at the page budget with more pages \
-                 pending — bucket too large for one pass; job left resumable",
-            concurrency: 1,
-        },
-        &mut step,
-    )
-    .await?;
-    Ok(step.count)
-}
-
-/// The `counting` phase: count the user objects of each page.
-struct CountStep<'a> {
-    db: &'a Arc<Mutex<ConfigDb>>,
-    state: &'a Arc<AppState>,
-    job: &'a MaintenanceJob,
-    count: i64,
-}
-
-impl PageStep for CountStep<'_> {
-    type Done = ();
-
-    async fn list(&mut self, token: Option<&str>) -> Result<KeyPage, ListError> {
-        let engine = self.state.engine.load().clone();
-        engine
-            .list_objects(&self.job.bucket, "", None, PAGE_SIZE, token, false)
-            .await
-            .map(KeyPage::from)
-            .map_err(|e| ListError::engine("counting list failed", &e))
-    }
-
-    /// Recount from page 0 (idempotent).
-    fn on_restart(&mut self) {
-        self.count = 0;
-    }
-
-    async fn save(&mut self, token: Option<&str>) -> Result<(), PhaseStop> {
-        let c = Counters {
-            total: Some(self.count),
-            ..Counters::default()
-        };
-        persist(self.db, self.job, "counting", &c, token).await;
-        Ok(())
-    }
-
-    async fn object(&self, _key: &str) {}
-
-    async fn settle(&mut self, _key: &str, _done: ()) -> Result<(), PhaseStop> {
-        self.count += 1;
         Ok(())
     }
 }
@@ -1284,71 +1260,6 @@ mod tests {
     /// A `counting` phase resumed from a persisted cursor keeps the count
     /// of the pages before the cursor, so `objects_total` is the whole
     /// bucket (it restarted at 0, and the bar reached 99 % early).
-    #[tokio::test]
-    async fn a_counting_resume_keeps_the_count_so_far() {
-        let data = tempfile::tempdir().unwrap();
-        let config = crate::config::Config::default();
-        let backend: Box<crate::storage::DynStorageBackend<'static>> = DynStorageBackend::new_box(
-            crate::storage::FilesystemBackend::new(data.path().to_path_buf())
-                .await
-                .unwrap(),
-        );
-        let engine = crate::deltaglider::DeltaGliderEngine::new_with_backend(
-            Arc::new(backend),
-            &config,
-            None,
-        );
-        engine.create_bucket("b").await.unwrap();
-        for k in ["a.txt", "b.txt", "c.txt"] {
-            engine
-                .store("b", k, b"x", None, Default::default())
-                .await
-                .unwrap();
-        }
-        let state = Arc::new(AppState {
-            engine: arc_swap::ArcSwap::from_pointee(engine),
-            multipart: Arc::new(crate::multipart::MultipartStore::new(
-                config.max_object_size,
-            )),
-            metrics: Arc::new(crate::metrics::Metrics::new()),
-            usage_scanner: Arc::new(crate::usage_scanner::UsageScanner::new()),
-            bucket_usage: None,
-            reference_lock: None,
-            config_db: None,
-            maintenance_gate: Arc::new(crate::maintenance::gate::MaintenanceGate::new()),
-            maintenance_notify: Arc::new(tokio::sync::Notify::new()),
-            backend_capabilities: Default::default(),
-            backend_health: Default::default(),
-        });
-        let db = ConfigDb::in_memory("testpass").unwrap();
-        let id = db
-            .maintenance_create_job("reencrypt", "b", "counting", None, "admin", 1)
-            .unwrap()
-            .unwrap();
-        db.maintenance_claim_next_job("inst", current_unix_seconds(), 60)
-            .unwrap()
-            .unwrap();
-        // The previous process counted a and b and persisted the filesystem
-        // cursor "b.txt" (the token is the last key) before it died.
-        db.maintenance_update_progress(id, "counting", Some(2), 0, 0, 0, 0, Some("b.txt"))
-            .unwrap();
-        let job = db.maintenance_job_by_id(id).unwrap().unwrap();
-        let db = Arc::new(Mutex::new(db));
-        let count = counting_phase(
-            &db,
-            &state,
-            Holder::test("inst"),
-            &job,
-            job.continuation_token.clone(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            count, 3,
-            "the resumed count includes the objects before the cursor"
-        );
-    }
-
     /// Review B3: a job row on the coordination bucket that an older
     /// release accepted resumes after the upgrade; it fails before any
     /// phase reads or rewrites that bucket.

@@ -206,23 +206,29 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// One page of every user object of `bucket` for a maintenance job:
     /// the keys as the storage lists them (stored sizes, no HEAD, no
-    /// listing facts), and the one stored form of each key that the page
-    /// proved ([`ListedPageForms`]).
+    /// listing facts), the one stored form of each key that the page
+    /// proved ([`ListedPageForms`]), and the deltaspaces whose
+    /// reference.bin it read ([`crate::storage::DelegatedListResult::reference_prefixes`]).
     pub(crate) async fn list_job_page(
         &self,
         bucket: &str,
         max_keys: u32,
         continuation_token: Option<&str>,
-    ) -> Result<(ListObjectsPage, ListedPageForms), EngineError> {
-        let (page, _, forms) = self
+    ) -> Result<JobPage, EngineError> {
+        let (page, _, listed) = self
             .list_lite_with_forms(bucket, "", None, max_keys, continuation_token)
             .await?;
-        let forms = ListedPageForms::of_page(&page.objects, &forms);
-        Ok((page, forms))
+        let forms = ListedPageForms::of_page(&page.objects, &listed.forms);
+        Ok(JobPage {
+            page,
+            forms,
+            reference_prefixes: listed.reference_prefixes,
+        })
     }
 
-    /// [`Self::list_objects_lite_counted`], and the stored forms that the
-    /// page saw (`Unreported` from the in-memory paging fallback).
+    /// [`Self::list_objects_lite_counted`], and what the storage reported
+    /// besides the page (`Unreported` / `None` from the in-memory paging
+    /// fallback).
     async fn list_lite_with_forms(
         &self,
         bucket: &str,
@@ -230,7 +236,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         delimiter: Option<&str>,
         max_keys_raw: u32,
         continuation_token: Option<&str>,
-    ) -> Result<(ListObjectsPage, u32, crate::storage::ListedForms), EngineError> {
+    ) -> Result<(ListObjectsPage, u32, ListedExtras), EngineError> {
         // S3 requires max-keys >= 1; clamp to prevent pagination invariant violations.
         let max_keys = max_keys_raw.max(1);
         // `delimiter=` (mc, rclone, restic send it) is no delimiter, as on
@@ -256,14 +262,22 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 next_continuation_token: result.next_continuation_token,
                 facts_missing_keys: Vec::new(),
             };
-            (page, result.upstream_requests, result.forms)
+            let extras = ListedExtras {
+                forms: result.forms,
+                reference_prefixes: result.reference_prefixes,
+            };
+            (page, result.upstream_requests, extras)
         } else {
             // Backend doesn't support delegated listing for this shape — fall
             // through to the generic bulk_list + in-memory paging path.
             let page = self
                 .list_objects_bulk(bucket, prefix, delimiter, max_keys, continuation_token)
                 .await?;
-            (page, 0, crate::storage::ListedForms::Unreported)
+            let extras = ListedExtras {
+                forms: crate::storage::ListedForms::Unreported,
+                reference_prefixes: None,
+            };
+            (page, 0, extras)
         };
         Ok(page)
     }
@@ -557,6 +571,22 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             })
         }
     }
+}
+
+/// What a storage listing reported besides its page.
+struct ListedExtras {
+    forms: crate::storage::ListedForms,
+    reference_prefixes: Option<Vec<String>>,
+}
+
+/// One page of a maintenance job's listing ([`DeltaGliderEngine::list_job_page`]).
+pub(crate) struct JobPage {
+    pub page: ListObjectsPage,
+    /// The one stored form of each key that the page proved.
+    pub forms: ListedPageForms,
+    /// The deltaspaces whose reference.bin the page read; `None`: not
+    /// reported.
+    pub reference_prefixes: Option<Vec<String>>,
 }
 
 /// What [`DeltaGliderEngine::complete_listed_page`] adds to a lite page.

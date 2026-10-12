@@ -340,8 +340,8 @@ async fn a_listed_form_that_is_gone_is_read_in_both_forms() {
         .store("b", "k.txt", b"x", None, Default::default())
         .await
         .unwrap();
-    let (_, forms) = engine.list_job_page("b", 1000, None).await.unwrap();
-    let form = forms.of("k.txt");
+    let page = engine.list_job_page("b", 1000, None).await.unwrap();
+    let form = page.forms.of("k.txt");
     assert_eq!(form, Some(crate::storage::ObjectVariant::Passthrough));
     // Gone outside the proxy.
     engine
@@ -543,4 +543,118 @@ async fn a_rewrite_is_fenced_on_the_jobs_read() {
         .await
         .unwrap();
     assert_eq!(now.file_size, 7, "{now:?}");
+}
+
+/// The ListObjectsV2 requests of the user objects of `bucket` (not the
+/// background listing-facts upkeep under `.dg/`).
+pub(crate) fn bucket_lists(fake: &FakeS3, bucket: &str) -> usize {
+    fake.requests()
+        .iter()
+        .filter(|r| r.starts_with(&format!("GET /{bucket}/?")) && r.contains("list-type=2"))
+        .filter(|r| !crate::storage::fake_s3::list_prefix(r).contains(".dg"))
+        .count()
+}
+
+/// P6.4: a re-encrypt listed the bucket three times (the count, the
+/// objects, the reference prefixes). It lists it once.
+#[tokio::test]
+async fn reencrypt_lists_the_bucket_once() {
+    let (engine, fake) = counted_engine().await;
+    store_marked(&engine, 5).await;
+    crate::deltaglider::store_deltas(&engine, "d", 3).await;
+    engine.metadata_cache().invalidate_prefix("b", "");
+    let row = run_kind(engine, &fake, "reencrypt").await;
+    assert_eq!(row.status, "completed", "{row:?}");
+    assert_eq!(row.objects_total, Some(8), "{row:?}");
+    assert_eq!(bucket_lists(&fake, "b"), 1, "{:#?}", fake.requests());
+}
+
+/// P6.4: the same for a backfill.
+#[tokio::test]
+async fn backfill_lists_the_bucket_once() {
+    let (engine, fake) = counted_engine().await;
+    store_foreign(&fake, 5);
+    let row = run_kind(engine, &fake, super::super::backfill::KIND).await;
+    assert_eq!(row.status, "completed", "{row:?}");
+    assert_eq!(row.objects_total, Some(5), "{row:?}");
+    assert_eq!(bucket_lists(&fake, "b"), 1, "{:#?}", fake.requests());
+}
+
+/// [`AppState`] for `engine` with the usage counter `usage`.
+fn state_with_usage(
+    engine: crate::deltaglider::DynEngine,
+    usage: Arc<crate::bucket_usage::BucketUsage>,
+) -> Arc<AppState> {
+    let mut state = Arc::try_unwrap(AppState::for_tests(engine)).ok().unwrap();
+    state.bucket_usage = Some(usage);
+    Arc::new(state)
+}
+
+/// P6.4: the progress total comes from the usage counter only when a
+/// full scan stamped its row (the quota gate's rule).
+#[tokio::test]
+async fn the_total_comes_from_a_scanned_counter_only() {
+    let (engine, _fake) = s3_engine().await;
+    let usage = Arc::new(crate::bucket_usage::BucketUsage::in_memory().unwrap());
+    let engine = engine.with_bucket_usage(Some(usage.clone()));
+    store_marked(&engine, 3).await;
+    let state = state_with_usage(engine, usage.clone());
+    // Writes alone: the row holds only what this counter saw.
+    assert_eq!(trusted_object_count(&state, "b"), None);
+    let ticket = usage.begin_scan("b");
+    let totals = crate::deltaglider::SavingsTotals {
+        passthrough_count: 3,
+        ..Default::default()
+    };
+    usage.overwrite_from_scan(ticket, &totals, 1).unwrap();
+    assert_eq!(trusted_object_count(&state, "b"), Some(3));
+    // A write whose prior read failed marks the row for a recount.
+    usage.mark_for_recount("b");
+    assert_eq!(trusted_object_count(&state, "b"), None);
+}
+
+/// P6.4 edge: a job resumed mid-walk (or persisted mid-count by a
+/// previous release) cannot vouch for the references of the pages before
+/// its cursor: it lists them, and it still ends with the exact total.
+#[tokio::test]
+async fn a_resumed_walk_lists_the_references() {
+    let (engine, fake) = counted_engine().await;
+    store_marked(&engine, 3).await;
+    crate::deltaglider::store_deltas(&engine, "d", 2).await;
+    engine.metadata_cache().invalidate_prefix("b", "");
+    let dir = tempfile::tempdir().unwrap();
+    let config: SharedConfig = crate::config::Config::default().into_shared();
+    let state = AppState::for_tests(engine);
+    let mutator = ConfigMutator {
+        config: config.clone(),
+        app: state.clone(),
+        persist_path: dir.path().join("c.yaml").display().to_string(),
+    };
+    let db = ConfigDb::in_memory("k").unwrap();
+    let id = db
+        .maintenance_create_job(
+            "reencrypt",
+            "b",
+            "counting",
+            None,
+            "admin",
+            unique_created_at(),
+        )
+        .unwrap()
+        .unwrap();
+    db.maintenance_claim_next_job("inst", current_unix_seconds(), 60)
+        .unwrap()
+        .unwrap();
+    // The previous process walked up to `d/build-001.zip` (2 objects).
+    db.maintenance_update_progress(id, "objects", None, 0, 2, 0, 0, Some("d/build-001.zip"))
+        .unwrap();
+    let job = db.maintenance_job_by_id(id).unwrap().unwrap();
+    let db = Arc::new(Mutex::new(db));
+    fake.clear();
+    run_job(&mutator, &config, &db, &state, Holder::test("inst"), job).await;
+    let row = db.lock().await.maintenance_job_by_id(id).unwrap().unwrap();
+    assert_eq!(row.status, "completed", "{row:?}");
+    assert_eq!(row.objects_total, Some(5), "{row:?}");
+    // The walk from the cursor, then the reference listing.
+    assert_eq!(bucket_lists(&fake, "b"), 2, "{:#?}", fake.requests());
 }

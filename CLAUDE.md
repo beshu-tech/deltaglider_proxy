@@ -138,7 +138,7 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
                             LeaseLost → phase stops, row NOT settled; graceful shutdown
                             (SIGTERM → `shutdown::begin()`) = ShuttingDown: record_failure refuses, `after_run` never
                             settles/unwinds any Err while shutting down, row released to `queued` for an instant resume), paged.rs (`paged_phase`: THE paged loop — pager, poison restart,
-                            persist, heartbeat, cancel, shutdown — used by reencrypt, backfill, counting, migrate copy/verify/prune; migrate can
+                            persist, heartbeat, cancel, shutdown — used by reencrypt, backfill, migrate copy/verify/prune; migrate can
                             persist only with a `Flushed` proof from `flush_copies`), migrate.rs (kind=migrate: stage→copy→verify→
                             flip→cleanup, transient __dgmigrate_* routes — gated from creation, filtered out of all bucket listings, cleared at
                             flip; pre-flip cancel unwind; cleanup re-checks routed_to_target PER SWEEP; cancel-in-cleanup settles completed with

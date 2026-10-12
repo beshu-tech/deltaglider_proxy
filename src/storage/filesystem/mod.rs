@@ -817,6 +817,7 @@ impl FilesystemBackend {
             forms: super::traits::ListedForms::Reported {
                 ambiguous: Vec::new(),
             },
+            reference_prefixes: None,
         };
         // As `bulk_list_objects_with_baselines`: walk the deepest directory
         // the prefix names completely, keep the keys that start with it.
@@ -908,6 +909,7 @@ impl FilesystemBackend {
             next_continuation_token,
             upstream_requests: 0,
             forms: super::traits::ListedForms::Reported { ambiguous },
+            reference_prefixes: None,
         })
     }
 
@@ -1967,6 +1969,7 @@ impl StorageBackend for FilesystemBackend {
                 next_continuation_token: None,
                 upstream_requests: 0,
                 forms: super::traits::ListedForms::Unreported,
+                reference_prefixes: None,
             }));
         }
 
@@ -2118,6 +2121,7 @@ impl StorageBackend for FilesystemBackend {
             next_continuation_token: page.next_continuation_token,
             upstream_requests: 0,
             forms: super::traits::ListedForms::Unreported,
+            reference_prefixes: None,
         }))
     }
 }

@@ -53,19 +53,27 @@ impl From<crate::deltaglider::ListObjectsPage> for KeyPage {
 }
 
 /// One page of every object of `bucket` for a job
-/// ([`crate::deltaglider::DynEngine::list_job_page`]): its keys, and the
-/// one stored form of each key that the page proved. `context` starts the
-/// error text.
+/// ([`crate::deltaglider::DynEngine::list_job_page`]): its keys, the one
+/// stored form of each key that the page proved, and the deltaspaces whose
+/// reference.bin the page read (`None`: not reported). `context` starts
+/// the error text.
 pub(crate) async fn list_job_keys(
     engine: &crate::deltaglider::DynEngine,
     bucket: &str,
     token: Option<&str>,
     context: &str,
-) -> Result<(KeyPage, crate::deltaglider::ListedPageForms), ListError> {
+) -> Result<
+    (
+        KeyPage,
+        crate::deltaglider::ListedPageForms,
+        Option<Vec<String>>,
+    ),
+    ListError,
+> {
     engine
         .list_job_page(bucket, super::worker::PAGE_SIZE, token)
         .await
-        .map(|(page, forms)| (KeyPage::from(page), forms))
+        .map(|p| (KeyPage::from(p.page), p.forms, p.reference_prefixes))
         .map_err(|e| ListError::engine(context, &e))
 }
 

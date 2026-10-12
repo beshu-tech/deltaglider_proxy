@@ -332,7 +332,11 @@ export function progressLabel(row: JobRow): string {
     const done = row.progress.processed + row.progress.skipped;
     const total = row.progress.total;
     if (row.phase === 'counting') return 'counting objects…';
-    return total != null ? `${done} / ${total} objects` : `${done} objects`;
+    if (total != null) return `${done} / ${total} objects`;
+    // A re-encrypt or backfill walks the bucket once and learns its total
+    // at the end, unless the bucket's usage counter knew it.
+    if (row.phase === 'objects') return `${done} objects (total known at the end)`;
+    return `${done} objects`;
   }
   const lifetime = row.lifetime?.objects ?? 0;
   return lifetime > 0 ? `${lifetime} objects lifetime` : '—';

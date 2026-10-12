@@ -170,6 +170,19 @@ test('progressLabel', () => {
     progressLabel(row({ trigger: 'oneoff', status: 'running', phase: 'counting' })),
     'counting objects…',
   );
+  // One listing: the total is unknown until the walk ends.
+  assert.equal(
+    progressLabel(
+      row({ trigger: 'oneoff', status: 'running', phase: 'objects', progress: { processed: 40, skipped: 10, total: null, bytes: 0, failed: 0 } }),
+    ),
+    '50 objects (total known at the end)',
+  );
+  assert.equal(
+    progressLabel(
+      row({ trigger: 'oneoff', status: 'running', phase: 'copy', progress: { processed: 5, skipped: 0, total: null, bytes: 0, failed: 0 } }),
+    ),
+    '5 objects',
+  );
   assert.equal(progressLabel(row({ lifetime: { objects: 7, bytes: 1 } })), '7 objects lifetime');
   assert.equal(progressLabel(row()), '—');
 });

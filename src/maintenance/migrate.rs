@@ -1241,7 +1241,7 @@ impl PageStep for CopyStep<'_, '_> {
     async fn list(&mut self, token: Option<&str>) -> Result<KeyPage, ListError> {
         self.page_token = token.map(str::to_string);
         let engine = self.engine.as_ref().expect("begin_page runs first");
-        let (page, forms) =
+        let (page, forms, _) =
             list_job_keys(engine, &self.m.job.bucket, token, "list source failed").await?;
         self.forms = forms;
         Ok(page)
@@ -1386,7 +1386,7 @@ impl PageStep for VerifyStep<'_, '_> {
 
     async fn list(&mut self, token: Option<&str>) -> Result<KeyPage, ListError> {
         let engine = self.engine.as_ref().expect("begin_page runs first");
-        let (page, forms) =
+        let (page, forms, _) =
             list_job_keys(engine, &self.m.job.bucket, token, "verify list failed").await?;
         self.forms = forms;
         Ok(page)
