@@ -1311,7 +1311,7 @@ fn insert_logged(db: &ConfigDb, events: &[NewEvent]) {
 /// takes the config DB mutex, never waits for a commit, and never runs an
 /// fsync on a runtime worker.
 ///
-/// The queue is bounded ([`APPEND_QUEUE_CAP`]). When it is full, the append
+/// The queue is bounded (65,536 appends). When it is full, the append
 /// waits for room (and counts [`OUTBOX_QUEUE_FULL`]); it never drops.
 ///
 /// A crash loses the events still in the queue (owner decision D2: about
