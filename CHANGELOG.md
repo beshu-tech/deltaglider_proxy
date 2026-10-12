@@ -11,6 +11,26 @@ delay that acknowledgement by about 40 ms, so most requests on a reused
 (keep-alive) connection, which is what the AWS SDKs use, took at least 40 ms.
 Ten GET requests on one connection took 412 ms and now take about 31 ms.
 
+### Changed — Fewer `HeadBucket` requests
+
+S3 answers a request to a missing bucket with `NoSuchBucket`, so the proxy
+checks that the bucket exists. PutObject and reads already used a 5-second
+memory of found buckets. CopyObject, UploadPartCopy, the multipart requests and
+the bucket sub-resource requests still sent their own `HeadBucket` request each
+time. Now they use the same memory, and a copy checks its source bucket only
+when the source object is missing. Many first requests to one bucket at the
+same time share one `HeadBucket` request. `HeadBucket` from a client still
+reaches the backend every time.
+
+### Changed — The reference lock and the replication lease send half the requests
+
+With a coordination bucket, each delta upload takes a lock object in that
+bucket. The proxy read the lock object before it created it, and read it again
+before it deleted it: 4 requests per upload. Now it creates the lock with a
+conditional write and reads it only when another node holds it. It deletes the
+lock with the ETag that its own write returned. A free lock now costs 2
+requests. The replication lease works the same way.
+
 ### Changed — Write requests no longer wait for the config database
 
 After each successful write or delete, the proxy records an object event in
