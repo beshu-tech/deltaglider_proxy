@@ -12,8 +12,8 @@ use crate::config::SharedConfig;
 use crate::config_db::ConfigDb;
 use crate::config_sections::{EventDeliveryConfig, EventDeliveryFormat};
 use crate::event_outbox::{
-    current_unix_seconds, EventOutboxRecord, STATUS_DELIVERED, STATUS_FAILED, STATUS_IN_PROGRESS,
-    STATUS_PENDING,
+    current_unix_seconds, EndpointOutcome, EventOutboxRecord, Settlement, STATUS_DELIVERED,
+    STATUS_FAILED, STATUS_IN_PROGRESS, STATUS_PENDING,
 };
 use crate::security::{validate_outbound_url, UrlKind};
 use reqwest::header::{HeaderName, HeaderValue};
@@ -749,38 +749,20 @@ pub async fn dispatch_once(
         }
     };
 
-    for event in claimed {
-        let outcome = deliver_to_targets(db, client, config, &event).await;
-        let db = db.lock().await;
-        match outcome {
-            Ok(()) => {
-                record_outcome(None, now);
-                if let Err(err) = db.event_outbox_mark_delivered(event.id, current_unix_seconds()) {
-                    warn!(
-                        "Event outbox mark delivered failed for {}: {}",
-                        event.id, err
-                    );
-                }
-            }
-            Err(err) => {
-                let stored = persistable_error(&err);
-                record_outcome(Some(&stored), now);
-                // A permanent error fails the row now: a retry cannot fix it.
-                let next_attempt_at = if is_permanent_error(&err) {
-                    None
-                } else {
-                    next_attempt_after(config, event.attempts, now)
-                };
-                if let Err(mark_err) =
-                    db.event_outbox_mark_failed(event.id, &stored, next_attempt_at)
-                {
-                    warn!(
-                        "Event outbox mark failed failed for {}: {}",
-                        event.id, mark_err
-                    );
-                }
-            }
-        }
+    // Deliver the whole batch, then settle it in one transaction. A crash
+    // between the posts and the commit re-delivers the batch after the
+    // stale claim (at-least-once; receivers deduplicate on `event.id`).
+    let (endpoints, rows) = deliver_batch(db, client, config, &claimed, now).await;
+    if let Err(err) =
+        db.lock()
+            .await
+            .event_outbox_settle_batch(&endpoints, &rows, current_unix_seconds())
+    {
+        warn!(
+            "Event outbox settle of {} row(s) failed; they are delivered again after the stale claim: {}",
+            rows.len(),
+            err
+        );
     }
 
     // Prune FLOOR: never delete a delivered row that a slower listener (e.g.
@@ -843,16 +825,69 @@ pub async fn dispatch_once(
     // `spawn_dispatcher_with_client` handles that via `prune_while_inactive`.
 }
 
-/// Fan-out: deliver to every target that has not yet received this event,
-/// record each outcome, and fail the row (for a retry) when any target failed.
-/// One failing target never stops the others, and a retry never re-posts to a
-/// target that already succeeded (Slack `chat.postMessage` has no idempotency
-/// key, so that would be a duplicate message).
-async fn deliver_to_targets(
+/// Deliver every claimed row and return what to write: the endpoint
+/// outcomes and each row's final state. Writes nothing, so the caller
+/// settles the batch in one transaction.
+async fn deliver_batch(
     db: &Arc<Mutex<ConfigDb>>,
     client: &(impl EventDeliveryClient + ?Sized),
     config: &EventDeliveryConfig,
+    claimed: &[EventOutboxRecord],
+    now: i64,
+) -> (Vec<EndpointOutcome>, Vec<Settlement>) {
+    let ids: Vec<i64> = claimed.iter().map(|e| e.id).collect();
+    let done = db
+        .lock()
+        .await
+        .event_delivery_done_endpoints_many(&ids)
+        .map_err(|e| format!("event delivery state unreadable: {e}"));
+    let mut endpoints = Vec::new();
+    let mut rows = Vec::with_capacity(claimed.len());
+    for event in claimed {
+        let outcome = match &done {
+            Ok(done) => {
+                let mut done = done.get(&event.id).cloned().unwrap_or_default();
+                deliver_to_targets(client, config, event, &mut done, &mut endpoints).await
+            }
+            Err(e) => Err(e.clone()),
+        };
+        rows.push(match outcome {
+            Ok(()) => {
+                record_outcome(None, now);
+                Settlement::Delivered { id: event.id }
+            }
+            Err(err) => {
+                let stored = persistable_error(&err);
+                record_outcome(Some(&stored), now);
+                // A permanent error fails the row now: a retry cannot fix it.
+                let next_attempt_at = if is_permanent_error(&err) {
+                    None
+                } else {
+                    next_attempt_after(config, event.attempts, now)
+                };
+                Settlement::Failed {
+                    id: event.id,
+                    error: stored,
+                    next_attempt_at,
+                }
+            }
+        });
+    }
+    (endpoints, rows)
+}
+
+/// Fan-out: deliver to every target that has not yet received this event
+/// (`done`), push each outcome onto `endpoints`, and fail the row (for a
+/// retry) when any target failed. One failing target never stops the
+/// others, and a retry never re-posts to a target that already succeeded
+/// (Slack `chat.postMessage` has no idempotency key, so that would be a
+/// duplicate message).
+async fn deliver_to_targets(
+    client: &(impl EventDeliveryClient + ?Sized),
+    config: &EventDeliveryConfig,
     event: &EventOutboxRecord,
+    done: &mut std::collections::HashSet<String>,
+    endpoints: &mut Vec<EndpointOutcome>,
 ) -> Result<(), String> {
     // A config fault (no endpoint, a bad glob, no channel) fails every retry
     // the same way until the config changes.
@@ -860,11 +895,6 @@ async fn deliver_to_targets(
     if targets.is_empty() {
         return Ok(()); // filtered out or routed nowhere: consumed
     }
-    let mut done = db
-        .lock()
-        .await
-        .event_delivery_done_endpoints(event.id)
-        .map_err(|e| format!("event delivery state unreadable: {e}"))?;
     let mut errors = Vec::new();
     for target in targets {
         let id = target.id();
@@ -873,16 +903,11 @@ async fn deliver_to_targets(
         }
         let outcome = client.deliver_target(config, event, &target).await;
         let error = outcome.as_ref().err().map(|e| persistable_error(e));
-        if let Err(e) = db.lock().await.event_delivery_record(
-            event.id,
-            &id,
-            error.as_deref(),
-            current_unix_seconds(),
-        ) {
-            // Unrecorded success: the retry may post to this target again
-            // (at-least-once), never skip it.
-            warn!("Event delivery record failed for {}: {}", event.id, e);
-        }
+        endpoints.push(EndpointOutcome {
+            outbox_id: event.id,
+            endpoint_id: id.clone(),
+            error: error.clone(),
+        });
         match error {
             Some(e) => errors.push(e),
             None => {
@@ -1361,6 +1386,98 @@ mod tests {
         config.webhook_url = Some("http://a.invalid/hook?token=new".into());
         dispatch_once(&db, &client, &config, "w", 205).await;
         assert_eq!(*client.posts.lock().unwrap(), vec!["http://b.invalid/hook"]);
+    }
+
+    /// P1.9: one dispatch of 100 rows to two endpoints settles in one
+    /// transaction. Before, each endpoint outcome and each row mark was its
+    /// own commit (300 commits for this batch).
+    #[tokio::test]
+    async fn a_dispatch_batch_settles_in_one_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Mutex::new(
+            ConfigDb::open_or_create(&dir.path().join("c.db"), "pw").unwrap(),
+        ));
+        let events: Vec<NewEvent> = (0..100).map(|i| event(&format!("k{i}"))).collect();
+        db.lock().await.event_outbox_insert_many(&events).unwrap();
+        let client = EndpointClient {
+            fail_url: "http://b.invalid/hook",
+            fail_times: 50,
+            failed: AtomicUsize::new(0),
+            posts: Default::default(),
+        };
+        let config = EventDeliveryConfig {
+            webhook_url: Some("http://a.invalid/hook".into()),
+            webhook_urls: vec!["http://b.invalid/hook".into()],
+            batch_size: 100,
+            ..cfg()
+        };
+        let before = crate::event_outbox::pages_written(&*db.lock().await);
+        dispatch_once(&db, &client, &config, "w", 200).await;
+        let pages = crate::event_outbox::pages_written(&*db.lock().await) - before;
+        assert_eq!(client.posts.lock().unwrap().len(), 200);
+        let counts = db.lock().await.event_outbox_status_counts().unwrap();
+        assert_eq!((counts.delivered, counts.pending), (50, 50));
+        let deliveries = db
+            .lock()
+            .await
+            .event_deliveries_for_many(&[1, 100])
+            .unwrap();
+        assert_eq!(deliveries[&1].len(), 2, "both endpoint outcomes recorded");
+        assert!(
+            deliveries[&100].iter().all(|d| d.status == "delivered"),
+            "the late rows reached both endpoints"
+        );
+        assert!(
+            pages <= 30,
+            "claim + one settle commit, wrote {pages} pages"
+        );
+    }
+
+    /// At-least-once across the batched settle: a crash after the posts and
+    /// before the settle commit leaves the rows claimed with no endpoint
+    /// state. Once the claim is stale, the next dispatch delivers them again
+    /// to every endpoint, with the same event id.
+    #[tokio::test]
+    async fn a_crash_before_the_settle_delivers_the_batch_again() {
+        let db = Arc::new(Mutex::new(ConfigDb::in_memory("test-pass").unwrap()));
+        let id = db
+            .lock()
+            .await
+            .event_outbox_insert(&event("crash"))
+            .unwrap();
+        let client = EndpointClient {
+            fail_url: "http://none.invalid/",
+            fail_times: 0,
+            failed: AtomicUsize::new(0),
+            posts: Default::default(),
+        };
+        let config = EventDeliveryConfig {
+            webhook_url: Some("http://a.invalid/hook".into()),
+            webhook_urls: vec!["http://b.invalid/hook".into()],
+            ..cfg()
+        };
+        // The crash: claim and post, then drop the settlement unwritten.
+        let claimed = db
+            .lock()
+            .await
+            .event_outbox_claim_due("w", 200, 60, 10)
+            .unwrap();
+        let _lost = deliver_batch(&db, &client, &config, &claimed, 200).await;
+        assert_eq!(client.posts.lock().unwrap().len(), 2);
+        let row = db.lock().await.event_outbox_load(id).unwrap().unwrap();
+        assert_eq!(row.status, STATUS_IN_PROGRESS);
+        // Before the claim is stale, nothing is delivered again.
+        dispatch_once(&db, &client, &config, "w2", 230).await;
+        assert_eq!(client.posts.lock().unwrap().len(), 2);
+        // After it, both endpoints get the event again.
+        client.posts.lock().unwrap().clear();
+        dispatch_once(&db, &client, &config, "w2", 261).await;
+        assert_eq!(
+            *client.posts.lock().unwrap(),
+            vec!["http://a.invalid/hook", "http://b.invalid/hook"]
+        );
+        let row = db.lock().await.event_outbox_load(id).unwrap().unwrap();
+        assert_eq!((row.id, row.status.as_str()), (id, STATUS_DELIVERED));
     }
 
     /// The same URL listed twice is one endpoint: one post.

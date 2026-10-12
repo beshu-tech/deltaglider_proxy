@@ -210,6 +210,63 @@ pub struct EventOutboxStatusCounts {
     pub failed: i64,
 }
 
+/// One endpoint's outcome in a delivery batch (`error = None`: success).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EndpointOutcome {
+    pub outbox_id: i64,
+    pub endpoint_id: String,
+    pub error: Option<String>,
+}
+
+/// The final state of one outbox row in a delivery batch.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Settlement {
+    Delivered {
+        id: i64,
+    },
+    /// `next_attempt_at = None`: permanently failed; `Some`: retry then.
+    Failed {
+        id: i64,
+        error: String,
+        next_attempt_at: Option<i64>,
+    },
+}
+
+const SQL_RECORD_ENDPOINT: &str =
+    "INSERT INTO event_deliveries (outbox_id, endpoint_id, status, attempts, last_error, updated_at)
+     VALUES (?1, ?2, ?3, 1, ?4, ?5)
+     ON CONFLICT(outbox_id, endpoint_id) DO UPDATE SET
+       status = excluded.status,
+       attempts = attempts + 1,
+       last_error = excluded.last_error,
+       updated_at = excluded.updated_at";
+
+const SQL_MARK_DELIVERED: &str = "UPDATE event_outbox
+    SET status = 'delivered',
+        delivered_at = ?,
+        claimed_by = NULL,
+        claimed_at = NULL,
+        next_attempt_at = NULL,
+        last_error = NULL
+  WHERE id = ?";
+
+const SQL_MARK_FAILED: &str = "UPDATE event_outbox
+    SET status = ?,
+        next_attempt_at = ?,
+        claimed_by = NULL,
+        claimed_at = NULL,
+        last_error = ?
+  WHERE id = ?";
+
+/// A failed row with a retry time waits as `pending`; without one it is dead.
+fn failed_status(next_attempt_at: Option<i64>) -> &'static str {
+    if next_attempt_at.is_some() {
+        STATUS_PENDING
+    } else {
+        STATUS_FAILED
+    }
+}
+
 pub fn current_unix_seconds() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -443,9 +500,12 @@ impl ConfigDb {
             rows.collect::<Result<Vec<_>, _>>()?
         };
 
+        // One transaction for the whole claim: one commit (journal + fsync),
+        // not one per row.
+        let tx = self.conn.unchecked_transaction()?;
         let mut claimed = Vec::with_capacity(ids.len());
         for id in ids {
-            let updated = self.conn.execute(
+            let updated = tx.execute(
                 "UPDATE event_outbox
                     SET status = 'in_progress',
                         attempts = attempts + 1,
@@ -472,6 +532,7 @@ impl ConfigDb {
                 }
             }
         }
+        tx.commit()?;
         Ok(claimed)
     }
 
@@ -489,28 +550,32 @@ impl ConfigDb {
             STATUS_DELIVERED
         };
         self.conn.execute(
-            "INSERT INTO event_deliveries (outbox_id, endpoint_id, status, attempts, last_error, updated_at)
-             VALUES (?1, ?2, ?3, 1, ?4, ?5)
-             ON CONFLICT(outbox_id, endpoint_id) DO UPDATE SET
-               status = excluded.status,
-               attempts = attempts + 1,
-               last_error = excluded.last_error,
-               updated_at = excluded.updated_at",
+            SQL_RECORD_ENDPOINT,
             params![outbox_id, endpoint_id, status, error, now],
         )?;
         Ok(())
     }
 
-    /// The endpoints that already received this outbox row.
-    pub fn event_delivery_done_endpoints(
+    /// The endpoints that already received each of `outbox_ids`, in one
+    /// query (ids with no delivered endpoint are absent).
+    pub fn event_delivery_done_endpoints_many(
         &self,
-        outbox_id: i64,
-    ) -> Result<std::collections::HashSet<String>, ConfigDbError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT endpoint_id FROM event_deliveries WHERE outbox_id = ? AND status = 'delivered'",
-        )?;
-        let rows = stmt.query_map(params![outbox_id], |r| r.get::<_, String>(0))?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        outbox_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, std::collections::HashSet<String>>, ConfigDbError>
+    {
+        let mut out: std::collections::HashMap<i64, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+        for (id, rows) in self.event_deliveries_for_many(outbox_ids)? {
+            let done: std::collections::HashSet<String> = rows
+                .into_iter()
+                .filter(|d| d.status == STATUS_DELIVERED)
+                .map(|d| d.endpoint_id)
+                .collect();
+            if !done.is_empty() {
+                out.insert(id, done);
+            }
+        }
+        Ok(out)
     }
 
     /// Per-endpoint delivery state for several outbox rows in one query,
@@ -571,17 +636,7 @@ impl ConfigDb {
     }
 
     pub fn event_outbox_mark_delivered(&self, id: i64, now: i64) -> Result<bool, ConfigDbError> {
-        let updated = self.conn.execute(
-            "UPDATE event_outbox
-                SET status = 'delivered',
-                    delivered_at = ?,
-                    claimed_by = NULL,
-                    claimed_at = NULL,
-                    next_attempt_at = NULL,
-                    last_error = NULL
-              WHERE id = ?",
-            params![now, id],
-        )?;
+        let updated = self.conn.execute(SQL_MARK_DELIVERED, params![now, id])?;
         Ok(updated > 0)
     }
 
@@ -591,22 +646,59 @@ impl ConfigDb {
         error: &str,
         next_attempt_at: Option<i64>,
     ) -> Result<bool, ConfigDbError> {
-        let status = if next_attempt_at.is_some() {
-            STATUS_PENDING
-        } else {
-            STATUS_FAILED
-        };
         let updated = self.conn.execute(
-            "UPDATE event_outbox
-                SET status = ?,
-                    next_attempt_at = ?,
-                    claimed_by = NULL,
-                    claimed_at = NULL,
-                    last_error = ?
-              WHERE id = ?",
-            params![status, next_attempt_at, error, id],
+            SQL_MARK_FAILED,
+            params![failed_status(next_attempt_at), next_attempt_at, error, id],
         )?;
         Ok(updated > 0)
+    }
+
+    /// Settle one delivery batch in ONE transaction: every endpoint outcome
+    /// of the batch, then every row's final state. A crash before the commit
+    /// leaves the rows `in_progress` with no endpoint state, so the stale
+    /// claim reclaims them and delivers them again to every endpoint
+    /// (at-least-once; receivers deduplicate on the event id).
+    pub fn event_outbox_settle_batch(
+        &self,
+        endpoints: &[EndpointOutcome],
+        rows: &[Settlement],
+        now: i64,
+    ) -> Result<(), ConfigDbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut record = tx.prepare(SQL_RECORD_ENDPOINT)?;
+            for e in endpoints {
+                let status = if e.error.is_some() {
+                    STATUS_FAILED
+                } else {
+                    STATUS_DELIVERED
+                };
+                record.execute(params![e.outbox_id, e.endpoint_id, status, e.error, now])?;
+            }
+            let mut delivered = tx.prepare(SQL_MARK_DELIVERED)?;
+            let mut failed = tx.prepare(SQL_MARK_FAILED)?;
+            for row in rows {
+                match row {
+                    Settlement::Delivered { id } => {
+                        delivered.execute(params![now, id])?;
+                    }
+                    Settlement::Failed {
+                        id,
+                        error,
+                        next_attempt_at,
+                    } => {
+                        failed.execute(params![
+                            failed_status(*next_attempt_at),
+                            next_attempt_at,
+                            error,
+                            id
+                        ])?;
+                    }
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn event_outbox_requeue_failed(&self, id: i64, now: i64) -> Result<bool, ConfigDbError> {
@@ -1199,6 +1291,26 @@ pub async fn flush_appends(db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>) {
     }
 }
 
+/// Write-cost probe for the outbox cost tests: the pages that SQLite wrote
+/// to the DB file so far. Each commit writes its changed pages, so N one-row
+/// commits write about N times more than one N-row commit.
+#[cfg(test)]
+pub(crate) fn pages_written(db: &ConfigDb) -> i64 {
+    let (mut cur, mut hi) = (0i32, 0i32);
+    // SAFETY: `handle()` is the open connection of `db`; the call only reads
+    // a status counter into two local integers.
+    unsafe {
+        rusqlite::ffi::sqlite3_db_status(
+            db.conn.handle(),
+            rusqlite::ffi::SQLITE_DBSTATUS_CACHE_WRITE,
+            &mut cur,
+            &mut hi,
+            0,
+        );
+    }
+    i64::from(cur)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1754,5 +1866,24 @@ mod tests {
             .unwrap();
         tx.commit().unwrap();
         assert_eq!(pragma_i64(&db, "freelist_count"), 0);
+    }
+
+    /// P1.9: a claim of 100 due rows is one transaction. Before, each row was
+    /// its own commit (about 100 commits, hundreds of pages written).
+    #[test]
+    fn claiming_a_batch_is_one_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ConfigDb::open_or_create(&dir.path().join("c.db"), "pw").unwrap();
+        let events: Vec<NewEvent> = (0..100).map(|i| event_at(i, &format!("k{i}"))).collect();
+        db.event_outbox_insert_many(&events).unwrap();
+        let before = pages_written(&db);
+        let claimed = db.event_outbox_claim_due("c", 1_000, 60, 100).unwrap();
+        let pages = pages_written(&db) - before;
+        assert_eq!(claimed.len(), 100);
+        assert!(
+            claimed.iter().all(|r| r.status == STATUS_IN_PROGRESS),
+            "every claimed row is in progress"
+        );
+        assert!(pages <= 10, "one commit for the claim, wrote {pages} pages");
     }
 }
