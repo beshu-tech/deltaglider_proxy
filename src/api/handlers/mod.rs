@@ -137,10 +137,12 @@ pub struct AppState {
 /// mysterious 500.
 ///
 /// A bucket found is trusted for [`BUCKET_SEEN_TTL`] per engine, so a
-/// 1,000-part upload sends one HeadBucket, not 1,000. The users are the
-/// write paths (PutObject, form POST, UploadPart, the destination of a
-/// copy), DeleteObject(s), the `NoSuchKey`-or-`NoSuchBucket` check of a
-/// read miss, and a LIST that finds nothing. DeleteBucket on this instance forgets the bucket
+/// 1,000-part upload sends one HeadBucket, not 1,000, and concurrent first
+/// checks of one bucket send one HeadBucket between them. Every S3 verb
+/// but HeadBucket itself checks its bucket here: the write paths, the
+/// multipart verbs, the bucket sub-resource verbs, DeleteObject(s), the
+/// `NoSuchKey`-or-`NoSuchBucket` check of a read miss and of a copy source,
+/// and a LIST that finds nothing. DeleteBucket on this instance forgets the bucket
 /// ([`forget_bucket`]); a bucket deleted elsewhere can pass for up to
 /// [`BUCKET_SEEN_TTL`], and a write into it still fails at the backend
 /// (`require_bucket_exists` on the filesystem, `NoSuchBucket` on S3). A
@@ -161,7 +163,36 @@ pub(crate) async fn ensure_bucket_exists_on(
     if bucket_seen(engine, bucket) {
         return Ok(());
     }
-    match engine.head_bucket(bucket).await {
+    // Single flight: N first requests to a bucket send one HeadBucket and
+    // share its answer (found / missing). A failed one is not shared: each
+    // waiter then asks on its own and reports its own error.
+    let key = (Arc::as_ptr(engine) as usize, bucket.to_string());
+    let flight = BUCKET_FLIGHTS
+        .lock()
+        .entry(key.clone())
+        .or_default()
+        .clone();
+    let mut own = None;
+    let shared = *flight
+        .get_or_init(|| async {
+            let answer = engine.head_bucket(bucket).await;
+            let found = answer.as_ref().ok().copied();
+            own = Some(answer);
+            found
+        })
+        .await;
+    {
+        let mut flights = BUCKET_FLIGHTS.lock();
+        if flights.get(&key).is_some_and(|f| Arc::ptr_eq(f, &flight)) {
+            flights.remove(&key);
+        }
+    }
+    let answer = match (shared, own) {
+        (Some(found), _) => Ok(found),
+        (None, Some(answer)) => answer,
+        (None, None) => engine.head_bucket(bucket).await,
+    };
+    match answer {
         Ok(true) => {
             remember_bucket(engine, bucket);
             Ok(())
@@ -170,6 +201,15 @@ pub(crate) async fn ensure_bucket_exists_on(
         Err(e) => Err(S3Error::from(e)),
     }
 }
+
+/// The cold bucket checks in flight, by (engine address, bucket): `Some`
+/// = the HeadBucket answered found / missing, `None` = it failed.
+#[allow(clippy::type_complexity)]
+static BUCKET_FLIGHTS: std::sync::LazyLock<
+    parking_lot::Mutex<
+        std::collections::HashMap<(usize, String), Arc<tokio::sync::OnceCell<Option<bool>>>>,
+    >,
+> = std::sync::LazyLock::new(Default::default);
 
 /// How long a write path trusts a bucket that it found.
 const BUCKET_SEEN_TTL: std::time::Duration = std::time::Duration::from_secs(5);
@@ -226,6 +266,31 @@ mod bucket_exists_tests {
             .iter()
             .filter(|r| **r == line || r.starts_with(&format!("{line}?")))
             .count()
+    }
+
+    /// N concurrent first checks of a bucket send one HeadBucket; N
+    /// concurrent checks of a missing bucket share its answer too.
+    #[tokio::test]
+    async fn concurrent_cold_checks_send_one_head_bucket() {
+        let (engine, fake) = crate::deltaglider::s3_engine().await;
+        let state = AppState::for_tests(engine);
+        fake.clear();
+        fake.set_delay_ms("HEAD_BUCKET", 100);
+        let checks = (0..8).map(|_| ensure_bucket_exists(&state, "b"));
+        for r in futures::future::join_all(checks).await {
+            r.unwrap();
+        }
+        assert_eq!(head_buckets(&fake, "b"), 1, "{:?}", fake.requests());
+
+        fake.fail("HEAD_BUCKET", "/nope", 404, "NoSuchBucket", u32::MAX);
+        let checks = (0..8).map(|_| ensure_bucket_exists(&state, "nope"));
+        for r in futures::future::join_all(checks).await {
+            assert!(matches!(r, Err(S3Error::NoSuchBucket(_))), "{r:?}");
+        }
+        assert_eq!(head_buckets(&fake, "nope"), 1, "{:?}", fake.requests());
+        // Missing is not remembered: the next check asks again.
+        assert!(ensure_bucket_exists(&state, "nope").await.is_err());
+        assert_eq!(head_buckets(&fake, "nope"), 2);
     }
 
     /// The write paths check a bucket with one HeadBucket per bucket per

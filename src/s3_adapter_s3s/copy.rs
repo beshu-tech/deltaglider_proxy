@@ -49,11 +49,19 @@ pub(super) async fn copy_object(
              redirect location or encryption attributes."
         ));
     }
-    ensure_bucket_exists_s3s(&svc.state, &source_bucket).await?;
     // The destination is written: the write paths' brief bucket cache.
     crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
     let engine = svc.state.engine.load();
-    let source_meta = engine.head(&source_bucket, &source_key).await?;
+    // No HeadBucket for the source: its HEAD answers NoSuchKey for a
+    // missing bucket too, and only then the cached check tells
+    // NoSuchBucket (as a read miss does).
+    let source_meta = match engine.head(&source_bucket, &source_key).await {
+        Ok(meta) => meta,
+        Err(e) => {
+            let err = s3s::S3Error::from(e);
+            return Err(no_such_key_or_bucket(&svc.state, &source_bucket, err).await);
+        }
+    };
     evaluate_copy_source_conditionals_s3s(
         &source_meta,
         input.copy_source_if_match.as_ref(),
@@ -263,11 +271,19 @@ pub(super) async fn upload_part_copy(
     // Gate on the DESTINATION bucket — part-copy feeds a client write
     // (403-before-404, no backend I/O for a doomed request).
     crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)?;
-    ensure_bucket_exists_s3s(&svc.state, &source_bucket).await?;
     // A part of the destination upload: the write paths' brief bucket cache.
     crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
     let engine = svc.state.engine.load();
-    let source_meta = engine.head(&source_bucket, &source_key).await?;
+    // No HeadBucket for the source: its HEAD answers NoSuchKey for a
+    // missing bucket too, and only then the cached check tells
+    // NoSuchBucket (as a read miss does).
+    let source_meta = match engine.head(&source_bucket, &source_key).await {
+        Ok(meta) => meta,
+        Err(e) => {
+            let err = s3s::S3Error::from(e);
+            return Err(no_such_key_or_bucket(&svc.state, &source_bucket, err).await);
+        }
+    };
     evaluate_copy_source_conditionals_s3s(
         &source_meta,
         input.copy_source_if_match.as_ref(),

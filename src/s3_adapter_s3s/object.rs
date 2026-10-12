@@ -1024,17 +1024,124 @@ mod bucket_check_cost_tests {
         assert!(sites.is_empty(), "list.rs lines {sites:?}");
     }
 
-    /// The object verbs check a bucket through the cached check
+    /// Every S3 verb checks a bucket through the cached check
     /// (`crate::api::handlers::ensure_bucket_exists`), never with a
-    /// HeadBucket of their own.
+    /// HeadBucket of its own. The one live check is the HeadBucket verb
+    /// (`ensure_bucket_on` in bucket.rs, defined in mod.rs).
     #[test]
     fn object_verbs_check_buckets_through_the_cache() {
-        let text = std::fs::read_to_string("src/s3_adapter_s3s/object.rs").unwrap();
-        let sites: Vec<usize> = crate::source_scan::prod_lines(&text)
-            .into_iter()
-            .filter(|(_, l)| l.contains("ensure_bucket_exists_s3s(") || l.contains(".head_bucket("))
-            .map(|(n, _)| n)
-            .collect();
-        assert!(sites.is_empty(), "object.rs lines {sites:?}");
+        let mut live = Vec::new();
+        for (file, text) in crate::source_scan::prod_sources("src/s3_adapter_s3s") {
+            let mut current_fn = String::new();
+            for (n, l) in crate::source_scan::prod_lines(&text) {
+                if let Some(i) = l.find("fn ") {
+                    current_fn = l[i + 3..].split('(').next().unwrap_or("").to_string();
+                }
+                let call = l.contains(".head_bucket(")
+                    || (l.contains("ensure_bucket_on(") && !l.contains("fn ensure_bucket_on("));
+                if call {
+                    live.push(format!("{file}:{n} in fn {current_fn}"));
+                }
+            }
+        }
+        let allowed = |site: &String| {
+            (site.starts_with("src/s3_adapter_s3s/bucket.rs:")
+                && site.ends_with("in fn head_bucket"))
+                || (site.starts_with("src/s3_adapter_s3s/mod.rs:")
+                    && site.ends_with("in fn ensure_bucket_on"))
+        };
+        let wrong: Vec<_> = live.iter().filter(|s| !allowed(s)).collect();
+        assert!(
+            wrong.is_empty(),
+            "live bucket checks outside HeadBucket: {wrong:?}"
+        );
+        assert_eq!(live.len(), 2, "{live:?}");
+    }
+
+    fn copy_from(bucket: &str, key: &str, dst: &str) -> s3s::dto::CopyObjectInput {
+        s3s::dto::CopyObjectInput::builder()
+            .bucket("b".into())
+            .key(dst.into())
+            .copy_source(s3s::dto::CopySource::Bucket {
+                bucket: bucket.into(),
+                key: key.into(),
+                version_id: None,
+            })
+            .build()
+            .unwrap()
+    }
+
+    /// CopyObject sent a HeadBucket for its source on every copy. The
+    /// source HEAD answers NoSuchKey for a missing bucket too; only then the
+    /// cached check tells NoSuchBucket.
+    #[tokio::test]
+    async fn copies_send_no_head_bucket_for_their_source() {
+        use crate::s3_adapter_s3s::copy::copy_object;
+        let (engine, fake) = crate::deltaglider::s3_engine().await;
+        let svc = service(AppState::for_tests(engine));
+        put_object(&svc, request(put("a/1.jpg"))).await.unwrap();
+        fake.clear();
+        for dst in ["a/2.jpg", "a/3.jpg", "a/4.jpg"] {
+            copy_object(&svc, request(copy_from("b", "a/1.jpg", dst)))
+                .await
+                .unwrap();
+        }
+        assert_eq!(head_buckets(&fake), 0, "{:?}", fake.requests());
+
+        let err = copy_object(&svc, request(copy_from("b", "a/none.jpg", "a/5.jpg")))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(*err.code(), s3s::S3ErrorCode::NoSuchKey);
+        fake.fail("HEAD_BUCKET", "/nope", 404, "NoSuchBucket", u32::MAX);
+        let err = copy_object(&svc, request(copy_from("nope", "k", "a/5.jpg")))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(*err.code(), s3s::S3ErrorCode::NoSuchBucket);
+    }
+
+    /// The multipart verbs and the bucket sub-resource verbs check through
+    /// the cache; HeadBucket itself stays live.
+    #[tokio::test]
+    async fn bucket_and_multipart_verbs_check_through_the_cache() {
+        use crate::s3_adapter_s3s::{bucket, multipart};
+        let (engine, fake) = crate::deltaglider::s3_engine().await;
+        let svc = service(AppState::for_tests(engine));
+        fake.clear();
+        for _ in 0..3 {
+            let input = s3s::dto::GetBucketLocationInput::builder()
+                .bucket("b".into())
+                .build()
+                .unwrap();
+            bucket::get_bucket_location(&svc, request(input))
+                .await
+                .unwrap();
+            let input = s3s::dto::CreateMultipartUploadInput::builder()
+                .bucket("b".into())
+                .key("a/big.bin".into())
+                .build()
+                .unwrap();
+            multipart::create_multipart_upload(&svc, request(input))
+                .await
+                .unwrap();
+            let input = s3s::dto::ListMultipartUploadsInput::builder()
+                .bucket("b".into())
+                .build()
+                .unwrap();
+            multipart::list_multipart_uploads(&svc, request(input))
+                .await
+                .unwrap();
+        }
+        assert_eq!(head_buckets(&fake), 1, "{:?}", fake.requests());
+        fake.clear();
+        for _ in 0..2 {
+            let input = s3s::dto::HeadBucketInput::builder()
+                .bucket("b".into())
+                .build()
+                .unwrap();
+            bucket::head_bucket(&svc, request(input)).await.unwrap();
+        }
+        assert_eq!(head_buckets(&fake), 2, "HeadBucket is live");
     }
 }

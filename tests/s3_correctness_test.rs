@@ -189,8 +189,39 @@ async fn test_upload_part_to_deleted_bucket_returns_nosuchbucket() {
         .send()
         .await;
 
-    assert!(res.is_err(), "UploadPart must fail on missing bucket");
-    let err_msg = format!("{:?}", res.unwrap_err());
+    // CreateMultipartUpload found the bucket a moment ago, and the proxy
+    // trusts a found bucket for 5 s (one HeadBucket per bucket, not per
+    // request). A bucket deleted outside the proxy in that window can take
+    // the part (it stays in memory); the completion must then fail, so no
+    // object lands in a missing bucket.
+    let res = match res {
+        Ok(part) => {
+            let parts = aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                .parts(
+                    aws_sdk_s3::types::CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(part.e_tag().unwrap_or_default())
+                        .build(),
+                )
+                .build();
+            client
+                .complete_multipart_upload()
+                .bucket(bucket)
+                .key("part.bin")
+                .upload_id(&upload_id)
+                .multipart_upload(parts)
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("{e:?}"))
+        }
+        Err(e) => Err(format!("{e:?}")),
+    };
+    assert!(
+        res.is_err(),
+        "a part upload into a missing bucket must not land"
+    );
+    let err_msg = res.unwrap_err();
     // The proxy may surface the rejection two equally-valid ways, and which one
     // the client observes is a timing race on a multi-MB body: (a) it drains the
     // request and replies `404 NoSuchBucket`, or (b) it rejects and closes the

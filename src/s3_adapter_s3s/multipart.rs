@@ -14,7 +14,7 @@ pub(super) async fn create_multipart_upload(
     // create saves the client uploading them at all (403-before-404).
     crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)?;
     check_user_metadata_size_s3s(input.metadata.as_ref())?;
-    ensure_bucket_exists_s3s(&svc.state, &input.bucket).await?;
+    crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
     let engine = svc.state.engine.load();
     let delta_limit = engine.tuning().mpu_delta_reconstruct_max_bytes;
     let user_metadata = input.metadata.unwrap_or_default();
@@ -124,7 +124,7 @@ pub(super) async fn complete_multipart_upload(
     // Defense-in-depth: the marker can be hot-applied mid-upload, so
     // Complete (the moment bytes reach the backend) re-checks.
     crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)?;
-    ensure_bucket_exists_s3s(&svc.state, &input.bucket).await?;
+    crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
     let requested_parts = completed_parts_to_request(input.multipart_upload.as_ref())?;
     svc.state
         .multipart
@@ -263,7 +263,7 @@ pub(super) async fn list_multipart_uploads(
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::ListMultipartUploadsOutput>> {
     let list_scope = req.extensions.get::<ListScope>().cloned();
     let input = req.input;
-    ensure_bucket_exists_s3s(&svc.state, &input.bucket).await?;
+    crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
     let max_uploads = input.max_uploads.unwrap_or(1000).clamp(1, 1000) as u32;
     let enc = ListKeyEncoding::of(input.encoding_type.as_ref());
     // A bucket-level LIST like ListObjects: a Filtered caller sees only the

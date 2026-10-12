@@ -12,7 +12,7 @@ use super::*;
 /// `test_entitytoolarge_response` integration tests after the legacy
 /// axum HEAD-bucket handler was retired in `2f8e483`. Real AWS / MinIO
 /// return `200` when the bucket exists and `404 NoSuchBucket` when it
-/// doesn't, so we mirror that contract via `ensure_bucket_exists_s3s`.
+/// doesn't, so we mirror that contract via `ensure_bucket_on`.
 ///
 /// The `x-amz-bucket-region` header is conventionally returned on
 /// HeadBucket; s3s emits it from `bucket_region` on the output, and
@@ -22,7 +22,9 @@ pub(super) async fn head_bucket(
     svc: &DeltaGliderS3Service,
     req: s3s::S3Request<s3s::dto::HeadBucketInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::HeadBucketOutput>> {
-    ensure_bucket_exists_s3s(&svc.state, &req.input.bucket).await?;
+    // HeadBucket is the client's own existence check: always live, never
+    // the 5 s cache (a client waits on it after a DeleteBucket elsewhere).
+    ensure_bucket_on(&svc.state.engine.load(), &req.input.bucket).await?;
     Ok(s3s::S3Response::new(s3s::dto::HeadBucketOutput {
         bucket_region: Some("us-east-1".to_string()),
         ..Default::default()
@@ -56,7 +58,7 @@ pub(super) async fn get_bucket_acl(
     svc: &DeltaGliderS3Service,
     req: s3s::S3Request<s3s::dto::GetBucketAclInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::GetBucketAclOutput>> {
-    ensure_bucket_exists_s3s(&svc.state, &req.input.bucket).await?;
+    crate::api::handlers::ensure_bucket_exists(&svc.state, &req.input.bucket).await?;
     Ok(s3s::S3Response::new(s3s::dto::GetBucketAclOutput {
         owner: Some(default_acl_owner()),
         grants: Some(vec![default_full_control_grant()]),
@@ -67,7 +69,7 @@ pub(super) async fn get_bucket_location(
     svc: &DeltaGliderS3Service,
     req: s3s::S3Request<s3s::dto::GetBucketLocationInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::GetBucketLocationOutput>> {
-    ensure_bucket_exists_s3s(&svc.state, &req.input.bucket).await?;
+    crate::api::handlers::ensure_bucket_exists(&svc.state, &req.input.bucket).await?;
     Ok(s3s::S3Response::new(s3s::dto::GetBucketLocationOutput {
         location_constraint: None,
     }))
@@ -77,7 +79,7 @@ pub(super) async fn get_bucket_versioning(
     svc: &DeltaGliderS3Service,
     req: s3s::S3Request<s3s::dto::GetBucketVersioningInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::GetBucketVersioningOutput>> {
-    ensure_bucket_exists_s3s(&svc.state, &req.input.bucket).await?;
+    crate::api::handlers::ensure_bucket_exists(&svc.state, &req.input.bucket).await?;
     Ok(s3s::S3Response::new(
         s3s::dto::GetBucketVersioningOutput::default(),
     ))
@@ -87,7 +89,7 @@ pub(super) async fn get_bucket_tagging(
     svc: &DeltaGliderS3Service,
     req: s3s::S3Request<s3s::dto::GetBucketTaggingInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::GetBucketTaggingOutput>> {
-    ensure_bucket_exists_s3s(&svc.state, &req.input.bucket).await?;
+    crate::api::handlers::ensure_bucket_exists(&svc.state, &req.input.bucket).await?;
     Err(s3s::s3_error!(
         NotImplemented,
         "Bucket tagging is not supported by this proxy"
@@ -98,7 +100,7 @@ pub(super) async fn put_bucket_tagging(
     svc: &DeltaGliderS3Service,
     req: s3s::S3Request<s3s::dto::PutBucketTaggingInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::PutBucketTaggingOutput>> {
-    ensure_bucket_exists_s3s(&svc.state, &req.input.bucket).await?;
+    crate::api::handlers::ensure_bucket_exists(&svc.state, &req.input.bucket).await?;
     Err(s3s::s3_error!(
         NotImplemented,
         "Bucket tagging is not supported by this proxy"
@@ -109,7 +111,7 @@ pub(super) async fn put_bucket_acl(
     svc: &DeltaGliderS3Service,
     req: s3s::S3Request<s3s::dto::PutBucketAclInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::PutBucketAclOutput>> {
-    ensure_bucket_exists_s3s(&svc.state, &req.input.bucket).await?;
+    crate::api::handlers::ensure_bucket_exists(&svc.state, &req.input.bucket).await?;
     Err(s3s::s3_error!(
         NotImplemented,
         "Bucket ACL mutation is not supported by this proxy"

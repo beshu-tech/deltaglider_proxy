@@ -454,10 +454,9 @@ async fn collect_blob_limited(
     Ok(body)
 }
 
-async fn ensure_bucket_exists_s3s(state: &Arc<AppState>, bucket: &str) -> s3s::S3Result<()> {
-    ensure_bucket_on(&state.engine.load(), bucket).await
-}
-
+/// A live HeadBucket. Only the HeadBucket verb uses it; every other verb
+/// checks its bucket through `crate::api::handlers::ensure_bucket_exists`
+/// (guard `s3_verbs_check_buckets_through_the_cache`).
 async fn ensure_bucket_on(
     engine: &crate::deltaglider::DynEngine,
     bucket: &str,
