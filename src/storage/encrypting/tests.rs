@@ -771,6 +771,18 @@ mod wrapper_tests {
     }
 
     impl StorageBackend for CountingBackend {
+        async fn copy_within(
+            &self,
+            v: crate::storage::ObjectVariant,
+            s: crate::storage::ObjectAt<'_>,
+            d: crate::storage::ObjectAt<'_>,
+            src: &crate::types::FileMetadata,
+            m: &crate::types::FileMetadata,
+        ) -> Result<crate::storage::CopyOutcome, crate::storage::StorageError> {
+            let _ = (v, s, d, src, m);
+            Ok(crate::storage::CopyOutcome::Unsupported)
+        }
+
         async fn reference_fence(
             &self,
             b: &str,

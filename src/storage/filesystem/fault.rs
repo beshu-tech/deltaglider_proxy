@@ -237,6 +237,19 @@ impl StorageBackend for FaultyFs {
         self.inner.flush_pending().await
     }
 
+    async fn copy_within(
+        &self,
+        variant: crate::storage::ObjectVariant,
+        src: crate::storage::ObjectAt<'_>,
+        dst: crate::storage::ObjectAt<'_>,
+        source: &FileMetadata,
+        metadata: &FileMetadata,
+    ) -> Result<crate::storage::CopyOutcome, StorageError> {
+        self.inner
+            .copy_within(variant, src, dst, source, metadata)
+            .await
+    }
+
     async fn create_bucket(&self, bucket: &str) -> Result<(), StorageError> {
         self.inner.create_bucket(bucket).await
     }

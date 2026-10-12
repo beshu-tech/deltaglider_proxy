@@ -671,6 +671,35 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
             .await
     }
 
+    /// The stored bytes move as they are, so the copy is valid only when
+    /// this wrapper would store them the same way: plaintext with no write
+    /// key, or encrypted under the write key's own id. Otherwise
+    /// `Unsupported` (the caller re-encrypts through the proxy). The
+    /// destination gets the markers of the copied bytes, never the
+    /// caller's.
+    async fn copy_within(
+        &self,
+        variant: super::traits::ObjectVariant,
+        src: super::traits::ObjectAt<'_>,
+        dst: super::traits::ObjectAt<'_>,
+        source: &FileMetadata,
+        metadata: &FileMetadata,
+    ) -> Result<super::traits::CopyOutcome, StorageError> {
+        let write_key_id = self.write_key().map(|(_, id)| id);
+        let same_form = match (&write_key_id, is_encrypted(source)) {
+            (None, false) => true,
+            (Some(Some(id)), true) => stamped_key_id(source) == Some(id.as_str()),
+            _ => false,
+        };
+        if !same_form {
+            return Ok(super::traits::CopyOutcome::Unsupported);
+        }
+        let meta = with_markers_of(metadata, source);
+        self.inner
+            .copy_within(variant, src, dst, source, &meta)
+            .await
+    }
+
     async fn put_delta(
         &self,
         bucket: &str,

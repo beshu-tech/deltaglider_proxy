@@ -1274,7 +1274,7 @@ fn same_delta_generation(
 }
 
 /// The client-visible fields of a copy's destination that the copy may
-/// change; [`shipped_delta_metadata`] derives every other field from the
+/// change; [`destination_metadata`] derives every other field from the
 /// source.
 #[derive(Debug, Clone)]
 pub(crate) struct DestinationFields {
@@ -1311,38 +1311,52 @@ impl DestinationFields {
     }
 }
 
-/// THE metadata of a delta that a copy ships verbatim to `dest_filename`:
-/// the logical facts of the source (SHA-256, size, MD5, reference), the
+/// THE metadata of an object that a copy writes to `dest_filename` with
+/// the source's stored bytes (the delta fast path ships the `.delta`, a
+/// server-side copy copies the stored file): the logical facts of the
+/// source (SHA-256, size, MD5, and for a delta its reference), the
 /// destination's own name, the caller's `fields`, a created-at as a new
-/// store gives it (now, or the time [`crate::types::with_created_at`] pins),
-/// and no source encryption marker (the destination write stamps its own
-/// when it encrypts). The result equals what a store of the same content
-/// under the same name writes.
-pub(crate) fn shipped_delta_metadata(
+/// store gives it (now, or the time [`crate::types::with_created_at`]
+/// pins), and no source encryption marker (the destination write stamps
+/// its own). The result equals what a store of the same content under the
+/// same name writes. `None` for a reference, and for a source without
+/// the DG content facts (a foreign object: its MD5 may be a backend ETag
+/// that is not the MD5 of the content); only a store computes those.
+pub(crate) fn destination_metadata(
     source: &crate::types::FileMetadata,
     dest_filename: &str,
     fields: DestinationFields,
 ) -> Option<crate::types::FileMetadata> {
-    let crate::types::StorageInfo::Delta {
-        ref_path,
-        ref_sha256,
-        delta_size,
-        ..
-    } = &source.storage_info
-    else {
+    use crate::types::{FileMetadata, StorageInfo};
+    if source.file_sha256.is_empty() || source.md5.is_empty() {
         return None;
+    }
+    let mut meta = match &source.storage_info {
+        StorageInfo::Delta {
+            ref_path,
+            ref_sha256,
+            delta_size,
+            ..
+        } => FileMetadata::new_delta(
+            dest_filename.to_string(),
+            source.file_sha256.clone(),
+            source.md5.clone(),
+            source.file_size,
+            ref_path.clone(),
+            ref_sha256.clone(),
+            *delta_size,
+            fields.content_type,
+        ),
+        StorageInfo::Passthrough => FileMetadata::new_passthrough(
+            dest_filename.to_string(),
+            source.file_sha256.clone(),
+            source.md5.clone(),
+            source.file_size,
+            fields.content_type,
+        ),
+        StorageInfo::Reference { .. } => return None,
     };
-    let mut meta = crate::types::FileMetadata::new_delta(
-        dest_filename.to_string(),
-        source.file_sha256.clone(),
-        source.md5.clone(),
-        source.file_size,
-        ref_path.clone(),
-        ref_sha256.clone(),
-        *delta_size,
-        fields.content_type,
-    );
-    meta.user_metadata = fields.user_metadata;
+    meta.set_user_metadata(fields.user_metadata);
     meta.multipart_etag = fields.multipart_etag;
     strip_encryption_markers(&mut meta.user_metadata);
     Some(meta)
@@ -1483,7 +1497,7 @@ async fn delta_passthrough_copy(
     if let StorageInfo::Delta { ref_sha256, .. } = &mut source_facts.storage_info {
         ref_sha256.clone_from(&src_ref_sha256);
     }
-    let Some(meta) = shipped_delta_metadata(&source_facts, &dest_filename, fields) else {
+    let Some(meta) = destination_metadata(&source_facts, &dest_filename, fields) else {
         return Ok(None);
     };
 
@@ -2538,6 +2552,18 @@ mod multipart_abort_tests {
     }
 
     impl StorageBackend for AbortSpy {
+        async fn copy_within(
+            &self,
+            v: crate::storage::ObjectVariant,
+            s: crate::storage::ObjectAt<'_>,
+            d: crate::storage::ObjectAt<'_>,
+            src: &crate::types::FileMetadata,
+            m: &crate::types::FileMetadata,
+        ) -> Result<crate::storage::CopyOutcome, crate::storage::StorageError> {
+            let _ = (v, s, d, src, m);
+            Ok(crate::storage::CopyOutcome::Unsupported)
+        }
+
         async fn reference_fence(
             &self,
             b: &str,
@@ -2843,6 +2869,17 @@ mod multipart_abort_tests {
     struct SpyRef(Arc<AbortSpy>);
 
     impl StorageBackend for SpyRef {
+        async fn copy_within(
+            &self,
+            v: crate::storage::ObjectVariant,
+            s: crate::storage::ObjectAt<'_>,
+            d: crate::storage::ObjectAt<'_>,
+            src: &crate::types::FileMetadata,
+            m: &crate::types::FileMetadata,
+        ) -> Result<crate::storage::CopyOutcome, crate::storage::StorageError> {
+            self.0.copy_within(v, s, d, src, m).await
+        }
+
         async fn reference_fence(
             &self,
             b: &str,

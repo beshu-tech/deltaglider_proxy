@@ -1345,3 +1345,72 @@ async fn test_copy_of_a_delta_reads_back_identical_s3() {
     skip_unless_minio!();
     copy_of_a_delta_reads_back_identical(&TestServer::s3().await).await;
 }
+
+/// A CopyObject of a passthrough object is a server-side copy in the
+/// backend (CopyObject on S3, a file copy on the filesystem). The copy
+/// reads back with the same bytes and ETag; a REPLACE self-copy changes
+/// only the metadata.
+async fn copy_of_a_passthrough_object_reads_back_identical(server: &TestServer) {
+    let http = server.http();
+    let prefix = format!("copyserver-{}", std::process::id());
+    let body = generate_binary(150_000, 11);
+    let source = format!("{prefix}/pics/a.jpg");
+    put_object(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        &source,
+        body.clone(),
+        "image/jpeg",
+    )
+    .await;
+    let src_head = head_headers(&http, &server.endpoint(), server.bucket(), &source).await;
+    assert_eq!(src_head["x-amz-storage-type"], "passthrough");
+    let client = server.s3_client().await;
+    let dest = format!("{prefix}/other/a.jpg");
+    client
+        .copy_object()
+        .bucket(server.bucket())
+        .key(&dest)
+        .copy_source(format!("{}/{source}", server.bucket()))
+        .send()
+        .await
+        .expect("CopyObject");
+    let head = head_headers(&http, &server.endpoint(), server.bucket(), &dest).await;
+    assert_eq!(head["etag"], src_head["etag"]);
+    assert_eq!(head["content-type"], "image/jpeg");
+    assert_eq!(
+        get_bytes(&http, &server.endpoint(), server.bucket(), &dest).await,
+        body
+    );
+    client
+        .copy_object()
+        .bucket(server.bucket())
+        .key(&dest)
+        .copy_source(format!("{}/{dest}", server.bucket()))
+        .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
+        .content_type("image/png")
+        .metadata("owner", "dana")
+        .send()
+        .await
+        .expect("REPLACE self-copy");
+    let head = head_headers(&http, &server.endpoint(), server.bucket(), &dest).await;
+    assert_eq!(head["etag"], src_head["etag"]);
+    assert_eq!(head["content-type"], "image/png");
+    assert_eq!(head["x-amz-meta-owner"], "dana");
+    assert_eq!(
+        get_bytes(&http, &server.endpoint(), server.bucket(), &dest).await,
+        body
+    );
+}
+
+#[tokio::test]
+async fn test_copy_of_a_passthrough_object_reads_back_identical_filesystem() {
+    copy_of_a_passthrough_object_reads_back_identical(&TestServer::filesystem().await).await;
+}
+
+#[tokio::test]
+async fn test_copy_of_a_passthrough_object_reads_back_identical_s3() {
+    skip_unless_minio!();
+    copy_of_a_passthrough_object_reads_back_identical(&TestServer::s3().await).await;
+}

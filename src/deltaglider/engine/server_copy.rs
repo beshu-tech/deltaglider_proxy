@@ -1,0 +1,265 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Server-side copy of a passthrough object: the backend copies the stored
+//! file ([`StorageBackend::copy_within`]), and the engine does what a store
+//! of the same object does around its write (the deltaspace lock, the
+//! usage counter, the other stored form, the metadata cache).
+
+use super::*;
+use crate::storage::{CopyOutcome, ObjectAt, ObjectVariant};
+
+impl<S: StorageBackend> DeltaGliderEngine<S> {
+    /// Copy the passthrough object `src` (`source`: its HEAD, the
+    /// generation pin) to `dst` inside the backend, with `metadata` (built
+    /// by `transfer::destination_metadata`, as the store path would write
+    /// it). `Ok(None)`: the backend cannot copy it (another backend or
+    /// encryption key, a provider without CopyObject, a source that is not
+    /// a passthrough object); nothing was written, and the caller copies
+    /// the bytes. A source that changed since `source` is
+    /// `PreconditionFailed`. The caller decides that the destination stores
+    /// the object as it is (no delta) and holds the object's write lock
+    /// when the write is a client's.
+    pub async fn copy_passthrough_within(
+        &self,
+        src: (&str, &str),
+        dst: (&str, &str),
+        source: &FileMetadata,
+        metadata: FileMetadata,
+    ) -> Result<Option<StoreResult>, EngineError> {
+        if !matches!(source.storage_info, StorageInfo::Passthrough)
+            || !matches!(metadata.storage_info, StorageInfo::Passthrough)
+        {
+            return Ok(None);
+        }
+        let (src_key, src_ds) = self.validated_key(src.0, src.1)?;
+        // A legacy object stored under its `.delta` name: the plain read
+        // path knows it; the copy leaves it to the stream path.
+        if source.original_name.strip_suffix(".delta") == Some(&src_key.filename) {
+            return Ok(None);
+        }
+        self.ensure_within_passthrough_ceiling(source.file_size)?;
+        let (dst_key, dst_ds) = self.validated_key_ingest(dst.0, dst.1)?;
+        self.metadata_cache.invalidate(dst.0, dst.1);
+        let prior = self.prior_for_counter(dst.0, dst.1).await;
+        let _guard = self.acquire_prefix_lock(dst.0, &dst_ds).await;
+        let outcome = self
+            .storage
+            .copy_within(
+                ObjectVariant::Passthrough,
+                ObjectAt {
+                    bucket: src.0,
+                    prefix: &src_ds,
+                    filename: &src_key.filename,
+                },
+                ObjectAt {
+                    bucket: dst.0,
+                    prefix: &dst_ds,
+                    filename: &dst_key.filename,
+                },
+                source,
+                &metadata,
+            )
+            .await?;
+        if outcome == CopyOutcome::Unsupported {
+            return Ok(None);
+        }
+        // Committed: count it before the next await.
+        self.record_commit(dst.0, &prior, &metadata);
+        self.drop_other_form(
+            dst.0,
+            &dst_ds,
+            &dst_key.filename,
+            ObjectVariant::Passthrough,
+            &prior,
+        )
+        .await;
+        self.metadata_cache.insert(dst.0, dst.1, metadata.clone());
+        let size = metadata.file_size;
+        Ok(Some(
+            StoreResult::new(metadata, size).with_accounting(prior.replaced(), 0),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::storage::{
+        same_stored_generation, CopyOutcome, DynStorageBackend, EncryptingBackend,
+        EncryptionConfig, EncryptionKey, FilesystemBackend, ObjectAt, ObjectVariant,
+        RoutingBackend, StorageBackend,
+    };
+    use crate::types::FileMetadata;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn meta(sha: &str) -> FileMetadata {
+        FileMetadata::new_passthrough("a.jpg".into(), sha.into(), "m".into(), 4, None)
+    }
+
+    #[test]
+    fn same_stored_generation_truth_table() {
+        let a = meta("aa");
+        assert!(same_stored_generation(&a, &a.clone()));
+        assert!(!same_stored_generation(&a, &meta("bb")), "other content");
+        let mut later = a.clone();
+        later.created_at += chrono::Duration::seconds(1);
+        assert!(!same_stored_generation(&a, &later), "rewritten");
+        let delta = |r: &str, size: u64| {
+            let mut d = FileMetadata::new_delta(
+                "a.jpg".into(),
+                "aa".into(),
+                "m".into(),
+                4,
+                "reference.bin".into(),
+                r.into(),
+                size,
+                None,
+            );
+            d.created_at = a.created_at;
+            d
+        };
+        assert!(same_stored_generation(&delta("r", 9), &delta("r", 9)));
+        assert!(
+            !same_stored_generation(&delta("r", 9), &delta("q", 9)),
+            "other reference"
+        );
+        assert!(
+            !same_stored_generation(&delta("r", 9), &delta("r", 8)),
+            "other delta"
+        );
+        assert!(!same_stored_generation(&a, &delta("r", 9)), "other form");
+    }
+
+    fn at<'a>(bucket: &'a str) -> ObjectAt<'a> {
+        ObjectAt {
+            bucket,
+            prefix: "pics",
+            filename: "a.jpg",
+        }
+    }
+
+    /// Store `a.jpg` in `bucket` through `backend`; returns its metadata as
+    /// a HEAD reads it (with the at-rest markers).
+    async fn put(backend: &impl StorageBackend, bucket: &str) -> FileMetadata {
+        backend.create_bucket(bucket).await.unwrap();
+        backend
+            .put_passthrough(
+                bucket,
+                "pics",
+                "a.jpg",
+                bytes::Bytes::from_static(b"data"),
+                &meta("aa"),
+            )
+            .await
+            .unwrap();
+        backend
+            .get_passthrough_metadata(bucket, "pics", "a.jpg")
+            .await
+            .unwrap()
+    }
+
+    fn keyed(id: &str) -> Arc<arc_swap::ArcSwap<EncryptionConfig>> {
+        Arc::new(arc_swap::ArcSwap::new(Arc::new(EncryptionConfig {
+            key: Some(EncryptionKey::from_hex(&"ab".repeat(32)).unwrap()),
+            key_id: Some(id.into()),
+            ..Default::default()
+        })))
+    }
+
+    /// The encrypting wrapper copies stored bytes only when it would store
+    /// them the same way: under its own key id. A source under another key
+    /// (a key rotation) or in plaintext (encryption turned on later) is
+    /// `Unsupported`: the caller re-encrypts through the proxy.
+    #[tokio::test]
+    async fn the_encrypting_wrapper_copies_only_its_own_ciphertext() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = keyed("kid");
+        let enc = EncryptingBackend::new(
+            FilesystemBackend::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+            cfg.clone(),
+        );
+        let source = put(&enc, "b").await;
+        enc.create_bucket("c").await.unwrap();
+        let copy = |m: FileMetadata| {
+            let enc = &enc;
+            async move {
+                enc.copy_within(
+                    ObjectVariant::Passthrough,
+                    at("b"),
+                    at("c"),
+                    &m,
+                    &meta("aa"),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(copy(source.clone()).await, CopyOutcome::Copied);
+        assert_eq!(
+            enc.get_passthrough("c", "pics", "a.jpg").await.unwrap(),
+            b"data"
+        );
+        cfg.store(keyed("rotated").load_full());
+        assert_eq!(copy(source.clone()).await, CopyOutcome::Unsupported);
+        let plain = FilesystemBackend::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let plain_source = put(&plain, "p").await;
+        cfg.store(keyed("kid").load_full());
+        let outcome = enc
+            .copy_within(
+                ObjectVariant::Passthrough,
+                at("p"),
+                at("c"),
+                &plain_source,
+                &meta("aa"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, CopyOutcome::Unsupported);
+    }
+
+    /// Routing copies server-side only inside one backend instance.
+    #[tokio::test]
+    async fn routing_copies_only_inside_one_backend() {
+        let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let fs = |p: std::path::PathBuf| async move {
+            Arc::new(DynStorageBackend::new_box(
+                FilesystemBackend::new(p).await.unwrap(),
+            ))
+        };
+        let backends = HashMap::from([
+            ("local-disk".to_string(), fs(d1.path().to_path_buf()).await),
+            ("aws-dr".to_string(), fs(d2.path().to_path_buf()).await),
+        ]);
+        let routes = HashMap::from([
+            ("releases".to_string(), ("local-disk".to_string(), None)),
+            ("downloads".to_string(), ("local-disk".to_string(), None)),
+            ("db-archive".to_string(), ("aws-dr".to_string(), None)),
+        ]);
+        let routing = RoutingBackend::new(backends, routes, "local-disk".to_string()).unwrap();
+        let source = put(&routing, "releases").await;
+        for b in ["downloads", "db-archive"] {
+            routing.create_bucket(b).await.unwrap();
+        }
+        let copy = |dst: &'static str| {
+            let (routing, source) = (&routing, &source);
+            async move {
+                routing
+                    .copy_within(
+                        ObjectVariant::Passthrough,
+                        at("releases"),
+                        at(dst),
+                        source,
+                        &meta("aa"),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(copy("downloads").await, CopyOutcome::Copied);
+        assert_eq!(copy("db-archive").await, CopyOutcome::Unsupported);
+    }
+}

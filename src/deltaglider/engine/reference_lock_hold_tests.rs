@@ -530,6 +530,17 @@ impl FencingFs {
 }
 
 impl crate::storage::StorageBackend for FencingFs {
+    async fn copy_within(
+        &self,
+        v: crate::storage::ObjectVariant,
+        s: crate::storage::ObjectAt<'_>,
+        d: crate::storage::ObjectAt<'_>,
+        src: &crate::types::FileMetadata,
+        m: &crate::types::FileMetadata,
+    ) -> Result<crate::storage::CopyOutcome, crate::storage::StorageError> {
+        self.inner.copy_within(v, s, d, src, m).await
+    }
+
     async fn create_bucket(&self, b: &str) -> Result<(), StorageError> {
         self.inner.create_bucket(b).await
     }

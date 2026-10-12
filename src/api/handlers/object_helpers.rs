@@ -13,6 +13,8 @@
 //!   gate, conditional store under the object's write lock, event.
 //! * [`store_client_delta_copy`] — the same for a CopyObject of a delta
 //!   that ships the `.delta` verbatim.
+//! * [`store_client_server_copy`] — the same for a CopyObject that the
+//!   backend copies server-side.
 //! * [`store_client_multipart_admit`] / [`store_client_multipart_commit`]
 //!   — the same quota gate, write lock and event for a multipart completion.
 //! * [`check_quota_for_write`] — pre-write quota gate.
@@ -27,6 +29,7 @@
 use super::AppState;
 use crate::api::errors::S3Error;
 use crate::event_outbox::NewEvent;
+use crate::storage::StorageError;
 use std::sync::Arc;
 
 /// Append a single object event to the outbox. Silently noops when
@@ -134,8 +137,9 @@ pub(crate) async fn store_client_write_spooled(
     Ok(result)
 }
 
-/// A client CopyObject of a delta source (see [`store_client_delta_copy`]).
-pub(crate) struct ClientDeltaCopy<'a> {
+/// A client CopyObject that copies the stored object as it is (see
+/// [`store_client_delta_copy`], [`store_client_server_copy`]).
+pub(crate) struct ClientStoredCopy<'a> {
     pub source: (&'a str, &'a str),
     pub bucket: &'a str,
     pub key: &'a str,
@@ -156,7 +160,7 @@ pub(crate) struct ClientDeltaCopy<'a> {
 /// released.
 pub(crate) async fn store_client_delta_copy(
     state: &Arc<AppState>,
-    copy: ClientDeltaCopy<'_>,
+    copy: ClientStoredCopy<'_>,
 ) -> Result<Option<crate::types::StoreResult>, S3Error> {
     let size = copy.source_head.file_size;
     check_quota_for_write(state, copy.bucket, copy.key, size).await?;
@@ -175,6 +179,61 @@ pub(crate) async fn store_client_delta_copy(
         )
         .await
         .map_err(crate::transfer::CopyError::into_s3_error)?
+    };
+    let Some(result) = result else {
+        return Ok(None);
+    };
+    object_created(state, copy.bucket, copy.key, size, &result).await;
+    Ok(Some(result))
+}
+
+/// [`store_client_write`] of a CopyObject of a passthrough source into a
+/// key that stores it as it is: the same quota gate, write lock,
+/// preconditions and event, but the backend copies the stored file
+/// ([`crate::deltaglider::DynEngine::copy_passthrough_within`]); no byte
+/// passes through the proxy. `Ok(None)`: the backend cannot copy it
+/// (another backend or key, no CopyObject on the provider); the caller
+/// copies through [`store_client_write`], after this lock is released.
+pub(crate) async fn store_client_server_copy(
+    state: &Arc<AppState>,
+    copy: ClientStoredCopy<'_>,
+) -> Result<Option<crate::types::StoreResult>, S3Error> {
+    let size = copy.source_head.file_size;
+    let Some(metadata) = crate::transfer::destination_metadata(
+        copy.source_head,
+        crate::types::ObjectKey::parse(copy.bucket, copy.key)
+            .filename
+            .as_str(),
+        crate::transfer::DestinationFields {
+            content_type: copy.content_type,
+            user_metadata: copy.user_metadata,
+            multipart_etag: None,
+        },
+    ) else {
+        return Ok(None);
+    };
+    check_quota_for_write(state, copy.bucket, copy.key, size).await?;
+    let engine = state.engine.load_full();
+    let result = {
+        let _guard = engine
+            .lock_and_check(copy.bucket, copy.key, copy.precondition)
+            .await?;
+        engine
+            .copy_passthrough_within(
+                copy.source,
+                (copy.bucket, copy.key),
+                copy.source_head,
+                metadata,
+            )
+            .await
+            .map_err(|e| match e {
+                crate::deltaglider::EngineError::Storage(StorageError::PreconditionFailed(_)) => {
+                    S3Error::SlowDown(
+                        "the copy source changed during the copy; retry the request".to_string(),
+                    )
+                }
+                e => e.into(),
+            })?
     };
     let Some(result) = result else {
         return Ok(None);

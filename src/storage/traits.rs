@@ -181,6 +181,58 @@ pub async fn open_reference_source_by_parts<B: StorageBackend + ?Sized>(
     Ok(ReferenceSource::stream(stream, size, metadata))
 }
 
+/// Where one stored object (a delta or a passthrough file) is, for
+/// [`StorageBackend::copy_within`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectAt<'a> {
+    pub bucket: &'a str,
+    pub prefix: &'a str,
+    pub filename: &'a str,
+}
+
+/// What [`StorageBackend::copy_within`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyOutcome {
+    /// The backend copied the object; no byte went through the proxy.
+    Copied,
+    /// The backend cannot copy this object inside itself (another backend
+    /// or encryption key at the destination, a provider without
+    /// CopyObject). Nothing was written: the caller copies the bytes.
+    Unsupported,
+}
+
+/// Pure: does `current` (the source as the backend holds it now) still
+/// hold the generation that `pin` (the caller's read of it) saw? The
+/// logical content must match (`DeltaGliderEngine::same_generation`),
+/// and so must the created-at and, for a delta, the reference and the
+/// delta size: a delta re-encoded against another reference has the same
+/// content but other bytes. Copying such bytes under the pin's metadata
+/// would make the destination unreadable.
+pub fn same_stored_generation(pin: &FileMetadata, current: &FileMetadata) -> bool {
+    use crate::types::StorageInfo;
+    if !crate::deltaglider::DynEngine::same_generation(pin, current)
+        || pin.created_at != current.created_at
+    {
+        return false;
+    }
+    match (&pin.storage_info, &current.storage_info) {
+        (
+            StorageInfo::Delta {
+                ref_sha256: a,
+                delta_size: da,
+                ..
+            },
+            StorageInfo::Delta {
+                ref_sha256: b,
+                delta_size: db,
+                ..
+            },
+        ) => a == b && da == db,
+        (StorageInfo::Passthrough, StorageInfo::Passthrough) => true,
+        _ => false,
+    }
+}
+
 /// One fenced write to `reference.bin` (see
 /// [`StorageBackend::write_reference_fenced`]).
 #[derive(Debug, Clone, Copy)]
@@ -708,6 +760,30 @@ pub trait StorageBackend: Send + Sync {
         fence: &RefFence,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> impl Future<Output = Result<RefFence, StorageError>> + Send;
+
+    /// Copy the stored object `src` (form `variant`) to `dst` inside this
+    /// backend: the bytes never pass through the proxy (S3: CopyObject, or
+    /// UploadPartCopy above 5 GiB; filesystem: a kernel file copy). The
+    /// destination gets `metadata` (the caller's, without at-rest
+    /// encryption markers: a wrapper restates the markers that it owns).
+    ///
+    /// `source` is the caller's read of the source, markers included: the
+    /// generation pin. A source that no longer holds that generation
+    /// ([`same_stored_generation`]) is `PreconditionFailed`, and nothing is
+    /// written. [`CopyOutcome::Unsupported`] writes nothing either. Not
+    /// for `reference.bin`: a reference write needs the lock proof.
+    ///
+    /// No default: a wrapper that forgot it would copy below its own
+    /// transform (an encrypting wrapper with another key, a routing
+    /// wrapper across two backends).
+    fn copy_within(
+        &self,
+        variant: ObjectVariant,
+        src: ObjectAt<'_>,
+        dst: ObjectAt<'_>,
+        source: &FileMetadata,
+        metadata: &FileMetadata,
+    ) -> impl Future<Output = Result<CopyOutcome, StorageError>> + Send;
 
     // === Delta file operations ===
 

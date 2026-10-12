@@ -12,6 +12,13 @@ use crate::deltaglider::{DeltaGliderEngine, DynEngine};
 use crate::storage::{DynStorageBackend, EncryptingBackend, EncryptionConfig, EncryptionKey};
 use md5::Digest;
 
+/// A backend under test: its name, the backend, its fake S3 (if any).
+type Backend = (
+    &'static str,
+    Box<DynStorageBackend<'static>>,
+    Option<Arc<crate::storage::FakeS3>>,
+);
+
 /// A REPLACE directive: the content type and the user metadata.
 type Replace<'a> = Option<(Option<&'a str>, &'a [(&'a str, &'a str)])>;
 
@@ -447,7 +454,7 @@ async fn a_source_that_changes_under_a_fast_copy_answers_slowdown() {
     let precondition = crate::deltaglider::Precondition::none();
     let err = crate::api::handlers::object_helpers::store_client_delta_copy(
         &f.state,
-        crate::api::handlers::object_helpers::ClientDeltaCopy {
+        crate::api::handlers::object_helpers::ClientStoredCopy {
             source: ("b", &f.keys[1]),
             bucket: "b",
             key: "run/copy.zip",
@@ -518,4 +525,211 @@ async fn the_parts_of_a_delta_source_share_one_decode() {
         1,
         "one decode for 3 parts"
     );
+}
+
+/// Store `n` bytes of noise as the passthrough object `b/key`.
+async fn store_passthrough(engine: &DynEngine, key: &str, n: usize, seed: u8) -> Vec<u8> {
+    let body: Vec<u8> = (0..n)
+        .map(|i| (i as u32).wrapping_mul(2_654_435_761).to_le_bytes()[seed as usize % 4] ^ seed)
+        .collect();
+    let stored = engine
+        .store(
+            "b",
+            key,
+            &body,
+            Some("image/jpeg".into()),
+            [("team".to_string(), "qa".to_string())].into(),
+        )
+        .await
+        .unwrap();
+    assert!(!stored.metadata.is_delta(), "fixture: {key} is passthrough");
+    body
+}
+
+/// P5.2: a CopyObject of a passthrough object downloaded the whole object
+/// and uploaded it again. The backend now copies it (one HEAD of the
+/// source for the generation pin, one CopyObject): no byte of the object
+/// passes through the proxy.
+#[tokio::test]
+async fn a_copy_of_a_passthrough_object_moves_no_bytes_through_the_proxy() {
+    let (s3, fake) = crate::storage::fake_s3_backend().await;
+    let f = Fixture::new(
+        DynStorageBackend::new_box(s3),
+        crate::config::Config::default(),
+    )
+    .await;
+    let engine = f.engine();
+    let body = store_passthrough(&engine, "pics/a.jpg", 200 * 1024, 3).await;
+    f.copy(("b", "pics/a.jpg"), ("b", "pics/warm.jpg"), None)
+        .await
+        .unwrap();
+    fake.clear();
+    f.copy(("b", "pics/a.jpg"), ("c1", "pics/a.jpg"), None)
+        .await
+        .unwrap();
+    let r: Vec<String> = fake
+        .requests()
+        .into_iter()
+        .filter(|x| !x.contains("/.dg/") && !x.contains("prefix=.dg"))
+        .collect();
+    assert_eq!(fake.bytes(), (0, 0), "{r:#?}");
+    assert_eq!(
+        r.iter().filter(|x| x.contains("x-id=CopyObject")).count(),
+        1,
+        "{r:#?}"
+    );
+    let (copied, meta) = engine.retrieve("c1", "pics/a.jpg").await.unwrap();
+    assert_eq!(copied, body);
+    assert_eq!(
+        meta.etag(),
+        engine.head("b", "pics/a.jpg").await.unwrap().etag()
+    );
+}
+
+/// The golden rule for the server-side copy: the object it writes is the
+/// object the store path writes (HEAD field by field, created-at aside;
+/// GET bytes and ETag). On the filesystem, S3, and encrypted S3.
+#[tokio::test]
+async fn the_server_side_copy_and_the_store_copy_write_the_same_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let (s3, f1) = crate::storage::fake_s3_backend().await;
+    let (s3_enc, f2) = crate::storage::fake_s3_backend().await;
+    let backends: Vec<Backend> = vec![
+        (
+            "filesystem",
+            DynStorageBackend::new_box(
+                crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            ),
+            None,
+        ),
+        ("s3", DynStorageBackend::new_box(s3), Some(f1)),
+        ("encrypted s3", encrypted(s3_enc), Some(f2)),
+    ];
+    for (name, backend, fake) in backends {
+        let f = Fixture::new(backend, crate::config::Config::default()).await;
+        let engine = f.engine();
+        let body = store_passthrough(&engine, "pics/a.jpg", 100 * 1024, 5).await;
+        if let Some(fake) = &fake {
+            fake.clear();
+        }
+        f.copy(("b", "pics/a.jpg"), ("c1", "pics/a.jpg"), None)
+            .await
+            .unwrap();
+        if let Some(fake) = &fake {
+            assert_eq!(fake.bytes(), (0, 0), "{name}: server-side");
+        }
+        f.copy_through_store(("b", "pics/a.jpg"), ("c2", "pics/a.jpg"))
+            .await;
+        let fast = engine.head("c1", "pics/a.jpg").await.unwrap();
+        let slow = engine.head("c2", "pics/a.jpg").await.unwrap();
+        assert_eq!(head_fields(&fast), head_fields(&slow), "{name}");
+        let (fast_body, fast_meta) = engine.retrieve("c1", "pics/a.jpg").await.unwrap();
+        let (slow_body, slow_meta) = engine.retrieve("c2", "pics/a.jpg").await.unwrap();
+        assert_eq!(fast_body, body, "{name}");
+        assert_eq!(slow_body, body, "{name}");
+        assert_eq!(fast_meta.etag(), slow_meta.etag(), "{name}");
+    }
+}
+
+/// A provider without CopyObject (501 NotImplemented, as some S3-compatible
+/// services answer): the copy moves the bytes through the proxy, and the
+/// backend remembers it, so the next copy does not try again.
+#[tokio::test]
+async fn a_provider_without_copyobject_gets_the_bytes_through_the_proxy() {
+    let (s3, fake) = crate::storage::fake_s3_backend().await;
+    let f = Fixture::new(
+        DynStorageBackend::new_box(s3),
+        crate::config::Config::default(),
+    )
+    .await;
+    let engine = f.engine();
+    let body = store_passthrough(&engine, "pics/a.jpg", 64 * 1024, 7).await;
+    fake.fail("COPY", "", 501, "NotImplemented", u32::MAX);
+    for dest in ["pics/one.jpg", "pics/two.jpg"] {
+        fake.clear();
+        f.copy(("b", "pics/a.jpg"), ("c1", dest), None)
+            .await
+            .unwrap();
+        assert_eq!(engine.retrieve("c1", dest).await.unwrap().0, body, "{dest}");
+        let copies = fake
+            .requests()
+            .iter()
+            .filter(|x| x.contains("x-id=CopyObject"))
+            .count();
+        assert_eq!(copies, usize::from(dest == "pics/one.jpg"), "{dest}");
+    }
+}
+
+/// A metadata-only REPLACE self-copy of a passthrough object: the backend
+/// copies the object onto itself with the new metadata; no byte passes
+/// through the proxy.
+#[tokio::test]
+async fn a_replace_self_copy_of_a_passthrough_object_moves_no_bytes() {
+    let (s3, fake) = crate::storage::fake_s3_backend().await;
+    let f = Fixture::new(
+        DynStorageBackend::new_box(s3),
+        crate::config::Config::default(),
+    )
+    .await;
+    let engine = f.engine();
+    let body = store_passthrough(&engine, "pics/a.jpg", 64 * 1024, 9).await;
+    fake.clear();
+    f.copy(
+        ("b", "pics/a.jpg"),
+        ("b", "pics/a.jpg"),
+        Some((Some("image/png"), &[("owner", "dana")])),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fake.bytes(), (0, 0));
+    let (data, meta) = engine.retrieve("b", "pics/a.jpg").await.unwrap();
+    assert_eq!(data, body);
+    assert_eq!(meta.content_type.as_deref(), Some("image/png"));
+    assert_eq!(
+        meta.user_metadata.get("owner").map(String::as_str),
+        Some("dana")
+    );
+    assert!(!meta.user_metadata.contains_key("team"));
+}
+
+/// A passthrough source overwritten after the HEAD that the conditionals
+/// judged: the server-side copy refuses it with 503 SlowDown.
+#[tokio::test]
+async fn a_source_that_changes_under_a_server_side_copy_answers_slowdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let (s3, _fake) = crate::storage::fake_s3_backend().await;
+    let backends: Vec<Box<DynStorageBackend<'static>>> = vec![
+        DynStorageBackend::new_box(s3),
+        DynStorageBackend::new_box(
+            crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        ),
+    ];
+    for backend in backends {
+        let f = Fixture::new(backend, crate::config::Config::default()).await;
+        let engine = f.engine();
+        store_passthrough(&engine, "pics/a.jpg", 64 * 1024, 1).await;
+        let stale = engine.head("b", "pics/a.jpg").await.unwrap();
+        store_passthrough(&engine, "pics/a.jpg", 64 * 1024, 2).await;
+        let precondition = crate::deltaglider::Precondition::none();
+        let err = crate::api::handlers::object_helpers::store_client_server_copy(
+            &f.state,
+            crate::api::handlers::object_helpers::ClientStoredCopy {
+                source: ("b", "pics/a.jpg"),
+                bucket: "c1",
+                key: "pics/a.jpg",
+                source_head: &stale,
+                content_type: None,
+                user_metadata: Default::default(),
+                precondition: &precondition,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, crate::api::S3Error::SlowDown(_)), "{err:?}");
+        assert!(engine.head("c1", "pics/a.jpg").await.is_err());
+    }
 }

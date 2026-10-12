@@ -35,6 +35,7 @@ mod metadata;
 mod raw;
 mod resources;
 mod retrieve;
+mod server_copy;
 pub(crate) mod store;
 mod usage;
 

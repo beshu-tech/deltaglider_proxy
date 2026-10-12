@@ -1196,6 +1196,34 @@ impl StorageBackend for RoutingBackend {
         route_existing!(self, bucket, put_delta, prefix, filename, data, metadata, proof)
     }
 
+    /// Inside one backend instance only: two buckets on two backends
+    /// (or two definitions of one provider) cannot copy server-side.
+    async fn copy_within(
+        &self,
+        variant: super::traits::ObjectVariant,
+        src: super::traits::ObjectAt<'_>,
+        dst: super::traits::ObjectAt<'_>,
+        source: &FileMetadata,
+        metadata: &FileMetadata,
+    ) -> Result<super::traits::CopyOutcome, StorageError> {
+        let (src_name, _, src_real) = self.resolve_existing_named(src.bucket).await;
+        let (dst_name, backend, dst_real) = self.resolve_existing_named(dst.bucket).await;
+        if src_name != dst_name {
+            return Ok(super::traits::CopyOutcome::Unsupported);
+        }
+        let src = super::traits::ObjectAt {
+            bucket: &src_real,
+            ..src
+        };
+        let dst = super::traits::ObjectAt {
+            bucket: &dst_real,
+            ..dst
+        };
+        backend
+            .copy_within(variant, src, dst, source, metadata)
+            .await
+    }
+
     async fn get_delta_metadata(
         &self,
         bucket: &str,
@@ -1760,6 +1788,18 @@ mod tests {
     }
 
     impl StorageBackend for TestBackend {
+        async fn copy_within(
+            &self,
+            v: crate::storage::ObjectVariant,
+            s: crate::storage::ObjectAt<'_>,
+            d: crate::storage::ObjectAt<'_>,
+            src: &crate::types::FileMetadata,
+            m: &crate::types::FileMetadata,
+        ) -> Result<crate::storage::CopyOutcome, crate::storage::StorageError> {
+            let _ = (v, s, d, src, m);
+            Ok(crate::storage::CopyOutcome::Unsupported)
+        }
+
         async fn reference_fence(
             &self,
             b: &str,

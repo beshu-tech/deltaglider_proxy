@@ -78,32 +78,40 @@ pub(super) async fn copy_object(
     if source_meta.file_size > copy_size_limit(&engine, &input.bucket, &input.key, &dest_metadata) {
         return Err(s3s::s3_error!(EntityTooLarge));
     }
-    // A delta source into a key that stores deltas: the `.delta` ships
-    // verbatim (no reconstruction, no re-encode) when the destination
-    // folder can take it; otherwise the copy goes through the store.
+    // The stored object moves as it is when the destination stores it in
+    // the same form: a delta into a key that stores deltas (the `.delta`
+    // ships, no reconstruction, no re-encode), a passthrough object into a
+    // key that does not (the backend copies it server-side). Otherwise, or
+    // when that is not possible, the copy goes through the store.
     let precondition = crate::deltaglider::Precondition::none();
-    let fast = if source_meta.is_delta()
-        && engine.write_tries_delta(&input.bucket, &input.key, &dest_metadata)
-    {
+    let tries_delta = engine.write_tries_delta(&input.bucket, &input.key, &dest_metadata);
+    let as_stored = source_meta.is_delta() == tries_delta
+        && (source_meta.is_delta()
+            || matches!(
+                source_meta.storage_info,
+                crate::types::StorageInfo::Passthrough
+            ));
+    let fast = if as_stored {
         let (content_type, user_metadata) = copy_destination_fields(
             directive,
             input.content_type.clone(),
             input.metadata.clone(),
             &source_meta,
         )?;
-        crate::api::handlers::object_helpers::store_client_delta_copy(
-            &svc.state,
-            crate::api::handlers::object_helpers::ClientDeltaCopy {
-                source: (&source_bucket, &source_key),
-                bucket: &input.bucket,
-                key: &input.key,
-                source_head: &source_meta,
-                content_type,
-                user_metadata,
-                precondition: &precondition,
-            },
-        )
-        .await?
+        let copy = crate::api::handlers::object_helpers::ClientStoredCopy {
+            source: (&source_bucket, &source_key),
+            bucket: &input.bucket,
+            key: &input.key,
+            source_head: &source_meta,
+            content_type,
+            user_metadata,
+            precondition: &precondition,
+        };
+        if tries_delta {
+            crate::api::handlers::object_helpers::store_client_delta_copy(&svc.state, copy).await?
+        } else {
+            crate::api::handlers::object_helpers::store_client_server_copy(&svc.state, copy).await?
+        }
     } else {
         None
     };

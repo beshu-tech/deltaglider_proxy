@@ -332,6 +332,66 @@ pub(super) async fn atomic_copy_with_metadata(
     .map_err(crate::storage::join_error)?
 }
 
+/// What a server-side copy of a stored file found at its source.
+pub(super) enum FileCopy {
+    Copied,
+    /// The source has no DG metadata xattr (an unmanaged file): nothing to
+    /// pin the copy on, so the caller copies through the proxy.
+    NoMetadata,
+}
+
+/// Copy the stored file `source_path` to `target_path` inside the
+/// filesystem (`copy_file_range`, which the kernel can turn into a
+/// reflink; a read/write loop across filesystems), with `metadata` as the
+/// target's xattr, through a temp file and an atomic rename. The source's
+/// xattr is read from the OPEN file, so it describes the copied bytes:
+/// another generation than `pin` is `PreconditionFailed`.
+pub(super) async fn atomic_server_copy(
+    dir: WriteDir,
+    source_path: &Path,
+    target_path: &Path,
+    pin: &FileMetadata,
+    metadata: &FileMetadata,
+    durability: Durability,
+) -> Result<FileCopy, StorageError> {
+    let source = source_path.to_path_buf();
+    let target = target_path.to_path_buf();
+    let meta_json = serde_json::to_vec(metadata)?;
+    let pin = pin.clone();
+    let (_gate, ticket) = commit_gate();
+    tokio::task::spawn_blocking(move || {
+        use xattr::FileExt;
+        // fsio-exempt: a write source, not a probe of the store.
+        let mut src = match std::fs::File::open(&source) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StorageError::NotFound(source.display().to_string()))
+            }
+            Err(e) => return Err(io_to_storage_error(e)),
+        };
+        let Some(raw) = src
+            .get_xattr(crate::storage::xattr_meta::XATTR_NAME)
+            .map_err(io_to_storage_error)?
+        else {
+            return Ok(FileCopy::NoMetadata);
+        };
+        let current: FileMetadata = serde_json::from_slice(&raw)?;
+        if !crate::storage::same_stored_generation(&pin, &current) {
+            return Err(StorageError::PreconditionFailed(format!(
+                "{} changed before the copy",
+                source.display()
+            )));
+        }
+        let mut tmp = dir.temp()?;
+        std::io::copy(&mut src, tmp.as_file_mut()).map_err(io_to_storage_error)?;
+        xattr_meta::set_metadata_xattr(tmp.path(), &meta_json)?;
+        durable_rename(tmp, &target, durability, ticket)?;
+        Ok(FileCopy::Copied)
+    })
+    .await
+    .map_err(crate::storage::join_error)?
+}
+
 #[cfg(test)]
 mod commit_gate_tests {
     use super::*;

@@ -1340,7 +1340,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// passthrough sink shares this — a new one that forgets the check would
     /// let an object past the wrong limit. (The delta path uses its own
     /// strategy-aware ceiling in `store_spooled_delta`; don't route it here.)
-    fn ensure_within_passthrough_ceiling(&self, total_size: u64) -> Result<(), EngineError> {
+    pub(super) fn ensure_within_passthrough_ceiling(
+        &self,
+        total_size: u64,
+    ) -> Result<(), EngineError> {
         if total_size > self.max_passthrough_object_size {
             return Err(EngineError::TooLarge {
                 size: total_size,

@@ -3,8 +3,8 @@
 //! An in-process S3 for unit tests that count requests: it keeps objects
 //! with their `x-amz-meta-*` headers in memory and records every request as
 //! `"METHOD /bucket/key"` (a bucket-level LIST as `"GET /bucket?..."`).
-//! It answers PUT, GET (with `Range: bytes=a-b` / `bytes=a-`), HEAD, DELETE
-//! and ListObjectsV2 (`prefix`,
+//! It answers PUT, CopyObject, GET (with `Range: bytes=a-b` / `bytes=a-`),
+//! HEAD, DELETE and ListObjectsV2 (`prefix`,
 //! `delimiter`, `start-after`, `max-keys` (up to 1000) and
 //! `continuation-token`, paged like S3) and ListBuckets. Other
 //! bucket-level requests get an empty listing. Tests can delay each
@@ -354,7 +354,10 @@ fn object_acl(f: &FakeS3, method: &Method) -> (StatusCode, HeaderMap, Vec<u8>) {
 /// CopyObject (`PUT` with `x-amz-copy-source`): the source's body under
 /// `path`, with the source's metadata (`COPY`) or the request's
 /// (`x-amz-metadata-directive: REPLACE`). `x-amz-copy-source-if-match`
-/// answers 412 when the source's ETag differs.
+/// answers 412 when the source's ETag differs; the destination's
+/// `If-None-Match` / `If-Match` are checked before, as for a PUT. The body
+/// never leaves the fake, so [`FakeS3::bytes`] does not count it. Fault
+/// rules name the operation `COPY`.
 fn copy_object(
     f: &FakeS3,
     path: &str,
@@ -500,7 +503,10 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                     async move {
                         f.record(&method, &uri);
                         let path = format!("{b}/{k}");
-                        if let Some((status, body)) = f.enter(method.as_str(), &path).await {
+                        let is_copy =
+                            method == Method::PUT && headers.contains_key("x-amz-copy-source");
+                        let op = if is_copy { "COPY" } else { method.as_str() };
+                        if let Some((status, body)) = f.enter(op, &path).await {
                             return (status, HeaderMap::new(), body);
                         }
                         let query = uri.query().unwrap_or("");
@@ -509,9 +515,6 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                             .any(|q| q == "acl" || q.starts_with("acl="))
                         {
                             return object_acl(&f, &method);
-                        }
-                        if let Some(source) = headers.get("x-amz-copy-source") {
-                            return copy_object(&f, &path, source, &headers);
                         }
                         let current = f.objects.lock().get(&path).cloned();
                         // Conditional writes (`If-None-Match: *`, `If-Match`)
@@ -533,6 +536,13 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                                 HeaderMap::new(),
                                 b"<Error><Code>PreconditionFailed</Code></Error>".to_vec(),
                             );
+                        }
+                        if let Some(source) = headers.get("x-amz-copy-source") {
+                            if query.contains("uploadId") {
+                                // UploadPartCopy is not modelled.
+                                return (StatusCode::NOT_IMPLEMENTED, HeaderMap::new(), Vec::new());
+                            }
+                            return copy_object(&f, &path, source, &headers);
                         }
                         match method {
                             Method::PUT => {

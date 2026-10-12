@@ -22,6 +22,7 @@
 
 mod body;
 mod client;
+mod copy;
 mod errors;
 mod facts;
 mod heal;
@@ -52,8 +53,9 @@ pub use timing::{BACKEND_REQUEST_ATTEMPTS, BACKEND_REQUEST_DURATION};
 use super::list_size_cache::{self, ListedSize, LogicalFacts, StoredObjectId};
 use super::listing_facts;
 use super::traits::{
-    reference_fence_lost, BulkListing, DelegatedListResult, LiteScanResult, MultipartUpload,
-    RefFence, RefWrite, StorageBackend, StorageError, StoredObject, UploadedPart,
+    reference_fence_lost, same_stored_generation, BulkListing, CopyOutcome, DelegatedListResult,
+    LiteScanResult, MultipartUpload, ObjectAt, ObjectVariant, RefFence, RefWrite, StorageBackend,
+    StorageError, StoredObject, UploadedPart,
 };
 use crate::config::BackendConfig;
 use crate::types::{FileMetadata, StorageInfo};
@@ -219,6 +221,11 @@ pub struct S3Backend {
     healer: heal::FactsHealer,
     /// Buckets whose backend refused object ACLs (self-copies skip the read).
     acl_support: std::sync::Arc<objects::AclSupport>,
+    /// The provider refused a server-side copy (501 NotImplemented): every
+    /// later copy on this backend moves the bytes through the proxy and
+    /// skips the attempt. One backend instance is one backend definition,
+    /// so a redefined backend tries again.
+    copy_unsupported: std::sync::atomic::AtomicBool,
 }
 
 impl S3Backend {
@@ -262,6 +269,7 @@ impl S3Backend {
         Ok(Self {
             healer: heal::FactsHealer::new(client.clone()),
             acl_support: Default::default(),
+            copy_unsupported: Default::default(),
             client,
             bulk_client,
             health_key: None,
@@ -765,6 +773,18 @@ impl StorageBackend for S3Backend {
             data.len()
         );
         Ok(())
+    }
+
+    async fn copy_within(
+        &self,
+        variant: ObjectVariant,
+        src: ObjectAt<'_>,
+        dst: ObjectAt<'_>,
+        source: &FileMetadata,
+        metadata: &FileMetadata,
+    ) -> Result<CopyOutcome, StorageError> {
+        self.copy_object_within(variant, src, dst, source, metadata)
+            .await
     }
 
     #[instrument(skip(self))]

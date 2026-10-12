@@ -3,8 +3,8 @@
 //! Filesystem-based storage backend with xattr-based metadata
 
 use super::traits::{
-    BulkListing, DelegatedListResult, RefFence, RefWrite, StorageBackend, StorageError,
-    StoredObject,
+    BulkListing, CopyOutcome, DelegatedListResult, ObjectAt, ObjectVariant, RefFence, RefWrite,
+    StorageBackend, StorageError, StoredObject,
 };
 use super::xattr_meta;
 use crate::types::FileMetadata;
@@ -1322,6 +1322,39 @@ impl StorageBackend for FilesystemBackend {
             "reference.bin",
         )
         .await
+    }
+
+    async fn copy_within(
+        &self,
+        variant: ObjectVariant,
+        src: ObjectAt<'_>,
+        dst: ObjectAt<'_>,
+        source: &FileMetadata,
+        metadata: &FileMetadata,
+    ) -> Result<CopyOutcome, StorageError> {
+        self.require_bucket_exists(dst.bucket).await?;
+        let path_of = |at: ObjectAt<'_>| match variant {
+            ObjectVariant::Delta => self.delta_path(at.bucket, at.prefix, at.filename),
+            ObjectVariant::Passthrough => self.passthrough_path(at.bucket, at.prefix, at.filename),
+        };
+        let (src_path, dst_path) = (path_of(src)?, path_of(dst)?);
+        let dir = self.ensure_dir(dst.bucket, &dst_path).await?;
+        let copied = atomic_server_copy(
+            dir,
+            &src_path,
+            &dst_path,
+            source,
+            metadata,
+            Durability::for_object(),
+        )
+        .await?;
+        Ok(match copied {
+            FileCopy::Copied => {
+                debug!("Copied {src_path:?} -> {dst_path:?} inside the filesystem");
+                CopyOutcome::Copied
+            }
+            FileCopy::NoMetadata => CopyOutcome::Unsupported,
+        })
     }
 
     // === Delta operations ===
