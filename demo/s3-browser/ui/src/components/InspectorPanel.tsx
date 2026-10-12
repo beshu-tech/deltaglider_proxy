@@ -44,7 +44,6 @@ interface Props {
   onDeleted: () => void;
   onPreview?: (obj: S3Object) => void;
   isMobile?: boolean;
-  headCache?: Record<string, { storageType?: string; storedSize?: number; error?: boolean }>;
   canDelete?: boolean;
   canRead?: boolean;
   /** When false, skip loading full bucket policy from Settings; public-prefix hint stays hidden. */
@@ -228,7 +227,6 @@ export default function InspectorPanel({
   onDeleted,
   onPreview,
   isMobile,
-  headCache,
   canDelete = true,
   canRead = true,
   hasAdminSession = true,
@@ -255,7 +253,11 @@ export default function InspectorPanel({
   const [showInternalMeta, setShowInternalMeta] = useState(false);
   const { copy: copyToClipboard } = useCopyToClipboard();
   const objectKey = object?.key;
-  const cachedHead = objectKey ? headCache?.[objectKey] : undefined;
+  // The storage facts the listing gave the row (P8.2). Read through a ref:
+  // the HEAD effect seeds from them but must not re-run when a refresh
+  // hands over a new row object for the same key.
+  const listedFacts = useRef<{ storageType?: string; storedSize?: number }>({});
+  listedFacts.current = { storageType: object?.storageType, storedSize: object?.storedSize };
 
   // Request-identity guard for the async button handlers (download / share /
   // delete). Same root cause and fix as the headObject + bucketPolicy effect
@@ -305,12 +307,10 @@ export default function InspectorPanel({
     // metadata for the wrong file. Capture a flag, only commit when alive.
     let cancelled = false;
     setHeadReadable(false);
-    // Seed from table's headCache so Storage Stats renders instantly
-    if (cachedHead) {
-      setHeadData({ headers: {}, storageType: cachedHead.storageType, storedSize: cachedHead.storedSize });
-    } else {
-      setHeadData(null);
-    }
+    // Seed from the listing's facts so Storage Stats renders at once; one
+    // HEAD per opened object fills in the full header view.
+    const seed = listedFacts.current;
+    setHeadData(seed.storageType ? { headers: {}, ...seed } : null);
     setHeadLoading(true);
     headObject(objectKey)
       .then((data) => {
@@ -327,7 +327,7 @@ export default function InspectorPanel({
       })
       .finally(() => { if (!cancelled) setHeadLoading(false); });
     return () => { cancelled = true; };
-  }, [cachedHead, objectKey]);
+  }, [objectKey]);
 
   const closeModal = useCallback(() => {
     setModalState(null);
@@ -603,7 +603,7 @@ export default function InspectorPanel({
               <InspectorSection title="Storage Stats">
                 {headLoading && Object.keys(headers).length === 0 && storedSize == null ? (
                   /* Spin only while the HEAD is in flight AND we have nothing
-                   * renderable yet. If the table's headCache already seeded a
+                   * renderable yet. If the listing's facts already seeded a
                    * storedSize/storageType, render immediately instead of
                    * spinning behind an in-flight HEAD that may be slow. */
                   <div style={{

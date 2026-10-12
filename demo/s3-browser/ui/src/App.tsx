@@ -797,7 +797,6 @@ export default function App() {
         onDeleted={s3.mutate}
         onPreview={openPreview}
         isMobile={isMobile}
-        headCache={s3.headCache}
         canDelete={canDeleteSelectedObject}
         canRead={canReadSelectedObject}
         hasAdminSession={sessionCaps.canFetchFullAdminConfig}
