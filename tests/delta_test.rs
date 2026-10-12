@@ -1288,3 +1288,60 @@ async fn test_range_request_on_delta_file() {
         "suffix range bytes must match last 50 bytes of full GET"
     );
 }
+
+/// A CopyObject of a delta ships the stored delta as it is (into the
+/// source's folder, and into a new folder that gets the source's
+/// reference). The copy reads back with the same bytes and ETag as the
+/// source, and stays a delta.
+async fn copy_of_a_delta_reads_back_identical(server: &TestServer) {
+    let http = server.http();
+    let prefix = format!("copyfast-{}", std::process::id());
+    let base = generate_binary(100_000, 7);
+    let variant = mutate_binary(&base, 0.01);
+    for (name, body) in [("base.zip", base), ("v1.zip", variant.clone())] {
+        put_object(
+            &http,
+            &server.endpoint(),
+            server.bucket(),
+            &format!("{prefix}/rel/{name}"),
+            body,
+            "application/zip",
+        )
+        .await;
+    }
+    let source = format!("{prefix}/rel/v1.zip");
+    let src_head = head_headers(&http, &server.endpoint(), server.bucket(), &source).await;
+    assert_eq!(src_head["x-amz-storage-type"], "delta");
+    let client = server.s3_client().await;
+    for dest in [
+        format!("{prefix}/rel/v1-copy.zip"),
+        format!("{prefix}/other/v1.zip"),
+    ] {
+        let out = client
+            .copy_object()
+            .bucket(server.bucket())
+            .key(&dest)
+            .copy_source(format!("{}/{source}", server.bucket()))
+            .send()
+            .await
+            .expect("CopyObject");
+        let etag = out.copy_object_result().and_then(|r| r.e_tag()).unwrap();
+        assert_eq!(etag, src_head["etag"], "{dest}");
+        let head = head_headers(&http, &server.endpoint(), server.bucket(), &dest).await;
+        assert_eq!(head["etag"], src_head["etag"], "{dest}");
+        assert_eq!(head["x-amz-storage-type"], "delta", "{dest}");
+        let body = get_bytes(&http, &server.endpoint(), server.bucket(), &dest).await;
+        assert_eq!(body, variant, "{dest}");
+    }
+}
+
+#[tokio::test]
+async fn test_copy_of_a_delta_reads_back_identical_filesystem() {
+    copy_of_a_delta_reads_back_identical(&TestServer::filesystem().await).await;
+}
+
+#[tokio::test]
+async fn test_copy_of_a_delta_reads_back_identical_s3() {
+    skip_unless_minio!();
+    copy_of_a_delta_reads_back_identical(&TestServer::s3().await).await;
+}

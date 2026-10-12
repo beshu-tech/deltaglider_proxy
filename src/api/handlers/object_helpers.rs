@@ -11,6 +11,8 @@
 //!
 //! * [`store_client_write`] — THE client write of a whole body: quota
 //!   gate, conditional store under the object's write lock, event.
+//! * [`store_client_delta_copy`] — the same for a CopyObject of a delta
+//!   that ships the `.delta` verbatim.
 //! * [`store_client_multipart_admit`] / [`store_client_multipart_commit`]
 //!   — the same quota gate, write lock and event for a multipart completion.
 //! * [`check_quota_for_write`] — pre-write quota gate.
@@ -130,6 +132,55 @@ pub(crate) async fn store_client_write_spooled(
     };
     object_created(state, write.bucket, write.key, write.size, &result).await;
     Ok(result)
+}
+
+/// A client CopyObject of a delta source (see [`store_client_delta_copy`]).
+pub(crate) struct ClientDeltaCopy<'a> {
+    pub source: (&'a str, &'a str),
+    pub bucket: &'a str,
+    pub key: &'a str,
+    /// The source HEAD that the copy-source conditionals judged.
+    pub source_head: &'a crate::types::FileMetadata,
+    pub content_type: Option<String>,
+    pub user_metadata: std::collections::HashMap<String, String>,
+    pub precondition: &'a crate::deltaglider::Precondition,
+}
+
+/// [`store_client_write`] of a CopyObject whose source is a delta: the
+/// same quota gate (on the logical size), write lock, preconditions and
+/// event, but the `.delta` ships verbatim
+/// ([`crate::transfer::client_delta_copy`]): no reconstruction and no
+/// re-encode. `Ok(None)`: the fast path does not apply (another
+/// reference at the destination, an incompatible encryption key); the
+/// caller copies through [`store_client_write`], after this lock is
+/// released.
+pub(crate) async fn store_client_delta_copy(
+    state: &Arc<AppState>,
+    copy: ClientDeltaCopy<'_>,
+) -> Result<Option<crate::types::StoreResult>, S3Error> {
+    let size = copy.source_head.file_size;
+    check_quota_for_write(state, copy.bucket, copy.key, size).await?;
+    let engine = state.engine.load_full();
+    let result = {
+        let _guard = engine
+            .lock_and_check(copy.bucket, copy.key, copy.precondition)
+            .await?;
+        crate::transfer::client_delta_copy(
+            &engine,
+            copy.source,
+            (copy.bucket, copy.key),
+            copy.source_head,
+            copy.content_type,
+            copy.user_metadata,
+        )
+        .await
+        .map_err(crate::transfer::CopyError::into_s3_error)?
+    };
+    let Some(result) = result else {
+        return Ok(None);
+    };
+    object_created(state, copy.bucket, copy.key, size, &result).await;
+    Ok(Some(result))
 }
 
 /// The `ObjectCreated` event of a client write.

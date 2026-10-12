@@ -36,7 +36,7 @@ pub enum CounterPrior {
 
 impl CounterPrior {
     /// The replaced object, for [`StoreResult::replaced`].
-    pub(super) fn replaced(&self) -> Option<FileMetadata> {
+    pub fn replaced(&self) -> Option<FileMetadata> {
         match self {
             CounterPrior::Present { object, .. } => Some(FileMetadata::clone(object)),
             _ => None,

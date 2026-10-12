@@ -293,8 +293,11 @@ async fn copy_object_once(
         source_head.storage_info,
         crate::types::StorageInfo::Delta { .. }
     ) {
-        if let Some(outcome) = delta_passthrough_copy(engine, request, source_head, prior).await? {
-            return Ok(outcome);
+        let fields = DestinationFields::of_transfer(&request, source_head);
+        if let Some(shipped) =
+            delta_passthrough_copy(engine, request, source_head, prior, fields).await?
+        {
+            return Ok(shipped.outcome);
         }
     }
 
@@ -971,6 +974,16 @@ pub(crate) struct CopyError {
     /// retries a request, never a body it already began to read, so the
     /// part fetch resumes it ([`fetch_part_with_resume`]).
     body_broke: bool,
+    /// The engine or storage error behind it, for a client answer
+    /// ([`CopyError::into_s3_error`]).
+    cause: Option<Box<CopyCause>>,
+}
+
+/// The error a [`CopyError`] came from.
+#[derive(Debug)]
+enum CopyCause {
+    Engine(crate::deltaglider::EngineError),
+    Storage(crate::storage::StorageError),
 }
 
 impl std::fmt::Display for CopyError {
@@ -987,6 +1000,24 @@ impl CopyError {
             class,
             message: message.into(),
             body_broke: false,
+            cause: None,
+        }
+    }
+
+    /// The S3 answer of a failed client copy: the answer of the error
+    /// behind it, as the store path gives it; a source that changed under
+    /// the copy is 503 SlowDown (the client retries, and the retry judges
+    /// the new object).
+    pub(crate) fn into_s3_error(self) -> crate::api::S3Error {
+        if self.class == CopyClass::SourceChanged {
+            return crate::api::S3Error::SlowDown(
+                "the copy source changed during the copy; retry the request".to_string(),
+            );
+        }
+        match self.cause.map(|c| *c) {
+            Some(CopyCause::Engine(e)) => e.into(),
+            Some(CopyCause::Storage(e)) => e.into(),
+            None => crate::api::S3Error::InternalError(self.message),
         }
     }
 
@@ -1001,12 +1032,37 @@ impl CopyError {
 
     /// `"{context}: {e}"`, classed by the engine error.
     pub(crate) fn engine(context: &str, e: crate::deltaglider::EngineError) -> Self {
-        Self::new(CopyClass::of_engine(&e), format!("{context}: {e}"))
+        Self {
+            cause: Some(Box::new(CopyCause::Engine(e))),
+            ..Self::new(CopyClass::Permanent, String::new())
+        }
+        .described(context)
     }
 
     /// `"{context}: {e}"`, classed by the storage error.
     pub(crate) fn storage(context: &str, e: crate::storage::StorageError) -> Self {
-        Self::new(CopyClass::of_storage(&e), format!("{context}: {e}"))
+        Self {
+            cause: Some(Box::new(CopyCause::Storage(e))),
+            ..Self::new(CopyClass::Permanent, String::new())
+        }
+        .described(context)
+    }
+
+    /// Class and message from the cause: `"{context}: {cause}"`, or the
+    /// cause alone for an empty context.
+    fn described(mut self, context: &str) -> Self {
+        let (class, text) = match self.cause.as_deref() {
+            Some(CopyCause::Engine(e)) => (CopyClass::of_engine(e), e.to_string()),
+            Some(CopyCause::Storage(e)) => (CopyClass::of_storage(e), e.to_string()),
+            None => (self.class, self.message.clone()),
+        };
+        self.class = class;
+        self.message = if context.is_empty() {
+            text
+        } else {
+            format!("{context}: {text}")
+        };
+        self
     }
 
     /// The source is not the generation the copy's HEAD saw.
@@ -1028,13 +1084,13 @@ impl CopyError {
 
 impl From<crate::deltaglider::EngineError> for CopyError {
     fn from(e: crate::deltaglider::EngineError) -> Self {
-        Self::new(CopyClass::of_engine(&e), e.to_string())
+        Self::engine("", e)
     }
 }
 
 impl From<crate::storage::StorageError> for CopyError {
     fn from(e: crate::storage::StorageError) -> Self {
-        Self::new(CopyClass::of_storage(&e), e.to_string())
+        Self::storage("", e)
     }
 }
 
@@ -1217,6 +1273,135 @@ fn same_delta_generation(
         && *fresh_size as usize == blob_len
 }
 
+/// The client-visible fields of a copy's destination that the copy may
+/// change; [`shipped_delta_metadata`] derives every other field from the
+/// source.
+#[derive(Debug, Clone)]
+pub(crate) struct DestinationFields {
+    pub content_type: Option<String>,
+    pub user_metadata: std::collections::HashMap<String, String>,
+    /// The multipart ETag the destination keeps (`None`: its ETag is the
+    /// MD5 of the content).
+    pub multipart_etag: Option<String>,
+}
+
+impl DestinationFields {
+    /// A background copy (replication, lifecycle, migrate, re-encrypt,
+    /// admin bulk copy): the source's fields, the rule's provenance stamp
+    /// added, the request's strip list removed.
+    fn of_transfer(
+        request: &ObjectTransferRequest<'_>,
+        source: &crate::types::FileMetadata,
+    ) -> Self {
+        let mut user_metadata = source.user_metadata.clone();
+        if let Some(provenance) = request.provenance {
+            user_metadata.insert(
+                provenance.metadata_key.to_string(),
+                provenance.metadata_value.to_string(),
+            );
+        }
+        for key in request.strip_user_metadata_keys {
+            user_metadata.remove(*key);
+        }
+        Self {
+            content_type: source.content_type.clone(),
+            user_metadata,
+            multipart_etag: source.multipart_etag.clone(),
+        }
+    }
+}
+
+/// THE metadata of a delta that a copy ships verbatim to `dest_filename`:
+/// the logical facts of the source (SHA-256, size, MD5, reference), the
+/// destination's own name, the caller's `fields`, a created-at as a new
+/// store gives it (now, or the time [`crate::types::with_created_at`] pins),
+/// and no source encryption marker (the destination write stamps its own
+/// when it encrypts). The result equals what a store of the same content
+/// under the same name writes.
+pub(crate) fn shipped_delta_metadata(
+    source: &crate::types::FileMetadata,
+    dest_filename: &str,
+    fields: DestinationFields,
+) -> Option<crate::types::FileMetadata> {
+    let crate::types::StorageInfo::Delta {
+        ref_path,
+        ref_sha256,
+        delta_size,
+        ..
+    } = &source.storage_info
+    else {
+        return None;
+    };
+    let mut meta = crate::types::FileMetadata::new_delta(
+        dest_filename.to_string(),
+        source.file_sha256.clone(),
+        source.md5.clone(),
+        source.file_size,
+        ref_path.clone(),
+        ref_sha256.clone(),
+        *delta_size,
+        fields.content_type,
+    );
+    meta.user_metadata = fields.user_metadata;
+    meta.multipart_etag = fields.multipart_etag;
+    strip_encryption_markers(&mut meta.user_metadata);
+    Some(meta)
+}
+
+/// A delta the fast path shipped.
+pub(crate) struct ShippedDelta {
+    pub outcome: ObjectTransferOutcome,
+    /// The metadata the destination got.
+    pub metadata: crate::types::FileMetadata,
+    /// The object the copy replaced (overwrite accounting).
+    pub replaced: Option<crate::types::FileMetadata>,
+    /// Bytes of a reference.bin the copy seeded at the destination.
+    pub seeded_reference_bytes: u64,
+}
+
+/// A client CopyObject of a delta source through the delta fast path: the
+/// `.delta` blob ships verbatim (no xdelta3, no reference download when the
+/// destination folder holds the same reference). `fields` are the
+/// destination's content type and user metadata as the metadata directive
+/// chose them; the copy gets a new created-at and no multipart ETag (S3
+/// CopyObject answers a single-part ETag). `Ok(None)`: the gate fell back,
+/// the caller copies through the store. The caller holds the object's
+/// write lock and ran the quota gate.
+pub(crate) async fn client_delta_copy(
+    engine: &Arc<DynEngine>,
+    source: (&str, &str),
+    destination: (&str, &str),
+    source_head: &crate::types::FileMetadata,
+    content_type: Option<String>,
+    mut user_metadata: std::collections::HashMap<String, String>,
+) -> Result<Option<crate::types::StoreResult>, CopyError> {
+    strip_rule_provenance(&mut user_metadata);
+    let request = ObjectTransferRequest {
+        source_bucket: source.0,
+        source_key: source.1,
+        destination_bucket: destination.0,
+        destination_key: destination.1,
+        provenance: None,
+        strip_user_metadata_keys: &[],
+        operation: "client copy",
+        upload_concurrency: None,
+        keep_created_at: false,
+    };
+    let fields = DestinationFields {
+        content_type,
+        user_metadata,
+        multipart_etag: None,
+    };
+    let Some(shipped) = delta_passthrough_copy(engine, request, source_head, None, fields).await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        crate::types::StoreResult::new(shipped.metadata, shipped.outcome.bytes_copied as u64)
+            .with_accounting(shipped.replaced, shipped.seeded_reference_bytes),
+    ))
+}
+
 /// Try the delta fast path. `Ok(None)` = fell back; the caller runs the
 /// existing reconstruct path. Enforces three corruption-defense layers
 /// (gate sha-check, seed sha-assert, post-lock re-gate).
@@ -1225,7 +1410,8 @@ async fn delta_passthrough_copy(
     request: ObjectTransferRequest<'_>,
     source_head: &crate::types::FileMetadata,
     known_prior: Option<&crate::deltaglider::CounterPrior>,
-) -> Result<Option<ObjectTransferOutcome>, CopyError> {
+    fields: DestinationFields,
+) -> Result<Option<ShippedDelta>, CopyError> {
     use crate::types::{ObjectKey, StorageInfo};
 
     // Source delta facts. `ref_sha256` comes from the HEAD; recover it via
@@ -1287,29 +1473,19 @@ async fn delta_passthrough_copy(
     let dest_prefix = dest_key.prefix.clone();
     let dest_filename = dest_key.filename.clone();
 
-    // The shipped delta's metadata: clone the source delta metadata so the
-    // LOGICAL fields (file_sha256/file_size/multipart_etag/original_name/
-    // content_type/StorageInfo::Delta{}) survive; stamp provenance + strip.
-    let mut meta = source_head.clone();
-    // The destination's own name (review D4): a cloned source name named a
-    // renamed copy after its source.
-    meta.original_name = dest_filename.clone();
-    if let Some(provenance) = request.provenance {
-        meta.user_metadata.insert(
-            provenance.metadata_key.to_string(),
-            provenance.metadata_value.to_string(),
-        );
+    // The shipped delta's metadata: the LOGICAL fields of the source, the
+    // destination's own name (review D4), the caller's fields. The source
+    // encryption markers go: the dest write re-stamps them iff it actually
+    // encrypts, and leaves the body plaintext-with-no-marker iff it doesn't
+    // (PassThrough shim / no key). A surviving source marker on a
+    // re-encrypted or passed-through body is silent corruption on read.
+    let mut source_facts = source_head.clone();
+    if let StorageInfo::Delta { ref_sha256, .. } = &mut source_facts.storage_info {
+        ref_sha256.clone_from(&src_ref_sha256);
     }
-    for key in request.strip_user_metadata_keys {
-        meta.user_metadata.remove(*key);
-    }
-    // Strip the SOURCE encryption markers: the dest write re-stamps them iff it
-    // actually encrypts (encrypt mode), and leaves the body plaintext-with-no-
-    // marker iff it doesn't (PassThrough shim / no key). Either way the stored
-    // metadata matches the body — a surviving source marker on a re-encrypted or
-    // passed-through body is silent corruption on read. Mirrors the reencrypt
-    // job (maintenance/worker.rs strip_encryption_markers).
-    strip_encryption_markers(&mut meta.user_metadata);
+    let Some(meta) = shipped_delta_metadata(&source_facts, &dest_filename, fields) else {
+        return Ok(None);
+    };
 
     // Decide AND ship under the dest prefix lock, so the gate's reference read
     // and the delta write are one critical section — mirrors the normal PUT
@@ -1337,8 +1513,9 @@ async fn delta_passthrough_copy(
                 .await
         }
     };
-    // `true` = shipped; `false` = fell back.
-    let shipped: Result<bool, CopyError> = engine
+    let counter_replaced = counter_prior.replaced();
+    // `Some(seeded reference bytes)` = shipped; `None` = fell back.
+    let shipped: Result<Option<u64>, CopyError> = engine
         .with_dest_prefix_lock(&counter_dest_bucket, &dest_prefix, || async move {
             // Re-read the dest reference UNDER the lock and re-run the SAME pure
             // gate — identical sha + enc precedence to the first read. A read
@@ -1350,11 +1527,11 @@ async fn delta_passthrough_copy(
                     file_sha256: m.file_sha256.clone(),
                     enc: enc_fingerprint(&m),
                 }),
-                Err(_) => return Ok(false),
+                Err(_) => return Ok(None),
             };
             let decision = can_delta_passthrough(&src, dest_ref.as_ref());
             if matches!(decision, DeltaPassthroughDecision::Fallback { .. }) {
-                return Ok(false);
+                return Ok(None);
             }
             // Read the source delta BEFORE any destination write: a failed
             // read then leaves no seeded reference.bin behind (its bytes
@@ -1372,6 +1549,7 @@ async fn delta_passthrough_copy(
                     "{src_bucket}/{src_prefix2}/{src_filename2} was overwritten after HEAD"
                 )));
             }
+            let mut seeded = 0;
             if decision == DeltaPassthroughDecision::SeedThenShip {
                 // Seed the dest reference verbatim, asserting it matches
                 // src.ref_sha256 before writing (defense layer 2).
@@ -1381,7 +1559,7 @@ async fn delta_passthrough_copy(
                     .get_reference_raw_with_metadata(&src_bucket, &src_prefix2)
                     .await?;
                 if ref_meta.file_sha256 != src.ref_sha256 {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 // Same marker strip as the delta: the dest write re-stamps
                 // (encrypt) or leaves plaintext (passthrough); a surviving
@@ -1397,6 +1575,7 @@ async fn delta_passthrough_copy(
                     .await?;
                 // Counted at its write: a ship that fails below leaves it.
                 engine2.record_seeded_reference(&dest_bucket, ref_meta.file_size);
+                seeded = ref_meta.file_size;
             }
             engine2
                 .put_delta_raw(
@@ -1412,12 +1591,12 @@ async fn delta_passthrough_copy(
             // commit itself, at the commit (before the next await): the
             // delta, overwrite-aware.
             engine2.record_fast_path_copy(&dest_bucket, &counter_prior, &meta, 0);
-            Ok(true)
+            Ok(Some(seeded))
         })
         .await;
-    if !shipped? {
+    let Some(seeded_reference_bytes) = shipped? else {
         return Ok(None);
-    }
+    };
 
     // HEAD reports the LOGICAL size when the dest delta's DG metadata is intact.
     // If the backend stripped that metadata, HEAD falls back to the raw delta
@@ -1435,7 +1614,7 @@ async fn delta_passthrough_copy(
         &dest,
         source_head.file_size as usize,
         Some(src_delta_size),
-        source_head.multipart_etag.as_deref(),
+        counter_meta.multipart_etag.as_deref(),
     )?;
     if accepted == VerifyAccepted::StrippedDelta {
         heal_stripped_dest_delta(engine, request, &counter_meta, src_delta_size).await;
@@ -1451,12 +1630,17 @@ async fn delta_passthrough_copy(
         }
     }
 
-    Ok(Some(ObjectTransferOutcome {
-        bytes_copied: src_delta_size as usize,
-        strategy: CopyStrategy::DeltaPassthrough,
-        source_storage_label: "delta",
-        source_file_size: source_head.file_size,
-        bytes_egress_saved,
+    Ok(Some(ShippedDelta {
+        outcome: ObjectTransferOutcome {
+            bytes_copied: src_delta_size as usize,
+            strategy: CopyStrategy::DeltaPassthrough,
+            source_storage_label: "delta",
+            source_file_size: source_head.file_size,
+            bytes_egress_saved,
+        },
+        metadata: counter_meta,
+        replaced: counter_replaced,
+        seeded_reference_bytes,
     }))
 }
 
@@ -1822,7 +2006,14 @@ mod tests {
             upload_concurrency: None,
             keep_created_at: false,
         };
-        let result = delta_passthrough_copy(&engine, request, &stale_head, None).await;
+        let result = delta_passthrough_copy(
+            &engine,
+            request,
+            &stale_head,
+            None,
+            DestinationFields::of_transfer(&request, &stale_head),
+        )
+        .await;
         match result {
             Err(e) => assert_eq!(
                 e.class,
@@ -1844,9 +2035,15 @@ mod tests {
         }
         // With a current HEAD the fast path ships, and the dest reads back.
         let fresh_head = engine.head("src", "p/b.zip").await.unwrap();
-        let shipped = delta_passthrough_copy(&engine, request, &fresh_head, None)
-            .await
-            .expect("fresh HEAD must not error");
+        let shipped = delta_passthrough_copy(
+            &engine,
+            request,
+            &fresh_head,
+            None,
+            DestinationFields::of_transfer(&request, &fresh_head),
+        )
+        .await
+        .expect("fresh HEAD must not error");
         assert!(
             shipped.is_some(),
             "unchanged source must take the fast path"
@@ -1925,7 +2122,14 @@ mod tests {
             upload_concurrency: None,
             keep_created_at: false,
         };
-        let _ = delta_passthrough_copy(&engine, request, &head, None).await;
+        let _ = delta_passthrough_copy(
+            &engine,
+            request,
+            &head,
+            None,
+            DestinationFields::of_transfer(&request, &head),
+        )
+        .await;
         faults.disarm_all();
         assert!(faults.fired(crate::storage::FaultPoint::GetReferenceMetadata, "dst/p/") > 0);
         let after = engine
@@ -3021,10 +3225,12 @@ mod request_count_tests {
         }
     }
 
+    /// Requests that start with `prefix`, without the background listing
+    /// facts upkeep under `.dg/` (it races the assertions).
     fn count(fake: &FakeS3, prefix: &str) -> usize {
         fake.requests()
             .iter()
-            .filter(|r| r.starts_with(prefix))
+            .filter(|r| r.starts_with(prefix) && !r.contains("/.dg/"))
             .count()
     }
 

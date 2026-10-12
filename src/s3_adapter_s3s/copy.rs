@@ -78,39 +78,90 @@ pub(super) async fn copy_object(
     if source_meta.file_size > copy_size_limit(&engine, &input.bucket, &input.key, &dest_metadata) {
         return Err(s3s::s3_error!(EntityTooLarge));
     }
+    // A delta source into a key that stores deltas: the `.delta` ships
+    // verbatim (no reconstruction, no re-encode) when the destination
+    // folder can take it; otherwise the copy goes through the store.
+    let precondition = crate::deltaglider::Precondition::none();
+    let fast = if source_meta.is_delta()
+        && engine.write_tries_delta(&input.bucket, &input.key, &dest_metadata)
+    {
+        let (content_type, user_metadata) = copy_destination_fields(
+            directive,
+            input.content_type.clone(),
+            input.metadata.clone(),
+            &source_meta,
+        )?;
+        crate::api::handlers::object_helpers::store_client_delta_copy(
+            &svc.state,
+            crate::api::handlers::object_helpers::ClientDeltaCopy {
+                source: (&source_bucket, &source_key),
+                bucket: &input.bucket,
+                key: &input.key,
+                source_head: &source_meta,
+                content_type,
+                user_metadata,
+                precondition: &precondition,
+            },
+        )
+        .await?
+    } else {
+        None
+    };
+    let result = match fast {
+        Some(result) => result,
+        None => {
+            copy_through_store(
+                svc,
+                &engine,
+                (&source_bucket, &source_key),
+                &input,
+                directive,
+                &source_meta,
+            )
+            .await?
+        }
+    };
+    let mut resp = s3s::S3Response::new(s3s::dto::CopyObjectOutput {
+        copy_object_result: Some(s3s::dto::CopyObjectResult {
+            e_tag: Some(parse_s3s_etag(&result.metadata.etag())?),
+            last_modified: Some(SystemTime::from(result.metadata.created_at).into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    add_write_fact_headers(&mut resp.headers, &result, writer);
+    Ok(resp)
+}
+
+/// A CopyObject through the store: read (and reconstruct) the source, then
+/// store it as a client write of the destination.
+async fn copy_through_store(
+    svc: &DeltaGliderS3Service,
+    engine: &crate::deltaglider::DynEngine,
+    (source_bucket, source_key): (&str, &str),
+    input: &s3s::dto::CopyObjectInput,
+    directive: &str,
+    source_meta: &FileMetadata,
+) -> s3s::S3Result<crate::types::StoreResult> {
     let body = read_copy_source(
-        &engine,
-        &source_bucket,
-        &source_key,
+        engine,
+        source_bucket,
+        source_key,
         source_meta.file_size,
         engine.spool_threshold(),
     )
     .await?;
-    let source_meta = body.metadata();
-    let (content_type, mut user_metadata) = if directive.eq_ignore_ascii_case("REPLACE") {
-        check_user_metadata_size_s3s(input.metadata.as_ref())?;
-        (input.content_type, input.metadata.unwrap_or_default())
-    } else if directive.eq_ignore_ascii_case("COPY") {
-        (
-            source_meta.content_type.clone(),
-            source_meta.user_metadata.clone(),
-        )
-    } else {
-        return Err(s3s::s3_error!(
-            InvalidArgument,
-            "metadata-directive must be COPY or REPLACE"
-        ));
-    };
-    // retrieve() decrypted the body; the source metadata still carries the
-    // source's dg-encryption markers. Storing them onto a decrypted body
-    // makes the destination unreadable (read path thinks it's encrypted).
-    crate::storage::encrypting::strip_encryption_markers(&mut user_metadata);
-    crate::transfer::strip_rule_provenance(&mut user_metadata);
+    let (content_type, user_metadata) = copy_destination_fields(
+        directive,
+        input.content_type.clone(),
+        input.metadata.clone(),
+        &body.metadata(),
+    )?;
     // A copy creates a new object at the destination: the same client
     // write as a PUT (quota on the destination, the object's write lock,
     // the ObjectCreated event). s3s models no conditional headers for it.
     let precondition = crate::deltaglider::Precondition::none();
-    let result = match &body {
+    Ok(match &body {
         CopySourceBody::Buffered(data, _) => {
             crate::api::handlers::object_helpers::store_client_write(
                 &svc.state,
@@ -140,17 +191,34 @@ pub(super) async fn copy_object(
             )
             .await?
         }
+    })
+}
+
+/// The content type and user metadata of a CopyObject destination: the
+/// request's under `REPLACE`, the source's under `COPY`. The source's
+/// encryption markers and rule provenance stamps never carry over: the
+/// destination write stamps its own markers, and a client copy was not
+/// written by a rule.
+fn copy_destination_fields(
+    directive: &str,
+    content_type: Option<String>,
+    metadata: Option<std::collections::HashMap<String, String>>,
+    source: &FileMetadata,
+) -> s3s::S3Result<(Option<String>, std::collections::HashMap<String, String>)> {
+    let (content_type, mut user_metadata) = if directive.eq_ignore_ascii_case("REPLACE") {
+        check_user_metadata_size_s3s(metadata.as_ref())?;
+        (content_type, metadata.unwrap_or_default())
+    } else if directive.eq_ignore_ascii_case("COPY") {
+        (source.content_type.clone(), source.user_metadata.clone())
+    } else {
+        return Err(s3s::s3_error!(
+            InvalidArgument,
+            "metadata-directive must be COPY or REPLACE"
+        ));
     };
-    let mut resp = s3s::S3Response::new(s3s::dto::CopyObjectOutput {
-        copy_object_result: Some(s3s::dto::CopyObjectResult {
-            e_tag: Some(parse_s3s_etag(&result.metadata.etag())?),
-            last_modified: Some(SystemTime::from(result.metadata.created_at).into()),
-            ..Default::default()
-        }),
-        ..Default::default()
-    });
-    add_write_fact_headers(&mut resp.headers, &result, writer);
-    Ok(resp)
+    crate::storage::encrypting::strip_encryption_markers(&mut user_metadata);
+    crate::transfer::strip_rule_provenance(&mut user_metadata);
+    Ok((content_type, user_metadata))
 }
 
 /// S3's limit on the source of one CopyObject request.
@@ -522,6 +590,10 @@ pub(super) fn parse_copy_range(range: &str, len: usize) -> s3s::S3Result<(usize,
     }
     Ok((start, end))
 }
+
+#[cfg(test)]
+#[path = "copy_cost_tests.rs"]
+mod copy_cost_tests;
 
 #[cfg(test)]
 mod large_copy_tests {
