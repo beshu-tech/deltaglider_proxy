@@ -360,3 +360,37 @@ async fn delta_path_counter_and_reference_reclamation() {
         );
     }
 }
+
+/// `GET /usage/buckets` answers the counter of every bucket in one request,
+/// with the same numbers as the per-bucket read (the analytics dashboard).
+#[tokio::test]
+async fn all_bucket_counters_in_one_request() {
+    let server = TestServer::builder().bucket("usage-batch").build().await;
+    let http = server.http();
+    let admin = admin_http_client(&server.endpoint()).await;
+    let bucket = server.bucket().to_string();
+    put_object(
+        &http,
+        &server.endpoint(),
+        &bucket,
+        "rel/a.bin",
+        base_blob(4096),
+        "application/octet-stream",
+    )
+    .await;
+    let one = get_usage(&server, &admin, &bucket).await;
+    let url = format!("{}/_/api/admin/usage/buckets", server.endpoint());
+    let resp = admin.get(&url).send().await.expect("usage request");
+    assert!(resp.status().is_success(), "{}", resp.status());
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let row = body["buckets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["bucket"] == bucket.as_str())
+        .unwrap_or_else(|| panic!("{bucket} missing in {body}"))
+        .clone();
+    assert_eq!(row["object_count"], one.object_count);
+    assert_eq!(row["logical_bytes"], one.logical_bytes);
+    assert_eq!(row["stored_bytes"], one.stored_bytes);
+}

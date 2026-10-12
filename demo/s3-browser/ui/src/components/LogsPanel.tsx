@@ -24,6 +24,7 @@ import { relativeTime } from '../utils';
 import { fetchLogs, streamLogs, type LogEntry, type LogFilters } from '../adminApi';
 import { normalizeUiError } from '../errorHandling';
 import { isSessionExpired } from '../errorHandling';
+import { useDocumentVisible } from '../useVisiblePolling';
 
 const { Text } = Typography;
 const RING_CAP = 2000; // client-side trim ceiling for the live tail
@@ -104,12 +105,27 @@ export default function LogsPanel({ onSessionExpired }: Props) {
     loadBacklog();
   }, [loadBacklog]);
 
-  // Live tail: (re)subscribe whenever Follow or the filters change.
+  // A hidden tab holds no live stream (it reconnects and delivered every
+  // line for nobody). On return, the backlog fills the gap, then the tail
+  // resumes.
+  const visible = useDocumentVisible();
+  const wasHidden = useRef(false);
+  useEffect(() => {
+    if (!visible) {
+      wasHidden.current = true;
+    } else if (wasHidden.current) {
+      wasHidden.current = false;
+      if (follow) loadBacklog();
+    }
+  }, [visible, follow, loadBacklog]);
+
+  // Live tail: (re)subscribe whenever Follow, the filters or the tab's
+  // visibility change.
   useEffect(() => {
     unsubRef.current?.();
     unsubRef.current = null;
     setStreamError(null);
-    if (!follow) return;
+    if (!follow || !visible) return;
     unsubRef.current = streamLogs(
       filters,
       (entry) => {
@@ -127,7 +143,7 @@ export default function LogsPanel({ onSessionExpired }: Props) {
       unsubRef.current?.();
       unsubRef.current = null;
     };
-  }, [follow, filters]);
+  }, [follow, filters, visible]);
 
   // Tick "time ago" once a second.
   useEffect(() => {

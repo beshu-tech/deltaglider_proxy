@@ -157,6 +157,39 @@ pub async fn get_bucket_usage(
     Ok(Json(usage_json(&bucket, row)))
 }
 
+/// GET /_/api/admin/usage/buckets — the O(1) counters of every bucket in
+/// one answer (the analytics dashboard), instead of one request per bucket.
+pub async fn get_all_bucket_usage(
+    State(state): State<Arc<AdminState>>,
+) -> Result<Json<serde_json::Value>, AdminError<JsonError>> {
+    all_usage_json(&state.s3_state)
+        .map(Json)
+        .map_err(AdminError::internal)
+}
+
+/// `{ buckets: [<counter of each bucket>] }`: every bucket the counter
+/// knows that a client may address (no transient migrate route, no
+/// reserved bucket). A bucket with no counter row is left out; the
+/// dashboard shows it as 0, as a `never_scanned` row of zeros.
+fn all_usage_json(s3_state: &crate::api::handlers::AppState) -> Result<serde_json::Value, String> {
+    let Some(usage) = s3_state.bucket_usage.as_ref() else {
+        return Ok(serde_json::json!({"disabled": true}));
+    };
+    let engine = s3_state.engine.load();
+    let registry = engine.bucket_policy_registry();
+    let buckets: Vec<serde_json::Value> = usage
+        .read_all()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|(bucket, _)| {
+            !crate::bucket_usage::is_transient_bucket(bucket)
+                && registry.client_bucket(bucket).is_ok()
+        })
+        .map(|(bucket, row)| usage_json(&bucket, Some(row)))
+        .collect();
+    Ok(serde_json::json!({ "buckets": buckets }))
+}
+
 /// POST /_/api/admin/usage/refresh?bucket=X — scan the whole bucket and
 /// overwrite the counter with ground truth. The scan is the dashboard
 /// bucket scan (`bucket_scan.rs`): single-flight per bucket, cancellable
@@ -305,5 +338,28 @@ mod tests {
         assert_eq!(body["estimate"]["object_count"], 5, "{body}");
         assert_eq!(body["object_count"], 5, "the kept counter: {body}");
         assert_eq!(body["logical_bytes"], 5_000_000, "the kept counter: {body}");
+    }
+
+    /// P8.8a: one request answers the counters of every bucket.
+    #[tokio::test]
+    async fn all_bucket_counters_in_one_answer() {
+        let (state, _fake, _, usage) = counted_state().await;
+        usage.apply_delta("b", 3, 300, 30);
+        usage.apply_delta("other", 1, 10, 10);
+        usage.flush_pending();
+        let body = all_usage_json(&state).unwrap();
+        let mut rows: Vec<(String, u64)> = body["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["bucket"].as_str().unwrap().to_string(),
+                    r["object_count"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        rows.sort();
+        assert_eq!(rows, [("b".to_string(), 3), ("other".to_string(), 1)]);
     }
 }

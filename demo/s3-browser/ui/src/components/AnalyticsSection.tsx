@@ -34,7 +34,7 @@ import { CaretRightOutlined, ReloadOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import { useVisiblePolling } from '../useVisiblePolling';
 import { listBuckets } from '../s3client';
-import { getBucketUsage } from '../adminApi';
+import { getAllBucketUsage } from '../adminApi';
 import type { AdminConfig, BucketUsage } from '../adminApi';
 import {
   getAllBucketScans,
@@ -167,14 +167,15 @@ export default function AnalyticsSection({ config }: Props) {
       .then(bs => {
         const names = bs.filter(b => !b.unavailable).map(b => b.name);
         setAllBuckets(names);
-        // Seed instant O(1) sizes for every bucket (best-effort; 403 → skip).
-        names.forEach(name => {
-          getBucketUsage(name)
-            .then(u => {
-              if (u) setCounters(prev => ({ ...prev, [name]: u }));
-            })
-            .catch(() => {});
-        });
+        // Seed instant O(1) sizes for every bucket, in one request
+        // (best-effort; 403 → skip).
+        const listed = new Set(names);
+        getAllBucketUsage()
+          .then(rows => {
+            if (!rows) return;
+            setCounters(Object.fromEntries(rows.filter(u => listed.has(u.bucket)).map(u => [u.bucket, u])));
+          })
+          .catch(() => {});
       })
       .catch(() => setAllBuckets([]));
   }, [refreshScans, seedQueue]);

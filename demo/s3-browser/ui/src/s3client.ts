@@ -21,6 +21,8 @@ import type { S3Object, ListResult, BucketInfo } from './types';
 import { codePointCompare, detectDefaultEndpoint, numericCompare } from './utils';
 import { createBucketOnBackend, getBucketOrigins } from './adminApi';
 import { normalizeS3Error } from './errorHandling';
+import { queryClient } from './queries/client';
+import { qk } from './queries/keys';
 import {
   appendThroughputSample,
   clampPercent,
@@ -708,9 +710,11 @@ type ListBucketsOptions = {
 const LIST_BUCKETS_TTL_MS = 5_000;
 let listBucketsShared: { at: number; key: string; promise: Promise<BucketInfo[]> } | null = null;
 
-/** Drop the shared listBuckets result (call after create/delete bucket). */
+/** Drop the shared listBuckets result and the bucket origins (call after
+ *  create/delete bucket). */
 export function invalidateListBucketsCache(): void {
   listBucketsShared = null;
+  void queryClient.invalidateQueries({ queryKey: qk.backends.origins() });
 }
 
 export async function listBuckets(opts?: ListBucketsOptions): Promise<BucketInfo[]> {
@@ -734,8 +738,13 @@ export async function listBuckets(opts?: ListBucketsOptions): Promise<BucketInfo
 
 async function listBucketsUncached(opts?: ListBucketsOptions): Promise<BucketInfo[]> {
   const includeOrigins = opts?.includeOrigins !== false;
+  // The bucket origins through the shared react-query entry: the Sidebar,
+  // the usage chip and the backends panel read the same one.
   const originsPromise = includeOrigins
-    ? getBucketOrigins().catch(() => null)
+    ? queryClient
+        // No retry: a session without admin rights gets a 403 at once.
+        .fetchQuery({ queryKey: qk.backends.origins(), queryFn: getBucketOrigins, staleTime: 5_000, retry: false })
+        .catch(() => null)
     : Promise.resolve(null);
   // allSettled, NOT all: on a TOTAL backend failure the S3 list rejects, but
   // the admin origins endpoint still returns the config-declared roster as

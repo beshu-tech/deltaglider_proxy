@@ -270,6 +270,10 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             get(admin::get_bucket_usage),
         )
         .route(
+            "/_/api/admin/usage/buckets",
+            get(admin::get_all_bucket_usage),
+        )
+        .route(
             "/_/api/admin/usage/refresh",
             post(admin::refresh_bucket_usage),
         )

@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 /**
  * Run `callback` on a `ms` interval, but ONLY while the tab is visible and
@@ -45,4 +45,15 @@ export function useVisiblePolling(callback: () => void, ms: number, enabled = tr
       document.removeEventListener('visibilitychange', onVisibility);
     };
   }, [ms, enabled]);
+}
+
+/** True while the tab is visible; follows `visibilitychange`. */
+export function useDocumentVisible(): boolean {
+  const [visible, setVisible] = useState(() => !document.hidden);
+  useEffect(() => {
+    const onVisibility = () => setVisible(!document.hidden);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => document.removeEventListener('visibilitychange', onVisibility);
+  }, []);
+  return visible;
 }

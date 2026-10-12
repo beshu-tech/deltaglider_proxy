@@ -134,6 +134,17 @@ export async function getBucketUsage(bucket: string): Promise<BucketUsage | null
   );
 }
 
+/** The O(1) counters of every bucket that has one, in one request (the
+ *  analytics dashboard). null without an admin session. */
+export async function getAllBucketUsage(): Promise<BucketUsage[] | null> {
+  const body = await nullWithoutAdminSession(
+    adminJson<{ buckets?: BucketUsage[] }>('/api/admin/usage/buckets', {
+      context: 'Bucket usage query',
+    }),
+  );
+  return body?.buckets ?? null;
+}
+
 /** Force an authoritative full scan and overwrite the counter; returns the
  *  reconciled row. The only O(n) path — the Refresh button. */
 export async function refreshBucketUsage(bucket: string): Promise<BucketUsage | null> {
