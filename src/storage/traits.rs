@@ -208,6 +208,21 @@ pub async fn unfenced_reference_fence<B: StorageBackend + ?Sized>(
     })
 }
 
+/// `reference_fence_with_metadata` of a backend that does not fence: the
+/// metadata read, and the fence [`unfenced_reference_fence`] gives
+/// (existence only).
+pub async fn unfenced_reference_fence_with_metadata<B: StorageBackend + ?Sized>(
+    backend: &B,
+    bucket: &str,
+    prefix: &str,
+) -> Result<(RefFence, Option<FileMetadata>), StorageError> {
+    match backend.get_reference_metadata(bucket, prefix).await {
+        Ok(meta) => Ok((RefFence::ETag(String::new()), Some(meta))),
+        Err(StorageError::NotFound(_)) => Ok((RefFence::Absent, None)),
+        Err(e) => Err(e),
+    }
+}
+
 /// `write_reference_fenced` of a backend that does not fence: the plain
 /// write, and `Unfenced`.
 pub async fn unfenced_reference_write<B: StorageBackend + ?Sized>(
@@ -516,6 +531,17 @@ pub trait StorageBackend: Send + Sync {
         bucket: &str,
         prefix: &str,
     ) -> impl Future<Output = Result<RefFence, StorageError>> + Send;
+
+    /// [`Self::reference_fence`] and the reference's metadata, from ONE
+    /// read (one HEAD on S3): `(Absent, None)` when it does not exist. The
+    /// cross-instance lock reads both at acquire; two HEADs could also
+    /// see two different objects. No default: a wrapper that forgot it
+    /// would drop the fence below it.
+    fn reference_fence_with_metadata(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> impl Future<Output = Result<(RefFence, Option<FileMetadata>), StorageError>> + Send;
 
     /// Write `reference.bin` only if `fence` still holds, and return the
     /// fence after the write. A lost precondition is

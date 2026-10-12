@@ -328,13 +328,14 @@ single-instance planes below are addressed.
   `reference_writes` module in `engine/locking.rs` makes, incl. delete-reclaim, sweep-reclaim,
   legacy-reference migration and the replication fast-path seed
   (`with_dest_prefix_lock` holds both locks).
-  FENCED: the acquire observes reference.bin (`StorageBackend::reference_fence`,
-  one HEAD that also replaces the caller's `has_reference`), and every reference
+  FENCED: the acquire observes reference.bin
+  (`StorageBackend::reference_fence_with_metadata`: one HEAD gives the fence AND the
+  metadata the PUT encodes against, so the caller sends no HEAD of its own), and every reference
   write of the hold goes through `write_reference_fenced` conditional on it (S3:
   `If-None-Match:*` / `If-Match` PUT, `copy-source-if-match` metadata self-copy,
   HEAD + `If-Match` DELETE). A lost precondition = `StorageError::Throttled`
   (503 SlowDown, retryable), never an overwrite; 501 (B2, non-CAS) falls back to
-  the unconditional write. Filesystem = `unfenced_reference_*` (no fence). Both
+  the unconditional write. Filesystem = `unfenced_reference_*` (no fence). The
   methods have NO trait default, so the compiler makes every wrapper (Box<dyn>,
   encrypting, routing) forward them.
   Single-instance (no coordination bucket) → the field is `None`, in-process lock

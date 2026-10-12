@@ -446,8 +446,9 @@ mod head_cost_tests {
     }
 
     /// One read answers whether a deltaspace has a reference and what it is
-    /// (`reference_metadata_if_present`): engine code does not ask
-    /// `has_reference` and then read the metadata (two HEADs on S3).
+    /// (`reference_metadata_if_present`, `reference_fence_with_metadata`):
+    /// engine code does not ask `has_reference` or `reference_fence` and
+    /// then read the metadata (two HEADs on S3).
     #[test]
     fn engine_code_reads_a_reference_once() {
         const ALLOWED: [&str; 0] = [];
@@ -455,7 +456,9 @@ mod head_cost_tests {
         for (file, text) in crate::source_scan::prod_sources("src/deltaglider/engine") {
             let lines = crate::source_scan::prod_lines(&text);
             for (i, (n, line)) in lines.iter().enumerate() {
-                if !line.contains(".has_reference(") {
+                // `reference_fence` then the metadata: the shape the
+                // cross-instance acquire had (reference_fence_with_metadata).
+                if !line.contains(".has_reference(") && !line.contains(".reference_fence(") {
                     continue;
                 }
                 let then_reads = lines[i..lines.len().min(i + 15)]

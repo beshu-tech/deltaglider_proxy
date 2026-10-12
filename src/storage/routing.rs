@@ -989,6 +989,14 @@ impl StorageBackend for RoutingBackend {
         route_existing!(self, bucket, reference_fence, prefix)
     }
 
+    async fn reference_fence_with_metadata(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<(super::traits::RefFence, Option<FileMetadata>), StorageError> {
+        route_existing!(self, bucket, reference_fence_with_metadata, prefix)
+    }
+
     async fn write_reference_fenced(
         &self,
         bucket: &str,
@@ -1562,6 +1570,16 @@ mod tests {
             p: &str,
         ) -> Result<crate::storage::RefFence, crate::storage::StorageError> {
             crate::storage::unfenced_reference_fence(self, b, p).await
+        }
+        async fn reference_fence_with_metadata(
+            &self,
+            b: &str,
+            p: &str,
+        ) -> Result<
+            (crate::storage::RefFence, Option<crate::types::FileMetadata>),
+            crate::storage::StorageError,
+        > {
+            crate::storage::unfenced_reference_fence_with_metadata(self, b, p).await
         }
         async fn write_reference_fenced(
             &self,

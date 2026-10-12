@@ -592,6 +592,19 @@ impl crate::storage::StorageBackend for FencingFs {
             None => RefFence::Absent,
         })
     }
+    async fn reference_fence_with_metadata(
+        &self,
+        b: &str,
+        p: &str,
+    ) -> Result<(RefFence, Option<FileMetadata>), StorageError> {
+        let fence = self.reference_fence(b, p).await?;
+        let meta = match self.inner.get_reference_metadata(b, p).await {
+            Ok(m) => Some(m),
+            Err(StorageError::NotFound(_)) => None,
+            Err(e) => return Err(e),
+        };
+        Ok((fence, meta))
+    }
     async fn write_reference_fenced(
         &self,
         b: &str,

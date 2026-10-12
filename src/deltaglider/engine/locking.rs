@@ -23,6 +23,9 @@ use crate::coordination::ReferenceLock;
 /// `reference_writes` module makes.
 pub(crate) struct ReferenceLockGuard {
     hold: Option<CrossNodeHold>,
+    /// reference.bin's metadata as the acquire read it, with the fence
+    /// (`Some(None)`: absent). `None`: no cross-instance hold, no read.
+    observed: Option<Option<FileMetadata>>,
 }
 
 struct CrossNodeHold {
@@ -83,7 +86,10 @@ pub(crate) fn hold_check(lost: bool, age: Duration, renew_interval: Duration) ->
 
 impl ReferenceLockGuard {
     pub(crate) fn inert() -> Self {
-        Self { hold: None }
+        Self {
+            hold: None,
+            observed: None,
+        }
     }
 
     /// A cross-instance hold with no lock object yet: [`Self::push_key`]
@@ -96,6 +102,7 @@ impl ReferenceLockGuard {
                 keys: Vec::new(),
                 fence: parking_lot::Mutex::new(crate::storage::RefFence::Unfenced),
             }),
+            observed: None,
         }
     }
 
@@ -123,16 +130,12 @@ impl ReferenceLockGuard {
         });
     }
 
-    /// Whether reference.bin existed when the lock was taken: `Some` for a
+    /// reference.bin when the lock was taken, from the same read as the
+    /// fence: `Some(None)` absent, `Some(Some(meta))` present. `Some` for a
     /// cross-instance hold (saves the caller its own HEAD), `None` when the
     /// caller must ask the backend.
-    pub(crate) fn observed_reference(&self) -> Option<bool> {
-        use crate::storage::RefFence;
-        match &*self.hold.as_ref()?.fence.lock() {
-            RefFence::Absent => Some(false),
-            RefFence::ETag(_) => Some(true),
-            RefFence::Unfenced => None,
-        }
+    pub(crate) fn observed_reference(&self) -> Option<Option<FileMetadata>> {
+        self.observed.clone()
     }
 
     /// Renew every `renew_interval` until dropped. A renew that reports the
@@ -578,10 +581,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             }
         }
         // Observe reference.bin under the lock: the fence of every reference
-        // write this hold makes.
-        let fence = self.storage.reference_fence(bucket, deltaspace).await?;
+        // write this hold makes, and the metadata the write reads next, from
+        // one read (two HEADs before).
+        let (fence, metadata) = self
+            .storage
+            .reference_fence_with_metadata(bucket, deltaspace)
+            .await?;
         if let Some(h) = &guard.hold {
             *h.fence.lock() = fence;
+            guard.observed = Some(metadata);
         }
         Ok(guard)
     }

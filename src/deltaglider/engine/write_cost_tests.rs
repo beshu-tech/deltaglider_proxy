@@ -278,3 +278,56 @@ async fn a_form_a_peer_adds_after_the_read_is_dropped_by_the_next_write() {
     let (_, forms) = engine.head_with_forms("b", key).await.unwrap();
     assert!(!forms.delta && forms.passthrough, "{forms:?}");
 }
+
+/// A cross-instance lock that always grants, with no requests of its own.
+struct GrantingLock;
+
+impl crate::coordination::ReferenceLock for GrantingLock {
+    async fn try_acquire(
+        &self,
+        _: &str,
+        _: &str,
+        _: i64,
+    ) -> Result<bool, crate::coordination::LeaseError> {
+        Ok(true)
+    }
+    async fn release(&self, _: &str, _: &str) -> Result<(), crate::coordination::LeaseError> {
+        Ok(())
+    }
+    async fn renew(&self, _: &str, _: &str, _: i64) -> Result<(), crate::coordination::LeaseError> {
+        Ok(())
+    }
+    fn ttl_secs(&self) -> i64 {
+        120
+    }
+    fn renew_interval(&self) -> Duration {
+        Duration::from_secs(30)
+    }
+    fn acquire_timeout(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+}
+
+/// Under the cross-instance lock, one HEAD of reference.bin gives the
+/// fence and the metadata that the PUT encodes against. It sent two (the
+/// fence, then the metadata). The third HEAD is the fence check after the
+/// delta write. Delta PUT into a folder with a baseline: 3 -> 2 HEADs of
+/// reference.bin.
+#[tokio::test]
+async fn a_locked_delta_put_heads_the_reference_for_fence_and_metadata_once() {
+    let (endpoint, fake) = crate::storage::fake_s3::start().await;
+    let engine = s3_engine_at(&endpoint).with_reference_lock(Some(
+        crate::coordination::DynReferenceLock::from_arc(Arc::new(GrantingLock)),
+    ));
+    engine.create_bucket("b").await.unwrap();
+    crate::deltaglider::store_deltas(&engine, "run", 1).await;
+    fake.clear();
+    crate::deltaglider::store_deltas(&engine, "run", 2).await;
+    // The second call stores build-000 again and build-001: two PUTs.
+    let heads = fake
+        .requests()
+        .iter()
+        .filter(|r| r.starts_with("HEAD /b/run/reference.bin"))
+        .count();
+    assert_eq!(heads, 4, "two locked delta PUTs: {:#?}", fake.requests());
+}

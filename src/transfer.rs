@@ -2299,6 +2299,16 @@ mod multipart_abort_tests {
         ) -> Result<crate::storage::RefFence, crate::storage::StorageError> {
             crate::storage::unfenced_reference_fence(self, b, p).await
         }
+        async fn reference_fence_with_metadata(
+            &self,
+            b: &str,
+            p: &str,
+        ) -> Result<
+            (crate::storage::RefFence, Option<crate::types::FileMetadata>),
+            crate::storage::StorageError,
+        > {
+            crate::storage::unfenced_reference_fence_with_metadata(self, b, p).await
+        }
         async fn write_reference_fenced(
             &self,
             b: &str,
@@ -2563,6 +2573,16 @@ mod multipart_abort_tests {
             p: &str,
         ) -> Result<crate::storage::RefFence, crate::storage::StorageError> {
             self.0.reference_fence(b, p).await
+        }
+        async fn reference_fence_with_metadata(
+            &self,
+            b: &str,
+            p: &str,
+        ) -> Result<
+            (crate::storage::RefFence, Option<crate::types::FileMetadata>),
+            crate::storage::StorageError,
+        > {
+            self.0.reference_fence_with_metadata(b, p).await
         }
         async fn write_reference_fenced(
             &self,

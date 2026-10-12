@@ -364,6 +364,16 @@ impl S3Backend {
         bucket: &str,
         key: &str,
     ) -> Result<FileMetadata, StorageError> {
+        Ok(self.head_object_metadata(bucket, key).await?.0)
+    }
+
+    /// One HEAD of `key`: its metadata and its ETag (`None` when the
+    /// response carried none). NotFound when absent.
+    pub(super) async fn head_object_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(FileMetadata, Option<String>), StorageError> {
         BACKEND_HEAD_REQUESTS.inc();
         let response = self
             .client
@@ -384,7 +394,7 @@ impl S3Backend {
                 self.classify(bucket, &e, S3Op::HeadObject)
             })?;
 
-        Ok(self.metadata_of_response(
+        let meta = self.metadata_of_response(
             bucket,
             key,
             &ObjectHeaders {
@@ -394,7 +404,8 @@ impl S3Backend {
                 content_length: response.content_length(),
                 content_type: response.content_type(),
             },
-        ))
+        );
+        Ok((meta, response.e_tag().map(str::to_string)))
     }
 
     /// The metadata of the object `key` from the headers of a HEAD or GET

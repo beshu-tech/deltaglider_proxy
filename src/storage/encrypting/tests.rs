@@ -772,6 +772,16 @@ mod wrapper_tests {
         ) -> Result<crate::storage::RefFence, crate::storage::StorageError> {
             crate::storage::unfenced_reference_fence(self, b, p).await
         }
+        async fn reference_fence_with_metadata(
+            &self,
+            b: &str,
+            p: &str,
+        ) -> Result<
+            (crate::storage::RefFence, Option<crate::types::FileMetadata>),
+            crate::storage::StorageError,
+        > {
+            crate::storage::unfenced_reference_fence_with_metadata(self, b, p).await
+        }
         async fn write_reference_fenced(
             &self,
             b: &str,

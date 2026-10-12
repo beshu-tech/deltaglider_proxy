@@ -1191,6 +1191,14 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     ) -> Result<super::traits::RefFence, StorageError> {
         self.inner.reference_fence(b, p).await
     }
+    /// Metadata is stored as-is (see `get_reference_metadata`).
+    async fn reference_fence_with_metadata(
+        &self,
+        b: &str,
+        p: &str,
+    ) -> Result<(super::traits::RefFence, Option<FileMetadata>), StorageError> {
+        self.inner.reference_fence_with_metadata(b, p).await
+    }
     /// The same transformation as the unfenced writes (encrypt the body, keep
     /// the stored markers on a metadata-only write), then the inner fenced
     /// write: the fence is on the stored object, which is what the inner

@@ -605,15 +605,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // A backend error here must ABORT the PUT — never fall through to the
         // "create baseline" branch, which would overwrite a reference.bin that
         // may exist and orphan every sibling delta. One read (a HEAD on S3)
-        // answers both "is there one" and "which": the fence of a
-        // cross-instance hold already answered the first.
+        // answers both "is there one" and "which": a cross-instance hold
+        // read both with its fence.
         let existing = match xnode.observed_reference() {
-            Some(false) => None,
-            Some(true) => Some(
-                self.storage
-                    .get_reference_metadata(bucket, deltaspace_id)
-                    .await?,
-            ),
+            Some(observed) => observed,
             None => {
                 self.reference_metadata_if_present(bucket, deltaspace_id)
                     .await?

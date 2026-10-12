@@ -623,6 +623,23 @@ impl StorageBackend for S3Backend {
         }
     }
 
+    #[instrument(skip(self))]
+    async fn reference_fence_with_metadata(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<(RefFence, Option<FileMetadata>), StorageError> {
+        let key = self.reference_key(prefix);
+        match self.head_object_metadata(bucket, &key).await {
+            Ok((meta, etag)) => Ok((
+                fence_from_head_etag(etag.as_deref(), bucket, &key),
+                Some(meta),
+            )),
+            Err(StorageError::NotFound(_)) => Ok((RefFence::Absent, None)),
+            Err(e) => Err(e),
+        }
+    }
+
     #[instrument(skip(self, op))]
     async fn write_reference_fenced(
         &self,

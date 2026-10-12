@@ -340,6 +340,18 @@ impl StorageBackend for FaultyFs {
         self.inner.reference_fence(bucket, prefix).await
     }
 
+    async fn reference_fence_with_metadata(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<(RefFence, Option<FileMetadata>), StorageError> {
+        self.armed(FaultPoint::GetReferenceMetadata, bucket, prefix, "")
+            .await?;
+        self.inner
+            .reference_fence_with_metadata(bucket, prefix)
+            .await
+    }
+
     async fn write_reference_fenced(
         &self,
         bucket: &str,

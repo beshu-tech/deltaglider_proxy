@@ -1239,6 +1239,15 @@ impl StorageBackend for FilesystemBackend {
         super::traits::unfenced_reference_fence(self, bucket, prefix).await
     }
 
+    /// The metadata read, and the existence-only fence (see above).
+    async fn reference_fence_with_metadata(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<(RefFence, Option<FileMetadata>), StorageError> {
+        super::traits::unfenced_reference_fence_with_metadata(self, bucket, prefix).await
+    }
+
     /// Ignores the fence and returns `Unfenced` (single node, see above).
     async fn write_reference_fenced(
         &self,
