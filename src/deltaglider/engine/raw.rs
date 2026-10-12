@@ -159,6 +159,27 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.reference_metadata_if_present(bucket, prefix).await
     }
 
+    /// Bytes `start..=end` of the delta object `bucket/key` whose HEAD is
+    /// `source_head`, for an UploadPartCopy. Every part of one source
+    /// reads the same verified reconstruction: the range-spool cache,
+    /// matched on the content SHA-256 of `source_head` (single flight).
+    /// Before, each part rebuilt the whole object. The HEAD is the caller's
+    /// fresh read of this request, so a cached reconstruction of its SHA-256
+    /// is the content that the request copies; a reconstruction that does
+    /// not match that SHA-256 fails the integrity gate.
+    pub async fn delta_copy_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        source_head: &FileMetadata,
+        start: u64,
+        end: u64,
+    ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), EngineError> {
+        let (obj_key, deltaspace_id) = self.validated_key(bucket, key)?;
+        self.retrieve_delta_range_spooled(bucket, &deltaspace_id, &obj_key, source_head, start, end)
+            .await
+    }
+
     /// Delta metadata for one object (full Delta info incl. `ref_sha256`).
     pub async fn delta_meta(
         &self,

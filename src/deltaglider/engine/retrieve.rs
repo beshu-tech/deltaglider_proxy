@@ -715,7 +715,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// spool is cached briefly (storage-11): the other ranges of the object
     /// read it instead of decoding again, and a concurrent range waits for a
     /// running decode. Returns `(stream, content_length)`.
-    async fn retrieve_delta_range_spooled(
+    pub(super) async fn retrieve_delta_range_spooled(
         &self,
         bucket: &str,
         deltaspace_id: &str,

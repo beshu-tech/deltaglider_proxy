@@ -376,15 +376,30 @@ pub(super) async fn upload_part_copy(
             if (end - start) as u64 >= engine.max_object_size() {
                 return Err(s3s::s3_error!(EntityTooLarge));
             }
-            engine
-                .retrieve_stream_range(
-                    &source_bucket,
-                    &source_key,
-                    start as u64,
-                    end as u64,
-                    Some(&source_meta),
-                )
-                .await?
+            if source_meta.is_delta() {
+                // Every part of a delta source reads one verified
+                // reconstruction (it rebuilt the whole object per part).
+                let (stream, len) = engine
+                    .delta_copy_range(
+                        &source_bucket,
+                        &source_key,
+                        &source_meta,
+                        start as u64,
+                        end as u64,
+                    )
+                    .await?;
+                Some((stream, len, source_meta.clone()))
+            } else {
+                engine
+                    .retrieve_stream_range(
+                        &source_bucket,
+                        &source_key,
+                        start as u64,
+                        end as u64,
+                        Some(&source_meta),
+                    )
+                    .await?
+            }
         }
         None => None,
     };

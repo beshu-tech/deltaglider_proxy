@@ -10,6 +10,7 @@ use super::super::multipart::adapter_test_support::{request, service};
 use super::*;
 use crate::deltaglider::{DeltaGliderEngine, DynEngine};
 use crate::storage::{DynStorageBackend, EncryptingBackend, EncryptionConfig, EncryptionKey};
+use md5::Digest;
 
 /// A REPLACE directive: the content type and the user metadata.
 type Replace<'a> = Option<(Option<&'a str>, &'a [(&'a str, &'a str)])>;
@@ -460,4 +461,61 @@ async fn a_source_that_changes_under_a_fast_copy_answers_slowdown() {
     .unwrap_err();
     assert!(matches!(err, crate::api::S3Error::SlowDown(_)), "{err:?}");
     assert!(engine.head("b", "run/copy.zip").await.is_err());
+}
+
+/// P5.5: an UploadPartCopy of a delta source rebuilt the whole object for
+/// EVERY part (one xdelta3 decode per part, the source read again each
+/// time). The parts now read one verified reconstruction.
+#[tokio::test]
+async fn the_parts_of_a_delta_source_share_one_decode() {
+    let (s3, _fake) = crate::storage::fake_s3_backend().await;
+    let f = Fixture::new(
+        DynStorageBackend::new_box(s3),
+        crate::config::Config::default(),
+    )
+    .await;
+    let engine = f.engine();
+    let (body, source) = engine.retrieve("b", &f.keys[1]).await.unwrap();
+    assert!(source.is_delta());
+    let upload_id = f
+        .state
+        .multipart
+        .create("c1", "parts/copy.zip", None, Default::default())
+        .unwrap();
+    let before = codec_runs(&f.metrics).1;
+    let len = body.len();
+    let ranges = [
+        (0, len / 3 - 1),
+        (len / 3, 2 * len / 3 - 1),
+        (2 * len / 3, len - 1),
+    ];
+    for (n, (start, end)) in ranges.iter().enumerate() {
+        let input = s3s::dto::UploadPartCopyInput::builder()
+            .bucket("c1".into())
+            .key("parts/copy.zip".into())
+            .upload_id(upload_id.clone())
+            .part_number(n as i32 + 1)
+            .copy_source(s3s::dto::CopySource::Bucket {
+                bucket: "b".into(),
+                key: f.keys[1].clone().into(),
+                version_id: None,
+            })
+            .copy_source_range(Some(format!("bytes={start}-{end}")))
+            .build()
+            .unwrap();
+        let out = copy::upload_part_copy(&f.svc, request(input))
+            .await
+            .unwrap();
+        let etag = out.output.copy_part_result.unwrap().e_tag.unwrap();
+        let want = format!(
+            "\"{}\"",
+            hex::encode(md5::Md5::digest(&body[*start..=*end]))
+        );
+        assert_eq!(etag, parse_s3s_etag(&want).unwrap(), "part {}", n + 1);
+    }
+    assert_eq!(
+        codec_runs(&f.metrics).1 - before,
+        1,
+        "one decode for 3 parts"
+    );
 }
