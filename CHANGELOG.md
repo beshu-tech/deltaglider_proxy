@@ -11,6 +11,22 @@ delay that acknowledgement by about 40 ms, so most requests on a reused
 (keep-alive) connection, which is what the AWS SDKs use, took at least 40 ms.
 Ten GET requests on one connection took 412 ms and now take about 31 ms.
 
+### Changed — Uploads send fewer requests and copy their body less
+
+- An overwrite of an object in the same stored form no longer sends a DELETE
+  request for the other form. The read before the write already showed that
+  the other form does not exist. An overwrite of a plain object now sends 3
+  requests instead of 4.
+- A PUT, HEAD or DELETE of a folder marker (a key that ends in `/`) sends one
+  request fewer, because a folder marker is never stored as a delta.
+- With a coordination bucket, a delta upload reads the metadata of
+  `reference.bin` once instead of twice.
+- A PUT keeps one copy of its body in memory, from the request to the storage
+  write. Before, the body was copied up to three times, and once more for each
+  retry to an S3 backend.
+- A large upload hashes its body while it writes the body to the spool disk,
+  instead of reading the spool file back afterwards.
+
 ### Changed — `metadata=true` lists storage facts only, with no HEAD request
 
 The proxy accepts the non-standard ListObjectsV2 parameter `metadata=true`. It
