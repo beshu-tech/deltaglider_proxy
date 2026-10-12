@@ -11,6 +11,44 @@ delay that acknowledgement by about 40 ms, so most requests on a reused
 (keep-alive) connection, which is what the AWS SDKs use, took at least 40 ms.
 Ten GET requests on one connection took 412 ms and now take about 31 ms.
 
+### Added — Write responses carry the storage facts of the object
+
+PutObject, CompleteMultipartUpload, CopyObject and a browser form upload now
+answer with the storage facts of the object that they wrote:
+`x-amz-storage-type` (how the proxy stores the object),
+`x-deltaglider-stored-size` (the size on the storage backend),
+`x-deltaglider-ref-sha256` (for a delta, the checksum of the folder's
+reference) and `x-deltaglider-baseline: created` (when this write created the
+folder's reference). A HEAD request already gave the same facts to every
+signed reader. A request from an anonymous reader or through a presigned URL
+gets none of these headers. `DGP_DEBUG_HEADERS` no longer controls them; it
+still controls the debug headers of GET, HEAD and LIST responses. A browser
+app under `cors_permissive` can read them, because they are in the CORS list of
+exposed headers.
+
+### Changed — The file browser sends far fewer requests
+
+- The file table takes the storage type and the stored size of each file from
+  the listing (`metadata=true`). Before, it sent one HEAD request per visible
+  file, 100 for a page of 100 files, and again after each return to a folder.
+- The object inspector shows the storage facts from the listing at once and
+  sends one HEAD request for the full header view, not two.
+- An upload reads the storage facts from the write response. Before, each
+  finished file sent a HEAD request, and the first file of a folder also
+  sent a LIST request.
+- A delete in the inspector removes the row from the table without listing the
+  folder again.
+- The automatic refresh every 60 seconds lists only the first page of a large
+  folder. The status bar shows when the later pages were listed; the Refresh
+  button and navigation list all pages again.
+- The savings chip remembers the totals of sub-folders from its walk of a
+  folder, so opening a sub-folder within 5 minutes sends no request to the
+  storage. A copy, move or delete in the browser clears the remembered totals
+  of the folders that it changed.
+- The analytics dashboard loads the usage of all buckets with one request
+  (`GET /_/api/admin/usage/buckets`), the bucket list loads the bucket origins
+  once, and the live log view closes its stream while its tab is hidden.
+
 ### Changed — Maintenance jobs and quota checks send fewer requests
 
 - A re-encrypt, metadata backfill or migrate job sends one HEAD request per
