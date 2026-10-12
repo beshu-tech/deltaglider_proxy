@@ -809,7 +809,7 @@ pub async fn handle_form_post_upload(
         ClientWrite {
             bucket,
             key: &parsed.resolved_key,
-            data: &parsed.file_data,
+            data: parsed.file_data.clone(),
             content_type: parsed.content_type.clone(),
             user_metadata: parsed.user_metadata.clone(),
             precondition: &precondition,

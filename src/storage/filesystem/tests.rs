@@ -43,7 +43,7 @@ mod backend_tests {
                 "missing-bucket",
                 "prefix",
                 "file.bin",
-                b"payload",
+                bytes::Bytes::from_static(b"payload"),
                 &dummy_metadata("file.bin"),
             )
             .await
@@ -74,7 +74,7 @@ mod backend_tests {
                 "ghost",
                 "ns",
                 "f.delta",
-                b"x",
+                bytes::Bytes::from_static(b"x"),
                 &dummy_metadata("f.delta"),
                 crate::deltaglider::RefWriteProof::for_tests(),
             )
@@ -103,7 +103,7 @@ mod backend_tests {
                 .put_reference(
                     "declared",
                     "ns",
-                    b"x",
+                    bytes::Bytes::from_static(b"x"),
                     &dummy_metadata("reference.bin"),
                     crate::deltaglider::RefWriteProof::for_tests()
                 )
@@ -123,7 +123,7 @@ mod backend_tests {
             .put_reference(
                 "declared",
                 "ns",
-                b"x",
+                bytes::Bytes::from_static(b"x"),
                 &dummy_metadata("reference.bin"),
                 crate::deltaglider::RefWriteProof::for_tests(),
             )
@@ -148,7 +148,7 @@ mod backend_tests {
             .put_reference(
                 "ghost",
                 "ns",
-                b"ref",
+                bytes::Bytes::from_static(b"ref"),
                 &dummy_metadata("reference.bin"),
                 crate::deltaglider::RefWriteProof::for_tests(),
             )
@@ -192,7 +192,13 @@ mod backend_tests {
         // because it's the first thing it checks. So this path proves
         // race-A is closed.
         let err = backend
-            .put_passthrough("racy", "ns", "f.bin", b"payload", &dummy_metadata("f.bin"))
+            .put_passthrough(
+                "racy",
+                "ns",
+                "f.bin",
+                bytes::Bytes::from_static(b"payload"),
+                &dummy_metadata("f.bin"),
+            )
             .await
             .expect_err("must refuse");
         assert!(matches!(err, StorageError::BucketNotFound(_)));
@@ -274,7 +280,7 @@ mod backend_tests {
                 "real-bucket",
                 "",
                 "file.bin",
-                b"payload",
+                bytes::Bytes::from_static(b"payload"),
                 &dummy_metadata("file.bin"),
             )
             .await
@@ -302,7 +308,7 @@ mod backend_tests {
                 "bucket",
                 "a/b",
                 "file.bin",
-                b"delta",
+                bytes::Bytes::from_static(b"delta"),
                 &dummy_metadata("file.bin"),
                 crate::deltaglider::RefWriteProof::for_tests(),
             )
@@ -342,7 +348,7 @@ mod backend_tests {
             .put_reference(
                 "bucket",
                 "only/ref",
-                b"ref",
+                bytes::Bytes::from_static(b"ref"),
                 &meta,
                 crate::deltaglider::RefWriteProof::for_tests(),
             )
@@ -378,7 +384,13 @@ mod backend_tests {
             let meta =
                 FileMetadata::new_passthrough(name.into(), "0".repeat(64), "0".repeat(32), 3, None);
             backend
-                .put_passthrough("bucket", prefix, name, b"abc", &meta)
+                .put_passthrough(
+                    "bucket",
+                    prefix,
+                    name,
+                    bytes::Bytes::from_static(b"abc"),
+                    &meta,
+                )
                 .await
                 .expect("put");
         }
@@ -426,7 +438,7 @@ mod backend_tests {
                 .put_reference(
                     "bucket",
                     ds,
-                    b"ref",
+                    bytes::Bytes::from_static(b"ref"),
                     &meta,
                     crate::deltaglider::RefWriteProof::for_tests(),
                 )
@@ -476,7 +488,7 @@ mod backend_tests {
             .put_reference(
                 "bucket",
                 "ghost",
-                b"ref",
+                bytes::Bytes::from_static(b"ref"),
                 &meta,
                 crate::deltaglider::RefWriteProof::for_tests(),
             )
@@ -511,7 +523,7 @@ mod backend_tests {
                 "bucket",
                 "a",
                 "secret.txt",
-                b"s",
+                bytes::Bytes::from_static(b"s"),
                 &dummy_metadata("secret.txt"),
             )
             .await
@@ -535,7 +547,7 @@ mod backend_tests {
                             "bucket",
                             prefix,
                             "x.zip",
-                            b"d",
+                            bytes::Bytes::from_static(b"d"),
                             &dummy_metadata("x.zip"),
                             crate::deltaglider::RefWriteProof::for_tests()
                         )
@@ -592,13 +604,19 @@ mod backend_tests {
                 "bucket",
                 ".well-known",
                 "cert.txt",
-                b"pem",
+                bytes::Bytes::from_static(b"pem"),
                 &dummy_metadata("cert.txt"),
             )
             .await
             .expect("put dot-dir object");
         backend
-            .put_passthrough("bucket", "", "top.txt", b"x", &dummy_metadata("top.txt"))
+            .put_passthrough(
+                "bucket",
+                "",
+                "top.txt",
+                bytes::Bytes::from_static(b"x"),
+                &dummy_metadata("top.txt"),
+            )
             .await
             .expect("put root object");
         // Internal residue at the bucket root: a `.dg` dir and a temp file.
@@ -654,7 +672,7 @@ mod backend_tests {
             .put_reference(
                 "bucket",
                 "ghost",
-                b"ref",
+                bytes::Bytes::from_static(b"ref"),
                 &meta,
                 crate::deltaglider::RefWriteProof::for_tests(),
             )
@@ -773,7 +791,7 @@ mod backend_tests {
                 "bucket",
                 "visible",
                 "file.bin",
-                b"payload",
+                bytes::Bytes::from_static(b"payload"),
                 &dummy_metadata("file.bin"),
             )
             .await
@@ -790,7 +808,7 @@ mod backend_tests {
             .put_reference(
                 "bucket",
                 "visible",
-                b"ref",
+                bytes::Bytes::from_static(b"ref"),
                 &meta,
                 crate::deltaglider::RefWriteProof::for_tests(),
             )
@@ -833,7 +851,7 @@ mod backend_tests {
             .put_reference(
                 "bucket",
                 "deltas",
-                &payload,
+                bytes::Bytes::copy_from_slice(&payload),
                 &meta,
                 crate::deltaglider::RefWriteProof::for_tests(),
             )
@@ -893,7 +911,7 @@ mod backend_tests {
             .put_reference(
                 "bucket",
                 "d",
-                b"old-baseline",
+                bytes::Bytes::from_static(b"old-baseline"),
                 &ref_meta(12),
                 crate::deltaglider::RefWriteProof::for_tests(),
             )
@@ -972,11 +990,23 @@ mod backend_tests {
             FileMetadata::new_passthrough(name.into(), "0".repeat(64), "0".repeat(32), 1, None)
         };
         backend
-            .put_passthrough("bucket", "", ".env", b"x", &meta(".env"))
+            .put_passthrough(
+                "bucket",
+                "",
+                ".env",
+                bytes::Bytes::from_static(b"x"),
+                &meta(".env"),
+            )
             .await
             .expect("put .env");
         backend
-            .put_passthrough("bucket", "cfg", ".gitignore", b"x", &meta(".gitignore"))
+            .put_passthrough(
+                "bucket",
+                "cfg",
+                ".gitignore",
+                bytes::Bytes::from_static(b"x"),
+                &meta(".gitignore"),
+            )
             .await
             .expect("put cfg/.gitignore");
         // Temp residue of an interrupted atomic write (old and new names).
@@ -1053,14 +1083,26 @@ mod backend_tests {
         let path = |n: &str| backend.passthrough_path("bucket", "d", n).unwrap();
 
         backend
-            .put_passthrough("bucket", "d", "plain.bin", b"x", &meta("plain.bin"))
+            .put_passthrough(
+                "bucket",
+                "d",
+                "plain.bin",
+                bytes::Bytes::from_static(b"x"),
+                &meta("plain.bin"),
+            )
             .await
             .unwrap();
         assert!(!pending_has(&path("plain.bin")), "outside the scope: fsync");
 
         crate::storage::with_deferred_fsync(async {
             backend
-                .put_passthrough("bucket", "d", "copy.bin", b"x", &meta("copy.bin"))
+                .put_passthrough(
+                    "bucket",
+                    "d",
+                    "copy.bin",
+                    bytes::Bytes::from_static(b"x"),
+                    &meta("copy.bin"),
+                )
                 .await
                 .unwrap();
             backend
@@ -1077,7 +1119,7 @@ mod backend_tests {
                 .put_reference(
                     "bucket",
                     "d",
-                    b"ref",
+                    bytes::Bytes::from_static(b"ref"),
                     &ref_meta(3),
                     crate::deltaglider::RefWriteProof::for_tests(),
                 )
@@ -1118,7 +1160,7 @@ mod backend_tests {
                     None,
                 );
                 backend
-                    .put_passthrough("bucket", "d", &name, b"x", &meta)
+                    .put_passthrough("bucket", "d", &name, bytes::Bytes::from_static(b"x"), &meta)
                     .await
                     .unwrap();
                 assert!(super::PENDING_FSYNC.lock().len() < super::PENDING_FSYNC_MAX);
@@ -1146,7 +1188,13 @@ mod backend_tests {
         for i in 0..600 {
             let put_prefix = if i % 2 == 0 { "a/b" } else { "a/b/c/d" };
             backend
-                .put_passthrough("bucket", "a/b/c", "x.bin", b"x", &meta)
+                .put_passthrough(
+                    "bucket",
+                    "a/b/c",
+                    "x.bin",
+                    bytes::Bytes::from_static(b"x"),
+                    &meta,
+                )
                 .await
                 .expect("seed");
             let (b1, b2, m) = (backend.clone(), backend.clone(), meta.clone());
@@ -1155,8 +1203,14 @@ mod backend_tests {
                     async move { b1.delete_passthrough("bucket", "a/b/c", "x.bin").await },
                 );
             let put = tokio::spawn(async move {
-                b2.put_passthrough("bucket", put_prefix, "y.bin", b"y", &m)
-                    .await
+                b2.put_passthrough(
+                    "bucket",
+                    put_prefix,
+                    "y.bin",
+                    bytes::Bytes::from_static(b"y"),
+                    &m,
+                )
+                .await
             });
             del.await.unwrap().expect("delete");
             if let Err(e) = put.await.unwrap() {
@@ -1213,7 +1267,7 @@ mod backend_tests {
                 "bucket",
                 "p",
                 "o.bin",
-                b"0123456789",
+                bytes::Bytes::from_static(b"0123456789"),
                 &dummy_metadata("o.bin"),
             )
             .await
@@ -1249,7 +1303,13 @@ mod backend_tests {
         let synced = |dir: &Path| super::SYNCED.lock().iter().any(|p| p == dir);
 
         backend
-            .put_passthrough("bucket", "s", "f.bin", b"x", &dummy_metadata("f.bin"))
+            .put_passthrough(
+                "bucket",
+                "s",
+                "f.bin",
+                bytes::Bytes::from_static(b"x"),
+                &dummy_metadata("f.bin"),
+            )
             .await
             .unwrap();
         let sync_dir = backend.deltaspace_dir("bucket", "s").unwrap();
@@ -1259,7 +1319,13 @@ mod backend_tests {
         crate::storage::with_deferred_fsync(async {
             for name in ["a.bin", "b.bin"] {
                 backend
-                    .put_passthrough("bucket", "d", name, b"x", &dummy_metadata(name))
+                    .put_passthrough(
+                        "bucket",
+                        "d",
+                        name,
+                        bytes::Bytes::from_static(b"x"),
+                        &dummy_metadata(name),
+                    )
                     .await
                     .unwrap();
             }
@@ -1291,13 +1357,14 @@ async fn a_stat_error_never_reads_as_absent() {
         .unwrap();
     fs.create_bucket("b").await.unwrap();
     let meta = FileMetadata::new_passthrough("k".into(), "s".into(), "m".into(), 1, None);
-    fs.put_passthrough("b", "d", "k", b"x", &meta)
+    fs.put_passthrough("b", "d", "k", bytes::Bytes::from_static(b"x"), &meta)
         .await
         .unwrap();
     let bucket = fault::fail_io(&dir.path().join("b"), libc::EIO);
     assert!(fs.head_bucket("b").await.is_err());
     assert!(matches!(
-        fs.put_passthrough("b", "d", "k2", b"x", &meta).await,
+        fs.put_passthrough("b", "d", "k2", bytes::Bytes::from_static(b"x"), &meta)
+            .await,
         Err(StorageError::Io(_))
     ));
     assert!(fs.delete_bucket("b").await.is_err());
@@ -1334,7 +1401,7 @@ async fn listing_fixture() -> (tempfile::TempDir, FilesystemBackend) {
         .unwrap();
     fs.create_bucket("b").await.unwrap();
     let pass = FileMetadata::new_passthrough("a.txt".into(), "s".into(), "m".into(), 1, None);
-    fs.put_passthrough("b", "x", "a.txt", b"a", &pass)
+    fs.put_passthrough("b", "x", "a.txt", bytes::Bytes::from_static(b"a"), &pass)
         .await
         .unwrap();
     let delta = |name: &str| {
@@ -1355,9 +1422,16 @@ async fn listing_fixture() -> (tempfile::TempDir, FilesystemBackend) {
         ("app-3.zip", "app-1.zip"),
         ("app-4.zip", "app-4.zip"),
     ] {
-        fs.put_delta("b", "x", file, b"ddd", &delta(named), proof)
-            .await
-            .unwrap();
+        fs.put_delta(
+            "b",
+            "x",
+            file,
+            bytes::Bytes::from_static(b"ddd"),
+            &delta(named),
+            proof,
+        )
+        .await
+        .unwrap();
     }
     let deltas = dir.path().join("b/deltaspaces/x");
     xattr::remove(deltas.join("app-2.zip.delta"), xattr_meta::XATTR_NAME).unwrap();

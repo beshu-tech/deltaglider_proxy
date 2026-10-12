@@ -866,7 +866,7 @@ async fn rewrite_reference_if_needed(
             let mut new_meta = meta;
             strip_encryption_markers(&mut new_meta.user_metadata);
             engine
-                .put_reference_raw(bucket, prefix, &data, &new_meta)
+                .put_reference_raw(bucket, prefix, &bytes::Bytes::from(data), &new_meta)
                 .await?;
             Ok(())
         })

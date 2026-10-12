@@ -35,7 +35,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         bucket: &str,
         prefix: &str,
         filename: &str,
-        data: &[u8],
+        data: Bytes,
         metadata: &FileMetadata,
         prior: &CounterPrior,
     ) -> Result<(), StorageError> {
@@ -81,7 +81,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         &self,
         bucket: &str,
         prefix: &str,
-        data: &[u8],
+        data: &Bytes,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         let held = self.held_reference_lock(bucket, prefix, "reference")?;

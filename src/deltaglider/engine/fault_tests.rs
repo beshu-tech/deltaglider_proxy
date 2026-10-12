@@ -157,7 +157,13 @@ async fn write_passthrough<S: StorageBackend>(storage: &S, bytes: &[u8], hours: 
     );
     meta.created_at += chrono::Duration::hours(hours);
     storage
-        .put_passthrough("b", "p", "k.zip", bytes, &meta)
+        .put_passthrough(
+            "b",
+            "p",
+            "k.zip",
+            bytes::Bytes::copy_from_slice(bytes),
+            &meta,
+        )
         .await
         .unwrap();
 }
@@ -298,7 +304,7 @@ async fn legacy_reference_migration_keeps_a_live_object() {
         .put_reference(
             "b",
             "rel",
-            &v1,
+            bytes::Bytes::copy_from_slice(&v1),
             &legacy,
             crate::deltaglider::RefWriteProof::for_tests(),
         )

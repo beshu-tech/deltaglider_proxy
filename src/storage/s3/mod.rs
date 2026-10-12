@@ -448,12 +448,12 @@ impl StorageBackend for S3Backend {
         &self,
         bucket: &str,
         prefix: &str,
-        data: &[u8],
+        data: Bytes,
         metadata: &FileMetadata,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
         let key = self.reference_key(prefix);
-        self.put_object_with_metadata(bucket, &key, data, metadata)
+        self.put_object_with_metadata(bucket, &key, data.clone(), metadata)
             .await?;
         debug!(
             "Stored reference for {}/{} ({} bytes)",
@@ -652,7 +652,7 @@ impl StorageBackend for S3Backend {
         let key = self.reference_key(prefix);
         let etag = match op {
             RefWrite::Put { data, metadata } => {
-                self.put_object_with_metadata_fenced(bucket, &key, data, metadata, fence)
+                self.put_object_with_metadata_fenced(bucket, &key, data.clone(), metadata, fence)
                     .await?
             }
             RefWrite::PutFile { path, metadata } => {
@@ -681,12 +681,12 @@ impl StorageBackend for S3Backend {
         bucket: &str,
         prefix: &str,
         filename: &str,
-        data: &[u8],
+        data: Bytes,
         metadata: &FileMetadata,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
         let key = self.delta_key(prefix, filename);
-        self.put_object_with_metadata(bucket, &key, data, metadata)
+        self.put_object_with_metadata(bucket, &key, data.clone(), metadata)
             .await?;
         debug!(
             "Stored delta for {}/{}/{} ({} bytes)",
@@ -742,11 +742,11 @@ impl StorageBackend for S3Backend {
         bucket: &str,
         prefix: &str,
         filename: &str,
-        data: &[u8],
+        data: Bytes,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         let key = self.passthrough_key(prefix, filename);
-        self.put_object_with_metadata(bucket, &key, data, metadata)
+        self.put_object_with_metadata(bucket, &key, data.clone(), metadata)
             .await?;
         debug!(
             "Stored passthrough for {}/{}/{} ({} bytes)",

@@ -125,7 +125,7 @@ impl StorePlan {
 /// holds (the streaming PUT).
 #[derive(Clone, Copy)]
 enum PutBody<'a> {
-    Buffered(&'a [u8]),
+    Buffered(&'a Bytes),
     Spooled(&'a crate::deltaglider::spool::Spool),
 }
 
@@ -208,7 +208,7 @@ fn passthrough_metadata(
 /// Where a passthrough write reads its bytes.
 #[derive(Clone, Copy)]
 enum PassthroughSource<'a> {
-    Bytes(&'a [u8]),
+    Bytes(&'a Bytes),
     /// A file; `held` is the spool it lives on when the op holds one.
     File {
         path: &'a Path,
@@ -266,7 +266,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         user_metadata: std::collections::HashMap<String, String>,
     ) -> Result<StoreResult, EngineError> {
         // The counter is recorded where the object commits (`record_commit`).
-        self.store_inner(bucket, key, data, content_type, user_metadata, None, None)
+        // One copy: the slice API. The client write passes its `Bytes`.
+        let body = Bytes::copy_from_slice(data);
+        self.store_inner(bucket, key, &body, content_type, user_metadata, None, None)
             .await
     }
 
@@ -284,10 +286,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         user_metadata: std::collections::HashMap<String, String>,
         multipart_etag: String,
     ) -> Result<StoreResult, EngineError> {
+        // One copy: the slice API.
+        let body = Bytes::copy_from_slice(data);
         self.store_inner(
             bucket,
             key,
-            data,
+            &body,
             content_type,
             user_metadata,
             Some(multipart_etag),
@@ -332,7 +336,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         &self,
         bucket: &str,
         key: &str,
-        data: &[u8],
+        data: &Bytes,
         content_type: Option<String>,
         user_metadata: std::collections::HashMap<String, String>,
         multipart_etag: Option<String>,
@@ -735,7 +739,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     async fn encode_buffered(
         &self,
         put: &PutObject<'_>,
-        data: &[u8],
+        data: &Bytes,
         ref_meta: &FileMetadata,
     ) -> Result<(EncodeOutcome, EncodedDelta), EngineError> {
         let (reference, _cache_hit) = self
@@ -747,8 +751,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // The source file first (spool before codec slot, as on every path).
         let source_file = self.codec_source_spool_now(reference.len())?;
         let _codec_permit = self.try_acquire_codec()?;
-        // spawn_blocking: xdelta3 is CPU-bound; data must be owned ('static).
-        let data_owned = data.to_vec();
+        // spawn_blocking: xdelta3 is CPU-bound; data must be owned ('static):
+        // a refcount clone of the body, not a copy.
+        let data_owned = data.clone();
         let codec = self.codec.clone();
         let encode_start = Instant::now();
         let delta = tokio::task::spawn_blocking(move || {
@@ -929,8 +934,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     )
                     .await?;
                 self.record_reference(put.bucket, put.size as i64);
-                self.cache
-                    .put(&cache_key, Bytes::copy_from_slice(data), &put.sha256);
+                // The cache shares the body's buffer.
+                self.cache.put(&cache_key, data.clone(), &put.sha256);
             }
             PutBody::Spooled(body) => {
                 // Streamed into place from the spool (no heap-load — M1.4).
@@ -985,6 +990,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         fresh_baseline: bool,
         xnode: &super::ReferenceLockGuard,
     ) -> Result<StoreResult, EngineError> {
+        let delta = Bytes::from(delta);
         let mut metadata = FileMetadata::new_delta(
             put.obj_key.filename.clone(),
             put.sha256.clone(),
@@ -1003,7 +1009,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 put.bucket,
                 put.deltaspace_id,
                 &put.obj_key.filename,
-                &delta,
+                delta.clone(),
                 &metadata,
             )
             .await?;
@@ -1055,7 +1061,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         match source {
             PassthroughSource::Bytes(data) => {
                 self.storage
-                    .put_passthrough(bucket, deltaspace_id, &filename, data, &metadata)
+                    .put_passthrough(bucket, deltaspace_id, &filename, data.clone(), &metadata)
                     .await?
             }
             PassthroughSource::File { path, held } => {
@@ -1861,7 +1867,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 bucket,
                 deltaspace_id,
                 filename,
-                &delta,
+                Bytes::from(delta),
                 &delta_meta,
             )
             .await?;
@@ -2258,7 +2264,7 @@ mod stale_reference_cache_tests {
             .put_reference(
                 "b",
                 "rel",
-                &r2,
+                bytes::Bytes::copy_from_slice(&r2),
                 &r2_meta,
                 crate::deltaglider::RefWriteProof::for_tests(),
             )

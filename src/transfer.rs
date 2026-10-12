@@ -1355,7 +1355,12 @@ async fn delta_passthrough_copy(
                 // source marker would corrupt the reference read.
                 strip_encryption_markers(&mut ref_meta.user_metadata);
                 engine2
-                    .put_reference_raw(&dest_bucket, &dest_prefix2, &ref_data, &ref_meta)
+                    .put_reference_raw(
+                        &dest_bucket,
+                        &dest_prefix2,
+                        &Bytes::from(ref_data),
+                        &ref_meta,
+                    )
                     .await?;
                 // Counted at its write: a ship that fails below leaves it.
                 engine2.record_seeded_reference(&dest_bucket, ref_meta.file_size);
@@ -1365,7 +1370,7 @@ async fn delta_passthrough_copy(
                     &dest_bucket,
                     &dest_prefix2,
                     &dest_filename2,
-                    &delta_bytes,
+                    Bytes::from(delta_bytes),
                     &meta,
                     &counter_prior,
                 )
@@ -1465,7 +1470,7 @@ async fn heal_stripped_dest_delta(
                     bucket,
                     &dest_key.prefix,
                     &dest_key.filename,
-                    &delta_bytes,
+                    Bytes::from(delta_bytes),
                     meta,
                     // A re-stamp of a stored delta: no read says the
                     // passthrough form is absent.
@@ -2430,7 +2435,7 @@ mod multipart_abort_tests {
             &self,
             _: &str,
             _: &str,
-            _: &[u8],
+            _: bytes::Bytes,
             _: &FileMetadata,
             _proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), StorageError> {
@@ -2474,7 +2479,7 @@ mod multipart_abort_tests {
             _: &str,
             _: &str,
             _: &str,
-            _: &[u8],
+            _: bytes::Bytes,
             _: &FileMetadata,
             _proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), StorageError> {
@@ -2496,7 +2501,7 @@ mod multipart_abort_tests {
             _: &str,
             _: &str,
             _: &str,
-            _: &[u8],
+            _: bytes::Bytes,
             _: &FileMetadata,
         ) -> Result<(), StorageError> {
             Err(nope())
@@ -2677,7 +2682,7 @@ mod multipart_abort_tests {
             &self,
             b: &str,
             p: &str,
-            d: &[u8],
+            d: bytes::Bytes,
             m: &FileMetadata,
             proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), StorageError> {
@@ -2721,7 +2726,7 @@ mod multipart_abort_tests {
             b: &str,
             p: &str,
             f: &str,
-            d: &[u8],
+            d: bytes::Bytes,
             m: &FileMetadata,
             proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), StorageError> {
@@ -2743,7 +2748,7 @@ mod multipart_abort_tests {
             b: &str,
             p: &str,
             f: &str,
-            d: &[u8],
+            d: bytes::Bytes,
             m: &FileMetadata,
         ) -> Result<(), StorageError> {
             self.0.put_passthrough(b, p, f, d, m).await

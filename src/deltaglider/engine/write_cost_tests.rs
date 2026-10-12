@@ -189,7 +189,14 @@ async fn a_raw_delta_write_drops_the_other_form_through_the_helper() {
         let res: Result<(), EngineError> = engine
             .with_dest_prefix_lock("b", "run", || async {
                 Ok(engine
-                    .put_delta_raw("b", "run", "copy.zip", &bytes, &meta, &prior)
+                    .put_delta_raw(
+                        "b",
+                        "run",
+                        "copy.zip",
+                        bytes::Bytes::copy_from_slice(&bytes),
+                        &meta,
+                        &prior,
+                    )
                     .await?)
             })
             .await;
@@ -250,7 +257,15 @@ async fn a_form_a_peer_adds_after_the_read_is_dropped_by_the_next_write() {
     // Our passthrough write, with the read from before the peer's write.
     fake.clear();
     engine
-        .store_inner("b", key, &ours, None, no_delta(), None, Some(prior))
+        .store_inner(
+            "b",
+            key,
+            &Bytes::from(ours.clone()),
+            None,
+            no_delta(),
+            None,
+            Some(prior),
+        )
         .await
         .unwrap();
     assert_eq!(count(&fake, "DELETE"), 0, "{:#?}", object_requests(&fake));
@@ -330,4 +345,63 @@ async fn a_locked_delta_put_heads_the_reference_for_fence_and_metadata_once() {
         .filter(|r| r.starts_with("HEAD /b/run/reference.bin"))
         .count();
     assert_eq!(heads, 4, "two locked delta PUTs: {:#?}", fake.requests());
+}
+
+/// Fix the class: a buffered PUT body is one `Bytes` from the S3 adapter
+/// to the storage write. The encode copied it (`data.to_vec()`), the S3
+/// PUT copied it per attempt (`ByteStream::from(data.to_vec())`), and the
+/// first delta copied it into the reference cache
+/// (`Bytes::copy_from_slice`): up to 3 copies of a body of up to
+/// `max_object_size`. The storage write methods take `Bytes`, so a copy
+/// can come back only as an explicit one here.
+#[test]
+fn buffered_put_bodies_are_not_copied() {
+    let mut sites = Vec::new();
+    for file in [
+        "src/deltaglider/engine/store.rs",
+        "src/deltaglider/engine/conditional.rs",
+        "src/storage/s3/objects.rs",
+    ] {
+        let text = std::fs::read_to_string(file).unwrap();
+        let lines = crate::source_scan::prod_lines(&text);
+        for (i, (n, line)) in lines.iter().enumerate() {
+            // The slice API (`store`, `store_with_multipart_etag`) copies
+            // once at its entry, and says so on the line above.
+            if i > 0 && lines[i - 1].1.contains("One copy: the slice API") {
+                continue;
+            }
+            if line.contains("data.to_vec()")
+                || line.contains("Bytes::copy_from_slice(data)")
+                || line.contains("ByteStream::from(data.to_vec())")
+            {
+                sites.push(format!("{file}:{n}: {}", line.trim()));
+            }
+        }
+    }
+    assert!(sites.is_empty(), "body copies: {sites:#?}");
+}
+
+/// The first delta PUT into a folder makes its body the baseline: the
+/// reference cache holds the client's buffer, not a copy of it.
+#[tokio::test]
+async fn the_baseline_in_the_reference_cache_is_the_client_buffer() {
+    let (engine, _fake) = counted_s3_engine().await;
+    let body = Bytes::from(noise(21, 64 * 1024));
+    let r = engine
+        .store_conditional(
+            "b",
+            "rel/a.zip",
+            body.clone(),
+            None,
+            HashMap::new(),
+            &crate::deltaglider::Precondition::none(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.metadata.storage_info.label(), "delta");
+    let cached = engine
+        .cache
+        .get(&engine.cache_key("b", "rel"))
+        .expect("the baseline is cached");
+    assert_eq!(cached.as_ptr(), body.as_ptr(), "the cache copied the body");
 }

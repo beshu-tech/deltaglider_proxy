@@ -66,8 +66,10 @@ pub type ByteStream = BoxStream<'static, Result<Bytes, StorageError>>;
 /// [`StorageBackend::write_reference_fenced`]).
 #[derive(Debug, Clone, Copy)]
 pub enum RefWrite<'a> {
+    /// The body is `Bytes`: a write (and each retry of it) shares the
+    /// caller's buffer instead of copying it.
     Put {
-        data: &'a [u8],
+        data: &'a Bytes,
         metadata: &'a FileMetadata,
     },
     PutFile {
@@ -235,7 +237,7 @@ pub async fn unfenced_reference_write<B: StorageBackend + ?Sized>(
     match op {
         RefWrite::Put { data, metadata } => {
             backend
-                .put_reference(bucket, prefix, data, metadata, proof)
+                .put_reference(bucket, prefix, data.clone(), metadata, proof)
                 .await?
         }
         RefWrite::PutFile { path, metadata } => {
@@ -431,7 +433,7 @@ pub trait StorageBackend: Send + Sync {
         &self,
         bucket: &str,
         prefix: &str,
-        data: &[u8],
+        data: Bytes,
         metadata: &FileMetadata,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
@@ -451,7 +453,7 @@ pub trait StorageBackend: Send + Sync {
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
             let data = tokio::fs::read(source_path).await?;
-            self.put_reference(bucket, prefix, &data, metadata, proof)
+            self.put_reference(bucket, prefix, Bytes::from(data), metadata, proof)
                 .await
         }
     }
@@ -573,7 +575,7 @@ pub trait StorageBackend: Send + Sync {
         bucket: &str,
         prefix: &str,
         filename: &str,
-        data: &[u8],
+        data: Bytes,
         metadata: &FileMetadata,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
@@ -610,7 +612,7 @@ pub trait StorageBackend: Send + Sync {
         bucket: &str,
         prefix: &str,
         filename: &str,
-        data: &[u8],
+        data: Bytes,
         metadata: &FileMetadata,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
@@ -631,7 +633,7 @@ pub trait StorageBackend: Send + Sync {
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
             let data = tokio::fs::read(source_path).await?;
-            self.put_passthrough(bucket, prefix, filename, &data, metadata)
+            self.put_passthrough(bucket, prefix, filename, Bytes::from(data), metadata)
                 .await
         }
     }
@@ -654,7 +656,7 @@ pub trait StorageBackend: Send + Sync {
                 let part = tokio::fs::read(path).await?;
                 assembled.extend_from_slice(&part);
             }
-            self.put_passthrough(bucket, prefix, filename, &assembled, metadata)
+            self.put_passthrough(bucket, prefix, filename, Bytes::from(assembled), metadata)
                 .await
         }
     }
@@ -792,7 +794,7 @@ pub trait StorageBackend: Send + Sync {
             for chunk in chunks {
                 buf.extend_from_slice(chunk);
             }
-            self.put_passthrough(bucket, prefix, filename, &buf, metadata)
+            self.put_passthrough(bucket, prefix, filename, Bytes::from(buf), metadata)
                 .await
         }
     }

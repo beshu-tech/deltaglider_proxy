@@ -437,7 +437,7 @@ pub(super) async fn put_object(
         crate::api::handlers::object_helpers::ClientWrite {
             bucket: &input.bucket,
             key: &input.key,
-            data: &data,
+            data: data.clone(),
             content_type: input.content_type,
             user_metadata: input.metadata.unwrap_or_default(),
             precondition: &crate::deltaglider::Precondition {

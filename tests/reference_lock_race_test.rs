@@ -333,23 +333,41 @@ async fn s3_reference_writes_are_fenced() {
         1,
         None,
     );
-    let put = |data: &'static [u8]| RefWrite::Put {
-        data,
-        metadata: &meta,
-    };
+    let (body_p, body_a) = (
+        bytes::Bytes::from_static(b"P"),
+        bytes::Bytes::from_static(b"A"),
+    );
 
     let proof = deltaglider_proxy::deltaglider::RefWriteProof::unguarded();
     let seen = s3.reference_fence(MINIO_BUCKET, &ds).await.unwrap();
     assert_eq!(seen, RefFence::Absent);
     // A peer creates the baseline after our observation.
     let peer = s3
-        .write_reference_fenced(MINIO_BUCKET, &ds, put(b"P"), &RefFence::Absent, proof)
+        .write_reference_fenced(
+            MINIO_BUCKET,
+            &ds,
+            RefWrite::Put {
+                data: &body_p,
+                metadata: &meta,
+            },
+            &RefFence::Absent,
+            proof,
+        )
         .await
         .unwrap();
     assert!(matches!(peer, RefFence::ETag(ref e) if !e.is_empty()));
     // Our create (fence: absent) must not overwrite it.
     let err = s3
-        .write_reference_fenced(MINIO_BUCKET, &ds, put(b"A"), &seen, proof)
+        .write_reference_fenced(
+            MINIO_BUCKET,
+            &ds,
+            RefWrite::Put {
+                data: &body_a,
+                metadata: &meta,
+            },
+            &seen,
+            proof,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, StorageError::Throttled(_)), "{err:?}");

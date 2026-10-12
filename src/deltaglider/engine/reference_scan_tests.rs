@@ -44,7 +44,7 @@ async fn put_ref<B: StorageBackend>(b: &B, prefix: &str, body: &[u8]) {
     b.put_reference(
         "b",
         prefix,
-        body,
+        bytes::Bytes::copy_from_slice(body),
         &reference(body),
         crate::deltaglider::RefWriteProof::for_tests(),
     )
@@ -58,15 +58,27 @@ async fn put_ref<B: StorageBackend>(b: &B, prefix: &str, body: &[u8]) {
 async fn seed<B: StorageBackend>(b: &B, dirs: usize) {
     for i in 0..dirs {
         let prefix = format!("{SCOPE}run{i}/shots");
-        b.put_passthrough("b", &prefix, "a.png", PNG, &passthrough("a.png", PNG))
-            .await
-            .unwrap();
+        b.put_passthrough(
+            "b",
+            &prefix,
+            "a.png",
+            bytes::Bytes::copy_from_slice(PNG),
+            &passthrough("a.png", PNG),
+        )
+        .await
+        .unwrap();
     }
     put_ref(b, REF_DS, REF_BODY).await;
     put_ref(b, "other/lib", b"another baseline").await;
-    b.put_passthrough("b", "other", "x.png", PNG, &passthrough("x.png", PNG))
-        .await
-        .unwrap();
+    b.put_passthrough(
+        "b",
+        "other",
+        "x.png",
+        bytes::Bytes::copy_from_slice(PNG),
+        &passthrough("x.png", PNG),
+    )
+    .await
+    .unwrap();
 }
 
 fn found(scan: &ReferenceScan) -> Vec<(String, u64)> {

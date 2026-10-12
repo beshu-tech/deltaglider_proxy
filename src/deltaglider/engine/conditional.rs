@@ -177,11 +177,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// A client write of a whole body: lock, judge the precondition, store.
+    /// `data` is the body as the S3 adapter collected it: the store shares
+    /// the buffer down to the storage write, it never copies it.
     pub async fn store_conditional(
         &self,
         bucket: &str,
         key: &str,
-        data: &[u8],
+        data: Bytes,
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
         precondition: &Precondition,
@@ -207,7 +209,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         &self,
         bucket: &str,
         key: &str,
-        data: &[u8],
+        data: Bytes,
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
         known_prior: Option<super::usage::CounterPrior>,
@@ -215,7 +217,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let size = data.len() as u64;
         if size > self.spool_threshold() && self.write_tries_delta(bucket, key, &user_metadata) {
             let spool = self.spool_acquire(size).await?;
-            tokio::fs::write(spool.path(), data)
+            tokio::fs::write(spool.path(), &data)
                 .await
                 .map_err(|e| EngineError::Storage(StorageError::from(e)))?;
             self.store_spooled_delta_inner(
@@ -233,7 +235,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             self.store_inner(
                 bucket,
                 key,
-                data,
+                &data,
                 content_type,
                 user_metadata,
                 None,
@@ -354,7 +356,14 @@ mod tests {
         };
         fake.clear();
         let stored = engine
-            .store_conditional("b", "img/a.jpg", b"one", None, HashMap::new(), &create_only)
+            .store_conditional(
+                "b",
+                "img/a.jpg",
+                Bytes::from_static(b"one"),
+                None,
+                HashMap::new(),
+                &create_only,
+            )
             .await
             .unwrap();
         let heads = object_heads(&fake);
@@ -368,7 +377,14 @@ mod tests {
         };
         fake.clear();
         engine
-            .store_conditional("b", "img/a.jpg", b"two!", None, HashMap::new(), &replace)
+            .store_conditional(
+                "b",
+                "img/a.jpg",
+                Bytes::from_static(b"two!"),
+                None,
+                HashMap::new(),
+                &replace,
+            )
             .await
             .unwrap();
         assert_eq!(object_heads(&fake), 2, "{:?}", fake.requests());

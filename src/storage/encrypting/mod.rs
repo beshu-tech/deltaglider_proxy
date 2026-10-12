@@ -389,18 +389,20 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         self.write_key().is_some()
     }
 
+    /// The stored body: the ciphertext, or `data` itself (shared, not
+    /// copied) when this backend does not encrypt.
     fn encrypt_if_enabled(
         &self,
-        data: &[u8],
+        data: &bytes::Bytes,
         metadata: &mut FileMetadata,
-    ) -> Result<Vec<u8>, StorageError> {
+    ) -> Result<bytes::Bytes, StorageError> {
         match self.write_key() {
             Some((key, key_id)) => {
                 let encrypted = encrypt(&key, data)?;
                 mark_encrypted(metadata, key_id.as_deref());
-                Ok(encrypted)
+                Ok(bytes::Bytes::from(encrypted))
             }
-            None => Ok(data.to_vec()),
+            None => Ok(data.clone()),
         }
     }
 
@@ -539,14 +541,14 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         &self,
         bucket: &str,
         prefix: &str,
-        data: &[u8],
+        data: bytes::Bytes,
         metadata: &FileMetadata,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
         let mut meta = without_markers(metadata);
-        let enc = self.encrypt_if_enabled(data, &mut meta)?;
+        let enc = self.encrypt_if_enabled(&data, &mut meta)?;
         self.inner
-            .put_reference(bucket, prefix, &enc, &meta, proof)
+            .put_reference(bucket, prefix, enc, &meta, proof)
             .await
     }
 
@@ -555,14 +557,14 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         bucket: &str,
         prefix: &str,
         filename: &str,
-        data: &[u8],
+        data: bytes::Bytes,
         metadata: &FileMetadata,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
         let mut meta = without_markers(metadata);
-        let enc = self.encrypt_if_enabled(data, &mut meta)?;
+        let enc = self.encrypt_if_enabled(&data, &mut meta)?;
         self.inner
-            .put_delta(bucket, prefix, filename, &enc, &meta, proof)
+            .put_delta(bucket, prefix, filename, enc, &meta, proof)
             .await
     }
 
@@ -571,13 +573,13 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         bucket: &str,
         prefix: &str,
         filename: &str,
-        data: &[u8],
+        data: bytes::Bytes,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         let mut meta = without_markers(metadata);
-        let enc = self.encrypt_if_enabled(data, &mut meta)?;
+        let enc = self.encrypt_if_enabled(&data, &mut meta)?;
         self.inner
-            .put_passthrough(bucket, prefix, filename, &enc, &meta)
+            .put_passthrough(bucket, prefix, filename, enc, &meta)
             .await
     }
 
@@ -1232,7 +1234,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
             // Like the unfenced default of `put_reference_from_file`: read the
             // file, then encrypt it as a Put.
             RefWrite::PutFile { path, metadata } => {
-                let data = tokio::fs::read(path).await?;
+                let data = bytes::Bytes::from(tokio::fs::read(path).await?);
                 let mut meta = without_markers(metadata);
                 let enc = self.encrypt_if_enabled(&data, &mut meta)?;
                 self.inner

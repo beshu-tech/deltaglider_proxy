@@ -57,7 +57,8 @@ pub(crate) async fn enqueue_object_events(state: &Arc<AppState>, events: &[NewEv
 pub(crate) struct ClientWrite<'a> {
     pub bucket: &'a str,
     pub key: &'a str,
-    pub data: &'a [u8],
+    /// The body as collected: shared, never copied, down to the storage write.
+    pub data: bytes::Bytes,
     pub content_type: Option<String>,
     pub user_metadata: std::collections::HashMap<String, String>,
     pub precondition: &'a crate::deltaglider::Precondition,
@@ -72,7 +73,8 @@ pub(crate) async fn store_client_write(
     state: &Arc<AppState>,
     write: ClientWrite<'_>,
 ) -> Result<crate::types::StoreResult, S3Error> {
-    check_quota_for_write(state, write.bucket, write.key, write.data.len() as u64).await?;
+    let size = write.data.len() as u64;
+    check_quota_for_write(state, write.bucket, write.key, size).await?;
     let result = state
         .engine
         .load()
@@ -85,14 +87,7 @@ pub(crate) async fn store_client_write(
             write.precondition,
         )
         .await?;
-    object_created(
-        state,
-        write.bucket,
-        write.key,
-        write.data.len() as u64,
-        &result,
-    )
-    .await;
+    object_created(state, write.bucket, write.key, size, &result).await;
     Ok(result)
 }
 
@@ -488,7 +483,7 @@ mod write_path_tests {
             ClientWrite {
                 bucket: "b",
                 key,
-                data: &data,
+                data: bytes::Bytes::from(data),
                 content_type: None,
                 user_metadata: Default::default(),
                 precondition: &crate::deltaglider::Precondition::none(),
@@ -512,7 +507,13 @@ mod write_path_tests {
             None,
         );
         f.raw
-            .put_passthrough("b", "", "old.jpg", &[0u8; 90], &meta)
+            .put_passthrough(
+                "b",
+                "",
+                "old.jpg",
+                bytes::Bytes::copy_from_slice(&[0u8; 90]),
+                &meta,
+            )
             .await
             .unwrap();
         put(&f.state, "a.jpg", 20)

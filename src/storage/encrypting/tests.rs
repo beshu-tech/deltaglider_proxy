@@ -95,7 +95,13 @@ mod wrapper_tests {
             crate::types::StorageInfo::Passthrough,
         );
         wrapper
-            .put_passthrough("b", "p", "o.bin", b"0123456789", &meta)
+            .put_passthrough(
+                "b",
+                "p",
+                "o.bin",
+                bytes::Bytes::from_static(b"0123456789"),
+                &meta,
+            )
             .await
             .unwrap();
         for (start, end) in [(20, 25), (10, 10), (8, 2)] {
@@ -902,7 +908,7 @@ mod wrapper_tests {
             &self,
             _: &str,
             _: &str,
-            _: &[u8],
+            _: bytes::Bytes,
             _: &FileMetadata,
             _proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), StorageError> {
@@ -943,7 +949,7 @@ mod wrapper_tests {
             _: &str,
             _: &str,
             _: &str,
-            _: &[u8],
+            _: bytes::Bytes,
             _: &FileMetadata,
             _proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), StorageError> {
@@ -968,7 +974,7 @@ mod wrapper_tests {
             _: &str,
             _: &str,
             _: &str,
-            _: &[u8],
+            _: bytes::Bytes,
             _: &FileMetadata,
         ) -> Result<(), StorageError> {
             Err(cb_err())
@@ -1653,8 +1659,14 @@ mod wrapper_tests {
             crate::types::StorageInfo::Passthrough,
         );
         let plaintext = b"no encrypt for me";
-        let out = wrapper.encrypt_if_enabled(plaintext, &mut meta).unwrap();
-        assert_eq!(out, plaintext, "PassThrough must return plaintext verbatim");
+        let out = wrapper
+            .encrypt_if_enabled(&bytes::Bytes::from_static(plaintext), &mut meta)
+            .unwrap();
+        assert_eq!(
+            &out[..],
+            plaintext,
+            "PassThrough must return plaintext verbatim"
+        );
         assert!(
             !is_encrypted(&meta),
             "PassThrough must NOT stamp dg-encrypted marker"
@@ -1689,8 +1701,10 @@ mod wrapper_tests {
             None,
             crate::types::StorageInfo::Passthrough,
         );
-        let out = wrapper.encrypt_if_enabled(b"secret", &mut meta).unwrap();
-        assert_ne!(out, b"secret", "Encrypt must actually encrypt");
+        let out = wrapper
+            .encrypt_if_enabled(&bytes::Bytes::from_static(b"secret"), &mut meta)
+            .unwrap();
+        assert_ne!(&out[..], &b"secret"[..], "Encrypt must actually encrypt");
         assert!(is_encrypted(&meta), "Encrypt must stamp dg-encrypted");
         assert_eq!(
             stamped_key_id(&meta),
@@ -1864,7 +1878,7 @@ mod wrapper_tests {
             let src = tmp.path().join("src.bin");
             tokio::fs::write(&src, &body).await.unwrap();
             wrapper
-                .put_passthrough("b", "p", "a", &body, &meta)
+                .put_passthrough("b", "p", "a", bytes::Bytes::copy_from_slice(&body), &meta)
                 .await
                 .unwrap();
             wrapper
@@ -1891,7 +1905,7 @@ mod wrapper_tests {
                     "b",
                     "p",
                     "f",
-                    &body,
+                    bytes::Bytes::copy_from_slice(&body),
                     &meta,
                     crate::deltaglider::RefWriteProof::for_tests(),
                 )
@@ -1901,7 +1915,7 @@ mod wrapper_tests {
                 .put_reference(
                     "b",
                     "p",
-                    &body,
+                    bytes::Bytes::copy_from_slice(&body),
                     &meta,
                     crate::deltaglider::RefWriteProof::for_tests(),
                 )
@@ -2190,9 +2204,15 @@ mod read_request_tests {
         for k in [None, Some(key())] {
             let (w, fake) = wrapped(k.clone()).await;
             let body = b"hello passthrough".to_vec();
-            w.put_passthrough("b", "p", "a.bin", &body, &meta(&body))
-                .await
-                .unwrap();
+            w.put_passthrough(
+                "b",
+                "p",
+                "a.bin",
+                bytes::Bytes::copy_from_slice(&body),
+                &meta(&body),
+            )
+            .await
+            .unwrap();
             fake.clear();
             let got: Vec<Bytes> = w
                 .get_passthrough_stream("b", "p", "a.bin")
@@ -2218,7 +2238,7 @@ mod read_request_tests {
                 "b",
                 "p",
                 "a.bin",
-                &body,
+                bytes::Bytes::copy_from_slice(&body),
                 &meta(&body),
                 crate::deltaglider::RefWriteProof::for_tests(),
             )
@@ -2227,7 +2247,7 @@ mod read_request_tests {
             w.put_reference(
                 "b",
                 "p",
-                &body,
+                bytes::Bytes::copy_from_slice(&body),
                 &meta(&body),
                 crate::deltaglider::RefWriteProof::for_tests(),
             )

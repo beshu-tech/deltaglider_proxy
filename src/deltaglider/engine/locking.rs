@@ -305,7 +305,7 @@ mod reference_writes {
             match op {
                 RefWrite::Put { data, metadata } => {
                     storage
-                        .put_reference(bucket, deltaspace, data, metadata, PROOF)
+                        .put_reference(bucket, deltaspace, data.clone(), metadata, PROOF)
                         .await?
                 }
                 RefWrite::PutFile { path, metadata } => {
@@ -330,7 +330,7 @@ mod reference_writes {
             storage: &B,
             bucket: &str,
             deltaspace: &str,
-            data: &[u8],
+            data: &Bytes,
             meta: &FileMetadata,
         ) -> Result<(), EngineError> {
             let op = crate::storage::RefWrite::Put {
@@ -387,7 +387,7 @@ mod reference_writes {
             bucket: &str,
             deltaspace: &str,
             filename: &str,
-            data: &[u8],
+            data: Bytes,
             meta: &FileMetadata,
         ) -> Result<(), EngineError> {
             self.ensure_held().await?;

@@ -116,7 +116,7 @@ pub(super) async fn copy_object(
                 crate::api::handlers::object_helpers::ClientWrite {
                     bucket: &input.bucket,
                     key: &input.key,
-                    data,
+                    data: bytes::Bytes::copy_from_slice(data),
                     content_type,
                     user_metadata,
                     precondition: &precondition,

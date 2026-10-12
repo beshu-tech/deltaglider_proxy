@@ -906,7 +906,7 @@ impl StorageBackend for RoutingBackend {
         &self,
         bucket: &str,
         prefix: &str,
-        data: &[u8],
+        data: bytes::Bytes,
         metadata: &FileMetadata,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
@@ -1032,7 +1032,7 @@ impl StorageBackend for RoutingBackend {
         bucket: &str,
         prefix: &str,
         filename: &str,
-        data: &[u8],
+        data: bytes::Bytes,
         metadata: &FileMetadata,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
@@ -1073,7 +1073,7 @@ impl StorageBackend for RoutingBackend {
         bucket: &str,
         prefix: &str,
         filename: &str,
-        data: &[u8],
+        data: bytes::Bytes,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         route_existing!(
@@ -1639,7 +1639,7 @@ mod tests {
             &self,
             _: &str,
             _: &str,
-            _: &[u8],
+            _: bytes::Bytes,
             _: &FileMetadata,
             _proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), StorageError> {
@@ -1690,7 +1690,7 @@ mod tests {
             _: &str,
             _: &str,
             _: &str,
-            _: &[u8],
+            _: bytes::Bytes,
             _: &FileMetadata,
             _proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), StorageError> {
@@ -1758,7 +1758,7 @@ mod tests {
             _: &str,
             _: &str,
             _: &str,
-            _: &[u8],
+            _: bytes::Bytes,
             _: &FileMetadata,
         ) -> Result<(), StorageError> {
             Ok(())

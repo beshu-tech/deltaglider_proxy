@@ -280,7 +280,7 @@ impl StorageBackend for FaultyFs {
         &self,
         bucket: &str,
         prefix: &str,
-        data: &[u8],
+        data: bytes::Bytes,
         metadata: &FileMetadata,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
@@ -433,7 +433,7 @@ impl StorageBackend for FaultyFs {
         bucket: &str,
         prefix: &str,
         filename: &str,
-        data: &[u8],
+        data: bytes::Bytes,
         metadata: &FileMetadata,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
@@ -480,7 +480,7 @@ impl StorageBackend for FaultyFs {
         bucket: &str,
         prefix: &str,
         filename: &str,
-        data: &[u8],
+        data: bytes::Bytes,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         self.inner

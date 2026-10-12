@@ -398,7 +398,7 @@ mod tests {
             .put_reference(
                 "b",
                 "rel",
-                &v1,
+                bytes::Bytes::copy_from_slice(&v1),
                 &legacy,
                 crate::deltaglider::RefWriteProof::for_tests(),
             )

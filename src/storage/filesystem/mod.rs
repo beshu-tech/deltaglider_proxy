@@ -1148,7 +1148,7 @@ impl StorageBackend for FilesystemBackend {
         &self,
         bucket: &str,
         prefix: &str,
-        data: &[u8],
+        data: bytes::Bytes,
         metadata: &FileMetadata,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
@@ -1156,7 +1156,7 @@ impl StorageBackend for FilesystemBackend {
         self.put_object_file(
             bucket,
             &self.reference_path(bucket, prefix)?,
-            data,
+            &data,
             metadata,
             "reference",
             prefix,
@@ -1307,7 +1307,7 @@ impl StorageBackend for FilesystemBackend {
         bucket: &str,
         prefix: &str,
         filename: &str,
-        data: &[u8],
+        data: bytes::Bytes,
         metadata: &FileMetadata,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
@@ -1315,7 +1315,7 @@ impl StorageBackend for FilesystemBackend {
         self.put_object_file(
             bucket,
             &self.delta_path(bucket, prefix, filename)?,
-            data,
+            &data,
             metadata,
             "delta",
             prefix,
@@ -1388,14 +1388,14 @@ impl StorageBackend for FilesystemBackend {
         bucket: &str,
         prefix: &str,
         filename: &str,
-        data: &[u8],
+        data: bytes::Bytes,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         self.require_bucket_exists(bucket).await?;
         self.put_object_file(
             bucket,
             &self.passthrough_path(bucket, prefix, filename)?,
-            data,
+            &data,
             metadata,
             "passthrough",
             prefix,

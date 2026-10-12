@@ -1529,7 +1529,7 @@ mod facts_off_the_put_path_tests {
             "b",
             "v1",
             "a.zip",
-            b"0123456789",
+            bytes::Bytes::from_static(b"0123456789"),
             &delta_meta(),
             crate::deltaglider::RefWriteProof::for_tests(),
         )
@@ -1754,7 +1754,7 @@ mod lost_response_tests {
                 "b",
                 "v1",
                 RefWrite::Put {
-                    data: &data,
+                    data: &bytes::Bytes::copy_from_slice(&data),
                     metadata: &meta(&data),
                 },
                 &RefFence::Absent,
@@ -1785,7 +1785,7 @@ mod lost_response_tests {
                 "b",
                 "v1",
                 RefWrite::Put {
-                    data: &data,
+                    data: &bytes::Bytes::copy_from_slice(&data),
                     metadata: &meta(&data),
                 },
                 &RefFence::Absent,

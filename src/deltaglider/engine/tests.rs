@@ -69,7 +69,7 @@ impl crate::storage::StorageBackend for NullInner {
         &self,
         _: &str,
         _: &str,
-        _: &[u8],
+        _: bytes::Bytes,
         _: &crate::types::FileMetadata,
         _proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), crate::storage::StorageError> {
@@ -114,7 +114,7 @@ impl crate::storage::StorageBackend for NullInner {
         _: &str,
         _: &str,
         _: &str,
-        _: &[u8],
+        _: bytes::Bytes,
         _: &crate::types::FileMetadata,
         _proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), crate::storage::StorageError> {
@@ -149,7 +149,7 @@ impl crate::storage::StorageBackend for NullInner {
         _: &str,
         _: &str,
         _: &str,
-        _: &[u8],
+        _: bytes::Bytes,
         _: &crate::types::FileMetadata,
     ) -> Result<(), crate::storage::StorageError> {
         Ok(())

@@ -258,7 +258,7 @@ impl S3Backend {
         &self,
         bucket: &str,
         key: &str,
-        data: &[u8],
+        data: Bytes,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         self.put_object_with_metadata_fenced(bucket, key, data, metadata, &RefFence::Unfenced)
@@ -272,7 +272,7 @@ impl S3Backend {
         &self,
         bucket: &str,
         key: &str,
-        data: &[u8],
+        data: Bytes,
         metadata: &FileMetadata,
         fence: &RefFence,
     ) -> Result<Option<String>, StorageError> {
@@ -297,7 +297,8 @@ impl S3Backend {
                 .put_object()
                 .bucket(bucket)
                 .key(key)
-                .body(ByteStream::from(data.to_vec()))
+                // A refcount clone per attempt: the body is never copied.
+                .body(ByteStream::from(data.clone()))
                 .content_type("application/octet-stream");
 
             for (k, v) in &headers {
@@ -351,7 +352,7 @@ impl S3Backend {
                         &crate::coordination::cas::sdk_error_signal(&e),
                     ) {
                         FencedWriteVerdict::Lost => {
-                            let md5 = hex::encode(<md5::Md5 as md5::Digest>::digest(data));
+                            let md5 = hex::encode(<md5::Md5 as md5::Digest>::digest(&data));
                             let etag = self.own_write_or_lost(bucket, key, &md5).await?;
                             let stored = data.len() as u64;
                             self.remember_listed_facts(bucket, key, &etag, stored, metadata);
@@ -800,7 +801,9 @@ mod one_retry_layer_tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let s3 = super::super::test_support::for_test_endpoint(&endpoint);
         let meta = meta();
-        let res = s3.put_object_with_metadata("b", "k", b"x", &meta).await;
+        let res = s3
+            .put_object_with_metadata("b", "k", Bytes::from_static(b"x"), &meta)
+            .await;
         assert!(res.is_err());
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -813,7 +816,7 @@ mod one_retry_layer_tests {
         let s3 = super::super::test_support::for_test_endpoint(&endpoint);
         fake.fail("PUT", "b/k", 400, "BadRequest", 1);
         let meta = meta();
-        s3.put_object_with_metadata("b", "k", b"x", &meta)
+        s3.put_object_with_metadata("b", "k", Bytes::from_static(b"x"), &meta)
             .await
             .expect("the retry succeeds");
         assert_eq!(puts(&fake, "/b/k"), 2);
@@ -899,7 +902,9 @@ mod one_retry_layer_tests {
             .unwrap();
         let meta = meta();
         let started = std::time::Instant::now();
-        let res = s3.put_object_with_metadata("b", "k", b"x", &meta).await;
+        let res = s3
+            .put_object_with_metadata("b", "k", Bytes::from_static(b"x"), &meta)
+            .await;
         assert!(matches!(res, Err(StorageError::Unavailable(_))), "{res:?}");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(4),
