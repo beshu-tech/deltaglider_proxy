@@ -551,6 +551,33 @@ pub async fn list_jobs(
     }))
 }
 
+/// GET /_/api/admin/jobs/:id — one job row. The list carries the most
+/// recent one-offs only, so a link to an older one-off reads it here.
+pub async fn get_job(
+    Path(id): Path<String>,
+    State(state): State<Arc<AdminState>>,
+) -> Result<Json<JobView>, AdminError> {
+    let (sub, key) = parse_job_id(&id).ok_or(not_found())?;
+    if sub == JobSubsystem::Maintenance {
+        let job_id: i64 = key.parse().map_err(|_| not_found())?;
+        let db = state
+            .jobs_db
+            .as_ref()
+            .ok_or_else(AdminError::no_jobs_db)?
+            .lock()
+            .await;
+        let job = db.maintenance_job_by_id(job_id)?.ok_or(not_found())?;
+        return Ok(Json(maintenance_job_view(&job)));
+    }
+    // A rule row is built from config + state exactly as the list builds it.
+    let Json(all) = list_jobs(State(state)).await?;
+    all.jobs
+        .into_iter()
+        .find(|j| j.id == id)
+        .map(Json)
+        .ok_or(not_found())
+}
+
 /// Options of a job action. `fresh` (preview): never answer from a walk
 /// that already ended.
 #[derive(Debug, Default, Deserialize)]

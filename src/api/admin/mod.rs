@@ -86,8 +86,8 @@ pub use groups::{
     update_group, AddGroupMemberRequest, CloneGroupRequest, CreateGroupRequest, UpdateGroupRequest,
 };
 pub use jobs::{
-    job_action as jobs_action, job_failures as jobs_failures, job_parity_version,
-    job_preview as jobs_preview, job_preview_status as jobs_preview_status,
+    get_job as jobs_get, job_action as jobs_action, job_failures as jobs_failures,
+    job_parity_version, job_preview as jobs_preview, job_preview_status as jobs_preview_status,
     job_replication_event_version, job_replication_run_version, job_runs as jobs_runs,
     job_verify_cancel as jobs_verify_cancel, job_verify_start as jobs_verify_start,
     job_verify_status as jobs_verify_status, list_jobs as jobs_list,

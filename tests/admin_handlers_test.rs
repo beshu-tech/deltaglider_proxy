@@ -2222,3 +2222,52 @@ async fn creating_an_existing_bucket_on_another_backend_is_refused() {
         .unwrap();
     assert_eq!(got.status().as_u16(), 200, "the bucket's objects vanished");
 }
+
+// ── One job by id ───────────────────────────────────────────────────────
+
+/// `GET /jobs/:id` answers for a rule and for a one-off, so a deep link to a
+/// one-off that the list no longer carries still opens it.
+#[tokio::test]
+async fn one_job_reads_by_id() {
+    let server = TestServer::builder()
+        .extra_yaml_storage_section(
+            "lifecycle:\n  enabled: false\n  rules:\n    - name: expire-downloads\n      enabled: true\n      bucket: downloads\n      prefix: \"\"\n      expire_after: \"30d\"\n",
+        )
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let get = |id: &str| admin.get(format!("{ep}/_/api/admin/jobs/{id}")).send();
+
+    let (code, rule) = json_of(get("lifecycle:expire-downloads").await.unwrap()).await;
+    assert_eq!(code, StatusCode::OK, "{rule}");
+    assert_eq!(rule["kind"], "lifecycle", "{rule}");
+    assert_eq!(rule["scope"]["bucket"], "downloads", "{rule}");
+
+    let (code, started) = json_of(
+        admin
+            .post(format!("{ep}/_/api/admin/jobs/backfill-metadata"))
+            .json(&json!({ "buckets": [server.bucket()] }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{started}");
+    let job_id = started["started"][0]["job_id"].as_i64().expect("job id");
+    let (code, job) = json_of(get(&format!("maintenance:{job_id}")).await.unwrap()).await;
+    assert_eq!(code, StatusCode::OK, "{job}");
+    assert_eq!(job["id"], format!("maintenance:{job_id}"), "{job}");
+    assert_eq!(job["kind"], "backfill-metadata", "{job}");
+    assert_eq!(job["trigger"], "oneoff", "{job}");
+
+    for missing in [
+        "maintenance:999999",
+        "lifecycle:nope",
+        "maintenance:x",
+        "nocolon",
+    ] {
+        let code = get(missing).await.unwrap().status();
+        assert_eq!(code, StatusCode::NOT_FOUND, "{missing}");
+    }
+}
