@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.9 — 2026-10-13
+
 ### Changed — A jobs database that no key opens stops the start
 
 This release keeps job state in `deltaglider_jobs.db`, which uses the same
