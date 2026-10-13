@@ -1008,7 +1008,7 @@ fn same_generation(a: chrono::DateTime<Utc>, b: chrono::DateTime<Utc>) -> bool {
 /// One planned delete of a lifecycle run. Every lifecycle delete is
 /// conditional: the plan was made on a listing snapshot, and a delete by
 /// key would remove a newer overwrite. The engine checks the object under
-/// the deltaspace lock that every PUT holds, so no overwrite lands between
+/// the object's write lock that every write holds, so no overwrite lands between
 /// the check and the delete (a HEAD, then a delete by key, lost one).
 #[derive(Debug)]
 struct PlannedDelete {

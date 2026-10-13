@@ -692,3 +692,233 @@ async fn spool_budget_under_concurrent_streaming_ops_returns_to_zero() {
         assert!(&got == b, "{key} reads back its bytes");
     }
 }
+
+/// P7.4: a passthrough write holds its key's write lock, not the folder's
+/// deltaspace lock. Passthrough writes (`dg-no-delta`) and delta writes of
+/// ONE key, at once, with reads in between: every write answers 200, every
+/// read answers 200 with one of the written versions, and the key ends as
+/// one of the versions of the last round. Without the key lock, each write
+/// could drop the stored form that the other just wrote: both 200, object
+/// gone.
+#[tokio::test]
+async fn mixed_passthrough_and_delta_writes_of_one_key_keep_a_version() {
+    mixed_forms_race(&TestServer::filesystem().await, "mix").await;
+}
+
+#[tokio::test]
+async fn mixed_passthrough_and_delta_writes_of_one_key_keep_a_version_on_s3() {
+    skip_unless_minio!();
+    let prefix = common::unique_bucket("mix");
+    mixed_forms_race(&TestServer::s3().await, &prefix).await;
+}
+
+async fn mixed_forms_race(server: &TestServer, prefix: &str) {
+    const ROUNDS: usize = 6;
+    let http = server.http();
+    let key = format!("{prefix}/k.zip");
+    let base = generate_binary(64 * 1024, 7);
+    // A baseline in the folder, so a delta write stores a delta.
+    let put = |key: String, body: Vec<u8>, passthrough: bool| {
+        let mut req = http.s3_request(Method::PUT, &obj_url(server, &key));
+        if passthrough {
+            req = req.header("x-amz-meta-dg-no-delta", "true");
+        }
+        req.body(body).send()
+    };
+    assert_eq!(
+        put(format!("{prefix}/base.zip"), base.clone(), false)
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        put(key.clone(), base.clone(), true).await.unwrap().status(),
+        200
+    );
+    let mut written: Vec<Vec<u8>> = vec![base.clone()];
+    for round in 0..ROUNDS {
+        let bodies: Vec<Vec<u8>> = (0..N)
+            .map(|i| mutate_binary(&base, 0.002 + (round * N + i) as f64 * 0.0005))
+            .collect();
+        let writes = join_all(
+            bodies
+                .iter()
+                .enumerate()
+                .map(|(i, b)| put(key.clone(), b.clone(), i % 2 == 0)),
+        );
+        let reads = join_all((0..N / 2).map(|_| get(server, &key)));
+        let (codes, reads) = tokio::join!(writes, reads);
+        let codes: Vec<u16> = codes
+            .into_iter()
+            .map(|r| r.unwrap().status().as_u16())
+            .collect();
+        assert!(codes.iter().all(|c| *c == 200), "round {round}: {codes:?}");
+        let allowed: Vec<&Vec<u8>> = written.iter().chain(bodies.iter()).collect();
+        for (code, got) in reads {
+            assert_eq!(
+                code, 200,
+                "round {round}: a read during the writes found no object"
+            );
+            assert!(
+                allowed.contains(&&got),
+                "round {round}: a read returned bytes that no write stored"
+            );
+        }
+        let (code, got) = get(server, &key).await;
+        assert_eq!(code, 200, "round {round}: the object is gone");
+        assert!(
+            bodies.contains(&got),
+            "round {round}: the object is not one of the round's versions"
+        );
+        written.extend(bodies);
+    }
+}
+
+/// P7.4 on the filesystem backend: passthrough writes into a folder while
+/// a DELETE of the folder's only other object prunes the (then empty)
+/// folder and its empty parents. The write makes the folder again
+/// (`WriteDir::temp`), so every write answers 200 and reads back.
+#[tokio::test]
+async fn passthrough_writes_racing_a_sibling_delete_prune_lose_nothing() {
+    const ROUNDS: usize = 10;
+    let server = TestServer::filesystem().await;
+    let http = server.http();
+    for round in 0..ROUNDS {
+        let dir = format!("prune/r{}/deep", round % 2);
+        let seed = format!("{dir}/seed.jpg");
+        let code = http
+            .s3_request(Method::PUT, &obj_url(&server, &seed))
+            .body(b"seed".to_vec())
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(code, 200);
+        let keys: Vec<String> = (0..N).map(|i| format!("{dir}/p{i:02}.jpg")).collect();
+        let bodies: Vec<Vec<u8>> = (0..N)
+            .map(|i| generate_binary(4096, (round * N + i) as u64))
+            .collect();
+        let delete = http
+            .s3_request(Method::DELETE, &obj_url(&server, &seed))
+            .send();
+        let writes = join_all(keys.iter().zip(&bodies).map(|(k, b)| {
+            http.s3_request(Method::PUT, &obj_url(&server, k))
+                .body(b.clone())
+                .send()
+        }));
+        let (deleted, codes) = tokio::join!(delete, writes);
+        assert_eq!(deleted.unwrap().status(), 204, "round {round}");
+        let codes: Vec<u16> = codes
+            .into_iter()
+            .map(|r| r.unwrap().status().as_u16())
+            .collect();
+        assert!(codes.iter().all(|c| *c == 200), "round {round}: {codes:?}");
+        for (k, b) in keys.iter().zip(&bodies) {
+            let (code, got) = get(&server, k).await;
+            assert_eq!(code, 200, "round {round}: {k} is gone");
+            assert!(&got == b, "round {round}: {k} reads back other bytes");
+        }
+        // Empty the folder again, so the next round's delete prunes it.
+        let gone = join_all(
+            keys.iter()
+                .map(|k| http.s3_request(Method::DELETE, &obj_url(&server, k)).send()),
+        )
+        .await;
+        assert!(gone.into_iter().all(|r| r.unwrap().status() == 204));
+    }
+}
+
+/// P7.4: passthrough writes into a folder while the DELETE of its last
+/// delta reclaims the folder's reference.bin. A passthrough object needs
+/// no reference, and a passthrough write never writes one: every write
+/// answers 200 and reads back, a later delta write in the folder reads
+/// back, and once the folder's delta-eligible objects are gone its
+/// reference is gone too (none resurrected, none orphaned).
+#[tokio::test]
+async fn passthrough_writes_during_a_reference_reclaim_lose_nothing() {
+    reclaim_race(&TestServer::filesystem().await, "reclaim").await;
+}
+
+#[tokio::test]
+async fn passthrough_writes_during_a_reference_reclaim_lose_nothing_on_s3() {
+    skip_unless_minio!();
+    let prefix = common::unique_bucket("reclaim");
+    reclaim_race(&TestServer::s3().await, &prefix).await;
+}
+
+async fn reclaim_race(server: &TestServer, prefix: &str) {
+    const ROUNDS: usize = 6;
+    let http = server.http();
+    let put = |key: &str, body: Vec<u8>| {
+        http.s3_request(Method::PUT, &obj_url(server, key))
+            .body(body)
+            .send()
+    };
+    let delete = |key: &str| {
+        http.s3_request(Method::DELETE, &obj_url(server, key))
+            .send()
+    };
+    for round in 0..ROUNDS {
+        let base = generate_binary(64 * 1024, 100 + round as u64);
+        let base_key = format!("{prefix}/base.zip");
+        assert_eq!(put(&base_key, base.clone()).await.unwrap().status(), 200);
+        let keys: Vec<String> = (0..N).map(|i| format!("{prefix}/p{i:02}.jpg")).collect();
+        let bodies: Vec<Vec<u8>> = (0..N)
+            .map(|i| generate_binary(4096, (round * N + i) as u64))
+            .collect();
+        let writes = join_all(keys.iter().zip(&bodies).map(|(k, b)| put(k, b.clone())));
+        let (deleted, codes) = tokio::join!(delete(&base_key), writes);
+        assert_eq!(deleted.unwrap().status(), 204, "round {round}");
+        let codes: Vec<u16> = codes
+            .into_iter()
+            .map(|r| r.unwrap().status().as_u16())
+            .collect();
+        assert!(codes.iter().all(|c| *c == 200), "round {round}: {codes:?}");
+        for (k, b) in keys.iter().zip(&bodies) {
+            let (code, got) = get(server, k).await;
+            assert_eq!(code, 200, "round {round}: {k} is gone");
+            assert!(&got == b, "round {round}: {k} reads back other bytes");
+        }
+        // A delta write in the folder after the race reads back.
+        let next = mutate_binary(&base, 0.01);
+        let next_key = format!("{prefix}/next.zip");
+        assert_eq!(put(&next_key, next.clone()).await.unwrap().status(), 200);
+        let (code, got) = get(server, &next_key).await;
+        assert_eq!(code, 200);
+        assert!(
+            got == next,
+            "round {round}: next.zip reads back other bytes"
+        );
+        // Empty the folder: the last delete reclaims the reference.
+        let mut all = keys.clone();
+        all.push(next_key);
+        for k in &all {
+            assert_eq!(delete(k).await.unwrap().status(), 204);
+        }
+        let refs: Vec<String> = match server.data_dir() {
+            Some(data) => references_under(&data.join(server.bucket()))
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+            None => common::minio_client()
+                .await
+                .list_objects_v2()
+                .bucket(server.bucket())
+                .prefix(format!("{prefix}/"))
+                .send()
+                .await
+                .unwrap()
+                .contents()
+                .iter()
+                .filter_map(|o| o.key())
+                .filter(|k| k.ends_with("reference.bin"))
+                .map(str::to_string)
+                .collect(),
+        };
+        assert!(
+            refs.is_empty(),
+            "round {round}: a reference outlived its folder: {refs:?}"
+        );
+    }
+}

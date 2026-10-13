@@ -931,8 +931,8 @@ pub trait StorageBackend: Send + Sync {
 
     /// The stored version (the backend's ETag) of one variant, for a later
     /// [`Self::delete_variant_if`]. `Ok(None)`: this backend has no
-    /// conditional delete; the engine's in-process deltaspace lock is the
-    /// only guard (enough single-instance: every PUT takes it). A missing
+    /// conditional delete; the engine's in-process object write lock is the
+    /// only guard (enough single-instance: every write takes it). A missing
     /// object is `Err(NotFound)`.
     fn variant_version(
         &self,

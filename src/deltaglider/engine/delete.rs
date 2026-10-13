@@ -24,7 +24,7 @@ pub struct DeleteItem<'a> {
     /// The object key, as a client names it.
     pub key: String,
     /// `Some`: delete the object only while this check accepts it, as read
-    /// under the deltaspace lock (see [`DeltaGliderEngine::delete_if`]).
+    /// under the object's write lock (see [`DeltaGliderEngine::delete_if`]).
     pub still_ours: Option<Box<StillOurs<'a>>>,
 }
 
@@ -184,10 +184,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// Delete `key` only if `still_ours` accepts the object as read under
-    /// the deltaspace lock. Every PUT holds that lock, so no overwrite can
-    /// land between the check and the delete (a HEAD, then a delete by key,
-    /// removed an overwrite that landed in between). A peer INSTANCE's PUT
-    /// does not take this lock: where the backend has a conditional delete
+    /// the object's write lock. Every write of the key on this process
+    /// holds that lock, so no overwrite can land between the check and the
+    /// delete (a HEAD, then a delete by key, removed an overwrite that
+    /// landed in between). A peer INSTANCE's PUT does not take this lock: where the backend has a conditional delete
     /// (S3 `If-Match`), the delete is also pinned to the stored version the
     /// check saw; elsewhere (filesystem, a backend answering 501) the
     /// in-process lock is the only guard. For more than one key use
@@ -594,8 +594,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 }
             }
             // A sibling that its HEAD did not find gets no DELETE (and no
-            // facts cleanup): under the prefix lock no PUT of this process
-            // can add one.
+            // facts cleanup): under the object's write lock no write of
+            // this process can add one.
             SiblingPin::Unpinned if !sibling_found => {}
             SiblingPin::Unpinned => {
                 self.delete_sibling_variant(bucket, &deltaspace_id, &obj_key.filename, sibling)

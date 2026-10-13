@@ -22,8 +22,8 @@ pub(super) static MKDIRS: parking_lot::Mutex<Vec<PathBuf>> = parking_lot::Mutex:
 pub(super) const MKDIR_ATTEMPTS: usize = 8;
 
 /// Create `dir` and its missing ancestors inside `bucket_dir`, never the
-/// bucket dir itself (a deleted bucket stays deleted: C-P0-1). A DELETE in
-/// another deltaspace prunes empty ancestors under its own lock, so a
+/// bucket dir itself (a deleted bucket stays deleted: C-P0-1). A DELETE of
+/// another key prunes empty ancestors under its own locks, so a
 /// component can vanish mid-walk: the walk starts again while the bucket
 /// exists (storage-1). Blocking.
 pub(super) fn mkdir_within(
@@ -104,9 +104,11 @@ pub(super) struct WriteDir {
 }
 
 impl WriteDir {
-    /// A temp file in the directory. A DELETE in another deltaspace can
-    /// prune the directory between `ensure_dir` and here (the PUT then got
-    /// ENOENT, which reads as 404 NoSuchKey): create it again and retry.
+    /// A temp file in the directory. A DELETE of another key, in this
+    /// deltaspace or another, can prune the directory between `ensure_dir`
+    /// and here: a passthrough write holds its key's lock only (P7.4).
+    /// The PUT then got ENOENT, which reads as 404 NoSuchKey: create the
+    /// directory again and retry.
     /// Once the temp file exists, the directory is not empty, so the
     /// rename that follows cannot lose it. Blocking.
     ///

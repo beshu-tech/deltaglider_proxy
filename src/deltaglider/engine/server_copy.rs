@@ -2,7 +2,7 @@
 
 //! Server-side copy of a passthrough object: the backend copies the stored
 //! file ([`StorageBackend::copy_within`]), and the engine does what a store
-//! of the same object does around its write (the deltaspace lock, the
+//! of the same object does around its write (the key's write lock, the
 //! usage counter, the other stored form, the metadata cache).
 
 use super::usage::CounterPrior;
@@ -47,7 +47,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             Some(prior) => prior,
             None => self.prior_for_counter(dst.0, dst.1).await,
         };
-        let _guard = self.acquire_prefix_lock(dst.0, &dst_ds).await;
+        // The key's write lock only, like every passthrough write (see
+        // `write_passthrough_locked`).
         // The metadata cache keeps the destination's entry until the copy
         // commits: a copy that is `Unsupported` falls back to a read of
         // the same object (a self-copy), and that read uses the entry.

@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tokio::io::AsyncReadExt;
 
-/// In-progress streaming passthrough multipart upload (Phase B). Holds the
-/// per-deltaspace lock for the upload's lifetime. The handle is IMMUTABLE
+/// In-progress streaming passthrough multipart upload (Phase B). Its caller
+/// holds the key's write lock for the upload's lifetime. The handle is IMMUTABLE
 /// during part uploads so the caller can drive parts concurrently; it
 /// collects the small [`UploadedPart`] receipts itself. Whole-object hashes
 /// are taken from the copy source (a copy doesn't recompute them), so no
@@ -28,7 +28,6 @@ pub struct PassthroughMultipartHandle {
     /// The object's final metadata, stored when the upload is created.
     metadata: FileMetadata,
     upload: MultipartUpload,
-    _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
 /// The facts of an object that a streaming multipart copy writes, all known
@@ -532,7 +531,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             prior: &prior,
         };
         if !self.tries_delta(bucket, &obj_key, &put.user_metadata) {
-            let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
+            // The key's write lock only (P7.4): see `write_passthrough_locked`.
             let result = self
                 .write_passthrough_locked(put.passthrough_write(), None)
                 .await?;
@@ -1280,7 +1279,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// Write a passthrough object, then drop an older delta variant of the
-    /// key. The caller holds the deltaspace prefix lock; this never takes it.
+    /// key. Under the key's write lock (`write.lock`) only, not the
+    /// deltaspace lock (P7.4): a passthrough object neither reads nor
+    /// writes reference.bin, so the folder's other keys write at the same
+    /// time. The key lock is what keeps a delta write of the SAME key out:
+    /// without it each could drop the form the other wrote. A delete of a
+    /// sibling can prune the folder on the filesystem backend under the
+    /// write: the write makes it again (`WriteDir::temp`). A reference
+    /// reclaim can delete reference.bin beside the new object: nothing
+    /// that the object needs. The delta path calls this under the
+    /// deltaspace lock that it holds already, and never takes it here.
     /// `reserved`: the spool the storage write uses, reserved by the caller
     /// before the lock, or under it when the op holds a spool already (a
     /// holder never waits).
@@ -1566,8 +1574,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             &sha256[..8]
         );
 
-        let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
-
+        // The key's write lock only (P7.4): see `write_passthrough_locked`.
         let mut metadata = FileMetadata::new_passthrough(
             obj_key.filename.clone(),
             sha256,
@@ -1682,8 +1689,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let reserved = self
             .reserve_storage_spool(bucket, total_size, true, parts_mib)
             .await?;
-        let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
-
+        // The key's write lock only (P7.4): see `write_passthrough_locked`.
         let mut metadata = FileMetadata::new_passthrough(
             obj_key.filename.clone(),
             sha256,
@@ -1799,7 +1805,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 held.map_or(0, crate::deltaglider::spool::Spool::reserved_mib),
             )
             .await?;
-        let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
+        // The key's write lock only (P7.4): see `write_passthrough_locked`.
         let write = PassthroughWrite {
             lock,
             bucket,
@@ -1825,9 +1831,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// Begin a streaming passthrough multipart upload (Phase B). Gated on
-    /// `max_passthrough_object_size`. Acquires the per-deltaspace lock and
-    /// holds it for the lifetime of the returned handle, mirroring
-    /// `store_passthrough_chunked_inner`. The caller drives parts via
+    /// `max_passthrough_object_size`. The caller holds the key's write lock
+    /// (`lock`) until it finishes or aborts; like every passthrough write,
+    /// the upload takes no deltaspace lock. The caller drives parts via
     /// [`Self::upload_passthrough_part`] then finalizes with
     /// [`Self::finish_passthrough_multipart`] (or aborts).
     pub async fn begin_passthrough_multipart(
@@ -1842,7 +1848,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         self.metadata_cache.invalidate(bucket, key);
         let (obj_key, deltaspace_id) = self.validated_key_ingest(lock, bucket, key)?;
-        let guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
 
         // The FINAL metadata, hashes included: a native S3 backend stores
         // object metadata only at create time (its complete takes none), so
@@ -1871,7 +1876,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             total_size,
             metadata,
             upload,
-            _guard: guard,
         })
     }
 
@@ -1916,7 +1920,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         parts.sort_by_key(|p| p.part_number);
 
         // Overwrite-net accounting for the usage counter (see store_inner). The
-        // handle already holds the per-deltaspace lock, so this is race-safe.
+        // caller holds the key's write lock, so this is race-safe.
         let prior = self.prior_for_counter(&handle.bucket, &handle.key).await;
 
         let metadata = handle.metadata.clone();
@@ -1963,8 +1967,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// Abort an in-progress passthrough multipart upload (best-effort)
     /// WITHOUT consuming the handle — callers holding it behind an Arc can
-    /// abort at any strong count (the prefix lock releases when the last
-    /// clone drops).
+    /// abort at any strong count.
     pub async fn abort_passthrough_multipart_ref(&self, handle: &PassthroughMultipartHandle) {
         if let Err(e) = self
             .storage

@@ -74,7 +74,10 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
                              bulk, every `transfer.rs` copy, delete, backfill, legacy migration): the store methods ask for the
                              `ObjectWriteGuard` (only `lock_object_write` makes one; `store()`, delete and `copy_object_*` lock
                              themselves — not re-entrant). Lock order: object → deltaspace prefix → cross-instance reference
-                             (source guards in conditional.rs), filtered-LIST algebra in `iam/listing.rs`
+                             (source guards in conditional.rs). A passthrough write holds the object lock ONLY (P7.4: one
+                             folder's passthrough PUTs run in parallel; the filesystem's `WriteDir::temp` re-creates a folder
+                             a sibling DELETE pruned); delta writes keep the deltaspace lock (reference RMW),
+                             filtered-LIST algebra in `iam/listing.rs`
                              (budget = `advanced.filtered_list_max_engine_pages`, default 50)
   → api/handlers/            Survivors after the s3s consolidation:
       mod.rs                 AppState (shared by s3s adapter + admin API), audit_log_s3, ensure_bucket_exists helpers

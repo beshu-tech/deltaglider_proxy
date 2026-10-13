@@ -414,3 +414,59 @@ async fn a_sibling_disk_error_does_not_pass_for_deleted() {
     engine.metadata_cache.invalidate("b", "p/k.zip");
     assert!(engine.retrieve("b", "p/k.zip").await.unwrap().0 == v2);
 }
+
+/// P7.4: passthrough writes into one folder run at once; they hold their
+/// key's write lock, not the folder's deltaspace lock. Writes of ONE key
+/// still go one at a time. Measured as the most backend writes in flight
+/// (each write waits 40 ms in the backend), not as wall time.
+#[tokio::test]
+async fn passthrough_writes_into_one_folder_run_at_once() {
+    let (_dir, engine, faults) = faulty_engine().await;
+    let engine = Arc::new(engine);
+    // The folder exists and has a reference.bin (a delta baseline).
+    engine
+        .store(
+            "b",
+            "d/base.zip",
+            &noise(1, 64 * 1024),
+            None,
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    faults.slow_passthrough_writes(std::time::Duration::from_millis(40));
+    let writes = (0..8).map(|i| {
+        let e = engine.clone();
+        tokio::spawn(async move {
+            e.store(
+                "b",
+                &format!("d/p{i}.jpg"),
+                &noise(i, 1024),
+                None,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        })
+    });
+    futures::future::join_all(writes).await;
+    let distinct = faults.max_passthrough_in_flight();
+    assert!(distinct > 1, "8 keys of one folder wrote one at a time");
+
+    faults.slow_passthrough_writes(std::time::Duration::from_millis(40));
+    let same = (0..4).map(|i| {
+        let e = engine.clone();
+        tokio::spawn(async move {
+            e.store("b", "d/same.jpg", &noise(i, 1024), None, HashMap::new())
+                .await
+                .unwrap();
+        })
+    });
+    futures::future::join_all(same).await;
+    assert_eq!(
+        faults.max_passthrough_in_flight(),
+        1,
+        "two writes of one key ran at once"
+    );
+    eprintln!("passthrough writes in flight in one folder: {distinct} (one key: 1)");
+}

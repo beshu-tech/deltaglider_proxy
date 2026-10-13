@@ -63,6 +63,11 @@ enum Arm {
 struct FaultState {
     armed: std::collections::HashMap<(FaultPoint, String), Arm>,
     fired: std::collections::HashMap<(FaultPoint, String), usize>,
+    /// `Some`: each passthrough write waits this long before it writes,
+    /// and the gauge counts the writes in flight.
+    slow_passthrough: Option<std::time::Duration>,
+    in_flight: usize,
+    max_in_flight: usize,
 }
 
 /// The faults armed on a [`FaultyFs`], by point and `"bucket/prefix/filename"`.
@@ -83,6 +88,40 @@ impl Faults {
     pub(crate) fn hook(&self, point: FaultPoint, key: &str, hook: Hook) {
         let mut state = self.0.lock().unwrap();
         state.armed.insert((point, key.to_string()), Arm::Run(hook));
+    }
+
+    /// Make every passthrough write wait `delay` before it writes, and
+    /// count how many run at once ([`Self::max_passthrough_in_flight`]).
+    pub(crate) fn slow_passthrough_writes(&self, delay: std::time::Duration) {
+        let mut state = self.0.lock().unwrap();
+        state.slow_passthrough = Some(delay);
+        state.max_in_flight = 0;
+    }
+
+    /// The most passthrough writes that ran at once since
+    /// [`Self::slow_passthrough_writes`].
+    pub(crate) fn max_passthrough_in_flight(&self) -> usize {
+        self.0.lock().unwrap().max_in_flight
+    }
+
+    /// One passthrough write: wait and count, when armed.
+    async fn passthrough_write<T>(&self, write: impl std::future::Future<Output = T>) -> T {
+        let delay = {
+            let mut state = self.0.lock().unwrap();
+            let delay = state.slow_passthrough;
+            if delay.is_some() {
+                state.in_flight += 1;
+                state.max_in_flight = state.max_in_flight.max(state.in_flight);
+            }
+            delay
+        };
+        let Some(delay) = delay else {
+            return write.await;
+        };
+        tokio::time::sleep(delay).await;
+        let out = write.await;
+        self.0.lock().unwrap().in_flight -= 1;
+        out
     }
 
     /// Disarm every fault. The fire counts stay.
@@ -510,8 +549,11 @@ impl StorageBackend for FaultyFs {
         data: bytes::Bytes,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        self.inner
-            .put_passthrough(bucket, prefix, filename, data, metadata)
+        self.faults
+            .passthrough_write(
+                self.inner
+                    .put_passthrough(bucket, prefix, filename, data, metadata),
+            )
             .await
     }
 
@@ -524,8 +566,15 @@ impl StorageBackend for FaultyFs {
         metadata: &FileMetadata,
         _spool: crate::deltaglider::spool::SpoolBudget<'_>,
     ) -> Result<(), StorageError> {
-        self.inner
-            .put_passthrough_file(bucket, prefix, filename, source_path, metadata, _spool)
+        self.faults
+            .passthrough_write(self.inner.put_passthrough_file(
+                bucket,
+                prefix,
+                filename,
+                source_path,
+                metadata,
+                _spool,
+            ))
             .await
     }
 
@@ -538,8 +587,11 @@ impl StorageBackend for FaultyFs {
         metadata: &FileMetadata,
         _spool: crate::deltaglider::spool::SpoolBudget<'_>,
     ) -> Result<(), StorageError> {
-        self.inner
-            .put_passthrough_parts(bucket, prefix, filename, part_paths, metadata, _spool)
+        self.faults
+            .passthrough_write(
+                self.inner
+                    .put_passthrough_parts(bucket, prefix, filename, part_paths, metadata, _spool),
+            )
             .await
     }
 
@@ -577,8 +629,11 @@ impl StorageBackend for FaultyFs {
         chunks: &[Bytes],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        self.inner
-            .put_passthrough_chunked(bucket, prefix, filename, chunks, metadata)
+        self.faults
+            .passthrough_write(
+                self.inner
+                    .put_passthrough_chunked(bucket, prefix, filename, chunks, metadata),
+            )
             .await
     }
 
