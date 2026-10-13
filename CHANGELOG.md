@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.11 — 2026-10-13
+
 ### Changed — An SSO login that no mapping rule matches is refused
 
 The first login of an account through an OAuth/OIDC provider created an IAM
