@@ -19,7 +19,7 @@
     "test": "vitest",
     "test:all": "vitest run",
     "e2e": "playwright test",
-    "e2e:qa": "QA_REGRESSION=1 playwright test e2e/qa-regression.spec.ts",
+    "e2e:qa": "QA_REGRESSION=1 playwright test e2e/qa-regression.spec.ts e2e/qa-jobs-",
     "typecheck": "tsc --noEmit",
     "knip": "knip"
   },

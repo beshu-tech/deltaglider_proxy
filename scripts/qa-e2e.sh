@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Run the QA regression pass (demo/s3-browser/ui/e2e/qa-regression.spec.ts)
-# against a release binary in bootstrap-auth mode. Nightly CI runs this; it
-# is not in the PR gate (it takes minutes and drives the whole admin UI).
+# Run the QA regression pass (demo/s3-browser/ui/e2e/qa-regression.spec.ts
+# and every e2e/qa-jobs-*.spec.ts, through `npm run e2e:qa`) against a release
+# binary in bootstrap-auth mode. Nightly CI runs this; it is not in the PR
+# gate (it takes minutes and drives the whole admin UI).
 #
 #   DELTAGLIDER_PROXY_BIN=target/release/deltaglider_proxy ./scripts/qa-e2e.sh
 set -euo pipefail
