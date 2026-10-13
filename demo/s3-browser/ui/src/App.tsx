@@ -108,10 +108,12 @@ export default function App() {
   // Maintenance (re-encryption) status for the active bucket. Polls fast
   // while a job runs; the banner self-dismisses on completion. Reads keep
   // working — only write affordances are disabled below.
-  const bucketMaintenance = useBucketMaintenance(view === 'browser' ? activeBucket || null : null).data?.active ?? null;
-  // A migration that is being cancelled (or is cleaning up after the
-  // switch) no longer blocks writes: Upload and Delete come back.
-  const bucketBusy = bucketWritesBlocked(bucketMaintenance);
+  const bucketStatus = useBucketMaintenance(view === 'browser' ? activeBucket || null : null).data;
+  const bucketMaintenance = bucketStatus?.active ?? null;
+  // The server's write gate decides: a migration that is being cancelled
+  // (or cleans up after the switch) no longer blocks writes, so Upload and
+  // Delete come back while its row is still active.
+  const bucketBusy = bucketWritesBlocked(bucketStatus);
   // Canonicalize the URL once a bucket is active but absent from the path
   // (landing at bare /_/browse: the Sidebar selects the first bucket into
   // s3client module state, but nothing put it in the URL). Without the bucket
@@ -558,7 +560,7 @@ export default function App() {
             <Spin size="small" />
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ fontSize: 13, fontWeight: 600 }}>
-                {browserBannerText(bucketMaintenance)}
+                {browserBannerText(bucketMaintenance, bucketBusy)}
               </div>
               <Progress
                 aria-label="Bucket maintenance progress"

@@ -46,16 +46,20 @@ export function activePercent(job: MaintenanceJobView): number | null {
 }
 
 /**
- * Whether uploads and deletes to the bucket are refused while this job is
- * active. The server's own answer wins; without it: a migration that is
- * cancelling (its source was opened again) or cleaning up after the switch
- * does not block writes, every other active job does.
+ * Whether uploads and deletes to the bucket are refused now. This is the
+ * server's answer (`writes_blocked`, the state of its write gate), never a
+ * guess from the job's kind or phase: a cancelled migration opens the
+ * bucket while its row is still active, and a migration that cleans up
+ * after the switch does not gate it. A server without the field gated the
+ * bucket for every active job.
  */
-export function bucketWritesBlocked(job: MaintenanceJobView | null): boolean {
-  if (!job) return false;
-  if (typeof job.writes_blocked === 'boolean') return job.writes_blocked;
-  if (job.kind === 'migrate' && (job.status === 'cancelling' || job.phase === 'cleanup')) return false;
-  return true;
+export function bucketWritesBlocked(
+  status: { active: MaintenanceJobView | null; writes_blocked?: boolean } | null | undefined,
+): boolean {
+  if (!status) return false;
+  if (typeof status.writes_blocked === 'boolean') return status.writes_blocked;
+  if (status.active && typeof status.active.writes_blocked === 'boolean') return status.active.writes_blocked;
+  return status.active != null;
 }
 
 /** Short human label for the active phase, used next to the progress bar. */
@@ -87,23 +91,29 @@ export function phaseLabel(job: MaintenanceJobView): string {
   }
 }
 
-/** One-line banner text for the object browser (kind-aware). */
-export function browserBannerText(job: MaintenanceJobView): string {
-  const pct = activePercent(job);
-  const pctPart = pct != null && job.status !== 'cancelling' ? ` — ${pct}%` : '';
-  if (job.kind === 'migrate' && job.status === 'cancelling') {
-    return 'The migration of this bucket is being cancelled. The bucket stays on its current backend, and uploads and deletes work again.';
+/**
+ * One-line banner text for the object browser (kind-aware). Whether it
+ * says that uploads work follows `writesBlocked` (the server's answer).
+ */
+export function browserBannerText(job: MaintenanceJobView, writesBlocked: boolean): string {
+  const noun = job.kind === 'migrate' ? 'migration' : job.kind === 'backfill-metadata' ? 'metadata backfill' : 're-encryption';
+  if (job.status === 'cancelling') {
+    return writesBlocked
+      ? `The ${noun} of this bucket is being cancelled. Files stay readable; uploads and deletes work again when it stops.`
+      : `The ${noun} of this bucket is being cancelled. Uploads and deletes work again.`;
   }
-  if (job.kind === 'migrate' && job.phase === 'cleanup') {
+  if (!writesBlocked && job.kind === 'migrate' && job.phase === 'cleanup') {
     return 'This bucket now uses its new backend. The proxy is deleting the old copies; uploads and deletes work.';
   }
+  const pct = activePercent(job);
+  const pctPart = pct != null ? ` — ${pct}%` : '';
   const verb =
     job.kind === 'migrate'
       ? 'Migrating this bucket to another backend'
       : job.kind === 'backfill-metadata'
         ? 'Adding metadata to the objects of this bucket'
         : 'Re-encrypting this bucket';
-  const tail = bucketWritesBlocked(job)
+  const tail = writesBlocked
     ? 'Files stay readable; uploads and deletes are temporarily unavailable.'
     : 'Files stay readable, and uploads and deletes work.';
   return `${verb}${pctPart}. ${tail}`;

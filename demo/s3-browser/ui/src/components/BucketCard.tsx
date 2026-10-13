@@ -37,6 +37,9 @@ import MigrateBucketModal from './MigrateBucketModal';
 import type { JobRow } from '../jobsView';
 import { progressLabel } from '../jobsView';
 import { runJobAction } from '../adminApi';
+import { useBucketMaintenance } from '../queries/maintenance';
+import { bucketWritesBlocked } from '../maintenanceStatus';
+import { cancelConfirmText } from '../jobsView';
 import { formatBytesIec } from '../utils';
 import { bytesFromGib, gibFromBytes } from '../savings';
 import { activateOnKey } from '../keyboard';
@@ -128,6 +131,11 @@ export default function BucketCard({
   const uid = useId();
   const colors = useColors();
   const [migrateOpen, setMigrateOpen] = useState(false);
+  // Whether the job blocks writes is the server's answer (its write gate),
+  // read only while a job runs on this bucket.
+  const gate = useBucketMaintenance(maintenanceJob ? name : null).data;
+  // Until the first answer, keep the job's busy look.
+  const writesBlocked = gate === undefined ? true : bucketWritesBlocked(gate);
 
   // Effective field values: the policy row when present, defaults otherwise.
   // Fresh fallback object (not the frozen singleton) so the shared
@@ -181,14 +189,17 @@ export default function BucketCard({
     chips.push(
       <Chip
         key="busy"
-        tone={colors.ACCENT_AMBER}
+        tone={writesBlocked ? colors.ACCENT_AMBER : colors.TEXT_MUTED}
         title={
-          maintenanceJob.kind === 'migrate'
-            ? 'Migrating this bucket to another backend. Reads work; uploads and deletes are temporarily rejected.'
-            : 'A re-encryption job is rewriting this bucket. Reads work; uploads and deletes are temporarily rejected.'
+          writesBlocked
+            ? maintenanceJob.kind === 'migrate'
+              ? 'Migrating this bucket to another backend. Reads work; uploads and deletes are temporarily rejected.'
+              : 'A job is rewriting this bucket. Reads work; uploads and deletes are temporarily rejected.'
+            : 'A job is still finishing on this bucket. Reads, uploads and deletes work.'
         }
       >
-        <SyncOutlined spin style={{ fontSize: 10 }} /> busy{pct != null ? ` ${pct}%` : ''}
+        <SyncOutlined spin style={{ fontSize: 10 }} /> {writesBlocked ? 'busy' : 'job finishing'}
+        {pct != null ? ` ${pct}%` : ''}
       </Chip>
     );
   }
@@ -395,8 +406,19 @@ export default function BucketCard({
               }
               onClick={(e) => {
                 e.stopPropagation();
-                void runJobAction(maintenanceJob.id, 'cancel').catch(() => {
-                  /* next poll reflects the real state either way */
+                // A migration cancelled before the switch deletes the copies
+                // it made: ask first, with the same words as the Jobs page.
+                const text = cancelConfirmText(maintenanceJob);
+                Modal.confirm({
+                  title: text.title,
+                  content: text.content,
+                  okText: 'Cancel job',
+                  cancelText: 'Keep running',
+                  okButtonProps: { danger: true },
+                  onOk: () =>
+                    runJobAction(maintenanceJob.id, 'cancel').catch(() => {
+                      /* next poll reflects the real state either way */
+                    }),
                 });
               }}
             >
