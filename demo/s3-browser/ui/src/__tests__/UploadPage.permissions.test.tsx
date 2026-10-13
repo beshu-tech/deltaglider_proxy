@@ -9,7 +9,7 @@ import userEvent from '@testing-library/user-event';
 import { expect, test, vi } from 'vitest';
 import { renderWithQuery } from '../test/render';
 
-const uploadObject = vi.hoisted(() => vi.fn());
+const uploadObject = vi.hoisted(() => vi.fn(async (..._args: unknown[]) => ({})));
 vi.mock('../s3client', () => ({
   getBucket: () => 'releases',
   listCommonPrefixes: async () => [],
