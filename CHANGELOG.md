@@ -12,6 +12,14 @@ with an "Access Denied" page and creates no user. An account that is already
 linked to a user still signs in. To keep the old behaviour, set
 `provision_unmapped: true` in the provider's `extra_config`.
 
+### Fixed — Google sign-in asks which account to use
+
+The proxy sent Google no `prompt` parameter, so Google signed in with the
+browser's current account and never showed its account chooser. A browser
+with a personal and a work account could sign in with the wrong one. A
+Google provider now sends `prompt=select_account`. The provider's
+`extra_config.prompt` sets another value, or none with an empty string.
+
 ## v2.0.10 — 2026-10-13
 
 ### Fixed — Deltas without an MD5 get listing facts, so listings stop sending HEAD requests for them

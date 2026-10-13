@@ -145,6 +145,23 @@ pub struct OidcProvider {
     cache: RwLock<Option<CachedDiscovery>>,
 }
 
+/// The OIDC `prompt` of the authorization request: `extra_config.prompt`
+/// when set (an empty string sends none), else `select_account` for Google.
+/// Without it, Google signs in with the browser's current account and never
+/// shows its account chooser, so a browser with a personal and a work
+/// account can sign in with the wrong one. Other providers get none by
+/// default: not every one accepts `select_account`.
+fn prompt_param(issuer_url: &str, extra_config: &serde_json::Value) -> Option<String> {
+    match extra_config.get("prompt").and_then(|v| v.as_str()) {
+        Some(p) => Some(p.trim().to_string()).filter(|p| !p.is_empty()),
+        None => {
+            let google = reqwest::Url::parse(issuer_url)
+                .is_ok_and(|u| u.host_str() == Some("accounts.google.com"));
+            google.then(|| "select_account".to_string())
+        }
+    }
+}
+
 /// OIDC Discovery Document (subset of fields we need).
 #[derive(Debug, Clone, Deserialize)]
 struct OidcDiscovery {
@@ -288,7 +305,8 @@ impl OidcProvider {
         rand::rngs::OsRng.fill(&mut nonce_bytes);
         let nonce = hex::encode(nonce_bytes);
 
-        let params = [
+        let prompt = prompt_param(&self.issuer_url, &self.extra_config);
+        let mut params = vec![
             ("response_type", "code"),
             ("client_id", &self.client_id),
             ("redirect_uri", redirect_uri),
@@ -298,6 +316,9 @@ impl OidcProvider {
             ("code_challenge", &code_challenge),
             ("code_challenge_method", "S256"),
         ];
+        if let Some(p) = prompt.as_deref() {
+            params.push(("prompt", p));
+        }
 
         let url = format!(
             "{}?{}",
@@ -757,6 +778,40 @@ mod tests {
             "https://idp.example.com",
             "https://idp.example.com/tenant"
         ));
+    }
+
+    #[test]
+    fn google_shows_its_account_chooser_unless_configured_otherwise() {
+        use serde_json::json;
+        let g = "https://accounts.google.com";
+        assert_eq!(
+            prompt_param(g, &json!({})).as_deref(),
+            Some("select_account")
+        );
+        assert_eq!(
+            prompt_param(&format!("{g}/"), &json!({})).as_deref(),
+            Some("select_account")
+        );
+        assert_eq!(
+            prompt_param(g, &json!({"prompt": ""})),
+            None,
+            "empty opts out"
+        );
+        assert_eq!(
+            prompt_param(g, &json!({"prompt": "consent select_account"})).as_deref(),
+            Some("consent select_account")
+        );
+        // Other providers send none unless configured.
+        let okta = "https://acme.okta.com";
+        assert_eq!(prompt_param(okta, &json!({})), None);
+        assert_eq!(
+            prompt_param("https://accounts.google.com.evil.example", &json!({})),
+            None
+        );
+        assert_eq!(
+            prompt_param(okta, &json!({"prompt": "login"})).as_deref(),
+            Some("login")
+        );
     }
 
     #[test]
