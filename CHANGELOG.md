@@ -11,6 +11,20 @@ delay that acknowledgement by about 40 ms, so most requests on a reused
 (keep-alive) connection, which is what the AWS SDKs use, took at least 40 ms.
 Ten GET requests on one connection took 412 ms and now take about 31 ms.
 
+### Changed — Uploads of plain files into one folder run in parallel
+
+The proxy held a lock on the whole folder for every upload, also for files
+that it stores as they are (images, video and other files that never become
+deltas). Uploads into one folder therefore ran one at a time: 16 parallel
+clients reached about 140 to 210 requests per second, against about 1,100
+across many folders. Now such an upload holds only a lock on its own object,
+and uploads that the proxy stores as deltas keep the folder lock, because
+they share the folder's reference. Uploads of plain files into one folder
+now reach about 1,000 to 1,300 requests per second. Every write of an object,
+from clients, replication, lifecycle, migration and maintenance jobs, now
+takes that object's lock, so two writes of one key never remove each other's
+stored form.
+
 ### Changed — The synced config database holds IAM only
 
 With `config_sync_bucket`, every IAM change uploads the encrypted config
