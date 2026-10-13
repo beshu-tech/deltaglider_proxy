@@ -334,8 +334,10 @@ and decisive check first, and lock the win with a cost test plus a source guard.
 - **Change:** `engine.retrieve_stream_fresh`: `open_object` on the *likely* form
   (`FileRouter::is_delta_eligible` + bucket compression setting + metadata cache
   hint if present) — the GET response headers carry the metadata — in parallel
-  with a HEAD of the other form. Newest-wins decides as today. A delta body that
-  was already read is passed down (`prefetched`).
+  with a HEAD of the other form. Newest-wins decides as today. A small delta
+  body that was already read is passed down (`prefetched`); a delta above the
+  spool threshold drops its opened body unread, and the decode reads it after
+  its spool reservation (bounded memory under concurrent cold GETs).
 - **When it applies:** no `Range`, no conditional headers (`If-*`), no
   `partNumber`. Those keep HEAD-first, so a 304/412/416 never opens a body.
 - **Edge cases (each needs a test):**

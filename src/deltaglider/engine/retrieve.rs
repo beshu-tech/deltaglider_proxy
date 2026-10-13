@@ -145,6 +145,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// - Opened metadata that names another layout (a `.delta` copied in
     ///   without its DG metadata, a passthrough object whose metadata says
     ///   delta), a folder marker: the HEAD-first path.
+    /// - A delta above the spool threshold drops its opened body unread
+    ///   (bounded memory): the shared fill reads the delta after its spool
+    ///   reservation, and the SHA-256 check against the opened metadata
+    ///   refuses a body of another version.
     ///
     /// The conditional and ranged reads keep HEAD-first, so a 304/412/416
     /// never opens a body.
@@ -315,18 +319,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 cache_hit: None,
             }),
             ObjectVariant::Delta => {
-                // A large delta whose verified reconstruction is in the
-                // range-spool cache does not need its delta body.
-                let spooled = meta.file_size > self.spool_threshold()
-                    && self
-                        .range_spools
-                        .get_fresh(&RangeSpoolKey::object(
-                            bucket,
-                            obj_key.full_key(),
-                            meta.file_sha256.clone(),
-                        ))
-                        .is_some();
-                let prefetched = if spooled {
+                // A large delta (spool path) drops its opened body unread:
+                // collecting it here would hold one delta in RAM per
+                // concurrent GET before the spool and codec admission, and
+                // a waiter of the shared fill would throw its copy away.
+                // The fill reads the delta after it reserved its spool, or
+                // the verified reconstruction is cached already.
+                let prefetched = if meta.file_size > self.spool_threshold() {
                     drop(stream);
                     None
                 } else {
@@ -1667,6 +1666,52 @@ mod reference_download_tests {
             metrics.delta_decode_duration_seconds.get_sample_count(),
             5,
             "eight concurrent GETs of four objects decode each once"
+        );
+    }
+
+    /// N concurrent cold GETs of one delta object above the spool threshold
+    /// read no delta body before the spool admission: each opened stream is
+    /// dropped unread, and the one fill reads the delta after it reserved
+    /// its spool. Before, each GET collected the whole delta into RAM before
+    /// it joined the fill, so N GETs held N deltas (and the fill read none).
+    #[tokio::test]
+    async fn cold_gets_of_a_large_delta_read_its_body_only_in_the_fill() {
+        let config = Config {
+            max_object_size: 32 * 1024,
+            ..Config::default()
+        };
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        let (writer, reader, fake, _) = writer_and_reader(&config, Some(metrics.clone())).await;
+        let keys = store_deltas(&writer, "run", 2).await;
+        let want = writer.retrieve("b", &keys[1]).await.unwrap().0;
+        fake.set_delay_ms("GET", 50);
+        fake.clear();
+        const N: usize = 6;
+        let (reader, key) = (&reader, &keys[1]);
+        let got = futures::future::join_all((0..N).map(|_| async move {
+            match reader.retrieve_stream_fresh("b", key).await.unwrap() {
+                RetrieveResponse::Streamed { stream, .. } => {
+                    let chunks: Vec<Bytes> = stream.try_collect().await.unwrap();
+                    chunks.concat()
+                }
+                RetrieveResponse::Buffered { data, .. } => data,
+            }
+        }))
+        .await;
+        for g in got {
+            assert_eq!(g, want);
+        }
+        assert_eq!(
+            metrics.delta_decode_duration_seconds.get_sample_count(),
+            1,
+            "one decode"
+        );
+        // N opens (dropped unread) and the one read of the fill.
+        assert_eq!(
+            count(&fake, &format!("GET /b/{}.delta", keys[1])),
+            N + 1,
+            "{:#?}",
+            fake.requests()
         );
     }
 

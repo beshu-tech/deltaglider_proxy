@@ -100,17 +100,6 @@ impl RangeSpoolCache {
         !self.ttl.is_zero()
     }
 
-    /// The fresh cached spool of `key`, without waiting: `None` when there
-    /// is none, or while a fill of it runs.
-    pub(crate) fn get_fresh(&self, key: &RangeSpoolKey) -> Option<Arc<Spool>> {
-        let slot = self.slots.lock().get(key)?.clone();
-        let entry = slot.entry.try_lock().ok()?;
-        entry
-            .as_ref()
-            .filter(|e| e.created.elapsed() < self.ttl)
-            .map(|e| e.spool.clone())
-    }
-
     /// How many times `fill` ran (decodes), for the tests.
     #[cfg(test)]
     pub(crate) fn fill_count(&self) -> u64 {

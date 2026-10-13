@@ -437,11 +437,13 @@ async fn a_conditional_get_opens_no_body_for_a_304() {
     assert_eq!(count(&key_requests(&fx.fake), "GET"), 0);
 }
 
-/// Large delta (above the spool threshold): the delta body comes from the
-/// one read and is not read again; a second GET whose reconstruction is in
-/// the range-spool cache reads only the delta's GET (its metadata).
+/// Large delta (above the spool threshold): the one read gives the
+/// metadata and its body is dropped unread (bounded memory: no delta body
+/// in RAM before the spool admission); the decode reads the delta after its
+/// spool reservation. A second GET whose reconstruction is in the
+/// range-spool cache reads only the delta's GET (its metadata).
 #[tokio::test]
-async fn a_large_delta_reads_its_delta_once() {
+async fn a_large_delta_reads_its_delta_after_admission() {
     for kind in KINDS {
         let fx = fixture(kind).await;
         let svc = svc_on(large_engine_on(&fx.backend));
@@ -453,7 +455,7 @@ async fn a_large_delta_reads_its_delta_once() {
             reqs.iter()
                 .filter(|r| *r == "GET /b/dir/v1.zip.delta")
                 .count(),
-            1,
+            2,
             "{kind:?}: {reqs:?}"
         );
         fx.fake.clear();
