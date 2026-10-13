@@ -12,6 +12,17 @@ with an "Access Denied" page and creates no user. An account that is already
 linked to a user still signs in. To keep the old behaviour, set
 `provision_unmapped: true` in the provider's `extra_config`.
 
+### Fixed — A read during a write that changes the stored form no longer answers 404
+
+An object is stored either as a delta or as a plain object. A write that
+switches between the two stores the new form first and then deletes the
+old one. A GET or HEAD reads both forms with two requests and takes no
+lock, so a switch between those two requests made the object look absent,
+and the read answered 404 for a live object. When a read finds no object
+while a write of the same key runs on the node, it now reads again, at
+most twice. A read of a missing key with no write in flight sends no extra
+request.
+
 ### Fixed — Google sign-in asks which account to use
 
 The proxy sent Google no `prompt` parameter, so Google signed in with the

@@ -32,6 +32,10 @@ pub struct TestSeams {
     /// a paged maintenance phase (reencrypt, backfill, migrate), so a test
     /// can act while the job is still running.
     pub maintenance_object_stall_ms: u64,
+    /// `DGP_TEST_READ_OTHER_FORM_STALL_MS`: sleep before a plain GET's HEAD
+    /// of the other stored form, so a test can switch the form inside the
+    /// read.
+    pub read_other_form_stall_ms: u64,
     /// `DGP_TEST_MAX_JOB_PAGES`: a smaller page budget for job loops.
     pub max_job_pages: Option<u32>,
     /// `DGP_TEST_FORCE_NONCAS_BACKEND` (comma-separated): backends that get
@@ -52,6 +56,8 @@ impl TestSeams {
             object_delay_ms: delay("DGP_TEST_OBJECT_BARRIER", "DGP_TEST_OBJECT_DELAY_MS"),
             copy_stall_ms: lookup_parse(env, "DGP_TEST_COPY_STALL_MS").unwrap_or(0),
             maintenance_object_stall_ms: lookup_parse(env, "DGP_TEST_MAINTENANCE_OBJECT_STALL_MS")
+                .unwrap_or(0),
+            read_other_form_stall_ms: lookup_parse(env, "DGP_TEST_READ_OTHER_FORM_STALL_MS")
                 .unwrap_or(0),
             max_job_pages: lookup_parse::<u32>(env, "DGP_TEST_MAX_JOB_PAGES").filter(|n| *n > 0),
             force_noncas_backends: env("DGP_TEST_FORCE_NONCAS_BACKEND")
@@ -107,6 +113,7 @@ mod tests {
             ("DGP_TEST_OBJECT_DELAY_MS", "20"),
             ("DGP_TEST_COPY_STALL_MS", "50"),
             ("DGP_TEST_MAINTENANCE_OBJECT_STALL_MS", "250"),
+            ("DGP_TEST_READ_OTHER_FORM_STALL_MS", "400"),
             ("DGP_TEST_MAX_JOB_PAGES", "3"),
             ("DGP_TEST_FORCE_NONCAS_BACKEND", " b2sim, ,other "),
         ]);
@@ -116,6 +123,7 @@ mod tests {
         assert_eq!(t.object_delay_ms, Some(20));
         assert_eq!(t.copy_stall_ms, 50);
         assert_eq!(t.maintenance_object_stall_ms, 250);
+        assert_eq!(t.read_other_form_stall_ms, 400);
         assert_eq!(t.max_job_pages, Some(3));
         assert_eq!(
             t.force_noncas_backends,

@@ -42,6 +42,18 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         bucket: &str,
         key: &str,
     ) -> Result<RetrieveResponse, EngineError> {
+        // Boxed: the GET future is deep enough to hit the type recursion limit.
+        self.retry_missing_during_writes(bucket, key, || {
+            Box::pin(self.retrieve_stream_once(bucket, key))
+        })
+        .await
+    }
+
+    async fn retrieve_stream_once(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<RetrieveResponse, EngineError> {
         let (obj_key, deltaspace_id) = self.validated_key(bucket, key)?;
 
         // Check metadata cache first (avoids resolve_metadata_with_migration I/O)
@@ -158,6 +170,17 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         bucket: &str,
         key: &str,
     ) -> Result<RetrieveResponse, EngineError> {
+        self.retry_missing_during_writes(bucket, key, || {
+            Box::pin(self.retrieve_stream_fresh_once(bucket, key))
+        })
+        .await
+    }
+
+    async fn retrieve_stream_fresh_once(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<RetrieveResponse, EngineError> {
         let (obj_key, deltaspace_id) = self.validated_key(bucket, key)?;
         if obj_key.is_directory_marker() {
             return self.retrieve_stream_headed(bucket, key).await;
@@ -194,7 +217,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let (opened, other) = tokio::join!(
             self.storage
                 .open_object(bucket, &deltaspace_id, stored_object(guess, filename)),
-            self.stored_form_metadata(bucket, &deltaspace_id, filename, other_form),
+            async {
+                let stall = crate::config::test_seams::test_seams().read_other_form_stall_ms;
+                if stall > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(stall)).await;
+                }
+                self.stored_form_metadata(bucket, &deltaspace_id, filename, other_form)
+                    .await
+            },
         );
         let opened = match opened {
             Ok(opened) => Some(opened),

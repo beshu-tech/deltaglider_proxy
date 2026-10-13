@@ -775,6 +775,63 @@ async fn mixed_forms_race(server: &TestServer, prefix: &str) {
     }
 }
 
+/// A plain GET opens one stored form and HEADs the other. A write that
+/// switches the form between those two requests (it writes the `.delta`,
+/// then deletes the plain object) made both look absent, so the GET of a
+/// live object answered 404 (CI, 2026-10-13). The seam holds the HEAD back
+/// until the switch is done; the read must find the object again.
+#[tokio::test]
+async fn a_get_during_a_form_switch_finds_the_object() {
+    let server = TestServer::builder()
+        .env("DGP_TEST_READ_OTHER_FORM_STALL_MS", "600")
+        // No metadata cache: the PUT's entry would send the GET down the
+        // one-request path, which never opens the gap.
+        .env("DGP_METADATA_CACHE_MB", "0")
+        .build()
+        .await;
+    let http = server.http();
+    let base = generate_binary(64 * 1024, 11);
+    let put = |key: &str, body: Vec<u8>, passthrough: bool| {
+        let mut req = http.s3_request(Method::PUT, &obj_url(&server, key));
+        if passthrough {
+            req = req.header("x-amz-meta-dg-no-delta", "true");
+        }
+        req.body(body).send()
+    };
+    // A baseline, so the switch stores a delta; the key starts plain.
+    assert_eq!(
+        put("sw/base.zip", base.clone(), false)
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        put("sw/k.zip", base.clone(), true).await.unwrap().status(),
+        200
+    );
+    let next = mutate_binary(&base, 0.01);
+    let read = get(&server, "sw/k.zip");
+    let switch = async {
+        // Inside the read: the `.delta` open has answered, the HEAD of
+        // the plain form waits for the seam.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let r = put("sw/k.zip", next.clone(), false).await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert_eq!(
+            r.headers()["x-amz-storage-type"].to_str().unwrap(),
+            "delta",
+            "the write must switch the form"
+        );
+    };
+    let ((code, got), ()) = tokio::join!(read, switch);
+    assert_eq!(code, 200, "a GET during a form switch found no object");
+    assert!(
+        got == base || got == next,
+        "the GET returned bytes no write stored"
+    );
+}
+
 /// P7.4 on the filesystem backend: passthrough writes into a folder while
 /// a DELETE of the folder's only other object prunes the (then empty)
 /// folder and its empty parents. The write makes the folder again

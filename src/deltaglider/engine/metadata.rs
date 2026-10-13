@@ -293,7 +293,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     pub async fn head(&self, bucket: &str, key: &str) -> Result<FileMetadata, EngineError> {
-        Ok(self.head_with_forms(bucket, key).await?.0)
+        let found = self
+            .retry_missing_during_writes(bucket, key, || self.head_with_forms(bucket, key))
+            .await?;
+        Ok(found.0)
     }
 
     /// [`Self::head`], and which stored forms of the key exist (the

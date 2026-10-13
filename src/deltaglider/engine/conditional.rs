@@ -111,6 +111,8 @@ impl From<ConditionalError> for crate::api::S3Error {
 /// the lock makes one.
 pub struct ObjectWriteGuard {
     _guard: tokio::sync::OwnedMutexGuard<()>,
+    /// The lock entry, for the write counter that `Drop` bumps.
+    lock: Arc<ObjectWriteLock>,
     /// The object this guard locks, as the engine parses its key.
     object: ObjectKey,
     /// The object as the precondition check read it under this lock
@@ -156,7 +158,49 @@ impl ObjectWriteGuard {
     }
 }
 
-type ObjectWriteLocks = DashMap<String, Arc<tokio::sync::Mutex<()>>>;
+impl Drop for ObjectWriteGuard {
+    /// A write that ends is a write event too: a read that overlapped it
+    /// sees the counter move (see [`WriteActivity`]).
+    fn drop(&mut self) {
+        self.lock
+            .events
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// One key's write lock and its write counter (bumped when a write takes
+/// the lock and when it lets go).
+struct ObjectWriteLock {
+    mutex: Arc<tokio::sync::Mutex<()>>,
+    events: std::sync::atomic::AtomicU64,
+}
+
+type ObjectWriteLocks = DashMap<String, Arc<ObjectWriteLock>>;
+
+/// What a reader saw of a key's writes: the lock entry, its counter, and
+/// whether a write held the lock. Reads take no lock. A write that
+/// switches the stored form (writes the new form, then deletes the old)
+/// between a read's two requests makes the object look absent, so a read
+/// that finds nothing compares two snapshots and reads again when a write
+/// ran in between ([`DeltaGliderEngine::retry_missing_during_writes`]).
+pub(super) struct WriteActivity {
+    lock: Option<Arc<ObjectWriteLock>>,
+    events: u64,
+    held: bool,
+}
+
+impl WriteActivity {
+    /// Pure: a write ran between `before` and `after` (or held the lock at
+    /// either end).
+    fn overlapped(before: &WriteActivity, after: &WriteActivity) -> bool {
+        let same_entry = match (&before.lock, &after.lock) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        before.held || after.held || !same_entry || before.events != after.events
+    }
+}
 
 /// THE process-wide object-write-lock map (like `shared_prefix_locks`): a
 /// rebuilt engine and the one it replaces must exclude each other.
@@ -191,12 +235,89 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 &self.storage.storage_identity(bucket),
                 &object,
             ))
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .or_insert_with(|| {
+                Arc::new(ObjectWriteLock {
+                    mutex: Arc::new(tokio::sync::Mutex::new(())),
+                    events: std::sync::atomic::AtomicU64::new(0),
+                })
+            })
             .clone();
+        let guard = mutex.mutex.clone().lock_owned().await;
+        mutex
+            .events
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         ObjectWriteGuard {
-            _guard: mutex.lock_owned().await,
+            _guard: guard,
+            lock: mutex,
             object,
             checked: None,
+        }
+    }
+
+    /// A snapshot of the key's writes on this node, for
+    /// [`Self::retry_missing_during_writes`]. Creates no lock entry.
+    pub(super) fn write_activity(&self, bucket: &str, key: &str) -> WriteActivity {
+        let object = ObjectKey::parse(bucket, key);
+        let lock = shared_object_write_locks()
+            .get(&object_write_lock_key(
+                &self.storage.storage_identity(bucket),
+                &object,
+            ))
+            .map(|e| e.value().clone());
+        match lock {
+            Some(l) => {
+                let held = l.mutex.try_lock().is_err();
+                WriteActivity {
+                    events: l.events.load(std::sync::atomic::Ordering::SeqCst),
+                    held,
+                    lock: Some(l),
+                }
+            }
+            None => WriteActivity {
+                lock: None,
+                events: 0,
+                held: false,
+            },
+        }
+    }
+
+    /// Run the read `op`, and run it again (at most twice more) when it
+    /// finds no object while a write of the key ran on this node: that
+    /// write can switch the stored form between the read's requests. A
+    /// read of a missing key with no write in flight sends nothing more.
+    /// A caller that holds the key's write lock gets the retries too (the
+    /// lock reads as held); it can only cost requests, never a deadlock,
+    /// because a read takes no lock.
+    pub(super) async fn retry_missing_during_writes<T, F, Fut>(
+        &self,
+        bucket: &str,
+        key: &str,
+        mut op: F,
+    ) -> Result<T, EngineError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, EngineError>>,
+    {
+        const RETRIES: usize = 2;
+        let mut attempt = 0;
+        loop {
+            let before = self.write_activity(bucket, key);
+            match op().await {
+                Err(e)
+                    if e.is_not_found()
+                        && attempt < RETRIES
+                        && WriteActivity::overlapped(
+                            &before,
+                            &self.write_activity(bucket, key),
+                        ) =>
+                {
+                    attempt += 1;
+                    tracing::debug!(
+                        "{bucket}/{key}: not found during a write of the key, reading again"
+                    );
+                }
+                r => return r,
+            }
         }
     }
 
@@ -327,6 +448,37 @@ mod tests {
     }
 
     /// A guard proves the write of its own key only.
+    #[test]
+    fn a_write_overlaps_a_read_when_anything_moved() {
+        use std::sync::atomic::AtomicU64;
+        let entry = || {
+            Arc::new(ObjectWriteLock {
+                mutex: Arc::new(tokio::sync::Mutex::new(())),
+                events: AtomicU64::new(0),
+            })
+        };
+        let (a, b) = (entry(), entry());
+        let snap = |lock: Option<&Arc<ObjectWriteLock>>, events, held| WriteActivity {
+            lock: lock.cloned(),
+            events,
+            held,
+        };
+        let quiet = |x: WriteActivity, y: WriteActivity| !WriteActivity::overlapped(&x, &y);
+        assert!(
+            quiet(snap(None, 0, false), snap(None, 0, false)),
+            "no writes"
+        );
+        assert!(quiet(snap(Some(&a), 4, false), snap(Some(&a), 4, false)));
+        // A write began, ended, held the lock at either end, or its entry
+        // appeared, went, or was replaced.
+        assert!(!quiet(snap(Some(&a), 4, false), snap(Some(&a), 5, false)));
+        assert!(!quiet(snap(Some(&a), 4, true), snap(Some(&a), 4, false)));
+        assert!(!quiet(snap(Some(&a), 4, false), snap(Some(&a), 4, true)));
+        assert!(!quiet(snap(None, 0, false), snap(Some(&a), 1, false)));
+        assert!(!quiet(snap(Some(&a), 2, false), snap(None, 0, false)));
+        assert!(!quiet(snap(Some(&a), 2, false), snap(Some(&b), 2, false)));
+    }
+
     #[tokio::test]
     async fn a_guard_covers_its_own_key_only() {
         let (engine, _fake, _usage) = counted_s3_engine().await;
