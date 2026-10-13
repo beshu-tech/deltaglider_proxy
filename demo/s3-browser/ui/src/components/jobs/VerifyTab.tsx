@@ -1003,12 +1003,37 @@ function FindingsTable({
   const totalDiffsExclUnverifiable =
     outcome.missing_on_dest + outcome.orphan_on_dest + outcome.checksum_mismatch;
   const capped = shown < totalDiffsExclUnverifiable;
+  // "Run now" runs the whole rule, which fixes every such row at once: one
+  // button for the table, not one per row that all spin together.
+  const fixedByRun = rows.filter(
+    (f) => f.remediation && fixActionMeta(f.remediation.fix, f.remediation.fix_detail).runnable
+  ).length;
 
   return (
     <div style={{ marginTop: 18 }}>
-      <Text strong style={{ display: 'block', fontSize: 13.5, marginBottom: 8 }}>
-        Differences
-      </Text>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8, flexWrap: 'wrap' }}>
+        <Text strong style={{ fontSize: 13.5 }}>
+          Differences
+        </Text>
+        {fixedByRun > 0 && (
+          <>
+            <Text type="secondary" style={{ fontSize: 12, color: c.TEXT_MUTED, marginInlineStart: 'auto' }}>
+              A run of the rule fixes {fixedByRun.toLocaleString()} of the {shown.toLocaleString()} shown
+            </Text>
+            <Button
+              size="small"
+              type="primary"
+              icon={<CaretRightOutlined />}
+              loading={runNowPending}
+              disabled={!onRunNow}
+              onClick={onRunNow}
+              title={onRunNow ? 'Run the whole rule now, then verify again' : 'Run-now is unavailable here'}
+            >
+              Run now
+            </Button>
+          </>
+        )}
+      </div>
       <RecordList<ParityFinding>
         rows={rows}
         rowKey={(f) => `${f.kind}:${f.key}`}
@@ -1043,9 +1068,7 @@ function FindingsTable({
             key: 'fix',
             label: 'Fix',
             track: 'minmax(0,1.5fr)',
-            render: (f) => (
-              <FixCell finding={f} c={c} onRunNow={onRunNow} runNowPending={runNowPending} />
-            ),
+            render: (f) => <FixCell finding={f} c={c} />,
           },
         ]}
       />
@@ -1094,41 +1117,24 @@ function WhyCell({ finding, c }: { finding: ParityFinding; c: ReturnType<typeof 
 }
 
 /**
- * Fix = a "Run now" button when re-run is the fix (the only executable action),
- * otherwise an instructional chip + muted one-line guidance (native `title`
- * carries the long form). Un-annotated findings render nothing here.
+ * Fix = how to fix this row: "Run the rule" when a run fixes it (the table's
+ * one "Run now" does that for every such row), otherwise an instructional
+ * label + muted one-line guidance (native `title` carries the long form).
+ * Un-annotated findings render nothing here.
  */
-function FixCell({
-  finding,
-  c,
-  onRunNow,
-  runNowPending,
-}: {
-  finding: ParityFinding;
-  c: ReturnType<typeof useColors>;
-  onRunNow?: () => void;
-  runNowPending?: boolean;
-}) {
+function FixCell({ finding, c }: { finding: ParityFinding; c: ReturnType<typeof useColors> }) {
   const rem = finding.remediation;
   if (!rem) return <Text type="secondary" style={{ fontSize: 12, color: c.TEXT_MUTED }}>—</Text>;
   const meta = fixActionMeta(rem.fix, rem.fix_detail);
 
   if (meta.runnable) {
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-        <Button
-          size="small"
-          type="primary"
-          icon={<CaretRightOutlined />}
-          loading={runNowPending}
-          disabled={!onRunNow}
-          onClick={onRunNow}
-          title={onRunNow ? rem.fix_detail : 'Run-now is unavailable here'}
-        >
-          Run now
-        </Button>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }} title={rem.fix_detail}>
+        <Text strong style={{ fontSize: 12.5, color: c.TEXT_PRIMARY, lineHeight: 1.35 }}>
+          Run the rule
+        </Text>
         <Text type="secondary" style={{ fontSize: 11.5, color: c.TEXT_MUTED, lineHeight: 1.4 }}>
-          {rem.fix_detail}
+          {rem.fix_detail} (Run now, above)
         </Text>
       </div>
     );
