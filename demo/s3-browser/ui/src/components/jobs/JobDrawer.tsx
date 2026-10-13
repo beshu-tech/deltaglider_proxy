@@ -431,7 +431,9 @@ export default function JobDrawer({
     <Drawer
       open={!!jobId}
       onClose={onClose}
-      size="min(640px, 100vw)"
+      // 100%, not 100vw: the drawer sits left of a classic scrollbar, and
+      // 100vw pushed its left edge off a phone screen.
+      size="min(640px, 100%)"
       // Room under the last field for the page's floating unsaved-changes bar.
       styles={bottomInset ? { body: { paddingBottom: 96 } } : undefined}
       extra={

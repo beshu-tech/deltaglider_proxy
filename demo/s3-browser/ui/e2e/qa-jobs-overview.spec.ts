@@ -103,10 +103,16 @@ test('jobs overview: palette, second tab sees a new job, 390 px layout', async (
   // The drawer fits the screen and shows what the job did.
   await jobRow(tabB).getByText(BUCKET).first().click();
   const drawer = tabB.getByRole('dialog');
-  await expect(drawer).toBeVisible();
-  const box = await drawer.boundingBox();
-  expect(box && box.x >= 0 && box.x + box.width <= 390 + 1).toBe(true);
   await expect(drawer.getByText('Last-Modified')).toBeVisible();
+  // After the slide-in the drawer panel lies inside the page. Regression:
+  // a 100vw panel next to a scrollbar lost its left 6 px off screen.
+  await expect
+    .poll(async () => {
+      const box = await drawer.boundingBox();
+      const page = await tabB.evaluate(() => document.documentElement.clientWidth);
+      return box ? [Math.round(box.x), Math.round(box.x + box.width) <= page] : null;
+    })
+    .toEqual([0, true]);
   await expect(drawer.getByText('kept as it was')).toBeVisible();
   await expect(drawer.getByText('Objects', { exact: true })).toBeVisible();
 
