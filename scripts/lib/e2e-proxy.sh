@@ -3,11 +3,14 @@
 # DeltaGlider proxy (filesystem backend, free port) for a Playwright run.
 #
 #   source scripts/lib/e2e-proxy.sh
-#   e2e_start_proxy open|bootstrap|docs   # exports PLAYWRIGHT_BASE_URL, sets an EXIT trap
+#   e2e_start_proxy open|bootstrap|qa-jobs|docs   # exports PLAYWRIGHT_BASE_URL, sets an EXIT trap
 #
 # bootstrap mode: SigV4 bootstrap creds in `access:` (E2E_ACCESS_KEY /
 # E2E_SECRET_KEY) and the `qa-public` bucket with `public_prefixes: ["pub/"]`,
 # the shape `demo/s3-browser/ui/e2e/qa-regression.spec.ts` expects.
+# qa-jobs mode: the same as bootstrap, but with TWO named filesystem backends,
+# `local-disk` (the default, data in $E2E_DIR/data) and `qa-target`, so a
+# migrate has somewhere to go (e2e/qa-jobs-maintenance.spec.ts).
 # docs mode (scripts/docs-screenshots.sh): bootstrap creds and ONE backend,
 # `local-disk`; the screenshot seed adds the rest of the fixed cast through
 # the admin API. Its state dir is fixed (E2E_STATE_DIR, default
@@ -79,6 +82,28 @@ advanced:
   listen_addr: "127.0.0.1:$port"
 YAML
       ;;
+    qa-jobs)
+      mkdir -p "$E2E_DIR/qa-target"
+      cat > "$config" <<YAML
+access:
+  access_key_id: "$E2E_ACCESS_KEY"
+  secret_access_key: "$E2E_SECRET_KEY"
+storage:
+  backends:
+    - name: local-disk
+      type: filesystem
+      path: "$E2E_DIR/data"
+    - name: qa-target
+      type: filesystem
+      path: "$E2E_DIR/qa-target"
+  default_backend: local-disk
+  buckets:
+    qa-public:
+      public_prefixes: ["pub/"]
+advanced:
+  listen_addr: "127.0.0.1:$port"
+YAML
+      ;;
     docs)
       mkdir -p "$E2E_DIR/local-disk"
       cat > "$config" <<YAML
@@ -96,7 +121,7 @@ advanced:
 YAML
       ;;
     *)
-      echo "error: unknown e2e auth mode '$mode' (open|bootstrap|docs)" >&2
+      echo "error: unknown e2e auth mode '$mode' (open|bootstrap|qa-jobs|docs)" >&2
       exit 2
       ;;
   esac

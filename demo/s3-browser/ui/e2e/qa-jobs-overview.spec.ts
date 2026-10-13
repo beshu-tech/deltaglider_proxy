@@ -96,6 +96,11 @@ test('jobs overview: palette, second tab sees a new job, 390 px layout', async (
   // 390 px: nothing scrolls sideways, and the meter label is not cut.
   const overflow = await tabB.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
   expect(overflow).toBeLessThanOrEqual(0);
+  // Dense cards: a phone shows more than one job per screen (the cards
+  // were about 310 px tall each).
+  const cardHeight = (await jobRow(tabB).boundingBox())?.height ?? 0;
+  expect(cardHeight).toBeGreaterThan(0);
+  expect(cardHeight).toBeLessThan(240);
   const label = jobRow(tabB).locator('.dg-meter-label');
   const cut = await label.evaluate((el) => el.scrollWidth > el.clientWidth + 1);
   expect(cut).toBe(false);

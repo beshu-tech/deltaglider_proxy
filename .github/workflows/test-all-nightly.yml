@@ -251,7 +251,7 @@ jobs:
           path: |
             demo/s3-browser/ui/playwright-report
             demo/s3-browser/ui/test-results
-            qa-proxy.log
+            qa-proxy*.log
           if-no-files-found: ignore
           retention-days: 14
 
