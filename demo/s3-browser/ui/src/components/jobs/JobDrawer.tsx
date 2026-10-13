@@ -2,16 +2,21 @@
  * Job detail drawer: Definition (editable for rule kinds via the parent's
  * section editors; read-only parameters for one-offs), Runs, Failures.
  */
-import { useEffect, useRef, useMemo } from 'react';
+import { useEffect, useRef, useMemo, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Alert, Drawer, Empty, Tabs, Tag, Typography } from 'antd';
+import { Alert, Button, Drawer, Empty, Modal, Tabs, Tag, Typography } from 'antd';
+import { StopOutlined } from '@ant-design/icons';
 import RowActionsMenu from '../RowActionsMenu';
 import { draftRemoveAction } from './draftRemoveAction';
 import { useColors } from '../../ThemeContext';
 import './OutcomeMeter.css';
 import type { LifecycleConfig, ReplicationConfig } from '../../adminApi';
-import type { JobRow } from '../../jobsView';
+import type { JobRow, LifecycleVerb } from '../../jobsView';
 import {
+  availableActions,
+  cancelConfirmText,
+  failuresCountText,
+  groupFailureErrors,
   isActiveJobStatus,
   jobInFlight,
   jobWalkProgress,
@@ -19,12 +24,19 @@ import {
   jobStatusLabel,
   jobStatusTone,
   kindLabel,
+  oneOffDefinition,
+  overlayLiveRun,
   parseJobId,
+  rowMeterInput,
+  runDuration,
+  runMeterInput,
+  runsRefreshKey,
 } from '../../jobsView';
+import { useNow } from '../../hooks/useNow';
 import StrategyBand from './StrategyBand';
 import { formatBytes } from '../../utils';
 import { qk } from '../../queries/keys';
-import { useJobFailures, useJobRuns } from '../../queries/jobs';
+import { useJob, useJobFailures, useJobRuns } from '../../queries/jobs';
 import TimeAgo from '../TimeAgo';
 import RecordList from './RecordList';
 import OutcomeMeter from './OutcomeMeter';
@@ -48,6 +60,12 @@ interface Props {
   onJobIdChange: (next: string) => void;
   /** Drop a draft (a rule that exists only in the unsaved edits). */
   onRemoveDraft: (draft: Pick<JobRow, 'id' | 'kind' | 'name'>) => void;
+  /** Cancel a running one-off (asked for confirmation here first). */
+  onCancelJob?: (row: JobRow) => Promise<unknown> | void;
+  /** What a lifecycle rule does to an object (meter words). */
+  lifecycleVerbOf?: (row: JobRow) => LifecycleVerb | undefined;
+  /** The page's unsaved-changes bar is showing: keep the last fields clear of it. */
+  bottomInset?: boolean;
   /** Currently active tab (URL-deep-linked). */
   activeTab?: string;
   /** Called when the user switches tabs. */
@@ -56,8 +74,15 @@ interface Props {
   onClose: () => void;
 }
 
-function fmt(ts?: number | null): string {
-  return ts ? new Date(ts * 1000).toLocaleString() : '—';
+/**
+ * Escape inside an open dropdown (an autocomplete, a select) closes the
+ * dropdown only. The drawer closes on Escape too, and it listens on an
+ * ancestor of the field, so the key must stop at the field.
+ */
+function stopEscapeFromOpenDropdown(e: React.KeyboardEvent) {
+  if (e.key !== 'Escape') return;
+  const t = e.target as HTMLElement | null;
+  if (t?.getAttribute('aria-expanded') === 'true') e.stopPropagation();
 }
 
 export default function JobDrawer({
@@ -69,6 +94,9 @@ export default function JobDrawer({
   onLifecycleChange,
   onJobIdChange,
   onRemoveDraft,
+  onCancelJob,
+  lifecycleVerbOf,
+  bottomInset,
   activeTab,
   onTabChange,
   inputRadius,
@@ -76,7 +104,16 @@ export default function JobDrawer({
 }: Props) {
   const c = useColors();
   const parsed = jobId ? parseJobId(jobId) : null;
-  const serverRow = rows.find((r) => r.id === jobId) ?? null;
+  const listedRow = rows.find((r) => r.id === jobId) ?? null;
+  // The list carries the recent one-offs only: a link to an older one reads
+  // it by id.
+  const isOneOffId = parsed?.subsystem === 'maintenance';
+  const fetched = useJob(isOneOffId && !listedRow ? jobId : null);
+  const serverRow = listedRow ?? (isOneOffId ? (fetched.data ?? null) : null);
+  const ruleKind = parsed?.subsystem === 'replication' ? 'replication' : parsed?.subsystem === 'lifecycle' ? 'lifecycle' : null;
+  const verb = serverRow ? lifecycleVerbOf?.(serverRow) : undefined;
+  const nowSec = useNow(serverRow && isActiveJobStatus(serverRow.status) ? 1000 : 60_000) / 1000;
+  const [cancelling, setCancelling] = useState(false);
   // Live "currently copying" objects (name + size) — justifies a slow-moving
   // counter when the run is chewing through multi-GB files.
   const inFlight = jobInFlight(serverRow);
@@ -92,39 +129,24 @@ export default function JobDrawer({
   const failuresQuery = useJobFailures(serverRow ? jobId : null);
   const bucketNames = useBucketNames();
 
-  // Refetch run history + failures exactly when the active run transitions to a
-  // terminal state — event-driven, so no second poller. The list poll is the
-  // single live source; this just captures the final numbers + the next run.
+  // Read run history + failures again whenever the row says a run started,
+  // settled, or the rule was paused — including a run that the scheduler
+  // started and finished between two polls of the list.
   const qc = useQueryClient();
-  const wasActive = useRef(false);
-  const liveActive = serverRow ? isActiveJobStatus(serverRow.status) : false;
+  const refreshKey = runsRefreshKey(serverRow);
+  const lastKey = useRef(refreshKey);
   useEffect(() => {
-    if (wasActive.current && !liveActive && serverRow) {
+    if (lastKey.current !== refreshKey && serverRow) {
       qc.invalidateQueries({ queryKey: qk.jobs.runs(serverRow.id) });
       qc.invalidateQueries({ queryKey: qk.jobs.failures(serverRow.id) });
     }
-    wasActive.current = liveActive;
-  }, [liveActive, serverRow, qc]);
+    lastKey.current = refreshKey;
+  }, [refreshKey, serverRow, qc]);
 
   // Overlay the live (list-polled) progress onto the running run row so its
-  // scanned/processed/status tick without re-fetching. Matched by started_at.
-  const liveRuns = (() => {
-    const runs = runsQuery.data?.runs ?? [];
-    if (!serverRow || !liveActive) return runs;
-    return runs.map((r) =>
-      r.started_at === serverRow.started_at && isActiveJobStatus(r.status)
-        ? {
-            ...r,
-            status: serverRow.status,
-            objects_processed: serverRow.progress.processed,
-            objects_skipped: serverRow.progress.skipped,
-            errors: serverRow.progress.failed,
-            // Carry live percent so the running run's meter fills (null = unknown).
-            __percent: serverRow.percent ?? null,
-          }
-        : r,
-    );
-  })();
+  // numbers tick without re-fetching.
+  const liveRuns = overlayLiveRun(runsQuery.data?.runs ?? [], serverRow);
+  const runKind = serverRow?.kind ?? ruleKind ?? 'replication';
 
   const replIndex =
     parsed?.subsystem === 'replication'
@@ -183,23 +205,45 @@ export default function JobDrawer({
       );
     }
     if (serverRow) {
-      // One-off job: read-only parameters.
-      const entries: Array<[string, string]> = [
-        ['Bucket', serverRow.scope.bucket],
-        ...(serverRow.scope.target ? ([['Target', serverRow.scope.target]] as Array<[string, string]>) : []),
-        ['Phase', serverRow.phase ?? '—'],
-        ['Created', fmt(serverRow.created_at)],
-        ['Started', fmt(serverRow.started_at)],
-        ['Finished', fmt(serverRow.finished_at)],
-      ];
+      // One-off job: read-only parameters, what it did, and Cancel.
+      const entries = oneOffDefinition(serverRow, nowSec);
+      const canCancel = availableActions(serverRow).includes('cancel') && !!onCancelJob;
+      const askCancel = () => {
+        const text = cancelConfirmText(serverRow);
+        Modal.confirm({
+          title: text.title,
+          content: text.content,
+          okText: 'Cancel job',
+          cancelText: 'Keep running',
+          okButtonProps: { danger: true },
+          onOk: async () => {
+            setCancelling(true);
+            try {
+              await onCancelJob?.(serverRow);
+            } finally {
+              setCancelling(false);
+            }
+          },
+        });
+      };
       return (
         <div>
           {serverRow.last_error && (
             <Alert type="error" showIcon title={serverRow.last_error} style={{ marginBottom: 12, borderRadius: 8 }} />
           )}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <OutcomeMeter {...rowMeterInput(serverRow)} />
+            </div>
+            {canCancel && (
+              <Button danger size="small" icon={<StopOutlined />} loading={cancelling} onClick={askCancel}>
+                Cancel job…
+              </Button>
+            )}
+          </div>
           {entries.map(([k, v]) => (
             <div key={k} style={{ display: 'flex', gap: 12, padding: '6px 0' }}>
-              <Text type="secondary" style={{ width: 90, flexShrink: 0, fontSize: 12 }}>
+              <Text type="secondary" style={{ width: 110, flexShrink: 0, fontSize: 12 }}>
                 {k}
               </Text>
               <Text
@@ -216,6 +260,9 @@ export default function JobDrawer({
           ))}
         </div>
       );
+    }
+    if (isOneOffId) {
+      return fetched.isLoading ? null : <Empty description="This job does not exist on this proxy." />;
     }
     // A rule-kind jobId that resolves to NEITHER a live editor rule NOR a server
     // row is a stale draft reference (the draft was discarded or renamed while
@@ -256,62 +303,114 @@ export default function JobDrawer({
           render: (r) => (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
               <OutcomeMeter
-                scanned={r.objects_scanned}
-                copied={r.objects_processed}
-                errors={r.errors}
-                skipped={r.objects_skipped}
-                status={r.status}
-                percent={'__percent' in r ? (r as { __percent: number | null }).__percent : null}
+                {...runMeterInput(
+                  r,
+                  runKind,
+                  verb,
+                  isActiveJobStatus(r.status) ? serverRow?.phase : null,
+                )}
               />
-              <StrategyBand mix={jobStrategyMix(r)} />
+              {/* How each copied object moved: replication only. */}
+              {runKind === 'replication' && <StrategyBand mix={jobStrategyMix(r)} />}
             </div>
+          ),
+        },
+        {
+          key: 'took',
+          label: 'Took',
+          track: 'max-content',
+          render: (r) => (
+            <Text type="secondary" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+              {runDuration(r.started_at, r.finished_at, nowSec) ?? '—'}
+            </Text>
+          ),
+        },
+        {
+          key: 'bytes',
+          label: 'Data',
+          track: 'max-content',
+          render: (r) => (
+            <Text
+              type="secondary"
+              style={{ fontSize: 12, whiteSpace: 'nowrap' }}
+              title="Logical size of the objects the run wrote"
+            >
+              {formatBytes(r.bytes)}
+            </Text>
           ),
         },
       ]}
     />
   );
 
+  const failures = failuresQuery.data?.failures ?? [];
+  const failuresCount = failuresCountText(failures.length, failuresQuery.data?.total);
+  const errorGroups = groupFailureErrors(failures);
   const failuresTable = (
-    <RecordList
-      rows={failuresQuery.data?.failures ?? []}
-      rowKey={(f) => String(f.id)}
-      empty="No recorded failures"
-      columns={[
-        {
-          key: 'when',
-          label: 'When',
-          track: 'max-content',
-          render: (f) => (
-            <span style={{ whiteSpace: 'nowrap' }}>
-              <TimeAgo ts={f.occurred_at} />
-            </span>
-          ),
-        },
-        {
-          key: 'object',
-          label: 'Object',
-          track: 'minmax(0,1.2fr)',
-          render: (f) => {
-            const obj = `${f.bucket ? `${f.bucket}/` : ''}${f.object_key || '(job-level)'}`;
-            return (
-              <span className="dg-fail-text" title={obj} style={{ fontFamily: 'var(--font-mono)' }}>
-                {obj}
+    <div>
+      {failuresCount && (
+        <Text type="secondary" style={{ display: 'block', fontSize: 12, marginBottom: 8 }}>
+          {failuresCount}
+        </Text>
+      )}
+      {errorGroups.length > 0 && (
+        <div style={{ marginBottom: 12, fontSize: 12 }} aria-label="Repeated errors">
+          {errorGroups.slice(0, 3).map((g) => (
+            <div key={g.error} style={{ display: 'flex', gap: 8, padding: '2px 0' }}>
+              <Text strong style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+                {g.count}×
+              </Text>
+              <span className="dg-fail-text" style={{ color: c.ACCENT_RED }}>
+                {g.error}
               </span>
-            );
+            </div>
+          ))}
+        </div>
+      )}
+      <RecordList
+        rows={failures}
+        rowKey={(f) => String(f.id)}
+        empty="No recorded failures"
+        columns={[
+          {
+            key: 'when',
+            label: 'When',
+            track: 'max-content',
+            render: (f) => (
+              <span style={{ whiteSpace: 'nowrap' }}>
+                <TimeAgo ts={f.occurred_at} />
+              </span>
+            ),
           },
-        },
-        {
-          key: 'error',
-          label: 'Error',
-          track: 'minmax(0,1.5fr)',
-          render: (f) => (
-            <span className="dg-fail-text" title={f.error} style={{ color: c.ACCENT_RED }}>
-              {f.error}
-            </span>
-          ),
-        },
-      ]}
-    />
+          {
+            key: 'object',
+            label: 'Object',
+            track: 'minmax(0,1.2fr)',
+            render: (f) => {
+              const obj = `${f.bucket ? `${f.bucket}/` : ''}${f.object_key || '(job-level)'}`;
+              return (
+                <span className="dg-fail-text" title={obj} style={{ fontFamily: 'var(--font-mono)' }}>
+                  {obj}
+                  {f.dest_key && f.dest_key !== f.object_key && (
+                    <span style={{ color: c.TEXT_MUTED }}> → {f.dest_key}</span>
+                  )}
+                </span>
+              );
+            },
+          },
+          {
+            key: 'error',
+            label: 'Error',
+            track: 'minmax(0,1.5fr)',
+            render: (f) => (
+              <span className="dg-fail-text" title={f.error} style={{ color: c.ACCENT_RED }}>
+                {f.error}
+              </span>
+            ),
+          },
+        ]}
+      />
+    </div>
   );
 
   // Clamp the URL-deep-linked tab to one that actually exists for this job —
@@ -333,15 +432,17 @@ export default function JobDrawer({
       open={!!jobId}
       onClose={onClose}
       size="min(640px, 100vw)"
+      // Room under the last field for the page's floating unsaved-changes bar.
+      styles={bottomInset ? { body: { paddingBottom: 96 } } : undefined}
       extra={
-        !serverRow && parsed ? (
+        !serverRow && parsed && ruleKind ? (
           <RowActionsMenu
             label={`More actions for ${parsed.key}`}
             actions={[
               draftRemoveAction(
                 {
                   id: jobId ?? '',
-                  kind: parsed.subsystem === 'replication' ? 'replication' : 'lifecycle',
+                  kind: ruleKind,
                   name: parsed.key,
                 },
                 onRemoveDraft,
@@ -358,19 +459,23 @@ export default function JobDrawer({
               {jobStatusLabel(serverRow)}
             </Tag>
           </span>
+        ) : parsed && ruleKind ? (
+          <span>
+            {kindLabel(ruleKind)} · <span style={{ fontFamily: 'var(--font-mono)' }}>{parsed.key}</span>{' '}
+            <Tag color="warning" style={{ marginLeft: 8 }}>
+              draft
+            </Tag>
+          </span>
         ) : (
           parsed && (
             <span>
-              {kindLabel(parsed.subsystem === 'replication' ? 'replication' : 'lifecycle')} ·{' '}
-              <span style={{ fontFamily: 'var(--font-mono)' }}>{parsed.key}</span>{' '}
-              <Tag color="warning" style={{ marginLeft: 8 }}>
-                draft
-              </Tag>
+              Job · <span style={{ fontFamily: 'var(--font-mono)' }}>{parsed.key}</span>
             </span>
           )
         )
       }
     >
+      <div onKeyDown={stopEscapeFromOpenDropdown}>
       {walk && (
         <div
           style={{
@@ -464,6 +569,7 @@ export default function JobDrawer({
             : []),
         ]}
       />
+      </div>
     </Drawer>
   );
 }

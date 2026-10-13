@@ -148,3 +148,42 @@ test('the restart banner lists the server restart reasons, not a fixed field lis
   expect(screen.getByText(/tls config changed — restart required/)).toBeInTheDocument();
   expect(screen.queryByText(/listen_addr, cache_size_mb/)).not.toBeInTheDocument();
 });
+
+// Regression: a change inside one rule showed the whole rules array twice,
+// truncated at the same prefix; and the first of two queued dialogs did not
+// say that a second one follows.
+test('a rule-array change names the rule and field, and a queued dialog says its step', () => {
+  const rule = (over: Record<string, unknown> = {}) => ({
+    name: 'nightly-dr',
+    enabled: true,
+    source: { bucket: 'releases', prefix: '' },
+    destination: { bucket: 'db-archive', prefix: '' },
+    replicate_deletes: false,
+    ...over,
+  });
+  render(
+    <ApplyDialog
+      open
+      section="storage"
+      response={{
+        ok: true,
+        diff: {
+          storage: {
+            'replication.rules': { before: [rule()], after: [rule({ replicate_deletes: true }), rule({ name: 'mirror-2' })] },
+          },
+        },
+      }}
+      onApply={() => {}}
+      onCancel={() => {}}
+      step={{ index: 1, total: 2, what: 'replication rules' }}
+    />,
+  );
+  const dialog = screen.getByRole('dialog');
+  expect(within(dialog).getByText('Step 1 of 2 · replication rules')).toBeInTheDocument();
+  expect(within(dialog).getByText('Changes (2)')).toBeInTheDocument();
+  expect(within(dialog).getByText('replication.rules["nightly-dr"].replicate_deletes')).toBeInTheDocument();
+  expect(within(dialog).getByText(/-\sfalse/)).toBeInTheDocument();
+  expect(within(dialog).getByText(/\+\strue/)).toBeInTheDocument();
+  expect(within(dialog).getByText('replication.rules["mirror-2"]')).toBeInTheDocument();
+  expect(within(dialog).getByText('new')).toBeInTheDocument();
+});

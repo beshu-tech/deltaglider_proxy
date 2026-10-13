@@ -23,6 +23,7 @@ Rules are recurring and YAML-authored; maintenance jobs are one-offs born in the
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/_/api/admin/jobs` | All jobs, normalized rows |
+| `GET` | `/_/api/admin/jobs/:id` | One job row, also a one-off that the list no longer carries; `404` for an unknown id |
 | `GET` | `/_/api/admin/jobs/:id/runs?limit=N` | Recent runs for one job |
 | `GET` | `/_/api/admin/jobs/:id/failures?limit=N` | Recent per-object failures. For a replication rule, the response also has `total` (every failure that the ring keeps), and each failure has `trigger`: `run` or `event`. The event-driven path keeps one failure per object: a new failed attempt replaces the older one. |
 | `POST` | `/_/api/admin/jobs/:id/pause` / `resume` / `run-now` / `preview` / `cancel` / `verify` / `kill` / `delete` | Per-kind actions; `400` outside the matrix |
@@ -35,6 +36,17 @@ Rules are recurring and YAML-authored; maintenance jobs are one-offs born in the
 | `GET` | `/_/api/admin/jobs/bucket/:bucket` | Busy state for one bucket; readable by non-admin browser sessions that may list the bucket (`403` otherwise) |
 
 All routes except the last are session-gated admin routes.
+
+## The Jobs screen
+
+- **Status.** `queued` reads "waiting to start" and `cancelling` reads "cancelling"; neither reads as running. A run in progress wins over a pause: a rule paused during a run reads "running · pauses after this run", because a pause stops the next run, not the run in progress.
+- **Progress.** A row in progress shows a meter with its counts, for rules and one-off jobs alike. The words depend on the kind: replication copies and deletes ("already in sync" for objects that need nothing), lifecycle deletes, moves or copies ("not due"), backfill stamps ("already stamped"), re-encrypt re-encrypts ("already current"), and migrate names its phase (preparing, copying, verifying the copies, switching to the new backend, cleaning up). A finished one-off keeps its meter, so a job that stamped 4,003 objects and one that found nothing to do look different.
+- **Last run.** The time at which the last run finished. During a run, the cell says how long the run has run. A scheduled rule also shows when it runs next. Relative times move between refreshes.
+- **Refresh.** The list reads `GET /_/api/admin/jobs` every 2 seconds while a job is in progress, and every 10 seconds otherwise, so a job that another tab or the scheduler starts shows up within 10 seconds. After **Review & apply**, **Resume**, **Run now** or **Cancel**, the list reads every 2 seconds until the run that follows is seen and finishes (at most 30 seconds when no run starts). The drawer's Runs and Failures tabs read again whenever a run starts or finishes, also a run that started and finished between two reads.
+- **Runs and failures.** Each run shows how long it took and the logical size of the data that it wrote. The Failures tab says "The 20 most recent of 1,000 failures" when the proxy recorded more than it lists, folds repeated error messages into a count, and wraps long errors.
+- **One-off jobs.** The Definition tab of a one-off shows its parameters (for a migration: the source and target backends, the destination mode, and what happens to the source copy), its counts, the data it wrote, and how long it ran. **Cancel job…** sits in the drawer and in the row's "⋯" menu, and it asks for confirmation first, because a migration that is cancelled before the switch deletes the copies it made.
+- **Unsaved edits.** A rule with unapplied edits shows an **edited** tag. **Run now** and **Preview** wait only on that rule; the other rules keep them. The review dialog names the changed rule and field (`replication.rules["nightly-dr"].replicate_deletes`), and when both replication and lifecycle rules changed, each of the two dialogs says its step ("Step 1 of 2").
+- **Busy banner.** The object browser polls `GET /_/api/admin/jobs/bucket/:bucket` every 10 seconds, and every 2 seconds while a job runs. A migration that is being cancelled, or that cleans up after the switch, no longer blocks writes, so the banner says that uploads and deletes work and the Upload button returns. After an expired session, the banner comes back without a reload once you sign in again.
 
 ## Metadata backfill
 

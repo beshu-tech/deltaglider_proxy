@@ -1,11 +1,13 @@
 /**
  * Unified jobs queries. The list polls fast (2s) while anything is live
- * — a running one-off or a running rule — and slowly (60s) otherwise, so a
- * scheduled run still shows up on an open Jobs page.
+ * — a running one-off or a running rule — or while the page watches a job
+ * after an action (see `JobWatch`), and every 10 s otherwise, so a
+ * scheduled run or a job started in another tab still shows up.
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   cancelVerifyParity,
+  getJob,
   getJobFailures,
   getJobRuns,
   getJobs,
@@ -16,7 +18,8 @@ import {
   startVerifyParity,
 } from '../adminApi';
 import type { ParityStatus, VerifyScope } from '../adminApi';
-import { jobsPollInterval, runsPollInterval } from '../jobsView';
+import { isActiveJobStatus, jobsPollInterval, runsPollInterval, ACTIVE_POLL_MS } from '../jobsView';
+import type { JobWatch } from '../jobsView';
 import { qk } from './keys';
 
 /**
@@ -27,12 +30,27 @@ import { qk } from './keys';
  */
 const VERIFY_POLL_MS = 800;
 
-export function useJobs(opts?: { enabled?: boolean }) {
+export function useJobs(opts?: { enabled?: boolean; watches?: readonly JobWatch[] }) {
+  const watches = opts?.watches ?? [];
   return useQuery({
     queryKey: qk.jobs.list(),
     queryFn: getJobs,
     enabled: opts?.enabled ?? true,
-    refetchInterval: (query) => jobsPollInterval(query.state.data?.jobs ?? []),
+    refetchInterval: (query) => jobsPollInterval(query.state.data?.jobs ?? [], watches),
+  });
+}
+
+/**
+ * One job by id, for a deep link to a job the list does not carry (an old
+ * one-off). Polls while the job is live.
+ */
+export function useJob(id: string | null) {
+  return useQuery({
+    queryKey: qk.jobs.one(id ?? ''),
+    queryFn: () => getJob(id as string),
+    enabled: !!id,
+    retry: false,
+    refetchInterval: (query) => (query.state.data && isActiveJobStatus(query.state.data.status) ? ACTIVE_POLL_MS : false),
   });
 }
 

@@ -4,7 +4,7 @@ import useS3Browser from './useS3Browser';
 import TopBar from './components/TopBar';
 import BulkActionBar from './components/BulkActionBar';
 import { useBucketMaintenance } from './queries/maintenance';
-import { browserBannerText, phaseLabel, activePercent } from './maintenanceStatus';
+import { browserBannerText, bucketWritesBlocked, phaseLabel, activePercent } from './maintenanceStatus';
 import Sidebar from './components/Sidebar';
 import ObjectTable from './components/ObjectTable';
 import InspectorPanel from './components/InspectorPanel';
@@ -109,7 +109,9 @@ export default function App() {
   // while a job runs; the banner self-dismisses on completion. Reads keep
   // working — only write affordances are disabled below.
   const bucketMaintenance = useBucketMaintenance(view === 'browser' ? activeBucket || null : null).data?.active ?? null;
-  const bucketBusy = bucketMaintenance !== null;
+  // A migration that is being cancelled (or is cleaning up after the
+  // switch) no longer blocks writes: Upload and Delete come back.
+  const bucketBusy = bucketWritesBlocked(bucketMaintenance);
   // Canonicalize the URL once a bucket is active but absent from the path
   // (landing at bare /_/browse: the Sidebar selects the first bucket into
   // s3client module state, but nothing put it in the URL). Without the bucket
@@ -541,13 +543,16 @@ export default function App() {
       <>
         {bucketMaintenance && (
           <div
+            role="status"
+            data-writes-blocked={bucketBusy ? 'true' : 'false'}
             style={{
               display: 'flex',
               alignItems: 'center',
               gap: 14,
               padding: '10px 16px',
-              background: 'rgba(217, 119, 6, 0.10)',
-              borderBottom: '1px solid rgba(217, 119, 6, 0.35)',
+              // Amber while writes are refused; calm once they work again.
+              background: bucketBusy ? 'rgba(217, 119, 6, 0.10)' : 'rgba(37, 99, 235, 0.08)',
+              borderBottom: bucketBusy ? '1px solid rgba(217, 119, 6, 0.35)' : '1px solid rgba(37, 99, 235, 0.25)',
             }}
           >
             <Spin size="small" />

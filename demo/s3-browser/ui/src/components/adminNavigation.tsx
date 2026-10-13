@@ -176,7 +176,7 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
         dirtyKeys: ['jobs/replication', 'jobs/lifecycle'],
         applyKey: 'jobs',
         description:
-          'Everything that runs in the background: replication, lifecycle, re-encryption, migrations.',
+          'Everything that runs in the background: replication, lifecycle, re-encryption, migrations, metadata backfill.',
       },
     ],
   },

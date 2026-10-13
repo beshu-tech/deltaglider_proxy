@@ -2,10 +2,10 @@
  * JobsPanel run-now: the button POSTs /jobs/:id/run-now, the server answers
  * 202 (the run goes on in the background), the panel refetches the list at
  * once, and then polls fast (2s) while the row is live until it settles.
- * With nothing live the list polls only every 60s.
+ * With nothing live the list polls every 10s.
  *
- * Also pins ccb32e65: run-now waits while that kind's rule editor holds
- * unsaved edits (it would run the SAVED rule).
+ * Also pins ccb32e65: run-now waits while the rule holds unsaved edits (it
+ * would run the SAVED rule) — and only that rule, not every rule of its kind.
  */
 import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -64,9 +64,12 @@ async function mount() {
 
 /** The record-list row for the rule. */
 function jobRow(): HTMLElement {
-  const row = screen.getByText('nightly-dr').closest('[role="row"]');
+  const row = screen
+    .getAllByText('nightly-dr')
+    .map((el) => el.closest('[role="row"]'))
+    .find((r): r is HTMLElement => r !== null);
   if (!row) throw new Error('no job row');
-  return row as HTMLElement;
+  return row;
 }
 
 async function advance(ms: number) {
@@ -93,8 +96,9 @@ describe('run-now', () => {
     expect(http.callsTo('POST', RUN_NOW)).toHaveLength(1);
     expect(await screen.findByText('Run started — progress shows in the row and the Runs tab')).toBeInTheDocument();
 
-    // Immediate refetch (invalidate), not the 60s idle poll.
-    await waitFor(() => expect(within(jobRow()).getByText('running')).toBeInTheDocument());
+    // Immediate refetch (invalidate), not the idle poll. A running rule shows
+    // its live meter.
+    await waitFor(() => expect(within(jobRow()).getByText(/^running · 0 copied/)).toBeInTheDocument());
     expect(http.callsTo('GET', JOBS).length).toBe(getsBefore + 1);
     // A running replication rule offers kill, not another run-now.
     expect(within(jobRow()).queryByRole('button', { name: 'Run now: nightly-dr' })).not.toBeInTheDocument();
@@ -128,18 +132,44 @@ describe('run-now', () => {
     ).toHaveTextContent('Run once');
   });
 
-  test('run-now waits while the replication editor has unsaved edits', async () => {
+  test('run-now waits while THIS rule has unsaved edits — not while another rule does', async () => {
+    http.on(
+      'GET',
+      '/_/api/admin/config/section/storage',
+      json({
+        replication: {
+          enabled: true,
+          rules: [
+            {
+              name: 'nightly-dr',
+              enabled: true,
+              source: { bucket: 'releases', prefix: '' },
+              destination: { bucket: 'db-archive', prefix: '' },
+            },
+          ],
+        },
+      }),
+    );
     const user = await mount();
-    // "New job → Replication rule" adds a draft rule: the editor is dirty.
+    const runNow = () => within(jobRow()).getByRole('button', { name: 'Run now: nightly-dr' });
+    // "New job → Replication rule" adds a draft rule: the editor is dirty,
+    // but nightly-dr itself is unchanged, so its Run now stays.
     await user.click(screen.getByRole('button', { name: /New job/ }));
     await user.click(await screen.findByText('Replication rule — continuous copy'));
-    await waitFor(() =>
-      expect(within(jobRow()).getByRole('button', { name: 'Run now: nightly-dr' })).toBeDisabled(),
-    );
-    expect(within(jobRow()).getByRole('button', { name: 'Run now: nightly-dr' })).toHaveAttribute(
+    expect(await screen.findAllByText('draft')).not.toHaveLength(0);
+    expect(runNow()).toBeEnabled();
+    expect(within(jobRow()).queryByText('edited')).not.toBeInTheDocument();
+
+    // Edit nightly-dr itself: now its Run now waits, and the row says why.
+    await user.click(within(jobRow()).getByText('nightly-dr'));
+    const enabled = await screen.findByRole('switch', { name: /Enabled/ });
+    await user.click(enabled);
+    await waitFor(() => expect(runNow()).toBeDisabled());
+    expect(runNow()).toHaveAttribute(
       'title',
-      'Apply or discard your unsaved rule edits first — this would use the saved rule.',
+      'Apply or discard your unsaved edits to this rule first — this would use the saved rule.',
     );
+    expect(within(jobRow()).getByText('edited')).toBeInTheDocument();
     expect(http.callsTo('POST', RUN_NOW)).toHaveLength(0);
   });
 });

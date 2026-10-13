@@ -22,6 +22,7 @@ import { CheckCircleOutlined, WarningOutlined, SyncOutlined } from '@ant-design/
 import type { SectionApplyResponse, SectionName } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import { BORDER_RADIUS } from './overlayStyles';
+import { expandDiff } from '../applyDiff';
 
 const { Text } = Typography;
 
@@ -38,6 +39,8 @@ interface Props {
   loading?: boolean;
   /** Optional human-readable summary rendered above the raw diff. */
   summary?: React.ReactNode;
+  /** Part of a sequence of dialogs: "Step 1 of 2 · replication rules". */
+  step?: { index: number; total: number; what: string };
 }
 
 export default function ApplyDialog({
@@ -48,6 +51,7 @@ export default function ApplyDialog({
   onCancel,
   loading,
   summary,
+  step,
 }: Props) {
   const { TEXT_PRIMARY: TEXT, TEXT_MUTED, BORDER, BG_CARD, ACCENT_RED, ACCENT_GREEN } = useColors();
 
@@ -55,7 +59,7 @@ export default function ApplyDialog({
 
   const { ok, warnings = [], existing_warnings: existingWarnings = [], requires_restart, restart_reasons: restartReasons = [], error, diff } = response;
   const sectionDiff = (diff && diff[section]) || {};
-  const diffRows = Object.entries(sectionDiff);
+  const diffRows = expandDiff(Object.entries(sectionDiff));
   // A diff that the server computed and found empty: nothing to apply.
   const noChanges = diff != null && diffRows.length === 0;
 
@@ -67,6 +71,11 @@ export default function ApplyDialog({
         <Space>
           <span>Review changes before applying</span>
           <Text code style={{ fontSize: 11 }}>{section}</Text>
+          {step && step.total > 1 && (
+            <Text type="secondary" style={{ fontSize: 12 }} data-testid="apply-dialog-step">
+              Step {step.index} of {step.total} · {step.what}
+            </Text>
+          )}
         </Space>
       }
       width={720}
@@ -164,15 +173,26 @@ export default function ApplyDialog({
           <Text type="secondary">No changes detected: there is nothing to apply.</Text>
         ) : (
           <div style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
-            {diffRows.map(([path, change]) => (
-              <div key={path} style={{ marginBottom: 10 }}>
-                <div style={{ color: TEXT, fontWeight: 600, marginBottom: 2 }}>{path}</div>
-                <div style={{ color: ACCENT_RED, opacity: 0.9 }}>
-                  -&nbsp;{formatValue(change.before)}
+            {diffRows.map((line) => (
+              <div key={`${line.kind}:${line.path}`} style={{ marginBottom: 10, wordBreak: 'break-word' }}>
+                <div style={{ color: TEXT, fontWeight: 600, marginBottom: 2 }}>
+                  {line.path}
+                  {line.kind !== 'changed' && (
+                    <Text type="secondary" style={{ fontWeight: 400, marginLeft: 8 }}>
+                      {line.kind === 'added' ? 'new' : 'removed'}
+                    </Text>
+                  )}
                 </div>
-                <div style={{ color: ACCENT_GREEN, opacity: 0.9 }}>
-                  +&nbsp;{formatValue(change.after)}
-                </div>
+                {line.kind !== 'added' && (
+                  <div style={{ color: ACCENT_RED, opacity: 0.9 }}>
+                    -&nbsp;{formatValue(line.before, line.kind === 'removed')}
+                  </div>
+                )}
+                {line.kind !== 'removed' && (
+                  <div style={{ color: ACCENT_GREEN, opacity: 0.9 }}>
+                    +&nbsp;{formatValue(line.after, line.kind === 'added')}
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -215,13 +235,14 @@ function WarningList({ items }: { items: string[] }) {
 /** Format any JSON-ish value for diff display. Keeps JSON shape but
  *  collapses long arrays/objects to a single-line preview so the diff
  *  stays readable. */
-function formatValue(v: unknown): string {
+function formatValue(v: unknown, whole = false): string {
   if (v === null || v === undefined) return 'null';
   if (typeof v === 'string') return JSON.stringify(v);
   if (typeof v === 'number' || typeof v === 'boolean') return String(v);
   try {
     const s = JSON.stringify(v);
-    if (s.length <= 120) return s;
+    // A whole added/removed rule is the change itself: show all of it.
+    if (whole || s.length <= 120) return s;
     return s.slice(0, 117) + '...';
   } catch {
     return String(v);

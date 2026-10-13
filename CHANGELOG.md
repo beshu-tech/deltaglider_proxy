@@ -2,6 +2,69 @@
 
 ## Unreleased
 
+### Fixed — The Jobs screen shows the runs that the proxy starts on its own
+
+After **Review & apply** or **Resume**, the scheduler starts the run of a
+rule less than a second later. The list went back to its 60-second refresh
+at once, so a short run was never seen running, and the drawer's Runs tab
+said "No runs yet" while the run had already finished. Now the list reads
+every 2 seconds after **Review & apply**, **Resume**, **Run now** and
+**Cancel**, until the run that follows is seen and finishes. With nothing
+running, it reads every 10 seconds instead of every 60, so a job that another
+tab or the scheduler starts shows up within 10 seconds. The Runs and
+Failures tabs read again whenever a run starts or finishes.
+
+### Fixed — The Jobs screen says what a job is doing, in the words of its kind
+
+A queued or cancelling job read "running · 0 copied…". A rule that was
+paused during a run read "paused" while the run went on. Every kind used
+the words of replication, so a backfill read "4,003 copied → straight copy"
+and a lifecycle run that deleted 8,000 objects read "8,000 copied". Now
+`queued` reads "waiting to start" and `cancelling` reads "cancelling". A
+paused rule in the middle of a run reads "running · pauses after this run".
+Each kind has its own words: replication copies and deletes, lifecycle
+deletes, moves or copies, backfill stamps, re-encrypt re-encrypts, and a
+migration names its phase. The meter also counts the objects that a run
+deleted and the objects that it skipped. Rule rows show live progress, the
+failure count and the last error, and a finished one-off keeps its counts.
+The **Last run** column shows when the last run finished, how long a run in
+progress has run, and when a scheduled rule runs next. Relative times now
+move between refreshes. Runs show how long they took and how much data they
+wrote. The Failures tab says how many failures the proxy recorded in total,
+folds repeated errors, and wraps long errors.
+
+### Fixed — Cancel of a one-off job asks first, and the drawer shows the job
+
+Cancel was a bare icon on the row, and a migration that is cancelled before
+the switch deletes every copy that it made. Cancel now sits in the row's
+"⋯" menu and in the drawer, and it asks for confirmation that says what the
+cancel deletes. The Definition tab of a one-off now shows its parameters
+(for a migration: source and target backend, destination mode, and the fate
+of the source copy), its counts, the data it wrote and how long it ran. A
+link to a one-off that the list no longer carries opened as "Lifecycle ·
+3 [draft]"; the new request `GET /_/api/admin/jobs/:id` reads one job by id,
+and the drawer uses it.
+
+### Fixed — The object browser lets you upload while a migration is cancelled
+
+When a migration is cancelled before the switch, the proxy opens the bucket
+for writes at once. The busy banner still said that uploads were
+unavailable and hid the Upload button for about 30 seconds. The banner now
+says that uploads and deletes work, and the Upload button returns. The
+banner names the phase of a migration, and it comes back after an expired
+session without a reload.
+
+### Fixed — Unsaved rule edits block only their own rule
+
+**Run now** and **Preview** waited while any rule of the same kind had
+unsaved edits. Now they wait only on the rule that has them, and that rule
+shows an **edited** tag. A draft row shows its bucket. The review dialog
+names the rule and the field that changed, instead of two copies of the
+whole rule list, and each of two queued dialogs says "Step 1 of 2". Escape
+in a bucket field of the job drawer closes the suggestions only, not the
+drawer, and the unsaved-changes bar no longer covers the last fields of the
+drawer.
+
 ### Fixed — The progress of a replication audit counts objects
 
 The progress of a parity audit counted listed entries of both sides plus

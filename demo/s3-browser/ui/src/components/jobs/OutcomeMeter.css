@@ -42,8 +42,9 @@
   display: flex;
   background: var(--m-track);
 }
-/* Calm: in-sync / cancelled tracks are the muted border color, ghosted. */
+/* Calm: in-sync / cancelled / waiting tracks are the muted border color, ghosted. */
 .dg-meter[data-state='in-sync'] .dg-meter-track,
+.dg-meter[data-state='waiting'] .dg-meter-track,
 .dg-meter[data-state='idle'] .dg-meter-track {
   opacity: 0.45;
 }
@@ -82,12 +83,26 @@
 .dg-meter[data-state='copied'] .dg-meter-label,
 .dg-meter[data-state='errors'] .dg-meter-label,
 .dg-meter[data-state='mixed'] .dg-meter-label,
-.dg-meter[data-state='running'] .dg-meter-label {
+.dg-meter[data-state='running'] .dg-meter-label,
+.dg-meter[data-state='cancelling'] .dg-meter-label {
   color: var(--m-text);
+}
+
+/* Narrow cell: the label goes on its own line under the bar and wraps,
+   instead of being cut ("running · 1,998 copie…"). */
+@container meter (max-width: 320px) {
+  .dg-meter { grid-template-columns: auto minmax(28px, 1fr); row-gap: 2px; }
+  .dg-meter-label {
+    grid-column: 1 / -1;
+    white-space: normal;
+    overflow: visible;
+    overflow-wrap: anywhere;
+  }
 }
 
 /* Extreme narrow: drop the track, keep dot + label so the number still reads. */
 @container meter (max-width: 120px) {
   .dg-meter { grid-template-columns: auto 1fr; }
   .dg-meter-track { display: none; }
+  .dg-meter-label { grid-column: auto; }
 }

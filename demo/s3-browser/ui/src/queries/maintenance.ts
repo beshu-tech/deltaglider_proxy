@@ -9,6 +9,7 @@
 import { useQuery } from '@tanstack/react-query';
 import { getBucketMaintenance } from '../adminApi';
 import { ACTIVE_POLL_MS, IDLE_POLL_MS } from '../jobsView';
+import { bucketStatusPollMs } from '../maintenanceStatus';
 import { qk } from './keys';
 
 /**
@@ -22,13 +23,13 @@ export function useBucketMaintenance(bucket: string | null) {
     queryKey: qk.maintenance.bucket(bucket ?? ''),
     queryFn: () => getBucketMaintenance(bucket as string),
     enabled: !!bucket,
-    // No session (anonymous browser) → the endpoint 401s; stop polling
-    // rather than hammering it. A signed-in session re-mounts the query.
+    // No session (anonymous browser, or one that expired) → the endpoint
+    // 401s. Do not retry at once; poll on, slower, so the banner returns
+    // after the user signs in again.
     retry: false,
-    // Idle floor: with no job running this poll only needs to catch a
-    // maintenance job STARTING (rare, operator-initiated) — 15s was chatty
-    // for a permanently-mounted browser-view query.
+    // Idle floor (10 s): catches a job that starts while the user browses
+    // before an upload hits the 503.
     refetchInterval: (query) =>
-      query.state.error ? false : query.state.data?.active ? ACTIVE_POLL_MS : IDLE_POLL_MS,
+      bucketStatusPollMs(!!query.state.data?.active, !!query.state.error, ACTIVE_POLL_MS, IDLE_POLL_MS),
   });
 }

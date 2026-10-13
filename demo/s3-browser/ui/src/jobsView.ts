@@ -11,6 +11,7 @@
  */
 
 import type { ConflictPolicy, FixAction, JobRunEntry, RerunVerdict } from './adminApi';
+import { formatBytes, formatDuration } from './utils';
 
 export type JobKind = 'replication' | 'lifecycle' | 'reencrypt' | 'migrate' | string;
 export type JobAction = 'pause' | 'resume' | 'run-now' | 'preview' | 'cancel' | 'delete' | 'kill';
@@ -23,11 +24,22 @@ export interface JobRow {
   trigger: 'continuous' | 'scheduled' | 'oneoff' | string;
   enabled?: boolean;
   paused?: boolean;
-  status: string; // normalized: idle|queued|running|cancelling|succeeded|failed|cancelled
+  /** normalized: idle|queued|running|cancelling|paused|succeeded|completed_with_errors|failed|cancelled */
+  status: string;
   status_raw: string;
   phase?: string;
   percent?: number | null;
-  progress: { processed: number; total?: number | null; bytes: number; failed: number; skipped: number };
+  progress: {
+    processed: number;
+    total?: number | null;
+    bytes: number;
+    failed: number;
+    skipped: number;
+    /** Objects the run deleted (mirror delete, lifecycle expiry). */
+    deleted?: number | null;
+  };
+  /** Total objects when known (also inside `progress.total` on older servers). */
+  total?: number | null;
   lifetime?: { objects: number; bytes: number };
   last_run_at?: number | null;
   next_due_at?: number | null;
@@ -35,6 +47,8 @@ export interface JobRow {
   started_at?: number | null;
   finished_at?: number | null;
   last_error?: string | null;
+  /** Failures recorded for the latest run. */
+  failed_total?: number | null;
   detail: Record<string, unknown>;
 }
 
@@ -53,14 +67,100 @@ export function isActiveJobStatus(status: string): boolean {
 /** Poll cadence while any job/run is live (progress bars move). */
 export const ACTIVE_POLL_MS = 2000;
 /**
- * Idle floor for job polls: with nothing running, a slow poll still catches a
- * job that STARTS elsewhere (scheduler tick, another operator) without a reload.
+ * Idle floor for job polls: with nothing running, the poll still catches a
+ * job that STARTS elsewhere (a scheduler tick, another operator, another
+ * tab) without a reload. 10 s: the list is one read of the jobs DB, and an
+ * operator who looks at the page sees a new run within 10 s. At 60 s a run
+ * shorter than a minute was often never seen as running at all. There is no
+ * cheap "something changed" counter for all job kinds, so a short poll it is.
  */
-export const IDLE_POLL_MS = 60_000;
+export const IDLE_POLL_MS = 10_000;
+/**
+ * How long the list polls fast after an action that makes the SERVER start a
+ * run a moment later (Apply of a rule, Resume, Run now). The scheduler picks
+ * the rule up within a second; the window only bounds the case where no run
+ * starts at all (a lifecycle rule with nothing due).
+ */
+export const WATCH_WINDOW_MS = 30_000;
+
+/**
+ * A job the list watches after an action: it polls fast until the run is
+ * seen and settles, or until the window ends.
+ */
+export interface JobWatch {
+  id: string;
+  /** `last_run_at` when the watch started: a later value = a run finished. */
+  baselineLastRunAt: number | null;
+  sawActive: boolean;
+  /** Epoch ms after which the watch ends even without a run. */
+  until: number;
+  /** Tell the operator how the run ended (Run now: they asked for it). */
+  announce?: boolean;
+}
+
+export function startJobWatch(
+  id: string,
+  row: Pick<JobRow, 'last_run_at'> | null | undefined,
+  nowMs: number,
+  announce = false,
+): JobWatch {
+  return {
+    id,
+    baselineLastRunAt: row?.last_run_at ?? null,
+    sawActive: false,
+    until: nowMs + WATCH_WINDOW_MS,
+    ...(announce ? { announce } : {}),
+  };
+}
+
+/** The watched run was seen (or its finish was) and is over. */
+export function watchSettled(w: JobWatch, row: Pick<JobRow, 'status' | 'last_run_at'> | null | undefined): boolean {
+  if (!row || isActiveJobStatus(row.status)) return false;
+  return w.sawActive || (row.last_run_at ?? 0) > (w.baselineLastRunAt ?? 0);
+}
+
+/** Fold one list sample into a watch; null = the watch is done. */
+export function stepJobWatch(
+  w: JobWatch,
+  row: Pick<JobRow, 'status' | 'last_run_at'> | null | undefined,
+  nowMs: number,
+): JobWatch | null {
+  if (row && isActiveJobStatus(row.status)) return w.sawActive ? w : { ...w, sawActive: true };
+  if (watchSettled(w, row)) return null;
+  return nowMs > w.until ? null : w;
+}
+
+/** The toast when a run that the operator started has ended. */
+export function runEndedMessage(row: JobRow, verb?: LifecycleVerb): { type: 'success' | 'warning' | 'error'; text: string } {
+  const input = rowMeterInput(row, verb);
+  // A rule row may carry no counts once its run ended: then point at the
+  // Runs tab instead of saying "no objects".
+  const label =
+    input.scanned > 0 || row.trigger === 'oneoff' ? deriveMeter(input).label : 'the Runs tab has its counts';
+  const what = `${kindLabel(row.kind)} "${row.name}"`;
+  if (row.status === 'failed') return { type: 'error', text: `${what}: the run failed${row.last_error ? ` — ${row.last_error}` : ''}` };
+  if (row.status === 'completed_with_errors' || row.progress.failed > 0)
+    return { type: 'warning', text: `${what}: the run finished with errors — ${label}` };
+  if (row.status === 'cancelled' || row.status === 'paused') return { type: 'warning', text: `${what}: the run stopped — ${label}` };
+  return { type: 'success', text: `${what}: the run finished — ${label}` };
+}
 
 /** refetchInterval for the unified jobs list. */
-export function jobsPollInterval(jobs: Pick<JobRow, 'status'>[]): number {
-  return jobs.some((j) => isActiveJobStatus(j.status)) ? ACTIVE_POLL_MS : IDLE_POLL_MS;
+export function jobsPollInterval(jobs: Pick<JobRow, 'status'>[], watches: readonly JobWatch[] = []): number {
+  return watches.length > 0 || jobs.some((j) => isActiveJobStatus(j.status)) ? ACTIVE_POLL_MS : IDLE_POLL_MS;
+}
+
+/**
+ * The open drawer's Runs and Failures tabs read again whenever this value
+ * changes: a run starts, settles, or the rule is paused. Waiting only for
+ * the active→terminal edge missed runs that the scheduler started and
+ * finished between two polls.
+ */
+export function runsRefreshKey(
+  row: Pick<JobRow, 'status' | 'last_run_at' | 'started_at' | 'finished_at' | 'paused'> | null,
+): string {
+  if (!row) return '';
+  return [row.status, row.last_run_at ?? '', row.started_at ?? '', row.finished_at ?? '', row.paused ? 'p' : ''].join('|');
 }
 
 export type InFlightCopy = { key: string; size: number; started_unix: number };
@@ -174,16 +274,18 @@ export function jobStrategyMix(
   };
 }
 
-/** AntD tag color for a job row. Pause/disable win over the last status. */
+/**
+ * AntD tag color for a job row. A run in progress wins over pause and
+ * disable (the run continues); otherwise pause/disable win over the last
+ * status.
+ */
 export function jobStatusTone(row: Pick<JobRow, 'status' | 'paused' | 'enabled'>): string {
+  if (row.status === 'running' || row.status === 'cancelling') return 'processing';
   if (row.enabled === false) return 'default';
-  if (row.paused) return 'warning';
+  if (row.paused || row.status === 'paused') return 'warning';
   switch (row.status) {
-    case 'running':
-    case 'cancelling':
-      return 'processing';
     case 'queued':
-      return 'warning';
+      return 'default';
     case 'succeeded':
       return 'success';
     case 'completed_with_errors':
@@ -199,10 +301,17 @@ export function jobStatusTone(row: Pick<JobRow, 'status' | 'paused' | 'enabled'>
   }
 }
 
-/** The status word the row should display (pause/disable beat status). */
+/**
+ * The status word the row should display. A run in progress wins: pausing a
+ * rule does not stop the run that is going, it stops the NEXT one, so a
+ * paused rule mid-run says so. Otherwise pause/disable beat the last status.
+ */
 export function jobStatusLabel(row: Pick<JobRow, 'status' | 'paused' | 'enabled'>): string {
+  if (row.status === 'running') return row.paused ? 'running · pauses after this run' : 'running';
+  if (row.status === 'cancelling') return 'cancelling';
   if (row.enabled === false) return 'disabled';
   if (row.paused) return 'paused';
+  if (row.status === 'queued') return 'waiting to start';
   // Shorten the verbose backend status for the chip; the run's error count is
   // shown separately in the Runs table.
   if (row.status === 'completed_with_errors') return 'completed · errors';
@@ -269,7 +378,7 @@ export function availableActions(row: JobRow): JobAction[] {
     // rule once (without flipping the flag). The backend 409s a disabled or
     // paused lifecycle rule: the row shows that button disabled, with the
     // reason from `lifecycleRunNowBlock`.
-    if (row.status !== 'running') out.push('run-now');
+    if (!isActiveJobStatus(row.status)) out.push('run-now');
     // Kill the in-flight run at will (interrupts mid-object, unlike pause).
     // Replication only — the backend has no lifecycle-kill arm (would 400).
     if (row.kind === 'replication' && row.status === 'running') out.push('kill');
@@ -303,12 +412,41 @@ export function lifecycleRunNowBlock(row: JobRow, schedulerOn: boolean): string 
  */
 export function draftBlocksAction(
   action: JobAction,
-  kind: JobKind,
-  dirty: { replication: boolean; lifecycle: boolean },
+  row: Pick<JobRow, 'kind' | 'name'>,
+  edited: ReadonlySet<string>,
 ): string | null {
   if (action !== 'preview' && action !== 'run-now') return null;
-  const isDirty = kind === 'replication' ? dirty.replication : kind === 'lifecycle' ? dirty.lifecycle : false;
-  return isDirty ? 'Apply or discard your unsaved rule edits first — this would use the saved rule.' : null;
+  return edited.has(`${row.kind}:${row.name}`)
+    ? 'Apply or discard your unsaved edits to this rule first — this would use the saved rule.'
+    : null;
+}
+
+/**
+ * Ids (`<kind>:<name>`) of the rules whose editor value differs from the
+ * saved one, plus rules that exist only in the editor. Only those rules
+ * block Run now and Preview, and only those show the "edited" marker.
+ */
+export function editedRuleIds(
+  kind: 'replication' | 'lifecycle',
+  rules: readonly NamedRule[],
+  baseline: readonly NamedRule[],
+): Set<string> {
+  const saved = new Map(baseline.map((r) => [r.name, stableJson(r)]));
+  const out = new Set<string>();
+  for (const r of rules) {
+    if (saved.get(r.name) !== stableJson(r)) out.add(`${kind}:${r.name}`);
+  }
+  return out;
+}
+
+/** JSON with sorted object keys: equal values give equal strings. */
+function stableJson(v: unknown): string {
+  return JSON.stringify(v, (_k, x) => {
+    if (x === null || typeof x !== 'object' || Array.isArray(x)) return x;
+    const o: Record<string, unknown> = {};
+    for (const k of Object.keys(x as Record<string, unknown>).sort()) o[k] = (x as Record<string, unknown>)[k];
+    return o;
+  });
 }
 
 /**
@@ -318,6 +456,39 @@ export function draftBlocksAction(
  */
 export function runNowMessage(_kind: JobKind, _result: unknown): string {
   return 'Run started — progress shows in the row and the Runs tab';
+}
+
+/**
+ * A run row of the Runs tab with the live numbers of the list row laid over
+ * it. The list polls; the runs table does not, so the running run's meter
+ * moves with the list. A rule row carries no `started_at` on older servers:
+ * the newest in-flight run is the one that is going.
+ */
+export function overlayLiveRun<R extends Pick<JobRunEntry, 'started_at' | 'status'>>(
+  runs: R[],
+  row: JobRow | null,
+): Array<R & { __percent?: number | null }> {
+  if (!row || !isActiveJobStatus(row.status)) return runs;
+  let done = false;
+  return runs.map((r) => {
+    const match =
+      !done &&
+      isActiveJobStatus(r.status) &&
+      (row.started_at == null || r.started_at === row.started_at);
+    if (!match) return r;
+    done = true;
+    return {
+      ...r,
+      status: row.status,
+      objects_processed: row.progress.processed,
+      objects_skipped: row.progress.skipped,
+      objects_deleted: row.progress.deleted ?? (r as { objects_deleted?: number | null }).objects_deleted,
+      errors: row.progress.failed,
+      bytes: row.progress.bytes,
+      objects_scanned: row.progress.processed + row.progress.skipped + row.progress.failed,
+      __percent: row.percent ?? null,
+    };
+  });
 }
 
 /** Runs tab poll: fast while any run in the table is still in flight, else off. */
@@ -481,9 +652,17 @@ export function fixActionMeta(
   }
 }
 
-/** A rule definition as the section editors carry it (name is enough here). */
+/**
+ * A rule definition as the section editors carry it. The name is enough to
+ * merge; the scope fields (replication `source`/`destination`, lifecycle
+ * `bucket`/`prefix`) fill the Scope column of a draft row.
+ */
 export interface NamedRule {
   name: string;
+  bucket?: string;
+  prefix?: string;
+  source?: { bucket: string; prefix?: string };
+  destination?: { bucket: string; prefix?: string };
 }
 
 export interface JobDisplayRow {
@@ -492,18 +671,40 @@ export interface JobDisplayRow {
   draft: boolean;
   /** Present on the server but deleted in the editor (pending removal). */
   pendingDelete: boolean;
+  /** Present on the server with unapplied edits in the editor. */
+  edited?: boolean;
+}
+
+/** The Scope column of a rule as the editor holds it. */
+function ruleScope(rule: NamedRule): JobRow['scope'] {
+  if (rule.source) {
+    return {
+      bucket: rule.source.bucket ?? '',
+      prefix: rule.source.prefix || undefined,
+      target: rule.destination?.bucket || undefined,
+    };
+  }
+  return { bucket: rule.bucket ?? '', prefix: rule.prefix || undefined };
+}
+
+/** One line for the Scope column: `bucket/prefix → target`, or "". */
+export function scopeText(scope: JobRow['scope']): string {
+  if (!scope.bucket && !scope.target) return '';
+  return `${scope.bucket}${scope.prefix ? `/${scope.prefix}` : ''}${scope.target ? ` → ${scope.target}` : ''}`;
 }
 
 /**
  * Merge server job rows with the two editors' staged rule lists:
- * editor-only rules surface as DRAFT rows (synthetic JobRow, idle); server
- * rules absent from the editor get `pendingDelete` (they vanish on Apply).
- * One-off jobs pass through untouched.
+ * editor-only rules surface as DRAFT rows (synthetic JobRow, idle, with the
+ * scope the editor holds); server rules absent from the editor get
+ * `pendingDelete` (they vanish on Apply); server rules in `edited` get the
+ * edited marker. One-off jobs pass through untouched.
  */
 export function mergeDraftRules(
   serverRows: JobRow[],
   replicationRules: NamedRule[],
-  lifecycleRules: NamedRule[]
+  lifecycleRules: NamedRule[],
+  edited: ReadonlySet<string> = new Set(),
 ): JobDisplayRow[] {
   const out: JobDisplayRow[] = [];
   const editorNames = {
@@ -515,11 +716,8 @@ export function mergeDraftRules(
   for (const row of serverRows) {
     if (row.kind === 'replication' || row.kind === 'lifecycle') {
       serverNames[row.kind].add(row.name);
-      out.push({
-        row,
-        draft: false,
-        pendingDelete: !editorNames[row.kind].has(row.name),
-      });
+      const pendingDelete = !editorNames[row.kind].has(row.name);
+      out.push({ row, draft: false, pendingDelete, edited: !pendingDelete && edited.has(row.id) });
     } else {
       out.push({ row, draft: false, pendingDelete: false });
     }
@@ -536,7 +734,7 @@ export function mergeDraftRules(
           id: `${kind}:${rule.name}`,
           kind,
           name: rule.name,
-          scope: { bucket: '' },
+          scope: ruleScope(rule),
           trigger: kind === 'replication' ? 'continuous' : 'scheduled',
           enabled: undefined,
           paused: undefined,
@@ -603,8 +801,93 @@ export function stepPendingReverify(
   return { next: p, start: false };
 }
 
+// ── Words per job kind ────────────────────────────────────────────────────
+
+/** How a lifecycle rule acts on an object (from the rule definition). */
+export type LifecycleVerb = 'delete' | 'move' | 'copy';
+
+/** The lifecycle verb of a rule's `action` (editor shape or row detail). */
+export function lifecycleVerb(action: unknown, deleteSourceAfterSuccess?: boolean): LifecycleVerb | undefined {
+  if (action === 'delete' || action === 'retain-newest') return 'delete';
+  if (action && typeof action === 'object') {
+    const a = action as { type?: string; delete_source_after_success?: boolean };
+    if (a.type === 'retain-newest') return 'delete';
+    if (a.type === 'transition' || a.type === 'archive') return a.delete_source_after_success ? 'move' : 'copy';
+  }
+  if (action === 'transition') return deleteSourceAfterSuccess === false ? 'copy' : deleteSourceAfterSuccess ? 'move' : undefined;
+  return undefined;
+}
+
+interface KindWords {
+  /** Past participle for an object the run acted on: "copied", "stamped". */
+  done: string;
+  /** For an object the run left alone because it needs nothing. */
+  skipped: string;
+  /** The run found objects and none needed work. */
+  nothing: string;
+}
+
+/**
+ * The words a meter uses for each job kind. Replication copies; lifecycle
+ * deletes, moves or copies; backfill stamps metadata; re-encrypt rewrites;
+ * migrate copies to the target backend. "In sync" is only true for
+ * replication.
+ */
+function kindWords(kind: JobKind, verb?: LifecycleVerb): KindWords {
+  switch (kind) {
+    case 'replication':
+      return { done: 'copied', skipped: 'already in sync', nothing: 'in sync' };
+    case 'lifecycle':
+      return {
+        done: verb === 'delete' ? 'deleted' : verb === 'move' ? 'moved' : verb === 'copy' ? 'copied' : 'acted on',
+        skipped: 'not due',
+        nothing: 'nothing due',
+      };
+    case 'backfill-metadata':
+      return { done: 'stamped', skipped: 'already stamped', nothing: 'all already stamped' };
+    case 'reencrypt':
+      return { done: 're-encrypted', skipped: 'already current', nothing: 'all already current' };
+    case 'migrate':
+      return { done: 'copied', skipped: 'already on the target', nothing: 'nothing to copy' };
+    default:
+      return { done: 'processed', skipped: 'skipped', nothing: 'nothing to do' };
+  }
+}
+
+/**
+ * The word for a run's phase, or null when the phase has no word worth
+ * showing (the plain object walk). Migrate: stage → copy → verify → flip →
+ * cleanup.
+ */
+export function phaseWord(kind: JobKind, phase: string | null | undefined): string | null {
+  switch (phase) {
+    case 'counting':
+      return 'counting objects';
+    case 'references':
+      return 'finishing shared reference files';
+    case 'stage':
+      return 'preparing';
+    case 'copy':
+      return kind === 'migrate' ? 'copying' : null;
+    case 'verify':
+      return 'verifying the copies';
+    case 'flip':
+      return 'switching to the new backend';
+    case 'cleanup':
+      return 'cleaning up';
+    case 'scanning':
+      return 'scanning';
+    case 'copying':
+      return 'copying';
+    case 'deleting':
+      return 'deleting';
+    default:
+      return null;
+  }
+}
+
 // ── Outcome meter (the calm-by-default run-result visual) ─────────────────
-type MeterState = 'in-sync' | 'copied' | 'errors' | 'mixed' | 'running' | 'idle';
+type MeterState = 'in-sync' | 'copied' | 'errors' | 'mixed' | 'running' | 'waiting' | 'cancelling' | 'idle';
 
 export interface OutcomeMeterInput {
   scanned: number;
@@ -614,6 +897,14 @@ export interface OutcomeMeterInput {
   status: string;
   /** Live percent for a running run; null/undefined = unknown (indeterminate). */
   percent?: number | null;
+  /** Selects the words (default: replication's). */
+  kind?: JobKind;
+  /** Objects the run deleted (replication mirror delete). */
+  deleted?: number | null;
+  /** The run's phase (migrate: stage|copy|verify|flip|cleanup). */
+  phase?: string | null;
+  /** Lifecycle: what the rule does to an object. */
+  verb?: LifecycleVerb;
 }
 
 export interface MeterView {
@@ -625,35 +916,73 @@ export interface MeterView {
   aria: string;
 }
 
+const n = (x: number) => x.toLocaleString();
+
 /** PURE: the whole meter is a function of a run's numbers + status. Color is an
  *  attention budget — the dominant all-skipped "in sync" case stays calm, and
  *  saturated green/red is spent only on work that happened or failed. */
 export function deriveMeter(p: OutcomeMeterInput): MeterView {
   const { scanned, copied, errors, skipped, status, percent } = p;
-  const acted = copied + errors;
-  const running = isActiveJobStatus(status);
+  const kind = p.kind ?? 'replication';
+  const w = kindWords(kind, p.verb);
+  // Lifecycle `processed` already counts the deletes of a delete rule.
+  const deleted = kind === 'lifecycle' ? 0 : Math.max(0, p.deleted ?? 0);
+  const acted = copied + deleted + errors;
+
+  const parts = (withZeroDone: boolean) => {
+    const out: string[] = [];
+    if (copied > 0 || withZeroDone) out.push(`${n(copied)} ${w.done}`);
+    if (deleted > 0) out.push(`${n(deleted)} deleted`);
+    if (skipped > 0) out.push(`${n(skipped)} ${w.skipped}`);
+    if (errors > 0) out.push(`${n(errors)} failed`);
+    return out;
+  };
 
   const aria =
-    `${scanned.toLocaleString()} scanned, ${copied.toLocaleString()} copied, ` +
-    `${skipped.toLocaleString()} skipped (already in sync), ` +
-    `${errors.toLocaleString()} error${errors === 1 ? '' : 's'}` +
+    `${n(scanned)} scanned, ${n(copied)} ${w.done}, ` +
+    (deleted > 0 ? `${n(deleted)} deleted, ` : '') +
+    `${n(skipped)} ${w.skipped}, ` +
+    `${n(errors)} error${errors === 1 ? '' : 's'}` +
+    (percent != null && isActiveJobStatus(status) ? `, ${percent}% done` : '') +
     `; status ${jobStatusLabel({ status })}`;
 
-  if (running) {
+  if (status === 'queued') {
+    return { state: 'waiting', greenPct: 0, redPct: 0, dot: 'muted', label: 'waiting to start', aria };
+  }
+  if (status === 'cancelling') {
+    const so = parts(false);
+    return {
+      state: 'cancelling',
+      greenPct: 0,
+      redPct: 0,
+      dot: 'amber',
+      label: so.length > 0 ? `cancelling · ${so.join(' · ')}` : 'cancelling',
+      aria,
+    };
+  }
+  if (status === 'running') {
     const known = percent != null;
+    const head = phaseWord(kind, p.phase) ?? 'running';
     return {
       state: 'running',
       greenPct: known ? Math.max(0, Math.min(100, percent)) : 0,
       redPct: 0,
       dot: 'amber',
-      label: known
-        ? `running · ${copied.toLocaleString()} copied${errors > 0 ? ` · ${errors.toLocaleString()} err` : ''}`
-        : `running · ${copied.toLocaleString()} copied…`,
+      label: [head, ...parts(true)].join(' · ') + (known ? '' : '…'),
       aria,
     };
   }
-  if (status === 'cancelled') {
-    return { state: 'idle', greenPct: 0, redPct: 0, dot: 'muted', label: 'cancelled', aria };
+  if (status === 'cancelled' || status === 'paused') {
+    const so = parts(false);
+    const word = status === 'paused' ? 'paused' : 'cancelled';
+    return {
+      state: 'idle',
+      greenPct: 0,
+      redPct: 0,
+      dot: 'muted',
+      label: so.length > 0 ? `${word} · ${so.join(' · ')}` : word,
+      aria,
+    };
   }
   if (status === 'failed' && acted === 0) {
     return { state: 'errors', greenPct: 0, redPct: 100, dot: 'red', label: 'failed', aria };
@@ -664,33 +993,202 @@ export function deriveMeter(p: OutcomeMeterInput): MeterView {
       greenPct: 0,
       redPct: 0,
       dot: 'muted',
-      label: scanned === 0 ? 'no objects' : 'in sync',
+      label: scanned === 0 ? 'no objects' : skipped > 0 ? `${w.nothing} · ${n(skipped)} ${w.skipped}` : w.nothing,
       aria,
     };
   }
-  const greenPct = (copied / acted) * 100;
+  const greenPct = ((copied + deleted) / acted) * 100;
   const redPct = (errors / acted) * 100;
-  if (errors > 0 && copied > 0) {
-    return {
-      state: 'mixed',
-      greenPct,
-      redPct,
-      dot: 'red',
-      label: `${copied.toLocaleString()} copied · ${errors.toLocaleString()} err`,
-      aria,
-    };
+  const label = parts(false).join(' · ');
+  if (errors > 0 && copied + deleted > 0) {
+    return { state: 'mixed', greenPct, redPct, dot: 'red', label, aria };
   }
   if (errors > 0) {
+    return { state: 'errors', greenPct, redPct, dot: 'red', label, aria };
+  }
+  return { state: 'copied', greenPct, redPct, dot: 'green', label, aria };
+}
+
+/**
+ * The meter input for a list row: live progress of the run in progress, or
+ * of the last one-off run. `scanned` counts failures too (a failed object
+ * was scanned).
+ */
+export function rowMeterInput(row: JobRow, verb?: LifecycleVerb): OutcomeMeterInput {
+  const pr = row.progress;
+  return {
+    scanned: pr.processed + pr.skipped + pr.failed,
+    copied: pr.processed,
+    errors: pr.failed,
+    skipped: pr.skipped,
+    deleted: pr.deleted ?? 0,
+    status: row.status,
+    percent: row.percent ?? null,
+    kind: row.kind,
+    phase: row.phase ?? null,
+    verb: verb ?? lifecycleVerb(row.detail?.action),
+  };
+}
+
+/**
+ * The meter input for a Runs-tab row. `objects_scanned` of an older server
+ * left out the failed objects ("6 scanned, 6 copied, 1 error"), so the
+ * scanned count is never below the sum of its parts.
+ */
+export function runMeterInput(
+  run: Pick<JobRunEntry, 'objects_scanned' | 'objects_processed' | 'objects_skipped' | 'errors' | 'status'> & {
+    objects_deleted?: number | null;
+    __percent?: number | null;
+  },
+  kind: JobKind,
+  verb?: LifecycleVerb,
+  phase?: string | null,
+): OutcomeMeterInput {
+  return {
+    scanned: Math.max(run.objects_scanned, run.objects_processed + run.objects_skipped + run.errors),
+    copied: run.objects_processed,
+    errors: run.errors,
+    skipped: run.objects_skipped,
+    deleted: run.objects_deleted ?? 0,
+    status: run.status,
+    percent: run.__percent ?? null,
+    kind,
+    phase: phase ?? null,
+    verb,
+  };
+}
+
+/** How long a run took (or is taking): "1m", "12s"; null when unknown. */
+export function runDuration(startedAt: number | null | undefined, finishedAt: number | null | undefined, nowSec: number): string | null {
+  if (!startedAt) return null;
+  const end = finishedAt ?? nowSec;
+  return formatDuration(Math.max(0, end - startedAt));
+}
+
+/**
+ * The "Last run" cell. A run in progress shows how long it has run (the
+ * previous run's time beside it would read as this run's); otherwise the
+ * time the last run FINISHED.
+ */
+export function lastRunCell(
+  row: Pick<JobRow, 'status' | 'trigger' | 'last_run_at' | 'started_at' | 'finished_at' | 'created_at'>,
+  nowSec: number,
+): { running: string | null; finishedAt: number | null } {
+  const finishedAt = row.trigger === 'oneoff' ? (row.finished_at ?? null) : (row.last_run_at ?? null);
+  if (row.status === 'running' || row.status === 'cancelling') {
+    const d = runDuration(row.started_at, null, nowSec);
+    return { running: d ? `running for ${d}` : 'running now', finishedAt: row.trigger === 'oneoff' ? null : finishedAt };
+  }
+  if (row.status === 'queued') return { running: 'not started yet', finishedAt: null };
+  return { running: null, finishedAt };
+}
+
+/** "next run in ~40 min" for a scheduled rule, or null. */
+export function nextRunText(
+  row: Pick<JobRow, 'trigger' | 'enabled' | 'paused' | 'next_due_at' | 'status'>,
+  nowMs: number,
+  schedulerOn = true,
+): string | null {
+  if (row.trigger === 'oneoff' || !row.next_due_at || !schedulerOn) return null;
+  if (row.enabled === false || row.paused || isActiveJobStatus(row.status)) return null;
+  const until = approxTimeUntil(row.next_due_at * 1000, nowMs);
+  return until === 'now' ? 'next run: due now' : `next run in ${until}`;
+}
+
+/** "20 most recent of 1,000" over the Failures tab; null when all shown. */
+export function failuresCountText(shown: number, total: number | null | undefined): string | null {
+  if (total == null || total <= shown) return null;
+  return `The ${n(shown)} most recent of ${n(total)} failures.`;
+}
+
+/**
+ * Identical error messages folded together, most frequent first. Only
+ * messages seen more than once are returned: the table still lists every
+ * object, this is the summary above it.
+ */
+export function groupFailureErrors(failures: readonly { error: string }[]): { error: string; count: number }[] {
+  const counts = new Map<string, number>();
+  for (const f of failures) counts.set(f.error, (counts.get(f.error) ?? 0) + 1);
+  return [...counts.entries()]
+    .filter(([, c]) => c > 1)
+    .map(([error, count]) => ({ error, count }))
+    .sort((a, b) => b.count - a.count);
+}
+
+/**
+ * The Definition tab of a one-off job: its parameters, what it did, and
+ * when. Read-only rows of [label, value].
+ */
+export function oneOffDefinition(row: JobRow, nowSec: number): Array<[string, string]> {
+  const d = row.detail ?? {};
+  const w = kindWords(row.kind);
+  const out: Array<[string, string]> = [['Bucket', row.scope.bucket]];
+  if (row.kind === 'migrate') {
+    if (typeof d.from_backend === 'string') out.push(['From backend', d.from_backend]);
+    const to = typeof d.target_backend === 'string' ? d.target_backend : row.scope.target;
+    if (to) out.push(['To backend', to]);
+    if (typeof d.target === 'string')
+      out.push([
+        'Destination',
+        d.target === 'mirror' ? 'made an exact mirror of the source' : 'must be empty before the copy',
+      ]);
+    if (typeof d.delete_source === 'boolean')
+      out.push(['Source copy', d.delete_source ? 'deleted after the switch' : 'kept after the switch']);
+  } else if (row.scope.target) {
+    out.push(['Target', row.scope.target]);
+  }
+  if (row.kind === 'backfill-metadata' && typeof d.refresh_last_modified === 'boolean')
+    out.push([
+      'Last-Modified',
+      d.refresh_last_modified ? 'set to the time of the backfill' : 'kept as it was',
+    ]);
+  const phase = phaseWord(row.kind, row.phase);
+  if (phase && isActiveJobStatus(row.status)) out.push(['Phase', phase]);
+  const pr = row.progress;
+  const total = row.total ?? pr.total;
+  out.push([
+    'Objects',
+    [
+      `${n(pr.processed)} ${w.done}`,
+      `${n(pr.skipped)} ${w.skipped}`,
+      ...(pr.deleted ? [`${n(pr.deleted)} deleted`] : []),
+      `${n(pr.failed)} failed`,
+      ...(total != null ? [`of ${n(total)}`] : []),
+    ].join(' · '),
+  ]);
+  out.push(['Data', formatBytes(pr.bytes)]);
+  out.push(['Created', fmtTs(row.created_at)]);
+  out.push(['Started', fmtTs(row.started_at)]);
+  out.push(['Finished', fmtTs(row.finished_at)]);
+  const dur = runDuration(row.started_at, row.finished_at, nowSec);
+  if (dur) out.push([row.finished_at ? 'Took' : 'Running for', dur]);
+  return out;
+}
+
+function fmtTs(ts?: number | null): string {
+  return ts ? new Date(ts * 1000).toLocaleString() : '—';
+}
+
+/**
+ * What Cancel of a one-off does, for its confirmation. A migration
+ * cancelled before the switch deletes the copies it made so far.
+ */
+export function cancelConfirmText(row: Pick<JobRow, 'kind' | 'phase' | 'scope'>): { title: string; content: string } {
+  const bucket = row.scope.bucket;
+  if (row.kind === 'migrate') {
+    const preFlip = row.phase == null || ['stage', 'copy', 'verify'].includes(row.phase);
     return {
-      state: 'errors',
-      greenPct,
-      redPct,
-      dot: 'red',
-      label: `${errors.toLocaleString()} error${errors === 1 ? '' : 's'}`,
-      aria,
+      title: `Cancel the migration of "${bucket}"?`,
+      content: preFlip
+        ? 'The proxy deletes the copies it made on the target backend so far, and the bucket stays on its current backend. A new migration starts the copy again from the beginning.'
+        : 'The bucket already uses the new backend. Cancel stops the clean-up of the old copies; the bucket stays on the new backend.',
     };
   }
-  return { state: 'copied', greenPct, redPct, dot: 'green', label: `${copied.toLocaleString()} copied`, aria };
+  return {
+    title: `Cancel the ${kindLabel(row.kind).toLowerCase()} job of "${bucket}"?`,
+    content:
+      'The job stops at the next safe point. The objects it already processed stay processed; a new job does the rest.',
+  };
 }
 
 /**

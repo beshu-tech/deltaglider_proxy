@@ -103,9 +103,9 @@
 .dg-fail-text {
   display: block;
   min-width: 0;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  /* Wrap: the cause of an error is usually at its END. */
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 /* ── NARROW: collapse to stacked cards (the list's OWN width, not viewport).

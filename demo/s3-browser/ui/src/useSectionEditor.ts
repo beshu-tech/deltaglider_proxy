@@ -96,6 +96,8 @@ export interface UseSectionEditorResult<Local, Wire = Local> {
   discard: () => void;
   /** True when `value` differs from the snapshot. */
   isDirty: boolean;
+  /** The snapshot: the value the server holds. */
+  baseline: Local;
   /** Loading = first GET hasn't resolved yet. */
   loading: boolean;
   /** Error string if the first GET failed (non-401). */
@@ -144,7 +146,7 @@ export function useSectionEditor<Wire, Local = Wire>(
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const queryClient = useQueryClient();
-  const { value, isDirty, setValue, discard, markApplied, resetWith, rebase } =
+  const { value, isDirty, baseline, setValue, discard, markApplied, resetWith, rebase } =
     useDirtySection<Local>(dirtyKey, initial);
 
   // `initial` / `pick` / `resetWith` are *expected* stable across renders, but
@@ -360,6 +362,7 @@ export function useSectionEditor<Wire, Local = Wire>(
     setValue,
     discard,
     isDirty,
+    baseline,
     loading,
     error,
     applyOpen,

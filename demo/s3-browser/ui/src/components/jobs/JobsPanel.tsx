@@ -30,22 +30,34 @@ import {
 import { useQueryClient } from '@tanstack/react-query';
 import type { LifecycleConfig, ReplicationConfig, StorageSectionBody } from '../../adminApi';
 import { runJobAction } from '../../adminApi';
-import type { JobAction, JobDisplayRow, JobRow } from '../../jobsView';
+import type { JobAction, JobDisplayRow, JobRow, JobWatch } from '../../jobsView';
 import {
   availableActions,
+  cancelConfirmText,
+  editedRuleIds,
   editorAfterDiscard,
   isActiveJobStatus,
   jobStatusLabel,
   jobStatusTone,
   kindLabel,
   kindTone,
+  lastRunCell,
+  lifecycleVerb,
   mergeDraftRules,
   draftBlocksAction,
   lifecycleRunNowBlock,
+  nextRunText,
   planRuleDeleteSync,
+  rowMeterInput,
+  runEndedMessage,
   runNowMessage,
+  scopeText,
+  startJobWatch,
+  stepJobWatch,
   triggerLabel,
+  watchSettled,
 } from '../../jobsView';
+import { tickPeriodMs, useNow } from '../../hooks/useNow';
 import { qk } from '../../queries/keys';
 import { useJobs } from '../../queries/jobs';
 import { useNavigation } from '../../NavigationContext';
@@ -123,22 +135,52 @@ const ACTION_META: Record<
 };
 
 /** Destructive row actions: shown in the row's "⋯" menu, not as buttons. */
-type MenuAction = 'kill' | 'delete';
-const MENU_ACTIONS: readonly JobAction[] = ['kill', 'delete'] satisfies MenuAction[];
+type MenuAction = 'kill' | 'delete' | 'cancel';
+const MENU_ACTIONS: readonly JobAction[] = ['kill', 'delete', 'cancel'] satisfies MenuAction[];
 /** The confirmation each menu action asks before it runs. */
-const MENU_CONFIRM: Record<MenuAction, (name: string) => RowActionConfirm> = {
-  delete: (name) => ({
-    title: `Delete rule "${name}"?`,
+const MENU_CONFIRM: Record<MenuAction, (row: JobRow) => RowActionConfirm> = {
+  delete: (row) => ({
+    title: `Delete rule "${row.name}"?`,
     content: 'This removes the rule from the configuration and clears its run history.',
     okText: 'Delete rule',
   }),
   // Kill aborts in-flight work mid-object.
-  kill: (name) => ({
-    title: `Kill the running "${name}" run?`,
+  kill: (row) => ({
+    title: `Kill the running "${row.name}" run?`,
     content: 'Transfers in progress stop immediately.',
     okText: 'Kill run',
   }),
+  // A migration cancelled before the switch deletes the copies made so far.
+  cancel: (row) => ({ ...cancelConfirmText(row), okText: 'Cancel job' }),
 };
+
+/**
+ * The Last run cell: how long a run in progress has run, else when the last
+ * run finished; under it, when a scheduled rule runs next. Its own component
+ * so that only this cell re-renders each second.
+ */
+function LastRunCell({ row, schedulerOn }: { row: JobRow; schedulerOn: boolean }) {
+  const live = isActiveJobStatus(row.status);
+  const now = useNow(live ? 1000 : tickPeriodMs(3600));
+  const cell = lastRunCell(row, now / 1000);
+  const next = nextRunText(row, now, row.kind === 'lifecycle' ? schedulerOn : true);
+  return (
+    <div style={{ fontSize: 12, whiteSpace: 'nowrap', lineHeight: 1.4 }}>
+      {cell.running && <Text style={{ fontSize: 12, display: 'block' }}>{cell.running}</Text>}
+      {(cell.finishedAt || !cell.running) && (
+        <Text type="secondary" style={{ fontSize: 12, display: 'block' }}>
+          {cell.running && cell.finishedAt ? 'last: ' : ''}
+          <TimeAgo ts={cell.finishedAt} />
+        </Text>
+      )}
+      {next && (
+        <Text type="secondary" style={{ fontSize: 11, display: 'block' }}>
+          {next}
+        </Text>
+      )}
+    </div>
+  );
+}
 
 export default function JobsPanel({ onSessionExpired, search }: Props) {
   const { cardStyle, inputRadius } = useCardStyles();
@@ -147,10 +189,44 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
   const { navigate } = useNavigation();
   const { markPushed, closeOverlay } = useOverlayClose();
 
-  const jobsQuery = useJobs();
+  // Jobs watched after an action that makes the server start a run a moment
+  // later: the list polls fast until that run is seen and settles.
+  const [watches, setWatches] = useState<JobWatch[]>([]);
+  const jobsQuery = useJobs({ watches });
   const serverRows: JobRow[] = useMemo(
     () => jobsQuery.data?.jobs ?? [],
     [jobsQuery.data]
+  );
+  const schedulerOn = jobsQuery.data?.workers?.lifecycle?.enabled ?? true;
+  const lastEventAt = jobsQuery.data?.workers?.replication?.last_event_applied_at ?? null;
+  useEffect(() => {
+    if (watches.length === 0) return;
+    const now = Date.now();
+    const next = watches
+      .map((w) => {
+        const row = serverRows.find((r) => r.id === w.id);
+        // A run the operator started: say how it ended. The row of a rule
+        // carries the counts of the run in progress only, so the words come
+        // from its status.
+        if (w.announce && row && watchSettled(w, row)) {
+          const m = runEndedMessage(row, ruleVerb(row));
+          messageApi[m.type](m.text);
+        }
+        return stepJobWatch(w, row, now);
+      })
+      .filter((w): w is JobWatch => w !== null);
+    if (next.length !== watches.length || next.some((w, i) => w !== watches[i])) setWatches(next);
+    // Each new list sample steps the watches; `watches` itself is not a trigger.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobsQuery.dataUpdatedAt]);
+  const watchJobs = useCallback(
+    (ids: Iterable<string>, announce = false) => {
+      const now = Date.now();
+      const add = [...ids].map((id) => startJobWatch(id, serverRows.find((r) => r.id === id), now, announce));
+      if (add.length === 0) return;
+      setWatches((cur) => [...cur.filter((w) => !add.some((a) => a.id === w.id)), ...add]);
+    },
+    [serverRows],
   );
 
   // ── The two rule-definition editors (disjoint storage merge-patches). ──
@@ -178,6 +254,13 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
       return res.ok ? res.body : {};
     },
   });
+
+  // What a lifecycle rule does to an object, from its saved definition.
+  const ruleVerb = (row: JobRow) => {
+    if (row.kind !== 'lifecycle') return undefined;
+    const rule = lc.baseline.rules.find((r) => r.name === row.name);
+    return lifecycleVerb(rule?.action ?? row.detail?.action);
+  };
 
   // True after a rule was deleted on the server while that editor was dirty:
   // the rule was filtered out of the value, but the baseline still holds it,
@@ -231,9 +314,22 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
     }
   };
 
+  // Rules with unapplied edits (and drafts): only THESE block Run now /
+  // Preview and show the "edited" marker.
+  const edited = useMemo(
+    () =>
+      new Set([
+        ...editedRuleIds('replication', repl.value.rules, repl.baseline.rules),
+        ...editedRuleIds('lifecycle', lc.value.rules, lc.baseline.rules),
+      ]),
+    [repl.value.rules, repl.baseline.rules, lc.value.rules, lc.baseline.rules],
+  );
+
   // ── Sequential apply queue: replication dialog → lifecycle dialog. ──
   // 'lifecycle-pending' means: after replication confirms, open lifecycle.
   const [queueLifecycleNext, setQueueLifecycleNext] = useState(false);
+  // How many dialogs this apply opens (1 or 2): each dialog says its step.
+  const [applySteps, setApplySteps] = useState(1);
   const startApplyQueue = useCallback(async () => {
     // Client-side validation for BOTH before any dialog opens.
     if (repl.isDirty) {
@@ -250,6 +346,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
         return;
       }
     }
+    setApplySteps(repl.isDirty && lc.isDirty ? 2 : 1);
     if (repl.isDirty) {
       setQueueLifecycleNext(lc.isDirty);
       await repl.runApply();
@@ -258,17 +355,27 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
     }
   }, [repl, lc, messageApi]);
 
+  // After an apply the scheduler starts the changed rules within a second:
+  // watch them so their runs show up without waiting for the idle poll.
+  const watchApplied = useCallback(
+    (kind: 'replication' | 'lifecycle') =>
+      watchJobs([...edited].filter((id) => id.startsWith(`${kind}:`))),
+    [edited, watchJobs],
+  );
+
   const anyDirty = repl.isDirty || lc.isDirty;
   useApplyHandler('jobs', startApplyQueue, anyDirty);
 
   const confirmReplApply = useCallback(async () => {
     const ok = await repl.confirmApply();
+    if (ok) watchApplied('replication');
     qc.invalidateQueries({ queryKey: qk.jobs.list() });
     if (!ok) {
       // Replication PUT failed: abort the queue. The lifecycle edits stay
       // dirty (nothing is discarded) and its dialog must NOT open stacked
       // on top of the failure the operator is looking at.
       setQueueLifecycleNext(false);
+      setApplySteps(1);
       return;
     }
     // A successful apply re-fetches the section: the baseline is fresh.
@@ -278,23 +385,28 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
       // Open the lifecycle dialog as the next step of the queue.
       await lc.runApply();
     }
-  }, [repl, lc, qc, queueLifecycleNext]);
+  }, [repl, lc, qc, queueLifecycleNext, watchApplied]);
 
   const cancelReplApply = useCallback(() => {
     // Aborting step 1 aborts the queue; BOTH edit sets stay dirty.
     setQueueLifecycleNext(false);
+    setApplySteps(1);
     repl.cancelApply();
   }, [repl]);
 
   const confirmLcApply = useCallback(async () => {
-    if (await lc.confirmApply()) lcBaselineStale.current = false;
+    if (await lc.confirmApply()) {
+      lcBaselineStale.current = false;
+      watchApplied('lifecycle');
+    }
+    setApplySteps(1);
     qc.invalidateQueries({ queryKey: qk.jobs.list() });
-  }, [lc, qc]);
+  }, [lc, qc, watchApplied]);
 
   // ── Display rows: server rows + drafts/pending-deletes overlay. ──
   const displayRows: JobDisplayRow[] = useMemo(
-    () => mergeDraftRules(serverRows, repl.value.rules, lc.value.rules),
-    [serverRows, repl.value.rules, lc.value.rules]
+    () => mergeDraftRules(serverRows, repl.value.rules, lc.value.rules, edited),
+    [serverRows, repl.value.rules, lc.value.rules, edited]
   );
 
   // ── Drawer + creation modals ──
@@ -391,6 +503,8 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
       } else {
         messageApi.success(ACTION_META[action].done ?? `${ACTION_META[action].label} OK`);
       }
+      // Resume and Run now make the server start a run a moment later.
+      if (action === 'run-now' || action === 'resume' || action === 'cancel') watchJobs([row.id], action === 'run-now');
       // A deleted rule no longer exists — close its drawer.
       if (action === 'delete' && drawerJobId === row.id) handleDrawerClose();
       // …and drop it from its editor, or it comes back as a draft that the
@@ -463,6 +577,15 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
             {d.row.name}
           </Text>
           {d.draft && <Tag color="warning" style={{ margin: 0, flexShrink: 0 }}>draft</Tag>}
+          {d.edited && (
+            <Tag
+              color="warning"
+              style={{ margin: 0, flexShrink: 0 }}
+              title="This rule has unsaved edits. Run now and Preview use the saved rule, so they wait until you apply or discard."
+            >
+              edited
+            </Tag>
+          )}
           {d.pendingDelete && <Tag color="error" style={{ margin: 0, flexShrink: 0 }}>removing</Tag>}
         </div>
       ),
@@ -472,9 +595,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
       label: 'Scope',
       track: 'minmax(140px,1.2fr)',
       render: (d) => {
-        const scope = `${d.row.scope.bucket}${d.row.scope.prefix ? `/${d.row.scope.prefix}` : ''}${
-          d.row.scope.target ? ` → ${d.row.scope.target}` : ''
-        }`;
+        const scope = scopeText(d.row.scope);
         return (
           <Text
             type="secondary"
@@ -502,31 +623,33 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
       label: 'Status',
       track: 'minmax(0,1fr)',
       render: (d) => {
-        const live = d.row.trigger === 'oneoff' && isActiveJobStatus(d.row.status);
+        const live = isActiveJobStatus(d.row.status);
+        // A one-off's row IS its run: after the run it still shows what the
+        // run did ("4,003 stamped", "cancelled · 20 copied").
+        const meter = live || (d.row.trigger === 'oneoff' && !d.draft);
+        const failed = d.row.failed_total ?? d.row.progress.failed;
         return (
           // OutcomeMeter.css grows this wrapper to the column width.
           <div>
-            {live ? (
-              <OutcomeMeter
-                scanned={d.row.progress.processed + d.row.progress.skipped + d.row.progress.failed}
-                copied={d.row.progress.processed}
-                errors={d.row.progress.failed}
-                skipped={d.row.progress.skipped}
-                status={d.row.status}
-                percent={d.row.percent ?? null}
-              />
+            {meter ? (
+              <OutcomeMeter {...rowMeterInput(d.row, ruleVerb(d.row))} />
             ) : (
               <Tag color={jobStatusTone(d.row)} style={{ margin: 0 }}>
                 {jobStatusLabel(d.row)}
               </Tag>
             )}
-            {!live && d.row.progress.failed > 0 && (
+            {live && d.row.paused && d.row.status === 'running' && (
+              <Text type="warning" style={{ display: 'block', fontSize: 11, marginTop: 2 }}>
+                Paused: this run goes on; the next one waits for Resume.
+              </Text>
+            )}
+            {failed > 0 && (
               <Button
                 type="link"
                 size="small"
                 danger
                 style={{ padding: '0 4px', height: 'auto', fontSize: 12 }}
-                aria-label={`${d.row.progress.failed} failed — show failures: ${d.row.name}`}
+                aria-label={`${failed} failed — show failures: ${d.row.name}`}
                 title="Show the failed objects"
                 onClick={(e) => {
                   // The row click opens the Definition tab; this opens Failures.
@@ -534,10 +657,10 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
                   openDrawer(d.row.id, 'failures');
                 }}
               >
-                {d.row.progress.failed} failed
+                {failed.toLocaleString()} failed
               </Button>
             )}
-            {!live && d.row.last_error && (
+            {d.row.last_error && (
               <Text type="danger" style={{ display: 'block', fontSize: 11, marginTop: 2 }} ellipsis title={d.row.last_error}>
                 {d.row.last_error}
               </Text>
@@ -550,14 +673,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
       key: 'last',
       label: 'Last run',
       track: 'max-content',
-      render: (d) => {
-        const ts = d.row.last_run_at ?? d.row.finished_at ?? d.row.started_at;
-        return (
-          <Text type="secondary" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
-            <TimeAgo ts={ts} />
-          </Text>
-        );
-      },
+      render: (d) => (d.draft ? <Text type="secondary">—</Text> : <LastRunCell row={d.row} schedulerOn={schedulerOn} />),
     },
     {
       key: 'actions',
@@ -586,13 +702,10 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
                   (d.row.enabled === false || d.row.paused === true);
                 const label = oneOff ? 'Run once' : ACTION_META[a].label;
                 const blocked =
-                  draftBlocksAction(a, d.row.kind, {
-                    replication: repl.isDirty,
-                    lifecycle: lc.isDirty,
-                  }) ??
-                  // Not dirty here, so lc.value.enabled is the saved switch
-                  // (unknown while it loads: do not block on the default).
-                  (a === 'run-now' ? lifecycleRunNowBlock(d.row, lc.loading || lc.value.enabled) : null);
+                  draftBlocksAction(a, d.row, edited) ??
+                  // The SAVED master switch decides (unknown while it loads:
+                  // do not block on the default).
+                  (a === 'run-now' ? lifecycleRunNowBlock(d.row, lc.loading || lc.baseline.enabled) : null);
                 const title = oneOff
                   ? 'Run this rule once now — does not enable or resume it'
                   : label;
@@ -628,7 +741,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
                   danger: true as const,
                   icon: ACTION_META[a].icon,
                   label: `${ACTION_META[a].label}…`,
-                  confirm: MENU_CONFIRM[a as MenuAction](d.row.name),
+                  confirm: MENU_CONFIRM[a as MenuAction](d.row),
                   onSelect: () => runAction(d.row, a),
                 }))}
             />
@@ -679,6 +792,9 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
         onLifecycleChange={lc.setValue}
         onJobIdChange={retargetDrawer}
         onRemoveDraft={removeDraft}
+        onCancelJob={(row) => runAction(row, 'cancel')}
+        lifecycleVerbOf={ruleVerb}
+        bottomInset={anyDirty}
         activeTab={drawerTab}
         onTabChange={handleTabChange}
         inputRadius={inputRadius}
@@ -690,10 +806,19 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
             description, so this row is just the count + the action (no duplicate
             heading). Keeps one header per screen and saves vertical space. */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
-          <Text type="secondary" style={{ fontSize: 13 }}>
-            {displayRows.length} job{displayRows.length === 1 ? '' : 's'} — tap one for definition,
-            runs, and failures.
-          </Text>
+          <div style={{ minWidth: 0 }}>
+            <Text type="secondary" style={{ fontSize: 13 }}>
+              {displayRows.length === 0
+                ? 'No jobs yet.'
+                : `${displayRows.length} job${displayRows.length === 1 ? '' : 's'} — select one for its definition, runs, and failures.`}
+            </Text>
+            {/* Event-driven copies write no run row: this is where they show. */}
+            {lastEventAt ? (
+              <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>
+                Replication last handled object changes as they happened <TimeAgo ts={lastEventAt} />.
+              </Text>
+            ) : null}
+          </div>
           <Dropdown
             menu={newJobMenu}
             trigger={['click']}
@@ -755,6 +880,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
         onApply={() => void confirmReplApply()}
         onCancel={cancelReplApply}
         loading={repl.applying}
+        step={{ index: 1, total: applySteps, what: 'replication rules' }}
         summary={<ReplicationApplySummary replication={repl.pendingBody?.replication ?? repl.value} />}
       />
       <ApplyDialog
@@ -762,8 +888,12 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
         section="storage"
         response={lc.applyResponse}
         onApply={() => void confirmLcApply()}
-        onCancel={lc.cancelApply}
+        onCancel={() => {
+          setApplySteps(1);
+          lc.cancelApply();
+        }}
         loading={lc.applying}
+        step={{ index: applySteps, total: applySteps, what: 'lifecycle rules' }}
         summary={<LifecycleApplySummary lifecycle={lc.pendingBody?.lifecycle ?? lc.value} />}
       />
     </div>

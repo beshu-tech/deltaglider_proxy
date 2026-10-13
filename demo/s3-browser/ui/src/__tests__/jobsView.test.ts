@@ -70,19 +70,32 @@ test('status helpers', () => {
   assert.equal(jobStatusTone(row({ enabled: false, status: 'failed' })), 'default', 'disabled wins');
   assert.equal(jobStatusLabel(row({ paused: true, status: 'idle' })), 'paused');
   assert.equal(jobStatusLabel(row({ enabled: false })), 'disabled');
+  // A run in progress wins over pause: the run goes on (regression: the row
+  // said "paused" while the run kept copying).
+  assert.equal(jobStatusLabel(row({ paused: true, status: 'running' })), 'running · pauses after this run');
+  assert.equal(jobStatusTone(row({ paused: true, status: 'running' })), 'processing');
+  assert.equal(jobStatusLabel(row({ enabled: false, status: 'running' })), 'running', 'a run-once of a disabled rule');
+  // queued and cancelling are not "running".
+  assert.equal(jobStatusLabel(row({ status: 'queued' })), 'waiting to start');
+  assert.equal(jobStatusLabel(row({ status: 'cancelling' })), 'cancelling');
+  assert.notEqual(jobStatusTone(row({ status: 'queued' })), 'processing');
 
   assert.equal(kindLabel('reencrypt'), 'Re-encrypt');
   assert.equal(kindLabel('migrate'), 'Migrate');
   assert.equal(triggerLabel('oneoff'), 'one-off');
 });
 
-test('draftBlocksAction: preview/run-now never run a stale definition', () => {
-  const clean = { replication: false, lifecycle: false };
-  assert.equal(draftBlocksAction('preview', 'lifecycle', clean), null);
-  assert.match(draftBlocksAction('preview', 'lifecycle', { ...clean, lifecycle: true }) ?? '', /saved rule/);
-  assert.match(draftBlocksAction('run-now', 'replication', { ...clean, replication: true }) ?? '', /saved rule/);
-  assert.equal(draftBlocksAction('run-now', 'replication', { ...clean, lifecycle: true }), null, 'only its own kind');
-  assert.equal(draftBlocksAction('pause', 'lifecycle', { replication: true, lifecycle: true }), null);
+test('draftBlocksAction: preview/run-now never run a stale definition — of THAT rule only', () => {
+  const lc = { kind: 'lifecycle', name: 'expire' };
+  const repl = { kind: 'replication', name: 'mirror' };
+  const none = new Set<string>();
+  assert.equal(draftBlocksAction('preview', lc, none), null);
+  assert.match(draftBlocksAction('preview', lc, new Set(['lifecycle:expire'])) ?? '', /saved rule/);
+  assert.match(draftBlocksAction('run-now', repl, new Set(['replication:mirror'])) ?? '', /saved rule/);
+  // Regression: one dirty rule blocked Run now on every rule of its kind.
+  assert.equal(draftBlocksAction('run-now', repl, new Set(['replication:other'])), null, 'another rule is edited');
+  assert.equal(draftBlocksAction('run-now', repl, new Set(['lifecycle:mirror'])), null, 'same name, other kind');
+  assert.equal(draftBlocksAction('pause', lc, new Set(['lifecycle:expire'])), null);
 });
 
 test('availableActions matrix', () => {
@@ -211,6 +224,18 @@ test('mergeDraftRules', () => {
   assert.equal(byId['replication:gone'].pendingDelete, true, 'editor-removed rule flagged');
   assert.equal(byId['replication:fresh'].draft, true, 'editor-only rule is a draft');
   assert.equal(byId['replication:fresh'].row.status, 'idle');
+  // Regression: a draft row showed scope "—" though the editor held a bucket.
+  const scoped = mergeDraftRules(
+    [],
+    [{ name: 'r', source: { bucket: 'releases', prefix: 'v1' }, destination: { bucket: 'downloads' } }],
+    [{ name: 'l', bucket: 'db-archive', prefix: '' }],
+  );
+  assert.deepEqual(scoped[0].row.scope, { bucket: 'releases', prefix: 'v1', target: 'downloads' });
+  assert.deepEqual(scoped[1].row.scope, { bucket: 'db-archive', prefix: undefined });
+  // A server rule with unapplied edits carries the marker.
+  const marked = mergeDraftRules(server, [{ name: 'keep' }], [{ name: 'lc' }], new Set(['replication:keep']));
+  assert.equal(marked.find((d) => d.row.id === 'replication:keep')?.edited, true);
+  assert.equal(marked.find((d) => d.row.id === 'lifecycle:lc')?.edited, false);
   assert.equal(byId['lifecycle:lc'].pendingDelete, false);
   assert.equal(byId['maintenance:9'].draft, false, 'one-offs pass through');
   assert.equal(byId['maintenance:9'].pendingDelete, false);
@@ -500,7 +525,9 @@ test('runsPollInterval (the Runs tab polls while a run is in flight)', () => {
 
 test('jobsPollInterval (idle floor: scheduled runs must still appear)', () => {
   assert.equal(ACTIVE_POLL_MS, 2000);
-  assert.equal(IDLE_POLL_MS, 60_000);
+  // 10 s: a job started in another tab or by the scheduler shows within
+  // 10 s (it was 60 s, and short runs were never seen running).
+  assert.equal(IDLE_POLL_MS, 10_000);
   assert.equal(jobsPollInterval([row({ status: 'running' })]), ACTIVE_POLL_MS);
   assert.equal(jobsPollInterval([row({ status: 'idle' }), row({ status: 'queued' })]), ACTIVE_POLL_MS);
   // Regression: all idle used to return `false` (never refetch), so a run the

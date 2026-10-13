@@ -57,6 +57,7 @@ export const qk = {
   jobs: {
     all: () => ['jobs'] as const,
     list: () => ['jobs', 'list'] as const,
+    one: (id: string) => ['jobs', 'one', id] as const,
     runs: (id: string) => ['jobs', 'runs', id] as const,
     failures: (id: string) => ['jobs', 'failures', id] as const,
     preview: (id: string) => ['jobs', 'preview', id] as const,

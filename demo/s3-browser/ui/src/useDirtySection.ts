@@ -177,6 +177,8 @@ interface UseDirtySectionResult<T> {
   value: T;
   /** True when `value` differs from the last applied snapshot. */
   isDirty: boolean;
+  /** The last applied snapshot (what the server holds). */
+  baseline: T;
   /** Update the form state. Accepts a value or a functional updater
    *  (`prev => next`) so callers can mutate-by-id without closing over a
    *  stale snapshot of the current value. */
@@ -300,7 +302,8 @@ export function useDirtySection<T>(
     forceRender(); // the value may stay put while the snapshot moved
   }, []);
 
-  return { value, isDirty, setValue, discard, markApplied, resetWith, rebase };
+  const baseline = snapshotRef.current;
+  return { value, isDirty, baseline, setValue, discard, markApplied, resetWith, rebase };
 }
 
 /**

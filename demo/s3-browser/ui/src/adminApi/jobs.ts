@@ -21,6 +21,7 @@ interface JobRunEntry {
   objects_processed: number;
   objects_skipped: number;
   objects_deleted?: number | null;
+  /** LOGICAL bytes the run moved. */
   bytes: number;
   errors: number;
   // Strategy mix (replication only; 0 elsewhere). Straight passthrough =
@@ -229,11 +230,17 @@ export async function cancelVerifyParity(ruleName: string): Promise<ParityStatus
   });
 }
 
+/** One job row by id (also a one-off that the list no longer carries). */
+export async function getJob(id: string): Promise<JobRow> {
+  return adminJson(`/api/admin/jobs/${encodeURIComponent(id)}`, { context: 'Job' });
+}
+
 export async function getJobRuns(id: string): Promise<{ runs: JobRunEntry[] }> {
   return adminJson(`/api/admin/jobs/${encodeURIComponent(id)}/runs`, { context: 'Job runs' });
 }
 
-export async function getJobFailures(id: string): Promise<{ failures: JobFailureEntry[] }> {
+/** `total`: all failures recorded (the list holds the most recent ones). */
+export async function getJobFailures(id: string): Promise<{ failures: JobFailureEntry[]; total?: number | null }> {
   return adminJson(`/api/admin/jobs/${encodeURIComponent(id)}/failures`, {
     context: 'Job failures',
   });

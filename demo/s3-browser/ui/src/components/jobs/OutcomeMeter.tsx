@@ -9,7 +9,7 @@ import './OutcomeMeter.css';
 export default function OutcomeMeter(props: OutcomeMeterInput) {
   const c = useColors();
   const m = deriveMeter(props);
-  const indeterminate = m.state === 'running' && props.percent == null;
+  const indeterminate = (m.state === 'running' && props.percent == null) || m.state === 'cancelling';
   return (
     <div
       className="dg-meter"
