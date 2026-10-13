@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BUSL-1.1
+
 use super::*;
 use crate::config_db::FallbackKind;
 use rusqlite::types::Value;
