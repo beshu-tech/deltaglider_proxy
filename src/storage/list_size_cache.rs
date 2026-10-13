@@ -45,7 +45,8 @@ pub struct StoredObjectId<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogicalFacts {
     pub size: u64,
-    /// The client-visible ETag, without quotes (`md5` or `md5-N`).
+    /// The client-visible ETag, without quotes (`md5` or `md5-N`; empty
+    /// for a delta without `dg-md5`, whose HEAD sends `""`).
     pub etag: String,
 }
 
@@ -98,12 +99,12 @@ pub fn differs(id: &StoredObjectId<'_>, facts: &LogicalFacts) -> bool {
 }
 
 /// Remember the logical facts of a stored object. A no-op when the stored
-/// facts already are the logical ones (a plain passthrough object), when the
-/// stored ETag is unknown, or when the logical ETag is unknown (a delta from
-/// a legacy toolchain without `dg-md5`): a LIST must never report an empty
-/// ETag.
+/// facts already are the logical ones (a plain passthrough object) or when
+/// the stored ETag is unknown. The logical ETag may be empty: a delta from
+/// an older toolchain carries no `dg-md5`, and its HEAD and GET send the
+/// empty ETag (`""`), so its LIST entry does too.
 pub fn record(id: &StoredObjectId<'_>, facts: LogicalFacts) {
-    if bare_etag(id.etag).is_empty() || facts.etag.is_empty() || !differs(id, &facts) {
+    if bare_etag(id.etag).is_empty() || !differs(id, &facts) {
         return;
     }
     CACHE.insert(cache_key(id), facts);
@@ -113,7 +114,7 @@ pub fn record(id: &StoredObjectId<'_>, facts: LogicalFacts) {
 /// object that a LIST asked about (see `listing_facts::asked_facts_key`),
 /// so the next LIST of this process finds it without a facts read.
 pub fn record_asked(id: &StoredObjectId<'_>, facts: LogicalFacts) {
-    if bare_etag(id.etag).is_empty() || facts.etag.is_empty() {
+    if bare_etag(id.etag).is_empty() {
         return;
     }
     CACHE.insert(cache_key(id), facts);
@@ -276,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_objects_and_unknown_etags_are_not_recorded() {
+    fn plain_objects_and_unknown_stored_etags_are_not_recorded() {
         let same = LogicalFacts {
             size: 10,
             etag: "e".into(),
@@ -289,13 +290,14 @@ mod tests {
         };
         record(&id("t2/noetag.delta", "", 5), facts);
         assert_eq!(lookup(&id("t2/noetag.delta", "", 5)), None);
-        // Legacy delta without `dg-md5`: no logical ETag, no entry.
+        // A delta without `dg-md5`: its HEAD sends the empty ETag, and the
+        // entry keeps it, so the LIST shows what the HEAD shows.
         let no_md5 = LogicalFacts {
             size: 99,
             etag: String::new(),
         };
-        record(&id("t2/legacy.delta", "s", 5), no_md5);
-        assert_eq!(lookup(&id("t2/legacy.delta", "s", 5)), None);
+        record(&id("t2/legacy.delta", "s", 5), no_md5.clone());
+        assert_eq!(lookup(&id("t2/legacy.delta", "s", 5)), Some(no_md5));
     }
 
     #[test]

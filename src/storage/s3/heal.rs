@@ -446,6 +446,63 @@ mod tests {
         assert_eq!(fake.requests().iter().filter(|r| delta_heads(r)).count(), 0);
     }
 
+    /// Prod (beshu, v2.0.9): deltas written by an older toolchain carry no
+    /// `dg-md5`. A HEAD and a GET send an empty ETag (`""`) for them, and
+    /// `facts_key` refused an empty logical ETag, so they never got facts:
+    /// 180k facts misses and 164k HEADs in 2 hours, 58 facts PUTs. One
+    /// heal now writes their facts with the ETag the HEAD sends, and a
+    /// fresh node lists them like the HEAD shows them, with no HEAD.
+    #[tokio::test]
+    async fn a_delta_without_md5_heals_with_the_etag_its_head_sends() {
+        const N: usize = 3;
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        fake.insert_object("b/rel/reference.bin", &[7u8; 4096], &[]);
+        for i in 0..N {
+            let name = format!("app-1.7.{i}.zip");
+            let size = (100_000 + i).to_string();
+            let sha = format!("{i:064}");
+            // Exactly the metadata set of the prod deltas: no dg-md5.
+            let meta = [
+                ("dg-created-at", "2024-03-01T10:00:00.000000Z"),
+                ("dg-delta-cmd", "xdelta3 -e -9 -s reference.bin"),
+                ("dg-delta-size", "333"),
+                ("dg-file-sha256", sha.as_str()),
+                ("dg-file-size", size.as_str()),
+                ("dg-original-name", name.as_str()),
+                ("dg-ref-key", "rel/reference.bin"),
+                ("dg-ref-sha256", &"e".repeat(64)),
+                ("dg-tool", "deltaglider/5.0.0"),
+            ];
+            fake.insert_object(&format!("b/rel/{name}.delta"), &[i as u8; 333], &meta);
+        }
+        let first = reader(&endpoint, "md5-node-1");
+        fake.clear();
+        let page = list(&first, "rel/").await;
+        assert_eq!(page.objects.len(), N);
+        assert!(wait_count(&fake, N, delta_heads).await);
+        assert!(
+            wait_count(&fake, N, |r| r.starts_with("PUT /b/.dg/facts/rel/")).await,
+            "no facts written: {:?}",
+            fake.requests()
+        );
+        let fresh = reader(&endpoint, "md5-node-2");
+        fake.clear();
+        let page = list(&fresh, "rel/").await;
+        assert!(page.facts_missing_keys.is_empty(), "{page:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(fake.requests().iter().filter(|r| delta_heads(r)).count(), 0);
+        for (key, listed) in &page.objects {
+            let head = fresh.head("b", key).await.unwrap();
+            assert_eq!(listed.file_size, head.file_size, "{key} size");
+            assert_eq!(listed.etag(), head.etag(), "{key} etag");
+        }
+        assert_eq!(
+            page.objects[0].1.etag(),
+            "\"\"",
+            "the ETag clients get today"
+        );
+    }
+
     /// The lifecycle scan's listing: the page, then a HEAD of each delta.
     async fn list_with_heads(
         engine: &DynEngine,

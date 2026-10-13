@@ -112,6 +112,15 @@ fn etag_fits(etag: &str) -> bool {
     !etag.is_empty() && etag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
+/// A logical ETag we can put in the last key field: one that fits, or the
+/// empty ETag (`""`) that a HEAD and a GET send for a delta without
+/// `dg-md5` (written by an older toolchain). The entry then lists that
+/// same ETag. The empty field is the last one, and a v2.0.9 reader does not
+/// parse such a key: it ignores the entry (a miss), never misreads it.
+fn logical_etag_fits(etag: &str) -> bool {
+    etag.is_empty() || etag_fits(etag)
+}
+
 /// The facts key that describes the stored object `stored_key` (with that
 /// stored ETag and size). `None` when the object needs none (its stored facts
 /// are the logical ones) or cannot have one (unknown ETag, key too long).
@@ -140,7 +149,7 @@ pub fn asked_facts_key(
 ) -> Option<String> {
     let stored_etag = bare(stored_etag);
     let etag = bare(&facts.etag);
-    if !etag_fits(stored_etag) || !etag_fits(etag) {
+    if !etag_fits(stored_etag) || !logical_etag_fits(etag) {
         return None;
     }
     let key = format!(
@@ -178,7 +187,7 @@ pub fn parse_facts_key(key: &str) -> Option<FactsEntry> {
     let stored_size = fields.next()?.parse().ok()?;
     let size = fields.next()?.parse().ok()?;
     let etag = fields.next()?.to_string();
-    if fields.next().is_some() || !etag_fits(&stored_etag) || !etag_fits(&etag) {
+    if fields.next().is_some() || !etag_fits(&stored_etag) || !logical_etag_fits(&etag) {
         return None;
     }
     Some(FactsEntry {
@@ -401,7 +410,11 @@ mod tests {
         assert_eq!(parse_facts_key(&asked).unwrap().facts, facts(5, "e1"));
         assert_eq!(asked_facts_key("a.txt", "", 5, &facts(5, "")), None);
         assert_eq!(facts_key("a.delta", "", 5, &facts(9, "e1")), None);
-        assert_eq!(facts_key("a.delta", "e1", 5, &facts(9, "")), None);
+        // A delta without `dg-md5`: its HEAD sends the empty ETag, and so
+        // does its entry.
+        let no_md5 = facts_key("a.delta", "e1", 5, &facts(9, "")).unwrap();
+        assert!(no_md5.ends_with("!!1.e1.5.9."), "{no_md5}");
+        assert_eq!(parse_facts_key(&no_md5).unwrap().facts, facts(9, ""));
         assert_eq!(facts_key("a.delta", "e.1", 5, &facts(9, "e2")), None);
         assert!(facts_key(&"k".repeat(1020), "e1", 5, &facts(9, "e2")).is_none());
     }
@@ -414,6 +427,8 @@ mod tests {
             ".dg/facts/a.delta!!1.e.x.2.e",
             ".dg/facts/a!z.delta!!1.e.1.2.e",
             ".dg/facts/a.delta!!1.e.1.2.e.extra",
+            ".dg/facts/a.delta!!1..1.2.e",
+            ".dg/facts/a.delta!!1.e.1.2.\"\"",
             "a.delta!!1.e.1.2.e",
         ] {
             assert_eq!(parse_facts_key(key), None, "{key}");
