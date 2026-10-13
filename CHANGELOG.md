@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.10 — 2026-10-13
+
 ### Fixed — Deltas without an MD5 get listing facts, so listings stop sending HEAD requests for them
 
 Deltas that an older toolchain wrote carry no `dg-md5` field. The proxy could
