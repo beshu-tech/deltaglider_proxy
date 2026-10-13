@@ -228,6 +228,16 @@ pub(crate) async fn paged_phase<S: PageStep>(
     Ok(())
 }
 
+/// Test seam (`DGP_TEST_MAINTENANCE_OBJECT_STALL_MS`, debug builds only):
+/// hold each object of every paged phase, so a test can send requests while
+/// the job is still running. Off in production.
+async fn object_stall() {
+    let ms = crate::config::test_seams::test_seams().maintenance_object_stall_ms;
+    if ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+}
+
 /// The objects `keys`, `concurrency` at a time, then their outcomes
 /// settled in key order. An object starts only while the process does not
 /// shut down and no earlier outcome stopped the phase (a graceful stop
@@ -249,7 +259,10 @@ async fn run_objects<S: PageStep>(
                 && !crate::shutdown::is_shutting_down()
             {
                 let Some(key) = next.next() else { break };
-                in_flight.push_back(step.object(key));
+                in_flight.push_back(async move {
+                    object_stall().await;
+                    step.object(key).await
+                });
             }
             let Some(done) = in_flight.next().await else {
                 break;

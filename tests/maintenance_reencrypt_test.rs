@@ -99,6 +99,29 @@ async fn wait_job_done_within(
     );
 }
 
+/// `DGP_TEST_MAINTENANCE_OBJECT_STALL_MS` for a gate test: each object of
+/// the job waits this long, so a 40-object job runs for about 3 s (4
+/// objects at a time) and is still running when the gated request goes out.
+const GATE_TEST_STALL: (&str, &str) = ("DGP_TEST_MAINTENANCE_OBJECT_STALL_MS", "300");
+
+/// Fail unless a maintenance job holds `bucket` busy now. A gate test calls
+/// it right before its gated request: a job that already ended would make
+/// the request pass the gate, and the test would prove nothing.
+async fn assert_bucket_busy(admin: &reqwest::Client, endpoint: &str, bucket: &str) {
+    let v: serde_json::Value = admin
+        .get(format!("{endpoint}/_/api/admin/jobs/bucket/{bucket}"))
+        .send()
+        .await
+        .expect("status GET failed")
+        .json()
+        .await
+        .expect("status not JSON");
+    assert!(
+        !v["active"].is_null(),
+        "the job on '{bucket}' must still run when the gated request goes out: {v}"
+    );
+}
+
 /// Newest job row from the admin list.
 async fn newest_job(admin: &reqwest::Client, endpoint: &str) -> serde_json::Value {
     let v: serde_json::Value = admin
@@ -193,6 +216,7 @@ async fn test_gate_state_hidden_from_unauthenticated_writers() {
     let server = TestServer::builder()
         .bucket(bucket)
         .auth("gatekey", "gatesecret")
+        .env(GATE_TEST_STALL.0, GATE_TEST_STALL.1)
         .build()
         .await;
     let endpoint = server.endpoint();
@@ -216,6 +240,7 @@ async fn test_gate_state_hidden_from_unauthenticated_writers() {
         "job should start: {res}"
     );
 
+    assert_bucket_busy(&admin, &endpoint, bucket).await;
     let resp = reqwest::Client::new()
         .put(format!("{endpoint}/{bucket}/gate-probe.txt"))
         .body("anonymous")
@@ -241,6 +266,7 @@ async fn test_reencrypt_full_cycle() {
     let server = TestServer::builder()
         .bucket(bucket)
         .extra_yaml_root(crate::common::OUTBOX_READER_YAML)
+        .env(GATE_TEST_STALL.0, GATE_TEST_STALL.1)
         .build()
         .await;
     let http = server.http();
@@ -268,9 +294,9 @@ async fn test_reencrypt_full_cycle() {
     );
 
     // ── While the job runs: writes 503-SlowDown, reads stay up. ──
-    // The gate arms synchronously inside the POST handler, so this PUT
-    // is deterministically gated unless the whole 42-object job already
-    // finished — which a fresh proxy can't do in one local round-trip.
+    // The gate arms synchronously inside the POST handler, and the object
+    // stall seam keeps the job running while the PUT goes out.
+    assert_bucket_busy(&admin, &endpoint, bucket).await;
     let put_resp = http
         .put(format!("{endpoint}/{bucket}/gate-probe.txt"))
         .body("blocked?")
@@ -475,7 +501,11 @@ async fn test_decrypt_after_disable_strips_markers() {
 #[tokio::test]
 async fn test_reencrypt_validation_errors() {
     let bucket = "maintval";
-    let server = TestServer::builder().bucket(bucket).build().await;
+    let server = TestServer::builder()
+        .bucket(bucket)
+        .env(GATE_TEST_STALL.0, GATE_TEST_STALL.1)
+        .build()
+        .await;
     let endpoint = server.endpoint();
     let admin = admin_http_client(&endpoint).await;
 
@@ -496,6 +526,7 @@ async fn test_reencrypt_validation_errors() {
     enable_encryption(&admin2, &endpoint).await;
     let first = start_reencrypt(&admin2, &endpoint, bucket).await;
     assert_eq!(first["started"][0]["bucket"], bucket, "{first}");
+    assert_bucket_busy(&admin2, &endpoint, bucket).await;
     let dup = start_reencrypt(&admin2, &endpoint, bucket).await;
     assert!(
         dup["errors"][0]["error"]
@@ -957,6 +988,7 @@ async fn review2_busy_bucket(bucket: &str) -> (TestServer, reqwest::Client) {
     let server = TestServer::builder()
         .bucket(bucket)
         .auth("gatekey", "gatesecret")
+        .env(GATE_TEST_STALL.0, GATE_TEST_STALL.1)
         .build()
         .await;
     let endpoint = server.endpoint();
@@ -990,6 +1022,7 @@ async fn review2_form_post_does_not_reveal_gate_state_unauthenticated() {
     let bucket = "maintform";
     let (server, admin) = review2_busy_bucket(bucket).await;
     let endpoint = server.endpoint();
+    assert_bucket_busy(&admin, &endpoint, bucket).await;
     let resp = reqwest::Client::new()
         .post(format!("{endpoint}/{bucket}"))
         .header("content-type", "multipart/form-data; boundary=x")
@@ -1027,6 +1060,7 @@ async fn review2_forged_signature_fails_auth_before_the_gate() {
             .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
             .build(),
     );
+    assert_bucket_busy(&admin, &endpoint, bucket).await;
     let err = bad
         .put_object()
         .bucket(bucket)
@@ -1055,6 +1089,7 @@ async fn review2_sdk_retry_of_a_gated_write_is_not_refused_as_replay() {
     let (server, admin) = review2_busy_bucket(bucket).await;
     let endpoint = server.endpoint();
     let s3 = server.s3_client().await;
+    assert_bucket_busy(&admin, &endpoint, bucket).await;
     let res = s3
         .put_object()
         .bucket(bucket)
@@ -1127,6 +1162,7 @@ async fn test_signed_form_post_to_busy_bucket_is_gated() {
                 .mime_str("text/plain")
                 .unwrap(),
         );
+    assert_bucket_busy(&admin, &endpoint, bucket).await;
     let resp = reqwest::Client::new()
         .post(format!("{endpoint}/{bucket}"))
         .multipart(form)

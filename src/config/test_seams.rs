@@ -28,6 +28,10 @@ pub struct TestSeams {
     pub object_delay_ms: Option<u64>,
     /// `DGP_TEST_COPY_STALL_MS`: stall per replicated / deleted object.
     pub copy_stall_ms: u64,
+    /// `DGP_TEST_MAINTENANCE_OBJECT_STALL_MS`: stall before each object of
+    /// a paged maintenance phase (reencrypt, backfill, migrate), so a test
+    /// can act while the job is still running.
+    pub maintenance_object_stall_ms: u64,
     /// `DGP_TEST_MAX_JOB_PAGES`: a smaller page budget for job loops.
     pub max_job_pages: Option<u32>,
     /// `DGP_TEST_FORCE_NONCAS_BACKEND` (comma-separated): backends that get
@@ -47,6 +51,8 @@ impl TestSeams {
             part_delay_ms: delay("DGP_TEST_PART_BARRIER", "DGP_TEST_PART_DELAY_MS"),
             object_delay_ms: delay("DGP_TEST_OBJECT_BARRIER", "DGP_TEST_OBJECT_DELAY_MS"),
             copy_stall_ms: lookup_parse(env, "DGP_TEST_COPY_STALL_MS").unwrap_or(0),
+            maintenance_object_stall_ms: lookup_parse(env, "DGP_TEST_MAINTENANCE_OBJECT_STALL_MS")
+                .unwrap_or(0),
             max_job_pages: lookup_parse::<u32>(env, "DGP_TEST_MAX_JOB_PAGES").filter(|n| *n > 0),
             force_noncas_backends: env("DGP_TEST_FORCE_NONCAS_BACKEND")
                 .map(|v| {
@@ -100,6 +106,7 @@ mod tests {
             ("DGP_TEST_OBJECT_BARRIER", "true"),
             ("DGP_TEST_OBJECT_DELAY_MS", "20"),
             ("DGP_TEST_COPY_STALL_MS", "50"),
+            ("DGP_TEST_MAINTENANCE_OBJECT_STALL_MS", "250"),
             ("DGP_TEST_MAX_JOB_PAGES", "3"),
             ("DGP_TEST_FORCE_NONCAS_BACKEND", " b2sim, ,other "),
         ]);
@@ -108,6 +115,7 @@ mod tests {
         assert_eq!(t.part_delay_ms, Some(150), "the default delay");
         assert_eq!(t.object_delay_ms, Some(20));
         assert_eq!(t.copy_stall_ms, 50);
+        assert_eq!(t.maintenance_object_stall_ms, 250);
         assert_eq!(t.max_job_pages, Some(3));
         assert_eq!(
             t.force_noncas_backends,
