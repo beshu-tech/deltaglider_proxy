@@ -105,6 +105,7 @@ static PREVIEWS: std::sync::Mutex<Vec<(PreviewKey, PreviewCell)>> =
 /// `fresh` (the GUI's "Refresh preview"): never answer from a walk that
 /// already ended; a walk that is still running is joined, not doubled.
 pub async fn preview_rule(
+    jobs_db: Option<Arc<Mutex<JobsDb>>>,
     engine: &Arc<DynEngine>,
     rule: &LifecycleRule,
     max_candidates: usize,
@@ -135,12 +136,21 @@ pub async fn preview_rule(
     let (_, result) = cell
         .get_or_init(|| async {
             // Preview never writes → no maintenance gate needed.
-            let result = run_or_preview(None, engine, rule, max_candidates, false, None, None)
-                .await
-                .map(|mut out| {
-                    out.computed_at = Some(chrono::Utc::now().to_rfc3339());
-                    out
-                });
+            let result = run_or_preview(
+                None,
+                jobs_db,
+                engine,
+                rule,
+                max_candidates,
+                false,
+                None,
+                None,
+            )
+            .await
+            .map(|mut out| {
+                out.computed_at = Some(chrono::Utc::now().to_rfc3339());
+                out
+            });
             (std::time::Instant::now(), result)
         })
         .await;
@@ -226,6 +236,7 @@ pub async fn run_begun_rule(
         lease_alive,
     };
     let outcome_result = run_or_preview(
+        db.clone(),
         db.clone(),
         engine,
         rule,
@@ -342,8 +353,12 @@ struct RunContext {
     lease_alive: LeaseAlive,
 }
 
+/// `db`: the run's state (none for a preview); `scan_db`: where the scan
+/// cache persists (the jobs DB, also for a preview).
+#[allow(clippy::too_many_arguments)]
 async fn run_or_preview(
     db: Option<Arc<Mutex<JobsDb>>>,
+    scan_db: Option<Arc<Mutex<JobsDb>>>,
     engine: &Arc<DynEngine>,
     rule: &LifecycleRule,
     response_cap: usize,
@@ -358,6 +373,7 @@ async fn run_or_preview(
     if let LifecycleAction::RetainNewest(action) = &rule.action {
         return run_or_preview_retain_newest(
             db,
+            scan_db,
             engine,
             rule,
             action,
@@ -423,7 +439,7 @@ async fn run_or_preview(
         status: if execute { "succeeded" } else { "preview" }.to_string(),
         ..LifecycleRunOutcome::default()
     };
-    let scan = super::scan_cache::ScanCache::of(engine);
+    let scan = super::scan_cache::ScanCache::of(engine, scan_db);
     let lease_alive = ctx
         .as_ref()
         .map_or_else(LeaseAlive::always, |c| c.lease_alive.clone());
@@ -623,6 +639,7 @@ const MAX_RETAIN_NEWEST_CANDIDATES: usize = 200_000;
 #[allow(clippy::too_many_arguments)]
 async fn run_or_preview_retain_newest(
     db: Option<Arc<Mutex<JobsDb>>>,
+    scan_db: Option<Arc<Mutex<JobsDb>>>,
     engine: &Arc<DynEngine>,
     rule: &LifecycleRule,
     action: &LifecycleRetainNewestAction,
@@ -662,7 +679,7 @@ async fn run_or_preview_retain_newest(
         status: if execute { "succeeded" } else { "preview" }.to_string(),
         ..LifecycleRunOutcome::default()
     };
-    let scan = super::scan_cache::ScanCache::of(engine);
+    let scan = super::scan_cache::ScanCache::of(engine, scan_db);
 
     // ── Collect phase (read-only): the full candidate set, structurally filtered ──
     // Keep the FileMetadata alongside each candidate so the act phase can emit the
@@ -1315,7 +1332,7 @@ impl DeleteEvents {
 /// transient error is retried with the same token; `Err` carries what the
 /// failure means for the cursor.
 async fn list_lifecycle_page(
-    scan: &super::scan_cache::ScanCache,
+    scan: &super::scan_cache::Scan,
     engine: &DynEngine,
     rule: &LifecycleRule,
     prefix: &str,

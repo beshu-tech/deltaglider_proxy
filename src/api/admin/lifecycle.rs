@@ -53,6 +53,7 @@ pub async fn preview(
 
     let engine = state.s3_state.engine.load().clone();
     lifecycle::preview_rule(
+        state.jobs_db.clone(),
         &engine,
         &rule,
         lifecycle_cfg.max_failures_retained as usize,

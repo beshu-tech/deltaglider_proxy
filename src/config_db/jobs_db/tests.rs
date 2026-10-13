@@ -188,6 +188,7 @@ fn jobs_tables_match_the_config_db() {
     );
     let mut expected: Vec<String> = NODE_LOCAL_TABLES
         .iter()
+        .chain(JOBS_ONLY_TABLES)
         .map(|s| s.to_string())
         .chain(["jobs_meta".to_string()])
         .collect();
@@ -575,6 +576,7 @@ fn a_newer_jobs_db_is_refused() {
 fn node_local_sql(text: &str) -> Vec<&'static str> {
     NODE_LOCAL_TABLES
         .iter()
+        .chain(JOBS_ONLY_TABLES)
         .copied()
         .filter(|t| {
             ["FROM", "INTO", "UPDATE", "JOIN"].iter().any(|kw| {

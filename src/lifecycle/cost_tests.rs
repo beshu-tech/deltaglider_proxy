@@ -153,12 +153,12 @@ async fn a_second_preview_answers_from_the_first() {
     store_deltas(&engine, "run", 20).await;
     let r = rule("preview-twice", "1ms");
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    let first = crate::lifecycle::preview_rule(&engine, &r, 100, false)
+    let first = crate::lifecycle::preview_rule(None, &engine, &r, 100, false)
         .await
         .unwrap();
     assert_eq!(first.objects_affected, 20, "{first:?}");
     fake.clear();
-    let second = crate::lifecycle::preview_rule(&engine, &r, 100, false)
+    let second = crate::lifecycle::preview_rule(None, &engine, &r, 100, false)
         .await
         .unwrap();
     assert_eq!(first, second);
@@ -166,7 +166,7 @@ async fn a_second_preview_answers_from_the_first() {
 
     // Another definition walks again.
     let other = rule("preview-twice", "2ms");
-    crate::lifecycle::preview_rule(&engine, &other, 100, false)
+    crate::lifecycle::preview_rule(None, &engine, &other, 100, false)
         .await
         .unwrap();
     assert_eq!(scope_lists(&fake), 1);
@@ -179,19 +179,19 @@ async fn a_fresh_preview_walks_again() {
     let (engine, fake) = engine().await;
     store_deltas(&engine, "run", 5).await;
     let r = rule("preview-fresh", "30d");
-    let first = crate::lifecycle::preview_rule(&engine, &r, 100, false)
+    let first = crate::lifecycle::preview_rule(None, &engine, &r, 100, false)
         .await
         .unwrap();
     assert!(first.computed_at.is_some());
     fake.clear();
-    let again = crate::lifecycle::preview_rule(&engine, &r, 100, true)
+    let again = crate::lifecycle::preview_rule(None, &engine, &r, 100, true)
         .await
         .unwrap();
     assert_eq!(scope_lists(&fake), 1, "{:#?}", fake.requests());
     assert!(again.computed_at >= first.computed_at);
     // The fresh walk is the one that later previews answer from.
     fake.clear();
-    let cached = crate::lifecycle::preview_rule(&engine, &r, 100, false)
+    let cached = crate::lifecycle::preview_rule(None, &engine, &r, 100, false)
         .await
         .unwrap();
     assert_eq!(cached, again);
@@ -207,13 +207,77 @@ async fn previews_asked_at_once_walk_once() {
     fake.clear();
     fake.set_delay_ms("LIST", 50);
     let (a, b, c) = tokio::join!(
-        crate::lifecycle::preview_rule(&engine, &r, 100, false),
-        crate::lifecycle::preview_rule(&engine, &r, 100, false),
-        crate::lifecycle::preview_rule(&engine, &r, 100, false),
+        crate::lifecycle::preview_rule(None, &engine, &r, 100, false),
+        crate::lifecycle::preview_rule(None, &engine, &r, 100, false),
+        crate::lifecycle::preview_rule(None, &engine, &r, 100, false),
     );
     assert_eq!(a.unwrap(), b.unwrap());
     assert!(c.is_ok());
     assert_eq!(scope_lists(&fake), 1, "{:#?}", fake.requests());
+}
+
+/// A lifecycle engine on the fake S3 at `endpoint`: a node that knows
+/// nothing in memory (a restart, or a config apply that built a new
+/// engine).
+async fn engine_at(endpoint: &str) -> Arc<DynEngine> {
+    let s3 = crate::storage::s3_test_support::for_test_endpoint(endpoint);
+    let backend: Box<crate::storage::DynStorageBackend<'static>> =
+        crate::storage::DynStorageBackend::new_box(s3);
+    Arc::new(crate::deltaglider::DeltaGliderEngine::new_with_backend(
+        Arc::new(backend),
+        &crate::config::Config::default(),
+        None,
+    ))
+}
+
+/// Prod: the scan cache lived in memory only, so the first preview or run
+/// after a deploy or a config apply sent a HEAD per delta or
+/// delta-eligible object (12k on prod). It persists in the jobs DB: a cold
+/// preview of unchanged objects sends none.
+#[tokio::test]
+async fn a_cold_preview_after_a_restart_sends_no_head() {
+    let (endpoint, fake) = crate::storage::fake_s3::start().await;
+    let db = Arc::new(Mutex::new(JobsDb::in_memory("k").unwrap()));
+    let before = engine_at(&endpoint).await;
+    before.create_bucket("b").await.unwrap();
+    store_deltas(&before, "run", 30).await;
+    let r = rule("cold-preview", "30d");
+    crate::lifecycle::preview_rule(Some(db.clone()), &before, &r, 100, false)
+        .await
+        .unwrap();
+    drop(before);
+
+    let after = engine_at(&endpoint).await;
+    fake.clear();
+    // `fresh`: a walk, never a remembered preview of an engine that a
+    // new one may reuse the address of.
+    let out = crate::lifecycle::preview_rule(Some(db.clone()), &after, &r, 100, true)
+        .await
+        .unwrap();
+    assert_eq!(out.objects_scanned, 30, "{out:?}");
+    assert_eq!(scope_lists(&fake), 1, "{:#?}", fake.requests());
+    assert_eq!(count(&fake, "HEAD"), 0, "{:#?}", fake.requests());
+
+    // An overwrite (a new stored object) is read again; only it.
+    let keys = store_deltas(&after, "run", 1).await;
+    after
+        .store("b", &keys[0], b"a new generation", None, Default::default())
+        .await
+        .unwrap();
+    let again = engine_at(&endpoint).await;
+    fake.clear();
+    crate::lifecycle::run_rule(Some(db.clone()), &again, &r, 10, "test", 60, None, None)
+        .await
+        .unwrap();
+    let heads: Vec<String> = fake
+        .requests()
+        .into_iter()
+        .filter(|r| r.starts_with("HEAD"))
+        .collect();
+    assert!(
+        !heads.is_empty() && heads.iter().all(|h| h.contains("build-000")),
+        "{heads:?}"
+    );
 }
 
 /// Run-now after a preview: the run plans from what the preview read, so
@@ -224,7 +288,7 @@ async fn a_run_after_a_preview_sends_no_head() {
     store_deltas(&engine, "run", 30).await;
     let r = rule("preview-then-run", "30d");
     engine.metadata_cache().invalidate_prefix("b", "");
-    crate::lifecycle::preview_rule(&engine, &r, 100, false)
+    crate::lifecycle::preview_rule(None, &engine, &r, 100, false)
         .await
         .unwrap();
     engine.metadata_cache().invalidate_prefix("b", "");

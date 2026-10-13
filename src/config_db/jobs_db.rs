@@ -45,6 +45,14 @@ pub(crate) const NODE_LOCAL_TABLES: &[&str] = &[
     "maintenance_failures",
 ];
 
+/// Tables only the jobs DB has: never in the config DB, so never adopted
+/// from it. Created at every open (`CREATE TABLE IF NOT EXISTS`) without a
+/// schema version bump: an older binary ignores them and still opens the
+/// file after a downgrade. Tests read it: the table-shape check and the
+/// node-local SQL source guard.
+#[cfg(test)]
+pub(crate) const JOBS_ONLY_TABLES: &[&str] = &["lifecycle_scan_cache"];
+
 /// The node-local job database. Shared as `Arc<tokio::sync::Mutex<JobsDb>>`;
 /// its own lock, so a job write never waits for an IAM read.
 pub struct JobsDb {
@@ -138,15 +146,15 @@ impl JobsDb {
                 supported: JOBS_SCHEMA_VERSION,
             });
         }
-        if version == JOBS_SCHEMA_VERSION {
-            return Ok(());
+        if version < JOBS_SCHEMA_VERSION {
+            let tx = conn.unchecked_transaction()?;
+            if version < 1 {
+                tx.execute_batch(SCHEMA_V1)?;
+            }
+            tx.pragma_update(None, "user_version", JOBS_SCHEMA_VERSION)?;
+            tx.commit()?;
         }
-        let tx = conn.unchecked_transaction()?;
-        if version < 1 {
-            tx.execute_batch(SCHEMA_V1)?;
-        }
-        tx.pragma_update(None, "user_version", JOBS_SCHEMA_VERSION)?;
-        tx.commit()?;
+        conn.execute_batch(SCHEMA_JOBS_ONLY)?;
         Ok(())
     }
 
@@ -378,6 +386,21 @@ pub fn no_key_opens_the_jobs_db(path: &Path, why: &str) -> String {
 /// The final shape of the node-local tables as the config DB had them at
 /// schema v29 (same column order, indexes and FKs; `jobs_tables_match_the_
 /// config_db` checks it), plus `jobs_meta`.
+/// The `JOBS_ONLY_TABLES`: additive, outside the schema version.
+const SCHEMA_JOBS_ONLY: &str = "
+CREATE TABLE IF NOT EXISTS lifecycle_scan_cache (
+    bucket           TEXT NOT NULL,
+    key              TEXT NOT NULL,
+    etag             TEXT NOT NULL,
+    size             INTEGER NOT NULL,
+    last_modified_ms INTEGER NOT NULL,
+    meta_json        TEXT NOT NULL,
+    seen_at          INTEGER NOT NULL,
+    PRIMARY KEY (bucket, key)
+);
+CREATE INDEX IF NOT EXISTS lifecycle_scan_cache_seen ON lifecycle_scan_cache (seen_at);
+";
+
 const SCHEMA_V1: &str = "
 CREATE TABLE IF NOT EXISTS jobs_meta (
     id      INTEGER PRIMARY KEY CHECK (id = 1),

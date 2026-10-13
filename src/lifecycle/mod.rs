@@ -10,6 +10,7 @@
 mod cost_tests;
 pub mod planner;
 mod scan_cache;
+mod scan_store;
 pub mod scheduler;
 pub mod state_store;
 pub mod worker;
