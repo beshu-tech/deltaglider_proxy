@@ -11,6 +11,23 @@ delay that acknowledgement by about 40 ms, so most requests on a reused
 (keep-alive) connection, which is what the AWS SDKs use, took at least 40 ms.
 Ten GET requests on one connection took 412 ms and now take about 31 ms.
 
+### Changed — The synced config database holds IAM only
+
+With `config_sync_bucket`, every IAM change uploads the encrypted config
+database to the sync bucket, and every other node downloads it. That file
+also held each node's own job state: the event outbox, the replication parity
+rows (one per object, per side, per rule), run histories, failure lists and
+maintenance jobs. On a large mirror it grew to hundreds of megabytes, all of
+it uploaded for each IAM change. Now job state lives in a second encrypted
+file next to the config database, `deltaglider_jobs.db`, which the proxy never
+syncs. It uses the same key, and a key rotation re-encrypts both files. In a
+test with 10,000 parity rows and 10,000 outbox rows, the synced file shrank
+from 6.9 MB to 262 KB. The first start of this release moves the job rows
+once; a start that a crash interrupts finishes the move on the next start.
+Nodes of this release and of the previous release still merge IAM changes
+with each other, so a rolling upgrade works. A downgrade keeps IAM but loses
+the job history. `/_/ready` also checks the jobs database.
+
 ### Changed — Less CPU and disk work per request
 
 - A signed PUT hashes its body once instead of three times. The S3 layer
