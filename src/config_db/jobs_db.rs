@@ -21,7 +21,7 @@
 use super::{open_encrypted, open_keyed, ConfigDb, ConfigDbError, ConfigDbKeys, OpenedWith};
 use rusqlite::{Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 /// Schema version of the jobs DB (independent of the config DB's).
 pub(crate) const JOBS_SCHEMA_VERSION: i32 = 1;
@@ -95,11 +95,13 @@ impl JobsDb {
         })
     }
 
-    /// Open the LIVE jobs DB with the config DB keys (a fallback-key file is
-    /// re-encrypted with the primary key). A file that no key opens is
-    /// renamed to `<name>.unreadable-<unix time>` (kept, never deleted) and
-    /// a new DB is created: job state is node-local and rebuilds; IAM is not
-    /// in this file.
+    /// Open the LIVE jobs DB with the config DB keys: the primary key, then
+    /// every fallback of the keyring (a fallback-key file is re-encrypted
+    /// with the primary key). A file that no key opens is an error
+    /// ([`ConfigDbError::WrongPassphrase`]) and stays as it is: it holds the
+    /// running jobs, and without it their write gates would open and the
+    /// boot would delete their `__dgmigrate_*` routes. The boot stops with
+    /// [`no_key_opens_the_jobs_db`].
     pub fn open_live(local_path: &Path, keys: &ConfigDbKeys) -> Result<Self, ConfigDbError> {
         match open_keyed(local_path, keys, Self::open_or_create, |_| Ok(())) {
             Ok((db, OpenedWith::Created)) => {
@@ -107,19 +109,6 @@ impl JobsDb {
                 Ok(db)
             }
             Ok((db, _)) => Ok(db),
-            Err(ConfigDbError::WrongPassphrase(why)) => {
-                let parked =
-                    unreadable_path(local_path, crate::event_outbox::current_unix_seconds());
-                std::fs::rename(local_path, &parked)?;
-                error!(
-                    "The jobs database {} does not open with the config DB key ({why}); it is \
-                     kept as {} and a new one is created. Job history and cursors start empty; \
-                     IAM is not affected.",
-                    local_path.display(),
-                    parked.display()
-                );
-                Self::open_or_create(local_path, keys.primary.expose())
-            }
             Err(e) => Err(e),
         }
     }
@@ -369,11 +358,21 @@ fn describe(counts: &[(String, i64)]) -> String {
         .join(", ")
 }
 
-/// Pure: where an unreadable jobs DB is kept.
-fn unreadable_path(path: &Path, now: i64) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".unreadable-{now}"));
-    path.with_file_name(name)
+/// Pure: the boot error when no config DB key opens the jobs DB at `path`
+/// (`why`: the open error). The usual cause is a key rotation: the config
+/// DB moved to the new key, and the jobs DB did not (a crash between the
+/// two, or `DGP_CONFIG_DB_KEY_PREVIOUS` removed before a boot moved it).
+pub fn no_key_opens_the_jobs_db(path: &Path, why: &str) -> String {
+    format!(
+        "FATAL: no config DB key opens the jobs database {path} ({why}). It holds the \
+         state of running jobs (re-encrypt and migrate write gates, migration routes), \
+         so the proxy does not start without it, and the file is left untouched. If you \
+         rotated DGP_CONFIG_DB_KEY, set DGP_CONFIG_DB_KEY_PREVIOUS to the old key again \
+         and restart: the boot moves the jobs database to the new key. If the file comes \
+         from another install, move it away and restart: the boot creates a new, empty \
+         jobs database.",
+        path = path.display()
+    )
 }
 
 /// The final shape of the node-local tables as the config DB had them at

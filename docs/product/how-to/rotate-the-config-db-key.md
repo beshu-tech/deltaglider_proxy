@@ -16,8 +16,10 @@ The rotation works because the proxy tries more than one key when it opens the d
 
 2. Set `DGP_CONFIG_DB_KEY_PREVIOUS` to the current key. That is the old value of `DGP_CONFIG_DB_KEY`, or the content of `deltaglider_config.db.key` when the variable was unset.
 3. Set `DGP_CONFIG_DB_KEY` to the new key, and restart the proxy.
-4. Check the log for the line `re-encrypted with DGP_CONFIG_DB_KEY`.
+4. Check the log for the line `re-encrypted with DGP_CONFIG_DB_KEY`. It appears once for `deltaglider_config.db` and once for `deltaglider_jobs.db`.
 5. Remove `DGP_CONFIG_DB_KEY_PREVIOUS`, restart the proxy again, and store the new key with your database backups.
+
+When the proxy stops between the two files, or when you remove `DGP_CONFIG_DB_KEY_PREVIOUS` before a start moved both files, the jobs database still has the old key. The proxy then does not start, and its log names `DGP_CONFIG_DB_KEY_PREVIOUS`. The proxy does not replace the jobs database, because that file holds the running re-encrypt and migrate jobs. Set `DGP_CONFIG_DB_KEY_PREVIOUS` to the old key again and restart: the start moves the jobs database to the new key.
 
 ## Rotate the key of a fleet with a sync bucket
 
@@ -43,7 +45,7 @@ Until the last instance runs the new release, the old instances cannot read the 
 
 ## Verify
 
-1. Check the log of every instance for the line `re-encrypted with DGP_CONFIG_DB_KEY` after the first restart.
+1. Check the log of every instance for the line `re-encrypted with DGP_CONFIG_DB_KEY` after the first restart, once for `deltaglider_config.db` and once for `deltaglider_jobs.db`.
 2. After the last restart, without `DGP_CONFIG_DB_KEY_PREVIOUS`, check that the admin API still lists the users:
 
    ```bash

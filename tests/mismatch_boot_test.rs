@@ -142,8 +142,9 @@ async fn legacy_hash_keyed_db_is_rekeyed_on_boot() {
     let key_path = dir.join("deltaglider_config.db.key");
     server.kill();
 
-    // Rebuild the pre-upgrade state: the DB keyed with the bootstrap hash and
-    // no key file on disk.
+    // Rebuild the pre-upgrade state: the DB keyed with the bootstrap hash, no
+    // key file on disk, and no jobs DB (a pre-S8 release had none; one keyed
+    // with the removed key file would stop the boot).
     let file_key = std::fs::read_to_string(&key_path).expect("first boot writes the key file");
     {
         let db = deltaglider_proxy::config_db::ConfigDb::open_or_create(&db_path, file_key.trim())
@@ -152,6 +153,7 @@ async fn legacy_hash_keyed_db_is_rekeyed_on_boot() {
             .expect("rekey to the legacy key");
     }
     std::fs::remove_file(&key_path).unwrap();
+    std::fs::remove_file(dir.join("deltaglider_jobs.db")).unwrap();
 
     server.respawn_with_env(&[]).await;
     let who = whoami(&endpoint).await;
@@ -307,6 +309,73 @@ async fn config_db_key_rotation_with_the_previous_key() {
     let jobs_path = data_dir(&server).join("deltaglider_jobs.db");
     assert!(deltaglider_proxy::config_db::probe_key(&jobs_path, KEY_WRONG).unwrap());
     assert!(!deltaglider_proxy::config_db::probe_key(&jobs_path, KEY_GOOD).unwrap());
+}
+
+/// A crash between the rekey of the config DB and the rekey of the jobs
+/// DB, then a boot without `DGP_CONFIG_DB_KEY_PREVIOUS` (the operator
+/// removed it, step 5 of the rotation): the config DB opens with the new
+/// key, the jobs DB with no key. The boot must stop and keep the jobs DB.
+/// Before, it parked the file as `.unreadable-*` and started a fresh one:
+/// running re-encrypt and migrate jobs were forgotten, their write gates
+/// opened, and the boot cleanup deleted the `__dgmigrate_*` routes.
+#[tokio::test]
+async fn a_jobs_db_that_no_key_opens_stops_the_boot_and_is_kept() {
+    let mut server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .env("DGP_CONFIG_DB_KEY", KEY_GOOD)
+        .build()
+        .await;
+    server.kill();
+    let dir = data_dir(&server);
+    let jobs_path = dir.join("deltaglider_jobs.db");
+    // Job state that must survive (a stand-in for a running migrate).
+    deltaglider_proxy::config_db::JobsDb::open_or_create(&jobs_path, KEY_GOOD)
+        .expect("jobs DB")
+        .listener_cursor_advance("replication", 7, 1)
+        .expect("cursor");
+    // The crash: only the config DB moved to the new key.
+    deltaglider_proxy::config_db::rekey_file(
+        &dir.join("deltaglider_config.db"),
+        KEY_GOOD,
+        KEY_WRONG,
+    )
+    .expect("rekey the config DB");
+
+    let (status, output) = server
+        .spawn_expect_exit(&[("DGP_CONFIG_DB_KEY", KEY_WRONG)], 30)
+        .await;
+    assert!(
+        status.is_some_and(|s| !s.success()),
+        "the boot must stop (status {status:?}): {output}"
+    );
+    assert!(
+        output.contains("DGP_CONFIG_DB_KEY_PREVIOUS"),
+        "the error must say how to fix it: {output}"
+    );
+    let parked: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.contains(".unreadable-"))
+        .collect();
+    assert!(parked.is_empty(), "the jobs DB was parked: {parked:?}");
+    assert_eq!(replication_cursor(&jobs_path), 7, "the job state is lost");
+
+    // With the previous key back, the boot moves the jobs DB to the new key
+    // and keeps its rows.
+    server
+        .respawn_with_env(&[
+            ("DGP_CONFIG_DB_KEY", KEY_WRONG),
+            ("DGP_CONFIG_DB_KEY_PREVIOUS", KEY_GOOD),
+        ])
+        .await;
+    server.kill();
+    assert!(deltaglider_proxy::config_db::probe_key(&jobs_path, KEY_WRONG).unwrap());
+    let cursor = deltaglider_proxy::config_db::JobsDb::open_or_create(&jobs_path, KEY_WRONG)
+        .unwrap()
+        .listener_cursor_load("replication")
+        .unwrap();
+    assert_eq!(cursor, 7);
 }
 
 /// Rows of `table` in the SQLCipher file at `path`.

@@ -898,6 +898,49 @@ impl TestServer {
         sigterm_then_wait(&mut self.process);
     }
 
+    /// Start the proxy again (stopped by [`Self::kill`]) on the same config
+    /// and data dir, with `extra` env vars, when that boot must FAIL: wait
+    /// up to `secs` for the process to exit and return its status and its
+    /// output. `None` as the status: it still ran at the deadline (it was
+    /// killed then). Follow with `respawn_with_env` to boot it for real.
+    pub async fn spawn_expect_exit(
+        &mut self,
+        extra: &[(&str, &str)],
+        secs: u64,
+    ) -> (Option<std::process::ExitStatus>, String) {
+        let mut cmd = proxy_command(&self.config_path, self.production_security);
+        for (key, value) in &self.extra_env {
+            cmd.env(key, value);
+        }
+        for (key, value) in extra {
+            cmd.env(key, value);
+        }
+        // Into files, not pipes: a full pipe would block the child.
+        let dir = tempfile::tempdir().expect("output dir");
+        let (out, err) = (dir.path().join("out"), dir.path().join("err"));
+        cmd.stdout(std::fs::File::create(&out).expect("stdout file"))
+            .stderr(std::fs::File::create(&err).expect("stderr file"));
+        let mut child = cmd.spawn().expect("spawn proxy");
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            sleep(Duration::from_millis(50)).await;
+        };
+        let output = format!(
+            "{}\n{}",
+            std::fs::read_to_string(&out).unwrap_or_default(),
+            std::fs::read_to_string(&err).unwrap_or_default()
+        );
+        (status, output)
+    }
+
     /// Kill + respawn against the SAME config file, data dir, and port —
     /// with `extra` env vars applied AFTER the default `env_remove` calls
     /// (so a test can inject e.g. `DGP_BOOTSTRAP_PASSWORD_HASH`).

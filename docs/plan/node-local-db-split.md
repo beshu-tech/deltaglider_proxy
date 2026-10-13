@@ -213,11 +213,17 @@ and locks the S3 API; the job workers do not start in that state today. The
 jobs DB is then NOT opened at all, so the file stays as it is under its old
 key; after the operator restores the key (recovery wizard, restart) it opens
 normally. The recovery wizard probes only the config DB: the jobs DB has the
-same key, so one answer covers both. A jobs DB that no key opens while the
-config DB opens (a file copied in from another install) is renamed to
-`deltaglider_jobs.db.unreadable-<unix time>` (never deleted) and a fresh one
-is created, with an error log: job state is node-local and can be rebuilt,
-IAM is not touched.
+same key, so one answer covers both. A jobs DB that no key of the keyring opens while the
+config DB opens stops the boot (`no_key_opens_the_jobs_db`, exit 1), and the
+file stays as it is. An earlier cut renamed it to `.unreadable-<unix time>`
+and created a fresh one, on the theory that job state rebuilds. It does not
+all rebuild: the file holds the running reencrypt and migrate jobs, so a
+fresh DB opened their write gates, and the boot cleanup deleted their
+`__dgmigrate_*` routes (a half-migrated bucket open to clients). The usual
+cause is a rotation that moved the config DB and not the jobs DB (a crash
+between the two `rekey_file` calls, or `DGP_CONFIG_DB_KEY_PREVIOUS` removed
+before a boot moved both); the error tells the operator to set it again. A
+file from another install is moved away by the operator.
 
 `--set-bootstrap-password` (`migrate_legacy_config_db_key`) handles a
 pre-S8 config DB keyed by the bootstrap hash. A jobs DB never had that key:

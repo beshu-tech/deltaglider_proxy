@@ -961,8 +961,9 @@ fn init_config_db_attempt(
 /// ([`JobsDb::adopt_from`]), then reconcile the job state a previous process
 /// left behind. `None` when there is no config DB, or when its key does not
 /// open it (mismatch: the jobs DB has the same key, so it stays untouched
-/// until the operator restores the key). Exits on an I/O error: the files
-/// are left as they are.
+/// until the operator restores the key). Exits when no key of the keyring
+/// opens the jobs DB (it holds the running jobs: without it, their write
+/// gates would open) and on an I/O error: the files are left as they are.
 ///
 /// [`JobsDb::adopt_from`]: deltaglider_proxy::config_db::JobsDb::adopt_from
 pub fn init_jobs_db(
@@ -984,6 +985,13 @@ pub fn init_jobs_db(
     let path = jobs_db_path();
     let db = match JobsDb::open_live(&path, keys) {
         Ok(db) => db,
+        Err(deltaglider_proxy::config_db::ConfigDbError::WrongPassphrase(why)) => {
+            error!(
+                "{}",
+                deltaglider_proxy::config_db::jobs_db::no_key_opens_the_jobs_db(&path, &why)
+            );
+            std::process::exit(1);
+        }
         Err(e) => {
             error!(
                 "FATAL: the jobs DB {} failed to open: {e}. The file is left untouched; \

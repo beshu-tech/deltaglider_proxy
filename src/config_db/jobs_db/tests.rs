@@ -516,29 +516,44 @@ fn rekey_file_for_test(path: &Path, from: &str, to: &str) {
     super::super::rekey_file(path, from, to).unwrap();
 }
 
-/// A jobs DB that no key opens (a file from another install) is kept under
-/// another name, never deleted, and a new one is created.
+/// A jobs DB that no key of the keyring opens is an error, and the file
+/// stays as it is (same bytes, no new file next to it). Before, it was
+/// renamed to `.unreadable-*` and a new, empty DB took its place: the
+/// running jobs were forgotten.
 #[test]
-fn an_unreadable_jobs_db_is_kept_aside() {
+fn a_jobs_db_that_no_key_opens_is_an_error_and_stays() {
     let n = node();
-    drop(JobsDb::open_or_create(&n.jobs_path, "some-other-key-0123456789abcdef0123").unwrap());
-    let jobs = JobsDb::open_live(&n.jobs_path, &ConfigDbKeys::primary_only(KEY)).unwrap();
-    assert!(!jobs.adopted().unwrap());
-    let kept: Vec<_> = std::fs::read_dir(n.jobs_path.parent().unwrap())
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|f| f.starts_with("deltaglider_jobs.db.unreadable-"))
-        .collect();
-    assert_eq!(kept.len(), 1, "{kept:?}");
+    const OLD: &str = "old-config-db-key-0123456789abcdef01234567";
+    drop(JobsDb::open_or_create(&n.jobs_path, OLD).unwrap());
+    let before = std::fs::read(&n.jobs_path).unwrap();
+    let files = || {
+        std::fs::read_dir(n.jobs_path.parent().unwrap())
+            .unwrap()
+            .count()
+    };
+    let count_before = files();
+    let err = JobsDb::open_live(&n.jobs_path, &ConfigDbKeys::primary_only(KEY))
+        .err()
+        .expect("no key opens it");
+    assert!(matches!(err, ConfigDbError::WrongPassphrase(_)), "{err}");
+    assert_eq!(
+        std::fs::read(&n.jobs_path).unwrap(),
+        before,
+        "the file changed"
+    );
+    assert_eq!(files(), count_before, "a file was added or removed");
+    // The fallback of the keyring opens it, and moves it to the primary key.
+    let keys = ConfigDbKeys::primary_only(KEY).with_fallback(FallbackKind::PreviousKey, OLD);
+    drop(JobsDb::open_live(&n.jobs_path, &keys).unwrap());
+    assert!(super::super::probe_key(&n.jobs_path, KEY).unwrap());
 }
 
 #[test]
-fn unreadable_path_appends_the_time() {
-    assert_eq!(
-        unreadable_path(Path::new("/d/deltaglider_jobs.db"), 42),
-        PathBuf::from("/d/deltaglider_jobs.db.unreadable-42")
-    );
+fn the_boot_error_names_the_fix() {
+    let msg = no_key_opens_the_jobs_db(Path::new("/d/deltaglider_jobs.db"), "bad key");
+    assert!(msg.contains("/d/deltaglider_jobs.db"), "{msg}");
+    assert!(msg.contains("DGP_CONFIG_DB_KEY_PREVIOUS"), "{msg}");
+    assert!(msg.contains("untouched"), "{msg}");
 }
 
 #[test]
