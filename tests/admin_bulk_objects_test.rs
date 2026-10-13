@@ -1087,11 +1087,11 @@ async fn test_bulk_copy_waits_for_a_completion_of_the_destination() {
                 .send()
                 .await
                 .expect("complete");
-            std::time::Instant::now()
         })
     };
     // Inside the stalled completion, which holds the key's write lock.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let copy_start = std::time::Instant::now();
     let resp = admin
         .post(format!("{}/_/api/admin/objects/copy", server.endpoint()))
         .json(&json!({
@@ -1103,12 +1103,16 @@ async fn test_bulk_copy_waits_for_a_completion_of_the_destination() {
         .send()
         .await
         .unwrap();
-    let copy_done = std::time::Instant::now();
+    let copy_took = copy_start.elapsed();
     assert_eq!(resp.status().as_u16(), 200);
-    let complete_done = complete.await.unwrap();
+    complete.await.unwrap();
+    // The completion stalls 1500 ms holding the lock and the copy starts
+    // 500 ms in, so a copy that waits takes most of the remaining second.
+    // The two responses' arrival order is not a signal: both leave the
+    // server right after the lock is released.
     assert!(
-        copy_done >= complete_done,
-        "the bulk copy stored inside the completion's write window"
+        copy_took >= std::time::Duration::from_millis(700),
+        "the bulk copy stored inside the completion's write window ({copy_took:?})"
     );
     let got = s3
         .get_object()
