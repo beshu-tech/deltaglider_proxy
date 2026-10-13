@@ -19,7 +19,6 @@ import {
   rerunVerdictMeta,
   fixActionMeta,
   computeRate,
-  deriveVerifyProgress,
   jobWalkProgress,
   jobStrategyMix,
   planRuleDeleteSync,
@@ -368,14 +367,6 @@ test('computeRate: EMA of objects/sec, holds on Δ=0, no negatives', () => {
     assert.ok(r > 400 && r < 1000, `EMA blends toward instantaneous, got ${r}`);
   }
   assert.ok(computeRate(5, 100, 1000, 90, 2000) >= 0, 'never negative');
-});
-
-test('deriveVerifyProgress: indeterminate until total known, then clamped percent', () => {
-  assert.deepEqual(deriveVerifyProgress(500, 0), { determinate: false, percent: 0 }, 'total 0 → indeterminate');
-  assert.deepEqual(deriveVerifyProgress(500, undefined), { determinate: false, percent: 0 }, 'no total → indeterminate');
-  assert.deepEqual(deriveVerifyProgress(500, 1000), { determinate: true, percent: 50 });
-  assert.deepEqual(deriveVerifyProgress(2000, 1000), { determinate: true, percent: 100 }, 'clamped at 100');
-  assert.deepEqual(deriveVerifyProgress(0, 1000), { determinate: true, percent: 0 });
 });
 
 test('jobWalkProgress: live only, defensive on shape', () => {

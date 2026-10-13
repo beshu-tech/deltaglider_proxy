@@ -49,8 +49,10 @@ import {
   nextRunText,
   deferredText,
   planRuleDeleteSync,
+  liveCopySummary,
   rowMeterInput,
   runEndedMessage,
+  statusCellView,
   runNowMessage,
   scopeText,
   startJobWatch,
@@ -205,7 +207,6 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
     [jobsQuery.data]
   );
   const schedulerOn = jobsQuery.data?.workers?.lifecycle?.enabled ?? true;
-  const lastEventAt = jobsQuery.data?.workers?.replication?.last_event_applied_at ?? null;
   const olderOneoffs = jobsQuery.data?.older_oneoffs ?? 0;
   useEffect(() => {
     if (watches.length === 0) return;
@@ -569,6 +570,8 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
       key: 'job',
       label: 'Job',
       // The name is what operators scan for; Status is usually one short tag.
+      // Self-describing: no caption on a phone card.
+      hideLabelOnNarrow: true,
       track: 'minmax(200px,2fr)',
       render: (d) => (
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
@@ -619,6 +622,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
     {
       key: 'trigger',
       label: 'Trigger',
+      narrowHalf: true,
       track: 'max-content',
       render: (d) => (
         <Text type="secondary" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
@@ -629,22 +633,31 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
     {
       key: 'status',
       label: 'Status',
+      // Self-describing: no caption on a phone card.
+      hideLabelOnNarrow: true,
       track: 'minmax(0,1fr)',
       render: (d) => {
         const live = isActiveJobStatus(d.row.status);
-        // A one-off's row IS its run: after the run it still shows what the
-        // run did ("4,003 stamped", "cancelled · 20 copied").
-        const meter = live || (d.row.trigger === 'oneoff' && !d.draft);
+        // A one-off's row IS its run, and a settled rule keeps the counts
+        // of its last run ("14 copied"), not only a status word.
+        const view = statusCellView(d.row, d.draft);
         const failed = d.row.failed_total ?? d.row.progress.failed;
+        const liveCopies = liveCopySummary(d.row);
         return (
           // OutcomeMeter.css grows this wrapper to the column width.
           <div>
-            {meter ? (
-              <OutcomeMeter {...rowMeterInput(d.row, ruleVerb(d.row))} />
-            ) : (
-              <Tag color={jobStatusTone(d.row)} style={{ margin: 0 }}>
+            {view.tag && (
+              <Tag color={jobStatusTone(d.row)} style={{ margin: view.meter ? '0 0 4px' : 0 }}>
                 {jobStatusLabel(d.row)}
               </Tag>
+            )}
+            {view.meter && <OutcomeMeter {...rowMeterInput(d.row, ruleVerb(d.row))} />}
+            {liveCopies && (
+              // Event-driven copies write no run row: this is where they show.
+              <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 2 }}>
+                last live copy {liveCopies.at ? <TimeAgo ts={liveCopies.at} /> : '—'}
+                {liveCopies.counts ? ` · ${liveCopies.counts}` : ''}
+              </Text>
             )}
             {live && d.row.paused && d.row.status === 'running' && (
               <Text type="warning" style={{ display: 'block', fontSize: 11, marginTop: 2 }}>
@@ -680,6 +693,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
     {
       key: 'last',
       label: 'Last run',
+      narrowHalf: true,
       track: 'max-content',
       render: (d) => (d.draft ? <Text type="secondary">—</Text> : <LastRunCell row={d.row} schedulerOn={schedulerOn} />),
     },
@@ -816,19 +830,14 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
           <div style={{ minWidth: 0 }}>
             <Text type="secondary" style={{ fontSize: 13 }}>
+              {/* With no jobs, the list's empty state says so (once). */}
               {displayRows.length === 0
-                ? 'No jobs yet.'
+                ? ''
                 : `${displayRows.length} job${displayRows.length === 1 ? '' : 's'} — select one for its definition, runs, and failures.`}
             </Text>
             {olderOneoffs > 0 ? (
               <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>
                 {olderOneoffs.toLocaleString()} older one-off job{olderOneoffs === 1 ? '' : 's'} not listed.
-              </Text>
-            ) : null}
-            {/* Event-driven copies write no run row: this is where they show. */}
-            {lastEventAt ? (
-              <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>
-                Replication last handled object changes as they happened <TimeAgo ts={lastEventAt} />.
               </Text>
             ) : null}
           </div>

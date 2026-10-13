@@ -14,6 +14,8 @@ export interface RecordColumn<T> {
   align?: 'start' | 'center' | 'end';
   /** Hide the per-cell caption on narrow (e.g. a self-describing meter). */
   hideLabelOnNarrow?: boolean;
+  /** On narrow, take half of the card's width (short values side by side). */
+  narrowHalf?: boolean;
 }
 
 /** A responsive record list: ONE DOM, ONE stylesheet. On a wide container it
@@ -86,6 +88,7 @@ export default function RecordList<T>({
                 data-align={col.align}
                 data-col={col.key}
                 data-label={col.hideLabelOnNarrow ? undefined : col.label}
+                data-half={col.narrowHalf ? '' : undefined}
               >
                 {col.render(row)}
               </div>

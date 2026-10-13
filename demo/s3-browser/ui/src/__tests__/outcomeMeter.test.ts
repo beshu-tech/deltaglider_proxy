@@ -11,7 +11,7 @@ test('in-sync: everything skipped (the dominant, calm case) — NOT saturated gr
   const v = m({ scanned: 11, skipped: 11, status: 'succeeded' });
   assert.equal(v.state, 'in-sync');
   assert.equal(v.dot, 'muted');
-  assert.equal(v.label, 'in sync · 11 already in sync');
+  assert.equal(v.label, 'in sync · 11 checked');
   assert.equal(v.greenPct, 0, 'in-sync must not paint green');
 });
 
@@ -92,7 +92,7 @@ test('cancelled → calm muted', () => {
   assert.equal(v.dot, 'muted');
   assert.equal(v.label, 'cancelled · 3 copied', 'says how far the run got');
   assert.equal(m({ status: 'cancelled' }).label, 'cancelled');
-  assert.equal(m({ status: 'paused', copied: 2, scanned: 2 }).label, 'paused · 2 copied', 'a pause keeps the cursor: not "cancelled"');
+  assert.equal(m({ status: 'paused', copied: 2, scanned: 2 }).label, 'stopped · 2 copied', 'a pause keeps the cursor: not "cancelled"');
 });
 
 test('huge numbers → thousands separators', () => {
@@ -117,7 +117,7 @@ test('words per kind', () => {
   assert.equal(m({ kind: 'backfill-metadata', scanned: 4003, copied: 4003 }).label, '4,003 stamped');
   assert.equal(
     m({ kind: 'backfill-metadata', scanned: 7, skipped: 7 }).label,
-    'all already stamped · 7 already stamped',
+    'all already stamped · 7 checked',
   );
   assert.equal(
     m({ kind: 'reencrypt', scanned: 10_003, copied: 3, skipped: 10_000 }).label,
@@ -126,7 +126,7 @@ test('words per kind', () => {
   assert.equal(m({ kind: 'lifecycle', verb: 'delete', scanned: 8000, copied: 8000 }).label, '8,000 deleted');
   assert.equal(m({ kind: 'lifecycle', verb: 'copy', scanned: 3, copied: 3 }).label, '3 copied');
   assert.equal(m({ kind: 'lifecycle', verb: 'move', scanned: 3, copied: 3 }).label, '3 moved');
-  assert.equal(m({ kind: 'lifecycle', scanned: 40, skipped: 40 }).label, 'nothing due · 40 not due');
+  assert.equal(m({ kind: 'lifecycle', scanned: 40, skipped: 40 }).label, 'nothing due · 40 checked');
   // Lifecycle `processed` already holds the deletes of a delete rule.
   assert.equal(m({ kind: 'lifecycle', verb: 'delete', scanned: 5, copied: 5, deleted: 5 }).label, '5 deleted');
   for (const kind of ['backfill-metadata', 'reencrypt', 'migrate', 'lifecycle']) {

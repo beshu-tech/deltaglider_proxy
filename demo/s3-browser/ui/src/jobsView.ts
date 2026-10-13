@@ -312,6 +312,9 @@ export function jobStatusLabel(row: Pick<JobRow, 'status' | 'paused' | 'enabled'
   if (row.enabled === false) return 'disabled';
   if (row.paused) return 'paused';
   if (row.status === 'queued') return 'waiting to start';
+  // A run that a pause stopped; it kept its position, so it is not
+  // "cancelled": the next run goes on from there.
+  if (row.status === 'paused') return 'stopped · resumes where it left off';
   // Shorten the verbose backend status for the chip; the run's error count is
   // shown separately in the Runs table.
   if (row.status === 'completed_with_errors') return 'completed · errors';
@@ -974,7 +977,8 @@ export function deriveMeter(p: OutcomeMeterInput): MeterView {
   }
   if (status === 'cancelled' || status === 'paused') {
     const so = parts(false);
-    const word = status === 'paused' ? 'paused' : 'cancelled';
+    // `paused`: a pause stopped the run and it kept its position.
+    const word = status === 'paused' ? 'stopped' : 'cancelled';
     return {
       state: 'idle',
       greenPct: 0,
@@ -993,7 +997,7 @@ export function deriveMeter(p: OutcomeMeterInput): MeterView {
       greenPct: 0,
       redPct: 0,
       dot: 'muted',
-      label: scanned === 0 ? 'no objects' : skipped > 0 ? `${w.nothing} · ${n(skipped)} ${w.skipped}` : w.nothing,
+      label: scanned === 0 ? 'no objects' : `${w.nothing} · ${n(scanned)} checked`,
       aria,
     };
   }
@@ -1123,6 +1127,49 @@ export function groupFailureErrors(failures: readonly { error: string }[]): { er
 }
 
 /**
+ * What the Status cell of a row shows. A run in progress, and a one-off
+ * (its row IS its run), show the meter. A settled rule shows its status
+ * word, and under it the meter of its last run when that run has counts,
+ * so "14 copied" stays after the run.
+ */
+export function statusCellView(
+  row: Pick<JobRow, 'status' | 'trigger' | 'paused' | 'enabled' | 'progress'>,
+  draft = false,
+): { meter: boolean; tag: boolean } {
+  if (draft) return { meter: false, tag: true };
+  if (isActiveJobStatus(row.status) || row.trigger === 'oneoff') return { meter: true, tag: false };
+  const pr = row.progress;
+  const counts = pr.processed + pr.skipped + pr.failed + (pr.deleted ?? 0) > 0;
+  return { meter: counts, tag: true };
+}
+
+/** What event-driven replication did for a rule (`detail.events`). */
+interface EventActivity {
+  last_applied_at?: number | null;
+  copied?: number;
+  deleted?: number;
+  failed?: number;
+  last_failed_at?: number | null;
+}
+
+/**
+ * The live (event-driven) copies of a replication rule since the proxy
+ * started: when the last one landed, and the counts. Null when there were
+ * none. Rendered as "last live copy <time> · 14 copied · 1 deleted".
+ */
+export function liveCopySummary(row: Pick<JobRow, 'kind' | 'detail'>): { at: number | null; counts: string } | null {
+  if (row.kind !== 'replication') return null;
+  const ev = (row.detail?.events ?? null) as EventActivity | null;
+  const at = (typeof row.detail?.last_event_applied_at === 'number' ? row.detail.last_event_applied_at : null) ?? ev?.last_applied_at ?? null;
+  const parts: string[] = [];
+  if (ev?.copied) parts.push(`${n(ev.copied)} copied`);
+  if (ev?.deleted) parts.push(`${n(ev.deleted)} deleted`);
+  if (ev?.failed) parts.push(`${n(ev.failed)} failed`);
+  if (at == null && parts.length === 0) return null;
+  return { at, counts: parts.join(' · ') };
+}
+
+/**
  * The Definition tab of a one-off job: its parameters, what it did, and
  * when. Read-only rows of [label, value].
  */
@@ -1196,20 +1243,6 @@ export function cancelConfirmText(row: Pick<JobRow, 'kind' | 'phase' | 'scope'>)
     content:
       'The job stops at the next safe point. The objects it already processed stay processed; a new job does the rest.',
   };
-}
-
-/**
- * Verify progress bar model. `total > 0` (after listing finishes) → determinate
- * percent; else indeterminate. Pure so it's testable. Percent is clamped and
- * never regresses past 100 (a late-arriving count can exceed the denominator).
- */
-export function deriveVerifyProgress(
-  scanned: number,
-  total: number | undefined,
-): { determinate: boolean; percent: number } {
-  if (!total || total <= 0) return { determinate: false, percent: 0 };
-  const pct = Math.round((scanned / total) * 100);
-  return { determinate: true, percent: Math.max(0, Math.min(100, pct)) };
 }
 
 /**

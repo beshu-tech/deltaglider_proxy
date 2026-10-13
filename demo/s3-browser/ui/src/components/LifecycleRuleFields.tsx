@@ -278,7 +278,7 @@ export default function RuleEditor({
           <FormField
             label="Exclude globs"
             yamlPath="storage.lifecycle.rules[].exclude_globs"
-            helpText="One glob per line. Keys matching any pattern are skipped. Defaults protect DeltaGlider's config-sync prefix."
+            helpText="One glob per line. Keys matching any pattern are skipped. The proxy never acts on its own .deltaglider/ and .dg/ keys, also when you replace the default pattern."
           >
             <GlobListTextArea
               value={rule.exclude_globs}

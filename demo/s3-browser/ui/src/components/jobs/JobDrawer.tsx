@@ -316,6 +316,16 @@ export default function JobDrawer({
           ),
         },
         {
+          key: 'finished',
+          label: 'Finished',
+          track: 'max-content',
+          render: (r) => (
+            <Text type="secondary" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+              {r.finished_at ? <TimeAgo ts={r.finished_at} /> : isActiveJobStatus(r.status) ? 'running' : '—'}
+            </Text>
+          ),
+        },
+        {
           key: 'took',
           label: 'Took',
           track: 'max-content',
@@ -379,6 +389,14 @@ export default function JobDrawer({
             render: (f) => (
               <span style={{ whiteSpace: 'nowrap' }}>
                 <TimeAgo ts={f.occurred_at} />
+                {f.trigger && (
+                  <Tag
+                    style={{ marginLeft: 6, fontSize: 11 }}
+                    title={f.trigger === 'event' ? 'A live copy, made when the object changed' : 'A run of the rule'}
+                  >
+                    {f.trigger === 'event' ? 'live copy' : 'run'}
+                  </Tag>
+                )}
               </span>
             ),
           },

@@ -24,6 +24,9 @@ import {
   startJobWatch,
   stepJobWatch,
   runEndedMessage,
+  statusCellView,
+  liveCopySummary,
+  jobStatusLabel,
   watchSettled,
   type JobRow,
 } from '../jobsView';
@@ -255,4 +258,37 @@ test('runEndedMessage says how a run the operator started ended', () => {
   assert.equal(watchSettled(w, { status: 'running', last_run_at: 5 }), false);
   assert.equal(watchSettled(w, { status: 'succeeded', last_run_at: 9 }), true);
   assert.equal(watchSettled(w, { status: 'succeeded', last_run_at: 5 }), false, 'nothing ran yet');
+});
+
+// REPL: a settled rule row showed only "succeeded", not what its last run did.
+test('statusCellView: a settled rule keeps the counts of its last run', () => {
+  const counts = { processed: 14, skipped: 3, failed: 0, bytes: 0, deleted: 1 };
+  assert.deepEqual(statusCellView(row({ status: 'succeeded', progress: counts })), { meter: true, tag: true });
+  assert.deepEqual(statusCellView(row({ status: 'succeeded' })), { meter: false, tag: true }, 'no run yet');
+  assert.deepEqual(statusCellView(row({ status: 'succeeded', paused: true, progress: counts })), { meter: true, tag: true });
+  assert.deepEqual(statusCellView(row({ status: 'paused', progress: counts })), { meter: true, tag: true });
+  assert.deepEqual(statusCellView(row({ status: 'running' })), { meter: true, tag: false });
+  assert.deepEqual(statusCellView(row({ trigger: 'oneoff', status: 'succeeded' })), { meter: true, tag: false });
+  assert.deepEqual(statusCellView(row(), true), { meter: false, tag: true }, 'draft');
+});
+
+// REPL: a run that a pause stopped kept its position; it is not "cancelled".
+test('a stopped (paused) run has its own label', () => {
+  assert.equal(jobStatusLabel(row({ status: 'paused' })), 'stopped · resumes where it left off');
+  assert.equal(jobStatusLabel(row({ status: 'paused', paused: true })), 'paused');
+});
+
+// REPL: event-driven copies were invisible on the row.
+test('liveCopySummary: when the last live copy landed, and the counts', () => {
+  assert.deepEqual(
+    liveCopySummary(row({ detail: { last_event_applied_at: 500, events: { copied: 14, deleted: 1, failed: 0 } } })),
+    { at: 500, counts: '14 copied · 1 deleted' },
+  );
+  assert.deepEqual(liveCopySummary(row({ detail: { events: { last_applied_at: 7, copied: 0, failed: 2 } } })), {
+    at: 7,
+    counts: '2 failed',
+  });
+  assert.equal(liveCopySummary(row({ detail: {} })), null);
+  assert.equal(liveCopySummary(row({ detail: { events: null } })), null);
+  assert.equal(liveCopySummary(row({ kind: 'lifecycle', detail: { last_event_applied_at: 5 } })), null);
 });

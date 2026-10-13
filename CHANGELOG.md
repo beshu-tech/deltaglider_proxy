@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Fixed — A settled rule row says what its last run did
+
+A rule row showed counts only while its run went on; afterwards it said
+only "succeeded". It now keeps the counts of its last run ("14 copied · 1
+deleted · 3 already in sync · 2 failed"), its failure count and its last
+error. A replication rule row also says when its last live copy landed and
+how many objects the live copies copied, deleted and failed on. A run that
+a pause stopped reads "stopped · resumes where it left off" instead of
+"cancelled", because it kept its position. In the drawer, each run says
+when it finished, and each replication failure says whether a run or a
+live copy hit it. On a phone, the job cards are denser, so the screen
+shows more than one job at a time.
+
+### Fixed — The Buckets page shows a bucket as busy only while writes are refused
+
+The busy chip on the Buckets page, the busy banner of the object browser
+and its Upload button now follow `writes_blocked`, the state of the write
+gate that `GET /_/api/admin/jobs/bucket/:bucket` reports. Before, the chip
+said "busy" for the whole life of the job, also while a cancelled migration
+had already opened the bucket again. The Cancel button on the Buckets page
+now asks for confirmation, because a migration that is cancelled before the
+switch deletes the copies it made.
+
 ### Fixed — The run-now confirmation shows the count that the run acts on
 
 The confirmation of a lifecycle run-now could name a count from a preview

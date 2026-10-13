@@ -123,9 +123,15 @@
      value (so a 1-cell row and a 6-cell row look consistent). */
   .dg-record-row {
     display: grid;
-    grid-template-columns: 1fr;
-    row-gap: 10px;
-    padding: 14px 16px;
+    /* Two tracks: a cell spans both, unless it is marked half-width. */
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    /* Dense: two half-width cells share a line even when a full-width
+       cell sits between them in the DOM. */
+    grid-auto-flow: row dense;
+    column-gap: 12px;
+    /* Dense: a phone shows several jobs per screen, not one. */
+    row-gap: 6px;
+    padding: 10px 12px;
     border: 1px solid var(--rl-border);
     border-radius: 10px;
     background: var(--rl-bg-card);
@@ -139,6 +145,9 @@
     min-width: 0;
     display: block;
   }
+  .dg-record-cell[data-half] { grid-column: auto; }
+  /* An actions cell with no button (a finished one-off) takes no room. */
+  .dg-record-cell[data-col='actions']:not(:has(button)) { display: none; }
   /* Caption from data-label, muted, above each value. */
   .dg-record-cell[data-label]::before {
     content: attr(data-label);
@@ -147,13 +156,13 @@
     text-transform: uppercase;
     letter-spacing: 0.04em;
     color: var(--rl-text-muted);
-    margin-bottom: 4px;
+    margin-bottom: 2px;
   }
   /* Actions sit as a full-width button row at the bottom of the card, and the
      buttons regain their text labels (screen space is no longer the constraint). */
   .dg-record-cell[data-col='actions'] {
     margin-top: 2px;
-    padding-top: 12px;
+    padding-top: 8px;
     border-top: 1px solid var(--rl-border);
   }
   .dg-action-label {

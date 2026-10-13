@@ -194,3 +194,11 @@ test('while edits are unsaved, the drawer leaves room under its last field', asy
   const body = (await screen.findByRole('dialog')).querySelector('.ant-drawer-body') as HTMLElement;
   expect(body.style.paddingBottom).toBe('96px');
 });
+
+// Regression (QA nightly step 7): the header and the empty list both said
+// "No jobs yet".
+test('an empty Jobs screen says "No jobs yet" once', async () => {
+  http.on('GET', JOBS, json({ jobs: [] }));
+  renderWithQuery(<JobsPanel />);
+  expect(await screen.findAllByText(/No jobs yet/)).toHaveLength(1);
+});

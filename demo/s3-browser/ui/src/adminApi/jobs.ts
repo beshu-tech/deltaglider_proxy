@@ -49,6 +49,8 @@ interface JobFailureEntry {
   source_key?: string | null;
   dest_key?: string | null;
   error: string;
+  /** Replication: `run` (a scheduled or manual run) or `event` (a live copy). */
+  trigger?: 'run' | 'event' | null;
 }
 
 // === Replication parity audit (the "Verify" tab) ===
