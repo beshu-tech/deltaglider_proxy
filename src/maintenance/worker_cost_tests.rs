@@ -700,7 +700,10 @@ async fn the_worker_drains_at_start_and_wakes_when_a_row_comes_due() {
         .maintenance_defer(id, "inst", not_before, "waiting")
         .unwrap());
     assert_eq!(
-        e.db.lock().await.maintenance_next_due_at().unwrap(),
+        e.db.lock()
+            .await
+            .maintenance_next_due_at(current_unix_seconds())
+            .unwrap(),
         Some(not_before)
     );
     // And one queued before the start, on another bucket.

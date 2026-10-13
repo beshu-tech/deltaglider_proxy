@@ -544,14 +544,18 @@ impl JobsDb {
 
     /// The earliest time (unix seconds) at which a row comes due by time
     /// alone: a deferred or backed-off row's `not_before`, or a lease that
-    /// lapses (its row then re-queues). The idle worker wakes then.
-    /// `None`: no row waits for a time.
-    pub fn maintenance_next_due_at(&self) -> Result<Option<i64>, ConfigDbError> {
+    /// lapses (its row then re-queues). The idle worker wakes then. The
+    /// claim takes a row once this time is BEFORE its `now`, so a time equal
+    /// to `now` still counts. A time already before `now` does not: the
+    /// claim just left that row, so only a notify or a poll can change it,
+    /// and counting it made the idle worker poll every second. `None`: no
+    /// row waits for a time.
+    pub fn maintenance_next_due_at(&self, now: i64) -> Result<Option<i64>, ConfigDbError> {
         Ok(self.conn.query_row(
             "SELECT MIN(leader_expires_at) FROM maintenance_jobs
               WHERE status IN ('queued', 'running', 'cancelling')
-                AND leader_expires_at IS NOT NULL",
-            [],
+                AND leader_expires_at >= ?",
+            params![now],
             |r| r.get(0),
         )?)
     }
@@ -657,6 +661,46 @@ mod tests {
 
     fn db() -> JobsDb {
         JobsDb::in_memory("testpass").expect("open in-memory db")
+    }
+
+    /// A lease or `not_before` already in the past is not a time to wake
+    /// at: the claim did not take that row, so time alone does not make it
+    /// claimable. Before, its past expiry made the idle worker poll every
+    /// second until something else changed the row.
+    #[test]
+    fn next_due_ignores_times_already_past() {
+        let db = db();
+        let now = 10_000;
+        let past = db
+            .maintenance_create_job("reencrypt", "a", "counting", None, "admin", 100)
+            .unwrap()
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE maintenance_jobs SET status = 'running',
+                        leader_instance_id = 'peer', leader_expires_at = ? WHERE id = ?",
+                params![now - 100, past],
+            )
+            .unwrap();
+        assert_eq!(db.maintenance_next_due_at(now).unwrap(), None);
+        let future = db
+            .maintenance_create_job("reencrypt", "b", "counting", None, "admin", 101)
+            .unwrap()
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE maintenance_jobs SET leader_instance_id = 'deferred',
+                        leader_expires_at = ? WHERE id = ?",
+                params![now + 30, future],
+            )
+            .unwrap();
+        assert_eq!(db.maintenance_next_due_at(now).unwrap(), Some(now + 30));
+        // The claim takes a row only once its time is BEFORE `now`: a time
+        // equal to `now` is still a time to wake at.
+        assert_eq!(
+            db.maintenance_next_due_at(now + 30).unwrap(),
+            Some(now + 30)
+        );
     }
 
     #[test]

@@ -140,10 +140,12 @@ pub fn spawn_worker(mutator: ConfigMutator, db: Arc<Mutex<JobsDb>>) -> tokio::ta
                     // any transition a crashed path did not sync.
                     state.maintenance_gate.sync_from(&db);
                     let next_due = match claimed {
-                        Ok(None) => db.maintenance_next_due_at().unwrap_or_else(|e| {
-                            warn!("maintenance: next due time unknown: {}", e);
-                            None
-                        }),
+                        Ok(None) => db
+                            .maintenance_next_due_at(current_unix_seconds())
+                            .unwrap_or_else(|e| {
+                                warn!("maintenance: next due time unknown: {}", e);
+                                None
+                            }),
                         _ => None,
                     };
                     (claimed, next_due)
