@@ -160,7 +160,7 @@ impl ObjectWriteGuard {
 
 impl Drop for ObjectWriteGuard {
     /// A write that ends is a write event too: a read that overlapped it
-    /// sees the counter move (see [`WriteActivity`]).
+    /// sees the counter move (see `WriteActivity`).
     fn drop(&mut self) {
         self.lock
             .events
