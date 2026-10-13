@@ -94,8 +94,17 @@ async fn put_as(
         Path::Buffered => match multipart_etag {
             None => h.engine.store(bucket, key, data, ct, user_meta()).await,
             Some(e) => {
+                let lock = h.engine.lock_object_write(bucket, key).await;
                 h.engine
-                    .store_with_multipart_etag(bucket, key, data, ct, user_meta(), e.to_string())
+                    .store_with_multipart_etag(
+                        &lock,
+                        bucket,
+                        key,
+                        data,
+                        ct,
+                        user_meta(),
+                        e.to_string(),
+                    )
                     .await
             }
         },
@@ -104,6 +113,7 @@ async fn put_as(
             tokio::fs::write(spool.path(), data).await.unwrap();
             h.engine
                 .store_spooled_delta(
+                    &h.engine.lock_object_write(bucket, key).await,
                     bucket,
                     key,
                     &spool,

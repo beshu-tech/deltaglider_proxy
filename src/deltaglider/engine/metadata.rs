@@ -128,8 +128,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// `validated_key` so pre-existing `//` objects stay reachable for cleanup
     /// on S3. (The filesystem backend refuses `.`/empty segments on every
     /// path it builds: `filesystem::check_path_segments`.)
+    /// `lock`: the write lock of `key`; a guard of another key is refused,
+    /// so every store writes under its own key's lock.
     pub(super) fn validated_key_ingest(
         &self,
+        lock: &super::conditional::ObjectWriteGuard,
         bucket: &str,
         key: &str,
     ) -> Result<(ObjectKey, String), EngineError> {
@@ -146,6 +149,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             ));
         }
         let deltaspace_id = obj_key.deltaspace_id();
+        lock.covers(bucket, &deltaspace_id, &obj_key.filename)?;
         Ok((obj_key, deltaspace_id))
     }
 

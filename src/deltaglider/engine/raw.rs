@@ -74,11 +74,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// Write a delta blob + metadata verbatim into a deltaspace. Call it
     /// inside [`Self::with_dest_prefix_lock`]; outside it, multi-instance
-    /// refuses. `prior`: what the key held, read before the write
+    /// refuses. `lock`: the key's write lock, taken BEFORE the deltaspace
+    /// lock. `prior`: what the key held, read before the write
     /// ([`Self::fast_path_prior`]); `CounterPrior::Unknown` when the
     /// caller did not read it.
+    #[allow(clippy::too_many_arguments)]
     pub async fn put_delta_raw(
         &self,
+        lock: &super::conditional::ObjectWriteGuard,
         bucket: &str,
         prefix: &str,
         filename: &str,
@@ -86,6 +89,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         metadata: &FileMetadata,
         prior: &CounterPrior,
     ) -> Result<(), StorageError> {
+        lock.covers(bucket, prefix, filename)
+            .map_err(engine_to_storage)?;
         // Inside `with_dest_prefix_lock`: the delta is only valid against the
         // reference the held cross-instance lock protects.
         let held = self.held_reference_lock(bucket, prefix, "delta")?;
@@ -96,6 +101,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // PASSTHROUGH variant of the same key — leaving it behind lets a
         // later delta delete resurrect old content. Cache must drop too.
         self.drop_other_form(
+            lock,
             bucket,
             prefix,
             filename,

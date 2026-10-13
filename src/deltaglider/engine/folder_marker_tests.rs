@@ -126,6 +126,7 @@ async fn a_marker_key_with_a_body_is_refused() {
         assert!(matches!(
             engine
                 .store_passthrough_chunked(
+                    &engine.lock_object_write("b", "photos/").await,
                     "b",
                     "photos/",
                     &[bytes::Bytes::from_static(b"data")],

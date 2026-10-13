@@ -92,8 +92,40 @@ pub(crate) async fn upload_file(
             observed: copied,
         });
     }
+    store_spooled(
+        engine,
+        bucket,
+        key,
+        &spool,
+        size,
+        content_type,
+        user_metadata,
+    )
+    .await
+}
+
+/// The streaming store of a spooled body, under the object's write lock.
+async fn store_spooled(
+    engine: &DynEngine,
+    bucket: &str,
+    key: &str,
+    spool: &crate::deltaglider::spool::Spool,
+    size: u64,
+    content_type: Option<String>,
+    user_metadata: HashMap<String, String>,
+) -> Result<StoreResult, TransferError> {
+    let lock = engine.lock_object_write(bucket, key).await;
     engine
-        .store_spooled_delta(bucket, key, &spool, size, content_type, user_metadata, None)
+        .store_spooled_delta(
+            &lock,
+            bucket,
+            key,
+            spool,
+            size,
+            content_type,
+            user_metadata,
+            None,
+        )
         .await
         .map_err(TransferError::Dest)
 }
@@ -264,9 +296,7 @@ pub(crate) async fn copy_object(
     if fill.written != size {
         return Err(changed(fill.written));
     }
-    dst.store_spooled_delta(dst_bucket, dst_key, &spool, size, ct, meta, None)
-        .await
-        .map_err(TransferError::Dest)
+    store_spooled(dst, dst_bucket, dst_key, &spool, size, ct, meta).await
 }
 
 #[cfg(test)]

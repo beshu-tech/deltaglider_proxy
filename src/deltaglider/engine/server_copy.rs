@@ -18,11 +18,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// a passthrough object); nothing was written, and the caller copies
     /// the bytes. A source that changed since `source` is
     /// `PreconditionFailed`. The caller decides that the destination stores
-    /// the object as it is (no delta) and holds the object's write lock
-    /// when the write is a client's. `prior`: what the destination key
-    /// holds, when the caller read it (`None`: read here).
+    /// the object as it is (no delta). `lock`: the destination's write
+    /// lock. `prior`: what the destination key holds, when the caller read
+    /// it (`None`: read here).
     pub async fn copy_passthrough_within(
         &self,
+        lock: &super::conditional::ObjectWriteGuard,
         src: (&str, &str),
         dst: (&str, &str),
         source: &FileMetadata,
@@ -41,7 +42,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             return Ok(None);
         }
         self.ensure_within_passthrough_ceiling(source.file_size)?;
-        let (dst_key, dst_ds) = self.validated_key_ingest(dst.0, dst.1)?;
+        let (dst_key, dst_ds) = self.validated_key_ingest(lock, dst.0, dst.1)?;
         let prior = match prior {
             Some(prior) => prior,
             None => self.prior_for_counter(dst.0, dst.1).await,
@@ -75,6 +76,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // Committed: count it before the next await.
         self.record_commit(dst.0, &prior, &metadata);
         self.drop_other_form(
+            lock,
             dst.0,
             &dst_ds,
             &dst_key.filename,

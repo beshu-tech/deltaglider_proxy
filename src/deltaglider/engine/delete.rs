@@ -494,8 +494,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         info!("Deleting {}/{}", bucket, key);
 
-        // Acquire per-deltaspace lock to prevent races with concurrent store/delete
-        // operations that may create or clean up the reference.
+        // The object's write lock first (lock order: object, then
+        // deltaspace): no write of this key on this process lands between
+        // the read below and the delete. Then the per-deltaspace lock, to
+        // prevent races with concurrent store/delete operations that may
+        // create or clean up the reference.
+        let _object_lock = self.lock_object_write(bucket, key).await;
         let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
 
         // No migration: we already hold the prefix lock, and

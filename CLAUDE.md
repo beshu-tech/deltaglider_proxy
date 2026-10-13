@@ -70,7 +70,11 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
                              multipart/bucket.rs) — owns S3 parse/DTO/XML only; `From<S3Error> for s3s::S3Error` is the one error bridge.
                              Product logic lives below it: conditional writes + the per-key object write lock in
                              `engine/conditional.rs` (`store_conditional`, reached by PutObject, CopyObject, form POST via
-                             `object_helpers::store_client_write`, and admin bulk copy), filtered-LIST algebra in `iam/listing.rs`
+                             `object_helpers::store_client_write`). EVERY object write takes that lock (client, multipart, admin
+                             bulk, every `transfer.rs` copy, delete, backfill, legacy migration): the store methods ask for the
+                             `ObjectWriteGuard` (only `lock_object_write` makes one; `store()`, delete and `copy_object_*` lock
+                             themselves — not re-entrant). Lock order: object → deltaspace prefix → cross-instance reference
+                             (source guards in conditional.rs), filtered-LIST algebra in `iam/listing.rs`
                              (budget = `advanced.filtered_list_max_engine_pages`, default 50)
   → api/handlers/            Survivors after the s3s consolidation:
       mod.rs                 AppState (shared by s3s adapter + admin API), audit_log_s3, ensure_bucket_exists helpers

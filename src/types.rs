@@ -114,10 +114,16 @@ impl ObjectKey {
 
     /// Get the full key (prefix + filename)
     pub fn full_key(&self) -> String {
-        if self.prefix.is_empty() {
-            self.filename.clone()
+        Self::join(&self.prefix, &self.filename)
+    }
+
+    /// The key of `filename` in the deltaspace `deltaspace_id` (the
+    /// inverse of [`Self::parse`]).
+    pub fn join(deltaspace_id: &str, filename: &str) -> String {
+        if deltaspace_id.is_empty() {
+            filename.to_string()
         } else {
-            format!("{}/{}", self.prefix, self.filename)
+            format!("{deltaspace_id}/{filename}")
         }
     }
 

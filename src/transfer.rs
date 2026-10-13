@@ -259,14 +259,20 @@ async fn copy_attempt(
             .await
             .map_err(|e| CopyError::engine("source head failed", e))?,
     };
+    // The destination's write lock, as every write of an object takes it:
+    // no other write of this key on this process interleaves its stored
+    // forms with the copy's. Per attempt, so a retry's back-off holds none.
+    let lock = engine
+        .lock_object_write(request.destination_bucket, request.destination_key)
+        .await;
     if request.keep_created_at {
         crate::types::with_created_at(
             source_head.created_at,
-            copy_object_once(engine, request, &source_head, prior),
+            copy_object_once(engine, &lock, request, &source_head, prior),
         )
         .await
     } else {
-        copy_object_once(engine, request, &source_head, prior).await
+        copy_object_once(engine, &lock, request, &source_head, prior).await
     }
 }
 
@@ -274,6 +280,7 @@ async fn copy_attempt(
 /// fast path use it, the streamed paths read their own.
 async fn copy_object_once(
     engine: &Arc<DynEngine>,
+    lock: &crate::deltaglider::ObjectWriteGuard,
     request: ObjectTransferRequest<'_>,
     source_head: &crate::types::FileMetadata,
     prior: Option<&crate::deltaglider::CounterPrior>,
@@ -285,7 +292,7 @@ async fn copy_object_once(
         source_head.storage_info,
         crate::types::StorageInfo::Passthrough
     ) {
-        if let Some(outcome) = server_side_copy(engine, request, source_head, prior).await? {
+        if let Some(outcome) = server_side_copy(engine, lock, request, source_head, prior).await? {
             return Ok(outcome);
         }
     }
@@ -299,7 +306,7 @@ async fn copy_object_once(
     if transfer_plan::should_stream_copy(source_head.file_size, label, threshold)
         && engine.destination_supports_native_multipart(request.destination_bucket)
     {
-        return stream_copy_passthrough(engine, request, source_head).await;
+        return stream_copy_passthrough(engine, lock, request, source_head).await;
     }
 
     // Delta fast path: when the source is delta-stored, try shipping the
@@ -312,7 +319,7 @@ async fn copy_object_once(
     ) {
         let fields = DestinationFields::of_transfer(&request, source_head);
         if let Some(shipped) =
-            delta_passthrough_copy(engine, request, source_head, prior, fields).await?
+            delta_passthrough_copy(engine, lock, request, source_head, prior, fields).await?
         {
             return Ok(shipped.outcome);
         }
@@ -324,7 +331,9 @@ async fn copy_object_once(
     // deltas; this closes it now that the store side streams (Phase 4).
     let source_size = source_head.file_size;
     if source_size > engine.spool_threshold() {
-        if let Some(outcome) = spooled_copy(engine, &request, source_head, source_size).await? {
+        if let Some(outcome) =
+            spooled_copy(engine, lock, &request, source_head, source_size).await?
+        {
             return Ok(outcome);
         }
     }
@@ -370,6 +379,7 @@ async fn copy_object_once(
 
     let stored = engine
         .store_known_prior(
+            lock,
             request.destination_bucket,
             request.destination_key,
             // The retrieved Vec moves into the body: no copy.
@@ -424,6 +434,7 @@ type PartUploadResult = (UploadedPart, Option<(i32, Bytes)>);
 /// ranged GET. Any unrecoverable error aborts the multipart upload.
 async fn stream_copy_passthrough(
     engine: &Arc<DynEngine>,
+    lock: &crate::deltaglider::ObjectWriteGuard,
     request: ObjectTransferRequest<'_>,
     source_head: &crate::types::FileMetadata,
 ) -> Result<ObjectTransferOutcome, CopyError> {
@@ -456,6 +467,7 @@ async fn stream_copy_passthrough(
     // create: a native S3 complete stores no metadata.
     let handle = engine
         .begin_passthrough_multipart(
+            lock,
             request.destination_bucket,
             request.destination_key,
             crate::deltaglider::MultipartObjectFacts {
@@ -582,7 +594,7 @@ async fn stream_copy_passthrough(
         }
     };
     let result = engine
-        .finish_passthrough_multipart(handle, parts, assembled)
+        .finish_passthrough_multipart(lock, handle, parts, assembled)
         .await
         .map_err(|e| CopyError::engine("multipart complete failed", e))?;
 
@@ -1367,6 +1379,7 @@ pub(crate) fn destination_metadata(
 /// provider without CopyObject); nothing was written.
 async fn server_side_copy(
     engine: &Arc<DynEngine>,
+    lock: &crate::deltaglider::ObjectWriteGuard,
     request: ObjectTransferRequest<'_>,
     source_head: &crate::types::FileMetadata,
     prior: Option<&crate::deltaglider::CounterPrior>,
@@ -1385,6 +1398,7 @@ async fn server_side_copy(
     };
     let copied = engine
         .copy_passthrough_within(
+            lock,
             (request.source_bucket, request.source_key),
             (request.destination_bucket, request.destination_key),
             source_head,
@@ -1420,9 +1434,10 @@ pub(crate) struct ShippedDelta {
 /// chose them; the copy gets a new created-at and no multipart ETag (S3
 /// CopyObject answers a single-part ETag). `Ok(None)`: the gate fell back,
 /// the caller copies through the store. The caller holds the object's
-/// write lock and ran the quota gate.
+/// write lock (`lock`) and ran the quota gate.
 pub(crate) async fn client_delta_copy(
     engine: &Arc<DynEngine>,
+    lock: &crate::deltaglider::ObjectWriteGuard,
     source: (&str, &str),
     destination: (&str, &str),
     source_head: &crate::types::FileMetadata,
@@ -1446,7 +1461,8 @@ pub(crate) async fn client_delta_copy(
         user_metadata,
         multipart_etag: None,
     };
-    let Some(shipped) = delta_passthrough_copy(engine, request, source_head, None, fields).await?
+    let Some(shipped) =
+        delta_passthrough_copy(engine, lock, request, source_head, None, fields).await?
     else {
         return Ok(None);
     };
@@ -1464,6 +1480,7 @@ pub(crate) async fn client_delta_copy(
 /// (gate sha-check, seed sha-assert, post-lock re-gate).
 async fn delta_passthrough_copy(
     engine: &Arc<DynEngine>,
+    lock: &crate::deltaglider::ObjectWriteGuard,
     request: ObjectTransferRequest<'_>,
     source_head: &crate::types::FileMetadata,
     known_prior: Option<&crate::deltaglider::CounterPrior>,
@@ -1642,6 +1659,7 @@ async fn delta_passthrough_copy(
             }
             engine2
                 .put_delta_raw(
+                    lock,
                     &dest_bucket,
                     &dest_prefix2,
                     &dest_filename2,
@@ -1680,7 +1698,7 @@ async fn delta_passthrough_copy(
         counter_meta.multipart_etag.as_deref(),
     )?;
     if accepted == VerifyAccepted::StrippedDelta {
-        heal_stripped_dest_delta(engine, request, &counter_meta, src_delta_size).await;
+        heal_stripped_dest_delta(engine, lock, request, &counter_meta, src_delta_size).await;
     }
 
     let bytes_egress_saved = source_head.file_size.saturating_sub(src_delta_size);
@@ -1719,6 +1737,7 @@ async fn delta_passthrough_copy(
 /// the object is present and byte-correct; the next run retries.
 async fn heal_stripped_dest_delta(
     engine: &Arc<DynEngine>,
+    lock: &crate::deltaglider::ObjectWriteGuard,
     request: ObjectTransferRequest<'_>,
     meta: &crate::types::FileMetadata,
     expected_delta_size: u64,
@@ -1751,6 +1770,7 @@ async fn heal_stripped_dest_delta(
             };
             match engine
                 .put_delta_raw(
+                    lock,
                     bucket,
                     &dest_key.prefix,
                     &dest_key.filename,
@@ -1776,6 +1796,7 @@ async fn heal_stripped_dest_delta(
 /// to the buffered path when the source can't be streamed to a spool here.
 async fn spooled_copy(
     engine: &Arc<DynEngine>,
+    lock: &crate::deltaglider::ObjectWriteGuard,
     request: &ObjectTransferRequest<'_>,
     source_head: &crate::types::FileMetadata,
     source_size: u64,
@@ -1843,6 +1864,7 @@ async fn spooled_copy(
 
     let stored = engine
         .store_spooled_delta(
+            lock,
             request.destination_bucket,
             request.destination_key,
             &spool,
@@ -1927,7 +1949,10 @@ mod tests {
             upload_concurrency: None,
             keep_created_at: false,
         };
-        match spooled_copy(&engine, &request, &stale, stale.file_size).await {
+        let lock = engine
+            .lock_object_write(request.destination_bucket, request.destination_key)
+            .await;
+        match spooled_copy(&engine, &lock, &request, &stale, stale.file_size).await {
             Err(e) => assert_eq!(
                 e.class,
                 CopyClass::SourceChanged,
@@ -2070,8 +2095,12 @@ mod tests {
             upload_concurrency: None,
             keep_created_at: false,
         };
+        let lock = engine
+            .lock_object_write(request.destination_bucket, request.destination_key)
+            .await;
         let result = delta_passthrough_copy(
             &engine,
+            &lock,
             request,
             &stale_head,
             None,
@@ -2101,6 +2130,7 @@ mod tests {
         let fresh_head = engine.head("src", "p/b.zip").await.unwrap();
         let shipped = delta_passthrough_copy(
             &engine,
+            &lock,
             request,
             &fresh_head,
             None,
@@ -2188,6 +2218,9 @@ mod tests {
         };
         let _ = delta_passthrough_copy(
             &engine,
+            &engine
+                .lock_object_write(request.destination_bucket, request.destination_key)
+                .await,
             request,
             &head,
             None,
@@ -3213,7 +3246,11 @@ mod multipart_abort_tests {
         let (engine, spy) = spy_engine(spy);
         let meta = spy.src_meta.clone();
 
-        let res = stream_copy_passthrough(&engine, copy_request(), &meta).await;
+        let req = copy_request();
+        let lock = engine
+            .lock_object_write(req.destination_bucket, req.destination_key)
+            .await;
+        let res = stream_copy_passthrough(&engine, &lock, req, &meta).await;
         assert!(res.is_err(), "part failure must surface");
         assert_eq!(
             spy.aborts.lock().unwrap().as_slice(),
@@ -3229,7 +3266,11 @@ mod multipart_abort_tests {
         let (engine, spy) = spy_engine(spy);
         let meta = spy.src_meta.clone();
 
-        let res = stream_copy_passthrough(&engine, copy_request(), &meta).await;
+        let req = copy_request();
+        let lock = engine
+            .lock_object_write(req.destination_bucket, req.destination_key)
+            .await;
+        let res = stream_copy_passthrough(&engine, &lock, req, &meta).await;
         assert!(res.is_err(), "complete failure must surface");
         assert_eq!(
             spy.aborts.lock().unwrap().as_slice(),
@@ -3247,7 +3288,11 @@ mod multipart_abort_tests {
 
         let eng = engine.clone();
         let task = tokio::spawn(async move {
-            let _ = stream_copy_passthrough(&eng, copy_request(), &meta).await;
+            let req = copy_request();
+            let lock = eng
+                .lock_object_write(req.destination_bucket, req.destination_key)
+                .await;
+            let _ = stream_copy_passthrough(&eng, &lock, req, &meta).await;
         });
         // Let the copy reach the (stalled) upload_part, then kill it — the
         // abort guard's Drop must abort even while part-task Arcs unwind.

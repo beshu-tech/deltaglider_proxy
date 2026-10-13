@@ -278,6 +278,7 @@ async fn a_client_copy_follows_the_client_metadata_rules() {
     .into();
     let stored = engine
         .store_with_multipart_etag(
+            &engine.lock_object_write("b", "run/mp.zip").await,
             "b",
             "run/mp.zip",
             &data,

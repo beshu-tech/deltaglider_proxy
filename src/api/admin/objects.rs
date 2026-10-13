@@ -652,9 +652,10 @@ async fn copy_one(
     )
     .await
     .map_err(|e| e.to_string())?;
-    // The destination's object write lock, as every client write takes it,
-    // so the copy never lands inside a conditional PUT's check-then-store.
-    let _write_lock = engine.lock_object_write(dst_bucket, dst_key).await;
+    // The transfer takes the destination's object write lock itself (as
+    // every write does), so the copy never lands inside a conditional
+    // PUT's check-then-store. Taking it here too would wait forever: the
+    // lock is not re-entrant.
     let outcome = crate::transfer::copy_object_with_retries(
         engine,
         crate::transfer::ObjectTransferRequest {

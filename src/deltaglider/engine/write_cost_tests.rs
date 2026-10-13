@@ -186,10 +186,12 @@ async fn a_raw_delta_write_drops_the_other_form_through_the_helper() {
     let meta = engine.delta_meta("b", "run", filename).await.unwrap();
     for (prior, deletes) in [(CounterPrior::Absent, 0), (CounterPrior::Unknown, 1)] {
         fake.clear();
+        let lock = engine.lock_object_write("b", "run/copy.zip").await;
         let res: Result<(), EngineError> = engine
             .with_dest_prefix_lock("b", "run", || async {
                 Ok(engine
                     .put_delta_raw(
+                        &lock,
                         "b",
                         "run",
                         "copy.zip",
@@ -258,6 +260,7 @@ async fn a_form_a_peer_adds_after_the_read_is_dropped_by_the_next_write() {
     fake.clear();
     engine
         .store_inner(
+            &engine.lock_object_write("b", key).await,
             "b",
             key,
             &Bytes::from(ours.clone()),

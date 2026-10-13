@@ -2,6 +2,7 @@
 
 //! Store pipeline — delta encoding, passthrough, and baseline management.
 
+use super::conditional::ObjectWriteGuard;
 use super::usage::CounterPrior;
 use super::*;
 use crate::deltaglider::spool::SpoolBudget;
@@ -218,6 +219,9 @@ impl PutBody<'_> {
 
 /// One delta-eligible PUT through the store pipeline.
 struct PutObject<'a> {
+    /// The write lock of the key: the proof that no other write of this
+    /// process writes it in between.
+    lock: &'a ObjectWriteGuard,
     bucket: &'a str,
     key: &'a str,
     obj_key: &'a ObjectKey,
@@ -240,6 +244,7 @@ struct PutObject<'a> {
 impl PutObject<'_> {
     fn passthrough_write(&self) -> PassthroughWrite<'_> {
         PassthroughWrite {
+            lock: self.lock,
             bucket: self.bucket,
             key: self.key,
             deltaspace_id: self.deltaspace_id,
@@ -295,6 +300,7 @@ enum PassthroughSource<'a> {
 
 /// One passthrough write (`write_passthrough_locked`).
 struct PassthroughWrite<'a> {
+    lock: &'a ObjectWriteGuard,
     bucket: &'a str,
     key: &'a str,
     deltaspace_id: &'a str,
@@ -345,7 +351,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // The counter is recorded where the object commits (`record_commit`).
         // One copy: the slice API. The client write passes its `Bytes`.
         let body = Bytes::copy_from_slice(data);
+        // The one store that takes the object write lock itself: a caller
+        // that holds it calls a method that asks for the guard.
+        let lock = self.lock_object_write(bucket, key).await;
         self.store_inner(
+            &lock,
             bucket,
             key,
             &body,
@@ -361,10 +371,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Multipart-aware variant of [`Self::store`]. The `multipart_etag` is
     /// persisted alongside the object so HEAD/GET/LIST return it verbatim
     /// (H1 correctness fix). All other semantics are identical.
-    #[instrument(skip(self, data, user_metadata, multipart_etag))]
+    #[instrument(skip(self, lock, data, user_metadata, multipart_etag))]
     #[allow(clippy::too_many_arguments)]
     pub async fn store_with_multipart_etag(
         &self,
+        lock: &ObjectWriteGuard,
         bucket: &str,
         key: &str,
         data: &[u8],
@@ -375,6 +386,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // One copy: the slice API.
         let body = Bytes::copy_from_slice(data);
         self.store_inner(
+            lock,
             bucket,
             key,
             &body,
@@ -395,10 +407,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// else writes in between may pass one: a conditional write under the
     /// object's write lock, or a maintenance job behind its bucket's write
     /// gate.
-    #[instrument(skip(self, body, user_metadata, multipart_etag, known_prior))]
+    #[instrument(skip(self, lock, body, user_metadata, multipart_etag, known_prior))]
     #[allow(clippy::too_many_arguments)]
     pub async fn store_known_prior(
         &self,
+        lock: &ObjectWriteGuard,
         bucket: &str,
         key: &str,
         body: &Bytes,
@@ -408,6 +421,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         known_prior: Option<CounterPrior>,
     ) -> Result<StoreResult, EngineError> {
         self.store_inner(
+            lock,
             bucket,
             key,
             body,
@@ -426,6 +440,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// still shows it as a zero-byte `photos/`.
     async fn store_directory_marker(
         &self,
+        lock: &ObjectWriteGuard,
         bucket: &str,
         key: &str,
         known_prior: Option<CounterPrior>,
@@ -437,6 +452,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .validate_ingest()
             .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
         let deltaspace_id = obj_key.deltaspace_id();
+        lock.covers(bucket, &deltaspace_id, &obj_key.filename)?;
         let prior = self.prior_or_read(bucket, key, known_prior).await;
         let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
         self.storage
@@ -454,6 +470,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn store_inner(
         &self,
+        lock: &ObjectWriteGuard,
         bucket: &str,
         key: &str,
         data: &Bytes,
@@ -476,9 +493,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
 
         if data.is_empty() && ObjectKey::parse(bucket, key).is_directory_marker() {
-            return self.store_directory_marker(bucket, key, known_prior).await;
+            return self
+                .store_directory_marker(lock, bucket, key, known_prior)
+                .await;
         }
-        let (obj_key, deltaspace_id) = self.validated_key_ingest(bucket, key)?;
+        let (obj_key, deltaspace_id) = self.validated_key_ingest(lock, bucket, key)?;
 
         // Usage-counter accounting: capture the PRIOR object metadata (S3 PUT is
         // an upsert) so the counter nets an overwrite to +0 instead of double-
@@ -498,6 +517,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         );
 
         let put = PutObject {
+            lock,
             bucket,
             key,
             obj_key: &obj_key,
@@ -597,6 +617,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     #[allow(clippy::too_many_arguments)]
     pub async fn store_spooled_delta(
         &self,
+        lock: &ObjectWriteGuard,
         bucket: &str,
         key: &str,
         body: &crate::deltaglider::spool::Spool,
@@ -606,6 +627,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         multipart_etag: Option<String>,
     ) -> Result<StoreResult, EngineError> {
         self.store_spooled_delta_inner(
+            lock,
             bucket,
             key,
             body,
@@ -625,6 +647,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn store_spooled_delta_inner(
         &self,
+        lock: &ObjectWriteGuard,
         bucket: &str,
         key: &str,
         body: &crate::deltaglider::spool::Spool,
@@ -636,7 +659,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         known_hashes: Option<BodyHashes>,
     ) -> Result<StoreResult, EngineError> {
         self.metadata_cache.invalidate(bucket, key);
-        let (obj_key, deltaspace_id) = self.validated_key_ingest(bucket, key)?;
+        let (obj_key, deltaspace_id) = self.validated_key_ingest(lock, bucket, key)?;
         // Size ceiling depends on the STRATEGY: a delta-eligible object is
         // bounded by max_object_size (it will be xdelta3-encoded in RAM); a
         // passthrough object streams from the spool and is bounded by the far
@@ -687,6 +710,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         if !self.tries_delta(bucket, &obj_key, &user_metadata) {
             let result = self
                 .store_passthrough_file_inner(
+                    lock,
                     bucket,
                     key,
                     body.path(),
@@ -708,6 +732,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         // (3) The pipeline the buffered PUT uses, reading the body spool.
         let put = PutObject {
+            lock,
             bucket,
             key,
             obj_key: &obj_key,
@@ -1241,6 +1266,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 .inc_by(put.size.saturating_sub(delta.len() as u64));
         });
         self.drop_other_form(
+            put.lock,
             put.bucket,
             put.deltaspace_id,
             &put.obj_key.filename,
@@ -1264,6 +1290,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         reserved: Option<&crate::deltaglider::spool::SpoolReservation>,
     ) -> Result<StoreResult, EngineError> {
         let PassthroughWrite {
+            lock,
             bucket,
             key,
             deltaspace_id,
@@ -1294,6 +1321,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // Committed: count it before the next await.
         self.record_commit(bucket, prior, &metadata);
         self.drop_other_form(
+            lock,
             bucket,
             deltaspace_id,
             &filename,
@@ -1419,9 +1447,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// Store a non-delta-eligible object from pre-split chunks without assembling
     /// into a contiguous buffer. Computes SHA256 and MD5 incrementally.
-    #[instrument(skip(self, chunks, user_metadata))]
+    #[instrument(skip(self, lock, chunks, user_metadata))]
+    #[allow(clippy::too_many_arguments)]
     pub async fn store_passthrough_chunked(
         &self,
+        lock: &ObjectWriteGuard,
         bucket: &str,
         key: &str,
         chunks: &[Bytes],
@@ -1432,6 +1462,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let prior = self.prior_for_counter(bucket, key).await;
         let result = self
             .store_passthrough_chunked_inner(
+                lock,
                 bucket,
                 key,
                 chunks,
@@ -1448,10 +1479,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Multipart-aware variant of [`Self::store_passthrough_chunked`]. The
     /// `multipart_etag` is persisted on metadata so HEAD/GET/LIST return
     /// it verbatim (H1 correctness fix).
-    #[instrument(skip(self, chunks, user_metadata, multipart_etag))]
+    #[instrument(skip(self, lock, chunks, user_metadata, multipart_etag))]
     #[allow(clippy::too_many_arguments)]
     pub async fn store_passthrough_chunked_with_multipart_etag(
         &self,
+        lock: &ObjectWriteGuard,
         bucket: &str,
         key: &str,
         chunks: &[Bytes],
@@ -1463,6 +1495,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let prior = self.prior_for_counter(bucket, key).await;
         let result = self
             .store_passthrough_chunked_inner(
+                lock,
                 bucket,
                 key,
                 chunks,
@@ -1497,6 +1530,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     #[allow(clippy::too_many_arguments)]
     async fn store_passthrough_chunked_inner(
         &self,
+        lock: &ObjectWriteGuard,
         bucket: &str,
         key: &str,
         chunks: &[Bytes],
@@ -1511,7 +1545,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // Invalidate stale metadata on overwrite
         self.metadata_cache.invalidate(bucket, key);
 
-        let (obj_key, deltaspace_id) = self.validated_key_ingest(bucket, key)?;
+        let (obj_key, deltaspace_id) = self.validated_key_ingest(lock, bucket, key)?;
 
         // Compute SHA256 + MD5 incrementally across chunks
         let mut sha256_hasher = Sha256::new();
@@ -1550,6 +1584,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // Committed: count it before the next await.
         self.record_commit(bucket, prior, &metadata);
         self.drop_other_form(
+            lock,
             bucket,
             &deltaspace_id,
             &obj_key.filename,
@@ -1566,10 +1601,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// Store a passthrough object from relayed multipart part files without
     /// materializing an assembled temporary file.
-    #[instrument(skip(self, part_paths, user_metadata, multipart_etag))]
+    #[instrument(skip(self, lock, part_paths, user_metadata, multipart_etag))]
     #[allow(clippy::too_many_arguments)]
     pub async fn store_passthrough_relayed_parts_with_multipart_etag(
         &self,
+        lock: &ObjectWriteGuard,
         bucket: &str,
         key: &str,
         part_paths: &[PathBuf],
@@ -1581,6 +1617,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let prior = self.prior_for_counter(bucket, key).await;
         let result = self
             .store_passthrough_relayed_parts_inner(
+                lock,
                 bucket,
                 key,
                 part_paths,
@@ -1598,6 +1635,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     #[allow(clippy::too_many_arguments)]
     async fn store_passthrough_relayed_parts_inner(
         &self,
+        lock: &ObjectWriteGuard,
         bucket: &str,
         key: &str,
         part_paths: &[PathBuf],
@@ -1610,7 +1648,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.ensure_within_passthrough_ceiling(total_size)?;
 
         self.metadata_cache.invalidate(bucket, key);
-        let (obj_key, deltaspace_id) = self.validated_key_ingest(bucket, key)?;
+        let (obj_key, deltaspace_id) = self.validated_key_ingest(lock, bucket, key)?;
 
         let mut sha256_hasher = Sha256::new();
         let mut md5_hasher = Md5::new();
@@ -1669,6 +1707,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // Committed: count it before the next await.
         self.record_commit(bucket, prior, &metadata);
         self.drop_other_form(
+            lock,
             bucket,
             &deltaspace_id,
             &obj_key.filename,
@@ -1685,10 +1724,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// Store a passthrough object from a local file path, computing hashes
     /// incrementally to avoid reconstructing large multipart payloads in memory.
-    #[instrument(skip(self, user_metadata, multipart_etag))]
+    #[instrument(skip(self, lock, user_metadata, multipart_etag))]
     #[allow(clippy::too_many_arguments)]
     pub async fn store_passthrough_file_with_multipart_etag(
         &self,
+        lock: &ObjectWriteGuard,
         bucket: &str,
         key: &str,
         source_path: &Path,
@@ -1700,6 +1740,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let prior = self.prior_for_counter(bucket, key).await;
         let result = self
             .store_passthrough_file_inner(
+                lock,
                 bucket,
                 key,
                 source_path,
@@ -1718,6 +1759,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     #[allow(clippy::too_many_arguments)]
     async fn store_passthrough_file_inner(
         &self,
+        lock: &ObjectWriteGuard,
         bucket: &str,
         key: &str,
         source_path: &Path,
@@ -1732,7 +1774,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.ensure_within_passthrough_ceiling(total_size)?;
 
         self.metadata_cache.invalidate(bucket, key);
-        let (obj_key, deltaspace_id) = self.validated_key_ingest(bucket, key)?;
+        let (obj_key, deltaspace_id) = self.validated_key_ingest(lock, bucket, key)?;
 
         let (sha256, md5) = match &held {
             // storage-9: the streaming PUT hashed its body already.
@@ -1759,6 +1801,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .await?;
         let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
         let write = PassthroughWrite {
+            lock,
             bucket,
             key,
             deltaspace_id: &deltaspace_id,
@@ -1789,6 +1832,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// [`Self::finish_passthrough_multipart`] (or aborts).
     pub async fn begin_passthrough_multipart(
         &self,
+        lock: &ObjectWriteGuard,
         bucket: &str,
         key: &str,
         facts: MultipartObjectFacts,
@@ -1797,7 +1841,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.ensure_within_passthrough_ceiling(total_size)?;
 
         self.metadata_cache.invalidate(bucket, key);
-        let (obj_key, deltaspace_id) = self.validated_key_ingest(bucket, key)?;
+        let (obj_key, deltaspace_id) = self.validated_key_ingest(lock, bucket, key)?;
         let guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
 
         // The FINAL metadata, hashes included: a native S3 backend stores
@@ -1862,6 +1906,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// for native backends.
     pub async fn finish_passthrough_multipart(
         &self,
+        lock: &ObjectWriteGuard,
         handle: PassthroughMultipartHandle,
         mut parts: Vec<UploadedPart>,
         assembled: Vec<Bytes>,
@@ -1896,6 +1941,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // Committed: count it before the next await.
         self.record_commit(&handle.bucket, &prior, &metadata);
         self.drop_other_form(
+            lock,
             &handle.bucket,
             &handle.deltaspace_id,
             &handle.filename,
@@ -1949,14 +1995,24 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ///
     /// THE way an engine write drops the other form (source guard
     /// `writes_drop_the_other_form_through_one_helper`).
+    ///
+    /// `lock`: the write lock of the key. Without it, a passthrough write
+    /// and a delta write of one key could each drop the form that the
+    /// other just wrote: both answer 200 and the object is gone.
     pub(super) async fn drop_other_form(
         &self,
+        lock: &ObjectWriteGuard,
         bucket: &str,
         deltaspace_id: &str,
         filename: &str,
         written: ObjectVariant,
         prior: &CounterPrior,
     ) {
+        if let Err(e) = lock.covers(bucket, deltaspace_id, filename) {
+            // Every caller checked its guard at its entry: unreachable.
+            warn!("the other form of {bucket}/{deltaspace_id}/{filename} stays: {e}");
+            return;
+        }
         let other_form = match written {
             ObjectVariant::Delta => ObjectVariant::Passthrough,
             ObjectVariant::Passthrough => ObjectVariant::Delta,
@@ -2018,13 +2074,17 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         )
     }
 
+    /// `lock`: the write lock of `filename`'s key: the check that no
+    /// object holds the name and the write of the delta are one step.
     pub(super) async fn migrate_legacy_reference_object_if_needed(
         &self,
+        lock: &ObjectWriteGuard,
         bucket: &str,
         deltaspace_id: &str,
         filename: &str,
         xnode: &super::ReferenceLockGuard,
     ) -> Result<bool, EngineError> {
+        lock.covers(bucket, deltaspace_id, filename)?;
         let Some(mut ref_meta) = self
             .reference_metadata_if_present(bucket, deltaspace_id)
             .await?
@@ -2136,6 +2196,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
             // This is a legacy reference — migrate it
             let filename = ref_meta.original_name.clone();
+            // Lock order: the object's write lock, then the deltaspace.
+            let object_lock = self
+                .lock_object_write(bucket, &ObjectKey::join(ds, &filename))
+                .await;
             let _guard = self.acquire_prefix_lock(bucket, ds).await;
             let xnode = match self.acquire_reference_lock(bucket, ds).await {
                 Ok(g) => g,
@@ -2146,7 +2210,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 }
             };
             match self
-                .migrate_legacy_reference_object_if_needed(bucket, ds, &filename, &xnode)
+                .migrate_legacy_reference_object_if_needed(
+                    &object_lock,
+                    bucket,
+                    ds,
+                    &filename,
+                    &xnode,
+                )
                 .await
             {
                 Ok(true) => {
@@ -2241,6 +2311,7 @@ mod counter_tests {
         tokio::fs::write(spool.path(), data).await.unwrap();
         h.engine
             .store_spooled_delta(
+                &h.engine.lock_object_write(BUCKET, key).await,
                 BUCKET,
                 key,
                 &spool,
@@ -2261,6 +2332,7 @@ mod counter_tests {
         tokio::fs::write(&paths[1], b).await.unwrap();
         h.engine
             .store_passthrough_relayed_parts_with_multipart_etag(
+                &h.engine.lock_object_write(BUCKET, key).await,
                 BUCKET,
                 key,
                 &paths,
@@ -2278,6 +2350,7 @@ mod counter_tests {
         tokio::fs::write(f.path(), data).await.unwrap();
         h.engine
             .store_passthrough_file_with_multipart_etag(
+                &h.engine.lock_object_write(BUCKET, key).await,
                 BUCKET,
                 key,
                 f.path(),
@@ -2294,6 +2367,7 @@ mod counter_tests {
         let chunks: Vec<Bytes> = data.chunks(64 * 1024).map(Bytes::copy_from_slice).collect();
         h.engine
             .store_passthrough_chunked_with_multipart_etag(
+                &h.engine.lock_object_write(BUCKET, key).await,
                 BUCKET,
                 key,
                 &chunks,
@@ -2401,6 +2475,7 @@ mod no_delta_hint_tests {
         let r = h
             .engine
             .store_spooled_delta(
+                &h.engine.lock_object_write(BUCKET, "rel/v3.zip").await,
                 BUCKET,
                 "rel/v3.zip",
                 &spool,
@@ -2535,7 +2610,9 @@ mod spool_budget_tests {
         for (key, data) in [("rel/a.zip", &v1), ("rel/b.zip", &v2)] {
             let body = engine.spool_acquire(data.len() as u64).await.unwrap();
             tokio::fs::write(body.path(), data).await.unwrap();
+            let lock = engine.lock_object_write("b", key).await;
             let put = engine.store_spooled_delta(
+                &lock,
                 "b",
                 key,
                 &body,
@@ -2708,7 +2785,12 @@ mod review2_tests {
         let body_b = engine.spool_acquire(v.len() as u64).await.unwrap();
         tokio::fs::write(body_a.path(), &v).await.unwrap();
         tokio::fs::write(body_b.path(), &v).await.unwrap();
+        let (lock_a, lock_b) = (
+            engine.lock_object_write("b", "x/a.zip").await,
+            engine.lock_object_write("b", "y/b.zip").await,
+        );
         let a = engine.store_spooled_delta(
+            &lock_a,
             "b",
             "x/a.zip",
             &body_a,
@@ -2718,6 +2800,7 @@ mod review2_tests {
             None,
         );
         let b = engine.store_spooled_delta(
+            &lock_b,
             "b",
             "y/b.zip",
             &body_b,
@@ -2776,16 +2859,12 @@ mod review2_tests {
         tokio::fs::write(body_a.path(), &v).await.unwrap();
         tokio::fs::write(body_b.path(), &v).await.unwrap();
         {
-            let put = |key: &'static str, body| {
-                engine.store_spooled_delta(
-                    "b",
-                    key,
-                    body,
-                    v.len() as u64,
-                    None,
-                    HashMap::new(),
-                    None,
-                )
+            let (engine, size) = (&engine, v.len() as u64);
+            let put = move |key: &'static str, body| async move {
+                let lock = engine.lock_object_write("b", key).await;
+                engine
+                    .store_spooled_delta(&lock, "b", key, body, size, None, HashMap::new(), None)
+                    .await
             };
             let (ra, rb) = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
@@ -2806,6 +2885,7 @@ mod review2_tests {
         tokio::fs::write(body.path(), &v).await.unwrap();
         engine
             .store_spooled_delta(
+                &engine.lock_object_write("b", "x/a.png").await,
                 "b",
                 "x/a.png",
                 &body,
@@ -2884,16 +2964,21 @@ mod review2_tests {
         let part = tmp.path().join("part1");
         let v = vec![5u8; 1024 * 1024];
         tokio::fs::write(&part, &v).await.unwrap();
-        let store = || {
-            engine.store_passthrough_relayed_parts_with_multipart_etag(
-                "b",
-                "x/a.png",
-                std::slice::from_ref(&part),
-                v.len() as u64,
-                None,
-                HashMap::new(),
-                "\"0123456789abcdef0123456789abcdef-1\"".to_string(),
-            )
+        let (engine_ref, part_ref, size) = (&engine, &part, v.len() as u64);
+        let store = move || async move {
+            let lock = engine_ref.lock_object_write("b", "x/a.png").await;
+            engine_ref
+                .store_passthrough_relayed_parts_with_multipart_etag(
+                    &lock,
+                    "b",
+                    "x/a.png",
+                    std::slice::from_ref(part_ref),
+                    size,
+                    None,
+                    HashMap::new(),
+                    "\"0123456789abcdef0123456789abcdef-1\"".to_string(),
+                )
+                .await
         };
         let full = engine.spool_acquire(4 * 1024 * 1024).await.unwrap();
         let r = tokio::time::timeout(std::time::Duration::from_secs(5), store())
@@ -3004,6 +3089,7 @@ mod other_form_tests {
         tokio::fs::write(spool.path(), &v2).await.unwrap();
         engine
             .store_spooled_delta(
+                &engine.lock_object_write("b", "img/s.jpg").await,
                 "b",
                 "img/s.jpg",
                 &spool,
@@ -3017,6 +3103,7 @@ mod other_form_tests {
         let chunks: Vec<Bytes> = v1.chunks(64 * 1024).map(Bytes::copy_from_slice).collect();
         engine
             .store_passthrough_chunked(
+                &engine.lock_object_write("b", "img/c.jpg").await,
                 "b",
                 "img/c.jpg",
                 &chunks,
@@ -3030,6 +3117,7 @@ mod other_form_tests {
         tokio::fs::write(f.path(), &v1).await.unwrap();
         engine
             .store_passthrough_file_with_multipart_etag(
+                &engine.lock_object_write("b", "img/f.jpg").await,
                 "b",
                 "img/f.jpg",
                 f.path(),

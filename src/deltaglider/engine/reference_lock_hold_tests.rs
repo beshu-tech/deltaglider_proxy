@@ -227,6 +227,7 @@ async fn fast_path_seed_holds_the_lock() {
     );
     let err = engine
         .put_delta_raw(
+            &engine.lock_object_write("releases", "v1/app.zip").await,
             "releases",
             "v1",
             "app.zip",

@@ -213,9 +213,9 @@ pub(super) async fn complete_multipart_upload(
             // the maintenance drain (`drain_inflight_writes`) must wait for it.
             let gate_write = svc.state.maintenance_gate.begin_write(&input.bucket);
             let handle = tokio::spawn(async move {
-                let _write_lock = write_lock;
                 let _gate_write = gate_write;
                 let result = run_multipart_completion(
+                    &write_lock,
                     state,
                     bucket,
                     key,
@@ -328,7 +328,9 @@ pub(super) async fn await_completion_outcome(
 /// The CompleteMultipartUpload store pipeline. Runs on a DETACHED tokio task so a
 /// client disconnect cannot cancel a half-done store (which used to roll back the
 /// whole upload and poison the SDK's retry). Owns finish/rollback + event emission.
+/// `write_lock`: the object's write lock, held until the store ends.
 pub(super) async fn run_multipart_completion(
+    write_lock: &crate::deltaglider::ObjectWriteGuard,
     state: Arc<AppState>,
     bucket: String,
     key: String,
@@ -352,6 +354,7 @@ pub(super) async fn run_multipart_completion(
             crate::multipart::PassthroughPayload::Chunks(parts) => {
                 engine
                     .store_passthrough_chunked_with_multipart_etag(
+                        write_lock,
                         &bucket,
                         &key,
                         &parts,
@@ -369,6 +372,7 @@ pub(super) async fn run_multipart_completion(
                 let _store_guard = state.multipart.store_guard(&upload_id);
                 engine
                     .store_passthrough_relayed_parts_with_multipart_etag(
+                        write_lock,
                         &bucket,
                         &key,
                         &paths,
@@ -394,6 +398,7 @@ pub(super) async fn run_multipart_completion(
         let etag = completed.etag.clone();
         match engine
             .store_with_multipart_etag(
+                write_lock,
                 &bucket,
                 &key,
                 &completed.data,

@@ -130,11 +130,12 @@ pub(crate) async fn store_client_write_spooled(
     check_quota_for_write(state, write.bucket, write.key, write.size).await?;
     let engine = state.engine.load();
     let result = {
-        let _guard = engine
+        let guard = engine
             .lock_and_check(write.bucket, write.key, write.precondition)
             .await?;
         engine
             .store_spooled_delta(
+                &guard,
                 write.bucket,
                 write.key,
                 write.spool,
@@ -178,11 +179,12 @@ pub(crate) async fn store_client_delta_copy(
     check_quota_for_write(state, copy.bucket, copy.key, size).await?;
     let engine = state.engine.load_full();
     let result = {
-        let _guard = engine
+        let guard = engine
             .lock_and_check(copy.bucket, copy.key, copy.precondition)
             .await?;
         crate::transfer::client_delta_copy(
             &engine,
+            &guard,
             copy.source,
             (copy.bucket, copy.key),
             copy.source_head,
@@ -227,11 +229,12 @@ pub(crate) async fn store_client_server_copy(
     check_quota_for_write(state, copy.bucket, copy.key, size).await?;
     let engine = state.engine.load_full();
     let result = {
-        let _guard = engine
+        let guard = engine
             .lock_and_check(copy.bucket, copy.key, copy.precondition)
             .await?;
         engine
             .copy_passthrough_within(
+                &guard,
                 copy.source,
                 (copy.bucket, copy.key),
                 copy.source_head,

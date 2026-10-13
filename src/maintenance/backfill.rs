@@ -231,6 +231,10 @@ impl super::worker::ObjectVisitor for Backfill<'_> {
     ) -> super::worker::Visit {
         use super::worker::Visit;
         let (prefix, filename) = split_key(key);
+        // The object's write lock, as every write of an object takes it:
+        // the read, the hash and the metadata rewrite are one step for
+        // this key on this process.
+        let _lock = engine.lock_object_write(self.bucket, key).await;
         let (meta, basis) = match self.read(engine, key, listed).await {
             Ok(read) => read,
             Err(visit) => return visit,

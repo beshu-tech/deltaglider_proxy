@@ -3,10 +3,24 @@
 //! Conditional client writes: the per-object write lock and the S3 write
 //! preconditions (`If-Match` / `If-None-Match`).
 //!
-//! Every client write of one object (PutObject, CompleteMultipartUpload,
-//! CopyObject, form POST, admin bulk copy) takes the same per-object lock,
-//! so a conditional check and the store that follows it are one step for
-//! that key on this process. Other instances are not covered.
+//! Every write of one object takes the same per-object lock: the client
+//! writes (PutObject, CompleteMultipartUpload, CopyObject, form POST), the
+//! admin bulk copy, every engine-routed copy (replication, lifecycle,
+//! maintenance), the delete, and the legacy-reference migration. So a
+//! conditional check and the store that follows it are one step for that
+//! key on this process, and two writes of one key never interleave their
+//! stored forms. Other instances are not covered.
+//!
+//! The store methods TAKE the guard ([`ObjectWriteGuard`]) as a parameter:
+//! only [`DeltaGliderEngine::lock_object_write`] makes one, so no write path
+//! can skip the lock. [`DeltaGliderEngine::store`] (and the delete) take the
+//! lock themselves; a caller that holds the guard must not call them for
+//! the same key (the lock is not re-entrant; source guard
+//! `a_lock_holder_never_calls_a_self_locking_writer`).
+//!
+//! Lock order, outermost first: the object write lock, then the
+//! per-deltaspace prefix lock, then the cross-instance reference lock. A
+//! holder of the prefix lock never takes an object write lock.
 
 use super::*;
 use crate::storage::StorageBackend;
@@ -92,15 +106,41 @@ impl From<ConditionalError> for crate::api::S3Error {
     }
 }
 
-/// Held for one client write of one object; see [`DeltaGliderEngine::lock_object_write`].
+/// Held for one write of one object; see [`DeltaGliderEngine::lock_object_write`].
+/// The proof that a store method asks for: its fields are private, so only
+/// the lock makes one.
 pub struct ObjectWriteGuard {
     _guard: tokio::sync::OwnedMutexGuard<()>,
+    /// The object this guard locks, as the engine parses its key.
+    object: ObjectKey,
     /// The object as the precondition check read it under this lock
     /// (`Some(None)`: absent). `None`: no precondition, nothing read.
     checked: Option<Option<(FileMetadata, super::metadata::StoredForms)>>,
 }
 
 impl ObjectWriteGuard {
+    /// `Ok` when this guard locks the object `deltaspace_id`/`filename` of
+    /// `bucket`. A store checks it before it writes, so a guard of one key
+    /// cannot stand in for another.
+    pub(super) fn covers(
+        &self,
+        bucket: &str,
+        deltaspace_id: &str,
+        filename: &str,
+    ) -> Result<(), EngineError> {
+        if self.object.bucket == bucket
+            && self.object.prefix == deltaspace_id
+            && self.object.filename == filename
+        {
+            return Ok(());
+        }
+        Err(EngineError::Storage(StorageError::Other(format!(
+            "the write of {bucket}/{deltaspace_id}/{filename} holds the write lock of {}/{}",
+            self.object.bucket,
+            self.object.full_key()
+        ))))
+    }
+
     /// What the key holds, for the store's usage counter, when the
     /// precondition check read it: no PUT of this process can change it
     /// while the lock is held, so the store needs no read of its own.
@@ -128,26 +168,34 @@ fn shared_object_write_locks() -> &'static ObjectWriteLocks {
 /// Pure: the write-lock key of an object. The engine trims leading `/`
 /// (`//a` and `a` are one object), so the lock must too, or two
 /// create-only PUTs through the two spellings both pass the check.
-fn object_write_lock_key(bucket: &str, key: &str) -> String {
-    format!("{bucket}/{}", ObjectKey::parse(bucket, key).full_key())
+/// `storage`: the storage identity of the bucket, so two alias names of one
+/// real bucket share the lock of a key (as they share its deltaspace lock).
+fn object_write_lock_key(storage: &str, key: &ObjectKey) -> String {
+    format!("{storage}\0{}", key.full_key())
 }
 
 impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// The per-object write lock (review C4). Always taken BEFORE the
     /// per-deltaspace prefix lock (the store takes that one). Idle entries
-    /// are pruned like the prefix locks.
+    /// are pruned like the prefix locks. Not re-entrant: a task that holds
+    /// the guard of a key and asks for it again waits forever.
     pub async fn lock_object_write(&self, bucket: &str, key: &str) -> ObjectWriteGuard {
         const CLEANUP_THRESHOLD: usize = 1024;
         let locks = shared_object_write_locks();
         if locks.len() > CLEANUP_THRESHOLD {
             locks.retain(|_, m| Arc::strong_count(m) > 1);
         }
+        let object = ObjectKey::parse(bucket, key);
         let mutex = locks
-            .entry(object_write_lock_key(bucket, key))
+            .entry(object_write_lock_key(
+                &self.storage.storage_identity(bucket),
+                &object,
+            ))
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         ObjectWriteGuard {
             _guard: mutex.lock_owned().await,
+            object,
             checked: None,
         }
     }
@@ -195,6 +243,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let guard = self.lock_and_check(bucket, key, precondition).await?;
         Ok(self
             .store_client_body(
+                &guard,
                 bucket,
                 key,
                 data,
@@ -213,6 +262,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     #[allow(clippy::too_many_arguments)]
     async fn store_client_body(
         &self,
+        lock: &ObjectWriteGuard,
         bucket: &str,
         key: &str,
         data: Bytes,
@@ -231,6 +281,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             written.map_err(|e| EngineError::Storage(StorageError::from(e)))?;
             let hashes = hashes?;
             self.store_spooled_delta_inner(
+                lock,
                 bucket,
                 key,
                 &spool,
@@ -244,6 +295,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .await
         } else {
             self.store_inner(
+                lock,
                 bucket,
                 key,
                 &data,
@@ -264,22 +316,25 @@ mod tests {
 
     #[test]
     fn object_write_lock_key_matches_the_engine_key() {
-        assert_eq!(
-            object_write_lock_key("b", "//a"),
-            object_write_lock_key("b", "a")
-        );
-        assert_eq!(
-            object_write_lock_key("b", "/x/y"),
-            object_write_lock_key("b", "x/y")
-        );
-        assert_ne!(
-            object_write_lock_key("b", "x/y"),
-            object_write_lock_key("b", "xy")
-        );
-        assert_ne!(
-            object_write_lock_key("b", "a/x"),
-            object_write_lock_key("c", "a/x")
-        );
+        let k = |b: &str, key: &str| object_write_lock_key(b, &ObjectKey::parse(b, key));
+        assert_eq!(k("b", "//a"), k("b", "a"));
+        assert_eq!(k("b", "/x/y"), k("b", "x/y"));
+        assert_ne!(k("b", "x/y"), k("b", "xy"));
+        assert_ne!(k("b", "a/x"), k("c", "a/x"));
+        // The bucket part cannot run into the key: `a` + `b/c` is not
+        // `a/b` + `c`.
+        assert_ne!(k("a", "b/c"), k("a/b", "c"));
+    }
+
+    /// A guard proves the write of its own key only.
+    #[tokio::test]
+    async fn a_guard_covers_its_own_key_only() {
+        let (engine, _fake, _usage) = counted_s3_engine().await;
+        let guard = engine.lock_object_write("b", "//d/a.txt").await;
+        assert!(guard.covers("b", "d", "a.txt").is_ok());
+        assert!(guard.covers("b", "d", "b.txt").is_err());
+        assert!(guard.covers("b", "", "a.txt").is_err());
+        assert!(guard.covers("c", "d", "a.txt").is_err());
     }
 
     #[test]
@@ -409,6 +464,201 @@ mod tests {
             (1, 4),
             "the overwrite nets the object it replaced"
         );
+    }
+
+    /// The production functions of every source under `dir`: `(file, first
+    /// line, signature, body)`. A function runs from its `fn` line to the
+    /// next `fn` line; the signature ends at the first line that ends in
+    /// `{`. Rough, but rustfmt keeps it exact enough for these guards.
+    fn prod_fns(dir: &str) -> Vec<(String, usize, String, String)> {
+        let starts_fn = |l: &str| {
+            let t = l.trim_start();
+            let t = t
+                .strip_prefix("pub(crate) ")
+                .or_else(|| t.strip_prefix("pub(super) "))
+                .or_else(|| t.strip_prefix("pub "))
+                .unwrap_or(t);
+            let t = t.strip_prefix("async ").unwrap_or(t);
+            t.starts_with("fn ")
+        };
+        let mut out = Vec::new();
+        for (file, text) in crate::source_scan::prod_sources(dir) {
+            let lines = crate::source_scan::prod_lines(&text);
+            let heads: Vec<usize> = (0..lines.len())
+                .filter(|&i| starts_fn(lines[i].1))
+                .collect();
+            for (n, &h) in heads.iter().enumerate() {
+                let end = heads.get(n + 1).copied().unwrap_or(lines.len());
+                let chunk: Vec<&str> = lines[h..end].iter().map(|(_, l)| *l).collect();
+                let sig_end = chunk
+                    .iter()
+                    .position(|l| l.trim_end().ends_with('{') || l.trim_end().ends_with(';'))
+                    .unwrap_or(0);
+                out.push((
+                    file.clone(),
+                    lines[h].0,
+                    chunk[..=sig_end].join("\n"),
+                    chunk.join("\n"),
+                ));
+            }
+        }
+        out
+    }
+
+    /// Every engine function that writes a stored form of an object, or
+    /// drops the other form, has the object's write lock in its signature
+    /// (the guard, or the `PutObject` / `PassthroughWrite` that carries
+    /// it). A new write path that skips the lock fails here: without it, a
+    /// passthrough write and a delta write of one key can each drop the
+    /// form the other wrote, and the object is gone.
+    #[test]
+    fn every_object_form_write_holds_the_object_write_lock() {
+        const FORM_WRITES: &[&str] = &[
+            ".put_passthrough(",
+            ".put_passthrough_file(",
+            ".put_passthrough_chunked(",
+            ".put_passthrough_parts(",
+            ".put_delta(",
+            ".copy_within(",
+            ".create_multipart_upload(",
+            ".complete_multipart_upload(",
+            ".drop_other_form(",
+            ".delete_passthrough_idempotent(",
+        ];
+        // The reference-write module forwards a delta write that its caller
+        // made under both locks (`RefWriteProof`); the helper that deletes
+        // a form is the delete's and the drop's.
+        const FORWARDERS: &[&str] = &[
+            "async fn put_delta<",
+            "async fn delete_passthrough_idempotent(",
+        ];
+        let proofs = ["ObjectWriteGuard", "PutObject", "PassthroughWrite"];
+        let mut offenders = Vec::new();
+        for (file, line, sig, body) in prod_fns("src/deltaglider/engine") {
+            if FORWARDERS.iter().any(|f| sig.contains(f)) {
+                continue;
+            }
+            let writes = FORM_WRITES.iter().any(|w| body.contains(w));
+            if writes
+                && !proofs.iter().any(|p| sig.contains(p))
+                && !body.contains("lock_object_write(")
+            {
+                offenders.push(format!("{file}:{line}"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "an engine write of an object form without the object's write lock: {offenders:?}"
+        );
+    }
+
+    /// The object write lock is not re-entrant. A function that takes it
+    /// must not call a writer that takes it again (the store that locks
+    /// itself, a delete, an engine-routed copy): for the same key that
+    /// waits forever. Such a function passes its guard to a method that
+    /// asks for one.
+    #[test]
+    fn a_lock_holder_never_calls_a_self_locking_writer() {
+        const TAKES: &[&str] = &[
+            "lock_object_write(",
+            "lock_and_check(",
+            "store_client_multipart_admit(",
+        ];
+        const SELF_LOCKING: &[&str] = &[
+            ".store(",
+            ".store_conditional(",
+            ".delete(",
+            ".delete_if(",
+            ".delete_batch(",
+            "copy_object_known(",
+            "copy_object_from(",
+            "copy_object_with_retries(",
+            ".migrate_legacy_references(",
+        ];
+        let mut offenders = Vec::new();
+        let mut holders = 0;
+        for (file, line, _sig, body) in prod_fns("src") {
+            let takes = TAKES.iter().filter(|t| body.contains(*t)).count();
+            if takes == 0 {
+                continue;
+            }
+            holders += 1;
+            for call in SELF_LOCKING {
+                if body.contains(call) {
+                    offenders.push(format!("{file}:{line} calls {call}"));
+                }
+            }
+        }
+        assert!(holders >= 8, "the scan found the lock holders ({holders})");
+        assert!(
+            offenders.is_empty(),
+            "a holder of the object write lock calls a writer that takes it again: {offenders:?}"
+        );
+    }
+
+    /// The lock order is object, then deltaspace. A writer that waits for
+    /// an object's lock holds no deltaspace lock while it waits, so the
+    /// other keys of the folder (writes, deletes, the reference reclaim)
+    /// go on. A path that took the deltaspace lock first and then waited
+    /// for the object lock would block them all, and with a second writer
+    /// of the other order, deadlock: the timeouts fail this test then.
+    #[tokio::test]
+    async fn a_writer_waiting_for_an_object_lock_holds_no_deltaspace_lock() {
+        use std::time::Duration;
+        let (engine, _fake, _usage) = counted_s3_engine().await;
+        let engine = Arc::new(engine);
+        engine
+            .store("b", "d/other.jpg", b"x", None, HashMap::new())
+            .await
+            .unwrap();
+        let held = engine.lock_object_write("b", "d/k.jpg").await;
+        // Writers of the held key wait: a store, a delete, a copy into it.
+        let waiting = {
+            let e = engine.clone();
+            tokio::spawn(async move { e.store("b", "d/k.jpg", b"one", None, HashMap::new()).await })
+        };
+        let deleting = {
+            let e = engine.clone();
+            tokio::spawn(async move { e.delete("b", "d/k.jpg").await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished() && !deleting.is_finished());
+        // Meanwhile the folder's other keys go on, deltaspace lock and all.
+        let deadline = Duration::from_secs(10);
+        tokio::time::timeout(deadline, async {
+            engine
+                .store("b", "d/a.jpg", b"a", None, HashMap::new())
+                .await
+                .unwrap();
+            engine.delete("b", "d/other.jpg").await.unwrap();
+            let lock = engine.lock_object_write("b", "d/c.zip").await;
+            engine
+                .store_known_prior(
+                    &lock,
+                    "b",
+                    "d/c.zip",
+                    &Bytes::from_static(b"delta-eligible"),
+                    None,
+                    HashMap::new(),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("a writer waiting for one key's lock blocked its folder");
+        drop(held);
+        tokio::time::timeout(deadline, waiting)
+            .await
+            .expect("the store never got the lock")
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(deadline, deleting)
+            .await
+            .expect("the delete never got the lock")
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
