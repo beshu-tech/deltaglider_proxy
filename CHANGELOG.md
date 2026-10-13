@@ -11,6 +11,28 @@ delay that acknowledgement by about 40 ms, so most requests on a reused
 (keep-alive) connection, which is what the AWS SDKs use, took at least 40 ms.
 Ten GET requests on one connection took 412 ms and now take about 31 ms.
 
+### Changed — Less CPU and disk work per request
+
+- A signed PUT hashes its body once instead of three times. The S3 layer
+  already checks the body against the signed `x-amz-content-sha256` header,
+  and the proxy now reuses that checked hash for the object's checksum when
+  the request shape proves that the check ran. Large bodies are hashed on a
+  blocking thread, not on the threads that serve requests.
+- Large delta uploads into one folder share one verified download of the
+  folder's reference, and an upload that created the reference keeps its own
+  body as that shared copy. A reference whose checksum does not match now
+  fails the upload with an error instead of being used to encode the delta.
+- A delta GET decodes against one shared reference file on disk instead of
+  writing the reference to a new temporary file for every request.
+- A ranged GET of an encrypted object sends no separate metadata HEAD request;
+  a range at the start of the object (`bytes=0-`) costs 2 requests instead of 4.
+- Each request shares the signed-in user's principal instead of copying it and
+  its permissions, and the permissions of each user are prepared once when the
+  user list is loaded. A permission check without conditions now takes about
+  0.15 µs instead of 14 to 32 µs.
+- On the filesystem backend, a PUT makes about 37 system calls instead of 76,
+  and a GET 23 instead of 31.
+
 ### Changed — Copies move far fewer bytes through the proxy
 
 - A CopyObject of an object that the proxy stores as a delta now copies the
