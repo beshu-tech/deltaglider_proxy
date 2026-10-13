@@ -342,18 +342,18 @@ impl JobsDb {
         Ok(n > 0)
     }
 
-    /// Resume a paused rule and make it due no later than `now`. The event
-    /// consumer drops a paused rule's events, so the reconcile run that the
-    /// next scheduler tick starts is what catches the destination up. That
-    /// run must be a FULL walk: a cursor kept from a run stopped mid-walk
-    /// would skip keys written during the pause below it, so it is cleared.
-    /// Resuming a rule that is NOT paused changes nothing (no forced run).
-    /// Returns `true` if the row existed.
+    /// Resume a paused rule and make it due no later than `now`. The cursor
+    /// of a run that the pause stopped is KEPT: the next run continues where
+    /// that run stopped. The event consumer drops a paused rule's events, so
+    /// keys written during the pause below the cursor are not seen by that
+    /// run; the worker makes the rule due again at once when a run resumed
+    /// after a pause finishes its pass (see `run_rule_gated`), and that full
+    /// walk catches them. Resuming a rule that is NOT paused changes nothing
+    /// (no forced run). Returns `true` if the row existed.
     pub fn replication_resume(&self, rule_name: &str, now: i64) -> Result<bool, ConfigDbError> {
         let n = self.conn.execute(
             "UPDATE replication_state \
              SET next_due_at = CASE WHEN paused = 1 THEN MIN(next_due_at, ?1) ELSE next_due_at END, \
-                 continuation_token = CASE WHEN paused = 1 THEN NULL ELSE continuation_token END, \
                  paused = 0 \
              WHERE rule_name = ?2",
             params![now, rule_name],
@@ -796,7 +796,7 @@ impl JobsDb {
             "SELECT id, rule_name, run_id, occurred_at, source_key, dest_key, error_message
              FROM replication_failures
              WHERE rule_name = ?
-             ORDER BY occurred_at DESC
+             ORDER BY occurred_at DESC, id DESC
              LIMIT ?",
         )?;
         let rows = stmt
@@ -815,6 +815,83 @@ impl JobsDb {
         Ok(rows)
     }
 
+    /// Every failure the ring keeps for a rule. The failures endpoint reports
+    /// it next to its page ("20 most recent of 500").
+    pub fn replication_failure_count(&self, rule_name: &str) -> Result<i64, ConfigDbError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM replication_failures WHERE rule_name = ?",
+            params![rule_name],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The failures one run recorded: how many the ring keeps, and the text
+    /// of the newest. The jobs list shows both on the rule's row.
+    pub fn replication_run_failure_summary(
+        &self,
+        rule_name: &str,
+        run_id: i64,
+    ) -> Result<(i64, Option<String>), ConfigDbError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM replication_failures WHERE rule_name = ? AND run_id = ?",
+            params![rule_name, run_id],
+            |r| r.get(0),
+        )?;
+        let last: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT error_message FROM replication_failures
+                  WHERE rule_name = ? AND run_id = ?
+                  ORDER BY id DESC LIMIT 1",
+                params![rule_name, run_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok((count, last))
+    }
+
+    /// Record a failure of the EVENT-DRIVEN path (no run). The consumer
+    /// retries a key until it copies, so a key that keeps failing wrote one
+    /// row per attempt and pushed every other failure out of the ring. One
+    /// key keeps ONE event row: the newest attempt replaces the older one.
+    pub fn replication_record_event_failure(
+        &self,
+        rule_name: &str,
+        occurred_at: i64,
+        source_key: &str,
+        dest_key: &str,
+        error_message: &str,
+        max_retained: u32,
+    ) -> Result<(), ConfigDbError> {
+        self.conn.execute(
+            "DELETE FROM replication_failures
+              WHERE rule_name = ? AND run_id IS NULL AND source_key = ?",
+            params![rule_name, source_key],
+        )?;
+        self.replication_record_failure(
+            rule_name,
+            FailureInsert {
+                run_id: None,
+                occurred_at,
+                source_key,
+                dest_key,
+                error_message,
+            },
+            max_retained,
+        )
+    }
+
+    /// The newest run of a rule (running or settled), if any.
+    pub fn replication_latest_run(
+        &self,
+        rule_name: &str,
+    ) -> Result<Option<RunRecord>, ConfigDbError> {
+        Ok(self
+            .replication_recent_runs(rule_name, 1)?
+            .into_iter()
+            .next())
+    }
+
     /// Recent run history for a rule, newest-first.
     pub fn replication_recent_runs(
         &self,
@@ -828,7 +905,7 @@ impl JobsDb {
                     delta_passthrough, bytes_egress_saved, reconstructed
              FROM replication_run_history
              WHERE rule_name = ?
-             ORDER BY started_at DESC
+             ORDER BY started_at DESC, id DESC
              LIMIT ?",
         )?;
         let rows = stmt
@@ -1451,8 +1528,9 @@ mod tests {
         assert!(!st.paused);
         assert_eq!(st.next_due_at, 500);
         assert_eq!(
-            st.continuation_token, None,
-            "the catch-up run is a full walk"
+            st.continuation_token.as_deref(),
+            Some("releases/m"),
+            "the next run continues where the paused run stopped"
         );
         // An earlier due time is kept.
         db.conn
@@ -1645,6 +1723,52 @@ mod tests {
         assert!(recent.iter().all(|f| f.run_id == Some(42)));
         let msgs: Vec<_> = recent.iter().map(|f| f.error_message.clone()).collect();
         assert_eq!(msgs, vec!["err-4", "err-3", "err-2"]);
+    }
+
+    /// A key that the event consumer retries keeps ONE failure row (the
+    /// newest), so its retries cannot push every other failure out of the
+    /// ring. A run's failures of the same key are never folded.
+    #[test]
+    fn event_failures_keep_one_row_per_key() {
+        let db = db();
+        db.replication_ensure_state("r", 100).unwrap();
+        let run = |key: &str, msg: &str| {
+            db.replication_record_failure(
+                "r",
+                FailureInsert {
+                    run_id: Some(7),
+                    occurred_at: 100,
+                    source_key: key,
+                    dest_key: key,
+                    error_message: msg,
+                },
+                50,
+            )
+            .unwrap()
+        };
+        run("a", "run-1");
+        run("a", "run-2");
+        for i in 0..10 {
+            db.replication_record_event_failure("r", 200 + i, "hot", "hot", &format!("ev-{i}"), 50)
+                .unwrap();
+        }
+        db.replication_record_event_failure("r", 300, "cold", "cold", "ev-cold", 50)
+            .unwrap();
+        let all = db.replication_recent_failures("r", 100).unwrap();
+        let hot: Vec<_> = all.iter().filter(|f| f.source_key == "hot").collect();
+        assert_eq!(hot.len(), 1, "one row per retried key");
+        assert_eq!(hot[0].error_message, "ev-9", "the newest attempt wins");
+        assert_eq!(all.iter().filter(|f| f.source_key == "a").count(), 2);
+        assert_eq!(db.replication_failure_count("r").unwrap(), 4);
+        // The run's summary counts only its own rows.
+        assert_eq!(
+            db.replication_run_failure_summary("r", 7).unwrap(),
+            (2, Some("run-2".to_string()))
+        );
+        assert_eq!(
+            db.replication_run_failure_summary("r", 8).unwrap(),
+            (0, None)
+        );
     }
 
     #[test]

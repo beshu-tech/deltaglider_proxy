@@ -44,7 +44,7 @@ pub(super) struct RunFlags {
     pub backend_throttled: bool,
     /// The operator paused the rule mid-run (DB `paused` flag, re-read at
     /// each control boundary). Not an error: the cursor is kept for resume,
-    /// the run settles "stopped".
+    /// the run settles "paused".
     pub stopped_paused: bool,
     /// Operator KILL: the run flipped to 'cancelling' mid-flight.
     pub killed: bool,

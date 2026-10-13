@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+### Fixed — Pause stops a replication run that is in progress
+
+A pause stopped only the runs that the scheduler started. A run that
+**Run now** started went on copying, while the row already said "paused".
+Now a pause stops any run of the rule at the end of the object that it
+copies. A rule that is already paused when **Run now** starts its run still
+runs once. The run that a pause stopped has the status `paused`, and no
+longer `cancelled`, which stays the status of a kill. Resume used to drop
+the position of that run, so the next run listed the whole source again.
+The next run now continues from that position. When it finishes, the rule
+is due again at once, and that full pass copies the objects that changed
+during the pause.
+
+### Fixed — A replication rule's row shows the progress of its run
+
+The row of a replication rule in `GET /_/api/admin/jobs` always reported
+zero progress and no error, so the Jobs screen could not show how far a
+run was or why it failed. The row now carries the counters of the newest
+run (copied, already in sync, failed, bytes, deleted), which the run writes
+while it runs. It also has `failed_total` and `last_error` for the failures
+of that run, and `started_at` and `finished_at`. Events copy objects between
+runs, and before, such a copy changed nothing on the row. The row now has
+`detail.events` (objects that events copied and deleted, and events that
+failed, since the proxy started) and `detail.last_event_applied_at`.
+
+### Fixed — Runs report the size of what they copied
+
+A replication run counted the bytes that went through the proxy. A copy on
+one backend is server-side, so the run reported 0 B for objects that it did
+copy, and a delta that the destination stores as it is counted only its
+delta size. Runs, rows and the lifetime counter now count the logical size
+of each copied object. The saved egress stays its own counter.
+
+### Fixed — The failures of event-driven replication no longer flood the ring
+
+The event-driven path tries a failing object again on every drain, and it
+wrote one failure row per attempt. One object could push every other failure
+out of the ring. It now keeps one row per object, with the newest error, and
+the message says that the event path made it. `GET …/failures` of a
+replication rule now also returns `total`, the number of failures that the
+ring keeps, and each failure has `trigger` (`run` or `event`).
+
 ### Fixed — A draft job can be removed on its own
 
 A rule that you add with "New job" stays a draft until you apply it. A draft

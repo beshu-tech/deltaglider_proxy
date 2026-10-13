@@ -1289,11 +1289,16 @@ fn settle_key(
     let err = match outcome {
         Ok(()) => {
             window.record(None);
+            // A copy notes itself in `apply_copy` (only a real copy counts).
+            if w.action == KeyAction::Delete && rule.replicate_deletes {
+                note_event_activity(&rule.name, w.action, true, current_unix_seconds());
+            }
             let _ = dbg.replication_clear_object_failure(&rule.name, key);
             return;
         }
         Err(err) => err,
     };
+    note_event_activity(&rule.name, w.action, false, current_unix_seconds());
     let class = failure_class(err.as_ref());
     window.record(Some(class));
     warn!(
@@ -1303,23 +1308,24 @@ fn settle_key(
     // The failure ring has a foreign key to the state row; a rule the
     // scheduler never ran has none yet.
     let _ = dbg.replication_ensure_state(&rule.name, now);
+    // One row per key: the consumer retries a held key on every drain, and a
+    // row per attempt pushed every other failure out of the ring.
+    let dest_key = rewrite_key(&rule.source.prefix, &rule.destination.prefix, key)
+        .unwrap_or_else(|_| key.to_string());
     let record = |msg: &str| {
-        let _ = dbg.replication_record_failure(
+        let _ = dbg.replication_record_event_failure(
             &rule.name,
-            crate::replication::state_store::FailureInsert {
-                run_id: None,
-                occurred_at: now,
-                source_key: key,
-                dest_key: key,
-                error_message: msg,
-            },
+            now,
+            key,
+            &dest_key,
+            &format!("event-driven {}: {msg}", event_action_word(w.action)),
             replication.max_failures_retained,
         );
     };
-    record(&err.to_string());
     // A permanent key error is recorded and counts as handled: holding it
     // would stall the rule, forever.
     if err.downcast_ref::<PermanentKeyError>().is_some() {
+        record(&err.to_string());
         return;
     }
     let mut hold = || {
@@ -1333,6 +1339,7 @@ fn settle_key(
     // giving up, or a short outage gave up on every key and dropped its
     // events.
     if !failure_counts_toward_give_up(class) {
+        record(&err.to_string());
         hold();
         return;
     }
@@ -1346,11 +1353,72 @@ fn settle_key(
             rule.name, bucket, key, attempts
         );
         record(&format!(
-            "event-driven replication gave up after {attempts} attempts; \
-             the next reconcile run retries the object"
+            "{err} (gave up after {attempts} attempts; the next reconcile run \
+             retries the object)"
         ));
     } else {
+        record(&err.to_string());
         hold();
+    }
+}
+
+/// The verb of an event action in a failure message.
+fn event_action_word(action: KeyAction) -> &'static str {
+    match action {
+        KeyAction::Copy => "copy",
+        KeyAction::Delete => "delete",
+        KeyAction::Noop => "event",
+    }
+}
+
+/// What the event-driven path did for one rule since the proxy started. The
+/// Jobs screen shows it on the rule's row: events apply between runs, so
+/// without it a copy made by an event changed nothing an operator could see.
+/// In memory and node-local, like the live walk progress.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct EventActivity {
+    /// When an event of the rule last copied or deleted an object (unix s).
+    pub last_applied_at: Option<i64>,
+    /// Objects the events copied / deleted, since the proxy started.
+    pub copied: u64,
+    pub deleted: u64,
+    /// Event actions that failed, since the proxy started.
+    pub failed: u64,
+    pub last_failed_at: Option<i64>,
+}
+
+static EVENT_ACTIVITY: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, EventActivity>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// The event activity of a rule, for the jobs API.
+pub fn event_activity(rule: &str) -> Option<EventActivity> {
+    EVENT_ACTIVITY.lock().get(rule).cloned()
+}
+
+fn note_event_activity(rule: &str, action: KeyAction, ok: bool, now: i64) {
+    let mut map = EVENT_ACTIVITY.lock();
+    let a = map.entry(rule.to_string()).or_default();
+    fold_event_activity(a, action, ok, now);
+}
+
+/// PURE: fold one settled event action into a rule's activity. A no-op
+/// action (a delete the rule does not mirror) is no activity.
+fn fold_event_activity(a: &mut EventActivity, action: KeyAction, ok: bool, now: i64) {
+    match (ok, action) {
+        (false, _) => {
+            a.failed += 1;
+            a.last_failed_at = Some(now);
+        }
+        (true, KeyAction::Copy) => {
+            a.copied += 1;
+            a.last_applied_at = Some(now);
+        }
+        (true, KeyAction::Delete) => {
+            a.deleted += 1;
+            a.last_applied_at = Some(now);
+        }
+        (true, KeyAction::Noop) => {}
     }
 }
 
@@ -1444,6 +1512,7 @@ async fn apply_copy(
             // Emit ReplicationObjectCopied so the chain is observable
             // (mirrors the reconcile worker).
             emit_replication_copied(db, rule, key, &dest_key, outcome.content_length()).await;
+            note_event_activity(&rule.name, KeyAction::Copy, true, current_unix_seconds());
             Ok(())
         }
         Decision::Skip { .. } => Ok(()),
@@ -1499,6 +1568,29 @@ mod rule_gate_tests {
             leader_instance_id: None,
             leader_expires_at: None,
         }
+    }
+
+    /// The rule row shows what events did between runs: a copy and a mirror
+    /// delete count and move the "last applied" time; a failure counts apart;
+    /// a no-op is no activity.
+    #[test]
+    fn event_activity_folds_each_outcome() {
+        let mut a = EventActivity::default();
+        fold_event_activity(&mut a, KeyAction::Noop, true, 5);
+        assert_eq!(a, EventActivity::default());
+        fold_event_activity(&mut a, KeyAction::Copy, true, 10);
+        fold_event_activity(&mut a, KeyAction::Delete, true, 20);
+        fold_event_activity(&mut a, KeyAction::Copy, false, 30);
+        assert_eq!(
+            a,
+            EventActivity {
+                last_applied_at: Some(20),
+                copied: 1,
+                deleted: 1,
+                failed: 1,
+                last_failed_at: Some(30),
+            }
+        );
     }
 
     #[test]

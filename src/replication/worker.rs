@@ -409,13 +409,18 @@ pub async fn run_rule_gated(
 
     // Look up the saved continuation token to resume from a prior tick.
     // Cleared at the end of a successful complete pass.
-    let (run_id, continuation) = {
+    let (run_id, continuation, paused_at_start, after_pause_stop) = {
         let db = db.lock().await;
         db.replication_ensure_state(&rule.name, started_at)?;
         let state = db.replication_load_state(&rule.name)?;
+        let paused_at_start = state.as_ref().is_some_and(|s| s.paused);
+        // The previous run stopped on a pause (its cursor is kept).
+        let after_pause_stop = state
+            .as_ref()
+            .is_some_and(|s| s.last_status == PAUSED_STOP_STATUS);
         let resume_token = state.and_then(|s| s.continuation_token);
         let id = db.replication_begin_run(&rule.name, started_at, triggered_by)?;
-        (id, resume_token)
+        (id, resume_token, paused_at_start, after_pause_stop)
     };
 
     info!(
@@ -447,15 +452,18 @@ pub async fn run_rule_gated(
             )
         }),
     };
-    // A run-now is a deliberate ONE-OFF: it runs even a paused rule (pause
-    // governs the scheduler); KILL is the stop affordance for a running one-off.
+    // A run-now is a deliberate ONE-OFF: it runs even a rule that is paused
+    // when it starts. A pause clicked DURING any run stops it (see
+    // `RunControl::pause_waived`).
     let ctrl = RunControl {
         db: db.clone(),
         rule_name: rule.name.clone(),
         run_id,
         lease: lease.clone(),
         lease_alive: lease_alive.clone(),
-        one_off: triggered_by == "run-now",
+        pause_waived: std::sync::atomic::AtomicBool::new(
+            triggered_by == "run-now" && paused_at_start,
+        ),
         max_failures_retained,
         dest_bucket: rule.destination.bucket.clone(),
         maintenance_gate,
@@ -582,7 +590,7 @@ pub async fn run_rule_gated(
     //   still copied everything else; flagging it "failed" cried wolf on
     //   99.99%-good runs and buried real fatal failures in the noise.
     // - "succeeded": clean pass, zero errors.
-    // A pause stop settles as "stopped" — NOT failed/completed (the sweep was
+    // A pause stop settles as "paused" — NOT failed/completed (the sweep was
     // intentionally interrupted, not broken). It outranks the error-derived
     // states because the partial-progress that's left is by operator request.
     // Final authoritative kill check: a kill requested while the LAST page was
@@ -612,7 +620,14 @@ pub async fn run_rule_gated(
             objects_copied: totals.objects_copied,
             truncated,
         });
-        let next_due = next_due_after(&flags, truncated, rule, finished_at);
+        let mut next_due = next_due_after(&flags, truncated, rule, finished_at);
+        // A run that continued from a pause stop saw nothing written during
+        // the pause below its cursor (the consumer drops a paused rule's
+        // events): once it finishes the pass, the rule is due again at once,
+        // and that full walk catches those keys.
+        if was_resumed && after_pause_stop && decision.clear_cursor {
+            next_due = finished_at;
+        }
 
         if decision.clear_cursor {
             db.replication_set_continuation_token(&rule.name, None)?;
@@ -755,9 +770,12 @@ async fn copy_one_object(
 
     match copy_result {
         Ok(outcome) => {
-            let bytes_copied = outcome.bytes_copied;
             out.objects_copied = 1;
-            out.bytes_copied = bytes_copied as i64;
+            // LOGICAL bytes (the object's size), whatever the strategy moved:
+            // a server-side copy moves 0 bytes through the proxy and a delta
+            // passthrough moves only the delta, and the run would report 0 B
+            // for objects it did copy. The egress saving is its own counter.
+            out.bytes_copied = outcome.content_length() as i64;
             // Only the fast path is counted; bytes_egress_saved is computed once
             // on the outcome (non-zero only for DeltaPassthrough).
             out.bytes_egress_saved = outcome.bytes_egress_saved as i64;
@@ -913,6 +931,10 @@ struct SettleDecision {
     clear_cursor: bool,
 }
 
+/// The terminal status of a run that an operator pause stopped. Its cursor
+/// is kept, and the next run continues from it — unlike `cancelled` (kill).
+pub(crate) const PAUSED_STOP_STATUS: &str = "paused";
+
 /// Terminal status + cursor decision, pure so the truth table is unit-tested.
 /// Precedence: killed > paused > fatal > budget-truncation ("stopped": halted
 /// mid-sweep, cursor kept, next tick resumes the tail) > errors > clean.
@@ -922,7 +944,7 @@ fn settle_run(i: SettleInput) -> SettleDecision {
     let status = if i.killed {
         "cancelled"
     } else if i.stopped_paused {
-        "stopped"
+        PAUSED_STOP_STATUS
     } else if i.hit_fatal_error || (i.had_any_error && i.objects_copied == 0) {
         "failed"
     } else if i.truncated {
@@ -948,19 +970,20 @@ enum ControlVerdict {
     LeaseLost,
 }
 
-/// PURE precedence fold for the page-boundary control check. `one_off`
-/// (run-now) suppresses ONLY the pause — kill and lease always apply.
+/// PURE precedence fold for the page-boundary control check. `pause_waived`
+/// (a run-now started on a paused rule, the pause not lifted since)
+/// suppresses ONLY the pause — kill and lease always apply.
 fn control_verdict(
     cancel_requested: bool,
     paused: bool,
-    one_off: bool,
+    pause_waived: bool,
     lease_ok: bool,
 ) -> ControlVerdict {
     if cancel_requested {
         ControlVerdict::Killed
     } else if !lease_ok {
         ControlVerdict::LeaseLost
-    } else if paused && !one_off {
+    } else if paused && !pause_waived {
         ControlVerdict::Paused
     } else {
         ControlVerdict::Continue
@@ -970,17 +993,17 @@ fn control_verdict(
 /// PURE: `control_verdict` plus the mid-run maintenance overlay. A dest bucket
 /// that went write-gated mid-run defers like a pause (cursor kept) — but ONLY
 /// when nothing higher-precedence fired: a kill or a lost lease MUST still win
-/// (we're stopping regardless; the reason matters for status/settle). `one_off`
-/// does NOT suppress the maintenance defer (a one-off must not write into a
-/// bucket being rewritten either).
+/// (we're stopping regardless; the reason matters for status/settle).
+/// `pause_waived` does NOT suppress the maintenance defer (a one-off must not
+/// write into a bucket being rewritten either).
 fn control_verdict_with_maintenance(
     cancel_requested: bool,
     paused: bool,
-    one_off: bool,
+    pause_waived: bool,
     lease_ok: bool,
     maint_busy: bool,
 ) -> ControlVerdict {
-    let base = control_verdict(cancel_requested, paused, one_off, lease_ok);
+    let base = control_verdict(cancel_requested, paused, pause_waived, lease_ok);
     if base == ControlVerdict::Continue && maint_busy {
         ControlVerdict::Paused
     } else {
@@ -996,7 +1019,12 @@ struct RunControl {
     run_id: i64,
     lease: Option<RunLease>,
     lease_alive: LeaseAlive,
-    one_off: bool,
+    /// True while a run-now started on a paused rule and the pause was not
+    /// lifted since: that pause does not stop it. Once a check sees the rule
+    /// NOT paused, this clears for good, so a pause clicked during the run
+    /// stops it at the next control boundary (cursor kept), as it stops a
+    /// scheduled run.
+    pause_waived: std::sync::atomic::AtomicBool,
     max_failures_retained: u32,
     /// Destination bucket + the write-gate: if a maintenance job starts
     /// rewriting the dest MID-RUN, defer (stop, cursor preserved) instead of
@@ -1038,7 +1066,7 @@ impl RunControl {
         // per listing page and per 32 events.
         // Mid-run maintenance deferral: a dest bucket that became write-gated
         // (migrate / re-encrypt) must stop the run like a pause — cursor kept,
-        // resumes when the maintenance job clears. Not suppressed by one_off:
+        // resumes when the maintenance job clears. Not suppressed by a waived pause:
         // a one-off must NOT write into a bucket being rewritten either.
         let maint_busy = self
             .maintenance_gate
@@ -1055,10 +1083,14 @@ impl RunControl {
             },
             None => false,
         };
+        if !paused {
+            self.pause_waived
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
         let verdict = control_verdict_with_maintenance(
             cancel_requested,
             paused,
-            self.one_off,
+            self.pause_waived.load(std::sync::atomic::Ordering::Relaxed),
             lease_ok,
             maint_busy || health_gated,
         );
@@ -1200,14 +1232,15 @@ mod tests {
     #[test]
     fn control_verdict_truth_table() {
         use ControlVerdict::*;
-        // (cancel, paused, one_off, lease_ok) -> verdict
+        // (cancel, paused, pause_waived, lease_ok) -> verdict
         let cases = [
             ((false, false, false, true), Continue),
             ((false, false, true, true), Continue),
-            // Paused stops a scheduled run but NOT a one-off (run-now contract).
+            // A pause stops a run, unless it is the pause a run-now started
+            // under (waived until the rule is seen unpaused).
             ((false, true, false, true), Paused),
             ((false, true, true, true), Continue),
-            // Kill outranks everything, one-off included.
+            // Kill outranks everything, a waived pause included.
             ((true, false, false, true), Killed),
             ((true, true, true, true), Killed),
             ((true, false, false, false), Killed),
@@ -1216,11 +1249,11 @@ mod tests {
             ((false, false, true, false), LeaseLost),
             ((false, true, true, false), LeaseLost),
         ];
-        for ((cancel, paused, one_off, lease_ok), want) in cases {
+        for ((cancel, paused, waived, lease_ok), want) in cases {
             assert_eq!(
-                control_verdict(cancel, paused, one_off, lease_ok),
+                control_verdict(cancel, paused, waived, lease_ok),
                 want,
-                "cancel={cancel} paused={paused} one_off={one_off} lease_ok={lease_ok}"
+                "cancel={cancel} paused={paused} waived={waived} lease_ok={lease_ok}"
             );
         }
     }
@@ -1289,11 +1322,13 @@ mod tests {
         });
         assert_eq!((d.status, d.clear_cursor), ("cancelled", false));
 
+        // A pause stop is "paused" (cursor kept), never "cancelled" (kill)
+        // nor the budget's "stopped".
         let d = settle_run(SettleInput {
             stopped_paused: true,
             ..base
         });
-        assert_eq!((d.status, d.clear_cursor), ("stopped", false));
+        assert_eq!((d.status, d.clear_cursor), ("paused", false));
 
         let d = settle_run(SettleInput {
             hit_fatal_error: true,
@@ -1843,6 +1878,22 @@ mod request_count_tests {
         );
         // The walk's root listing, then one re-check of f/.
         assert!(src_lists <= 2, "{src_lists} source listings");
+    }
+
+    /// A run reports the LOGICAL bytes of what it copied. A same-backend
+    /// copy is server-side (no byte crosses the proxy), and the run said
+    /// "0 B" for objects it did copy.
+    #[tokio::test]
+    async fn a_server_side_copy_counts_the_object_size() {
+        let (engine, _fake) = s3_engine().await;
+        engine
+            .store("src", "a.bin", &[7u8; 1000], None, Default::default())
+            .await
+            .unwrap();
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("t").unwrap()));
+        let outcome = run(&db, &engine, &rule(false)).await;
+        assert_eq!(outcome.totals.objects_copied, 1, "{outcome:?}");
+        assert_eq!(outcome.totals.bytes_copied, 1000, "{outcome:?}");
     }
 
     /// Jobs finding 8: on S3 every converged pair cost two engine HEADs

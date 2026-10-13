@@ -589,9 +589,8 @@ replication:
 ";
 
 /// A pause issued WHILE a SCHEDULED run is in flight must stop the run
-/// promptly — not let it run to completion. (One-offs are the opposite
-/// contract: run-now ignores pause and is stopped by KILL, so this test uses a
-/// scheduler-started run — tick_interval 1s — as the pause target.)
+/// promptly — not let it run to completion. (A run-now stops on a pause
+/// too: `test_replication_pause_stops_a_run_now_and_resumes_from_its_cursor`.)
 ///
 /// Deterministic enough: `batch_size: 1` makes each object its own page, so the
 /// page-boundary check fires between every object; with 60 objects and a pause
@@ -684,17 +683,13 @@ async fn test_replication_pause_mid_run_stops_promptly_and_preserves_cursor() {
     // stopped/cancelled with the cursor kept.)
     let copied = body["objects_processed"].as_i64().unwrap_or(-1);
     let status = body["status"].as_str().unwrap_or("");
-    // A mid-run pause settles as "stopped" (normalized to `cancelled` in the
-    // jobs LIST view). If the pause raced in only after the final page, the run
-    // may have finished "succeeded".
+    // A mid-run pause settles as "paused" (cursor kept). If the pause raced
+    // in only after the final page, the run may have finished "succeeded".
     assert!(
-        matches!(
-            status,
-            "stopped" | "cancelled" | "succeeded" | "completed_with_errors"
-        ),
+        matches!(status, "paused" | "succeeded" | "completed_with_errors"),
         "run must end terminal, got status={status} body={body}"
     );
-    if matches!(status, "stopped" | "cancelled") {
+    if status == "paused" {
         assert!(
             copied < 60,
             "a stopped run must NOT have copied all 60: {body}"
@@ -755,6 +750,140 @@ async fn test_replication_pause_mid_run_stops_promptly_and_preserves_cursor() {
         final_dst.contents().len(),
         60,
         "all objects eventually replicate after resume"
+    );
+}
+
+const PAUSE_RUN_NOW_RULE_YAML: &str = "
+replication:
+  enabled: true
+  tick_interval: \"1h\"
+  rules:
+    - name: pause-now-rule
+      enabled: true
+      source:
+        bucket: pn-src
+        prefix: \"\"
+      destination:
+        bucket: pn-dst
+        prefix: \"\"
+      interval: \"1h\"
+      batch_size: 1
+";
+
+/// What an operator sees while a run-now copies, and what Pause does to it:
+/// - the `GET /jobs` row reports the run's LIVE counters while it runs (it
+///   reported zeros until the run ended);
+/// - Pause stops the run at the next object boundary (it ignored a pause and
+///   copied everything), the run settles `paused` — not `cancelled`, which is
+///   a kill — and the row reads `paused`;
+/// - after Resume, the next run continues from the kept cursor (it rescanned
+///   from the first key), and when it finishes, the rule is due again at once
+///   so a full pass catches what the pause made it miss.
+#[tokio::test]
+async fn test_replication_pause_stops_a_run_now_and_resumes_from_its_cursor() {
+    // Each copy stalls 50 ms: 80 objects take about 4 s, so the pause lands
+    // mid-run.
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(PAUSE_RUN_NOW_RULE_YAML)
+        .env("DGP_TEST_COPY_STALL_MS", "50")
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    for b in ["pn-src", "pn-dst"] {
+        client.create_bucket().bucket(b).send().await.ok();
+    }
+    for i in 0..80 {
+        client
+            .put_object()
+            .bucket("pn-src")
+            .key(format!("obj-{i:03}.txt"))
+            .body(ByteStream::from(format!("payload-{i}").into_bytes()))
+            .send()
+            .await
+            .expect("seed");
+    }
+    let admin = admin_http_client(&server.endpoint()).await;
+    let ep = server.endpoint();
+    let id = "replication:pause-now-rule";
+
+    let before = latest_run_id(&admin, &ep, "pause-now-rule").await;
+    let resp = admin
+        .post(format!("{ep}/_/api/admin/jobs/{id}/run-now"))
+        .send()
+        .await
+        .expect("run-now");
+    assert_eq!(resp.status().as_u16(), 202);
+
+    // Live progress on the row, mid-run.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let live = loop {
+        let row = job_row(&admin, &ep, id).await;
+        let copied = row["progress"]["processed"].as_i64().unwrap_or(0);
+        if row["status"] == "running" && copied > 0 {
+            break row;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the row never showed the run's progress: {row}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert!(live["started_at"].as_i64().is_some(), "{live}");
+    assert_eq!(live["failed_total"].as_i64(), Some(0), "{live}");
+
+    let p = admin
+        .post(format!("{ep}/_/api/admin/jobs/{id}/pause"))
+        .send()
+        .await
+        .expect("pause");
+    assert_eq!(p.status().as_u16(), 204);
+    let stopped = wait_for_run_after(&admin, &ep, "pause-now-rule", before).await;
+    assert_eq!(
+        stopped["status"], "paused",
+        "a pause stops a run-now and keeps its cursor: {stopped}"
+    );
+    let copied = stopped["objects_processed"].as_i64().unwrap();
+    assert!(
+        (1..80).contains(&copied),
+        "the pause landed mid-run: {stopped}"
+    );
+    let row = job_row(&admin, &ep, id).await;
+    assert_eq!(
+        (row["status"].as_str(), row["paused"].as_bool()),
+        (Some("paused"), Some(true)),
+        "{row}"
+    );
+
+    // Resume, then run: the run continues from the cursor.
+    let r = admin
+        .post(format!("{ep}/_/api/admin/jobs/{id}/resume"))
+        .send()
+        .await
+        .expect("resume");
+    assert_eq!(r.status().as_u16(), 204);
+    let resumed = fire_run_now(&admin, &ep, "pause-now-rule").await;
+    assert_eq!(resumed["status"], "succeeded", "{resumed}");
+    let scanned = resumed["objects_scanned"].as_i64().unwrap();
+    assert!(
+        scanned < 80,
+        "the resumed run continues from the cursor of the paused run \
+         (paused after {copied} copies, resumed run scanned {scanned}): {resumed}"
+    );
+    let dst = client
+        .list_objects_v2()
+        .bucket("pn-dst")
+        .send()
+        .await
+        .unwrap()
+        .contents()
+        .len();
+    assert_eq!(dst, 80, "the two runs copied every object");
+    // The catch-up: a run resumed after a pause makes the rule due at once.
+    let row = job_row(&admin, &ep, id).await;
+    assert!(
+        row["next_due_at"].as_i64() <= row["last_run_at"].as_i64(),
+        "the rule is due again for a full pass: {row}"
     );
 }
 
@@ -1483,6 +1612,36 @@ async fn test_event_driven_replication_copies_and_deletes() {
         deleted,
         "delete should propagate to ev-dst (replicate_deletes: true)"
     );
+
+    // The rule's row shows what the events did between runs: the delete
+    // (and, unless a reconcile run beat the event to it, the copy) and when
+    // an event last applied. Before, an event copy changed nothing on the row.
+    let admin = admin_http_client(&endpoint).await;
+    let row = job_row(&admin, &endpoint, "replication:ev-a-to-b").await;
+    let events = &row["detail"]["events"];
+    assert_eq!(events["deleted"].as_u64(), Some(1), "{row}");
+    assert!(events["copied"].as_u64().unwrap_or(9) <= 1, "{row}");
+    assert!(
+        row["detail"]["last_event_applied_at"].as_i64().is_some(),
+        "{row}"
+    );
+}
+
+/// The `GET /jobs` row of one job.
+async fn job_row(admin: &reqwest::Client, ep: &str, id: &str) -> Value {
+    let jobs: Value = admin
+        .get(format!("{ep}/_/api/admin/jobs"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    jobs["jobs"]
+        .as_array()
+        .and_then(|a| a.iter().find(|j| j["id"] == id))
+        .cloned()
+        .unwrap_or_else(|| panic!("no job {id}: {jobs}"))
 }
 
 /// Pausing a rule must stop the event consumer too, not only the scheduler:

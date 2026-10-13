@@ -143,7 +143,7 @@ curl -b cookies https://s3.acme.example/_/api/admin/jobs/replication:releases-to
 curl -b cookies https://s3.acme.example/_/api/admin/jobs/replication:releases-to-dr/failures
 ```
 
-To stop the rule for a while, click **Pause** in its row (or send `POST …/pause`), and click **Resume** to start it again (`POST …/resume`). A paused rule copies and deletes nothing, also for new events, and the pause survives restarts. The proxy does not keep the events of the pause, so after a resume the next scheduler tick starts a full reconcile to bring `releases-dr` in sync. With delete replication on, that reconcile also applies the deletes of the pause.
+To stop the rule for a while, click **Pause** in its row (or send `POST …/pause`), and click **Resume** to start it again (`POST …/resume`). A paused rule copies and deletes nothing, also for new events, and the pause survives restarts. A run that is in progress when you click **Pause** stops at the end of the object that it copies, also when **Run now** started it. That run gets the status `paused` and keeps its position in the walk. After a resume, the next scheduler tick starts a run that continues from that position, so it copies the rest first. The proxy does not keep the events of the pause, so that run cannot see the objects that changed during the pause in the part of the walk that is already done. For this reason, when the continued run finishes, the rule is due again at once, and the full reconcile that follows brings `releases-dr` in sync. With delete replication on, that reconcile also applies the deletes of the pause.
 
 ## Verify
 

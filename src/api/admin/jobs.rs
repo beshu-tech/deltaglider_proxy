@@ -62,8 +62,8 @@ pub fn parse_job_id(id: &str) -> Option<(JobSubsystem, &str)> {
 }
 
 /// One status vocabulary:
-/// `idle | queued | running | cancelling | succeeded | completed_with_errors |
-/// failed | cancelled`.
+/// `idle | queued | running | cancelling | paused | succeeded |
+/// completed_with_errors | failed | cancelled`.
 /// The raw subsystem value is reported alongside (`status_raw`); unknown
 /// raw values normalize to `idle` (total function — never panics).
 ///
@@ -84,6 +84,9 @@ pub fn normalize_status(raw: &str) -> &'static str {
         // surface it as `cancelled` (same vocabulary as an explicit cancel) so the
         // UI stops showing it as `running`. Cursor is preserved; resume continues.
         "cancelled" | "stopped" => "cancelled",
+        // A run that an operator pause stopped: its cursor is kept and the
+        // next run continues from it — not the same as a kill (`cancelled`).
+        "paused" => "paused",
         _ => "idle",
     }
 }
@@ -166,7 +169,7 @@ pub struct JobScope {
     pub target: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
 pub struct JobProgress {
     pub processed: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -174,6 +177,9 @@ pub struct JobProgress {
     pub bytes: i64,
     pub failed: i64,
     pub skipped: i64,
+    /// Objects the job deleted (replication mirror deletes).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -214,6 +220,9 @@ pub struct JobView {
     pub finished_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Failures recorded for the latest run (the ring may keep fewer).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_total: Option<i64>,
     pub detail: serde_json::Value,
 }
 
@@ -267,6 +276,29 @@ pub struct JobFailureEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dest_key: Option<String>,
     pub error: String,
+    /// What recorded the failure: `run` (a run of the rule) or `event` (the
+    /// event-driven path, which copies between runs). Replication only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<&'static str>,
+}
+
+/// PURE: the live progress of a replication rule's row, from its newest run
+/// (its counters are written at each checkpoint while it runs). No run yet:
+/// zeros. `bytes` is the logical size of the objects copied.
+fn replication_row_progress(
+    run: Option<&crate::replication::state_store::RunRecord>,
+) -> JobProgress {
+    match run {
+        None => JobProgress::default(),
+        Some(r) => JobProgress {
+            processed: r.objects_copied,
+            total: None,
+            bytes: r.bytes_copied,
+            failed: r.errors,
+            skipped: r.objects_skipped,
+            deleted: Some(r.objects_deleted),
+        },
+    }
 }
 
 fn maintenance_job_view(j: &MaintenanceJob) -> JobView {
@@ -315,6 +347,7 @@ fn maintenance_job_view(j: &MaintenanceJob) -> JobView {
             bytes: j.bytes_done,
             failed: j.objects_failed,
             skipped: j.objects_skipped,
+            deleted: None,
         },
         lifetime: None,
         last_run_at: None,
@@ -323,6 +356,7 @@ fn maintenance_job_view(j: &MaintenanceJob) -> JobView {
         started_at: j.started_at,
         finished_at: j.finished_at,
         last_error: j.last_error.clone(),
+        failed_total: None,
         detail,
     }
 }
@@ -358,13 +392,23 @@ pub async fn list_jobs(
             // immediately, but the worker may not observe it for a while (e.g.
             // wedged in the planning phase). Surface the live history status so a
             // killed run shows `cancelling`, not a stale `running`.
+            // The newest run: its live counters (written at each checkpoint)
+            // are the row's progress, and its failures the row's error.
+            let latest = db.replication_latest_run(&rule.name).ok().flatten();
             if status_raw == "running" {
-                if let Ok(Some(live)) = db.replication_latest_run_status(&rule.name) {
+                if let Some(live) = latest.as_ref().map(|r| r.status.as_str()) {
                     if live == "cancelling" {
-                        status_raw = live;
+                        status_raw = live.to_string();
                     }
                 }
             }
+            let (failed_total, last_error) = match latest.as_ref() {
+                Some(r) => db
+                    .replication_run_failure_summary(&rule.name, r.id)
+                    .unwrap_or((0, None)),
+                None => (0, None),
+            };
+            let events = crate::replication::event_consumer::event_activity(&rule.name);
             jobs.push(JobView {
                 id: format!("replication:{}", rule.name),
                 kind: "replication".into(),
@@ -381,13 +425,7 @@ pub async fn list_jobs(
                 status_raw,
                 phase: None,
                 percent: None,
-                progress: JobProgress {
-                    processed: 0,
-                    total: None,
-                    bytes: 0,
-                    failed: 0,
-                    skipped: 0,
-                },
+                progress: replication_row_progress(latest.as_ref()),
                 lifetime: Some(JobLifetime {
                     objects: st.as_ref().map(|s| s.objects_copied_lifetime).unwrap_or(0),
                     bytes: st.as_ref().map(|s| s.bytes_copied_lifetime).unwrap_or(0),
@@ -395,12 +433,18 @@ pub async fn list_jobs(
                 last_run_at: st.as_ref().and_then(|s| s.last_run_at),
                 next_due_at: st.as_ref().map(|s| s.next_due_at),
                 created_at: None,
-                started_at: None,
-                finished_at: None,
-                last_error: None,
+                started_at: latest.as_ref().map(|r| r.started_at),
+                finished_at: latest.as_ref().and_then(|r| r.finished_at),
+                last_error,
+                failed_total: Some(failed_total),
                 detail: serde_json::json!({
                     "interval": rule.interval,
                     "destination_prefix": rule.destination.prefix,
+                    // What the event-driven path did between runs, since the
+                    // proxy started (node-local): copies and deletes it
+                    // applied, its failures, and when it last applied one.
+                    "last_event_applied_at": events.as_ref().and_then(|e| e.last_applied_at),
+                    "events": events,
                     // Live "currently copying" objects (largest first, top 3)
                     // so a slow-moving counter is explained in the UI — a
                     // 4 GB tarball at 10 MB/s is work, not a hang.
@@ -451,6 +495,7 @@ pub async fn list_jobs(
                     bytes: 0,
                     failed: 0,
                     skipped: 0,
+                    deleted: None,
                 },
                 lifetime: Some(JobLifetime {
                     objects: st
@@ -465,6 +510,7 @@ pub async fn list_jobs(
                 started_at: None,
                 finished_at: None,
                 last_error: None,
+                failed_total: None,
                 detail: serde_json::json!({
                     "action": rule.action.kind(),
                     "expire_after": rule.expire_after,
@@ -741,6 +787,7 @@ pub async fn job_failures(
                 source_key: Some(f.source_key),
                 dest_key: Some(f.dest_key),
                 error: f.error_message,
+                trigger: Some(if f.run_id.is_some() { "run" } else { "event" }),
             })
             .collect(),
         JobSubsystem::Lifecycle => db
@@ -755,6 +802,7 @@ pub async fn job_failures(
                 source_key: None,
                 dest_key: None,
                 error: f.error_message,
+                trigger: None,
             })
             .collect(),
         JobSubsystem::Maintenance => {
@@ -770,11 +818,22 @@ pub async fn job_failures(
                     source_key: None,
                     dest_key: None,
                     error: f.error,
+                    trigger: None,
                 })
                 .collect()
         }
     };
-    Ok(Json(serde_json::json!({ "failures": failures })))
+    // How many the ring keeps in all, so the UI can say "20 most recent of
+    // 500". Kinds without a count leave it out.
+    let total = match sub {
+        JobSubsystem::Replication => Some(db.replication_failure_count(key)?),
+        _ => None,
+    };
+    let mut body = serde_json::json!({ "failures": failures });
+    if let Some(total) = total {
+        body["total"] = total.into();
+    }
+    Ok(Json(body))
 }
 
 /// POST /_/api/admin/jobs/:id/:action — uniform action dispatch.
@@ -1132,11 +1191,48 @@ mod tests {
             ("completed", "succeeded"),
             ("failed", "failed"),
             ("cancelled", "cancelled"),
+            // A pause stop keeps its cursor: it is not a kill.
+            ("paused", "paused"),
             ("something-new", "idle"),
             ("", "idle"),
         ] {
             assert_eq!(normalize_status(raw), want, "raw={raw}");
         }
+    }
+
+    /// A replication rule's row carries the live counters of its newest run
+    /// (copied, in sync, failed, logical bytes, deleted) — not zeros.
+    #[test]
+    fn replication_row_progress_reads_the_newest_run() {
+        assert_eq!(replication_row_progress(None), JobProgress::default());
+        let run = crate::replication::state_store::RunRecord {
+            id: 3,
+            rule_name: "r".into(),
+            triggered_by: "run-now".into(),
+            started_at: 10,
+            finished_at: None,
+            objects_scanned: 9,
+            objects_copied: 5,
+            objects_skipped: 3,
+            objects_deleted: 2,
+            bytes_copied: 4096,
+            errors: 1,
+            status: "running".into(),
+            delta_passthrough: 0,
+            bytes_egress_saved: 0,
+            reconstructed: 0,
+        };
+        assert_eq!(
+            replication_row_progress(Some(&run)),
+            JobProgress {
+                processed: 5,
+                total: None,
+                bytes: 4096,
+                failed: 1,
+                skipped: 3,
+                deleted: Some(2),
+            }
+        );
     }
 
     #[test]

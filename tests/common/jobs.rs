@@ -178,7 +178,12 @@ pub async fn wait_for_run_after(
             if id > after_id
                 && matches!(
                     st,
-                    "succeeded" | "failed" | "completed_with_errors" | "cancelled" | "stopped"
+                    "succeeded"
+                        | "failed"
+                        | "completed_with_errors"
+                        | "cancelled"
+                        | "stopped"
+                        | "paused"
                 )
             {
                 return run.clone();
