@@ -121,7 +121,7 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
       worker.rs              Async copy loop (engine.retrieve source → engine.store dest); resumable cursor + poison-token guard
       scheduler.rs           Periodic tick from replication.tick_interval; executes due rules (skips paused)
       event_consumer.rs      Consumes the event outbox for lazy/event-driven replication (defers busy-gated destinations)
-      state_store.rs         ConfigDb wrapper for replication_state / run_history / failures tables (delegates to config_db/job_store.rs)
+      state_store.rs         JobsDb wrapper for replication_state / run_history / failures tables (delegates to config_db/job_store.rs)
   → lifecycle/              Object lifecycle (YAML-authored, disabled by default, previewable; acts through the engine): planner/scheduler/worker/state_store.
                             Has crash-resume cursor (scope-stamped `bucket|prefix`, v15 — a redefined same-named rule never replays the old token)
                             + pause/resume parity with replication. Scheduler AND run-now defer when ANY rule write-bucket (source or transition
@@ -178,7 +178,8 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
 - `Engine::validated_key()` — shared parse+validate+deltaspace_id helper used by all public engine methods
 - `IamState` (in `iam/mod.rs`) — enum: `Disabled`, `Legacy(AuthConfig)`, or `Iam(IamIndex)` for multi-user auth
 - `IamMode` (in `config_sections.rs`) — `Gui` (default) = encrypted IAM DB is source of truth; `Declarative` = YAML owns IAM state. In `Declarative` mode: (a) admin-API IAM mutations return 403, and (b) `apply_config_transition` runs the **Phase 3c.3 reconciler** (`src/iam/declarative.rs` + `src/config_db/declarative.rs`) — pure `diff_iam` → single-transaction `apply_iam_reconcile` diffs the YAML `access.iam_users` / `iam_groups` / `auth_providers` / `group_mapping_rules` against the DB and applies creates/updates/deletes atomically. Diff is **by NAME** so user/group IDs stay stable across updates and `external_identities` stay valid. An empty-YAML gate blocks `gui→declarative` flips that would wipe a non-empty DB. Every mutation emits an `iam_reconcile_*` audit entry.
-- `ConfigDb` (in `config_db/mod.rs`) — encrypted SQLCipher database for IAM users, groups, OAuth providers, and mapping rules. Stored as `deltaglider_config.db`. Independent of the YAML config file; `access: {}` in YAML with no legacy SigV4 creds is **correct** when IAM users exist in the DB.
+- `ConfigDb` (in `config_db/mod.rs`) — encrypted SQLCipher database for IAM users, groups, OAuth providers, and mapping rules. Stored as `deltaglider_config.db`. Independent of the YAML config file; `access: {}` in YAML with no legacy SigV4 creds is **correct** when IAM users exist in the DB. Holds NO job state: its node-local tables stay only as empty shells for older peers/downgrades (schema v29), and the source guard `node_local_sql_never_runs_on_the_config_db` refuses job SQL next to `ConfigDb`.
+- `JobsDb` (in `config_db/jobs_db.rs`) — the node-local, NEVER-synced SQLCipher file `deltaglider_jobs.db` (same keys as the config DB, opened through the same `open_keyed`, so a rotation moves both): replication/lifecycle/maintenance state, run history, failure rings, leases, parity cache, event outbox + deliveries + listener cursors. Shared as `Arc<Mutex<JobsDb>>` (`AppState::jobs_db`, `JobPlane.db`); not opened on a config-DB key mismatch. `JobsDb::adopt_from` moves an older release's job rows out of the LIVE config DB once at boot (copy tx in the jobs DB with `adopted = 1` → delete tx in the config DB → VACUUM; crash-safe either side). Design: `docs/plan/node-local-db-split.md`.
 - `SectionedConfig` (in `config_sections.rs`) — serde boundary only: the on-disk sectioned YAML shape (`admission` / `access` / `storage` / `advanced`). Collapsed into/from the flat `Config` struct via `into_flat` / `from_flat`. Canonical YAML export always uses the sectioned shape; the flat shape still loads for backwards compat. Hard error on "mixed" shapes (a doc that combines flat-root + section-header keys).
 - `AdmissionBlockSpec` (in `admission/spec.rs`) — operator-authored wire format for admission blocks: `name`, `match` (method / source_ip / source_ip_list CIDR / bucket / path_glob / authenticated / config_flag), `action` (allow-anonymous / deny / reject { status, message } / continue). `source_ip_list` capped at 4096 entries; names restricted to `[A-Za-z0-9_:.-]` (max 128 chars) with the `public-prefix:` prefix reserved for synthesized blocks.
 - `MetadataCache` (in `metadata_cache.rs`) — 50MB moka-based in-memory cache for `FileMetadata`. Populated on PUT, HEAD, and the HEAD that a `metadata=true` LIST sends for an entry whose listing facts are missing (the only HEAD such a LIST sends). Consulted on HEAD, GET, and for those facts misses. Invalidated on DELETE (exact key) and prefix delete (all matching keys). 10-minute TTL. Configurable size via `DGP_METADATA_CACHE_MB` (default: 50).
@@ -264,7 +265,7 @@ single-instance planes below are addressed.
 
 **Instance-LOCAL (NOT shared — break or degrade under non-sticky round-robin):**
 - **Background-job leadership** — the SQLite leases (`config_db/job_store.rs`) are
-  NODE-LOCAL (B3 dropped coordination tables from the sync set). **Exception —
+  NODE-LOCAL (they live in the unsynced jobs DB `deltaglider_jobs.db`, P4.4). **Exception —
   REPLICATION now has an OPTIONAL cross-instance lease** (`src/coordination/`):
   when a CAS-capable coordination bucket is configured (`config_sync_bucket`), the
   replication scheduler, event consumer and admin run-now share ONE per-rule
@@ -382,7 +383,7 @@ See `docs/plan/architecture-ha-audit-2026-06-28.md` for the full analysis and th
 roadmap (audit Tiers A→C) toward true round-robin HA. `/_/health` is liveness-only
 (fast, no I/O); `/_/ready` answers the backend half from the health loop's
 verdicts while they are younger than 2 x its interval (else one single-flight
-live probe per 5 s) and probes the config DB live (503 when not ready) —
+live probe per 5 s) and probes the config DB and jobs DB locks live (503 when not ready) —
 point LB readiness checks at `/_/ready`.
 
 ## Frontend (demo/s3-browser/ui)

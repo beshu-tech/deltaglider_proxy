@@ -75,6 +75,8 @@ Two instances can also create a user with the same name at about the same time, 
 
 The first sync after an upgrade has no merge base yet. Without a merge base, the merge cannot tell a delete from a row that the other side never had, so it keeps every row of both sides (a union). A change or a create that was not synced yet survives, and a delete that was not synced yet comes back. The merge base is stored next to the database as `deltaglider_config.db.sync-base`.
 
+The synced database holds IAM only. The job state of each instance (replication and lifecycle cursors, run history, failure rows, maintenance jobs, the parity cache and the event outbox) is in a separate file, `deltaglider_jobs.db`, which the sync never uploads. An IAM change therefore uploads a file of a few hundred kilobytes, not the job history of the instance. During a rolling upgrade from a release that kept the job state in the config database, the instances keep merging IAM in both directions: a new instance ignores the job rows in a copy that an older instance uploads, and an older instance reads only the IAM tables of a copy that a new instance uploads.
+
 If you want no writer at all, switch to `iam_mode: declarative` and manage IAM through YAML and GitOps. See [How to manage IAM as code](manage-iam-as-code.md).
 
 ## 4. Force a sync when you can't wait

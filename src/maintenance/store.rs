@@ -10,7 +10,7 @@
 //!   bucket.
 //! - `maintenance_failures`: per-object errors, ring-bounded.
 //!
-//! Implemented as methods on [`ConfigDb`] so the SQLCipher mutex
+//! Implemented as methods on [`JobsDb`] so the SQLCipher mutex
 //! serialises all maintenance mutations alongside IAM/replication state
 //! (same pattern as `src/replication/state_store.rs`).
 //!
@@ -18,7 +18,7 @@
 //!
 //! Replication flips zombie `running` runs to `failed` on boot because a
 //! new periodic run will follow anyway. A maintenance job is a one-off
-//! the operator explicitly started, so [`ConfigDb::maintenance_requeue_abandoned`]
+//! the operator explicitly started, so [`JobsDb::maintenance_requeue_abandoned`]
 //! flips `running`/`cancelling` back to **`queued`** with the phase and
 //! continuation token preserved — the worker resumes where the previous
 //! process died. This is what makes the server-side state "stable":
@@ -26,7 +26,7 @@
 //! leader lease are touched (a synced DB can carry a peer's live job).
 
 use crate::config_db::job_store;
-use crate::config_db::{ConfigDb, ConfigDbError};
+use crate::config_db::{ConfigDbError, JobsDb};
 use rusqlite::{params, OptionalExtension};
 
 pub use crate::replication::state_store::current_unix_seconds;
@@ -117,7 +117,7 @@ pub struct GateArm {
     pub migrate_source: bool,
 }
 
-impl ConfigDb {
+impl JobsDb {
     /// Create a queued job for `bucket`. Returns `Ok(None)` when the
     /// bucket already has an active job (the partial unique index fires) —
     /// the caller turns that into a 409. Returns the new job id otherwise.
@@ -655,8 +655,8 @@ impl ConfigDb {
 mod tests {
     use super::*;
 
-    fn db() -> ConfigDb {
-        ConfigDb::in_memory("testpass").expect("open in-memory db")
+    fn db() -> JobsDb {
+        JobsDb::in_memory("testpass").expect("open in-memory db")
     }
 
     #[test]
@@ -755,7 +755,7 @@ mod tests {
             .is_none());
     }
 
-    fn lease_cols(db: &ConfigDb, id: i64) -> (Option<String>, Option<i64>) {
+    fn lease_cols(db: &JobsDb, id: i64) -> (Option<String>, Option<i64>) {
         db.conn
             .query_row(
                 "SELECT leader_instance_id, leader_expires_at FROM maintenance_jobs WHERE id = ?",
@@ -765,7 +765,7 @@ mod tests {
             .unwrap()
     }
 
-    fn job_status(db: &ConfigDb, id: i64) -> String {
+    fn job_status(db: &JobsDb, id: i64) -> String {
         db.conn
             .query_row(
                 "SELECT status FROM maintenance_jobs WHERE id = ?",
@@ -820,7 +820,7 @@ mod tests {
         // winner and one clean loser (no double-claim, no corruption).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("maint-race.db");
-        let setup = ConfigDb::open_or_create(&path, "testpass").unwrap();
+        let setup = JobsDb::open_or_create(&path, "testpass").unwrap();
         let id = setup
             .maintenance_create_job("reencrypt", "b", "counting", None, "admin", 1)
             .unwrap()
@@ -834,7 +834,7 @@ mod tests {
                 let p = path.clone();
                 let b = barrier.clone();
                 std::thread::spawn(move || {
-                    let db = ConfigDb::open_or_create(&p, "testpass").unwrap();
+                    let db = JobsDb::open_or_create(&p, "testpass").unwrap();
                     b.wait(); // maximise the overlap window
                     db.maintenance_claim_next_job(inst, 100, 60).unwrap()
                 })
@@ -845,7 +845,7 @@ mod tests {
         assert_eq!(winners, 1, "exactly one thread may claim the row");
 
         // The row is now exactly-once running under one instance.
-        let verify = ConfigDb::open_or_create(&path, "testpass").unwrap();
+        let verify = JobsDb::open_or_create(&path, "testpass").unwrap();
         assert_eq!(job_status(&verify, id), "running");
         let (leader, _) = lease_cols(&verify, id);
         assert!(

@@ -11,7 +11,7 @@ People often confuse these three mechanisms:
 | Mechanism | What it is | Use it when |
 |---|---|---|
 | **Full Backup** (zip from the admin UI or the admin API) | Operator-initiated, point-in-time snapshot: config + IAM + secrets, sha256-verified, atomic restore | Before every upgrade; on a schedule; before risky config changes. This is THE backup. |
-| **DB snapshot** (file copy) | Filesystem-level copy of `deltaglider_config.db` (SQLCipher-encrypted SQLite) | You already snapshot volumes (PVC snapshots, ZFS, etc.) and preserve the config DB key alongside |
+| **DB snapshot** (file copy) | Filesystem-level copy of `deltaglider_config.db` (SQLCipher-encrypted SQLite), and optionally of `deltaglider_jobs.db` (job history, cursors and the event outbox of the instance, same key) | You already snapshot volumes (PVC snapshots, ZFS, etc.) and preserve the config DB key alongside |
 | **S3 config sync** (`config_sync_bucket`) | Automatic live replication of the encrypted DB across instances | Horizontal scaling or blue-green deployments. See [How to run multiple instances](run-multiple-instances.md). **Not a backup**: a bad mutation propagates to every reader. |
 
 Take a Full Backup in every case. The other two mechanisms add to it and do not replace it.

@@ -1285,7 +1285,7 @@ fn unchanged(merged: &Merged, plan: &IdPlan, local: &Snapshot) -> bool {
 /// COMMIT's, the transaction is rolled back: a COMMIT can fail (a deferred
 /// constraint, I/O, a full disk), and a transaction left open would swallow
 /// every later write on this connection until the process dies.
-fn immediate_tx<T>(
+pub(crate) fn immediate_tx<T>(
     conn: &Connection,
     f: impl FnOnce(&Connection) -> Result<T, ConfigDbError>,
 ) -> Result<T, ConfigDbError> {
@@ -1304,8 +1304,9 @@ fn immediate_tx<T>(
 impl ConfigDb {
     /// Three-way merge of the IAM tables of the peer DB at `remote_path` into
     /// this DB, against the last synced DB at `base_path` (see the module doc).
-    /// Coordination tables (jobs, leases, outbox, cursors, parity) are never
-    /// touched (B3). `session_revocations` merges as a monotonic MAX-upsert.
+    /// Node-local tables (jobs, leases, outbox, cursors, parity) are never
+    /// read or written (B3): their rows live in the jobs DB, and a copy from
+    /// an older peer that still carries them is ignored. `session_revocations` merges as a monotonic MAX-upsert.
     pub fn merge_iam_from(
         &self,
         remote_path: &Path,

@@ -9,13 +9,13 @@
 //! - `replication_failures`: per-object errors. Ring-bounded per
 //!   `record_failure`'s `max_retained`.
 //!
-//! Implemented as methods on [`ConfigDb`] so the SQLCipher mutex (held
+//! Implemented as methods on [`JobsDb`] so the SQLCipher mutex (held
 //! at the type boundary) serialises all replication state mutations
 //! alongside IAM mutations. Matches the pattern in
 //! `src/config_db/users.rs`.
 
 use crate::config_db::job_store;
-use crate::config_db::{ConfigDb, ConfigDbError};
+use crate::config_db::{ConfigDbError, JobsDb};
 use rusqlite::{params, OptionalExtension};
 
 /// Scheduling + lifetime state for a single rule.
@@ -159,7 +159,7 @@ pub fn current_replication_event_version() -> u64 {
     REPLICATION_EVENT_VERSION.load(Ordering::SeqCst)
 }
 
-impl ConfigDb {
+impl JobsDb {
     /// Upsert the initial state row for a rule. Idempotent: existing
     /// rows (including `paused` flag + lifetime counters) are preserved.
     pub fn replication_ensure_state(&self, rule_name: &str, now: i64) -> Result<(), ConfigDbError> {
@@ -1345,12 +1345,12 @@ pub struct ParityCacheEntry {
 mod tests {
     use super::*;
 
-    fn db() -> ConfigDb {
-        ConfigDb::in_memory("testpass").expect("open in-memory db")
+    fn db() -> JobsDb {
+        JobsDb::in_memory("testpass").expect("open in-memory db")
     }
 
     /// Every `replication_*` table with a `rule_name` column, from the schema.
-    fn rule_keyed_tables_in_schema(db: &ConfigDb) -> Vec<String> {
+    fn rule_keyed_tables_in_schema(db: &JobsDb) -> Vec<String> {
         let mut stmt = db
             .conn
             .prepare(

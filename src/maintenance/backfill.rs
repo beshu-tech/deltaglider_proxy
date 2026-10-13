@@ -149,7 +149,7 @@ pub async fn hash_object_content<S: crate::storage::StorageBackend>(
 /// references either carry intact metadata or are healed by the write
 /// path's `heal_reference_if_corrupt`.
 pub(crate) async fn execute_backfill_phases(
-    db: &std::sync::Arc<tokio::sync::Mutex<crate::config_db::ConfigDb>>,
+    db: &std::sync::Arc<tokio::sync::Mutex<crate::config_db::JobsDb>>,
     state: &std::sync::Arc<crate::api::handlers::AppState>,
     holder: super::worker::Holder<'_>,
     job: &super::store::MaintenanceJob,

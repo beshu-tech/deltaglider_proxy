@@ -2,11 +2,11 @@
 
 //! Persistent runtime state for lifecycle rules.
 //!
-//! Rules are YAML-owned. The config DB stores only scheduler state,
+//! Rules are YAML-owned. The jobs DB stores only scheduler state,
 //! execution history, per-object failures, and per-rule leases.
 
 use crate::config_db::job_store;
-use crate::config_db::{ConfigDb, ConfigDbError};
+use crate::config_db::{ConfigDbError, JobsDb};
 use rusqlite::{params, OptionalExtension};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -71,7 +71,7 @@ pub struct LifecycleRunTotals {
     pub errors: i64,
 }
 
-impl ConfigDb {
+impl JobsDb {
     pub fn lifecycle_ensure_state(&self, rule_name: &str, now: i64) -> Result<(), ConfigDbError> {
         self.conn.execute(
             "INSERT OR IGNORE INTO lifecycle_state
@@ -481,8 +481,8 @@ impl ConfigDb {
 mod tests {
     use super::*;
 
-    fn db() -> ConfigDb {
-        ConfigDb::in_memory("testpass").expect("open in-memory db")
+    fn db() -> JobsDb {
+        JobsDb::in_memory("testpass").expect("open in-memory db")
     }
 
     #[test]

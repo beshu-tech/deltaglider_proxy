@@ -6,7 +6,7 @@ use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::config_db::ConfigDb;
+use crate::config_db::JobsDb;
 
 /// Why a lease or lock step did not succeed. `Lost` is a verdict (refused,
 /// stolen, lapsed: stop before more work); `Backend` is "could not tell"
@@ -116,11 +116,11 @@ pub trait CoordinationLease: Send + Sync {
 /// correct within one node's process restarts, invisible to peers. Selecting this
 /// impl is what "HA inactive" means — no coordination bucket, no S3 traffic.
 pub struct LocalLease {
-    db: Arc<Mutex<ConfigDb>>,
+    db: Arc<Mutex<JobsDb>>,
 }
 
 impl LocalLease {
-    pub fn new(db: Arc<Mutex<ConfigDb>>) -> Self {
+    pub fn new(db: Arc<Mutex<JobsDb>>) -> Self {
         Self { db }
     }
 }
@@ -191,9 +191,9 @@ impl CoordinationLease for LocalLease {
 mod tests {
     use super::*;
 
-    fn mem_db() -> Arc<Mutex<ConfigDb>> {
-        // In-memory config DB (schema created), for lease-tiling parity tests.
-        Arc::new(Mutex::new(ConfigDb::in_memory("testpass").unwrap()))
+    fn mem_db() -> Arc<Mutex<JobsDb>> {
+        // In-memory jobs DB (schema created), for lease-tiling parity tests.
+        Arc::new(Mutex::new(JobsDb::in_memory("testpass").unwrap()))
     }
 
     async fn ensure_rule(lease: &LocalLease, rule: &str) {

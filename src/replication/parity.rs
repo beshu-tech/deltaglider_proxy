@@ -18,7 +18,7 @@
 //! foreign dest). A naive sha-compare would false-alarm every foreign
 //! object, so the verifier degrades through three tiers (see `compare_pair`).
 
-use crate::config_db::ConfigDb;
+use crate::config_db::JobsDb;
 use crate::config_sections::{ConflictPolicy, ReplicationRule};
 use crate::deltaglider::DynEngine;
 use crate::types::FileMetadata;
@@ -41,14 +41,14 @@ use super::state_store::{ObjectFailure, ParityCacheEntry, ParitySide};
 /// cancel from ANOTHER instance / after a restart, where the in-process flag is
 /// absent). Passing `None` runs without progress/cancel (no-DB fallback path).
 pub struct ParityProgress<'a> {
-    pub db: &'a tokio::sync::Mutex<ConfigDb>,
+    pub db: &'a tokio::sync::Mutex<JobsDb>,
     pub rule: &'a str,
     /// In-process cancel flag set by this instance's `verify_cancel`.
     pub cancel: &'a std::sync::atomic::AtomicBool,
 }
 
 /// Flush progress to the DB once every N pages (not every page) — the global
-/// ConfigDb mutex is shared with the whole IAM/admin path. At 8 pages (~8k
+/// JobsDb mutex is shared with the whole IAM/admin path. At 8 pages (~8k
 /// objects) the live count ticks every few seconds so the UI reads as alive and
 /// a client-side rate stays smooth; the mutex cost of the extra flushes over a
 /// minutes-long scan is negligible.
@@ -917,7 +917,7 @@ async fn resolve_logical(
     dst_prefix: &str,
     raw_keys: &[String],
     source: &mut BTreeMap<String, ObjState>,
-    failures: Option<&tokio::sync::Mutex<ConfigDb>>,
+    failures: Option<&tokio::sync::Mutex<JobsDb>>,
     progress: Option<&ParityProgress<'_>>,
     progress_base: u64,
 ) -> Vec<String> {
@@ -990,7 +990,7 @@ async fn resolve_logical_dest(
     raw_keys: &[String],
     dest: &mut BTreeMap<String, ObjState>,
     on_source: impl Fn(&str) -> bool,
-    failures: Option<&tokio::sync::Mutex<ConfigDb>>,
+    failures: Option<&tokio::sync::Mutex<JobsDb>>,
     progress: Option<&ParityProgress<'_>>,
     progress_base: u64,
 ) -> Vec<String> {
@@ -1177,13 +1177,13 @@ async fn head_burst(
     out
 }
 
-/// Rows one hold of the config DB lock reads, writes or deletes at most.
+/// Rows one hold of the jobs DB lock reads, writes or deletes at most.
 /// Every client PUT and DELETE awaits that lock (its event append), so a
 /// verify of 140k objects in one transaction stalled them all.
 pub(crate) const PARITY_DB_CHUNK: usize = 1000;
 
 pub(crate) async fn cache_get(
-    failures: Option<&tokio::sync::Mutex<ConfigDb>>,
+    failures: Option<&tokio::sync::Mutex<JobsDb>>,
     rule: &str,
     side: ParitySide,
     keys: &[String],
@@ -1204,7 +1204,7 @@ pub(crate) async fn cache_get(
 }
 
 pub(crate) async fn cache_put(
-    failures: Option<&tokio::sync::Mutex<ConfigDb>>,
+    failures: Option<&tokio::sync::Mutex<JobsDb>>,
     rule: &str,
     side: ParitySide,
     entries: &[(String, ParityCacheEntry)],
@@ -1336,7 +1336,7 @@ async fn scan_prefix(
 /// freed pages go back to the disk. Best-effort (logs on error).
 async fn prune_parity_cache(
     rule: &ReplicationRule,
-    failures: Option<&tokio::sync::Mutex<ConfigDb>>,
+    failures: Option<&tokio::sync::Mutex<JobsDb>>,
     src_complete: bool,
     dst_complete: bool,
     source: &BTreeMap<String, ObjState>,
@@ -1367,7 +1367,7 @@ async fn prune_parity_cache(
 /// Delete `rule`'s rows on `side` whose key is not in `keep`, a page of
 /// keys at a time.
 async fn prune_side(
-    mutex: &tokio::sync::Mutex<ConfigDb>,
+    mutex: &tokio::sync::Mutex<JobsDb>,
     rule: &str,
     side: ParitySide,
     keep: &std::collections::HashSet<&str>,
@@ -1416,7 +1416,7 @@ pub async fn parity_audit(
     engine: &DynEngine,
     rule: &ReplicationRule,
     max_objects: usize,
-    failures: Option<&tokio::sync::Mutex<ConfigDb>>,
+    failures: Option<&tokio::sync::Mutex<JobsDb>>,
     progress: Option<ParityProgress<'_>>,
 ) -> Result<ParityOutcome, String> {
     let progress = progress.as_ref();
@@ -1670,7 +1670,7 @@ pub async fn parity_audit(
 
     // Annotate the bounded samples (≤300 keys) with the causal model. The
     // ledger join is one small `IN (…)` query over exactly those keys; empty
-    // when no config DB was passed (still a correct, ledger-less diagnosis).
+    // when no jobs DB was passed (still a correct, ledger-less diagnosis).
     // The ledger is keyed by the worker's RAW SOURCE key, but findings carry
     // dest-namespace keys — invert via dest_to_source so the join hits when
     // source.prefix != destination.prefix (orphans have no source key → skip).
@@ -1683,7 +1683,7 @@ pub async fn parity_audit(
         .map(|s| s.as_str())
         .collect();
     // Lock the DB ONLY here, for the synchronous ledger query — never across
-    // the listing awaits above (a `&ConfigDb` is `!Send`, so holding one across
+    // the listing awaits above (a `&JobsDb` is `!Send`, so holding one across
     // an await would make this future non-`Send` and unusable as a handler).
     let ledger: HashMap<String, ObjectFailure> = match failures {
         Some(mutex) => {
@@ -2147,7 +2147,7 @@ mod tests {
     #[tokio::test]
     async fn check_cancel_honours_in_process_flag_without_a_db_hit() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        let db = tokio::sync::Mutex::new(crate::config_db::ConfigDb::in_memory("t").unwrap());
+        let db = tokio::sync::Mutex::new(crate::config_db::JobsDb::in_memory("t").unwrap());
         let flag = AtomicBool::new(true);
         let p = ParityProgress {
             db: &db,
@@ -2625,7 +2625,7 @@ mod request_count_tests {
             && !r.contains("prefix=.dg%2Ffacts%2F")
     }
 
-    fn rows(db: &ConfigDb, side: &str) -> Vec<String> {
+    fn rows(db: &JobsDb, side: &str) -> Vec<String> {
         let mut stmt = db
             .conn
             .prepare(
@@ -2731,7 +2731,7 @@ mod request_count_tests {
                 .await
                 .unwrap();
         }
-        let db = Mutex::new(ConfigDb::in_memory("pw").unwrap());
+        let db = Mutex::new(JobsDb::in_memory("pw").unwrap());
         parity_audit(&engine, &rule(&[]), 1_000, Some(&db), None)
             .await
             .unwrap();
@@ -2755,11 +2755,11 @@ mod request_count_tests {
     }
 
     /// Jobs finding 10: a verify wrote all its cache rows in one
-    /// transaction under the config DB lock, which every client PUT and
+    /// transaction under the jobs DB lock, which every client PUT and
     /// DELETE awaits. It writes at most 1,000 rows per lock now.
     #[tokio::test]
     async fn parity_cache_writes_take_the_db_lock_per_1000_rows() {
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("pw").unwrap()));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("pw").unwrap()));
         let entries: Vec<(String, ParityCacheEntry)> = (0..2_500)
             .map(|i| {
                 (
@@ -2808,7 +2808,7 @@ mod request_count_tests {
                 .unwrap();
             replicate(&engine, key).await;
         }
-        let db = Mutex::new(ConfigDb::in_memory("pw").unwrap());
+        let db = Mutex::new(JobsDb::in_memory("pw").unwrap());
         parity_audit(&engine, &rule(&[]), 1_000, Some(&db), None)
             .await
             .unwrap();
@@ -2846,7 +2846,7 @@ mod request_count_tests {
     async fn a_parity_prune_gives_its_pages_back() {
         let dir = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
-        let mut db = ConfigDb::open_or_create(&dir.path().join("c.db"), "pw").unwrap();
+        let mut db = JobsDb::open_or_create(&dir.path().join("c.db"), "pw").unwrap();
         let entries: Vec<(String, ParityCacheEntry)> = (0..20_000)
             .map(|i| {
                 (

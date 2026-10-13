@@ -6,7 +6,7 @@
 //! happens from a background dispatcher that claims due rows and never blocks
 //! the S3 request path.
 
-use crate::config_db::{ConfigDb, ConfigDbError};
+use crate::config_db::{ConfigDbError, JobsDb};
 use rusqlite::{params, types::Type, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -274,7 +274,7 @@ pub fn current_unix_seconds() -> i64 {
         .unwrap_or(0)
 }
 
-impl ConfigDb {
+impl JobsDb {
     pub fn event_outbox_insert(&self, event: &NewEvent) -> Result<i64, ConfigDbError> {
         let ids = self.event_outbox_insert_many(std::slice::from_ref(event))?;
         ids.first()
@@ -289,7 +289,7 @@ impl ConfigDb {
     /// leave a partial write — a ~10K-row batch either lands in full or not
     /// at all. Mirrors the atomicity guarantee of
     /// [`event_outbox_requeue_failed_many`](Self::event_outbox_requeue_failed_many).
-    /// No schema change; the S3 path still holds the same `ConfigDb` tokio
+    /// No schema change; the S3 path still holds the same `JobsDb` tokio
     /// Mutex (a later phase addresses contention).
     pub fn event_outbox_insert_many(&self, events: &[NewEvent]) -> Result<Vec<i64>, ConfigDbError> {
         let tx = self.conn.unchecked_transaction()?;
@@ -1178,9 +1178,9 @@ pub static OUTBOX_QUEUE_FULL: std::sync::LazyLock<prometheus::IntCounter> =
         .expect("valid metric")
     });
 
-/// The writer task of one config DB (see [`append_events`]).
+/// The writer task of one jobs DB (see [`append_events`]).
 struct Appender {
-    db: std::sync::Weak<tokio::sync::Mutex<ConfigDb>>,
+    db: std::sync::Weak<tokio::sync::Mutex<JobsDb>>,
     tx: tokio::sync::mpsc::Sender<Vec<NewEvent>>,
     /// Events handed to the writer and not written yet.
     queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -1213,7 +1213,7 @@ impl Default for Readers {
     }
 }
 
-/// One writer per config DB, found by the DB's `Arc` (`AppState` has no
+/// One writer per jobs DB, found by the DB's `Arc` (`AppState` has no
 /// field for it: the request path reaches the DB only through the state).
 static APPENDERS: std::sync::LazyLock<parking_lot::Mutex<Vec<Appender>>> =
     std::sync::LazyLock::new(Default::default);
@@ -1226,7 +1226,7 @@ type AppenderHandles = (
 );
 
 /// The writer of `db`, started on first use with a queue of `cap` appends.
-fn appender(db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>, cap: usize) -> AppenderHandles {
+fn appender(db: &std::sync::Arc<tokio::sync::Mutex<JobsDb>>, cap: usize) -> AppenderHandles {
     let mut all = APPENDERS.lock();
     all.retain(|a| a.db.strong_count() > 0);
     let weak = std::sync::Arc::downgrade(db);
@@ -1262,7 +1262,7 @@ fn appender(db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>, cap: usize) -> Ap
 /// Each insert runs on a blocking thread (the commit fsyncs), and the next
 /// batch waits for it, so outbox ids keep the order of the appends.
 async fn write_appended(
-    db: std::sync::Weak<tokio::sync::Mutex<ConfigDb>>,
+    db: std::sync::Weak<tokio::sync::Mutex<JobsDb>>,
     mut rx: tokio::sync::mpsc::Receiver<Vec<NewEvent>>,
     queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     written: std::sync::Arc<tokio::sync::Notify>,
@@ -1277,7 +1277,7 @@ async fn write_appended(
         }
         let n = batch.len();
         let Some(db) = db.upgrade() else {
-            tracing::warn!("event outbox: the config DB is gone; {n} queued event(s) dropped");
+            tracing::warn!("event outbox: the jobs DB is gone; {n} queued event(s) dropped");
             return;
         };
         let guard = db.lock_owned().await;
@@ -1292,7 +1292,7 @@ async fn write_appended(
 
 /// Insert `events`; a failure is logged and the events dropped
 /// (notifications are best-effort by design).
-fn insert_logged(db: &ConfigDb, events: &[NewEvent]) {
+fn insert_logged(db: &JobsDb, events: &[NewEvent]) {
     if let Err(err) = db.event_outbox_insert_many(events) {
         tracing::warn!(
             "failed to append {} object event(s), first kind={} bucket={} key={:?}: {}",
@@ -1308,7 +1308,7 @@ fn insert_logged(db: &ConfigDb, events: &[NewEvent]) {
 /// Append object events. A client PUT/COPY/DELETE calls this after its
 /// write. The events go to a queue that one writer task drains in order,
 /// many events per transaction, on a blocking thread. So the request never
-/// takes the config DB mutex, never waits for a commit, and never runs an
+/// takes the jobs DB mutex, never waits for a commit, and never runs an
 /// fsync on a runtime worker.
 ///
 /// The queue is bounded (65,536 appends). When it is full, the append
@@ -1317,15 +1317,12 @@ fn insert_logged(db: &ConfigDb, events: &[NewEvent]) {
 /// A crash loses the events still in the queue (owner decision D2: about
 /// the last milliseconds of writes); [`flush_appends`] writes them at a
 /// graceful shutdown.
-pub async fn append_events(
-    db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>,
-    events: Vec<NewEvent>,
-) {
+pub async fn append_events(db: &std::sync::Arc<tokio::sync::Mutex<JobsDb>>, events: Vec<NewEvent>) {
     append_events_capped(db, events, APPEND_QUEUE_CAP).await
 }
 
 async fn append_events_capped(
-    db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>,
+    db: &std::sync::Arc<tokio::sync::Mutex<JobsDb>>,
     events: Vec<NewEvent>,
     cap: usize,
 ) {
@@ -1356,7 +1353,7 @@ async fn append_events_capped(
 
 /// Wait until every event queued by [`append_events`] for `db` is written
 /// (graceful shutdown; tests that read the outbox after a write).
-pub async fn flush_appends(db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>) {
+pub async fn flush_appends(db: &std::sync::Arc<tokio::sync::Mutex<JobsDb>>) {
     use std::sync::atomic::Ordering::SeqCst;
     let (_, queued, written, _) = appender(db, APPEND_QUEUE_CAP);
     loop {
@@ -1386,14 +1383,14 @@ pub fn config_has_outbox_readers(config: &crate::config::Config) -> bool {
 /// Does anything read `db`'s outbox now? Every emitter (client writes,
 /// replication, lifecycle) skips its append when nothing does: the row
 /// would only be pruned again.
-pub fn outbox_has_readers(db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>) -> bool {
+pub fn outbox_has_readers(db: &std::sync::Arc<tokio::sync::Mutex<JobsDb>>) -> bool {
     appender(db, APPEND_QUEUE_CAP).3.any(current_unix_seconds())
 }
 
 /// Record the reader state of `config` for `db` (boot and every config
 /// apply). Takes no DB lock: an apply may run while the DB is held.
 pub fn set_config_readers(
-    db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>,
+    db: &std::sync::Arc<tokio::sync::Mutex<JobsDb>>,
     config: &crate::config::Config,
 ) {
     let on = config_has_outbox_readers(config);
@@ -1405,7 +1402,7 @@ pub fn set_config_readers(
 
 /// A listener cursor of `db` advanced (or was created) at `at`: it counts
 /// as an active reader for `LISTENER_CURSOR_STALE_SECS` after `at`.
-pub fn note_listener_cursor(db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>, at: i64) {
+pub fn note_listener_cursor(db: &std::sync::Arc<tokio::sync::Mutex<JobsDb>>, at: i64) {
     appender(db, APPEND_QUEUE_CAP)
         .3
         .cursor_active_until
@@ -1418,7 +1415,7 @@ pub fn note_listener_cursor(db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>, a
 /// Boot: the reader state of `config`, plus the newest listener-cursor
 /// advance in the DB (a cursor active before the restart still replays).
 pub async fn init_readers(
-    db: &std::sync::Arc<tokio::sync::Mutex<ConfigDb>>,
+    db: &std::sync::Arc<tokio::sync::Mutex<JobsDb>>,
     config: &crate::config::Config,
 ) {
     set_config_readers(db, config);
@@ -1437,7 +1434,7 @@ pub async fn init_readers(
 /// to the DB file so far. Each commit writes its changed pages, so N one-row
 /// commits write about N times more than one N-row commit.
 #[cfg(test)]
-pub(crate) fn pages_written(db: &ConfigDb) -> i64 {
+pub(crate) fn pages_written(db: &JobsDb) -> i64 {
     let (mut cur, mut hi) = (0i32, 0i32);
     // SAFETY: `handle()` is the open connection of `db`; the call only reads
     // a status counter into two local integers.
@@ -1471,12 +1468,12 @@ mod tests {
 
     #[test]
     fn migration_creates_outbox_table() {
-        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let db = JobsDb::in_memory("test-pass").unwrap();
         let version: i32 = db
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert!(version >= 9);
+        assert_eq!(version, crate::config_db::jobs_db::JOBS_SCHEMA_VERSION);
 
         let count: i64 = db
             .conn
@@ -1491,7 +1488,7 @@ mod tests {
 
     #[test]
     fn insert_and_recent_preserve_payload_order() {
-        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let db = JobsDb::in_memory("test-pass").unwrap();
         let first = db.event_outbox_insert(&event_at(10, "a")).unwrap();
         let second = db.event_outbox_insert(&event_at(20, "b")).unwrap();
         assert!(second > first);
@@ -1510,7 +1507,7 @@ mod tests {
         // batched `event_outbox_insert_many` path: N=0 is a no-op, and a
         // multi-row batch commits atomically (all-or-nothing) with ids landing
         // in insertion order.
-        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let db = JobsDb::in_memory("test-pass").unwrap();
 
         // N=0: no-op — empty ids, nothing written.
         let ids = db.event_outbox_insert_many(&[]).unwrap();
@@ -1534,7 +1531,7 @@ mod tests {
 
     #[test]
     fn claim_due_marks_rows_and_skips_future_retries() {
-        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let db = JobsDb::in_memory("test-pass").unwrap();
         let due = db.event_outbox_insert(&event_at(10, "due")).unwrap();
         let future = db.event_outbox_insert(&event_at(11, "future")).unwrap();
         db.event_outbox_mark_failed(future, "try later", Some(500))
@@ -1559,7 +1556,7 @@ mod tests {
 
     #[test]
     fn mark_delivered_and_prune_removes_only_old_delivered_rows() {
-        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let db = JobsDb::in_memory("test-pass").unwrap();
         let old = db.event_outbox_insert(&event_at(10, "old")).unwrap();
         let new = db.event_outbox_insert(&event_at(20, "new")).unwrap();
         let pending = db.event_outbox_insert(&event_at(30, "pending")).unwrap();
@@ -1581,7 +1578,7 @@ mod tests {
 
     #[test]
     fn list_supports_status_pagination_and_sorting() {
-        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let db = JobsDb::in_memory("test-pass").unwrap();
         let first = db.event_outbox_insert(&event_at(10, "a")).unwrap();
         let second = db.event_outbox_insert(&event_at(30, "b")).unwrap();
         let third = db.event_outbox_insert(&event_at(20, "c")).unwrap();
@@ -1617,7 +1614,7 @@ mod tests {
 
     #[test]
     fn prune_delivered_over_count_keeps_newest_delivered_rows() {
-        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let db = JobsDb::in_memory("test-pass").unwrap();
         let old = db.event_outbox_insert(&event_at(10, "old")).unwrap();
         let mid = db.event_outbox_insert(&event_at(20, "mid")).unwrap();
         let new = db.event_outbox_insert(&event_at(30, "new")).unwrap();
@@ -1643,7 +1640,7 @@ mod tests {
 
     #[test]
     fn requeue_failed_preserves_attempt_count_and_clears_failure_state() {
-        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let db = JobsDb::in_memory("test-pass").unwrap();
         let id = db.event_outbox_insert(&event_at(10, "dead")).unwrap();
 
         let claimed = db.event_outbox_claim_due("worker-a", 100, 30, 10).unwrap();
@@ -1665,7 +1662,7 @@ mod tests {
 
     #[test]
     fn requeue_failed_many_only_touches_dead_rows() {
-        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let db = JobsDb::in_memory("test-pass").unwrap();
         let failed = db.event_outbox_insert(&event_at(10, "failed")).unwrap();
         let pending = db.event_outbox_insert(&event_at(20, "pending")).unwrap();
         let delivered = db.event_outbox_insert(&event_at(30, "delivered")).unwrap();
@@ -1690,7 +1687,7 @@ mod tests {
 
     #[test]
     fn prune_and_purge_failed_rows_respect_cursor_floor() {
-        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let db = JobsDb::in_memory("test-pass").unwrap();
         // Three failed rows, ascending id: below, at, above the floor.
         let below = db.event_outbox_insert(&event_at(10, "below")).unwrap();
         let at = db.event_outbox_insert(&event_at(10, "at")).unwrap();
@@ -1735,7 +1732,7 @@ mod tests {
 
     #[test]
     fn listener_cursor_load_advance_monotonic() {
-        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let db = JobsDb::in_memory("test-pass").unwrap();
         // Absent cursor reads as 0.
         assert_eq!(db.listener_cursor_load("replication").unwrap(), 0);
         db.listener_cursor_advance("replication", 5, 100).unwrap();
@@ -1757,7 +1754,7 @@ mod tests {
 
     #[test]
     fn min_active_listener_cursor_ignores_stale_cursors() {
-        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let db = JobsDb::in_memory("test-pass").unwrap();
         // Two listeners: webhook fresh at id=20 (updated_at=1000), replication
         // stale at id=5 (updated_at=100).
         db.listener_cursor_advance("webhook", 20, 1000).unwrap();
@@ -1790,7 +1787,7 @@ mod tests {
         // H65: updated_at marks when the cursor last ADVANCED, not when it was
         // touched. A zero-advance heartbeat must NOT move updated_at, or a wedged
         // listener looks perpetually "active" and pins the prune floor forever.
-        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let db = JobsDb::in_memory("test-pass").unwrap();
         db.listener_cursor_advance("replication", 5, 100).unwrap();
         // Zero-advance heartbeat: same id, later now → updated_at stays at 100.
         db.listener_cursor_advance("replication", 5, 5000).unwrap();
@@ -1815,7 +1812,7 @@ mod tests {
 
     #[test]
     fn stale_cursor_still_pins_operator_purge_floor() {
-        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let db = JobsDb::in_memory("test-pass").unwrap();
         let below = db.event_outbox_insert(&event_at(10, "below")).unwrap();
         let above = db.event_outbox_insert(&event_at(10, "above")).unwrap();
         for id in [below, above] {
@@ -1847,7 +1844,7 @@ mod tests {
 
     #[test]
     fn event_outbox_since_returns_id_ordered_window() {
-        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let db = JobsDb::in_memory("test-pass").unwrap();
         let a = db.event_outbox_insert(&event_at(10, "a")).unwrap();
         let b = db.event_outbox_insert(&event_at(20, "b")).unwrap();
         let c = db.event_outbox_insert(&event_at(30, "c")).unwrap();
@@ -1862,7 +1859,7 @@ mod tests {
 
     #[test]
     fn prune_respects_listener_cursor_floor() {
-        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let db = JobsDb::in_memory("test-pass").unwrap();
         let a = db.event_outbox_insert(&event_at(10, "a")).unwrap();
         let b = db.event_outbox_insert(&event_at(20, "b")).unwrap();
         // Both delivered long ago.
@@ -1884,7 +1881,7 @@ mod tests {
     /// them (they require status=delivered/failed); prune_below_floor can.
     #[test]
     fn prune_below_floor_removes_consumed_pending_rows() {
-        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let db = JobsDb::in_memory("test-pass").unwrap();
         let a = db.event_outbox_insert(&event_at(10, "a")).unwrap();
         let b = db.event_outbox_insert(&event_at(20, "b")).unwrap();
         let c = db.event_outbox_insert(&event_at(30, "c")).unwrap();
@@ -1904,7 +1901,7 @@ mod tests {
     /// delivery already tried. A failed or retrying row stays for a requeue.
     #[test]
     fn prune_below_floor_keeps_rows_delivery_already_tried() {
-        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let db = JobsDb::in_memory("test-pass").unwrap();
         let tried = db.event_outbox_insert(&event_at(10, "tried")).unwrap();
         let fresh = db.event_outbox_insert(&event_at(20, "fresh")).unwrap();
         let claimed = db.event_outbox_claim_due("c", 100, 60, 1).unwrap();
@@ -1916,7 +1913,7 @@ mod tests {
         assert!(db.event_outbox_load(fresh).unwrap().is_none());
     }
 
-    fn pragma_i64(db: &ConfigDb, name: &str) -> i64 {
+    fn pragma_i64(db: &JobsDb, name: &str) -> i64 {
         db.conn
             .pragma_query_value(None, name, |r| r.get(0))
             .unwrap()
@@ -1928,7 +1925,7 @@ mod tests {
     #[test]
     fn pruning_outbox_rows_gives_their_pages_back() {
         let dir = tempfile::tempdir().unwrap();
-        let db = ConfigDb::open_or_create(&dir.path().join("c.db"), "pw").unwrap();
+        let db = JobsDb::open_or_create(&dir.path().join("c.db"), "pw").unwrap();
         let pad = "x".repeat(200);
         let events: Vec<NewEvent> = (0..10_000)
             .map(|i| {
@@ -1963,7 +1960,7 @@ mod tests {
     #[tokio::test]
     async fn flush_appends_writes_the_queued_events_in_order() {
         let db = std::sync::Arc::new(tokio::sync::Mutex::new(
-            ConfigDb::in_memory("test-pass").unwrap(),
+            JobsDb::in_memory("test-pass").unwrap(),
         ));
         let held = db.lock().await;
         for k in ["a", "b", "c"] {
@@ -1995,7 +1992,7 @@ mod tests {
     #[test]
     fn a_failure_ring_prune_in_a_transaction_reclaims_pages() {
         let dir = tempfile::tempdir().unwrap();
-        let db = ConfigDb::open_or_create(&dir.path().join("c.db"), "pw").unwrap();
+        let db = JobsDb::open_or_create(&dir.path().join("c.db"), "pw").unwrap();
         db.conn
             .execute_batch(
                 "CREATE TABLE fails (id INTEGER PRIMARY KEY, rule_name TEXT, b BLOB);
@@ -2015,7 +2012,7 @@ mod tests {
     #[test]
     fn claiming_a_batch_is_one_transaction() {
         let dir = tempfile::tempdir().unwrap();
-        let db = ConfigDb::open_or_create(&dir.path().join("c.db"), "pw").unwrap();
+        let db = JobsDb::open_or_create(&dir.path().join("c.db"), "pw").unwrap();
         let events: Vec<NewEvent> = (0..100).map(|i| event_at(i, &format!("k{i}"))).collect();
         db.event_outbox_insert_many(&events).unwrap();
         let before = pages_written(&db);
@@ -2029,11 +2026,11 @@ mod tests {
         assert!(pages <= 10, "one commit for the claim, wrote {pages} pages");
     }
 
-    fn shared(db: ConfigDb) -> std::sync::Arc<tokio::sync::Mutex<ConfigDb>> {
+    fn shared(db: JobsDb) -> std::sync::Arc<tokio::sync::Mutex<JobsDb>> {
         std::sync::Arc::new(tokio::sync::Mutex::new(db))
     }
 
-    fn outbox_keys(db: &ConfigDb) -> Vec<String> {
+    fn outbox_keys(db: &JobsDb) -> Vec<String> {
         db.event_outbox_since(0, 1000)
             .unwrap()
             .into_iter()
@@ -2046,7 +2043,7 @@ mod tests {
     /// with its fsync) inline on the request's runtime worker.
     #[tokio::test]
     async fn an_append_never_writes_on_the_request_task() {
-        let db = shared(ConfigDb::in_memory("pw").unwrap());
+        let db = shared(JobsDb::in_memory("pw").unwrap());
         append_events(&db, vec![event_at(1, "a")]).await;
         // Single-threaded runtime: the writer has not run yet.
         assert!(
@@ -2061,7 +2058,7 @@ mod tests {
     /// nothing, and the ids keep the order of the appends.
     #[tokio::test]
     async fn a_full_queue_waits_and_drops_nothing() {
-        let db = shared(ConfigDb::in_memory("pw").unwrap());
+        let db = shared(JobsDb::in_memory("pw").unwrap());
         let held = db.lock().await; // the writer blocks on the DB
         let full_before = OUTBOX_QUEUE_FULL.get();
         append_events_capped(&db, vec![event_at(1, "k0")], 2).await;
@@ -2088,7 +2085,7 @@ mod tests {
     /// P4.2: with no reader the append writes nothing; a reader turns it on.
     #[tokio::test]
     async fn an_append_without_a_reader_writes_nothing() {
-        let db = shared(ConfigDb::in_memory("pw").unwrap());
+        let db = shared(JobsDb::in_memory("pw").unwrap());
         let mut config = crate::config::Config::default();
         set_config_readers(&db, &config);
         assert!(!outbox_has_readers(&db));
@@ -2109,7 +2106,7 @@ mod tests {
     /// not. Boot reads it from the DB.
     #[tokio::test]
     async fn an_active_listener_cursor_is_a_reader() {
-        let db = shared(ConfigDb::in_memory("pw").unwrap());
+        let db = shared(JobsDb::in_memory("pw").unwrap());
         let config = crate::config::Config::default();
         let now = current_unix_seconds();
         let stale = crate::event_delivery::LISTENER_CURSOR_STALE_SECS;

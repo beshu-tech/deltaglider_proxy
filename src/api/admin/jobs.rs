@@ -341,7 +341,7 @@ pub async fn list_jobs(
     let mut jobs: Vec<JobView> = Vec::new();
     let mut last_event_applied_at: Option<i64> = None;
 
-    if let Some(db) = state.config_db.as_ref() {
+    if let Some(db) = state.jobs_db.as_ref() {
         let db = db.lock().await;
 
         for rule in &repl_cfg.rules {
@@ -588,9 +588,9 @@ pub async fn job_runs(
     let (sub, key) = parse_job_id(&id).ok_or(not_found())?;
     let limit = q.limit.unwrap_or(20).clamp(1, 100);
     let db = state
-        .config_db
+        .jobs_db
         .as_ref()
-        .ok_or_else(AdminError::no_config_db)?
+        .ok_or_else(AdminError::no_jobs_db)?
         .lock()
         .await;
     let runs: Vec<JobRunEntry> = match sub {
@@ -670,9 +670,9 @@ pub async fn job_failures(
     let (sub, key) = parse_job_id(&id).ok_or(not_found())?;
     let limit = q.limit.unwrap_or(20).clamp(1, 100);
     let db = state
-        .config_db
+        .jobs_db
         .as_ref()
-        .ok_or_else(AdminError::no_config_db)?
+        .ok_or_else(AdminError::no_jobs_db)?
         .lock()
         .await;
     let failures: Vec<JobFailureEntry> = match sub {
@@ -794,10 +794,7 @@ pub async fn job_action(
             Ok((StatusCode::NO_CONTENT, Json(serde_json::json!({}))))
         }
         (JobSubsystem::Replication, JobAction::Kill) => {
-            let db = state
-                .config_db
-                .as_ref()
-                .ok_or_else(AdminError::no_config_db)?;
+            let db = state.jobs_db.as_ref().ok_or_else(AdminError::no_jobs_db)?;
             let flipped = {
                 let db = db.lock().await;
                 db.replication_request_run_cancel(&name)?
@@ -903,7 +900,7 @@ async fn delete_rule_locked(
 ) -> Result<(), AdminError> {
     use super::config::{HeldRefusal, Internal, InternalRefusal, OnPersistError};
     let hold = async {
-        let db = match state.config_db.as_ref() {
+        let db = match state.jobs_db.as_ref() {
             Some(db) => Some(db.lock().await),
             None => None,
         };

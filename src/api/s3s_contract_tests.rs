@@ -305,6 +305,7 @@ async fn harness() -> Harness {
         bucket_usage: None,
         reference_lock: None,
         config_db: None,
+        jobs_db: None,
         maintenance_gate: Arc::new(crate::maintenance::gate::MaintenanceGate::new()),
         maintenance_notify: Arc::new(tokio::sync::Notify::new()),
         backend_capabilities: Default::default(),

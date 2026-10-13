@@ -5,7 +5,7 @@
 use crate::api::handlers::AppState;
 use crate::background::parse_duration_or;
 use crate::config::SharedConfig;
-use crate::config_db::ConfigDb;
+use crate::config_db::JobsDb;
 use crate::config_sections::{JobsConfig, LeaseTiming, LifecycleConfig};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +23,7 @@ const MIN_TICK: Duration = Duration::from_secs(60);
 
 pub fn spawn_scheduler(
     config: SharedConfig,
-    db: Option<Arc<Mutex<ConfigDb>>>,
+    db: Option<Arc<Mutex<JobsDb>>>,
     state: Arc<AppState>,
 ) -> tokio::task::JoinHandle<()> {
     let instance_id = format!("lifecycle-scheduler:{}", uuid::Uuid::new_v4());
@@ -61,7 +61,7 @@ async fn run_due_rules(
     lifecycle: &LifecycleConfig,
     live: &SharedConfig,
     lease: LeaseTiming,
-    db: Option<Arc<Mutex<ConfigDb>>>,
+    db: Option<Arc<Mutex<JobsDb>>>,
     state: &Arc<AppState>,
     instance_id: &str,
 ) {
@@ -303,11 +303,11 @@ mod tests {
         assert_eq!(scheduler_tick(&cfg), DEFAULT_TICK);
     }
 
-    // ── The scheduler loop over a real engine (filesystem) + config DB ──
+    // ── The scheduler loop over a real engine (filesystem) + jobs DB ──
 
     struct Env {
         state: Arc<AppState>,
-        db: Arc<Mutex<ConfigDb>>,
+        db: Arc<Mutex<JobsDb>>,
         _data: tempfile::TempDir,
     }
 
@@ -334,12 +334,13 @@ mod tests {
             bucket_usage: None,
             reference_lock: None,
             config_db: None,
+            jobs_db: None,
             maintenance_gate: Arc::new(crate::maintenance::gate::MaintenanceGate::new()),
             maintenance_notify: Arc::new(tokio::sync::Notify::new()),
             backend_capabilities: Default::default(),
             backend_health: Default::default(),
         });
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("test").unwrap()));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("test").unwrap()));
         Env {
             state,
             db,
@@ -605,7 +606,7 @@ mod tests {
         assert!(!exists(&env, "sched-ok").await, "the valid rule runs");
     }
 
-    /// Without a config DB the in-process guard picks one runner: a rule
+    /// Without a jobs DB the in-process guard picks one runner: a rule
     /// already running here is skipped.
     #[tokio::test]
     async fn without_a_db_the_process_guard_serialises_a_rule() {

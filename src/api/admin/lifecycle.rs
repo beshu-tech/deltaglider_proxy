@@ -89,9 +89,9 @@ async fn set_paused(
         return Err(AdminError::not_found("rule not found"));
     }
     let db = state
-        .config_db
+        .jobs_db
         .as_ref()
-        .ok_or_else(AdminError::no_config_db)?
+        .ok_or_else(AdminError::no_jobs_db)?
         .lock()
         .await;
     let _ = db.lifecycle_ensure_state(name, lifecycle::current_unix_seconds());
@@ -185,9 +185,9 @@ pub async fn run_now(
     };
 
     let db_arc = state
-        .config_db
+        .jobs_db
         .as_ref()
-        .ok_or_else(AdminError::no_config_db)?
+        .ok_or_else(AdminError::no_jobs_db)?
         .clone();
     let lease_owner = format!("run-now:{}", uuid::Uuid::new_v4());
     let now = lifecycle::current_unix_seconds();

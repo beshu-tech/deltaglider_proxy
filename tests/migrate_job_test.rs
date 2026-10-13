@@ -885,8 +885,8 @@ async fn test_migrate_cancel_interrupted_by_shutdown_still_unwinds() {
     let dir = server.config_path().parent().unwrap().to_path_buf();
     let key = std::fs::read_to_string(dir.join("deltaglider_config.db.key")).unwrap();
     {
-        let db = deltaglider_proxy::config_db::ConfigDb::open_or_create(
-            &dir.join("deltaglider_config.db"),
+        let db = deltaglider_proxy::config_db::JobsDb::open_or_create(
+            &dir.join("deltaglider_jobs.db"),
             key.trim(),
         )
         .unwrap();

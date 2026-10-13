@@ -81,6 +81,9 @@ deltaglider_config.db.key
 deltaglider_config.db.rekey.tmp
 deltaglider_config.db.discarded
 deltaglider_usage.db
+deltaglider_jobs.db
+deltaglider_jobs.db.rekey.tmp
+deltaglider_jobs.db.unreadable-*
 
 # Full-backup zips — contain plaintext secrets (bootstrap password
 # hash, OAuth client_secrets, S3 access/secret keys). Never commit.

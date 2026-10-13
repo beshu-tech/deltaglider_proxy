@@ -195,6 +195,9 @@ pub struct ReadinessResponse {
     pub backend: &'static str,
     /// Config DB openability ("ready" | "locked" | "absent").
     pub config_db: &'static str,
+    /// Jobs DB openability ("ready" | "locked" | "absent"): the node-local
+    /// job state and event outbox.
+    pub jobs_db: &'static str,
     /// Live health of each configured backend (name → `healthy` |
     /// `unreachable` | `auth-rejected` | `erroring`), from the periodic
     /// health probe and from requests that found a backend unavailable.
@@ -363,6 +366,14 @@ async fn live_backend_readiness(engine: &crate::deltaglider::DynEngine) -> &'sta
     backend
 }
 
+/// `ready` when the lock is free within [`CONFIG_DB_READY_WAIT`], else `locked`.
+async fn lock_readiness<T>(db: &tokio::sync::Mutex<T>) -> &'static str {
+    match tokio::time::timeout(CONFIG_DB_READY_WAIT, db.lock()).await {
+        Ok(_) => "ready",
+        Err(_) => "locked",
+    }
+}
+
 /// Readiness probe — actually exercises dependencies, so an LB can pull a node
 /// out of rotation when its backend is down (vs `/health` which only proves the
 /// process answers). Returns 503 when not ready.
@@ -387,15 +398,17 @@ pub async fn readiness_check(
                 .await
         }
     };
-    // config DB: if configured, confirm we can take the lock (a wedged mutex
-    // means the control plane is stuck). Every S3 mutation holds it for a
-    // moment (the event outbox), so the probe waits briefly: a busy mutex
-    // is ready, only one held past the wait is not. `None` = legacy/open mode.
+    // The config DB and the jobs DB: if configured, confirm we can take the
+    // lock (a wedged mutex means the control plane is stuck). Every S3
+    // mutation holds the jobs DB lock for a moment (the event outbox), so
+    // the probe waits briefly: a busy mutex is ready, only one held past the
+    // wait is not. `None` = legacy/open mode.
     let config_db = match &state.config_db {
-        Some(db) => match tokio::time::timeout(CONFIG_DB_READY_WAIT, db.lock()).await {
-            Ok(_) => "ready",
-            Err(_) => "locked",
-        },
+        Some(db) => lock_readiness(db).await,
+        None => "absent",
+    };
+    let jobs_db = match &state.jobs_db {
+        Some(db) => lock_readiness(db).await,
         None => "absent",
     };
     let live = state.backend_health.snapshot();
@@ -412,7 +425,7 @@ pub async fn readiness_check(
         .collect();
     let backends_ok = live_backends_ready(&verdicts);
     let backend = if backends_ok { backend } else { "unreachable" };
-    let ready = backend_verdict_is_ready(backend) && config_db != "locked";
+    let ready = backend_verdict_is_ready(backend) && config_db != "locked" && jobs_db != "locked";
     let code = if ready {
         StatusCode::OK
     } else {
@@ -424,6 +437,7 @@ pub async fn readiness_check(
             status: if ready { "ready" } else { "not_ready" },
             backend,
             config_db,
+            jobs_db,
             backends,
         }),
     )

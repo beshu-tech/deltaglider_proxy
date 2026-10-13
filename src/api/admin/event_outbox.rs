@@ -107,9 +107,9 @@ pub async fn list(
     let delivery = { state.config.read().await.event_delivery.clone() };
     let last = crate::event_delivery::last_outcome();
     let db = state
-        .config_db
+        .jobs_db
         .as_ref()
-        .ok_or_else(AdminError::no_config_db)?
+        .ok_or_else(AdminError::no_jobs_db)?
         .lock()
         .await;
 
@@ -167,9 +167,9 @@ pub async fn requeue_one(
     State(state): State<Arc<AdminState>>,
 ) -> Result<Json<RequeueEventOutboxResponse>, AdminError> {
     let db = state
-        .config_db
+        .jobs_db
         .as_ref()
-        .ok_or_else(AdminError::no_config_db)?
+        .ok_or_else(AdminError::no_jobs_db)?
         .lock()
         .await;
 
@@ -200,9 +200,9 @@ pub async fn requeue_many(
     }
 
     let db = state
-        .config_db
+        .jobs_db
         .as_ref()
-        .ok_or_else(AdminError::no_config_db)?
+        .ok_or_else(AdminError::no_jobs_db)?
         .lock()
         .await;
 
@@ -221,9 +221,9 @@ pub async fn purge_failed(
     headers: axum::http::HeaderMap,
 ) -> Result<Json<PurgeFailedResponse>, AdminError> {
     let db = state
-        .config_db
+        .jobs_db
         .as_ref()
-        .ok_or_else(AdminError::no_config_db)?
+        .ok_or_else(AdminError::no_jobs_db)?
         .lock()
         .await;
 

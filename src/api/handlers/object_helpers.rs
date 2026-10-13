@@ -20,7 +20,7 @@
 //! * [`check_quota_for_write`] — pre-write quota gate.
 //! * [`enqueue_object_event`] / [`enqueue_object_events`] — best-
 //!   effort event-outbox append for notification dispatch; never waits
-//!   for the config DB mutex (a full writer queue makes it wait).
+//!   for the jobs DB mutex (a full writer queue makes it wait).
 //!
 //! Everything else moved into the s3s adapter or was already
 //! axum-handler-specific and went away with `object.rs` /
@@ -33,9 +33,9 @@ use crate::storage::StorageError;
 use std::sync::Arc;
 
 /// Append a single object event to the outbox. Silently noops when
-/// no config DB is attached (open-mode dev runs). Errors are
+/// no jobs DB is attached (open-mode dev runs). Errors are
 /// warn-logged and dropped — notifications are best-effort by design.
-/// Never waits for the config DB mutex; waits only when the writer's
+/// Never waits for the jobs DB mutex; waits only when the writer's
 /// queue is full (see [`crate::event_outbox::append_events`]).
 pub(crate) async fn enqueue_object_event(state: &Arc<AppState>, event: NewEvent) {
     enqueue_object_events(state, &[event]).await;
@@ -52,10 +52,10 @@ pub(crate) async fn enqueue_object_events(state: &Arc<AppState>, events: &[NewEv
         .filter(|e| crate::replication::event_consumer::is_user_object_key(&e.key))
         .cloned()
         .collect();
-    let Some(config_db) = state.config_db.as_ref() else {
+    let Some(jobs_db) = state.jobs_db.as_ref() else {
         return;
     };
-    crate::event_outbox::append_events(config_db, filtered).await;
+    crate::event_outbox::append_events(jobs_db, filtered).await;
 }
 
 /// One client write of a whole body (PutObject, CopyObject, form POST).
@@ -542,7 +542,7 @@ mod quota_tests {
 }
 
 /// The quota gate and the outbox enqueue against a real engine, counter and
-/// config DB.
+/// jobs DB.
 #[cfg(test)]
 mod write_path_tests {
     use super::*;
@@ -585,8 +585,8 @@ mod write_path_tests {
         engine.create_bucket("b").await.unwrap();
         let mut state = Arc::try_unwrap(AppState::for_tests(engine)).ok().unwrap();
         state.bucket_usage = Some(usage.clone());
-        state.config_db = Some(Arc::new(tokio::sync::Mutex::new(
-            crate::config_db::ConfigDb::in_memory("pw").unwrap(),
+        state.jobs_db = Some(Arc::new(tokio::sync::Mutex::new(
+            crate::config_db::JobsDb::in_memory("pw").unwrap(),
         )));
         let raw = FilesystemBackend::new(tmp.path().to_path_buf())
             .await
@@ -689,7 +689,7 @@ mod write_path_tests {
     }
 
     async fn outbox_keys(state: &Arc<AppState>) -> Vec<String> {
-        let db = state.config_db.as_ref().unwrap().lock().await;
+        let db = state.jobs_db.as_ref().unwrap().lock().await;
         db.event_outbox_since(0, 100)
             .unwrap()
             .into_iter()
@@ -697,13 +697,13 @@ mod write_path_tests {
             .collect()
     }
 
-    /// A client PUT/DELETE never waits for the config DB mutex: a long holder
+    /// A client PUT/DELETE never waits for the jobs DB mutex: a long holder
     /// (a parity verify, the sync snapshot) used to stall every write
     /// request on its event append. The events still land, in order.
     #[tokio::test]
-    async fn an_object_event_never_waits_for_the_config_db() {
+    async fn an_object_event_never_waits_for_the_jobs_db() {
         let f = fixture(u64::MAX).await;
-        let db = f.state.config_db.clone().unwrap();
+        let db = f.state.jobs_db.clone().unwrap();
         let held = db.lock().await;
         for key in ["a.zip", "b.zip"] {
             tokio::time::timeout(
@@ -711,7 +711,7 @@ mod write_path_tests {
                 enqueue_object_events(&f.state, &[event(key)]),
             )
             .await
-            .expect("the event append waited for the config DB mutex");
+            .expect("the event append waited for the jobs DB mutex");
         }
         drop(held);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);

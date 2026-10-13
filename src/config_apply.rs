@@ -43,7 +43,7 @@ pub async fn build_engine(app: &AppState, cfg: &Config) -> Result<DynEngine, Str
 /// rows forever: only a rule delete through the admin API dropped them.
 /// Runs after every config apply and at boot. Never fails the caller: a
 /// failed purge leaves rows that the next apply or boot drops.
-pub fn reconcile_job_rules(db: &crate::config_db::ConfigDb, cfg: &Config) {
+pub fn reconcile_job_rules(db: &crate::config_db::JobsDb, cfg: &Config) {
     let replication: Vec<String> = cfg
         .replication
         .rules
@@ -168,7 +168,7 @@ impl ConfigMutator {
                 e
             );
         }
-        if let Some(db) = &self.app.config_db {
+        if let Some(db) = &self.app.jobs_db {
             // Not under the config write lock: a task that holds the DB
             // mutex may wait for the config.
             let live = cfg.clone();
@@ -201,7 +201,7 @@ mod tests {
         );
         let cfg = Config::from_yaml_str(&yaml).unwrap();
         assert_eq!(cfg.lifecycle.rules.len(), 2, "{:?}", cfg.lifecycle);
-        let db = crate::config_db::ConfigDb::in_memory("k").unwrap();
+        let db = crate::config_db::JobsDb::in_memory("k").unwrap();
         for rule in ["keep", "old"] {
             db.lifecycle_ensure_state(rule, 1).unwrap();
             let run = db.lifecycle_begin_run(rule, 1, "test").unwrap();
@@ -221,7 +221,7 @@ mod tests {
         db.replication_ensure_state("gone-repl", 1).unwrap();
         let engine = DynEngine::new(&cfg, None).await.unwrap();
         let app = Arc::new(AppState {
-            config_db: Some(Arc::new(tokio::sync::Mutex::new(db))),
+            jobs_db: Some(Arc::new(tokio::sync::Mutex::new(db))),
             ..Arc::into_inner(AppState::for_tests(engine)).unwrap()
         });
         let mutator = ConfigMutator {
@@ -233,7 +233,7 @@ mod tests {
             .mutate_and_apply("test", |c| c.lifecycle.rules.retain(|r| r.name != "old"))
             .await
             .unwrap();
-        let db = app.config_db.as_ref().unwrap().lock().await;
+        let db = app.jobs_db.as_ref().unwrap().lock().await;
         assert!(db.lifecycle_load_state("old").unwrap().is_none());
         assert!(db.lifecycle_recent_runs("old", 10).unwrap().is_empty());
         assert!(db.lifecycle_recent_failures("old", 10).unwrap().is_empty());

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Replication worker: executes one full run of a single rule against
-//! a live engine + config DB.
+//! a live engine + jobs DB.
 //!
 //! What `run_rule` does (H1+H2+H3+M1 fixes wave):
 //!
@@ -31,7 +31,7 @@ use super::planner::{compile_rule_globs, normalize_prefix};
 use super::state_store::{current_unix_seconds, FailureInsert, RunTotals};
 use super::walk;
 use crate::background::{LeaseAlive, LeaseKeeper, RunLease};
-use crate::config_db::ConfigDb;
+use crate::config_db::JobsDb;
 use crate::config_sections::ReplicationRule;
 use crate::coordination::CoordinationLease;
 use crate::deltaglider::DynEngine;
@@ -356,7 +356,7 @@ impl Default for RunConcurrency {
 /// [`run_rule_gated`] without the backend health gate.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_rule(
-    db: Arc<Mutex<ConfigDb>>,
+    db: Arc<Mutex<JobsDb>>,
     engine: &Arc<DynEngine>,
     rule: &ReplicationRule,
     max_failures_retained: u32,
@@ -390,7 +390,7 @@ pub async fn run_rule(
 /// gated, as for a maintenance job on its destination.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_rule_gated(
-    db: Arc<Mutex<ConfigDb>>,
+    db: Arc<Mutex<JobsDb>>,
     engine: &Arc<DynEngine>,
     rule: &ReplicationRule,
     max_failures_retained: u32,
@@ -696,7 +696,7 @@ struct PerObjectResult {
 
 /// Copy one object: poison-skip check → bounded copy → record/clear the
 /// per-object failure. Runs concurrently with up to `transfers` siblings;
-/// all DB writes serialize through the shared `Arc<Mutex<ConfigDb>>`.
+/// all DB writes serialize through the shared `Arc<Mutex<JobsDb>>`.
 #[allow(clippy::too_many_arguments)]
 /// DB-FREE by contract: this future is parked inside the driver's `select!`
 /// and may go unpolled while the driver itself awaits the config-DB mutex.
@@ -991,7 +991,7 @@ fn control_verdict_with_maintenance(
 /// Uniform run-control: kill / pause / lease evaluated identically at every
 /// page boundary of every pass (forward copy, delete pass, oracle descent).
 struct RunControl {
-    db: Arc<Mutex<ConfigDb>>,
+    db: Arc<Mutex<JobsDb>>,
     rule_name: String,
     run_id: i64,
     lease: Option<RunLease>,
@@ -1083,7 +1083,7 @@ impl RunControl {
 type EventSink = std::sync::Arc<parking_lot::Mutex<Vec<NewEvent>>>;
 
 /// Drain the sink and flush under a freshly-acquired DB lock.
-async fn flush_event_sink(db: &Arc<Mutex<ConfigDb>>, rule_name: &str, sink: &EventSink) {
+async fn flush_event_sink(db: &Arc<Mutex<JobsDb>>, rule_name: &str, sink: &EventSink) {
     let mut drained: Vec<NewEvent> = std::mem::take(&mut *sink.lock());
     flush_page_events(db, rule_name, &mut drained).await;
 }
@@ -1092,7 +1092,7 @@ async fn flush_event_sink(db: &Arc<Mutex<ConfigDb>>, rule_name: &str, sink: &Eve
 /// `events`. Used on the lease-loss break path where there's no
 /// already-held guard. A failure is logged, not propagated — event
 /// append is non-critical (the copies themselves are durable).
-async fn flush_page_events(db: &Arc<Mutex<ConfigDb>>, rule_name: &str, events: &mut Vec<NewEvent>) {
+async fn flush_page_events(db: &Arc<Mutex<JobsDb>>, rule_name: &str, events: &mut Vec<NewEvent>) {
     if events.is_empty() {
         return;
     }
@@ -1107,7 +1107,7 @@ async fn flush_page_events(db: &Arc<Mutex<ConfigDb>>, rule_name: &str, events: &
 /// Flush buffered copy events through an already-held DB guard, draining
 /// `events`. Batches the whole page into one `event_outbox_insert_many`
 /// so a 10k-object run costs one insert per page instead of per object.
-fn flush_page_events_locked(db: &ConfigDb, rule_name: &str, events: &mut Vec<NewEvent>) {
+fn flush_page_events_locked(db: &JobsDb, rule_name: &str, events: &mut Vec<NewEvent>) {
     if events.is_empty() {
         return;
     }
@@ -1122,7 +1122,7 @@ fn flush_page_events_locked(db: &ConfigDb, rule_name: &str, events: &mut Vec<New
 }
 
 async fn log_failure(
-    db: &Arc<Mutex<ConfigDb>>,
+    db: &Arc<Mutex<JobsDb>>,
     rule_name: &str,
     run_id: i64,
     source_key: &str,
@@ -1423,7 +1423,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("t").unwrap()));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("t").unwrap()));
         let lease = Arc::new(CountingLease(
             std::sync::atomic::AtomicUsize::new(0),
             std::sync::atomic::AtomicUsize::new(0),
@@ -1484,7 +1484,7 @@ mod tests {
             std::sync::atomic::AtomicUsize::new(0),
             std::sync::atomic::AtomicUsize::new(0),
         ));
-        let run = |db: Arc<Mutex<ConfigDb>>| {
+        let run = |db: Arc<Mutex<JobsDb>>| {
             let engine = engine.clone();
             let lease = lease.clone();
             async move {
@@ -1510,7 +1510,7 @@ mod tests {
         };
         let released = || lease.1.load(std::sync::atomic::Ordering::SeqCst);
         // Normal exit: no release from the run itself.
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("t").unwrap()));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("t").unwrap()));
         run(db).await.unwrap();
         assert_eq!(released(), 0);
         // Abnormal exit: dropping the run's guard (a panic or a dropped run
@@ -1660,7 +1660,7 @@ mod tests {
 
     #[test]
     fn running_progress_updates_history_before_finish() {
-        let db = ConfigDb::in_memory("testpass").unwrap();
+        let db = JobsDb::in_memory("testpass").unwrap();
         db.replication_ensure_state("r", 100).unwrap();
         let run_id = db.replication_begin_run("r", 100, "scheduler").unwrap();
         let totals = RunTotals {
@@ -1769,7 +1769,7 @@ mod request_count_tests {
     }
 
     async fn run(
-        db: &Arc<Mutex<ConfigDb>>,
+        db: &Arc<Mutex<JobsDb>>,
         engine: &Arc<DynEngine>,
         rule: &ReplicationRule,
     ) -> RunOutcome {
@@ -1827,7 +1827,7 @@ mod request_count_tests {
                 .await
                 .unwrap();
         }
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("t").unwrap()));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("t").unwrap()));
         fake.clear();
         let outcome = run(&db, &engine, &rule(true)).await;
         assert_eq!(outcome.totals.objects_deleted, 50, "{outcome:?}");
@@ -1864,7 +1864,7 @@ mod request_count_tests {
                 .await
                 .unwrap();
         }
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("t").unwrap()));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("t").unwrap()));
         let r = rule(false);
         assert_eq!(run(&db, &engine, &r).await.totals.objects_copied, 100);
         // The first converged walk resolves (and remembers) each pair.
@@ -1897,7 +1897,7 @@ mod request_count_tests {
                     .unwrap();
             }
         }
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("t").unwrap()));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("t").unwrap()));
         fake.set_delay_ms("HEAD", 20);
         let outcome = run(&db, &engine, &rule(false)).await;
         assert_eq!(outcome.totals.objects_copied, 0, "{outcome:?}");

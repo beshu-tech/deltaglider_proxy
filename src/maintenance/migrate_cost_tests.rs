@@ -13,7 +13,7 @@ use crate::storage::FakeS3;
 struct Env {
     state: Arc<AppState>,
     fake: Arc<FakeS3>,
-    db: Arc<Mutex<ConfigDb>>,
+    db: Arc<Mutex<JobsDb>>,
     job: MaintenanceJob,
     mutator: ConfigMutator,
     params: MigrateParams,
@@ -41,7 +41,7 @@ async fn env_with(phase: &str, objects: usize, in_target: bool) -> Env {
         from_backend: "src".into(),
         target: MigrateTarget::Empty,
     };
-    let db = ConfigDb::in_memory("k").unwrap();
+    let db = JobsDb::in_memory("k").unwrap();
     let id = db
         .maintenance_create_job(
             "migrate",
@@ -299,7 +299,7 @@ async fn the_flip_marks_the_usage_row_for_a_recount() {
         bucket_usage: Some(usage.clone()),
         ..Arc::into_inner(AppState::for_tests(engine)).unwrap()
     });
-    let db = ConfigDb::in_memory("k").unwrap();
+    let db = JobsDb::in_memory("k").unwrap();
     let id = db
         .maintenance_create_job(
             "migrate",

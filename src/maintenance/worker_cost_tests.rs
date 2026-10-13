@@ -18,7 +18,7 @@ fn unique_created_at() -> i64 {
 struct Env {
     state: Arc<AppState>,
     fake: Arc<FakeS3>,
-    db: Arc<Mutex<ConfigDb>>,
+    db: Arc<Mutex<JobsDb>>,
     config: SharedConfig,
     mutator: ConfigMutator,
     _dir: tempfile::TempDir,
@@ -48,7 +48,7 @@ async fn env(objects: usize) -> Env {
         app: state.clone(),
         persist_path: dir.path().join("c.yaml").display().to_string(),
     };
-    let db = ConfigDb::in_memory("k").unwrap();
+    let db = JobsDb::in_memory("k").unwrap();
     db.maintenance_create_job(
         "reencrypt",
         "b",
@@ -263,7 +263,7 @@ async fn run_kind(
         app: state.clone(),
         persist_path: dir.path().join("c.yaml").display().to_string(),
     };
-    let db = ConfigDb::in_memory("k").unwrap();
+    let db = JobsDb::in_memory("k").unwrap();
     db.maintenance_create_job(kind, "b", "counting", None, "admin", unique_created_at())
         .unwrap()
         .unwrap();
@@ -630,7 +630,7 @@ async fn a_resumed_walk_lists_the_references() {
         app: state.clone(),
         persist_path: dir.path().join("c.yaml").display().to_string(),
     };
-    let db = ConfigDb::in_memory("k").unwrap();
+    let db = JobsDb::in_memory("k").unwrap();
     let id = db
         .maintenance_create_job(
             "reencrypt",
@@ -673,7 +673,7 @@ fn the_idle_wait_is_half_a_ttl_or_the_next_due_row() {
 }
 
 /// Wait (up to `secs`) until job `id` settles; its row.
-async fn settled(db: &Arc<Mutex<ConfigDb>>, id: i64, secs: u64) -> MaintenanceJob {
+async fn settled(db: &Arc<Mutex<JobsDb>>, id: i64, secs: u64) -> MaintenanceJob {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
     loop {
         let row = db.lock().await.maintenance_job_by_id(id).unwrap().unwrap();

@@ -9,7 +9,7 @@
 
 use crate::background::parse_duration_or;
 use crate::config::SharedConfig;
-use crate::config_db::ConfigDb;
+use crate::config_db::JobsDb;
 use crate::config_sections::{EventDeliveryConfig, EventDeliveryFormat};
 use crate::event_outbox::{
     current_unix_seconds, EndpointOutcome, EventOutboxRecord, Settlement, STATUS_DELIVERED,
@@ -623,7 +623,7 @@ impl HttpWebhookDeliveryClient {
 
 pub fn spawn_dispatcher(
     config: SharedConfig,
-    db: Arc<Mutex<ConfigDb>>,
+    db: Arc<Mutex<JobsDb>>,
 ) -> tokio::task::JoinHandle<()> {
     spawn_dispatcher_with_client(
         config,
@@ -634,7 +634,7 @@ pub fn spawn_dispatcher(
 
 pub fn spawn_dispatcher_with_client(
     config: SharedConfig,
-    db: Arc<Mutex<ConfigDb>>,
+    db: Arc<Mutex<JobsDb>>,
     client: Arc<DynEventDeliveryClient<'static>>,
 ) -> tokio::task::JoinHandle<()> {
     let claimant = format!("event-delivery:{}", uuid::Uuid::new_v4());
@@ -699,7 +699,7 @@ pub(crate) fn inactive_prune_floor(
 /// Prune the outbox while delivery is off (see `inactive_prune_floor`).
 /// Events are therefore not kept for a later enable of delivery: the UI says so.
 pub async fn prune_while_inactive(
-    db: &Arc<Mutex<ConfigDb>>,
+    db: &Arc<Mutex<JobsDb>>,
     config: &EventDeliveryConfig,
     replication_enabled: bool,
     now: i64,
@@ -726,7 +726,7 @@ pub async fn prune_while_inactive(
 }
 
 pub async fn dispatch_once(
-    db: &Arc<Mutex<ConfigDb>>,
+    db: &Arc<Mutex<JobsDb>>,
     client: &(impl EventDeliveryClient + ?Sized),
     config: &EventDeliveryConfig,
     claimant: &str,
@@ -832,7 +832,7 @@ pub async fn dispatch_once(
 /// outcomes and each row's final state. Writes nothing, so the caller
 /// settles the batch in one transaction.
 async fn deliver_batch(
-    db: &Arc<Mutex<ConfigDb>>,
+    db: &Arc<Mutex<JobsDb>>,
     client: &(impl EventDeliveryClient + ?Sized),
     config: &EventDeliveryConfig,
     claimed: &[EventOutboxRecord],
@@ -1002,7 +1002,7 @@ pub fn known_status(status: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_db::ConfigDb;
+    use crate::config_db::JobsDb;
 
     #[test]
     fn truncate_error_never_panics_on_multibyte_boundary() {
@@ -1097,7 +1097,7 @@ mod tests {
         let mut off = cfg();
         off.enabled = false;
         off.prune_batch = 2; // forces several batches in one tick
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("test-pass").unwrap()));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("test-pass").unwrap()));
         {
             let db = db.lock().await;
             for i in 0..5 {
@@ -1157,7 +1157,7 @@ mod tests {
         let prod = HttpWebhookDeliveryClient::default();
         // Insert one event + claim it so we have a real EventOutboxRecord; the
         // SSRF guard fires before the record content matters.
-        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let db = JobsDb::in_memory("test-pass").unwrap();
         db.event_outbox_insert(&event("k")).unwrap();
         let rec = db
             .event_outbox_claim_due("w", current_unix_seconds() + 1, 60, 1)
@@ -1203,7 +1203,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_marks_success_delivered() {
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("test-pass").unwrap()));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("test-pass").unwrap()));
         let id = {
             let db = db.lock().await;
             db.event_outbox_insert(&event("ok")).unwrap()
@@ -1229,7 +1229,7 @@ mod tests {
     /// before delivery ever succeeded.
     #[tokio::test]
     async fn dispatch_keeps_undelivered_row_below_replication_floor() {
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("test-pass").unwrap()));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("test-pass").unwrap()));
         let id = {
             let db = db.lock().await;
             let id = db.event_outbox_insert(&event("down")).unwrap();
@@ -1296,7 +1296,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_retry_posts_only_to_endpoints_that_have_not_succeeded() {
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("test-pass").unwrap()));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("test-pass").unwrap()));
         let id = db.lock().await.event_outbox_insert(&event("fan")).unwrap();
         let client = EndpointClient {
             fail_url: "http://b.invalid/hook",
@@ -1371,7 +1371,7 @@ mod tests {
     /// hash, A's new URL looked like a new endpoint and got it again.
     #[tokio::test]
     async fn a_rotated_endpoint_url_keeps_its_delivered_state() {
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("test-pass").unwrap()));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("test-pass").unwrap()));
         db.lock().await.event_outbox_insert(&event("rot")).unwrap();
         let client = EndpointClient {
             fail_url: "http://b.invalid/hook",
@@ -1398,7 +1398,7 @@ mod tests {
     async fn a_dispatch_batch_settles_in_one_transaction() {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(Mutex::new(
-            ConfigDb::open_or_create(&dir.path().join("c.db"), "pw").unwrap(),
+            JobsDb::open_or_create(&dir.path().join("c.db"), "pw").unwrap(),
         ));
         let events: Vec<NewEvent> = (0..100).map(|i| event(&format!("k{i}"))).collect();
         db.lock().await.event_outbox_insert_many(&events).unwrap();
@@ -1442,7 +1442,7 @@ mod tests {
     /// to every endpoint, with the same event id.
     #[tokio::test]
     async fn a_crash_before_the_settle_delivers_the_batch_again() {
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("test-pass").unwrap()));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("test-pass").unwrap()));
         let id = db
             .lock()
             .await
@@ -1486,7 +1486,7 @@ mod tests {
     /// The same URL listed twice is one endpoint: one post.
     #[tokio::test]
     async fn a_url_listed_twice_gets_one_post() {
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("test-pass").unwrap()));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("test-pass").unwrap()));
         db.lock().await.event_outbox_insert(&event("dup")).unwrap();
         let client = EndpointClient {
             fail_url: "http://none.invalid/",
@@ -1519,7 +1519,7 @@ mod tests {
         config: EventDeliveryConfig,
         fail: &'static str,
     ) -> (Vec<String>, Vec<String>) {
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("test-pass").unwrap()));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("test-pass").unwrap()));
         let id = db.lock().await.event_outbox_insert(&slack_event()).unwrap();
         let client = EndpointClient {
             fail_url: fail,
@@ -1600,7 +1600,7 @@ mod tests {
 
     #[tokio::test]
     async fn deliveries_for_many_groups_rows_by_outbox_id() {
-        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let db = JobsDb::in_memory("test-pass").unwrap();
         let a = db.event_outbox_insert(&event("a")).unwrap();
         let b = db.event_outbox_insert(&event("b")).unwrap();
         db.event_delivery_record(a, "e1", None, 10).unwrap();
@@ -1710,7 +1710,7 @@ mod tests {
     /// instead of retrying max_attempts times.
     #[tokio::test]
     async fn ssrf_refusal_dead_letters_at_once() {
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("test-pass").unwrap()));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("test-pass").unwrap()));
         let id = db.lock().await.event_outbox_insert(&event("ssrf")).unwrap();
         let mut config = cfg();
         config.max_attempts = 8;
@@ -1761,7 +1761,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_retries_then_permanently_fails() {
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("test-pass").unwrap()));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("test-pass").unwrap()));
         let id = {
             let db = db.lock().await;
             db.event_outbox_insert(&event("fail")).unwrap()
@@ -1839,7 +1839,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("test-pass").unwrap()));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("test-pass").unwrap()));
         let id = {
             let db = db.lock().await;
             db.event_outbox_insert(&event("webhook")).unwrap()
@@ -1903,7 +1903,7 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("test-pass").unwrap()));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("test-pass").unwrap()));
         // One notifying event + one that the kind filter drops.
         let created = {
             let db = db.lock().await;
@@ -1976,7 +1976,7 @@ mod tests {
     #[tokio::test]
     async fn transport_error_does_not_persist_the_webhook_secret() {
         for format in [EventDeliveryFormat::Raw, EventDeliveryFormat::Slack] {
-            let db = Arc::new(Mutex::new(ConfigDb::in_memory("test-pass").unwrap()));
+            let db = Arc::new(Mutex::new(JobsDb::in_memory("test-pass").unwrap()));
             db.lock()
                 .await
                 .event_outbox_insert(&event("ror/app.zip"))

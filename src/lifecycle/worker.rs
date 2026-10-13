@@ -8,7 +8,7 @@ use super::planner::{
 };
 use super::state_store::{LifecycleFailureInsert, LifecycleRunTotals};
 use crate::background::{LeaseAlive, LeaseKeeper, RunLease};
-use crate::config_db::ConfigDb;
+use crate::config_db::JobsDb;
 use crate::config_sections::{LifecycleAction, LifecycleRetainNewestAction, LifecycleRule};
 use crate::coordination::LeaseError;
 use crate::deltaglider::{DeleteHooks, DeleteItem, DeleteOutcome, DynEngine, ListObjectsPage};
@@ -141,7 +141,7 @@ fn forget_previews(rule_name: &str) {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_rule(
-    db: Option<Arc<Mutex<ConfigDb>>>,
+    db: Option<Arc<Mutex<JobsDb>>>,
     engine: &Arc<DynEngine>,
     rule: &LifecycleRule,
     max_failures_retained: u32,
@@ -167,7 +167,7 @@ pub async fn run_rule(
 /// Open the run-history row (`running`) and return its id. Split from the run
 /// so an async caller (admin run-now) can answer with the id before the run.
 pub async fn begin_run(
-    db: Option<&Arc<Mutex<ConfigDb>>>,
+    db: Option<&Arc<Mutex<JobsDb>>>,
     rule: &LifecycleRule,
     triggered_by: &str,
 ) -> Result<Option<i64>, String> {
@@ -184,7 +184,7 @@ pub async fn begin_run(
 /// Execute a run whose history row `begin_run` opened, and settle that row.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_begun_rule(
-    db: Option<Arc<Mutex<ConfigDb>>>,
+    db: Option<Arc<Mutex<JobsDb>>>,
     engine: &Arc<DynEngine>,
     rule: &LifecycleRule,
     max_failures_retained: u32,
@@ -294,7 +294,7 @@ pub async fn run_begun_rule(
 struct RunLeaseGuard {
     keeper: Option<LeaseKeeper>,
     /// (db, rule, owner) to release on an abnormal exit.
-    release: Option<(Arc<Mutex<ConfigDb>>, String, String)>,
+    release: Option<(Arc<Mutex<JobsDb>>, String, String)>,
 }
 
 impl RunLeaseGuard {
@@ -329,7 +329,7 @@ struct RunContext {
 }
 
 async fn run_or_preview(
-    db: Option<Arc<Mutex<ConfigDb>>>,
+    db: Option<Arc<Mutex<JobsDb>>>,
     engine: &Arc<DynEngine>,
     rule: &LifecycleRule,
     response_cap: usize,
@@ -608,7 +608,7 @@ const MAX_RETAIN_NEWEST_CANDIDATES: usize = 200_000;
 /// only the act phase mutates, and `engine.delete` is idempotent.
 #[allow(clippy::too_many_arguments)]
 async fn run_or_preview_retain_newest(
-    db: Option<Arc<Mutex<ConfigDb>>>,
+    db: Option<Arc<Mutex<JobsDb>>>,
     engine: &Arc<DynEngine>,
     rule: &LifecycleRule,
     action: &LifecycleRetainNewestAction,
@@ -1059,7 +1059,7 @@ enum Planned {
 }
 
 async fn plan_action(
-    db: Option<&Arc<Mutex<ConfigDb>>>,
+    db: Option<&Arc<Mutex<JobsDb>>>,
     engine: &Arc<DynEngine>,
     rule: &LifecycleRule,
     key: &str,
@@ -1135,7 +1135,7 @@ async fn plan_action(
 /// keys; the result is `true` when it did (the caller stops the run).
 #[allow(clippy::too_many_arguments)]
 async fn delete_planned(
-    db: Option<&Arc<Mutex<ConfigDb>>>,
+    db: Option<&Arc<Mutex<JobsDb>>>,
     engine: &DynEngine,
     rule: &LifecycleRule,
     deletes: Vec<PlannedDelete>,
@@ -1226,7 +1226,7 @@ async fn delete_planned(
 /// deleted key's event, and [`DeleteEvents::flush`] stores the page's
 /// events in one outbox insert (one commit, not one per key).
 struct DeleteEvents {
-    db: Option<Arc<Mutex<ConfigDb>>>,
+    db: Option<Arc<Mutex<JobsDb>>>,
     rule_name: String,
     bucket: String,
     expire_after: Option<String>,
@@ -1342,7 +1342,7 @@ enum ActionOutcome {
 
 #[cfg(test)]
 async fn execute_action(
-    db: Option<&Arc<Mutex<ConfigDb>>>,
+    db: Option<&Arc<Mutex<JobsDb>>>,
     engine: &Arc<DynEngine>,
     rule: &LifecycleRule,
     key: &str,
@@ -1373,7 +1373,7 @@ async fn execute_action(
 
 /// The run's lease keeper (`None` without a DB or a lease: nothing to renew).
 fn spawn_lease_keeper(
-    db: Option<Arc<Mutex<ConfigDb>>>,
+    db: Option<Arc<Mutex<JobsDb>>>,
     rule_name: &str,
     lease: Option<RunLease>,
 ) -> Option<LeaseKeeper> {
@@ -1444,7 +1444,7 @@ fn begin_write_windows(
 }
 
 async fn renew_run_lease(
-    db: &Option<Arc<Mutex<ConfigDb>>>,
+    db: &Option<Arc<Mutex<JobsDb>>>,
     rule: &LifecycleRule,
     ctx: Option<&RunContext>,
     failures: &mut Vec<LifecycleFailure>,
@@ -1496,7 +1496,7 @@ async fn renew_run_lease(
 }
 
 async fn record_failure(
-    db: &Option<Arc<Mutex<ConfigDb>>>,
+    db: &Option<Arc<Mutex<JobsDb>>>,
     rule: &LifecycleRule,
     ctx: Option<&RunContext>,
     key: &str,
@@ -1528,7 +1528,7 @@ async fn record_failure(
 
 #[allow(clippy::too_many_arguments)]
 async fn append_lifecycle_transition_event(
-    db: Option<&Arc<Mutex<ConfigDb>>>,
+    db: Option<&Arc<Mutex<JobsDb>>>,
     rule: &LifecycleRule,
     key: &str,
     meta: &crate::types::FileMetadata,
@@ -1876,7 +1876,7 @@ mod tests {
         let engine = fs_engine(dir.path()).await;
         let dbdir = tempfile::tempdir().unwrap();
         let db = Arc::new(tokio::sync::Mutex::new(
-            crate::config_db::ConfigDb::open_or_create(&dbdir.path().join("c.db"), "pw").unwrap(),
+            crate::config_db::JobsDb::open_or_create(&dbdir.path().join("c.db"), "pw").unwrap(),
         ));
         let mut deletes = Vec::new();
         for i in 0..20 {
@@ -1919,7 +1919,7 @@ mod tests {
     #[tokio::test]
     async fn a_dropped_batch_still_stores_its_buffered_events() {
         let db = Arc::new(tokio::sync::Mutex::new(
-            crate::config_db::ConfigDb::in_memory("pw").unwrap(),
+            crate::config_db::JobsDb::in_memory("pw").unwrap(),
         ));
         let events = super::DeleteEvents {
             db: Some(db.clone()),
@@ -2001,7 +2001,7 @@ mod review3_tests {
                 .await
                 .unwrap();
         }
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("k").unwrap()));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("k").unwrap()));
         let rule = crate::config_sections::LifecycleRule {
             name: "r".to_string(),
             enabled: true,
@@ -2056,7 +2056,7 @@ mod heartbeat_db_error_tests {
     /// as "lost" and stopped the run.
     #[tokio::test]
     async fn a_db_error_on_one_renew_does_not_lose_the_lease() {
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("k").unwrap()));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("k").unwrap()));
         let now = crate::lifecycle::current_unix_seconds();
         {
             let d = db.lock().await;

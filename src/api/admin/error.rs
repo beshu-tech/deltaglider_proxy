@@ -127,6 +127,10 @@ impl<B: ErrorBody> AdminError<B> {
         Self::unavailable("config DB not available")
     }
 
+    pub(crate) fn no_jobs_db() -> Self {
+        Self::unavailable("jobs DB not available")
+    }
+
     pub(crate) fn status_code(&self) -> StatusCode {
         self.status
     }

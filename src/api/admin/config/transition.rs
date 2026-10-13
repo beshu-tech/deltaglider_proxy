@@ -251,7 +251,7 @@ pub(crate) async fn apply_config_transition(
     }
     // Event delivery or replication may have started or stopped reading the
     // outbox: the append path skips its write while nothing reads it.
-    if let Some(db) = ctx.app().config_db.as_ref() {
+    if let Some(db) = ctx.app().jobs_db.as_ref() {
         crate::event_outbox::set_config_readers(db, &new_cfg);
     }
     **cfg = new_cfg;

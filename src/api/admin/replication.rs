@@ -299,7 +299,7 @@ pub async fn verify(
 ) -> Result<(StatusCode, ParityStatusResponse), AdminError> {
     let (_repl, rule) = snapshot_and_find_rule(&state, &name).await?;
     let Some(plane) = state.job_plane.clone() else {
-        // No config DB → fall back to a synchronous in-request audit (dev/no-DB).
+        // No jobs DB → fall back to a synchronous in-request audit (dev/no-DB).
         let engine = state.s3_state.engine.load().clone();
         let outcome = replication::parity_audit(
             &engine,
@@ -549,7 +549,7 @@ pub async fn verify_status(
     name: String,
 ) -> Result<ParityStatusResponse, AdminError> {
     let _ = snapshot_and_find_rule(&state, &name).await?;
-    let row = match &state.config_db {
+    let row = match &state.jobs_db {
         Some(db_arc) => {
             let db = db_arc.lock().await;
             // Self-heal a zombie 'running' row (dead task, no boot since) before
@@ -576,7 +576,7 @@ pub async fn verify_cancel(
     if let Some(flag) = state.parity_cancels.lock().unwrap().get(&name) {
         flag.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    let row = match &state.config_db {
+    let row = match &state.jobs_db {
         Some(db_arc) => {
             let db = db_arc.lock().await;
             let now = crate::replication::current_unix_seconds();
@@ -608,9 +608,9 @@ pub async fn pause(
         return Err(AdminError::not_found("rule not found"));
     }
     let db = state
-        .config_db
+        .jobs_db
         .as_ref()
-        .ok_or_else(AdminError::no_config_db)?
+        .ok_or_else(AdminError::no_jobs_db)?
         .lock()
         .await;
     let _ = db.replication_ensure_state(&name, replication::current_unix_seconds());
@@ -628,9 +628,9 @@ pub async fn resume(
         return Err(AdminError::not_found("rule not found"));
     }
     let db = state
-        .config_db
+        .jobs_db
         .as_ref()
-        .ok_or_else(AdminError::no_config_db)?
+        .ok_or_else(AdminError::no_jobs_db)?
         .lock()
         .await;
     let now = replication::current_unix_seconds();

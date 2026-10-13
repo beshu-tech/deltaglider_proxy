@@ -15,7 +15,7 @@ use futures::StreamExt;
 use tokio::sync::Mutex;
 use tracing::warn;
 
-use crate::config_db::ConfigDb;
+use crate::config_db::JobsDb;
 use crate::job_loop::{list_retry_delay, ListFailure, Pager, LIST_ATTEMPTS};
 
 use super::store::MaintenanceJob;
@@ -30,7 +30,7 @@ pub(crate) const PAGE_CONCURRENCY: usize = 4;
 /// The job a phase runs for.
 #[derive(Clone, Copy)]
 pub(crate) struct JobCtx<'a> {
-    pub db: &'a Arc<Mutex<ConfigDb>>,
+    pub db: &'a Arc<Mutex<JobsDb>>,
     pub holder: Holder<'a>,
     pub job: &'a MaintenanceJob,
 }
@@ -386,7 +386,7 @@ mod tests {
             .collect()
     }
 
-    fn claimed(db: &ConfigDb) -> MaintenanceJob {
+    fn claimed(db: &JobsDb) -> MaintenanceJob {
         let id = db
             .maintenance_create_job("reencrypt", "b", "objects", None, "admin", 1)
             .unwrap()
@@ -415,12 +415,12 @@ mod tests {
     }
 
     struct Db {
-        db: Arc<Mutex<ConfigDb>>,
+        db: Arc<Mutex<JobsDb>>,
         job: MaintenanceJob,
     }
 
     fn db() -> Db {
-        let db = ConfigDb::in_memory("t").unwrap();
+        let db = JobsDb::in_memory("t").unwrap();
         let job = claimed(&db);
         Db {
             db: Arc::new(Mutex::new(db)),

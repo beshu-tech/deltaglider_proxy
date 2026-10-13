@@ -106,17 +106,17 @@ Lifecycle skips:
 - Keys outside `include_globs` when includes are configured.
 - Keys newer than `expire_after`.
 
-Deletion is idempotent at the object level. A copy failure never deletes the source; a configured source delete runs only after the destination write verifies. The proxy reports per-object failures in the response and persists them in the config DB with the id of the run that observed them.
+Deletion is idempotent at the object level. A copy failure never deletes the source; a configured source delete runs only after the destination write verifies. The proxy reports per-object failures in the response and persists them in the jobs DB with the id of the run that observed them.
 
 ## Runtime state
 
-The config DB stores:
+The jobs DB (`deltaglider_jobs.db`, next to the config DB, never synced) stores:
 
 - `lifecycle_state`: current `last_status`, `last_run_at`, `next_due_at`, lifetime expired-object/byte counters, and the active scheduler lease.
 - `lifecycle_run_history`: one row per `run-now` or scheduler execution.
 - `lifecycle_failures`: recent per-object failures, ring-bounded by `max_failures_retained` per rule.
 
-The scheduler and run-now take a per-rule lease in the config DB, so two workers of one instance never run the same rule at the same time. The lease lasts 5 minutes and is renewed every 60 seconds; `advanced.jobs.lease_ttl` and `advanced.jobs.heartbeat_interval` change these values (see [Job leases](configuration.md#job-leases)). The lease is node-local, because the config sync does not carry it, so two instances can run the same rule at the same time. A boot-time reconciliation marks runs left in `running` by a dead process as `failed` and records an operator-visible failure row.
+The scheduler and run-now take a per-rule lease in the jobs DB, so two workers of one instance never run the same rule at the same time. The lease lasts 5 minutes and is renewed every 60 seconds; `advanced.jobs.lease_ttl` and `advanced.jobs.heartbeat_interval` change these values (see [Job leases](configuration.md#job-leases)). The lease is node-local, because the config sync does not carry the jobs DB, so two instances can run the same rule at the same time. A boot-time reconciliation marks runs left in `running` by a dead process as `failed` and records an operator-visible failure row.
 
 Runs persist a continuation cursor: a run interrupted by a crash or restart resumes from the stored cursor instead of rescanning from the top. A listing that fails because the backend is slow or answers with a 5xx status is sent again with the same cursor, up to 5 times. Only a cursor that the backend refuses as invalid restarts the listing fresh, exactly once.
 
@@ -126,7 +126,7 @@ While the backend health check marks the backend of a bucket that the rule write
 
 ## Events
 
-When a config DB is available, successful lifecycle deletes append a `LifecycleExpired` event to the durable event outbox with rule name, expiration age, object creation time, and content length. Successful transitions append `LifecycleTransitioned` with source/destination coordinates and copied bytes. If a transition rule also deletes the source, that source delete appends a `LifecycleExpired` event with action `transition-source-delete`.
+When a jobs DB is available, successful lifecycle deletes append a `LifecycleExpired` event to the durable event outbox with rule name, expiration age, object creation time, and content length. Successful transitions append `LifecycleTransitioned` with source/destination coordinates and copied bytes. If a transition rule also deletes the source, that source delete appends a `LifecycleExpired` event with action `transition-source-delete`.
 
 ## Deferred
 

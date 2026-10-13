@@ -11,7 +11,7 @@ use crate::replication::state_store::{ParityCacheEntry, ParitySide};
 
 /// What one run needs, fixed for the whole walk.
 pub(super) struct RunScope<'a> {
-    pub db: &'a Arc<Mutex<ConfigDb>>,
+    pub db: &'a Arc<Mutex<JobsDb>>,
     pub engine: &'a Arc<DynEngine>,
     pub rule: &'a ReplicationRule,
     pub run_id: i64,

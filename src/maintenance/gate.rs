@@ -44,12 +44,12 @@ use axum::response::Response;
 use dashmap::DashMap;
 
 use super::store::GateArm;
-use crate::config_db::ConfigDb;
+use crate::config_db::JobsDb;
 
 /// Lock-free busy-bucket set (reads) + per-bucket in-flight write counters.
 ///
 /// The busy set is DERIVED: [`MaintenanceGate::sync_from`] recomputes it
-/// from the active job rows (`ConfigDb::maintenance_gate_arms`) after every
+/// from the active job rows (`JobsDb::maintenance_gate_arms`) after every
 /// row transition, at boot, and on every worker poll tick. There is no hand
 /// `set_busy`/`clear` outside tests, so a missed or reordered call can
 /// neither strand a finished bucket busy nor open a bucket whose row is
@@ -99,7 +99,7 @@ impl MaintenanceGate {
     /// guard of the row transition still held, so two syncs store in the
     /// order of the transitions. A DB that cannot be read changes nothing
     /// (fail closed: the keys stay armed until the next sync).
-    pub fn sync_from(&self, db: &ConfigDb) {
+    pub fn sync_from(&self, db: &JobsDb) {
         let arms = match db.maintenance_gate_arms() {
             Ok(arms) => arms,
             Err(e) => {
@@ -118,7 +118,7 @@ impl MaintenanceGate {
     /// after the staged-copy cleanup. The row is still active until the
     /// worker settles it; this is the one release that its row does not
     /// drive. The staging route stays gated until the row settles.
-    pub fn release_for_unwind(&self, job_id: i64, db: &ConfigDb) {
+    pub fn release_for_unwind(&self, job_id: i64, db: &JobsDb) {
         self.unwinding.lock().insert(job_id);
         self.sync_from(db);
     }
@@ -369,7 +369,7 @@ mod tests {
     /// until its row settles or its phase stops gating it.
     #[test]
     fn sync_from_derives_the_busy_set_from_active_rows() {
-        let db = ConfigDb::in_memory("testpass").unwrap();
+        let db = JobsDb::in_memory("testpass").unwrap();
         let g = MaintenanceGate::new();
         g.set_busy("stale");
         let r = db
@@ -405,7 +405,7 @@ mod tests {
 
     #[test]
     fn sync_from_an_unreadable_db_changes_nothing() {
-        let db = ConfigDb::in_memory("testpass").unwrap();
+        let db = JobsDb::in_memory("testpass").unwrap();
         db.maintenance_create_job("reencrypt", "b", "counting", None, "admin", 1)
             .unwrap()
             .unwrap();
@@ -423,7 +423,7 @@ mod tests {
     /// and the release does not outlive the row.
     #[test]
     fn release_for_unwind_opens_only_the_source_until_the_row_settles() {
-        let db = ConfigDb::in_memory("testpass").unwrap();
+        let db = JobsDb::in_memory("testpass").unwrap();
         let m = db
             .maintenance_create_job("migrate", "m", "verify", Some(MIGRATE_PARAMS), "admin", 1)
             .unwrap()

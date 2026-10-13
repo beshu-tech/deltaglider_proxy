@@ -4,12 +4,12 @@
 //!
 //! The admin API owns explicit "run now" execution. This module owns the
 //! background loop that wakes up, discovers due rules from the hot-reloaded
-//! config + config DB state, and runs them through the same worker path.
+//! config + jobs DB state, and runs them through the same worker path.
 
 use crate::api::handlers::AppState;
 use crate::background::parse_duration_or;
 use crate::config::SharedConfig;
-use crate::config_db::ConfigDb;
+use crate::config_db::JobsDb;
 use crate::config_sections::ReplicationConfig;
 use crate::coordination::DynCoordinationLease;
 use crate::coordination::{CoordinationLease, LeaseSubsystem};
@@ -26,7 +26,7 @@ const DEFAULT_HEARTBEAT_SECS: i64 = 60;
 
 pub fn spawn_scheduler(
     config: SharedConfig,
-    db: Arc<Mutex<ConfigDb>>,
+    db: Arc<Mutex<JobsDb>>,
     state: Arc<AppState>,
     lease: Arc<DynCoordinationLease<'static>>,
 ) -> tokio::task::JoinHandle<()> {
@@ -53,7 +53,7 @@ pub fn spawn_scheduler(
 async fn run_due_rules(
     replication: &ReplicationConfig,
     config: &SharedConfig,
-    db: &Arc<Mutex<ConfigDb>>,
+    db: &Arc<Mutex<JobsDb>>,
     state: &Arc<AppState>,
     instance_id: &str,
     lease: &Arc<DynCoordinationLease<'static>>,
@@ -412,7 +412,7 @@ storage:
         );
         let replication = cfg.replication.clone();
         let config: SharedConfig = Arc::new(tokio::sync::RwLock::new(cfg));
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("pw").unwrap()));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("pw").unwrap()));
         let lease = DynCoordinationLease::from_arc(Arc::new(FreeLease));
         fake.clear();
         run_due_rules(&replication, &config, &db, &state, "i", &lease).await;

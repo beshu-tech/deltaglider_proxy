@@ -38,7 +38,7 @@ use tracing::{debug, info, warn};
 
 use crate::api::handlers::AppState;
 use crate::config::SharedConfig;
-use crate::config_db::ConfigDb;
+use crate::config_db::JobsDb;
 use crate::config_sections::ReplicationRule;
 use crate::coordination::{CoordinationLease, LeaseSubsystem};
 use crate::event_outbox::{
@@ -268,7 +268,7 @@ pub fn match_rules<'a>(
 /// new outbox events past its cursor and applies them to matching rules.
 pub fn spawn_event_consumer(
     config: SharedConfig,
-    db: Arc<Mutex<ConfigDb>>,
+    db: Arc<Mutex<JobsDb>>,
     state: Arc<AppState>,
     lease: Arc<DynCoordinationLease<'static>>,
 ) -> tokio::task::JoinHandle<()> {
@@ -313,7 +313,7 @@ pub fn spawn_event_consumer(
 #[allow(clippy::too_many_arguments)]
 async fn consumer_tick(
     config: &SharedConfig,
-    db: &Arc<Mutex<ConfigDb>>,
+    db: &Arc<Mutex<JobsDb>>,
     engine: &Arc<crate::deltaglider::DynEngine>,
     gate: &crate::maintenance::gate::MaintenanceGate,
     health: Option<&crate::coordination::BackendHealthCache>,
@@ -390,7 +390,7 @@ async fn consumer_tick(
 /// Does a drain have anything to do? Read-only. A failed read counts as
 /// work, so the tick runs as before.
 fn consumer_has_work(
-    dbg: &ConfigDb,
+    dbg: &JobsDb,
     replication: &crate::config_sections::ReplicationConfig,
 ) -> bool {
     let read = || -> Result<bool, crate::config_db::ConfigDbError> {
@@ -448,7 +448,7 @@ fn has_work(
 /// "0": the row is written even at 0 (an empty outbox). Otherwise the next tick
 /// saw a 0 cursor again, took the first LIVE event for history and seeded past
 /// it — that event was never replicated.
-async fn seed_cursor_if_absent(db: &Arc<Mutex<ConfigDb>>) {
+async fn seed_cursor_if_absent(db: &Arc<Mutex<JobsDb>>) {
     let dbg = db.lock().await;
     if matches!(
         dbg.listener_cursor_load_full(REPLICATION_LISTENER),
@@ -502,7 +502,7 @@ enum RuleClaim {
 /// once per drain: an operator's pause or delete must stop the consumer at
 /// the next key, not up to a whole drain later.
 async fn live_rule_gate(
-    db: &Arc<Mutex<ConfigDb>>,
+    db: &Arc<Mutex<JobsDb>>,
     config: &crate::config::SharedConfig,
     rule_name: &str,
 ) -> RuleClaim {
@@ -543,7 +543,7 @@ async fn live_rule_gate(
 /// `Held` leaves the lease released.
 async fn claim_rule(
     lease: &(impl CoordinationLease + ?Sized),
-    db: &Arc<Mutex<ConfigDb>>,
+    db: &Arc<Mutex<JobsDb>>,
     config: &crate::config::SharedConfig,
     rule_name: &str,
     instance_id: &str,
@@ -619,7 +619,7 @@ fn classify_engine_error(
 #[allow(clippy::too_many_arguments)]
 async fn drain_once(
     config: &crate::config::SharedConfig,
-    db: &Arc<Mutex<ConfigDb>>,
+    db: &Arc<Mutex<JobsDb>>,
     engine: &Arc<crate::deltaglider::DynEngine>,
     gate: &crate::maintenance::gate::MaintenanceGate,
     health: Option<&crate::coordination::BackendHealthCache>,
@@ -743,7 +743,7 @@ fn global_watermark(rule_cursors: &BTreeMap<String, i64>, global: i64, rows_max:
 /// event is skipped. Rows of rules no longer enabled are dropped (they would
 /// pin the prune floor).
 fn load_rule_cursors(
-    dbg: &ConfigDb,
+    dbg: &JobsDb,
     rule_names: &[&str],
     global: i64,
     now: i64,
@@ -773,7 +773,7 @@ fn load_rule_cursors(
 #[allow(clippy::too_many_arguments)]
 async fn drain_rules(
     config: &crate::config::SharedConfig,
-    db: &Arc<Mutex<ConfigDb>>,
+    db: &Arc<Mutex<JobsDb>>,
     engine: &Arc<crate::deltaglider::DynEngine>,
     gate: &crate::maintenance::gate::MaintenanceGate,
     health: Option<&crate::coordination::BackendHealthCache>,
@@ -963,7 +963,7 @@ enum KeyClaim {
 #[allow(clippy::too_many_arguments)]
 async fn claim_key(
     config: &crate::config::SharedConfig,
-    db: &Arc<Mutex<ConfigDb>>,
+    db: &Arc<Mutex<JobsDb>>,
     lease: &(impl CoordinationLease + ?Sized),
     claims: &mut std::collections::HashMap<String, RuleClaim>,
     rule_name: &str,
@@ -1087,7 +1087,7 @@ pub(crate) fn drain_must_stop(w: &DrainWindow) -> bool {
 #[allow(clippy::too_many_arguments)]
 async fn drain_rule_rows(
     config: &crate::config::SharedConfig,
-    db: &Arc<Mutex<ConfigDb>>,
+    db: &Arc<Mutex<JobsDb>>,
     engine: &Arc<crate::deltaglider::DynEngine>,
     gate: &crate::maintenance::gate::MaintenanceGate,
     replication: &crate::config_sections::ReplicationConfig,
@@ -1277,7 +1277,7 @@ async fn drain_rule_rows(
 /// Record one key's outcome: clear or record its failure, and hold its
 /// events unless the failure is about the key and its attempts are used up.
 fn settle_key(
-    dbg: &ConfigDb,
+    dbg: &JobsDb,
     replication: &crate::config_sections::ReplicationConfig,
     w: &KeyWork<'_>,
     outcome: Result<(), Box<dyn std::error::Error + Send + Sync>>,
@@ -1384,7 +1384,7 @@ fn key_attempts_exhausted(consecutive_failures: u32) -> bool {
 /// with reconcile).
 async fn apply_copy(
     engine: &Arc<crate::deltaglider::DynEngine>,
-    db: &Arc<Mutex<ConfigDb>>,
+    db: &Arc<Mutex<JobsDb>>,
     rule: &ReplicationRule,
     bucket: &str,
     key: &str,
@@ -1453,7 +1453,7 @@ async fn apply_copy(
 /// Append a `ReplicationObjectCopied` event (best-effort) so the replication
 /// chain is observable downstream, identical to the reconcile worker.
 async fn emit_replication_copied(
-    db: &Arc<Mutex<ConfigDb>>,
+    db: &Arc<Mutex<JobsDb>>,
     rule: &ReplicationRule,
     source_key: &str,
     dest_key: &str,
@@ -1909,8 +1909,8 @@ mod claim_rule_tests {
         }
     }
 
-    fn setup(rules: &[&str]) -> (Arc<Mutex<ConfigDb>>, crate::config::SharedConfig) {
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("testpass").unwrap()));
+    fn setup(rules: &[&str]) -> (Arc<Mutex<JobsDb>>, crate::config::SharedConfig) {
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("testpass").unwrap()));
         let mut cfg = Config::default();
         cfg.replication.rules = rules.iter().map(|n| tests_rule(n)).collect();
         (db, Arc::new(tokio::sync::RwLock::new(cfg)))
@@ -1979,7 +1979,7 @@ mod claim_rule_tests {
 mod seed_tests {
     use super::*;
 
-    fn put_event(db: &ConfigDb, key: &str) -> i64 {
+    fn put_event(db: &JobsDb, key: &str) -> i64 {
         db.event_outbox_insert(&NewEvent::new(
             EventKind::ObjectCreated,
             "b",
@@ -1996,7 +1996,7 @@ mod seed_tests {
     /// seeded past it, and that event was never replicated.
     #[tokio::test]
     async fn seed_does_not_swallow_the_first_live_event() {
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("pw").unwrap()));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("pw").unwrap()));
         seed_cursor_if_absent(&db).await; // first enabled tick, empty outbox
         let first = put_event(&*db.lock().await, "k1");
         seed_cursor_if_absent(&db).await; // next tick, before any drain
@@ -2014,7 +2014,7 @@ mod seed_tests {
     /// History from before the enable is still skipped once.
     #[tokio::test]
     async fn seed_skips_history_once() {
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("pw").unwrap()));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("pw").unwrap()));
         let old = put_event(&*db.lock().await, "old");
         seed_cursor_if_absent(&db).await;
         let cursor = db
@@ -2087,7 +2087,7 @@ mod per_rule_cursor_tests {
         rules: Vec<ReplicationRule>,
     ) -> (
         tempfile::TempDir,
-        Arc<Mutex<ConfigDb>>,
+        Arc<Mutex<JobsDb>>,
         crate::config::SharedConfig,
         Arc<DynEngine>,
     ) {
@@ -2108,20 +2108,15 @@ mod per_rule_cursor_tests {
         let mut cfg = Config::default();
         cfg.replication.enabled = true;
         cfg.replication.rules = rules;
-        let db = Arc::new(Mutex::new(ConfigDb::in_memory("pw").unwrap()));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("pw").unwrap()));
         (dir, db, Arc::new(tokio::sync::RwLock::new(cfg)), engine)
     }
 
-    async fn put(db: &Arc<Mutex<ConfigDb>>, engine: &DynEngine, key: &str) -> i64 {
+    async fn put(db: &Arc<Mutex<JobsDb>>, engine: &DynEngine, key: &str) -> i64 {
         put_bytes(db, engine, key, b"data").await
     }
 
-    async fn put_bytes(
-        db: &Arc<Mutex<ConfigDb>>,
-        engine: &DynEngine,
-        key: &str,
-        body: &[u8],
-    ) -> i64 {
+    async fn put_bytes(db: &Arc<Mutex<JobsDb>>, engine: &DynEngine, key: &str, body: &[u8]) -> i64 {
         engine
             .store("src", key, body, None, Default::default())
             .await
@@ -2141,7 +2136,7 @@ mod per_rule_cursor_tests {
 
     async fn drain(
         config: &crate::config::SharedConfig,
-        db: &Arc<Mutex<ConfigDb>>,
+        db: &Arc<Mutex<JobsDb>>,
         engine: &Arc<DynEngine>,
         lease: &(impl CoordinationLease + ?Sized),
     ) {
@@ -2163,14 +2158,14 @@ mod per_rule_cursor_tests {
         .await;
     }
 
-    async fn cursor(db: &Arc<Mutex<ConfigDb>>, listener: &str) -> i64 {
+    async fn cursor(db: &Arc<Mutex<JobsDb>>, listener: &str) -> i64 {
         db.lock().await.listener_cursor_load(listener).unwrap()
     }
 
     /// One full consumer tick (seed, lease, drain, release) as the loop runs it.
     async fn tick(
         config: &crate::config::SharedConfig,
-        db: &Arc<Mutex<ConfigDb>>,
+        db: &Arc<Mutex<JobsDb>>,
         engine: &Arc<DynEngine>,
         lease: &(impl CoordinationLease + ?Sized),
     ) -> u64 {
@@ -2292,7 +2287,7 @@ mod per_rule_cursor_tests {
     /// no event is skipped or replayed from zero; a removed rule's row goes.
     #[tokio::test]
     async fn rule_cursors_seed_from_the_global_cursor() {
-        let db = ConfigDb::in_memory("pw").unwrap();
+        let db = JobsDb::in_memory("pw").unwrap();
         db.listener_cursor_advance(&rule_listener("gone"), 3, 1)
             .unwrap();
         let cursors = load_rule_cursors(&db, &["r"], 42, 1).unwrap();
@@ -2369,7 +2364,7 @@ mod per_rule_cursor_tests {
     }
 
     fn rows_template() -> EventOutboxRecord {
-        let db = ConfigDb::in_memory("pw").unwrap();
+        let db = JobsDb::in_memory("pw").unwrap();
         db.event_outbox_insert(&NewEvent::new(
             EventKind::ObjectCreated,
             "b",
@@ -2525,7 +2520,7 @@ mod request_count_tests {
     /// Buckets `src` and `dst` on one fake S3; `dst` lives on backend
     /// `dst-be` in the config (so a test can gate it alone).
     struct Fixture {
-        db: Arc<Mutex<ConfigDb>>,
+        db: Arc<Mutex<JobsDb>>,
         config: crate::config::SharedConfig,
         engine: Arc<DynEngine>,
         fake: Arc<FakeS3>,
@@ -2582,7 +2577,7 @@ storage:
             engine.create_bucket(b).await.unwrap();
         }
         Fixture {
-            db: Arc::new(Mutex::new(ConfigDb::in_memory("pw").unwrap())),
+            db: Arc::new(Mutex::new(JobsDb::in_memory("pw").unwrap())),
             config: Arc::new(tokio::sync::RwLock::new(gated_config(deletes))),
             engine,
             fake,

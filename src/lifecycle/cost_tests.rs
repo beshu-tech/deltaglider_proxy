@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::config_db::ConfigDb;
+use crate::config_db::JobsDb;
 use crate::config_sections::LifecycleRule;
 use crate::deltaglider::{s3_engine, store_deltas, DynEngine};
 use crate::storage::FakeS3;
@@ -217,7 +217,7 @@ async fn a_transient_list_error_keeps_the_cursor() {
     store_deltas(&engine, "run", 30).await;
     let mut r = rule("resume", "30d");
     r.batch_size = 10;
-    let db = Arc::new(Mutex::new(ConfigDb::in_memory("k").unwrap()));
+    let db = Arc::new(Mutex::new(JobsDb::in_memory("k").unwrap()));
     {
         let db = db.lock().await;
         db.lifecycle_ensure_state("resume", 0).unwrap();

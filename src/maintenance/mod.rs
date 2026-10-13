@@ -17,7 +17,7 @@
 //!
 //! Architecture (mirrors `src/replication/` / `src/lifecycle/`):
 //!
-//! - [`store`] — durable job rows in the SQLCipher ConfigDb: phase +
+//! - [`store`] — durable job rows in the SQLCipher JobsDb: phase +
 //!   continuation-token cursor, progress counters, leader lease,
 //!   boot-time reconcile (running → queued, cursor preserved).
 //! - [`gate`] — the per-bucket WRITE gate. While a bucket has an active
@@ -34,7 +34,7 @@
 //!
 //! ## Multi-instance caveat
 //!
-//! The ConfigDb is per-instance and the write gate is in-process memory.
+//! The JobsDb is per-instance and the write gate is in-process memory.
 //! In a multi-instance deployment, other instances do not gate the
 //! bucket — the same single-runner posture replication and lifecycle
 //! already have. The leader lease prevents double-running on one

@@ -55,11 +55,13 @@ mod declarative;
 mod groups;
 pub(crate) mod iam_merge;
 pub(crate) mod job_store;
+pub mod jobs_db;
 pub mod key;
 pub mod restore;
 mod users;
 pub(crate) use users::first_free_user_name;
 
+pub use jobs_db::{jobs_db_path, JobsDb};
 pub use key::{ConfigDbKeys, DbKeySource, DbSecret, FallbackKind};
 
 /// How [`ConfigDb::open_with_keys`] opened the DB.
@@ -157,6 +159,90 @@ fn convert_to_incremental_vacuum(conn: &Connection, path: &Path) {
     }
 }
 
+/// Open the SQLCipher file at `local_path` with `passphrase` and check
+/// the key. Returns the connection (foreign keys on, 5 s busy timeout) and
+/// the number of schema objects (0 = a new, empty file). A key that does not
+/// decrypt the file is `WrongPassphrase` with `wrong_key_context`.
+pub(crate) fn open_encrypted(
+    local_path: &Path,
+    passphrase: &str,
+    wrong_key_context: &str,
+) -> Result<(Connection, i32), ConfigDbError> {
+    if passphrase.is_empty() {
+        return Err(ConfigDbError::WrongPassphrase(
+            "Config database passphrase must not be empty".to_string(),
+        ));
+    }
+
+    let conn = crate::sqlite_open::open(local_path)?;
+
+    // Set the encryption key (PRAGMA key must be the first statement)
+    conn.pragma_update(None, "key", passphrase)?;
+    // Wait up to 5s for locks instead of failing immediately (also for the
+    // key check below: a busy DB must not read as a wrong key).
+    // Prevents "database is locked" errors during concurrent S3 sync + admin ops.
+    conn.pragma_update(None, "busy_timeout", "5000")?;
+
+    // Test that the key is correct by reading the schema
+    let schema_objects = conn
+        .query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+            r.get::<_, i32>(0)
+        })
+        .map_err(|e| key_check_error(e, wrong_key_context))?;
+
+    // Enable foreign keys (per-connection setting, not persisted)
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    Ok((conn, schema_objects))
+}
+
+/// Open (or create) the file at `local_path` with `keys.primary`, through
+/// `open`. A file that opens only with a fallback key (the legacy bootstrap
+/// hash, a key file that an env key replaces, `DGP_CONFIG_DB_KEY_PREVIOUS`)
+/// is re-encrypted with the primary key first, see [`rekey_file`], and its
+/// companions follow ([`heal_companions`]). A file that opens with no key is
+/// `WrongPassphrase`. The config DB and the jobs DB both open here, so a
+/// key rotation moves both.
+pub(crate) fn open_keyed<T>(
+    local_path: &Path,
+    keys: &ConfigDbKeys,
+    open: impl Fn(&Path, &str) -> Result<T, ConfigDbError>,
+    before_swap: impl FnOnce(&Path) -> Result<(), ConfigDbError>,
+) -> Result<(T, OpenedWith), ConfigDbError> {
+    let existed = local_path.exists();
+    let primary = keys.primary.expose();
+    let wrong = match open(local_path, primary) {
+        Ok(db) => {
+            let how = if existed {
+                OpenedWith::Primary
+            } else {
+                OpenedWith::Created
+            };
+            // A crash after the DB moved to the primary key, but before
+            // its companions did, heals here.
+            heal_companions(local_path, keys);
+            return Ok((db, how));
+        }
+        Err(ConfigDbError::WrongPassphrase(msg)) => msg,
+        Err(e) => return Err(e),
+    };
+    for (kind, old) in &keys.fallbacks {
+        if !probe_key(local_path, old.expose())? {
+            continue;
+        }
+        rekey_file_hooked(local_path, old.expose(), primary, before_swap)?;
+        heal_companions(local_path, keys);
+        warn!(
+            "{} opened with {}; it is now re-encrypted with {}",
+            local_path.display(),
+            kind.describe(),
+            keys.source.describe()
+        );
+        let db = open(local_path, primary)?;
+        return Ok((db, OpenedWith::Migrated(*kind)));
+    }
+    Err(ConfigDbError::WrongPassphrase(wrong))
+}
+
 /// Compute the path to the IAM config database file.
 ///
 /// Derives the directory from `DGP_CONFIG` (parent of the config file)
@@ -242,35 +328,11 @@ impl ConfigDb {
     /// Open an existing DB or create a new one at `local_path`.
     /// The `passphrase` is used as the SQLCipher encryption key.
     pub fn open_or_create(local_path: &Path, passphrase: &str) -> Result<Self, ConfigDbError> {
-        if passphrase.is_empty() {
-            return Err(ConfigDbError::WrongPassphrase(
-                "Config database passphrase must not be empty".to_string(),
-            ));
-        }
-
-        let conn = crate::sqlite_open::open(local_path)?;
-
-        // Set the encryption key (PRAGMA key must be the first statement)
-        conn.pragma_update(None, "key", passphrase)?;
-        // Wait up to 5s for locks instead of failing immediately (also for the
-        // key check below: a busy DB must not read as a wrong key).
-        // Prevents "database is locked" errors during concurrent S3 sync + admin ops.
-        conn.pragma_update(None, "busy_timeout", "5000")?;
-
-        // Test that the key is correct by reading the schema
-        let schema_objects = conn
-            .query_row("SELECT count(*) FROM sqlite_master", [], |r| {
-                r.get::<_, i32>(0)
-            })
-            .map_err(|e| {
-                key_check_error(
-                    e,
-                    "Cannot decrypt config database (wrong DGP_CONFIG_DB_KEY or key file?)",
-                )
-            })?;
-
-        // Enable foreign keys (per-connection setting, not persisted)
-        conn.pragma_update(None, "foreign_keys", "ON")?;
+        let (conn, schema_objects) = open_encrypted(
+            local_path,
+            passphrase,
+            "Cannot decrypt config database (wrong DGP_CONFIG_DB_KEY or key file?)",
+        )?;
 
         // A new DB takes incremental auto-vacuum before its first table; an
         // older one converts after its migration (one VACUUM).
@@ -308,39 +370,7 @@ impl ConfigDb {
         keys: &ConfigDbKeys,
         before_swap: impl FnOnce(&Path) -> Result<(), ConfigDbError>,
     ) -> Result<(Self, OpenedWith), ConfigDbError> {
-        let existed = local_path.exists();
-        let primary = keys.primary.expose();
-        let wrong = match Self::open_or_create(local_path, primary) {
-            Ok(db) => {
-                let how = if existed {
-                    OpenedWith::Primary
-                } else {
-                    OpenedWith::Created
-                };
-                // A crash after the DB moved to the primary key, but before
-                // its companions did, heals here.
-                heal_companions(local_path, keys);
-                return Ok((db, how));
-            }
-            Err(ConfigDbError::WrongPassphrase(msg)) => msg,
-            Err(e) => return Err(e),
-        };
-        for (kind, old) in &keys.fallbacks {
-            if !probe_key(local_path, old.expose())? {
-                continue;
-            }
-            rekey_file_hooked(local_path, old.expose(), primary, before_swap)?;
-            heal_companions(local_path, keys);
-            warn!(
-                "Config DB {} opened with {}; it is now re-encrypted with {}",
-                local_path.display(),
-                kind.describe(),
-                keys.source.describe()
-            );
-            let db = Self::open_or_create(local_path, primary)?;
-            return Ok((db, OpenedWith::Migrated(*kind)));
-        }
-        Err(ConfigDbError::WrongPassphrase(wrong))
+        open_keyed(local_path, keys, Self::open_or_create, before_swap)
     }
 
     /// Create an in-memory DB for testing.
@@ -2076,62 +2106,6 @@ mod tests {
             "a busy DB was reported as a wrong passphrase: {err}"
         );
         holder.execute_batch("ROLLBACK;").unwrap();
-    }
-
-    #[test]
-    fn merge_iam_from_merges_iam_but_preserves_coordination() {
-        // B3: a sync download must merge IAM tables from the peer while
-        // leaving this node's coordination tables (here: a listener cursor)
-        // intact — the bug the old fs::rename caused.
-        let dir = tempfile::tempdir().unwrap();
-        let local_path = dir.path().join("local.db");
-        let peer_path = dir.path().join("peer.db");
-        let pass = "shared-bootstrap-hash";
-
-        // LOCAL: one user ("local-only") + a coordination cursor at 4242.
-        let local = ConfigDb::open_or_create(&local_path, pass).unwrap();
-        local
-            .create_user("local-only", "AKLOCAL00001", "secret0000001", true, &[])
-            .unwrap();
-        local
-            .listener_cursor_advance("replication", 4242, 1)
-            .unwrap();
-
-        // PEER: a DIFFERENT user set ("peer-user") + its OWN cursor (must NOT
-        // overwrite local's).
-        {
-            let peer = ConfigDb::open_or_create(&peer_path, pass).unwrap();
-            peer.create_user("peer-user", "AKPEER000001", "secret0000002", true, &[])
-                .unwrap();
-            peer.listener_cursor_advance("replication", 9999, 2)
-                .unwrap();
-        }
-
-        // Merge peer's IAM into local.
-        local.merge_iam_from(&peer_path, None, pass).unwrap();
-
-        // IAM merged (no base: a union): the peer's user arrives, the local
-        // one stays.
-        let mut names: Vec<String> = local
-            .load_users()
-            .unwrap()
-            .into_iter()
-            .map(|u| u.name)
-            .collect();
-        names.sort();
-        assert_eq!(
-            names,
-            vec!["local-only", "peer-user"],
-            "IAM must be merged from the peer's"
-        );
-
-        // Coordination preserved: local's cursor (4242) survived, NOT clobbered
-        // to the peer's 9999.
-        assert_eq!(
-            local.listener_cursor_load("replication").unwrap(),
-            4242,
-            "coordination state must NOT be touched by an IAM merge"
-        );
     }
 
     #[test]

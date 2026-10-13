@@ -4,7 +4,7 @@ This guide shows you how to move the encrypted config database (`deltaglider_con
 
 The key exists only in the environment or in the key file next to the database. The admin UI and the YAML file cannot set it, so every step here sets environment variables and restarts the proxy.
 
-The rotation works because the proxy tries more than one key when it opens the database. It tries `DGP_CONFIG_DB_KEY` first and `DGP_CONFIG_DB_KEY_PREVIOUS` after it. When the database opens only with the previous key, the proxy re-encrypts it with the new key. It re-encrypts a copy, checks that the copy opens with the new key, and only then replaces the original, so a failed step never damages the database. The sync merge base next to the database (`deltaglider_config.db.sync-base`) moves to the new key in the same step.
+The rotation works because the proxy tries more than one key when it opens the database. It tries `DGP_CONFIG_DB_KEY` first and `DGP_CONFIG_DB_KEY_PREVIOUS` after it. When the database opens only with the previous key, the proxy re-encrypts it with the new key. It re-encrypts a copy, checks that the copy opens with the new key, and only then replaces the original, so a failed step never damages the database. The sync merge base next to the database (`deltaglider_config.db.sync-base`) and the jobs database (`deltaglider_jobs.db`, the job state of the instance) move to the new key in the same step.
 
 ## Rotate the key of one instance
 

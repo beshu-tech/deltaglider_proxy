@@ -293,9 +293,9 @@ pub(super) async fn run(
 /// Drop the runtime rows of the job rules that the applied config no
 /// longer names (a rule removed or renamed by this write). It runs after
 /// the config write lock is released and reads a copy of the config: a
-/// task that holds the config DB can wait for the config.
+/// task that holds the jobs DB can wait for the config.
 async fn reconcile_job_rules(state: &Arc<AdminState>) {
-    let Some(db) = state.config_db.as_ref() else {
+    let Some(db) = state.jobs_db.as_ref() else {
         return;
     };
     let cfg = state.config.read().await.clone();

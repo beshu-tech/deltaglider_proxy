@@ -39,7 +39,7 @@ use crate::api::handlers::AppState;
 use crate::background::LeaseKeeper;
 use crate::config::SharedConfig;
 use crate::config_apply::ConfigMutator;
-use crate::config_db::ConfigDb;
+use crate::config_db::JobsDb;
 use crate::config_sections::LeaseTiming;
 use crate::coordination::LeaseError;
 use crate::deltaglider::CounterPrior;
@@ -104,10 +104,7 @@ impl<'a> Holder<'a> {
 /// the time at which a deferred, backed-off or abandoned row comes due, or
 /// at most half a lease TTL (`idle_wait_secs`). It drains at once on
 /// start: a job that the previous process left queued resumes at boot.
-pub fn spawn_worker(
-    mutator: ConfigMutator,
-    db: Arc<Mutex<ConfigDb>>,
-) -> tokio::task::JoinHandle<()> {
+pub fn spawn_worker(mutator: ConfigMutator, db: Arc<Mutex<JobsDb>>) -> tokio::task::JoinHandle<()> {
     let config: SharedConfig = mutator.config.clone();
     let state: Arc<AppState> = mutator.app.clone();
     let instance_id = format!("maintenance:{}", uuid::Uuid::new_v4());
@@ -198,7 +195,7 @@ pub(crate) fn idle_wait_secs(lease_ttl_secs: i64, next_due: Option<i64>, now: i6
 async fn run_job(
     mutator: &ConfigMutator,
     config: &SharedConfig,
-    db: &Arc<Mutex<ConfigDb>>,
+    db: &Arc<Mutex<JobsDb>>,
     state: &Arc<AppState>,
     holder: Holder<'_>,
     job: MaintenanceJob,
@@ -394,7 +391,7 @@ async fn run_job(
 
 /// The row of `job` as the DB holds it now (the claimed row when the DB
 /// cannot answer).
-pub(crate) async fn current_row(db: &Arc<Mutex<ConfigDb>>, job: &MaintenanceJob) -> MaintenanceJob {
+pub(crate) async fn current_row(db: &Arc<Mutex<JobsDb>>, job: &MaintenanceJob) -> MaintenanceJob {
     db.lock()
         .await
         .maintenance_job_by_id(job.id)
@@ -498,7 +495,7 @@ fn backend_check(
 /// skipped over instead).
 async fn execute_phases(
     config: &SharedConfig,
-    db: &Arc<Mutex<ConfigDb>>,
+    db: &Arc<Mutex<JobsDb>>,
     state: &Arc<AppState>,
     holder: Holder<'_>,
     job: &MaintenanceJob,
@@ -711,7 +708,7 @@ pub(crate) struct Walked {
 /// reference.bin it read. A job persisted in a later phase gets its row's
 /// counters back untouched. `what` names the job in the page-budget error.
 pub(crate) async fn run_count_then_walk<V: ObjectVisitor>(
-    db: &Arc<Mutex<ConfigDb>>,
+    db: &Arc<Mutex<JobsDb>>,
     state: &Arc<AppState>,
     holder: Holder<'_>,
     job: &MaintenanceJob,
@@ -800,7 +797,7 @@ pub(crate) fn resumable_in(job: &MaintenanceJob, phase: &str) -> Option<String> 
 
 /// The `objects` phase: HEAD each object, hand it to the visitor.
 struct ObjectsStep<'a, V> {
-    db: &'a Arc<Mutex<ConfigDb>>,
+    db: &'a Arc<Mutex<JobsDb>>,
     state: &'a Arc<AppState>,
     job: &'a MaintenanceJob,
     visitor: &'a mut V,
@@ -932,7 +929,7 @@ pub(crate) async fn drain_inflight_writes(
 
 /// Cancellation check between pages. Maps "operator asked to cancel"
 /// into the Err channel so phases unwind; the caller distinguishes it.
-pub(crate) async fn check_cancel(db: &Arc<Mutex<ConfigDb>>, job_id: i64) -> Result<(), PhaseStop> {
+pub(crate) async fn check_cancel(db: &Arc<Mutex<JobsDb>>, job_id: i64) -> Result<(), PhaseStop> {
     let db = db.lock().await;
     match db.maintenance_cancel_requested(job_id) {
         Ok(true) => Err(PhaseStop::Cancelled),
@@ -1041,7 +1038,7 @@ pub(crate) fn after_run(
 /// [`persist_flushed`], which takes the proof that their deferred copies
 /// are durable.
 async fn persist(
-    db: &Arc<Mutex<ConfigDb>>,
+    db: &Arc<Mutex<JobsDb>>,
     job: &MaintenanceJob,
     phase: &str,
     c: &Counters,
@@ -1063,7 +1060,7 @@ async fn persist(
 /// a saved cursor never points past a copy that a crash can lose.
 pub(crate) async fn persist_flushed(
     _proof: super::migrate::Flushed,
-    db: &Arc<Mutex<ConfigDb>>,
+    db: &Arc<Mutex<JobsDb>>,
     job: &MaintenanceJob,
     phase: &str,
     c: &Counters,
@@ -1078,7 +1075,7 @@ pub(crate) async fn persist_flushed(
 /// When the keeper gives the lease up, the next per-page `heartbeat`
 /// reports `LeaseLost` (a lapsed lease never renews).
 pub(crate) fn spawn_lease_keeper(
-    db: Arc<Mutex<ConfigDb>>,
+    db: Arc<Mutex<JobsDb>>,
     job_id: i64,
     instance_id: String,
     ttl_secs: i64,
@@ -1112,7 +1109,7 @@ pub(crate) fn spawn_lease_keeper(
 /// row stayed active. A lapsed lease never renews, so once the DB answers
 /// again a lapse still reads as `LeaseLost`.
 pub(crate) async fn heartbeat(
-    db: &Arc<Mutex<ConfigDb>>,
+    db: &Arc<Mutex<JobsDb>>,
     job_id: i64,
     holder: Holder<'_>,
 ) -> Result<(), PhaseStop> {
@@ -1153,7 +1150,7 @@ pub(crate) fn settled_status<'a>(computed: &'a str, row_status: Option<&'a str>)
 /// not the object, and counting it would settle a healthy job with errors.
 /// Callers propagate the Err so the phase stops before its page persists.
 pub(crate) async fn record_failure(
-    db: &Arc<Mutex<ConfigDb>>,
+    db: &Arc<Mutex<JobsDb>>,
     job_id: i64,
     key: &str,
     error: &str,
@@ -1178,8 +1175,8 @@ mod tests {
     use super::*;
     use crate::storage::DynStorageBackend;
 
-    fn claimed_job(ttl: i64) -> (Arc<Mutex<ConfigDb>>, i64) {
-        let db = ConfigDb::in_memory("testpass").unwrap();
+    fn claimed_job(ttl: i64) -> (Arc<Mutex<JobsDb>>, i64) {
+        let db = JobsDb::in_memory("testpass").unwrap();
         let id = db
             .maintenance_create_job("reencrypt", "b", "counting", None, "admin", 1)
             .unwrap()
@@ -1321,12 +1318,13 @@ mod tests {
             bucket_usage: None,
             reference_lock: None,
             config_db: None,
+            jobs_db: None,
             maintenance_gate: Arc::new(crate::maintenance::gate::MaintenanceGate::new()),
             maintenance_notify: Arc::new(tokio::sync::Notify::new()),
             backend_capabilities: Default::default(),
             backend_health: Default::default(),
         });
-        let db = ConfigDb::in_memory("testpass").unwrap();
+        let db = JobsDb::in_memory("testpass").unwrap();
         let id = db
             .maintenance_create_job(
                 super::super::backfill::KIND,

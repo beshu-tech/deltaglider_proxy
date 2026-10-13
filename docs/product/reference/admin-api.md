@@ -8,7 +8,7 @@ A browser marks each request with a `Sec-Fetch-Site` header, and it adds an `Ori
 
 A request body or query string that the proxy cannot accept gets `400` with a JSON body `{"error": <code>, "message": <text>}`. The message names the field and the rule that the value breaks, for example `dest_prefix: invalid path "../x/": '.' and '..' segments are not allowed`. The code is `invalid_path` for an object key or prefix with a `.` or `..` segment, a leading `/` or a NUL character, `invalid_bucket` for a bucket name that breaks the S3 naming rules, and `invalid_request` for every other bad input, such as a missing field or a body that is not valid JSON. A body sent without the `application/json` content type gets `415` with the same JSON shape.
 
-An endpoint that needs the encrypted config DB (for example IAM users, groups, external auth, backup, declarative IAM, the event log, and the job actions) answers `503` with the message `config DB not available` when the instance has no config DB open.
+An endpoint that needs the encrypted config DB (for example IAM users, groups, external auth, backup and declarative IAM) answers `503` with the message `config DB not available` when the instance has no config DB open. An endpoint that needs the jobs DB (the event log and the job actions) answers `503` with the message `jobs DB not available` when the instance has no jobs DB open. That is the case when the config DB key does not open the config DB, see [Config database key](authentication.md#config-database-key).
 
 This page documents only the admin endpoints. The S3-compatible API lives under `/`, and the AWS S3 documentation describes it.
 
@@ -295,7 +295,7 @@ maintenance one-offs are DB-born. See [replication.md](replication.md) and
 An action outside a kind's capability matrix returns `400`, and the error names
 the actions that the kind supports. An unknown action returns `404`. Lifecycle
 preview is read-only on purpose; scheduler and run-now executions persist
-history/failure rows in the config DB and take a per-rule lease, so two
+history/failure rows in the jobs DB (`deltaglider_jobs.db`) and take a per-rule lease, so two
 workers never run the same rule at the same time. With a coordination bucket,
 the replication lease is shared by every instance. The lifecycle and
 maintenance leases are node-local: the config sync does not carry them.
@@ -344,14 +344,14 @@ These endpoints need no authentication, because load-balancer probes and Prometh
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/_/health` | Liveness: the process answers. No backend I/O, and no version (anti-fingerprinting) |
-| `GET` | `/_/ready` | Readiness: checks the storage backends and the config DB; `200 {status:"ready"}` or `503`. Point LB readiness checks here; use `/_/health` for liveness. |
+| `GET` | `/_/ready` | Readiness: checks the storage backends, the config DB and the jobs DB; `200 {status:"ready"}` or `503`. Point LB readiness checks here; use `/_/health` for liveness. |
 | `GET` | `/_/metrics` | Prometheus text format. When `DGP_METRICS_BEARER_TOKEN` is set, it answers only to `Authorization: Bearer <token>` or to an admin session, and `401` to other requests |
 
 `/_/ready` usually sends no request to the storage backends. The proxy already probes every backend once per health interval (`DGP_BACKEND_HEALTH_INTERVAL_SECS`, default 30 seconds). While the latest result of each backend is younger than twice that interval, `/_/ready` answers from those results. A backend that answers is `ready`, a backend that answers only with errors is `degraded` (the node stays ready), and when every backend is `unreachable` or `auth-rejected` the node reports `503 not_ready`. Because of this, a backend that dies makes the node not ready within two health intervals (60 seconds with the default), not at the next readiness check.
 
 The proxy probes the backend directly in three cases: when the health loop is off (`DGP_BACKEND_HEALTH_INTERVAL_SECS=0` or `DGP_BOOT_BACKEND_PROBE=off`), when the loop has not finished its first round after a start, and when a result is older than twice the interval (for example, because a probe round hangs). That direct probe is a bounded, retried `ListBuckets`, so a brief provider latency spike does not flip readiness to a paging `503`: it reports not-ready only if every attempt fails. One direct probe answers every readiness check for the next 5 seconds, and the checks that arrive while it runs wait for its answer, so many load balancers that check at the same time send one request to the backend. Tune the direct probe with `DGP_READY_TIMEOUT_SECS` (per attempt, default 3) and `DGP_READY_RETRIES` (extra attempts, default 2). Raise the timeout for a storage provider with a long tail latency. Raise the retries to ride out short blips.
 
-The config DB part of the probe takes the lock of the config DB. Every S3 write holds that lock for a moment, because it appends an event to the outbox, and replication, event delivery and the IAM sync hold it too. So the probe waits up to one second for the lock. A node whose lock is only busy stays ready, and only a lock that stays held for longer than that wait reports `config_db: "locked"` and `503 not_ready`.
+The database part of the probe takes the lock of the config DB and the lock of the jobs DB, one after the other. The IAM sync and the admin API hold the lock of the config DB. Every S3 write holds the lock of the jobs DB for a moment, because it appends an event to the outbox, and replication, lifecycle, maintenance jobs and event delivery hold it too. So the probe waits up to one second for each lock. A node whose lock is only busy stays ready. Only a lock that stays held for longer than that wait reports `config_db: "locked"` or `jobs_db: "locked"`, and `503 not_ready`. A field is `absent` when the instance has no such database open.
 
 The response also carries `backends`, a map from each backend name to its live health (`healthy`, `unreachable`, `auth-rejected` or `erroring`). The proxy keeps this map current with the periodic health probe (`DGP_BACKEND_HEALTH_INTERVAL_SECS`) and with requests that find a backend unavailable. When every backend in the map is `unreachable` or `auth-rejected`, the node reports `503 not_ready`, because it cannot serve any bucket. When only some backends are down, the node stays ready: the other backends' buckets still work, and every node sees the same outage.
 

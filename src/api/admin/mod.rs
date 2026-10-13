@@ -33,7 +33,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::api::handlers::AppState;
 use crate::config::SharedConfig;
-use crate::config_db::ConfigDb;
+use crate::config_db::{ConfigDb, JobsDb};
 use crate::config_db_sync::ConfigDbSync;
 use crate::iam::external_auth::ExternalAuthManager;
 use crate::iam::SharedIamState;
@@ -133,6 +133,9 @@ pub struct AdminState {
     pub iam_state: SharedIamState,
     /// Encrypted config database for IAM users (None in legacy/open-access mode).
     pub config_db: Option<Arc<tokio::sync::Mutex<ConfigDb>>>,
+    /// The node-local jobs database (job state, run history, outbox). Not
+    /// synced. `None` when the config DB is `None` or has a key mismatch.
+    pub jobs_db: Option<Arc<tokio::sync::Mutex<JobsDb>>>,
     /// Background usage scanner for computing prefix sizes.
     pub usage_scanner: Arc<UsageScanner>,
     /// Background delta-efficiency scanner. Same shape as
@@ -170,28 +173,28 @@ pub struct AdminState {
     /// `verify_cancel` sets the flag for a fast (lock-free) abort; the durable
     /// `cancelling` DB row remains the cross-instance / post-restart signal.
     pub parity_cancels: ParityCancels,
-    /// The job plane (job DB + coordination lease), `Some` exactly when
-    /// `config_db` is. See [`JobPlane`].
+    /// The job plane (jobs DB + coordination lease), `Some` exactly when
+    /// `jobs_db` is. See [`JobPlane`].
     pub job_plane: Option<JobPlane>,
 }
 
-/// What the job handlers (run-now, verify, delete, kill) need: the config DB
+/// What the job handlers (run-now, verify, delete, kill) need: the jobs DB
 /// that holds the job rows AND the coordination lease the schedulers take
 /// (S3 when a coordination bucket is configured, else node-local SQLite).
 /// One value, so a handler never holds one without the other and never
 /// builds its own `LocalLease` fallback: the node-local SQLite check alone is
 /// blind to a scheduler that holds the S3 lease (H14/H29/H48). Built once at
-/// startup; `db` is the same `Arc` as [`AdminState::config_db`].
+/// startup; `db` is the same `Arc` as [`AdminState::jobs_db`].
 #[derive(Clone)]
 pub struct JobPlane {
-    pub db: Arc<tokio::sync::Mutex<ConfigDb>>,
+    pub db: Arc<tokio::sync::Mutex<JobsDb>>,
     pub lease: Arc<crate::coordination::DynCoordinationLease<'static>>,
 }
 
 impl AdminState {
-    /// The job plane, or 503 when this instance has no config DB.
+    /// The job plane, or 503 when this instance has no jobs DB.
     pub(crate) fn job_plane(&self) -> Result<&JobPlane, AdminError> {
-        self.job_plane.as_ref().ok_or_else(AdminError::no_config_db)
+        self.job_plane.as_ref().ok_or_else(AdminError::no_jobs_db)
     }
 }
 
@@ -344,6 +347,29 @@ where
         .config_db
         .as_ref()
         .ok_or_else(AdminError::no_config_db)?;
+    let db = db.lock().await;
+    f(&db).map_err(|e| {
+        let e = AdminError::from(e);
+        if e.status_code().is_server_error() {
+            tracing::error!("Failed to {op_label}: {}", e.message());
+        } else {
+            tracing::warn!("Failed to {op_label}: {}", e.message());
+        }
+        e
+    })
+}
+
+/// [`with_config_db`] for the node-local jobs DB.
+pub(crate) async fn with_jobs_db<T, B, F>(
+    state: &Arc<AdminState>,
+    op_label: &str,
+    f: F,
+) -> Result<T, AdminError<B>>
+where
+    B: ErrorBody,
+    F: FnOnce(&JobsDb) -> Result<T, crate::config_db::ConfigDbError>,
+{
+    let db = state.jobs_db.as_ref().ok_or_else(AdminError::no_jobs_db)?;
     let db = db.lock().await;
     f(&db).map_err(|e| {
         let e = AdminError::from(e);

@@ -885,8 +885,8 @@ mod delete_objects_tests {
     async fn service() -> (DeltaGliderS3Service, Arc<FakeS3>) {
         let (engine, fake) = crate::deltaglider::s3_engine().await;
         let mut state = crate::api::handlers::AppState::for_tests(engine);
-        Arc::get_mut(&mut state).unwrap().config_db = Some(Arc::new(tokio::sync::Mutex::new(
-            crate::config_db::ConfigDb::in_memory("test").unwrap(),
+        Arc::get_mut(&mut state).unwrap().jobs_db = Some(Arc::new(tokio::sync::Mutex::new(
+            crate::config_db::JobsDb::in_memory("test").unwrap(),
         )));
         let config = Arc::new(tokio::sync::RwLock::new(crate::config::Config::default()));
         (DeltaGliderS3Service::new(state, config), fake)
@@ -921,7 +921,7 @@ mod delete_objects_tests {
     }
 
     async fn deleted_events(svc: &DeltaGliderS3Service) -> i64 {
-        let db = svc.state().config_db.as_ref().unwrap();
+        let db = svc.state().jobs_db.as_ref().unwrap();
         crate::event_outbox::flush_appends(db).await;
         let db = db.lock().await;
         db.event_outbox_count(None).unwrap()

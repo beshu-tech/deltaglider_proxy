@@ -735,6 +735,8 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Config versions (ETags) keyed from the DB key: stable across restarts.
     deltaglider_proxy::api::admin::install_config_version_key(db_keys.primary.expose());
     let (config_db, config_db_mismatch) = init_config_db(&db_keys, &iam_state, &config);
+    // The node-local job state, in its own unsynced file next to the config DB.
+    let jobs_db = init_jobs_db(&db_keys, &config_db, config_db_mismatch, &config);
     // After the DB: its IAM users (declarative ones are reconciled into it
     // by now) are credentials. A DB this key cannot read may hold users too.
     validate_auth_config(
@@ -778,6 +780,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         bucket_usage: bucket_usage.clone(),
         reference_lock: reference_lock.clone(),
         config_db: config_db.clone(),
+        jobs_db: jobs_db.clone(),
         maintenance_gate: maintenance_gate.clone(),
         maintenance_notify: maintenance_notify.clone(),
         backend_capabilities: backend_capabilities.clone(),
@@ -787,7 +790,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Re-arm the maintenance write-gate for jobs that survived a restart
     // (boot reconcile re-queued them). MUST happen before the S3 router
     // serves: a gated bucket's writes stay blocked across the restart.
-    if let Some(db) = config_db.as_ref() {
+    if let Some(db) = jobs_db.as_ref() {
         let db = db.lock().await;
         maintenance_gate.sync_from(&db);
         if let Ok(arms) = db.maintenance_gate_arms() {
@@ -820,7 +823,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // that no ACTIVE migrate job references (a crashed-then-resumed job's
     // transient stays in place for the job to reuse). Runs before the
     // listener serves, so clients never see an orphaned route.
-    if let Some(db) = config_db.as_ref() {
+    if let Some(db) = jobs_db.as_ref() {
         let active: std::collections::HashSet<String> = {
             let db = db.lock().await;
             db.maintenance_active_transient_keys()
@@ -857,7 +860,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // Built once here so it's in scope both for the schedulers below AND for the
     // AdminState (so run-now/verify/delete can check the active lease — H14/29/48).
-    let job_plane = match config_db.as_ref() {
+    let job_plane = match jobs_db.as_ref() {
         Some(db) => Some(deltaglider_proxy::api::admin::JobPlane {
             db: db.clone(),
             lease: build_coordination_lease(&config, db, &db_keys).await,
@@ -867,7 +870,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut maintenance_worker = None;
     if !config_db_mismatch {
-        if let Some(db) = config_db.as_ref() {
+        if let Some(db) = jobs_db.as_ref() {
             maintenance_worker = Some(deltaglider_proxy::maintenance::worker::spawn_worker(
                 config_mutator.clone(),
                 db.clone(),
@@ -881,7 +884,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         // node-local for now — documented follow-ups.
         deltaglider_proxy::lifecycle::scheduler::spawn_scheduler(
             shared_config.clone(),
-            config_db.clone(),
+            jobs_db.clone(),
             state.clone(),
         );
         if let Some(deltaglider_proxy::api::admin::JobPlane { db, lease }) = job_plane.as_ref() {
@@ -1031,6 +1034,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         s3_state: state.clone(),
         iam_state,
         config_db: config_db.clone(),
+        jobs_db: jobs_db.clone(),
         usage_scanner: usage_scanner.clone(),
         delta_efficiency_scanner: Arc::new(
             deltaglider_proxy::api::admin::DeltaEfficiencyScanner::new(),
@@ -1130,10 +1134,10 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         usage.flush_pending();
     }
 
-    // Object events that waited for the config DB are queued for one writer
+    // Object events that waited for the jobs DB are queued for one writer
     // task; write them before exit (event-outbox.md promises it). Bounded,
     // like the other shutdown drains.
-    if let Some(db) = config_db.as_ref() {
+    if let Some(db) = jobs_db.as_ref() {
         if tokio::time::timeout(
             Duration::from_secs(10),
             deltaglider_proxy::event_outbox::flush_appends(db),

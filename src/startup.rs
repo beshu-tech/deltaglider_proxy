@@ -703,57 +703,6 @@ fn init_config_db_attempt(
                     );
                 }
             };
-            match db.replication_reconcile_on_boot(config.replication.max_failures_retained) {
-                Ok(count) if count > 0 => {
-                    warn!(
-                        "Reconciled {count} replication run(s) left running by a previous process"
-                    );
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    warn!("Failed to reconcile replication runtime state on boot: {err}");
-                }
-            }
-            // Clear a parity audit left 'running' by a crashed process + its lease.
-            match db.parity_reconcile_on_boot() {
-                Ok(count) if count > 0 => {
-                    warn!("Reconciled {count} parity audit(s) left running by a previous process");
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    warn!("Failed to reconcile parity audit state on boot: {err}");
-                }
-            }
-            // Rows of rules the YAML no longer names (removed or renamed
-            // while the proxy was down, or by an apply that predates this).
-            deltaglider_proxy::config_apply::reconcile_job_rules(&db, config);
-            match db.lifecycle_reconcile_on_boot(config.lifecycle.max_failures_retained) {
-                Ok(count) if count > 0 => {
-                    warn!("Reconciled {count} lifecycle run(s) left running by a previous process");
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    warn!("Failed to reconcile lifecycle runtime state on boot: {err}");
-                }
-            }
-            // Maintenance jobs are one-offs the operator explicitly started:
-            // interrupted ones go back to QUEUED with their cursor preserved
-            // (the worker resumes them), unlike replication's running→failed.
-            // Lease-aware: a freshly-crashed job's lease may still be live
-            // here; the worker loop re-runs this on every poll tick, so it
-            // becomes claimable within one lease TTL.
-            match db.maintenance_requeue_abandoned() {
-                Ok(count) if count > 0 => {
-                    warn!(
-                        "Re-queued {count} maintenance job(s) interrupted by a previous process — \
-                         they will resume shortly"
-                    );
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    warn!("Failed to reconcile maintenance jobs on boot: {err}");
-                }
-            }
             // Declarative IAM: the YAML is the source of truth, so reconcile it
             // into the DB AT STARTUP (not just on a `config apply`). Without this
             // a fresh declarative deployment comes up with an empty DB and needs
@@ -1006,6 +955,112 @@ fn init_config_db_attempt(
     }
 }
 
+/// Open the node-local jobs DB next to the config DB (same keys), move the
+/// job rows of an older release out of the live config DB once
+/// ([`JobsDb::adopt_from`]), then reconcile the job state a previous process
+/// left behind. `None` when there is no config DB, or when its key does not
+/// open it (mismatch: the jobs DB has the same key, so it stays untouched
+/// until the operator restores the key). Exits on an I/O error: the files
+/// are left as they are.
+///
+/// [`JobsDb::adopt_from`]: deltaglider_proxy::config_db::JobsDb::adopt_from
+pub fn init_jobs_db(
+    keys: &deltaglider_proxy::config_db::ConfigDbKeys,
+    config_db: &Option<Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>>>,
+    config_db_mismatch: bool,
+    config: &Config,
+) -> Option<Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::JobsDb>>> {
+    use deltaglider_proxy::config_db::{jobs_db_path, JobsDb};
+    let config_db = config_db.as_ref()?;
+    if config_db_mismatch {
+        warn!(
+            "The config DB key does not open the config DB: the jobs DB {} is not opened \
+             (it has the same key) and the job workers do not run",
+            jobs_db_path().display()
+        );
+        return None;
+    }
+    let path = jobs_db_path();
+    let db = match JobsDb::open_live(&path, keys) {
+        Ok(db) => db,
+        Err(e) => {
+            error!(
+                "FATAL: the jobs DB {} failed to open: {e}. The file is left untouched; \
+                 fix the cause and restart.",
+                path.display()
+            );
+            std::process::exit(1);
+        }
+    };
+    {
+        // Boot: nothing else holds the config DB yet.
+        let Ok(cfg_db) = config_db.try_lock() else {
+            error!("FATAL: the config DB is locked during boot");
+            std::process::exit(1);
+        };
+        if let Err(e) = db.adopt_from(&cfg_db, keys.primary.expose()) {
+            error!(
+                "FATAL: moving the job rows from the config DB {} to the jobs DB {} failed: \
+                 {e}. Both files are left consistent (the move is one transaction per \
+                 file); fix the cause and restart.",
+                cfg_db.local_path().display(),
+                path.display()
+            );
+            std::process::exit(1);
+        }
+    }
+    match db.replication_reconcile_on_boot(config.replication.max_failures_retained) {
+        Ok(count) if count > 0 => {
+            warn!("Reconciled {count} replication run(s) left running by a previous process");
+        }
+        Ok(_) => {}
+        Err(err) => {
+            warn!("Failed to reconcile replication runtime state on boot: {err}");
+        }
+    }
+    // Clear a parity audit left 'running' by a crashed process + its lease.
+    match db.parity_reconcile_on_boot() {
+        Ok(count) if count > 0 => {
+            warn!("Reconciled {count} parity audit(s) left running by a previous process");
+        }
+        Ok(_) => {}
+        Err(err) => {
+            warn!("Failed to reconcile parity audit state on boot: {err}");
+        }
+    }
+    // Rows of rules the YAML no longer names (removed or renamed
+    // while the proxy was down, or by an apply that predates this).
+    deltaglider_proxy::config_apply::reconcile_job_rules(&db, config);
+    match db.lifecycle_reconcile_on_boot(config.lifecycle.max_failures_retained) {
+        Ok(count) if count > 0 => {
+            warn!("Reconciled {count} lifecycle run(s) left running by a previous process");
+        }
+        Ok(_) => {}
+        Err(err) => {
+            warn!("Failed to reconcile lifecycle runtime state on boot: {err}");
+        }
+    }
+    // Maintenance jobs are one-offs the operator explicitly started:
+    // interrupted ones go back to QUEUED with their cursor preserved
+    // (the worker resumes them), unlike replication's running→failed.
+    // Lease-aware: a freshly-crashed job's lease may still be live
+    // here; the worker loop re-runs this on every poll tick, so it
+    // becomes claimable within one lease TTL.
+    match db.maintenance_requeue_abandoned() {
+        Ok(count) if count > 0 => {
+            warn!(
+                "Re-queued {count} maintenance job(s) interrupted by a previous process — \
+                 they will resume shortly"
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            warn!("Failed to reconcile maintenance jobs on boot: {err}");
+        }
+    }
+    Some(Arc::new(tokio::sync::Mutex::new(db)))
+}
+
 /// `DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC` (S8, transitional): may a synced copy
 /// open with the legacy bootstrap hash?
 fn accept_legacy_sync() -> bool {
@@ -1038,14 +1093,14 @@ fn coordination_backend(config: &Config) -> &BackendConfig {
 /// witness fast-path makes the second a single cheap GET).
 pub async fn build_coordination_lease(
     config: &Config,
-    config_db: &Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>>,
+    jobs_db: &Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::JobsDb>>,
     db_keys: &deltaglider_proxy::config_db::ConfigDbKeys,
 ) -> Arc<deltaglider_proxy::coordination::DynCoordinationLease<'static>> {
     use deltaglider_proxy::coordination::{
         durable_node_id, process_boot_ids, DynCoordinationLease, LocalLease, S3Lease,
     };
 
-    let local = || DynCoordinationLease::new_arc(LocalLease::new(config_db.clone()));
+    let local = || DynCoordinationLease::new_arc(LocalLease::new(jobs_db.clone()));
 
     let sync_bucket = match &config.config_sync_bucket {
         Some(b) if !b.is_empty() => b.clone(),

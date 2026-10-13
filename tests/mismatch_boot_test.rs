@@ -302,4 +302,89 @@ async fn config_db_key_rotation_with_the_previous_key() {
     );
     let names = user_names(&admin_http_client(&endpoint).await, &endpoint).await;
     assert!(names.iter().any(|n| n == "alice"), "got {names:?}");
+    // The jobs DB moved to the new key on the same boot.
+    server.kill();
+    let jobs_path = data_dir(&server).join("deltaglider_jobs.db");
+    assert!(deltaglider_proxy::config_db::probe_key(&jobs_path, KEY_WRONG).unwrap());
+    assert!(!deltaglider_proxy::config_db::probe_key(&jobs_path, KEY_GOOD).unwrap());
+}
+
+/// Rows of `table` in the SQLCipher file at `path`.
+fn row_count(path: &std::path::Path, key: &str, table: &str) -> i64 {
+    let conn = deltaglider_proxy::sqlite_open::open(path).expect("open");
+    conn.pragma_update(None, "key", key).expect("key");
+    conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+        .expect("count")
+}
+
+fn replication_cursor(jobs_path: &std::path::Path) -> i64 {
+    deltaglider_proxy::config_db::JobsDb::open_or_create(jobs_path, KEY_GOOD)
+        .expect("the jobs DB opens with the config DB key")
+        .listener_cursor_load("replication")
+        .expect("cursor")
+}
+
+/// P4.4: a boot on a config DB of an older release (job rows inside, no
+/// jobs DB) moves the job rows to `deltaglider_jobs.db` and leaves IAM in
+/// place. A key-mismatch boot does not touch the jobs DB; the boot with
+/// the right key finds it as it was.
+#[tokio::test]
+async fn a_boot_moves_job_rows_out_of_the_config_db() {
+    let mut server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .env("DGP_CONFIG_DB_KEY", KEY_GOOD)
+        .build()
+        .await;
+    let endpoint = server.endpoint();
+    create_alice(&endpoint).await;
+    let dir = data_dir(&server);
+    let db_path = dir.join("deltaglider_config.db");
+    let jobs_path = dir.join("deltaglider_jobs.db");
+    server.kill();
+
+    // The state an older release leaves: a job row in the config DB, no
+    // jobs DB.
+    std::fs::remove_file(&jobs_path).expect("the first boot created the jobs DB");
+    {
+        let conn = deltaglider_proxy::sqlite_open::open(&db_path).unwrap();
+        conn.pragma_update(None, "key", KEY_GOOD).unwrap();
+        conn.execute(
+            "INSERT INTO listener_cursors (listener_name, last_event_id) VALUES ('replication', 777)",
+            [],
+        )
+        .unwrap();
+    }
+
+    server
+        .respawn_with_env(&[("DGP_CONFIG_DB_KEY", KEY_GOOD)])
+        .await;
+    let admin = admin_http_client(&endpoint).await;
+    assert!(user_names(&admin, &endpoint)
+        .await
+        .contains(&"alice".to_string()));
+    server.kill();
+    assert_eq!(replication_cursor(&jobs_path), 777, "the row moved");
+    assert_eq!(
+        row_count(&db_path, KEY_GOOD, "listener_cursors"),
+        0,
+        "the synced config DB keeps no job row"
+    );
+
+    // A wrong key locks the node and leaves the jobs DB alone.
+    let jobs_bytes = std::fs::read(&jobs_path).unwrap();
+    server
+        .respawn_with_env(&[("DGP_CONFIG_DB_KEY", KEY_WRONG)])
+        .await;
+    assert_locked(&whoami(&endpoint).await, "wrong-key boot");
+    server.kill();
+    assert_eq!(std::fs::read(&jobs_path).unwrap(), jobs_bytes);
+
+    // The right key brings both back.
+    server
+        .respawn_with_env(&[("DGP_CONFIG_DB_KEY", KEY_GOOD)])
+        .await;
+    let who = whoami(&endpoint).await;
+    assert_ne!(who["config_db_mismatch"], true, "{who}");
+    server.kill();
+    assert_eq!(replication_cursor(&jobs_path), 777);
 }

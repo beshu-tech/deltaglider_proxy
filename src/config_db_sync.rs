@@ -1329,8 +1329,9 @@ pub async fn reopen_and_rebuild_iam(
     };
     let db = db_arc.lock().await;
     // B3: merge ONLY the IAM tables out of the downloaded peer DB into the live
-    // connection — the live coordination tables (jobs/leases/outbox/cursors)
-    // stay intact (a file swap would clobber them). D16: a three-way merge
+    // connection. Job state lives in the jobs DB (`config_db::jobs_db`); a
+    // copy from an older peer still carries job tables, and nothing reads
+    // them. D16: a three-way merge
     // against the last synced DB, so a change on either side survives.
     let base = sync_base_path(db.local_path());
     let merge = db.merge_iam_from(downloaded, Some(&base), db_key);

@@ -74,7 +74,7 @@ Two related states are fatal config errors, which the proxy refuses at boot and 
 
    ```bash
    curl -s https://s3.acme.example/_/ready
-   # {"status":"ready","backend":"ready","config_db":"ready","backends":{"aws-dr":"healthy","hetzner-fsn1":"healthy","local-disk":"healthy"}}
+   # {"status":"ready","backend":"ready","config_db":"ready","jobs_db":"ready","backends":{"aws-dr":"healthy","hetzner-fsn1":"healthy","local-disk":"healthy"}}
    ```
 
 2. Check that a bucket on the repaired backend serves again. A list request must succeed instead of answering `503`:

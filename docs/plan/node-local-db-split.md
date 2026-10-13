@@ -100,9 +100,10 @@ as `Arc<tokio::sync::Mutex<JobsDb>>`. The four `impl ConfigDb` blocks become
 holds a `ConfigDb` cannot reach a job table through the API: the compiler
 moves every call site. `JobPlane.db`, the replication/lifecycle/maintenance
 workers, the outbox appender, the dispatcher, the event consumer and
-`LocalLease` take `JobsDb`. A source guard refuses raw SQL on a node-local
-table name in any file that has an `impl ConfigDb` block, so the
-`pub(crate) conn` of `ConfigDb` cannot be used to write a job row by hand.
+`LocalLease` take `JobsDb`. A source guard (`node_local_sql_never_runs_on_the_config_db`) refuses any
+production file that has SQL on a node-local table and also names
+`ConfigDb`, so the `pub(crate) conn` of `ConfigDb` cannot be used to write a
+job row by hand.
 
 ### 4.2 Schema of the jobs DB
 
@@ -124,8 +125,8 @@ DB schema version stays 29. Why:
 - **Old peer downloads a new blob.** An old binary opens the copy
   (`open_with_keys` -> `migrate`: v29 = up to date, nothing runs) and merges
   only IAM tables (section 2). A copy with empty node-local tables is a valid
-  v29 DB for it. Measured cost of the empty tables: about one page per table
-  and index (about 100 KB).
+  v29 DB for it. Measured cost of the empty tables: 140 KB (a config DB
+  with 20 users is 256 KB with them and 116 KB without them).
 - **No schema bump.** A bump to v30 makes every old peer refuse every new
   blob (`download_if_newer`: "newer than this binary ... NOT merging"), so
   IAM sync between old and new nodes stops for the whole rolling upgrade.
@@ -172,7 +173,7 @@ The jobs DB has a one-row `jobs_meta` table with `adopted` (0/1).
 Each boot re-runs the check: `adopted = 1` and a node-local table in the
 config DB that has rows -> step 3 and 4 again, with a warning that names the
 counts. That is the state after a crash between step 2 and 3, or after an
-old binary wrote job rows during a downgrade (section 6).
+old binary wrote job rows during a downgrade (section 7).
 
 **Crash safety.** IAM rows are never written by the move. Step 2 is one
 transaction in the jobs DB: a crash before its commit leaves `adopted = 0`
@@ -264,7 +265,14 @@ handlers for jobs, the outbox and maintenance; the boot reconciles in
 - Size: a config DB seeded with 10k parity rows and 10k outbox rows, before
   and after the move.
 
-## 6. Downgrade
+## 6. Measured
+
+`the_synced_blob_shrinks_to_the_iam_rows` (20 users, 10,000 parity rows,
+10,000 outbox rows): the synced blob is 6,918,144 bytes before the move and
+262,144 bytes after it (the size of a fresh config DB with the same users).
+The job rows (6,815,744 bytes) stay on the node in `deltaglider_jobs.db`.
+
+## 7. Downgrade
 
 After the move, an older binary starts on a config DB with empty job tables:
 IAM is intact; job history, failure rings, parity cache, outbox rows,
@@ -276,7 +284,7 @@ it. Upgrading again restores the jobs DB as it was before the downgrade; job
 rows that the old binary wrote into the config DB are deleted at that boot
 (logged with counts), because their ids collide with the jobs DB's.
 
-## 7. Not done here
+## 8. Not done here
 
 - Dropping the empty tables from the config DB (needs a schema bump; after
   every peer runs a release with the split).

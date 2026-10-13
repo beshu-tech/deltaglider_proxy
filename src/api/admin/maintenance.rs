@@ -104,14 +104,14 @@ pub struct ReencryptResponse {
 }
 
 /// The request gate that the reencrypt and backfill starts share: 1 to
-/// 100 buckets, a config DB, and the real bucket set from the engine
+/// 100 buckets, a jobs DB, and the real bucket set from the engine
 /// (authoritative across backends), lowercased.
 async fn check_job_request(
     state: &AdminState,
     buckets: Vec<super::path_guard::AdminBucket>,
 ) -> Result<
     (
-        &Arc<tokio::sync::Mutex<crate::config_db::ConfigDb>>,
+        &Arc<tokio::sync::Mutex<crate::config_db::JobsDb>>,
         std::collections::HashSet<String>,
         Vec<crate::bucket_policy::ClientBucket>,
     ),
@@ -127,10 +127,7 @@ async fn check_job_request(
         .into_iter()
         .map(|b| b.admit(state))
         .collect::<Result<Vec<_>, _>>()?;
-    let db = state
-        .config_db
-        .as_ref()
-        .ok_or_else(AdminError::no_config_db)?;
+    let db = state.jobs_db.as_ref().ok_or_else(AdminError::no_jobs_db)?;
     let engine = state.s3_state.engine.load().clone();
     let real = engine
         .list_bucket_origins()
@@ -335,10 +332,7 @@ pub async fn start_migrate(
     }
     super::path_guard::check_bucket(&bucket).map_err(AdminError::invalid)?;
     let bucket = super::admit_bucket::<super::Text>(&state, &bucket)?.into_string();
-    let db = state
-        .config_db
-        .as_ref()
-        .ok_or_else(AdminError::no_config_db)?;
+    let db = state.jobs_db.as_ref().ok_or_else(AdminError::no_jobs_db)?;
 
     // The bucket must actually exist (the old handler skipped this check).
     let engine = state.s3_state.engine.load().clone();
@@ -463,10 +457,7 @@ pub async fn cancel_job(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AdminError> {
-    let db = state
-        .config_db
-        .as_ref()
-        .ok_or_else(AdminError::no_config_db)?;
+    let db = state.jobs_db.as_ref().ok_or_else(AdminError::no_jobs_db)?;
     let (outcome, job) = {
         let db = db.lock().await;
         let job = db.maintenance_job_by_id(id)?;
@@ -529,7 +520,7 @@ pub async fn bucket_status(
             "the session may not list this bucket",
         ));
     }
-    let job = super::with_config_db(&state, "read bucket maintenance status", |db| {
+    let job = super::with_jobs_db(&state, "read bucket maintenance status", |db| {
         db.maintenance_active_job_for_bucket(&bucket.to_ascii_lowercase())
     })
     .await?;

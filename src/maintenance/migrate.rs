@@ -56,7 +56,7 @@ use tracing::info;
 
 use crate::api::handlers::AppState;
 use crate::config_apply::ConfigMutator;
-use crate::config_db::ConfigDb;
+use crate::config_db::JobsDb;
 use crate::deltaglider::{
     CounterPrior, DeleteHooks, DeleteItem, DeleteOutcome, DynEngine, ListObjectsPage, StoredForms,
 };
@@ -484,7 +484,7 @@ struct CancelWatch {
 }
 
 impl CancelWatch {
-    fn spawn(db: &Arc<Mutex<ConfigDb>>, job_id: i64) -> Self {
+    fn spawn(db: &Arc<Mutex<JobsDb>>, job_id: i64) -> Self {
         let requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (flag, db) = (requested.clone(), db.clone());
         let task = tokio::spawn(async move {
@@ -630,7 +630,7 @@ async fn count_objects(engine: &DynEngine, bucket: &str) -> Result<(u64, bool), 
 /// failure is recorded on the job and the unwind goes on.
 async fn remove_staged_copies(
     mutator: &ConfigMutator,
-    db: &Arc<Mutex<ConfigDb>>,
+    db: &Arc<Mutex<JobsDb>>,
     state: &Arc<AppState>,
     job: &MaintenanceJob,
     params: &MigrateParams,
@@ -709,7 +709,7 @@ async fn remove_staged_copies(
 /// route on any PRE-FLIP termination (cancel or failure).
 pub(crate) async fn execute_migrate_phases(
     mutator: &ConfigMutator,
-    db: &Arc<Mutex<ConfigDb>>,
+    db: &Arc<Mutex<JobsDb>>,
     state: &Arc<AppState>,
     holder: Holder<'_>,
     job: &MaintenanceJob,
@@ -777,7 +777,7 @@ pub(crate) async fn execute_migrate_phases(
 
 async fn run_phases(
     mutator: &ConfigMutator,
-    db: &Arc<Mutex<ConfigDb>>,
+    db: &Arc<Mutex<JobsDb>>,
     state: &Arc<AppState>,
     holder: Holder<'_>,
     job: &MaintenanceJob,
@@ -823,7 +823,7 @@ async fn run_phases(
 /// One migrate job's run: what every phase needs.
 struct MigrateRun<'a> {
     mutator: &'a ConfigMutator,
-    db: &'a Arc<Mutex<ConfigDb>>,
+    db: &'a Arc<Mutex<JobsDb>>,
     state: &'a Arc<AppState>,
     holder: Holder<'a>,
     job: &'a MaintenanceJob,

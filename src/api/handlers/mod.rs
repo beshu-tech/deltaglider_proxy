@@ -28,7 +28,7 @@ pub(crate) mod object_helpers;
 mod status;
 
 use super::errors::S3Error;
-use crate::config_db::ConfigDb;
+use crate::config_db::{ConfigDb, JobsDb};
 use crate::deltaglider::DynEngine;
 use crate::metrics::Metrics;
 use crate::multipart::MultipartStore;
@@ -71,6 +71,7 @@ impl AppState {
             bucket_usage: None,
             reference_lock: None,
             config_db: None,
+            jobs_db: None,
             maintenance_gate: Arc::new(crate::maintenance::gate::MaintenanceGate::new()),
             maintenance_notify: Arc::new(tokio::sync::Notify::new()),
             backend_capabilities: Default::default(),
@@ -93,6 +94,9 @@ pub struct AppState {
     /// `bucket_usage`, so a config reload never drops the cross-node protection.
     pub reference_lock: Option<Arc<crate::coordination::DynReferenceLock<'static>>>,
     pub config_db: Option<Arc<tokio::sync::Mutex<ConfigDb>>>,
+    /// The node-local jobs DB: event outbox, job state (see
+    /// [`crate::config_db::jobs_db`]). Never synced.
+    pub jobs_db: Option<Arc<tokio::sync::Mutex<JobsDb>>>,
     /// Per-bucket WRITE gate for maintenance jobs (re-encryption). Layered
     /// into the S3 router as middleware; admin handlers and background
     /// writers consult it explicitly. See `src/maintenance/gate.rs`.
