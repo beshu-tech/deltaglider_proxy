@@ -27,9 +27,20 @@ interface Props {
   /** Forwarded to the textarea, so a FormField label names it. */
   id?: string;
   'aria-labelledby'?: string;
+  /** `error` marks the field (an invalid glob). */
+  status?: 'error';
 }
 
-export default function GlobListTextArea({ value, onChange, rows = 3, placeholder, style, id, 'aria-labelledby': labelledBy }: Props) {
+export default function GlobListTextArea({
+  value,
+  onChange,
+  rows = 3,
+  placeholder,
+  style,
+  id,
+  'aria-labelledby': labelledBy,
+  status,
+}: Props) {
   const [text, setText] = useState<string>(() => lines(value));
   // The last array we emitted, as a stable key, to tell our own echo apart from
   // a real external prop change.
@@ -64,6 +75,7 @@ export default function GlobListTextArea({ value, onChange, rows = 3, placeholde
       rows={rows}
       placeholder={placeholder}
       style={style}
+      status={status}
     />
   );
 }

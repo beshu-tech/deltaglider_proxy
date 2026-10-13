@@ -2,12 +2,22 @@ import { Tag, Typography } from 'antd';
 import type { LifecycleAction, LifecycleConfig } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import { actionKind, actionLabel } from './lifecyclePayload';
+import { useJobs } from '../queries/jobs';
+import { firstRunText } from './jobs/lifecycleText';
 
 const { Text } = Typography;
 
 /** Apply-dialog summary card describing the pending lifecycle plan. */
 export function LifecycleApplySummary({ lifecycle }: { lifecycle: LifecycleConfig }) {
   const colors = useColors();
+  // A rule that the proxy has not scheduled yet (new, or enabled for the
+  // first time) first runs one tick after the apply: say when, so nobody is
+  // surprised by a delete a minute later.
+  const jobs = useJobs();
+  const scheduled = new Set(
+    (jobs.data?.jobs ?? []).filter((j) => j.kind === 'lifecycle' && j.next_due_at).map((j) => j.name),
+  );
+  const firstRun = firstRunText(lifecycle.tick_interval, Date.now());
   return (
     <div
       style={{
@@ -45,6 +55,14 @@ export function LifecycleApplySummary({ lifecycle }: { lifecycle: LifecycleConfi
                 </div>
               );
             })()}
+            {rule.enabled && !scheduled.has(rule.name) && firstRun && (
+              <div>
+                <Text type="warning">New schedule: {firstRun}.</Text>{' '}
+                {lifecycle.enabled
+                  ? 'Open its Preview tab after the apply to see what it will do before then.'
+                  : 'It runs only after you turn on "Run lifecycle rules on schedule".'}
+              </div>
+            )}
             {(rule.include_globs.length > 0 || rule.exclude_globs.length > 0) && (
               <div>
                 Include: {rule.include_globs.length ? rule.include_globs.join(', ') : 'all'} · Exclude: {rule.exclude_globs.length ? rule.exclude_globs.join(', ') : 'none'}

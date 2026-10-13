@@ -66,7 +66,7 @@ test('when nothing matches, the preview says when the first object becomes due',
     ),
   ).toBeInTheDocument();
   const at = new Date('2026-10-13T20:19:26Z').toLocaleTimeString();
-  expect(screen.getByText(`Scanned 12,148 objects at ${at}.`)).toBeInTheDocument();
+  expect(screen.getByText((t) => t.startsWith(`Scanned 12,148 objects at ${at} (`))).toBeInTheDocument();
 });
 
 test('while the proxy walks, the tab shows how many objects it scanned so far', async () => {

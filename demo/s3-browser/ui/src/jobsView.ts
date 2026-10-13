@@ -379,9 +379,9 @@ export function availableActions(row: JobRow): JobAction[] {
     // paused lifecycle rule: the row shows that button disabled, with the
     // reason from `lifecycleRunNowBlock`.
     if (!isActiveJobStatus(row.status)) out.push('run-now');
-    // Kill the in-flight run at will (interrupts mid-object, unlike pause).
-    // Replication only — the backend has no lifecycle-kill arm (would 400).
-    if (row.kind === 'replication' && row.status === 'running') out.push('kill');
+    // Kill the in-flight run at will: it stops at the next object and, unlike
+    // pause, drops the cursor (lifecycle) or interrupts the copy (replication).
+    if (row.status === 'running') out.push('kill');
     out.push('delete');
     return out;
   }
@@ -1093,6 +1093,13 @@ export function nextRunText(
   if (row.enabled === false || row.paused || isActiveJobStatus(row.status)) return null;
   const until = approxTimeUntil(row.next_due_at * 1000, nowMs);
   return until === 'now' ? 'next run: due now' : `next run in ${until}`;
+}
+
+/** "deferred: bucket 'x' has an active maintenance job; …" — why the
+ *  scheduler did not run a due lifecycle rule (server `detail.deferred`). */
+export function deferredText(row: Pick<JobRow, 'detail'>): string | null {
+  const why = row.detail?.deferred;
+  return typeof why === 'string' && why ? `deferred: ${why}` : null;
 }
 
 /** "20 most recent of 1,000" over the Failures tab; null when all shown. */

@@ -2,6 +2,7 @@ import { Button } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
 import { useLifecyclePreview, useRefreshLifecyclePreview } from '../../queries/jobs';
 import { normalizeUiError } from '../../errorHandling';
+import { useNow } from '../../hooks/useNow';
 import LifecyclePreviewList from './LifecyclePreviewList';
 import LifecyclePreviewScanning from './LifecyclePreviewScanning';
 
@@ -17,6 +18,7 @@ export default function LifecyclePreviewTab({ jobId }: { jobId: string }) {
   const refresh = useRefreshLifecyclePreview(jobId);
   const busy = preview.isFetching || refresh.isPending;
   const error = refresh.error ?? preview.error;
+  const now = useNow(30_000);
   return (
     <div>
       <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 8 }}>
@@ -31,6 +33,7 @@ export default function LifecyclePreviewTab({ jobId }: { jobId: string }) {
         error={error}
         errorText={normalizeUiError(error, 'Preview failed')}
         receivedAt={preview.dataUpdatedAt}
+        nowMs={now}
       />
     </div>
   );

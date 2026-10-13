@@ -29,6 +29,12 @@ interface JobRunEntry {
   delta_passthrough?: number;
   bytes_egress_saved?: number;
   reconstructed?: number;
+  // Lifecycle only: what the run did with the objects it acted on, and why
+  // it skipped the others.
+  objects_moved?: number;
+  objects_copied?: number;
+  objects_excluded?: number;
+  objects_not_due?: number;
 }
 export type { JobRunEntry };
 
@@ -277,7 +283,10 @@ interface LifecycleCandidate {
   destination_key?: string;
   delete_source_after_success: boolean;
   created_at: string;
+  /** Logical (uncompressed) size. */
   size: number;
+  /** Bytes on the backend (a delta is much smaller than `size`). */
+  stored_size?: number;
 }
 
 /** `POST /jobs/lifecycle:<rule>/preview` (mirrors `LifecycleRunOutcome`).
@@ -285,7 +294,19 @@ interface LifecycleCandidate {
 export interface LifecyclePreview {
   objects_scanned: number;
   objects_affected: number;
+  objects_skipped?: number;
+  /** Of the skipped: kept out of the rule by a glob (or an internal key). */
+  objects_excluded?: number;
+  /** Of the skipped: not old enough yet. */
+  objects_not_due?: number;
+  /** Of the affected: deleted / moved (source deleted) / copied (source kept). */
+  objects_deleted?: number;
+  objects_moved?: number;
+  objects_copied?: number;
+  /** Logical size of the affected objects. */
   bytes_affected: number;
+  /** Their bytes on the backend. */
+  stored_bytes_affected?: number;
   candidates: LifecycleCandidate[];
   /** When the proxy's walk ended (RFC 3339): a preview can answer from an earlier walk. */
   computed_at?: string;

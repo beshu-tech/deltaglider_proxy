@@ -125,8 +125,8 @@ test('availableActions matrix', () => {
   );
   assert.deepEqual(
     availableActions(row({ kind: 'lifecycle', status: 'running' })),
-    ['pause', 'preview', 'delete'],
-    'lifecycle has NO kill (backend would 400)',
+    ['pause', 'preview', 'kill', 'delete'],
+    'a running lifecycle run can be killed (#2)',
   );
   // Lifecycle run-now stays in the list for a paused/disabled rule: the row
   // renders it disabled with the reason from lifecycleRunNowBlock.

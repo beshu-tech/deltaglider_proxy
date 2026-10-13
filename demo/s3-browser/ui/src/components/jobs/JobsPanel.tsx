@@ -15,7 +15,7 @@
  * have no dirty state, just live progress + cancel.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Alert, Button, Space, Spin, Switch, Tag, Typography, message } from 'antd';
+import { Alert, Button, Input, Space, Spin, Switch, Tag, Typography, message } from 'antd';
 import Dropdown from '../KeyboardDropdown';
 import {
   CaretRightOutlined,
@@ -47,6 +47,7 @@ import {
   draftBlocksAction,
   lifecycleRunNowBlock,
   nextRunText,
+  deferredText,
   planRuleDeleteSync,
   rowMeterInput,
   runEndedMessage,
@@ -164,6 +165,7 @@ function LastRunCell({ row, schedulerOn }: { row: JobRow; schedulerOn: boolean }
   const now = useNow(live ? 1000 : tickPeriodMs(3600));
   const cell = lastRunCell(row, now / 1000);
   const next = nextRunText(row, now, row.kind === 'lifecycle' ? schedulerOn : true);
+  const deferred = deferredText(row);
   return (
     <div style={{ fontSize: 12, whiteSpace: 'nowrap', lineHeight: 1.4 }}>
       {cell.running && <Text style={{ fontSize: 12, display: 'block' }}>{cell.running}</Text>}
@@ -176,6 +178,11 @@ function LastRunCell({ row, schedulerOn }: { row: JobRow; schedulerOn: boolean }
       {next && (
         <Text type="secondary" style={{ fontSize: 11, display: 'block' }}>
           {next}
+        </Text>
+      )}
+      {deferred && (
+        <Text type="warning" style={{ fontSize: 11, display: 'block', whiteSpace: 'normal' }}>
+          {deferred}
         </Text>
       )}
     </div>
@@ -843,6 +850,22 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
             checked={lc.value.enabled}
             disabled={lc.loading}
             onChange={(enabled) => lc.setValue((cur) => ({ ...cur, enabled }))}
+          />
+        </FormField>
+        {/* How often each lifecycle rule runs: the "next run in …" of a row
+            is the end of its last run plus this. */}
+        <FormField
+          label="Run each lifecycle rule every"
+          yamlPath="storage.lifecycle.tick_interval"
+          helpText="A rule runs this long after its last run ended. A new rule first runs this long after you apply it, so you can preview it first. Humantime, at least 1m, e.g. 1h, 30m, 1d."
+          style={{ marginTop: 12, marginBottom: 0, maxWidth: 360 }}
+        >
+          <Input
+            value={lc.value.tick_interval}
+            disabled={lc.loading}
+            placeholder="1h"
+            onChange={(e) => lc.setValue((cur) => ({ ...cur, tick_interval: e.target.value }))}
+            style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
           />
         </FormField>
 

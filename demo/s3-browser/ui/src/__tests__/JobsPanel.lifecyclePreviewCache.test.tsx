@@ -48,12 +48,14 @@ beforeEach(() => {
   http.on('GET', JOBS, json({ jobs: [row] }));
   http.on('GET', SECTION, json({ lifecycle: { enabled: true, rules: [] } }));
   http.on('GET', '/_/api/admin/buckets', json({ buckets: [] }));
-  http.on('POST', PREVIEW, json({
+  // A walk that just ended: the run-now confirmation may reuse it.
+  http.on('POST', PREVIEW, () => json({
     rule_name: 'expire-nightlies', status: 'preview', objects_scanned: 40, objects_affected: 2, objects_skipped: 0,
     bytes_affected: 3 * 1024 * 1024, errors: 0,
     candidates: [candidate('nightly/app-0.9.tar', 1024 * 1024), candidate('nightly/app-0.8.tar', 2 * 1024 * 1024)],
-    failures: [],
+    failures: [], computed_at: new Date().toISOString(),
   }));
+  http.on('GET', `/_/api/admin/jobs/${ID}/runs`, json({ runs: [] }));
   http.on('POST', RUN_NOW, json({ started: true }, 202));
 });
 afterEach(() => {
@@ -115,7 +117,7 @@ test('Refresh preview is disabled while a walk runs, and the time shown is when 
   await act(async () => release());
   await waitFor(() => expect(screen.getByRole('button', { name: /Refresh preview/ })).toBeEnabled());
   const shown = new Date('2026-10-13T10:00:00Z').toLocaleTimeString();
-  expect(screen.getByText(`Scanned 40 objects at ${shown}.`)).toBeInTheDocument();
+  expect(screen.getByText((t) => t.startsWith(`Scanned 40 objects at ${shown} (`))).toBeInTheDocument();
 });
 
 test("Run now's confirmation reuses the cached preview", async () => {
@@ -161,4 +163,57 @@ test('applying the storage section (the lifecycle rules live there) drops the ca
   });
   expect(qc.getQueryState(key)?.isInvalidated).toBe(true);
   qc.clear();
+});
+
+/**
+ * #1: the confirmation said "delete 46" from a walk that the proxy had
+ * cached for 29 s, and the run deleted 80. A preview older than a few
+ * seconds is walked again (`?fresh=true`) before the button names a
+ * count, and the dialog says how old the walk is.
+ */
+test("Run now's confirmation walks again when its preview is old, and says how old", async () => {
+  let fresh = 0;
+  http.on('POST', PREVIEW, (req) => {
+    const isFresh = req.path.endsWith('?fresh=true');
+    if (isFresh) fresh += 1;
+    return json({
+      rule_name: 'expire-nightlies', status: 'preview', objects_scanned: 90,
+      objects_affected: isFresh ? 80 : 46, objects_deleted: isFresh ? 80 : 46, objects_skipped: 10,
+      objects_not_due: 8, objects_excluded: 2, bytes_affected: 1024, errors: 0,
+      candidates: [candidate('nightly/app-0.9.tar', 1024)], failures: [],
+      computed_at: isFresh ? new Date().toISOString() : new Date(Date.now() - 29_000).toISOString(),
+    });
+  });
+  const user = userEvent.setup();
+  renderWithQuery(<JobsPanel />);
+  await screen.findByText('expire-nightlies');
+  await user.click(within(jobRow()).getByRole('button', { name: 'Run now: expire-nightlies' }));
+  const dialog = await screen.findByRole('dialog');
+  expect(await within(dialog).findByRole('button', { name: 'Run: delete 80 objects' })).toBeEnabled();
+  expect(fresh).toBe(1);
+  expect(within(dialog).queryByRole('button', { name: 'Run: delete 46 objects' })).toBeNull();
+  expect(within(dialog).getByText((t) => t.startsWith('Scanned 90 objects at') && t.includes('s ago)'))).toBeInTheDocument();
+  expect(
+    within(dialog).getByText('Of the other scanned objects, 8 are not old enough yet, 2 are kept out by a glob.'),
+  ).toBeInTheDocument();
+  await user.click(within(dialog).getByRole('button', { name: /Refresh preview/ }));
+  await waitFor(() => expect(fresh).toBe(2));
+});
+
+/** #15: when the run that the operator started ends, a toast says what it did. */
+test('a run-now ends with a toast that counts what it did', async () => {
+  http.on('GET', `/_/api/admin/jobs/${ID}/runs`, () => json({
+    runs: [{
+      id: 7, triggered_by: 'run-now', started_at: Math.floor(Date.now() / 1000), finished_at: Math.floor(Date.now() / 1000),
+      status: 'succeeded', status_raw: 'succeeded', objects_scanned: 40, objects_processed: 2, objects_skipped: 38,
+      objects_deleted: 2, objects_moved: 0, objects_copied: 0, bytes: 3, errors: 0,
+    }],
+  }));
+  const user = userEvent.setup();
+  renderWithQuery(<JobsPanel />);
+  await screen.findByText('expire-nightlies');
+  await user.click(within(jobRow()).getByRole('button', { name: 'Run now: expire-nightlies' }));
+  const dialog = await screen.findByRole('dialog');
+  await user.click(await within(dialog).findByRole('button', { name: 'Run: delete 2 objects' }));
+  expect(await screen.findByText('Lifecycle rule "expire-nightlies" finished: deleted 2.', {}, { timeout: 5000 })).toBeInTheDocument();
 });

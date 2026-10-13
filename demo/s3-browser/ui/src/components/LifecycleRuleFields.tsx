@@ -5,6 +5,7 @@ import FormField from './FormField';
 import { AdvancedDisclosure } from './ruleEditorFields';
 import GlobListTextArea from './GlobListTextArea';
 import { actionKind } from './lifecyclePayload';
+import { ruleGlobError } from './jobs/lifecycleText';
 
 type RetainAction = Extract<LifecycleAction, { type: 'retain-newest' }>;
 type TransitionAction = Extract<LifecycleAction, { type: 'transition' | 'archive' }>;
@@ -53,6 +54,9 @@ export default function RuleEditor({
     updateRetain({ qualify: { ...current.qualify, ...patch } });
   };
 
+  const includeError = ruleGlobError(rule.name, rule.include_globs);
+  const excludeError = ruleGlobError(rule.name, rule.exclude_globs);
+
   return (
     <div>
       <Alert
@@ -99,7 +103,7 @@ export default function RuleEditor({
           <FormField
             label="Expire after"
             yamlPath="storage.lifecycle.rules[].expire_after"
-            helpText="Objects whose created_at is older than this age become candidates. Humantime duration, e.g. 30d, 12h, 90d."
+            helpText="Objects whose creation time is older than this age become candidates. The proxy stamps the creation time when it stores an object. For an object that was written without the proxy (a restore, a copy straight to the disk or the backend), it uses the file's modification time instead. Humantime duration, e.g. 30d, 12h, 90d."
           >
             <Input
               value={rule.expire_after || ''}
@@ -263,7 +267,13 @@ export default function RuleEditor({
               rows={3}
               placeholder={'*.zip\nreleases/**'}
               style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
+              status={includeError ? 'error' : undefined}
             />
+            {includeError && (
+              <div role="alert" style={{ color: 'var(--ant-color-error, #ff4d4f)', fontSize: 12, marginTop: 4 }}>
+                {includeError}
+              </div>
+            )}
           </FormField>
           <FormField
             label="Exclude globs"
@@ -276,7 +286,13 @@ export default function RuleEditor({
               rows={3}
               placeholder=".deltaglider/**"
               style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
+              status={excludeError ? 'error' : undefined}
             />
+            {excludeError && (
+              <div role="alert" style={{ color: 'var(--ant-color-error, #ff4d4f)', fontSize: 12, marginTop: 4 }}>
+                {excludeError}
+              </div>
+            )}
           </FormField>
           <FormField
             label="Batch size"

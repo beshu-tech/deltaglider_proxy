@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Fixed — The run-now confirmation shows the count that the run acts on
+
+The confirmation of a lifecycle run-now could name a count from a preview
+that the proxy had computed up to a minute earlier, or that the GUI had
+kept for five minutes. A confirmation said "delete 46", and the run deleted
+80. When the preview at hand is older than 10 seconds, the confirmation now
+asks the proxy for a new walk of the scope, and the run button stays off
+until the walk ends. The dialog says when the proxy scanned the scope and
+how long ago, and **Refresh preview** always asks for a new walk. When the
+run ends, a message says what it did ("finished: deleted 80").
+
+### Changed — The lifecycle preview and editor say more
+
+The preview now says "copy to" or "move to" for a transition, with the
+destination key, instead of "move to" for both. It says how many of the
+skipped objects are not old enough yet and how many a glob keeps out, it
+shows the creation date of each object, and it shows the space that the
+objects use on the backend when that differs from their size. The Jobs
+screen has a field for `tick_interval` next to the lifecycle switch, a row
+says why the scheduler did not run a due rule, and a running lifecycle run
+has **Kill**. The review step names the time of the first run of a new
+rule. The rule editor marks an invalid include or exclude glob under the
+field, with the name of the rule, and its help says that the age of an
+object that was written without the proxy comes from its modification
+time.
+
 ### Fixed — Pause stops a running lifecycle run, and Kill is new
 
 Before, **Pause** on a lifecycle rule only set a flag that the scheduler
