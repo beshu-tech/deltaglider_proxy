@@ -26,8 +26,9 @@
 #   $1                          — a prod backup zip (restored via the API,
 #                                 mode=preserve-bootstrap, like
 #                                 restart-local-with-prod-backup.sh)
-#   /private/tmp/dgp-backup-*.zip (newest)
-#   /private/tmp/dgp-prod-local — clone of the already-restored local dir
+#   $TMP_ROOT/dgp-backup-*.zip (newest)
+#   $TMP_ROOT/dgp-prod-local — clone of the already-restored local dir
+# TMP_ROOT is /tmp (on macOS that is /private/tmp).
 #
 # Local-only (needs the prod backup / restored state + its secrets); not
 # part of CI. CI covers the sanitized shape via `prod_shape_tests` in
@@ -39,7 +40,8 @@ BIN="$REPO/target/release/deltaglider_proxy"
 PORT="${PORT:-9450}"
 BASE="http://127.0.0.1:${PORT}"
 PW="testpassword123"
-DIR="$(mktemp -d /private/tmp/dgp-prodconf-test.XXXXXX)"
+TMP_ROOT="${TMP_ROOT:-/tmp}"
+DIR="$(mktemp -d "${TMP_ROOT}/dgp-prodconf-test.XXXXXX")"
 COOKIES="${DIR}/cookies.txt"
 
 PASS=0
@@ -58,17 +60,31 @@ trap cleanup EXIT
 [[ -x "${BIN}" ]] || { echo "ERROR: ${BIN} missing — run 'cargo build --release' first" >&2; exit 1; }
 command -v aws >/dev/null || { echo "ERROR: aws cli required" >&2; exit 1; }
 
+# Is something listening on the port? lsof on macOS, ss on Linux.
+port_in_use() {
+  if command -v lsof >/dev/null; then
+    lsof -ti ":$1" -sTCP:LISTEN >/dev/null 2>&1
+  else
+    ss -Hltn "sport = :$1" | grep -q .
+  fi
+}
+
 # ── Acquire prod state ──────────────────────────────────────────────────
-BACKUP="${1:-$(ls -t /private/tmp/dgp-backup-*.zip 2>/dev/null | head -1 || true)}"
+BACKUP="${1:-$(ls -t ${TMP_ROOT}/dgp-backup-*.zip 2>/dev/null | head -1 || true)}"
 start_proxy() {
   # Fail loudly if something already holds the port — otherwise the health
   # probe below would happily talk to a STALE instance and every assertion
   # would test the wrong process (same trap tests/common/mod.rs guards).
-  if lsof -ti ":${PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
+  if port_in_use "${PORT}"; then
     echo "ERROR: port ${PORT} already in use — kill the stray instance or set PORT=" >&2
     return 1
   fi
-  ( cd "${DIR}" && nohup "${BIN}" --listen "127.0.0.1:${PORT}" > "${DIR}/proxy.log" 2>&1 & echo $! > "${DIR}/proxy.pid" )
+  # `&` on the proxy command alone: `$!` must be the proxy's PID, not a
+  # subshell's (killing a subshell leaves the proxy running with prod
+  # credentials, and the next start finds the port taken).
+  ( cd "${DIR}" || exit 1
+    DGP_LISTING_FACTS_GC=false nohup "${BIN}" --listen "127.0.0.1:${PORT}" > "${DIR}/proxy.log" 2>&1 &
+    echo $! > "${DIR}/proxy.pid" )
   for _ in $(seq 1 40); do
     curl -fsS -o /dev/null "${BASE}/_/health" 2>/dev/null && return 0
     sleep 0.5
@@ -78,8 +94,47 @@ start_proxy() {
   return 1
 }
 
+# SAFETY: the restored config holds the REAL backend credentials. Turn off
+# every background job that writes on its own (replication, lifecycle, event
+# delivery) BEFORE any proxy loads it: the restore applies the config to a
+# running proxy at once, and prod runs as one instance with no
+# cross-instance locks. The rules stay in the YAML, so step 5 still sees them.
+neutralize_yaml() {  # neutralize_yaml <in.yaml> <out.yaml>
+  python3 - "$1" "$2" <<'PY'
+import sys, yaml
+cfg = yaml.safe_load(open(sys.argv[1])) or {}
+storage = cfg.get('storage') or {}
+for section in ('replication', 'lifecycle'):
+    if isinstance(storage.get(section), dict):
+        storage[section]['enabled'] = False
+advanced = cfg.get('advanced') or {}
+if isinstance(advanced.get('event_delivery'), dict):
+    advanced['event_delivery']['enabled'] = False
+yaml.safe_dump(cfg, open(sys.argv[2], 'w'), sort_keys=False)
+PY
+}
+neutralize_backup() {  # neutralize_backup <in.zip> <out.zip>
+  local work="${DIR}/backup-src"
+  mkdir -p "${work}" && unzip -q "$1" -d "${work}"
+  neutralize_yaml "${work}/config.yaml" "${work}/config.yaml"
+  python3 - "${work}" <<'PY'
+import hashlib, json, os, sys
+d = sys.argv[1]
+m = json.load(open(os.path.join(d, 'manifest.json')))
+for f in m.get('files', []):
+    data = open(os.path.join(d, f['name']), 'rb').read()
+    f['bytes'], f['sha256'] = len(data), hashlib.sha256(data).hexdigest()
+json.dump(m, open(os.path.join(d, 'manifest.json'), 'w'), indent=2)
+PY
+  ( cd "${work}" && zip -q -X "$2" manifest.json config.yaml iam.json secrets.json )
+  cp "${work}/iam.json" "${DIR}/backup-iam.json"
+  rm -rf "${work}"
+}
+
 if [[ -n "${BACKUP}" && -f "${BACKUP}" ]]; then
   echo "==> Source: backup zip ${BACKUP}"
+  neutralize_backup "${BACKUP}" "${DIR}/backup-safe.zip"
+  BACKUP="${DIR}/backup-safe.zip"
   mkdir -p "${DIR}/data"
   cat > "${DIR}/deltaglider_proxy.yaml" <<EOF
 access:
@@ -98,19 +153,20 @@ EOF
     -H 'Content-Type: application/zip' --data-binary "@${BACKUP}" -o /dev/null
   kill "$(cat "${DIR}/proxy.pid")" 2>/dev/null || true
   for _ in $(seq 1 20); do
-    lsof -ti ":${PORT}" -sTCP:LISTEN >/dev/null 2>&1 || break
+    port_in_use "${PORT}" || break
     sleep 0.5
   done
-elif [[ -d /private/tmp/dgp-prod-local ]]; then
-  echo "==> Source: clone of /private/tmp/dgp-prod-local (no backup zip found)"
-  cp /private/tmp/dgp-prod-local/deltaglider_proxy.yaml "${DIR}/"
-  cp /private/tmp/dgp-prod-local/deltaglider_config.db "${DIR}/" 2>/dev/null || true
+elif [[ -d ${TMP_ROOT}/dgp-prod-local ]]; then
+  echo "==> Source: clone of ${TMP_ROOT}/dgp-prod-local (no backup zip found)"
+  cp ${TMP_ROOT}/dgp-prod-local/deltaglider_proxy.yaml "${DIR}/"
+  cp ${TMP_ROOT}/dgp-prod-local/deltaglider_config.db "${DIR}/" 2>/dev/null || true
   # The bootstrap hash lives in a hidden sidecar file — without it the
   # proxy generates a fresh password and quarantines the cloned DB.
-  cp /private/tmp/dgp-prod-local/.deltaglider_bootstrap_hash "${DIR}/" 2>/dev/null || true
+  cp ${TMP_ROOT}/dgp-prod-local/.deltaglider_bootstrap_hash "${DIR}/" 2>/dev/null || true
+  neutralize_yaml "${DIR}/deltaglider_proxy.yaml" "${DIR}/deltaglider_proxy.yaml"
   mkdir -p "${DIR}/data"
 else
-  echo "ERROR: no prod state found (no backup zip, no /private/tmp/dgp-prod-local)" >&2
+  echo "ERROR: no prod state found (no backup zip, no ${TMP_ROOT}/dgp-prod-local)" >&2
   exit 1
 fi
 
@@ -164,9 +220,21 @@ out = {
     'replication_rules': [r['name'] for r in ((storage.get('replication') or {}).get('rules') or [])],
     'lifecycle_rules': [r['name'] for r in ((storage.get('lifecycle') or {}).get('rules') or [])],
 }
+# GUI-mode IAM lives in the database, not the YAML: the backup's iam.json
+# holds what the restore must bring back.
+iam_path = os.path.join(os.path.dirname(sys.argv[1]), 'backup-iam.json')
+if out['iam_mode'] != 'declarative' and os.path.exists(iam_path):
+    iam = json.load(open(iam_path))
+    out['users'] = sorted(u['name'] for u in iam.get('users', [])
+                          if u.get('auth_source', 'local') != 'external')
+    out['groups'] = sorted(g['name'] for g in iam.get('groups', []))
+    out['providers'] = sorted(p['name'] for p in iam.get('auth_providers', []))
+    out['iam_source'] = 'backup iam.json'
+else:
+    out['iam_source'] = 'YAML'
 json.dump(out, sys.stdout)
 PY
-note "expectations: $(python3 -c "import json;d=json.load(open('${EXPECT_JSON}'));print(f\"{len(d['users'])} users, {len(d['groups'])} groups, {len(d['providers'])} providers, {len(d['buckets'])} buckets, {len(d['replication_rules'])} repl rules\")")"
+note "expectations: $(python3 -c "import json;d=json.load(open('${EXPECT_JSON}'));print(f\"IAM from {d['iam_source']}: {len(d['users'])} users, {len(d['groups'])} groups, {len(d['providers'])} providers, {len(d['buckets'])} buckets, {len(d['replication_rules'])} repl rules\")")"
 
 # ── 1. config lint ──────────────────────────────────────────────────────
 ASSERT="config lint accepts the prod YAML"
@@ -209,11 +277,11 @@ assert ${pred}, (resp, expect)
 # Declarative-mode contract: LOCAL users exactly mirror the YAML;
 # OAuth-born users (auth_source == 'external') are preserved by the
 # reconciler and may appear in addition.
-api_matches "declarative IAM users match the YAML (externals allowed)" "${BASE}/_/api/admin/users" \
+api_matches "IAM users match the expectations (externals allowed)" "${BASE}/_/api/admin/users" \
   "(lambda users: sorted(u['name'] for u in users if u.get('auth_source') != 'external') == expect['users'])(resp if isinstance(resp, list) else resp.get('users', []))"
-api_matches "IAM groups match the YAML" "${BASE}/_/api/admin/groups" \
+api_matches "IAM groups match the expectations" "${BASE}/_/api/admin/groups" \
   "set(expect['groups']) <= set(g['name'] for g in (resp if isinstance(resp, list) else resp.get('groups', [])))"
-api_matches "OIDC providers match the YAML" "${BASE}/_/api/admin/ext-auth/providers" \
+api_matches "OIDC providers match the expectations" "${BASE}/_/api/admin/ext-auth/providers" \
   "sorted(p['name'] for p in (resp if isinstance(resp, list) else resp.get('providers', []))) == expect['providers']"
 
 # ── 4. bucket routing ───────────────────────────────────────────────────
@@ -254,7 +322,7 @@ fi
 FS_BUCKET="$(python3 -c "import json;d=json.load(open('${EXPECT_JSON}'));print(d['fs_buckets'][0] if d['fs_buckets'] else '')")"
 if [[ -n "${FS_BUCKET}" ]]; then
   ASSERT="PUT+GET sha256 round-trip on filesystem bucket '${FS_BUCKET}'"
-  dd if=/dev/urandom of="${DIR}/blob.bin" bs=1m count=2 2>/dev/null
+  dd if=/dev/urandom of="${DIR}/blob.bin" bs=1048576 count=2 2>/dev/null
   SUM1="$(shasum -a 256 "${DIR}/blob.bin" | cut -d' ' -f1)"
   if aws "${EP[@]}" s3 cp "${DIR}/blob.bin" "s3://${FS_BUCKET}/__prodconf_test/blob.bin" --no-progress >/dev/null 2>&1 \
      && aws "${EP[@]}" s3 cp "s3://${FS_BUCKET}/__prodconf_test/blob.bin" "${DIR}/blob.out" --no-progress >/dev/null 2>&1 \
