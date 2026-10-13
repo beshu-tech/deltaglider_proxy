@@ -173,9 +173,12 @@ exposed headers.
   metadata and its bytes with one request. Before, the proxy sent HEAD
   requests for both stored forms of the key and then a GET: two round trips.
   When the proxy already has the object's metadata in memory, a GET now costs
-  one request instead of three. The ETag and the body of the answer now always
-  come from the same stored version, also when another node overwrites the
-  object at the same moment.
+  one request instead of three. When the first request finds the object in the
+  form that the proxy expects, the ETag and the body of the answer come from
+  the same stored version, also when another node overwrites the object at the
+  same moment. When it does not (for example, a file type that the proxy
+  usually stores as a delta is stored as a plain object), the proxy sends a
+  HEAD request and then a GET, as before.
 - A delta GET that loads its reference into memory sends one GET request
   instead of a GET and a HEAD. A large delta GET takes the size of the
   reference from the download itself, without a HEAD request.
