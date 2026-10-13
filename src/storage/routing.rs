@@ -81,8 +81,9 @@ fn alias_owns_real_bucket(
 /// Where an unrouted bucket lives: the HeadBucket probe and its caches.
 ///
 /// Cold resolutions of one bucket are single-flight: requests that find no
-/// cached answer wait for one probe (`gates`) and read its answer. An
-/// error is not cached, so the next request probes again.
+/// cached answer wait for one probe (`flights`) and read its answer, an
+/// error answer included. An error is not cached past that probe, so the
+/// next request probes again.
 ///
 /// Stale-while-revalidate: a resolution older than `RESOLVE_TTL` is still
 /// served at once while ONE background probe refreshes it; one older than
@@ -94,6 +95,9 @@ fn alias_owns_real_bucket(
 /// within `RESOLVE_TTL` (found) or `MISS_TTL` (absent). A config apply
 /// that changes routes or backends builds a new `RoutingBackend`, so a new
 /// `Resolver` with empty caches.
+/// One cold resolution's probe, shared by its participants.
+type Flight = Arc<tokio::sync::OnceCell<(String, Probed)>>;
+
 struct Resolver {
     backends: HashMap<String, Arc<Box<DynStorageBackend<'static>>>>,
     routes: HashMap<String, BucketRoute>,
@@ -108,9 +112,9 @@ struct Resolver {
     /// that no backend holds does not send a HeadBucket to each backend
     /// every time. Cleared on create/delete bucket.
     missed: parking_lot::Mutex<HashMap<String, std::time::Instant>>,
-    /// Unrouted bucket → the gate its cold resolution runs under. The entry
-    /// goes when the probe ends.
-    gates: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Unrouted bucket → the probe its cold resolution waits for. The entry
+    /// goes when a participant of that probe ends, however it ends.
+    flights: parking_lot::Mutex<HashMap<String, Flight>>,
     /// Buckets whose stale resolution a background probe is refreshing:
     /// one refresher per bucket.
     refreshing: Arc<parking_lot::Mutex<HashSet<String>>>,
@@ -131,7 +135,7 @@ impl Resolver {
             default_backend,
             resolved: Default::default(),
             missed: Default::default(),
-            gates: Default::default(),
+            flights: Default::default(),
             refreshing: Default::default(),
             generation: Default::default(),
         }
@@ -231,35 +235,55 @@ impl Resolver {
         }
     }
 
-    /// The gate a probe of `virtual_bucket` runs under.
-    fn gate(&self, virtual_bucket: &str) -> Arc<tokio::sync::Mutex<()>> {
-        self.gates
+    /// The cached answer, else the answer of the one probe that every
+    /// request arriving while it runs shares. Its participants all get the
+    /// probe's answer, so a failing backend costs one probe per flight, not
+    /// one per waiting request in turn. A cancelled first participant hands
+    /// the probe to the next (`OnceCell`).
+    async fn probe_once(&self, virtual_bucket: &str) -> (String, Probed) {
+        let flight = self
+            .flights
             .lock()
             .entry(virtual_bucket.to_string())
             .or_default()
+            .clone();
+        /// Removes this flight's entry however the participant ends, so a
+        /// cancelled request leaves nothing behind.
+        struct EndFlight<'r>(&'r Resolver, &'r str, Flight);
+        impl Drop for EndFlight<'_> {
+            fn drop(&mut self) {
+                let mut map = self.0.flights.lock();
+                if map.get(self.1).is_some_and(|f| Arc::ptr_eq(f, &self.2)) {
+                    map.remove(self.1);
+                }
+            }
+        }
+        let end = EndFlight(self, virtual_bucket, flight);
+        end.2
+            .get_or_init(|| async {
+                // A flight that ended just before this one may have answered.
+                match self.cached(virtual_bucket) {
+                    Some(hit) => hit,
+                    None => self.probe(virtual_bucket).await,
+                }
+            })
+            .await
             .clone()
     }
 
     /// Resolve an unrouted bucket: the cached answer, a stale one (and a
-    /// background refresh), else one probe shared by every request that
-    /// arrives while it runs.
-    async fn resolve(self: &Arc<Self>, virtual_bucket: &str) -> (String, Probed) {
+    /// background refresh) when `stale_ok`, else one shared probe.
+    async fn resolve(self: &Arc<Self>, virtual_bucket: &str, stale_ok: bool) -> (String, Probed) {
         if let Some(hit) = self.cached(virtual_bucket) {
             return hit;
         }
-        if let Some(name) = self.stale_resolution(virtual_bucket) {
-            self.refresh_in_background(virtual_bucket);
-            return (name, Probed::No);
+        if stale_ok {
+            if let Some(name) = self.stale_resolution(virtual_bucket) {
+                self.refresh_in_background(virtual_bucket);
+                return (name, Probed::No);
+            }
         }
-        let gate = self.gate(virtual_bucket);
-        let _held = gate.lock().await;
-        // The probe that held the gate may have answered for us.
-        if let Some(hit) = self.cached(virtual_bucket) {
-            return hit;
-        }
-        let out = self.probe(virtual_bucket).await;
-        self.gates.lock().remove(virtual_bucket);
-        out
+        self.probe_once(virtual_bucket).await
     }
 
     /// Start the one background probe of a stale resolution (none when one
@@ -283,12 +307,9 @@ impl Resolver {
         let this = Arc::clone(self);
         runtime.spawn(async move {
             let bucket = mark.1.clone();
-            let gate = this.gate(&bucket);
-            let _held = gate.lock().await;
             if this.cached_resolution(&bucket).is_none() {
-                this.probe(&bucket).await;
+                this.probe_once(&bucket).await;
             }
-            this.gates.lock().remove(&bucket);
             drop(mark);
         });
     }
@@ -778,6 +799,26 @@ impl RoutingBackend {
         &'a self,
         virtual_bucket: &'a str,
     ) -> (String, &'a DynStorageBackend<'a>, Cow<'a, str>, Probed) {
+        self.resolve_with(virtual_bucket, true).await
+    }
+
+    /// [`Self::resolve_existing`] with no stale answer: CreateBucket and
+    /// declared-bucket setup decide WHERE a bucket lives, so a bucket that
+    /// was deleted from its backend since it was found must not pull the new
+    /// one there.
+    async fn resolve_existing_fresh<'a>(
+        &'a self,
+        virtual_bucket: &'a str,
+    ) -> (&'a DynStorageBackend<'a>, Cow<'a, str>) {
+        let (_, backend, real, _) = self.resolve_with(virtual_bucket, false).await;
+        (backend, real)
+    }
+
+    async fn resolve_with<'a>(
+        &'a self,
+        virtual_bucket: &'a str,
+        stale_ok: bool,
+    ) -> (String, &'a DynStorageBackend<'a>, Cow<'a, str>, Probed) {
         if let Some(route) = self.routes.get(virtual_bucket) {
             let backend = self.backends[&route.backend_name].as_ref().as_ref();
             let real = match &route.real_bucket {
@@ -786,7 +827,7 @@ impl RoutingBackend {
             };
             return (route.backend_name.clone(), backend, real, Probed::No);
         }
-        let (name, probed) = self.resolver.resolve(virtual_bucket).await;
+        let (name, probed) = self.resolver.resolve(virtual_bucket, stale_ok).await;
         let backend = self.backends[&name].as_ref().as_ref();
         (name, backend, Cow::Borrowed(virtual_bucket), probed)
     }
@@ -821,7 +862,8 @@ impl StorageBackend for RoutingBackend {
     // === Bucket operations ===
 
     async fn create_bucket(&self, bucket: &str) -> Result<(), StorageError> {
-        let res = route_existing!(self, bucket, create_bucket);
+        let (backend, real_bucket) = self.resolve_existing_fresh(bucket).await;
+        let res = backend.create_bucket(&real_bucket).await;
         if res.is_ok() {
             self.invalidate_listing_freshness();
         }
@@ -831,7 +873,8 @@ impl StorageBackend for RoutingBackend {
     /// Route a declared bucket to its target backend so the backend decides
     /// whether to create it (filesystem → mkdir, others → no-op). #63.
     async fn ensure_declared_bucket(&self, bucket: &str) -> Result<(), StorageError> {
-        route_existing!(self, bucket, ensure_declared_bucket)
+        let (backend, real_bucket) = self.resolve_existing_fresh(bucket).await;
+        backend.ensure_declared_bucket(&real_bucket).await
     }
 
     async fn delete_bucket(&self, bucket: &str) -> Result<(), StorageError> {
@@ -3206,6 +3249,52 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(bucket_heads(&fake), 1, "{:?}", fake.requests());
+    }
+
+    /// A failing probe answers every request that waited for it: N waiters
+    /// cost one probe, not N probes one after the other.
+    #[tokio::test]
+    async fn a_failed_cold_probe_answers_all_its_waiters() {
+        let (routing, fake) = fake_routing(100).await;
+        fake.fail("HEAD_BUCKET", "/b", 503, "SlowDown", 100);
+        let all =
+            futures::future::join_all((0..8).map(|_| routing.resolve_existing_named("b"))).await;
+        assert!(all.iter().all(|(name, _, _)| name == "primary"));
+        assert_eq!(bucket_heads(&fake), 1, "{:?}", fake.requests());
+        assert!(routing.resolver.flights.lock().is_empty());
+    }
+
+    /// A request cancelled during the probe leaves no flight behind.
+    #[tokio::test]
+    async fn a_cancelled_resolution_leaves_no_flight() {
+        let (routing, _fake) = fake_routing(300).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            routing.resolve_existing_named("b"),
+        )
+        .await;
+        assert!(routing.resolver.flights.lock().is_empty());
+    }
+
+    /// CreateBucket never follows a stale resolution: it probes, so a
+    /// bucket that left its old backend is created where the probe says.
+    #[tokio::test]
+    async fn create_bucket_ignores_a_stale_resolution() {
+        let (routing, _fake) = fake_routing(300).await;
+        routing.resolve_existing_named("b").await;
+        age_resolution(
+            &routing,
+            "b",
+            RESOLVE_TTL + std::time::Duration::from_secs(1),
+        );
+        // A stale answer comes at once; CreateBucket waits for the probe.
+        let started = std::time::Instant::now();
+        let _ = routing.create_bucket("b").await;
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(300),
+            "CreateBucket used the stale resolution ({:?})",
+            started.elapsed()
+        );
     }
 
     /// Hard expiry: a resolution older than 5 x RESOLVE_TTL is not served;
