@@ -206,6 +206,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
   );
   const schedulerOn = jobsQuery.data?.workers?.lifecycle?.enabled ?? true;
   const lastEventAt = jobsQuery.data?.workers?.replication?.last_event_applied_at ?? null;
+  const olderOneoffs = jobsQuery.data?.older_oneoffs ?? 0;
   useEffect(() => {
     if (watches.length === 0) return;
     const now = Date.now();
@@ -819,6 +820,11 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
                 ? 'No jobs yet.'
                 : `${displayRows.length} job${displayRows.length === 1 ? '' : 's'} — select one for its definition, runs, and failures.`}
             </Text>
+            {olderOneoffs > 0 ? (
+              <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>
+                {olderOneoffs.toLocaleString()} older one-off job{olderOneoffs === 1 ? '' : 's'} not listed.
+              </Text>
+            ) : null}
             {/* Event-driven copies write no run row: this is where they show. */}
             {lastEventAt ? (
               <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>

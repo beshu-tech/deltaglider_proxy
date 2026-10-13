@@ -55,6 +55,10 @@ interface CardProps {
   onToggle: () => void;
   backends: BackendInfo[];
   defaultBackend: string | null;
+  /** The backend that holds the bucket now (origins `backend_name`). It can
+   *  differ from the default without an explicit route: a bucket that lives
+   *  only on another backend. */
+  originBackend?: string | null;
   /** Global compression default — for resolved labels. */
   globalCompressionOn: boolean;
   globalRatio: number;
@@ -109,6 +113,7 @@ export default function BucketCard({
   onToggle,
   backends,
   defaultBackend,
+  originBackend = null,
   globalCompressionOn,
   globalRatio,
   onPatch,
@@ -164,7 +169,7 @@ export default function BucketCard({
 
   // ── Collapsed status chips (effective state, always resolved) ──
   const encryptionInfo = (() => {
-    const info = resolveBackendFor(eff.backend, backends, defaultBackend);
+    const info = resolveBackendFor(eff.backend || originBackend, backends, defaultBackend);
     return describeEncryption(info?.encryption);
   })();
   const advancedActive =
@@ -198,6 +203,14 @@ export default function BucketCard({
     eff.backend ? (
       <Chip key="backend" tone={colors.ACCENT_BLUE} title={`Explicitly routed to ${eff.backend}`}>
         → {eff.backend}
+      </Chip>
+    ) : originBackend && originBackend !== defaultBackend ? (
+      <Chip
+        key="backend"
+        tone={colors.ACCENT_BLUE}
+        title={`No explicit route — the bucket exists on ${originBackend}${defaultBackend ? ` (the default backend is ${defaultBackend})` : ''}`}
+      >
+        on {originBackend}
       </Chip>
     ) : (
       <Chip key="backend" tone={colors.TEXT_MUTED} title="No explicit route — uses the default backend">

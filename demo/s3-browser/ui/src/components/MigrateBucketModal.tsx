@@ -4,6 +4,12 @@
  * endpoint is gone). On 202 the modal closes and points the operator at
  * the Jobs page; the bucket row meanwhile shows the busy chip + progress.
  *
+ * The target picker shows each backend's health and encryption; a backend
+ * that the health loop gates cannot be picked. A move from an encrypting
+ * backend to a plaintext one needs an explicit acknowledgement. A start
+ * that the server refuses (409: gated target, non-empty destination) shows
+ * its reason inside the dialog.
+ *
  * Two entry points: pre-targeted from a bucket card (`bucket` set), or
  * the Jobs page's "New job → Migrate bucket…" (`bucket` null → internal
  * bucket picker).
@@ -14,7 +20,16 @@ import { useQueryClient } from '@tanstack/react-query';
 import { createMigrateJob } from '../adminApi';
 import { qk } from '../queries/keys';
 import { useBackends, useBucketOrigins } from '../queries/backends';
-import { normalizeUiError } from '../errorHandling';
+import { ApiError, normalizeUiError } from '../errorHandling';
+import {
+  MIRROR_OPTION_LABEL,
+  encryptionWord,
+  encryptsAtRest,
+  healthWord,
+  isGated,
+  migrateErrorInModalWords,
+  originBackendOf,
+} from '../backendFacts';
 
 const { Text } = Typography;
 
@@ -33,6 +48,9 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
   const [deleteSource, setDeleteSource] = useState(false);
   const [mirror, setMirror] = useState(false);
   const [starting, setStarting] = useState(false);
+  const [plaintextAck, setPlaintextAck] = useState(false);
+  /** Why the server refused the last start, in the dialog's words. */
+  const [startError, setStartError] = useState<string | null>(null);
   const [messageApi, contextHolder] = message.useMessage();
 
   const backendsQuery = useBackends();
@@ -42,20 +60,36 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
   const origins = originsQuery.data?.buckets ?? [];
 
   const effectiveBucket = bucket ?? pickedBucket;
-  const currentBackend =
-    origins.find((o) => o.name === effectiveBucket)?.backend_name ?? defaultBackend;
-  const targets = backends.filter((b) => b.name !== currentBackend);
+  // Unknown until the origins load: the default backend is not a safe guess
+  // for a bucket that lives on another backend.
+  const currentBackend = originsQuery.isSuccess
+    ? originBackendOf(
+        origins.find((o) => o.name === effectiveBucket),
+        defaultBackend,
+      )
+    : null;
+  const source = backends.find((b) => b.name === currentBackend);
+  const targets = originsQuery.isSuccess ? backends.filter((b) => b.name !== currentBackend) : [];
+  const targetInfo = backends.find((b) => b.name === target);
+  const targetGated = isGated(targetInfo?.health);
+  const dropsEncryption =
+    !!targetInfo && encryptsAtRest(source?.encryption) && !encryptsAtRest(targetInfo.encryption);
+  const canStart =
+    !!effectiveBucket && !!target && !targetGated && (!dropsEncryption || plaintextAck);
 
   const reset = () => {
     setPickedBucket(undefined);
     setTarget(undefined);
     setDeleteSource(false);
     setMirror(false);
+    setPlaintextAck(false);
+    setStartError(null);
   };
 
   const handleStart = async () => {
-    if (!effectiveBucket || !target) return;
+    if (!canStart || !effectiveBucket || !target) return;
     setStarting(true);
+    setStartError(null);
     try {
       await createMigrateJob(effectiveBucket, target, deleteSource, mirror ? 'mirror' : 'empty');
       messageApi.success(
@@ -67,7 +101,13 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
       onClose();
       onStarted?.();
     } catch (e) {
-      messageApi.error(normalizeUiError(e, 'Failed to start migration'));
+      // A refusal (4xx) carries the server's reason: show it in the dialog,
+      // next to the options that change it.
+      if (e instanceof ApiError && e.status >= 400 && e.status < 500 && e.detail) {
+        setStartError(migrateErrorInModalWords(e.detail));
+      } else {
+        messageApi.error(normalizeUiError(e, 'Failed to start migration'));
+      }
     } finally {
       setStarting(false);
     }
@@ -82,7 +122,7 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
       }}
       onOk={() => void handleStart()}
       okText="Start migration"
-      okButtonProps={{ disabled: !effectiveBucket || !target, loading: starting }}
+      okButtonProps={{ disabled: !canStart, loading: starting }}
       title={effectiveBucket ? `Migrate ${effectiveBucket} to another backend` : 'Migrate a bucket'}
     >
       {contextHolder}
@@ -113,10 +153,15 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
             style={{ width: '100%' }}
             placeholder="Pick a bucket"
             value={pickedBucket}
-            onChange={setPickedBucket}
+            onChange={(v) => {
+              setPickedBucket(v);
+              setTarget(undefined);
+              setPlaintextAck(false);
+              setStartError(null);
+            }}
             options={origins.map((o) => ({
               value: o.name,
-              label: `${o.name} (on ${o.backend_name ?? defaultBackend ?? 'default'})`,
+              label: `${o.name} (on ${originBackendOf(o, defaultBackend) ?? 'default'})`,
             }))}
           />
         </div>
@@ -125,6 +170,11 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
         <Text id="migrate-target-label" strong style={{ fontSize: 13, display: 'block', marginBottom: 6 }}>
           Target backend
         </Text>
+        {source && (
+          <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 6 }}>
+            Now on <Text code>{source.name}</Text> ({encryptionWord(source.encryption)}).
+          </Text>
+        )}
         <Select
           aria-labelledby="migrate-target-label"
           style={{ width: '100%' }}
@@ -132,14 +182,59 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
             targets.length === 0 ? 'No other backend available' : 'Pick the destination backend'
           }
           value={target}
-          onChange={setTarget}
+          onChange={(v) => {
+            setTarget(v);
+            setPlaintextAck(false);
+            setStartError(null);
+          }}
           disabled={targets.length === 0}
           options={targets.map((b) => ({
             value: b.name,
-            label: `${b.name} (${b.backend_type})`,
+            // A gated backend fails every copy: it cannot be picked.
+            disabled: isGated(b.health),
+            label: `${b.name} (${b.backend_type}) · ${encryptionWord(b.encryption)} · ${
+              isGated(b.health) ? `unavailable: ${healthWord(b.health)}` : healthWord(b.health)
+            }`,
           }))}
         />
       </div>
+      {targetInfo && targetGated && (
+        <Alert
+          type="error"
+          showIcon
+          style={{ marginBottom: 12, borderRadius: 8 }}
+          title={`Backend ${targetInfo.name} is unavailable: ${healthWord(targetInfo.health)}`}
+          description={
+            <span style={{ fontSize: 12 }}>
+              Every copy to it would fail. Fix the backend first (Storage → Backends → Test
+              connection).
+            </span>
+          }
+        />
+      )}
+      {targetInfo && dropsEncryption && (
+        <Alert
+          type="error"
+          showIcon
+          style={{ marginBottom: 12, borderRadius: 8 }}
+          title={`Objects will be stored unencrypted at rest on ${targetInfo.name}`}
+          description={
+            <div style={{ fontSize: 12 }}>
+              <div style={{ marginBottom: 6 }}>
+                The source backend <Text code>{source?.name}</Text> encrypts at rest (
+                {encryptionWord(source?.encryption)}). The target backend{' '}
+                <Text code>{targetInfo.name}</Text> does not, so every copied object is written
+                as plaintext.
+              </div>
+              <Checkbox checked={plaintextAck} onChange={(e) => setPlaintextAck(e.target.checked)}>
+                <span style={{ fontSize: 12 }}>
+                  I understand that the objects are stored unencrypted on {targetInfo.name}
+                </span>
+              </Checkbox>
+            </div>
+          }
+        />
+      )}
       <Checkbox checked={deleteSource} onChange={(e) => setDeleteSource(e.target.checked)}>
         <Text style={{ fontSize: 13 }}>
           Delete source objects after the switch-over{' '}
@@ -150,8 +245,14 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
         If the destination bucket already holds objects, the job refuses to start: an old safety
         copy there would bring back objects that were deleted since.
       </Text>
-      <Checkbox checked={mirror} onChange={(e) => setMirror(e.target.checked)}>
-        <Text style={{ fontSize: 13 }}>Make the destination an exact mirror of the source</Text>
+      <Checkbox
+        checked={mirror}
+        onChange={(e) => {
+          setMirror(e.target.checked);
+          setStartError(null);
+        }}
+      >
+        <Text style={{ fontSize: 13 }}>{MIRROR_OPTION_LABEL}</Text>
       </Checkbox>
       {mirror && (
         <Alert
@@ -166,6 +267,15 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
               audit log.
             </span>
           }
+        />
+      )}
+      {startError && (
+        <Alert
+          type="error"
+          showIcon
+          style={{ marginTop: 12, borderRadius: 8 }}
+          title="The migration did not start"
+          description={<span style={{ fontSize: 12 }}>{startError}</span>}
         />
       )}
     </Modal>

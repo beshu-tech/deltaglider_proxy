@@ -96,9 +96,17 @@ export interface LegacyKeyUsage {
   safe_to_clear: boolean;
 }
 
+/**
+ * Objects one check reads. The server default is 10,000 (max 1,000,000); a
+ * check of 20,000 objects on a local MinIO answers in about 1 s, so the UI
+ * asks for more than the default and stays well under a minute on a remote
+ * backend.
+ */
+export const LEGACY_KEY_SCAN_LIMIT = 50_000;
+
 /** `fresh` skips the proxy's 60 s cache of the last check. */
 export async function getLegacyKeyUsage(name: string, fresh = false): Promise<LegacyKeyUsage> {
-  const query = fresh ? '?fresh=true' : '';
+  const query = `?limit=${LEGACY_KEY_SCAN_LIMIT}${fresh ? '&fresh=true' : ''}`;
   return adminJson(`/api/admin/backends/${encodeURIComponent(name)}/legacy-key-usage${query}`, {
     context: `Check the legacy key of ${name}`,
   });

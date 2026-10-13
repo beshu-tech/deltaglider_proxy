@@ -64,7 +64,7 @@ test('objects still under the legacy key keep the button disabled and say how ma
 test('a scan stopped by its limit keeps the button disabled', async () => {
   http.on('GET', USAGE, json(usage({ complete: false, objects_scanned: 10000, safe_to_clear: false })));
   await renderEditor();
-  expect(await screen.findByText(/stopped after 10,000 objects/)).toBeInTheDocument();
+  expect(await screen.findByText(/stopped at its limit of 10,000 objects/)).toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Clear legacy key' })).toBeDisabled();
 });
 

@@ -9,16 +9,23 @@
  *
  * Also reusable as the manual "[Later]" path from the Buckets page
  * (single-bucket preset).
+ *
+ * Jobs-page mode (`pickBuckets`) ignores `transition`: the job has nothing
+ * to do with a key change there, so the copy says what the job does to each
+ * object. It lists only buckets whose backend a re-encrypt can change
+ * (proxy AES with a key, or a legacy key still set), each with its backend
+ * and encryption, behind a search box.
  */
-import { useEffect, useState } from 'react';
-import { Alert, Button, Checkbox, Modal, Typography, message } from 'antd';
-import { useQueryClient } from '@tanstack/react-query';
+import { useEffect, useMemo, useState } from 'react';
+import { Alert, Button, Checkbox, Input, Modal, Typography, message } from 'antd';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { SyncOutlined } from '@ant-design/icons';
-import { startReencrypt } from '../adminApi';
+import { getBackends, startReencrypt } from '../adminApi';
 import { qk } from '../queries/keys';
 import { useColors } from '../ThemeContext';
 import { useBucketOrigins } from '../queries/backends';
 import { normalizeUiError } from '../errorHandling';
+import { encryptionWord, originBackendOf, reencryptHasWork } from '../backendFacts';
 
 const { Text } = Typography;
 
@@ -42,6 +49,16 @@ const TITLES: Record<ReencryptTransition, string> = {
   decrypt: 'Decrypt existing objects?',
 };
 
+const PICK_TITLE = 'Re-encrypt existing objects';
+const PICK_EXPLAIN =
+  "A one-off background job rewrites each object that is not stored under its backend's current setting. A plaintext object gets encrypted, and an object under an older key gets re-encrypted with the current key. On a backend whose encryption is off but whose legacy key is still set, an encrypted object gets decrypted. Objects that already match are skipped, and the job resumes automatically if the proxy restarts.";
+
+interface PickRow {
+  bucket: string;
+  backend: string | null;
+  encryption: string;
+}
+
 const EXPLAIN: Record<ReencryptTransition, string> = {
   encrypt:
     'Encryption applies to NEW writes only. Objects already stored on this backend are still plaintext on disk until rewritten.',
@@ -62,8 +79,42 @@ export default function ReencryptProposalModal({
   const colors = useColors();
   const qc = useQueryClient();
   const originsQuery = useBucketOrigins({ enabled: open && pickBuckets });
-  const allBuckets = (originsQuery.data?.buckets ?? []).map((b) => b.name);
-  const candidates = pickBuckets ? allBuckets : buckets;
+  // Same cache entry as useBackends, fetched only while the picker is open.
+  const backendsQuery = useQuery({
+    queryKey: qk.backends.list(),
+    queryFn: getBackends,
+    enabled: open && pickBuckets,
+  });
+  const [search, setSearch] = useState('');
+  const { pickRows, skippedPlaintext } = useMemo(() => {
+    const backends = backendsQuery.data?.backends ?? [];
+    const defaultBackend = backendsQuery.data?.default_backend ?? null;
+    const rows: PickRow[] = [];
+    let skipped = 0;
+    if (!backendsQuery.data) return { pickRows: rows, skippedPlaintext: skipped };
+    for (const o of originsQuery.data?.buckets ?? []) {
+      const backend = originBackendOf(o, defaultBackend);
+      const info = backends.find((b) => b.name === backend);
+      if (!reencryptHasWork(info)) {
+        skipped += 1;
+        continue;
+      }
+      const enc = encryptionWord(info?.encryption);
+      rows.push({
+        bucket: o.name,
+        backend,
+        encryption: info?.encryption.shim_active ? `${enc}, legacy key set` : enc,
+      });
+    }
+    return { pickRows: rows, skippedPlaintext: skipped };
+  }, [originsQuery.data, backendsQuery.data]);
+  const needle = search.trim().toLowerCase();
+  const visibleRows = needle
+    ? pickRows.filter(
+        (r) => r.bucket.toLowerCase().includes(needle) || (r.backend ?? '').toLowerCase().includes(needle)
+      )
+    : pickRows;
+  const candidates = pickBuckets ? pickRows.map((r) => r.bucket) : buckets;
   const [selected, setSelected] = useState<string[]>(buckets);
   const [starting, setStarting] = useState(false);
   const [messageApi, msgCtx] = message.useMessage();
@@ -71,7 +122,10 @@ export default function ReencryptProposalModal({
   useEffect(() => {
     // Jobs-page mode starts with NOTHING selected (explicit opt-in);
     // the post-apply proposal preselects the affected backend's buckets.
-    if (open) setSelected(pickBuckets ? [] : buckets);
+    if (open) {
+      setSelected(pickBuckets ? [] : buckets);
+      setSearch('');
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, pickBuckets, candidates.join('|')]);
 
@@ -89,6 +143,10 @@ export default function ReencryptProposalModal({
         messageApi.error(`${e.bucket}: ${e.error}`);
       }
       qc.invalidateQueries({ queryKey: qk.jobs.list() });
+      // Only the buckets that failed stay selected: a second Start must not
+      // send the started ones again.
+      const failed = new Set(res.errors.map((e) => e.bucket));
+      setSelected((cur) => cur.filter((b) => failed.has(b)));
       if (res.errors.length === 0) onClose();
     } catch (e) {
       messageApi.error(normalizeUiError(e, 'Failed to start'));
@@ -104,7 +162,7 @@ export default function ReencryptProposalModal({
       title={
         <span>
           <SyncOutlined style={{ marginRight: 8, color: colors.ACCENT_BLUE }} />
-          {TITLES[transition]}
+          {pickBuckets ? PICK_TITLE : TITLES[transition]}
         </span>
       }
       footer={[
@@ -123,12 +181,17 @@ export default function ReencryptProposalModal({
       ]}
     >
       {msgCtx}
-      <Text type="secondary" style={{ fontSize: 13, display: 'block', marginBottom: 12 }}>
-        {EXPLAIN[transition]} A one-off background job rewrites every object whose at-rest
-        state doesn't match{pickBuckets ? ' its backend setting' : <> the new setting on <Text code>{backendName}</Text></>}.
-        Already-matching objects are skipped, and the job resumes automatically if the
-        proxy restarts.
-      </Text>
+      {pickBuckets ? (
+        <Text type="secondary" style={{ fontSize: 13, display: 'block', marginBottom: 12 }}>
+          {PICK_EXPLAIN}
+        </Text>
+      ) : (
+        <Text type="secondary" style={{ fontSize: 13, display: 'block', marginBottom: 12 }}>
+          {EXPLAIN[transition]} A one-off background job rewrites every object whose at-rest
+          state doesn't match the new setting on <Text code>{backendName}</Text>. Already-matching
+          objects are skipped, and the job resumes automatically if the proxy restarts.
+        </Text>
+      )}
       <Alert
         type="warning"
         showIcon
@@ -142,7 +205,51 @@ export default function ReencryptProposalModal({
           </span>
         }
       />
-      {candidates.length === 0 ? (
+      {pickBuckets ? (
+        <>
+          <Input.Search
+            allowClear
+            aria-label="Search buckets"
+            placeholder="Search buckets or backends"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            style={{ marginBottom: 8 }}
+          />
+          {skippedPlaintext > 0 && (
+            <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
+              {skippedPlaintext} bucket{skippedPlaintext === 1 ? ' is' : 's are'} not listed: on a
+              plaintext backend, there is nothing to encrypt.
+            </Text>
+          )}
+          {visibleRows.length === 0 ? (
+            <Text type="secondary">
+              {pickRows.length === 0 ? 'No bucket is on an encrypting backend.' : 'No bucket matches the search.'}
+            </Text>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 320, overflowY: 'auto' }}>
+              {visibleRows.map((r) => (
+                <Checkbox
+                  key={r.bucket}
+                  aria-label={r.bucket}
+                  checked={selected.includes(r.bucket)}
+                  onChange={(e) =>
+                    setSelected((cur) =>
+                      e.target.checked ? [...cur, r.bucket] : cur.filter((x) => x !== r.bucket)
+                    )
+                  }
+                >
+                  <Text code style={{ fontSize: 13 }}>
+                    {r.bucket}
+                  </Text>{' '}
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    on {r.backend ?? 'default'} · {r.encryption}
+                  </Text>
+                </Checkbox>
+              ))}
+            </div>
+          )}
+        </>
+      ) : candidates.length === 0 ? (
         <Text type="secondary">No buckets available.</Text>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>

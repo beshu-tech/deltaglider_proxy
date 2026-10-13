@@ -25,6 +25,7 @@ import {
   ReloadOutlined,
 } from '@ant-design/icons';
 import type { BackendEncryptionSummary, BackendEncryptionMode, LegacyKeyUsage } from '../adminApi';
+import { LEGACY_KEY_SCAN_LIMIT } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import { useCardStyles } from './shared-styles';
 import { generateAesKeyHex } from '../aesKeyGen';
@@ -458,7 +459,7 @@ function usageSummary(u: LegacyKeyUsage): string {
   const kid = u.legacy_key_id ?? '(unknown)';
   const where = plural(u.buckets.length, 'bucket', 'buckets');
   if (!u.complete) {
-    return `The check stopped after ${u.objects_scanned.toLocaleString('en-US')} objects, so it cannot prove that no object uses the legacy key id ${kid}. Run a re-encrypt job on every bucket of this backend, then check again with a higher limit through the admin API.`;
+    return `The check stopped at its limit of ${u.limit.toLocaleString('en-US')} objects, so it cannot prove that no object uses the legacy key id ${kid}. Run a re-encrypt job on every bucket of this backend. Then check again through the admin API with a higher limit (GET /_/api/admin/backends/<name>/legacy-key-usage?limit=1000000).`;
   }
   const objects = u.objects_under_legacy_key;
   const refs = u.references_under_legacy_key;
@@ -524,8 +525,9 @@ function LegacyShimBanner({
           </span>
           {!u && !usage.isFetching && !usage.error && (
             <span>
-              Check usage reads the metadata of every object on this backend, which can take
-              several minutes on a large or slow backend.
+              Check usage reads the metadata of up to{' '}
+              {LEGACY_KEY_SCAN_LIMIT.toLocaleString('en-US')} objects on this backend. On a local
+              backend, 20,000 objects take about a second; a remote backend takes longer.
             </span>
           )}
           {usage.isFetching && <span>Checking which objects still use the legacy key…</span>}

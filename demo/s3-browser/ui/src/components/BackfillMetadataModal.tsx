@@ -4,15 +4,20 @@
  * created-at) onto objects that were written to the backend without the
  * proxy, reading each object once to hash it and rewriting only its
  * metadata. POST /_/api/admin/jobs/backfill-metadata.
+ *
+ * The bucket list has a search box and the backend of each bucket, and it
+ * scrolls on its own so Start stays in view. After a start, only the
+ * buckets that failed stay selected.
  */
 import { useEffect, useState } from 'react';
-import { Alert, Button, Checkbox, Modal, Typography, message } from 'antd';
+import { Alert, Button, Checkbox, Input, Modal, Typography, message } from 'antd';
 import { useQueryClient } from '@tanstack/react-query';
 import { TagsOutlined } from '@ant-design/icons';
 import { startBackfillMetadata } from '../adminApi';
 import { qk } from '../queries/keys';
 import { useColors } from '../ThemeContext';
 import { useBucketOrigins } from '../queries/backends';
+import { originBackendOf } from '../backendFacts';
 import { normalizeUiError } from '../errorHandling';
 
 const { Text } = Typography;
@@ -26,7 +31,16 @@ export default function BackfillMetadataModal({ open, onClose }: Props) {
   const colors = useColors();
   const qc = useQueryClient();
   const originsQuery = useBucketOrigins({ enabled: open });
-  const candidates = (originsQuery.data?.buckets ?? []).map((b) => b.name);
+  // No default backend name here: a bucket without `backend_name` shows "default".
+  const candidates = (originsQuery.data?.buckets ?? []).map((b) => ({
+    name: b.name,
+    backend: originBackendOf(b, null) ?? 'default',
+  }));
+  const [search, setSearch] = useState('');
+  const needle = search.trim().toLowerCase();
+  const visible = needle
+    ? candidates.filter((c) => c.name.toLowerCase().includes(needle) || c.backend.toLowerCase().includes(needle))
+    : candidates;
   const [selected, setSelected] = useState<string[]>([]);
   const [refreshLastModified, setRefreshLastModified] = useState(false);
   const [starting, setStarting] = useState(false);
@@ -37,6 +51,7 @@ export default function BackfillMetadataModal({ open, onClose }: Props) {
     if (open) {
       setSelected([]);
       setRefreshLastModified(false);
+      setSearch('');
     }
   }, [open]);
 
@@ -50,6 +65,10 @@ export default function BackfillMetadataModal({ open, onClose }: Props) {
       }
       for (const e of res.errors) messageApi.error(`${e.bucket}: ${e.error}`);
       qc.invalidateQueries({ queryKey: qk.jobs.list() });
+      // Only the buckets that failed stay selected: a second Start must not
+      // send the started ones again.
+      const failed = new Set(res.errors.map((e) => e.bucket));
+      setSelected((cur) => cur.filter((b) => failed.has(b)));
       if (res.errors.length === 0) onClose();
     } catch (e) {
       messageApi.error(normalizeUiError(e, 'Failed to start'));
@@ -110,20 +129,37 @@ export default function BackfillMetadataModal({ open, onClose }: Props) {
       {candidates.length === 0 ? (
         <Text type="secondary">No buckets available.</Text>
       ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-          {candidates.map((b) => (
-            <Checkbox
-              key={b}
-              aria-label={b}
-              checked={selected.includes(b)}
-              onChange={(e) => setSelected((cur) => (e.target.checked ? [...cur, b] : cur.filter((x) => x !== b)))}
-            >
-              <Text code style={{ fontSize: 13 }}>
-                {b}
-              </Text>
-            </Checkbox>
-          ))}
-        </div>
+        <>
+          <Input.Search
+            allowClear
+            aria-label="Search buckets"
+            placeholder="Search buckets or backends"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            style={{ marginBottom: 8 }}
+          />
+          {visible.length === 0 ? (
+            <Text type="secondary">No bucket matches the search.</Text>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 280, overflowY: 'auto' }}>
+              {visible.map(({ name: b, backend }) => (
+                <Checkbox
+                  key={b}
+                  aria-label={b}
+                  checked={selected.includes(b)}
+                  onChange={(e) => setSelected((cur) => (e.target.checked ? [...cur, b] : cur.filter((x) => x !== b)))}
+                >
+                  <Text code style={{ fontSize: 13 }}>
+                    {b}
+                  </Text>{' '}
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    on {backend}
+                  </Text>
+                </Checkbox>
+              ))}
+            </div>
+          )}
+        </>
       )}
     </Modal>
   );

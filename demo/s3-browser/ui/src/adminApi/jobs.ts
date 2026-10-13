@@ -8,6 +8,8 @@ interface JobsOverview {
     lifecycle: { enabled: boolean; tick_interval: string };
   };
   jobs: JobRow[];
+  /** Finished one-off jobs older than the listed ones (absent when 0). */
+  older_oneoffs?: number;
 }
 
 interface JobRunEntry {

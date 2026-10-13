@@ -23,7 +23,7 @@
  * Uses the section-level storage Apply flow so dirty-state indicators,
  * beforeunload, and Cmd/Ctrl+S behave like the rest of Configuration.
  */
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { Alert, Button, Space, Typography, message } from 'antd';
 import Dropdown from './KeyboardDropdown';
 import { DownOutlined, PlusOutlined } from '@ant-design/icons';
@@ -31,7 +31,7 @@ import { LoadingState } from './StatePlaceholders';
 import type { AdminConfig } from '../adminApi';
 import { useQueryClient } from '@tanstack/react-query';
 import { useAdminConfig } from '../queries/config';
-import { useBackends, useBucketNames } from '../queries/backends';
+import { useBackends, useBucketNames, useBucketOrigins } from '../queries/backends';
 import { qk } from '../queries/keys';
 import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
 import ApplyDialog from './ApplyDialog';
@@ -112,6 +112,13 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
   // this panel no longer re-fetches /buckets that other consumers already hold.
   const fallbackBackends = useBackends().data?.backends ?? [];
   const realBuckets = useBucketNames();
+  // The backend that holds each bucket now: a bucket without an explicit
+  // route can still live on a non-default backend.
+  const originsData = useBucketOrigins().data;
+  const originBackendByName = useMemo(
+    () => new Map((originsData?.buckets ?? []).map((o) => [o.name, o.backend_name ?? null] as const)),
+    [originsData]
+  );
   const [createOpen, setCreateOpen] = useState(false);
   /** Expanded row: `real:<name>` for buckets, the row `_id` for drafts. */
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
@@ -263,6 +270,7 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
                 onToggle={() => setExpandedKey((k) => (k === key ? null : key))}
                 backends={backends}
                 defaultBackend={defaultBackend}
+                originBackend={originBackendByName.get(name) ?? null}
                 globalCompressionOn={globalCompressionOn}
                 globalRatio={globalRatio}
                 onPatch={(patch) => patchBucket(name, patch)}
@@ -340,7 +348,10 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
         transition="encrypt"
         backendName={
           reencryptBucket
-            ? (rowByName.get(reencryptBucket)?.backend || defaultBackend || 'default')
+            ? (rowByName.get(reencryptBucket)?.backend ||
+              originBackendByName.get(reencryptBucket) ||
+              defaultBackend ||
+              'default')
             : ''
         }
         buckets={reencryptBucket ? [reencryptBucket] : []}
