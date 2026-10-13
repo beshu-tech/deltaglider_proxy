@@ -10,6 +10,54 @@ follow [semantic versioning](https://semver.org/); the Docker image
 
 _Last updated: 2026-10-13_
 
+## v2.0.10 — 2026-10-13
+
+### Fixed — Deltas without an MD5 get listing facts, so listings stop sending HEAD requests for them
+
+Deltas that an older toolchain wrote carry no `dg-md5` field. The proxy could
+not store durable listing facts for such a delta, so every listing missed
+them and every lifecycle scan sent a HEAD request for each one, again and
+again. On a production bucket this came to more than 160,000 HEAD requests in
+two hours. Such a delta now gets its facts after one HEAD request. A listing
+then shows the same ETag and size as a HEAD request of the object: the empty
+ETag (`""`) and the original size. Before, a listing showed the ETag and size
+of the stored delta, which are not the ETag and size of the object.
+
+### Fixed — A lifecycle preview after a restart sends no HEAD request for unchanged objects
+
+A lifecycle scan needs the creation time of each delta and delta-eligible
+object, which only a HEAD request returns. The proxy kept those answers in
+memory only, so the first preview or run after a restart or a configuration
+change sent one HEAD request per object again. The answers are now kept in
+the node-local jobs database, matched on the object's stored ETag, size and
+LastModified, so an object that changed is still read again.
+
+### Fixed — Listing facts converge faster
+
+A write of listing facts waited behind the cleanup of deleted objects, which
+can take minutes on a slow backend. Writes and cleanups now run separately.
+A listing that sends its own HEAD requests no longer starts a second
+background HEAD request for the same objects: a lifecycle preview of 40
+deltas sent 80 HEAD requests and now sends at most 44. On a backend with an
+encryption key, a plain object stored before the key existed no longer counts
+as a facts miss on every listing.
+
+### Fixed — "Refresh preview" computes a new lifecycle preview
+
+The proxy keeps a finished lifecycle preview for a minute, so that the
+Preview tab and the Run-now confirmation share one walk of the rule's
+objects. "Refresh preview" got that kept preview back, so it seemed to do
+nothing, and the time it showed was when the browser received the answer.
+Now "Refresh preview" asks for a new walk, the preview shows the time when
+the proxy computed it, and the button is disabled while a walk runs.
+
+### Fixed — One "Run now" for the differences of a replication check
+
+In the Verify tab of a replication rule, every difference that a run of the
+rule fixes had its own "Run now" button. Each one runs the whole rule, so a
+click on one of them showed every button as busy. The Differences table now
+has one "Run now", which says how many of the shown differences a run fixes.
+
 ## v2.0.9 — 2026-10-13
 
 ### Changed — A jobs database that no key opens stops the start
