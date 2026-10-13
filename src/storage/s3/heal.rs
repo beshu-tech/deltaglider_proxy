@@ -402,6 +402,79 @@ mod tests {
         assert_eq!(puts, N, "one facts write per delta");
     }
 
+    /// An engine with a proxy-encryption key on the fake, with its own
+    /// listing-cache scope.
+    fn encrypted_reader(endpoint: &str, node: &str) -> DynEngine {
+        use crate::storage::{EncryptingBackend, EncryptionConfig, EncryptionKey};
+        let mut s3 = test_support::for_test_endpoint(endpoint);
+        s3.list_cache_scope = format!("{endpoint}/{node}");
+        let cfg = Arc::new(arc_swap::ArcSwap::new(Arc::new(EncryptionConfig {
+            key: Some(EncryptionKey::from_hex(&"ab".repeat(32)).unwrap()),
+            key_id: Some("kid".into()),
+            ..Default::default()
+        })));
+        let backend: Box<DynStorageBackend<'static>> =
+            DynStorageBackend::new_box(EncryptingBackend::new(s3, cfg));
+        DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &crate::config::Config::default(),
+            None,
+        )
+    }
+
+    /// Q2: with an encryption key, a plain object stored before the key
+    /// lists its stored facts, and they are its logical facts. The LIST
+    /// cannot know that, so it reads the facts namespace for it; the healer
+    /// HEAD learned the facts, found them equal and wrote nothing. Every
+    /// LIST, on every node and after each restart, missed the object again
+    /// (a facts LIST per page a minute, a HEAD per object an hour). The
+    /// HEAD now records the facts, equal or not, once a LIST asked.
+    #[tokio::test]
+    async fn plain_objects_under_an_encryption_key_heal_for_good() {
+        const N: usize = 5;
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let writer = engine_on(test_support::for_test_endpoint(&endpoint));
+        writer.create_bucket("b").await.unwrap();
+        for i in 0..N {
+            let body = format!("plain object {i}");
+            writer
+                .store(
+                    "b",
+                    &format!("old/p{i}.txt"),
+                    body.as_bytes(),
+                    None,
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let first = encrypted_reader(&endpoint, "enc-node-1");
+        fake.clear();
+        let page = list(&first, "old/").await;
+        assert_eq!(page.objects.len(), N);
+        assert!(wait_count(&fake, N, |r| r.starts_with("HEAD /b/old/p")).await);
+        assert!(
+            wait_count(&fake, N, |r| r.starts_with("PUT /b/.dg/facts/old/p")).await,
+            "the healer wrote no facts: {:?}",
+            fake.requests()
+        );
+        // Another node (or this one after a restart) reads the facts.
+        let second = encrypted_reader(&endpoint, "enc-node-2");
+        fake.clear();
+        let page = list(&second, "old/").await;
+        assert!(page.facts_missing_keys.is_empty(), "{page:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            fake.requests()
+                .iter()
+                .filter(|r| r.starts_with("HEAD "))
+                .count(),
+            0,
+            "{:?}",
+            fake.requests()
+        );
+    }
+
     /// A miss that a LIST marked.
     fn miss(scope: &str, key: &str) -> Miss {
         let miss = Miss {

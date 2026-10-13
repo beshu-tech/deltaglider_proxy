@@ -252,7 +252,10 @@ pub(super) fn remember_facts(id: &StoredObjectId<'_>, meta: &FileMetadata) {
 }
 
 /// When a LIST marked the stored object `id` as missing its durable facts,
-/// take the mark and hand its facts key to `write` (the bounded drain).
+/// take the mark, remember its facts and hand its facts key to `write` (the
+/// bounded drain). Also when the facts are the stored ones: the LIST asked
+/// because it cannot tell (a plain object behind an encryption key), and
+/// without an entry it asks again on every LIST.
 pub(super) fn backfill_facts(
     id: &StoredObjectId<'_>,
     meta: &FileMetadata,
@@ -261,9 +264,12 @@ pub(super) fn backfill_facts(
     if !list_size_cache::take_missing_facts(id) {
         return;
     }
-    if let Some(facts_key) =
-        listing_facts::facts_key(id.key, id.etag, id.size, &LogicalFacts::of(meta))
-    {
+    if id.key.rsplit('/').next() == Some("reference.bin") {
+        return;
+    }
+    let facts = LogicalFacts::of(meta);
+    if let Some(facts_key) = listing_facts::asked_facts_key(id.key, id.etag, id.size, &facts) {
+        list_size_cache::record_asked(id, facts);
         write(facts_key);
     }
 }

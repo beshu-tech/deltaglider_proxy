@@ -121,12 +121,26 @@ pub fn facts_key(
     stored_size: u64,
     facts: &LogicalFacts,
 ) -> Option<String> {
+    if stored_size == facts.size && bare(stored_etag) == bare(&facts.etag) {
+        return None;
+    }
+    asked_facts_key(stored_key, stored_etag, stored_size, facts)
+}
+
+/// [`facts_key`], also when the stored facts are the logical ones. For an
+/// object that a LIST asked about: behind a proxy-encryption key a LIST
+/// cannot tell a plain object from a ciphertext, so it reads the facts of
+/// every passthrough, and an object without an entry is a miss on every
+/// LIST. `None` when it cannot have one (unknown ETag, key too long).
+pub fn asked_facts_key(
+    stored_key: &str,
+    stored_etag: &str,
+    stored_size: u64,
+    facts: &LogicalFacts,
+) -> Option<String> {
     let stored_etag = bare(stored_etag);
     let etag = bare(&facts.etag);
     if !etag_fits(stored_etag) || !etag_fits(etag) {
-        return None;
-    }
-    if stored_size == facts.size && stored_etag == etag {
         return None;
     }
     let key = format!(
@@ -381,6 +395,11 @@ mod tests {
     #[test]
     fn objects_that_list_their_own_facts_get_none() {
         assert_eq!(facts_key("a.txt", "e1", 5, &facts(5, "e1")), None);
+        // Unless a LIST asked: then the entry says "the stored facts are
+        // the logical ones".
+        let asked = asked_facts_key("a.txt", "\"e1\"", 5, &facts(5, "e1")).unwrap();
+        assert_eq!(parse_facts_key(&asked).unwrap().facts, facts(5, "e1"));
+        assert_eq!(asked_facts_key("a.txt", "", 5, &facts(5, "")), None);
         assert_eq!(facts_key("a.delta", "", 5, &facts(9, "e1")), None);
         assert_eq!(facts_key("a.delta", "e1", 5, &facts(9, "")), None);
         assert_eq!(facts_key("a.delta", "e.1", 5, &facts(9, "e2")), None);

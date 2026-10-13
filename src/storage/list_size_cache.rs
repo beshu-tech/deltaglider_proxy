@@ -109,6 +109,16 @@ pub fn record(id: &StoredObjectId<'_>, facts: LogicalFacts) {
     CACHE.insert(cache_key(id), facts);
 }
 
+/// [`record`], also when the stored facts are the logical ones: for an
+/// object that a LIST asked about (see `listing_facts::asked_facts_key`),
+/// so the next LIST of this process finds it without a facts read.
+pub fn record_asked(id: &StoredObjectId<'_>, facts: LogicalFacts) {
+    if bare_etag(id.etag).is_empty() || facts.etag.is_empty() {
+        return;
+    }
+    CACHE.insert(cache_key(id), facts);
+}
+
 /// The logical facts of exactly this stored object, if the process learned
 /// them.
 pub fn lookup(id: &StoredObjectId<'_>) -> Option<LogicalFacts> {
