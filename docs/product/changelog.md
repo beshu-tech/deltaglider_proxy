@@ -10,6 +10,37 @@ follow [semantic versioning](https://semver.org/); the Docker image
 
 _Last updated: 2026-10-13_
 
+## v2.0.11 — 2026-10-13
+
+### Changed — An SSO login that no mapping rule matches is refused
+
+The first login of an account through an OAuth/OIDC provider created an IAM
+user, even when no group mapping rule matched the account. So any account at
+the provider (for a Google provider, any Google account) could sign in and
+get a user row with no permissions. The proxy now refuses such a first login
+with an "Access Denied" page and creates no user. An account that is already
+linked to a user still signs in. To keep the old behaviour, set
+`provision_unmapped: true` in the provider's `extra_config`.
+
+### Fixed — A read during a write that changes the stored form no longer answers 404
+
+An object is stored either as a delta or as a plain object. A write that
+switches between the two stores the new form first and then deletes the
+old one. A GET or HEAD reads both forms with two requests and takes no
+lock, so a switch between those two requests made the object look absent,
+and the read answered 404 for a live object. When a read finds no object
+while a write of the same key runs on the node, it now reads again, at
+most twice. A read of a missing key with no write in flight sends no extra
+request.
+
+### Fixed — Google sign-in asks which account to use
+
+The proxy sent Google no `prompt` parameter, so Google signed in with the
+browser's current account and never showed its account chooser. A browser
+with a personal and a work account could sign in with the wrong one. A
+Google provider now sends `prompt=select_account`. The provider's
+`extra_config.prompt` sets another value, or none with an empty string.
+
 ## v2.0.10 — 2026-10-13
 
 ### Fixed — Deltas without an MD5 get listing facts, so listings stop sending HEAD requests for them
