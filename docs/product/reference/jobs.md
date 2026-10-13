@@ -24,6 +24,7 @@ Rules are recurring and YAML-authored; maintenance jobs are one-offs born in the
 | `GET` | `/_/api/admin/jobs/:id/runs?limit=N` | Recent runs for one job |
 | `GET` | `/_/api/admin/jobs/:id/failures?limit=N` | Recent per-object failures |
 | `POST` | `/_/api/admin/jobs/:id/pause` / `resume` / `run-now` / `preview` / `cancel` / `verify` / `kill` / `delete` | Per-kind actions; `400` outside the matrix |
+| `GET` | `/_/api/admin/jobs/:id/preview` | Progress of the running preview walk of a lifecycle rule |
 | `GET` | `/_/api/admin/jobs/:id/verify` | State of the parity audit of a replication rule |
 | `POST` | `/_/api/admin/jobs/:id/verify/cancel` | Stop a running parity audit |
 | `POST` | `/_/api/admin/jobs/reencrypt` | Create re-encrypt jobs: `{"buckets": [...]}` (max 100), one job per bucket |

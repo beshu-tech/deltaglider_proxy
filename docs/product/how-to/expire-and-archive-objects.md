@@ -100,7 +100,9 @@ Always preview a rule before you enable it. The preview lists the objects that a
 
    ![The Preview tab of the expire-nightly-dumps rule lists three dumps that the rule would delete, with their total size; the arrow points at Refresh preview.](/_/screenshots/lifecycle-preview.webp)
 
-The admin UI keeps a preview for 5 minutes and shows when it computed it. A preview reads the metadata of every object in the scope of the rule, so the UI does not compute it again each time you open the tab. **Refresh preview** computes a new one, and a run or a change to the lifecycle rules discards the old one. The same preview with the admin API:
+While the proxy computes a preview, the tab shows how many objects it scanned so far, for example "Scanning… 4,210 objects so far", and the number grows about every second. When the preview is ready, the tab shows how many objects the proxy scanned and when. When no object matches the rule now, the tab says when the first object becomes due, for example "Nothing to do now. The first object becomes due on 11/12/2026, 11:00:00 AM (in ~13 h)." An object becomes due when its age reaches **Expire after**.
+
+The admin UI keeps a preview for 5 minutes. A preview reads the metadata of every object in the scope of the rule, so the UI does not compute it again each time you open the tab. **Refresh preview** computes a new one, and a run or a change to the lifecycle rules discards the old one. The same preview with the admin API:
 
 ```bash
 curl -b cookies -X POST \

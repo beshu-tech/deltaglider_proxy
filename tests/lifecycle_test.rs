@@ -132,6 +132,20 @@ async fn test_lifecycle_run_now_deletes_visible_expired_and_preserves_skipped_ke
     assert_eq!(preview["status"].as_str(), Some("preview"));
     assert_eq!(preview["objects_affected"].as_i64(), Some(1), "{preview}");
 
+    // GET on the same path polls a running preview walk; none runs now.
+    let walk: Value = admin
+        .get(format!(
+            "{}/_/api/admin/jobs/lifecycle:expire-old-prefix/preview",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .expect("preview status request")
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(walk["running"].as_bool(), Some(false), "{walk}");
+
     let history_before: Value = admin
         .get(format!(
             "{}/_/api/admin/jobs/lifecycle:expire-old-prefix/runs",

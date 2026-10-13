@@ -368,6 +368,54 @@ pub fn plan_object(
     }
 }
 
+/// When an object that `plan_object` judged becomes due, if it is not due
+/// now: `plan_object` applies the rule once `created_at <= now -
+/// expire_after`, so the object becomes due at `created_at + expire_after`.
+/// `None` for an object the rule applies to now, and for every other skip
+/// (excluded, internal, directory marker): no amount of time makes those
+/// match.
+pub fn due_at(
+    decision: &Decision,
+    created_at: DateTime<Utc>,
+    expire_after: ChronoDuration,
+) -> Option<DateTime<Utc>> {
+    match decision {
+        Decision::Skip {
+            reason: SkipReason::NotExpired,
+        } => created_at.checked_add_signed(expire_after),
+        _ => None,
+    }
+}
+
+/// The earlier of `next` and the [`due_at`] of one more object: the fold
+/// step of [`next_due_at`], used by the worker page by page.
+pub fn earlier_due(
+    next: Option<DateTime<Utc>>,
+    decision: &Decision,
+    created_at: DateTime<Utc>,
+    expire_after: ChronoDuration,
+) -> Option<DateTime<Utc>> {
+    match (next, due_at(decision, created_at, expire_after)) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// The earliest moment at which an object of a scan that does not match
+/// now will match. `expire_after` is `None` for a rule without an age
+/// condition (retain-newest): such a rule never has a next due time.
+pub fn next_due_at<'a>(
+    expire_after: Option<ChronoDuration>,
+    judged: impl IntoIterator<Item = (&'a Decision, DateTime<Utc>)>,
+) -> Option<DateTime<Utc>> {
+    let expire_after = expire_after?;
+    judged
+        .into_iter()
+        .fold(None, |next, (decision, created_at)| {
+            earlier_due(next, decision, created_at, expire_after)
+        })
+}
+
 /// Defense-in-depth for keys that should never be lifecycle targets.
 ///
 /// Engine listings normally expose user objects, not storage artifacts. This
@@ -881,6 +929,58 @@ mod tests {
         assert_skip(
             plan_object(&rule, "new.txt", &meta_at(1_001), cutoff, &inc, &exc),
             SkipReason::NotExpired,
+        );
+    }
+
+    /// The truth table of `next_due_at`: the time at which the first object
+    /// that does not match now will match.
+    #[test]
+    fn next_due_at_is_the_earliest_not_expired_object_plus_expire_after() {
+        let (rule, inc, exc) = globs(&["logs/**"], &[]);
+        let thirty_days = Duration::days(30);
+        let now = Utc.timestamp_opt(100 * 86_400, 0).unwrap();
+        let cutoff = now - thirty_days;
+        let judge = |key: &str, ts: i64| {
+            (
+                plan_object(&rule, key, &meta_at(ts), cutoff, &inc, &exc).unwrap(),
+                Utc.timestamp_opt(ts, 0).unwrap(),
+            )
+        };
+        let next = |objects: &[(Decision, DateTime<Utc>)]| {
+            next_due_at(Some(thirty_days), objects.iter().map(|(d, t)| (d, *t)))
+        };
+        let day = |d: i64| d * 86_400;
+
+        // No objects: nothing becomes due.
+        assert_eq!(next(&[]), None);
+        // Excluded objects never count, however young.
+        assert_eq!(
+            next(&[judge("tmp/a", day(99)), judge("logs/", day(99))]),
+            None
+        );
+        // An object that is due now is not a "next" due.
+        assert_eq!(next(&[judge("logs/old", day(1))]), None);
+        // One young object: due at created_at + expire_after.
+        let young = judge("logs/young", day(80));
+        assert_eq!(
+            next(std::slice::from_ref(&young)),
+            Some(Utc.timestamp_opt(day(110), 0).unwrap())
+        );
+        // The earliest of several, ignoring the due and the excluded ones.
+        assert_eq!(
+            next(&[
+                judge("logs/old", day(1)),
+                judge("tmp/older-young", day(71)),
+                young.clone(),
+                judge("logs/younger", day(95)),
+                judge("logs/oldest-young", day(75)),
+            ]),
+            Some(Utc.timestamp_opt(day(105), 0).unwrap())
+        );
+        // A rule without an age condition (retain-newest) has no next due.
+        assert_eq!(
+            next_due_at(None, std::iter::once((&young.0, young.1))),
+            None
         );
     }
 

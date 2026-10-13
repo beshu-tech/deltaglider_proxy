@@ -321,3 +321,62 @@ async fn a_transient_list_error_keeps_the_cursor() {
     assert_eq!(out.errors, 0, "{out:?}");
     assert_eq!(out.objects_scanned, 20, "resumed at the cursor: {out:?}");
 }
+
+/// Prod: "Refresh preview" showed only a spinner for the whole walk. The
+/// running walk publishes its counters after each page.
+#[tokio::test]
+async fn a_running_preview_publishes_its_progress() {
+    let (engine, fake) = engine().await;
+    store_deltas(&engine, "run", 30).await;
+    let mut r = rule("preview-progress", "30d");
+    r.batch_size = 10;
+    assert!(!crate::lifecycle::preview_status("preview-progress").running);
+    fake.set_delay_ms("LIST", 100);
+    let walk = {
+        let engine = engine.clone();
+        let r = r.clone();
+        tokio::spawn(async move {
+            crate::lifecycle::preview_rule(None, &engine, &r, 100, true)
+                .await
+                .unwrap()
+        })
+    };
+    let mut seen = Vec::new();
+    while !walk.is_finished() {
+        let status = crate::lifecycle::preview_status("preview-progress");
+        if status.running {
+            assert!(status.started_at.is_some(), "{status:?}");
+            seen.push(status.objects_scanned);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let out = walk.await.unwrap();
+    assert_eq!(out.objects_scanned, 30, "{out:?}");
+    assert!(
+        seen.iter().any(|&n| n > 0 && n < 30),
+        "no partial count while the walk ran: {seen:?}"
+    );
+    assert!(seen.windows(2).all(|w| w[0] <= w[1]), "{seen:?}");
+    assert!(!crate::lifecycle::preview_status("preview-progress").running);
+}
+
+/// Prod: a preview said "nothing to do" without saying when something
+/// will be. It names when the first object that does not match now will.
+#[tokio::test]
+async fn a_preview_names_when_the_next_object_becomes_due() {
+    let (engine, _fake) = engine().await;
+    store_deltas(&engine, "run", 3).await;
+    let out = crate::lifecycle::preview_rule(None, &engine, &rule("next-due", "30d"), 100, true)
+        .await
+        .unwrap();
+    assert_eq!(out.objects_affected, 0, "{out:?}");
+    let next = chrono::DateTime::parse_from_rfc3339(out.next_due_at.as_deref().unwrap()).unwrap();
+    let in_30d = chrono::Utc::now() + chrono::Duration::days(30);
+    assert!(
+        (in_30d - next.with_timezone(&chrono::Utc))
+            .num_seconds()
+            .abs()
+            < 60,
+        "{next} is not about 30 days from now"
+    );
+}

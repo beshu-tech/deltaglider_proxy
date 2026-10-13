@@ -5,6 +5,7 @@ import { lifecycleRunLabel } from '../../jobsView';
 import { useLifecyclePreview } from '../../queries/jobs';
 import { normalizeUiError } from '../../errorHandling';
 import LifecyclePreviewList from './LifecyclePreviewList';
+import LifecyclePreviewScanning from './LifecyclePreviewScanning';
 
 interface Props {
   /** The lifecycle rule to run; null = closed. */
@@ -45,12 +46,13 @@ export default function LifecycleRunConfirm({ row, onRun, onCancel }: Props) {
           Refresh preview
         </Button>
       </div>
+      <LifecyclePreviewScanning jobId={row?.id ?? null} active={preview.isFetching} />
       <LifecyclePreviewList
         preview={data}
         loading={preview.isLoading}
         error={preview.error}
         errorText={normalizeUiError(preview.error, 'Preview failed')}
-        computedAt={preview.dataUpdatedAt}
+        receivedAt={preview.dataUpdatedAt}
       />
     </Modal>
   );

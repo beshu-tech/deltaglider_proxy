@@ -3,8 +3,8 @@
 //! Lifecycle execution through the DeltaGlider engine.
 
 use super::planner::{
-    compile_rule_globs, is_internal_key, lifecycle_prefix, plan_object, plan_retain_newest,
-    Candidate, Decision, PlannedLifecycleAction, QualifySpec, SkipReason,
+    compile_rule_globs, earlier_due, is_internal_key, lifecycle_prefix, plan_object,
+    plan_retain_newest, Candidate, Decision, PlannedLifecycleAction, QualifySpec, SkipReason,
 };
 use super::state_store::{LifecycleFailureInsert, LifecycleRunTotals};
 use crate::background::{LeaseAlive, LeaseKeeper, RunLease};
@@ -69,6 +69,12 @@ pub struct LifecycleRunOutcome {
     /// not the time it received the answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computed_at: Option<String>,
+    /// The earliest moment (RFC 3339) at which a scanned object that the
+    /// rule does not match now will match: its `created_at` plus
+    /// `expire_after`. Absent when no scanned object will ever match, and
+    /// for a rule without an age condition (retain-newest).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_due_at: Option<String>,
 }
 
 fn is_zero_i64(v: &i64) -> bool {
@@ -88,9 +94,98 @@ type PreviewCell =
 /// and engine.
 type PreviewKey = (String, String, usize, usize);
 
-/// The previews of the last [`PREVIEW_TTL`].
-static PREVIEWS: std::sync::Mutex<Vec<(PreviewKey, PreviewCell)>> =
+/// The previews of the last [`PREVIEW_TTL`], each with the live counters
+/// of its walk.
+static PREVIEWS: std::sync::Mutex<Vec<(PreviewKey, PreviewCell, Arc<PreviewProgress>)>> =
     std::sync::Mutex::new(Vec::new());
+
+/// The live counters of a preview walk, updated after each page, so the
+/// GUI can show the walk advance while the preview request waits.
+#[derive(Debug, Default)]
+struct PreviewProgress {
+    /// A walk runs now. A walk whose request went away stops (its future
+    /// is dropped) and a later request starts it again, so this is not
+    /// the same as "the cell has no result yet".
+    running: std::sync::atomic::AtomicBool,
+    /// When the running walk started (Unix milliseconds).
+    started_ms: std::sync::atomic::AtomicI64,
+    scanned: std::sync::atomic::AtomicI64,
+    affected: std::sync::atomic::AtomicI64,
+}
+
+/// Marks a walk as running until it ends or its future is dropped.
+struct WalkRunning<'a>(&'a PreviewProgress);
+
+impl Drop for WalkRunning<'_> {
+    fn drop(&mut self) {
+        self.0
+            .running
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl PreviewProgress {
+    /// Start a walk: counters from zero, running until the guard drops.
+    fn start(&self) -> WalkRunning<'_> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.scanned.store(0, Relaxed);
+        self.affected.store(0, Relaxed);
+        self.started_ms
+            .store(Utc::now().timestamp_millis(), Relaxed);
+        self.running.store(true, Relaxed);
+        WalkRunning(self)
+    }
+
+    /// Publish the counters of the walk so far.
+    fn publish(&self, out: &LifecycleRunOutcome) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.scanned.store(out.objects_scanned, Relaxed);
+        self.affected.store(out.objects_affected, Relaxed);
+    }
+}
+
+/// `GET /jobs/lifecycle:<rule>/preview`: the preview walk of a rule that
+/// runs now, if any.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PreviewStatus {
+    pub running: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    pub objects_scanned: i64,
+    /// Matches so far. A retain-newest rule knows its matches only at the
+    /// end of the walk, so this stays 0 for it while the walk runs.
+    pub objects_affected: i64,
+}
+
+/// The progress of the running preview walk of `rule_name`. When several
+/// walks of the rule run (an edit of its definition while one walks), the
+/// newest one answers.
+pub fn preview_status(rule_name: &str) -> PreviewStatus {
+    use std::sync::atomic::Ordering::Relaxed;
+    let previews = PREVIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    previews
+        .iter()
+        .filter(|((name, ..), _, progress)| name == rule_name && progress.running.load(Relaxed))
+        .map(|(_, _, progress)| progress)
+        .max_by_key(|progress| progress.started_ms.load(Relaxed))
+        .map_or(
+            PreviewStatus {
+                running: false,
+                started_at: None,
+                objects_scanned: 0,
+                objects_affected: 0,
+            },
+            |progress| PreviewStatus {
+                running: true,
+                started_at: chrono::DateTime::from_timestamp_millis(
+                    progress.started_ms.load(Relaxed),
+                )
+                .map(|at| at.to_rfc3339()),
+                objects_scanned: progress.scanned.load(Relaxed),
+                objects_affected: progress.affected.load(Relaxed),
+            },
+        )
+}
 
 /// The read-only estimate of a run of `rule`. The Jobs drawer asks for it
 /// when it opens the Preview tab and again in the Run-now confirmation,
@@ -117,24 +212,26 @@ pub async fn preview_rule(
         max_candidates,
         Arc::as_ptr(engine) as usize,
     );
-    let cell = {
+    let (cell, progress) = {
         let mut previews = PREVIEWS.lock().unwrap_or_else(|e| e.into_inner());
-        previews.retain(|(k, cell)| {
+        previews.retain(|(k, cell, _)| {
             cell.get().is_none_or(|(at, result)| {
                 result.is_ok() && at.elapsed() < PREVIEW_TTL && !(fresh && *k == key)
             })
         });
-        match previews.iter().find(|(k, _)| *k == key) {
-            Some((_, cell)) => cell.clone(),
+        match previews.iter().find(|(k, ..)| *k == key) {
+            Some((_, cell, progress)) => (cell.clone(), progress.clone()),
             None => {
                 let cell = PreviewCell::default();
-                previews.push((key, cell.clone()));
-                cell
+                let progress = Arc::new(PreviewProgress::default());
+                previews.push((key, cell.clone(), progress.clone()));
+                (cell, progress)
             }
         }
     };
     let (_, result) = cell
         .get_or_init(|| async {
+            let _running = progress.start();
             // Preview never writes → no maintenance gate needed.
             let result = run_or_preview(
                 None,
@@ -145,6 +242,7 @@ pub async fn preview_rule(
                 false,
                 None,
                 None,
+                Some(&progress),
             )
             .await
             .map(|mut out| {
@@ -160,7 +258,7 @@ pub async fn preview_rule(
 /// Drop the previews of `rule_name`: a run changed what they show.
 fn forget_previews(rule_name: &str) {
     let mut previews = PREVIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    previews.retain(|((name, ..), _)| name != rule_name);
+    previews.retain(|((name, ..), ..)| name != rule_name);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -244,6 +342,7 @@ pub async fn run_begun_rule(
         true,
         Some(ctx.clone()),
         maintenance_gate.clone(),
+        None,
     )
     .await;
     // Normal exit: stop renewing. The caller releases the lease it took.
@@ -354,7 +453,8 @@ struct RunContext {
 }
 
 /// `db`: the run's state (none for a preview); `scan_db`: where the scan
-/// cache persists (the jobs DB, also for a preview).
+/// cache persists (the jobs DB, also for a preview); `progress`: where a
+/// preview publishes its counters after each page.
 #[allow(clippy::too_many_arguments)]
 async fn run_or_preview(
     db: Option<Arc<Mutex<JobsDb>>>,
@@ -365,6 +465,7 @@ async fn run_or_preview(
     execute: bool,
     ctx: Option<RunContext>,
     maintenance_gate: Option<Arc<crate::maintenance::gate::MaintenanceGate>>,
+    progress: Option<&PreviewProgress>,
 ) -> Result<LifecycleRunOutcome, String> {
     // retain-newest is SET-RELATIVE (it ranks the whole prefix) and takes a
     // dedicated collect→rank→act path — it must never touch the per-object age
@@ -381,6 +482,7 @@ async fn run_or_preview(
             execute,
             ctx,
             maintenance_gate,
+            progress,
         )
         .await;
     }
@@ -433,6 +535,7 @@ async fn run_or_preview(
         }
     }
     let mut pager = Pager::resuming(resume_token);
+    let mut next_due = None;
     let mut out = LifecycleRunOutcome {
         run_id: ctx.as_ref().and_then(|c| c.run_id),
         rule_name: rule.name.clone(),
@@ -511,14 +614,18 @@ async fn run_or_preview(
         // This page's deletes, run as ONE engine batch after the plan.
         let mut deletes: Vec<PlannedDelete> = Vec::new();
         for (key, meta) in page.objects {
-            match plan_object(
+            let decision = plan_object(
                 rule,
                 &key,
                 &meta,
                 expire_before,
                 &include_globs,
                 &exclude_globs,
-            ) {
+            );
+            if let Ok(decision) = &decision {
+                next_due = earlier_due(next_due, decision, meta.created_at, expire_after);
+            }
+            match decision {
                 Err(err) => {
                     out.errors += 1;
                     let msg = err.to_string();
@@ -582,6 +689,10 @@ async fn run_or_preview(
             }
         }
 
+        if let Some(progress) = progress {
+            progress.publish(&out);
+        }
+
         if !deletes.is_empty() {
             let stopped = delete_planned(
                 db.as_ref(),
@@ -617,6 +728,7 @@ async fn run_or_preview(
         }
     }
 
+    out.next_due_at = next_due.map(|at| at.to_rfc3339());
     if out.errors > 0 {
         out.status = "failed".to_string();
     }
@@ -647,6 +759,7 @@ async fn run_or_preview_retain_newest(
     execute: bool,
     ctx: Option<RunContext>,
     maintenance_gate: Option<Arc<crate::maintenance::gate::MaintenanceGate>>,
+    progress: Option<&PreviewProgress>,
 ) -> Result<LifecycleRunOutcome, String> {
     // Defensive guard: a count-0 retain rule would delete every qualifying
     // object in the prefix. The Deserialize impl and validate_lifecycle already
@@ -757,6 +870,9 @@ async fn run_or_preview_retain_newest(
                 size: meta.file_size,
             });
             metas.insert(key, meta);
+        }
+        if let Some(progress) = progress {
+            progress.publish(&out);
         }
 
         if !pager.advance(page.is_truncated, page.next_continuation_token) {

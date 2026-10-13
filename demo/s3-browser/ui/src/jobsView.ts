@@ -731,6 +731,19 @@ export function computeRate(
 }
 
 /**
+ * How far away a moment is, rounded for a reader: "~40 min", "~13 h",
+ * "~3 days". A moment that is already here or past is "now".
+ */
+export function approxTimeUntil(atMs: number, nowMs: number): string {
+  const minutes = Math.round((atMs - nowMs) / 60_000);
+  if (minutes <= 0) return 'now';
+  if (minutes < 60) return `~${minutes} min`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `~${hours} h`;
+  return `~${Math.round(hours / 24)} days`;
+}
+
+/**
  * The lifecycle run-now confirm button names what the run does and to how
  * many objects: "Run: delete 2 objects". The verb comes from the preview's
  * candidate sample (one kind of action → that verb, a mix → "act on").

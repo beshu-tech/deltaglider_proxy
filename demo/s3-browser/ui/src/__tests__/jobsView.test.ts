@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'vitest';
 import {
+  approxTimeUntil,
   parseJobId,
   isActiveJobStatus,
   jobStatusTone,
@@ -521,4 +522,14 @@ test('lifecycleRunLabel names the verb and the count', () => {
   assert.equal(lifecycleRunLabel(1, ['transition']), 'Run: transition 1 object');
   assert.equal(lifecycleRunLabel(3, ['delete', 'transition']), 'Run: act on 3 objects');
   assert.equal(lifecycleRunLabel(0, []), 'Run: nothing to do');
+});
+
+test('approxTimeUntil rounds a wait for a reader', () => {
+  const now = 1_000_000_000_000;
+  const min = 60_000;
+  assert.equal(approxTimeUntil(now - min, now), 'now');
+  assert.equal(approxTimeUntil(now, now), 'now');
+  assert.equal(approxTimeUntil(now + 40 * min, now), '~40 min');
+  assert.equal(approxTimeUntil(now + 13 * 60 * min + min, now), '~13 h');
+  assert.equal(approxTimeUntil(now + 3 * 24 * 60 * min, now), '~3 days');
 });

@@ -575,6 +575,39 @@ pub async fn job_verify_cancel(
     Ok(Json(serde_json::to_value(resp).map_err(internal)?))
 }
 
+/// GET /_/api/admin/jobs/:id/preview — the progress of the preview walk of a
+/// lifecycle rule that runs now (`running: false` when none runs). The GUI
+/// polls it while its `POST …/preview` waits. No walk is started.
+pub async fn job_preview_status(
+    Path(id): Path<String>,
+    State(state): State<Arc<AdminState>>,
+) -> Result<Json<crate::lifecycle::PreviewStatus>, AdminError> {
+    let (sub, key) = parse_job_id(&id).ok_or(not_found())?;
+    if sub != JobSubsystem::Lifecycle {
+        return Err(not_found());
+    }
+    let known = {
+        let cfg = state.config.read().await;
+        cfg.lifecycle.rules.iter().any(|r| r.name == key)
+    };
+    if !known {
+        return Err(AdminError::not_found("rule not found"));
+    }
+    Ok(Json(crate::lifecycle::preview_status(key)))
+}
+
+/// POST /_/api/admin/jobs/:id/preview — the `preview` action. The literal
+/// `preview` route carries the GET above, and a literal segment shadows the
+/// `:action` param at this path, so it carries this POST too.
+pub async fn job_preview(
+    Path(id): Path<String>,
+    state: State<Arc<AdminState>>,
+    query: AdminQuery<ActionQuery>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<serde_json::Value>), AdminError> {
+    job_action(Path((id, "preview".to_string())), state, query, headers).await
+}
+
 /// GET /_/api/admin/jobs/parity-version — monotonic counter bumped each time a
 /// background parity audit settles. Mirrors `iam/version`: lets integration
 /// tests poll for a deterministic completion barrier instead of sleeping.

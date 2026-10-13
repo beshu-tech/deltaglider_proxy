@@ -26,8 +26,8 @@ pub use state_store::{
     LifecycleFailureRecord, LifecycleRunRecord, LifecycleRunTotals, LifecycleState,
 };
 pub use worker::{
-    begin_run, preview_rule, run_begun_rule, run_rule, LifecycleFailure, LifecycleRunOutcome,
-    PreviewObject,
+    begin_run, preview_rule, preview_status, run_begun_rule, run_rule, LifecycleFailure,
+    LifecycleRunOutcome, PreviewObject, PreviewStatus,
 };
 
 /// HTTP status for a lifecycle run/preview error. Config-attribute problems

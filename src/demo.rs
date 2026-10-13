@@ -395,6 +395,13 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             "/_/api/admin/jobs/:id/verify/cancel",
             post(admin::jobs_verify_cancel),
         )
+        // `preview`: GET polls the progress of a running preview walk, POST
+        // is the preview action (a literal segment shadows `:action`, as
+        // for `verify` above).
+        .route(
+            "/_/api/admin/jobs/:id/preview",
+            get(admin::jobs_preview_status).post(admin::jobs_preview),
+        )
         .route("/_/api/admin/jobs/:id/:action", post(admin::jobs_action))
         // Merge the IAM-gated subrouter in; it already carries its own
         // `require_not_declarative` layer.

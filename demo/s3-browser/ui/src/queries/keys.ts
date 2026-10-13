@@ -62,6 +62,7 @@ export const qk = {
     preview: (id: string) => ['jobs', 'preview', id] as const,
     // Root of every rule's preview (a storage-section apply may change any rule).
     allPreviews: () => ['jobs', 'preview'] as const,
+    previewProgress: (id: string) => ['jobs', 'preview-progress', id] as const,
     verify: (rule: string) => ['jobs', 'verify', rule] as const,
   },
   // Per-bucket busy banner (session-light endpoint).

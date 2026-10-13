@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Added — A lifecycle preview says when the next object becomes due
+
+A preview that matched no object said only "0 of 12,148 scanned objects
+would be affected", so a rule that already deleted every old object looked
+broken. The preview response now has a `next_due_at` field. It is the
+earliest time at which a scanned object that the rule does not match now
+will match: the creation time of the object plus `expire_after`. The proxy
+reads these times from the metadata that the walk already has, so the
+field costs no extra request. The Preview tab now says "Nothing to do now.
+The first object becomes due on <date> (in ~13 h)." When some objects
+match, the tab also says when the next of the others becomes due. The line
+"Computed at" is now "Scanned 12,148 objects at <time>", which makes clear
+that the proxy walked the scope at that time.
+
+### Added — A lifecycle preview shows its progress while it runs
+
+A preview walks the whole scope of the rule, which can take a while on a
+large prefix. Before, **Refresh preview** showed only a spinner until the
+walk ended, so a running walk could not be told apart from a stuck one.
+The walk now publishes its counters after each listing page, and the new
+request `GET /_/api/admin/jobs/lifecycle:<name>/preview` reads them without
+starting a walk. While a preview request waits, the Preview tab and the
+Run-now dialog read these counters every second and show "Scanning… 4,210
+objects so far."
+
 ## v2.0.12 — 2026-10-13
 
 ### Added — Re-check only the objects that a replication audit could not read

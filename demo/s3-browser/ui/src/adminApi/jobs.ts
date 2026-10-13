@@ -270,6 +270,22 @@ export interface LifecyclePreview {
   candidates: LifecycleCandidate[];
   /** When the proxy's walk ended (RFC 3339): a preview can answer from an earlier walk. */
   computed_at?: string;
+  /** When the first scanned object that does not match now will match (RFC 3339):
+   *  its age reference plus `expire_after`. Absent when none will, and for retain-newest. */
+  next_due_at?: string;
+}
+
+/** `GET /jobs/lifecycle:<rule>/preview`: the progress of the rule's running preview walk. */
+export interface LifecyclePreviewStatus {
+  running: boolean;
+  started_at?: string;
+  objects_scanned: number;
+  /** Matches so far (0 for retain-newest until its walk ends). */
+  objects_affected: number;
+}
+
+export async function getLifecyclePreviewStatus(id: string): Promise<LifecyclePreviewStatus> {
+  return adminJson(`/api/admin/jobs/${encodeURIComponent(id)}/preview`, { context: 'Preview progress' });
 }
 
 /** `fresh`: never answer from a walk that already ended ("Refresh preview"). */

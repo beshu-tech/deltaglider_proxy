@@ -9,6 +9,7 @@ import {
   getJobFailures,
   getJobRuns,
   getJobs,
+  getLifecyclePreviewStatus,
   getVerifyStatus,
   previewLifecycleJob,
   runJobAction,
@@ -89,6 +90,25 @@ export function useRefreshLifecyclePreview(id: string | null) {
   return useMutation({
     mutationFn: () => previewLifecycleJob(id as string, true),
     onSuccess: (data) => qc.setQueryData(qk.jobs.preview(id ?? ''), data),
+  });
+}
+
+/** How often the progress of a running preview walk is read. */
+const PREVIEW_PROGRESS_POLL_MS = 1000;
+
+/**
+ * The counters of the rule's running preview walk, read every second while
+ * `active` (a preview request waits), so the GUI shows the walk advance
+ * instead of a bare spinner. Reading it starts no walk.
+ */
+export function useLifecyclePreviewProgress(id: string | null, active: boolean) {
+  return useQuery({
+    queryKey: qk.jobs.previewProgress(id ?? ''),
+    queryFn: () => getLifecyclePreviewStatus(id as string),
+    enabled: !!id && active,
+    refetchInterval: active ? PREVIEW_PROGRESS_POLL_MS : false,
+    gcTime: 0,
+    refetchOnWindowFocus: false,
   });
 }
 

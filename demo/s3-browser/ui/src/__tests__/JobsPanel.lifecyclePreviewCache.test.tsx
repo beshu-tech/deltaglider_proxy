@@ -115,7 +115,7 @@ test('Refresh preview is disabled while a walk runs, and the time shown is when 
   await act(async () => release());
   await waitFor(() => expect(screen.getByRole('button', { name: /Refresh preview/ })).toBeEnabled());
   const shown = new Date('2026-10-13T10:00:00Z').toLocaleTimeString();
-  expect(screen.getByText(`Computed at ${shown}.`)).toBeInTheDocument();
+  expect(screen.getByText(`Scanned 40 objects at ${shown}.`)).toBeInTheDocument();
 });
 
 test("Run now's confirmation reuses the cached preview", async () => {
