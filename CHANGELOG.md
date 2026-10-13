@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Fixed — "Refresh preview" computes a new lifecycle preview
+
+The proxy keeps a finished lifecycle preview for a minute, so that the
+Preview tab and the Run-now confirmation share one walk of the rule's
+objects. "Refresh preview" got that kept preview back, so it seemed to do
+nothing, and the time it showed was when the browser received the answer.
+Now "Refresh preview" asks for a new walk, the preview shows the time when
+the proxy computed it, and the button is disabled while a walk runs.
+
+### Fixed — One "Run now" for the differences of a replication check
+
+In the Verify tab of a replication rule, every difference that a run of the
+rule fixes had its own "Run now" button. Each one runs the whole rule, so a
+click on one of them showed every button as busy. The Differences table now
+has one "Run now", which says how many of the shown differences a run fixes.
+
 ## v2.0.9 — 2026-10-13
 
 ### Changed — A jobs database that no key opens stops the start
