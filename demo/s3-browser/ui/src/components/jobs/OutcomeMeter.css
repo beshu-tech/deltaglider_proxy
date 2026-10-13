@@ -13,6 +13,15 @@
   container-name: meter;
 }
 
+/* A RecordList cell is a flex row, and its child takes the width of its
+   content. The meter is size-contained, so it has none: with nothing wider
+   beside it, the track vanished and "in sync" read "in s…". Any cell that
+   holds a meter grows its child to the column width. */
+.dg-record-cell:has(.dg-meter) > * {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
 .dg-meter-dot {
   width: 8px;
   height: 8px;

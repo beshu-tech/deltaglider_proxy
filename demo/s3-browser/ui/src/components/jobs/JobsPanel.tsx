@@ -504,10 +504,8 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
       render: (d) => {
         const live = d.row.trigger === 'oneoff' && isActiveJobStatus(d.row.status);
         return (
-          // The cell is a flex row: without flex 1 this wrapper takes the
-          // width of its content, and the meter (size-contained) has none,
-          // so a running migration read "run…".
-          <div style={{ minWidth: 0, flex: 1 }}>
+          // OutcomeMeter.css grows this wrapper to the column width.
+          <div>
             {live ? (
               <OutcomeMeter
                 scanned={d.row.progress.processed + d.row.progress.skipped + d.row.progress.failed}
