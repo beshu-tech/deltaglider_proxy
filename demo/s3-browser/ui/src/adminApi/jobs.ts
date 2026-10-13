@@ -167,12 +167,18 @@ export interface ParityOutcome {
   verdict_summary?: string;
 }
 
-/** One object a parity audit could not read. Internal to the outcome shape. */
-interface UnresolvedKey {
+/** One object a parity audit could not read. */
+export interface UnresolvedKey {
   dest_key: string;
   /** Absent for a destination-only object. */
   source_key?: string;
+  /** The error of its last failed read, "source: …" or "destination: …". */
+  error?: string;
 }
+
+/** What a running parity audit does now. Each phase counts objects against
+ *  its own total; a listing phase starts from the previous audit's count. */
+export type ParityPhase = 'listing_source' | 'listing_destination' | 'reading' | 'comparing';
 
 /** The single server-derived conclusion of a parity audit. Internal to the
  *  outcome shape (consumed via `ParityOutcome.verdict`); not re-exported. */
@@ -190,11 +196,17 @@ export async function getJobs(): Promise<JobsOverview> {
  */
 export interface ParityStatus {
   status: 'idle' | 'running' | 'cancelling' | 'done' | 'failed' | 'cancelled';
+  /** Objects done in the current `phase`. */
   progress_scanned: number;
-  /** Compare-phase denominator (0/absent = unknown → indeterminate bar). */
+  /** Objects of the current `phase` (0/absent = unknown → indeterminate bar). */
   progress_total?: number;
+  /** What a running audit does now (absent when none runs). */
+  phase?: ParityPhase;
   scanned_at?: number;
   outcome?: ParityOutcome;
+  /** While an audit runs: the result of the previous one (shown dimmed). */
+  previous_outcome?: ParityOutcome;
+  previous_scanned_at?: number;
   error?: string;
 }
 

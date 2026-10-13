@@ -145,6 +145,27 @@ whole rule list, and each of two queued dialogs says "Step 1 of 2". Escape
 in a bucket field of the job drawer closes the suggestions only, not the
 drawer, and the unsaved-changes bar no longer covers the last fields of the
 drawer.
+### Fixed — The Verify tab keeps the operator informed
+
+The Verify tab now names the step of a running audit and counts the objects
+of that step. Its rate decays when the count stands still, and after 30
+seconds it says "no progress for N s". A re-audit keeps the previous verdict
+on the screen, dimmed, instead of hiding it. An audit that did not finish
+says so above the last complete result: "cancelled", or "failed" with the
+error of the server. The audit buttons are off while a run of the rule is in
+progress, and a note says why, where a click used to fail with a raw 409.
+When an audit could not read some objects, the headline no longer says
+"(scanned portion)" next to a body that says that the whole mirror was
+listed. The panel lists those objects with the error of their last read,
+and it suggests `DGP_PARITY_HEAD_CONCURRENCY` only when the backend
+throttled the reads. An empty Differences table no longer shows.
+
+### Fixed — Turning on delete replication asks first
+
+The switch for delete replication in the rule editor had no name for a
+screen reader, and one click turned it on. It now has a name and a visible
+state, and turning it on asks for confirmation, because the rule then
+deletes every object on the destination that is not on the source.
 
 ### Fixed — The progress of a replication audit counts objects
 

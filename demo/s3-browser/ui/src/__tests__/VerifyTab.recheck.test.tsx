@@ -15,12 +15,12 @@ const VERIFY = '/_/api/admin/jobs/replication:copyHzToBackup/verify';
 
 afterEach(() => vi.unstubAllGlobals());
 
-function partial(unresolved: number, kept: number, rechecked_at?: number): ParityOutcome {
+function partial(unresolved: number, kept: number, rechecked_at?: number, error?: string): ParityOutcome {
   return {
     rule_name: 'copyHzToBackup', source_bucket: 'releases', dest_bucket: 'db-archive',
     source_objects: 100, dest_objects: 100, matched: 100, missing_on_dest: 0, orphan_on_dest: 0,
     checksum_mismatch: 0, unverifiable: 0, truncated: true, cap_hit: false, unresolved,
-    unresolved_keys: Array.from({ length: kept }, (_, i) => ({ dest_key: `k${i}.zip`, source_key: `k${i}.zip` })),
+    unresolved_keys: Array.from({ length: kept }, (_, i) => ({ dest_key: `k${i}.zip`, source_key: `k${i}.zip`, error })),
     unresolved_keys_capped: kept < unresolved, rechecked_at,
     in_sync: false, scanned_at: 1_760_000_000, conflict_policy: 'content-diff', replicate_deletes: true,
     actionable: { rerun_fixes: 0, rerun_conditional: 0, needs_manual: 0, copy_failing: 0 },
@@ -57,12 +57,35 @@ test('a capped list says how many objects the re-check reads', async () => {
   expect(screen.getByText(/A full audit reads the other\s+500/)).toBeInTheDocument();
 });
 
-test('after a re-check that failed again, the banner names the concurrency setting', async () => {
-  serve(partial(3, 3, 1_760_000_600));
+test('after a re-check that the backend throttled again, the banner names the concurrency setting', async () => {
+  serve(partial(3, 3, 1_760_000_600, 'source: service error: 503 SlowDown'));
   renderWithQuery(<VerifyTab ruleName="copyHzToBackup" />);
   expect(await screen.findByRole('button', { name: /Re-check these 3 objects/ })).toBeInTheDocument();
   expect(screen.getByText('DGP_PARITY_HEAD_CONCURRENCY')).toBeInTheDocument();
   expect(screen.getByText(/unread objects re-checked/)).toBeInTheDocument();
+  expect(screen.getByText('source: service error: 503 SlowDown')).toBeInTheDocument();
+});
+
+test('after a re-check that timed out again, the banner shows the error and not the concurrency setting', async () => {
+  serve(partial(3, 3, 1_760_000_600, 'destination: operation timed out'));
+  renderWithQuery(<VerifyTab ruleName="copyHzToBackup" />);
+  expect(await screen.findByText('destination: operation timed out')).toBeInTheDocument();
+  expect(screen.getByText(/did not answer in time/)).toBeInTheDocument();
+  expect(screen.queryByText('DGP_PARITY_HEAD_CONCURRENCY')).toBeNull();
+});
+
+test('the unread objects are listed by name, and the headline does not contradict the body', async () => {
+  serve(partial(3, 3));
+  renderWithQuery(<VerifyTab ruleName="copyHzToBackup" />);
+  const list = await screen.findByRole('list', { name: 'Unread objects' });
+  expect(list).toHaveTextContent('k0.zip');
+  expect(list).toHaveTextContent('k2.zip');
+  // The whole mirror was listed: the headline says no "(scanned portion)".
+  expect(screen.getByText('Not fully verified')).toBeInTheDocument();
+  expect(screen.queryByText(/scanned portion/)).toBeNull();
+  // No sampled differences: no empty Differences table and its advice.
+  expect(screen.queryByText('No sampled differences')).toBeNull();
+  expect(screen.queryByText(/After fixing, run verification again/)).toBeNull();
 });
 
 test('an outcome without the key list offers only the full audit', async () => {

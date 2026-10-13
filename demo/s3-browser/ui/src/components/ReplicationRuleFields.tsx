@@ -1,4 +1,4 @@
-import { Alert, Input, InputNumber, Radio, Switch, Typography } from 'antd';
+import { Alert, Input, InputNumber, Modal, Radio, Switch, Typography } from 'antd';
 import type { ReplicationRuleConfig } from '../adminApi';
 import BucketPrefixInput from './BucketPrefixInput';
 import FormField from './FormField';
@@ -120,10 +120,28 @@ export default function ReplicationRuleFields({
             yamlPath="storage.replication.rules[].replicate_deletes"
             helpText="Make the destination a faithful mirror: any object not present at source is deleted."
           >
-            <Switch
-              checked={rule.replicate_deletes}
-              onChange={(replicate_deletes) => onChange({ replicate_deletes })}
-            />
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+              <Switch
+                aria-label="Delete objects on the destination that are not on the source"
+                checked={rule.replicate_deletes}
+                onChange={(on) => {
+                  // Turning it off is safe; turning it on can delete data on
+                  // the destination, so it asks first.
+                  if (!on) {
+                    onChange({ replicate_deletes: false });
+                    return;
+                  }
+                  Modal.confirm({
+                    title: 'Delete objects on the destination?',
+                    content: `When this rule runs, it deletes every object under ${rule.destination.bucket || 'the destination'}${rule.destination.prefix ? '/' + rule.destination.prefix : ''} that is not on the source, also objects that other tools wrote there.`,
+                    okText: 'Turn on delete replication',
+                    okButtonProps: { danger: true },
+                    onOk: () => onChange({ replicate_deletes: true }),
+                  });
+                }}
+              />
+              <span>{rule.replicate_deletes ? 'On: the destination mirrors deletes' : 'Off: deletes are not copied'}</span>
+            </label>
             <Alert
               type="warning"
               showIcon

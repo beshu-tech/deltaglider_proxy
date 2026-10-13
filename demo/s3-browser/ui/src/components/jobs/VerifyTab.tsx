@@ -21,17 +21,25 @@ import {
   SafetyCertificateOutlined,
   WarningOutlined,
 } from '@ant-design/icons';
-import type { ParityFinding, ParityOutcome, Verifier } from '../../adminApi';
+import type { ParityFinding, ParityOutcome, ParityPhase, UnresolvedKey, Verifier } from '../../adminApi';
 import type { PendingReverify } from '../../jobsView';
 import {
   computeRate,
   conflictPolicyLabel,
-  deriveVerifyProgress,
   fixActionMeta,
   parityKindMeta,
   rerunVerdictMeta,
   stepPendingReverify,
 } from '../../jobsView';
+import {
+  auditBlockedReason,
+  displayRate,
+  distinctErrors,
+  headlineFor,
+  unreadCause,
+  verifyPhaseLabel,
+  verifyProgress,
+} from './verifyView';
 import {
   useCancelVerify,
   useJobs,
@@ -66,8 +74,9 @@ function verifierLabel(v: Verifier | undefined): string | null {
 
 /**
  * Smoothed objects/sec from the live `scanned` count. Resets when the scan
- * stops/restarts (scanned drops or goes undefined). Returns a display string
- * ("—/s" until a second forward sample) so the running UI reads as alive.
+ * stops, restarts or enters a new phase (scanned drops or goes undefined).
+ * A one-second clock lets the shown rate decay while the count stands still
+ * (`displayRate`), so a stalled audit does not show its old speed.
  */
 function useObjRate(scanned: number | undefined): string {
   const prev = useRef<{ scanned: number; ts: number; rate: number | null }>({
@@ -75,29 +84,38 @@ function useObjRate(scanned: number | undefined): string {
     ts: 0,
     rate: null,
   });
-  const [rate, setRate] = useState<number | null>(null);
+  const [sample, setSample] = useState<{ rate: number | null; lastForward: number | null }>({
+    rate: null,
+    lastForward: null,
+  });
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
 
   useEffect(() => {
     if (scanned == null) {
       prev.current = { scanned: 0, ts: 0, rate: null };
-      setRate(null);
+      setSample({ rate: null, lastForward: null });
       return;
     }
-    const now = Date.now();
+    const t = Date.now();
     const p = prev.current;
     if (scanned < p.scanned || p.ts === 0) {
-      // fresh scan (or first sample) — seed, no rate yet
-      prev.current = { scanned, ts: now, rate: null };
-      setRate(null);
+      // fresh scan, new phase, or first sample — seed, no rate yet
+      prev.current = { scanned, ts: t, rate: null };
+      setSample({ rate: null, lastForward: t });
       return;
     }
-    const next = computeRate(p.rate, p.scanned, p.ts, scanned, now);
-    prev.current = { scanned, ts: now, rate: next };
-    setRate(next);
+    if (scanned === p.scanned) return;
+    const next = computeRate(p.rate, p.scanned, p.ts, scanned, t);
+    prev.current = { scanned, ts: t, rate: next };
+    setSample({ rate: next, lastForward: t });
   }, [scanned]);
 
-  if (rate == null || rate <= 0) return '—/s';
-  return `~${rate < 10 ? rate.toFixed(1) : Math.round(rate).toLocaleString()}/s`;
+  return displayRate(sample.rate, sample.lastForward, now);
 }
 
 /** Severity drives the halo + headline color. Driven by the server's
@@ -122,24 +140,6 @@ function toneFor(o: ParityOutcome): Tone {
   if (o.checksum_mismatch > 0) return 'red';
   if (o.missing_on_dest === 0 && o.orphan_on_dest === 0 && o.unverifiable > 0) return 'blue';
   return 'amber';
-}
-
-/** Short headline word from the authoritative verdict (+ truncation nuance).
- *  Legacy fallback mirrors toneFor/legacyBody: ANY real diff (missing/extra/
- *  mismatch) → at_risk, so the headline can't read "not fully verified" while
- *  the halo + body say files are missing. */
-function headlineFor(o: ParityOutcome): string {
-  const realDiffs = o.missing_on_dest + o.orphan_on_dest + o.checksum_mismatch;
-  const v = o.verdict ?? (o.in_sync ? 'safe' : realDiffs > 0 ? 'at_risk' : 'incomplete');
-  const scoped = o.truncated ? ' (scanned portion)' : '';
-  switch (v) {
-    case 'safe':
-      return `Verified in sync${scoped}`;
-    case 'incomplete':
-      return `Not fully verified${scoped}`;
-    case 'at_risk':
-      return `Differences found${scoped}`;
-  }
 }
 
 /** Derived body sentence for pre-field (legacy) outcomes with no summary. */
@@ -179,11 +179,20 @@ export default function VerifyTab({ ruleName }: Props) {
   const s = status.data;
   const cancelling = s?.status === 'cancelling' || cancel.isPending;
   const running = s?.status === 'running' || cancelling || start.isPending;
-  const outcome = s?.outcome;
+  // While an audit runs, the server hands over the previous verdict apart
+  // (`previous_outcome`); it stays in view, dimmed, under the live progress.
+  const outcome = s?.outcome ?? (running ? s?.previous_outcome : undefined);
+  const phase = s?.phase;
+  // A replication run of the rule is in progress: the server refuses an audit.
+  const blocked = running ? null : auditBlockedReason(ruleRow?.status);
 
-  const run = () => start.mutate();
+  const run = () => {
+    if (!blocked) start.mutate();
+  };
   // Re-read only the objects the last audit could not read.
-  const recheck = () => start.mutate('unresolved');
+  const recheck = () => {
+    if (!blocked) start.mutate('unresolved');
+  };
   const rechecking = running && start.variables === 'unresolved';
   const onCancel = () => cancel.mutate();
   // The one executable per-finding fix: run the rule, then re-verify once the
@@ -234,24 +243,15 @@ export default function VerifyTab({ ruleName }: Props) {
 
     // ── running with NO prior result → live progress + cancel ──────────────────
     if (running && !outcome) {
-      // Phase label: an unknown/zero denominator means we're still LISTING (the
-      // dominant early cost on a big bucket); a known total means COMPARING. This
-      // explains the early indeterminate span instead of reading as "frozen".
-      const listing = !s?.progress_total || s.progress_total <= 0;
+      // The server names the phase (listing a side, reading metadata,
+      // comparing), and each phase counts objects against its own total.
       return (
         <LoadingBlock
           c={c}
-          label={
-            cancelling
-              ? 'Cancelling…'
-              : rechecking
-                ? 'Re-checking the objects that could not be read…'
-                : listing
-                  ? 'Listing objects…'
-                  : 'Comparing source and destination…'
-          }
+          label={verifyPhaseLabel(phase, { cancelling, rechecking })}
           scanned={s?.progress_scanned}
           total={s?.progress_total}
+          phase={phase}
           onCancel={cancelling ? undefined : onCancel}
         />
       );
@@ -273,9 +273,12 @@ export default function VerifyTab({ ruleName }: Props) {
             icon={<SafetyCertificateOutlined />}
             onClick={run}
             loading={start.isPending}
+            disabled={!!blocked}
+            title={blocked ?? undefined}
           >
             Run verification
           </Button>
+          <BlockedNote reason={blocked} c={c} />
         </div>
       );
     }
@@ -291,9 +294,16 @@ export default function VerifyTab({ ruleName }: Props) {
             description={s.error || 'The parity audit could not complete.'}
             style={{ borderRadius: 8, marginBottom: 16 }}
           />
-          <Button icon={<ReloadOutlined />} onClick={run} loading={start.isPending}>
+          <Button
+            icon={<ReloadOutlined />}
+            onClick={run}
+            loading={start.isPending}
+            disabled={!!blocked}
+            title={blocked ?? undefined}
+          >
             Retry
           </Button>
+          <BlockedNote reason={blocked} c={c} />
         </div>
       );
     }
@@ -321,9 +331,12 @@ export default function VerifyTab({ ruleName }: Props) {
             icon={<SafetyCertificateOutlined />}
             onClick={run}
             loading={start.isPending}
+            disabled={!!blocked}
+            title={blocked ?? undefined}
           >
             Run audit
           </Button>
+          <BlockedNote reason={blocked} c={c} />
         </div>
       );
     }
@@ -335,6 +348,18 @@ export default function VerifyTab({ ruleName }: Props) {
         reverifying={running}
         reverifyScanned={running ? s?.progress_scanned : undefined}
         reverifyTotal={running ? s?.progress_total : undefined}
+        reverifyPhase={running ? phase : undefined}
+        reverifyLabel={running ? verifyPhaseLabel(phase, { cancelling, rechecking }) : undefined}
+        lastAttempt={
+          running
+            ? undefined
+            : s?.status === 'cancelled'
+              ? { kind: 'cancelled' }
+              : s?.status === 'failed'
+                ? { kind: 'failed', error: s.error }
+                : undefined
+        }
+        blockedReason={blocked}
         onReverify={run}
         onRecheck={recheck}
         onCancelReverify={cancelling ? undefined : onCancel}
@@ -364,17 +389,19 @@ function LoadingBlock({
   label = 'Comparing source and destination…',
   scanned,
   total,
+  phase,
   onCancel,
 }: {
   c: ReturnType<typeof useColors>;
   label?: string;
   scanned?: number;
   total?: number;
+  phase?: ParityPhase;
   /** When provided, shows a Cancel button (a running audit). */
   onCancel?: () => void;
 }) {
   const rate = useObjRate(scanned);
-  const prog = deriveVerifyProgress(scanned ?? 0, total);
+  const prog = verifyProgress(scanned, total, phase);
   // Smooth count-up so the scanned count ticks into place rather than
   // snapping — LOAD-BEARING for PureMirror fast scans where the full
   // count arrives in a single update (no incremental HEAD phase).
@@ -438,11 +465,11 @@ function LoadingBlock({
             minHeight: 18,
           }}
         >
-          {scanned != null
-            ? prog.determinate
-              ? `${Math.round(animatedScanned).toLocaleString()} of ${total!.toLocaleString()} · ${rate}`
-              : `${Math.round(animatedScanned).toLocaleString()} objects scanned · ${rate}`
-            : 'Starting scan…'}
+          {scanned != null && prog.text
+            ? `${verifyProgress(Math.round(animatedScanned), total, phase).text} · ${rate}`
+            : scanned != null
+              ? ''
+              : 'Starting scan…'}
         </div>
 
         {/* Progress bar: determinate once the server publishes the total, else
@@ -529,6 +556,10 @@ export function ParityResult({
   reverifying,
   reverifyScanned,
   reverifyTotal,
+  reverifyPhase,
+  reverifyLabel,
+  lastAttempt,
+  blockedReason,
   onReverify,
   onRecheck,
   onCancelReverify,
@@ -541,8 +572,16 @@ export function ParityResult({
   reverifying?: boolean;
   /** Live objects-scanned of the in-flight re-verify (for the badge). */
   reverifyScanned?: number;
-  /** Compare-phase denominator of the in-flight re-verify (determinate bar). */
+  /** Total of the current phase of the in-flight re-verify. */
   reverifyTotal?: number;
+  reverifyPhase?: ParityPhase;
+  /** Headline of the in-flight re-verify (its phase). */
+  reverifyLabel?: string;
+  /** The audit after this result did not finish: it was cancelled, or it
+   *  failed (with the server's error). This result is the last complete one. */
+  lastAttempt?: { kind: 'cancelled' } | { kind: 'failed'; error?: string };
+  /** Why an audit may not start now (a run of the rule is in progress). */
+  blockedReason?: string | null;
   onReverify: () => void;
   /** Re-read only the objects the audit could not read. Omitted = no button. */
   onRecheck?: () => void;
@@ -580,8 +619,6 @@ export function ParityResult({
   const scannedAbsolute = scannedDate.toLocaleString();
   const recheckedDate = outcome.rechecked_at ? new Date(outcome.rechecked_at * 1000) : null;
   const unresolved = outcome.unresolved ?? 0;
-  // The objects a re-check reads: the kept list (capped at 1,000 server-side).
-  const recheckable = outcome.unresolved_keys?.length ?? 0;
 
   return (
     <div style={{ padding: '4px 2px' }}>
@@ -590,10 +627,34 @@ export function ParityResult({
       {reverifying && (
         <ReverifyBanner
           c={c}
+          label={reverifyLabel}
           scanned={reverifyScanned}
           total={reverifyTotal}
+          phase={reverifyPhase}
           onCancel={onCancelReverify}
           since={scannedDate}
+        />
+      )}
+      {!reverifying && lastAttempt && (
+        <Alert
+          type={lastAttempt.kind === 'failed' ? 'error' : 'info'}
+          showIcon
+          style={{ borderRadius: 8, marginBottom: 14 }}
+          title={
+            lastAttempt.kind === 'failed'
+              ? 'The last audit failed'
+              : 'The last audit was cancelled before it finished'
+          }
+          description={
+            <>
+              {lastAttempt.kind === 'failed' && lastAttempt.error && (
+                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 12, wordBreak: 'break-word', marginBottom: 4 }}>
+                  {lastAttempt.error}
+                </div>
+              )}
+              The result below is from the last audit that finished, {relativeTime(scannedDate)}.
+            </>
+          }
         />
       )}
       {/* Framed verdict panel on elevated bg. Dimmed + non-interactive while a
@@ -713,11 +774,19 @@ export function ParityResult({
         {/* Re-verify control lives here only when idle; while running, the
             ReverifyBanner above owns the progress + Cancel. */}
         {!reverifying && (
-          <div style={{ marginTop: 18, display: 'flex', gap: 8, justifyContent: 'center', alignItems: 'center' }}>
-            <Button icon={<ReloadOutlined />} onClick={onReverify}>
-              {inSync ? 'Re-audit' : 'Audit again'}
-            </Button>
-          </div>
+          <>
+            <div style={{ marginTop: 18, display: 'flex', gap: 8, justifyContent: 'center', alignItems: 'center' }}>
+              <Button
+                icon={<ReloadOutlined />}
+                onClick={onReverify}
+                disabled={!!blockedReason}
+                title={blockedReason ?? undefined}
+              >
+                {inSync ? 'Re-audit' : 'Audit again'}
+              </Button>
+            </div>
+            <BlockedNote reason={blockedReason} c={c} />
+          </>
         )}
       </div>
 
@@ -768,8 +837,9 @@ export function ParityResult({
               ) : unresolved > 0 ? (
                 <UnreadObjectsNote
                   unresolved={unresolved}
-                  recheckable={recheckable}
+                  keys={outcome.unresolved_keys}
                   rechecked={recheckedDate != null}
+                  blockedReason={blockedReason}
                   onRecheck={onRecheck}
                 />
               ) : (
@@ -800,8 +870,10 @@ export function ParityResult({
             />
           )}
 
-        {/* Findings table */}
-        {!inSync && (
+        {/* Findings table — only when there are sampled differences to list
+            (an audit that only could not read some objects has none). */}
+        {!inSync &&
+          outcome.missing_samples.length + outcome.orphan_samples.length + outcome.mismatch_samples.length > 0 && (
           <FindingsTable
             outcome={outcome}
             c={c}
@@ -814,30 +886,42 @@ export function ParityResult({
   );
 }
 
+/** How many unread objects the note lists by name. */
+const UNREAD_LISTED = 10;
+
 /**
  * The remedy for objects the audit could not read: re-check only those
  * objects (no listing, no reads of the rest of the mirror). "Audit again"
- * below the verdict stays the full option. The concurrency hint shows only after a re-check also
- * failed, because one transient failure usually clears on its own.
+ * below the verdict stays the full option. The note lists the objects with
+ * the error of their last read, and after a re-check that failed again it
+ * names the remedy that fits that error: fewer parallel reads for a backend
+ * that throttles, the backend itself for a timeout.
  */
 function UnreadObjectsNote({
   unresolved,
-  recheckable,
+  keys,
   rechecked,
+  blockedReason,
   onRecheck,
 }: {
   unresolved: number;
-  recheckable: number;
+  keys?: UnresolvedKey[];
   rechecked: boolean;
+  blockedReason?: string | null;
   onRecheck?: () => void;
 }) {
+  const recheckable = keys?.length ?? 0;
   const capped = recheckable < unresolved;
+  const cause = unreadCause(keys);
+  const errors = distinctErrors(keys);
+  const listed = (keys ?? []).slice(0, UNREAD_LISTED);
+  const them = unresolved === 1 ? 'this object' : 'these objects';
   return (
     <>
       <div>
         The whole mirror was listed, but the backend kept failing the reads of{' '}
-        {unresolved.toLocaleString()} {noun(unresolved, 'object')} (usually because it throttled
-        the requests). These objects are <strong>unverified</strong>.{' '}
+        {unresolved.toLocaleString()} {noun(unresolved, 'object')}. {unresolved === 1 ? 'This object is' : 'These objects are'}{' '}
+        <strong>unverified</strong>.{' '}
         {recheckable > 0 ? (
           <>
             A re-check reads only {recheckable === 1 ? 'this object' : 'these objects'} again,
@@ -857,25 +941,78 @@ function UnreadObjectsNote({
         )}
         {rechecked && (
           <>
-            {' '}A re-check also failed to read{' '}
-            {unresolved === 1 ? 'this object' : 'these objects'}. Lower{' '}
-            <code>DGP_PARITY_HEAD_CONCURRENCY</code> to send fewer requests to the backend at the
-            same time, then re-check again.
+            {' '}A re-check also failed to read {them}.{' '}
+            {cause === 'throttled' ? (
+              <>
+                The backend throttled the reads. Lower <code>DGP_PARITY_HEAD_CONCURRENCY</code> to
+                send fewer requests to it at the same time, then re-check again.
+              </>
+            ) : cause === 'timeout' ? (
+              <>
+                The backend did not answer in time. Sending fewer requests does not fix that:
+                check the health of the backend, then re-check again.
+              </>
+            ) : (
+              <>Read the errors below to find the cause, then re-check again.</>
+            )}
           </>
         )}
       </div>
+      {errors.length > 0 && (
+        <div style={{ marginTop: 8 }}>
+          <Text strong style={{ fontSize: 12.5 }}>
+            {errors.length === 1 ? 'Error of the last read' : 'Errors of the last reads'}
+          </Text>
+          {errors.map((e) => (
+            <div key={e} style={{ fontFamily: 'var(--font-mono)', fontSize: 12, wordBreak: 'break-word' }}>
+              {e}
+            </div>
+          ))}
+        </div>
+      )}
+      {listed.length > 0 && (
+        <details style={{ marginTop: 8 }}>
+          <summary style={{ cursor: 'pointer', fontSize: 12.5 }}>
+            {recheckable === 1 ? 'The unread object' : `The unread objects (${recheckable.toLocaleString()})`}
+          </summary>
+          <ul aria-label="Unread objects" style={{ margin: '6px 0 0', paddingInlineStart: 18 }}>
+            {listed.map((k) => (
+              <li key={k.dest_key} style={{ fontFamily: 'var(--font-mono)', fontSize: 12, wordBreak: 'break-all' }}>
+                {k.dest_key}
+              </li>
+            ))}
+          </ul>
+          {recheckable > listed.length && (
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              and {(recheckable - listed.length).toLocaleString()} more
+            </Text>
+          )}
+        </details>
+      )}
       {recheckable > 0 && onRecheck && (
         <Button
           type="primary"
           size="small"
           icon={<ReloadOutlined />}
           onClick={onRecheck}
+          disabled={!!blockedReason}
+          title={blockedReason ?? undefined}
           style={{ marginTop: 10 }}
         >
           Re-check {recheckable === 1 ? 'this object' : `these ${recheckable.toLocaleString()} objects`}
         </Button>
       )}
     </>
+  );
+}
+
+/** The reason the audit buttons are off, under them. */
+function BlockedNote({ reason, c }: { reason?: string | null; c: ReturnType<typeof useColors> }) {
+  if (!reason) return null;
+  return (
+    <Text type="secondary" role="note" style={{ display: 'block', fontSize: 12.5, marginTop: 8, color: c.TEXT_MUTED }}>
+      {reason}
+    </Text>
   );
 }
 
@@ -925,20 +1062,24 @@ function DeepVerifyAffordance({ c }: { c: ReturnType<typeof useColors> }) {
  */
 function ReverifyBanner({
   c,
+  label,
   scanned,
   total,
+  phase,
   onCancel,
   since,
 }: {
   c: ReturnType<typeof useColors>;
+  label?: string;
   scanned?: number;
   total?: number;
+  phase?: ParityPhase;
   onCancel?: () => void;
   since: Date;
 }) {
   const rate = useObjRate(scanned);
-  const prog = deriveVerifyProgress(scanned ?? 0, total);
   const animatedScanned = useTweenedCount(scanned ?? 0);
+  const prog = verifyProgress(Math.round(animatedScanned), total, phase);
   return (
     <div
       role="status"
@@ -957,15 +1098,11 @@ function ReverifyBanner({
       <span className="dg-verify-spinner dg-verify-spinner-sm" aria-hidden />
       <div style={{ flex: 1, minWidth: 0 }}>
         <Text strong style={{ display: 'block', fontSize: 14, color: c.TEXT_PRIMARY }}>
-          Re-verifying parity…
+          {label ?? 'Re-verifying parity…'}
         </Text>
         <Text type="secondary" style={{ fontSize: 12.5, color: c.TEXT_MUTED }}>
-          {scanned != null
-            ? prog.determinate
-              ? `${Math.round(animatedScanned).toLocaleString()} of ${total!.toLocaleString()} · ${rate} · `
-              : `${Math.round(animatedScanned).toLocaleString()} objects scanned · ${rate} · `
-            : ''}
-          recomputing — the result below is from {relativeTime(since)} and is being refreshed.
+          {scanned != null && prog.text ? `${prog.text} · ${rate} · ` : ''}
+          the result below is from {relativeTime(since)} and is being refreshed.
         </Text>
       </div>
       {onCancel && (
