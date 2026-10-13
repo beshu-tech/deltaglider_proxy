@@ -593,7 +593,9 @@ impl StorageBackend for S3Backend {
     }
 
     /// One GET: the size from its Content-Length, the metadata from its
-    /// headers, the body streamed by the caller.
+    /// headers, the body streamed by the caller. A response without
+    /// Content-Length (a chunked body) takes the size from a HEAD: the
+    /// caller reserves spool at this size, and a body longer than it fails.
     async fn open_reference_source(
         &self,
         bucket: &str,
@@ -608,7 +610,13 @@ impl StorageBackend for S3Backend {
             .send()
             .await
             .map_err(|e| self.classify_get(bucket, &key, &e))?;
-        let size = response.content_length().unwrap_or(0).max(0) as u64;
+        let size = match response.content_length() {
+            Some(len) => len.max(0) as u64,
+            None => {
+                let (_, head) = self.head_object_response(bucket, &key).await?;
+                head.content_length().unwrap_or(0).max(0) as u64
+            }
+        };
         let meta = self.metadata_of_response(
             bucket,
             &key,

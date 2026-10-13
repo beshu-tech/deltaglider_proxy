@@ -53,6 +53,10 @@ pub(crate) struct FakeS3 {
     /// Object ACL requests (`?acl`) answer 501 NotImplemented, as on a
     /// backend that does not serve ACLs ([`FakeS3::set_acl_unsupported`]).
     acl_unsupported: std::sync::atomic::AtomicBool,
+    /// Object GET responses carry no Content-Length: the body is sent
+    /// chunked, as some S3-compatible stores do
+    /// ([`FakeS3::set_chunked_gets`]).
+    chunked_gets: std::sync::atomic::AtomicBool,
     /// Object body bytes since the last [`FakeS3::clear`]: (sent by GET,
     /// received by PUT), without the background `.dg/` upkeep.
     bytes: parking_lot::Mutex<(u64, u64)>,
@@ -96,6 +100,12 @@ impl FakeS3 {
             code: code.to_string(),
             remaining: times,
         });
+    }
+
+    /// Send object GET bodies chunked, with no Content-Length header.
+    pub(crate) fn set_chunked_gets(&self, chunked: bool) {
+        self.chunked_gets
+            .store(chunked, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Remove every fault rule.
@@ -466,6 +476,7 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
     let on_object = fake.clone();
     let on_bucket = fake.clone();
     let on_root = fake.clone();
+    let on_chunked = fake.clone();
     let on_bucket_handler =
         move |method: Method,
               uri: Uri,
@@ -692,7 +703,24 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
             }),
         )
         .route("/:bucket", axum::routing::any(on_bucket_handler.clone()))
-        .route("/:bucket/", axum::routing::any(on_bucket_handler));
+        .route("/:bucket/", axum::routing::any(on_bucket_handler))
+        .layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let f = on_chunked.clone();
+                async move {
+                    let chunked = req.method() == Method::GET
+                        && f.chunked_gets.load(std::sync::atomic::Ordering::SeqCst);
+                    let resp = next.run(req).await;
+                    if !chunked {
+                        return resp;
+                    }
+                    let (mut parts, body) = resp.into_parts();
+                    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                    let body = axum::body::Body::from_stream(body.into_data_stream());
+                    axum::response::Response::from_parts(parts, body)
+                }
+            },
+        ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });

@@ -2445,3 +2445,50 @@ mod reference_key_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod reference_source_tests {
+    use super::*;
+
+    /// A reference GET whose response has no Content-Length (a chunked
+    /// body, as some S3-compatible stores send) learns the size from a
+    /// HEAD. Before, the size was 0 and every large-delta GET failed: the
+    /// body was "longer than its declared 0 bytes".
+    #[tokio::test]
+    async fn a_reference_get_without_content_length_takes_the_size_from_a_head() {
+        let (s3, fake) = crate::storage::fake_s3::backend().await;
+        let body: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        let meta = FileMetadata::new_passthrough(
+            "reference.bin".into(),
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&body)),
+            hex::encode(<md5::Md5 as md5::Digest>::digest(&body)),
+            body.len() as u64,
+            None,
+        );
+        s3.put_reference(
+            "b",
+            "p",
+            bytes::Bytes::from(body.clone()),
+            &meta,
+            crate::deltaglider::RefWriteProof::for_tests(),
+        )
+        .await
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        for chunked in [false, true] {
+            fake.set_chunked_gets(chunked);
+            fake.clear();
+            let source = s3.open_reference_source("b", "p").await.unwrap();
+            assert_eq!(source.size, body.len() as u64, "chunked {chunked}");
+            let dest = tmp.path().join(format!("ref-{chunked}"));
+            assert_eq!(source.write_to(&dest).await.unwrap(), body.len() as u64);
+            assert_eq!(std::fs::read(&dest).unwrap(), body);
+            let heads = fake
+                .requests()
+                .iter()
+                .filter(|r| r.starts_with("HEAD "))
+                .count();
+            assert_eq!(heads, usize::from(chunked), "{:?}", fake.requests());
+        }
+    }
+}
