@@ -35,13 +35,22 @@ fn unique_key() -> String {
 
 /// Build an `S3ReferenceLock` over MinIO with a given durable node id and the
 /// short test TTL. The coordination bucket is the shared MinIO test bucket.
+/// MinIO enforces `If-Match` on DELETE (see
+/// `minio_enforces_conditional_delete`), so the lock releases by its kept
+/// ETag, as in production on this backend.
 async fn lock_for(node_id: &str) -> S3ReferenceLock {
+    lock_with(node_id, true).await
+}
+
+/// [`lock_for`] with an explicit conditional-DELETE verdict.
+async fn lock_with(node_id: &str, conditional_delete: bool) -> S3ReferenceLock {
     S3ReferenceLock::new(
         minio_client().await,
         MINIO_BUCKET.to_string(),
         node_id.to_string(),
     )
     .with_tunables(TTL, 30)
+    .with_conditional_delete(conditional_delete)
 }
 
 fn now() -> i64 {
@@ -279,23 +288,54 @@ async fn reference_lock_release_is_owner_scoped() {
     }
     // A stale release from a previous owner must NOT delete a lock a peer now
     // holds — otherwise a late best-effort release (spawned on guard drop) could
-    // free a lock the new holder is relying on, re-opening the race.
-    let key = unique_key();
-    let a = lock_for("nodeA").await;
-    let b = lock_for("nodeB").await;
+    // free a lock the new holder is relying on, re-opening the race. Both
+    // release paths: the DELETE by A's kept ETag (MinIO answers 412), and the
+    // read-then-delete of a bucket that did not prove conditional DELETE.
+    for conditional_delete in [true, false] {
+        let key = unique_key();
+        let a = lock_with("nodeA", conditional_delete).await;
+        let b = lock_with("nodeB", conditional_delete).await;
 
-    assert!(a.try_acquire(&key, "ref-a", now()).await.unwrap());
-    // B steals after expiry (A "crashed").
-    tokio::time::sleep(PAST_TTL).await;
-    assert!(b.try_acquire(&key, "ref-b", now()).await.unwrap());
-    // A's late release (wrong owner) must be a no-op — B still holds it.
-    a.release(&key, "ref-a").await.unwrap();
-    assert!(
-        !a.try_acquire(&key, "ref-a2", now()).await.unwrap(),
-        "B's live lock must survive A's stale owner-mismatched release"
+        assert!(a.try_acquire(&key, "ref-a", now()).await.unwrap());
+        // B steals after expiry (A "crashed").
+        tokio::time::sleep(PAST_TTL).await;
+        assert!(b.try_acquire(&key, "ref-b", now()).await.unwrap());
+        // A's late release must be a no-op — B still holds it.
+        a.release(&key, "ref-a").await.unwrap();
+        assert!(
+            !a.try_acquire(&key, "ref-a2", now()).await.unwrap(),
+            "B's live lock must survive A's stale release \
+             (conditional_delete={conditional_delete})"
+        );
+
+        b.release(&key, "ref-b").await.unwrap();
+        cleanup(&key).await;
+    }
+}
+
+/// The experiment behind the kept-ETag release: MinIO refuses a DELETE
+/// whose `If-Match` names another ETag (412), so the CAS probe reports
+/// conditional DELETE as enforced on it.
+#[tokio::test]
+async fn minio_enforces_conditional_delete() {
+    if !minio_available().await {
+        eprintln!("Skipping minio_enforces_conditional_delete: MinIO not available");
+        return;
+    }
+    let key = format!("_dgp/probe-itest/{}", uuid::Uuid::new_v4());
+    let got = deltaglider_proxy::coordination::cas_probe::probe_cas(
+        &minio_client().await,
+        MINIO_BUCKET,
+        &key,
+    )
+    .await;
+    assert_eq!(
+        got,
+        Ok(deltaglider_proxy::coordination::cas_probe::ProbeResult {
+            cas: true,
+            conditional_delete: true
+        })
     );
-
-    b.release(&key, "ref-b").await.unwrap();
     cleanup(&key).await;
 }
 

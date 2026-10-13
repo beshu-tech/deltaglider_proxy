@@ -60,6 +60,9 @@ pub(crate) struct FakeS3 {
     /// Object body bytes since the last [`FakeS3::clear`]: (sent by GET,
     /// received by PUT), without the background `.dg/` upkeep.
     bytes: parking_lot::Mutex<(u64, u64)>,
+    /// Object DELETEs ignore `If-Match`, as on a backend that honours the
+    /// condition on PUT only ([`FakeS3::set_delete_if_match_ignored`]).
+    delete_if_match_ignored: std::sync::atomic::AtomicBool,
 }
 
 impl FakeS3 {
@@ -106,6 +109,12 @@ impl FakeS3 {
     pub(crate) fn set_chunked_gets(&self, chunked: bool) {
         self.chunked_gets
             .store(chunked, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Make object DELETEs ignore `If-Match` (delete whatever is there).
+    pub(crate) fn set_delete_if_match_ignored(&self, ignored: bool) {
+        self.delete_if_match_ignored
+            .store(ignored, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Remove every fault rule.
@@ -547,7 +556,11 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                                 (if_none && current.is_some())
                                     || if_match.is_some_and(|m| Some(m) != etag_now)
                             }
-                            Method::DELETE => if_match.is_some_and(|m| Some(m) != etag_now),
+                            Method::DELETE => {
+                                !f.delete_if_match_ignored
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                    && if_match.is_some_and(|m| Some(m) != etag_now)
+                            }
                             _ => false,
                         };
                         if failed {

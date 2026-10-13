@@ -317,7 +317,9 @@ single-instance planes below are addressed.
   baseline and corrupt it (closes B1). It is a short-lived S3-CAS lock object
   (`_dgp/locks/reference/<hash>.json`, create-if-absent / steal-on-TTL-expiry /
   owner-scoped release; write first and read only on a 412, release by the
-  kept ETag of our last write = 2 requests per free hold, same for `S3Lease`), NOT the 300s leader lease; a peer holding it past the
+  kept ETag of our last write = 2 requests per free hold, same for `S3Lease` — only when the
+  CAS probe proved `If-Match` on DELETE (`ProbeResult::conditional_delete`, kept in the
+  coordination witness); otherwise the release reads first and deletes only its own), NOT the 300s leader lease; a peer holding it past the
   acquire timeout fails the PUT closed rather than risk a second baseline. The
   holder renews it every TTL/4 (heartbeat) and `ReferenceLockGuard::ensure_held`
   runs before every reference/delta commit, so a holder that lost it stops

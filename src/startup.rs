@@ -1154,10 +1154,13 @@ pub async fn build_coordination_lease(
         }
     };
 
-    if let Err(e) = sync.validate_coordination_bucket().await {
-        error!("FATAL: coordination bucket validation failed (lease build): {e}");
-        std::process::exit(1);
-    }
+    let conditional_delete = match sync.validate_coordination_bucket().await {
+        Ok(v) => v.conditional_delete(),
+        Err(e) => {
+            error!("FATAL: coordination bucket validation failed (lease build): {e}");
+            std::process::exit(1);
+        }
+    };
 
     match ConfigDbSync::build_client(coordination_backend(config)).await {
         Ok(client) => {
@@ -1170,7 +1173,10 @@ pub async fn build_coordination_lease(
                     .parent()
                     .unwrap_or_else(|| std::path::Path::new(".")),
             );
-            DynCoordinationLease::new_arc(S3Lease::with_boot(client, sync_bucket, node_id, boot))
+            DynCoordinationLease::new_arc(
+                S3Lease::with_boot(client, sync_bucket, node_id, boot)
+                    .with_conditional_delete(conditional_delete),
+            )
         }
         Err(e) => {
             warn!("Job-plane lease: coordination client build failed ({e}) — node-local fallback");
@@ -1185,10 +1191,13 @@ pub async fn build_coordination_lease(
 /// Gated exactly like the job-plane lease: no `config_sync_bucket` → `None`
 /// (single-instance; the engine's in-process prefix mutex is the whole story,
 /// zero S3 traffic). With a coordination bucket set, build a CAS client against
-/// it and return an [`S3ReferenceLock`]. This does NOT re-validate the bucket's
-/// CAS support — [`build_coordination_lease`] already did (and `exit(1)`s a
-/// silent-clobber backend), so by the time the engine writes a reference the
-/// bucket is known-good. A client-build failure is non-fatal (`None`, warn):
+/// it and return an [`S3ReferenceLock`]. It validates the bucket (a fresh
+/// witness makes this one GET): the lock must know whether the bucket
+/// enforces `If-Match` on DELETE before it releases by a kept ETag with no
+/// read. A failed validation is not fatal HERE: the lock then reads before
+/// each release, and the later gates ([`build_coordination_lease`],
+/// `init_config_sync`, after the backend capability gate) `exit(1)` on it.
+/// A client-build failure is non-fatal (`None`, warn):
 /// same "never a SPOF" stance as the lease builder — a transient blip must not
 /// wedge startup, and the single-writer routing contract still applies.
 pub async fn build_reference_lock(
@@ -1216,13 +1225,35 @@ pub async fn build_reference_lock(
     );
     match ConfigDbSync::build_client(coordination_backend(config)).await {
         Ok(client) => {
+            let conditional_delete =
+                match deltaglider_proxy::config_db_sync::validate_coordination_bucket_with(
+                    &client,
+                    &sync_bucket,
+                )
+                .await
+                {
+                    Ok(v) => v.conditional_delete(),
+                    Err(e) => {
+                        warn!(
+                            "Reference lock: coordination bucket validation failed ({e}); \
+                             releases read the lock first"
+                        );
+                        false
+                    }
+                };
             info!(
                 "Reference lock: S3-CAS on bucket '{sync_bucket}' (cross-node reference.bin \
-                 protection, node_id={node_id})"
+                 protection, node_id={node_id}, conditional DELETE {})",
+                if conditional_delete {
+                    "enforced"
+                } else {
+                    "not enforced: releases read first"
+                }
             );
             Some(DynReferenceLock::new_arc(
                 S3ReferenceLock::new(client, sync_bucket, node_id)
-                    .with_tunables(ttl_secs, acquire_timeout_secs),
+                    .with_tunables(ttl_secs, acquire_timeout_secs)
+                    .with_conditional_delete(conditional_delete),
             ))
         }
         Err(e) => {
@@ -1450,11 +1481,12 @@ pub async fn init_config_sync(
         Ok(deltaglider_proxy::config_db_sync::CoordinationValidation::CachedWitness {
             validated_at_unix,
             validated_by,
+            ..
         }) => info!(
             "Coordination bucket '{}': conditional-write support confirmed (cached witness, validated at unix={} by {})",
             sync_bucket, validated_at_unix, validated_by
         ),
-        Ok(deltaglider_proxy::config_db_sync::CoordinationValidation::Probed) => info!(
+        Ok(deltaglider_proxy::config_db_sync::CoordinationValidation::Probed { .. }) => info!(
             "Coordination bucket '{}': conditional-write support PROBED and confirmed (witness written)",
             sync_bucket
         ),

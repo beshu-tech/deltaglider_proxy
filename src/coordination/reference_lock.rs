@@ -279,6 +279,10 @@ pub struct S3ReferenceLock {
     /// The ETag of each lock this process wrote last: the release deletes
     /// on it without reading the lock first.
     kept: super::cas::KeptEtags,
+    /// The bucket enforces `If-Match` on DELETE (the probe proved it). Only
+    /// then may a release delete by its kept ETag with no read: on a bucket
+    /// that ignores the condition, that DELETE removes a lock a peer stole.
+    conditional_delete: bool,
 }
 
 impl S3ReferenceLock {
@@ -292,7 +296,15 @@ impl S3ReferenceLock {
             acquire_timeout,
             request_timeout: lock_request_timeout(acquire_timeout),
             kept: Default::default(),
+            conditional_delete: false,
         }
+    }
+
+    /// Set what the CAS probe found about `If-Match` on DELETE. The default
+    /// (`false`) reads the lock before every release.
+    pub fn with_conditional_delete(mut self, enforced: bool) -> Self {
+        self.conditional_delete = enforced;
+        self
     }
 
     pub fn with_tunables(mut self, ttl_secs: i64, acquire_timeout_secs: u64) -> Self {
@@ -430,8 +442,10 @@ impl ReferenceLock for S3ReferenceLock {
 
     async fn release(&self, key: &str, owner: &str) -> Result<(), LeaseError> {
         // Our last write of the lock: delete it only while it is still that
-        // write. A 412 = a peer stole it after our hold lapsed. No read.
-        if let Some(etag) = self.kept.take(key, owner) {
+        // write. A 412 = a peer stole it after our hold lapsed. No read, but
+        // only on a bucket that enforces the condition on DELETE.
+        let kept = self.kept.take(key, owner);
+        if let Some(etag) = kept.filter(|_| self.conditional_delete) {
             let delete = super::cas::delete_if_match(&self.client, &self.bucket, key, &etag);
             let _ = self
                 .bounded(async {
@@ -441,7 +455,8 @@ impl ReferenceLock for S3ReferenceLock {
                 .await;
             return Ok(());
         }
-        // No kept ETag (our last write of it lost or failed): read first.
+        // No kept ETag (our last write of it lost or failed), or a bucket
+        // that may ignore `If-Match` on DELETE: read first, delete only our own.
         let now = crate::event_outbox::current_unix_seconds();
         if let Observed::Held { lock, etag } = self.read_lock(key, now).await? {
             if lock.owner == owner {
@@ -883,7 +898,15 @@ mod tests {
         assert!(res.is_err(), "a hung call must fail the write closed");
     }
 
-    /// A lock on a fake S3 coordination bucket `coord`.
+    /// A lock on a fake S3 coordination bucket `coord` that proved
+    /// conditional DELETE.
+    async fn fake_lock_proven() -> (S3ReferenceLock, Arc<crate::storage::FakeS3>) {
+        let (lock, fake) = fake_lock().await;
+        (lock.with_conditional_delete(true), fake)
+    }
+
+    /// A lock on a fake S3 coordination bucket `coord` (no conditional
+    /// DELETE proven: the release reads first).
     async fn fake_lock() -> (S3ReferenceLock, Arc<crate::storage::FakeS3>) {
         let (endpoint, fake) = crate::storage::fake_s3::start().await;
         let client =
@@ -916,7 +939,7 @@ mod tests {
     /// write-first + the kept ETag make it 2.
     #[tokio::test]
     async fn a_free_lock_costs_one_put_and_one_delete() {
-        let (lock, fake) = fake_lock().await;
+        let (lock, fake) = fake_lock_proven().await;
         let now = crate::event_outbox::current_unix_seconds();
         assert!(lock.try_acquire("k", "o1", now).await.unwrap());
         lock.release("k", "o1").await.unwrap();
@@ -928,12 +951,24 @@ mod tests {
         assert_eq!(methods(&fake), ["PUT", "DELETE"]);
     }
 
+    /// A bucket that did not prove conditional DELETE: the release reads
+    /// the lock first (one request more per hold).
+    #[tokio::test]
+    async fn an_unproven_bucket_reads_the_lock_before_the_release() {
+        let (lock, fake) = fake_lock().await;
+        let now = crate::event_outbox::current_unix_seconds();
+        assert!(lock.try_acquire("k", "o1", now).await.unwrap());
+        lock.release("k", "o1").await.unwrap();
+        assert_eq!(methods(&fake), ["PUT", "GET", "DELETE"]);
+        assert!(lock.try_acquire("k", "o2", now).await.unwrap(), "released");
+    }
+
     /// A held lock: the create 412s, the read judges it live → blocked (one
     /// request more than before; contention is rare). A renew keeps the new
     /// ETag, so the release still deletes without a read.
     #[tokio::test]
     async fn a_held_lock_is_read_only_on_conflict() {
-        let (lock, fake) = fake_lock().await;
+        let (lock, fake) = fake_lock_proven().await;
         let now = crate::event_outbox::current_unix_seconds();
         assert!(lock.try_acquire("k", "holder", now).await.unwrap());
         fake.clear();
@@ -952,7 +987,7 @@ mod tests {
     /// kept ETag: the DELETE answers 412 and the peer's lock stays.
     #[tokio::test]
     async fn a_release_after_a_steal_leaves_the_peer_lock() {
-        let (lock, fake) = fake_lock().await;
+        let (lock, fake) = fake_lock_proven().await;
         let now = crate::event_outbox::current_unix_seconds();
         assert!(lock.try_acquire("k", "holder", now).await.unwrap());
         // The hold lapses (a body without `ttl_secs` is judged by its
@@ -974,6 +1009,36 @@ mod tests {
         fake.clear();
         lock.release("k", "holder").await.unwrap();
         assert_eq!(methods(&fake), ["DELETE"]);
+        assert!(
+            !lock.try_acquire("k", "third", now).await.unwrap(),
+            "the stale release deleted the peer's lock"
+        );
+    }
+
+    /// A backend that ignores `If-Match` on DELETE (it honours it on PUT,
+    /// so the CAS probe of the writes passes): the stale holder's release
+    /// by its kept ETag deleted the peer's live lock, and two nodes held
+    /// it. A lock whose bucket did not prove conditional DELETE reads
+    /// the lock first and deletes only its own.
+    #[tokio::test]
+    async fn a_stale_release_keeps_the_peer_lock_when_delete_ignores_if_match() {
+        let (lock, fake) = fake_lock().await;
+        fake.set_delete_if_match_ignored(true);
+        let now = crate::event_outbox::current_unix_seconds();
+        assert!(lock.try_acquire("k", "holder", now).await.unwrap());
+        let lapsed = serde_json::json!({
+            "owner": "holder", "node_id": "node", "epoch": 1, "expires_at": now - 1
+        });
+        lock.client
+            .put_object()
+            .bucket("coord")
+            .key("k")
+            .body(ByteStream::from(serde_json::to_vec(&lapsed).unwrap()))
+            .send()
+            .await
+            .unwrap();
+        assert!(lock.try_acquire("k", "peer", now).await.unwrap());
+        lock.release("k", "holder").await.unwrap();
         assert!(
             !lock.try_acquire("k", "third", now).await.unwrap(),
             "the stale release deleted the peer's lock"

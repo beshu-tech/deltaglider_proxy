@@ -778,20 +778,28 @@ impl ConfigDbSync {
     ///     STALE witness is refreshed with a plain overwrite (CAS already proven
     ///     in step 2; the timestamp bump isn't CAS-critical).
     pub async fn validate_coordination_bucket(&self) -> Result<CoordinationValidation, String> {
-        validate_cas_bucket(&self.s3_client, &self.bucket, COORDINATION_WITNESS_KEY)
-            .await
-            .map_err(|failure| match failure {
-                CasValidationFailure::NonCas => format!(
-                    "Coordination bucket '{}' does NOT enforce atomic conditional writes \
-                     (If-None-Match). HA coordination (leases, single-writer locks) would be \
-                     UNSAFE — refusing to start. Use a coordination bucket on AWS S3, MinIO \
-                     (>=2024-09), or Ceph/Hetzner; Backblaze B2 (501) and old MinIO/SeaweedFS \
-                     (silent overwrite) are NOT supported.",
-                    self.bucket
-                ),
-                CasValidationFailure::Indeterminate(e) => e,
-            })
+        validate_coordination_bucket_with(&self.s3_client, &self.bucket).await
     }
+}
+
+/// [`ConfigDbSync::validate_coordination_bucket`] with a caller's client:
+/// the reference-lock builder has no `ConfigDbSync`.
+pub async fn validate_coordination_bucket_with(
+    client: &Client,
+    bucket: &str,
+) -> Result<CoordinationValidation, String> {
+    validate_cas_bucket(client, bucket, COORDINATION_WITNESS_KEY)
+        .await
+        .map_err(|failure| match failure {
+            CasValidationFailure::NonCas => format!(
+                "Coordination bucket '{bucket}' does NOT enforce atomic conditional writes \
+                 (If-None-Match). HA coordination (leases, single-writer locks) would be \
+                 UNSAFE — refusing to start. Use a coordination bucket on AWS S3, MinIO \
+                 (>=2024-09), or Ceph/Hetzner; Backblaze B2 (501) and old MinIO/SeaweedFS \
+                 (silent overwrite) are NOT supported."
+            ),
+            CasValidationFailure::Indeterminate(e) => e,
+        })
 }
 
 /// Why a CAS validation did not pass. `NonCas` is DEFINITIVE (the backend
@@ -815,6 +823,16 @@ pub async fn validate_cas_bucket(
     bucket: &str,
     witness_key: &str,
 ) -> Result<CoordinationValidation, CasValidationFailure> {
+    validate_cas_bucket_as(client, bucket, witness_key, node_id).await
+}
+
+/// [`validate_cas_bucket`] with the witness writer's id from `node`.
+async fn validate_cas_bucket_as(
+    client: &Client,
+    bucket: &str,
+    witness_key: &str,
+    node: fn() -> String,
+) -> Result<CoordinationValidation, CasValidationFailure> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -824,15 +842,23 @@ pub async fn validate_cas_bucket(
     // `refreshing_stale` = we saw an EXISTING witness that aged out. It
     // matters for step 3: a stale witness must be OVERWRITTEN (its key already
     // exists, so a create-if-absent write would 412 and never bump the stamp).
+    // A witness from a release before the conditional-DELETE step has no
+    // verdict for it: it counts as stale, so the probe runs once more.
     let mut refreshing_stale = false;
     match read_witness(client, bucket, witness_key).await {
-        Ok(Some(w)) if witness_is_fresh(w.validated_at_unix, now, WITNESS_MAX_AGE_SECS) => {
+        Ok(Some(Witness {
+            validated_at_unix,
+            validated_by,
+            conditional_delete: Some(conditional_delete),
+            ..
+        })) if witness_is_fresh(validated_at_unix, now, WITNESS_MAX_AGE_SECS) => {
             return Ok(CoordinationValidation::CachedWitness {
-                validated_at_unix: w.validated_at_unix,
-                validated_by: w.validated_by,
+                validated_at_unix,
+                validated_by,
+                conditional_delete,
             });
         }
-        Ok(Some(_)) => refreshing_stale = true, // exists but aged out → overwrite
+        Ok(Some(_)) => refreshing_stale = true, // aged out or no DELETE verdict → overwrite
         Ok(None) => {}                          // absent → create-if-absent
         Err(e) => {
             // A read error is not itself a validation failure (transient), but
@@ -843,15 +869,25 @@ pub async fn validate_cas_bucket(
 
     // ── 2. Isolated probe on a random key (fail-closed) ──
     let probe_key = format!(".deltaglider/_cwprobe/{}", uuid::Uuid::new_v4());
-    match crate::coordination::cas_probe::probe_cas(client, bucket, &probe_key).await {
-        Ok(true) => {}
-        Ok(false) => return Err(CasValidationFailure::NonCas),
-        Err(e) => return Err(CasValidationFailure::Indeterminate(e)),
-    }
+    let conditional_delete =
+        match crate::coordination::cas_probe::probe_cas(client, bucket, &probe_key).await {
+            Ok(p) if p.cas => p.conditional_delete,
+            Ok(_) => return Err(CasValidationFailure::NonCas),
+            Err(e) => return Err(CasValidationFailure::Indeterminate(e)),
+        };
 
     // ── 3. Witness write (create-if-absent; overwrite if refreshing stale) ──
-    write_witness(client, bucket, witness_key, now, refreshing_stale).await; // best-effort
-    Ok(CoordinationValidation::Probed)
+    write_witness(
+        client,
+        bucket,
+        witness_key,
+        now,
+        node(),
+        conditional_delete,
+        refreshing_stale,
+    )
+    .await; // best-effort
+    Ok(CoordinationValidation::Probed { conditional_delete })
 }
 
 /// Read + parse a witness object. `Ok(None)` = absent (a 404/NoSuchKey).
@@ -885,12 +921,21 @@ async fn read_witness(client: &Client, bucket: &str, key: &str) -> Result<Option
 ///    harmlessly (a free live-fire CAS test).
 ///  - `true` (refreshing a STALE witness): plain overwrite — the key already
 ///    exists, so create-if-absent would 412 forever and never bump the stamp.
-async fn write_witness(client: &Client, bucket: &str, key: &str, now: i64, overwrite: bool) {
+async fn write_witness(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    now: i64,
+    validated_by: String,
+    conditional_delete: bool,
+    overwrite: bool,
+) {
     let body = serde_json::to_vec(&Witness {
         version: 1,
         validated_at_unix: now,
-        validated_by: node_id(),
+        validated_by,
         primitive: "if-none-match-cas".to_string(),
+        conditional_delete: Some(conditional_delete),
     })
     .unwrap_or_default();
     let mut put = client
@@ -921,9 +966,23 @@ pub enum CoordinationValidation {
     CachedWitness {
         validated_at_unix: i64,
         validated_by: String,
+        conditional_delete: bool,
     },
     /// We ran the live probe this boot (and it passed).
-    Probed,
+    Probed { conditional_delete: bool },
+}
+
+impl CoordinationValidation {
+    /// Does the bucket enforce `If-Match` on DELETE? When it does not, a
+    /// lock or lease release reads the object before it deletes it.
+    pub fn conditional_delete(&self) -> bool {
+        match self {
+            Self::CachedWitness {
+                conditional_delete, ..
+            }
+            | Self::Probed { conditional_delete } => *conditional_delete,
+        }
+    }
 }
 
 /// The witness object written after a successful validation.
@@ -933,6 +992,10 @@ struct Witness {
     validated_at_unix: i64,
     validated_by: String,
     primitive: String,
+    /// The conditional-DELETE verdict of the probe. Absent in a witness
+    /// from an older release: the next boot probes again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    conditional_delete: Option<bool>,
 }
 
 /// Pure freshness check — extracted so the TTL decision is unit-testable.
@@ -1938,6 +2001,65 @@ mod tests {
         assert!(!witness_is_fresh(2000, 1000, max));
     }
 
+    /// A fresh witness from a release before the conditional-DELETE step
+    /// carries no verdict for it: the boot probes again and rewrites it.
+    /// A witness with the verdict is the fast path (one GET).
+    #[tokio::test]
+    async fn a_witness_without_a_delete_verdict_is_probed_again() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        fake.set_delete_if_match_ignored(true);
+        let client = ConfigDbSync::build_client(&crate::config::BackendConfig::S3 {
+            endpoint: Some(endpoint),
+            region: "us-east-1".into(),
+            force_path_style: true,
+            access_key_id: Some("k".into()),
+            secret_access_key: Some("s".into()),
+            allow_local: true,
+            session_token: None,
+        })
+        .await
+        .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let old = serde_json::json!({"version": 1, "validated_at_unix": now,
+            "validated_by": "old-node", "primitive": "if-none-match-cas"});
+        client
+            .put_object()
+            .bucket("coord")
+            .key(COORDINATION_WITNESS_KEY)
+            .body(ByteStream::from(serde_json::to_vec(&old).unwrap()))
+            .send()
+            .await
+            .unwrap();
+        let validate = || {
+            validate_cas_bucket_as(&client, "coord", COORDINATION_WITNESS_KEY, || {
+                "test-node".into()
+            })
+        };
+        let first = validate().await;
+        assert_eq!(
+            first,
+            Ok(CoordinationValidation::Probed {
+                conditional_delete: false
+            })
+        );
+        fake.clear();
+        let second = validate().await.unwrap();
+        assert!(
+            matches!(
+                second,
+                CoordinationValidation::CachedWitness {
+                    conditional_delete: false,
+                    ..
+                }
+            ),
+            "{second:?}"
+        );
+        assert_eq!(fake.requests().len(), 1, "{:?}", fake.requests());
+    }
+
     #[test]
     fn witness_json_round_trips() {
         let w = Witness {
@@ -1945,6 +2067,7 @@ mod tests {
             validated_at_unix: 1_783_000_000,
             validated_by: "node-abc".into(),
             primitive: "if-none-match-cas".into(),
+            conditional_delete: Some(false),
         };
         let bytes = serde_json::to_vec(&w).unwrap();
         let back: Witness = serde_json::from_slice(&bytes).unwrap();

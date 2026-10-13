@@ -231,7 +231,7 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 ///
 /// NO witness object in the data bucket: a witness there is client-visible,
 /// blocks DeleteBucket with a ghost key, and lands unencrypted on encrypting
-/// backends. The probe is 5 requests once per (backend definition, boot) —
+/// backends. The probe is 6 requests once per (backend definition, boot) —
 /// the in-memory fingerprint cache absorbs repeats within a process.
 pub async fn establish_backend_verdict(
     name: &str,
@@ -279,10 +279,10 @@ pub async fn establish_backend_verdict(
                 reason: format!("capability probe timed out ({}s)", PROBE_TIMEOUT.as_secs()),
             }
         }
-        Ok(Ok(true)) => CapabilityVerdict::CasVerified {
+        Ok(Ok(p)) if p.cas => CapabilityVerdict::CasVerified {
             via: VerifiedVia::Probe,
         },
-        Ok(Ok(false)) => CapabilityVerdict::NonCas,
+        Ok(Ok(_)) => CapabilityVerdict::NonCas,
         Ok(Err(reason)) => CapabilityVerdict::Unknown { reason },
     }
 }

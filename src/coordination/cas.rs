@@ -95,7 +95,8 @@ pub(crate) async fn conditional_put_etag(
 
 /// The ETag of each coordination object that this process wrote last, by
 /// (key, owner): the lease and the lock keep it so that a release is one
-/// `DELETE If-Match` with no read first. An entry is dropped when a write
+/// `DELETE If-Match` with no read first (when the bucket enforces the
+/// condition on DELETE). An entry is dropped when a write
 /// of it lost or failed (the object may have moved): the caller then
 /// reads before it deletes, as before.
 #[derive(Debug, Default)]
@@ -127,6 +128,10 @@ impl KeptEtags {
 /// `DELETE If-Match: etag`. A 412 means that the object is no longer the
 /// one we wrote (a peer stole it after our hold lapsed): nothing of ours
 /// is left to delete. Best-effort; errors are logged at debug.
+///
+/// Safe with no read first ONLY on a bucket whose CAS probe proved that
+/// it enforces `If-Match` on DELETE (`ProbeResult::conditional_delete`):
+/// a backend that ignores the condition deletes whatever is there.
 pub(crate) async fn delete_if_match(
     client: &aws_sdk_s3::Client,
     bucket: &str,

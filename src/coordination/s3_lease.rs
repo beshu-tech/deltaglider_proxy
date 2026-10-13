@@ -184,6 +184,10 @@ pub struct S3Lease {
     /// The ETag of each lease this process wrote last: the release deletes
     /// on it without reading the lease first.
     kept: super::cas::KeptEtags,
+    /// The bucket enforces `If-Match` on DELETE (the probe proved it). Only
+    /// then may a release delete by its kept ETag with no read: on a bucket
+    /// that ignores the condition, that DELETE removes a lease a peer stole.
+    conditional_delete: bool,
 }
 
 impl S3Lease {
@@ -215,7 +219,15 @@ impl S3Lease {
             boot_id: boot.current,
             previous_boot_id: boot.previous,
             kept: Default::default(),
+            conditional_delete: false,
         }
+    }
+
+    /// Set what the CAS probe found about `If-Match` on DELETE. The default
+    /// (`false`) reads the lease before every release.
+    pub fn with_conditional_delete(mut self, enforced: bool) -> Self {
+        self.conditional_delete = enforced;
+        self
     }
 
     fn object_key(subsystem: LeaseSubsystem, rule: &str) -> String {
@@ -419,12 +431,15 @@ impl CoordinationLease for S3Lease {
         // Owner-scoped release: only delete the object if WE still own it, so a
         // release can't clobber a lease a peer legitimately stole. Our last
         // write of it: delete it only while it is still that write (a 412 =
-        // stolen). No read.
-        if let Some(etag) = self.kept.take(&key, owner) {
+        // stolen). No read, but only on a bucket that enforces the condition
+        // on DELETE.
+        let kept = self.kept.take(&key, owner);
+        if let Some(etag) = kept.filter(|_| self.conditional_delete) {
             super::cas::delete_if_match(&self.client, &self.bucket, &key, &etag).await;
             return Ok(());
         }
-        // No kept ETag (our last write of it lost or failed): read first.
+        // No kept ETag (our last write of it lost or failed), or a bucket
+        // that may ignore `If-Match` on DELETE: read first, delete only our own.
         let now = crate::event_outbox::current_unix_seconds();
         if let LeaseRead::Valid { lease, etag } = self.read_lease(&key, now).await? {
             if lease.owner == owner {
@@ -473,6 +488,12 @@ mod tests {
         }
     }
 
+    /// A lease on a fake bucket that proved conditional DELETE.
+    async fn fake_lease_proven() -> (S3Lease, std::sync::Arc<crate::storage::FakeS3>) {
+        let (lease, fake) = fake_lease().await;
+        (lease.with_conditional_delete(true), fake)
+    }
+
     async fn fake_lease() -> (S3Lease, std::sync::Arc<crate::storage::FakeS3>) {
         let (endpoint, fake) = crate::storage::fake_s3::start().await;
         let client =
@@ -502,7 +523,7 @@ mod tests {
     /// after the create answers 412; a renew keeps the new ETag.
     #[tokio::test]
     async fn a_free_lease_costs_one_put_and_one_delete() {
-        let (lease, fake) = fake_lease().await;
+        let (lease, fake) = fake_lease_proven().await;
         let sub = LeaseSubsystem::Replication;
         let now = crate::event_outbox::current_unix_seconds();
         assert!(lease.try_acquire(sub, "r", "o1", now, 300).await.unwrap());
@@ -519,6 +540,38 @@ mod tests {
             ["PUT", "PUT", "GET", "GET", "PUT", "DELETE"]
         );
         assert!(!lease.is_held(sub, "r", now).await.unwrap(), "released");
+    }
+
+    /// A backend that ignores `If-Match` on DELETE: the stale leader's
+    /// release by its kept ETag deleted the peer's live lease. A lease
+    /// whose bucket did not prove conditional DELETE reads first.
+    #[tokio::test]
+    async fn a_stale_release_keeps_the_peer_lease_when_delete_ignores_if_match() {
+        let (lease, fake) = fake_lease().await;
+        fake.set_delete_if_match_ignored(true);
+        let sub = LeaseSubsystem::Replication;
+        let now = crate::event_outbox::current_unix_seconds();
+        assert!(lease.try_acquire(sub, "r", "old", now, 300).await.unwrap());
+        let lapsed = serde_json::json!({
+            "owner": "old", "node_id": "node", "epoch": 1, "expires_at": now - 1
+        });
+        lease
+            .client
+            .put_object()
+            .bucket("coord")
+            .key(S3Lease::object_key(sub, "r"))
+            .body(aws_sdk_s3::primitives::ByteStream::from(
+                serde_json::to_vec(&lapsed).unwrap(),
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(lease.try_acquire(sub, "r", "new", now, 300).await.unwrap());
+        lease.release(sub, "r", "old").await.unwrap();
+        assert!(
+            lease.is_held(sub, "r", now).await.unwrap(),
+            "the stale release deleted the peer's lease"
+        );
     }
 
     fn canned_lease(body: serde_json::Value, age: i64) -> crate::coordination::test_s3::Canned {

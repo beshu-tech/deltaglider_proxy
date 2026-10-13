@@ -7,6 +7,11 @@
 //! honours only the first passes a create-only probe and then lets two nodes
 //! renew or steal the same lock. So the probe tests both, on a caller-owned
 //! key, and the verdict is a pure function of the four step outcomes.
+//!
+//! A fifth step tests `If-Match` on DELETE (a wrong ETag must answer 412).
+//! It does not change the CAS verdict: a lock or lease release on a bucket
+//! that ignores it reads the object first and deletes only its own
+//! ([`ProbeResult::conditional_delete`]).
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
@@ -51,6 +56,23 @@ pub fn classify_cas_probe(
     }
 }
 
+/// Pure: did the backend enforce `If-Match` on DELETE? Only a real 412
+/// counts. A DELETE that went through, a 501 or an unclear answer all mean
+/// "not proven", and the release then reads before it deletes.
+pub fn classify_conditional_delete(delete_wrong_etag: &StepOutcome) -> bool {
+    matches!(delete_wrong_etag, StepOutcome::PreconditionFailed)
+}
+
+/// The result of [`probe_cas`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeResult {
+    /// `If-None-Match` and `If-Match` are enforced on PUT (the CAS verdict).
+    pub cas: bool,
+    /// `If-Match` is enforced on DELETE: a release may delete by its kept
+    /// ETag with no read first.
+    pub conditional_delete: bool,
+}
+
 fn outcome<T, E>(res: &Result<T, aws_sdk_s3::error::SdkError<E>>) -> StepOutcome
 where
     E: std::error::Error + aws_sdk_s3::error::ProvideErrorMetadata + 'static,
@@ -83,8 +105,9 @@ async fn key_holds(client: &Client, bucket: &str, key: &str, body: &[u8]) -> boo
 }
 
 /// Run the probe on `bucket/key` and delete the key afterwards (best
-/// effort). Same three-way result as [`classify_cas_probe`].
-pub async fn probe_cas(client: &Client, bucket: &str, key: &str) -> Result<bool, String> {
+/// effort). `Err` = indeterminate, as in [`classify_cas_probe`]. Six
+/// requests: four PUTs, the DELETE with a wrong ETag, and the cleanup.
+pub async fn probe_cas(client: &Client, bucket: &str, key: &str) -> Result<ProbeResult, String> {
     let first = client
         .put_object()
         .bucket(bucket)
@@ -121,8 +144,23 @@ pub async fn probe_cas(client: &Client, bucket: &str, key: &str) -> Result<bool,
             other => other,
         }
     };
+    // The key exists here (the probe wrote it). A DELETE with a wrong ETag
+    // must leave it; a backend that ignores the condition deletes it, and
+    // the cleanup below is then a no-op.
+    let delete_wrong = outcome(
+        &client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .if_match("\"00000000000000000000000000000000\"")
+            .send()
+            .await,
+    );
     let _ = client.delete_object().bucket(bucket).key(key).send().await;
-    classify_cas_probe(&create, &wrong, &right)
+    Ok(ProbeResult {
+        cas: classify_cas_probe(&create, &wrong, &right)?,
+        conditional_delete: classify_conditional_delete(&delete_wrong),
+    })
 }
 
 #[cfg(test)]
@@ -252,10 +290,74 @@ mod lost_response_tests {
         let verdict = probe_cas(&client, "coord", "_dgp/probe").await;
         assert!(*fake.lost_one.lock().unwrap(), "the fake lost a response");
         assert_eq!(
-            verdict,
+            verdict.map(|p| p.cas),
             Ok(true),
             "the probe's own landed write read as NonCas"
         );
+    }
+}
+
+#[cfg(test)]
+mod conditional_delete_tests {
+    use super::*;
+
+    async fn fake_client() -> (Client, std::sync::Arc<crate::storage::FakeS3>) {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let client =
+            crate::config_db_sync::ConfigDbSync::build_client(&crate::config::BackendConfig::S3 {
+                endpoint: Some(endpoint),
+                region: "us-east-1".into(),
+                force_path_style: true,
+                access_key_id: Some("k".into()),
+                secret_access_key: Some("s".into()),
+                allow_local: true,
+                session_token: None,
+            })
+            .await
+            .unwrap();
+        (client, fake)
+    }
+
+    #[tokio::test]
+    async fn the_probe_reports_an_enforced_conditional_delete() {
+        let (client, fake) = fake_client().await;
+        let got = probe_cas(&client, "coord", "_probe").await;
+        assert_eq!(
+            got,
+            Ok(ProbeResult {
+                cas: true,
+                conditional_delete: true
+            })
+        );
+        assert_eq!(fake.requests().len(), 6, "{:?}", fake.requests());
+    }
+
+    /// A backend that enforces `If-Match` on PUT only: CAS holds, but a
+    /// release must not delete by its kept ETag alone.
+    #[tokio::test]
+    async fn the_probe_reports_an_ignored_conditional_delete() {
+        let (client, fake) = fake_client().await;
+        fake.set_delete_if_match_ignored(true);
+        let got = probe_cas(&client, "coord", "_probe").await;
+        assert_eq!(
+            got,
+            Ok(ProbeResult {
+                cas: true,
+                conditional_delete: false
+            })
+        );
+    }
+
+    #[test]
+    fn only_a_412_proves_conditional_delete() {
+        assert!(classify_conditional_delete(
+            &StepOutcome::PreconditionFailed
+        ));
+        assert!(!classify_conditional_delete(&StepOutcome::Written));
+        assert!(!classify_conditional_delete(&StepOutcome::NotImplemented));
+        assert!(!classify_conditional_delete(&StepOutcome::Other(
+            "timeout".into()
+        )));
     }
 }
 

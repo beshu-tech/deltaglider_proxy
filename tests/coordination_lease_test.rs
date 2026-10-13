@@ -36,13 +36,56 @@ fn now() -> i64 {
         .as_secs() as i64
 }
 
-/// Build an S3Lease over MinIO with a given durable node id.
+/// Build an S3Lease over MinIO with a given durable node id. MinIO enforces
+/// `If-Match` on DELETE, so the lease releases by its kept ETag, as in
+/// production on this backend.
 async fn lease_for(node_id: &str) -> S3Lease {
+    lease_with(node_id, true).await
+}
+
+/// [`lease_for`] with an explicit conditional-DELETE verdict.
+async fn lease_with(node_id: &str, conditional_delete: bool) -> S3Lease {
     S3Lease::new(
         minio_client().await,
         MINIO_BUCKET.to_string(),
         node_id.to_string(),
     )
+    .with_conditional_delete(conditional_delete)
+}
+
+/// A leader whose lease lapsed and a peer stole releases late: the peer's
+/// lease must survive. Both release paths: the DELETE by the kept ETag
+/// (MinIO answers 412), and the read-then-delete of a bucket that did not
+/// prove conditional DELETE.
+#[tokio::test]
+async fn s3_lease_stale_release_keeps_the_peers_lease() {
+    if !minio_available().await {
+        eprintln!("Skipping s3_lease_stale_release_keeps_the_peers_lease: MinIO not available");
+        return;
+    }
+    for conditional_delete in [true, false] {
+        let rule = unique_rule();
+        let a = lease_with("nodeA", conditional_delete).await;
+        let b = lease_with("nodeB", conditional_delete).await;
+        assert!(a
+            .try_acquire(SUB, &rule, "task-a", now(), TTL)
+            .await
+            .unwrap());
+        tokio::time::sleep(PAST_TTL).await;
+        assert!(
+            b.try_acquire(SUB, &rule, "task-b", now(), 60)
+                .await
+                .unwrap(),
+            "B steals the lapsed lease"
+        );
+        a.release(SUB, &rule, "task-a").await.unwrap();
+        assert!(
+            b.is_held(SUB, &rule, now()).await.unwrap(),
+            "B's lease must survive A's stale release (conditional_delete={conditional_delete})"
+        );
+        b.release(SUB, &rule, "task-b").await.unwrap();
+        delete_lease(&rule).await;
+    }
 }
 
 async fn delete_lease(rule: &str) {
