@@ -13,5 +13,8 @@ source "$ROOT/scripts/lib/e2e-proxy.sh"
 e2e_start_proxy bootstrap
 
 export QA_ACCESS_KEY="$E2E_ACCESS_KEY" QA_SECRET_KEY="$E2E_SECRET_KEY" QA_PUBLIC_BUCKET=qa-public
+# The data dir of the filesystem backend: qa-jobs-lifecycle plants objects
+# with old modification times there, as a restore leaves them.
+export QA_DATA_DIR="$E2E_DIR/data"
 cd "$ROOT/demo/s3-browser/ui"
 npm run e2e:qa
