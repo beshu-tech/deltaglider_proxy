@@ -161,11 +161,13 @@ impl FactsHealer {
             }
             pending.insert(key.clone());
         }
-        self.state.tried.insert(key.clone(), ());
         let (state, facts) = (self.state.clone(), facts.clone());
         runtime.spawn(async move {
             if let Ok(_permit) = state.permits.acquire().await {
                 if !crate::shutdown::is_shutting_down() && !state.paused() {
+                    // Tried only once its HEAD is sent: a miss that a pause
+                    // skipped is queued again by the next LIST that sees it.
+                    state.tried.insert(key.clone(), ());
                     heal_one(&state, &miss, &facts).await;
                 }
             }
@@ -394,6 +396,31 @@ mod tests {
             s3.healer.queue(miss("p", "c.delta"), &writer),
             Some(Skip::Paused)
         );
+    }
+
+    /// A miss whose task found the healer paused sent no HEAD, so it is not
+    /// "tried": the next LIST that sees it queues it again.
+    #[tokio::test]
+    async fn a_miss_skipped_by_a_pause_is_queued_again() {
+        let (s3, fake) = crate::storage::fake_s3_backend().await;
+        let writer = s3.facts_cleanup.writer();
+        let state = s3.healer.state.clone();
+        let held = state
+            .permits
+            .acquire_many(HEAL_CONCURRENCY as u32)
+            .await
+            .unwrap();
+        assert_eq!(s3.healer.queue(miss("p", "a.delta"), &writer), None);
+        state.pause();
+        drop(held);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !state.pending.lock().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "task never ran");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        *state.paused_until.lock().unwrap() = None;
+        assert_eq!(s3.healer.queue(miss("p", "a.delta"), &writer), None);
+        assert!(wait_count(&fake, 1, |r| r.starts_with("HEAD /b/a.delta")).await);
     }
 
     #[test]

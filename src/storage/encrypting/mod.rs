@@ -1683,8 +1683,10 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
             .resolve_listed_sizes(b, objects, passthrough_may_differ || self.has_any_key())
             .await;
         // An inner listing of ciphertext (S3) reports the ciphertext size of a
-        // passthrough object: without a cache hit, only that is known.
-        if self.actively_encrypts() && !self.inner.lite_list_carries_logical_facts(b) {
+        // passthrough object: without a cache hit, only that is known. A
+        // decrypt-only key (write mode passthrough, or a legacy key) still
+        // reads ciphertext written before.
+        if self.has_any_key() && !self.inner.lite_list_carries_logical_facts(b) {
             downgrade_ciphertext_listings(objects, &mut sizes);
         }
         // A listed delta may be ciphertext whenever a key exists: its
