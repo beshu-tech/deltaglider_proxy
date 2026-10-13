@@ -231,6 +231,14 @@ pub struct JobView {
 pub struct JobsOverview {
     pub workers: serde_json::Value,
     pub jobs: Vec<JobView>,
+    /// Finished one-off jobs older than the ones listed (`GET /jobs/:id`
+    /// still answers for them). Omitted when 0.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub older_oneoffs: i64,
+}
+
+fn is_zero(n: &i64) -> bool {
+    *n == 0
 }
 
 /// Unified run entry. Maintenance jobs synthesize ONE run from the job
@@ -340,7 +348,7 @@ fn maintenance_job_view(j: &MaintenanceJob) -> JobView {
         paused: None,
         status: normalize_status(&j.status),
         status_raw: j.status.clone(),
-        phase: Some(j.phase.clone()),
+        phase: maintenance_phase(j),
         percent,
         progress: JobProgress {
             processed: j.objects_done,
@@ -357,7 +365,8 @@ fn maintenance_job_view(j: &MaintenanceJob) -> JobView {
         started_at: j.started_at,
         finished_at: j.finished_at,
         last_error: j.last_error.clone(),
-        failed_total: None,
+        // A one-off job is its one run: every failed object of it.
+        failed_total: Some(j.objects_failed),
         detail,
     }
 }
@@ -562,6 +571,42 @@ fn lifecycle_failure_text(key: &str, error: &str) -> String {
     }
 }
 
+/// The phase a one-off row reports: the phase it is in while active, the
+/// phase it stopped in when it failed or was cancelled, none once it
+/// completed (a finished migrate read "Phase: cleanup").
+fn maintenance_phase(j: &MaintenanceJob) -> Option<String> {
+    match j.status.as_str() {
+        "completed" | "completed_with_errors" => None,
+        _ => Some(j.phase.clone()),
+    }
+}
+
+/// A one-off job IS its run: the one run entry of `GET /jobs/:id/runs`.
+/// Scanned counts every object the job reached, failed ones included.
+fn maintenance_run_entry(job: &MaintenanceJob) -> JobRunEntry {
+    JobRunEntry {
+        id: job.id,
+        triggered_by: job.triggered_by.clone().unwrap_or_else(|| "admin".into()),
+        started_at: job.started_at.unwrap_or(job.created_at),
+        finished_at: job.finished_at,
+        status: normalize_status(&job.status),
+        status_raw: job.status.clone(),
+        objects_scanned: job.objects_done + job.objects_skipped + job.objects_failed,
+        objects_processed: job.objects_done,
+        objects_skipped: job.objects_skipped,
+        objects_deleted: None,
+        bytes: job.bytes_done,
+        errors: job.objects_failed,
+        delta_passthrough: 0,
+        bytes_egress_saved: 0,
+        reconstructed: 0,
+    }
+}
+
+/// One-off rows that `GET /jobs` lists: every active one and this many of
+/// the newest. The answer counts the older ones it leaves out.
+const ONEOFF_LIST_LIMIT: usize = 200;
+
 // ─────────────────────────── handlers ───────────────────────────
 
 /// GET /_/api/admin/jobs
@@ -575,6 +620,7 @@ pub async fn list_jobs(
 
     let mut jobs: Vec<JobView> = Vec::new();
     let mut last_event_applied_at: Option<i64> = None;
+    let mut older_oneoffs = 0i64;
 
     if let Some(db) = state.jobs_db.as_ref() {
         let db = db.lock().await;
@@ -672,8 +718,10 @@ pub async fn list_jobs(
             jobs.push(lifecycle_job_view(&db, rule, &lc_cfg));
         }
 
-        for j in db.maintenance_list_jobs(50)? {
-            jobs.push(maintenance_job_view(&j));
+        let oneoffs = db.maintenance_list_jobs(ONEOFF_LIST_LIMIT)?;
+        older_oneoffs = (db.maintenance_count_jobs()? - oneoffs.len() as i64).max(0);
+        for j in &oneoffs {
+            jobs.push(maintenance_job_view(j));
         }
 
         last_event_applied_at = db
@@ -696,6 +744,7 @@ pub async fn list_jobs(
             },
         }),
         jobs,
+        older_oneoffs,
     }))
 }
 
@@ -903,23 +952,7 @@ pub async fn job_runs(
         JobSubsystem::Maintenance => {
             let job_id: i64 = key.parse().map_err(|_| not_found())?;
             let job = db.maintenance_job_by_id(job_id)?.ok_or(not_found())?;
-            vec![JobRunEntry {
-                id: job.id,
-                triggered_by: job.triggered_by.clone().unwrap_or_else(|| "admin".into()),
-                started_at: job.started_at.unwrap_or(job.created_at),
-                finished_at: job.finished_at,
-                status: normalize_status(&job.status),
-                status_raw: job.status.clone(),
-                objects_scanned: job.objects_done + job.objects_skipped,
-                objects_processed: job.objects_done,
-                objects_skipped: job.objects_skipped,
-                objects_deleted: None,
-                bytes: job.bytes_done,
-                errors: job.objects_failed,
-                delta_passthrough: 0,
-                bytes_egress_saved: 0,
-                reconstructed: 0,
-            }]
+            vec![maintenance_run_entry(&job)]
         }
     };
     Ok(Json(serde_json::json!({ "runs": runs })))
@@ -988,12 +1021,17 @@ pub async fn job_failures(
                 .collect()
         }
     };
-    // How many the ring keeps in all, so the UI can say "20 most recent of
-    // 500". Kinds without a count leave it out.
+    // How many failures there are in all, so the UI can say "20 most
+    // recent of 500".
     let total = match sub {
         JobSubsystem::Replication => Some(db.replication_failure_count(key)?),
         JobSubsystem::Lifecycle => Some(db.lifecycle_failure_count(key)?),
-        _ => None,
+        // A one-off row counts every failed object; the ring keeps the newest.
+        JobSubsystem::Maintenance => key
+            .parse::<i64>()
+            .ok()
+            .and_then(|id| db.maintenance_job_by_id(id).ok().flatten())
+            .map(|j| j.objects_failed),
     };
     let mut body = serde_json::json!({ "failures": failures });
     if let Some(total) = total {
@@ -1426,5 +1464,59 @@ mod tests {
         assert_eq!(JobAction::parse("nope"), None);
         // Verify is replication-only.
         assert!(!supported_actions(JobSubsystem::Lifecycle).contains(&Verify));
+    }
+
+    fn oneoff(status: &str, phase: &str) -> MaintenanceJob {
+        MaintenanceJob {
+            id: 7,
+            kind: "backfill-metadata".into(),
+            bucket: "releases".into(),
+            status: status.into(),
+            phase: phase.into(),
+            objects_total: Some(7),
+            objects_done: 4,
+            objects_skipped: 2,
+            objects_failed: 1,
+            bytes_done: 99,
+            continuation_token: None,
+            last_error: None,
+            triggered_by: None,
+            params: None,
+            created_at: 1,
+            started_at: Some(2),
+            finished_at: Some(3),
+            updated_at: 3,
+        }
+    }
+
+    /// Overview B5: a backfill with 1 failure of 7 read "6 scanned, 6
+    /// copied, 1 error". Scanned counts the failed object too.
+    #[test]
+    fn a_oneoff_run_entry_counts_failed_objects_as_scanned() {
+        let e = maintenance_run_entry(&oneoff("completed_with_errors", "objects"));
+        assert_eq!(e.objects_scanned, 7);
+        assert_eq!(e.objects_processed, 4);
+        assert_eq!(e.objects_skipped, 2);
+        assert_eq!(e.errors, 1);
+        assert_eq!(e.status, "completed_with_errors");
+    }
+
+    /// Maint M1: a finished migrate read "Phase: cleanup".
+    #[test]
+    fn a_completed_oneoff_reports_no_phase() {
+        assert_eq!(maintenance_phase(&oneoff("completed", "cleanup")), None);
+        assert_eq!(
+            maintenance_phase(&oneoff("completed_with_errors", "cleanup")),
+            None
+        );
+        assert_eq!(
+            maintenance_phase(&oneoff("failed", "copy")).as_deref(),
+            Some("copy"),
+            "a failure keeps the phase it stopped in"
+        );
+        assert_eq!(
+            maintenance_phase(&oneoff("running", "verify")).as_deref(),
+            Some("verify")
+        );
     }
 }

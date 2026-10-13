@@ -1105,6 +1105,64 @@ mod classify_tests {
         assert!(!S3Op::Other("delete_bucket").is_bucket_level());
     }
 
+    /// Maint B1: a migrate to a backend with a wrong secret failed with
+    /// "create bucket on target failed: Bucket not found". A CreateBucket
+    /// 403, or any 403 whose code names the credentials, is a refusal.
+    #[test]
+    fn a_refused_create_bucket_is_access_denied_not_bucket_not_found() {
+        assert!(!bucket_level_403_means_absent(
+            &S3Op::CreateBucket,
+            "AccessDenied"
+        ));
+        assert!(!bucket_level_403_means_absent(
+            &S3Op::ListObjects,
+            "SignatureDoesNotMatch"
+        ));
+        assert!(!bucket_level_403_means_absent(
+            &S3Op::ListObjects,
+            "InvalidAccessKeyId"
+        ));
+        assert!(bucket_level_403_means_absent(
+            &S3Op::ListObjects,
+            "AccessDenied"
+        ));
+        assert!(bucket_level_403_means_absent(&S3Op::HeadBucket, ""));
+        assert!(!bucket_level_403_means_absent(
+            &S3Op::GetObject,
+            "AccessDenied"
+        ));
+
+        let err_with = |code: &str| {
+            let inner = aws_sdk_s3::operation::create_bucket::CreateBucketError::generic(
+                aws_smithy_types::error::ErrorMetadata::builder()
+                    .code(code)
+                    .build(),
+            );
+            SdkError::service_error(inner, http_response(403, Some("req-cb")))
+        };
+        for code in [
+            "SignatureDoesNotMatch",
+            "AccessDenied",
+            "InvalidAccessKeyId",
+        ] {
+            let got = S3Backend::classify_s3_error("dest", &err_with(code), S3Op::CreateBucket);
+            assert!(
+                matches!(got, StorageError::AccessDenied(_)),
+                "code={code}: {got:?}"
+            );
+        }
+        let inner = aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error::generic(
+            aws_smithy_types::error::ErrorMetadata::builder()
+                .code("SignatureDoesNotMatch")
+                .build(),
+        );
+        let err: SdkError<_> = SdkError::service_error(inner, http_response(403, Some("req-l")));
+        assert!(matches!(
+            S3Backend::classify_s3_error("b", &err, S3Op::ListObjects),
+            StorageError::AccessDenied(_)
+        ));
+    }
+
     // ──────────────────────────────────────────────────────────────
     // Step 4: native encryption config
     // ──────────────────────────────────────────────────────────────

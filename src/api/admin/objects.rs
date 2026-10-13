@@ -364,10 +364,10 @@ fn reject_if_under_maintenance(
     state: &std::sync::Arc<crate::api::admin::AdminState>,
     bucket: &str,
 ) -> Result<(), AdminError> {
-    if state.s3_state.maintenance_gate.is_busy(bucket) {
-        return Err(AdminError::conflict(format!(
-            "bucket '{bucket}' is temporarily read-only: maintenance in progress"
-        )));
+    if let Some(kind) = state.s3_state.maintenance_gate.busy_kind(bucket) {
+        return Err(AdminError::conflict(
+            crate::maintenance::gate::refusal_message(bucket, &kind),
+        ));
     }
     Ok(())
 }

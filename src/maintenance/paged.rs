@@ -35,6 +35,71 @@ pub(crate) struct JobCtx<'a> {
     pub job: &'a MaintenanceJob,
 }
 
+/// A paged phase also checks for a cancel, and saves its counters, every
+/// this many objects, not only once per 1000-object page: a page of large
+/// objects can take minutes.
+pub(crate) const CANCEL_CHECK_EVERY: usize = 20;
+
+/// The object count of a bucket, made by a listing that runs NEXT TO a
+/// phase's walk: the walk starts at once, and its progress turns
+/// determinate when the count ends (one more listing of the bucket, about
+/// 1% of the requests of a walk that reads every object). A failed count
+/// stays unknown. The count stops with the struct.
+pub(crate) struct BackgroundCount {
+    counted: Arc<std::sync::atomic::AtomicI64>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl BackgroundCount {
+    /// Count the objects (keys that end in `/` excluded, as the walk skips
+    /// them) of `bucket`.
+    pub(crate) fn spawn(engine: Arc<crate::deltaglider::DynEngine>, bucket: String) -> Self {
+        let counted = Arc::new(std::sync::atomic::AtomicI64::new(-1));
+        let out = counted.clone();
+        let task = tokio::spawn(async move {
+            let mut n = 0i64;
+            let mut token: Option<String> = None;
+            for _ in 0..crate::job_loop::MAX_JOB_PAGES {
+                let page = match engine
+                    .list_job_page(&bucket, super::worker::PAGE_SIZE, token.as_deref())
+                    .await
+                {
+                    Ok(p) => p.page,
+                    Err(e) => {
+                        tracing::debug!("maintenance: object count of '{bucket}' failed: {e}");
+                        return;
+                    }
+                };
+                n += page
+                    .objects
+                    .iter()
+                    .filter(|(k, _)| !k.ends_with('/'))
+                    .count() as i64;
+                match page.next_continuation_token {
+                    Some(t) if page.is_truncated => token = Some(t),
+                    _ => {
+                        out.store(n, std::sync::atomic::Ordering::Release);
+                        return;
+                    }
+                }
+            }
+        });
+        Self { counted, task }
+    }
+
+    /// The count, once the listing ended.
+    pub(crate) fn get(&self) -> Option<i64> {
+        let n = self.counted.load(std::sync::atomic::Ordering::Acquire);
+        (n >= 0).then_some(n)
+    }
+}
+
+impl Drop for BackgroundCount {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// One listing page, reduced to what the loop needs.
 pub(crate) struct KeyPage {
     pub keys: Vec<String>,

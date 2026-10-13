@@ -33,7 +33,7 @@
 //! reach zero before scanning anything (bounded by the server's request
 //! timeout — no request can legitimately outlive it).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -56,7 +56,8 @@ use crate::config_db::JobsDb;
 /// still active. The one early release is [`MaintenanceGate::release_for_unwind`].
 #[derive(Debug)]
 pub struct MaintenanceGate {
-    busy: ArcSwap<HashSet<String>>,
+    /// Busy key (lowercased) → the kind of the job that holds it.
+    busy: ArcSwap<HashMap<String, String>>,
     /// Serialises the recompute-and-store of `busy`, and holds the ids of
     /// the jobs whose pre-flip unwind released their source bucket. Without
     /// it two concurrent writers both build from their own view and the
@@ -68,20 +69,39 @@ pub struct MaintenanceGate {
 impl Default for MaintenanceGate {
     fn default() -> Self {
         Self {
-            busy: ArcSwap::from_pointee(HashSet::new()),
+            busy: ArcSwap::from_pointee(HashMap::new()),
             unwinding: parking_lot::Mutex::new(HashSet::new()),
             inflight_writes: DashMap::new(),
         }
     }
 }
 
-/// Pure: the busy set for these arms. A job in `unwinding` keeps every key
-/// except its migrate source bucket. Keys compare lowercased.
-pub(crate) fn busy_set(arms: &[GateArm], unwinding: &HashSet<i64>) -> HashSet<String> {
+/// Pure: the busy set for these arms, each key with the kind of its job. A
+/// job in `unwinding` keeps every key except its migrate source bucket.
+/// Keys compare lowercased.
+pub(crate) fn busy_set(arms: &[GateArm], unwinding: &HashSet<i64>) -> HashMap<String, String> {
     arms.iter()
         .filter(|a| !(a.migrate_source && unwinding.contains(&a.job_id)))
-        .map(|a| a.key.to_ascii_lowercase())
+        .map(|a| (a.key.to_ascii_lowercase(), a.kind.clone()))
         .collect()
+}
+
+/// Pure: the words for a job kind in the gate's 503 text.
+pub fn kind_words(kind: &str) -> &'static str {
+    match kind {
+        "reencrypt" => "a re-encryption",
+        "migrate" => "a migration to another backend",
+        "backfill-metadata" => "a metadata backfill",
+        _ => "a maintenance job",
+    }
+}
+
+/// Pure: the 503 SlowDown text for a write to a gated bucket.
+pub fn refusal_message(bucket: &str, kind: &str) -> String {
+    format!(
+        "bucket '{bucket}' is temporarily read-only while {} finishes — please retry shortly",
+        kind_words(kind)
+    )
 }
 
 impl MaintenanceGate {
@@ -92,7 +112,12 @@ impl MaintenanceGate {
     /// Is this bucket currently gated? (Bucket names compare lowercased —
     /// the same normalization the routing layer uses.)
     pub fn is_busy(&self, bucket: &str) -> bool {
-        self.busy.load().contains(&bucket.to_ascii_lowercase())
+        self.busy.load().contains_key(&bucket.to_ascii_lowercase())
+    }
+
+    /// The kind of the job that gates this bucket, if one does.
+    pub fn busy_kind(&self, bucket: &str) -> Option<String> {
+        self.busy.load().get(&bucket.to_ascii_lowercase()).cloned()
     }
 
     /// Recompute the busy set from the active job rows. Call it with the DB
@@ -127,8 +152,8 @@ impl MaintenanceGate {
     #[cfg(test)]
     pub fn set_busy(&self, bucket: &str) {
         let _g = self.unwinding.lock();
-        let mut next = HashSet::clone(&self.busy.load());
-        next.insert(bucket.to_ascii_lowercase());
+        let mut next = HashMap::clone(&self.busy.load());
+        next.insert(bucket.to_ascii_lowercase(), "reencrypt".to_string());
         self.busy.store(Arc::new(next));
     }
 
@@ -136,7 +161,7 @@ impl MaintenanceGate {
     #[cfg(test)]
     pub fn clear(&self, bucket: &str) {
         let _g = self.unwinding.lock();
-        let mut next = HashSet::clone(&self.busy.load());
+        let mut next = HashMap::clone(&self.busy.load());
         next.remove(&bucket.to_ascii_lowercase());
         self.busy.store(Arc::new(next));
     }
@@ -248,13 +273,8 @@ pub fn write_gate_refusal(
         return None;
     }
     let bucket = bucket_from_path(path)?;
-    // The busy set doesn't carry the job kind — name both candidates.
-    gate.is_busy(&bucket).then(|| {
-        crate::api::errors::S3Error::SlowDown(format!(
-            "bucket '{bucket}' is temporarily read-only while a background job \
-             (re-encryption or migration) finishes — please retry shortly"
-        ))
-    })
+    gate.busy_kind(&bucket)
+        .map(|kind| crate::api::errors::S3Error::SlowDown(refusal_message(&bucket, &kind)))
 }
 
 /// The request gates whose refusal reveals internal state (a busy bucket,
@@ -359,7 +379,7 @@ mod tests {
     const MIGRATE_PARAMS: &str = r#"{"target_backend":"t","delete_source":false,"transient_key":"__dgmigrate_m_0","from_backend":"s"}"#;
 
     fn busy(g: &MaintenanceGate) -> Vec<String> {
-        let mut v: Vec<String> = g.busy.load().iter().cloned().collect();
+        let mut v: Vec<String> = g.busy.load().keys().cloned().collect();
         v.sort();
         v
     }
@@ -457,16 +477,21 @@ mod tests {
             GateArm {
                 job_id: 1,
                 key: "B".into(),
+                kind: "reencrypt".into(),
                 migrate_source: false,
             },
             GateArm {
                 job_id: 2,
                 key: "m".into(),
+                kind: "migrate".into(),
                 migrate_source: true,
             },
         ];
         let unwinding = HashSet::from([1, 2]);
-        assert_eq!(busy_set(&arms, &unwinding), HashSet::from(["b".into()]));
+        assert_eq!(
+            busy_set(&arms, &unwinding),
+            HashMap::from([("b".into(), "reencrypt".into())])
+        );
         assert_eq!(busy_set(&arms, &HashSet::new()).len(), 2);
     }
 
@@ -598,6 +623,35 @@ mod tests {
         ext.insert(g);
         assert!(check_verified_request(&ext, &Method::PUT, "/b/k").is_err());
         assert!(check_verified_request(&ext, &Method::HEAD, "/b/k").is_ok());
+    }
+
+    /// Overview B6: a write during a backfill read "(re-encryption or
+    /// migration)". The 503 names the job that holds the bucket.
+    #[test]
+    fn the_refusal_names_the_job_kind_that_holds_the_bucket() {
+        let db = JobsDb::in_memory("testpass").unwrap();
+        db.maintenance_create_job("backfill-metadata", "bf", "counting", None, "admin", 1)
+            .unwrap()
+            .unwrap();
+        db.maintenance_create_job("migrate", "m", "copy", Some(MIGRATE_PARAMS), "admin", 1)
+            .unwrap()
+            .unwrap();
+        let g = MaintenanceGate::new();
+        g.sync_from(&db);
+        let text = |path: &str| match write_gate_refusal(&g, &Method::PUT, path) {
+            Some(crate::api::errors::S3Error::SlowDown(m)) => m,
+            other => panic!("expected SlowDown, got {other:?}"),
+        };
+        assert!(
+            text("/bf/k").contains("a metadata backfill"),
+            "{}",
+            text("/bf/k")
+        );
+        assert!(!text("/bf/k").contains("re-encryption"));
+        assert!(text("/m/k").contains("a migration"));
+        assert!(text("/__dgmigrate_m_0/k").contains("a migration"));
+        assert_eq!(kind_words("reencrypt"), "a re-encryption");
+        assert_eq!(kind_words("future-kind"), "a maintenance job");
     }
 
     #[test]

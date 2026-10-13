@@ -334,8 +334,8 @@ async fn test_reencrypt_full_cycle() {
         "the 503 body names its request: {put_body}"
     );
     assert!(
-        put_body.contains("temporarily read-only"),
-        "the 503 says why the bucket refuses writes: {put_body}"
+        put_body.contains("temporarily read-only while a re-encryption finishes"),
+        "the 503 says why the bucket refuses writes, naming the job kind: {put_body}"
     );
     let read_back = get_bytes(&http, &endpoint, bucket, "plain-00.json").await;
     assert!(
@@ -1369,4 +1369,83 @@ async fn test_legacy_key_usage_counts_until_reencrypted() {
         [PLAINTEXT_MARKER, b" object 0"].concat(),
         "objects read under the current key after the clear"
     );
+}
+
+/// Maint M3: a re-encrypt saved its progress, and checked for a cancel,
+/// once per 1000-object page: a page of large objects showed no progress
+/// for minutes and could not be cancelled. Now it does both every few
+/// objects, with a total from the count next to the walk; a new job then
+/// finishes the rest and skips what the cancelled one rewrote.
+#[tokio::test]
+async fn test_reencrypt_cancels_mid_page_and_a_new_job_finishes_the_rest() {
+    let bucket = "maintmid";
+    let server = TestServer::builder()
+        .bucket(bucket)
+        .env("DGP_TEST_MAINTENANCE_OBJECT_STALL_MS", "40")
+        .build()
+        .await;
+    let http = server.http();
+    let endpoint = server.endpoint();
+    let admin = admin_http_client(&endpoint).await;
+    const N: i64 = 200;
+    for i in 0..N {
+        let body = [PLAINTEXT_MARKER, format!(" obj {i}").as_bytes()].concat();
+        put_object(
+            &http,
+            &endpoint,
+            bucket,
+            &format!("plain-{i:03}.json"),
+            body,
+            "application/json",
+        )
+        .await;
+    }
+    enable_encryption(&admin, &endpoint).await;
+    let job_id = start_reencrypt(&admin, &endpoint, bucket).await["started"][0]["job_id"]
+        .as_i64()
+        .expect("job id");
+
+    // Progress before the page (all 200 objects) ends, with the total.
+    let mut seen = serde_json::Value::Null;
+    for _ in 0..500 {
+        seen = newest_job(&admin, &endpoint).await;
+        if seen["progress"]["processed"].as_i64().unwrap_or(0) >= 20
+            && seen["progress"]["total"] == N
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let processed = seen["progress"]["processed"].as_i64().unwrap_or(0);
+    assert!((20..N).contains(&processed), "mid-page progress: {seen}");
+    assert_eq!(seen["progress"]["total"], N, "{seen}");
+    assert!(seen["percent"].is_u64(), "{seen}");
+
+    let cancel = admin
+        .post(format!(
+            "{endpoint}/_/api/admin/jobs/maintenance:{job_id}/cancel"
+        ))
+        .send()
+        .await
+        .expect("cancel POST failed");
+    assert!(cancel.status().is_success(), "cancel: {}", cancel.status());
+    wait_job_done(&admin, &endpoint, bucket).await;
+    let job = newest_job(&admin, &endpoint).await;
+    assert_eq!(job["status"], "cancelled", "{job}");
+    let rewritten = job["progress"]["processed"].as_i64().unwrap_or(0);
+    assert!(
+        (20..N).contains(&rewritten),
+        "the cancel stopped the job inside its one page: {job}"
+    );
+
+    // A new job rewrites the rest and skips what the cancelled one did.
+    start_reencrypt(&admin, &endpoint, bucket).await;
+    wait_job_done(&admin, &endpoint, bucket).await;
+    let job = newest_job(&admin, &endpoint).await;
+    assert_eq!(job["status"], "succeeded", "{job}");
+    assert_eq!(job["progress"]["skipped"], rewritten, "{job}");
+    assert_eq!(job["progress"]["processed"], N - rewritten, "{job}");
+    assert_eq!(job["progress"]["total"], N, "{job}");
+    let data_dir = server.data_dir().unwrap();
+    assert_eq!(plaintext_count(data_dir, bucket, N as usize), 0);
 }

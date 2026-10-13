@@ -610,7 +610,7 @@ async fn listed_keys(
 /// Explore #5: A → B keeps a safety copy on A. An object deleted on B and a
 /// migrate back to A used to bring the deleted object back from that copy.
 /// The default now refuses a destination that holds objects, and names the
-/// count and the `mirror` option.
+/// count and the mirror option, at once in the start request's answer.
 #[tokio::test]
 async fn test_migrate_back_refuses_a_destination_with_an_old_copy() {
     let dir_a = tempfile::TempDir::new().unwrap();
@@ -648,18 +648,22 @@ async fn test_migrate_back_refuses_a_destination_with_an_old_copy() {
     );
     delete_object(&http, &endpoint, bucket, "gone.json").await;
 
-    assert_eq!(
-        start_migrate(&admin, &endpoint, bucket, "src", false)
-            .await
-            .status(),
-        202
-    );
-    wait_job_done(&admin, &endpoint, bucket).await;
-    let job = newest_job(&admin, &endpoint).await;
-    assert_eq!(job["status"], "failed", "job: {job}");
-    let err = job["last_error"].as_str().unwrap_or_default();
+    // Maint M4: the refusal is the start request's answer (a 409 that the
+    // dialog shows, in its own words), not a job that fails a moment later.
+    let jobs_before = newest_job(&admin, &endpoint).await["id"].clone();
+    let resp = start_migrate(&admin, &endpoint, bucket, "src", false).await;
+    assert_eq!(resp.status(), 409);
+    let err = resp.text().await.unwrap_or_default();
     assert!(err.contains("already holds 2 object(s)"), "{err}");
-    assert!(err.contains("mirror"), "{err}");
+    assert!(
+        err.contains("Make the destination an exact mirror"),
+        "{err}"
+    );
+    assert_eq!(
+        newest_job(&admin, &endpoint).await["id"],
+        jobs_before,
+        "a refused start creates no job"
+    );
     assert_eq!(
         bucket_backend(&admin, &endpoint, bucket).await.as_deref(),
         Some("dst"),
@@ -1053,4 +1057,92 @@ async fn bench_migrate_small_objects() {
         "migrate bench: {n} objects in {el:?} = {:.2} ms/object",
         el.as_secs_f64() * 1000.0 / n as f64
     );
+}
+
+/// Maint M1 + B3: a running migrate row reports its phase and a total (the
+/// count next to the copy), so its percent is determinate; the bucket
+/// status reports the write gate (`writes_blocked`) apart from the row (`active`):
+/// a cancelling migrate releases the source before its row settles.
+#[tokio::test]
+async fn test_migrate_row_reports_progress_and_status_follows_the_gate() {
+    let dir_a = tempfile::TempDir::new().unwrap();
+    let dir_b = tempfile::TempDir::new().unwrap();
+    let bucket = "migprog";
+    let server = TestServer::builder()
+        .bucket(bucket)
+        .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
+        .env("DGP_TEST_MAINTENANCE_OBJECT_STALL_MS", "20")
+        .build()
+        .await;
+    let http = server.http();
+    let endpoint = server.endpoint();
+    seed(&http, &endpoint, bucket, 300).await;
+    let admin = admin_http_client(&endpoint).await;
+    let resp = start_migrate(&admin, &endpoint, bucket, "dst", false).await;
+    assert_eq!(resp.status(), 202);
+    let job_id = resp.json::<serde_json::Value>().await.unwrap()["job_id"]
+        .as_i64()
+        .unwrap();
+
+    // The copy, with a known total and a determinate percent.
+    let mut seen = serde_json::Value::Null;
+    for _ in 0..500 {
+        seen = newest_job(&admin, &endpoint).await;
+        if seen["phase"] == "copy"
+            && seen["progress"]["total"] == 300
+            && seen["percent"].is_u64()
+            && seen["progress"]["processed"].as_i64().unwrap_or(0) > 0
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(seen["phase"], "copy", "{seen}");
+    assert_eq!(seen["progress"]["total"], 300, "{seen}");
+    assert!(seen["percent"].as_u64().is_some_and(|p| p < 50), "{seen}");
+
+    let status =
+        |v: &serde_json::Value| (v["writes_blocked"].as_bool(), v["active"]["status"].clone());
+    let read = || async {
+        admin
+            .get(format!("{endpoint}/_/api/admin/jobs/bucket/{bucket}"))
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()
+    };
+    let v = read().await;
+    assert_eq!(status(&v), (Some(true), "running".into()), "{v}");
+    assert_eq!(v["active"]["writes_blocked"], true, "{v}");
+
+    let cancel = admin
+        .post(format!(
+            "{endpoint}/_/api/admin/jobs/maintenance:{job_id}/cancel"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(cancel.status().is_success(), "cancel: {}", cancel.status());
+    let mut last = serde_json::Value::Null;
+    for _ in 0..600 {
+        last = read().await;
+        assert!(last["writes_blocked"].is_boolean(), "{last}");
+        if last["active"].is_null() {
+            break;
+        }
+        assert_eq!(
+            last["active"]["writes_blocked"], last["writes_blocked"],
+            "{last}"
+        );
+        assert!(
+            !(last["writes_blocked"] == false && last["active"]["status"] == "running"),
+            "a running job always holds the gate: {last}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(last["active"].is_null(), "{last}");
+    assert_eq!(last["writes_blocked"], false, "{last}");
+    assert_eq!(newest_job(&admin, &endpoint).await["status"], "cancelled");
 }

@@ -556,7 +556,10 @@ pub(crate) fn bucket_lists(fake: &FakeS3, bucket: &str) -> usize {
 }
 
 /// P6.4: a re-encrypt listed the bucket three times (the count, the
-/// objects, the reference prefixes). It lists it once.
+/// objects, the reference prefixes) one after the other. The walk lists it
+/// once; without a trusted total, a count listing runs NEXT TO the walk
+/// (maint M1: the bar stayed indeterminate to the end), and stops with it,
+/// so it may not finish on a small bucket.
 #[tokio::test]
 async fn reencrypt_lists_the_bucket_once() {
     let (engine, fake) = counted_engine().await;
@@ -566,7 +569,11 @@ async fn reencrypt_lists_the_bucket_once() {
     let row = run_kind(engine, &fake, "reencrypt").await;
     assert_eq!(row.status, "completed", "{row:?}");
     assert_eq!(row.objects_total, Some(8), "{row:?}");
-    assert_eq!(bucket_lists(&fake, "b"), 1, "{:#?}", fake.requests());
+    assert!(
+        (1..=2).contains(&bucket_lists(&fake, "b")),
+        "{:#?}",
+        fake.requests()
+    );
 }
 
 /// P6.4: the same for a backfill.
@@ -577,7 +584,11 @@ async fn backfill_lists_the_bucket_once() {
     let row = run_kind(engine, &fake, super::super::backfill::KIND).await;
     assert_eq!(row.status, "completed", "{row:?}");
     assert_eq!(row.objects_total, Some(5), "{row:?}");
-    assert_eq!(bucket_lists(&fake, "b"), 1, "{:#?}", fake.requests());
+    assert!(
+        (1..=2).contains(&bucket_lists(&fake, "b")),
+        "{:#?}",
+        fake.requests()
+    );
 }
 
 /// [`AppState`] for `engine` with the usage counter `usage`.
@@ -655,8 +666,13 @@ async fn a_resumed_walk_lists_the_references() {
     let row = db.lock().await.maintenance_job_by_id(id).unwrap().unwrap();
     assert_eq!(row.status, "completed", "{row:?}");
     assert_eq!(row.objects_total, Some(5), "{row:?}");
-    // The walk from the cursor, then the reference listing.
-    assert_eq!(bucket_lists(&fake, "b"), 2, "{:#?}", fake.requests());
+    // The walk from the cursor, then the reference listing (and the count
+    // listing next to the walk, which may not finish).
+    assert!(
+        (2..=3).contains(&bucket_lists(&fake, "b")),
+        "{:#?}",
+        fake.requests()
+    );
 }
 
 /// P6.6: the idle worker waits for a notify, for the next due row, or at
@@ -727,4 +743,20 @@ async fn the_worker_drains_at_start_and_wakes_when_a_row_comes_due() {
     let row = settled(&e.db, id, 4).await;
     worker.abort();
     assert_eq!(row.status, "completed", "not run when due: {row:?}");
+}
+
+/// Maint M1 / overview M1: without a scanned total the bar stayed
+/// indeterminate until the walk ended. The count next to the walk gives it.
+#[tokio::test]
+async fn the_background_count_gives_the_total() {
+    let (engine, _fake) = s3_engine().await;
+    store_marked(&engine, 5).await;
+    let count = BackgroundCount::spawn(Arc::new(engine), "b".into());
+    for _ in 0..200 {
+        if count.get().is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(count.get(), Some(5));
 }

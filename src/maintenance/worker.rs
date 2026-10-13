@@ -47,7 +47,8 @@ use crate::storage::encrypting::{ENCRYPTION_KEY_ID_KEY, ENCRYPTION_MARKER_KEY};
 use crate::transfer::{copy_object_known, ObjectTransferRequest};
 
 use super::paged::{
-    list_job_keys, paged_phase, JobCtx, KeyPage, ListError, PageStep, PhaseSpec, PAGE_CONCURRENCY,
+    list_job_keys, paged_phase, BackgroundCount, JobCtx, KeyPage, ListError, PageStep, PhaseSpec,
+    CANCEL_CHECK_EVERY, PAGE_CONCURRENCY,
 };
 use super::store::{current_unix_seconds, MaintenanceJob};
 use super::{needs_rewrite, resolve_desired, strip_encryption_markers, DesiredEncryption};
@@ -746,6 +747,11 @@ pub(crate) async fn run_count_then_walk<V: ObjectVisitor>(
     // Resume only when the job was persisted IN this phase (a fresh
     // transition from counting starts at page 0).
     let resume = resumable_in(job, "objects");
+    // No trusted total: count the bucket next to the walk.
+    let count = c
+        .total
+        .is_none()
+        .then(|| BackgroundCount::spawn(state.engine.load().clone(), job.bucket.clone()));
     let mut step = ObjectsStep {
         db,
         state,
@@ -756,13 +762,16 @@ pub(crate) async fn run_count_then_walk<V: ObjectVisitor>(
         // A resumed walk misses the pages before its cursor.
         references: resume.is_none().then(Default::default),
         c,
+        count,
     };
     paged_phase(
         JobCtx { db, holder, job },
         PhaseSpec {
             phase: "objects",
             resume,
-            cancel_every: None,
+            // Progress and a cancel every few objects, not per 1000: a
+            // page of large objects can take minutes.
+            cancel_every: Some(CANCEL_CHECK_EVERY),
             budget_exhausted: &budget,
             concurrency: PAGE_CONCURRENCY,
         },
@@ -811,6 +820,19 @@ struct ObjectsStep<'a, V> {
     /// once the walk cannot vouch for all of them ([`Walked::references`]).
     references: Option<std::collections::BTreeSet<String>>,
     c: Counters,
+    /// The bucket's object count, made next to the walk (`None`: the total
+    /// was known at the start).
+    count: Option<BackgroundCount>,
+}
+
+impl<V: ObjectVisitor> ObjectsStep<'_, V> {
+    /// Save the counters with `token`, the total from the count once known.
+    async fn save_at(&mut self, token: Option<&str>) {
+        if self.c.total.is_none() {
+            self.c.total = self.count.as_ref().and_then(BackgroundCount::get);
+        }
+        persist(self.db, self.job, "objects", &self.c, token).await;
+    }
 }
 
 impl<V: ObjectVisitor> PageStep for ObjectsStep<'_, V> {
@@ -847,7 +869,14 @@ impl<V: ObjectVisitor> PageStep for ObjectsStep<'_, V> {
     // never a second rewrite.
 
     async fn save(&mut self, token: Option<&str>) -> Result<(), PhaseStop> {
-        persist(self.db, self.job, "objects", &self.c, token).await;
+        self.save_at(token).await;
+        Ok(())
+    }
+
+    /// Mid-page: the counters so far, with the cursor of the page in
+    /// progress (a resume redoes the page; done objects then skip).
+    async fn mid_page(&mut self, page_token: Option<&str>) -> Result<(), PhaseStop> {
+        self.save_at(page_token).await;
         Ok(())
     }
 

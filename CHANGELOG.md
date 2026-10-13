@@ -251,6 +251,51 @@ the message says that the event path made it. `GET …/failures` of a
 replication rule now also returns `total`, the number of failures that the
 ring keeps, and each failure has `trigger` (`run` or `event`).
 
+### Fixed — Maintenance jobs show their progress, and refuse a bad start at once
+
+A migrate row had no percent for the whole job, and a re-encrypt or backfill
+row had none until the job reached the end of the bucket, unless a usage scan
+had counted the bucket before. These jobs now count the objects with a second
+listing that runs next to their work, so the bar becomes determinate when the
+count ends. A migrate shows its copy as 0 to 49 percent and its verify phase
+as 50 to 98 percent. A re-encrypt or backfill job now saves its progress, and
+checks for a cancel, every 20 objects instead of once per 1,000-object page,
+so a page of large objects no longer hides its progress for minutes. A
+completed one-off row no longer reports the phase it ended in, and the run
+entry of a one-off job counts its failed objects as scanned.
+
+A migrate to a non-empty destination now fails at the start request with
+`409 Conflict`, which the dialog shows, instead of a job that fails a moment
+later. A migrate to a backend that the health check marks as unavailable is
+refused the same way. A migrate to a backend with wrong credentials said
+"Bucket not found", because the proxy read every `403` on a bucket request as
+a hidden missing bucket. A refused `CreateBucket`, and a `403` whose error
+code names the credentials, now read as access denied.
+
+The `503 SlowDown` of a gated bucket now names the job that holds it (a
+re-encryption, a migration, or a metadata backfill); before, it always said
+"re-encryption or migration". `GET /_/api/admin/jobs/bucket/:bucket` now has
+a `writes_blocked` field that follows the write gate, which a cancelled migrate
+releases before its row settles. `GET /_/api/admin/jobs` now lists the 200
+newest one-off jobs instead of 50, and its `older_oneoffs` field counts the
+ones that it leaves out. The failures of a one-off job now carry a `total`.
+
+### Fixed — The migrate, re-encrypt and backfill dialogs say what a job will do
+
+The migrate dialog now shows the health and the encryption mode of every
+target backend. It does not offer a backend that is unavailable, and it asks
+for a confirmation before it moves a bucket from an encrypting backend to a
+plaintext one, because the objects are then stored unencrypted. The
+re-encrypt dialog of **Jobs → New job** said "Encrypt existing objects" also
+after a key rotation, and it offered every bucket. It now lists only the
+buckets on a backend with something to rewrite, with the backend and its
+encryption, and a search box. The backfill dialog has a search box and the
+backend of each bucket, and after a partial start it keeps only the buckets
+that did not start selected. The Buckets page labelled every bucket without
+an explicit route with the default backend, also when the bucket lives on
+another backend. The legacy-key usage check now asks for up to 50,000
+objects.
+
 ### Fixed — A draft job can be removed on its own
 
 A rule that you add with "New job" stays a draft until you apply it. A draft

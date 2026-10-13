@@ -42,6 +42,7 @@
 
 pub mod backfill;
 pub mod gate;
+pub mod live;
 pub mod migrate;
 mod paged;
 pub mod store;
@@ -181,12 +182,49 @@ pub fn settle_status(done: i64, skipped: i64, failed: i64) -> (&'static str, Opt
 pub fn display_percent(job: &store::MaintenanceJob) -> Option<u8> {
     match job.status.as_str() {
         "completed" | "completed_with_errors" => Some(100),
+        _ if job.kind == "migrate" => migrate_percent(
+            &job.phase,
+            job.objects_total,
+            job.objects_done + job.objects_skipped,
+            live::verified(job),
+        ),
         _ => progress_percent(
             &job.phase,
             job.objects_total,
             job.objects_done,
             job.objects_skipped,
         ),
+    }
+}
+
+/// Percent of a migrate: the copy is the first half (0-49), the verify the
+/// second (50-98), the flip and cleanup 99. `total` is the source's object
+/// count (counted next to the copy, exact after it), `copied` the objects
+/// copied or skipped, `verified` the objects that this run of the verify
+/// phase checked (`None`: not running here). `None` while the total is
+/// unknown (stage, and the copy until the count ends).
+pub fn migrate_percent(
+    phase: &str,
+    total: Option<i64>,
+    copied: i64,
+    verified: Option<i64>,
+) -> Option<u8> {
+    let share = |n: i64, t: i64, width: i64| (n.clamp(0, t) * width / t) as u8;
+    match phase {
+        "copy" => {
+            let t = total?;
+            Some(if t <= 0 { 49 } else { share(copied, t, 49) })
+        }
+        "verify" => {
+            let t = total?;
+            Some(if t <= 0 {
+                98
+            } else {
+                50 + share(verified.unwrap_or(0), t, 48)
+            })
+        }
+        "flip" | "cleanup" => Some(99),
+        _ => None,
     }
 }
 
@@ -201,9 +239,7 @@ pub fn progress_percent(
 ) -> Option<u8> {
     match phase {
         "counting" => None,
-        // Migrate phases: no total is ever counted (D9 — the copy must be
-        // failure-free to flip anyway), so the bar stays indeterminate
-        // until the post-flip endgame.
+        // Migrate phases: see `migrate_percent`.
         "stage" | "copy" | "verify" => None,
         "references" | "flip" | "cleanup" => Some(99),
         _ => {
@@ -346,6 +382,37 @@ mod tests {
             "capped at 99"
         );
         assert_eq!(progress_percent("references", Some(100), 100, 0), Some(99));
+    }
+
+    /// Maint M1: a migrate row stayed indeterminate for the whole job.
+    #[test]
+    fn migrate_percent_is_determinate_once_the_total_is_known() {
+        assert_eq!(migrate_percent("stage", None, 0, None), None);
+        assert_eq!(
+            migrate_percent("copy", None, 500, None),
+            None,
+            "count running"
+        );
+        assert_eq!(migrate_percent("copy", Some(1000), 0, None), Some(0));
+        assert_eq!(migrate_percent("copy", Some(1000), 500, None), Some(24));
+        assert_eq!(migrate_percent("copy", Some(1000), 1000, None), Some(49));
+        assert_eq!(
+            migrate_percent("copy", Some(10), 50, None),
+            Some(49),
+            "capped"
+        );
+        assert_eq!(migrate_percent("verify", Some(1000), 1000, None), Some(50));
+        assert_eq!(
+            migrate_percent("verify", Some(1000), 1000, Some(500)),
+            Some(74)
+        );
+        assert_eq!(
+            migrate_percent("verify", Some(1000), 1000, Some(1000)),
+            Some(98)
+        );
+        assert_eq!(migrate_percent("verify", Some(0), 0, None), Some(98));
+        assert_eq!(migrate_percent("flip", Some(1), 1, None), Some(99));
+        assert_eq!(migrate_percent("cleanup", None, 0, None), Some(99));
     }
 
     #[test]

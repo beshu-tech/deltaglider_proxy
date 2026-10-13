@@ -66,7 +66,8 @@ use crate::transfer::{
 };
 
 use super::paged::{
-    list_job_keys, paged_phase, JobCtx, KeyPage, ListError, PageStep, PhaseSpec, PAGE_CONCURRENCY,
+    list_job_keys, paged_phase, BackgroundCount, JobCtx, KeyPage, ListError, PageStep, PhaseSpec,
+    CANCEL_CHECK_EVERY, PAGE_CONCURRENCY,
 };
 use super::store::MaintenanceJob;
 use super::worker::{
@@ -76,9 +77,6 @@ use super::worker::{
 
 pub const TRANSIENT_PREFIX: &str = "__dgmigrate_";
 const PAGE_SIZE: u32 = 1000;
-/// Pre-flip loops check for a cancel (and the copy persists its counters)
-/// every this many objects, not only once per 1000-object page.
-const CANCEL_CHECK_EVERY: usize = 20;
 
 /// What the migrate does with objects that already sit in the destination
 /// bucket.
@@ -137,8 +135,8 @@ pub fn destination_check(
         "destination bucket '{dest_bucket}' on backend '{target_backend}' already holds \
          {}{existing} object(s). A migrate copies on top of them, so objects deleted at the \
          source since that copy was made come back. Empty the destination first, or start \
-         the migrate with \"target\": \"mirror\" to make the destination an exact copy of \
-         the source (objects absent at the source are deleted).",
+         the move again with \"Make the destination an exact mirror\" (API: \"target\": \
+         \"mirror\"): objects absent at the source are then deleted from the destination.",
         if more { "at least " } else { "" }
     ))
 }
@@ -622,6 +620,62 @@ async fn count_objects(engine: &DynEngine, bucket: &str) -> Result<(u64, bool), 
     Ok((count, true))
 }
 
+/// Objects (references excluded) that `real_bucket` holds on backend
+/// `backend`, read straight from the backend (the job's staging route does
+/// not exist yet), up to `limit`. `(count, more)`; a missing bucket is
+/// `(0, false)`. The start request runs it so that a non-empty destination
+/// is refused at once, with a 4xx the migrate dialog shows; the stage phase
+/// checks again through the route.
+pub(crate) async fn destination_count_on_backend(
+    cfg: &crate::config::Config,
+    backend: &str,
+    real_bucket: &str,
+    limit: usize,
+) -> Result<(u64, bool), String> {
+    let def = cfg
+        .backend_by_name(backend)
+        .ok_or_else(|| format!("unknown backend '{backend}'"))?;
+    let enc = cfg
+        .backend_encryption_by_name(backend)
+        .cloned()
+        .unwrap_or_default();
+    use crate::storage::StorageBackend;
+    let storage = crate::deltaglider::build_raw_backend(backend, def, &enc)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !storage
+        .head_bucket(real_bucket)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        return Ok((0, false));
+    }
+    let listing = storage
+        .bulk_list_objects_with_baselines(real_bucket, "", None, Some(limit))
+        .await
+        .map_err(|e| e.to_string())?;
+    let count = listing
+        .objects
+        .iter()
+        .filter(|(k, _)| !k.ends_with('/'))
+        .count() as u64;
+    Ok((count, listing.next_start_after.is_some()))
+}
+
+/// Pure: refuse a migrate to a backend that the health loop gates (its
+/// credentials are refused, or it does not answer): every copy would fail.
+pub fn target_health_refusal(
+    target_backend: &str,
+    verdict: Option<&crate::coordination::health::HealthVerdict>,
+) -> Option<String> {
+    let v = verdict.filter(|v| v.is_gating())?;
+    Some(format!(
+        "backend '{target_backend}' is unavailable: {}. Fix the backend (Storage → Backends → \
+         Test connection) before you move a bucket to it",
+        v.cause()
+    ))
+}
+
 /// Pre-flip unwind: delete the destination objects THIS job copied (their
 /// `dg-migration` value carries the job id), and nothing else — objects
 /// this job did not write stay. Each page goes to the engine's batch as
@@ -764,9 +818,10 @@ pub(crate) async fn execute_migrate_phases(
         if unwinds && transient && phase != "stage" {
             if let Err(PhaseStop::FailedTransient(e)) = result {
                 return Err(PhaseStop::FailedTransient(format!(
-                    "{e} — the copies made so far stay on backend '{}'. Start the migrate \
-                     again with \"target\": \"mirror\" to reuse them (it copies only what \
-                     differs), or empty the destination bucket",
+                    "{e} — the copies made so far stay on backend '{}'. Start the move \
+                     again with \"Make the destination an exact mirror\" (API: \"target\": \
+                     \"mirror\") to reuse them (it copies only what differs), or empty the \
+                     destination bucket",
                     params.target_backend
                 )));
             }
@@ -792,11 +847,9 @@ async fn run_phases(
         params,
         provenance: provenance_value(params, job.id),
     };
-    // Migrate rows never carry a total.
-    let mut c = Counters {
-        total: None,
-        ..Counters::of(job)
-    };
+    // The total is the source's object count: counted next to the copy,
+    // exact once the copy ended (every object copied or skipped).
+    let mut c = Counters::of(job);
     let mut phase = job.phase.as_str();
     if phase == "stage" {
         m.stage(&c).await?;
@@ -907,9 +960,13 @@ impl MigrateRun<'_> {
 
     /// ── Phase: copy (resumable; ANY copy failure aborts pre-flip) ──
     async fn copy(&self, c: &mut Counters) -> Result<(), PhaseStop> {
+        let count = c.total.is_none().then(|| {
+            BackgroundCount::spawn(self.state.engine.load().clone(), self.job.bucket.clone())
+        });
         let mut step = CopyStep {
             m: self,
             c,
+            count,
             recopy: RecopyScope::on_resume(self.job.phase == "copy"),
             engine: None,
             forms: Default::default(),
@@ -933,6 +990,8 @@ impl MigrateRun<'_> {
             &mut step,
         )
         .await?;
+        // A failed copy stops the phase, so every object is copied or skipped.
+        c.total = Some(c.done + c.skipped);
         self.checkpoint("verify", c, None).await
     }
 
@@ -943,8 +1002,9 @@ impl MigrateRun<'_> {
             c,
             engine: None,
             forms: Default::default(),
+            verified: 0,
         };
-        paged_phase(
+        let verified = paged_phase(
             self.ctx(),
             PhaseSpec {
                 phase: "verify",
@@ -957,7 +1017,9 @@ impl MigrateRun<'_> {
             },
             &mut step,
         )
-        .await?;
+        .await;
+        super::live::clear(self.job);
+        verified?;
         if self.params.target == MigrateTarget::Mirror {
             self.prune_destination_extras().await?;
         }
@@ -1206,12 +1268,23 @@ impl MigrateRun<'_> {
 struct CopyStep<'a, 'r> {
     m: &'a MigrateRun<'r>,
     c: &'a mut Counters,
+    /// The source's object count, made next to the copy.
+    count: Option<BackgroundCount>,
     recopy: RecopyScope,
     engine: Option<Arc<DynEngine>>,
     /// The stored forms that the page's source listing proved.
     forms: crate::deltaglider::ListedPageForms,
     /// The cursor of the page in progress (where a failed page resumes).
     page_token: Option<String>,
+}
+
+impl CopyStep<'_, '_> {
+    /// The source count, into the counters once it ended.
+    fn take_count(&mut self) {
+        if self.c.total.is_none() {
+            self.c.total = self.count.as_ref().and_then(BackgroundCount::get);
+        }
+    }
 }
 
 /// What the copy of one object ended in.
@@ -1255,12 +1328,14 @@ impl PageStep for CopyStep<'_, '_> {
     }
 
     async fn save(&mut self, token: Option<&str>) -> Result<(), PhaseStop> {
+        self.take_count();
         self.m.checkpoint("copy", self.c, token).await
     }
 
     /// Resume token = this page's: the verdict skip makes the redo of its
     /// first part idempotent.
     async fn mid_page(&mut self, page_token: Option<&str>) -> Result<(), PhaseStop> {
+        self.take_count();
         self.m.checkpoint("copy", self.c, page_token).await
     }
 
@@ -1374,6 +1449,8 @@ struct VerifyStep<'a, 'r> {
     engine: Option<Arc<DynEngine>>,
     /// The stored forms that the page's source listing proved.
     forms: crate::deltaglider::ListedPageForms,
+    /// Objects checked so far in this run of the phase.
+    verified: i64,
 }
 
 impl PageStep for VerifyStep<'_, '_> {
@@ -1425,7 +1502,10 @@ impl PageStep for VerifyStep<'_, '_> {
     }
 
     async fn settle(&mut self, _key: &str, done: Result<(), PhaseStop>) -> Result<(), PhaseStop> {
-        done
+        done?;
+        self.verified += 1;
+        super::live::set_verified(self.m.job, self.verified);
+        Ok(())
     }
 }
 
@@ -1675,11 +1755,29 @@ mod tests {
         assert!(e.contains("already holds 3 object(s)"), "{e}");
         assert!(e.contains("'b' on backend 'hz'"), "{e}");
         assert!(
-            e.contains("\"target\": \"mirror\""),
-            "names the option: {e}"
+            e.contains("\"Make the destination an exact mirror\""),
+            "names the option in the words of the migrate dialog: {e}"
         );
         let e = destination_check(Empty, 10_000, true, "b", "hz").unwrap_err();
         assert!(e.contains("at least 10000"), "{e}");
+    }
+
+    /// Maint B1: the migrate dialog offered a backend in failure cooldown.
+    #[test]
+    fn a_gated_target_backend_is_refused() {
+        use crate::coordination::health::HealthVerdict;
+        assert!(target_health_refusal("hz", None).is_none(), "never probed");
+        assert!(target_health_refusal("hz", Some(&HealthVerdict::Healthy)).is_none());
+        let erroring = HealthVerdict::Erroring {
+            detail: "500".into(),
+        };
+        assert!(target_health_refusal("hz", Some(&erroring)).is_none());
+        let auth = HealthVerdict::AuthRejected {
+            detail: "SignatureDoesNotMatch".into(),
+        };
+        let e = target_health_refusal("hz", Some(&auth)).unwrap();
+        assert!(e.contains("backend 'hz' is unavailable"), "{e}");
+        assert!(e.contains("credentials rejected"), "{e}");
     }
 
     #[test]

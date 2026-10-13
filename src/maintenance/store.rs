@@ -112,6 +112,9 @@ const JOB_COLUMNS: &str = "id, kind, bucket, status, phase, objects_total, objec
 pub struct GateArm {
     pub job_id: i64,
     pub key: String,
+    /// The job kind (`reencrypt`, `migrate`, `backfill-metadata`): the 503
+    /// that the gate answers names it.
+    pub kind: String,
     /// The source bucket of a migrate: the one key that a pre-flip unwind
     /// releases before its row settles (see `MaintenanceGate::release_for_unwind`).
     pub migrate_source: bool,
@@ -169,6 +172,13 @@ impl JobsDb {
             .query_map(params![limit as i64], row_to_job)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// How many job rows the table holds.
+    pub fn maintenance_count_jobs(&self) -> Result<i64, ConfigDbError> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM maintenance_jobs", [], |r| r.get(0))?)
     }
 
     /// The bucket's active job (queued/running/cancelling), if any.
@@ -237,6 +247,7 @@ impl JobsDb {
                     arms.push(GateArm {
                         job_id,
                         key: t.transient_key,
+                        kind: kind.clone(),
                         migrate_source: false,
                     });
                 }
@@ -244,6 +255,7 @@ impl JobsDb {
             arms.push(GateArm {
                 job_id,
                 key: bucket,
+                kind,
                 migrate_source: migrate,
             });
         }

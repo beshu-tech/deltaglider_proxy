@@ -112,7 +112,7 @@ pub(super) fn native_encryption_for(
 /// here; proxy-AES encryption is layered on top by
 /// `wrap_backend_with_encryption`. Filesystem backends ignore native
 /// modes (rejected at `Config::check` time).
-async fn build_raw_backend(
+pub(crate) async fn build_raw_backend(
     name: &str,
     cfg: &BackendConfig,
     enc: &crate::config::BackendEncryptionConfig,

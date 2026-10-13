@@ -188,7 +188,7 @@ impl S3Backend {
             if s == 416 {
                 return StorageError::InvalidRange(format!("{op} on bucket '{bucket}': {e}"));
             }
-            if s == 403 && op.is_bucket_level() {
+            if s == 403 && bucket_level_403_means_absent(&op, code) {
                 return StorageError::BucketNotFound(bucket.to_string());
             }
             // E-P1-1: 503 SlowDown is the AWS-spec transient throttle
@@ -258,6 +258,30 @@ impl S3Backend {
         }
         Self::classify_s3_error(bucket, e, S3Op::GetObject)
     }
+}
+
+/// Pure: does a 403 on `op` mean "the bucket is not there"? Providers that
+/// hide bucket existence answer a bucket-level probe of a missing bucket with
+/// 403, so a 403 on a LIST or a HEAD bucket reads as absent. Two cases are
+/// never absence: a CreateBucket 403 (the bucket being created cannot be the
+/// missing thing; a migrate to a backend with a wrong secret said "Bucket not
+/// found") and an error code that names the credentials.
+pub(super) fn bucket_level_403_means_absent(op: &S3Op, code: &str) -> bool {
+    op.is_bucket_level() && !matches!(op, S3Op::CreateBucket) && !code_is_credential_refusal(code)
+}
+
+/// Pure: an S3 error code that says the request's credentials are wrong.
+fn code_is_credential_refusal(code: &str) -> bool {
+    matches!(
+        code,
+        "SignatureDoesNotMatch"
+            | "InvalidAccessKeyId"
+            | "InvalidToken"
+            | "ExpiredToken"
+            | "TokenRefreshRequired"
+            | "AccountProblem"
+            | "InvalidSecurity"
+    )
 }
 
 /// Pure: an S3 error code that means "storage cap or quota used up".

@@ -17,7 +17,8 @@ pub use engine::store::{
     KnownSha256, MultipartObjectFacts, PassthroughMultipartHandle, BLOCKING_HASH_THRESHOLD,
 };
 pub(crate) use engine::{
-    derive_key_id, effective_legacy_key_id, interleave_and_paginate, CounterPrior,
+    build_raw_backend, derive_key_id, effective_legacy_key_id, interleave_and_paginate,
+    CounterPrior,
 };
 #[cfg(test)]
 pub(crate) use engine::{s3_engine, store_deltas};

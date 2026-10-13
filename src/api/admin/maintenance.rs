@@ -47,6 +47,10 @@ pub struct MaintenanceJobView {
     pub bytes_done: i64,
     /// 0-99 while running (`None` while counting); 100 on `completed`.
     pub percent: Option<u8>,
+    /// Whether the write gate refuses writes to the bucket now. Set only by
+    /// the bucket status, which reads the gate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub writes_blocked: Option<bool>,
     // NO `last_error` here: this view is readable by non-admin browser
     // sessions, and worker errors can embed object keys + raw backend
     // error strings. The busy banner needs status/phase/counts only;
@@ -72,6 +76,7 @@ impl From<MaintenanceJob> for MaintenanceJobView {
             objects_failed: j.objects_failed,
             bytes_done: j.bytes_done,
             percent,
+            writes_blocked: None,
             triggered_by: j.triggered_by,
             created_at: j.created_at,
             started_at: j.started_at,
@@ -397,6 +402,53 @@ pub async fn start_migrate(
         .map_err(AdminError::conflict)?;
     }
 
+    // A backend that the health loop gates would fail every copy: refuse
+    // now, in the dialog, instead of a job that fails a second later.
+    // Then the destination check of the stage phase, at once: a non-empty
+    // destination is a 409 that the dialog shows. The stage phase checks
+    // again (the destination can change in between). A count that fails
+    // here (an unreadable listing) leaves the decision to the stage phase.
+    {
+        let cfg = state.config.read().await.clone();
+        let verdict = cfg.backend_by_name(&params.target_backend).and_then(|def| {
+            state
+                .s3_state
+                .backend_health
+                .get(&params.target_backend, def)
+        });
+        if let Some(reason) = crate::maintenance::migrate::target_health_refusal(
+            &params.target_backend,
+            verdict.as_ref(),
+        ) {
+            return Err(AdminError::conflict(reason));
+        }
+        if params.target == MigrateTarget::Empty {
+            let real = crate::maintenance::migrate::real_bucket_name(&cfg.buckets, &bucket_key)
+                .to_string();
+            match crate::maintenance::migrate::destination_count_on_backend(
+                &cfg,
+                &params.target_backend,
+                &real,
+                1000,
+            )
+            .await
+            {
+                Ok((existing, more)) => crate::maintenance::migrate::destination_check(
+                    params.target,
+                    existing,
+                    more,
+                    &real,
+                    &params.target_backend,
+                )
+                .map_err(AdminError::conflict)?,
+                Err(e) => tracing::warn!(
+                    "maintenance: migrate of '{bucket}': destination pre-check failed ({e}); \
+                     the stage phase checks it"
+                ),
+            }
+        }
+    }
+
     let params_json =
         serde_json::to_string(&params).map_err(|e| AdminError::internal(e.to_string()))?;
     let created = {
@@ -524,7 +576,17 @@ pub async fn bucket_status(
         db.maintenance_active_job_for_bucket(&bucket.to_ascii_lowercase())
     })
     .await?;
+    // `active` is the job row (until it settles); `writes_blocked` is the
+    // write gate.
+    // They differ: a cancelled migrate releases the source while it still
+    // removes its staged copies, and a migrate in `cleanup` no longer gates
+    // the bucket. "Uploads are unavailable" follows `writes_blocked`.
+    let busy = state.s3_state.maintenance_gate.is_busy(&bucket);
     Ok(Json(serde_json::json!({
-        "active": job.map(MaintenanceJobView::from)
+        "active": job.map(|j| MaintenanceJobView {
+            writes_blocked: Some(busy),
+            ..MaintenanceJobView::from(j)
+        }),
+        "writes_blocked": busy,
     })))
 }

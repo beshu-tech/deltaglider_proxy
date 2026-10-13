@@ -101,6 +101,169 @@ async fn head_last_modified(
         .expect("HEAD carries LastModified")
 }
 
+/// A foreign multipart upload straight into the backend: no dg metadata,
+/// and an ETag of the "…-2" multipart shape. Returns the two parts.
+async fn seed_foreign_multipart(
+    raw: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+) -> (Vec<u8>, Vec<u8>) {
+    let part1 = vec![7u8; 5 * 1024 * 1024];
+    let part2 = vec![9u8; 1024];
+    let upload_id = raw
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .expect("create mpu")
+        .upload_id
+        .expect("upload id");
+    let mut parts = Vec::new();
+    for (n, body) in [(1, part1.clone()), (2, part2.clone())] {
+        let etag = raw
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(n)
+            .body(aws_sdk_s3::primitives::ByteStream::from(body))
+            .send()
+            .await
+            .expect("upload part")
+            .e_tag
+            .expect("part etag");
+        parts.push(
+            aws_sdk_s3::types::CompletedPart::builder()
+                .part_number(n)
+                .e_tag(etag)
+                .build(),
+        );
+    }
+    raw.complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(
+            aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                .set_parts(Some(parts))
+                .build(),
+        )
+        .send()
+        .await
+        .expect("complete mpu");
+    (part1, part2)
+}
+
+/// Overview B2: after a backfill on S3 a LIST and a HEAD of the same object
+/// must agree. The self-copy gives the stored object a new single-part
+/// ETag; the HEAD serves the preserved multipart ETag (`dg-multipart-etag`),
+/// the LIST serves the stored one. A LIST on a plaintext S3 backend reads
+/// no listing facts for passthrough objects (one more LIST request per page
+/// for every listing), so writing facts at the rewrite does not reach it.
+#[tokio::test]
+#[ignore = "known gap: LIST reports the self-copy ETag after an S3 backfill of a multipart object; a plaintext S3 LIST reads no listing facts for passthrough objects (see docs/product/reference/jobs.md)"]
+async fn backfill_s3_list_reports_the_etag_that_head_reports() {
+    skip_unless_minio!();
+    let bucket = "backfill-s3-list-etag";
+    let server = TestServer::s3_with_endpoint(&common::minio_endpoint_url(), bucket).await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let client = server.s3_client().await;
+    let raw = common::minio_client().await;
+    let key = "foreign-mpu.bin";
+    seed_foreign_multipart(&raw, bucket, key).await;
+
+    start_backfill(&admin, &server.endpoint(), server.bucket(), true).await;
+    wait_job_done(&admin, &server.endpoint(), server.bucket()).await;
+
+    // LIST before any HEAD: a HEAD teaches this process the facts (the
+    // in-process size cache), and a LIST on another node or after a restart
+    // has only the durable listing facts. The facts object is written in
+    // the background: give it a moment.
+    let multipart = |e: &str| e.contains('-');
+    let mut listed = String::new();
+    for _ in 0..50 {
+        listed = listed_etag(&client, server.bucket(), key).await;
+        if multipart(&listed) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let head = client
+        .head_object()
+        .bucket(server.bucket())
+        .key(key)
+        .send()
+        .await
+        .expect("HEAD");
+    let head_etag = head.e_tag.expect("etag").trim_matches('"').to_string();
+    assert!(
+        multipart(&head_etag),
+        "HEAD keeps the multipart ETag: {head_etag}"
+    );
+    assert_eq!(listed, head_etag, "LIST and HEAD disagree on the ETag");
+}
+
+/// Overview B2, the time half: with the default (keep the served time) a
+/// HEAD serves the pre-job `dg-created-at`, but an S3 self-copy moves the
+/// stored Last-Modified, and a LIST reports the stored time. The listing
+/// facts carry the logical size and ETag only, and the listing never
+/// changes a listed time, so a fix needs a new facts format with the time.
+#[tokio::test]
+#[ignore = "known gap: LIST reports the self-copy time after an S3 backfill; the listing facts carry no time (see docs/product/reference/jobs.md)"]
+async fn backfill_s3_list_reports_the_last_modified_that_head_reports() {
+    skip_unless_minio!();
+    let bucket = "backfill-s3-list-time";
+    let server = TestServer::s3_with_endpoint(&common::minio_endpoint_url(), bucket).await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let client = server.s3_client().await;
+    let raw = common::minio_client().await;
+    let key = "foreign-mpu.bin";
+    seed_foreign_multipart(&raw, bucket, key).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    start_backfill(&admin, &server.endpoint(), server.bucket(), false).await;
+    wait_job_done(&admin, &server.endpoint(), server.bucket()).await;
+
+    let head_lm = head_last_modified(&client, server.bucket(), key)
+        .await
+        .secs();
+    let list = client
+        .list_objects_v2()
+        .bucket(server.bucket())
+        .send()
+        .await
+        .expect("LIST");
+    let listed_lm = list
+        .contents()
+        .iter()
+        .find(|o| o.key() == Some(key))
+        .and_then(|o| o.last_modified())
+        .expect("listed")
+        .secs();
+    assert_eq!(
+        listed_lm, head_lm,
+        "LIST and HEAD disagree on Last-Modified"
+    );
+}
+
+/// The ETag that a LIST through the proxy reports for `key`.
+async fn listed_etag(client: &aws_sdk_s3::Client, bucket: &str, key: &str) -> String {
+    let list = client
+        .list_objects_v2()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("LIST");
+    list.contents()
+        .iter()
+        .find(|o| o.key() == Some(key))
+        .and_then(|o| o.e_tag())
+        .expect("listed with an ETag")
+        .trim_matches('"')
+        .to_string()
+}
+
 #[tokio::test]
 async fn backfill_stamps_canonical_metadata_and_preserves_served_time() {
     let server = TestServer::builder()
@@ -237,53 +400,8 @@ async fn backfill_s3_self_copy_preserves_etag_and_served_time() {
     let client = server.s3_client().await;
     let raw = common::minio_client().await;
 
-    // Foreign multipart upload straight into the backend: no dg metadata,
-    // and an ETag of the "…-2" multipart shape.
     let key = "foreign-mpu.bin";
-    let part1 = vec![7u8; 5 * 1024 * 1024];
-    let part2 = vec![9u8; 1024];
-    let upload_id = raw
-        .create_multipart_upload()
-        .bucket(bucket)
-        .key(key)
-        .send()
-        .await
-        .expect("create mpu")
-        .upload_id
-        .expect("upload id");
-    let mut parts = Vec::new();
-    for (n, body) in [(1, part1.clone()), (2, part2.clone())] {
-        let etag = raw
-            .upload_part()
-            .bucket(bucket)
-            .key(key)
-            .upload_id(&upload_id)
-            .part_number(n)
-            .body(aws_sdk_s3::primitives::ByteStream::from(body))
-            .send()
-            .await
-            .expect("upload part")
-            .e_tag
-            .expect("part etag");
-        parts.push(
-            aws_sdk_s3::types::CompletedPart::builder()
-                .part_number(n)
-                .e_tag(etag)
-                .build(),
-        );
-    }
-    raw.complete_multipart_upload()
-        .bucket(bucket)
-        .key(key)
-        .upload_id(&upload_id)
-        .multipart_upload(
-            aws_sdk_s3::types::CompletedMultipartUpload::builder()
-                .set_parts(Some(parts))
-                .build(),
-        )
-        .send()
-        .await
-        .expect("complete mpu");
+    let (part1, part2) = seed_foreign_multipart(&raw, bucket, key).await;
 
     let before = client
         .head_object()
