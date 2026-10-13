@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### Fixed — Deltas without an MD5 get listing facts, so listings stop sending HEAD requests for them
+
+Deltas that an older toolchain wrote carry no `dg-md5` field. The proxy could
+not store durable listing facts for such a delta, so every listing missed
+them and every lifecycle scan sent a HEAD request for each one, again and
+again. On a production bucket this came to more than 160,000 HEAD requests in
+two hours. Such a delta now gets its facts after one HEAD request. A listing
+then shows the same ETag and size as a HEAD request of the object: the empty
+ETag (`""`) and the original size. Before, a listing showed the ETag and size
+of the stored delta, which are not the ETag and size of the object.
+
+### Fixed — A lifecycle preview after a restart sends no HEAD request for unchanged objects
+
+A lifecycle scan needs the creation time of each delta and delta-eligible
+object, which only a HEAD request returns. The proxy kept those answers in
+memory only, so the first preview or run after a restart or a configuration
+change sent one HEAD request per object again. The answers are now kept in
+the node-local jobs database, matched on the object's stored ETag, size and
+LastModified, so an object that changed is still read again.
+
+### Fixed — Listing facts converge faster
+
+A write of listing facts waited behind the cleanup of deleted objects, which
+can take minutes on a slow backend. Writes and cleanups now run separately.
+A listing that sends its own HEAD requests no longer starts a second
+background HEAD request for the same objects: a lifecycle preview of 40
+deltas sent 80 HEAD requests and now sends at most 44. On a backend with an
+encryption key, a plain object stored before the key existed no longer counts
+as a facts miss on every listing.
+
 ### Fixed — "Refresh preview" computes a new lifecycle preview
 
 The proxy keeps a finished lifecycle preview for a minute, so that the
