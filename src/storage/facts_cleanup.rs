@@ -5,18 +5,20 @@
 //! of deleted objects.
 //!
 //! A PUT does not write its facts object in its own request path (storage-8):
-//! it queues the write, and the drain task below sends it. Until then a LIST
+//! it queues the write, and the write task below sends it. Until then a LIST
 //! reports the stored size. The entries of an overwritten object are left to
 //! the facts GC (`gc_bucket`), which deletes every entry that does not
 //! describe the live object.
 //!
 //! A delete does not clean up in its own request path either. It queues the stored
-//! key, and one background task per backend drains the queue in batches: it
+//! key, and one cleanup task per backend drains the queue in batches: it
 //! reads each directory's facts range ONCE and deletes the matching entries
 //! with batched `DeleteObjects` requests. A 1000-key `DeleteObjects` from a
 //! client (or a lifecycle, replication or admin bulk delete, which delete key
 //! by key) then costs a few requests, not 1000 LISTs. Cleanup is best effort
 //! by design: an entry that is left behind never matches a later object.
+//! The cleanup task is not the write task, so a long cleanup never delays
+//! a facts write.
 
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
@@ -261,18 +263,22 @@ struct QueueState {
 
 type Rewritten = Arc<Mutex<QueueState>>;
 
-/// One job of the drain task.
-enum Queued {
-    /// `(bucket, stored key, server time of the delete)`.
-    Deleted(String, String, Option<i64>),
-    /// Write the facts object `facts_key` into `bucket`.
-    Write { bucket: String, facts_key: String },
-}
+/// A deleted stored key: `(bucket, stored key, server time of the delete)`.
+type Deleted = (String, String, Option<i64>);
+
+/// A facts write: the facts object `facts_key` in `bucket`.
+type Write = (String, String);
 
 /// Queue of facts writes, and of deleted stored keys whose facts the
 /// background task removes.
+///
+/// Two tasks, one per kind of work. The delete cleanup of a large batch
+/// on a slow backend reads for minutes; when one task did both, every facts
+/// write queued meanwhile waited for it (prod, v2.0.9: a lifecycle run that
+/// deleted thousands of keys, and zero facts written in 30 minutes).
 pub(super) struct FactsCleanupQueue {
     writer: FactsWriter,
+    deleted: mpsc::UnboundedSender<Deleted>,
     /// The GC task never ends on its own: the queue owns it and aborts it
     /// on drop, else every engine rebuild leaked one with the old client.
     gc: Option<tokio::task::JoinHandle<()>>,
@@ -287,15 +293,20 @@ impl Drop for FactsCleanupQueue {
 }
 
 impl FactsCleanupQueue {
-    /// Start the drain task. Needs a tokio runtime (the S3 backend is built
-    /// in one). The task ends when the queue is dropped, after a last flush.
+    /// Start the write and cleanup tasks. Needs a tokio runtime (the S3
+    /// backend is built in one). The cleanup task ends when the queue is
+    /// dropped, the write task when the queue and every writer are, each
+    /// after a last batch.
     pub(super) fn start(client: Client, native: NativeEncryptionConfig) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+        let (deleted, deleted_rx) = mpsc::unbounded_channel();
         let rewritten: Rewritten = Default::default();
-        tokio::spawn(drain(client.clone(), native, rx, rewritten.clone()));
+        tokio::spawn(write_drain(client.clone(), native, rx));
+        tokio::spawn(cleanup_drain(client.clone(), deleted_rx, rewritten.clone()));
         let gc = crate::config::env_bool(GC_ENV, true).then(|| tokio::spawn(gc_loop(client)));
         Self {
             writer: FactsWriter { tx, rewritten },
+            deleted,
             gc,
         }
     }
@@ -314,35 +325,32 @@ impl FactsCleanupQueue {
             st.rewritten.remove(&pair);
             st.pending.insert(pair.clone());
         }
-        if self
-            .writer
-            .tx
-            .send(Queued::Deleted(pair.0, pair.1, deleted_at))
-            .is_err()
-        {
+        if self.deleted.send((pair.0, pair.1, deleted_at)).is_err() {
             debug!("facts cleanup queue closed; {bucket}/{stored_key} keeps its entries");
         }
     }
 
     /// `stored_key` was written again, with the facts object `facts_key`:
     /// write it in the background, and a queued delete cleanup of the key
-    /// keeps its newest entry. The drain sends the writes of a batch before
-    /// its delete cleanup, so that entry exists when the cleanup lists.
+    /// keeps its newest entry.
     pub(super) fn write(&self, bucket: &str, stored_key: &str, facts_key: String) {
         self.writer.write(bucket, stored_key, facts_key)
     }
 }
 
-/// The write side of a [`FactsCleanupQueue`]. The drain ends when the
+/// The write side of a [`FactsCleanupQueue`]. The write task ends when the
 /// queue and every writer are dropped.
 #[derive(Clone)]
 pub(super) struct FactsWriter {
-    tx: mpsc::UnboundedSender<Queued>,
+    tx: mpsc::UnboundedSender<Write>,
     rewritten: Rewritten,
 }
 
 impl FactsWriter {
-    /// See [`FactsCleanupQueue::write`].
+    /// See [`FactsCleanupQueue::write`]. The write does not wait for a
+    /// cleanup: when the cleanup lists the key before the new entry lands,
+    /// it does not see that entry and leaves it; when after, the rewrite
+    /// mark keeps the newest entry.
     pub(super) fn write(&self, bucket: &str, stored_key: &str, facts_key: String) {
         if let Ok(mut st) = self.rewritten.lock() {
             let pair = (bucket.to_string(), stored_key.to_string());
@@ -350,48 +358,42 @@ impl FactsWriter {
                 st.rewritten.insert(pair);
             }
         }
-        let job = Queued::Write {
-            bucket: bucket.to_string(),
-            facts_key,
-        };
-        if self.tx.send(job).is_err() {
+        if self.tx.send((bucket.to_string(), facts_key)).is_err() {
             debug!("facts queue closed; {bucket}/{stored_key} lists its stored size");
         }
     }
 }
 
-async fn drain(
-    client: Client,
-    native: NativeEncryptionConfig,
-    mut rx: mpsc::UnboundedReceiver<Queued>,
-    rewritten: Rewritten,
-) {
-    while let Some(first) = rx.recv().await {
-        let mut batch = vec![first];
-        while batch.len() < MAX_BATCH {
-            match rx.try_recv() {
-                Ok(x) => batch.push(x),
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
-                Err(mpsc::error::TryRecvError::Empty) => {
-                    match tokio::time::timeout(DEBOUNCE, rx.recv()).await {
-                        Ok(Some(x)) => batch.push(x),
-                        _ => break,
-                    }
+/// The next batch of a queue: the first item (waiting for it), then what
+/// arrives within [`DEBOUNCE`] of the previous one, up to [`MAX_BATCH`].
+/// `None` when the queue is closed and empty.
+async fn next_batch<T>(rx: &mut mpsc::UnboundedReceiver<T>) -> Option<Vec<T>> {
+    let mut batch = vec![rx.recv().await?];
+    while batch.len() < MAX_BATCH {
+        match rx.try_recv() {
+            Ok(x) => batch.push(x),
+            Err(mpsc::error::TryRecvError::Disconnected) => break,
+            Err(mpsc::error::TryRecvError::Empty) => {
+                match tokio::time::timeout(DEBOUNCE, rx.recv()).await {
+                    Ok(Some(x)) => batch.push(x),
+                    _ => break,
                 }
             }
         }
-        let (writes, deletes): (Vec<Queued>, Vec<Queued>) = batch
-            .into_iter()
-            .partition(|q| matches!(q, Queued::Write { .. }));
+    }
+    Some(batch)
+}
+
+/// Send the queued facts writes.
+async fn write_drain(
+    client: Client,
+    native: NativeEncryptionConfig,
+    mut rx: mpsc::UnboundedReceiver<Write>,
+) {
+    while let Some(batch) = next_batch(&mut rx).await {
         // Concurrently, one write per key: one task serves every client, so
         // a sequential loop capped the facts rate at one S3 round-trip each.
-        let writes: HashSet<(String, String)> = writes
-            .into_iter()
-            .filter_map(|q| match q {
-                Queued::Write { bucket, facts_key } => Some((bucket, facts_key)),
-                Queued::Deleted(..) => None,
-            })
-            .collect();
+        let writes: HashSet<Write> = batch.into_iter().collect();
         futures::stream::iter(writes)
             .for_each_concurrent(FACTS_WRITE_CONCURRENCY, |(bucket, facts_key)| {
                 let (client, native) = (&client, &native);
@@ -402,19 +404,20 @@ async fn drain(
                 }
             })
             .await;
-        let batch: Vec<(String, String, Option<i64>)> = deletes
-            .into_iter()
-            .filter_map(|q| match q {
-                Queued::Deleted(b, k, at) => Some((b, k, at)),
-                Queued::Write { .. } => None,
-            })
-            .collect();
-        if batch.is_empty() {
-            continue;
-        }
-        // A write after this point is not seen by the flush: its new entry
-        // can be deleted, which only makes a LIST report the stored size
-        // until a HEAD backfills it.
+    }
+}
+
+/// Remove the facts of the queued deleted stored keys.
+async fn cleanup_drain(
+    client: Client,
+    mut rx: mpsc::UnboundedReceiver<Deleted>,
+    rewritten: Rewritten,
+) {
+    while let Some(batch) = next_batch(&mut rx).await {
+        // A rewrite marked after this point is not seen by the flush: if
+        // its new entry lands before the flush lists, it can be deleted,
+        // which only makes a LIST report the stored size until a HEAD
+        // backfills it.
         let rewritten_now: HashSet<(String, String)> = match rewritten.lock() {
             Ok(mut st) => batch
                 .iter()
@@ -680,6 +683,66 @@ mod tests {
             started.elapsed() < Duration::from_millis(1600),
             "{:?} for {N} writes",
             started.elapsed()
+        );
+    }
+
+    /// A client of the fake S3 at `endpoint`, without SDK retries.
+    fn fake_client(endpoint: &str) -> Client {
+        let conf = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "a", "b", None, None, "t",
+            ))
+            .force_path_style(true)
+            .endpoint_url(endpoint)
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .build();
+        Client::from_conf(conf)
+    }
+
+    /// Prod (v2.0.9, a slow backend): a lifecycle run and replication
+    /// deleted thousands of keys, and the one drain task read their facts
+    /// one LIST per directory, for many minutes. Every facts write that was
+    /// queued meanwhile waited for that flush to end: 30 minutes and zero
+    /// facts PUTs. A facts write does not wait for a delete cleanup now.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_slow_delete_cleanup_does_not_hold_up_facts_writes() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        fake.set_delay_ms("LIST", 300);
+        let queue = FactsCleanupQueue::start(fake_client(&endpoint), NativeEncryptionConfig::None);
+        // One key in each of 20 directories: 20 facts LISTs, 6 s.
+        for i in 0..20 {
+            queue.enqueue("b", &format!("d{i:02}/k.html"), None);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !fake
+            .requests()
+            .iter()
+            .any(|r| r.starts_with("GET /b/?list-type"))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the cleanup never listed: {:?}",
+                fake.requests()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let queued = std::time::Instant::now();
+        queue.write("b", "p/x.zip.delta", ".dg/facts/p/x".to_string());
+        let written = || {
+            fake.requests()
+                .iter()
+                .any(|r| r.starts_with("PUT /b/.dg/facts/p/x"))
+        };
+        while !written() && queued.elapsed() < Duration::from_secs(10) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(written(), "the facts write was never sent");
+        assert!(
+            queued.elapsed() < Duration::from_millis(1500),
+            "the facts write waited {:?} for the delete cleanup",
+            queued.elapsed()
         );
     }
 
