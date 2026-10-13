@@ -16,7 +16,7 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use tracing::warn;
 
-use super::list_size_cache::ListedSize;
+use super::list_size_cache::{ListedSize, ResolveListed};
 use crate::types::FileMetadata;
 
 use super::traits::{
@@ -1742,11 +1742,11 @@ impl StorageBackend for RoutingBackend {
         &self,
         bucket: &str,
         objects: &mut [(String, FileMetadata)],
-        passthrough_may_differ: bool,
+        how: ResolveListed,
     ) -> Vec<ListedSize> {
         let (backend, real_bucket) = self.resolve_existing(bucket).await;
         backend
-            .resolve_listed_sizes(&real_bucket, objects, passthrough_may_differ)
+            .resolve_listed_sizes(&real_bucket, objects, how)
             .await
     }
 

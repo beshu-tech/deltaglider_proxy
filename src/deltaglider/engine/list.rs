@@ -330,7 +330,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             Vec::new()
         } else {
             self.storage
-                .resolve_listed_sizes(bucket, &mut page.objects, false)
+                .resolve_listed_sizes(
+                    bucket,
+                    &mut page.objects,
+                    crate::storage::list_size_cache::ResolveListed {
+                        caller_heads_misses: completion != Completion::Sizes,
+                        ..Default::default()
+                    },
+                )
                 .await
         };
         page.facts_missing_keys = stored_size_only_keys(&page.objects, &sizes);

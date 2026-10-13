@@ -148,6 +148,13 @@ pub fn missing_recently(id: &StoredObjectId<'_>) -> bool {
         .is_some_and(|at| at.elapsed() < MISSING_FACTS_TTL)
 }
 
+/// Is this stored object still marked by [`mark_missing_facts`], whatever
+/// the mark's age? `false` once a HEAD learned its facts (and took the
+/// mark): the facts healer then sends no HEAD of its own.
+pub fn still_missing(id: &StoredObjectId<'_>) -> bool {
+    MISSING.contains_key(&cache_key(id))
+}
+
 /// Was this stored object marked by [`mark_missing_facts`]? Clears the mark,
 /// so one object is backfilled once.
 pub fn take_missing_facts(id: &StoredObjectId<'_>) -> bool {
@@ -166,6 +173,21 @@ pub fn apply(meta: &mut FileMetadata, facts: &LogicalFacts) {
         meta.md5 = facts.etag.clone();
         meta.multipart_etag = None;
     }
+}
+
+/// How [`crate::storage::StorageBackend::resolve_listed_sizes`] treats one
+/// listing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResolveListed {
+    /// A passthrough entry may be stored in another form (the
+    /// proxy-encryption wrapper sets it), so its facts are looked up too.
+    pub passthrough_may_differ: bool,
+    /// The caller HEADs the entries whose facts stay unknown (a
+    /// `metadata=true` LIST, the lifecycle scan, a savings scan that HEADs
+    /// its unknowns). That HEAD learns the facts and writes them, so the
+    /// backend queues no background HEAD of its own: two HEADs per object
+    /// otherwise.
+    pub caller_heads_misses: bool,
 }
 
 /// How much of a listed entry's size a LIST knows.
@@ -221,8 +243,10 @@ mod tests {
         mark_missing_facts(&id("neg/x.delta", "", 1));
         assert!(!missing_recently(&id("neg/x.delta", "", 1)));
         // The HEAD that learns the facts takes the mark.
+        assert!(still_missing(&id(key, "e1", 46)));
         assert!(take_missing_facts(&id(key, "e1", 46)));
         assert!(!missing_recently(&id(key, "e1", 46)));
+        assert!(!still_missing(&id(key, "e1", 46)));
     }
 
     #[test]

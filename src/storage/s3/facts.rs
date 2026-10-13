@@ -143,12 +143,14 @@ impl S3Backend {
 
     /// Read the durable listing facts for the unresolved entries of one
     /// listing page and apply them. `candidates` are indices into `objects`
-    /// with their stored keys. Returns the indices it resolved.
+    /// with their stored keys. With `heal`, a miss gets a background HEAD
+    /// (the caller sends none of its own). Returns the indices it resolved.
     pub(super) async fn apply_durable_listing_facts(
         &self,
         bucket: &str,
         objects: &mut [(String, FileMetadata)],
         candidates: &[(usize, String)],
+        heal: bool,
     ) -> Vec<usize> {
         let Some(scan) = listing_facts::plan_facts_scan(candidates.iter().map(|(_, k)| k.as_str()))
         else {
@@ -218,6 +220,9 @@ impl S3Backend {
                 None => {
                     LISTING_FACTS_MISSES.inc();
                     list_size_cache::mark_missing_facts(&id);
+                    if !heal {
+                        continue;
+                    }
                     // One background HEAD learns the facts for good.
                     let _ = self.healer.queue(
                         super::heal::Miss {

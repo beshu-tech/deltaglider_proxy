@@ -396,7 +396,14 @@ async fn list_totals_page(
         Vec::new()
     } else {
         storage
-            .resolve_listed_sizes(bucket, &mut objects, false)
+            .resolve_listed_sizes(
+                bucket,
+                &mut objects,
+                crate::storage::list_size_cache::ResolveListed {
+                    caller_heads_misses: head_unknown,
+                    ..Default::default()
+                },
+            )
             .await
     };
     let mut unknown: Vec<usize> = (0..objects.len())

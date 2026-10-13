@@ -3,7 +3,7 @@
 //! Storage backend trait definitions
 
 use crate::deltaglider::spool::SpoolBudget;
-use crate::storage::list_size_cache::ListedSize;
+use crate::storage::list_size_cache::{ListedSize, ResolveListed};
 use crate::types::FileMetadata;
 use bytes::Bytes;
 use futures::stream::BoxStream;
@@ -1357,8 +1357,7 @@ pub trait StorageBackend: Send + Sync {
     /// per entry, how much of its size is known. `created_at` (the listed
     /// LastModified) is never changed.
     ///
-    /// `passthrough_may_differ`: a passthrough entry may be stored in another
-    /// form (the proxy-encryption wrapper sets it), so look its facts up too.
+    /// `how`: see [`ResolveListed`].
     ///
     /// The default suits a backend whose listing already carries logical
     /// sizes (filesystem: the xattrs are read during the listing): only a
@@ -1367,7 +1366,7 @@ pub trait StorageBackend: Send + Sync {
         &self,
         _bucket: &str,
         objects: &mut [(String, FileMetadata)],
-        _passthrough_may_differ: bool,
+        _how: ResolveListed,
     ) -> impl Future<Output = Vec<ListedSize>> + Send {
         async move {
             objects

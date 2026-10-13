@@ -50,7 +50,7 @@ pub(crate) use timing::backend_request_samples;
 pub(crate) use timing::{BackendLabel, RequestTimer, CAPABILITY_PROBE, COORDINATION, HEALTH_PROBE};
 pub use timing::{BACKEND_REQUEST_ATTEMPTS, BACKEND_REQUEST_DURATION};
 
-use super::list_size_cache::{self, ListedSize, LogicalFacts, StoredObjectId};
+use super::list_size_cache::{self, ListedSize, LogicalFacts, ResolveListed, StoredObjectId};
 use super::listing_facts;
 use super::traits::{
     reference_fence_lost, same_stored_generation, BulkListing, CopyOutcome, DelegatedListResult,
@@ -1620,7 +1620,7 @@ impl StorageBackend for S3Backend {
         &self,
         bucket: &str,
         objects: &mut [(String, FileMetadata)],
-        passthrough_may_differ: bool,
+        how: ResolveListed,
     ) -> Vec<ListedSize> {
         let mut sizes: Vec<ListedSize> = objects
             .iter_mut()
@@ -1635,7 +1635,7 @@ impl StorageBackend for S3Backend {
             .filter_map(|(i, ((key, meta), size))| match size {
                 ListedSize::StoredOnly => Some((i, format!("{key}.delta"))),
                 ListedSize::Listed
-                    if passthrough_may_differ && !key.ends_with('/') && !meta.is_delta() =>
+                    if how.passthrough_may_differ && !key.ends_with('/') && !meta.is_delta() =>
                 {
                     Some((i, key.clone()))
                 }
@@ -1654,7 +1654,7 @@ impl StorageBackend for S3Backend {
             .collect();
         if !candidates.is_empty() {
             for i in self
-                .apply_durable_listing_facts(bucket, objects, &candidates)
+                .apply_durable_listing_facts(bucket, objects, &candidates, !how.caller_heads_misses)
                 .await
             {
                 sizes[i] = ListedSize::Cached;

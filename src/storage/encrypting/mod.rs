@@ -62,7 +62,7 @@ mod tests;
 pub use format::*;
 
 use super::io_to_storage_error;
-use super::list_size_cache::ListedSize;
+use super::list_size_cache::{ListedSize, ResolveListed};
 use super::traits::{
     BulkListing, ByteStream, DelegatedListResult, LiteScanResult, MultipartUpload, ReferenceSource,
     StorageBackend, StorageError, StoredObject, UploadedPart,
@@ -1674,13 +1674,20 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         &self,
         b: &str,
         objects: &mut [(String, FileMetadata)],
-        passthrough_may_differ: bool,
+        how: ResolveListed,
     ) -> Vec<ListedSize> {
         // With a key (current or legacy), a passthrough entry may be
         // ciphertext: its facts are looked up like a delta's.
         let mut sizes = self
             .inner
-            .resolve_listed_sizes(b, objects, passthrough_may_differ || self.has_any_key())
+            .resolve_listed_sizes(
+                b,
+                objects,
+                ResolveListed {
+                    passthrough_may_differ: how.passthrough_may_differ || self.has_any_key(),
+                    ..how
+                },
+            )
             .await;
         // An inner listing of ciphertext (S3) reports the ciphertext size of a
         // passthrough object: without a cache hit, only that is known. A

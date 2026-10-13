@@ -9,7 +9,8 @@
 //!
 //! Off the client's path, and bounded: [`HEAL_CONCURRENCY`] HEADs in flight
 //! per backend, [`MAX_PENDING`] queued, one HEAD per stored object (key,
-//! ETag, size) per [`TRIED_TTL`], nothing during a graceful shutdown, and
+//! ETag, size) per [`TRIED_TTL`], none for an object that another HEAD
+//! learned meanwhile, nothing during a graceful shutdown, and
 //! nothing for [`PAUSE`] after a HEAD fails (a backend that fails requests
 //! is not sent more background work; its passive health signal comes from
 //! client requests).
@@ -164,7 +165,13 @@ impl FactsHealer {
         let (state, facts) = (self.state.clone(), facts.clone());
         runtime.spawn(async move {
             if let Ok(_permit) = state.permits.acquire().await {
-                if !crate::shutdown::is_shutting_down() && !state.paused() {
+                // A HEAD since the LIST (the listing's own, for
+                // `metadata=true` or the lifecycle scan) took the mark and
+                // wrote the facts: no second HEAD.
+                if !crate::shutdown::is_shutting_down()
+                    && !state.paused()
+                    && list_size_cache::still_missing(&miss.id())
+                {
                     // Tried only once its HEAD is sent: a miss that a pause
                     // skipped is queued again by the next LIST that sees it.
                     state.tried.insert(key.clone(), ());
@@ -364,14 +371,48 @@ mod tests {
         assert_eq!(heads, 24, "one HEAD per stored object");
     }
 
+    /// A listing that HEADs its own facts misses (`metadata=true`, the
+    /// lifecycle scan) also queued a healer HEAD of each: two HEADs per
+    /// delta (seen on MinIO: 80 HEADs for 40 deltas). The healer now skips
+    /// an object whose facts a HEAD learned since the LIST.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_listing_that_heads_its_misses_sends_one_head_per_object() {
+        const N: usize = 40;
+        let (engine, fake, _) = deltas_without_facts("rel", N).await;
+        fake.set_delay_ms("HEAD", 20);
+        fake.clear();
+        let page = engine
+            .list_objects("b", "rel/", None, 1000, None, true)
+            .await
+            .unwrap();
+        assert!(page.objects.iter().all(|(_, m)| m.file_size == 65_536));
+        assert!(wait_count(&fake, N, |r| r.starts_with("PUT /b/.dg/facts/")).await);
+        // Let the healer's queued tasks run out.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let heads = fake.requests().iter().filter(|r| delta_heads(r)).count();
+        assert!(
+            heads <= N + HEAL_CONCURRENCY,
+            "{heads} HEADs for {N} deltas"
+        );
+        let puts = fake
+            .requests()
+            .iter()
+            .filter(|r| r.starts_with("PUT /b/.dg/facts/"))
+            .count();
+        assert_eq!(puts, N, "one facts write per delta");
+    }
+
+    /// A miss that a LIST marked.
     fn miss(scope: &str, key: &str) -> Miss {
-        Miss {
+        let miss = Miss {
             scope: scope.into(),
             bucket: "b".into(),
             stored_key: key.into(),
             etag: "e".into(),
             size: 1,
-        }
+        };
+        list_size_cache::mark_missing_facts(&miss.id());
+        miss
     }
 
     /// A failed HEAD pauses the healer; the same miss is queued once.
@@ -421,6 +462,30 @@ mod tests {
         *state.paused_until.lock().unwrap() = None;
         assert_eq!(s3.healer.queue(miss("p", "a.delta"), &writer), None);
         assert!(wait_count(&fake, 1, |r| r.starts_with("HEAD /b/a.delta")).await);
+    }
+
+    /// A HEAD that learned the facts after the LIST queued the miss (a
+    /// client's HEAD or GET) took the mark: the healer sends no HEAD.
+    #[tokio::test]
+    async fn a_miss_that_another_head_healed_is_not_headed_again() {
+        let (s3, fake) = crate::storage::fake_s3_backend().await;
+        let writer = s3.facts_cleanup.writer();
+        let state = s3.healer.state.clone();
+        let held = state
+            .permits
+            .acquire_many(HEAL_CONCURRENCY as u32)
+            .await
+            .unwrap();
+        let healed = miss("p3", "h.delta");
+        assert!(list_size_cache::take_missing_facts(&healed.id()));
+        assert_eq!(s3.healer.queue(healed, &writer), None);
+        assert_eq!(s3.healer.queue(miss("p3", "u.delta"), &writer), None);
+        drop(held);
+        assert!(wait_count(&fake, 1, |r| r.starts_with("HEAD /b/u.delta")).await);
+        while !state.pending.lock().unwrap().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!fake.requests().iter().any(|r| r.contains("h.delta")));
     }
 
     #[test]
