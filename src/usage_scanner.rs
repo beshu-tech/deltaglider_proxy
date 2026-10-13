@@ -473,8 +473,16 @@ impl UsageScanner {
             if !truncated && !totals.sizes_estimated {
                 let now = crate::replication::current_unix_seconds();
                 let savings = savings_totals(&objects, &listing.baselines);
-                if let Err(e) = usage.overwrite_from_scan(ticket, &savings, now) {
-                    warn!(bucket = %bucket, error = %e, "usage counter not stamped by the scan");
+                // Only a quiet scan: nobody repeats this scan, so a write
+                // that it may count twice must not stamp the counter.
+                match usage.overwrite_from_quiet_scan(ticket, &savings, now) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        debug!(bucket = %bucket, "usage counter not stamped: the bucket changed during the scan")
+                    }
+                    Err(e) => {
+                        warn!(bucket = %bucket, error = %e, "usage counter not stamped by the scan")
+                    }
                 }
             }
         }
@@ -1051,11 +1059,19 @@ mod stamp_tests {
             .unwrap();
         scan.await.unwrap().unwrap();
         let row = usage.read("b").unwrap().unwrap();
-        assert!(row.last_scan_at.is_some(), "{row:?}");
-        assert!(
-            row.object_count >= 3,
-            "the write during the scan was lost: {row:?}"
+        // The bucket changed during the scan: the scan may have counted the
+        // write AND its delta, so it does not stamp the counter (the quota
+        // check scans again after the TTL). The write is still counted once.
+        assert_eq!(row.last_scan_at, None, "{row:?}");
+        assert_eq!(
+            row.object_count, 3,
+            "the write was lost or counted twice: {row:?}"
         );
+        // The next quiet scan stamps.
+        UsageScanner::do_scan(&st, "b", "").await.unwrap();
+        let row = usage.read("b").unwrap().unwrap();
+        assert!(row.last_scan_at.is_some(), "{row:?}");
+        assert_eq!(row.object_count, 3, "{row:?}");
     }
 
     /// A truncated scan, or one of a folder, never replaces the counter.

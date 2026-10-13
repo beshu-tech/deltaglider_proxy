@@ -545,17 +545,33 @@ impl BucketUsage {
     /// is better than losing writes on every Refresh of a busy bucket.
     pub fn overwrite_from_scan(
         &self,
-        mut ticket: ScanTicket<'_>,
+        ticket: ScanTicket<'_>,
         totals: &SavingsTotals,
         now: i64,
     ) -> Result<(), rusqlite::Error> {
+        self.overwrite_from_scan_inner(ticket, totals, now, false)
+            .map(|_| ())
+    }
+
+    /// `quiet_only`: write nothing (and keep the un-flushed delta) when the
+    /// bucket changed while the scan ran. `Ok(false)`: nothing written.
+    fn overwrite_from_scan_inner(
+        &self,
+        mut ticket: ScanTicket<'_>,
+        totals: &SavingsTotals,
+        now: i64,
+        quiet_only: bool,
+    ) -> Result<bool, rusqlite::Error> {
         // conn → pending, the lock order of flush and read: no flush can run
         // between the journal take and the REPLACE.
         let conn = self.conn.lock().unwrap();
         let bucket = std::mem::take(&mut ticket.bucket);
         let journal = self.end_scan(&bucket, ticket.id).unwrap_or_default();
-        let (jc, jl, js) = journal.delta;
         ticket.consumed = true;
+        if quiet_only && (journal.delta != (0, 0, 0) || journal.recount) {
+            return Ok(false);
+        }
+        let (jc, jl, js) = journal.delta;
         let _ = self.take_delta(&bucket);
         self.pending
             .remove_if(&bucket, |_, p| p.scans.is_empty() && p.delta == (0, 0, 0));
@@ -576,7 +592,27 @@ impl BucketUsage {
                 scanned_at
             ],
         )?;
-        Ok(())
+        Ok(true)
+    }
+
+    /// [`Self::overwrite_from_scan`] for a scan that nobody repeats: the
+    /// quota check's own scan of a bucket (`UsageScanner`, prefix "").
+    ///
+    /// A write that lands while the scan lists can count twice in
+    /// `overwrite_from_scan` (the scan may list the key AND the journal
+    /// adds its delta). An operator's Refresh repairs that. A quota scan
+    /// stamps a row that the quota check then trusts with no further scan,
+    /// so a double count would hold a bucket over its quota for good. This
+    /// variant stamps only a QUIET scan, one with no change of the bucket
+    /// while it ran; otherwise it writes nothing, and the next quota scan
+    /// (after the scanner's TTL) tries again. `Ok(true)`: stamped.
+    pub fn overwrite_from_quiet_scan(
+        &self,
+        ticket: ScanTicket<'_>,
+        totals: &SavingsTotals,
+        now: i64,
+    ) -> Result<bool, rusqlite::Error> {
+        self.overwrite_from_scan_inner(ticket, totals, now, true)
     }
 
     /// Forget a bucket (DeleteBucket): its row and its un-flushed changes
@@ -850,6 +886,56 @@ mod tests {
         assert_eq!(row.logical_bytes, 1100);
         assert_eq!(row.stored_bytes, 130);
         assert_eq!(row.last_scan_at, Some(99));
+    }
+
+    /// A write that reaches storage before a scan lists, but records its
+    /// delta after the scan started, is in the listing AND in the journal.
+    /// `overwrite_from_scan` (an operator's Refresh, which they can repeat)
+    /// counts it twice; the quota scan's `overwrite_from_quiet_scan` writes
+    /// nothing instead, so the trusted counter is never stamped wrong.
+    #[test]
+    fn a_quiet_scan_never_stamps_a_double_count() {
+        let mut totals = SavingsTotals::default();
+        totals.accumulate(&meta_passthrough(100));
+        totals.accumulate(&meta_passthrough(50)); // the late write, listed
+
+        let db = BucketUsage::in_memory().unwrap();
+        db.apply_object("b", &meta_passthrough(100), 1);
+        db.flush_pending();
+        let ticket = db.begin_scan("b");
+        db.apply_object("b", &meta_passthrough(50), 1); // its delta, late
+        db.overwrite_from_scan(ticket, &totals, 7).unwrap();
+        let row = db.read("b").unwrap().unwrap();
+        assert_eq!(
+            (row.logical_bytes, row.last_scan_at),
+            (200, Some(7)),
+            "the Refresh trade-off"
+        );
+
+        let db = BucketUsage::in_memory().unwrap();
+        db.apply_object("b", &meta_passthrough(100), 1);
+        db.flush_pending();
+        let ticket = db.begin_scan("b");
+        db.apply_object("b", &meta_passthrough(50), 1);
+        assert!(!db.overwrite_from_quiet_scan(ticket, &totals, 7).unwrap());
+        let row = db.read("b").unwrap().unwrap();
+        assert_eq!(
+            (row.logical_bytes, row.last_scan_at),
+            (150, None),
+            "{row:?}"
+        );
+        db.flush_pending();
+        assert_eq!(db.read("b").unwrap().unwrap().logical_bytes, 150);
+
+        // A quiet scan stamps.
+        let ticket = db.begin_scan("b");
+        assert!(db.overwrite_from_quiet_scan(ticket, &totals, 8).unwrap());
+        let row = db.read("b").unwrap().unwrap();
+        assert_eq!(
+            (row.logical_bytes, row.last_scan_at),
+            (150, Some(8)),
+            "{row:?}"
+        );
     }
 
     /// H14b: a PUT or DELETE that lands while the Refresh scan runs is
