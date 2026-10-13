@@ -429,6 +429,28 @@ impl FilesystemBackend {
         ))
     }
 
+    /// The metadata of reference.bin for a read. An xattr that does not
+    /// parse is described from the file's stat, with no checksum: the
+    /// reference check is skipped, and the SHA-256 of each object still
+    /// checks its reconstruction. Refusing it failed every delta GET of
+    /// the deltaspace. Other errors pass through.
+    fn reference_metadata_or_stat(
+        parsed: Result<FileMetadata, StorageError>,
+        path: &Path,
+        stat: Option<std::fs::Metadata>,
+    ) -> Result<FileMetadata, StorageError> {
+        match parsed {
+            Err(StorageError::Serialization(e)) => {
+                tracing::warn!(
+                    "Corrupt metadata on {}: {e}; the reference is read without its checksum",
+                    path.display()
+                );
+                Self::fallback_metadata_from_stat(path, stat, "reference.bin")
+            }
+            other => other,
+        }
+    }
+
     /// The metadata of the object file at `path`, and whether it came from
     /// the xattr (`false`: an unmanaged file, described from its stat as
     /// `filename`). One blocking task; a missing file is known from the
@@ -1206,9 +1228,14 @@ impl StorageBackend for FilesystemBackend {
         let file = fsio::open(&path)
             .await
             .map_err(|e| fsio::storage_error(e, || format!("reference: {prefix}/reference.bin")))?;
-        let size = file.metadata().await?.len();
+        let stat = file.metadata().await?;
+        let size = stat.len();
         drop(file);
-        let meta = self.get_reference_metadata(bucket, prefix).await?;
+        let meta = Self::reference_metadata_or_stat(
+            self.get_reference_metadata(bucket, prefix).await,
+            &path,
+            Some(stat),
+        )?;
         Ok(super::ReferenceSource::local(path, size, meta))
     }
 
@@ -1693,6 +1720,7 @@ impl StorageBackend for FilesystemBackend {
         };
         let what = format!("{label}: {prefix}/{name}");
         let name = name.to_string();
+        let is_reference = matches!(object, StoredObject::Reference);
         // One blocking task: open, then the metadata of the OPEN file
         // (fgetxattr; fstat for an unmanaged file), so the metadata and the
         // bytes are one file's even if a write renames over the path.
@@ -1703,6 +1731,14 @@ impl StorageBackend for FilesystemBackend {
                 .get_xattr(xattr_meta::XATTR_NAME)
                 .map_err(io_to_storage_error)?;
             let meta = match found {
+                Some(json) if is_reference => (
+                    Self::reference_metadata_or_stat(
+                        serde_json::from_slice(&json).map_err(StorageError::from),
+                        &path,
+                        file.metadata().ok(),
+                    )?,
+                    true,
+                ),
                 Some(json) => (serde_json::from_slice(&json)?, true),
                 None => (
                     Self::fallback_metadata_from_stat(&path, file.metadata().ok(), &name)?,

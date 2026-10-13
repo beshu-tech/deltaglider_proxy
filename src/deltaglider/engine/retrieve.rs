@@ -1779,6 +1779,67 @@ mod range_spool_tests {
         (v1, v2)
     }
 
+    /// A corrupt xattr on reference.bin (metadata that is not JSON) only
+    /// skips the reference's own checksum: a delta GET still serves, and
+    /// the object's SHA-256 still checks the reconstruction. Small deltas
+    /// (buffered) and large ones (spooled), from cold readers. Before, every
+    /// delta GET of the deltaspace failed.
+    #[tokio::test]
+    async fn a_corrupt_reference_xattr_does_not_fail_delta_gets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = Arc::new(
+            FilesystemBackend::new(tmp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        backend.create_bucket("b").await.unwrap();
+        let (v1, v2) = versions();
+        let writer = DeltaGliderEngine::new_with_backend(backend.clone(), &Config::default(), None);
+        for (k, body) in [("v/a.zip", &v1), ("v/b.zip", &v2)] {
+            writer
+                .store("b", k, body, None, HashMap::new())
+                .await
+                .unwrap();
+        }
+        assert!(writer.head("b", "v/b.zip").await.unwrap().is_delta());
+        let reference = walkdir::WalkDir::new(tmp.path())
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|e| e.file_name() == "reference.bin")
+            .expect("reference.bin")
+            .into_path();
+        xattr::set(
+            &reference,
+            crate::storage::xattr_meta::XATTR_NAME,
+            b"this is not valid JSON {{{",
+        )
+        .unwrap();
+        for max_object_size in [Config::default().max_object_size, 64 * 1024] {
+            let config = Config {
+                max_object_size,
+                ..Config::default()
+            };
+            for fresh in [true, false] {
+                let reader = DeltaGliderEngine::new_with_backend(backend.clone(), &config, None);
+                let response = if fresh {
+                    reader.retrieve_stream_fresh("b", "v/b.zip").await
+                } else {
+                    reader.retrieve_stream("b", "v/b.zip").await
+                };
+                let got = match response.unwrap_or_else(|e| {
+                    panic!("max_object_size {max_object_size} fresh {fresh}: {e}")
+                }) {
+                    RetrieveResponse::Buffered { data, .. } => data,
+                    RetrieveResponse::Streamed { stream, .. } => {
+                        let chunks: Vec<Bytes> = stream.try_collect().await.unwrap();
+                        chunks.concat()
+                    }
+                };
+                assert!(got == v2, "max_object_size {max_object_size} fresh {fresh}");
+            }
+        }
+    }
+
     /// Eight concurrent ranges and four later ones decode the object once.
     #[tokio::test]
     async fn many_ranges_of_a_large_delta_decode_it_once() {
