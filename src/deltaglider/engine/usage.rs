@@ -32,6 +32,19 @@ pub enum CounterPrior {
     /// change and marks the bucket's row for a Refresh. Before, the error
     /// read as "absent", and each such overwrite added the object again.
     Unknown,
+    /// A read taken BEFORE the key's object write lock, while other
+    /// writers on this node (a client PUT) could still write the key
+    /// ([`DeltaGliderEngine::head_with_counter_prior`]). It counts: the
+    /// write nets against the inner read. It does not decide the drop: a
+    /// write in the window may have stored the other form, so
+    /// [`Self::may_hold`] says yes and the write deletes that form.
+    ///
+    /// The other variants come from a read under the object write lock
+    /// (the store paths, a conditional write's precondition check), or
+    /// behind the bucket's maintenance write gate (re-encrypt, migrate);
+    /// the source guard `priors_outside_the_engine_are_read_ahead_or_gated`
+    /// holds the list of the latter.
+    ReadAhead(Box<CounterPrior>),
 }
 
 impl CounterPrior {
@@ -39,18 +52,38 @@ impl CounterPrior {
     pub fn replaced(&self) -> Option<FileMetadata> {
         match self {
             CounterPrior::Present { object, .. } => Some(FileMetadata::clone(object)),
+            CounterPrior::ReadAhead(inner) => inner.replaced(),
             _ => None,
+        }
+    }
+
+    /// `prior`, read before the object write lock: it counts, but it
+    /// never skips the DELETE of the other form ([`Self::ReadAhead`]).
+    pub fn read_ahead(prior: CounterPrior) -> CounterPrior {
+        match prior {
+            CounterPrior::Untracked => CounterPrior::Untracked,
+            CounterPrior::ReadAhead(_) => prior,
+            other => CounterPrior::ReadAhead(Box::new(other)),
+        }
+    }
+
+    /// The read the counter nets against ([`Self::ReadAhead`] unwrapped).
+    fn counted(&self) -> &CounterPrior {
+        match self {
+            CounterPrior::ReadAhead(inner) => inner.counted(),
+            other => other,
         }
     }
 
     /// Whether the key may hold the stored form `form`, as the read saw
     /// it. Only a read that found the form absent says no. No read
-    /// (`Untracked`) or a failed one (`Unknown`) says yes.
+    /// (`Untracked`), a failed one (`Unknown`) or one taken before the
+    /// object write lock (`ReadAhead`) says yes.
     pub(super) fn may_hold(&self, form: crate::storage::ObjectVariant) -> bool {
         match self {
             CounterPrior::Absent => false,
             CounterPrior::Present { forms, .. } => forms.has(form),
-            CounterPrior::Untracked | CounterPrior::Unknown => true,
+            CounterPrior::Untracked | CounterPrior::Unknown | CounterPrior::ReadAhead(_) => true,
         }
     }
 }
@@ -69,8 +102,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// the next await (see the module doc).
     pub(super) fn record_commit(&self, bucket: &str, prior: &CounterPrior, added: &FileMetadata) {
         let Some(u) = &self.bucket_usage else { return };
-        match prior {
-            CounterPrior::Untracked => {}
+        match prior.counted() {
+            // `counted()` unwraps a ReadAhead: never one here.
+            CounterPrior::Untracked | CounterPrior::ReadAhead(_) => {}
             CounterPrior::Absent => u.apply_net(bucket, None, Some(added), 0),
             CounterPrior::Present { object, .. } => {
                 u.apply_net(bucket, Some(&**object), Some(added), 0)
@@ -142,9 +176,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// replication event consumer reads the destination before it
     /// copies): the metadata (`None` = absent), and the same read as the
     /// `CounterPrior` of that write, so the copy does not read the key a
-    /// second time. The prior is only as fresh as this read: a write by
-    /// someone else between this read and the copy skews the usage counter
-    /// (never the stored data), and the next usage scan corrects it.
+    /// second time. The read is taken before the object write lock, so the
+    /// prior is a `CounterPrior::ReadAhead`: a write by someone else
+    /// between this read and the copy skews the usage counter (the next
+    /// usage scan corrects it), and the copy still deletes the other
+    /// stored form, which that write may have stored.
     pub async fn head_with_counter_prior(
         &self,
         bucket: &str,
@@ -155,10 +191,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         match self.head_with_forms(bucket, key).await {
             Ok((meta, forms)) => {
                 let prior = if tracked {
-                    CounterPrior::Present {
+                    CounterPrior::read_ahead(CounterPrior::Present {
                         object: Box::new(meta.clone()),
                         forms,
-                    }
+                    })
                 } else {
                     CounterPrior::Untracked
                 };
@@ -167,7 +203,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             Err(EngineError::NotFound(_)) => Ok((
                 None,
                 if tracked {
-                    CounterPrior::Absent
+                    CounterPrior::read_ahead(CounterPrior::Absent)
                 } else {
                     CounterPrior::Untracked
                 },
@@ -553,5 +589,43 @@ mod tests {
             self.record_commit(bucket, prior, &m);
             self.delete_delta_idempotent(b, d, f).await;";
         assert!(unrecorded_commits(new).is_empty());
+    }
+
+    /// A prior that code outside the engine builds by hand decides which
+    /// stored form the write deletes. Outside the engine that is right
+    /// only behind the bucket's maintenance write gate, where no writer on
+    /// this node writes the key between the read and the write. Every
+    /// other read outside the object write lock is a `ReadAhead`
+    /// (`head_with_counter_prior`): the replication event consumer read
+    /// the destination before the lock, a client PUT in that window stored
+    /// the other form, and the copy left both forms.
+    #[test]
+    fn priors_outside_the_engine_are_read_ahead_or_gated() {
+        // Each file builds the prior of a copy into a bucket that its
+        // maintenance job holds behind the write gate.
+        const GATED: &[&str] = &["src/maintenance/worker.rs", "src/maintenance/migrate.rs"];
+        let mut sites = Vec::new();
+        for (file, text) in crate::source_scan::prod_sources("src") {
+            if file.starts_with("src/deltaglider/engine/") {
+                continue;
+            }
+            for (n, line) in crate::source_scan::prod_lines(&text) {
+                if (line.contains("CounterPrior::Present") || line.contains("CounterPrior::Absent"))
+                    && !line.trim_start().starts_with("//")
+                {
+                    sites.push((file.clone(), n));
+                }
+            }
+        }
+        let ungated: Vec<_> = sites
+            .iter()
+            .filter(|(f, _)| !GATED.contains(&f.as_str()))
+            .collect();
+        assert!(
+            ungated.is_empty(),
+            "a prior built outside the engine and outside a write gate: {ungated:?} \
+             (use head_with_counter_prior, which returns a ReadAhead)"
+        );
+        assert!(!sites.is_empty(), "the scan found the gated sites");
     }
 }

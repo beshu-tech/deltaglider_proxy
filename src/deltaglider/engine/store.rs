@@ -402,10 +402,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// for a caller that read what the key holds already: `known_prior`
     /// replaces the write's own prior read (`CounterPrior`), so the write
     /// sends no HEAD for it and no DELETE for a stored form that the read
-    /// found absent. `None` reads it here. Only a caller whose key no one
-    /// else writes in between may pass one: a conditional write under the
-    /// object's write lock, or a maintenance job behind its bucket's write
-    /// gate.
+    /// found absent. `None` reads it here. A plain prior only from a
+    /// caller whose key no one else writes in between: a conditional write
+    /// under the object's write lock, or a maintenance job behind its
+    /// bucket's write gate. A read taken before the lock while others
+    /// write is a `CounterPrior::ReadAhead`: it counts, and the write
+    /// still deletes the other form.
     #[instrument(skip(self, lock, body, user_metadata, multipart_etag, known_prior))]
     #[allow(clippy::too_many_arguments)]
     pub async fn store_known_prior(
@@ -1990,8 +1992,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// the read before the write found it absent
     /// ([`CounterPrior::may_hold`]). Each write sent this DELETE for a form
     /// that read had just found absent (a same-form overwrite too). No
-    /// read, or a failed one, still sends it. A form that a writer without
-    /// the object's write lock (a peer instance, a replication copy) adds
+    /// read, a failed one, or one taken before the object write lock
+    /// ([`CounterPrior::ReadAhead`]) still sends it. A form that a writer
+    /// without this process's object write lock (a peer instance) adds
     /// after that read stays beside the new object; a read resolves the
     /// newer of the two, and the key's next write or delete drops the
     /// older one (`a_form_a_peer_adds_after_the_read_is_dropped_by_the_next_write`).

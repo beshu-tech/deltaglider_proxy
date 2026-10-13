@@ -186,15 +186,17 @@ pub(crate) async fn copy_object_from(
 
 /// [`copy_object_from`], and what the destination key holds when the
 /// caller read it already (`destination_prior`): the write then reads no
-/// prior and deletes no stored form that the read found absent. A caller
-/// whose destination no one else writes in between passes it (a
-/// maintenance job behind its write gate), and so does the replication
-/// event consumer, which HEADs the destination just before it copies
-/// ([`DynEngine::head_with_counter_prior`]): a write by someone else in that
-/// window skews only the usage counter (the next usage scan corrects it),
-/// the same window the copy's own prior read had. The first attempt alone uses
-/// the given source and prior: a retry follows a failed attempt that may
-/// have written the destination, so it reads both again.
+/// prior. A caller whose destination no one else writes in between (a
+/// maintenance job behind its write gate) passes a plain prior: the write
+/// also deletes no stored form that the read found absent. The replication
+/// event consumer HEADs the destination before the copy takes the key's
+/// write lock ([`DynEngine::head_with_counter_prior`]), so its prior is a
+/// [`crate::deltaglider::CounterPrior::ReadAhead`]: it counts, but a client
+/// PUT in that window may have stored the other form, so the write still
+/// deletes that form. That write skews only the usage counter (the next
+/// usage scan corrects it). The first attempt alone uses the given source
+/// and prior: a retry follows a failed attempt that may have written the
+/// destination, so it reads both again.
 pub(crate) async fn copy_object_known(
     engine: &Arc<DynEngine>,
     request: ObjectTransferRequest<'_>,
@@ -3321,7 +3323,7 @@ mod request_count_tests {
     use crate::bucket_usage::BucketUsage;
     use crate::config::Config;
     use crate::deltaglider::DeltaGliderEngine;
-    use crate::storage::{DynStorageBackend, FakeS3};
+    use crate::storage::{DynStorageBackend, FakeS3, StorageBackend};
 
     async fn engine_on(
         backend: crate::storage::S3Backend,
@@ -3553,7 +3555,9 @@ mod request_count_tests {
     /// P5.4: a caller that HEADed the destination (the replication event
     /// consumer) hands that read in as the counter prior: the copy sends no
     /// HEAD of the destination key before its write, and the usage counter
-    /// still nets an overwrite to +0 objects.
+    /// still nets an overwrite to +0 objects. The read came before the
+    /// key's write lock, so the copy still deletes the other stored form
+    /// (`a_form_written_after_the_read_ahead_is_dropped_by_the_copy`).
     #[tokio::test]
     async fn the_callers_destination_head_is_the_counter_prior() {
         let usage = Arc::new(BucketUsage::in_memory().unwrap());
@@ -3573,11 +3577,55 @@ mod request_count_tests {
             // Reference HEAD + the verify HEAD of the written form.
             assert_eq!(count(&fake, "HEAD "), 2, "round {round}: {r:#?}");
             assert!(!r.iter().any(|x| x == "HEAD /dst/p/b.zip"), "{r:#?}");
-            assert_eq!(count(&fake, "DELETE "), 0, "{r:#?}");
+            assert_eq!(count(&fake, "DELETE "), 1, "{r:#?}");
+            assert_eq!(count(&fake, "DELETE /dst/p/b.zip?"), 1, "{r:#?}");
         }
         usage.flush_pending();
         let row = usage.read("dst").unwrap().unwrap();
         assert_eq!(row.object_count, 2, "c.zip + b.zip once");
+    }
+
+    /// The replication event consumer reads the destination before the
+    /// copy takes the key's write lock. A client PUT in that window stored
+    /// the other form (passthrough); the copy (a delta) skipped its DELETE
+    /// because the read had seen no such form. Both forms stayed, and the
+    /// client's object, newer than the replica's kept created-at, hid it.
+    #[tokio::test]
+    async fn a_form_written_after_the_read_ahead_is_dropped_by_the_copy() {
+        let usage = Arc::new(BucketUsage::in_memory().unwrap());
+        let (engine, _fake) = s3_engine(Some(usage)).await;
+        let head = seeded_delta_pair(&engine).await;
+        let (dest, prior) = engine
+            .head_with_counter_prior("dst", "p/b.zip")
+            .await
+            .unwrap();
+        assert!(dest.is_none());
+        engine
+            .store(
+                "dst",
+                "p/b.zip",
+                &versioned(7, 64 * 1024),
+                None,
+                std::collections::HashMap::from([("dg-no-delta".to_string(), "true".to_string())]),
+            )
+            .await
+            .unwrap();
+        let outcome = copy_object_known(&engine, request("p/b.zip"), Some(&head), Some(&prior))
+            .await
+            .unwrap();
+        assert_eq!(outcome.strategy, CopyStrategy::DeltaPassthrough);
+        let left = engine
+            .storage()
+            .get_passthrough_metadata("dst", "p", "b.zip")
+            .await;
+        assert!(
+            left.is_err(),
+            "the client's passthrough form stayed beside the replica: {left:?}"
+        );
+        assert_eq!(
+            engine.retrieve("dst", "p/b.zip").await.unwrap().0,
+            engine.retrieve("src", "p/b.zip").await.unwrap().0
+        );
     }
 
     /// P5.2: a background copy of a passthrough object inside one backend
