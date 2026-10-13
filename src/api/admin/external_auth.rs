@@ -446,6 +446,18 @@ pub async fn oauth_callback(
         }
     };
 
+    // Mapping rules, evaluated before the user lookup: a first login that
+    // no rule matches creates no user (below).
+    //
+    // SECURITY: gate email-based rules on `email_verified` — an unverified email
+    // (attacker-controllable on self-service IdPs) must not bootstrap a group
+    // grant via an `*@corp.com → administrators` rule. Non-email rules are
+    // unaffected. Login still succeeds as a bare identity with no email-derived
+    // groups; only the mapping is gated. See mapping::filter_rules_for_email_verification.
+    let rules = db.load_group_mapping_rules().unwrap_or_default();
+    let rules = mapping::filter_rules_for_email_verification(&rules, &identity);
+    let rule_groups = mapping::evaluate_mappings(&rules, &identity, provider_config.id);
+
     // Find or create the local user. `synced_change`: the login changed a
     // row that peers must see (not only `last_login` / `raw_claims`).
     let mut synced_change = false;
@@ -472,6 +484,25 @@ pub async fn oauth_callback(
                         .into_response();
                 }
             }
+        }
+        Ok(None) if !first_login_allowed(&rule_groups, &provider.extra_config) => {
+            tracing::warn!(
+                "OAuth login refused for '{}' via '{}': no group mapping rule matches",
+                identity.email.as_deref().unwrap_or("<no email>"),
+                pending.provider_name
+            );
+            audit_log(
+                "external_login_refused",
+                identity.email.as_deref().unwrap_or(""),
+                &pending.provider_name,
+                &req_headers,
+            );
+            return error_page(
+                "Access Denied",
+                "This account has no access to this proxy. Sign in with an account \
+                 that an administrator allows.",
+            )
+            .into_response();
         }
         Ok(None) => {
             // First login — auto-provision local IAM user
@@ -533,18 +564,9 @@ pub async fn oauth_callback(
         .into_response();
     }
 
-    // Evaluate group mapping rules and MERGE with existing memberships.
+    // MERGE the rule groups with existing memberships.
     // Manual group assignments (e.g., admin added user to "administrators" via GUI)
     // are preserved — mapping rules only ADD groups, never remove manually-assigned ones.
-    //
-    // SECURITY: gate email-based rules on `email_verified` — an unverified email
-    // (attacker-controllable on self-service IdPs) must not bootstrap a group
-    // grant via an `*@corp.com → administrators` rule. Non-email rules are
-    // unaffected. Login still succeeds as a bare identity with no email-derived
-    // groups; only the mapping is gated. See mapping::filter_rules_for_email_verification.
-    let rules = db.load_group_mapping_rules().unwrap_or_default();
-    let rules = mapping::filter_rules_for_email_verification(&rules, &identity);
-    let rule_groups = mapping::evaluate_mappings(&rules, &identity, provider_config.id);
     let existing_groups = db.get_user_group_ids(user.id).unwrap_or_default();
     let merged = merge_group_memberships(existing_groups.clone(), &rule_groups);
     if merged != existing_groups {
@@ -1344,6 +1366,18 @@ fn error_page(title: &str, message: &str) -> impl IntoResponse {
     axum::response::Html(crate::api::error_page::themed_error_html(title, message))
 }
 
+/// A first login (no linked identity yet) creates a user only when a group
+/// mapping rule matches it, or when the provider's `extra_config` sets
+/// `provision_unmapped: true`. Otherwise any account at the IdP (any Google
+/// account, for a Google provider) would get a user row.
+fn first_login_allowed(rule_groups: &[i64], extra_config: &serde_json::Value) -> bool {
+    !rule_groups.is_empty()
+        || extra_config
+            .get("provision_unmapped")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+}
+
 /// Merge rule-evaluated groups into existing memberships, preserving manual assignments.
 /// Returns the union of `existing` and `rule_groups` (order-preserving, no duplicates).
 fn merge_group_memberships(existing: Vec<i64>, rule_groups: &[i64]) -> Vec<i64> {
@@ -1384,10 +1418,31 @@ fn rule_target(
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_oauth_state_cookie, oauth_state_clear_cookie, oauth_state_cookie,
-        sanitize_next_param, validate_mapping_rule, validate_match_type,
+        extract_oauth_state_cookie, first_login_allowed, oauth_state_clear_cookie,
+        oauth_state_cookie, sanitize_next_param, validate_mapping_rule, validate_match_type,
     };
     use axum::http::HeaderMap;
+
+    #[test]
+    fn a_first_login_needs_a_matching_rule_or_the_opt_in() {
+        use serde_json::json;
+        let none = json!({});
+        assert!(!first_login_allowed(&[], &none), "unmapped is refused");
+        assert!(!first_login_allowed(
+            &[],
+            &json!({"provision_unmapped": false})
+        ));
+        // A non-boolean is not an opt-in.
+        assert!(!first_login_allowed(
+            &[],
+            &json!({"provision_unmapped": "true"})
+        ));
+        assert!(first_login_allowed(
+            &[],
+            &json!({"provision_unmapped": true})
+        ));
+        assert!(first_login_allowed(&[3], &none), "a matching rule admits");
+    }
 
     #[test]
     fn validate_match_type_accepts_known_kinds() {

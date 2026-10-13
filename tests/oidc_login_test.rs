@@ -157,6 +157,43 @@ async fn start_idp_with_delay(discovery_delay: std::time::Duration) -> (String, 
     (issuer, ca.pem())
 }
 
+/// The browser flow: authorize → IdP → callback. Returns the callback's
+/// status, its Set-Cookie values and its body.
+async fn oauth_login(
+    browser: &reqwest::Client,
+    ep: &str,
+    issuer: &str,
+) -> (u16, Vec<String>, String) {
+    let r = browser
+        .get(format!("{ep}/_/api/admin/oauth/authorize/corp"))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_redirection(), "authorize: {}", r.status());
+    let to_idp = r.headers()["location"].to_str().unwrap().to_string();
+    assert!(
+        to_idp.starts_with(&format!("{issuer}/authorize?")),
+        "{to_idp}"
+    );
+    let r = browser.get(&to_idp).send().await.unwrap();
+    assert!(r.status().is_redirection(), "IdP authorize: {}", r.status());
+    let callback = r.headers()["location"].to_str().unwrap().to_string();
+    assert!(
+        callback.starts_with(&format!("{ep}/_/api/admin/oauth/callback?")),
+        "{callback}"
+    );
+    let r = browser.get(&callback).send().await.unwrap();
+    let status = r.status().as_u16();
+    let cookies: Vec<String> = r
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect();
+    let body = r.text().await.unwrap_or_default();
+    (status, cookies, body)
+}
+
 #[tokio::test]
 async fn oidc_login_against_a_private_idp_with_a_private_ca() {
     let (issuer, ca_pem) = start_idp().await;
@@ -312,33 +349,47 @@ async fn oidc_login_against_a_private_idp_with_a_private_ca() {
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
         .unwrap();
-    let r = browser
-        .get(format!("{ep}/_/api/admin/oauth/authorize/corp"))
+    // A first login that no group mapping rule matches is refused, and
+    // creates no user: any account at the IdP could sign in otherwise.
+    let (status, cookies, body) = oauth_login(&browser, &ep, &issuer).await;
+    assert_eq!(status, 200, "callback: {body}");
+    assert!(body.contains("Access Denied"), "{body}");
+    assert!(
+        !cookies
+            .iter()
+            .any(|c| c.starts_with("dgp_session=") && !c.starts_with("dgp_session=;")),
+        "a refused login got a session: {cookies:?}"
+    );
+    let users = admin
+        .get(format!("{ep}/_/api/admin/users"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        !users.contains("Alice"),
+        "a refused login made a user: {users}"
+    );
+
+    // A rule for Alice's domain admits her. The group grants nothing here.
+    let r = admin
+        .post(format!("{ep}/_/api/admin/groups"))
+        .json(&json!({ "name": "Engineering", "permissions": [] }))
         .send()
         .await
         .unwrap();
-    assert!(r.status().is_redirection(), "authorize: {}", r.status());
-    let to_idp = r.headers()["location"].to_str().unwrap().to_string();
-    assert!(
-        to_idp.starts_with(&format!("{issuer}/authorize?")),
-        "{to_idp}"
-    );
-    let r = browser.get(&to_idp).send().await.unwrap();
-    assert!(r.status().is_redirection(), "IdP authorize: {}", r.status());
-    let callback = r.headers()["location"].to_str().unwrap().to_string();
-    assert!(
-        callback.starts_with(&format!("{ep}/_/api/admin/oauth/callback?")),
-        "{callback}"
-    );
-    let r = browser.get(&callback).send().await.unwrap();
-    let status = r.status();
-    let cookies: Vec<String> = r
-        .headers()
-        .get_all("set-cookie")
-        .iter()
-        .map(|v| v.to_str().unwrap().to_string())
-        .collect();
-    let body = r.text().await.unwrap_or_default();
+    assert_eq!(r.status(), 201);
+    let gid = r.json::<Value>().await.unwrap()["id"].as_i64().unwrap();
+    let r = admin
+        .post(format!("{ep}/_/api/admin/ext-auth/mappings"))
+        .json(&json!({ "match_type": "email_domain", "match_value": "acme.example", "group_id": gid }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let (status, cookies, body) = oauth_login(&browser, &ep, &issuer).await;
     assert_eq!(status, 302, "callback: {body}");
     assert!(
         cookies

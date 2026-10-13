@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Changed — An SSO login that no mapping rule matches is refused
+
+The first login of an account through an OAuth/OIDC provider created an IAM
+user, even when no group mapping rule matched the account. So any account at
+the provider (for a Google provider, any Google account) could sign in and
+get a user row with no permissions. The proxy now refuses such a first login
+with an "Access Denied" page and creates no user. An account that is already
+linked to a user still signs in. To keep the old behaviour, set
+`provision_unmapped: true` in the provider's `extra_config`.
+
 ## v2.0.10 — 2026-10-13
 
 ### Fixed — Deltas without an MD5 get listing facts, so listings stop sending HEAD requests for them
