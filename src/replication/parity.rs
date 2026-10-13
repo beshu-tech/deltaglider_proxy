@@ -695,6 +695,20 @@ pub struct ParityOutcome {
     pub cap_hit: bool,
     #[serde(default)]
     pub unresolved: u64,
+    /// The objects behind `unresolved`, sorted by destination key, at most
+    /// [`UNRESOLVED_KEYS_CAP`] of them. A targeted re-check
+    /// (`parity_recheck_unresolved`) reads only these. Empty on rows persisted
+    /// before the field existed.
+    #[serde(default)]
+    pub unresolved_keys: Vec<UnresolvedKey>,
+    /// True when `unresolved` is larger than the kept list (the cap applied):
+    /// a re-check then cannot settle every unread object, only a full audit can.
+    #[serde(default)]
+    pub unresolved_keys_capped: bool,
+    /// When a targeted re-check last merged its result into this outcome
+    /// (unix seconds). `scanned_at` stays the time of the full scan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rechecked_at: Option<i64>,
     /// The signal: strict — `unverifiable` counts against it.
     pub in_sync: bool,
     pub scanned_at: i64,
@@ -723,6 +737,31 @@ pub struct ParityOutcome {
     /// headline the UI shows verbatim. Empty for pre-field outcomes.
     #[serde(default)]
     pub verdict_summary: String,
+}
+
+/// The most unread objects an outcome remembers by key. A re-check reads at
+/// most this many objects; above it the count stays exact but only a full
+/// audit settles the rest.
+pub const UNRESOLVED_KEYS_CAP: usize = 1000;
+
+/// One object a parity audit dropped from the compare because a read of it
+/// kept failing. Carries both namespaces, so a re-check can read the source
+/// object and the destination object without the rule's listing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnresolvedKey {
+    /// The key on the destination (the namespace every finding uses).
+    pub dest_key: String,
+    /// The raw key on the source. `None` when the source listing did not
+    /// carry the key (a destination-only object).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_key: Option<String>,
+    /// The stored-blob tokens of the listing entries (see `stored_version`).
+    /// A re-check stamps its cache rows with them, so the next audit uses a
+    /// row only while the object is unchanged since that listing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dest_version: Option<String>,
 }
 
 /// The single authoritative conclusion of a parity audit. Replaces the
@@ -794,7 +833,7 @@ pub fn derive_verdict(
     } else if unresolved > 0 {
         format!(
             "{unresolved} object(s) couldn't be read (transient backend errors) — \
-             re-running the audit usually clears this"
+             re-check them to finish the audit"
         )
     } else if truncated {
         "the scan was partial, so completeness isn't proven".to_string()
@@ -905,9 +944,11 @@ pub(crate) fn cache_hit_fresh(
 /// HEAD burst for the misses + the changed objects, persisting fresh results so
 /// the next verify is HEAD-free. `source` is keyed by the dest-namespace key.
 ///
-/// Returns the number of keys left UNRESOLVED by a transient HEAD failure —
-/// the caller must treat a non-zero count as a partial audit (in_sync=false),
-/// since a dropped key can't be compared and would otherwise vanish silently.
+/// Returns the keys left UNRESOLVED by a transient HEAD failure, each with
+/// the stored-blob token its listing entry carried — the caller must treat a
+/// non-empty list as a partial audit (in_sync=false), since a dropped key
+/// can't be compared and would otherwise vanish silently. The token lets a
+/// later targeted re-check write a cache row the next verify can use.
 #[allow(clippy::too_many_arguments)]
 async fn resolve_logical(
     engine: &DynEngine,
@@ -920,7 +961,7 @@ async fn resolve_logical(
     failures: Option<&tokio::sync::Mutex<JobsDb>>,
     progress: Option<&ParityProgress<'_>>,
     progress_base: u64,
-) -> Vec<String> {
+) -> Vec<(String, Option<String>)> {
     if raw_keys.is_empty() {
         return Vec::new();
     }
@@ -948,7 +989,7 @@ async fn resolve_logical(
     }
     let fresh = head_burst(engine, bucket, &miss_raw, progress, progress_base + hits).await;
     let mut to_cache: Vec<(String, ParityCacheEntry)> = Vec::new();
-    let mut unresolved_keys: Vec<String> = Vec::new();
+    let mut unresolved_keys: Vec<(String, Option<String>)> = Vec::new();
     for (raw, outcome) in fresh {
         let Ok(dk) = rewrite_key(src_prefix, dst_prefix, &raw) else {
             continue;
@@ -970,8 +1011,9 @@ async fn resolve_logical(
             // becomes a false missing/extra finding (#H5). The count still
             // marks the audit partial (#3).
             HeadOutcome::Unresolved => {
+                let lite = lite_stored_version(source, &dk);
                 source.remove(&dk);
-                unresolved_keys.push(dk);
+                unresolved_keys.push((dk, lite));
             }
         }
     }
@@ -980,8 +1022,8 @@ async fn resolve_logical(
 }
 
 /// Dest-side logical resolution: dest is keyed by its own raw key (== cache key).
-/// Returns the count of keys left UNRESOLVED by a transient HEAD (see
-/// `resolve_logical`). A non-zero count makes the audit partial.
+/// Returns the keys left UNRESOLVED by a transient HEAD (see
+/// `resolve_logical`). A non-empty list makes the audit partial.
 #[allow(clippy::too_many_arguments)]
 async fn resolve_logical_dest(
     engine: &DynEngine,
@@ -993,7 +1035,7 @@ async fn resolve_logical_dest(
     failures: Option<&tokio::sync::Mutex<JobsDb>>,
     progress: Option<&ParityProgress<'_>>,
     progress_base: u64,
-) -> Vec<String> {
+) -> Vec<(String, Option<String>)> {
     if raw_keys.is_empty() {
         return Vec::new();
     }
@@ -1023,7 +1065,7 @@ async fn resolve_logical_dest(
     }
     let fresh = head_burst(engine, bucket, &miss, progress, progress_base + hits).await;
     let mut to_cache: Vec<(String, ParityCacheEntry)> = Vec::new();
-    let mut unresolved_keys: Vec<String> = Vec::new();
+    let mut unresolved_keys: Vec<(String, Option<String>)> = Vec::new();
     for (k, outcome) in fresh {
         match outcome {
             HeadOutcome::Resolved(meta) => {
@@ -1046,8 +1088,9 @@ async fn resolve_logical_dest(
             // it from the source side (#H5: a one-sided drop is a false
             // orphan/missing). Count still marks the audit partial (#3).
             HeadOutcome::Unresolved => {
+                let lite = lite_stored_version(dest, &k);
                 dest.remove(&k);
-                unresolved_keys.push(k);
+                unresolved_keys.push((k, lite));
             }
         }
     }
@@ -1611,12 +1654,24 @@ pub async fn parity_audit(
     // A key left unresolved on EITHER side must be dropped from BOTH maps
     // before the diff, or the merge-walk reports it as a false missing/orphan
     // (it exists on both, one side just couldn't HEAD it). #H5.
-    for k in src_unresolved_keys.iter().chain(dst_unresolved_keys.iter()) {
-        source.remove(k);
-        dest.remove(k);
+    // Keep each dropped key with BOTH sides' listing tokens (one side's came
+    // back from its resolve, the other side's is still in its map), so a
+    // targeted re-check can compare it later and write usable cache rows.
+    let mut dropped: BTreeMap<String, (Option<String>, Option<String>)> = BTreeMap::new();
+    for (k, v) in &src_unresolved_keys {
+        dropped.entry(k.clone()).or_default().0 = v.clone();
     }
-    let src_unresolved = src_unresolved_keys.len();
-    let dst_unresolved = dst_unresolved_keys.len();
+    for (k, v) in &dst_unresolved_keys {
+        dropped.entry(k.clone()).or_default().1 = v.clone();
+    }
+    for (k, (src_v, dst_v)) in dropped.iter_mut() {
+        if let Some(st) = source.remove(k) {
+            *src_v = st.stored_version;
+        }
+        if let Some(st) = dest.remove(k) {
+            *dst_v = st.stored_version;
+        }
+    }
 
     // Everything examined — land the counter exactly on the denominator.
     if let Some(p) = progress {
@@ -1630,7 +1685,8 @@ pub async fn parity_audit(
     // `cap_hit` vs `unresolved` are carried SEPARATELY into the outcome: the
     // UI must never tell the operator to raise the object cap when the real
     // cause was transient read failures (and vice versa).
-    let unresolved = (src_unresolved + dst_unresolved) as u64;
+    // One key per object: a key whose HEAD failed on both sides counts once.
+    let unresolved = dropped.len() as u64;
     let cap_hit = src_truncated || dst_truncated;
     let truncated = cap_hit || unresolved > 0;
 
@@ -1642,11 +1698,7 @@ pub async fn parity_audit(
     }
 
     // Phase 5: prune stale cache rows, then diff + annotate into the outcome.
-    let unresolved_keys: Vec<String> = src_unresolved_keys
-        .iter()
-        .chain(&dst_unresolved_keys)
-        .cloned()
-        .collect();
+    let unresolved_keys: Vec<String> = dropped.keys().cloned().collect();
     prune_parity_cache(
         rule,
         failures,
@@ -1716,6 +1768,17 @@ pub async fn parity_audit(
         diff.matched,
     );
 
+    let unresolved_list: Vec<UnresolvedKey> = dropped
+        .into_iter()
+        .take(UNRESOLVED_KEYS_CAP)
+        .map(|(dest_key, (source_version, dest_version))| UnresolvedKey {
+            source_key: dest_to_source.get(&dest_key).cloned(),
+            dest_key,
+            source_version,
+            dest_version,
+        })
+        .collect();
+
     Ok(ParityOutcome {
         rule_name: rule.name.clone(),
         source_bucket: rule.source.bucket.clone(),
@@ -1730,6 +1793,9 @@ pub async fn parity_audit(
         truncated,
         cap_hit,
         unresolved,
+        unresolved_keys_capped: unresolved > unresolved_list.len() as u64,
+        unresolved_keys: unresolved_list,
+        rechecked_at: None,
         in_sync,
         scanned_at: super::current_unix_seconds(),
         regime,
@@ -1742,6 +1808,220 @@ pub async fn parity_audit(
         verdict,
         verdict_summary,
     })
+}
+
+/// Re-read only the objects the last audit could not read, and fold the
+/// answer into that audit's outcome (see [`merge_recheck`]). Lists nothing:
+/// it HEADs each kept key on the source and on the destination, with the same
+/// bounded HEAD burst (concurrency, throttle abort) the audit uses, and writes
+/// the same parity-cache rows, stamped with the listing tokens the audit kept.
+/// An object whose read fails again stays in the unresolved list.
+pub async fn parity_recheck_unresolved(
+    engine: &DynEngine,
+    rule: &ReplicationRule,
+    prev: &ParityOutcome,
+    failures: Option<&tokio::sync::Mutex<JobsDb>>,
+    progress: Option<ParityProgress<'_>>,
+) -> Result<ParityOutcome, String> {
+    let progress = progress.as_ref();
+    let entries = &prev.unresolved_keys;
+    if entries.is_empty() {
+        return Err("the last audit kept no unread objects to re-check".to_string());
+    }
+    let src_keys: Vec<&String> = entries
+        .iter()
+        .filter_map(|e| e.source_key.as_ref())
+        .collect();
+    let dst_keys: Vec<&String> = entries.iter().map(|e| &e.dest_key).collect();
+    let total = (src_keys.len() + dst_keys.len()) as u64;
+    if let Some(p) = progress {
+        p.set_total(total).await;
+        p.check_cancel().await?;
+    }
+    let src_reads: HashMap<String, HeadOutcome> =
+        head_burst(engine, &rule.source.bucket, &src_keys, progress, 0)
+            .await
+            .into_iter()
+            .collect();
+    if let Some(p) = progress {
+        p.check_cancel().await?;
+    }
+    let dst_reads: HashMap<String, HeadOutcome> = head_burst(
+        engine,
+        &rule.destination.bucket,
+        &dst_keys,
+        progress,
+        src_keys.len() as u64,
+    )
+    .await
+    .into_iter()
+    .collect();
+    if let Some(p) = progress {
+        p.flush_scanned(total).await;
+    }
+
+    // `Some(None)`: the object is absent on that side. `None`: still unread.
+    fn read(o: Option<&HeadOutcome>) -> Option<Option<&FileMetadata>> {
+        match o {
+            Some(HeadOutcome::Resolved(m)) => Some(Some(m)),
+            Some(HeadOutcome::Gone) => Some(None),
+            Some(HeadOutcome::Unresolved) | None => None,
+        }
+    }
+    let mut source: BTreeMap<String, ObjState> = BTreeMap::new();
+    let mut dest: BTreeMap<String, ObjState> = BTreeMap::new();
+    let mut dest_to_source: HashMap<String, String> = HashMap::new();
+    let mut still: Vec<UnresolvedKey> = Vec::new();
+    let mut settled = 0u64;
+    let mut src_rows: Vec<(String, ParityCacheEntry)> = Vec::new();
+    let mut dst_rows: Vec<(String, ParityCacheEntry)> = Vec::new();
+    for e in entries {
+        let src = match &e.source_key {
+            None => Some(None),
+            Some(sk) => read(src_reads.get(sk)),
+        };
+        let dst = read(dst_reads.get(&e.dest_key));
+        let (Some(src), Some(dst)) = (src, dst) else {
+            still.push(e.clone());
+            continue;
+        };
+        settled += 1;
+        let dk = &e.dest_key;
+        if let Some(sk) = &e.source_key {
+            dest_to_source.insert(dk.clone(), sk.clone());
+        }
+        let on_source = src.is_some();
+        if let Some(m) = src {
+            src_rows.push((
+                dk.clone(),
+                cache_entry_from_meta(m, e.source_version.clone()),
+            ));
+            source.insert(dk.clone(), ObjState::from_metadata(m));
+        }
+        if let Some(m) = dst {
+            // A HEAD carries the user metadata, so ownership is exact here.
+            let mut st = ObjState::from_metadata(m);
+            st.owned_by_rule = Some(event_consumer::owned_by_rule(m, &rule.name));
+            // The audit keeps rows only for keys on both sides (see
+            // `resolve_logical_dest`).
+            if on_source {
+                dst_rows.push((dk.clone(), cache_entry_from_meta(m, e.dest_version.clone())));
+            }
+            dest.insert(dk.clone(), st);
+        }
+    }
+    cache_put(failures, &rule.name, ParitySide::Source, &src_rows).await;
+    cache_put(failures, &rule.name, ParitySide::Dest, &dst_rows).await;
+
+    let mut diff = diff_parity(&source, &dest);
+    let sample_keys: Vec<&str> = diff
+        .missing_samples
+        .iter()
+        .chain(&diff.orphan_samples)
+        .chain(&diff.mismatch_samples)
+        .filter_map(|f| dest_to_source.get(&f.key))
+        .map(String::as_str)
+        .collect();
+    let ledger: HashMap<String, ObjectFailure> = match failures {
+        Some(mutex) => {
+            let db = mutex.lock().await;
+            db.replication_object_failures_for_keys(&rule.name, &sample_keys)
+                .unwrap_or_default()
+        }
+        None => HashMap::new(),
+    };
+    annotate_findings(
+        &mut diff,
+        &source,
+        &dest,
+        rule.conflict,
+        rule.replicate_deletes,
+        &ledger,
+        &dest_to_source,
+    );
+    Ok(merge_recheck(
+        prev,
+        RecheckResult {
+            settled,
+            still_unresolved: still,
+            source_present: source.len() as u64,
+            dest_present: dest.len() as u64,
+            diff,
+            rechecked_at: super::current_unix_seconds(),
+        },
+    ))
+}
+
+/// What a targeted re-check found, ready to fold into the outcome it re-checked.
+#[derive(Debug, Clone)]
+pub struct RecheckResult {
+    /// Objects read on every side they need (present or absent).
+    pub settled: u64,
+    /// Objects whose read failed again — they stay unresolved.
+    pub still_unresolved: Vec<UnresolvedKey>,
+    /// Settled objects present on the source / on the destination.
+    pub source_present: u64,
+    pub dest_present: u64,
+    /// The annotated diff of the settled objects only.
+    pub diff: ParityDiff,
+    pub rechecked_at: i64,
+}
+
+/// PURE: fold a re-check into the outcome it re-checked. Settled objects
+/// move into the counts and the (capped) samples; objects still unread stay
+/// in the list, and the objects the capped list never named stay counted.
+/// `cap_hit` and `scanned_at` do not change. `truncated`, `in_sync`,
+/// `actionable` and the verdict are derived again by the same rules the
+/// audit uses.
+pub fn merge_recheck(prev: &ParityOutcome, r: RecheckResult) -> ParityOutcome {
+    let mut o = prev.clone();
+    let d = r.diff;
+    o.source_objects += r.source_present;
+    o.dest_objects += r.dest_present;
+    o.matched += d.matched;
+    o.missing_on_dest += d.missing_on_dest;
+    o.orphan_on_dest += d.orphan_on_dest;
+    o.checksum_mismatch += d.checksum_mismatch;
+    o.unverifiable += d.unverifiable;
+    for f in d.missing_samples {
+        push_capped(&mut o.missing_samples, f);
+    }
+    for f in d.orphan_samples {
+        push_capped(&mut o.orphan_samples, f);
+    }
+    for f in d.mismatch_samples {
+        push_capped(&mut o.mismatch_samples, f);
+    }
+    o.unresolved = prev.unresolved.saturating_sub(r.settled);
+    o.unresolved_keys = r.still_unresolved;
+    o.unresolved_keys_capped = o.unresolved > o.unresolved_keys.len() as u64;
+    o.truncated = o.cap_hit || o.unresolved > 0;
+    o.in_sync = !o.truncated
+        && o.missing_on_dest == 0
+        && o.orphan_on_dest == 0
+        && o.checksum_mismatch == 0
+        && o.unverifiable == 0;
+    o.actionable = fold_actionable(&ParityDiff {
+        missing_samples: o.missing_samples.clone(),
+        orphan_samples: o.orphan_samples.clone(),
+        mismatch_samples: o.mismatch_samples.clone(),
+        ..ParityDiff::default()
+    });
+    let (verdict, summary) = derive_verdict(
+        o.in_sync,
+        o.truncated,
+        o.cap_hit,
+        o.unresolved,
+        o.missing_on_dest,
+        o.orphan_on_dest,
+        o.checksum_mismatch,
+        o.unverifiable,
+        o.matched,
+    );
+    o.verdict = verdict;
+    o.verdict_summary = summary;
+    o.rechecked_at = Some(r.rechecked_at);
+    o
 }
 
 #[cfg(test)]
@@ -1797,7 +2077,7 @@ mod tests {
         let (v, s) = derive_verdict(false, true, false, 36, 0, 0, 0, 0, 100);
         assert_eq!(v, Verdict::Incomplete);
         assert!(s.contains("36") && s.contains("couldn't be read"), "{s}");
-        assert!(s.contains("re-run") || s.contains("re-running"), "{s}");
+        assert!(s.contains("re-check them"), "{s}");
         assert!(!s.contains("cap"), "{s}");
         // Size-only variant.
         let (v, s) = derive_verdict(false, false, false, 0, 0, 0, 0, 5, 100);
@@ -2572,6 +2852,193 @@ mod tests {
         assert_eq!(v, Some(Verifier::SizeOnly));
         assert!(unver);
     }
+
+    // ── merge_recheck: fold a targeted re-check into the last outcome ──
+
+    fn ukey(k: &str) -> UnresolvedKey {
+        UnresolvedKey {
+            dest_key: k.to_string(),
+            source_key: Some(k.to_string()),
+            source_version: None,
+            dest_version: None,
+        }
+    }
+
+    /// The outcome of an audit that matched 10 objects and could not read
+    /// `keys` (plus `unlisted` more the capped list does not name).
+    fn partial(keys: &[&str], unlisted: u64) -> ParityOutcome {
+        let unresolved = keys.len() as u64 + unlisted;
+        let (verdict, verdict_summary) =
+            derive_verdict(false, true, false, unresolved, 0, 0, 0, 0, 10);
+        ParityOutcome {
+            rule_name: "r".into(),
+            source_bucket: "s".into(),
+            dest_bucket: "d".into(),
+            source_objects: 10,
+            dest_objects: 10,
+            matched: 10,
+            missing_on_dest: 0,
+            orphan_on_dest: 0,
+            checksum_mismatch: 0,
+            unverifiable: 0,
+            truncated: true,
+            cap_hit: false,
+            unresolved,
+            unresolved_keys: keys.iter().map(|k| ukey(k)).collect(),
+            unresolved_keys_capped: unlisted > 0,
+            rechecked_at: None,
+            in_sync: false,
+            scanned_at: 100,
+            regime: Regime::Transforming,
+            conflict_policy: ConflictPolicy::NewerWins,
+            replicate_deletes: false,
+            actionable: ActionableSummary::default(),
+            missing_samples: vec![],
+            orphan_samples: vec![],
+            mismatch_samples: vec![],
+            verdict,
+            verdict_summary,
+        }
+    }
+
+    fn recheck(
+        src: &[(&str, ObjState)],
+        dst: &[(&str, ObjState)],
+        settled: u64,
+        still: &[&str],
+    ) -> RecheckResult {
+        let (s, d) = (map(src), map(dst));
+        let mut diff = diff_parity(&s, &d);
+        annotate_findings(
+            &mut diff,
+            &s,
+            &d,
+            ConflictPolicy::NewerWins,
+            false,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        RecheckResult {
+            settled,
+            still_unresolved: still.iter().map(|k| ukey(k)).collect(),
+            source_present: s.len() as u64,
+            dest_present: d.len() as u64,
+            diff,
+            rechecked_at: 200,
+        }
+    }
+
+    fn sha(x: &str) -> ObjState {
+        st(Some(x), 5, Some("e"), None)
+    }
+
+    #[test]
+    fn merge_recheck_all_match_is_safe() {
+        let prev = partial(&["a", "b"], 0);
+        let o = merge_recheck(
+            &prev,
+            recheck(
+                &[("a", sha("1")), ("b", sha("2"))],
+                &[("a", sha("1")), ("b", sha("2"))],
+                2,
+                &[],
+            ),
+        );
+        assert_eq!((o.matched, o.source_objects, o.dest_objects), (12, 12, 12));
+        assert_eq!(o.unresolved, 0);
+        assert!(o.unresolved_keys.is_empty() && !o.unresolved_keys_capped);
+        assert!(!o.truncated && o.in_sync);
+        assert_eq!(o.verdict, Verdict::Safe, "{}", o.verdict_summary);
+        assert_eq!((o.scanned_at, o.rechecked_at), (100, Some(200)));
+    }
+
+    #[test]
+    fn merge_recheck_keeps_the_keys_that_fail_again() {
+        let prev = partial(&["a", "b", "c"], 0);
+        let o = merge_recheck(
+            &prev,
+            recheck(&[("a", sha("1"))], &[("a", sha("1"))], 1, &["b", "c"]),
+        );
+        assert_eq!(o.matched, 11);
+        assert_eq!(o.unresolved, 2);
+        assert_eq!(o.unresolved_keys, vec![ukey("b"), ukey("c")]);
+        assert!(o.truncated && !o.in_sync);
+        assert_eq!(o.verdict, Verdict::Incomplete);
+        assert!(
+            o.verdict_summary.contains("2 object(s)"),
+            "{}",
+            o.verdict_summary
+        );
+    }
+
+    #[test]
+    fn merge_recheck_a_missing_object_puts_the_mirror_at_risk() {
+        let prev = partial(&["a", "b"], 0);
+        // `b` is on the source only: the destination HEAD said "not found".
+        let o = merge_recheck(
+            &prev,
+            recheck(
+                &[("a", sha("1")), ("b", sha("2"))],
+                &[("a", sha("1"))],
+                2,
+                &[],
+            ),
+        );
+        assert_eq!((o.matched, o.missing_on_dest, o.unresolved), (11, 1, 0));
+        assert_eq!((o.source_objects, o.dest_objects), (12, 11));
+        assert_eq!(o.missing_samples.len(), 1);
+        assert!(o.missing_samples[0].remediation.is_some(), "annotated");
+        assert_eq!(o.actionable.rerun_fixes, 1);
+        assert_eq!(o.verdict, Verdict::AtRisk);
+        assert!(!o.in_sync);
+    }
+
+    #[test]
+    fn merge_recheck_of_a_capped_list_stays_incomplete() {
+        // 3 named + 5 the cap left out: re-checking the 3 leaves 5 unread.
+        let prev = partial(&["a", "b", "c"], 5);
+        let all = [("a", sha("1")), ("b", sha("2")), ("c", sha("3"))];
+        let o = merge_recheck(&prev, recheck(&all, &all, 3, &[]));
+        assert_eq!(o.unresolved, 5);
+        assert!(o.unresolved_keys.is_empty() && o.unresolved_keys_capped);
+        assert!(o.truncated && !o.in_sync);
+        assert_eq!(o.verdict, Verdict::Incomplete);
+    }
+
+    #[test]
+    fn merge_recheck_keeps_cap_hit_and_size_only_matches() {
+        let mut prev = partial(&["a"], 0);
+        prev.cap_hit = true;
+        let o = merge_recheck(
+            &prev,
+            recheck(&[("a", sha("1"))], &[("a", sha("1"))], 1, &[]),
+        );
+        assert!(o.cap_hit && o.truncated && !o.in_sync);
+        assert_eq!(o.verdict, Verdict::Incomplete);
+        assert!(o.verdict_summary.contains("cap"), "{}", o.verdict_summary);
+
+        let prev = partial(&["a"], 0);
+        let size_only = st(None, 5, None, None);
+        let o = merge_recheck(
+            &prev,
+            recheck(&[("a", size_only.clone())], &[("a", size_only)], 1, &[]),
+        );
+        assert_eq!((o.unverifiable, o.unresolved), (1, 0));
+        assert!(!o.truncated && !o.in_sync);
+        assert_eq!(o.verdict, Verdict::Incomplete);
+    }
+
+    #[test]
+    fn an_outcome_persisted_before_the_key_list_still_loads() {
+        let mut v = serde_json::to_value(partial(&[], 3)).unwrap();
+        let m = v.as_object_mut().unwrap();
+        for f in ["unresolved_keys", "unresolved_keys_capped", "rechecked_at"] {
+            m.remove(f);
+        }
+        let o: ParityOutcome = serde_json::from_value(v).unwrap();
+        assert_eq!(o.unresolved, 3);
+        assert!(o.unresolved_keys.is_empty() && o.rechecked_at.is_none());
+    }
 }
 
 /// Parity's requests and cache rows, on a fake S3.
@@ -2837,6 +3304,77 @@ mod request_count_tests {
             rows(&*db.lock().await, "src"),
             ["a.bin", "b.bin"],
             "the row of the deleted c.bin must go; b.bin's stays"
+        );
+    }
+
+    /// A re-check of the objects an audit could not read HEADs only those
+    /// objects (no listing), settles them into the result, and writes their
+    /// cache rows, so the next audit reads them from the cache.
+    #[tokio::test]
+    async fn a_recheck_reads_only_the_unread_objects_and_settles_them() {
+        let (engine, fake) = s3_engine().await;
+        for key in ["a.bin", "b.bin", "c.bin"] {
+            engine
+                .store("src", key, b"payload", None, Default::default())
+                .await
+                .unwrap();
+            replicate(&engine, key).await;
+        }
+        let db = Mutex::new(JobsDb::in_memory("pw").unwrap());
+        fake.fail("HEAD", "src/b.bin", 503, "SlowDown", u32::MAX);
+        fake.fail("HEAD", "dst/c.bin", 503, "SlowDown", u32::MAX);
+        let audit = parity_audit(&engine, &rule(&[]), 1_000, Some(&db), None)
+            .await
+            .unwrap();
+        assert_eq!(audit.unresolved, 2);
+        let kept: Vec<_> = audit
+            .unresolved_keys
+            .iter()
+            .map(|k| k.dest_key.as_str())
+            .collect();
+        assert_eq!(kept, ["b.bin", "c.bin"]);
+        assert!(audit.unresolved_keys.iter().all(|k| k.source_key.is_some()));
+        assert_eq!(audit.verdict, Verdict::Incomplete);
+
+        // c.bin's destination still fails; b.bin reads now.
+        fake.clear_faults();
+        fake.fail("HEAD", "dst/c.bin", 503, "SlowDown", u32::MAX);
+        fake.clear();
+        let once = parity_recheck_unresolved(&engine, &rule(&[]), &audit, Some(&db), None)
+            .await
+            .unwrap();
+        assert!(
+            !fake.requests().iter().any(|r| r.contains("list-type=2")),
+            "a re-check lists nothing: {:?}",
+            fake.requests()
+        );
+        assert_eq!(count(&fake, |r| r.starts_with("HEAD /src/a.bin")), 0);
+        assert_eq!((once.matched, once.unresolved), (audit.matched + 1, 1));
+        assert_eq!(once.unresolved_keys.len(), 1);
+        assert_eq!(once.unresolved_keys[0].dest_key, "c.bin");
+        assert_eq!(once.verdict, Verdict::Incomplete);
+        assert_eq!(once.scanned_at, audit.scanned_at);
+        assert!(once.rechecked_at.is_some());
+
+        fake.clear_faults();
+        let twice = parity_recheck_unresolved(&engine, &rule(&[]), &once, Some(&db), None)
+            .await
+            .unwrap();
+        assert_eq!((twice.matched, twice.unresolved), (3, 0));
+        assert!(twice.in_sync, "{}", twice.verdict_summary);
+        assert_eq!(twice.verdict, Verdict::Safe);
+
+        // The rows the re-checks wrote answer the next audit: no HEAD.
+        fake.clear();
+        let next = parity_audit(&engine, &rule(&[]), 1_000, Some(&db), None)
+            .await
+            .unwrap();
+        assert!(next.in_sync);
+        assert_eq!(
+            count(&fake, |r| r.starts_with("HEAD /")),
+            0,
+            "{:?}",
+            fake.requests()
         );
     }
 

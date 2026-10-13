@@ -131,8 +131,18 @@ export interface ParityOutcome {
    *  Optional: absent on rows persisted before these fields existed. */
   cap_hit?: boolean;
   /** Objects dropped from the compare because their read kept failing
-   *  transiently (throttling). Re-running usually clears it. */
+   *  transiently (throttling). A re-check of these objects usually clears it. */
   unresolved?: number;
+  /** The objects behind `unresolved` (at most 1,000), sorted by destination
+   *  key. A re-check (`startVerifyParity(rule, 'unresolved')`) reads only these.
+   *  Absent on rows persisted before the field existed. */
+  unresolved_keys?: UnresolvedKey[];
+  /** True when `unresolved` is larger than `unresolved_keys` (the list hit
+   *  its cap): only a full audit can read the objects the list leaves out. */
+  unresolved_keys_capped?: boolean;
+  /** When a re-check last merged into this result (unix SECONDS).
+   *  `scanned_at` stays the time of the full scan. */
+  rechecked_at?: number;
   /** THE signal: true iff !truncated && missing/orphan/mismatch/unverifiable all 0. */
   in_sync: boolean;
   scanned_at: number; // unix SECONDS
@@ -154,6 +164,13 @@ export interface ParityOutcome {
   verdict?: Verdict;
   /** Plain-language sentence matching `verdict` — shown verbatim as the body. */
   verdict_summary?: string;
+}
+
+/** One object a parity audit could not read. Internal to the outcome shape. */
+interface UnresolvedKey {
+  dest_key: string;
+  /** Absent for a destination-only object. */
+  source_key?: string;
 }
 
 /** The single server-derived conclusion of a parity audit. Internal to the
@@ -180,11 +197,20 @@ export interface ParityStatus {
   error?: string;
 }
 
-/** POST: start (or report) the background parity audit. */
-export async function startVerifyParity(ruleName: string): Promise<ParityStatus> {
-  return adminJson(`/api/admin/jobs/replication:${encodeURIComponent(ruleName)}/verify`, {
+/** What a verify reads: the whole mirror, or only the objects the last audit
+ *  could not read. */
+export type VerifyScope = 'all' | 'unresolved';
+
+/** POST: start (or report) the background parity audit. `unresolved` re-checks
+ *  only the objects the last audit could not read (409 when there are none). */
+export async function startVerifyParity(
+  ruleName: string,
+  scope: VerifyScope = 'all',
+): Promise<ParityStatus> {
+  const query = scope === 'unresolved' ? '?scope=unresolved' : '';
+  return adminJson(`/api/admin/jobs/replication:${encodeURIComponent(ruleName)}/verify${query}`, {
     method: 'POST',
-    context: 'Verify replication parity',
+    context: scope === 'unresolved' ? 'Re-check unread objects' : 'Verify replication parity',
   });
 }
 

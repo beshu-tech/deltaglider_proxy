@@ -14,7 +14,7 @@ import {
   runJobAction,
   startVerifyParity,
 } from '../adminApi';
-import type { ParityStatus } from '../adminApi';
+import type { ParityStatus, VerifyScope } from '../adminApi';
 import { jobsPollInterval, runsPollInterval } from '../jobsView';
 import { qk } from './keys';
 
@@ -111,11 +111,13 @@ export function useParityStatus(ruleName: string) {
   });
 }
 
-/** Kick off the background parity audit, then refetch its status. */
+/** Kick off the background parity audit, then refetch its status.
+ *  `mutate('unresolved')` re-checks only the objects the last audit could
+ *  not read; `mutate()` audits the whole mirror. */
 export function useStartVerify(ruleName: string) {
   const qc = useQueryClient();
-  return useMutation<ParityStatus, Error, void>({
-    mutationFn: () => startVerifyParity(ruleName),
+  return useMutation<ParityStatus, Error, VerifyScope | void>({
+    mutationFn: (scope) => startVerifyParity(ruleName, scope ?? 'all'),
     onSuccess: (data) => {
       qc.setQueryData(qk.jobs.verify(ruleName), data);
       qc.invalidateQueries({ queryKey: qk.jobs.verify(ruleName) });

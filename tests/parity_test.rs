@@ -265,6 +265,33 @@ async fn test_parity_audit_lifecycle() {
         404,
         "verify cancel is replication-only"
     );
+
+    // 7. Targeted re-check: the last audit read every object, so there is
+    //    nothing to re-check (409); an unknown scope is a 400.
+    let url = format!(
+        "{}/_/api/admin/jobs/replication:parity-a-to-b/verify",
+        server.endpoint()
+    );
+    let recheck = admin
+        .post(format!("{url}?scope=unresolved"))
+        .send()
+        .await
+        .expect("re-check request");
+    assert_eq!(recheck.status().as_u16(), 409);
+    let body = recheck.text().await.unwrap();
+    assert!(body.contains("nothing to re-check"), "{body}");
+    let bogus = admin
+        .post(format!("{url}?scope=everything"))
+        .send()
+        .await
+        .expect("bogus scope request");
+    assert_eq!(bogus.status().as_u16(), 400);
+    let st: Value = admin.get(&url).send().await.unwrap().json().await.unwrap();
+    assert_eq!(
+        st["status"].as_str(),
+        Some("done"),
+        "a refusal leaves the result"
+    );
 }
 
 /// On an S3 backend the lite LIST carries no user_metadata, so parity resolves

@@ -182,6 +182,9 @@ export default function VerifyTab({ ruleName }: Props) {
   const outcome = s?.outcome;
 
   const run = () => start.mutate();
+  // Re-read only the objects the last audit could not read.
+  const recheck = () => start.mutate('unresolved');
+  const rechecking = running && start.variables === 'unresolved';
   const onCancel = () => cancel.mutate();
   // The one executable per-finding fix: run the rule, then re-verify once the
   // run settles. Run-now answers 202 while the run still holds the lease, and
@@ -241,9 +244,11 @@ export default function VerifyTab({ ruleName }: Props) {
           label={
             cancelling
               ? 'Cancelling…'
-              : listing
-                ? 'Listing objects…'
-                : 'Comparing source and destination…'
+              : rechecking
+                ? 'Re-checking the objects that could not be read…'
+                : listing
+                  ? 'Listing objects…'
+                  : 'Comparing source and destination…'
           }
           scanned={s?.progress_scanned}
           total={s?.progress_total}
@@ -331,6 +336,7 @@ export default function VerifyTab({ ruleName }: Props) {
         reverifyScanned={running ? s?.progress_scanned : undefined}
         reverifyTotal={running ? s?.progress_total : undefined}
         onReverify={run}
+        onRecheck={recheck}
         onCancelReverify={cancelling ? undefined : onCancel}
         onRunNow={onRunNow}
         runNowPending={runNow.isPending || pendingReverify != null}
@@ -524,6 +530,7 @@ export function ParityResult({
   reverifyScanned,
   reverifyTotal,
   onReverify,
+  onRecheck,
   onCancelReverify,
   onRunNow,
   runNowPending,
@@ -537,6 +544,8 @@ export function ParityResult({
   /** Compare-phase denominator of the in-flight re-verify (determinate bar). */
   reverifyTotal?: number;
   onReverify: () => void;
+  /** Re-read only the objects the audit could not read. Omitted = no button. */
+  onRecheck?: () => void;
   /** Cancel the in-flight re-verify. Omitted (or while cancelling) = no button. */
   onCancelReverify?: () => void;
   /** Executes the rule's run-now (the only executable fix). Omitted = disabled CTA. */
@@ -569,6 +578,10 @@ export function ParityResult({
 
   const scannedDate = new Date(outcome.scanned_at * 1000);
   const scannedAbsolute = scannedDate.toLocaleString();
+  const recheckedDate = outcome.rechecked_at ? new Date(outcome.rechecked_at * 1000) : null;
+  const unresolved = outcome.unresolved ?? 0;
+  // The objects a re-check reads: the kept list (capped at 1,000 server-side).
+  const recheckable = outcome.unresolved_keys?.length ?? 0;
 
   return (
     <div style={{ padding: '4px 2px' }}>
@@ -687,6 +700,11 @@ export function ParityResult({
           title={`Scanned at ${scannedAbsolute}`}
         >
           Checked {relativeTime(scannedDate)} ·{' '}
+          {recheckedDate && (
+            <span title={`Re-checked at ${recheckedDate.toLocaleString()}`}>
+              unread objects re-checked {relativeTime(recheckedDate)} ·{' '}
+            </span>
+          )}
           {pure
             ? 'compared sizes + checksums from the object listing — no downloads'
             : 'compared recorded checksums + sizes — no downloads'}
@@ -722,10 +740,10 @@ export function ParityResult({
         }}
       >
         {/* Partial-scan note — the CAUSE decides the remedy shown. cap_hit →
-            raise the cap; unresolved reads → re-run (raising the cap would do
-            nothing — the incident where 36 throttled HEADs rendered as "raise
-            DGP_PARITY_MAX_OBJECTS"). Legacy rows (neither field) get the
-            hedged both-causes wording. */}
+            raise the cap; unresolved reads → re-check only those objects
+            (raising the cap would do nothing — the incident where 36 throttled
+            HEADs rendered as "raise DGP_PARITY_MAX_OBJECTS"). Legacy rows
+            (neither field) get the hedged both-causes wording. */}
         {outcome.truncated && (
           <Alert
             type="warning"
@@ -734,8 +752,8 @@ export function ParityResult({
             title={
               outcome.cap_hit
                 ? 'Only part of the mirror was checked'
-                : (outcome.unresolved ?? 0) > 0
-                  ? `${(outcome.unresolved ?? 0).toLocaleString()} object${(outcome.unresolved ?? 0) === 1 ? '' : 's'} couldn't be read`
+                : unresolved > 0
+                  ? `${unresolved.toLocaleString()} ${noun(unresolved, 'object')} couldn't be read`
                   : 'Only part of the mirror was checked'
             }
             description={
@@ -747,16 +765,13 @@ export function ParityResult({
                   below cover only the scanned portion. Raise the cap with the{' '}
                   <code>DGP_PARITY_MAX_OBJECTS</code> environment variable to scan more.
                 </>
-              ) : (outcome.unresolved ?? 0) > 0 ? (
-                <>
-                  The whole mirror was listed, but{' '}
-                  {(outcome.unresolved ?? 0).toLocaleString()} object
-                  {(outcome.unresolved ?? 0) === 1 ? '' : 's'} had to be dropped from the compare
-                  because the backend kept failing their reads (usually throttling) — they are{' '}
-                  <strong>unverified</strong>. <strong>Re-run the audit</strong> — this typically
-                  clears on its own. If it persists, lower{' '}
-                  <code>DGP_PARITY_HEAD_CONCURRENCY</code> to be gentler on the backend.
-                </>
+              ) : unresolved > 0 ? (
+                <UnreadObjectsNote
+                  unresolved={unresolved}
+                  recheckable={recheckable}
+                  rechecked={recheckedDate != null}
+                  onRecheck={onRecheck}
+                />
               ) : (
                 <>
                   The audit covered only part of the mirror — the rest is{' '}
@@ -796,6 +811,71 @@ export function ParityResult({
         )}
       </div>
     </div>
+  );
+}
+
+/**
+ * The remedy for objects the audit could not read: re-check only those
+ * objects (no listing, no reads of the rest of the mirror). "Audit again"
+ * below the verdict stays the full option. The concurrency hint shows only after a re-check also
+ * failed, because one transient failure usually clears on its own.
+ */
+function UnreadObjectsNote({
+  unresolved,
+  recheckable,
+  rechecked,
+  onRecheck,
+}: {
+  unresolved: number;
+  recheckable: number;
+  rechecked: boolean;
+  onRecheck?: () => void;
+}) {
+  const capped = recheckable < unresolved;
+  return (
+    <>
+      <div>
+        The whole mirror was listed, but the backend kept failing the reads of{' '}
+        {unresolved.toLocaleString()} {noun(unresolved, 'object')} (usually because it throttled
+        the requests). These objects are <strong>unverified</strong>.{' '}
+        {recheckable > 0 ? (
+          <>
+            A re-check reads only {recheckable === 1 ? 'this object' : 'these objects'} again,
+            so it is much faster than a full audit.
+            {capped && (
+              <>
+                {' '}The audit kept the names of {recheckable.toLocaleString()} of them, so the
+                re-check reads those {recheckable.toLocaleString()}. A full audit reads the other{' '}
+                {(unresolved - recheckable).toLocaleString()}.
+              </>
+            )}
+          </>
+        ) : (
+          <>
+            The audit did not keep their names, so only a full audit can read them again.
+          </>
+        )}
+        {rechecked && (
+          <>
+            {' '}A re-check also failed to read{' '}
+            {unresolved === 1 ? 'this object' : 'these objects'}. Lower{' '}
+            <code>DGP_PARITY_HEAD_CONCURRENCY</code> to send fewer requests to the backend at the
+            same time, then re-check again.
+          </>
+        )}
+      </div>
+      {recheckable > 0 && onRecheck && (
+        <Button
+          type="primary"
+          size="small"
+          icon={<ReloadOutlined />}
+          onClick={onRecheck}
+          style={{ marginTop: 10 }}
+        >
+          Re-check {recheckable === 1 ? 'this object' : `these ${recheckable.toLocaleString()} objects`}
+        </Button>
+      )}
+    </>
   );
 }
 

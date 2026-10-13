@@ -533,19 +533,31 @@ pub async fn job_verify_status(
     Ok(Json(serde_json::to_value(resp).map_err(internal)?))
 }
 
+/// Options of `POST …/verify`. `scope=unresolved` re-reads only the objects
+/// the last audit could not read; absent (or `all`) audits the whole mirror.
+#[derive(Debug, Default, Deserialize)]
+pub struct VerifyQuery {
+    #[serde(default)]
+    pub scope: super::replication::VerifyScope,
+}
+
 /// POST /_/api/admin/jobs/:id/verify — kick off the background parity audit
 /// (replication only). Returns 202 + the running status. The literal `verify`
 /// route carries this POST because it shadows the `:action` param at this path.
+/// `?scope=unresolved` re-checks only the last audit's unread objects (409
+/// when there are none, or an audit is running).
 pub async fn job_verify_start(
     Path(id): Path<String>,
     State(state): State<Arc<AdminState>>,
+    AdminQuery(q): AdminQuery<VerifyQuery>,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AdminError> {
     let (sub, key) = parse_job_id(&id).ok_or(not_found())?;
     if sub != JobSubsystem::Replication {
         return Err(not_found());
     }
-    let (code, resp) = super::replication::verify(state, key.to_string(), &headers).await?;
+    let (code, resp) =
+        super::replication::verify(state, key.to_string(), &headers, q.scope).await?;
     Ok((code, Json(serde_json::to_value(resp).map_err(internal)?)))
 }
 
@@ -769,7 +781,13 @@ pub async fn job_action(
         }
         (JobSubsystem::Replication, JobAction::Verify) => {
             // Kicks off a BACKGROUND audit; returns 202 + the (running) status.
-            let (code, resp) = super::replication::verify(state, name, &headers).await?;
+            let (code, resp) = super::replication::verify(
+                state,
+                name,
+                &headers,
+                super::replication::VerifyScope::All,
+            )
+            .await?;
             Ok((code, Json(serde_json::to_value(resp).map_err(internal)?)))
         }
         (JobSubsystem::Lifecycle, JobAction::Pause) => {

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added — Re-check only the objects that a replication audit could not read
+
+On an S3 backend, a replication Verify audit sends a HEAD request for many
+objects. When the backend throttles, some of these requests can keep failing,
+and the audit reports that N objects couldn't be read. Before, the only
+remedy was a full audit again, which lists and reads the whole mirror. The
+audit now keeps the names of up to 1,000 of these objects, and the Verify tab
+shows a **Re-check these N objects** button. The re-check reads only those
+objects on both sides and adds the result to the last audit, so the verdict
+can become "Verified in sync" in seconds. Objects that fail again stay in the
+list. The admin API form is `POST /_/api/admin/jobs/:id/verify?scope=unresolved`.
+
 ## v2.0.11 — 2026-10-13
 
 ### Changed — An SSO login that no mapping rule matches is refused

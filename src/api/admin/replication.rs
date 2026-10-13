@@ -287,18 +287,73 @@ fn parity_status_from_row(
     }
 }
 
+/// What a verify reads: the whole mirror, or only the objects the last
+/// audit could not read (`?scope=unresolved`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyScope {
+    #[default]
+    All,
+    Unresolved,
+}
+
+/// PURE: the previous outcome a `scope=unresolved` re-check folds into, or
+/// the reason it cannot run (a 409). `row` is the persisted parity row.
+fn recheck_base(
+    row: Option<&crate::replication::ParityResultRow>,
+    rule: &ReplicationRule,
+) -> Result<replication::ParityOutcome, String> {
+    let Some(row) = row else {
+        return Err("no audit has run for this rule yet — run a full audit".to_string());
+    };
+    if matches!(row.status.as_str(), "running" | "cancelling") {
+        return Err("an audit is already running for this rule".to_string());
+    }
+    let Some(prev) = row
+        .outcome_json
+        .as_deref()
+        .and_then(|j| serde_json::from_str::<replication::ParityOutcome>(j).ok())
+    else {
+        return Err("no audit result to re-check — run a full audit".to_string());
+    };
+    if prev.unresolved_keys.is_empty() {
+        return Err(if prev.unresolved > 0 {
+            "the last audit did not keep the list of unread objects — run a full audit"
+        } else {
+            "the last audit read every object — there is nothing to re-check"
+        }
+        .to_string());
+    }
+    if prev.source_bucket != rule.source.bucket || prev.dest_bucket != rule.destination.bucket {
+        return Err(
+            "the rule's buckets changed since the last audit — run a full audit".to_string(),
+        );
+    }
+    Ok(prev)
+}
+
 /// POST: kick off a parity audit as a BACKGROUND job and return immediately
 /// (202). If an audit is already running, just report its status. The result
 /// is persisted server-side so it survives navigation + restart; poll
 /// `GET verify`. Gated only on rule existence (auditing a disabled rule is
 /// valid). Idempotent under the lease — a second POST won't double-scan.
+///
+/// `VerifyScope::Unresolved` re-reads only the objects the last audit could
+/// not read and merges the answer into that result. It is refused (409) when
+/// there is no previous result, nothing to re-check, or an audit running.
 pub async fn verify(
     state: Arc<AdminState>,
     name: String,
     headers: &HeaderMap,
+    scope: VerifyScope,
 ) -> Result<(StatusCode, ParityStatusResponse), AdminError> {
     let (_repl, rule) = snapshot_and_find_rule(&state, &name).await?;
     let Some(plane) = state.job_plane.clone() else {
+        if scope == VerifyScope::Unresolved {
+            return Err(AdminError::conflict(
+                "no audit result is kept without a jobs database — run a full audit",
+            ));
+        }
         // No jobs DB → fall back to a synchronous in-request audit (dev/no-DB).
         let engine = state.s3_state.engine.load().clone();
         let outcome = replication::parity_audit(
@@ -326,6 +381,13 @@ pub async fn verify(
     let db_arc = plane.db;
     let owner = format!("verify:{}", uuid::Uuid::new_v4());
     let now = crate::replication::current_unix_seconds();
+    // The outcome a targeted re-check folds into — read before the lease,
+    // and again under it below (a full audit may settle in between).
+    if scope == VerifyScope::Unresolved {
+        let db = db_arc.lock().await;
+        let row = db.parity_result_load(&rule.name).ok().flatten();
+        recheck_base(row.as_ref(), &rule).map_err(AdminError::conflict)?;
+    }
     // A verify DURING a replication run of the same rule is meaningless — the
     // dest is expected to be mid-sync — and the UI's "fix then verify" flow
     // (run-now → verify) would otherwise race a false 'not in sync' verdict.
@@ -370,6 +432,11 @@ pub async fn verify(
         let db = db_arc.lock().await;
         db.parity_try_acquire_lease(&rule.name, &owner, now, lease.ttl_secs)?
     };
+    if !acquired && scope == VerifyScope::Unresolved {
+        return Err(AdminError::conflict(
+            "an audit is already running for this rule",
+        ));
+    }
     if !acquired {
         // Someone else holds the lease → a scan IS in flight. Report 'running'
         // even if the winner hasn't written its set_running row yet (a small
@@ -385,29 +452,48 @@ pub async fn verify(
         return Ok((StatusCode::ACCEPTED, resp));
     }
 
-    {
+    let recheck_of = {
         let db = db_arc.lock().await;
+        let row = db.parity_result_load(&rule.name).ok().flatten();
+        let recheck_of = match scope {
+            VerifyScope::All => None,
+            VerifyScope::Unresolved => match recheck_base(row.as_ref(), &rule) {
+                Ok(prev) => Some(prev),
+                Err(msg) => {
+                    let _ = db.parity_release_lease(&rule.name, &owner);
+                    return Err(AdminError::conflict(msg));
+                }
+            },
+        };
         // Seed the progress bar with the PRIOR run's object count so it goes
         // determinate immediately (kills the "looked frozen" indeterminate span
         // during listing); the driver's real set_total corrects it. First-ever
-        // run has no prior → 0 → indeterminate, as before.
-        let est_total = db
-            .parity_result_load(&rule.name)
-            .ok()
-            .flatten()
-            .and_then(|r| r.outcome_json)
-            .and_then(|j| serde_json::from_str::<replication::ParityOutcome>(&j).ok())
-            .map(|o| (o.source_objects + o.dest_objects) as i64)
-            .unwrap_or(0);
+        // run has no prior → 0 → indeterminate, as before. A re-check reads
+        // each kept key on both sides.
+        let est_total = match &recheck_of {
+            Some(prev) => (prev.unresolved_keys.len() * 2) as i64,
+            None => row
+                .and_then(|r| r.outcome_json)
+                .and_then(|j| serde_json::from_str::<replication::ParityOutcome>(&j).ok())
+                .map(|o| (o.source_objects + o.dest_objects) as i64)
+                .unwrap_or(0),
+        };
         let _ = db.parity_result_set_running(&rule.name, est_total, now);
-    }
+        recheck_of
+    };
     // NOTE: no sync push — coordination tables (leases, parity, run history)
     // are NODE-LOCAL (dropped from the IAM sync set in B3), so a push cannot
     // make a peer see this lease. Two instances CAN double-scan; see CLAUDE.md.
 
-    info!("Replication verify (background) started: rule='{}'", name);
+    info!(
+        "Replication verify (background) started: rule='{}' scope={:?}",
+        name, scope
+    );
     crate::audit::audit_log(
-        "replication_verify",
+        match scope {
+            VerifyScope::All => "replication_verify",
+            VerifyScope::Unresolved => "replication_verify_unresolved",
+        },
         "admin",
         &name,
         headers,
@@ -437,17 +523,35 @@ pub async fn verify(
         // Catch a panic in the audit so the lease + 'running' status are ALWAYS
         // settled — otherwise a panicked task would leave the lease stuck for the
         // full TTL and the UI polling a never-ending 'running' forever.
-        let audit = std::panic::AssertUnwindSafe(replication::parity_audit(
-            &engine,
-            &rule_clone,
-            replication::parity::max_parity_objects(),
-            Some(&db_for_task),
-            Some(replication::parity::ParityProgress {
-                db: &db_for_task,
-                rule: &rule_clone.name,
-                cancel: &cancel_flag,
-            }),
-        ));
+        let progress = replication::parity::ParityProgress {
+            db: &db_for_task,
+            rule: &rule_clone.name,
+            cancel: &cancel_flag,
+        };
+        let audit = std::panic::AssertUnwindSafe(async {
+            match &recheck_of {
+                Some(prev) => {
+                    replication::parity_recheck_unresolved(
+                        &engine,
+                        &rule_clone,
+                        prev,
+                        Some(&db_for_task),
+                        Some(progress),
+                    )
+                    .await
+                }
+                None => {
+                    replication::parity_audit(
+                        &engine,
+                        &rule_clone,
+                        replication::parity::max_parity_objects(),
+                        Some(&db_for_task),
+                        Some(progress),
+                    )
+                    .await
+                }
+            }
+        });
         let audit = futures::FutureExt::catch_unwind(audit);
         // Keeper: renew the lease every heartbeat so a scan that runs longer
         // than the TTL doesn't let a concurrent POST acquire + double-scan. It stops
@@ -500,7 +604,14 @@ pub async fn verify(
             // serialize — a 'done' with empty outcome_json reads as no result.
             Ok(outcome) => match serde_json::to_string(&outcome) {
                 Ok(json) => {
-                    let _ = db.parity_result_done(&rule_clone.name, outcome.in_sync, &json, now);
+                    // `scanned_at` of the outcome, not `now`: a re-check keeps
+                    // the time of the full scan it merged into.
+                    let _ = db.parity_result_done(
+                        &rule_clone.name,
+                        outcome.in_sync,
+                        &json,
+                        outcome.scanned_at,
+                    );
                 }
                 Err(e) => {
                     let _ = db.parity_result_failed(
@@ -664,6 +775,9 @@ mod tests {
             truncated: false,
             cap_hit: false,
             unresolved: 0,
+            unresolved_keys: vec![],
+            unresolved_keys_capped: false,
+            rechecked_at: None,
             in_sync: true,
             scanned_at: 1000,
             regime: Regime::Transforming,
@@ -706,6 +820,60 @@ mod tests {
             // Progress still flows so the UI shows a live bar.
             assert_eq!(r.progress_scanned, 5);
             assert_eq!(r.progress_total, 10);
+        }
+    }
+
+    /// A re-check needs a settled result that kept the keys it could not read.
+    #[test]
+    fn recheck_base_refusals() {
+        let rule: ReplicationRule = serde_yaml::from_str(
+            "name: r\nenabled: true\nsource: {bucket: s}\ndestination: {bucket: d}\n",
+        )
+        .unwrap();
+        let with = |f: &dyn Fn(&mut ParityOutcome)| {
+            let mut o: ParityOutcome = serde_json::from_str(&some_outcome_json()).unwrap();
+            f(&mut o);
+            ParityResultRow {
+                outcome_json: Some(serde_json::to_string(&o).unwrap()),
+                ..row("done", false)
+            }
+        };
+        let key = crate::replication::parity::UnresolvedKey {
+            dest_key: "k".into(),
+            source_key: Some("k".into()),
+            source_version: None,
+            dest_version: None,
+        };
+        let unread = |o: &mut ParityOutcome| {
+            o.unresolved = 1;
+            o.unresolved_keys = vec![key.clone()];
+        };
+        let err = |r: Option<&ParityResultRow>| recheck_base(r, &rule).unwrap_err();
+
+        assert!(err(None).contains("no audit"));
+        assert!(err(Some(&row("done", false))).contains("no audit result"));
+        assert!(err(Some(&with(&|_| {}))).contains("nothing to re-check"));
+        assert!(err(Some(&with(&|o| o.unresolved = 5))).contains("did not keep"));
+        for st in ["running", "cancelling"] {
+            let r = ParityResultRow {
+                status: st.into(),
+                ..with(&unread)
+            };
+            assert!(err(Some(&r)).contains("already running"));
+        }
+        let moved = with(&|o| {
+            unread(o);
+            o.dest_bucket = "elsewhere".into();
+        });
+        assert!(err(Some(&moved)).contains("buckets changed"));
+        // A failed or cancelled re-check keeps the result: it can run again.
+        for st in ["done", "failed", "cancelled"] {
+            let r = ParityResultRow {
+                status: st.into(),
+                ..with(&unread)
+            };
+            let prev = recheck_base(Some(&r), &rule).unwrap();
+            assert_eq!(prev.unresolved_keys, vec![key.clone()]);
         }
     }
 }

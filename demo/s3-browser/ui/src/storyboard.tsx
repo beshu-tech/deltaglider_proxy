@@ -147,7 +147,7 @@ const truncated: ParityOutcome = {
 };
 
 // Whole mirror listed, but some reads kept failing transiently (throttling):
-// the remedy is RE-RUN, never "raise the cap" — the alert must say so.
+// the remedy is a RE-CHECK of those objects, never "raise the cap" — the alert must say so.
 const unresolvedReads: ParityOutcome = {
   ...base,
   source_objects: 99654,
@@ -156,11 +156,15 @@ const unresolvedReads: ParityOutcome = {
   truncated: true,
   cap_hit: false,
   unresolved: 36,
+  unresolved_keys: Array.from({ length: 36 }, (_, i) => ({
+    dest_key: `builds/app-${i}.zip`,
+    source_key: `builds/app-${i}.zip`,
+  })),
   in_sync: false,
   scanned_at: ago(7),
   verdict: 'incomplete',
   verdict_summary:
-    "Nothing is missing or different, but 36 object(s) couldn't be read (transient backend errors) — re-running the audit usually clears this.",
+    "Nothing is missing or different, but 36 object(s) couldn't be read (transient backend errors) — re-check them to finish the audit.",
 };
 
 const amber: ParityOutcome = {

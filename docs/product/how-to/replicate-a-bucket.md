@@ -153,6 +153,8 @@ To stop the rule for a while, click **Pause** in its row (or send `POST …/paus
 
    The audit proves that the two sides agree on the recorded metadata. It does not prove that the destination reconstructs each object byte for byte. For that proof, use the checks below.
 
+   On an S3 backend, the audit sends a HEAD request for each object whose metadata the listing does not carry. A backend that throttles can fail some of these requests again and again. The audit then cannot compare those objects, so it leaves them out and reports **Not fully verified**, with the number of objects that it could not read. The audit keeps the names of up to 1,000 of these objects. Click **Re-check these N objects** to read only those objects again. The re-check lists nothing and does not read the rest of the mirror, so it finishes in seconds even on a large bucket. The proxy then adds the result to the last audit: each object that it now reads counts as a match or as a difference, and the verdict is computed again. The panel keeps the time of the full audit and also shows the time of the re-check. If the re-check also fails to read some objects, lower `DGP_PARITY_HEAD_CONCURRENCY` so that the proxy sends fewer requests to the backend at the same time, and re-check again. If more than 1,000 objects failed, the re-check reads the first 1,000, and only **Audit again** (a full audit) reads the others. The same re-check through the admin API is `POST /_/api/admin/jobs/replication:releases-to-dr/verify?scope=unresolved`.
+
 2. Check that the destination has the objects:
 
    ```bash
