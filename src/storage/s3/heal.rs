@@ -402,6 +402,66 @@ mod tests {
         assert_eq!(puts, N, "one facts write per delta");
     }
 
+    /// The prod case (v2.0.9, slow backend): deltas without durable facts,
+    /// a node whose delete cleanup reads for a long time (a lifecycle run
+    /// deleted many keys), and a scan that HEADs its misses. The facts the
+    /// HEADs learned waited behind the cleanup, so no facts PUT was sent
+    /// and every node and restart missed the deltas again. Now they land
+    /// at once, and another node lists every delta from the facts: no miss,
+    /// no HEAD.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn facts_converge_while_a_long_delete_cleanup_runs() {
+        const N: usize = 20;
+        let (_, fake, endpoint) = deltas_without_facts("rel", N).await;
+        let mut s3 = test_support::for_test_endpoint(&endpoint);
+        s3.list_cache_scope = format!("{endpoint}/busy-node");
+        fake.set_delay_ms("LIST", 150);
+        // 40 deleted keys, one per directory: 40 facts LISTs, 6 s.
+        for i in 0..40 {
+            s3.facts_cleanup
+                .enqueue("b", &format!("e2e/run{i:03}/index.html"), None);
+        }
+        let busy = engine_on(s3);
+        assert!(
+            fake.wait_for(|r| r.contains("prefix=.dg%2Ffacts%2Fe2e"))
+                .await
+        );
+        fake.clear();
+        let started = std::time::Instant::now();
+        let page = list_with_heads(&busy, "rel/").await;
+        assert!(page.objects.iter().all(|(_, m)| m.file_size == 65_536));
+        let landed = wait_count(&fake, N, |r| r.starts_with("PUT /b/.dg/facts/rel/")).await;
+        assert!(
+            landed && started.elapsed() < std::time::Duration::from_secs(4),
+            "{N} facts PUTs after {:?}: {landed}",
+            started.elapsed()
+        );
+        fake.set_delay_ms("LIST", 0);
+        let other = reader(&endpoint, "fresh-node");
+        fake.clear();
+        let page = list(&other, "rel/").await;
+        assert!(page.objects.iter().all(|(_, m)| m.file_size == 65_536));
+        assert!(page.facts_missing_keys.is_empty());
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(fake.requests().iter().filter(|r| delta_heads(r)).count(), 0);
+    }
+
+    /// The lifecycle scan's listing: the page, then a HEAD of each delta.
+    async fn list_with_heads(
+        engine: &DynEngine,
+        prefix: &str,
+    ) -> crate::deltaglider::ListObjectsPage {
+        let mut page = engine
+            .list_objects_lite("b", prefix, None, 1000, None)
+            .await
+            .unwrap();
+        engine
+            .finish_listed_page_with_heads("b", &mut page)
+            .await
+            .unwrap();
+        page
+    }
+
     /// An engine with a proxy-encryption key on the fake, with its own
     /// listing-cache scope.
     fn encrypted_reader(endpoint: &str, node: &str) -> DynEngine {
