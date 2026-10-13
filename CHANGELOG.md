@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.12 — 2026-10-13
+
 ### Added — Re-check only the objects that a replication audit could not read
 
 On an S3 backend, a replication Verify audit sends a HEAD request for many
