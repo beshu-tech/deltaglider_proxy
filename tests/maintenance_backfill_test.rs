@@ -162,7 +162,9 @@ async fn seed_foreign_multipart(
 /// no listing facts for passthrough objects (one more LIST request per page
 /// for every listing), so writing facts at the rewrite does not reach it.
 #[tokio::test]
-#[ignore = "known gap: LIST reports the self-copy ETag after an S3 backfill of a multipart object; a plaintext S3 LIST reads no listing facts for passthrough objects (see docs/product/reference/jobs.md)"]
+// Known gap: a plaintext S3 LIST reads no listing facts for passthrough
+// objects, so it reports the self-copy ETag (docs/product/reference/jobs.md).
+#[ignore = "manual: cargo test --test all -- maintenance_backfill_test::backfill_s3_list_reports_the_etag_that_head_reports --ignored"]
 async fn backfill_s3_list_reports_the_etag_that_head_reports() {
     skip_unless_minio!();
     let bucket = "backfill-s3-list-etag";
@@ -210,7 +212,9 @@ async fn backfill_s3_list_reports_the_etag_that_head_reports() {
 /// facts carry the logical size and ETag only, and the listing never
 /// changes a listed time, so a fix needs a new facts format with the time.
 #[tokio::test]
-#[ignore = "known gap: LIST reports the self-copy time after an S3 backfill; the listing facts carry no time (see docs/product/reference/jobs.md)"]
+// Known gap: the listing facts carry no time, so a LIST reports the
+// self-copy time (docs/product/reference/jobs.md).
+#[ignore = "manual: cargo test --test all -- maintenance_backfill_test::backfill_s3_list_reports_the_last_modified_that_head_reports --ignored"]
 async fn backfill_s3_list_reports_the_last_modified_that_head_reports() {
     skip_unless_minio!();
     let bucket = "backfill-s3-list-time";
