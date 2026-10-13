@@ -41,6 +41,21 @@ pub struct LifecycleRunRecord {
     pub bytes_affected: i64,
     pub errors: i64,
     pub status: String,
+    /// The split of the run's counters (`lifecycle_run_counts`). `None` for
+    /// a run that ended before the table existed, or that is still running.
+    pub split: Option<LifecycleRunSplit>,
+}
+
+/// What a run did with the objects it acted on and why it skipped the
+/// others. Stored next to the run-history row, in the jobs-only table
+/// `lifecycle_run_counts`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LifecycleRunSplit {
+    pub objects_deleted: i64,
+    pub objects_moved: i64,
+    pub objects_copied: i64,
+    pub objects_excluded: i64,
+    pub objects_not_due: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,17 +84,52 @@ pub struct LifecycleRunTotals {
     pub objects_skipped: i64,
     pub bytes_affected: i64,
     pub errors: i64,
+    pub objects_deleted: i64,
+    pub objects_moved: i64,
+    pub objects_copied: i64,
+    pub objects_excluded: i64,
+    pub objects_not_due: i64,
+}
+
+/// PURE: when a rule that has no state row yet first runs on schedule:
+/// one tick after the proxy first sees it enabled (an apply, a boot, or a
+/// scheduler check). A new rule never runs on the next check: the
+/// operator has one tick to preview what it will do.
+pub fn first_due_at(now: i64, tick_secs: i64) -> i64 {
+    now.saturating_add(tick_secs.max(1))
 }
 
 impl JobsDb {
-    pub fn lifecycle_ensure_state(&self, rule_name: &str, now: i64) -> Result<(), ConfigDbError> {
+    /// Create the state row of a rule that has none, first due at
+    /// `next_due_at` (see [`first_due_at`]). An existing row is unchanged.
+    pub fn lifecycle_ensure_state(
+        &self,
+        rule_name: &str,
+        next_due_at: i64,
+    ) -> Result<(), ConfigDbError> {
         self.conn.execute(
             "INSERT OR IGNORE INTO lifecycle_state
                 (rule_name, next_due_at, last_status)
              VALUES (?, ?, 'idle')",
-            params![rule_name, now],
+            params![rule_name, next_due_at],
         )?;
         Ok(())
+    }
+
+    /// A resume after a pause that STOPPED a run: the run kept its cursor,
+    /// so the rule is due now and the scheduler continues it at its next
+    /// check. A rule paused while idle keeps its schedule.
+    pub fn lifecycle_due_now_if_stopped_by_pause(
+        &self,
+        rule_name: &str,
+        now: i64,
+    ) -> Result<bool, ConfigDbError> {
+        let n = self.conn.execute(
+            "UPDATE lifecycle_state SET next_due_at = MIN(next_due_at, ?)
+              WHERE rule_name = ? AND last_status = 'paused'",
+            params![now, rule_name],
+        )?;
+        Ok(n > 0)
     }
 
     pub fn lifecycle_reconcile_rules(
@@ -105,6 +155,11 @@ impl JobsDb {
                 )?;
                 // Run history + failure ring are keyed by rule_name too; drop
                 // them so a deleted rule leaves no orphaned rows in the GUI.
+                tx.execute(
+                    "DELETE FROM lifecycle_run_counts WHERE run_id IN
+                        (SELECT id FROM lifecycle_run_history WHERE rule_name = ?)",
+                    params![existing],
+                )?;
                 tx.execute(
                     "DELETE FROM lifecycle_run_history WHERE rule_name = ?",
                     params![existing],
@@ -366,6 +421,20 @@ impl JobsDb {
             ],
         )?;
         self.conn.execute(
+            "INSERT OR REPLACE INTO lifecycle_run_counts
+                (run_id, objects_deleted, objects_moved, objects_copied,
+                 objects_excluded, objects_not_due)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![
+                run_id,
+                totals.objects_deleted,
+                totals.objects_moved,
+                totals.objects_copied,
+                totals.objects_excluded,
+                totals.objects_not_due
+            ],
+        )?;
+        self.conn.execute(
             "UPDATE lifecycle_state
                 SET last_run_at = ?,
                     last_status = ?,
@@ -442,18 +511,61 @@ impl JobsDb {
         Ok(rows)
     }
 
+    /// How many failures the ring keeps for `rule_name` (the failures
+    /// endpoint lists the most recent of them).
+    pub fn lifecycle_failure_count(&self, rule_name: &str) -> Result<i64, ConfigDbError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM lifecycle_failures WHERE rule_name = ?",
+            params![rule_name],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The newest failure of the run `run_id`, if any.
+    pub fn lifecycle_last_failure_of_run(
+        &self,
+        rule_name: &str,
+        run_id: i64,
+    ) -> Result<Option<LifecycleFailureRecord>, ConfigDbError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, rule_name, run_id, occurred_at, bucket, object_key, error_message
+                 FROM lifecycle_failures
+                 WHERE rule_name = ? AND run_id = ?
+                 ORDER BY occurred_at DESC, id DESC
+                 LIMIT 1",
+                params![rule_name, run_id],
+                |r| {
+                    Ok(LifecycleFailureRecord {
+                        id: r.get(0)?,
+                        rule_name: r.get(1)?,
+                        run_id: r.get(2)?,
+                        occurred_at: r.get(3)?,
+                        bucket: r.get(4)?,
+                        object_key: r.get(5)?,
+                        error_message: r.get(6)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
     pub fn lifecycle_recent_runs(
         &self,
         rule_name: &str,
         limit: u32,
     ) -> Result<Vec<LifecycleRunRecord>, ConfigDbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, rule_name, triggered_by, started_at, finished_at,
-                    objects_scanned, objects_affected, objects_skipped,
-                    bytes_affected, errors, status
-             FROM lifecycle_run_history
-             WHERE rule_name = ?
-             ORDER BY started_at DESC, id DESC
+            "SELECT h.id, h.rule_name, h.triggered_by, h.started_at, h.finished_at,
+                    h.objects_scanned, h.objects_affected, h.objects_skipped,
+                    h.bytes_affected, h.errors, h.status,
+                    c.objects_deleted, c.objects_moved, c.objects_copied,
+                    c.objects_excluded, c.objects_not_due
+             FROM lifecycle_run_history h
+             LEFT JOIN lifecycle_run_counts c ON c.run_id = h.id
+             WHERE h.rule_name = ?
+             ORDER BY h.started_at DESC, h.id DESC
              LIMIT ?",
         )?;
         let rows = stmt
@@ -470,6 +582,16 @@ impl JobsDb {
                     bytes_affected: r.get(8)?,
                     errors: r.get(9)?,
                     status: r.get(10)?,
+                    split: match r.get::<_, Option<i64>>(11)? {
+                        None => None,
+                        Some(objects_deleted) => Some(LifecycleRunSplit {
+                            objects_deleted,
+                            objects_moved: r.get(12)?,
+                            objects_copied: r.get(13)?,
+                            objects_excluded: r.get(14)?,
+                            objects_not_due: r.get(15)?,
+                        }),
+                    },
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -605,6 +727,11 @@ mod tests {
                 objects_skipped: 8,
                 bytes_affected: 1234,
                 errors: 0,
+                objects_deleted: 1,
+                objects_moved: 1,
+                objects_not_due: 5,
+                objects_excluded: 3,
+                ..LifecycleRunTotals::default()
             },
             900,
         )
@@ -621,6 +748,82 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].triggered_by, "run-now");
         assert_eq!(runs[0].objects_affected, 2);
+        assert_eq!(
+            runs[0].split,
+            Some(LifecycleRunSplit {
+                objects_deleted: 1,
+                objects_moved: 1,
+                objects_copied: 0,
+                objects_excluded: 3,
+                objects_not_due: 5,
+            }),
+            "the split is stored with the run"
+        );
+        // A running run has no split yet; a removed rule takes its splits.
+        db.lifecycle_begin_run("r", 400, "scheduler").unwrap();
+        assert_eq!(db.lifecycle_recent_runs("r", 1).unwrap()[0].split, None);
+        db.lifecycle_reconcile_rules(&[]).unwrap();
+        let left: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM lifecycle_run_counts", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(left, 0);
+    }
+
+    /// #6: a new rule first runs one tick after the proxy sees it, never on
+    /// the next check.
+    #[test]
+    fn a_new_rule_is_first_due_one_tick_later() {
+        assert_eq!(first_due_at(1_000, 3_600), 4_600);
+        assert_eq!(first_due_at(1_000, 0), 1_001, "never due at once");
+        let db = db();
+        db.lifecycle_ensure_state("new", first_due_at(1_000, 3_600))
+            .unwrap();
+        assert_eq!(
+            db.lifecycle_load_state("new").unwrap().unwrap().next_due_at,
+            4_600
+        );
+    }
+
+    /// #2: a resume continues a run that a pause stopped at once; a rule
+    /// paused while idle keeps its schedule.
+    #[test]
+    fn a_resume_makes_a_pause_stopped_rule_due_now() {
+        let db = db();
+        db.lifecycle_ensure_state("stopped", 100).unwrap();
+        let run = db.lifecycle_begin_run("stopped", 10, "run-now").unwrap();
+        db.lifecycle_finish_run(
+            run,
+            "stopped",
+            "paused",
+            20,
+            LifecycleRunTotals::default(),
+            5_000,
+        )
+        .unwrap();
+        assert!(db
+            .lifecycle_due_now_if_stopped_by_pause("stopped", 30)
+            .unwrap());
+        assert_eq!(
+            db.lifecycle_load_state("stopped")
+                .unwrap()
+                .unwrap()
+                .next_due_at,
+            30
+        );
+        db.lifecycle_ensure_state("idle", 5_000).unwrap();
+        assert!(!db
+            .lifecycle_due_now_if_stopped_by_pause("idle", 30)
+            .unwrap());
+        assert_eq!(
+            db.lifecycle_load_state("idle")
+                .unwrap()
+                .unwrap()
+                .next_due_at,
+            5_000
+        );
     }
 
     #[test]

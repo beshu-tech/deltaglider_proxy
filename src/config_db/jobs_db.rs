@@ -51,7 +51,7 @@ pub(crate) const NODE_LOCAL_TABLES: &[&str] = &[
 /// file after a downgrade. Tests read it: the table-shape check and the
 /// node-local SQL source guard.
 #[cfg(test)]
-pub(crate) const JOBS_ONLY_TABLES: &[&str] = &["lifecycle_scan_cache"];
+pub(crate) const JOBS_ONLY_TABLES: &[&str] = &["lifecycle_scan_cache", "lifecycle_run_counts"];
 
 /// The node-local job database. Shared as `Arc<tokio::sync::Mutex<JobsDb>>`;
 /// its own lock, so a job write never waits for an IAM read.
@@ -399,6 +399,15 @@ CREATE TABLE IF NOT EXISTS lifecycle_scan_cache (
     PRIMARY KEY (bucket, key)
 );
 CREATE INDEX IF NOT EXISTS lifecycle_scan_cache_seen ON lifecycle_scan_cache (seen_at);
+CREATE TABLE IF NOT EXISTS lifecycle_run_counts (
+    run_id           INTEGER PRIMARY KEY
+                     REFERENCES lifecycle_run_history(id) ON DELETE CASCADE,
+    objects_deleted  INTEGER NOT NULL DEFAULT 0,
+    objects_moved    INTEGER NOT NULL DEFAULT 0,
+    objects_copied   INTEGER NOT NULL DEFAULT 0,
+    objects_excluded INTEGER NOT NULL DEFAULT 0,
+    objects_not_due  INTEGER NOT NULL DEFAULT 0
+);
 ";
 
 const SCHEMA_V1: &str = "

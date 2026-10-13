@@ -35,7 +35,10 @@ pub struct PreviewObject {
     pub destination_key: Option<String>,
     pub delete_source_after_success: bool,
     pub created_at: String,
+    /// Logical (uncompressed) size.
     pub size: u64,
+    /// Bytes on the backend: a delta is much smaller than `size`.
+    pub stored_size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -62,8 +65,34 @@ pub struct LifecycleRunOutcome {
     /// retain-newest only: candidates spared by `protect_younger_than` this run.
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub objects_protected: i64,
+    /// Of `objects_skipped`: kept out of the rule by an include/exclude
+    /// glob, an internal key or a folder marker.
+    #[serde(default)]
+    pub objects_excluded: i64,
+    /// Of `objects_skipped`: not old enough yet.
+    #[serde(default)]
+    pub objects_not_due: i64,
+    /// Of `objects_affected`: deleted (a preview: would delete).
+    #[serde(default)]
+    pub objects_deleted: i64,
+    /// Of `objects_affected`: transitioned, and the source deleted.
+    #[serde(default)]
+    pub objects_moved: i64,
+    /// Of `objects_affected`: transitioned, and the source kept.
+    #[serde(default)]
+    pub objects_copied: i64,
+    /// Bytes on the backend of the affected objects (`bytes_affected` is
+    /// their logical size). Deltas make it much smaller.
+    #[serde(default)]
+    pub stored_bytes_affected: i64,
     pub candidates: Vec<PreviewObject>,
     pub failures: Vec<LifecycleFailure>,
+    /// Writes (copies and deletes) tried and failed so far: a run whose
+    /// first writes all fail stops early.
+    #[serde(skip)]
+    pub(crate) write_attempts: i64,
+    #[serde(skip)]
+    pub(crate) write_failures: i64,
     /// A preview only: when the walk that answers ended (RFC 3339). A
     /// preview can answer from an earlier walk, so the GUI shows this,
     /// not the time it received the answer.
@@ -79,6 +108,67 @@ pub struct LifecycleRunOutcome {
 
 fn is_zero_i64(v: &i64) -> bool {
     *v == 0
+}
+
+impl LifecycleRunOutcome {
+    /// The counters a running run publishes.
+    pub fn counters(&self) -> super::live::LiveCounters {
+        super::live::LiveCounters {
+            objects_scanned: self.objects_scanned,
+            objects_affected: self.objects_affected,
+            objects_skipped: self.objects_skipped,
+            objects_excluded: self.objects_excluded,
+            objects_not_due: self.objects_not_due,
+            objects_deleted: self.objects_deleted,
+            objects_moved: self.objects_moved,
+            objects_copied: self.objects_copied,
+            bytes_affected: self.bytes_affected,
+            errors: self.errors,
+        }
+    }
+
+    /// The totals of the run-history row.
+    fn totals(&self) -> LifecycleRunTotals {
+        LifecycleRunTotals {
+            objects_scanned: self.objects_scanned,
+            objects_affected: self.objects_affected,
+            objects_skipped: self.objects_skipped,
+            bytes_affected: self.bytes_affected,
+            errors: self.errors,
+            objects_deleted: self.objects_deleted,
+            objects_moved: self.objects_moved,
+            objects_copied: self.objects_copied,
+            objects_excluded: self.objects_excluded,
+            objects_not_due: self.objects_not_due,
+        }
+    }
+}
+
+/// How many writes a run tries before it judges them: when the first
+/// [`EARLY_STOP_WRITES`] copies and deletes ALL failed, the destination or
+/// the backend is broken, and going on only repeats the same error for
+/// every object of the scope.
+const EARLY_STOP_WRITES: i64 = 20;
+
+/// PURE: must the run stop because every write so far failed?
+fn every_write_failing(attempts: i64, failures: i64) -> bool {
+    attempts >= EARLY_STOP_WRITES && failures == attempts
+}
+
+/// The failure a run records when it stops because every write failed.
+fn every_write_failed_message(attempts: i64, last: Option<&LifecycleFailure>) -> String {
+    let last = last.map_or_else(String::new, |f| {
+        if f.key.is_empty() {
+            format!(" The last error: {}", f.error)
+        } else {
+            format!(" The last error ({}): {}", f.key, f.error)
+        }
+    });
+    format!(
+        "The run stopped early: all of its first {attempts} writes failed, so the \
+         destination or the backend cannot accept writes. Fix that, then run the rule \
+         again.{last}"
+    )
 }
 
 /// How long a preview answers again without a new walk of the rule's
@@ -327,11 +417,14 @@ pub async fn run_begun_rule(
             .map(|(db, l)| (db, rule.name.clone(), l.owner.clone())),
     };
 
+    // Visible to GET /jobs while it runs, and stoppable by pause / kill.
+    let live = super::live::register(&rule.name, run_id);
     let ctx = RunContext {
         run_id,
         max_failures_retained,
         lease,
         lease_alive,
+        live: Some(live.run().clone()),
     };
     let outcome_result = run_or_preview(
         db.clone(),
@@ -388,13 +481,7 @@ pub async fn run_begun_rule(
     outcome.run_id = run_id;
 
     if let (Some(db), Some(run_id)) = (db.as_ref(), run_id) {
-        let totals = LifecycleRunTotals {
-            objects_scanned: outcome.objects_scanned,
-            objects_affected: outcome.objects_affected,
-            objects_skipped: outcome.objects_skipped,
-            bytes_affected: outcome.bytes_affected,
-            errors: outcome.errors,
-        };
+        let totals = outcome.totals();
         let finished_at = super::current_unix_seconds();
         let db = db.lock().await;
         db.lifecycle_finish_run(
@@ -450,6 +537,25 @@ struct RunContext {
     max_failures_retained: u32,
     lease: Option<RunLease>,
     lease_alive: LeaseAlive,
+    /// Where the run publishes its counters, and reads a pause or kill.
+    live: Option<Arc<super::live::LiveRun>>,
+}
+
+impl RunContext {
+    fn stop_requested(&self) -> Option<super::live::StopRequest> {
+        self.live.as_ref().and_then(|l| l.stop_requested())
+    }
+
+    fn publish(&self, out: &LifecycleRunOutcome) {
+        if let Some(live) = &self.live {
+            live.publish(out.counters());
+        }
+    }
+}
+
+/// The operator's stop request for the run of `ctx`, if any.
+fn stop_of(ctx: Option<&RunContext>) -> Option<super::live::StopRequest> {
+    ctx.and_then(RunContext::stop_requested)
 }
 
 /// `db`: the run's state (none for a preview); `scan_db`: where the scan
@@ -546,13 +652,22 @@ async fn run_or_preview(
     let lease_alive = ctx
         .as_ref()
         .map_or_else(LeaseAlive::always, |c| c.lease_alive.clone());
-    // Asked before each key of a delete batch: a lost lease or a bucket
-    // that a maintenance job gates stops the batch between keys.
+    // Asked before each key of a delete batch: a lost lease, a bucket
+    // that a maintenance job gates, or an operator pause / kill stops the
+    // batch between keys.
     let proceed = || {
-        lease_alive.is_alive() && !maintenance_write_bucket_busy(rule, maintenance_gate.as_ref())
+        lease_alive.is_alive()
+            && !maintenance_write_bucket_busy(rule, maintenance_gate.as_ref())
+            && stop_of(ctx.as_ref()).is_none()
     };
+    // Set when an operator pause or kill stopped the run.
+    let mut stopped_by = None;
 
     'pages: while let Some(page_idx) = pager.begin_page() {
+        if let Some(stop) = stop_of(ctx.as_ref()) {
+            stopped_by = Some(stop);
+            break 'pages;
+        }
         // Acquire the gate write-window BEFORE the busy check (acquire-then-
         // recheck) so a concurrently-arming maintenance drain either waits for
         // this page's writes or we defer below with the guards dropped (H22).
@@ -609,11 +724,25 @@ async fn run_or_preview(
             Err((_, err)) => return Err(err),
         };
 
-        out.objects_scanned += page.objects.len() as i64;
-
         // This page's deletes, run as ONE engine batch after the plan.
         let mut deletes: Vec<PlannedDelete> = Vec::new();
         for (key, meta) in page.objects {
+            // A pause or kill stops at the next object: the page is not
+            // done, so the cursor stays before it.
+            if execute {
+                if let Some(stop) = stop_of(ctx.as_ref()) {
+                    stopped_by = Some(stop);
+                    break;
+                }
+                if let Some(ctx) = ctx.as_ref() {
+                    ctx.publish(&out);
+                }
+                let stall = crate::config::test_seams::test_seams().lifecycle_object_stall_ms;
+                if stall > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(stall)).await;
+                }
+            }
+            out.objects_scanned += 1;
             let decision = plan_object(
                 rule,
                 &key,
@@ -636,6 +765,11 @@ async fn run_or_preview(
                 }
                 Ok(Decision::Skip { reason }) => {
                     out.objects_skipped += 1;
+                    if matches!(reason, SkipReason::NotExpired) {
+                        out.objects_not_due += 1;
+                    } else {
+                        out.objects_excluded += 1;
+                    }
                     if !matches!(reason, SkipReason::NotExpired) {
                         debug!(
                             "lifecycle rule '{}' skipped key {:?}: {:?}",
@@ -656,20 +790,30 @@ async fn run_or_preview(
                             delete_source_after_success: delete_source,
                             created_at: meta.created_at.to_rfc3339(),
                             size: meta.file_size,
+                            stored_size: meta.stored_size(),
                         });
                     }
                     if execute {
                         match plan_action(db.as_ref(), engine, rule, &key, &meta, &action).await {
                             Ok(Planned::Delete(delete)) => deletes.push(delete),
                             Ok(Planned::Copied { bytes, delete }) => {
+                                out.write_attempts += 1;
                                 out.objects_affected += 1;
                                 out.bytes_affected += bytes as i64;
+                                out.stored_bytes_affected += meta.stored_size() as i64;
+                                // Copy mode: done. Move mode: a move once
+                                // its source delete (in the batch) succeeds.
+                                if delete.is_none() {
+                                    out.objects_copied += 1;
+                                }
                                 deletes.extend(delete);
                             }
                             Ok(Planned::Skipped) => {
                                 out.objects_skipped += 1;
                             }
                             Err(err) => {
+                                out.write_attempts += 1;
+                                out.write_failures += 1;
                                 out.errors += 1;
                                 let msg = err.to_string();
                                 push_failure(
@@ -684,6 +828,15 @@ async fn run_or_preview(
                     } else {
                         out.objects_affected += 1;
                         out.bytes_affected += meta.file_size as i64;
+                        out.stored_bytes_affected += meta.stored_size() as i64;
+                        match &action {
+                            PlannedLifecycleAction::Delete => out.objects_deleted += 1,
+                            PlannedLifecycleAction::Transition {
+                                delete_source_after_success: true,
+                                ..
+                            } => out.objects_moved += 1,
+                            PlannedLifecycleAction::Transition { .. } => out.objects_copied += 1,
+                        }
                     }
                 }
             }
@@ -691,6 +844,13 @@ async fn run_or_preview(
 
         if let Some(progress) = progress {
             progress.publish(&out);
+        }
+        if let Some(ctx) = ctx.as_ref() {
+            ctx.publish(&out);
+        }
+        if stopped_by.is_some() {
+            // Copies already made stay; the page's deletes do not run.
+            break 'pages;
         }
 
         if !deletes.is_empty() {
@@ -705,11 +865,23 @@ async fn run_or_preview(
                 response_cap,
             )
             .await?;
+            if let Some(ctx) = ctx.as_ref() {
+                ctx.publish(&out);
+            }
             if stopped {
                 // The page is not done: the cursor stays where it was, so
                 // the next run plans this page again.
+                stopped_by = stop_of(ctx.as_ref());
                 break 'pages;
             }
+        }
+        if execute && every_write_failing(out.write_attempts, out.write_failures) {
+            let msg = every_write_failed_message(out.write_attempts, out.failures.last());
+            warn!("lifecycle rule '{}': {msg}", rule.name);
+            out.errors += 1;
+            push_failure(&mut out.failures, response_cap, String::new(), msg.clone());
+            record_failure(&db, rule, ctx.as_ref(), "", &msg).await?;
+            break 'pages;
         }
 
         let more = pager.advance(page.is_truncated, page.next_continuation_token);
@@ -732,7 +904,40 @@ async fn run_or_preview(
     if out.errors > 0 {
         out.status = "failed".to_string();
     }
+    if let Some(stop) = stopped_by {
+        settle_stopped(&db, rule, &cursor_scope, stop, &mut out).await;
+    }
+    if let Some(ctx) = ctx.as_ref() {
+        ctx.publish(&out);
+    }
     Ok(out)
+}
+
+/// A run that an operator pause or kill stopped: status `paused` (the
+/// cursor stays, a resume continues there) or `cancelled` (the cursor is
+/// dropped, the next run starts from the top).
+async fn settle_stopped(
+    db: &Option<Arc<Mutex<JobsDb>>>,
+    rule: &LifecycleRule,
+    cursor_scope: &str,
+    stop: super::live::StopRequest,
+    out: &mut LifecycleRunOutcome,
+) {
+    info!(
+        "lifecycle rule '{}' stopped by the operator ({}) after {} object(s)",
+        rule.name,
+        stop.run_status(),
+        out.objects_scanned
+    );
+    out.status = stop.run_status().to_string();
+    if stop == super::live::StopRequest::Kill {
+        if let Some(db) = db.as_ref() {
+            let _ =
+                db.lock()
+                    .await
+                    .lifecycle_set_continuation_token(&rule.name, None, cursor_scope);
+        }
+    }
 }
 
 /// Upper bound on objects collected for a single retain-newest pass. The decision
@@ -808,6 +1013,10 @@ async fn run_or_preview_retain_newest(
     let mut incomplete_collect: Option<&'static str> = None;
 
     'pages: while let Some(page_idx) = pager.begin_page() {
+        if execute && stop_of(ctx.as_ref()).is_some() {
+            incomplete_collect = Some("stopped by the operator");
+            break 'pages;
+        }
         // Mid-run maintenance defer: a write bucket (source or transition dest)
         // became gated mid-run. Abort — the next scheduled run re-collects the
         // WHOLE set once maintenance clears. execute-only (preview never writes).
@@ -835,16 +1044,13 @@ async fn run_or_preview_retain_newest(
             // Same structural guards as the age path (the pure plan_object's
             // first three checks). Globs/internal/marker filtering happens HERE,
             // BEFORE the size/age qualify ranking in plan_retain_newest.
-            if key.ends_with('/') || is_internal_key(&key) {
+            if key.ends_with('/')
+                || is_internal_key(&key)
+                || exclude_globs.is_match(&key)
+                || (!include_globs.is_empty() && !include_globs.is_match(&key))
+            {
                 out.objects_skipped += 1;
-                continue;
-            }
-            if exclude_globs.is_match(&key) {
-                out.objects_skipped += 1;
-                continue;
-            }
-            if !include_globs.is_empty() && !include_globs.is_match(&key) {
-                out.objects_skipped += 1;
+                out.objects_excluded += 1;
                 continue;
             }
 
@@ -874,6 +1080,9 @@ async fn run_or_preview_retain_newest(
         if let Some(progress) = progress {
             progress.publish(&out);
         }
+        if let Some(ctx) = ctx.as_ref() {
+            ctx.publish(&out);
+        }
 
         if !pager.advance(page.is_truncated, page.next_continuation_token) {
             break 'pages;
@@ -900,6 +1109,9 @@ async fn run_or_preview_retain_newest(
             );
             if out.errors > 0 {
                 out.status = "failed".to_string();
+            }
+            if let Some(stop) = stop_of(ctx.as_ref()) {
+                out.status = stop.run_status().to_string();
             }
             return Ok(out);
         }
@@ -950,13 +1162,20 @@ async fn run_or_preview_retain_newest(
             delete_source_after_success: false,
             created_at: c.created_at.to_rfc3339(),
             size: c.size,
+            stored_size: stored_size_of(&metas, &c.key, c.size),
         });
     }
 
     // ── Act phase ──
     if !execute {
         out.objects_affected = plan.delete.len() as i64;
+        out.objects_deleted = out.objects_affected;
         out.bytes_affected = plan.delete.iter().map(|c| c.size as i64).sum();
+        out.stored_bytes_affected = plan
+            .delete
+            .iter()
+            .map(|c| stored_size_of(&metas, &c.key, c.size) as i64)
+            .sum();
         return Ok(out);
     }
 
@@ -992,6 +1211,7 @@ async fn run_or_preview_retain_newest(
                 },
             },
             size: c.size,
+            stored_size: stored_size_of(&metas, &c.key, c.size),
             action: "retain-newest",
             counted: true,
         })
@@ -1000,7 +1220,9 @@ async fn run_or_preview_retain_newest(
         .as_ref()
         .map_or_else(LeaseAlive::always, |c| c.lease_alive.clone());
     let proceed = || {
-        lease_alive.is_alive() && !maintenance_write_bucket_busy(rule, maintenance_gate.as_ref())
+        lease_alive.is_alive()
+            && !maintenance_write_bucket_busy(rule, maintenance_gate.as_ref())
+            && stop_of(ctx.as_ref()).is_none()
     };
     delete_planned(
         db.as_ref(),
@@ -1017,7 +1239,23 @@ async fn run_or_preview_retain_newest(
     if out.errors > 0 {
         out.status = "failed".to_string();
     }
+    if let Some(stop) = stop_of(ctx.as_ref()) {
+        out.status = stop.run_status().to_string();
+    }
+    if let Some(ctx) = ctx.as_ref() {
+        ctx.publish(&out);
+    }
     Ok(out)
+}
+
+/// The bytes on the backend of a collected candidate (its logical size
+/// when the listing did not keep its metadata).
+fn stored_size_of(
+    metas: &std::collections::HashMap<String, crate::types::FileMetadata>,
+    key: &str,
+    size: u64,
+) -> u64 {
+    metas.get(key).map_or(size, |m| m.stored_size())
 }
 
 /// Parse an optional humantime string into a chrono Duration, mapping errors to
@@ -1163,8 +1401,10 @@ struct PlannedDelete {
     /// What the listing saw: the delete goes only while the object is
     /// still this one.
     snapshot: Snapshot,
-    /// The size the run reports for it.
+    /// The size the run reports for it (logical).
     size: u64,
+    /// Its bytes on the backend.
+    stored_size: u64,
     /// The `action` of its delete event.
     action: &'static str,
     /// Counted as an affected object. A transition's source delete is not:
@@ -1183,6 +1423,7 @@ impl PlannedDelete {
             key: key.to_string(),
             snapshot: Snapshot::of(meta),
             size: meta.file_size,
+            stored_size: meta.stored_size(),
             action,
             counted,
         }
@@ -1250,7 +1491,8 @@ async fn plan_action(
                     keep_created_at: true,
                 },
             )
-            .await?;
+            .await
+            .map_err(|err| copy_failure_message(destination_bucket, destination_key, &err))?;
             append_lifecycle_transition_event(
                 db,
                 rule,
@@ -1264,13 +1506,26 @@ async fn plan_action(
             .await;
             // Overwritten since the listing: the copy is done, but the new
             // source is not ours to delete (the batch's condition).
+            // The LOGICAL size: a server-side copy moves no bytes through
+            // the proxy (`bytes_copied` is 0), and the run reports what
+            // it archived, not what it streamed.
             Ok(Planned::Copied {
-                bytes: copied.bytes_copied as u64,
+                bytes: copied.content_length(),
                 delete: delete_source_after_success
                     .then(|| PlannedDelete::of(key, meta, "transition-source-delete", false)),
             })
         }
     }
+}
+
+/// The failure of a transition copy names where it went: the source key
+/// alone does not say which destination refused it.
+fn copy_failure_message(
+    destination_bucket: &str,
+    destination_key: &str,
+    err: &dyn std::fmt::Display,
+) -> String {
+    format!("copy to {destination_bucket}/{destination_key} failed: {err}")
 }
 
 /// Run `deletes` as ONE engine batch (`DeltaGliderEngine::delete_batch`):
@@ -1328,14 +1583,31 @@ async fn delete_planned(
     for (d, outcome) in deletes.iter().zip(outcomes) {
         match outcome {
             DeleteOutcome::Deleted(_) if d.counted => {
+                out.write_attempts += 1;
                 out.objects_affected += 1;
+                out.objects_deleted += 1;
                 out.bytes_affected += d.size as i64;
+                out.stored_bytes_affected += d.stored_size as i64;
             }
-            DeleteOutcome::Deleted(_) => {}
-            DeleteOutcome::Changed | DeleteOutcome::NotFound | DeleteOutcome::Skipped => {
-                stopped |= matches!(outcome, DeleteOutcome::Skipped);
+            DeleteOutcome::Deleted(_) => {
+                // A move's source delete: the copy was counted already.
+                out.write_attempts += 1;
+                out.objects_moved += 1;
+            }
+            DeleteOutcome::Skipped => {
+                // Not tried: the run stops (lease, gate, pause or kill),
+                // and the next run plans this key again.
+                stopped = true;
+                if !d.counted {
+                    out.objects_copied += 1;
+                }
+            }
+            DeleteOutcome::Changed | DeleteOutcome::NotFound => {
                 if d.counted {
                     out.objects_skipped += 1;
+                } else {
+                    // The copy stands; the source changed, so it stays.
+                    out.objects_copied += 1;
                 }
                 debug!(
                     "lifecycle rule '{}' did not delete {:?}: {outcome:?}",
@@ -1343,8 +1615,17 @@ async fn delete_planned(
                 );
             }
             DeleteOutcome::Failed(err) => {
+                out.write_attempts += 1;
+                out.write_failures += 1;
+                if !d.counted {
+                    out.objects_copied += 1;
+                }
                 out.errors += 1;
-                let msg = err.to_string();
+                let msg = if d.counted {
+                    format!("delete failed: {err}")
+                } else {
+                    format!("the copy succeeded, but the source delete failed: {err}")
+                };
                 push_failure(&mut out.failures, response_cap, d.key.clone(), msg.clone());
                 record_failure(&db.cloned(), rule, ctx, &d.key, &msg).await?;
             }
@@ -1360,7 +1641,7 @@ async fn delete_planned(
             msg.to_string(),
         );
         record_failure(&db.cloned(), rule, ctx, "", msg).await?;
-    } else if stopped {
+    } else if stopped && stop_of(ctx).is_none() {
         info!(
             "lifecycle rule '{}' deferring mid-run — a write bucket is under maintenance",
             rule.name
@@ -1987,6 +2268,201 @@ mod tests {
             ActionOutcome::Skipped,
             "the second run copied again"
         );
+    }
+
+    /// #5: a transition reports the LOGICAL size it archived. A copy inside
+    /// one backend is server-side and streams no byte through the proxy
+    /// (`bytes_copied` is 0), and the run, the row and the lifetime total
+    /// all said 0 B.
+    #[tokio::test]
+    async fn a_transition_reports_the_logical_bytes() {
+        use super::ActionOutcome;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = fs_engine(dir.path()).await;
+        engine
+            .store("b", "m.bin", b"0123456789", None, Default::default())
+            .await
+            .unwrap();
+        let meta = engine.head("b", "m.bin").await.unwrap();
+        let action = PlannedLifecycleAction::Transition {
+            destination_bucket: "dst".to_string(),
+            destination_key: "m.bin".to_string(),
+            delete_source_after_success: true,
+        };
+        let out = execute_action(None, &engine, &rule(), "m.bin", &meta, &action)
+            .await
+            .unwrap();
+        assert_eq!(out, ActionOutcome::Acted(10));
+    }
+
+    #[test]
+    fn a_run_stops_early_only_when_every_write_failed() {
+        use super::{every_write_failing, EARLY_STOP_WRITES};
+        assert!(!every_write_failing(0, 0));
+        assert!(!every_write_failing(
+            EARLY_STOP_WRITES - 1,
+            EARLY_STOP_WRITES - 1
+        ));
+        assert!(every_write_failing(EARLY_STOP_WRITES, EARLY_STOP_WRITES));
+        assert!(!every_write_failing(
+            EARLY_STOP_WRITES,
+            EARLY_STOP_WRITES - 1
+        ));
+        assert!(!every_write_failing(500, 499), "one success: go on");
+    }
+
+    /// #12: a failed transition copy names its destination.
+    #[test]
+    fn a_copy_failure_names_the_destination_key() {
+        let msg = super::copy_failure_message("archive", "old/a.bin", &"403 AccessDenied");
+        assert_eq!(msg, "copy to archive/old/a.bin failed: 403 AccessDenied");
+    }
+
+    async fn store_all(engine: &DynEngine, keys: &[&str]) {
+        for key in keys {
+            engine
+                .store("b", key, b"payload", None, Default::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    fn jobs_db() -> Arc<tokio::sync::Mutex<crate::config_db::JobsDb>> {
+        Arc::new(tokio::sync::Mutex::new(
+            crate::config_db::JobsDb::in_memory("t").unwrap(),
+        ))
+    }
+
+    /// #9 + #10: a run (and a preview) tells the objects kept out by a glob
+    /// from the ones not old enough yet, and counts its deletes; the run
+    /// history keeps the split.
+    #[tokio::test]
+    async fn a_run_splits_its_skips_and_counts_its_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = fs_engine(dir.path()).await;
+        store_all(&engine, &["old/a.bin", "old/b.bin", "keep/c.bin"]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        store_all(&engine, &["young.bin"]).await;
+        let rule = LifecycleRule {
+            expire_after: Some("1s".into()),
+            exclude_globs: vec!["keep/**".into()],
+            ..rule()
+        };
+        let preview = super::preview_rule(None, &engine, &rule, 10, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                preview.objects_deleted,
+                preview.objects_excluded,
+                preview.objects_not_due
+            ),
+            (2, 1, 1),
+            "{preview:?}"
+        );
+        assert_eq!(preview.stored_bytes_affected, 14);
+        let db = jobs_db();
+        let out = super::run_rule(
+            Some(db.clone()),
+            &engine,
+            &rule,
+            10,
+            "test",
+            3600,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                out.objects_deleted,
+                out.objects_excluded,
+                out.objects_not_due,
+                out.bytes_affected
+            ),
+            (2, 1, 1, 14),
+            "{out:?}"
+        );
+        let runs = db.lock().await.lifecycle_recent_runs("r", 1).unwrap();
+        let split = runs[0].split.expect("the split is stored");
+        assert_eq!(
+            (
+                split.objects_deleted,
+                split.objects_excluded,
+                split.objects_not_due
+            ),
+            (2, 1, 1)
+        );
+    }
+
+    /// #2: a run that an operator pause (or kill) stops ends at the next
+    /// object, deletes nothing more, and says so in its status. A pause
+    /// keeps the cursor; a kill drops it.
+    #[tokio::test]
+    async fn a_pause_or_kill_stops_the_run_at_the_next_object() {
+        use crate::lifecycle::live::{self, StopRequest};
+        for (stop, status) in [
+            (StopRequest::Pause, "paused"),
+            (StopRequest::Kill, "cancelled"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = fs_engine(dir.path()).await;
+            store_all(&engine, &["x/1.bin", "x/2.bin"]).await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let rule = LifecycleRule {
+                name: format!("stop-{status}"),
+                expire_after: Some("1ms".into()),
+                ..rule()
+            };
+            let db = jobs_db();
+            {
+                let db = db.lock().await;
+                db.lifecycle_ensure_state(&rule.name, 0).unwrap();
+                db.lifecycle_set_continuation_token(&rule.name, Some("tok"), "b|")
+                    .unwrap();
+            }
+            let guard = live::register(&rule.name, None);
+            assert!(live::request_stop(&rule.name, stop));
+            let ctx = super::RunContext {
+                run_id: None,
+                max_failures_retained: 10,
+                lease: None,
+                lease_alive: crate::background::LeaseAlive::always(),
+                live: Some(guard.run().clone()),
+            };
+            let out = super::run_or_preview(
+                Some(db.clone()),
+                None,
+                &engine,
+                &rule,
+                10,
+                true,
+                Some(ctx),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(out.status, status);
+            assert_eq!(out.objects_deleted, 0);
+            assert!(
+                engine.head("b", "x/1.bin").await.is_ok(),
+                "{status}: deleted"
+            );
+            let cursor = db
+                .lock()
+                .await
+                .lifecycle_load_state(&rule.name)
+                .unwrap()
+                .unwrap()
+                .continuation_token;
+            assert_eq!(
+                cursor.is_some(),
+                stop == StopRequest::Pause,
+                "{status}: cursor {cursor:?}"
+            );
+        }
     }
 
     /// An unchanged object is still deleted (the guard must not block the rule).

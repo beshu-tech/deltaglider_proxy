@@ -153,6 +153,7 @@ pub fn supported_actions(sub: JobSubsystem) -> &'static [JobAction] {
             JobAction::RunNow,
             JobAction::Preview,
             JobAction::Delete,
+            JobAction::Kill,
         ],
         JobSubsystem::Maintenance => &[JobAction::Cancel],
     }
@@ -361,6 +362,206 @@ fn maintenance_job_view(j: &MaintenanceJob) -> JobView {
     }
 }
 
+/// The Jobs row of a lifecycle rule. While a run of the rule runs in this
+/// process, `progress` carries its live counters (the run-history row
+/// gets its totals only at the end).
+fn lifecycle_job_view(
+    db: &crate::config_db::JobsDb,
+    rule: &crate::config_sections::LifecycleRule,
+    lc_cfg: &crate::config_sections::LifecycleConfig,
+) -> JobView {
+    let st = db.lifecycle_load_state(&rule.name).ok().flatten();
+    let status_raw = st
+        .as_ref()
+        .map(|s| s.last_status.clone())
+        .unwrap_or_else(|| "idle".to_string());
+    let live = crate::lifecycle::live::running(&rule.name);
+    let latest = db
+        .lifecycle_recent_runs(&rule.name, 1)
+        .ok()
+        .and_then(|mut runs| runs.pop());
+    let progress = match (&live, &latest) {
+        (Some(run), _) => {
+            let c = run.counters();
+            lifecycle_progress(
+                c.objects_affected,
+                c.objects_skipped,
+                c.errors,
+                c.bytes_affected,
+                c.objects_deleted,
+            )
+        }
+        (None, Some(r)) => lifecycle_progress(
+            r.objects_affected,
+            r.objects_skipped,
+            r.errors,
+            r.bytes_affected,
+            r.split.map_or(0, |s| s.objects_deleted),
+        ),
+        (None, None) => lifecycle_progress(0, 0, 0, 0, 0),
+    };
+    // The latest run's last failure, so a failed row says why.
+    let (last_error, failed_total) = match &latest {
+        Some(r) if r.errors > 0 => (
+            db.lifecycle_last_failure_of_run(&rule.name, r.id)
+                .ok()
+                .flatten()
+                .map(|f| lifecycle_failure_text(&f.object_key, &f.error_message)),
+            Some(r.errors),
+        ),
+        _ => (None, None),
+    };
+    let started_at = live
+        .as_ref()
+        .map(|run| run.started_at)
+        .or_else(|| latest.as_ref().map(|r| r.started_at));
+    JobView {
+        id: format!("lifecycle:{}", rule.name),
+        kind: "lifecycle".into(),
+        name: rule.name.clone(),
+        scope: JobScope {
+            bucket: rule.bucket.clone(),
+            prefix: (!rule.prefix.is_empty()).then(|| rule.prefix.clone()),
+            target: match &rule.action {
+                crate::config_sections::LifecycleAction::Transition(t) => {
+                    Some(t.destination.bucket.clone())
+                }
+                _ => None,
+            },
+        },
+        trigger: "scheduled",
+        enabled: Some(rule.enabled),
+        paused: Some(st.as_ref().map(|s| s.paused).unwrap_or(false)),
+        status: normalize_status(&status_raw),
+        status_raw,
+        phase: None,
+        percent: None,
+        progress,
+        lifetime: Some(JobLifetime {
+            objects: st
+                .as_ref()
+                .map(|s| s.objects_affected_lifetime)
+                .unwrap_or(0),
+            bytes: st.as_ref().map(|s| s.bytes_affected_lifetime).unwrap_or(0),
+        }),
+        last_run_at: st.as_ref().and_then(|s| s.last_run_at),
+        next_due_at: st.as_ref().map(|s| s.next_due_at),
+        created_at: None,
+        started_at,
+        finished_at: if live.is_some() {
+            None
+        } else {
+            latest.as_ref().and_then(|r| r.finished_at)
+        },
+        last_error,
+        failed_total,
+        detail: serde_json::json!({
+            "action": rule.action.kind(),
+            "expire_after": rule.expire_after,
+            "retain_count": match &rule.action {
+                crate::config_sections::LifecycleAction::RetainNewest(a) => Some(a.count),
+                _ => None,
+            },
+            "delete_source_after_success": match &rule.action {
+                crate::config_sections::LifecycleAction::Transition(t) => {
+                    Some(t.delete_source_after_success)
+                }
+                _ => None,
+            },
+            "include_globs": rule.include_globs,
+            "exclude_globs": rule.exclude_globs,
+            // How often the rule runs: `next_due_at` is the end of its
+            // last run plus this.
+            "tick_interval": lc_cfg.tick_interval,
+            // Why the scheduler did not run the due rule (a maintenance
+            // job, or an unhealthy backend); absent when nothing holds it.
+            "deferred": crate::lifecycle::live::deferred(&rule.name),
+            "live": live.as_ref().map(|run| run.counters()),
+        }),
+    }
+}
+
+/// One lifecycle run entry: the shared shape, plus `objects_deleted`,
+/// `objects_moved`, `objects_copied`, `objects_excluded` and
+/// `objects_not_due`. The running run of this process shows its live
+/// counters.
+fn lifecycle_run_entry(
+    r: crate::lifecycle::LifecycleRunRecord,
+    live: Option<&crate::lifecycle::live::LiveRun>,
+) -> serde_json::Value {
+    let live = live
+        .filter(|run| run.run_id == Some(r.id) && r.finished_at.is_none())
+        .map(|run| run.counters());
+    let c = match live {
+        Some(c) => c,
+        None => crate::lifecycle::live::LiveCounters {
+            objects_scanned: r.objects_scanned,
+            objects_affected: r.objects_affected,
+            objects_skipped: r.objects_skipped,
+            bytes_affected: r.bytes_affected,
+            errors: r.errors,
+            objects_deleted: r.split.map_or(0, |s| s.objects_deleted),
+            objects_moved: r.split.map_or(0, |s| s.objects_moved),
+            objects_copied: r.split.map_or(0, |s| s.objects_copied),
+            objects_excluded: r.split.map_or(0, |s| s.objects_excluded),
+            objects_not_due: r.split.map_or(0, |s| s.objects_not_due),
+        },
+    };
+    // A run that ended before the split was stored: unknown, not 0.
+    let known = live.is_some() || r.split.is_some();
+    let entry = JobRunEntry {
+        id: r.id,
+        triggered_by: r.triggered_by,
+        started_at: r.started_at,
+        finished_at: r.finished_at,
+        status: normalize_status(&r.status),
+        status_raw: r.status,
+        objects_scanned: c.objects_scanned,
+        objects_processed: c.objects_affected,
+        objects_skipped: c.objects_skipped,
+        objects_deleted: known.then_some(c.objects_deleted),
+        bytes: c.bytes_affected,
+        errors: c.errors,
+        delta_passthrough: 0,
+        bytes_egress_saved: 0,
+        reconstructed: 0,
+    };
+    let mut v = serde_json::to_value(entry).unwrap_or_default();
+    if let (true, Some(obj)) = (known, v.as_object_mut()) {
+        obj.insert("objects_moved".into(), c.objects_moved.into());
+        obj.insert("objects_copied".into(), c.objects_copied.into());
+        obj.insert("objects_excluded".into(), c.objects_excluded.into());
+        obj.insert("objects_not_due".into(), c.objects_not_due.into());
+    }
+    v
+}
+
+fn lifecycle_progress(
+    processed: i64,
+    skipped: i64,
+    failed: i64,
+    bytes: i64,
+    deleted: i64,
+) -> JobProgress {
+    JobProgress {
+        processed,
+        total: None,
+        bytes,
+        failed,
+        skipped,
+        deleted: Some(deleted),
+    }
+}
+
+/// A lifecycle failure as one line: the key, then the error.
+fn lifecycle_failure_text(key: &str, error: &str) -> String {
+    if key.is_empty() {
+        error.to_string()
+    } else {
+        format!("{key}: {error}")
+    }
+}
+
 // ─────────────────────────── handlers ───────────────────────────
 
 /// GET /_/api/admin/jobs
@@ -468,60 +669,7 @@ pub async fn list_jobs(
         }
 
         for rule in &lc_cfg.rules {
-            let st = db.lifecycle_load_state(&rule.name).ok().flatten();
-            let status_raw = st
-                .as_ref()
-                .map(|s| s.last_status.clone())
-                .unwrap_or_else(|| "idle".to_string());
-            jobs.push(JobView {
-                id: format!("lifecycle:{}", rule.name),
-                kind: "lifecycle".into(),
-                name: rule.name.clone(),
-                scope: JobScope {
-                    bucket: rule.bucket.clone(),
-                    prefix: (!rule.prefix.is_empty()).then(|| rule.prefix.clone()),
-                    target: None,
-                },
-                trigger: "scheduled",
-                enabled: Some(rule.enabled),
-                paused: Some(st.as_ref().map(|s| s.paused).unwrap_or(false)),
-                status: normalize_status(&status_raw),
-                status_raw,
-                phase: None,
-                percent: None,
-                progress: JobProgress {
-                    processed: 0,
-                    total: None,
-                    bytes: 0,
-                    failed: 0,
-                    skipped: 0,
-                    deleted: None,
-                },
-                lifetime: Some(JobLifetime {
-                    objects: st
-                        .as_ref()
-                        .map(|s| s.objects_affected_lifetime)
-                        .unwrap_or(0),
-                    bytes: st.as_ref().map(|s| s.bytes_affected_lifetime).unwrap_or(0),
-                }),
-                last_run_at: st.as_ref().and_then(|s| s.last_run_at),
-                next_due_at: st.as_ref().map(|s| s.next_due_at),
-                created_at: None,
-                started_at: None,
-                finished_at: None,
-                last_error: None,
-                failed_total: None,
-                detail: serde_json::json!({
-                    "action": rule.action.kind(),
-                    "expire_after": rule.expire_after,
-                    "retain_count": match &rule.action {
-                        crate::config_sections::LifecycleAction::RetainNewest(a) => Some(a.count),
-                        _ => None,
-                    },
-                    "include_globs": rule.include_globs,
-                    "exclude_globs": rule.exclude_globs,
-                }),
-            });
+            jobs.push(lifecycle_job_view(&db, rule, &lc_cfg));
         }
 
         for j in db.maintenance_list_jobs(50)? {
@@ -741,27 +889,17 @@ pub async fn job_runs(
                 reconstructed: r.reconstructed,
             })
             .collect(),
-        JobSubsystem::Lifecycle => db
-            .lifecycle_recent_runs(key, limit)?
-            .into_iter()
-            .map(|r| JobRunEntry {
-                id: r.id,
-                triggered_by: r.triggered_by,
-                started_at: r.started_at,
-                finished_at: r.finished_at,
-                status: normalize_status(&r.status),
-                status_raw: r.status,
-                objects_scanned: r.objects_scanned,
-                objects_processed: r.objects_affected,
-                objects_skipped: r.objects_skipped,
-                objects_deleted: None,
-                bytes: r.bytes_affected,
-                errors: r.errors,
-                delta_passthrough: 0,
-                bytes_egress_saved: 0,
-                reconstructed: 0,
-            })
-            .collect(),
+        JobSubsystem::Lifecycle => {
+            // Lifecycle entries carry more than the shared shape (the
+            // copy/move split and why objects were skipped): answer here.
+            let runs = db.lifecycle_recent_runs(key, limit)?;
+            let live = crate::lifecycle::live::running(key);
+            let runs: Vec<serde_json::Value> = runs
+                .into_iter()
+                .map(|r| lifecycle_run_entry(r, live.as_deref()))
+                .collect();
+            return Ok(Json(serde_json::json!({ "runs": runs })));
+        }
         JobSubsystem::Maintenance => {
             let job_id: i64 = key.parse().map_err(|_| not_found())?;
             let job = db.maintenance_job_by_id(job_id)?.ok_or(not_found())?;
@@ -854,6 +992,7 @@ pub async fn job_failures(
     // 500". Kinds without a count leave it out.
     let total = match sub {
         JobSubsystem::Replication => Some(db.replication_failure_count(key)?),
+        JobSubsystem::Lifecycle => Some(db.lifecycle_failure_count(key)?),
         _ => None,
     };
     let mut body = serde_json::json!({ "failures": failures });
@@ -938,6 +1077,13 @@ pub async fn job_action(
         (JobSubsystem::Replication | JobSubsystem::Lifecycle, JobAction::Delete) => {
             delete_rule(&state, sub, &name, &headers).await?;
             Ok((StatusCode::NO_CONTENT, Json(serde_json::json!({}))))
+        }
+        (JobSubsystem::Lifecycle, JobAction::Kill) => {
+            let code = super::lifecycle::kill(state, name, &headers).await?;
+            Ok((
+                code,
+                Json(serde_json::json!({"killing": true, "instance_local": true})),
+            ))
         }
         (JobSubsystem::Replication, JobAction::Kill) => {
             let db = state.jobs_db.as_ref().ok_or_else(AdminError::no_jobs_db)?;
@@ -1271,7 +1417,7 @@ mod tests {
         );
         assert_eq!(
             supported_actions(JobSubsystem::Lifecycle),
-            &[Pause, Resume, RunNow, Preview, Delete]
+            &[Pause, Resume, RunNow, Preview, Delete, Kill]
         );
         assert_eq!(supported_actions(JobSubsystem::Maintenance), &[Cancel]);
         assert_eq!(JobAction::parse("run-now"), Some(RunNow));

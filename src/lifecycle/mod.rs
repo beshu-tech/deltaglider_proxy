@@ -8,6 +8,7 @@
 
 #[cfg(test)]
 mod cost_tests;
+pub mod live;
 pub mod planner;
 mod scan_cache;
 mod scan_store;

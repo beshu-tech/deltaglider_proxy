@@ -422,6 +422,305 @@ async fn test_lifecycle_transition_copy_failure_does_not_delete_source() {
         .send()
         .await
         .expect("source must survive failed transition copy");
+
+    // #12: the row says why it failed, naming the destination key, and the
+    // failures list says how many the ring keeps.
+    let row = lifecycle_row(&admin, &server.endpoint(), "failed-move").await;
+    let last_error = row["last_error"].as_str().unwrap_or_default();
+    assert!(
+        last_error.contains("missing-destination/cold/app.zip"),
+        "{row}"
+    );
+    assert_eq!(row["failed_total"].as_i64(), Some(1), "{row}");
+    let failures: Value = admin
+        .get(format!(
+            "{}/_/api/admin/jobs/lifecycle:failed-move/failures",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(failures["total"].as_i64(), Some(1), "{failures}");
+}
+
+/// The `GET /jobs` row of lifecycle rule `rule`.
+async fn lifecycle_row(admin: &reqwest::Client, endpoint: &str, rule: &str) -> Value {
+    let body: Value = admin
+        .get(format!("{endpoint}/_/api/admin/jobs"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    body["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["id"] == format!("lifecycle:{rule}"))
+        .unwrap_or_else(|| panic!("no row for {rule}: {body}"))
+        .clone()
+}
+
+/// Poll the row of `rule` until `done(row)` holds (10 s).
+async fn wait_for_row(
+    admin: &reqwest::Client,
+    endpoint: &str,
+    rule: &str,
+    done: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let row = lifecycle_row(admin, endpoint, rule).await;
+        if done(&row) {
+            return row;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "row never got there: {row}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+async fn job_post(admin: &reqwest::Client, endpoint: &str, rule: &str, action: &str) -> u16 {
+    admin
+        .post(format!(
+            "{endpoint}/_/api/admin/jobs/lifecycle:{rule}/{action}"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+const SLOW_LIFECYCLE_YAML: &str = r#"
+lifecycle:
+  enabled: true
+  tick_interval: "1h"
+  rules:
+    - name: slow-expire
+      enabled: true
+      bucket: life-slow
+      prefix: "old/"
+      expire_after: "1ms"
+      batch_size: 4
+"#;
+
+/// #2 + #10: a running lifecycle run shows LIVE progress in `GET /jobs`
+/// and in its run entry; Pause stops it at the next object (status
+/// `paused`, the rest of the objects stay), and Kill stops a run too
+/// (status `cancelled`). Before, Pause only flagged the rule and the run
+/// went on to the end, and the row showed zeros until the run ended.
+#[tokio::test]
+async fn test_lifecycle_pause_and_kill_stop_a_running_run_with_live_progress() {
+    let server = TestServer::builder()
+        .bucket("life-slow")
+        .env("DGP_TEST_LIFECYCLE_OBJECT_STALL_MS", "60")
+        .extra_yaml_storage_section(SLOW_LIFECYCLE_YAML)
+        .build()
+        .await;
+    let endpoint = server.endpoint();
+    let client = server.s3_client().await;
+    const N: usize = 40;
+    for i in 0..N {
+        client
+            .put_object()
+            .bucket("life-slow")
+            .key(format!("old/{i:03}.txt"))
+            .body(ByteStream::from(b"expired".to_vec()))
+            .send()
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let admin = admin_http_client(&endpoint).await;
+
+    // ── Pause ──
+    let resp: Value = admin
+        .post(format!(
+            "{endpoint}/_/api/admin/jobs/lifecycle:slow-expire/run-now"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let run_id = resp["run_id"].as_i64().expect("run id");
+    let row = wait_for_row(&admin, &endpoint, "slow-expire", |r| {
+        r["status"] == "running" && r["progress"]["deleted"].as_i64().unwrap_or(0) >= 4
+    })
+    .await;
+    assert!(
+        row["detail"]["live"]["objects_scanned"].as_i64().unwrap() >= 4,
+        "{row}"
+    );
+    let runs: Value = admin
+        .get(format!(
+            "{endpoint}/_/api/admin/jobs/lifecycle:slow-expire/runs"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(runs["runs"][0]["status"], "running", "{runs}");
+    assert!(
+        runs["runs"][0]["objects_deleted"].as_i64().unwrap_or(0) >= 4,
+        "the running entry is live: {runs}"
+    );
+    assert_eq!(
+        job_post(&admin, &endpoint, "slow-expire", "pause").await,
+        204
+    );
+    let run = common::wait_for_job_run(&admin, &endpoint, "lifecycle:slow-expire", run_id).await;
+    assert_eq!(run["status"], "paused", "{run}");
+    let deleted = run["objects_deleted"].as_i64().unwrap();
+    assert!(deleted >= 4 && deleted < N as i64, "{run}");
+    let row = lifecycle_row(&admin, &endpoint, "slow-expire").await;
+    assert_eq!(row["status"], "paused", "{row}");
+    assert_eq!(row["paused"], true, "{row}");
+    let left = client
+        .list_objects_v2()
+        .bucket("life-slow")
+        .prefix("old/")
+        .send()
+        .await
+        .unwrap()
+        .key_count()
+        .unwrap_or(0);
+    assert_eq!(
+        left as i64,
+        N as i64 - deleted,
+        "the paused run deleted nothing more"
+    );
+
+    // ── Kill ──
+    assert_eq!(
+        job_post(&admin, &endpoint, "slow-expire", "resume").await,
+        204
+    );
+    let resp: Value = admin
+        .post(format!(
+            "{endpoint}/_/api/admin/jobs/lifecycle:slow-expire/run-now"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let run_id = resp["run_id"].as_i64().expect("run id");
+    wait_for_row(&admin, &endpoint, "slow-expire", |r| {
+        r["status"] == "running" && r["progress"]["deleted"].as_i64().unwrap_or(0) >= 1
+    })
+    .await;
+    assert_eq!(
+        job_post(&admin, &endpoint, "slow-expire", "kill").await,
+        202
+    );
+    let run = common::wait_for_job_run(&admin, &endpoint, "lifecycle:slow-expire", run_id).await;
+    assert_eq!(run["status"], "cancelled", "{run}");
+    assert_eq!(
+        job_post(&admin, &endpoint, "slow-expire", "kill").await,
+        409,
+        "no run left to kill"
+    );
+}
+
+/// #6: a new enabled rule is first due one tick after the proxy sees it,
+/// and the row says when. Before, it ran (and deleted) on the next tick.
+#[tokio::test]
+async fn test_lifecycle_new_rule_is_first_due_one_tick_later() {
+    let server = TestServer::builder()
+        .bucket("life-pause")
+        .extra_yaml_storage_section(
+            SLOW_LIFECYCLE_YAML
+                .replace("life-slow", "life-pause")
+                .as_str(),
+        )
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let row = lifecycle_row(&admin, &server.endpoint(), "slow-expire").await;
+    let due = row["next_due_at"]
+        .as_i64()
+        .expect("a new rule has a first run");
+    assert!(
+        due >= now + 3600 - 120 && due <= now + 3600 + 5,
+        "first due one tick after boot: due={due} now={now} {row}"
+    );
+    assert_eq!(row["detail"]["tick_interval"], "1h", "{row}");
+}
+
+/// #13: run-now refuses a rule whose bucket a maintenance job gates, and
+/// says which bucket.
+#[tokio::test]
+async fn test_lifecycle_run_now_refuses_while_a_maintenance_job_gates_the_bucket() {
+    let server = TestServer::builder()
+        .bucket("life-gated")
+        .env("DGP_TEST_MAINTENANCE_OBJECT_STALL_MS", "400")
+        .extra_yaml_storage_section(
+            SLOW_LIFECYCLE_YAML
+                .replace("life-slow", "life-gated")
+                .as_str(),
+        )
+        .build()
+        .await;
+    let endpoint = server.endpoint();
+    let client = server.s3_client().await;
+    for i in 0..10 {
+        client
+            .put_object()
+            .bucket("life-gated")
+            .key(format!("old/{i}.txt"))
+            .body(ByteStream::from(b"x".to_vec()))
+            .send()
+            .await
+            .unwrap();
+    }
+    let admin = admin_http_client(&endpoint).await;
+    let started = admin
+        .post(format!("{endpoint}/_/api/admin/jobs/backfill-metadata"))
+        .json(&serde_json::json!({ "buckets": ["life-gated"] }))
+        .send()
+        .await
+        .unwrap();
+    assert!(started.status().is_success(), "{}", started.status());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let resp = admin
+            .post(format!(
+                "{endpoint}/_/api/admin/jobs/lifecycle:slow-expire/run-now"
+            ))
+            .send()
+            .await
+            .unwrap();
+        let code = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if code == 409 {
+            assert!(
+                text.contains("bucket 'life-gated' has an active maintenance job"),
+                "{text}"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "run-now never refused under the gate: {code} {text}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 /// Pause/resume parity (new in the unified jobs API): a paused lifecycle

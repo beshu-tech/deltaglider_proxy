@@ -63,7 +63,9 @@ pub async fn preview(
     .map_err(|err| AdminError::status(lifecycle::classify_lifecycle_run_error(&err), err))
 }
 
-/// Pause a lifecycle rule (scheduler skips it; run-now 409s).
+/// Pause a lifecycle rule (scheduler skips it; run-now 409s). A run in
+/// progress stops at the next object and keeps its cursor: Resume
+/// continues it at the scheduler's next check.
 pub async fn pause(
     state: Arc<AdminState>,
     name: String,
@@ -88,6 +90,41 @@ async fn set_paused(
     audit_action: &str,
     headers: &HeaderMap,
 ) -> Result<StatusCode, AdminError> {
+    let tick = {
+        let cfg = state.config.read().await;
+        if !cfg.lifecycle.rules.iter().any(|r| r.name == name) {
+            return Err(AdminError::not_found("rule not found"));
+        }
+        lifecycle::scheduler::scheduler_tick(&cfg.lifecycle).as_secs() as i64
+    };
+    let db = state
+        .jobs_db
+        .as_ref()
+        .ok_or_else(AdminError::no_jobs_db)?
+        .lock()
+        .await;
+    let now = lifecycle::current_unix_seconds();
+    let _ = db.lifecycle_ensure_state(name, lifecycle::state_store::first_due_at(now, tick));
+    db.lifecycle_set_paused(name, paused)?;
+    if paused {
+        // The flag stops the scheduler; this stops the run in progress.
+        lifecycle::live::request_stop(name, lifecycle::live::StopRequest::Pause);
+    } else {
+        db.lifecycle_due_now_if_stopped_by_pause(name, now)?;
+    }
+    crate::audit::audit_log(audit_action, "admin", name, headers, "", "");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Kill the run of a lifecycle rule in progress: it stops at the next
+/// object and drops its cursor, so the next run starts from the top. The
+/// rule keeps its schedule. Reaches only the run of THIS instance (the
+/// lifecycle lease is node-local), like a replication kill.
+pub async fn kill(
+    state: Arc<AdminState>,
+    name: String,
+    headers: &HeaderMap,
+) -> Result<StatusCode, AdminError> {
     let in_config = {
         let cfg = state.config.read().await;
         cfg.lifecycle.rules.iter().any(|r| r.name == name)
@@ -95,16 +132,11 @@ async fn set_paused(
     if !in_config {
         return Err(AdminError::not_found("rule not found"));
     }
-    let db = state
-        .jobs_db
-        .as_ref()
-        .ok_or_else(AdminError::no_jobs_db)?
-        .lock()
-        .await;
-    let _ = db.lifecycle_ensure_state(name, lifecycle::current_unix_seconds());
-    db.lifecycle_set_paused(name, paused)?;
-    crate::audit::audit_log(audit_action, "admin", name, headers, "", "");
-    Ok(StatusCode::NO_CONTENT)
+    if !lifecycle::live::request_stop(&name, lifecycle::live::StopRequest::Kill) {
+        return Err(AdminError::conflict("no running run to kill"));
+    }
+    crate::audit::audit_log("lifecycle_kill", "admin", &name, headers, "", "");
+    Ok(StatusCode::ACCEPTED)
 }
 
 /// Why run-now refuses a lifecycle rule, or `None` when it may run. Names
@@ -163,7 +195,7 @@ pub async fn run_now(
     {
         return Err(AdminError::conflict(format!(
             "bucket '{busy}' has an active maintenance job — run the rule again \
-                 when it finishes"
+             when it finishes"
         )));
     }
 
@@ -200,6 +232,7 @@ pub async fn run_now(
     let now = lifecycle::current_unix_seconds();
     {
         let db = db_arc.lock().await;
+        // The run's end sets the next due time; this only creates the row.
         db.lifecycle_ensure_state(&rule.name, now)?;
         // Paused beats run-now (same contract as replication): the operator
         // paused the rule for a reason; an explicit run must not sidestep it.

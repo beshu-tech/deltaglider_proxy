@@ -14,6 +14,18 @@ use tracing::{debug, info, warn};
 
 const DEFAULT_TICK: Duration = Duration::from_secs(3600);
 const MIN_TICK: Duration = Duration::from_secs(60);
+/// How often the scheduler checks which rules are due. The tick is how
+/// often a RULE runs (its `next_due_at` = the end of its last run plus one
+/// tick); the scheduler wakes far more often, so a rule runs at most one
+/// check after it is due. Before, the loop slept a whole tick: the first
+/// check after a boot came one tick late, and a run-now that moved a
+/// rule's due time could delay its next run by up to two ticks.
+const CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// PURE: how long the scheduler sleeps between two checks.
+fn check_interval(tick: Duration) -> Duration {
+    tick.min(CHECK_INTERVAL)
+}
 // Lifecycle leases default to 5x maintenance's (`LeaseTiming::LIFECYCLE`,
 // 300s/60s): lifecycle wakes at most once a minute (MIN_TICK) and typically
 // hourly (DEFAULT_TICK), and one run does full prefix scans + deletes, so a
@@ -34,7 +46,7 @@ pub fn spawn_scheduler(
                 let cfg = config.read().await;
                 scheduler_tick(&cfg.lifecycle)
             };
-            tokio::time::sleep(tick).await;
+            tokio::time::sleep(check_interval(tick)).await;
 
             let (lifecycle, lease) = {
                 let cfg = config.read().await;
@@ -107,7 +119,11 @@ async fn run_due_rules(
         let mut process_guard = None;
         let should_run = if let Some(db) = db.as_ref() {
             let db_guard = db.lock().await;
-            if let Err(err) = db_guard.lifecycle_ensure_state(&rule.name, now) {
+            // A rule seen for the first time runs one tick from now, not at
+            // once: the operator has a tick to preview it (#6).
+            let first_due =
+                super::state_store::first_due_at(now, scheduler_tick(lifecycle).as_secs() as i64);
+            if let Err(err) = db_guard.lifecycle_ensure_state(&rule.name, first_due) {
                 warn!(
                     "Lifecycle scheduler could not initialise state for rule '{}': {}",
                     rule.name, err
@@ -117,6 +133,7 @@ async fn run_due_rules(
                 match db_guard.lifecycle_load_state(&rule.name) {
                     Ok(Some(st)) if st.paused => {
                         debug!("Lifecycle scheduler skipped paused rule '{}'", rule.name);
+                        super::live::set_deferred(&rule.name, None);
                         false
                     }
                     Ok(Some(st)) if st.next_due_at > now => false,
@@ -183,10 +200,13 @@ async fn run_due_rules(
             .into_iter()
             .find(|b| state.maintenance_gate.is_busy(b))
         {
-            info!(
-                "Lifecycle scheduler deferring rule '{}': bucket '{}' is under maintenance",
-                rule.name, busy
-            );
+            // Shown on the rule's Jobs row; logged once, not every check.
+            if super::live::set_deferred(&rule.name, Some(maintenance_deferral(busy))) {
+                info!(
+                    "Lifecycle scheduler deferring rule '{}': bucket '{}' is under maintenance",
+                    rule.name, busy
+                );
+            }
             // Release the just-acquired lease — leaking it blocks run-now
             // for a full TTL after the maintenance window.
             if let Some(db) = db.as_ref() {
@@ -209,7 +229,12 @@ async fn run_due_rules(
             Vec::new(),
         );
         if let Some(why) = check.gated() {
-            info!("Lifecycle scheduler deferring rule '{}': {why}", rule.name);
+            if super::live::set_deferred(
+                &rule.name,
+                Some(format!("{why}; the rule runs when the backend recovers")),
+            ) {
+                info!("Lifecycle scheduler deferring rule '{}': {why}", rule.name);
+            }
             if let Some(db) = db.as_ref() {
                 let db = db.lock().await;
                 let _ = db.lifecycle_release_lease(&rule.name, instance_id);
@@ -255,6 +280,12 @@ async fn run_due_rules(
         }
         drop(process_guard);
     }
+}
+
+/// The deferral a rule's row shows while a maintenance job gates one of
+/// its write buckets. Run-now refuses with the same words.
+pub(crate) fn maintenance_deferral(bucket: &str) -> String {
+    format!("bucket '{bucket}' has an active maintenance job; the rule runs when it ends")
 }
 
 pub(crate) fn scheduler_tick(lifecycle: &LifecycleConfig) -> Duration {
@@ -371,6 +402,14 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
+    /// Make `rule` due now (a rule the scheduler has not seen yet is due
+    /// only one tick later).
+    async fn due(env: &Env, rule: &str) {
+        let db = env.db.lock().await;
+        let now = crate::lifecycle::current_unix_seconds();
+        db.lifecycle_ensure_state(rule, now - 1).unwrap();
+    }
+
     async fn exists(env: &Env, bucket: &str) -> bool {
         env.state
             .engine
@@ -437,6 +476,7 @@ mod tests {
         let env = env().await;
         seed(&env, "sched-due").await;
         let cfg = lifecycle(&[("sched-due-rule", "sched-due")]);
+        due(&env, "sched-due-rule").await;
         run(&env, &cfg).await;
         assert!(
             !exists(&env, "sched-due").await,
@@ -493,7 +533,13 @@ mod tests {
         seed(&env, "sched-gated").await;
         env.state.maintenance_gate.set_busy("sched-gated");
         let cfg = lifecycle(&[("sched-gated-rule", "sched-gated")]);
+        due(&env, "sched-gated-rule").await;
         run(&env, &cfg).await;
+        assert_eq!(
+            crate::lifecycle::live::deferred("sched-gated-rule").as_deref(),
+            Some(maintenance_deferral("sched-gated").as_str()),
+            "#13: the row can say why the rule did not run"
+        );
         assert!(
             exists(&env, "sched-gated").await,
             "deferred: nothing deleted"
@@ -523,6 +569,11 @@ mod tests {
             !exists(&env, "sched-gated").await,
             "runs once the gate clears"
         );
+        assert_eq!(
+            crate::lifecycle::live::deferred("sched-gated-rule"),
+            None,
+            "a run clears the deferral"
+        );
     }
 
     /// jobs-13: a rule whose bucket's backend the health gate closed (an
@@ -541,6 +592,7 @@ mod tests {
         };
         let (name, def) = full.effective_backend_for_bucket("sched-health").unwrap();
         let verdict = |v| env.state.backend_health.set(&name, def, v);
+        due(&env, "sched-health-rule").await;
         verdict(HealthVerdict::Unreachable {
             detail: "connection refused".into(),
         });
@@ -600,6 +652,9 @@ mod tests {
             ("sched-ok-rule", "sched-ok"),
         ]);
         cfg.rules[2].expire_after = None;
+        for rule in ["sched-dup-rule", "sched-bad-rule", "sched-ok-rule"] {
+            due(&env, rule).await;
+        }
         run(&env, &cfg).await;
         assert!(exists(&env, "sched-dup").await, "duplicated names: skipped");
         assert!(exists(&env, "sched-bad").await, "no expire_after: skipped");
@@ -642,8 +697,70 @@ mod tests {
         assert!(!exists(&env, "sched-nodb").await, "free: runs");
     }
 
-    /// The spawned loop sleeps one tick, then runs due rules; with lifecycle
-    /// disabled it runs nothing. Virtual time: the minimum tick is 60 s.
+    /// #6: a rule the scheduler sees for the first time does not run on
+    /// that check: its first run is one tick later.
+    #[tokio::test]
+    async fn a_new_rule_does_not_run_before_its_first_tick() {
+        let env = env().await;
+        seed(&env, "sched-new").await;
+        let cfg = lifecycle(&[("sched-new-rule", "sched-new")]);
+        run(&env, &cfg).await;
+        assert!(
+            exists(&env, "sched-new").await,
+            "a new rule deleted on the first check"
+        );
+        let st = env
+            .db
+            .lock()
+            .await
+            .lifecycle_load_state("sched-new-rule")
+            .unwrap()
+            .unwrap();
+        let now = crate::lifecycle::current_unix_seconds();
+        assert!(
+            (now + 3600 - 5..=now + 3600).contains(&st.next_due_at),
+            "first due one tick later: {st:?}"
+        );
+    }
+
+    #[test]
+    fn the_scheduler_checks_more_often_than_a_tick() {
+        assert_eq!(check_interval(Duration::from_secs(3600)), CHECK_INTERVAL);
+        assert_eq!(
+            check_interval(Duration::from_secs(10)),
+            Duration::from_secs(10)
+        );
+    }
+
+    /// #11: the first check after a boot comes one check interval later,
+    /// not one tick; and a rule whose due time passes between two ticks
+    /// runs at the next check. Virtual time.
+    #[tokio::test(start_paused = true)]
+    async fn a_due_rule_runs_at_the_first_check_after_boot() {
+        let env = env().await;
+        seed(&env, "sched-boot").await;
+        due(&env, "sched-boot-rule").await;
+        let config = crate::config::Config {
+            lifecycle: lifecycle(&[("sched-boot-rule", "sched-boot")]),
+            ..Default::default()
+        };
+        let shared: crate::config::SharedConfig = Arc::new(tokio::sync::RwLock::new(config));
+        let task = spawn_scheduler(shared, Some(env.db.clone()), env.state.clone());
+        tokio::time::sleep(CHECK_INTERVAL + Duration::from_secs(1)).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while exists(&env, "sched-boot").await {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first check after boot runs a due rule (not one tick later)"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        task.abort();
+    }
+
+    /// The spawned loop checks on its interval and runs due rules; with
+    /// lifecycle disabled it runs nothing. Virtual time: the minimum tick is
+    /// 60 s.
     #[tokio::test(start_paused = true)]
     async fn the_spawned_scheduler_runs_rules_each_tick_while_enabled() {
         let env = env().await;
@@ -655,6 +772,9 @@ mod tests {
             ..Default::default()
         };
         let shared: crate::config::SharedConfig = Arc::new(tokio::sync::RwLock::new(config));
+        // Due now: the clock of `next_due_at` is the wall clock, which the
+        // virtual time of this test does not move.
+        due(&env, "sched-loop-rule").await;
         let task = spawn_scheduler(shared.clone(), Some(env.db.clone()), env.state.clone());
         tokio::time::sleep(Duration::from_secs(3601)).await;
         assert!(exists(&env, "sched-loop").await, "disabled: no run");

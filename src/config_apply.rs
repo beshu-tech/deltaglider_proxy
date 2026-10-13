@@ -61,6 +61,21 @@ pub fn reconcile_job_rules(db: &crate::config_db::JobsDb, cfg: &Config) {
             Err(e) => tracing::warn!("could not drop the rows of removed {what} rules: {e}"),
         }
     }
+    // A lifecycle rule enabled by this apply (or found at boot) without a
+    // state row is first due one tick from now, so the Jobs page can show
+    // when it first runs, and it never deletes on the next check.
+    let first_due = crate::lifecycle::state_store::first_due_at(
+        crate::lifecycle::current_unix_seconds(),
+        crate::lifecycle::scheduler::scheduler_tick(&cfg.lifecycle).as_secs() as i64,
+    );
+    for rule in cfg.lifecycle.rules.iter().filter(|r| r.enabled) {
+        if let Err(e) = db.lifecycle_ensure_state(&rule.name, first_due) {
+            tracing::warn!(
+                "could not schedule the first run of lifecycle rule '{}': {e}",
+                rule.name
+            );
+        }
+    }
 }
 
 /// Hot-swap an engine built by [`build_engine`] into `app.engine`.
@@ -188,6 +203,34 @@ impl ConfigMutator {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// #6: an apply that enables a new lifecycle rule schedules its first
+    /// run one tick later; a disabled rule gets no schedule, and a rule
+    /// that has one keeps it.
+    #[test]
+    fn an_enabled_new_lifecycle_rule_is_first_due_one_tick_after_the_apply() {
+        let cfg = Config::from_yaml_str(
+            "storage:\n  lifecycle:\n    tick_interval: 2h\n    rules:\n    - name: new\n      enabled: true\n      bucket: b\n      expire_after: 30d\n    - name: off\n      bucket: b\n      expire_after: 30d\n    - name: known\n      enabled: true\n      bucket: b\n      expire_after: 30d\n",
+        )
+        .unwrap();
+        let db = crate::config_db::JobsDb::in_memory("k").unwrap();
+        db.lifecycle_ensure_state("known", 42).unwrap();
+        let now = crate::lifecycle::current_unix_seconds();
+        reconcile_job_rules(&db, &cfg);
+        let due = db.lifecycle_load_state("new").unwrap().unwrap().next_due_at;
+        assert!(
+            (now + 7200..=now + 7205).contains(&due),
+            "due={due} now={now}"
+        );
+        assert!(db.lifecycle_load_state("off").unwrap().is_none());
+        assert_eq!(
+            db.lifecycle_load_state("known")
+                .unwrap()
+                .unwrap()
+                .next_due_at,
+            42
+        );
+    }
 
     /// jobs-12: a rule removed from the YAML kept its rows (state, run
     /// history, failures) forever: only a rule delete through the admin

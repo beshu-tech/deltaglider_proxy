@@ -2,6 +2,87 @@
 
 ## Unreleased
 
+### Fixed — Pause stops a running lifecycle run, and Kill is new
+
+Before, **Pause** on a lifecycle rule only set a flag that the scheduler
+reads before it starts a run. A run that was already in progress went on
+to its end, and the Jobs page showed "paused" while the run still deleted
+objects. Now a pause also stops the run in progress at the next object.
+The run keeps its cursor and ends with the status `paused`. When you
+resume the rule, the scheduler continues the run at its next check. The
+new **Kill** action (`POST /_/api/admin/jobs/lifecycle:<name>/kill`) stops
+a run in progress in the same way, but drops the cursor, so the next run
+starts from the top. The run ends with the status `cancelled`. Like a
+replication kill, it reaches only the run on the instance that you send
+the request to.
+
+### Fixed — A lifecycle run shows its progress while it runs
+
+The Jobs row of a lifecycle rule showed zeros until the run ended, because
+the run wrote its counters only at the end. A run now publishes its
+counters after each object. `GET /_/api/admin/jobs` gives them in
+`progress` (`processed`, `skipped`, `failed`, `bytes` and `deleted`) and in
+`detail.live`. The running entry of `GET /jobs/lifecycle:<name>/runs` shows
+the same live counters.
+
+### Fixed — A lifecycle transition reports the bytes that it archived
+
+A transition inside one backend is a server-side copy, which sends no byte
+through the proxy. The run reported the bytes that went through the
+proxy, so such a run, its Jobs row and the lifetime total all said 0 B.
+A run now reports the logical (uncompressed) size of every object that it
+deleted, moved or copied.
+
+### Added — A lifecycle run says what it did with each object
+
+A lifecycle run entry now has `objects_deleted`, `objects_moved` (the
+source was deleted after the copy), `objects_copied` (the source was kept),
+`objects_excluded` (an include or exclude glob keeps the object out of the
+rule) and `objects_not_due` (the object is not old enough yet). The preview
+response has the same fields, and also `stored_bytes_affected`, which is
+the space that the affected objects use on the backend. A delta is much
+smaller than the object that it stores, so this number can be much smaller
+than `bytes_affected`. Every preview object has a `stored_size` field for
+the same reason.
+
+### Changed — A new lifecycle rule first runs one tick after you apply it
+
+A new enabled rule ran at the next scheduler tick after you applied it, so
+it could delete objects less than a minute later, without a warning. Now
+the proxy schedules the first run of a new enabled rule one
+`tick_interval` after it first sees the rule (the apply, or the boot). The
+`next_due_at` field of the Jobs row says when. Use that time to open the
+Preview tab and see what the rule will do. A rule that you enable again
+after it ran before keeps its old schedule.
+
+### Fixed — The lifecycle scheduler checks for due rules every 30 seconds
+
+The scheduler slept a whole `tick_interval` between two checks. After a
+boot, the first check came one tick late. A run-now moves the next due
+time of the rule, and a due time that fell just after a check waited for
+the next tick, so the next run could come up to two ticks late. The
+scheduler now checks every 30 seconds (or every tick, if the tick is
+shorter), so a rule runs at most 30 seconds after it is due. The tick
+still sets how often each rule runs.
+
+### Added — The Jobs row says why a due lifecycle rule did not run
+
+When a maintenance job gates a bucket of a due rule, or the health check
+closed one of its backends, the scheduler does not run the rule. Before,
+only a log line said so. The Jobs row now has `detail.deferred`, for
+example "bucket 'releases' has an active maintenance job; the rule runs
+when it ends". The proxy logs the deferral once, not at every check.
+
+### Fixed — A failed lifecycle row says why
+
+A lifecycle row with the status `failed` had no `last_error`. The row now
+has the last failure of the latest run in `last_error`, and the number of
+failures of that run in `failed_total`. A failed transition copy
+names the destination bucket and key. `GET /jobs/lifecycle:<name>/failures`
+has a `total` field: the number of failures that the proxy keeps for the
+rule, of which the response lists the most recent. A run whose first 20
+writes all fail now stops with an error that says so, instead of trying
+the same write on every object of the scope.
 ### Fixed — The Jobs screen shows the runs that the proxy starts on its own
 
 After **Review & apply** or **Resume**, the scheduler starts the run of a
