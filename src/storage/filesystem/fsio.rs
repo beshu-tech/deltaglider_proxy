@@ -40,8 +40,24 @@ fn injected(_path: &Path) -> Option<io::Error> {
     None
 }
 
+/// Every path a test's backend stats, for the syscall-cost tests (filter
+/// by your own temp dir: tests run in parallel).
+#[cfg(test)]
+pub(super) static STATS: parking_lot::Mutex<Vec<std::path::PathBuf>> =
+    parking_lot::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn record_stat(path: &Path) {
+    STATS.lock().push(path.to_path_buf());
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn record_stat(_path: &Path) {}
+
 /// The file's metadata; `None` when no file is there.
 pub(super) async fn stat(path: &Path) -> Result<Option<std::fs::Metadata>, StorageError> {
+    record_stat(path);
     let res = match injected(path) {
         Some(e) => Err(e),
         None => tokio::fs::metadata(path).await,
@@ -63,6 +79,7 @@ pub(super) async fn dir_exists(path: &Path) -> Result<bool, StorageError> {
 
 /// [`dir_exists`] for blocking code (inside `spawn_blocking`).
 pub(super) fn dir_exists_blocking(path: &Path) -> Result<bool, StorageError> {
+    record_stat(path);
     let res = match injected(path) {
         Some(e) => Err(e),
         None => std::fs::metadata(path),
@@ -71,6 +88,53 @@ pub(super) fn dir_exists_blocking(path: &Path) -> Result<bool, StorageError> {
         Ok(m) => Ok(m.is_dir()),
         Err(e) if absent(&e) => Ok(false),
         Err(e) => Err(io_to_storage_error(e)),
+    }
+}
+
+/// [`stat`] for blocking code.
+pub(super) fn stat_blocking(path: &Path) -> Result<Option<std::fs::Metadata>, StorageError> {
+    record_stat(path);
+    let res = match injected(path) {
+        Some(e) => Err(e),
+        None => std::fs::metadata(path),
+    };
+    match res {
+        Ok(m) => Ok(Some(m)),
+        Err(e) if absent(&e) => Ok(None),
+        Err(e) => Err(io_to_storage_error(e)),
+    }
+}
+
+/// What one read of an object file's metadata xattr found.
+pub(super) enum StoredXattr {
+    Value(Vec<u8>),
+    /// The file is there without the xattr (ENODATA): an unmanaged file.
+    Missing,
+    /// No file at this path ([`absent`]): no stat needs to follow.
+    NoFile,
+}
+
+/// The metadata xattr of `path`, one `getxattr` (blocking). It tells "no
+/// file" from "a file without the xattr", so a missing object form costs
+/// no stat (P7.3).
+pub(super) fn metadata_xattr_blocking(path: &Path) -> Result<StoredXattr, StorageError> {
+    let res = match injected(path) {
+        Some(e) => Err(e),
+        None => xattr::get(path, crate::storage::xattr_meta::XATTR_NAME),
+    };
+    match res {
+        Ok(Some(v)) => Ok(StoredXattr::Value(v)),
+        Ok(None) => Ok(StoredXattr::Missing),
+        Err(e) if absent(&e) => Ok(StoredXattr::NoFile),
+        Err(e) => Err(io_to_storage_error(e)),
+    }
+}
+
+/// Open `path` for reading (blocking).
+pub(super) fn open_blocking(path: &Path) -> io::Result<std::fs::File> {
+    match injected(path) {
+        Some(e) => Err(e),
+        None => std::fs::File::open(path),
     }
 }
 

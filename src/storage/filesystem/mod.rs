@@ -47,6 +47,20 @@ fn key_filename(name: &str) -> &str {
     }
 }
 
+/// Metadata read by [`FilesystemBackend::object_metadata`], named for the
+/// key: the key's file name wins over what the xattr says (review D4); an
+/// unmanaged file's stat metadata is named already.
+fn keyed((meta, from_xattr): (FileMetadata, bool), filename: &str) -> FileMetadata {
+    if from_xattr {
+        FileMetadata {
+            original_name: filename.to_string(),
+            ..meta
+        }
+    } else {
+        meta
+    }
+}
+
 /// What a file of a deltaspace directory stores, by its name (review D4:
 /// a listing takes the key and the kind from the stored name, never from
 /// the metadata inside, which a copy can clone from another file).
@@ -378,13 +392,23 @@ impl FilesystemBackend {
         path: &Path,
         filename: &str,
     ) -> Result<FileMetadata, StorageError> {
+        Self::fallback_metadata_from_stat(path, fsio::stat(path).await?, filename)
+    }
+
+    /// [`Self::fallback_metadata_from_path`] from a stat already taken
+    /// (`None`: no file), of the path or of an open file.
+    fn fallback_metadata_from_stat(
+        path: &Path,
+        stat: Option<std::fs::Metadata>,
+        filename: &str,
+    ) -> Result<FileMetadata, StorageError> {
         use crate::types::StorageInfo;
         use chrono::{DateTime, Utc};
 
         // A directory (a key prefix) or a path under a file is no object
         // (s3surface-2): without this a GET of `dir` answered 200 with the
         // directory's size and then failed mid-body.
-        let stat = match fsio::stat(path).await? {
+        let stat = match stat {
             Some(stat) if stat.is_file() => stat,
             _ => return Err(StorageError::NotFound(path.display().to_string())),
         };
@@ -403,6 +427,27 @@ impl FilesystemBackend {
             None,
             StorageInfo::Passthrough,
         ))
+    }
+
+    /// The metadata of the object file at `path`, and whether it came from
+    /// the xattr (`false`: an unmanaged file, described from its stat as
+    /// `filename`). One blocking task; a missing file is known from the
+    /// xattr read's ENOENT and costs no stat (P7.3).
+    async fn object_metadata(
+        path: &Path,
+        filename: &str,
+    ) -> Result<(FileMetadata, bool), StorageError> {
+        let (path, filename) = (path.to_path_buf(), filename.to_string());
+        tokio::task::spawn_blocking(move || match fsio::metadata_xattr_blocking(&path)? {
+            fsio::StoredXattr::Value(json) => Ok((serde_json::from_slice(&json)?, true)),
+            fsio::StoredXattr::NoFile => Err(StorageError::NotFound(path.display().to_string())),
+            fsio::StoredXattr::Missing => Ok((
+                Self::fallback_metadata_from_stat(&path, fsio::stat_blocking(&path)?, &filename)?,
+                false,
+            )),
+        })
+        .await
+        .map_err(super::join_error)?
     }
 
     /// One object file of a listing or a scan (review D3, D4): the key and
@@ -484,23 +529,19 @@ impl FilesystemBackend {
     /// non-recursive `mkdir`. If the bucket root went missing under us,
     /// the very first `mkdir` (of the first child of the bucket dir)
     /// fails with `ENOENT`, which we propagate as `BucketNotFound`.
-    async fn ensure_dir(&self, bucket: &str, path: &Path) -> Result<WriteDir, StorageError> {
+    ///
+    /// No I/O here (P7.3): the write's own blocking task makes the
+    /// directory ([`WriteDir::temp`]), unless the process knows it already.
+    /// Every caller ran `require_bucket_exists` first, so the bucket was
+    /// stat'ed once; a bucket deleted since then is found by `mkdir_within`.
+    fn ensure_dir(&self, bucket: &str, path: &Path) -> Result<WriteDir, StorageError> {
         let bucket_dir = self.bucket_dir(bucket);
         let dir = path.parent().unwrap_or(&bucket_dir).to_path_buf();
-        if !fsio::dir_exists(&bucket_dir).await? {
-            return Err(StorageError::BucketNotFound(bucket.to_string()));
-        }
-        let wd = WriteDir {
+        Ok(WriteDir {
             bucket: bucket.to_string(),
             bucket_dir,
             dir,
-        };
-        tokio::task::spawn_blocking(move || {
-            mkdir_within(&wd.bucket, &wd.bucket_dir, &wd.dir)?;
-            Ok(wd)
         })
-        .await
-        .map_err(super::join_error)?
     }
 
     /// Reject a write if the bucket root does NOT already exist. Prevents
@@ -940,21 +981,19 @@ impl FilesystemBackend {
         &self,
         bucket: &str,
         data_path: &Path,
-        data: &[u8],
+        data: Bytes,
         metadata: &FileMetadata,
         label: &str,
         prefix: &str,
         filename: &str,
         durability: Durability,
     ) -> Result<(), StorageError> {
-        let dir = self.ensure_dir(bucket, data_path).await?;
+        let dir = self.ensure_dir(bucket, data_path)?;
+        let len = data.len();
         atomic_write_with_metadata(dir, data_path, data, Some(metadata), durability).await?;
         debug!(
             "Wrote {} ({} bytes) for {}/{}",
-            label,
-            data.len(),
-            prefix,
-            filename
+            label, len, prefix, filename
         );
         Ok(())
     }
@@ -998,6 +1037,7 @@ impl FilesystemBackend {
 
                 match fs::remove_dir(&current).await {
                     Ok(()) => {
+                        write::forget_dirs_under(&current);
                         debug!("Pruned empty filesystem prefix dir: {:?}", current);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1047,6 +1087,8 @@ impl StorageBackend for FilesystemBackend {
         }
         // Check if bucket has any user-visible object content.
         let deltaspaces_dir = bucket_dir.join("deltaspaces");
+        // The writes' known folders: the prune below may remove them.
+        write::forget_dirs_under(&bucket_dir);
         if fsio::exists(&deltaspaces_dir).await? {
             if !Self::prune_invisible_data_recursive(&deltaspaces_dir).await? {
                 return Err(StorageError::BucketNotEmpty(bucket.to_string()));
@@ -1183,7 +1225,7 @@ impl StorageBackend for FilesystemBackend {
         self.put_object_file(
             bucket,
             &self.reference_path(bucket, prefix)?,
-            &data,
+            data,
             metadata,
             "reference",
             prefix,
@@ -1206,7 +1248,7 @@ impl StorageBackend for FilesystemBackend {
         let dest = self.reference_path(bucket, prefix)?;
         // `ensure_dir`, never `create_dir_all`: that re-created a bucket
         // deleted after `require_bucket_exists` (C-P0-1, storage-12).
-        let dir = self.ensure_dir(bucket, &dest).await?;
+        let dir = self.ensure_dir(bucket, &dest)?;
         // Copy to a temp file + xattr + fsync + rename. Delete-then-copy lost
         // the baseline on a failed or short copy, and a hardlink shared the
         // inode (and so the xattr) with the caller's source file.
@@ -1264,14 +1306,8 @@ impl StorageBackend for FilesystemBackend {
         prefix: &str,
     ) -> Result<FileMetadata, StorageError> {
         let path = self.reference_path(bucket, prefix)?;
-        match xattr_meta::read_metadata(&path).await {
-            Ok(meta) => Ok(meta),
-            Err(StorageError::NotFound(_)) => {
-                // No xattr metadata — fall back to filesystem stats if the file exists.
-                Self::fallback_metadata_from_path(&path, "reference.bin").await
-            }
-            Err(other) => Err(other),
-        }
+        // No xattr metadata: described from its stat.
+        Ok(Self::object_metadata(&path, "reference.bin").await?.0)
     }
 
     /// Existence only: the filesystem backend is single-node, so it never
@@ -1341,7 +1377,7 @@ impl StorageBackend for FilesystemBackend {
             ObjectVariant::Passthrough => self.passthrough_path(at.bucket, at.prefix, at.filename),
         };
         let (src_path, dst_path) = (path_of(src)?, path_of(dst)?);
-        let dir = self.ensure_dir(dst.bucket, &dst_path).await?;
+        let dir = self.ensure_dir(dst.bucket, &dst_path)?;
         let copied = atomic_server_copy(
             dir,
             &src_path,
@@ -1392,7 +1428,7 @@ impl StorageBackend for FilesystemBackend {
         self.put_object_file(
             bucket,
             &self.delta_path(bucket, prefix, filename)?,
-            &data,
+            data,
             metadata,
             "delta",
             prefix,
@@ -1410,18 +1446,10 @@ impl StorageBackend for FilesystemBackend {
         filename: &str,
     ) -> Result<FileMetadata, StorageError> {
         let path = self.delta_path(bucket, prefix, filename)?;
-        match xattr_meta::read_metadata(&path).await {
-            // The key's file name, whatever the xattr says (review D4).
-            Ok(meta) => Ok(FileMetadata {
-                original_name: filename.to_string(),
-                ..meta
-            }),
-            Err(StorageError::NotFound(_)) => {
-                // No xattr metadata — fall back to filesystem stats if the file exists.
-                Self::fallback_metadata_from_path(&path, filename).await
-            }
-            Err(other) => Err(other),
-        }
+        Ok(keyed(
+            Self::object_metadata(&path, filename).await?,
+            filename,
+        ))
     }
 
     #[instrument(skip(self))]
@@ -1472,7 +1500,7 @@ impl StorageBackend for FilesystemBackend {
         self.put_object_file(
             bucket,
             &self.passthrough_path(bucket, prefix, filename)?,
-            &data,
+            data,
             metadata,
             "passthrough",
             prefix,
@@ -1494,7 +1522,7 @@ impl StorageBackend for FilesystemBackend {
     ) -> Result<(), StorageError> {
         self.require_bucket_exists(bucket).await?;
         let data_path = self.passthrough_path(bucket, prefix, filename)?;
-        let dir = self.ensure_dir(bucket, &data_path).await?;
+        let dir = self.ensure_dir(bucket, &data_path)?;
         atomic_copy_with_metadata(
             dir,
             source_path,
@@ -1522,7 +1550,7 @@ impl StorageBackend for FilesystemBackend {
     ) -> Result<(), StorageError> {
         self.require_bucket_exists(bucket).await?;
         let data_path = self.passthrough_path(bucket, prefix, filename)?;
-        let dir = self.ensure_dir(bucket, &data_path).await?;
+        let dir = self.ensure_dir(bucket, &data_path)?;
         let target = data_path.clone();
         let parts: Vec<PathBuf> = part_paths.to_vec();
         let meta_json = serde_json::to_vec(metadata)?;
@@ -1551,19 +1579,11 @@ impl StorageBackend for FilesystemBackend {
         filename: &str,
     ) -> Result<FileMetadata, StorageError> {
         let path = self.passthrough_path(bucket, prefix, filename)?;
-        match xattr_meta::read_metadata(&path).await {
-            // The key's file name, whatever the xattr says (review D4).
-            Ok(meta) => Ok(FileMetadata {
-                original_name: filename.to_string(),
-                ..meta
-            }),
-            Err(StorageError::NotFound(_)) => {
-                // No xattr metadata — file may exist without DG metadata (unmanaged).
-                // Fall back to filesystem stats if the file exists.
-                Self::fallback_metadata_from_path(&path, filename).await
-            }
-            Err(other) => Err(other),
-        }
+        // No xattr: an unmanaged file, described from its stat.
+        Ok(keyed(
+            Self::object_metadata(&path, filename).await?,
+            filename,
+        ))
     }
 
     #[instrument(skip(self))]
@@ -1597,7 +1617,7 @@ impl StorageBackend for FilesystemBackend {
         self.require_bucket_exists(bucket).await?;
         let data_path = self.passthrough_path(bucket, prefix, filename)?;
 
-        let dir = self.ensure_dir(bucket, &data_path).await?;
+        let dir = self.ensure_dir(bucket, &data_path)?;
 
         // Write chunks sequentially to a temp file, then fsync + rename.
         // This avoids allocating a contiguous buffer for the entire object.
@@ -1660,29 +1680,44 @@ impl StorageBackend for FilesystemBackend {
         object: StoredObject<'_>,
     ) -> Result<(super::ByteStream, FileMetadata), StorageError> {
         use futures::StreamExt;
-        let (path, meta, label, name) = match object {
+        let (path, label, name) = match object {
             StoredObject::Reference => (
                 self.reference_path(bucket, prefix)?,
-                self.get_reference_metadata(bucket, prefix).await?,
                 "reference",
                 "reference.bin",
             ),
-            StoredObject::Delta(f) => (
-                self.delta_path(bucket, prefix, f)?,
-                self.get_delta_metadata(bucket, prefix, f).await?,
-                "delta",
-                f,
-            ),
-            StoredObject::Passthrough(f) => (
-                self.passthrough_path(bucket, prefix, f)?,
-                self.get_passthrough_metadata(bucket, prefix, f).await?,
-                "passthrough",
-                f,
-            ),
+            StoredObject::Delta(f) => (self.delta_path(bucket, prefix, f)?, "delta", f),
+            StoredObject::Passthrough(f) => {
+                (self.passthrough_path(bucket, prefix, f)?, "passthrough", f)
+            }
         };
-        let file = fsio::open(&path)
-            .await
-            .map_err(|e| fsio::storage_error(e, || format!("{label}: {prefix}/{name}")))?;
+        let what = format!("{label}: {prefix}/{name}");
+        let name = name.to_string();
+        // One blocking task: open, then the metadata of the OPEN file
+        // (fgetxattr; fstat for an unmanaged file), so the metadata and the
+        // bytes are one file's even if a write renames over the path.
+        let (file, meta) = tokio::task::spawn_blocking(move || {
+            use xattr::FileExt;
+            let file = fsio::open_blocking(&path).map_err(|e| fsio::storage_error(e, || what))?;
+            let found = file
+                .get_xattr(xattr_meta::XATTR_NAME)
+                .map_err(io_to_storage_error)?;
+            let meta = match found {
+                Some(json) => (serde_json::from_slice(&json)?, true),
+                None => (
+                    Self::fallback_metadata_from_stat(&path, file.metadata().ok(), &name)?,
+                    false,
+                ),
+            };
+            Ok::<_, StorageError>((file, meta))
+        })
+        .await
+        .map_err(super::join_error)??;
+        let meta = match object {
+            StoredObject::Reference => meta.0,
+            StoredObject::Delta(f) | StoredObject::Passthrough(f) => keyed(meta, f),
+        };
+        let file = tokio::fs::File::from_std(file);
         let stream = ReaderStream::new(file).map(|r| r.map_err(StorageError::Io));
         Ok((Box::pin(stream), meta))
     }
@@ -1865,7 +1900,7 @@ impl StorageBackend for FilesystemBackend {
         self.put_object_file(
             bucket,
             &path,
-            &[],
+            Bytes::new(),
             &meta,
             "folder marker",
             &obj.prefix,

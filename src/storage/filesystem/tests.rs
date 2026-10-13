@@ -226,9 +226,11 @@ mod backend_tests {
             .join("deltaspaces")
             .join("p")
             .join("file.bin");
+        // `ensure_dir` does no I/O; the write's temp file makes the folder.
         let err = backend
             .ensure_dir("phantom-bucket", &bogus_path)
-            .await
+            .expect("no I/O")
+            .temp()
             .expect_err("must refuse to create dirs in a missing bucket");
 
         match err {
@@ -1385,7 +1387,11 @@ async fn a_stat_error_never_reads_as_absent() {
         Err(StorageError::Io(_))
     ));
     assert!(fs.get_passthrough_stream("b", "d", "k").await.is_err());
-    assert!(fs.get_passthrough_metadata("b", "d", "k").await.is_ok());
+    // The metadata read goes through the same rule: an error, not absent.
+    assert!(matches!(
+        fs.get_passthrough_metadata("b", "d", "k").await,
+        Err(StorageError::Io(_))
+    ));
     drop(object);
     assert_eq!(fs.bulk_list_objects("b", "").await.unwrap().len(), 1);
 }
@@ -1521,4 +1527,228 @@ async fn a_flat_page_reports_the_keys_it_saw_in_both_forms() {
             ambiguous: vec!["d/a".into()]
         }
     );
+}
+
+/// P7.3: the filesystem syscalls of one GET and one PUT.
+#[cfg(test)]
+mod syscall_cost_tests {
+    use super::*;
+
+    fn meta(name: &str) -> FileMetadata {
+        FileMetadata::new_passthrough(name.into(), "0".repeat(64), "0".repeat(32), 1, None)
+    }
+
+    fn stats_under(root: &Path) -> usize {
+        fsio::STATS
+            .lock()
+            .iter()
+            .filter(|p| p.starts_with(root))
+            .count()
+    }
+
+    fn mkdirs_under(root: &Path) -> usize {
+        write::MKDIRS
+            .lock()
+            .iter()
+            .filter(|p| p.starts_with(root))
+            .count()
+    }
+
+    async fn backend() -> (tempfile::TempDir, FilesystemBackend) {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        b.create_bucket("releases").await.unwrap();
+        (tmp, b)
+    }
+
+    /// A GET of a passthrough object HEADs its `.delta` form, which is
+    /// absent: the xattr read's ENOENT says so, no stat follows. A file
+    /// without the xattr (ENODATA) still falls back to its stat.
+    #[tokio::test]
+    async fn a_missing_form_costs_no_stat() {
+        let (tmp, b) = backend().await;
+        b.put_passthrough(
+            "releases",
+            "p",
+            "a.png",
+            Bytes::from_static(b"x"),
+            &meta("a.png"),
+        )
+        .await
+        .unwrap();
+        let before = stats_under(tmp.path());
+        let miss = b.get_delta_metadata("releases", "p", "a.png").await;
+        assert!(matches!(miss, Err(StorageError::NotFound(_))), "{miss:?}");
+        assert_eq!(
+            stats_under(tmp.path()) - before,
+            0,
+            "a missing form was stat'ed"
+        );
+
+        // An unmanaged file (no xattr) is described from its stat.
+        let plain = tmp.path().join("releases/deltaspaces/p/plain.bin");
+        std::fs::write(&plain, b"abc").unwrap();
+        let m = b
+            .get_passthrough_metadata("releases", "p", "plain.bin")
+            .await
+            .unwrap();
+        assert_eq!(m.file_size, 3);
+        // A directory is no object.
+        std::fs::create_dir(tmp.path().join("releases/deltaspaces/p/d")).unwrap();
+        assert!(matches!(
+            b.get_passthrough_metadata("releases", "p", "d").await,
+            Err(StorageError::NotFound(_))
+        ));
+    }
+
+    /// `open_object` reads the metadata from the file it opened: no path
+    /// stat, and the bytes and the metadata are one file's.
+    #[tokio::test]
+    async fn open_object_reads_metadata_from_the_opened_file() {
+        use futures::StreamExt;
+        let (tmp, b) = backend().await;
+        b.put_passthrough(
+            "releases",
+            "p",
+            "a.png",
+            Bytes::from_static(b"xyz"),
+            &meta("a.png"),
+        )
+        .await
+        .unwrap();
+        let before = stats_under(tmp.path());
+        let (mut stream, m) = b
+            .open_object("releases", "p", StoredObject::Passthrough("a.png"))
+            .await
+            .unwrap();
+        assert_eq!(m.original_name, "a.png");
+        assert_eq!(stream.next().await.unwrap().unwrap().as_ref(), b"xyz");
+        assert_eq!(stats_under(tmp.path()) - before, 0);
+        // Unmanaged and missing files keep their answers.
+        std::fs::write(tmp.path().join("releases/deltaspaces/p/plain.bin"), b"abcd").unwrap();
+        let (_, m) = b
+            .open_object("releases", "p", StoredObject::Passthrough("plain.bin"))
+            .await
+            .unwrap();
+        assert_eq!(m.file_size, 4);
+        assert!(matches!(
+            b.open_object("releases", "p", StoredObject::Delta("gone.zip"))
+                .await,
+            Err(StorageError::NotFound(_))
+        ));
+    }
+
+    /// A PUT stats the bucket once, and a second PUT into a folder that
+    /// this process made asks for no directory.
+    #[tokio::test]
+    async fn a_put_into_a_known_folder_makes_no_directory() {
+        let (tmp, b) = backend().await;
+        b.put_passthrough(
+            "releases",
+            "p/q",
+            "a.png",
+            Bytes::from_static(b"x"),
+            &meta("a.png"),
+        )
+        .await
+        .unwrap();
+        let (stats, mkdirs) = (stats_under(tmp.path()), mkdirs_under(tmp.path()));
+        b.put_passthrough(
+            "releases",
+            "p/q",
+            "b.png",
+            Bytes::from_static(b"y"),
+            &meta("b.png"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stats_under(tmp.path()) - stats,
+            1,
+            "one bucket stat per PUT"
+        );
+        assert_eq!(
+            mkdirs_under(tmp.path()) - mkdirs,
+            0,
+            "a known folder was made again"
+        );
+    }
+
+    /// A known folder that a DELETE pruned is made again by the next write
+    /// (the cache never makes a write fail).
+    #[tokio::test]
+    async fn a_pruned_known_folder_is_made_again() {
+        let (tmp, b) = backend().await;
+        b.put_passthrough(
+            "releases",
+            "p/q",
+            "a.png",
+            Bytes::from_static(b"x"),
+            &meta("a.png"),
+        )
+        .await
+        .unwrap();
+        b.delete_passthrough("releases", "p/q", "a.png")
+            .await
+            .unwrap();
+        assert!(
+            !tmp.path().join("releases/deltaspaces/p").exists(),
+            "pruned"
+        );
+        // Removed behind the backend's back too: the cache does not know.
+        b.put_passthrough(
+            "releases",
+            "p/q",
+            "b.png",
+            Bytes::from_static(b"y"),
+            &meta("b.png"),
+        )
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(tmp.path().join("releases/deltaspaces/p")).unwrap();
+        b.put_passthrough(
+            "releases",
+            "p/q",
+            "c.png",
+            Bytes::from_static(b"z"),
+            &meta("c.png"),
+        )
+        .await
+        .unwrap();
+        assert!(tmp.path().join("releases/deltaspaces/p/q/c.png").exists());
+    }
+
+    /// A deleted bucket stays deleted: a write into a folder that the cache
+    /// knows gets BucketNotFound and never re-creates the bucket (C-P0-1).
+    #[tokio::test]
+    async fn a_known_folder_of_a_deleted_bucket_is_not_made_again() {
+        let (tmp, b) = backend().await;
+        b.put_passthrough(
+            "releases",
+            "p",
+            "a.png",
+            Bytes::from_static(b"x"),
+            &meta("a.png"),
+        )
+        .await
+        .unwrap();
+        b.delete_passthrough("releases", "p", "a.png")
+            .await
+            .unwrap();
+        b.delete_bucket("releases").await.unwrap();
+        let err = b
+            .put_passthrough(
+                "releases",
+                "p",
+                "b.png",
+                Bytes::from_static(b"y"),
+                &meta("b.png"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::BucketNotFound(_)), "{err:?}");
+        assert!(!tmp.path().join("releases").exists());
+    }
 }

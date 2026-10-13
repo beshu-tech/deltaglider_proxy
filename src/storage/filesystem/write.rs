@@ -14,6 +14,10 @@ pub(super) fn internal_temp_in(dir: &Path) -> std::io::Result<NamedTempFile> {
         .tempfile_in(dir)
 }
 
+/// Every directory `mkdir_within` asks for, for the syscall-cost tests.
+#[cfg(test)]
+pub(super) static MKDIRS: parking_lot::Mutex<Vec<PathBuf>> = parking_lot::Mutex::new(Vec::new());
+
 /// How often a write re-creates a directory that a concurrent DELETE pruned.
 pub(super) const MKDIR_ATTEMPTS: usize = 8;
 
@@ -37,6 +41,8 @@ pub(super) fn mkdir_within(
         let mut current = bucket_dir.to_path_buf();
         for component in rel.components() {
             current.push(component);
+            #[cfg(test)]
+            MKDIRS.lock().push(current.clone());
             match std::fs::create_dir(&current) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -56,6 +62,38 @@ pub(super) fn mkdir_within(
     )))
 }
 
+/// The directories that this process made or found while writing, so a
+/// write into a known folder asks for none (P7.3). Process-wide, like the
+/// pending-fsync set: paths are absolute, and an engine rebuild replaces
+/// the backend, not the disk. Bounded: a full set starts over.
+///
+/// A stale entry is never wrong, only slower: a DELETE's prune, a bucket
+/// delete, or a hand removal can take a known folder away, and the write's
+/// temp file then gets ENOENT and makes the folder again
+/// ([`WriteDir::temp`]). The removers still forget what they remove.
+static KNOWN_DIRS: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(Default::default);
+
+const KNOWN_DIRS_MAX: usize = 4096;
+
+fn dir_is_known(dir: &Path) -> bool {
+    KNOWN_DIRS.lock().contains(dir)
+}
+
+fn remember_dir(dir: &Path) {
+    let mut known = KNOWN_DIRS.lock();
+    if known.len() >= KNOWN_DIRS_MAX {
+        known.clear();
+    }
+    known.insert(dir.to_path_buf());
+}
+
+/// Forget `root` and every known directory below it (a prune, a bucket
+/// delete).
+pub(super) fn forget_dirs_under(root: &Path) {
+    KNOWN_DIRS.lock().retain(|d| !d.starts_with(root));
+}
+
 /// The directory an atomic write puts its temp file in. Made only by
 /// `FilesystemBackend::ensure_dir`, so every write can re-create it.
 #[derive(Debug)]
@@ -71,7 +109,13 @@ impl WriteDir {
     /// ENOENT, which reads as 404 NoSuchKey): create it again and retry.
     /// Once the temp file exists, the directory is not empty, so the
     /// rename that follows cannot lose it. Blocking.
+    ///
+    /// The directory is made first unless this process knows it already.
     pub(super) fn temp(&self) -> Result<NamedTempFile, StorageError> {
+        if !dir_is_known(&self.dir) {
+            mkdir_within(&self.bucket, &self.bucket_dir, &self.dir)?;
+            remember_dir(&self.dir);
+        }
         for _ in 0..MKDIR_ATTEMPTS {
             match internal_temp_in(&self.dir) {
                 Ok(tmp) => return Ok(tmp),
@@ -258,30 +302,24 @@ pub(super) fn durable_rename(
 ///
 /// The xattr is written to the temp file BEFORE the rename, so a crash can never
 /// leave a data file without its metadata. Either both are visible or neither is.
+///
+/// One blocking task does it all (directory, temp file, body, xattr,
+/// rename): the body is a shared `Bytes`, so the task owns it without a
+/// copy (storage-15: a copy of the whole body doubled the RAM of every
+/// buffered write).
 pub(super) async fn atomic_write_with_metadata(
     dir: WriteDir,
     path: &Path,
-    data: &[u8],
+    data: Bytes,
     metadata: Option<&FileMetadata>,
     durability: Durability,
 ) -> Result<(), StorageError> {
-    use tokio::io::AsyncWriteExt;
     let path = path.to_path_buf();
     let meta_json = metadata.map(serde_json::to_vec).transpose()?;
-
-    let tmp = tokio::task::spawn_blocking(move || dir.temp())
-        .await
-        .map_err(crate::storage::join_error)??;
-    // The body goes through an async file handle, which copies it in small
-    // chunks: a blocking task needs an owned buffer, and a copy of the whole
-    // body doubled the RAM of every buffered write (storage-15).
-    let handle = tmp.as_file().try_clone().map_err(io_to_storage_error)?;
-    let mut file = tokio::fs::File::from_std(handle);
-    file.write_all(data).await.map_err(io_to_storage_error)?;
-    file.flush().await.map_err(io_to_storage_error)?;
-    drop(file);
     let (_gate, ticket) = commit_gate();
     tokio::task::spawn_blocking(move || {
+        let mut tmp = dir.temp()?;
+        tmp.write_all(&data).map_err(io_to_storage_error)?;
         // Write xattr to temp file BEFORE rename — atomic metadata+data visibility.
         if let Some(json) = &meta_json {
             xattr_meta::set_metadata_xattr(tmp.path(), json)?;
