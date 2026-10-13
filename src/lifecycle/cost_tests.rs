@@ -153,12 +153,12 @@ async fn a_second_preview_answers_from_the_first() {
     store_deltas(&engine, "run", 20).await;
     let r = rule("preview-twice", "1ms");
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    let first = crate::lifecycle::preview_rule(&engine, &r, 100)
+    let first = crate::lifecycle::preview_rule(&engine, &r, 100, false)
         .await
         .unwrap();
     assert_eq!(first.objects_affected, 20, "{first:?}");
     fake.clear();
-    let second = crate::lifecycle::preview_rule(&engine, &r, 100)
+    let second = crate::lifecycle::preview_rule(&engine, &r, 100, false)
         .await
         .unwrap();
     assert_eq!(first, second);
@@ -166,10 +166,36 @@ async fn a_second_preview_answers_from_the_first() {
 
     // Another definition walks again.
     let other = rule("preview-twice", "2ms");
-    crate::lifecycle::preview_rule(&engine, &other, 100)
+    crate::lifecycle::preview_rule(&engine, &other, 100, false)
         .await
         .unwrap();
     assert_eq!(scope_lists(&fake), 1);
+}
+
+/// "Refresh preview" walks again: a fresh preview never answers from a
+/// walk that ended, and its answer names when it was computed.
+#[tokio::test]
+async fn a_fresh_preview_walks_again() {
+    let (engine, fake) = engine().await;
+    store_deltas(&engine, "run", 5).await;
+    let r = rule("preview-fresh", "30d");
+    let first = crate::lifecycle::preview_rule(&engine, &r, 100, false)
+        .await
+        .unwrap();
+    assert!(first.computed_at.is_some());
+    fake.clear();
+    let again = crate::lifecycle::preview_rule(&engine, &r, 100, true)
+        .await
+        .unwrap();
+    assert_eq!(scope_lists(&fake), 1, "{:#?}", fake.requests());
+    assert!(again.computed_at >= first.computed_at);
+    // The fresh walk is the one that later previews answer from.
+    fake.clear();
+    let cached = crate::lifecycle::preview_rule(&engine, &r, 100, false)
+        .await
+        .unwrap();
+    assert_eq!(cached, again);
+    assert!(fake.requests().is_empty(), "{:#?}", fake.requests());
 }
 
 /// Previews asked while one walks wait for that walk (single-flight).
@@ -181,9 +207,9 @@ async fn previews_asked_at_once_walk_once() {
     fake.clear();
     fake.set_delay_ms("LIST", 50);
     let (a, b, c) = tokio::join!(
-        crate::lifecycle::preview_rule(&engine, &r, 100),
-        crate::lifecycle::preview_rule(&engine, &r, 100),
-        crate::lifecycle::preview_rule(&engine, &r, 100),
+        crate::lifecycle::preview_rule(&engine, &r, 100, false),
+        crate::lifecycle::preview_rule(&engine, &r, 100, false),
+        crate::lifecycle::preview_rule(&engine, &r, 100, false),
     );
     assert_eq!(a.unwrap(), b.unwrap());
     assert!(c.is_ok());
@@ -198,7 +224,7 @@ async fn a_run_after_a_preview_sends_no_head() {
     store_deltas(&engine, "run", 30).await;
     let r = rule("preview-then-run", "30d");
     engine.metadata_cache().invalidate_prefix("b", "");
-    crate::lifecycle::preview_rule(&engine, &r, 100)
+    crate::lifecycle::preview_rule(&engine, &r, 100, false)
         .await
         .unwrap();
     engine.metadata_cache().invalidate_prefix("b", "");

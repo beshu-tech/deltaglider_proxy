@@ -505,6 +505,14 @@ pub async fn list_jobs(
     }))
 }
 
+/// Options of a job action. `fresh` (preview): never answer from a walk
+/// that already ended.
+#[derive(Debug, Default, Deserialize)]
+pub struct ActionQuery {
+    #[serde(default)]
+    pub fresh: bool,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LimitQuery {
     pub limit: Option<u32>,
@@ -728,6 +736,7 @@ pub async fn job_failures(
 pub async fn job_action(
     Path((id, action)): Path<(String, String)>,
     State(state): State<Arc<AdminState>>,
+    AdminQuery(q): AdminQuery<ActionQuery>,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AdminError> {
     let (sub, key) = parse_job_id(&id).ok_or(not_found())?;
@@ -777,7 +786,7 @@ pub async fn job_action(
             Ok((code, Json(serde_json::to_value(resp).map_err(internal)?)))
         }
         (JobSubsystem::Lifecycle, JobAction::Preview) => {
-            let resp = super::lifecycle::preview(state, name).await?;
+            let resp = super::lifecycle::preview(state, name, q.fresh).await?;
             Ok((
                 StatusCode::OK,
                 Json(serde_json::to_value(resp).map_err(internal)?),

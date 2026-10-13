@@ -214,8 +214,8 @@ export async function getJobFailures(id: string): Promise<{ failures: JobFailure
 }
 
 /** Uniform action dispatch; returns the action's JSON payload (if any). */
-export async function runJobAction(id: string, action: JobAction): Promise<unknown> {
-  const res = await adminRequest(`/api/admin/jobs/${encodeURIComponent(id)}/${action}`, {
+export async function runJobAction(id: string, action: JobAction, query = ''): Promise<unknown> {
+  const res = await adminRequest(`/api/admin/jobs/${encodeURIComponent(id)}/${action}${query}`, {
     method: 'POST',
     context: `Job ${action}`,
   });
@@ -242,10 +242,13 @@ export interface LifecyclePreview {
   objects_affected: number;
   bytes_affected: number;
   candidates: LifecycleCandidate[];
+  /** When the proxy's walk ended (RFC 3339): a preview can answer from an earlier walk. */
+  computed_at?: string;
 }
 
-export async function previewLifecycleJob(id: string): Promise<LifecyclePreview> {
-  return (await runJobAction(id, 'preview')) as LifecyclePreview;
+/** `fresh`: never answer from a walk that already ended ("Refresh preview"). */
+export async function previewLifecycleJob(id: string, fresh = false): Promise<LifecyclePreview> {
+  return (await runJobAction(id, 'preview', fresh ? '?fresh=true' : '')) as LifecyclePreview;
 }
 
 /** Queue re-encryption jobs for the given buckets. */

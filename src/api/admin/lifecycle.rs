@@ -37,6 +37,7 @@ fn check_rule_runnable(
 pub async fn preview(
     state: Arc<AdminState>,
     name: String,
+    fresh: bool,
 ) -> Result<lifecycle::LifecycleRunOutcome, AdminError> {
     let lifecycle_cfg = { state.config.read().await.lifecycle.clone() };
     let rule = lifecycle_cfg
@@ -51,9 +52,14 @@ pub async fn preview(
     check_rule_runnable(&rule, &lifecycle_cfg.rules)?;
 
     let engine = state.s3_state.engine.load().clone();
-    lifecycle::preview_rule(&engine, &rule, lifecycle_cfg.max_failures_retained as usize)
-        .await
-        .map_err(|err| AdminError::status(lifecycle::classify_lifecycle_run_error(&err), err))
+    lifecycle::preview_rule(
+        &engine,
+        &rule,
+        lifecycle_cfg.max_failures_retained as usize,
+        fresh,
+    )
+    .await
+    .map_err(|err| AdminError::status(lifecycle::classify_lifecycle_run_error(&err), err))
 }
 
 /// Pause a lifecycle rule (scheduler skips it; run-now 409s).

@@ -10,7 +10,7 @@ interface Props {
   loading: boolean;
   error: unknown;
   errorText: string;
-  /** When the proxy computed the preview (ms since the epoch): a preview is reused for a few minutes. */
+  /** When the proxy's walk ended (ms since the epoch): a preview is reused for a few minutes. */
   computedAt?: number;
 }
 

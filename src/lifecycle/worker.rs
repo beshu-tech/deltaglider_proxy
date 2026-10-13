@@ -64,6 +64,11 @@ pub struct LifecycleRunOutcome {
     pub objects_protected: i64,
     pub candidates: Vec<PreviewObject>,
     pub failures: Vec<LifecycleFailure>,
+    /// A preview only: when the walk that answers ended (RFC 3339). A
+    /// preview can answer from an earlier walk, so the GUI shows this,
+    /// not the time it received the answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computed_at: Option<String>,
 }
 
 fn is_zero_i64(v: &i64) -> bool {
@@ -96,10 +101,14 @@ static PREVIEWS: std::sync::Mutex<Vec<(PreviewKey, PreviewCell)>> =
 /// previews. The run itself reuses the preview's metadata (the scan
 /// cache), so Run-now right after a preview sends no HEAD for an object
 /// that did not change.
+///
+/// `fresh` (the GUI's "Refresh preview"): never answer from a walk that
+/// already ended; a walk that is still running is joined, not doubled.
 pub async fn preview_rule(
     engine: &Arc<DynEngine>,
     rule: &LifecycleRule,
     max_candidates: usize,
+    fresh: bool,
 ) -> Result<LifecycleRunOutcome, String> {
     let key = (
         rule.name.clone(),
@@ -109,9 +118,10 @@ pub async fn preview_rule(
     );
     let cell = {
         let mut previews = PREVIEWS.lock().unwrap_or_else(|e| e.into_inner());
-        previews.retain(|(_, cell)| {
-            cell.get()
-                .is_none_or(|(at, result)| result.is_ok() && at.elapsed() < PREVIEW_TTL)
+        previews.retain(|(k, cell)| {
+            cell.get().is_none_or(|(at, result)| {
+                result.is_ok() && at.elapsed() < PREVIEW_TTL && !(fresh && *k == key)
+            })
         });
         match previews.iter().find(|(k, _)| *k == key) {
             Some((_, cell)) => cell.clone(),
@@ -125,8 +135,12 @@ pub async fn preview_rule(
     let (_, result) = cell
         .get_or_init(|| async {
             // Preview never writes → no maintenance gate needed.
-            let result =
-                run_or_preview(None, engine, rule, max_candidates, false, None, None).await;
+            let result = run_or_preview(None, engine, rule, max_candidates, false, None, None)
+                .await
+                .map(|mut out| {
+                    out.computed_at = Some(chrono::Utc::now().to_rfc3339());
+                    out
+                });
             (std::time::Instant::now(), result)
         })
         .await;

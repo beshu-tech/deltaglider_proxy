@@ -80,6 +80,19 @@ export function useLifecyclePreview(id: string | null) {
 }
 
 /**
+ * "Refresh preview": a new walk of the rule's scope. The proxy also keeps
+ * a finished preview for a minute, so a plain refetch could answer from it;
+ * this asks for a fresh walk and puts its answer in the shared query.
+ */
+export function useRefreshLifecyclePreview(id: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => previewLifecycleJob(id as string, true),
+    onSuccess: (data) => qc.setQueryData(qk.jobs.preview(id ?? ''), data),
+  });
+}
+
+/**
  * Server-side parity verification status for a replication rule. The audit is a
  * BACKGROUND job: the result is persisted server-side, so this query gives an
  * instant cached verdict on mount (survives navigation + restart) and polls

@@ -90,6 +90,32 @@ test('reopening the Preview tab shows the same preview; Refresh preview recomput
 
   await user.click(screen.getByRole('button', { name: /Refresh preview/ }));
   await waitFor(() => expect(previews()).toBe(2));
+  // The proxy keeps a finished walk for a minute: Refresh asks for a new one.
+  expect(http.callsTo('POST', PREVIEW)[1].path).toBe(`${PREVIEW}?fresh=true`);
+  expect(http.callsTo('POST', PREVIEW)[0].path).toBe(PREVIEW);
+});
+
+test('Refresh preview is disabled while a walk runs, and the time shown is when the proxy computed it', async () => {
+  let release: () => void = () => {};
+  const gate = new Promise<void>((r) => { release = r; });
+  http.on('POST', PREVIEW, async () => {
+    await gate;
+    return json({
+      rule_name: 'expire-nightlies', status: 'preview', objects_scanned: 40, objects_affected: 0, objects_skipped: 0,
+      bytes_affected: 0, errors: 0, candidates: [], failures: [], computed_at: '2026-10-13T10:00:00Z',
+    });
+  });
+  const user = userEvent.setup();
+  renderWithQuery(<JobsPanel />);
+  await screen.findByText('expire-nightlies');
+  await user.click(within(jobRow()).getByRole('button', { name: 'Preview: expire-nightlies' }));
+  await screen.findByRole('tab', { name: 'Preview', selected: true });
+  const refresh = await screen.findByRole('button', { name: /Refresh preview/ });
+  expect(refresh).toBeDisabled();
+  await act(async () => release());
+  await waitFor(() => expect(screen.getByRole('button', { name: /Refresh preview/ })).toBeEnabled());
+  const shown = new Date('2026-10-13T10:00:00Z').toLocaleTimeString();
+  expect(screen.getByText(`Computed at ${shown}.`)).toBeInTheDocument();
 });
 
 test("Run now's confirmation reuses the cached preview", async () => {
