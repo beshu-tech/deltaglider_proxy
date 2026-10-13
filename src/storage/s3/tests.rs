@@ -1026,6 +1026,40 @@ mod classify_tests {
         );
     }
 
+    /// A 416 is the backend saying "range not satisfiable": every ranged
+    /// read gets `InvalidRange` (416 to the client), whatever the error
+    /// code and the operation. Before, only `open_passthrough_range`
+    /// mapped it; the other ranged reads turned it into a 500.
+    #[test]
+    fn classify_s3_error_maps_416_to_invalid_range() {
+        let err_with = |code: Option<&str>, status: u16| {
+            let mut m = aws_smithy_types::error::ErrorMetadata::builder();
+            if let Some(c) = code {
+                m = m.code(c);
+            }
+            let inner = GetObjectError::generic(m.build());
+            SdkError::service_error(inner, http_response(status, Some("req-416")))
+        };
+        for (code, status, op, want_range) in [
+            (Some("InvalidRange"), 416, S3Op::GetObject, true),
+            (None, 416, S3Op::GetObject, true),
+            (Some("InvalidRange"), 416, S3Op::Other("x"), true),
+            (Some("InvalidRange"), 400, S3Op::GetObject, false),
+            (Some("InvalidRequest"), 400, S3Op::GetObject, false),
+        ] {
+            let e = S3Backend::classify_s3_error("b", &err_with(code, status), op);
+            assert_eq!(
+                matches!(e, StorageError::InvalidRange(_)),
+                want_range,
+                "code={code:?} status={status} op={op}: {e:?}"
+            );
+            let e = S3Backend::classify_get_error("b", "k", &err_with(code, status));
+            if op.to_string() == "get_object" {
+                assert_eq!(matches!(e, StorageError::InvalidRange(_)), want_range);
+            }
+        }
+    }
+
     /// head_bucket routing guard: a transient HEAD-bucket failure must not
     /// classify as BucketNotFound/NotFound — else resolve_existing reads the
     /// bucket as "absent here" and reroutes the operation to the wrong

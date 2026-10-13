@@ -2416,6 +2416,63 @@ mod read_request_tests {
         }
     }
 
+    /// A ranged read whose second GET starts at or past the object's end
+    /// gets a 416 from the backend; that is `InvalidRange`, never a 500.
+    /// (a) A v1 object whose wire size is exactly the first read's guess:
+    /// the "rest" read starts at the end, and a valid range must serve.
+    /// (b) A plaintext object on a keyed backend and a range that starts
+    /// past its end, in a later chunk: 416, not 500 (next test).
+    #[tokio::test]
+    async fn a_v1_object_that_fills_the_guess_serves_a_valid_range() {
+        let (w, _fake) = wrapped(Some(key())).await;
+        // The chunk-0 guess reads wire bytes 0..=header+one frame-1.
+        let guess = (CHUNK_HEADER_LEN + CHUNK_FRAME_WIRE_LEN) as u64;
+        let plain_len = guess as usize
+            - crate::storage::encrypting::format::IV_LEN
+            - crate::storage::encrypting::format::GCM_TAG_LEN;
+        let body: Vec<u8> = (0..plain_len as u32).map(|i| (i % 249) as u8).collect();
+        w.put_passthrough("b", "p", "v1.bin", Bytes::from(body.clone()), &meta(&body))
+            .await
+            .unwrap();
+        let wire = w.inner.get_passthrough("b", "p", "v1.bin").await.unwrap();
+        assert_eq!(wire.len() as u64, guess, "the v1 wire must fill the guess");
+        let (stream, len, _) = w
+            .open_passthrough_range("b", "p", "v1.bin", 0, 100)
+            .await
+            .unwrap();
+        let got: Vec<Bytes> = stream.try_collect().await.unwrap();
+        assert_eq!(got.concat(), &body[..=100]);
+        assert_eq!(len, 101);
+    }
+
+    /// (b) of the test above: a plaintext object on a keyed backend.
+    #[tokio::test]
+    async fn a_plaintext_range_past_the_end_on_a_keyed_backend_is_invalid_range() {
+        let (w, _fake) = wrapped(Some(key())).await;
+        // Plaintext written by the inner backend directly.
+        let small: Vec<u8> = (0..1000u32).map(|i| (i % 7) as u8).collect();
+        w.inner
+            .put_passthrough(
+                "b",
+                "p",
+                "plain.bin",
+                Bytes::from(small.clone()),
+                &meta(&small),
+            )
+            .await
+            .unwrap();
+        for start in [70_000u64, CHUNK_PLAINTEXT_SIZE as u64] {
+            let res = w
+                .open_passthrough_range("b", "p", "plain.bin", start, u64::MAX - 1)
+                .await;
+            assert!(
+                matches!(res, Err(StorageError::InvalidRange(_))),
+                "start {start}: {:?}",
+                res.map(|(_, l, _)| l)
+            );
+        }
+    }
+
     #[tokio::test]
     async fn delta_and_reference_reads_are_one_get() {
         for k in [None, Some(key())] {

@@ -123,9 +123,11 @@ impl S3Backend {
         let status_text = status
             .map(|s| s.to_string())
             .unwrap_or_else(|| "-".to_string());
-        if s3_error_is_expected_absence(&op, status) {
+        // A 416 is the ordinary answer to a range past the end (the
+        // encrypting wrapper's "rest" read hits it by design): debug too.
+        if s3_error_is_expected_absence(&op, status) || status == Some(416) {
             debug!(
-                "S3 absent: op={} bucket={} status={} request_id={}",
+                "S3 absent or range past the end: op={} bucket={} status={} request_id={}",
                 op, bucket, status_text, request_id,
             );
         } else {
@@ -180,6 +182,12 @@ impl S3Backend {
         // if the operation is bucket-level. Object-level 403 errors are genuine
         // AccessDenied and should not be misclassified.
         if let Some(s) = status {
+            // 416: the range starts at or past the object's end. Every
+            // ranged read (passthrough range, the encrypting wrapper's
+            // second read, chunked frames) answers the client 416, not 500.
+            if s == 416 {
+                return StorageError::InvalidRange(format!("{op} on bucket '{bucket}': {e}"));
+            }
             if s == 403 && op.is_bucket_level() {
                 return StorageError::BucketNotFound(bucket.to_string());
             }

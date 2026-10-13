@@ -1057,12 +1057,7 @@ impl StorageBackend for S3Backend {
             .range(&range_header)
             .send()
             .await
-            .map_err(|e| match &e {
-                SdkError::ServiceError(svc) if svc.raw().status().as_u16() == 416 => {
-                    StorageError::InvalidRange(format!("{range_header} of {bucket}/{key}"))
-                }
-                _ => self.classify_get(bucket, &key, &e),
-            })?;
+            .map_err(|e| self.classify_get(bucket, &key, &e))?;
         let content_length = response.content_length().unwrap_or(0).max(0) as u64;
         let total = match response.content_range().and_then(content_range_total) {
             Some(total) => total,
