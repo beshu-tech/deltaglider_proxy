@@ -54,6 +54,7 @@ import { useOverlayClose } from '../../hooks/useOverlayClose';
 import TimeAgo from '../TimeAgo';
 import RecordList, { type RecordColumn } from './RecordList';
 import RowActionsMenu, { type RowActionConfirm } from '../RowActionsMenu';
+import { draftRemoveAction } from './draftRemoveAction';
 import OutcomeMeter from './OutcomeMeter';
 import { useSectionEditor } from '../../useSectionEditor';
 import { useApplyHandler } from '../../useDirtySection';
@@ -202,6 +203,18 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
         lcBaselineStale.current = true;
       }
     }
+  };
+
+  // A draft (staged, never applied) leaves the editor alone: the other
+  // unsaved edits stay, and the dirty bar goes away if it was the only one.
+  const removeDraft = (row: Pick<JobRow, 'id' | 'kind' | 'name'>) => {
+    const drop = <T extends { rules: { name: string }[] }>(cur: T): T => ({
+      ...cur,
+      rules: cur.rules.filter((r) => r.name !== row.name),
+    });
+    if (row.kind === 'replication') repl.setValue(drop);
+    else if (row.kind === 'lifecycle') lc.setValue(drop);
+    if (drawerJobId === row.id) handleDrawerClose();
   };
 
   const discardEditors = () => {
@@ -556,7 +569,12 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
       hideLabelOnNarrow: true,
       render: (d) =>
         d.draft ? (
-          <span />
+          <Space size={2} onClick={(e) => e.stopPropagation()}>
+            <RowActionsMenu
+              label={`More actions for ${d.row.name}`}
+              actions={[draftRemoveAction(d.row, removeDraft)]}
+            />
+          </Space>
         ) : (
           <Space size={2} onClick={(e) => e.stopPropagation()}>
             {availableActions(d.row)
@@ -662,6 +680,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
         onReplicationChange={repl.setValue}
         onLifecycleChange={lc.setValue}
         onJobIdChange={retargetDrawer}
+        onRemoveDraft={removeDraft}
         activeTab={drawerTab}
         onTabChange={handleTabChange}
         inputRadius={inputRadius}

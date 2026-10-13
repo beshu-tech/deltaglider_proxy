@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed — A draft job can be removed on its own
+
+A rule that you add with "New job" stays a draft until you apply it. A draft
+row had no actions, so the only way to remove it was Discard, which also
+dropped every other unsaved edit. The "⋯" menu of a draft row, and of the
+draft's drawer, now has "Remove draft". It asks for confirmation, removes
+only that rule, and keeps your other unsaved edits.
+
 ### Added — A lifecycle preview says when the next object becomes due
 
 A preview that matched no object said only "0 of 12,148 scanned objects

@@ -5,6 +5,8 @@
 import { useEffect, useRef, useMemo } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Alert, Drawer, Empty, Tabs, Tag, Typography } from 'antd';
+import RowActionsMenu from '../RowActionsMenu';
+import { draftRemoveAction } from './draftRemoveAction';
 import { useColors } from '../../ThemeContext';
 import './OutcomeMeter.css';
 import type { LifecycleConfig, ReplicationConfig } from '../../adminApi';
@@ -44,6 +46,8 @@ interface Props {
   /** Rename support: the drawer is keyed by `<kind>:<name>`, so a rename
    *  must retarget the key or the lookup loses the rule mid-keystroke. */
   onJobIdChange: (next: string) => void;
+  /** Drop a draft (a rule that exists only in the unsaved edits). */
+  onRemoveDraft: (draft: Pick<JobRow, 'id' | 'kind' | 'name'>) => void;
   /** Currently active tab (URL-deep-linked). */
   activeTab?: string;
   /** Called when the user switches tabs. */
@@ -64,6 +68,7 @@ export default function JobDrawer({
   onReplicationChange,
   onLifecycleChange,
   onJobIdChange,
+  onRemoveDraft,
   activeTab,
   onTabChange,
   inputRadius,
@@ -328,6 +333,23 @@ export default function JobDrawer({
       open={!!jobId}
       onClose={onClose}
       size="min(640px, 100vw)"
+      extra={
+        !serverRow && parsed ? (
+          <RowActionsMenu
+            label={`More actions for ${parsed.key}`}
+            actions={[
+              draftRemoveAction(
+                {
+                  id: jobId ?? '',
+                  kind: parsed.subsystem === 'replication' ? 'replication' : 'lifecycle',
+                  name: parsed.key,
+                },
+                onRemoveDraft,
+              ),
+            ]}
+          />
+        ) : undefined
+      }
       title={
         serverRow ? (
           <span>
