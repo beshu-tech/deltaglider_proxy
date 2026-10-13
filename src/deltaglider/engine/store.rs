@@ -997,7 +997,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                             put.bucket,
                             put.deltaspace_id,
                             &ref_meta.file_sha256,
-                            Some(body),
+                            body,
                         )
                     })
                     .await

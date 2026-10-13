@@ -415,6 +415,10 @@ pub struct DeltaCodec {
     /// when accepted. Detected at construction, never per-request.
     armor_supported: bool,
     timeouts: CodecTimeouts,
+    /// Bytes the buffered driver wrote to source files (tests measure the
+    /// disk writes per decode with it).
+    #[cfg(test)]
+    source_bytes_written: std::sync::atomic::AtomicU64,
 }
 
 /// Which way an xdelta3 run goes.
@@ -492,10 +496,19 @@ impl DeltaCodec {
             cli_version,
             armor_supported,
             timeouts: CodecTimeouts::default(),
+            #[cfg(test)]
+            source_bytes_written: Default::default(),
         }
     }
 
     /// Use `timeouts` instead of the defaults.
+    /// Bytes the buffered driver wrote to source files so far.
+    #[cfg(test)]
+    pub(crate) fn source_bytes_written(&self) -> u64 {
+        self.source_bytes_written
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn with_timeouts(mut self, timeouts: CodecTimeouts) -> Self {
         self.timeouts = timeouts;
         self
@@ -719,6 +732,9 @@ impl DeltaCodec {
             let mut f = std::fs::File::create(source_file.path())?;
             f.write_all(source)?;
             f.flush()?;
+            #[cfg(test)]
+            self.source_bytes_written
+                .fetch_add(source.len() as u64, std::sync::atomic::Ordering::SeqCst);
         }
 
         let mut proc = self.spawn_xdelta3(mode, source_file.path())?;

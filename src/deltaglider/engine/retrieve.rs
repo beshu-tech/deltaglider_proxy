@@ -623,7 +623,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             let shared = self
                 .range_spools
                 .get_or_fill(key, || {
-                    self.download_verified_reference(bucket, deltaspace_id, ref_sha256, Some(&out))
+                    self.download_verified_reference(bucket, deltaspace_id, ref_sha256, &out)
                 })
                 .await;
             match shared {
@@ -667,9 +667,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
     }
 
-    /// Download the reference to a spool file beside `held`, or with none
-    /// held (never waits for budget; the size comes from the reference's
-    /// own GET) and check it
+    /// Download the reference to a spool file beside `held` (never waits for
+    /// budget; the size comes from the reference's own GET) and check it
     /// against `ref_sha256`. Only a file that passes is shared. The GET
     /// path and the streaming PUT (`encode_spooled`) fill `range_spools`
     /// with it.
@@ -678,20 +677,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         bucket: &str,
         deltaspace_id: &str,
         ref_sha256: &str,
-        held: Option<&crate::deltaglider::spool::Spool>,
+        held: &crate::deltaglider::spool::Spool,
     ) -> Result<crate::deltaglider::spool::Spool, SharedReferenceError> {
         let source = self
             .storage
             .open_reference_source(bucket, deltaspace_id)
             .await
             .map_err(EngineError::from)?;
-        // Never waits: with the response open, and beside `held` when the
-        // op holds a spool already (no hold-and-wait).
-        let reserved = match held {
-            Some(held) => self.spool.acquire_beside(Some(held), source.size).await,
-            None => self.spool.try_acquire(source.size),
-        };
-        let spool = match reserved {
+        let spool = match self.spool.acquire_beside(Some(held), source.size).await {
             Ok(spool) => spool,
             Err(e) if e.kind() == crate::deltaglider::spool::CONTENDED => {
                 return Err(SharedReferenceError::NoRoom)
@@ -938,6 +931,137 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
     }
 
+    /// P3.6: decode a small delta against the deltaspace's verified shared
+    /// reference FILE (`range_spools`, matched on `ref_sha256`), not a new
+    /// spool copy of the reference per GET. The file is written once per
+    /// cache TTL: from the RAM reference cache when it holds the verified
+    /// bytes (no request), else by one verified download. Every decode that
+    /// reads it holds a share (`Arc<Spool>`), so an eviction or the TTL
+    /// never deletes it under a running decode, and its budget is released
+    /// when the last share drops. The output is capped at the object's
+    /// size (the decompression-bomb guard); the caller checks its SHA-256.
+    ///
+    /// `Fallback(delta)`: no shared file (no spool room, or no reference
+    /// under the internal key): the caller decodes the buffered way, with
+    /// the delta this read already fetched.
+    async fn decode_against_shared_reference(
+        &self,
+        bucket: &str,
+        deltaspace_id: &str,
+        obj_key: &ObjectKey,
+        metadata: &FileMetadata,
+        ref_sha256: &str,
+        prefetched: Option<Vec<u8>>,
+    ) -> Result<SharedDecode, EngineError> {
+        let key = RangeSpoolKey::reference(
+            self.cache_key(bucket, deltaspace_id),
+            ref_sha256.to_string(),
+        );
+        let filled = std::sync::atomic::AtomicBool::new(false);
+        let (shared, delta) = tokio::join!(
+            self.range_spools.get_or_fill(key, || {
+                filled.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.fill_shared_reference(bucket, deltaspace_id, ref_sha256)
+            }),
+            async {
+                match prefetched {
+                    Some(delta) => Ok(delta),
+                    None => {
+                        self.storage
+                            .get_delta(bucket, deltaspace_id, &obj_key.filename)
+                            .await
+                    }
+                }
+            }
+        );
+        let delta = delta?;
+        let reference = match shared {
+            Ok(file) => file,
+            Err(SharedReferenceError::NoRoom)
+            | Err(SharedReferenceError::Engine(EngineError::MissingReference(_)))
+            | Err(SharedReferenceError::Engine(EngineError::Storage(StorageError::NotFound(_)))) => {
+                return Ok(SharedDecode::Fallback(delta))
+            }
+            Err(SharedReferenceError::Engine(e)) => return Err(e),
+        };
+        let hit = !filled.load(std::sync::atomic::Ordering::Relaxed);
+        self.with_metrics(|m| {
+            if hit {
+                m.cache_hits_total.inc()
+            } else {
+                m.cache_misses_total.inc()
+            }
+        });
+        // Decompression-bomb guard: the declared size is at most the max
+        // (see the buffered branch below).
+        if metadata.file_size > self.max_object_size {
+            return Err(EngineError::TooLarge {
+                size: metadata.file_size,
+                max: self.max_object_size,
+            });
+        }
+        let _codec_permit = self
+            .acquire_codec_timeout(std::time::Duration::from_secs(60))
+            .await?;
+        let codec = self.codec.clone();
+        let cap = metadata.file_size;
+        let decode_start = Instant::now();
+        let data = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, EngineError> {
+            let mut out = CappedVec {
+                buf: Vec::with_capacity(cap as usize),
+                cap,
+            };
+            codec
+                .decode_to_writer(reference.path(), &delta[..], &mut out)
+                .map_err(EngineError::Codec)?;
+            // `reference` (this decode's share of the file) drops here.
+            Ok(out.buf)
+        })
+        .await
+        .map_err(|e| {
+            EngineError::Storage(StorageError::Other(format!("decode task panicked: {e}")))
+        })??;
+        drop(_codec_permit);
+        self.with_metrics(|m| {
+            m.delta_decode_duration_seconds
+                .observe(decode_start.elapsed().as_secs_f64())
+        });
+        Ok(SharedDecode::Decoded(data, hit))
+    }
+
+    /// The verified reference file of a deltaspace, for `range_spools`:
+    /// the bytes come through the RAM reference cache (`get_reference_cached`:
+    /// a hit sends no request, a miss is the one verified download that the
+    /// buffered GET sent before, and it fills the RAM cache that PUT
+    /// encodes use), and only bytes whose SHA-256 is `ref_sha256` are
+    /// written. Never waits for spool budget (`NoRoom`). Bytes that the RAM
+    /// cache did not keep, or that do not have `ref_sha256`, are `NoRoom`
+    /// too: the caller decodes the buffered way, which checks the result.
+    async fn fill_shared_reference(
+        &self,
+        bucket: &str,
+        deltaspace_id: &str,
+        ref_sha256: &str,
+    ) -> Result<crate::deltaglider::spool::Spool, SharedReferenceError> {
+        self.get_reference_cached(bucket, deltaspace_id, ref_sha256)
+            .await?;
+        let cache_key = self.cache_key(bucket, deltaspace_id);
+        let Some(bytes) = self.cache.get_matching(&cache_key, ref_sha256) else {
+            return Err(SharedReferenceError::NoRoom);
+        };
+        let spool = match self.spool.try_acquire(bytes.len() as u64) {
+            Ok(spool) => spool,
+            Err(e) if e.kind() == crate::deltaglider::spool::CONTENDED => {
+                return Err(SharedReferenceError::NoRoom)
+            }
+            Err(e) => return Err(EngineError::Storage(StorageError::from(e)).into()),
+        };
+        tokio::fs::write(spool.path(), &bytes)
+            .await
+            .map_err(|e| EngineError::Storage(StorageError::from(e)))?;
+        Ok(spool)
+    }
+
     /// Fetch and reconstruct a reference or delta object, with checksum verification.
     /// Returns `(data, cache_hit)` where `cache_hit` is `Some(bool)` for delta objects.
     async fn retrieve_buffered(
@@ -948,12 +1072,38 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         metadata: &FileMetadata,
         prefetched: Option<Vec<u8>>,
     ) -> Result<(Vec<u8>, Option<bool>), EngineError> {
-        let (data, cache_hit) = match &metadata.storage_info {
-            StorageInfo::Reference { .. } => (
+        let mut prefetched = prefetched;
+        let shared = match &metadata.storage_info {
+            StorageInfo::Delta { ref_sha256, .. }
+                if !ref_sha256.is_empty() && self.range_spools.caches() =>
+            {
+                match self
+                    .decode_against_shared_reference(
+                        bucket,
+                        deltaspace_id,
+                        obj_key,
+                        metadata,
+                        ref_sha256,
+                        prefetched.take(),
+                    )
+                    .await?
+                {
+                    SharedDecode::Decoded(data, hit) => Some((data, Some(hit))),
+                    SharedDecode::Fallback(delta) => {
+                        prefetched = Some(delta);
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        let (data, cache_hit) = match (shared, &metadata.storage_info) {
+            (Some(done), _) => done,
+            (None, StorageInfo::Reference { .. }) => (
                 self.storage.get_reference(bucket, deltaspace_id).await?,
                 None,
             ),
-            StorageInfo::Delta { ref_sha256, .. } => {
+            (None, StorageInfo::Delta { ref_sha256, .. }) => {
                 // Fetch reference and delta in parallel — saves one S3 round-trip.
                 // The reference is sibling to the delta: same parent directory + "reference.bin".
                 let (ref_result, delta_result) = tokio::join!(
@@ -1050,7 +1200,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 self.with_metrics(|m| m.delta_decode_duration_seconds.observe(decode_secs));
                 (result, Some(cache_hit))
             }
-            StorageInfo::Passthrough => {
+            (None, StorageInfo::Passthrough) => {
                 // Callers route Passthrough to the streaming path in retrieve_stream().
                 // This arm is kept as a safe fallback rather than panicking.
                 debug_assert!(
@@ -1194,6 +1344,38 @@ impl ReferenceFile {
 }
 
 /// Why a shared reference download did not happen.
+/// What `decode_against_shared_reference` did.
+enum SharedDecode {
+    /// The reconstruction, and whether the shared file was there already.
+    Decoded(Vec<u8>, bool),
+    /// No shared file: decode the buffered way with this delta.
+    Fallback(Vec<u8>),
+}
+
+/// A `Write` sink into memory that fails past `cap` bytes: a correct
+/// reconstruction is exactly the object's size (decompression-bomb guard).
+struct CappedVec {
+    buf: Vec<u8>,
+    cap: u64,
+}
+
+impl std::io::Write for CappedVec {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len() as u64 + data.len() as u64 > self.cap {
+            return Err(std::io::Error::other(format!(
+                "delta reconstruction exceeded expected size ({} bytes)",
+                self.cap
+            )));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 pub(super) enum SharedReferenceError {
     /// No spool budget beside the GET's own: it downloads its own copy.
     NoRoom,
@@ -1337,6 +1519,56 @@ mod reference_download_tests {
     use crate::config::Config;
     use crate::storage::{DynStorageBackend, FakeS3};
     use futures::TryStreamExt;
+
+    /// P3.6: small-delta GETs decode against the deltaspace's verified
+    /// shared reference file (`range_spools`), written to disk once per
+    /// cache TTL. Each GET wrote the whole reference to a new spool file
+    /// for xdelta3: 6 GETs of deltas of a 64 KiB reference wrote 384 KiB of
+    /// source files; now 0, and the one shared file is 64 KiB. The
+    /// requests stay: one reference GET for the cold reader.
+    #[tokio::test]
+    async fn small_delta_gets_decode_against_the_shared_reference_file() {
+        let (writer, reader, fake, _) = writer_and_reader(&Config::default(), None).await;
+        let keys =
+            crate::deltaglider::engine::delete_cost_tests::store_deltas(&writer, "rel", 2).await;
+        let mut expected = Vec::new();
+        for k in &keys {
+            expected.push(writer.retrieve("b", k).await.unwrap().0);
+        }
+        fake.clear();
+        let before = reader.codec.source_bytes_written();
+        for _ in 0..3 {
+            for (k, want) in keys.iter().zip(&expected) {
+                let (got, meta) = reader.retrieve("b", k).await.unwrap();
+                assert_eq!(&got, want);
+                assert_eq!(meta.storage_info.label(), "delta");
+            }
+        }
+        assert_eq!(
+            reader.codec.source_bytes_written() - before,
+            0,
+            "source bytes written by 6 decodes"
+        );
+        // Concurrent decodes share the one file too.
+        let reads =
+            futures::future::join_all((0..8).map(|i| reader.retrieve("b", &keys[i % keys.len()])))
+                .await;
+        for (i, r) in reads.into_iter().enumerate() {
+            assert_eq!(r.unwrap().0, expected[i % keys.len()]);
+        }
+        assert_eq!(reader.codec.source_bytes_written() - before, 0);
+        assert_eq!(
+            reader.range_spools.fill_count(),
+            1,
+            "one shared reference file"
+        );
+        let ref_gets = fake
+            .requests()
+            .iter()
+            .filter(|r| r.starts_with("GET ") && r.contains("reference.bin"))
+            .count();
+        assert_eq!(ref_gets, 1, "{:#?}", fake.requests());
+    }
 
     /// A writer engine and a cold reader engine (`config`, `metrics`) on one
     /// fake S3 with bucket `b`.
