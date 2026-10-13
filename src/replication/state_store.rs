@@ -1126,8 +1126,8 @@ impl JobsDb {
     /// keeps the last outcome_json visible while the new scan runs). `est_total`
     /// seeds `progress_total` with an ESTIMATE (the prior run's object count) so
     /// the bar goes determinate from the first poll instead of showing a rising
-    /// count against a zero denominator (the "looked frozen" kill). The real
-    /// `parity_result_set_total` corrects it exactly once listing finishes. Pass
+    /// count against a zero denominator (the "looked frozen" kill). Each phase
+    /// then sets its own total (`parity_result_set_phase`). Pass
     /// 0 on a first-ever run (no prior estimate → indeterminate, as before).
     pub fn parity_result_set_running(
         &self,
@@ -1145,16 +1145,17 @@ impl JobsDb {
         Ok(())
     }
 
-    /// Publish the compare-phase denominator (source object count) once listing
-    /// finishes, so the UI bar goes determinate. 0 stays indeterminate.
-    pub fn parity_result_set_total(
+    /// Enter a new phase of a running parity audit: its count starts at 0
+    /// against `total` (0 = unknown → indeterminate bar).
+    pub fn parity_result_set_phase(
         &self,
         rule: &str,
         total: i64,
         now: i64,
     ) -> Result<(), ConfigDbError> {
         self.conn.execute(
-            "UPDATE replication_parity SET progress_total = ?, updated_at = ? WHERE rule_name = ?",
+            "UPDATE replication_parity SET progress_scanned = 0, progress_total = ?, updated_at = ?
+             WHERE rule_name = ?",
             params![total, now, rule],
         )?;
         Ok(())
@@ -2017,10 +2018,12 @@ mod tests {
         assert_eq!(row.progress_total, 8500, "estimate seeds the denominator");
 
         db.parity_result_progress("r", 4200, 110).unwrap();
-        db.parity_result_set_total("r", 9000, 110).unwrap();
         let row = db.parity_result_load("r").unwrap().unwrap();
         assert_eq!(row.progress_scanned, 4200);
-        assert_eq!(row.progress_total, 9000, "real total corrects the estimate");
+        // A new phase counts from 0 against its own total.
+        db.parity_result_set_phase("r", 9000, 110).unwrap();
+        let row = db.parity_result_load("r").unwrap().unwrap();
+        assert_eq!((row.progress_scanned, row.progress_total), (0, 9000));
         // A new run resets scanned to 0 and re-seeds the denominator with the
         // new estimate (0 here = first-ever-style → indeterminate).
         db.parity_result_set_running("r", 0, 115).unwrap();

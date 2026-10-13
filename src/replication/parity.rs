@@ -45,6 +45,65 @@ pub struct ParityProgress<'a> {
     pub rule: &'a str,
     /// In-process cancel flag set by this instance's `verify_cancel`.
     pub cancel: &'a std::sync::atomic::AtomicBool,
+    /// The object counts of the previous audit (source, destination), the
+    /// first estimate of each listing phase. 0 = unknown.
+    pub estimate: (u64, u64),
+}
+
+/// What a running audit is doing. Each phase counts OBJECTS against its own
+/// total, so the bar never mixes units: the listing phases count listed
+/// objects (total = the previous audit's count of that side, an estimate),
+/// `reading` counts objects whose metadata it read (total exact), and
+/// `comparing` has no count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParityPhase {
+    ListingSource,
+    ListingDestination,
+    Reading,
+    Comparing,
+}
+
+/// The phase of each running audit, by rule. In memory and node-local, like
+/// the live walk progress: a running audit exists only in its process.
+static PARITY_PHASE: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, ParityPhase>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// The phase of the running audit of `rule`, if one runs here.
+pub fn parity_phase(rule: &str) -> Option<ParityPhase> {
+    PARITY_PHASE.lock().get(rule).copied()
+}
+
+/// Forget the phase of `rule`'s audit (it settled).
+pub fn clear_parity_phase(rule: &str) {
+    PARITY_PHASE.lock().remove(rule);
+}
+
+/// Progress of the `reading` phase, in objects. A key read on both sides
+/// costs two reads, so the count of objects read is the share of reads done
+/// times the objects to read: monotone, and it lands on `objects`.
+#[derive(Clone, Copy)]
+struct ReadProgress<'a> {
+    p: &'a ParityProgress<'a>,
+    objects: u64,
+    reads: u64,
+}
+
+impl ReadProgress<'_> {
+    async fn reads_done(&self, done: u64) {
+        self.p
+            .flush_scanned(objects_of_reads(done, self.reads, self.objects))
+            .await;
+    }
+}
+
+/// PURE: the objects read so far, from the reads done.
+fn objects_of_reads(done: u64, reads: u64, objects: u64) -> u64 {
+    if reads == 0 {
+        return objects;
+    }
+    done.min(reads).saturating_mul(objects) / reads
 }
 
 /// Flush progress to the DB once every N pages (not every page) — the global
@@ -121,12 +180,13 @@ impl ParityProgress<'_> {
         Ok(())
     }
 
-    /// Publish the denominator once it's known (best-effort; a failed write
-    /// just leaves the bar indeterminate).
-    async fn set_total(&self, total: u64) {
+    /// Enter a phase: its count starts at 0 against `total` (0 = unknown).
+    /// Best-effort; a failed write just leaves the bar indeterminate.
+    async fn set_phase(&self, phase: ParityPhase, total: u64) {
+        PARITY_PHASE.lock().insert(self.rule.to_string(), phase);
         let now = super::current_unix_seconds();
         let db = self.db.lock().await;
-        let _ = db.parity_result_set_total(self.rule, total as i64, now);
+        let _ = db.parity_result_set_phase(self.rule, total as i64, now);
     }
 
     /// Best-effort write of the running objects-examined counter.
@@ -762,6 +822,10 @@ pub struct UnresolvedKey {
     pub source_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dest_version: Option<String>,
+    /// The error of the last failed read ("source: …" / "destination: …"),
+    /// so the operator sees the cause (a timeout, a throttle, a refusal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// The single authoritative conclusion of a parity audit. Replaces the
@@ -806,13 +870,22 @@ pub fn derive_verdict(
     if real_diffs > 0 {
         let mut parts = Vec::new();
         if missing_on_dest > 0 {
-            parts.push(format!("{missing_on_dest} missing on destination"));
+            parts.push(format!(
+                "{} missing on destination",
+                fmt_count(missing_on_dest)
+            ));
         }
         if orphan_on_dest > 0 {
-            parts.push(format!("{orphan_on_dest} extra on destination"));
+            parts.push(format!(
+                "{} extra on destination",
+                fmt_count(orphan_on_dest)
+            ));
         }
         if checksum_mismatch > 0 {
-            parts.push(format!("{checksum_mismatch} with differing bytes"));
+            parts.push(format!(
+                "{} with differing bytes",
+                fmt_count(checksum_mismatch)
+            ));
         }
         return (
             Verdict::AtRisk,
@@ -822,7 +895,14 @@ pub fn derive_verdict(
     if in_sync {
         return (
             Verdict::Safe,
-            format!("All {matched} objects are present and verified identical."),
+            if matched == 1 {
+                "The 1 object is present and verified identical.".to_string()
+            } else {
+                format!(
+                    "All {} objects are present and verified identical.",
+                    fmt_count(matched)
+                )
+            },
         );
     }
     // Not in_sync with no real diffs → couldn't fully prove equality. The
@@ -832,8 +912,9 @@ pub fn derive_verdict(
         "the scan hit the object cap, so completeness isn't proven".to_string()
     } else if unresolved > 0 {
         format!(
-            "{unresolved} object(s) couldn't be read (transient backend errors) — \
-             re-check them to finish the audit"
+            "{} couldn't be read — re-check {} to finish the audit",
+            objects(unresolved),
+            if unresolved == 1 { "it" } else { "them" }
         )
     } else if truncated {
         "the scan was partial, so completeness isn't proven".to_string()
@@ -846,6 +927,25 @@ pub fn derive_verdict(
         Verdict::Incomplete,
         format!("Nothing is missing or different, but {why}."),
     )
+}
+
+/// `1234567` → `"1,234,567"`: the counts in a verdict sentence, which the UI
+/// shows verbatim.
+pub fn fmt_count(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `"1 object"` / `"1,000 objects"`.
+fn objects(n: u64) -> String {
+    format!("{} object{}", fmt_count(n), if n == 1 { "" } else { "s" })
 }
 
 /// True when an object listed under a prefix is an internal/marker key we
@@ -959,9 +1059,9 @@ async fn resolve_logical(
     raw_keys: &[String],
     source: &mut BTreeMap<String, ObjState>,
     failures: Option<&tokio::sync::Mutex<JobsDb>>,
-    progress: Option<&ParityProgress<'_>>,
+    progress: Option<ReadProgress<'_>>,
     progress_base: u64,
-) -> Vec<(String, Option<String>)> {
+) -> Vec<Unread> {
     if raw_keys.is_empty() {
         return Vec::new();
     }
@@ -985,11 +1085,11 @@ async fn resolve_logical(
     // Cache hits resolve instantly — count them before the burst starts.
     let hits = (raw_keys.len() - miss_raw.len()) as u64;
     if let Some(p) = progress {
-        p.flush_scanned(progress_base + hits).await;
+        p.reads_done(progress_base + hits).await;
     }
     let fresh = head_burst(engine, bucket, &miss_raw, progress, progress_base + hits).await;
     let mut to_cache: Vec<(String, ParityCacheEntry)> = Vec::new();
-    let mut unresolved_keys: Vec<(String, Option<String>)> = Vec::new();
+    let mut unresolved_keys: Vec<Unread> = Vec::new();
     for (raw, outcome) in fresh {
         let Ok(dk) = rewrite_key(src_prefix, dst_prefix, &raw) else {
             continue;
@@ -1010,10 +1110,10 @@ async fn resolve_logical(
             // driver also drops it from the OTHER side — else a one-sided drop
             // becomes a false missing/extra finding (#H5). The count still
             // marks the audit partial (#3).
-            HeadOutcome::Unresolved => {
+            HeadOutcome::Unresolved(error) => {
                 let lite = lite_stored_version(source, &dk);
                 source.remove(&dk);
-                unresolved_keys.push((dk, lite));
+                unresolved_keys.push((dk, lite, error));
             }
         }
     }
@@ -1033,9 +1133,9 @@ async fn resolve_logical_dest(
     dest: &mut BTreeMap<String, ObjState>,
     on_source: impl Fn(&str) -> bool,
     failures: Option<&tokio::sync::Mutex<JobsDb>>,
-    progress: Option<&ParityProgress<'_>>,
+    progress: Option<ReadProgress<'_>>,
     progress_base: u64,
-) -> Vec<(String, Option<String>)> {
+) -> Vec<Unread> {
     if raw_keys.is_empty() {
         return Vec::new();
     }
@@ -1061,11 +1161,11 @@ async fn resolve_logical_dest(
     // Cache hits resolve instantly — count them before the burst starts.
     let hits = (raw_keys.len() - miss.len()) as u64;
     if let Some(p) = progress {
-        p.flush_scanned(progress_base + hits).await;
+        p.reads_done(progress_base + hits).await;
     }
     let fresh = head_burst(engine, bucket, &miss, progress, progress_base + hits).await;
     let mut to_cache: Vec<(String, ParityCacheEntry)> = Vec::new();
-    let mut unresolved_keys: Vec<(String, Option<String>)> = Vec::new();
+    let mut unresolved_keys: Vec<Unread> = Vec::new();
     for (k, outcome) in fresh {
         match outcome {
             HeadOutcome::Resolved(meta) => {
@@ -1087,16 +1187,20 @@ async fn resolve_logical_dest(
             // Transient HEAD failure → drop and RETURN so the driver also drops
             // it from the source side (#H5: a one-sided drop is a false
             // orphan/missing). Count still marks the audit partial (#3).
-            HeadOutcome::Unresolved => {
+            HeadOutcome::Unresolved(error) => {
                 let lite = lite_stored_version(dest, &k);
                 dest.remove(&k);
-                unresolved_keys.push((k, lite));
+                unresolved_keys.push((k, lite, error));
             }
         }
     }
     cache_put(failures, &rule.name, ParitySide::Dest, &to_cache).await;
     unresolved_keys
 }
+
+/// A key whose read failed: (destination key, stored version of its listing
+/// entry, error text).
+type Unread = (String, Option<String>, String);
 
 /// Outcome of one HEAD in the burst. A NotFound is a raced delete (the object
 /// is genuinely gone → drop it). A TRANSIENT error (throttle/5xx) must NOT be
@@ -1106,7 +1210,8 @@ async fn resolve_logical_dest(
 enum HeadOutcome {
     Resolved(Box<FileMetadata>),
     Gone,
-    Unresolved,
+    /// The read failed; the text of its error.
+    Unresolved(String),
 }
 
 /// Bounded-concurrent HEAD burst (the cache-miss path). Returns per-key
@@ -1129,7 +1234,7 @@ async fn head_burst(
     engine: &DynEngine,
     bucket: &str,
     keys: &[&String],
-    progress: Option<&ParityProgress<'_>>,
+    progress: Option<ReadProgress<'_>>,
     base: u64,
 ) -> Vec<(String, HeadOutcome)> {
     use futures::stream::StreamExt;
@@ -1163,7 +1268,7 @@ async fn head_burst(
             // Only a missing OBJECT is "gone". A missing bucket or any other
             // failure is unresolved, so both sides drop the key (#H5).
             Err(e) if e.is_not_found() => HeadOutcome::Gone,
-            Err(_) => HeadOutcome::Unresolved,
+            Err(e) => HeadOutcome::Unresolved(e.to_string()),
         };
         (key, outcome)
     }))
@@ -1173,7 +1278,7 @@ async fn head_burst(
     let mut window_transient = 0usize;
     let mut aborted = false;
     while let Some((key, outcome)) = stream.next().await {
-        let is_transient = matches!(outcome, HeadOutcome::Unresolved);
+        let is_transient = matches!(outcome, HeadOutcome::Unresolved(_));
         window.push_back(is_transient);
         if is_transient {
             window_transient += 1;
@@ -1195,7 +1300,7 @@ async fn head_burst(
         }
         if let Some(p) = progress {
             if out.len().is_multiple_of(FLUSH_EVERY_N_HEADS) {
-                p.flush_scanned(base + out.len() as u64).await;
+                p.reads_done(base + out.len() as u64).await;
             }
         }
     }
@@ -1213,7 +1318,14 @@ async fn head_burst(
         );
         for k in &owned {
             if !done.contains(k) {
-                out.push((k.clone(), HeadOutcome::Unresolved));
+                out.push((
+                    k.clone(),
+                    HeadOutcome::Unresolved(
+                        "not read: the audit stopped reading this backend after most \
+                         recent reads failed"
+                            .to_string(),
+                    ),
+                ));
             }
         }
     }
@@ -1498,7 +1610,10 @@ pub async fn parity_audit(
     let pure_mirror = regime == Regime::PureMirror;
 
     // ── Phase 1: scan SOURCE prefix ──
-    let (src_truncated, src_seen) = scan_prefix(
+    if let Some(p) = progress {
+        p.set_phase(ParityPhase::ListingSource, p.estimate.0).await;
+    }
+    let (src_truncated, _src_seen) = scan_prefix(
         engine,
         &rule.source.bucket,
         &source_prefix,
@@ -1548,13 +1663,17 @@ pub async fn parity_audit(
     // dest key must be HEAD-resolved: the lite entry can't be trusted for the
     // orphan-ownership check (#4) or the size/etag compare (#5).
     // ── Phase 2: scan DEST prefix ──
-    let (dst_truncated, dst_seen) = scan_prefix(
+    if let Some(p) = progress {
+        p.set_phase(ParityPhase::ListingDestination, p.estimate.1)
+            .await;
+    }
+    let (dst_truncated, _dst_seen) = scan_prefix(
         engine,
         &rule.destination.bucket,
         &dest_prefix,
         max_objects,
         progress,
-        src_seen,
+        0,
         |key, meta| {
             if is_skippable_key(key) {
                 return Ok(false);
@@ -1603,13 +1722,28 @@ pub async fn parity_audit(
     // OWNERSHIP must be HEAD-resolved (delete-safety) — keep those.
     dst_needs_logical.retain(|dk| source.contains_key(dk) || !dest_lite_authoritative);
 
-    // Denominator = everything the audit will examine, in the SAME units as
-    // progress_scanned (listed objects + keys needing logical resolution) — so
-    // the bar goes determinate here and climbs monotonically to exactly 100%.
-    let listed = (src_seen + dst_seen) as u64;
+    // The `reading` phase counts OBJECTS: a key read on both sides is one
+    // object, two reads (see `ReadProgress`).
+    let reads = (src_needs_logical.len() + dst_needs_logical.len()) as u64;
+    let objects_to_read = {
+        let mut keys: std::collections::HashSet<&str> =
+            dst_needs_logical.iter().map(String::as_str).collect();
+        let src_dest_keys: Vec<String> = src_needs_logical
+            .iter()
+            .filter_map(|raw| rewrite_key(&rule.source.prefix, &rule.destination.prefix, raw).ok())
+            .collect();
+        keys.extend(src_dest_keys.iter().map(String::as_str));
+        keys.len() as u64
+    };
+    let read_progress = progress.map(|p| ReadProgress {
+        p,
+        objects: objects_to_read,
+        reads,
+    });
     if let Some(p) = progress {
-        p.set_total(listed + (src_needs_logical.len() + dst_needs_logical.len()) as u64)
-            .await;
+        if reads > 0 {
+            p.set_phase(ParityPhase::Reading, objects_to_read).await;
+        }
     }
 
     // Resolve logical metadata for the delta-eligible keys: parity cache first
@@ -1631,8 +1765,8 @@ pub async fn parity_audit(
         &src_needs_logical,
         &mut source,
         failures,
-        progress,
-        listed,
+        read_progress,
+        0,
     )
     .await;
     if let Some(p) = progress {
@@ -1646,8 +1780,8 @@ pub async fn parity_audit(
         &mut dest,
         |k| source.contains_key(k),
         failures,
-        progress,
-        listed + src_needs_logical.len() as u64,
+        read_progress,
+        src_needs_logical.len() as u64,
     )
     .await;
 
@@ -1657,14 +1791,20 @@ pub async fn parity_audit(
     // Keep each dropped key with BOTH sides' listing tokens (one side's came
     // back from its resolve, the other side's is still in its map), so a
     // targeted re-check can compare it later and write usable cache rows.
-    let mut dropped: BTreeMap<String, (Option<String>, Option<String>)> = BTreeMap::new();
-    for (k, v) in &src_unresolved_keys {
-        dropped.entry(k.clone()).or_default().0 = v.clone();
+    // dest key → (source version, destination version, read error).
+    type Dropped = (Option<String>, Option<String>, Option<String>);
+    let mut dropped: BTreeMap<String, Dropped> = BTreeMap::new();
+    for (k, v, err) in &src_unresolved_keys {
+        let e = dropped.entry(k.clone()).or_default();
+        e.0 = v.clone();
+        e.2 = Some(format!("source: {err}"));
     }
-    for (k, v) in &dst_unresolved_keys {
-        dropped.entry(k.clone()).or_default().1 = v.clone();
+    for (k, v, err) in &dst_unresolved_keys {
+        let e = dropped.entry(k.clone()).or_default();
+        e.1 = v.clone();
+        e.2.get_or_insert_with(|| format!("destination: {err}"));
     }
-    for (k, (src_v, dst_v)) in dropped.iter_mut() {
+    for (k, (src_v, dst_v, _)) in dropped.iter_mut() {
         if let Some(st) = source.remove(k) {
             *src_v = st.stored_version;
         }
@@ -1673,10 +1813,14 @@ pub async fn parity_audit(
         }
     }
 
-    // Everything examined — land the counter exactly on the denominator.
+    // Everything read — land the counter exactly on the denominator.
+    if let Some(rp) = read_progress {
+        if reads > 0 {
+            rp.reads_done(reads).await;
+        }
+    }
     if let Some(p) = progress {
-        p.flush_scanned(listed + (src_needs_logical.len() + dst_needs_logical.len()) as u64)
-            .await;
+        p.set_phase(ParityPhase::Comparing, 0).await;
     }
 
     // A transient HEAD that left a key unresolved means the audit couldn't see
@@ -1771,12 +1915,15 @@ pub async fn parity_audit(
     let unresolved_list: Vec<UnresolvedKey> = dropped
         .into_iter()
         .take(UNRESOLVED_KEYS_CAP)
-        .map(|(dest_key, (source_version, dest_version))| UnresolvedKey {
-            source_key: dest_to_source.get(&dest_key).cloned(),
-            dest_key,
-            source_version,
-            dest_version,
-        })
+        .map(
+            |(dest_key, (source_version, dest_version, error))| UnresolvedKey {
+                source_key: dest_to_source.get(&dest_key).cloned(),
+                dest_key,
+                source_version,
+                dest_version,
+                error,
+            },
+        )
         .collect();
 
     Ok(ParityOutcome {
@@ -1833,13 +1980,19 @@ pub async fn parity_recheck_unresolved(
         .filter_map(|e| e.source_key.as_ref())
         .collect();
     let dst_keys: Vec<&String> = entries.iter().map(|e| &e.dest_key).collect();
-    let total = (src_keys.len() + dst_keys.len()) as u64;
+    let reads = (src_keys.len() + dst_keys.len()) as u64;
+    let read_progress = progress.map(|p| ReadProgress {
+        p,
+        objects: entries.len() as u64,
+        reads,
+    });
     if let Some(p) = progress {
-        p.set_total(total).await;
+        p.set_phase(ParityPhase::Reading, entries.len() as u64)
+            .await;
         p.check_cancel().await?;
     }
     let src_reads: HashMap<String, HeadOutcome> =
-        head_burst(engine, &rule.source.bucket, &src_keys, progress, 0)
+        head_burst(engine, &rule.source.bucket, &src_keys, read_progress, 0)
             .await
             .into_iter()
             .collect();
@@ -1850,14 +2003,17 @@ pub async fn parity_recheck_unresolved(
         engine,
         &rule.destination.bucket,
         &dst_keys,
-        progress,
+        read_progress,
         src_keys.len() as u64,
     )
     .await
     .into_iter()
     .collect();
+    if let Some(rp) = read_progress {
+        rp.reads_done(reads).await;
+    }
     if let Some(p) = progress {
-        p.flush_scanned(total).await;
+        p.set_phase(ParityPhase::Comparing, 0).await;
     }
 
     // `Some(None)`: the object is absent on that side. `None`: still unread.
@@ -1865,7 +2021,14 @@ pub async fn parity_recheck_unresolved(
         match o {
             Some(HeadOutcome::Resolved(m)) => Some(Some(m)),
             Some(HeadOutcome::Gone) => Some(None),
-            Some(HeadOutcome::Unresolved) | None => None,
+            Some(HeadOutcome::Unresolved(_)) | None => None,
+        }
+    }
+    // The error of a read that failed again, for the kept entry.
+    fn read_error(side: &str, o: Option<&HeadOutcome>) -> Option<String> {
+        match o {
+            Some(HeadOutcome::Unresolved(e)) => Some(format!("{side}: {e}")),
+            _ => None,
         }
     }
     let mut source: BTreeMap<String, ObjState> = BTreeMap::new();
@@ -1882,7 +2045,17 @@ pub async fn parity_recheck_unresolved(
         };
         let dst = read(dst_reads.get(&e.dest_key));
         let (Some(src), Some(dst)) = (src, dst) else {
-            still.push(e.clone());
+            let mut kept = e.clone();
+            let src_err = e
+                .source_key
+                .as_ref()
+                .and_then(|sk| read_error("source", src_reads.get(sk)));
+            if let Some(err) =
+                src_err.or_else(|| read_error("destination", dst_reads.get(&e.dest_key)))
+            {
+                kept.error = Some(err);
+            }
+            still.push(kept);
             continue;
         };
         settled += 1;
@@ -2038,6 +2211,44 @@ mod tests {
         assert_eq!(classify_regime(false, true), Transforming);
         assert_eq!(classify_regime(true, false), Transforming);
         assert_eq!(classify_regime(false, false), Transforming);
+    }
+
+    /// The verdict sentence is shown verbatim: counts carry thousands
+    /// separators and the noun agrees with the count ("All 4000 objects",
+    /// "3 object(s)" before).
+    #[test]
+    fn verdict_sentences_read_as_written_english() {
+        assert_eq!(fmt_count(0), "0");
+        assert_eq!(fmt_count(999), "999");
+        assert_eq!(fmt_count(4000), "4,000");
+        assert_eq!(fmt_count(1_234_567), "1,234,567");
+        let (_, s) = derive_verdict(true, false, false, 0, 0, 0, 0, 0, 4000);
+        assert_eq!(s, "All 4,000 objects are present and verified identical.");
+        let (_, s) = derive_verdict(true, false, false, 0, 0, 0, 0, 0, 1);
+        assert_eq!(s, "The 1 object is present and verified identical.");
+        let (_, s) = derive_verdict(false, true, false, 1, 0, 0, 0, 0, 10);
+        assert!(s.contains("1 object couldn't be read — re-check it"), "{s}");
+        let (_, s) = derive_verdict(false, false, false, 0, 12_000, 0, 0, 0, 10);
+        assert!(s.contains("12,000 missing"), "{s}");
+    }
+
+    /// The `reading` phase counts objects, not reads: an object read on
+    /// both sides is one object of two reads, and the count lands exactly on
+    /// the objects to read.
+    #[test]
+    fn objects_of_reads_is_monotone_and_lands_on_the_total() {
+        assert_eq!(objects_of_reads(0, 8000, 4000), 0);
+        assert_eq!(objects_of_reads(4000, 8000, 4000), 2000);
+        assert_eq!(objects_of_reads(8000, 8000, 4000), 4000);
+        assert_eq!(objects_of_reads(9000, 8000, 4000), 4000, "never past");
+        assert_eq!(objects_of_reads(0, 0, 0), 0);
+        let mut last = 0;
+        for done in 0..=7 {
+            let n = objects_of_reads(done, 7, 3);
+            assert!(n >= last);
+            last = n;
+        }
+        assert_eq!(last, 3);
     }
 
     #[test]
@@ -2433,6 +2644,7 @@ mod tests {
             db: &db,
             rule: "r",
             cancel: &flag,
+            estimate: (0, 0),
         };
         assert!(p.cancelled_local());
         assert_eq!(p.check_cancel().await.unwrap_err(), CANCELLED);
@@ -2861,6 +3073,7 @@ mod tests {
             source_key: Some(k.to_string()),
             source_version: None,
             dest_version: None,
+            error: None,
         }
     }
 
@@ -2965,7 +3178,7 @@ mod tests {
         assert!(o.truncated && !o.in_sync);
         assert_eq!(o.verdict, Verdict::Incomplete);
         assert!(
-            o.verdict_summary.contains("2 object(s)"),
+            o.verdict_summary.contains("2 objects couldn't be read"),
             "{}",
             o.verdict_summary
         );

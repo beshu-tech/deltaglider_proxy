@@ -237,9 +237,21 @@ pub async fn run_now(
 #[derive(serde::Serialize)]
 pub struct ParityStatusResponse {
     pub status: String,
+    /// Objects done in the current `phase`.
     pub progress_scanned: i64,
-    /// Compare-phase denominator (0 = unknown → indeterminate bar).
+    /// Objects of the current `phase` (0 = unknown → indeterminate bar). A
+    /// listing phase starts from the previous audit's count (an estimate).
     pub progress_total: i64,
+    /// What a running audit does now (absent when none runs here).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<replication::parity::ParityPhase>,
+    /// While an audit runs: the result of the previous one, which the UI
+    /// shows dimmed so the operator keeps the last verdict in view. Never in
+    /// `outcome`, which a reader takes for the current result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_outcome: Option<replication::ParityOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_scanned_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scanned_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -250,12 +262,16 @@ pub struct ParityStatusResponse {
 
 fn parity_status_from_row(
     row: Option<crate::replication::ParityResultRow>,
+    phase: Option<replication::parity::ParityPhase>,
 ) -> ParityStatusResponse {
     let Some(row) = row else {
         return ParityStatusResponse {
             status: "idle".into(),
             progress_scanned: 0,
             progress_total: 0,
+            phase: None,
+            previous_outcome: None,
+            previous_scanned_at: None,
             scanned_at: None,
             outcome: None,
             error: None,
@@ -268,17 +284,26 @@ fn parity_status_from_row(
     // stale outcome until the current scan settles; the UI then shows live
     // progress (its `running && !outcome` guard) instead of a phantom verdict.
     let in_flight = matches!(row.status.as_str(), "running" | "cancelling");
-    let outcome = if in_flight {
-        None
+    let persisted: Option<replication::ParityOutcome> = row
+        .outcome_json
+        .as_deref()
+        .and_then(|j| serde_json::from_str(j).ok());
+    let (outcome, previous_outcome) = if in_flight {
+        (None, persisted)
     } else {
-        row.outcome_json
-            .as_deref()
-            .and_then(|j| serde_json::from_str(j).ok())
+        (persisted, None)
     };
     ParityStatusResponse {
         status: row.status,
         progress_scanned: row.progress_scanned,
         progress_total: row.progress_total,
+        phase: if in_flight { phase } else { None },
+        previous_scanned_at: if previous_outcome.is_some() {
+            row.scanned_at
+        } else {
+            None
+        },
+        previous_outcome,
         // scanned_at also describes the PREVIOUS result — hide it while in flight
         // so the UI never pairs a live scan with a stale timestamp.
         scanned_at: if in_flight { None } else { row.scanned_at },
@@ -371,6 +396,9 @@ pub async fn verify(
                 status: "done".into(),
                 progress_scanned: outcome.source_objects as i64,
                 progress_total: outcome.source_objects as i64,
+                phase: None,
+                previous_outcome: None,
+                previous_scanned_at: None,
                 scanned_at: Some(outcome.scanned_at),
                 outcome: Some(outcome),
                 error: None,
@@ -445,14 +473,14 @@ pub async fn verify(
             let db = db_arc.lock().await;
             db.parity_result_load(&rule.name).ok().flatten()
         };
-        let mut resp = parity_status_from_row(row);
+        let mut resp = parity_status_from_row(row, replication::parity::parity_phase(&rule.name));
         if resp.status == "idle" || resp.status == "failed" {
             resp.status = "running".to_string();
         }
         return Ok((StatusCode::ACCEPTED, resp));
     }
 
-    let recheck_of = {
+    let (recheck_of, estimate) = {
         let db = db_arc.lock().await;
         let row = db.parity_result_load(&rule.name).ok().flatten();
         let recheck_of = match scope {
@@ -465,21 +493,21 @@ pub async fn verify(
                 }
             },
         };
-        // Seed the progress bar with the PRIOR run's object count so it goes
-        // determinate immediately (kills the "looked frozen" indeterminate span
-        // during listing); the driver's real set_total corrects it. First-ever
-        // run has no prior → 0 → indeterminate, as before. A re-check reads
-        // each kept key on both sides.
-        let est_total = match &recheck_of {
-            Some(prev) => (prev.unresolved_keys.len() * 2) as i64,
-            None => row
-                .and_then(|r| r.outcome_json)
-                .and_then(|j| serde_json::from_str::<replication::ParityOutcome>(&j).ok())
-                .map(|o| (o.source_objects + o.dest_objects) as i64)
-                .unwrap_or(0),
+        // Seed each listing phase with the PRIOR audit's object count of that
+        // side, so the bar goes determinate at once (kills the "looked frozen"
+        // indeterminate span during listing). First-ever audit: no prior → 0 →
+        // indeterminate. A re-check counts the objects it reads.
+        let estimate = row
+            .and_then(|r| r.outcome_json)
+            .and_then(|j| serde_json::from_str::<replication::ParityOutcome>(&j).ok())
+            .map(|o| (o.source_objects, o.dest_objects))
+            .unwrap_or((0, 0));
+        let first_total = match &recheck_of {
+            Some(prev) => prev.unresolved_keys.len() as i64,
+            None => estimate.0 as i64,
         };
-        let _ = db.parity_result_set_running(&rule.name, est_total, now);
-        recheck_of
+        let _ = db.parity_result_set_running(&rule.name, first_total, now);
+        (recheck_of, estimate)
     };
     // NOTE: no sync push — coordination tables (leases, parity, run history)
     // are NODE-LOCAL (dropped from the IAM sync set in B3), so a push cannot
@@ -527,6 +555,7 @@ pub async fn verify(
             db: &db_for_task,
             rule: &rule_clone.name,
             cancel: &cancel_flag,
+            estimate,
         };
         let audit = std::panic::AssertUnwindSafe(async {
             match &recheck_of {
@@ -630,6 +659,7 @@ pub async fn verify(
         }
         let _ = db.parity_release_lease(&rule_clone.name, &owner);
         drop(db);
+        replication::parity::clear_parity_phase(&rule_clone.name);
         // Bump AFTER the terminal row is written, so a test polling parity-version
         // that sees the new count also sees the settled row.
         replication::parity::bump_parity_version();
@@ -650,7 +680,10 @@ pub async fn verify(
         let db = db_arc.lock().await;
         db.parity_result_load(&rule.name).ok().flatten()
     };
-    Ok((StatusCode::ACCEPTED, parity_status_from_row(row)))
+    Ok((
+        StatusCode::ACCEPTED,
+        parity_status_from_row(row, replication::parity::parity_phase(&rule.name)),
+    ))
 }
 
 /// GET: poll the current parity audit status / last result (server-side, so it
@@ -671,7 +704,10 @@ pub async fn verify_status(
         }
         None => None,
     };
-    Ok(parity_status_from_row(row))
+    Ok(parity_status_from_row(
+        row,
+        replication::parity::parity_phase(&name),
+    ))
 }
 
 /// POST: request cancellation of a running parity audit. Flips the row to
@@ -697,7 +733,10 @@ pub async fn verify_cancel(
         }
         None => None,
     };
-    Ok(parity_status_from_row(row))
+    Ok(parity_status_from_row(
+        row,
+        replication::parity::parity_phase(&name),
+    ))
 }
 
 /// Check whether a rule with the given name exists in the live config.
@@ -807,16 +846,23 @@ mod tests {
     #[test]
     fn stale_outcome_is_suppressed_while_scan_in_flight() {
         // A settled scan surfaces its outcome + timestamp.
-        let done = parity_status_from_row(Some(row("done", true)));
+        let phase = Some(replication::parity::ParityPhase::Reading);
+        let done = parity_status_from_row(Some(row("done", true)), phase);
         assert!(done.outcome.is_some(), "done → outcome shown");
         assert_eq!(done.scanned_at, Some(1000));
+        assert!(done.previous_outcome.is_none() && done.phase.is_none());
 
         // A running/cancelling scan must NOT surface the PREVIOUS outcome or its
-        // timestamp — else the UI renders a phantom (stale) verdict mid-scan.
+        // timestamp as the current result — else the UI renders a phantom
+        // verdict mid-scan. It hands it over as `previous_outcome`, which the
+        // UI shows dimmed, so the last verdict stays in view.
         for st in ["running", "cancelling"] {
-            let r = parity_status_from_row(Some(row(st, true)));
+            let r = parity_status_from_row(Some(row(st, true)), phase);
             assert!(r.outcome.is_none(), "{st}: stale outcome must be hidden");
             assert_eq!(r.scanned_at, None, "{st}: stale timestamp must be hidden");
+            assert!(r.previous_outcome.is_some(), "{st}: previous verdict kept");
+            assert_eq!(r.previous_scanned_at, Some(1000));
+            assert_eq!(r.phase, phase);
             // Progress still flows so the UI shows a live bar.
             assert_eq!(r.progress_scanned, 5);
             assert_eq!(r.progress_total, 10);
@@ -843,6 +889,7 @@ mod tests {
             source_key: Some("k".into()),
             source_version: None,
             dest_version: None,
+            error: None,
         };
         let unread = |o: &mut ParityOutcome| {
             o.unresolved = 1;

@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Fixed — The progress of a replication audit counts objects
+
+The progress of a parity audit counted listed entries of both sides plus
+metadata reads, so a mirror of 4,000 objects showed "10,327 of 16,000" and
+then "All 4000 objects". The audit now reports a `phase`
+(`listing_source`, `listing_destination`, `reading`, `comparing`), and
+each phase counts objects against its own total. A listing phase starts
+from the object count of the previous audit, as an estimate. The `reading`
+phase counts an object that it reads on both sides once. While an audit
+runs, `GET …/verify` returns the previous result as `previous_outcome` (and
+`previous_scanned_at`), so the screen can keep the last verdict in view.
+Each object that an audit could not read now keeps the error of its last
+read (`unresolved_keys[].error`), so the cause (a timeout, a throttle) is
+visible. The verdict sentence writes counts with thousands separators and
+agrees in number ("1 object", "3 objects", not "3 object(s)").
+
 ### Fixed — Pause stops a replication run that is in progress
 
 A pause stopped only the runs that the scheduler started. A run that

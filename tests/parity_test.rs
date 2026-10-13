@@ -68,6 +68,15 @@ async fn verify(admin: &reqwest::Client, endpoint: &str) -> Value {
 }
 
 async fn verify_rule(admin: &reqwest::Client, endpoint: &str, rule: &str) -> Value {
+    verify_rule_with_start(admin, endpoint, rule).await.1
+}
+
+/// [`verify_rule`], also returning the body of the starting POST.
+async fn verify_rule_with_start(
+    admin: &reqwest::Client,
+    endpoint: &str,
+    rule: &str,
+) -> (Value, Value) {
     let url = format!("{endpoint}/_/api/admin/jobs/replication:{rule}/verify");
     // The jobs/parity-version route is public (like iam/version), so the settle
     // barrier can be polled with a plain, unauthenticated client. `admin` is
@@ -82,6 +91,7 @@ async fn verify_rule(admin: &reqwest::Client, endpoint: &str, rule: &str) -> Val
         code == 202 || code == 200,
         "verify POST should be 202 (background) or 200 (no-DB), got {code}"
     );
+    let start: Value = resp.json().await.expect("verify POST body");
     // Wait for the counter to advance (≤ ~10s), then read the settled status.
     for _ in 0..100 {
         if parity_version(&barrier, endpoint).await > before {
@@ -98,7 +108,7 @@ async fn verify_rule(admin: &reqwest::Client, endpoint: &str, rule: &str) -> Val
         .await
         .unwrap();
     match s.get("status").and_then(|v| v.as_str()) {
-        Some("done") => s.get("outcome").cloned().expect("done has outcome"),
+        Some("done") => (start, s.get("outcome").cloned().expect("done has outcome")),
         Some("failed") => panic!("parity audit failed: {:?}", s.get("error")),
         other => panic!("parity audit did not settle to done; status={other:?}"),
     }
@@ -162,6 +172,25 @@ async fn test_parity_audit_lifecycle() {
     // Plaintext filesystem both sides + same compression → PureMirror path
     // (stored size+etag from the lite list, no HEAD burst).
     assert_eq!(out["regime"].as_str(), Some("pure_mirror"), "{out}");
+    assert_eq!(
+        out["verdict_summary"].as_str(),
+        Some("All 4 objects are present and verified identical."),
+        "{out}"
+    );
+
+    // 1b. A re-audit keeps the previous verdict in view: while it runs, the
+    //     status carries it as `previous_outcome` (the UI dims it), never as
+    //     `outcome` (which reads as the current result).
+    let (start, again) = verify_rule_with_start(&admin, &server.endpoint(), "parity-a-to-b").await;
+    assert_eq!(start["status"].as_str(), Some("running"), "{start}");
+    assert!(start.get("outcome").is_none(), "{start}");
+    assert_eq!(
+        start["previous_outcome"]["matched"].as_u64(),
+        Some(N as u64),
+        "{start}"
+    );
+    assert!(start["previous_scanned_at"].as_i64().is_some(), "{start}");
+    assert_eq!(again["in_sync"].as_bool(), Some(true), "{again}");
 
     // 2. Delete one dest object out-of-band → missing_on_dest == 1.
     client
