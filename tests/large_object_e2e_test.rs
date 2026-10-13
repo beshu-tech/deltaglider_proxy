@@ -106,6 +106,44 @@ replication:
     )
 }
 
+/// The rule of [`rule_yaml`] between two named backends on the same MinIO.
+///
+/// A copy inside one backend is a server-side copy (`copy_within`): no
+/// bytes and no parts pass through the proxy. The streamed multipart copy
+/// that these tests measure is the path of a copy BETWEEN backends (for
+/// example from one provider to another), so the source and the
+/// destination bucket live on two backend definitions here.
+fn cross_backend_rule_yaml(b: &Buckets, transfers: u32, upload_concurrency: u32) -> String {
+    let endpoint = minio_endpoint_url();
+    format!(
+        "
+backends:
+  - name: e2e-a
+    type: s3
+    endpoint: \"{endpoint}\"
+    region: us-east-1
+    force_path_style: true
+    access_key_id: {key}
+    secret_access_key: {secret}
+  - name: e2e-b
+    type: s3
+    endpoint: \"{endpoint}\"
+    region: us-east-1
+    force_path_style: true
+    access_key_id: {key}
+    secret_access_key: {secret}
+default_backend: e2e-a
+buckets:
+  {dst}:
+    backend: e2e-b
+{rule}",
+        key = common::MINIO_ACCESS_KEY,
+        secret = common::MINIO_SECRET_KEY,
+        dst = b.dst,
+        rule = rule_yaml(b, transfers, upload_concurrency),
+    )
+}
+
 /// Trigger the replication rule synchronously and assert it succeeded.
 async fn run_now_ok(server: &TestServer) -> Value {
     let admin = admin_http_client(&server.endpoint()).await;
@@ -178,8 +216,7 @@ async fn memory_bounded_resident_part_bytes() {
     let obj_size = 64 * MIB;
     let server = TestServer::builder()
         .auth("k", "s")
-        .s3_endpoint(&minio_endpoint_url())
-        .extra_yaml_storage_section(&rule_yaml(&b, 1, 2))
+        .extra_yaml_storage_section(&cross_backend_rule_yaml(&b, 1, 2))
         .env("DGP_STREAM_COPY_THRESHOLD", "1048576") // 1 MiB
         .env("DGP_MULTIPART_PART_SIZE", "5242880") // 5 MiB (S3 min)
         .build()
@@ -223,8 +260,7 @@ async fn part_count_matches_plan() {
     let part_size: u64 = 5 * MIB as u64;
     let server = TestServer::builder()
         .auth("k", "s")
-        .s3_endpoint(&minio_endpoint_url())
-        .extra_yaml_storage_section(&rule_yaml(&b, 1, 2))
+        .extra_yaml_storage_section(&cross_backend_rule_yaml(&b, 1, 2))
         .env("DGP_STREAM_COPY_THRESHOLD", "1048576")
         .env("DGP_MULTIPART_PART_SIZE", &part_size.to_string())
         .build()
@@ -259,8 +295,7 @@ async fn inflight_parts_reach_concurrency() {
     let obj_size = 32 * MIB; // 5 MiB parts → ~7 parts, >= concurrency
     let server = TestServer::builder()
         .auth("k", "s")
-        .s3_endpoint(&minio_endpoint_url())
-        .extra_yaml_storage_section(&rule_yaml(&b, 1, concurrency))
+        .extra_yaml_storage_section(&cross_backend_rule_yaml(&b, 1, concurrency))
         .env("DGP_STREAM_COPY_THRESHOLD", "1048576")
         .env("DGP_MULTIPART_PART_SIZE", "5242880")
         .env("DGP_TEST_PART_BARRIER", "1")
@@ -335,8 +370,7 @@ async fn per_part_resume_single_retry() {
     let obj_size = 32 * MIB;
     let server = TestServer::builder()
         .auth("k", "s")
-        .s3_endpoint(&minio_endpoint_url())
-        .extra_yaml_storage_section(&rule_yaml(&b, 1, 2))
+        .extra_yaml_storage_section(&cross_backend_rule_yaml(&b, 1, 2))
         .env("DGP_STREAM_COPY_THRESHOLD", "1048576")
         .env("DGP_MULTIPART_PART_SIZE", "5242880")
         .env("DGP_TEST_FAIL_PART_ONCE", "2") // fail part #2 exactly once
