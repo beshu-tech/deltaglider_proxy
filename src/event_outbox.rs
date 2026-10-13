@@ -655,9 +655,11 @@ impl JobsDb {
 
     /// Settle one delivery batch in ONE transaction: every endpoint outcome
     /// of the batch, then every row's final state. A crash before the commit
-    /// leaves the rows `in_progress` with no endpoint state, so the stale
-    /// claim reclaims them and delivers them again to every endpoint
-    /// (at-least-once; receivers deduplicate on the event id).
+    /// leaves the rows `in_progress` without these endpoint outcomes, so the
+    /// stale claim reclaims them and delivers them again to every raw
+    /// webhook (at-least-once; receivers deduplicate on the event id). A
+    /// Slack success is not in `endpoints`: the dispatcher saves it right
+    /// after its post, because Slack cannot deduplicate a message.
     pub fn event_outbox_settle_batch(
         &self,
         endpoints: &[EndpointOutcome],

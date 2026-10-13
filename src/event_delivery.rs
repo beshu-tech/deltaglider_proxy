@@ -753,8 +753,10 @@ pub async fn dispatch_once(
     };
 
     // Deliver the whole batch, then settle it in one transaction. A crash
-    // between the posts and the commit re-delivers the batch after the
-    // stale claim (at-least-once; receivers deduplicate on `event.id`).
+    // between the posts and the commit re-delivers the batch to the raw
+    // webhooks after the stale claim (at-least-once; receivers deduplicate
+    // on `event.id`). A Slack success is saved right after its post, so
+    // Slack gets no second message.
     let (endpoints, rows) = deliver_batch(db, client, config, &claimed, now).await;
     if let Err(err) =
         db.lock()
@@ -850,7 +852,7 @@ async fn deliver_batch(
         let outcome = match &done {
             Ok(done) => {
                 let mut done = done.get(&event.id).cloned().unwrap_or_default();
-                deliver_to_targets(client, config, event, &mut done, &mut endpoints).await
+                deliver_to_targets(db, client, config, event, &mut done, &mut endpoints).await
             }
             Err(e) => Err(e.clone()),
         };
@@ -879,13 +881,26 @@ async fn deliver_batch(
     (endpoints, rows)
 }
 
+/// Pure: `true` when a post under `config` cannot be deduplicated by the
+/// receiver, so a success must be saved before the next post. A Slack post
+/// (`chat.postMessage` or an Incoming Webhook) has no idempotency key: a
+/// second post is a second message. A raw webhook carries `event.id`, and
+/// its receiver deduplicates on it, so its outcome waits for the batch
+/// commit.
+fn saves_each_success(config: &EventDeliveryConfig) -> bool {
+    config.format == EventDeliveryFormat::Slack
+}
+
 /// Fan-out: deliver to every target that has not yet received this event
 /// (`done`), push each outcome onto `endpoints`, and fail the row (for a
 /// retry) when any target failed. One failing target never stops the
-/// others, and a retry never re-posts to a target that already succeeded
-/// (Slack `chat.postMessage` has no idempotency key, so that would be a
-/// duplicate message).
+/// others, and a retry never re-posts to a Slack target that already
+/// succeeded: a Slack success is saved right after its post
+/// ([`saves_each_success`]), so not even a crash before the batch settle
+/// sends the message twice. A raw webhook can get the event again after
+/// such a crash; its receiver deduplicates on `event.id`.
 async fn deliver_to_targets(
+    db: &Arc<Mutex<JobsDb>>,
     client: &(impl EventDeliveryClient + ?Sized),
     config: &EventDeliveryConfig,
     event: &EventOutboxRecord,
@@ -906,6 +921,23 @@ async fn deliver_to_targets(
         }
         let outcome = client.deliver_target(config, event, &target).await;
         let error = outcome.as_ref().err().map(|e| persistable_error(e));
+        if error.is_none() && saves_each_success(config) {
+            match db
+                .lock()
+                .await
+                .event_delivery_record(event.id, &id, None, current_unix_seconds())
+            {
+                Ok(()) => {
+                    done.insert(id);
+                    continue;
+                }
+                // The batch settle tries again.
+                Err(e) => warn!(
+                    "Event delivery: saving the Slack post of outbox row {} failed: {}",
+                    event.id, e
+                ),
+            }
+        }
         endpoints.push(EndpointOutcome {
             outbox_id: event.id,
             endpoint_id: id.clone(),
@@ -1481,6 +1513,76 @@ mod tests {
         );
         let row = db.lock().await.event_outbox_load(id).unwrap().unwrap();
         assert_eq!((row.id, row.status.as_str()), (id, STATUS_DELIVERED));
+    }
+
+    /// Slack has no idempotency key (neither `chat.postMessage` nor an
+    /// Incoming Webhook), so each successful Slack post is saved at once,
+    /// not with the batch. A crash after the posts and before the settle
+    /// commit then posts nothing again once the claim is stale. Before, the
+    /// whole batch was posted to every channel a second time.
+    #[tokio::test]
+    async fn a_crash_before_the_settle_posts_no_slack_message_twice() {
+        let route = |c: &str| crate::config_sections::SlackRoute {
+            name: None,
+            bucket: None,
+            prefix_globs: vec![],
+            channel: c.into(),
+        };
+        let bot = EventDeliveryConfig {
+            format: EventDeliveryFormat::Slack,
+            webhook_url: None,
+            slack_bot_token: Some("xoxb-test".into()),
+            slack_routes: vec![route("C1"), route("C2")],
+            ..cfg()
+        };
+        let hooks = EventDeliveryConfig {
+            format: EventDeliveryFormat::Slack,
+            webhook_url: Some("https://hooks.slack.test/a".into()),
+            webhook_urls: vec!["https://hooks.slack.test/b".into()],
+            slack_bot_token: None,
+            ..cfg()
+        };
+        for config in [bot, hooks] {
+            let db = Arc::new(Mutex::new(JobsDb::in_memory("test-pass").unwrap()));
+            let ids: Vec<i64> = (0..3)
+                .map(|_| {
+                    db.try_lock()
+                        .unwrap()
+                        .event_outbox_insert(&slack_event())
+                        .unwrap()
+                })
+                .collect();
+            let client = EndpointClient {
+                fail_url: "none",
+                fail_times: 0,
+                failed: AtomicUsize::new(0),
+                posts: Default::default(),
+            };
+            let claimed = db
+                .lock()
+                .await
+                .event_outbox_claim_due("w", 200, 60, 10)
+                .unwrap();
+            let _lost = deliver_batch(&db, &client, &config, &claimed, 200).await;
+            assert_eq!(client.posts.lock().unwrap().len(), 6);
+            client.posts.lock().unwrap().clear();
+            dispatch_once(&db, &client, &config, "w2", 261).await;
+            assert!(
+                client.posts.lock().unwrap().is_empty(),
+                "a Slack message went out twice: {:?}",
+                client.posts.lock().unwrap()
+            );
+            for id in ids {
+                let row = db.lock().await.event_outbox_load(id).unwrap().unwrap();
+                assert_eq!(row.status, STATUS_DELIVERED);
+                let d = db.lock().await.event_deliveries_for(id).unwrap();
+                assert_eq!(d.len(), 2);
+                assert!(
+                    d.iter().all(|d| d.status == "delivered" && d.attempts == 1),
+                    "{d:?}"
+                );
+            }
+        }
     }
 
     /// The same URL listed twice is one endpoint: one post.
