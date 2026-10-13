@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Security — Dependency updates for QUIC and YAML parsing
+
+The proxy now uses `quinn-proto` 0.11.19, which fixes five advisories
+(RUSTSEC-2026-0338 to RUSTSEC-2026-0342). The proxy and the Kubernetes
+operator no longer use `serde_yaml`, whose YAML parser `unsafe-libyaml` is
+unmaintained (RUSTSEC-2024-0449). They now use `serde_norway`, the maintained
+fork of the same library, so configuration files parse the same way. The
+operator moves to `kube` 4 for the same reason.
+
+### Fixed — A failing bucket lookup no longer makes requests wait in turn
+
+When a bucket has no route in the configuration, the proxy finds its backend
+with a HeadBucket request, and the requests that arrive meanwhile wait for
+that one lookup. When the lookup failed, for example because the backend
+timed out, each waiting request then sent its own lookup, one after the
+other, so the last request waited for many timeouts. Now every waiting request
+gets the answer of the one lookup, also when it is an error. CreateBucket now
+always checks where a bucket lives, and no longer uses a remembered answer
+that can be up to two and a half minutes old.
+
 ### Fixed — A response on a reused connection no longer waits about 40 ms
 
 The proxy did not turn off Nagle's algorithm on its connections, on HTTP and
