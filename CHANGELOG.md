@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Changed — A jobs database that no key opens stops the start
+
+This release keeps job state in `deltaglider_jobs.db`, which uses the same
+key as the config database. When no configured key opens that file, for
+example because `DGP_CONFIG_DB_KEY_PREVIOUS` was removed before the file was
+re-encrypted, the proxy now stops at start and keeps the file unchanged. It
+does not start with an empty jobs database, because that database also holds
+the write gates of running migrations, and an empty one would open a
+half-migrated bucket to client writes. Set the previous key again, start the
+proxy once so that it re-encrypts the file, and then remove the key.
+
+### Changed — The coordination bucket probe also tests conditional DELETE
+
+The startup probe of the coordination bucket now also sends a DELETE request
+with a wrong `If-Match` value to its own probe object. A backend that refuses
+that request with 412 lets a node release its locks with one DELETE request.
+On a backend that ignores the condition, a node reads a lock before it deletes
+it, so a node whose lock expired never deletes a lock that another node took
+over.
+
 ### Security — Dependency updates for QUIC and YAML parsing
 
 The proxy now uses `quinn-proto` 0.11.19, which fixes five advisories
