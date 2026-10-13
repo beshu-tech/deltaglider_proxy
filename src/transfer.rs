@@ -1452,7 +1452,10 @@ pub(crate) async fn client_delta_copy(
     };
     Ok(Some(
         crate::types::StoreResult::new(shipped.metadata, shipped.outcome.bytes_copied as u64)
-            .with_accounting(shipped.replaced, shipped.seeded_reference_bytes),
+            .with_accounting(shipped.replaced, shipped.seeded_reference_bytes)
+            // A copy that seeded the destination folder's reference.bin
+            // created its baseline, as a first delta PUT does.
+            .with_baseline_created(shipped.seeded_reference_bytes > 0),
     ))
 }
 
