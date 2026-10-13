@@ -8,7 +8,329 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-10-12_
+_Last updated: 2026-10-13_
+
+## v2.0.9 — 2026-10-13
+
+### Changed — A jobs database that no key opens stops the start
+
+This release keeps job state in `deltaglider_jobs.db`, which uses the same
+key as the config database. When no configured key opens that file, for
+example because `DGP_CONFIG_DB_KEY_PREVIOUS` was removed before the file was
+re-encrypted, the proxy now stops at start and keeps the file unchanged. It
+does not start with an empty jobs database, because that database also holds
+the write gates of running migrations, and an empty one would open a
+half-migrated bucket to client writes. Set the previous key again, start the
+proxy once so that it re-encrypts the file, and then remove the key.
+
+### Changed — The coordination bucket probe also tests conditional DELETE
+
+The startup probe of the coordination bucket now also sends a DELETE request
+with a wrong `If-Match` value to its own probe object. A backend that refuses
+that request with 412 lets a node release its locks with one DELETE request.
+On a backend that ignores the condition, a node reads a lock before it deletes
+it, so a node whose lock expired never deletes a lock that another node took
+over.
+
+### Security — Dependency updates for QUIC and YAML parsing
+
+The proxy now uses `quinn-proto` 0.11.19, which fixes five advisories
+(RUSTSEC-2026-0338 to RUSTSEC-2026-0342). The proxy and the Kubernetes
+operator no longer use `serde_yaml`, whose YAML parser `unsafe-libyaml` is
+unmaintained (RUSTSEC-2024-0449). They now use `serde_norway`, the maintained
+fork of the same library, so configuration files parse the same way. The
+operator moves to `kube` 4 for the same reason.
+
+### Fixed — A failing bucket lookup no longer makes requests wait in turn
+
+When a bucket has no route in the configuration, the proxy finds its backend
+with a HeadBucket request, and the requests that arrive meanwhile wait for
+that one lookup. When the lookup failed, for example because the backend
+timed out, each waiting request then sent its own lookup, one after the
+other, so the last request waited for many timeouts. Now every waiting request
+gets the answer of the one lookup, also when it is an error. CreateBucket now
+always checks where a bucket lives, and no longer uses a remembered answer
+that can be up to two and a half minutes old.
+
+### Fixed — A response on a reused connection no longer waits about 40 ms
+
+The proxy did not turn off Nagle's algorithm on its connections, on HTTP and
+on HTTPS. A response is written as a header and then a body, and Nagle's
+algorithm held the body back until the client acknowledged the header. Clients
+delay that acknowledgement by about 40 ms, so most requests on a reused
+(keep-alive) connection, which is what the AWS SDKs use, took at least 40 ms.
+Ten GET requests on one connection took 412 ms and now take about 31 ms.
+
+### Changed — Uploads of plain files into one folder run in parallel
+
+The proxy held a lock on the whole folder for every upload, also for files
+that it stores as they are (images, video and other files that never become
+deltas). Uploads into one folder therefore ran one at a time: 16 parallel
+clients reached about 140 to 210 requests per second, against about 1,100
+across many folders. Now such an upload holds only a lock on its own object,
+and uploads that the proxy stores as deltas keep the folder lock, because
+they share the folder's reference. Uploads of plain files into one folder
+now reach about 1,000 to 1,300 requests per second. Every write of an object,
+from clients, replication, lifecycle, migration and maintenance jobs, now
+takes that object's lock, so two writes of one key never remove each other's
+stored form.
+
+### Changed — The synced config database holds IAM only
+
+With `config_sync_bucket`, every IAM change uploads the encrypted config
+database to the sync bucket, and every other node downloads it. That file
+also held each node's own job state: the event outbox, the replication parity
+rows (one per object, per side, per rule), run histories, failure lists and
+maintenance jobs. On a large mirror it grew to hundreds of megabytes, all of
+it uploaded for each IAM change. Now job state lives in a second encrypted
+file next to the config database, `deltaglider_jobs.db`, which the proxy never
+syncs. It uses the same key, and a key rotation re-encrypts both files. In a
+test with 10,000 parity rows and 10,000 outbox rows, the synced file shrank
+from 6.9 MB to 262 KB. The first start of this release moves the job rows
+once; a start that a crash interrupts finishes the move on the next start.
+Nodes of this release and of the previous release still merge IAM changes
+with each other, so a rolling upgrade works. A downgrade keeps IAM but loses
+the job history. `/_/ready` also checks the jobs database.
+
+### Changed — Less CPU and disk work per request
+
+- A signed PUT hashes its body once instead of three times. The S3 layer
+  already checks the body against the signed `x-amz-content-sha256` header,
+  and the proxy now reuses that checked hash for the object's checksum when
+  the request shape proves that the check ran. Large bodies are hashed on a
+  blocking thread, not on the threads that serve requests.
+- Large delta uploads into one folder share one verified download of the
+  folder's reference, and an upload that created the reference keeps its own
+  body as that shared copy. A reference whose checksum does not match now
+  fails the upload with an error instead of being used to encode the delta.
+- A delta GET decodes against one shared reference file on disk instead of
+  writing the reference to a new temporary file for every request.
+- A ranged GET of an encrypted object sends no separate metadata HEAD request;
+  a range at the start of the object (`bytes=0-`) costs 2 requests instead of 4.
+- Each request shares the signed-in user's principal instead of copying it and
+  its permissions, and the permissions of each user are prepared once when the
+  user list is loaded. A permission check without conditions now takes about
+  0.15 µs instead of 14 to 32 µs.
+- On the filesystem backend, a PUT makes about 37 system calls instead of 76,
+  and a GET 23 instead of 31.
+
+### Changed — Copies move far fewer bytes through the proxy
+
+- A CopyObject of an object that the proxy stores as a delta now copies the
+  stored delta. Before, the proxy downloaded the folder's reference, rebuilt the
+  whole object with xdelta3 and compressed it again. A copy into the same
+  folder now sends 7 requests instead of 12, runs no xdelta3, and moves only
+  the small delta.
+- A CopyObject of an object that is stored as it is, on one storage backend,
+  is now a server-side copy: the bytes do not pass through the proxy. Admin
+  bulk copy and move, replication, lifecycle transitions and bucket migration
+  use the same server-side copy when the source and the destination are on
+  one backend and use the same encryption key. A re-encrypt job still rewrites
+  the bytes, because its purpose is a new encryption key.
+- An UploadPartCopy from a delta object rebuilds the object once for all of
+  its parts, not once per part.
+- Every copy checks the object it wrote with one HEAD request of that stored
+  form. A migrate copy now sends 5 requests per object instead of 10.
+- An admin bulk copy now gives the copy the time of the copy as its creation
+  time, as a CopyObject request does. Before, a bulk copy kept the creation
+  time of the source.
+
+### Added — Write responses carry the storage facts of the object
+
+PutObject, CompleteMultipartUpload, CopyObject and a browser form upload now
+answer with the storage facts of the object that they wrote:
+`x-amz-storage-type` (how the proxy stores the object),
+`x-deltaglider-stored-size` (the size on the storage backend),
+`x-deltaglider-ref-sha256` (for a delta, the checksum of the folder's
+reference) and `x-deltaglider-baseline: created` (when this write created the
+folder's reference). A HEAD request already gave the same facts to every
+signed reader. A request from an anonymous reader or through a presigned URL
+gets none of these headers. `DGP_DEBUG_HEADERS` no longer controls them; it
+still controls the debug headers of GET, HEAD and LIST responses. A browser
+app under `cors_permissive` can read them, because they are in the CORS list of
+exposed headers.
+
+### Changed — The file browser sends far fewer requests
+
+- The file table takes the storage type and the stored size of each file from
+  the listing (`metadata=true`). Before, it sent one HEAD request per visible
+  file, 100 for a page of 100 files, and again after each return to a folder.
+- The object inspector shows the storage facts from the listing at once and
+  sends one HEAD request for the full header view, not two.
+- An upload reads the storage facts from the write response. Before, each
+  finished file sent a HEAD request, and the first file of a folder also
+  sent a LIST request.
+- A delete in the inspector removes the row from the table without listing the
+  folder again.
+- The automatic refresh every 60 seconds lists only the first page of a large
+  folder. The status bar shows when the later pages were listed; the Refresh
+  button and navigation list all pages again.
+- The savings chip remembers the totals of sub-folders from its walk of a
+  folder, so opening a sub-folder within 5 minutes sends no request to the
+  storage. A copy, move or delete in the browser clears the remembered totals
+  of the folders that it changed.
+- The analytics dashboard loads the usage of all buckets with one request
+  (`GET /_/api/admin/usage/buckets`), the bucket list loads the bucket origins
+  once, and the live log view closes its stream while its tab is hidden.
+
+### Changed — Maintenance jobs and quota checks send fewer requests
+
+- A re-encrypt, metadata backfill or migrate job sends one HEAD request per
+  object instead of two. The job's listing already shows in which form the
+  proxy stores each key, and the job's write gate keeps that true until the
+  read.
+- A re-encrypt or migrate job gives the object's metadata that it already read
+  to the copy, instead of reading it again twice. A re-encrypt that rewrites
+  an object sends 5 requests instead of 11; a migrate copy sends 7 instead
+  of 10.
+- A metadata backfill sends 4 requests per object instead of 6, and 3 on a
+  backend that has no object ACLs. It also no longer rewrites an object that
+  changed after the job read it: the rewrite is conditional on the object's
+  ETag, and the job records such an object as failed.
+- A re-encrypt or backfill job lists the bucket once instead of two or three
+  times. It shows an exact total at once only when the bucket's usage counter
+  is known; otherwise the total appears when the walk ends.
+- A bucket with a quota needs one full scan to trust its usage counter.
+  Before, the quota check scanned the whole bucket every 5 minutes until an
+  operator pressed Refresh on the bucket's usage.
+- An idle proxy checks the maintenance job queue every 30 seconds instead of
+  every 3. A new job still starts at once, and a job that a restart left in
+  the queue resumes at once.
+
+### Changed — Downloads send fewer requests
+
+- A plain GET (no `Range` and no conditional headers) reads the object's
+  metadata and its bytes with one request. Before, the proxy sent HEAD
+  requests for both stored forms of the key and then a GET: two round trips.
+  When the proxy already has the object's metadata in memory, a GET now costs
+  one request instead of three. When the first request finds the object in the
+  form that the proxy expects, the ETag and the body of the answer come from
+  the same stored version, also when another node overwrites the object at the
+  same moment. When it does not (for example, a file type that the proxy
+  usually stores as a delta is stored as a plain object), the proxy sends a
+  HEAD request and then a GET, as before.
+- A delta GET that loads its reference into memory sends one GET request
+  instead of a GET and a HEAD. A large delta GET takes the size of the
+  reference from the download itself, without a HEAD request.
+- A ranged GET of an object that is not stored as a delta sends the ranged
+  read and the check for a delta form at the same time: one round trip instead
+  of two.
+- Requests that arrive at the same time for a bucket whose backend location is
+  not known yet send one bucket check instead of one each. When the remembered
+  location is older than 30 seconds, the proxy uses it and refreshes it in the
+  background, so the request does not wait for the check.
+
+### Changed — Uploads send fewer requests and copy their body less
+
+- An overwrite of an object in the same stored form no longer sends a DELETE
+  request for the other form. The read before the write already showed that
+  the other form does not exist. An overwrite of a plain object now sends 3
+  requests instead of 4.
+- A PUT, HEAD or DELETE of a folder marker (a key that ends in `/`) sends one
+  request fewer, because a folder marker is never stored as a delta.
+- With a coordination bucket, a delta upload reads the metadata of
+  `reference.bin` once instead of twice.
+- A PUT keeps one copy of its body in memory, from the request to the storage
+  write. Before, the body was copied up to three times, and once more for each
+  retry to an S3 backend.
+- A large upload hashes its body while it writes the body to the spool disk,
+  instead of reading the spool file back afterwards.
+
+### Changed — `metadata=true` lists storage facts only, with no HEAD request
+
+The proxy accepts the non-standard ListObjectsV2 parameter `metadata=true`. It
+sent one HEAD request for every delta and every file type that can become a
+delta, to list the metadata that HeadObject returns. Now each listed object
+carries only its storage facts: `x-amz-meta-dg-note` (how the proxy stores the
+object), and `x-amz-meta-dg-delta-size` for a delta. The proxy takes these facts
+from the listing itself, so it sends no HEAD request for them. The user metadata
+and the content type of an object are no longer listed; a HeadObject request
+returns them. Before, objects of other file types never had them in the list
+either. The file browser will use this listing instead of one HEAD request per
+row.
+
+### Changed — Faster and cheaper listings
+
+- A LIST by a user who can see only some keys of a bucket sends fewer backend
+  requests. Its pages can hold fewer than `max-keys` entries while
+  `IsTruncated` is true, which S3 allows. Follow `NextContinuationToken`.
+- On the filesystem backend, a LIST with a delimiter checks only the folders
+  that its page shows. A folder with 3,000 sub-folders took 18,000 directory
+  reads for three pages and now takes about 6,000.
+- An object stored before the listing facts index existed lists with its
+  stored size until the proxy reads its metadata once. A LIST now reads that
+  metadata in the background, a few objects at a time, so the next LIST shows
+  the original size. A LIST also remembers for one minute which objects have no
+  facts, and does not look for them again in that minute.
+- DeleteBucket checks that the bucket is empty with one LIST request.
+
+### Changed — Fewer `HeadBucket` requests
+
+S3 answers a request to a missing bucket with `NoSuchBucket`, so the proxy
+checks that the bucket exists. PutObject and reads already used a 5-second
+memory of found buckets. CopyObject, UploadPartCopy, the multipart requests and
+the bucket sub-resource requests still sent their own `HeadBucket` request each
+time. Now they use the same memory, and a copy checks its source bucket only
+when the source object is missing. Many first requests to one bucket at the
+same time share one `HeadBucket` request. `HeadBucket` from a client still
+reaches the backend every time.
+
+### Changed — The reference lock and the replication lease send half the requests
+
+With a coordination bucket, each delta upload takes a lock object in that
+bucket. The proxy read the lock object before it created it, and read it again
+before it deleted it: 4 requests per upload. Now it creates the lock with a
+conditional write and reads it only when another node holds it. It deletes the
+lock with the ETag that its own write returned. A free lock now costs 2
+requests. The replication lease works the same way.
+
+### Changed — Write requests no longer wait for the config database
+
+After each successful write or delete, the proxy records an object event in
+the event outbox, which event delivery and replication read. When the config
+database was free, the request wrote this row itself, with four disk syncs,
+before it answered. Now every event goes to one background writer that
+records the events of many requests in one transaction. The request answers
+without waiting. A crash can lose the events of the writes from the last few
+milliseconds before it. Scheduled replication copies those objects at its next
+run, but a webhook receiver does not get those events.
+
+### Changed — The proxy records object events only while something reads them
+
+The outbox exists for event delivery and replication. A default install has
+neither, and it still wrote one outbox row per write request and deleted the
+row again a few seconds later. Now the proxy records events only while event
+delivery is on, a replication rule is enabled, or an event listener read the
+outbox in the last hour. Events from the time before you turn one of these on
+are not kept, as before.
+
+### Changed — Fewer database writes for event delivery and replication
+
+Event delivery now claims a batch of events and records the results of the
+whole batch in one transaction each. Before, it wrote each event on its own:
+100 events to 2 endpoints wrote 913 database pages and now write 17. An idle
+replication event consumer no longer writes to the database on every tick,
+and a lifecycle run records the delete events of one page in one write.
+
+### Changed — `/_/ready` answers from the backend health checks
+
+Each `/_/ready` request sent a `ListBuckets` request to every storage backend.
+With the Kubernetes operator, the kubelet and the routers probe each pod every
+10 seconds, which made about 1,800 requests per hour per pod and backend. Now
+`/_/ready` uses the result of the background health check while that result
+is younger than twice the health interval, and sends no request. A backend that
+stops answering makes the node not ready within 2 × the health interval (60
+seconds by default). The operator's router also checks each pod once instead
+of twice.
+
+### Fixed — The file browser no longer sends folder-size requests in a loop
+
+When a folder had a cached size scan, opening it made the browser send
+`GET /_/api/admin/usage` requests without end, hundreds per second, for as long
+as the folder stayed open. The table asked for the folder sizes each time its
+list of folders changed, and the browser built a new list on every render, so
+each answer started the next request. Now the browser sends one request per
+folder visit.
 
 ## v2.0.8 — 2026-10-12
 
