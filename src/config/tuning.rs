@@ -55,6 +55,13 @@ pub struct RuntimeTuning {
     pub request_timeout_secs: u64,
     /// `DGP_MAX_CONCURRENT_REQUESTS`.
     pub max_concurrent_requests: usize,
+    /// `DGP_HEADER_READ_TIMEOUT_SECS` (at least 1): the time a client has
+    /// to send the head of a request, and the keep-alive idle limit.
+    pub header_read_timeout_secs: u64,
+    /// `DGP_MAX_CONNECTIONS` (at least 1): the most connections open at
+    /// once. `None`: 4 x `max_concurrent_requests`, at least 4096
+    /// (`serve::ListenerLimits`).
+    pub max_connections: Option<usize>,
     /// `DGP_BACKEND_SHARE_PERCENT` (1-100): the most of the request slots
     /// that the requests to one backend may hold when several backends are
     /// configured. The spool reads the same variable for its budget.
@@ -121,6 +128,12 @@ impl RuntimeTuning {
             request_timeout_secs: parse_or("DGP_REQUEST_TIMEOUT_SECS", 300),
             max_concurrent_requests: lookup_parse(env, "DGP_MAX_CONCURRENT_REQUESTS")
                 .unwrap_or(1024),
+            header_read_timeout_secs: parse_or(
+                "DGP_HEADER_READ_TIMEOUT_SECS",
+                crate::serve::DEFAULT_HEADER_READ_TIMEOUT.as_secs(),
+            )
+            .max(1),
+            max_connections: lookup_parse::<usize>(env, "DGP_MAX_CONNECTIONS").map(|n| n.max(1)),
             backend_share_percent: lookup_parse::<u8>(env, "DGP_BACKEND_SHARE_PERCENT")
                 .unwrap_or(DEFAULT_BACKEND_SHARE_PERCENT)
                 .clamp(1, 100),

@@ -1090,9 +1090,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     // --- Start server ---
-    let limits = deltaglider_proxy::serve::ListenerLimits::for_request_cap(
-        config.tuning.max_concurrent_requests,
-    );
+    let limits = deltaglider_proxy::serve::ListenerLimits::from_tuning(&config.tuning);
     if let Some(rustls_config) = rustls_config {
         let handle = axum_server::Handle::new();
         let shutdown_handle = handle.clone();

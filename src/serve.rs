@@ -8,7 +8,8 @@
 //! (about 40 ms on Linux), so every response after the first on a
 //! keep-alive connection waited about 40 ms.
 //!
-//! Both apply the same [`ListenerLimits`]. A client has
+//! Both apply the same [`ListenerLimits`] (`DGP_HEADER_READ_TIMEOUT_SECS`,
+//! `DGP_MAX_CONNECTIONS`). A client has
 //! `header_read_timeout` to send the head of each request (hyper measures
 //! it only when it has a timer, and neither `axum::serve` nor
 //! `axum-server` gives it one): without it, a connection that sent half a
@@ -83,9 +84,22 @@ impl ListenerLimits {
     }
 }
 
+impl ListenerLimits {
+    /// The limits of a config snapshot: `DGP_HEADER_READ_TIMEOUT_SECS` and
+    /// `DGP_MAX_CONNECTIONS` when set, else the defaults of
+    /// [`Self::for_request_cap`]. The listener reads them once, at boot.
+    pub fn from_tuning(tuning: &crate::config::RuntimeTuning) -> Self {
+        let derived = Self::for_request_cap(tuning.max_concurrent_requests);
+        Self {
+            header_read_timeout: Duration::from_secs(tuning.header_read_timeout_secs),
+            max_connections: tuning.max_connections.unwrap_or(derived.max_connections),
+        }
+    }
+}
+
 impl Default for ListenerLimits {
     fn default() -> Self {
-        Self::for_request_cap(crate::config::RuntimeTuning::default().max_concurrent_requests)
+        Self::from_tuning(&crate::config::RuntimeTuning::default())
     }
 }
 
@@ -536,6 +550,39 @@ mod tests {
             ListenerLimits::default().header_read_timeout,
             Duration::from_secs(30)
         );
+    }
+
+    /// `DGP_HEADER_READ_TIMEOUT_SECS` and `DGP_MAX_CONNECTIONS` set the
+    /// limits; unset, they keep the defaults (30 s; 4 x the request cap,
+    /// at least 4096). A zero value is raised to 1.
+    #[test]
+    fn the_listener_limits_come_from_the_environment() {
+        let limits = |pairs: &[(&str, &str)]| {
+            let map: std::collections::HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            ListenerLimits::from_tuning(&crate::config::RuntimeTuning::from_env(&move |n: &str| {
+                map.get(n).cloned()
+            }))
+        };
+        assert_eq!(limits(&[]), ListenerLimits::for_request_cap(1024));
+        assert_eq!(
+            limits(&[("DGP_MAX_CONCURRENT_REQUESTS", "4096")]).max_connections,
+            16_384
+        );
+        let set = limits(&[
+            ("DGP_HEADER_READ_TIMEOUT_SECS", "5"),
+            ("DGP_MAX_CONNECTIONS", "100"),
+        ]);
+        assert_eq!(set.header_read_timeout, Duration::from_secs(5));
+        assert_eq!(set.max_connections, 100);
+        let zero = limits(&[
+            ("DGP_HEADER_READ_TIMEOUT_SECS", "0"),
+            ("DGP_MAX_CONNECTIONS", "0"),
+        ]);
+        assert_eq!(zero.header_read_timeout, Duration::from_secs(1));
+        assert_eq!(zero.max_connections, 1);
     }
 
     async fn tls_server(

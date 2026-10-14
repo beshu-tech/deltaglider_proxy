@@ -88,14 +88,16 @@ With more than one storage backend, the requests to one backend can hold at most
 
 The request limit above counts requests in flight, so it does not count a connection that has not sent a complete request yet. The listener therefore has two limits of its own, for plain HTTP and for HTTPS alike.
 
-A client has 30 seconds to send the head of each request: the request line and the headers. The proxy closes a connection whose head does not arrive in that time, so a client that sends half a request and then waits cannot keep the connection open. The same limit closes a keep-alive connection that sends no new request for 30 seconds. S3 clients open a new connection when they need one, so this close is not an error for them. The request body is not under this limit; the request timeout covers it.
+A client has 30 seconds (`DGP_HEADER_READ_TIMEOUT_SECS`) to send the head of each request: the request line and the headers. The proxy closes a connection whose head does not arrive in that time, so a client that sends half a request and then waits cannot keep the connection open. The same limit closes a keep-alive connection that sends no new request for 30 seconds. S3 clients open a new connection when they need one, so this close is not an error for them. The request body is not under this limit; the request timeout covers it.
 
-The proxy keeps at most a fixed number of connections open at the same time: four connections for each request slot (`DGP_MAX_CONCURRENT_REQUESTS`), and never fewer than 4096. A connection that arrives while that many connections are open is closed at once, before the TLS handshake, and the metric `deltaglider_connections_refused_total` counts it. A slot frees when a connection closes.
+The proxy keeps at most a fixed number of connections open at the same time. By default, this number is four connections for each request slot (`DGP_MAX_CONCURRENT_REQUESTS`), and never fewer than 4096. `DGP_MAX_CONNECTIONS` sets the number directly. A connection that arrives while that many connections are open is closed at once, before the TLS handshake, and the metric `deltaglider_connections_refused_total` counts it. A slot frees when a connection closes.
 
 | Setting | Default | Env var |
 |---------|---------|---------|
-| Request head timeout (and keep-alive idle limit) | 30 s | — |
-| Max open connections | 4 × `DGP_MAX_CONCURRENT_REQUESTS`, at least 4096 | — |
+| Request head timeout (and keep-alive idle limit) | 30 s | `DGP_HEADER_READ_TIMEOUT_SECS` |
+| Max open connections | 4 × `DGP_MAX_CONCURRENT_REQUESTS`, at least 4096 | `DGP_MAX_CONNECTIONS` |
+
+The proxy reads both variables only at startup. A change needs a restart.
 
 ## Request timeout
 

@@ -453,6 +453,18 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Server",
     },
     EnvVarEntry {
+        name: "DGP_HEADER_READ_TIMEOUT_SECS",
+        description: "Seconds a client has to send the head of each request (the request line and the headers), and the most seconds a keep-alive connection stays idle between requests (default: 30, at least 1). The listener reads it at startup",
+        example: "30",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_MAX_CONNECTIONS",
+        description: "The most client connections open at once (default: 4 x DGP_MAX_CONCURRENT_REQUESTS, at least 4096). A connection above the cap is closed before the TLS handshake and counted in deltaglider_connections_refused_total. The listener reads it at startup",
+        example: "4096",
+        category: "Server",
+    },
+    EnvVarEntry {
         name: "DGP_BACKEND_SHARE_PERCENT",
         description: "With more than one storage backend: the most of DGP_MAX_CONCURRENT_REQUESTS, and of DGP_SPOOL_MAX_BYTES, that the requests to one backend may hold (1-100, default: 75). A request to a backend whose share of request slots is full gets 503 SlowDown at once; one whose share of spool is full waits for that backend's own spool. A slow backend then cannot stall the others",
         example: "75",

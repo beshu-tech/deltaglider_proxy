@@ -190,6 +190,8 @@ pub const ENV_FIELD_BINDINGS: &[EnvFieldBinding] = &[
     },
     env_only("DGP_REQUEST_TIMEOUT_SECS"),
     env_only("DGP_MAX_CONCURRENT_REQUESTS"),
+    env_only("DGP_HEADER_READ_TIMEOUT_SECS"),
+    env_only("DGP_MAX_CONNECTIONS"),
     env_only("DGP_MAX_MULTIPART_UPLOADS"),
 ];
 

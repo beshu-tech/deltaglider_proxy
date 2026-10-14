@@ -30,6 +30,16 @@ page is truncated. The remaining leak, for runs of more than about 50,000
 hidden keys in a row, is described in the IAM permissions reference. The
 file browser's folder listing reads pages of 1000 keys too, and goes on from
 its scan position, so it no longer reads a backend page twice.
+### Fixed — The listener limits can be set: `DGP_HEADER_READ_TIMEOUT_SECS` and `DGP_MAX_CONNECTIONS`
+
+The listener limits were fixed values. Two environment variables now set
+them: `DGP_HEADER_READ_TIMEOUT_SECS` is the time that a client has to send
+the head of a request, and also the idle limit of a keep-alive connection
+(default 30 seconds). `DGP_MAX_CONNECTIONS` is the most client connections
+that are open at the same time (default 4 × `DGP_MAX_CONCURRENT_REQUESTS`,
+at least 4096). The proxy reads both at startup. The defaults do not
+change.
+
 ### Fixed — A negative multipart list argument gets `400 InvalidArgument`
 
 A `ListParts` request with a negative `max-parts` got a page of one part,
