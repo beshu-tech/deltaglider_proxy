@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added — A bucket can have its own encryption key (YAML)
+
+A bucket policy can now carry an `encryption` block with the same fields as the `encryption` block of a backend. The writes to that bucket then use the bucket's own proxy-AES key, or no encryption, while the other buckets on the same backend keep the backend's encryption. Before, encryption was a backend setting only, and a second key on one disk needed a second backend definition.
+
+- Each backend keeps one encrypting layer with a keyring: the keys of the backend and of every bucket on it. A read picks the key by the key id that the object carries, so a bucket still reads the objects and delta references that it wrote under the backend key before it got its own key.
+- A bucket block needs an explicit `key_id`, an explicit `backend:` when `storage.backends` is used, and the mode `aes256-gcm-proxy` or `none`. Two names of one stored bucket (an alias) must agree, a key id names one key everywhere, and the block is refused while `config_sync_bucket` is set. The key comes from the YAML file or from any `${env:NAME}` reference.
+- An apply that changes the encryption of a bucket answers with a warning that names the re-encrypt job for that bucket. An apply that removes the key that a bucket writes with is refused; set `mode: none` first (the old key stays as `legacy_key`), run the re-encrypt job, and then remove the block. `GET /_/api/admin/backends/<backend>/legacy-key-usage?bucket=<bucket>` scans one bucket's legacy key.
+- The migrate job carries the bucket's block to the target backend, and its verify phase checks the at-rest form of every copy. A replication rule from an encrypted bucket into a plaintext one gives a `config lint` warning.
+- Bucket keys are redacted from `GET /config`, the section GET and the export, survive a round trip through the admin UI, and ride in the backup's `secrets.json` (`bucket_encryption`).
+- The admin UI does not show or edit bucket keys yet.
+
 ### Fixed — An unknown bucket policy field is refused, not ignored
 
 A bucket policy (`storage.buckets.<name>`) accepted any field and dropped the

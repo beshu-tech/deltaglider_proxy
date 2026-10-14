@@ -12,6 +12,7 @@ The examples use the backend `hetzner-fsn1`, which holds the buckets `releases` 
 | Rotate so that the old key never stays in the running proxy | **B**: new backend and migrate job |
 | Move from proxy-side AES to SSE-KMS or SSE-S3 | **C**: migrate job to a new SSE backend |
 | Stop encrypting a backend | **D**: mode `none`, keep the shim |
+| Give one bucket its own key, rotate it, or remove it | **E**: the bucket's `encryption` block |
 
 ## Recipe A: rotation with the shim
 
@@ -107,6 +108,75 @@ In the admin UI, select **None (plaintext)** in the **Encryption mode** list of 
 
 New writes are plaintext. The encrypted objects stay readable through the shim (`mode: none` with a `legacy_key` is a valid shape). If you want the old objects decrypted on disk too, run the re-encrypt job. It rewrites objects toward the *current* configuration, so under `mode: none` it decrypts them. Clear the legacy key only when no encrypted object remains.
 
+## Recipe E: a key for one bucket
+
+A bucket can have its own key on a shared backend ([per-bucket encryption](../reference/encryption.md#per-bucket-encryption)). The admin UI does not show or edit bucket keys in this release, so you make every change of this recipe in the YAML file. The examples give the bucket `db-archive` on the backend `local-disk` its own key.
+
+### Give the bucket its own key
+
+1. Generate the key, and store it in your secrets manager. Make it available to the proxy as an environment variable, for example `DB_ARCHIVE_AES_KEY`:
+
+   ```bash
+   export DB_ARCHIVE_AES_KEY=$(openssl rand -hex 32)
+   ```
+
+2. Add the `encryption` block to the bucket in `deltaglider_proxy.yaml`. The bucket needs `backend:` when the file lists `storage.backends`, and the key id must be explicit:
+
+   ```yaml
+   # fragment
+       db-archive:
+         backend: local-disk
+         encryption:
+           mode: aes256-gcm-proxy
+           key: "${env:DB_ARCHIVE_AES_KEY}"
+           key_id: db-archive-2026
+   ```
+
+3. Apply the file with `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example`, or restart the proxy. The response of the apply has a warning for `db-archive`: new writes use the key id `db-archive-2026`, and the objects stored before keep their old form.
+4. Rewrite the old objects under the new key with the re-encrypt job:
+
+   ```bash
+   curl -b cookies.txt -X POST https://s3.acme.example/_/api/admin/jobs/reencrypt \
+     -H 'Content-Type: application/json' -d '{"buckets": ["db-archive"]}'
+   ```
+
+   Until the job is done, the old objects stay readable under the backend key, because the proxy picks the key of each object by the key id that the object carries.
+
+### Rotate the bucket key
+
+1. Make the new key available to the proxy, for example as `DB_ARCHIVE_2027_AES_KEY`, and keep the old one.
+2. Change `key` and `key_id` of the bucket, and apply the file. When the file leaves out `legacy_key`, the proxy keeps the old key as the bucket's `legacy_key`, with `legacy_key_id: db-archive-2026`. To keep the old key out of the running config file, set both legacy fields yourself:
+
+   ```yaml
+   # fragment
+       db-archive:
+         backend: local-disk
+         encryption:
+           mode: aes256-gcm-proxy
+           key: "${env:DB_ARCHIVE_2027_AES_KEY}"
+           key_id: db-archive-2027
+           legacy_key: "${env:DB_ARCHIVE_AES_KEY}"
+           legacy_key_id: db-archive-2026
+   ```
+
+3. Run the re-encrypt job for `db-archive`, as in step 4 above.
+4. Check that no object of the bucket still uses the old key. The scan reads the metadata of every object of the bucket:
+
+   ```bash
+   curl -b cookies.txt 'https://s3.acme.example/_/api/admin/backends/local-disk/legacy-key-usage?bucket=db-archive'
+   ```
+
+   The answer has `"safe_to_clear": true` when the scan read every object and found none under the legacy key id.
+5. Remove `legacy_key` and `legacy_key_id` from the bucket, and apply again.
+
+### Stop encrypting the bucket
+
+The proxy refuses an apply that removes the key that a bucket writes with, because the objects written under that key would become unreadable. Remove a bucket key in two steps:
+
+1. Set the bucket's `mode` to `none`, and apply. The proxy keeps the old key as the bucket's `legacy_key`. New writes to the bucket are plaintext, and the old objects stay readable.
+2. Run the re-encrypt job for the bucket. Under `mode: none`, it decrypts the old objects.
+3. Check the scan, as in step 4 of the rotation. When `safe_to_clear` is `true`, remove the bucket's `encryption` block, and apply. The bucket then uses the encryption of its backend again.
+
 ## Two questions that come up
 
 **What if I lose only the `legacy_key` after I clear it?** Nothing changes. This is the same state as "the shim was never set". If the re-encrypt job already rewrote everything, no object references the old generation, and nothing is lost. If some objects still do, those objects are unrecoverable, like after any other key loss.
@@ -125,6 +195,7 @@ New writes are plaintext. The encrypted objects stay readable through the shim (
 3. On the raw backend, check that the `dg-encryption-key-id` metadata of a rewritten object shows the **new** key id.
 4. Check that the banner **Decrypt-only shim active** is gone after you clear the legacy key.
 5. If a read fails with "object was encrypted with key id X, but this backend is configured with key id Y", the job missed some objects. Restore the shim and run the job again ([troubleshooting](troubleshooting.md)).
+6. For a bucket key (recipe E), check the stored metadata of a new object in that bucket: its `dg-encryption-key-id` is the bucket's `key_id`, and the objects of the other buckets on the backend keep the backend's key id.
 
 ## Related
 

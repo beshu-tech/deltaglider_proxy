@@ -1,6 +1,6 @@
 # About encryption at rest
 
-Encryption at rest in DeltaGlider Proxy is a per-backend decision with four modes: `none`, `aes256-gcm-proxy`, `sse-kms`, and `sse-s3`. The configuration is small, but the reasoning behind the choice of mode, and behind the shape of the limits, is not. This page explains that reasoning.
+Encryption at rest in DeltaGlider Proxy is a per-backend decision with four modes: `none`, `aes256-gcm-proxy`, `sse-kms`, and `sse-s3`. A bucket can replace the decision of its backend with its own proxy-AES key, or with no encryption. The configuration is small, but the reasoning behind the choice of mode, and behind the shape of the limits, is not. This page explains that reasoning.
 
 ## The threat model: what this defends, and what it cannot
 
@@ -29,6 +29,26 @@ With `sse-kms`, the proxy delegates encryption to AWS and never touches key mate
 
 The decision comes down to two questions. First, is the backend storage untrusted (a third-party provider, a hostile jurisdiction, or a compliance rule that says "provider must not see plaintext")? Then use proxy-AES. It is also the only encrypting option for filesystem backends like `local-disk`, because the native modes work only on S3. Second, is the backend AWS, and is your compliance story AWS-native? Then use SSE-KMS if you need the audit trail and key lifecycle. Use SSE-S3 if the requirement is only "encrypted at rest: yes" on a checklist. Acme uses all three answers at once: proxy-AES on `hetzner-fsn1`, SSE-KMS on `aws-dr`, and no encryption on the public-CDN path. Encryption is per-backend so that one proxy can hold all of these postures at the same time.
 
+## Why a bucket can have its own key
+
+A backend is a place to store bytes, and a bucket is a data set. Two data sets on one backend can need different treatment. Acme keeps `releases` and `db-archive` on the same `local-disk` backend. The dumps in `db-archive` hold customer data, and Acme wants them under a key that only the database team rotates. The release builds in `releases` need no such key. Before per-bucket encryption, Acme had to define a second backend on the same disk only to give `db-archive` another key.
+
+A bucket `encryption` block gives the bucket its own proxy-AES key, or no encryption, on a shared backend. The block belongs to the stored bucket, which is the backend and the real bucket name. The proxy decides the key by the stored bucket, not by the name in the request, because two names can reach one stored bucket through an alias. If the two names had different keys, one deltaspace would hold deltas and references under two keys, and nobody could tell which name wrote which object. For the same reason, a bucket key id is always explicit: an id derived from a name would change when the name changes.
+
+## The keyring: how a bucket reads what it wrote before
+
+Each backend has one encrypting layer. That layer holds a keyring: every key that the config gives to the backend, which is the key and legacy key of the backend and the key and legacy key of each bucket on it. Each encrypted object carries the id of the key that wrote it. When the proxy reads the object, it looks up that id in the keyring.
+
+This is what makes a change of key safe. When `db-archive` gets its own key, its existing objects and its delta references are still under the backend key. Their ids are in the keyring, so they stay readable. A new delta in an existing deltaspace is computed against the old reference (read with the backend key) and stored under the bucket key. The re-encrypt job later rewrites the old objects and references under the bucket key.
+
+The keyring is bounded by the config: it never holds a key that the YAML does not name. When an object names a key id that the keyring does not have, the read fails with an error that names the id, and the proxy never tries keys at random.
+
+## What is encrypted, per bucket
+
+With a bucket key, the bodies of the bucket's objects, of their deltas and of the bucket's delta references are encrypted under that key. The metadata is plaintext, as under every mode (see below). The other buckets on the backend are not affected: they keep the encryption of the backend, or their own block.
+
+Per-bucket encryption has two limits in this release. A bucket block takes only `aes256-gcm-proxy` or `none`; native SSE stays a backend setting. And the proxy refuses a bucket block while `config_sync_bucket` is set, because the YAML config is per node: two nodes with different blocks would write one bucket under two keys, and no node would detect it.
+
 ## Why enabling isn't retroactive
 
 Flipping a backend to `aes256-gcm-proxy` encrypts *new writes only*. Existing objects stay in their stored form. This surprises people, so this section explains why it is a design choice and not a gap.
@@ -39,9 +59,9 @@ Instead, you bring history under the new mode with an explicit, visible operatio
 
 ## Why in-place rotation is unsupported, and the shim that designs around it
 
-A proxy-AES backend cannot simply swap its `key`. If the old key were gone, every object written under it would become unreadable. AES-GCM does not degrade gracefully: it authenticates or it fails. That is why a key change keeps the previous key in the legacy slot described below. Supporting transparent multi-key rotation would mean a key ring, per-object key resolution against an unbounded set, and a hidden pile of complexity in the hottest read path. The proxy does not accept that trade.
+A proxy-AES backend cannot simply swap its `key`. If the old key were gone, every object written under it would become unreadable. AES-GCM does not degrade gracefully: it authenticates or it fails. That is why a key change keeps the previous key in the legacy slot described below. Transparent rotation through an unbounded set of old keys would put a growing pile of key generations in the hottest read path. The proxy does not accept that trade: the keyring holds only the keys that the config names.
 
-Instead, the proxy offers a deliberately minimal mechanism: a decrypt-only `legacy_key` shim that holds exactly one previous key generation. Every proxy-AES write stamps a `dg-encryption-key-id` on the object. Reads check the stamped id against the current key, then against the legacy slot. Writes never use the legacy key. So during a rotation, old objects stay readable while every new object lands under the new key, and the population converges in one direction only. Run the re-encrypt job to rewrite the remaining old objects, and then clear the shim. One legacy slot is a constraint, but it also forces each rotation to finish, so key generations do not pile up. The key-id mechanism also gives clear errors. A mismatch tells you *which* key an object wanted, instead of an opaque GCM authentication failure. The full procedure is in [how to rotate encryption keys](../how-to/rotate-encryption-keys.md).
+Instead, the proxy offers a deliberately minimal mechanism: a decrypt-only `legacy_key` shim that holds exactly one previous key generation per backend, and one per bucket that has its own key. Every proxy-AES write stamps a `dg-encryption-key-id` on the object. Reads check the stamped id against the current key, then against the legacy slot. Writes never use the legacy key. So during a rotation, old objects stay readable while every new object lands under the new key, and the population converges in one direction only. Run the re-encrypt job to rewrite the remaining old objects, and then clear the shim. One legacy slot is a constraint, but it also forces each rotation to finish, so key generations do not pile up. The key-id mechanism also gives clear errors. A mismatch tells you *which* key an object wanted, instead of an opaque GCM authentication failure. The full procedure is in [how to rotate encryption keys](../how-to/rotate-encryption-keys.md).
 
 **Key loss in proxy-AES mode is data loss.** The proxy does not escrow keys, and there is no recovery path. Back up the key off-box (in a secrets manager, a vault, or a sealed envelope) before the first encrypted write.
 

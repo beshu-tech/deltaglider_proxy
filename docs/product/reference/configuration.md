@@ -763,8 +763,9 @@ storage:
 | `public` | bool | — | Shorthand for `public_prefixes: [""]` (entire bucket public) |
 | `quota_bytes` | u64 | — | Soft storage quota (it may overshoot by up to 5 minutes of writes); `0` freezes the bucket |
 | `replication_target_only` | bool | `false` | Client writes return 403; replication is the only writer. This makes a non-CAS backend (e.g. Backblaze B2) a safe mirror (see [backend capability validation](../how-to/backend-capability-validation.md)) |
+| `encryption` | encryption block | the backend's | The bucket's own encryption at rest, with the same fields as a backend's `encryption` block. Only `aes256-gcm-proxy` and `none`; `key_id` is required. See [Encryption at rest](#encryption-at-rest) |
 
-A bucket policy refuses an unknown field, in the sectioned shape and in the flat shape. The proxy does not start, `config lint` exits with code `4`, and an apply is refused, and each error names the field. Before this release, the proxy ignored an unknown bucket field and kept running without it. The refusal is deliberate: when a later release adds a bucket field (for example per-bucket encryption), an older binary refuses a config that uses it, instead of running without the setting after a downgrade.
+A bucket policy refuses an unknown field, in the sectioned shape and in the flat shape. The proxy does not start, `config lint` exits with code `4`, and an apply is refused, and each error names the field. Before this release, the proxy ignored an unknown bucket field and kept running without it. The refusal is deliberate: when a later release adds a bucket field, an older binary refuses a config that uses it, instead of running without the setting after a downgrade. A release without per-bucket encryption therefore refuses a config with a bucket `encryption` block.
 
 ### Public prefixes
 
@@ -943,6 +944,26 @@ Environment variables (infra secrets) are the recommended key source. Canonical 
 Name normalisation: the proxy uppercases `<NAME>` and replaces `-` and `.` with `_`. For example, `hetzner-fsn1` becomes `DGP_BACKEND_HETZNER_FSN1_ENCRYPTION_KEY`.
 
 When the `encryption` block is absent, the mode is `none` (plaintext).
+
+A bucket can carry its own `encryption` block, which replaces the encryption of its backend for that bucket's writes:
+
+```yaml
+# validate
+storage:
+  backends:
+    - name: local-disk
+      type: filesystem
+      path: /var/lib/deltaglider_proxy/data
+  buckets:
+    db-archive:
+      backend: local-disk               # required when storage.backends is used
+      encryption:
+        mode: aes256-gcm-proxy          # or none; native SSE is not supported on a bucket
+        key: "${env:DB_ARCHIVE_AES_KEY}"    # any variable name; no DGP_* variable exists for a bucket
+        key_id: db-archive-2026         # required on a bucket
+```
+
+The proxy refuses a bucket `encryption` block without `key_id`, with `legacy_key` but without `legacy_key_id`, in a native SSE mode, without `backend:` when `storage.backends` is used, with a key id that another key already uses, on an alias that disagrees with the other names of its stored bucket, or while `config_sync_bucket` is set. The [encryption reference](encryption.md#per-bucket-encryption) explains each rule.
 
 `key` / `legacy_key` are 64-character lowercase hex strings (256 bits). `kms_key_id` is a KMS ARN or alias. `key_id` (optional) must match `[A-Za-z0-9_.-]{1,64}` (S3 user-metadata header-safe).
 

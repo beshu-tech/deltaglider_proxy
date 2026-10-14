@@ -1,6 +1,6 @@
 # Encryption reference
 
-Encryption at rest is configured per backend. Each backend in `storage.backends[]` (or the singleton `storage.backend`, via the top-level `storage.backend_encryption`) carries one `encryption` block with exactly one of four modes. The modes are mutually exclusive on a given backend; the `BackendEncryptionConfig` enum enforces this by construction.
+Encryption at rest is configured per backend, and a bucket can replace the encryption of its backend with its own. Each backend in `storage.backends[]` (or the singleton `storage.backend`, via the top-level `storage.backend_encryption`) carries one `encryption` block with exactly one of four modes. The modes are mutually exclusive on a given backend; the `BackendEncryptionConfig` enum enforces this by construction. A bucket in `storage.buckets` can carry an `encryption` block of the same schema. The rules of that block are in [Per-bucket encryption](#per-bucket-encryption).
 
 ## Modes
 
@@ -19,7 +19,7 @@ A backend with no `encryption` block has `mode: none`. `Config::check` rejects `
 |---|---|---|
 | `mode` | all | `none` \| `aes256-gcm-proxy` \| `sse-kms` \| `sse-s3` |
 | `key` | `aes256-gcm-proxy` | 32-byte hex AES-256 key. Treated as an infrastructure secret: stripped from canonical exports (`/config/export`). |
-| `key_id` | `aes256-gcm-proxy` | Optional stable identifier stamped on written objects. Derived from backend name + key when absent. |
+| `key_id` | `aes256-gcm-proxy` | Stable identifier stamped on written objects. On a backend, optional: derived from backend name + key when absent. On a bucket, required. |
 | `kms_key_id` | `sse-kms` | KMS key ARN. |
 | `bucket_key_enabled` | `sse-kms` | S3 Bucket Keys; reduces per-request KMS cost. |
 | `legacy_key`, `legacy_key_id` | any mode | Decrypt-only shim for objects written under a previous proxy-AES key. Valid under every mode, including `none`. |
@@ -107,6 +107,81 @@ storage:
 
 You can also set keys in the admin GUI (**Storage → Backends**). The browser generates GUI keys with `crypto.getRandomValues`, and the keys do not go through the server before Apply. When you apply, the proxy writes the key in plain text into the config file. A new config file is readable only by its owner (mode 0600), and a rewritten file keeps the owner and group permissions of the old one, and nobody else can read it. To keep the key out of the file, set it in `DGP_BACKEND_<NAME>_ENCRYPTION_KEY` instead.
 
+## Per-bucket encryption
+
+A bucket policy can carry its own `encryption` block. The block uses the same fields as the `encryption` block of a backend. When a bucket has this block, the writes to that bucket use it instead of the encryption of the backend. A bucket without the block uses the encryption of its backend, as before.
+
+```yaml
+# validate
+storage:
+  backends:
+    - name: local-disk
+      type: filesystem
+      path: /var/lib/deltaglider_proxy/data
+      encryption:
+        mode: aes256-gcm-proxy
+        key: "${env:LOCAL_DISK_AES_KEY}"
+        key_id: local-disk-2026
+  buckets:
+    releases:
+      backend: local-disk
+    db-archive:
+      backend: local-disk
+      encryption:
+        mode: aes256-gcm-proxy
+        key: "${env:DB_ARCHIVE_AES_KEY}"
+        key_id: db-archive-2026
+    downloads:
+      backend: local-disk
+      encryption:
+        mode: none
+```
+
+In this example, `releases` uses the key of `local-disk`, `db-archive` uses its own key, and `downloads` stores plaintext.
+
+### Rules
+
+The proxy refuses to start with a config that breaks one of these rules, and it refuses an apply that breaks one. `config lint` reports them as errors.
+
+| Rule | Reason |
+|---|---|
+| The mode is `aes256-gcm-proxy` or `none`. | Native SSE per bucket (`sse-kms`, `sse-s3`) is not supported yet. Set native SSE on the backend instead. |
+| `key_id` is set explicitly. | Every object carries the id of its key, and the proxy picks the key by that id when it reads the object. A bucket key id is therefore never derived from a name: a renamed bucket or an alias would otherwise change the id. |
+| `legacy_key_id` is set explicitly when `legacy_key` is set. | The same reason. |
+| The bucket has `backend:` when `storage.backends` is used. | A bucket without a route can live on any backend, so the proxy cannot tell which storage the block applies to. With a single backend (`storage.backend`), the bucket is always on that backend, and `backend:` is not needed. |
+| Every name of one stored bucket has the same effective encryption. | The encryption belongs to the stored bucket (the backend and the real bucket name), not to a name. When two bucket names reach the same real bucket through `alias`, they must carry the same `encryption` block, or none. |
+| A key id names one key. | Two keys with the same `key_id` and different key bytes are refused, across all backends and all buckets. The same key with the same id in two places is allowed. |
+| `config_sync_bucket` is not set. | The YAML config is per node. In a multi-instance deployment, two nodes could write one bucket with different keys, so per-bucket encryption is single-instance only in this release. |
+
+A bucket key has no `DGP_*` environment variable. Put the key in the YAML file, or reference any environment variable with `${env:NAME}`, as in the example.
+
+A bucket block in `aes256-gcm-proxy` mode with no key makes the proxy refuse every write to that bucket, as for a backend (see [A proxy-AES backend with no key](#a-proxy-aes-backend-with-no-key)). An apply that puts a bucket into this state is refused.
+
+### Changing a bucket's encryption
+
+When an apply changes the encryption that a bucket writes with, the proxy does not rewrite the objects that the bucket already holds. They keep the form they were written in, and they stay readable, because each object carries the id of its key. The response of the apply has a warning for each such bucket. The warning names the re-encrypt job (`POST /_/api/admin/jobs/reencrypt` with `{"buckets": ["<bucket>"]}`), which rewrites the objects and the delta references into the new form. The proxy does not start the job by itself.
+
+A key that a bucket writes with cannot leave the config in one step. An apply that removes the bucket's `encryption` block, or its key, is refused while that key id is not kept somewhere else on the same backend. The objects written under that key would otherwise become unreadable. To stop using a bucket key, do these steps:
+
+1. Set the bucket's `mode` to `none`, or give the bucket a new key and key id. An apply that leaves `legacy_key` out keeps the old key as the bucket's `legacy_key`, with its id as `legacy_key_id`.
+2. Run the re-encrypt job for the bucket.
+3. Check that no object of the bucket still uses the old key: `GET /_/api/admin/backends/<backend>/legacy-key-usage?bucket=<bucket>`.
+4. Remove the bucket's `legacy_key` and `legacy_key_id`, or the whole `encryption` block when its mode is `none`.
+
+### The keyring
+
+Each backend has one encrypting layer, which holds every key that the config gives to that backend: the key and legacy key of the backend, and the key and legacy key of each bucket on it. When the proxy reads an object, it picks the key by the `dg-encryption-key-id` of the object. A bucket therefore reads the objects that it wrote under the backend key before it got its own key, and it reads them again after its own key is retired into `legacy_key`. An object without a key id (written before key ids existed) is decrypted with the key of the backend.
+
+When the proxy writes an object, it picks the key of the stored bucket that the object goes to. A server-side copy inside one backend keeps the stored bytes only when the destination bucket writes with the same key id as the source object. Otherwise the proxy decrypts the object and encrypts it again with the key of the destination.
+
+### Multipart uploads, migrate and replication
+
+A multipart upload into a bucket with its own key is encrypted with that key. The proxy does not use native S3 multipart for a bucket that encrypts in the proxy, because each part would reach the backend in plaintext.
+
+When a bucket moves to another backend (`POST /_/api/admin/buckets/<bucket>/migrate`), its `encryption` block moves with it. The copies on the target backend are written under the bucket's key, and the verify phase checks the at-rest form of each copy.
+
+A replication rule from a bucket that encrypts into a bucket that stores plaintext is allowed. `Config::check` reports a warning for it, because the copies are not encrypted at rest.
+
 ## Key IDs
 
 Every proxy-AES write stamps a `dg-encryption-key-id` metadata field on the object. The id is either the explicit `key_id` from YAML or derived as the first 8 bytes of `SHA-256(backend_name ‖ 0x00 ‖ key)`, written as 16 hex characters. The backend name is part of the derivation: two backends with identical key material but different names produce different ids, so objects are not portable across backends by default. Pinning the same explicit `key_id` with identical key bytes on two backends is the documented portability escape hatch.
@@ -171,7 +246,7 @@ When `legacy_key` / `legacy_key_id` are set, reads check the object's `dg-encryp
 - **An apply keeps what it does not name.** For `key`, `key_id` and `legacy_key`, the same rule applies to every apply, whether it is a section `PUT` or a full document. When the field is absent, the proxy keeps the current value. When the field is `null`, the proxy clears it. A `key: null` is a key change like any other: the previous key moves into `legacy_key` (or the apply is refused while `legacy_key` holds a different key), so the proxy never drops a key that objects can still need. A backend that is left in `aes256-gcm-proxy` mode with no key is then refused, as described in [A proxy-AES backend with no key](#a-proxy-aes-backend-with-no-key). When the field has a value, that value replaces the current one. An id is kept only together with its own key: when the apply sets a new `key` and no `key_id`, the new key gets a derived id, and the previous id moves to `legacy_key_id` with the previous key.
 - **Enabling is not retroactive.** Switching a backend's mode affects new writes only; existing objects keep their stored form and markers until rewritten.
 - **Key loss is data loss** in `aes256-gcm-proxy` mode. The proxy does not escrow keys, and there is no recovery path.
-- **No per-bucket encryption.** Encryption is backend-scoped; a bucket inherits the encryption of the backend it routes to.
+- **Per-bucket encryption is proxy-AES only and single-instance only.** A bucket `encryption` block takes `aes256-gcm-proxy` or `none`, and the proxy refuses it while `config_sync_bucket` is set. See [Per-bucket encryption](#per-bucket-encryption).
 - **Metadata is plaintext** under every mode, including SSE-KMS: object names, sizes, content-type, and `x-amz-meta-*` user metadata are stored unencrypted.
 - **No forward secrecy.** A disclosed proxy-AES key decrypts all past ciphertext written under it.
 - **Memory.** Encrypted GET is streaming: the decoder holds ~130 KiB in flight regardless of object size, and range GETs fetch only the target chunks plus the 16-byte header (in the same request when the range starts in the first chunk). An encrypted PUT in proxy-AES mode of a body that the proxy holds in memory buffers every encrypted frame before handing off to the inner backend: peak write memory ≈ plaintext size + 0.03%, so a 100 MiB `PutObject` peaks around 200 to 300 MiB RSS. A body that the proxy stores from a file (a large upload, or a multipart upload whose parts are relay files) is encrypted into a temporary file in `DGP_SPOOL_DIR` instead. That file counts against `DGP_SPOOL_MAX_BYTES`, and when the budget is in use the upload gets `503 SlowDown`. The proxy rejects passthrough objects above `max_object_size` (default 100 MiB) up front. SSE-KMS / SSE-S3 stream through without this buffering.
