@@ -1,5 +1,6 @@
 // === Multi-Backend Management ===
-import { adminJson } from './core';
+import { adminJson, confirmHeaderMap } from './core';
+import type { ConfirmHeaders } from './core';
 import type { BackendEncryptionMode, BackendInfo } from './core';
 
 interface BackendListResponse {
@@ -79,15 +80,33 @@ export async function getBucketOrigins(): Promise<BucketOriginListResponse> {
   return adminJson('/api/admin/buckets', { context: 'Load bucket origins' });
 }
 
+/**
+ * POST /api/admin/buckets: route + optional own `encryption` block + the
+ * create, in ONE config write on the server. The server checks the name
+ * before it changes anything, and a failed create takes the route and the
+ * block back (issue #116 P2, review defect 1).
+ */
 export async function createBucketOnBackend(
   name: string,
   backendName: string,
+  opts: { encryption?: Record<string, unknown>; confirm?: ConfirmHeaders } = {},
 ): Promise<{ success: boolean; bucket: string; backend_name: string }> {
+  const headers = confirmHeaderMap(opts.confirm);
   return adminJson('/api/admin/buckets', {
     method: 'POST',
-    body: { name, backend_name: backendName },
+    body: { name, backend_name: backendName, ...(opts.encryption ? { encryption: opts.encryption } : {}) },
     context: `Create bucket ${name}`,
+    ...(Object.keys(headers).length > 0 ? { headers } : {}),
   });
+}
+
+/** What a new bucket of this name would get on `backend` (the server's
+ *  answer, also for a name that already has settings). */
+export async function getBucketEncryptionPreview(name: string, backend: string): Promise<EffectiveEncryption> {
+  return adminJson(
+    `/api/admin/buckets/${encodeURIComponent(name)}/encryption-preview?backend=${encodeURIComponent(backend)}`,
+    { context: `Encryption of a new bucket ${name}` },
+  );
 }
 
 

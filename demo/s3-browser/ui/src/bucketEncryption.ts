@@ -390,19 +390,11 @@ export type NewBucketEncryption =
   | { kind: 'off' };
 
 /**
- * The storage-section body that the create-bucket dialog writes BEFORE it
- * creates the bucket, so the first object is already written with the
- * chosen encryption. `null` for "Same as backend" (no policy needed).
- * `backend` is the named backend to pin (`null` on a single unnamed
- * backend, where the server needs no route).
+ * The `encryption` block that the create-bucket dialog sends WITH the
+ * create (POST /api/admin/buckets, one server write), so the first object
+ * is already written with it. `undefined` for "Same as backend".
  */
-export function newBucketPolicyBody(
-  bucket: string,
-  backend: string | null,
-  enc: NewBucketEncryption,
-): { buckets: Record<string, Record<string, unknown>> } | null {
-  if (enc.kind === 'same') return null;
-  const encryption =
-    enc.kind === 'off' ? { mode: 'none' } : { mode: 'aes256-gcm-proxy', key: enc.key, key_id: enc.keyId };
-  return { buckets: { [bucket]: { ...(backend ? { backend } : {}), encryption } } };
+export function newBucketEncryptionBlock(enc: NewBucketEncryption): Record<string, unknown> | undefined {
+  if (enc.kind === 'same') return undefined;
+  return enc.kind === 'off' ? { mode: 'none' } : { mode: 'aes256-gcm-proxy', key: enc.key, key_id: enc.keyId };
 }

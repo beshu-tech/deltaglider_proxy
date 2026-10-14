@@ -15,24 +15,26 @@
  *
  * Encryption (admin only, issue #116): "Same as backend (<mode>)" by
  * default, or "Encrypt with a bucket key" / "Off for this bucket" when the
- * backend accepts that mode on a bucket (`bucket_encryption_modes`). A
- * chosen bucket encryption is written as the bucket's policy BEFORE the
- * bucket is created, so no object is ever written in the backend's mode
- * first. If the create then fails, the policy stays (the Buckets page shows
- * it as "bucket not found") and a retry creates the bucket under it.
+ * server accepts that mode for the bucket. What the bucket gets by default
+ * is the server's answer (GET /buckets/:name/encryption-preview), which
+ * also knows settings that the name already has. A chosen block goes WITH
+ * the create in one request (POST /api/admin/buckets): the server checks
+ * the name first, and a failed create takes the route and the block back.
+ * "Off" on an encrypting backend asks for a confirmation before it sends
+ * the downgrade header.
  */
 import { useEffect, useRef, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { Alert, Modal, Input, Radio, Select, Typography, message } from 'antd';
 import type { InputRef } from 'antd';
-import { useQueryClient } from '@tanstack/react-query';
 import { createBucket } from '../s3client';
-import { getBackends, getSectionVersioned } from '../adminApi';
+import { getBackends, getBucketEncryptionPreview } from '../adminApi';
 import type { BackendInfo } from '../adminApi';
 import { normalizeUiError } from '../errorHandling';
 import { bucketNameError } from '../bucketName';
-import { applySection } from '../applySection';
-import { encryptionWord, encryptsAtRest } from '../backendFacts';
-import { newBucketPolicyBody, type NewBucketEncryption } from '../bucketEncryption';
+import { encryptionWord } from '../backendFacts';
+import { describeBucketEncryption, modeWord, newBucketEncryptionBlock, type NewBucketEncryption } from '../bucketEncryption';
+import { confirmDialog } from '../confirmDialog';
 import BucketKeySetup, { type BucketKeyValue } from './BucketKeySetup';
 
 const { Text } = Typography;
@@ -62,7 +64,6 @@ export default function CreateBucketModal({
   const [selectedBackend, setSelectedBackend] = useState<string | undefined>(undefined);
   const inputRef = useRef<InputRef>(null);
   const [messageApi, contextHolder] = message.useMessage();
-  const qc = useQueryClient();
   const [encChoice, setEncChoice] = useState<NewBucketEncryption['kind']>('same');
   const [keyValue, setKeyValue] = useState<BucketKeyValue | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
@@ -100,11 +101,19 @@ export default function CreateBucketModal({
 
   const showPicker = canAdmin && backends.length > 1;
   const nameError = bucketNameError(name.trim());
-  // The backend the bucket lands on: the picked one, else the default.
-  const target = backends.find((b) => b.name === (selectedBackend ?? defaultBackend)) ?? backends[0];
-  const modes = canAdmin ? (target?.bucket_encryption_modes ?? []) : [];
+  // The backend the bucket lands on: the picked one, else the default
+  // (a name, not an encryption: the server answers that below).
+  const targetName = selectedBackend ?? defaultBackend ?? backends[0]?.name;
+  const trimmedName = name.trim();
+  const preview = useQuery({
+    queryKey: ['bucket-encryption-preview', trimmedName, targetName],
+    queryFn: () => getBucketEncryptionPreview(trimmedName, targetName!),
+    enabled: open && canAdmin && !!targetName && !!trimmedName && bucketNameError(trimmedName) === null,
+    retry: false,
+  }).data;
+  const modes = preview?.bucket_modes ?? [];
   const offerKey = modes.includes('aes256-gcm-proxy');
-  const offerOff = modes.includes('none') && encryptsAtRest(target?.encryption);
+  const offerOff = modes.includes('none') && !!preview && preview.mode !== 'none';
   const choice: NewBucketEncryption['kind'] =
     (encChoice === 'bucket-key' && !offerKey) || (encChoice === 'off' && !offerOff) ? 'same' : encChoice;
   const keyNotReady = choice === 'bucket-key' && !keyValue?.ready;
@@ -119,48 +128,43 @@ export default function CreateBucketModal({
 
   const handleCreate = async () => {
     const trimmed = name.trim();
-    if (!trimmed || keyNotReady) return;
-    setCreating(true);
-    setCreateError(null);
-    // The bucket's own encryption first: the policy is in place before the
-    // bucket exists, so its first write already uses it.
+    // A second Enter while the first create runs must not send another.
+    if (creating || !trimmed || keyNotReady) return;
     const enc: NewBucketEncryption =
       choice === 'bucket-key' && keyValue ? { kind: 'bucket-key', key: keyValue.key, keyId: keyValue.keyId } : { kind: choice === 'off' ? 'off' : 'same' };
-    const pin = target && !target.is_synthesized ? target.name : null;
-    const body = newBucketPolicyBody(trimmed, pin, enc);
-    if (body) {
-      try {
-        const { version } = await getSectionVersioned('storage');
-        // Off on an encrypting backend: the operator chose plaintext here.
-        const resp = await applySection(qc, 'storage', body, version, enc.kind === 'off' ? { downgrades: [trimmed] } : undefined);
-        if (!resp.ok) {
-          setCreateError(resp.error || 'The proxy refused the encryption setting.');
-          setCreating(false);
-          return;
-        }
-      } catch (e: unknown) {
-        setCreateError(`The bucket was not created: ${normalizeUiError(e, 'the encryption setting failed')}`);
-        setCreating(false);
-        return;
-      }
+    const encryption = newBucketEncryptionBlock(enc);
+    // Plaintext where the backend encrypts: the operator confirms it here,
+    // and only then does the request carry the downgrade header.
+    if (enc.kind === 'off') {
+      setCreating(true);
+      const ok = await confirmDialog({
+        title: `Store ${trimmed} as plaintext?`,
+        content: `Backend ${targetName} encrypts its buckets. New writes to ${trimmed} will not be encrypted at rest.`,
+        okText: 'Store as plaintext',
+        danger: true,
+      });
+      setCreating(false);
+      if (!ok) return;
     }
+    setCreating(true);
+    setCreateError(null);
     try {
-      // Only pass an explicit backend when there's a real choice to make.
-      const explicitBackend = showPicker ? selectedBackend : undefined;
-      await createBucket(trimmed, explicitBackend);
+      // With a block, the create goes to the named target in one request;
+      // otherwise only pass an explicit backend when there is a choice.
+      const explicitBackend = encryption ? targetName : showPicker ? selectedBackend : undefined;
+      await createBucket(
+        trimmed,
+        explicitBackend,
+        encryption ? { encryption, confirm: enc.kind === 'off' ? { downgrades: [trimmed] } : undefined } : undefined,
+      );
       messageApi.success(`Bucket "${trimmed}" created`);
       reset();
       onClose();
       onCreated(trimmed);
     } catch (e: unknown) {
       const msg = normalizeUiError(e, "Unknown error");
-      if (body) {
-        setCreateError(
-          `The encryption setting is saved, but the bucket was not created: ${msg}. Click Create to try again, or remove the setting on the Buckets page.`
-        );
-      } else {
-        messageApi.error(`Failed to create bucket: ${msg}`);
-      }
+      if (encryption) setCreateError(`The bucket was not created: ${msg}`);
+      else messageApi.error(`Failed to create bucket: ${msg}`);
     } finally {
       setCreating(false);
     }
@@ -194,7 +198,7 @@ export default function CreateBucketModal({
           // Keep what the user typed and say what is wrong: a silent rewrite
           // ("My_Bucket" → "mybucket") creates a bucket nobody asked for.
           onChange={(e) => setName(e.target.value)}
-          onPressEnter={() => { if (!nameError && !keyNotReady) void handleCreate(); }}
+          onPressEnter={() => { if (!creating && !nameError && !keyNotReady) void handleCreate(); }}
           status={nameError ? 'error' : undefined}
           style={{ fontFamily: 'var(--font-mono)' }}
         />
@@ -232,7 +236,7 @@ export default function CreateBucketModal({
             </Text>
           </div>
         )}
-        {canAdmin && target && (offerKey || offerOff) && (
+        {canAdmin && preview && (offerKey || offerOff) && (
           <div style={{ marginTop: 12 }} data-testid="bucket-encryption-choice">
             <Text strong style={{ display: 'block', fontSize: 12, marginBottom: 4 }}>
               Encryption
@@ -243,13 +247,17 @@ export default function CreateBucketModal({
               onChange={(e) => setEncChoice(e.target.value)}
               style={{ display: 'flex', flexDirection: 'column', gap: 4 }}
             >
-              <Radio value="same">Same as backend ({encryptionWord(target.encryption)})</Radio>
+              <Radio value="same">
+                {preview.source === 'bucket'
+                  ? `Keep the settings this name already has (${describeBucketEncryption(preview).label})`
+                  : `Same as backend (${modeWord(preview.mode, preview.encrypts)})`}
+              </Radio>
               {offerKey && <Radio value="bucket-key">Encrypt with a bucket key</Radio>}
               {offerOff && <Radio value="off">Off for this bucket (plaintext)</Radio>}
             </Radio.Group>
             {choice === 'bucket-key' && name.trim() && !nameError && (
               <div style={{ marginTop: 8 }}>
-                <BucketKeySetup bucket={name.trim()} backend={target.name} onChange={setKeyValue} />
+                <BucketKeySetup bucket={name.trim()} backend={preview.backend} onChange={setKeyValue} />
               </div>
             )}
             {choice === 'bucket-key' && (!name.trim() || nameError) && (
@@ -259,7 +267,7 @@ export default function CreateBucketModal({
             )}
             {choice === 'off' && (
               <Text type="warning" style={{ display: 'block', fontSize: 11, marginTop: 6 }}>
-                New writes to this bucket are stored as plaintext, although {target.name} encrypts.
+                New writes to this bucket are stored as plaintext, although {preview.backend} encrypts. You confirm this when you click Create.
               </Text>
             )}
           </div>

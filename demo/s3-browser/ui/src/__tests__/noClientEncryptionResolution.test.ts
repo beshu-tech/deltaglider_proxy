@@ -13,6 +13,12 @@
  *   * a backend looked up from the list and its `encryption` read in one
  *     expression (`backends.find(…).encryption`): the shape of the old
  *     post-apply proposal, which took a backend's mode for its buckets.
+ *
+ * The shapes above are one-line patterns, and review P2 (defect 5) found a
+ * two-line bypass (`const target = backends.find(…)` and later
+ * `target?.encryption`). So the last test counts EVERY `.encryption` read
+ * in each file against a short allowlist with a reason per entry: a new
+ * read anywhere else fails, whatever its shape.
  */
 import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
@@ -67,4 +73,32 @@ test('the guard sees the shapes it refuses', () => {
       'backends.find((b) => b.name === backendName)?.encryption?.mode',
   };
   for (const rule of RULES) assert.ok(rule.re.test(samples[rule.name]), rule.name);
+});
+
+/** Files that may read `.encryption`, with the number of reads and why. */
+const ENCRYPTION_READS: Record<string, [number, string]> = {
+  'components/BackendsPanel.tsx': [2, 'a backend card edits that backend\'s own encryption'],
+  'components/CreateBucketModal.tsx': [1, 'the backend picker labels each backend with its own mode'],
+  'components/MigrateBucketModal.tsx': [2, 'the target picker and the target backend\'s own mode'],
+  'components/bucketPolicyPayload.ts': [3, 'the bucket policy\'s own block, not a backend'],
+  'components/BucketCard.tsx': [3, 'a draft policy\'s own block, not a backend'],
+  'adminApi/backends.ts': [2, 'the create request body'],
+  'backendEncryptionPayload.ts': [1, 'the storage section body of a backend change'],
+  'envOverrides.ts': [1, 'a YAML path string'],
+  'bucketEncryption.ts': [1, 'the YAML path in the key file text'],
+};
+
+test('every `.encryption` read is on the allowlist', () => {
+  const bad: string[] = [];
+  for (const file of sourceFiles(SRC)) {
+    const rel = relative(SRC, file);
+    const code = readFileSync(file, 'utf8')
+      .split('\n')
+      .filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l))
+      .join('\n');
+    const n = (code.match(/\??\.encryption\b/g) ?? []).length;
+    const allowed = ENCRYPTION_READS[rel]?.[0] ?? 0;
+    if (n > allowed) bad.push(`${rel}: ${n} reads of .encryption (allowed ${allowed})`);
+  }
+  assert.deepEqual(bad, [], 'show the server answer (effective_encryption, encryption-preview) instead');
 });

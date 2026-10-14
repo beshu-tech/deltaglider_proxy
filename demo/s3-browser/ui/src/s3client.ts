@@ -807,9 +807,15 @@ async function listBucketsUncached(opts?: ListBucketsOptions): Promise<BucketInf
   return merged;
 }
 
-export async function createBucket(name: string, backendName?: string): Promise<void> {
+export async function createBucket(
+  name: string,
+  backendName?: string,
+  /** The bucket's own encryption block (and its confirmation), created in
+   *  the same server write as the bucket. Needs `backendName`. */
+  opts?: Parameters<typeof createBucketOnBackend>[2],
+): Promise<void> {
   if (backendName) {
-    await createBucketOnBackend(name, backendName);
+    await createBucketOnBackend(name, backendName, opts);
     invalidateListBucketsCache();
     return;
   }

@@ -57,7 +57,7 @@ const PICK_EXPLAIN =
 interface PickRow {
   bucket: string;
   backend: string | null;
-  encryption: string;
+  encryptionLabel: string;
 }
 
 const EXPLAIN: Record<ReencryptTransition, string> = {
@@ -94,7 +94,7 @@ export default function ReencryptProposalModal({
       rows.push({
         bucket: o.name,
         backend: eff.backend,
-        encryption: eff.legacy_key_id ? `${enc}, legacy key ${eff.legacy_key_id}` : enc,
+        encryptionLabel: eff.legacy_key_id ? `${enc}, legacy key ${eff.legacy_key_id}` : enc,
       });
     }
     return { pickRows: rows, skippedPlaintext: skipped };
@@ -235,7 +235,7 @@ export default function ReencryptProposalModal({
                     {r.bucket}
                   </Text>{' '}
                   <Text type="secondary" style={{ fontSize: 12 }}>
-                    on {r.backend ?? 'default'} · {r.encryption}
+                    on {r.backend ?? 'default'} · {r.encryptionLabel}
                   </Text>
                 </Checkbox>
               ))}
