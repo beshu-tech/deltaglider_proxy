@@ -175,6 +175,7 @@ Earlier releases encrypted `deltaglider_config.db` with the bootstrap password h
 
 - **`$` in Docker env.** Bcrypt hashes contain `$`. Use the base64-wrapped form (`DGP_BOOTSTRAP_PASSWORD_HASH=JDJ5JDEyJGV...`) or single-quote the value in compose files.
 - **`force_path_style`.** MinIO needs `true`; AWS S3 needs `false`. The migrator preserves whatever the TOML had.
+- **Unknown bucket fields.** A bucket policy refuses a field that the proxy does not know (see [Bucket policies](../reference/configuration.md#bucket-policies)). Before you upgrade, run `deltaglider_proxy config lint` with the new binary on your config file. A misspelled bucket field, which an older release ignored, now stops the start with an error that names the field.
 - **Implicit defaults.** Fields absent from YAML take their default. Do not copy fields that were already at their default in TOML, because they clutter the canonical shape.
 - **Request rule order.** The order of the request rules (`admission.blocks`) matters. The migrator preserves order; review `admission:` carefully.
 - **`iam_mode: declarative`.** YAML becomes authoritative for IAM users, groups, OAuth providers, and mapping rules. Admin-API IAM mutations return 403; `/config/apply` reconciles the encrypted DB to YAML atomically. Seed from an existing DB with `GET /_/api/admin/config/declarative-iam-export`, or author IAM directly in YAML.

@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Fixed — An unknown bucket policy field is refused, not ignored
+
+A bucket policy (`storage.buckets.<name>`) accepted any field and dropped the
+ones that it did not know: `config lint` reported `ok`, and the proxy ran
+without the setting. A misspelled field (for example `quota_byte`) therefore
+did nothing, and a field that a later release adds (per-bucket encryption is
+planned) would be lost after a downgrade, so the bucket could store plaintext.
+Now an unknown bucket field stops the start, makes `config lint` exit with
+code `4`, and refuses an apply, and each error names the field. **Upgrade
+note:** a config with a misspelled bucket field, which this release's
+predecessors accepted, no longer starts. Run `config lint` with the new
+binary before you upgrade. Every documented field, and the `public: true`
+shorthand, loads as before.
+
 ### Fixed — `key: null` on a proxy-encrypted backend no longer drops the key
 
 A section update or a YAML apply that set `key: null` on a backend that

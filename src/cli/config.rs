@@ -771,6 +771,26 @@ storage:
         assert_eq!(lint(path.to_str().unwrap()), EXIT_OK);
     }
 
+    /// Issue #116 P0.3: an unknown bucket field is a parse error that
+    /// names the field (a newer release's field must not be dropped).
+    #[test]
+    fn lint_refuses_an_unknown_bucket_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.yaml");
+        std::fs::write(
+            &path,
+            "storage:\n  buckets:\n    db-archive:\n      encryption: {mode: none}\n",
+        )
+        .unwrap();
+        assert_eq!(lint(path.to_str().unwrap()), EXIT_PARSE);
+        std::fs::write(
+            &path,
+            "storage:\n  buckets:\n    db-archive:\n      public: true\n",
+        )
+        .unwrap();
+        assert_eq!(lint(path.to_str().unwrap()), EXIT_OK);
+    }
+
     #[test]
     fn lint_rejects_admission_duplicate_block_name() {
         let dir = tempfile::tempdir().unwrap();

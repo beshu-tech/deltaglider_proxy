@@ -764,6 +764,8 @@ storage:
 | `quota_bytes` | u64 | — | Soft storage quota (it may overshoot by up to 5 minutes of writes); `0` freezes the bucket |
 | `replication_target_only` | bool | `false` | Client writes return 403; replication is the only writer. This makes a non-CAS backend (e.g. Backblaze B2) a safe mirror (see [backend capability validation](../how-to/backend-capability-validation.md)) |
 
+A bucket policy refuses an unknown field, in the sectioned shape and in the flat shape. The proxy does not start, `config lint` exits with code `4`, and an apply is refused, and each error names the field. Before this release, the proxy ignored an unknown bucket field and kept running without it. The refusal is deliberate: when a later release adds a bucket field (for example per-bucket encryption), an older binary refuses a config that uses it, instead of running without the setting after a downgrade.
+
 ### Public prefixes
 
 When `public_prefixes` (or `public: true`) is set, anonymous users can GET, HEAD, and LIST objects under the prefix. Writes always require authentication. Use trailing `/` for directory-aligned matching (`"public/"` matches `public/installer.zip` but not `publicity/`). The empty string `""` makes the entire bucket public, and the proxy logs a warning. The proxy rejects prefixes that contain `..`, null bytes, or `//`. The proxy creates `public-prefix:<bucket>` request rules from this setting.

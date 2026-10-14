@@ -12,7 +12,14 @@ use std::collections::HashMap;
 
 /// Per-bucket policy overrides. All fields are optional — `None` means
 /// "use the global default".
+///
+/// `deny_unknown_fields`: a field this binary does not know is a load
+/// error that names the field, never silently dropped. A later release
+/// that adds a bucket field (per-bucket encryption, issue #116) then fails
+/// closed on a downgrade or a mixed rolling deploy instead of running
+/// without it.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BucketPolicyConfig {
     /// Enable/disable delta compression for this bucket.
     /// When `false`, all files in this bucket are stored as passthrough
@@ -637,6 +644,43 @@ pub type SharedPublicPrefixSnapshot = std::sync::Arc<arc_swap::ArcSwap<PublicPre
 
 #[cfg(test)]
 mod tests {
+
+    /// Issue #116 P0.3: an unknown bucket field fails the load (sectioned
+    /// and flat shapes) and names the field, so a binary older than a
+    /// future bucket field refuses it instead of dropping it.
+    #[test]
+    fn an_unknown_bucket_field_is_refused_and_named() {
+        let sectioned = "storage:\n  filesystem: /tmp/p116\n  buckets:\n    db-archive:\n      \
+                         encryption:\n        mode: aes256-gcm-proxy\n";
+        let flat = "buckets:\n  db-archive:\n    encryption: {mode: none}\n";
+        for yaml in [sectioned, flat] {
+            let err = crate::config::Config::from_yaml_str(yaml)
+                .expect_err("an unknown bucket field must not load")
+                .to_string();
+            assert!(
+                err.contains("encryption"),
+                "the error names the field: {err}"
+            );
+        }
+    }
+
+    /// Every documented bucket field (and the `public: true` shorthand)
+    /// still loads.
+    #[test]
+    fn every_documented_bucket_field_loads() {
+        let yaml = "storage:\n  filesystem: /tmp/p116\n  backends:\n  - name: local-disk\n    \
+                    type: filesystem\n    path: /tmp/p116b\n  buckets:\n    releases:\n      \
+                    compression: false\n      max_delta_ratio: 0.5\n      backend: local-disk\n      \
+                    alias: releases-2026\n      public_prefixes: [builds/]\n      \
+                    quota_bytes: 1000\n    downloads:\n      public: true\n      \
+                    replication_target_only: true\n";
+        let cfg = crate::config::Config::from_yaml_str(yaml).unwrap();
+        let r = &cfg.buckets["releases"];
+        assert_eq!(r.compression, Some(false));
+        assert_eq!(r.alias.as_deref(), Some("releases-2026"));
+        assert_eq!(r.quota_bytes, Some(1000));
+        assert!(cfg.buckets["downloads"].replication_target_only);
+    }
     /// Unset overrides stay out of the persisted YAML (they were written as
     /// `compression: null` / `max_delta_ratio: null` for every bucket).
     #[test]
