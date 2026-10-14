@@ -17,11 +17,16 @@
 //! Do NOT replace moka with a simple `Mutex<HashMap>` or `Mutex<LruCache>` — it will
 //! re-introduce the global-lock serialization bottleneck on every GET request.
 
+use super::engine::EngineError;
+use crate::single_flight::SingleFlight;
 use bytes::Bytes;
 use moka::sync::Cache;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
+
+/// One load's answer, shared by every caller that waited for it: the bytes
+/// and whether they came from the cache, or the load's error.
+type LoadAnswer = Result<(Bytes, bool), Arc<EngineError>>;
 
 /// Concurrent LRU cache for frequently accessed reference files.
 ///
@@ -38,10 +43,11 @@ use tracing::debug;
 pub struct ReferenceCache {
     cache: Cache<String, CachedReference>,
     max_capacity_bytes: u64,
-    /// One load per key at a time ([`Self::get_or_load`]): K concurrent
-    /// cold reads of one deltaspace download its reference once, not K
-    /// times.
-    loads: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// One load per (key, expected SHA-256) at a time
+    /// ([`Self::get_or_load`]): K concurrent cold reads of one deltaspace
+    /// download its reference once, not K times, and a failed download is
+    /// one answer to all K.
+    loads: SingleFlight<(String, String), LoadAnswer>,
 }
 
 /// Cached reference bytes plus their SHA-256, so a reader can tell that the
@@ -80,46 +86,46 @@ impl ReferenceCache {
     /// The cached reference of `prefix` with `expected_sha256` (as
     /// [`Self::get_matching`]), else the result of `load`, which returns the
     /// bytes and their SHA-256. Only a successful load is cached. Single
-    /// flight: a concurrent caller of the same key waits for the running
-    /// load and then reads the cache; when that load failed, it runs its
-    /// own. Returns `(data, cache_hit)`; a read that waited for another
-    /// caller's load is a hit.
-    pub async fn get_or_load<F, Fut, E>(
+    /// flight (`crate::single_flight::SingleFlight`): a concurrent caller that expects the same
+    /// SHA-256 waits for the running load and gets its answer, an error
+    /// included. A caller that expects another SHA-256 (the reference
+    /// changed between the two reads of its metadata) has its own flight,
+    /// because the answer of the other flight is stale for it. A cancelled
+    /// caller leaves no flight behind. Returns `(data, cache_hit)`; a read
+    /// that waited for another caller's load is a hit.
+    pub async fn get_or_load<F, Fut>(
         &self,
         prefix: &str,
         expected_sha256: &str,
         load: F,
-    ) -> Result<(Bytes, bool), E>
+    ) -> Result<(Bytes, bool), EngineError>
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<(Bytes, String), E>>,
+        Fut: std::future::Future<Output = Result<(Bytes, String), EngineError>>,
     {
         if let Some(data) = self.get_matching(prefix, expected_sha256) {
             return Ok((data, true));
         }
-        let slot = self
+        let mut ran = false;
+        let answer = self
             .loads
-            .lock()
-            .entry(prefix.to_string())
-            .or_default()
-            .clone();
-        let result = {
-            let _one = slot.lock().await;
-            match self.get_matching(prefix, expected_sha256) {
-                Some(data) => Ok((data, true)),
-                None => load().await.map(|(data, sha256)| {
+            .run((prefix.to_string(), expected_sha256.to_string()), || {
+                ran = true;
+                async {
+                    // A flight that ended just before this one cached it.
+                    if let Some(data) = self.get_matching(prefix, expected_sha256) {
+                        return Ok((data, true));
+                    }
+                    let (data, sha256) = load().await.map_err(Arc::new)?;
                     self.put(prefix, data.clone(), &sha256);
-                    (data, false)
-                }),
-            }
-        };
-        // Forget the slot when no other caller holds it. A caller clones it
-        // under the map lock, so the count cannot grow behind this check.
-        let mut loads = self.loads.lock();
-        if Arc::strong_count(&slot) == 2 {
-            loads.remove(prefix);
+                    Ok((data, false))
+                }
+            })
+            .await;
+        match answer {
+            Ok((data, hit)) => Ok((data, hit || !ran)),
+            Err(e) => Err(Arc::try_unwrap(e).unwrap_or_else(|e| e.duplicate())),
         }
-        result
     }
 
     /// Return the configured maximum cache capacity in bytes.
@@ -204,6 +210,10 @@ mod tests {
         fn put_test(&self, prefix: &str, data: Bytes) {
             self.put(prefix, data, "");
         }
+
+        fn no_load_in_flight(&self) -> bool {
+            self.loads.is_idle()
+        }
     }
 
     /// Eight concurrent cold reads of one key run one load; a failed load
@@ -215,27 +225,67 @@ mod tests {
         let load = || async {
             loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            Ok::<_, ()>((Bytes::from_static(b"ref"), "s1".to_string()))
+            Ok::<_, EngineError>((Bytes::from_static(b"ref"), "s1".to_string()))
         };
         let got =
             futures::future::join_all((0..8).map(|_| cache.get_or_load("k", "s1", load))).await;
         assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(got.iter().all(|r| r.as_ref().unwrap().0 == "ref"));
         assert_eq!(got.iter().filter(|r| !r.as_ref().unwrap().1).count(), 1);
-        assert!(cache.loads.lock().is_empty(), "the slot is forgotten");
+        assert!(cache.no_load_in_flight(), "the flight is forgotten");
 
         let failed = cache
-            .get_or_load("f", "", || async { Err::<(Bytes, String), _>("boom") })
+            .get_or_load("f", "", || async {
+                Err::<(Bytes, String), _>(EngineError::NotFound("boom".into()))
+            })
             .await;
         assert!(failed.is_err());
         assert!(cache.get("f").is_none(), "a failed load is not cached");
         let (data, hit) = cache
             .get_or_load("f", "", || async {
-                Ok::<_, &str>((Bytes::from_static(b"x"), "s".to_string()))
+                Ok::<_, EngineError>((Bytes::from_static(b"x"), "s".to_string()))
             })
             .await
             .unwrap();
         assert_eq!((&data[..], hit), (&b"x"[..], false));
+    }
+
+    /// A failed load is one answer to every caller that waited for it: K
+    /// concurrent cold reads of a reference that the backend refuses send
+    /// one GET, not K.
+    #[tokio::test]
+    async fn a_failed_load_is_answered_once_to_every_waiter() {
+        let cache = ReferenceCache::new(10);
+        let loads = std::sync::atomic::AtomicUsize::new(0);
+        let load = || async {
+            loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Err::<(Bytes, String), _>(EngineError::MissingReference("ds".into()))
+        };
+        let got =
+            futures::future::join_all((0..8).map(|_| cache.get_or_load("k", "s1", load))).await;
+        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(got
+            .iter()
+            .all(|r| matches!(r, Err(EngineError::MissingReference(d)) if d == "ds")));
+        assert!(cache.no_load_in_flight());
+    }
+
+    /// A caller that is cancelled during its load leaves nothing behind.
+    #[tokio::test]
+    async fn a_cancelled_load_leaves_no_entry() {
+        let cache = ReferenceCache::new(10);
+        for key in ["a", "b", "c"] {
+            let slow = cache.get_or_load(key, "s", || async {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                Ok::<_, crate::deltaglider::engine::EngineError>((
+                    Bytes::from_static(b"x"),
+                    "s".to_string(),
+                ))
+            });
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(20), slow).await;
+        }
+        assert!(cache.no_load_in_flight(), "a cancelled load left its entry");
     }
 
     #[test]

@@ -10,8 +10,9 @@
 //! removes the flight, so a cancelled request leaves nothing behind.
 //!
 //! THE single-flight primitive: the cold bucket check of the S3 write paths
-//! (`api::handlers::ensure_bucket_exists`) and the routing resolver's
-//! bucket probe (`storage::routing`) both use it. The source guard
+//! (`api::handlers::ensure_bucket_exists`), the routing resolver's bucket
+//! probe (`storage::routing`) and the reference cache's load
+//! (`deltaglider::cache`) use it. The source guard
 //! `single_flights_use_the_shared_primitive` refuses a hand-rolled one.
 
 use std::collections::HashMap;
@@ -181,20 +182,28 @@ mod tests {
     }
 
     /// Source guard: a single flight is this primitive, not a hand-rolled
-    /// map of `OnceCell`s. A hand-rolled one forgot to share a failed
-    /// answer and to remove a cancelled caller's entry (review 2d). The
-    /// lifecycle preview cells are a cache with a TTL (they keep their
-    /// answer past the flight by design), not a single flight.
+    /// map of `OnceCell`s or of async mutexes. A hand-rolled one forgot to
+    /// share a failed answer and to remove a cancelled caller's entry
+    /// (review 2d: the bucket check, the routing probe, then the reference
+    /// cache, a map of `tokio::sync::Mutex<()>`). The lifecycle preview
+    /// cells are a cache with a TTL (they keep their answer past the flight
+    /// by design), not a single flight. The deltaspace lock table
+    /// (`engine/locking.rs`) is a lock, not a single flight: each holder
+    /// does its own work under it.
     #[test]
     fn single_flights_use_the_shared_primitive() {
-        const ALLOWED: &[&str] = &["src/single_flight.rs", "src/lifecycle/worker.rs"];
+        const ONCE_CELL_ALLOWED: &[&str] = &["src/single_flight.rs", "src/lifecycle/worker.rs"];
+        const MUTEX_MAP_ALLOWED: &[&str] = &["src/deltaglider/engine/locking.rs"];
         let mut offenders = Vec::new();
         for (rel, text) in crate::source_scan::prod_sources("src") {
-            if ALLOWED.contains(&rel.as_str()) {
-                continue;
-            }
             for (n, line) in crate::source_scan::prod_lines(&text) {
-                if line.contains("OnceCell<") && !line.contains("OnceLock") {
+                let once_cell = line.contains("OnceCell<")
+                    && !line.contains("OnceLock")
+                    && !ONCE_CELL_ALLOWED.contains(&rel.as_str());
+                let mutex_map = line.contains("Map<")
+                    && line.contains("Mutex<()>")
+                    && !MUTEX_MAP_ALLOWED.contains(&rel.as_str());
+                if once_cell || mutex_map {
                     offenders.push(format!("{rel}:{n}: {}", line.trim()));
                 }
             }

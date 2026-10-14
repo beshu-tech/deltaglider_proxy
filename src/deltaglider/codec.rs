@@ -112,6 +112,27 @@ pub enum CodecError {
     Io(#[from] std::io::Error),
 }
 
+impl CodecError {
+    /// A second error of the same variant and text, for an error that one
+    /// single flight hands to each of its waiters (`crate::single_flight`).
+    /// The match is exhaustive, so a new variant must say how it is copied.
+    pub(crate) fn duplicate(&self) -> Self {
+        match self {
+            Self::EncodeFailed(s) => Self::EncodeFailed(s.clone()),
+            Self::DecodeFailed(s) => Self::DecodeFailed(s.clone()),
+            Self::TimedOut(s) => Self::TimedOut(s.clone()),
+            Self::TooLarge { size, max } => Self::TooLarge {
+                size: *size,
+                max: *max,
+            },
+            Self::Io(e) => Self::Io(match e.raw_os_error() {
+                Some(code) => std::io::Error::from_raw_os_error(code),
+                None => std::io::Error::new(e.kind(), e.to_string()),
+            }),
+        }
+    }
+}
+
 type IoResult<T> = Result<T, std::io::Error>;
 
 /// The flag a pump raises when its pipe I/O ends, so its watchdog stands

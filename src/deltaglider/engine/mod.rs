@@ -82,6 +82,33 @@ pub enum EngineError {
 }
 
 impl EngineError {
+    /// A second error of the same variant and text, for an error that one
+    /// single flight hands to each of its waiters (`crate::single_flight`).
+    /// The match is exhaustive, so a new variant must say how it is copied.
+    pub(crate) fn duplicate(&self) -> Self {
+        match self {
+            Self::Storage(e) => Self::Storage(e.duplicate()),
+            Self::Codec(e) => Self::Codec(e.duplicate()),
+            Self::NotFound(s) => Self::NotFound(s.clone()),
+            Self::ChecksumMismatch {
+                key,
+                expected,
+                actual,
+            } => Self::ChecksumMismatch {
+                key: key.clone(),
+                expected: expected.clone(),
+                actual: actual.clone(),
+            },
+            Self::MissingReference(s) => Self::MissingReference(s.clone()),
+            Self::TooLarge { size, max } => Self::TooLarge {
+                size: *size,
+                max: *max,
+            },
+            Self::InvalidArgument(s) => Self::InvalidArgument(s.clone()),
+            Self::Overloaded(s) => Self::Overloaded(s.clone()),
+        }
+    }
+
     /// The object does not exist. The engine reports a missing object as
     /// EITHER a top-level `NotFound` OR a storage-level `NotFound` (a stale
     /// cached storage type reads the wrong path), so callers must accept both.
