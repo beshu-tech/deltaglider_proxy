@@ -6,7 +6,7 @@ The example encrypts `db-archive`, where `backup-bot` writes nightly database du
 
 **If you lose the bucket key, the objects that it encrypts are unrecoverable.** A full backup (the **Backup** card on the **System** page) includes a key that is in the config file. It does not include a key that an environment variable supplies, and a backup on the same host is lost with the host. Store every key outside the proxy host as well, for example in a secrets manager.
 
-Per-bucket encryption has two limits in this release. A bucket block takes the modes that the server accepts on a bucket (`aes256-gcm-proxy` or `none` today; the admin UI shows only the modes that the server accepts). And the proxy refuses a bucket block while `config_sync_bucket` is set, because the YAML config is per node. The [encryption reference](../reference/encryption.md#per-bucket-encryption) has the full list of rules.
+A bucket block takes `aes256-gcm-proxy`, `none`, and on an S3 backend also the native modes `sse-kms` and `sse-s3`. The admin UI offers only the modes that the server accepts for the bucket's backend. With `config_sync_bucket` set (several instances), the encryption witness makes an instance that disagrees about a bucket's encryption refuse writes to it, so apply the same configuration on every instance. The [encryption reference](../reference/encryption.md#per-bucket-encryption) has the full list of rules.
 
 ## 1. Give the bucket its own key
 

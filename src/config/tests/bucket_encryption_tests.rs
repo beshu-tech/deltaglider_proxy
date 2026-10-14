@@ -491,23 +491,45 @@ fn bucket_modes_match_the_fatal_rules() {
         ),
         (
             "sse-kms",
-            "{ mode: sse-kms, kms_key_id: \"arn:aws:kms:eu-central-1:1:key/x\" }".to_string(),
+            "{ mode: sse-kms, kms_key_id: \"arn:aws:kms:eu-central-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab\" }".to_string(),
         ),
         ("sse-s3", "{ mode: sse-s3 }".to_string()),
     ];
-    let cfg = Config::from_yaml_str(&named("{ backend: local-disk }")).unwrap();
-    let offered = cfg.bucket_encryption_modes("local-disk");
-    for (mode, block) in blocks {
-        let errs = fatal(&named(&format!(
-            "{{ backend: local-disk, encryption: {block} }}"
-        )));
-        let accepted = !errs.iter().any(|e| e.contains("bucket 'db-archive'"));
-        assert_eq!(
-            accepted,
-            offered.contains(&mode),
-            "mode {mode}: the server accepts it = {accepted}, the UI offers it = {}: {errs:?}",
-            offered.contains(&mode)
-        );
+    // A filesystem backend (local-disk) and an S3 backend (aws-dr): native
+    // SSE is offered, and accepted, only on S3.
+    let doc = |bucket: &str| {
+        format!(
+            r#"
+storage:
+  backends:
+    - name: local-disk
+      type: filesystem
+      path: /tmp/dgp-bucket-modes
+    - name: aws-dr
+      type: s3
+      region: eu-central-1
+      access_key_id: AKIAEXAMPLE
+      secret_access_key: example-secret
+  buckets:
+    db-archive: {bucket}
+"#
+        )
+    };
+    let cfg = Config::from_yaml_str(&doc("{ backend: local-disk }")).unwrap();
+    for backend in ["local-disk", "aws-dr"] {
+        let offered = cfg.bucket_encryption_modes(backend);
+        for (mode, block) in &blocks {
+            let errs = fatal(&doc(&format!(
+                "{{ backend: {backend}, encryption: {block} }}"
+            )));
+            let accepted = !errs.iter().any(|e| e.contains("bucket 'db-archive'"));
+            assert_eq!(
+                accepted,
+                offered.contains(mode),
+                "{backend}, mode {mode}: the server accepts it = {accepted}, the UI offers it = {}: {errs:?}",
+                offered.contains(mode)
+            );
+        }
     }
 }
 

@@ -44,7 +44,10 @@ impl EncryptionSite {
 /// server learns to accept appears in the UI with no client change. The
 /// test `bucket_modes_match_the_fatal_rules` ties this list to
 /// [`Config::bucket_encryption_errors`].
-pub const BUCKET_ENCRYPTION_MODES: &[&str] = &["none", "aes256-gcm-proxy"];
+pub const BUCKET_ENCRYPTION_MODES: &[&str] = &["none", "aes256-gcm-proxy", "sse-kms", "sse-s3"];
+
+/// The native S3 modes: a filesystem backend refuses them on a bucket.
+const NATIVE_MODES: &[&str] = &["sse-kms", "sse-s3"];
 
 /// One bucket override with the storage it applies to.
 #[derive(Debug, Clone)]
@@ -354,8 +357,15 @@ impl Config {
 
     /// The modes that the own `encryption` block of a bucket stored on
     /// `backend` accepts (see [`BUCKET_ENCRYPTION_MODES`]).
-    pub fn bucket_encryption_modes(&self, _backend: &str) -> Vec<&'static str> {
-        BUCKET_ENCRYPTION_MODES.to_vec()
+    pub fn bucket_encryption_modes(&self, backend: &str) -> Vec<&'static str> {
+        let on_filesystem = self
+            .backend_by_name(backend)
+            .is_some_and(|def| matches!(def, BackendConfig::Filesystem { .. }));
+        BUCKET_ENCRYPTION_MODES
+            .iter()
+            .copied()
+            .filter(|m| !(on_filesystem && NATIVE_MODES.contains(m)))
+            .collect()
     }
 
     /// Bucket overrides in proxy mode with no key (the engine refuses every

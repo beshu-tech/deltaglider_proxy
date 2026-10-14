@@ -94,24 +94,28 @@ pub fn effective_encryption(
 ) -> Option<EffectiveEncryption> {
     let name = bucket.to_ascii_lowercase();
     let e = cfg.encryption_for_listed_bucket(&name, held_by)?;
+    // The mode and key id as the engine writes them (WriteEncryption: the
+    // proxy key id, or the KMS key of SSE-KMS).
+    let write = e.write_encryption();
     let keys = e.site_keys();
     let primary_ok = matches!(keys.primary, Some(Ok(_)));
-    let (has_key, kms_key_id, encrypts) = match e.config {
-        BackendEncryptionConfig::None { .. } => (false, None, false),
-        BackendEncryptionConfig::Aes256GcmProxy { key, .. } => (key.is_some(), None, primary_ok),
-        BackendEncryptionConfig::SseKms { kms_key_id, .. } => {
-            (true, Some(kms_key_id.clone()), true)
+    let (has_key, encrypts) = match e.config {
+        BackendEncryptionConfig::None { .. } => (false, false),
+        BackendEncryptionConfig::Aes256GcmProxy { key, .. } => (key.is_some(), primary_ok),
+        BackendEncryptionConfig::SseKms { .. } | BackendEncryptionConfig::SseS3 { .. } => {
+            (true, true)
         }
-        BackendEncryptionConfig::SseS3 { .. } => (true, None, true),
     };
-    // With no key, an explicit id still shows (what the writes would carry).
-    let key_id = keys
-        .primary_id()
-        .map(str::to_string)
-        .or_else(|| match e.config {
-            BackendEncryptionConfig::Aes256GcmProxy { key_id, .. } => key_id.clone(),
-            _ => None,
-        });
+    let is_kms = matches!(e.config, BackendEncryptionConfig::SseKms { .. });
+    let kms_key_id = write.key_id.clone().filter(|_| is_kms);
+    // The proxy key id of the writes. With no key, an explicit id still
+    // shows (what the writes would carry once a key is set).
+    let key_id = match e.config {
+        BackendEncryptionConfig::Aes256GcmProxy { key_id, .. } => {
+            write.key_id.clone().or_else(|| key_id.clone())
+        }
+        _ => None,
+    };
     let legacy_key_id = keys
         .legacy_id()
         .map(str::to_string)
@@ -137,7 +141,7 @@ pub fn effective_encryption(
     let inherited = backend_own(cfg, &e.backend)?;
     Some(EffectiveEncryption {
         inherited,
-        mode: e.config.mode_tag().to_string(),
+        mode: write.mode.clone(),
         source: if e.from_bucket { "bucket" } else { "backend" },
         backend: e.backend.clone(),
         has_key,
@@ -239,6 +243,36 @@ storage:
         // The JSON never carries a key.
         let json = serde_json::to_string(&e).unwrap();
         assert!(!json.contains(KB), "{json}");
+    }
+
+    /// Native SSE on a bucket of an S3 backend (P3): the KMS key is the
+    /// key id of the write, and the bucket offers every mode.
+    #[test]
+    fn a_native_bucket_mode_reports_its_kms_key() {
+        let arn = "arn:aws:kms:eu-central-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab";
+        let c = Config::from_yaml_str(&format!(
+            r#"
+storage:
+  backends:
+    - name: aws-dr
+      type: s3
+      region: eu-central-1
+      access_key_id: AKIAEXAMPLE
+      secret_access_key: example-secret
+  buckets:
+    db-archive: {{ backend: aws-dr, encryption: {{ mode: sse-kms, kms_key_id: "{arn}" }} }}
+"#
+        ))
+        .unwrap();
+        let e = effective_encryption(&c, "db-archive", None).unwrap();
+        assert_eq!((e.mode.as_str(), e.source), ("sse-kms", "bucket"));
+        assert_eq!(e.kms_key_id.as_deref(), Some(arn));
+        assert_eq!(e.key_id, None);
+        assert!(e.encrypts && !e.reencrypt);
+        assert_eq!(
+            e.bucket_modes,
+            vec!["none", "aes256-gcm-proxy", "sse-kms", "sse-s3"]
+        );
     }
 
     #[test]

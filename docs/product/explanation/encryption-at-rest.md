@@ -47,7 +47,7 @@ The keyring is bounded by the config: it never holds a key that the YAML does no
 
 With a bucket key, the bodies of the bucket's objects, of their deltas and of the bucket's delta references are encrypted under that key. The metadata is plaintext, as under every mode (see below). The other buckets on the backend are not affected: they keep the encryption of the backend, or their own block.
 
-Per-bucket encryption has two limits in this release. A bucket block takes only `aes256-gcm-proxy` or `none`; native SSE stays a backend setting. And the proxy refuses a bucket block while `config_sync_bucket` is set, because the YAML config is per node: two nodes with different blocks would write one bucket under two keys, and no node would detect it.
+A bucket block can also use native SSE (`sse-kms`, `sse-s3`) when the bucket is on an S3 backend; a filesystem backend would store the bytes as they are, so it refuses them. The YAML config is per node, so with several instances two nodes with different blocks could write one bucket under two keys. The encryption witness in the sync bucket detects that: an instance that disagrees about a bucket refuses writes to it.
 
 ## Why enabling isn't retroactive
 
