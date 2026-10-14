@@ -657,6 +657,8 @@ pub(crate) async fn destination_count_on_backend(
     let def = cfg
         .backend_by_name(backend)
         .ok_or_else(|| format!("unknown backend '{backend}'"))?;
+    // Backend-level: the raw client of the target backend, not a
+    // bucket's encryption (allowed by `bucket_encryption_rule_has_one_home`).
     let enc = cfg
         .backend_encryption_by_name(backend)
         .cloned()

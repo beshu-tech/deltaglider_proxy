@@ -804,6 +804,8 @@ pub async fn legacy_key_usage(
     };
     {
         let cfg = state.config.read().await;
+        // Backend-level: the legacy key is the backend's own (allowed by
+        // `bucket_encryption_rule_has_one_home`).
         let enc = cfg
             .backend_encryption_by_name(&name)
             .ok_or(AdminError::not_found(format!("no backend named '{name}'")))?;
@@ -813,9 +815,10 @@ pub async fn legacy_key_usage(
             if registry.is_reserved(&b.name) {
                 continue;
             }
+            // The buckets whose encryption comes from this backend.
             if cfg
-                .effective_backend_for_bucket(&b.name)
-                .is_some_and(|(n, _)| n == name)
+                .encryption_for_bucket(&b.name)
+                .is_some_and(|e| e.backend == name)
             {
                 if let Some(e) = &b.unavailable {
                     usage.error(format!("{}: {e}", b.name));

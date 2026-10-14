@@ -646,6 +646,16 @@ pub(crate) fn backend_encryption_env_names(backend_name: &str) -> (String, Strin
     }
 }
 
+/// What [`Config::encryption_for_bucket`] resolves for one bucket.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BucketEncryption<'a> {
+    /// The backend the encryption comes from. A derived key id mixes this
+    /// name in (`derive_key_id`), so it is also the key-id scope.
+    pub backend: String,
+    /// The encryption config that the bucket's writes use.
+    pub config: &'a BackendEncryptionConfig,
+}
+
 /// A named storage backend with its connection configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct NamedBackendConfig {
@@ -1792,6 +1802,20 @@ impl Config {
             .iter()
             .find(|b| b.name == name)
             .map(|b| &b.encryption)
+    }
+
+    /// THE encryption that applies to `bucket`'s objects: the one every
+    /// "how is this bucket encrypted" question (the re-encrypt target,
+    /// legacy-key usage, summaries) asks. Today it is the encryption of the
+    /// bucket's effective backend; per-bucket encryption (issue #116) will
+    /// plug in here. `None` = the bucket routes to an undefined backend.
+    /// The source test `bucket_encryption_rule_has_one_home` refuses
+    /// [`Self::backend_encryption_by_name`] outside the allowed
+    /// backend-level views.
+    pub fn encryption_for_bucket(&self, bucket: &str) -> Option<BucketEncryption<'_>> {
+        let (backend, _) = self.effective_backend_for_bucket(bucket)?;
+        let config = self.backend_encryption_by_name(&backend)?;
+        Some(BucketEncryption { backend, config })
     }
 
     /// `(name, definition)` of the backend a bucket routes to by config: its

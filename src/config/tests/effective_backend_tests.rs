@@ -146,3 +146,60 @@ fn effective_backend_rule_has_one_home() {
         "resolve the bucket's backend with Config::effective_backend_for_bucket: {offenders:?}"
     );
 }
+
+/// Issue #116 P0.4: the encryption of a BUCKET has one home,
+/// `Config::encryption_for_bucket`. A call site that reads a backend's
+/// encryption by name to decide a bucket's would miss a per-bucket
+/// override later. Only the backend-level views listed here may ask
+/// about a backend by name, each the given number of times.
+#[test]
+fn bucket_encryption_rule_has_one_home() {
+    let needle = concat!("backend_encryption", "_by_name(");
+    let allowed: &[(&str, usize, &str)] = &[
+        // The definition and the resolver.
+        ("src/config/mod.rs", 2, "home"),
+        // GET /backends/:name/legacy-key-usage: the backend's own legacy key.
+        ("src/api/admin/backends.rs", 1, "backend-level view"),
+        // destination_count_on_backend: the raw client of a target backend.
+        ("src/maintenance/migrate.rs", 1, "backend-level client"),
+    ];
+    let mut offenders = Vec::new();
+    for path in crate::source_scan::rust_files("src") {
+        let rel = crate::source_scan::rel(&path);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let n = text.matches(needle).count();
+        let limit = allowed
+            .iter()
+            .find(|(f, _, _)| *f == rel)
+            .map_or(0, |(_, n, _)| *n);
+        if n > limit {
+            offenders.push(format!("{rel}: {n} (allowed {limit})"));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "decide a bucket's encryption with Config::encryption_for_bucket: {offenders:?}"
+    );
+}
+
+/// `encryption_for_bucket` answers with the effective backend's
+/// encryption (no bucket override exists yet), and `None` for a route to
+/// an undefined backend.
+#[test]
+fn encryption_for_bucket_follows_the_effective_backend() {
+    let mut cfg = Config::from_yaml_str(NAMED).unwrap();
+    cfg.backends[1].encryption = BackendEncryptionConfig::Aes256GcmProxy {
+        key: Some("ab".repeat(32)),
+        key_id: Some("local-2026".into()),
+        legacy_key: None,
+        legacy_key_id: None,
+    };
+    let e = cfg.encryption_for_bucket("db-archive").unwrap();
+    assert_eq!(e.backend, "local-disk");
+    assert_eq!(e.config, &cfg.backends[1].encryption);
+    let e = cfg.encryption_for_bucket("releases").unwrap();
+    assert_eq!(e.backend, "hetzner-fsn1");
+    assert_eq!(e.config.mode_tag(), "none");
+    cfg.buckets.get_mut("releases").unwrap().backend = Some("gone".into());
+    assert!(cfg.encryption_for_bucket("releases").is_none());
+}
