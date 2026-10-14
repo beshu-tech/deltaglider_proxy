@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+### Fixed — The Jobs editor no longer mixes up two rules with the same name
+
+The Jobs screen found a rule in the editor by its name. When you typed the
+name of a new rule through the name of a rule that already existed
+("nightly" on the way to "nightly-eu"), the drawer moved onto the existing
+rule, the next keys renamed that rule, and **Review & apply** swapped the
+two definitions. A draft whose name you cleared disappeared from the table
+and left an empty drawer. Each rule in the editor now has an identity of
+its own that the browser keeps and never sends to the proxy. The drawer,
+the table and **Remove draft** use it. A draft with an empty name shows as
+"(unnamed)". A rename shows as a removed rule and a draft, because the
+proxy deletes the old rule and creates the new one, and after the apply
+the drawer follows the rule to its new name. The cached result of a
+replication rule's **Verify** tab is dropped when the rule is deleted,
+renamed or changed, so a new rule with the same name does not show it.
+
+### Fixed — One toast when a lifecycle Run now ends
+
+A lifecycle **Run now** showed two toasts when the run ended: one from the
+Jobs screen and one from the confirmation dialog. The dialog compared the
+browser clock with the start time that the proxy recorded, so with a clock
+difference its toast did not show at all. The Jobs screen now shows one
+toast. It waits for the job row to settle, which compares only times from
+the proxy, and then reads the run record, so the toast names what the run
+did, for example "finished: deleted 80".
+
+### Fixed — The object browser shows an upload on a later page at once
+
+After an upload, a delete or a copy, the object browser lists the whole
+folder again. When the 60-second refresh started during that listing, it
+replaced it. The refresh lists the first page only and keeps the later
+pages from before, so an object that sorted onto a later page did not show
+until the next full reload. A refresh no longer starts while a full listing
+is in progress. Also, a refresh that a hidden browser tab skipped now runs
+as soon as the tab shows again.
+
+### Fixed — The object inspector shows the new object after an overwrite
+
+The inspector read the object's headers once, when it opened. When the
+object was overwritten under the same key, the inspector kept the stored
+size, the storage type and the headers of the old object. It now reads the
+headers again when the listing shows a new ETag for the object.
+
 ### Fixed — A copy during a re-encryption no longer serves ciphertext
 
 A server-side copy checks that its source did not change after the copy
