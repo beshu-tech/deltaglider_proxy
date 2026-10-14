@@ -398,6 +398,37 @@ pub async fn create_bucket_on_backend(
     }))
 }
 
+#[derive(Deserialize)]
+pub struct EncryptionPreviewQuery {
+    pub backend: String,
+}
+
+/// GET /api/admin/buckets/:bucket/encryption-preview?backend=B — the
+/// `effective_encryption` that a bucket of this name would get when it is
+/// created on backend `B` without an encryption block of its own: the
+/// backend's encryption, or the block of settings that this name already
+/// has (pre-provisioned). The create dialog shows this answer instead of
+/// resolving it itself (issue #116 P2, review defect 5).
+pub async fn bucket_encryption_preview(
+    State(state): State<Arc<AdminState>>,
+    Path(bucket): Path<String>,
+    crate::api::admin::extract::AdminQuery(q): crate::api::admin::extract::AdminQuery<
+        EncryptionPreviewQuery,
+    >,
+) -> Result<Json<super::bucket_encryption_view::EffectiveEncryption>, AdminError> {
+    let bucket = super::admit_bucket::<super::Text>(&state, bucket.trim())?.into_string();
+    let key = bucket.to_ascii_lowercase();
+    let mut cfg = state.config.read().await.clone();
+    // The config the create would make (route only), then THE resolver.
+    route_bucket(&mut cfg, &key, q.backend.trim(), None)?;
+    super::bucket_encryption_view::effective_encryption(&cfg, &key, Some(q.backend.trim()))
+        .map(Json)
+        .ok_or(AdminError::invalid(format!(
+            "Unknown backend '{}'",
+            q.backend.trim()
+        )))
+}
+
 /// Route `bucket_key` to `backend_name` in `cfg`, with the bucket's own
 /// encryption block when one is given (the edit of
 /// [`create_bucket_on_backend`]).

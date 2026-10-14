@@ -1934,3 +1934,58 @@ async fn settings_of_a_bucket_that_does_not_exist_can_be_removed() {
         "removing a key of an existing bucket: {code} {v}"
     );
 }
+
+/// Review P2, defect 5: the create dialog asks the server what a new
+/// bucket would get on a backend, also for a name that already has
+/// settings (pre-provisioned with its own block).
+#[tokio::test]
+async fn the_encryption_preview_of_a_new_bucket() {
+    let env = spawn(
+        Shape::NamedFs,
+        Some(BACKEND_A),
+        "    ghost: { backend: aws-dr, encryption: { mode: none } }\n",
+        "",
+        "releases",
+    )
+    .await;
+    let preview = |bucket: &'static str, backend: &'static str| {
+        let admin = env.admin.clone();
+        let url = format!(
+            "{}/_/api/admin/buckets/{bucket}/encryption-preview?backend={backend}",
+            env.server.endpoint()
+        );
+        async move {
+            let resp = admin.get(url).send().await.unwrap();
+            (
+                resp.status().as_u16(),
+                resp.json::<serde_json::Value>().await.unwrap_or_default(),
+            )
+        }
+    };
+    let (code, v) = preview("db-archive", "local-disk").await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(
+        (&v["mode"], &v["source"], &v["key_id"]),
+        (
+            &json!("aes256-gcm-proxy"),
+            &json!("backend"),
+            &json!("local-a")
+        ),
+        "{v}"
+    );
+    let (_, v) = preview("db-archive", "aws-dr").await;
+    assert_eq!(
+        (&v["mode"], &v["backend"]),
+        (&json!("none"), &json!("aws-dr")),
+        "{v}"
+    );
+    // A pre-provisioned name keeps its own block.
+    let (_, v) = preview("ghost", "aws-dr").await;
+    assert_eq!(
+        (&v["mode"], &v["source"]),
+        (&json!("none"), &json!("bucket")),
+        "{v}"
+    );
+    let (code, _) = preview("db-archive", "gone").await;
+    assert_eq!(code, 400);
+}
