@@ -706,6 +706,27 @@ pub(crate) async fn destination_count_on_backend(
     Ok((count, listing.next_start_after.is_some()))
 }
 
+/// THE flip of a migrate: route `bucket_key` to `target` (its policy, with
+/// its `encryption` block, moves along) and drop the staging route. The
+/// alias is pinned to the name the copies used (the real name BEFORE the
+/// flip): setting `backend` activates `alias`. The migrate start runs it on
+/// a copy to judge the encryption downgrade before the job exists.
+pub(crate) fn apply_flip(
+    cfg: &mut crate::config::Config,
+    bucket_key: &str,
+    target: &str,
+    transient: Option<&str>,
+) {
+    let real = real_bucket_name(&cfg.buckets, bucket_key).to_string();
+    let mut policy = cfg.buckets.get(bucket_key).cloned().unwrap_or_default();
+    policy.alias = (real != bucket_key).then_some(real);
+    policy.backend = Some(target.to_string());
+    cfg.buckets.insert(bucket_key.to_string(), policy);
+    if let Some(transient) = transient {
+        cfg.buckets.remove(transient);
+    }
+}
+
 /// Pure: refuse a migrate to a backend that the health loop gates (its
 /// credentials are refused, or it does not answer): every copy would fail.
 pub fn target_health_refusal(
@@ -1125,16 +1146,7 @@ impl MigrateRun<'_> {
             // clients to the source while the resumed cleanup deletes it.
             .mutate_and_apply_strict(
                 &format!("Bucket '{bucket_key}' migrated to backend '{target}'"),
-                move |cfg| {
-                    // Pin the alias to the name the copies used (the real name
-                    // BEFORE the flip): setting `backend` activates `alias`.
-                    let real = real_bucket_name(&cfg.buckets, &bucket_key).to_string();
-                    let mut policy = cfg.buckets.get(&bucket_key).cloned().unwrap_or_default();
-                    policy.alias = (real != bucket_key).then_some(real);
-                    policy.backend = Some(target);
-                    cfg.buckets.insert(bucket_key, policy);
-                    cfg.buckets.remove(&transient);
-                },
+                move |cfg| apply_flip(cfg, &bucket_key, &target, Some(&transient)),
             )
             .await?;
         info!(

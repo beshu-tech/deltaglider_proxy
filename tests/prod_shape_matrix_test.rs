@@ -905,6 +905,9 @@ async fn jobs_matrix(ps: &ProdShape) {
     .await;
     let resp = admin
         .post(format!("{ep}/_/api/admin/buckets/scratch/migrate"))
+        // Off the encrypted backend onto a plaintext one: a confirmed
+        // downgrade (issue #116 P3).
+        .header("X-DGP-Confirm-Encryption-Downgrade", "scratch")
         .json(&serde_json::json!({ "target_backend": "hetzner-fsn1", "delete_source": false }))
         .send()
         .await

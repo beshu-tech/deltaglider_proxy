@@ -5,6 +5,11 @@
 pub mod advisories;
 mod bucket_encryption;
 pub use bucket_encryption::{BucketOverride, EncryptionSite};
+mod encryption_state;
+pub(crate) use encryption_state::confirmed_downgrades;
+pub use encryption_state::{
+    EncryptionChange, EncryptionChangeKind, WriteEncryption, CONFIRM_ENCRYPTION_DOWNGRADE_HEADER,
+};
 mod keys;
 pub(crate) use keys::*;
 mod check;
@@ -739,6 +744,11 @@ impl BucketEncryption<'_> {
             None => KeyScope::Backend(&self.backend),
         };
         resolve_site_keys(scope, self.config)
+    }
+
+    /// The mode and the public key id that new writes use.
+    pub fn write_encryption(&self) -> WriteEncryption {
+        WriteEncryption::of(self.config, self.site_keys().primary_id())
     }
 }
 
@@ -1929,9 +1939,34 @@ impl Config {
                 owner: Some(owner),
             });
         }
-        let config = self.backend_encryption_by_name(&backend)?;
+        self.encryption_for_storage(&backend, &storage.1)
+    }
+
+    /// The encryption of the stored bucket `real_bucket` on the raw backend
+    /// `backend`: the override that belongs to that storage, else the
+    /// backend's own encryption. What the engine's wrapper of `backend`
+    /// writes `real_bucket` with; the multi-instance witness compares it.
+    /// `None` = no such backend.
+    pub fn encryption_for_storage(
+        &self,
+        backend: &str,
+        real_bucket: &str,
+    ) -> Option<BucketEncryption<'_>> {
+        if let Some(o) = self
+            .bucket_encryption_overrides()
+            .into_iter()
+            .find(|o| o.backend == backend && o.real_bucket == real_bucket)
+        {
+            return Some(BucketEncryption {
+                backend: backend.to_string(),
+                config: o.config,
+                from_bucket: true,
+                owner: Some(o.bucket.to_string()),
+            });
+        }
+        let config = self.backend_encryption_by_name(backend)?;
         Some(BucketEncryption {
-            backend,
+            backend: backend.to_string(),
             config,
             from_bucket: false,
             owner: None,

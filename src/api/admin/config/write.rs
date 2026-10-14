@@ -251,6 +251,7 @@ pub(super) async fn run(
                 &old,
                 &p.new_cfg,
                 &super::transition::confirmed_key_removals(write.headers),
+                Some(&crate::config::confirmed_downgrades(write.headers)),
             ) {
                 // What the apply would refuse, a validate refuses too.
                 Err(error) => Outcome::Rejected(Rejection {

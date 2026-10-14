@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added — Audit entries for a bucket's encryption, and a confirmed downgrade
+
+Every change of a bucket's write encryption now writes one audit entry: `bucket_encryption_set`, `bucket_encryption_cleared` or `bucket_encryption_key_rotated`. The target names the mode and the key id before and after the change, never key material. The config transition writes them, so every write path does: a config apply, a section PUT, a field PATCH, the backend endpoints, a backup restore, and the flip of a migrate (user `background`).
+
+### Changed — A change that makes a bucket store plaintext needs a confirmation
+
+A config write that makes a bucket store new objects in plaintext where it encrypted them before (`mode: none`, a removed block on a plaintext backend, a move to a plaintext backend, or the backend's own `mode: none`) is refused unless the request carries `X-DGP-Confirm-Encryption-Downgrade: <bucket>` (or `backend:<name>` for a backend's own change). `config apply` has the new flag `--confirm-encryption-downgrade`. The migrate start runs the same gate. A start from an edited file is not gated. **Upgrade note:** a script or the admin UI that sets `mode: none` must now send the confirmation.
+
 ### Added — A bucket can use native SSE (`sse-kms`, `sse-s3`)
 
 A bucket on an S3 backend can now set `mode: sse-kms` or `mode: sse-s3` in its own `encryption` block. The S3 backend keeps one client and picks the SSE headers of each request (PutObject, CreateMultipartUpload, CopyObject, UploadPartCopy, folder markers, listing facts) from the bucket that the request writes to. One backend can hold proxy-AES, SSE and plaintext buckets side by side: a bucket that encrypts in the proxy gets no SSE headers (never encrypted twice), and `mode: none` on a bucket means plaintext also on a backend with native SSE. A server-side copy takes the SSE headers of the destination bucket. A bucket in a native mode on a filesystem backend is refused. The KMS permissions that the backend's credentials need are in the encryption reference.

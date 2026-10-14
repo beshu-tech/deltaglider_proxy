@@ -178,7 +178,7 @@ A bucket can have its own key on a shared backend ([per-bucket encryption](../re
 
 The proxy refuses an apply that removes the key that a bucket writes with, because the objects written under that key would become unreadable. Remove a bucket key in two steps:
 
-1. Set the bucket's `mode` to `none`, and apply. The proxy keeps the old key as the bucket's `legacy_key`. New writes to the bucket are plaintext, and the old objects stay readable.
+1. Set the bucket's `mode` to `none`, and apply with the confirmation of the downgrade (`config apply --confirm-encryption-downgrade db-archive`, or the header `X-DGP-Confirm-Encryption-Downgrade: db-archive`). Without it, the proxy refuses the apply. The proxy keeps the old key as the bucket's `legacy_key`. New writes to the bucket are plaintext, and the old objects stay readable.
 2. Run the re-encrypt job for the bucket. Under `mode: none`, it decrypts the old objects.
 3. Check the scan, as in step 4 of the rotation. When `safe_to_clear` is `true`, remove the bucket's `encryption` block, and apply with `--confirm-key-removal` and the old key id, as in step 5 of the rotation. The bucket then uses the encryption of its backend again.
 

@@ -45,7 +45,7 @@ Emits per-field defaults and doc-comment descriptions as JSON Schema. The output
 ## `config apply`
 
 ```text
-deltaglider_proxy config apply <FILE> [--server <URL>] [--timeout <SECS>] [--confirm-key-removal <KEY_ID>]...
+deltaglider_proxy config apply <FILE> [--server <URL>] [--timeout <SECS>] [--confirm-key-removal <KEY_ID>]... [--confirm-encryption-downgrade <SUBJECT>]...
 ```
 
 Sends a full YAML document to a running server with `POST /_/api/admin/config/apply`. The server validates the document, swaps the runtime config atomically, and persists it. Before the command sends the document, it expands `${env:NAME}` references against the environment of the operator. The command refuses an empty rendered body.
@@ -53,6 +53,8 @@ Sends a full YAML document to a running server with `POST /_/api/admin/config/ap
 The command reads the password from the `DGP_BOOTSTRAP_PASSWORD` environment variable. It does not take the password as a flag, because `ps` listings show the command line. The command logs in, holds the session cookie in memory only, and discards it on exit. Defaults: `--server http://127.0.0.1:9000`, `--timeout 30`. A cleartext `http://` URL to a non-loopback host produces a warning. The command echoes the warnings of the server to stderr verbatim.
 
 `--confirm-key-removal <KEY_ID>` (repeatable) confirms that the apply may remove that legacy (decrypt-only) key id from a bucket's `encryption` block. The server refuses such an apply without the confirmation, because objects that still carry the id would become unreadable. Run the legacy-key usage scan first ([per-bucket encryption](encryption.md#changing-a-buckets-encryption)).
+
+`--confirm-encryption-downgrade <SUBJECT>` (repeatable) confirms that the apply may make a bucket store new objects in plaintext where it encrypted them before. The subject is a bucket name, or `backend:<name>` for every bucket that inherits the encryption of that backend. The server refuses such an apply without the confirmation ([a downgrade needs a confirmation](encryption.md#a-downgrade-needs-a-confirmation)).
 
 Exit: `0` applied and persisted (with a stderr note when a restart-only field changed); `5` applied in memory but not persisted (also HTTP errors and login rate-limiting); `6` server rejected the apply; `7` missing/wrong `DGP_BOOTSTRAP_PASSWORD`; `3` local I/O error.
 

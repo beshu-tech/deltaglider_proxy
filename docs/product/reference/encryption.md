@@ -174,7 +174,32 @@ To stop using a bucket key, do these steps:
 3. Check that no object still uses the old key: `GET /_/api/admin/backends/<backend>/legacy-key-usage?bucket=<bucket>`. This scan counts the objects under that key id in every bucket stored on the backend, because an object can carry the id in another bucket too (for example, when two buckets shared the key, or when an object was moved at the storage level).
 4. When the scan answers `"safe_to_clear": true`, remove the bucket's `legacy_key` and `legacy_key_id`, or the whole `encryption` block when its mode is `none`, and confirm the key id as described above.
 
-These gates run on an apply through the admin API. A proxy that starts from an edited file has no previous config to compare with, so the gates do not run at boot.
+#### A downgrade needs a confirmation
+
+A change that makes a bucket store new objects in plaintext, where it encrypted them before, is a downgrade. The proxy refuses a downgrade unless the request confirms it. These changes are downgrades:
+
+- The bucket's block gets `mode: none`.
+- The bucket's block is removed, and the backend of the bucket stores plaintext.
+- The bucket moves to a backend that stores plaintext (a changed `backend:`, or a migrate).
+- The backend's own encryption becomes `mode: none`. This is a downgrade for every bucket on that backend without its own block.
+
+To confirm, send the header `X-DGP-Confirm-Encryption-Downgrade: <subject>` with the request (comma-separated for several subjects), or use `config apply --confirm-encryption-downgrade <subject>`. The subject is the bucket name. For a backend's own downgrade, the subject is `backend:<name>`, and that one confirmation covers every bucket that inherits the backend's encryption. The refusal names the subject that it needs. Every config write runs this gate: the document apply, a section PUT, a field PATCH, the backend endpoints, a backup restore, and `config apply`. The migrate start (`POST /_/api/admin/buckets/<bucket>/migrate`) runs it too, and answers `400` without the confirmation; the flip at the end of the migrate is then not checked again. Objects stored before a downgrade keep their encryption, and they stay readable.
+
+A change from one encrypting mode to another (for example from `aes256-gcm-proxy` to `sse-kms`) and a key rotation are not downgrades.
+
+These gates run on an apply through the admin API. A proxy that starts from an edited file has no previous config to compare with, so the gates do not run at boot: a file edited to `mode: none` takes effect at the next start with no confirmation.
+
+#### Audit entries
+
+Every change of a bucket's write encryption writes one audit entry, whatever the write path: a config apply, a section PUT, a field PATCH, the backend endpoints, a backup restore, or the flip of a migrate. The entry names the mode and the key id before and after the change, never key material. The action is one of these:
+
+| Action | Change |
+|---|---|
+| `bucket_encryption_set` | From plaintext to an encrypting mode, or from one encrypting mode to another. |
+| `bucket_encryption_cleared` | From an encrypting mode to plaintext (a downgrade). |
+| `bucket_encryption_key_rotated` | The same mode with another key id (`kms_key_id` for SSE-KMS). |
+
+The target of the entry is `<subject>: <before> -> <after>`, for example `db-archive: aes256-gcm-proxy (key id 'db-archive-2026') -> none`. The subject is the bucket name, or `backend:<name>` for a change of the backend's own encryption. A change that the proxy makes by itself (the flip of a migrate) has the user `background`.
 
 ### The keyring
 

@@ -376,6 +376,17 @@ pub async fn start_migrate(
                 "Bucket '{bucket}' is already on backend '{target_backend}'"
             )));
         }
+        // A move onto a backend that stores the bucket in plaintext where it
+        // encrypted is a downgrade: the same confirmation as a config
+        // apply (issue #116 P3). The flip itself runs in the background
+        // and is not gated again.
+        let mut flipped = cfg.clone();
+        crate::maintenance::migrate::apply_flip(&mut flipped, &bucket_key, &target_backend, None);
+        let confirmed = crate::config::confirmed_downgrades(Some(&headers));
+        let downgrades = flipped.unconfirmed_encryption_downgrades(&cfg, Some(&confirmed));
+        if !downgrades.is_empty() {
+            return Err(AdminError::invalid(downgrades.join("; ")));
+        }
         MigrateParams {
             target_backend,
             delete_source: body.delete_source,

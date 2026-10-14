@@ -842,6 +842,9 @@ async fn test_section_put_explicit_null_clears_per_backend_encryption_key() {
             "{}/_/api/admin/config/section/storage",
             server.endpoint()
         ))
+        // Disabling the backend's encryption is a downgrade for its buckets:
+        // it needs the confirmation (issue #116 P3).
+        .header("X-DGP-Confirm-Encryption-Downgrade", "backend:default")
         .json(&serde_json::json!({ "backend_encryption": { "mode": "none" } }))
         .send()
         .await

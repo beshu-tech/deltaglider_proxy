@@ -163,6 +163,12 @@ enum ConfigCommand {
         /// object under it. Repeat for several ids.
         #[arg(long = "confirm-key-removal", value_name = "KEY_ID")]
         confirm_key_removal: Vec<String>,
+        /// Confirm that the apply may make this subject store new objects
+        /// in plaintext where it encrypted before: a bucket name, or
+        /// `backend:<name>` for the buckets of a backend that the config
+        /// does not name. Repeat for several subjects.
+        #[arg(long = "confirm-encryption-downgrade", value_name = "SUBJECT")]
+        confirm_encryption_downgrade: Vec<String>,
     },
     /// Validate a config file without applying or hitting a server.
     ///
@@ -239,6 +245,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     server,
                     timeout,
                     confirm_key_removal,
+                    confirm_encryption_downgrade,
                 } => {
                     let mut opts = AdminClientOpts::default();
                     if let Some(s) = server.as_deref() {
@@ -247,7 +254,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(t) = timeout {
                         opts.timeout_secs = *t;
                     }
-                    apply(file, opts, confirm_key_removal)
+                    let confirm = deltaglider_proxy::cli::config::ApplyConfirmations {
+                        key_removal: confirm_key_removal.clone(),
+                        encryption_downgrade: confirm_encryption_downgrade.clone(),
+                    };
+                    apply(file, opts, &confirm)
                 }
                 ConfigCommand::Lint { file } => lint(file),
                 ConfigCommand::Defaults { out } => defaults(out.as_deref()),

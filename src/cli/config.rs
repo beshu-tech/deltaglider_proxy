@@ -453,7 +453,17 @@ impl CliError {
 /// |  5   | persist failed after apply succeeded (runtime OK, disk stale) |
 /// |  7   | missing/wrong `DGP_BOOTSTRAP_PASSWORD` |
 /// |  3   | local IO error (file not found, unreadable, …) |
-pub fn apply(input: &str, opts: AdminClientOpts, confirm_key_removal: &[String]) -> i32 {
+/// The confirmations that a `config apply` sends with the document.
+#[derive(Debug, Default, Clone)]
+pub struct ApplyConfirmations {
+    /// Legacy key ids that the apply may remove (`--confirm-key-removal`).
+    pub key_removal: Vec<String>,
+    /// Subjects (bucket names, `backend:<name>`) that the apply may make
+    /// store plaintext (`--confirm-encryption-downgrade`).
+    pub encryption_downgrade: Vec<String>,
+}
+
+pub fn apply(input: &str, opts: AdminClientOpts, confirm: &ApplyConfirmations) -> i32 {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -461,7 +471,7 @@ pub fn apply(input: &str, opts: AdminClientOpts, confirm_key_removal: &[String])
             return EXIT_IO;
         }
     };
-    match runtime.block_on(apply_async(input, opts, confirm_key_removal)) {
+    match runtime.block_on(apply_async(input, opts, confirm)) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("{}", e.user_message());
@@ -473,7 +483,7 @@ pub fn apply(input: &str, opts: AdminClientOpts, confirm_key_removal: &[String])
 async fn apply_async(
     input: &str,
     opts: AdminClientOpts,
-    confirm_key_removal: &[String],
+    confirm: &ApplyConfirmations,
 ) -> Result<i32, CliError> {
     let yaml =
         std::fs::read_to_string(input).map_err(|e| CliError::Io(format!("read {input}: {e}")))?;
@@ -499,10 +509,18 @@ async fn apply_async(
     );
 
     let mut req = client.post(&url).json(&serde_json::json!({ "yaml": yaml }));
-    if !confirm_key_removal.is_empty() {
+    if !confirm.key_removal.is_empty() {
         // Issue #116 review A: the server refuses to drop a bucket's
         // legacy key id unless the request confirms it.
-        req = req.header("x-dgp-confirm-key-removal", confirm_key_removal.join(","));
+        req = req.header("x-dgp-confirm-key-removal", confirm.key_removal.join(","));
+    }
+    if !confirm.encryption_downgrade.is_empty() {
+        // Issue #116 P3: the server refuses a change that makes a bucket
+        // store plaintext where it encrypted unless the request confirms it.
+        req = req.header(
+            crate::config::CONFIRM_ENCRYPTION_DOWNGRADE_HEADER,
+            confirm.encryption_downgrade.join(","),
+        );
     }
     let resp = req
         .send()

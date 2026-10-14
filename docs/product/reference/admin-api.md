@@ -104,6 +104,8 @@ deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.e
 
 With `bucket=B`, the scan answers for the legacy key id of bucket `B`'s own `encryption` block instead. It still reads the objects and delta references of every bucket stored on the backend, because another bucket can hold objects under the same key id (two buckets that shared a key, or an object moved at the storage level). The response then also has `bucket`. A bucket without its own `encryption` block on backend `:name` returns `404`. An apply that removes a bucket's legacy key is refused unless the request confirms the key id with the header `X-DGP-Confirm-Key-Removal: <key id>` (comma-separated for several ids); `config apply --confirm-key-removal <key id>` sends it.
 
+A config write that makes a bucket store new objects in plaintext where it encrypted them before is refused (`422`, or `400` on the migrate start) unless the request carries the header `X-DGP-Confirm-Encryption-Downgrade: <subject>` (comma-separated for several subjects). The subject is the bucket name, or `backend:<name>` for a change of a backend's own encryption. The refusal names the subjects that it needs. See [a downgrade needs a confirmation](encryption.md#a-downgrade-needs-a-confirmation).
+
 ## IAM (gated by `iam_mode`)
 
 `POST`/`PUT`/`DELETE` return `403 { "error": "iam_declarative" }` when `access.iam_mode: declarative`. Reads stay open for diagnostics.

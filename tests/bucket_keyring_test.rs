@@ -171,16 +171,23 @@ impl Env {
 
     /// PUT a merge-patch of the storage section; the parsed response.
     async fn storage_patch(&self, body: serde_json::Value) -> (u16, serde_json::Value) {
-        let resp = self
-            .admin
-            .put(format!(
-                "{}/_/api/admin/config/section/storage",
-                self.server.endpoint()
-            ))
-            .json(&body)
-            .send()
-            .await
-            .expect("section PUT");
+        self.storage_patch_with(body, &[]).await
+    }
+
+    /// [`Self::storage_patch`] with extra request headers (confirmations).
+    async fn storage_patch_with(
+        &self,
+        body: serde_json::Value,
+        headers: &[(&str, &str)],
+    ) -> (u16, serde_json::Value) {
+        let mut req = self.admin.put(format!(
+            "{}/_/api/admin/config/section/storage",
+            self.server.endpoint()
+        ));
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let resp = req.json(&body).send().await.expect("section PUT");
         let code = resp.status().as_u16();
         (code, resp.json().await.unwrap_or_default())
     }
@@ -463,10 +470,14 @@ async fn removing_a_bucket_override_takes_two_steps() {
     );
     assert_eq!(env.get("releases", "old.txt").await, b"under key A");
 
-    env.storage_patch_ok(
-        json!({ "buckets": { "releases": { "encryption": { "mode": "none" } } } }),
-    )
-    .await;
+    // `mode: none` is a downgrade: it needs its confirmation (issue #116 P3).
+    let (code, v) = env
+        .storage_patch_with(
+            json!({ "buckets": { "releases": { "encryption": { "mode": "none" } } } }),
+            &[("X-DGP-Confirm-Encryption-Downgrade", "releases")],
+        )
+        .await;
+    assert!(code == 200 && v["ok"] == true, "{code} {v}");
     assert_eq!(env.get("releases", "old.txt").await, b"under key A");
     env.put("releases", "new.txt", b"plaintext now").await;
     assert_eq!(env.at_rest("releases", "new.txt").await, None);
@@ -961,4 +972,232 @@ async fn native_sse_per_bucket_minio() {
     let mut want = part1;
     want.extend_from_slice(&part2);
     assert_eq!(env.get(kms, "big.bin").await, want);
+}
+
+// ── Scenario: audit and confirmed downgrade (issue #116 P3) ─────────────
+
+const KC: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+const KD: &str = "4444444444444444444444444444444444444444444444444444444444444444";
+
+/// The audit entries of `action`, newest first, as their targets.
+async fn audit_targets(env: &Env, action: &str) -> Vec<String> {
+    let v: serde_json::Value = env
+        .admin
+        .get(format!(
+            "{}/_/api/admin/audit?limit=500",
+            env.server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entries = v
+        .get("entries")
+        .and_then(|e| e.as_array())
+        .or_else(|| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    entries
+        .iter()
+        .filter(|e| e["action"] == action)
+        .map(|e| e["target"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Every change of a bucket's encryption is one audit entry (key ids,
+/// never keys), and a change that makes the bucket store plaintext where
+/// it encrypted needs its confirmation: the section PUT and the document
+/// apply (through the CLI) refuse it without one and take it with one.
+#[tokio::test]
+async fn a_downgrade_needs_confirmation_and_every_change_is_audited() {
+    let env = spawn(
+        Shape::NamedFs,
+        None,
+        &format!(
+            "    releases: {{ backend: local-disk, encryption: {{ mode: aes256-gcm-proxy, key: \"{KB}\", key_id: releases-b }} }}\n    downloads: {{ backend: local-disk, encryption: {{ mode: aes256-gcm-proxy, key: \"{KC}\", key_id: downloads-c }} }}\n"
+        ),
+        "",
+        "releases",
+    )
+    .await;
+    let endpoint = env.server.endpoint();
+
+    // Section PUT: `mode: none` is refused without the header.
+    let downgrade = json!({ "buckets": { "releases": { "encryption": { "mode": "none" } } } });
+    let (code, v) = env.storage_patch(downgrade.clone()).await;
+    assert!(
+        code == 422
+            && v.to_string()
+                .contains("X-DGP-Confirm-Encryption-Downgrade: releases"),
+        "{code} {v}"
+    );
+    env.put("releases", "still.txt", b"still encrypted").await;
+    assert_eq!(
+        env.at_rest("releases", "still.txt").await.as_deref(),
+        Some("releases-b"),
+        "the refused change changed nothing"
+    );
+    let (code, v) = env
+        .storage_patch_with(
+            downgrade,
+            &[("X-DGP-Confirm-Encryption-Downgrade", "releases")],
+        )
+        .await;
+    assert!(code == 200 && v["ok"] == true, "{code} {v}");
+    env.put("releases", "plain.txt", b"now plaintext").await;
+    assert_eq!(env.at_rest("releases", "plain.txt").await, None);
+    let cleared = audit_targets(&env, "bucket_encryption_cleared").await;
+    assert!(
+        cleared
+            .iter()
+            .any(|t| t == "releases: aes256-gcm-proxy (key id 'releases-b') -> none"),
+        "{cleared:?}"
+    );
+
+    // Back to encrypting needs no confirmation: `set`.
+    env.storage_patch_ok(
+        json!({ "buckets": { "releases": { "encryption": override_json(KA, "releases-a") } } }),
+    )
+    .await;
+    let set = audit_targets(&env, "bucket_encryption_set").await;
+    assert!(
+        set.iter()
+            .any(|t| t == "releases: none -> aes256-gcm-proxy (key id 'releases-a')"),
+        "{set:?}"
+    );
+    // A rotation: `key_rotated`. The key moves to the legacy slot, which
+    // drops the older legacy id `releases-b` (confirmed).
+    let (code, v) = env
+        .storage_patch_with(
+            json!({ "buckets": { "releases": { "encryption": {
+                "mode": "aes256-gcm-proxy", "key": KD, "key_id": "releases-d",
+                "legacy_key": KA, "legacy_key_id": "releases-a" } } } }),
+            &[("X-DGP-Confirm-Key-Removal", "releases-b")],
+        )
+        .await;
+    assert!(code == 200 && v["ok"] == true, "{code} {v}");
+    let rotated = audit_targets(&env, "bucket_encryption_key_rotated").await;
+    assert!(
+        rotated.iter().any(|t| t
+            == "releases: aes256-gcm-proxy (key id 'releases-a') -> aes256-gcm-proxy (key id 'releases-d')"),
+        "{rotated:?}"
+    );
+
+    // The document apply, through the CLI: `downloads` loses its block.
+    let file = std::fs::read_to_string(env.server.config_path()).unwrap();
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(&file).unwrap();
+    doc["storage"]["buckets"]["downloads"]
+        .as_mapping_mut()
+        .unwrap()
+        .remove("encryption");
+    // The key stays readable as the backend's legacy key (the key gate).
+    doc["storage"]["backends"][0]["encryption"] = serde_yaml::from_str(&format!(
+        "{{ mode: none, legacy_key: \"{KC}\", legacy_key_id: downloads-c }}"
+    ))
+    .unwrap();
+    let yaml_path = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(yaml_path.path(), serde_yaml::to_string(&doc).unwrap()).unwrap();
+    let cli = |confirm: &[&str]| {
+        let mut args = vec![
+            "config".to_string(),
+            "apply".into(),
+            yaml_path.path().display().to_string(),
+            "--server".into(),
+            endpoint.clone(),
+        ];
+        for c in confirm {
+            args.push("--confirm-encryption-downgrade".into());
+            args.push(c.to_string());
+        }
+        std::process::Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
+            .current_dir(std::env::temp_dir())
+            .args(args)
+            .env("DGP_BOOTSTRAP_PASSWORD", common::TEST_BOOTSTRAP_PASSWORD)
+            .output()
+            .unwrap()
+    };
+    let refused = cli(&[]);
+    let stderr = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert_eq!(refused.status.code(), Some(6), "{stderr}");
+    assert!(
+        stderr.contains("--confirm-encryption-downgrade downloads"),
+        "{stderr}"
+    );
+    let applied = cli(&["downloads"]);
+    assert_eq!(
+        applied.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    env.put("downloads", "x.txt", b"plain").await;
+    assert_eq!(env.at_rest("downloads", "x.txt").await, None);
+
+    // No audit target ever holds key material.
+    for action in [
+        "bucket_encryption_set",
+        "bucket_encryption_cleared",
+        "bucket_encryption_key_rotated",
+    ] {
+        for t in audit_targets(&env, action).await {
+            for k in [KA, KB, KC, KD] {
+                assert!(!t.contains(k), "{action}: {t}");
+            }
+        }
+    }
+}
+
+/// The migrate start judges the flip: a bucket that inherits an encrypting
+/// backend and moves to a plaintext one needs the confirmation (400
+/// without it); the flip then runs in the background, ungated.
+#[tokio::test]
+async fn a_migrate_onto_plaintext_needs_confirmation() {
+    let env = spawn(
+        Shape::NamedFs,
+        Some(BACKEND_A),
+        "    releases: { backend: local-disk }\n",
+        "",
+        "releases",
+    )
+    .await;
+    env.put("releases", "x.txt", b"encrypted at the source")
+        .await;
+    let endpoint = env.server.endpoint();
+    let start = |confirm: Option<&'static str>| {
+        let mut req = env
+            .admin
+            .post(format!("{endpoint}/_/api/admin/buckets/releases/migrate"))
+            .json(&json!({ "target_backend": "aws-dr", "delete_source": false }));
+        if let Some(c) = confirm {
+            req = req.header("X-DGP-Confirm-Encryption-Downgrade", c);
+        }
+        req.send()
+    };
+    let resp = start(None).await.unwrap();
+    let code = resp.status().as_u16();
+    let body = resp.text().await.unwrap();
+    assert!(
+        code == 400 && body.contains("X-DGP-Confirm-Encryption-Downgrade: releases"),
+        "{code} {body}"
+    );
+    let resp = start(Some("releases")).await.unwrap();
+    assert!(resp.status().is_success(), "migrate: {}", resp.status());
+    wait_job_done(&env.admin, &endpoint, "releases").await;
+    env.put("releases", "after.txt", b"plaintext on aws-dr")
+        .await;
+    let dr = env.dr.as_ref().unwrap();
+    assert_eq!(fs_at_rest(&fs_blob(dr, "releases", "after.txt")), None);
+    assert_eq!(
+        env.get("releases", "x.txt").await,
+        b"encrypted at the source"
+    );
+    let cleared = audit_targets(&env, "bucket_encryption_cleared").await;
+    assert!(
+        cleared
+            .iter()
+            .any(|t| t.starts_with("releases: aes256-gcm-proxy")),
+        "the background flip is audited: {cleared:?}"
+    );
 }

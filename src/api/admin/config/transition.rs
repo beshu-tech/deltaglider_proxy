@@ -242,6 +242,10 @@ pub(crate) async fn apply_config_transition(
     // A bucket whose write encryption changes: existing objects keep their
     // form; the response names the re-encrypt job (issue #116).
     warnings.extend(new_cfg.bucket_encryption_notes(old_cfg));
+    // One audit entry per subject whose write encryption changes (issue
+    // #116 P3): here, so every write path (document, section, field,
+    // backends, backup, migrate flip) emits it once. Key ids only.
+    audit_encryption_changes(&ctx, &new_cfg.encryption_changes(old_cfg));
 
     // The engine store and the config swap are the LAST steps: every check
     // above passed, and the write guard is held across both.
@@ -263,6 +267,25 @@ pub(crate) async fn apply_config_transition(
         warnings,
         discovery,
     })
+}
+
+/// The audit entries of a transition's encryption changes.
+fn audit_encryption_changes(ctx: &TransitionCtx<'_>, changes: &[crate::config::EncryptionChange]) {
+    let none = HeaderMap::new();
+    let (user, headers) = match ctx {
+        TransitionCtx::Admin { headers, .. } => ("admin", *headers),
+        TransitionCtx::Background { .. } => ("background", &none),
+    };
+    for c in changes {
+        crate::audit::audit_log(
+            c.kind.audit_action(),
+            user,
+            &c.audit_target(),
+            headers,
+            c.bucket.as_deref().unwrap_or(""),
+            "",
+        );
+    }
 }
 
 /// The gates of [`transition_gates`] that need no I/O. The validate
@@ -289,6 +312,7 @@ pub(super) fn static_transition_gates(
     old_cfg: &crate::config::Config,
     new_cfg: &crate::config::Config,
     confirmed_key_removals: &[String],
+    confirmed_downgrades: Option<&[String]>,
 ) -> Result<(), String> {
     // FATAL config-graph errors (bucket → undefined backend, duplicate
     // backend names): un-runnable states that boot refuses too.
@@ -299,6 +323,9 @@ pub(super) fn static_transition_gates(
     // A bucket's active key never leaves the keyring in one step (issue
     // #116): its objects would become unreadable.
     fatal.extend(new_cfg.dropped_bucket_keys(old_cfg, confirmed_key_removals));
+    // A bucket that would store plaintext where it encrypted needs an
+    // explicit confirmation (issue #116 P3).
+    fatal.extend(new_cfg.unconfirmed_encryption_downgrades(old_cfg, confirmed_downgrades));
     // A webhook URL that every delivery would refuse: refuse the apply that
     // adds it, instead of failing (and retrying) every event later.
     fatal.extend(
@@ -333,7 +360,18 @@ async fn transition_gates(
         TransitionCtx::Admin { headers, .. } => confirmed_key_removals(Some(headers)),
         TransitionCtx::Background { .. } => Vec::new(),
     };
-    static_transition_gates(old_cfg, new_cfg, &confirmed)?;
+    // The downgrade gate judges forward admin writes. A rollback puts back
+    // a config that was live; a background change (the migrate flip) was
+    // confirmed when the job started.
+    let downgrades = match ctx {
+        TransitionCtx::Admin {
+            headers,
+            restoring: false,
+            ..
+        } => Some(crate::config::confirmed_downgrades(Some(headers))),
+        _ => None,
+    };
+    static_transition_gates(old_cfg, new_cfg, &confirmed, downgrades.as_deref())?;
 
     // Backend write-capability gate (guard B, hot-apply half): refuse routing
     // a client-writable bucket onto a non-CAS backend under multi-instance.
@@ -871,7 +909,7 @@ mod keyless_proxy_gate_tests {
         let old = Config::default();
         let mut keyless = old.clone();
         keyless.backend_encryption = proxy(None);
-        let err = static_transition_gates(&old, &keyless, &[])
+        let err = static_transition_gates(&old, &keyless, &[], Some(&[]))
             .expect_err("a keyless proxy backend must be refused");
         assert!(
             err.contains("backend 'default'") && err.contains("DGP_ENCRYPTION_KEY"),
@@ -880,11 +918,12 @@ mod keyless_proxy_gate_tests {
 
         let mut keyed = old.clone();
         keyed.backend_encryption = proxy(Some(&"ab".repeat(32)));
-        static_transition_gates(&old, &keyed, &[]).expect("a keyed proxy backend applies");
+        static_transition_gates(&old, &keyed, &[], Some(&[]))
+            .expect("a keyed proxy backend applies");
 
         let mut unrelated = keyless.clone();
         unrelated.log_level = "warn".into();
-        static_transition_gates(&keyless, &unrelated, &[])
+        static_transition_gates(&keyless, &unrelated, &[], Some(&[]))
             .expect("a backend that was keyless before does not block another edit");
     }
 

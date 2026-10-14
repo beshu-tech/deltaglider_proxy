@@ -23,6 +23,9 @@ const PLAINTEXT_MARKER: &[u8] = b"MAINT_PLAINTEXT_MARKER_0123456789";
 async fn put_storage_encryption(admin: &reqwest::Client, endpoint: &str, body: serde_json::Value) {
     let resp = admin
         .put(format!("{endpoint}/_/api/admin/config/section/storage"))
+        // A disable is a downgrade: confirmed (issue #116 P3). The header
+        // changes nothing for a change that is not one.
+        .header("X-DGP-Confirm-Encryption-Downgrade", "backend:default")
         .json(&serde_json::json!({ "backend_encryption": body }))
         .send()
         .await
