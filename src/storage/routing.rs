@@ -248,17 +248,21 @@ impl Resolver {
             .await
     }
 
-    /// Resolve an unrouted bucket: the cached answer, a stale one (and a
-    /// background refresh) when `stale_ok`, else one shared probe.
-    async fn resolve(self: &Arc<Self>, virtual_bucket: &str, stale_ok: bool) -> (String, Probed) {
+    /// Resolve an unrouted bucket. `Lookup::Cached`: the cached answer, a
+    /// stale one (and a background refresh), else one shared probe.
+    /// `Lookup::Probe`: a probe of its own, no cached answer at all.
+    async fn resolve(self: &Arc<Self>, virtual_bucket: &str, lookup: Lookup) -> (String, Probed) {
+        if lookup == Lookup::Probe {
+            // Not a flight: a flight may answer from the cache (its runner
+            // checks it first), and this probe must start after the request.
+            return self.probe(virtual_bucket).await;
+        }
         if let Some(hit) = self.cached(virtual_bucket) {
             return hit;
         }
-        if stale_ok {
-            if let Some(name) = self.stale_resolution(virtual_bucket) {
-                self.refresh_in_background(virtual_bucket);
-                return (name, Probed::No);
-            }
+        if let Some(name) = self.stale_resolution(virtual_bucket) {
+            self.refresh_in_background(virtual_bucket);
+            return (name, Probed::No);
         }
         self.probe_once(virtual_bucket).await
     }
@@ -437,6 +441,18 @@ enum Probed {
     Found,
     /// Every backend answered just now that it does not have the bucket.
     Absent,
+}
+
+/// How a resolution of an unrouted bucket may answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lookup {
+    /// From the caches (fresh, or stale while one background probe
+    /// refreshes), else from one probe shared by concurrent requests.
+    Cached,
+    /// From a probe of its own. For decisions about WHERE a bucket lives
+    /// (CreateBucket, declared-bucket setup): a cached answer, fresh or
+    /// not, can miss a bucket that a peer created or moved meanwhile.
+    Probe,
 }
 
 /// How long a found unrouted bucket stays resolved without a new probe.
@@ -779,25 +795,27 @@ impl RoutingBackend {
         &'a self,
         virtual_bucket: &'a str,
     ) -> (String, &'a DynStorageBackend<'a>, Cow<'a, str>, Probed) {
-        self.resolve_with(virtual_bucket, true).await
+        self.resolve_with(virtual_bucket, Lookup::Cached).await
     }
 
-    /// [`Self::resolve_existing`] with no stale answer: CreateBucket and
-    /// declared-bucket setup decide WHERE a bucket lives, so a bucket that
-    /// was deleted from its backend since it was found must not pull the new
-    /// one there.
+    /// [`Self::resolve_existing`] with no cached answer: CreateBucket and
+    /// declared-bucket setup decide WHERE a bucket lives, so they always
+    /// probe. A fresh resolution (< `RESOLVE_TTL`) or miss (< `MISS_TTL`)
+    /// can be wrong already: a peer can have deleted the bucket, or created
+    /// it on another backend, and a twin on the default backend would hide
+    /// that bucket's objects. CreateBucket is rare; one probe is cheap.
     async fn resolve_existing_fresh<'a>(
         &'a self,
         virtual_bucket: &'a str,
     ) -> (&'a DynStorageBackend<'a>, Cow<'a, str>) {
-        let (_, backend, real, _) = self.resolve_with(virtual_bucket, false).await;
+        let (_, backend, real, _) = self.resolve_with(virtual_bucket, Lookup::Probe).await;
         (backend, real)
     }
 
     async fn resolve_with<'a>(
         &'a self,
         virtual_bucket: &'a str,
-        stale_ok: bool,
+        lookup: Lookup,
     ) -> (String, &'a DynStorageBackend<'a>, Cow<'a, str>, Probed) {
         if let Some(route) = self.routes.get(virtual_bucket) {
             let backend = self.backends[&route.backend_name].as_ref().as_ref();
@@ -807,7 +825,7 @@ impl RoutingBackend {
             };
             return (route.backend_name.clone(), backend, real, Probed::No);
         }
-        let (name, probed) = self.resolver.resolve(virtual_bucket, stale_ok).await;
+        let (name, probed) = self.resolver.resolve(virtual_bucket, lookup).await;
         let backend = self.backends[&name].as_ref().as_ref();
         (name, backend, Cow::Borrowed(virtual_bucket), probed)
     }
@@ -3289,6 +3307,48 @@ mod tests {
         let answer = routing.head_bucket("b").await;
         assert!(answer.is_err(), "{answer:?}");
         assert_eq!(bucket_heads(&fake), 1, "{:?}", fake.requests());
+    }
+
+    /// Review 2d: CreateBucket probes even while a resolution or a miss is
+    /// fresh. A peer that moved or created the bucket on another backend
+    /// meanwhile must not get a same-named twin on the default backend,
+    /// which would hide the peer bucket's objects.
+    #[tokio::test]
+    async fn create_bucket_probes_inside_the_fresh_windows() {
+        let primary = TestBackend::with_buckets(&["moved"]);
+        let archive = TestBackend::default();
+        let mut backends = HashMap::new();
+        backends.insert(
+            "primary".to_string(),
+            Arc::new(DynStorageBackend::new_box(primary.clone())),
+        );
+        backends.insert(
+            "archive".to_string(),
+            Arc::new(DynStorageBackend::new_box(archive.clone())),
+        );
+        let routing = RoutingBackend::new(backends, HashMap::new(), "primary".to_string())
+            .expect("routing backend");
+
+        // A fresh resolution (< RESOLVE_TTL): `moved` is on primary.
+        assert_eq!(routing.resolve_existing_named("moved").await.0, "primary");
+        // A fresh miss (< MISS_TTL): no backend has `late`.
+        assert_eq!(routing.resolve_existing_named("late").await.0, "primary");
+        // A peer moves `moved` to archive and creates `late` there.
+        primary.delete_bucket("moved").await.unwrap();
+        archive.create_bucket("moved").await.unwrap();
+        archive.create_bucket("late").await.unwrap();
+
+        for bucket in ["moved", "late"] {
+            let result = routing.create_bucket(bucket).await;
+            assert!(
+                matches!(&result, Err(StorageError::AlreadyExists(b)) if b == bucket),
+                "{bucket}: {result:?}"
+            );
+            assert!(
+                !primary.head_bucket(bucket).await.unwrap(),
+                "{bucket}: a twin was created on the default backend"
+            );
+        }
     }
 
     /// Hard expiry: a resolution older than 5 x RESOLVE_TTL is not served;
