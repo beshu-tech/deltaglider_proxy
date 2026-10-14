@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BUSL-1.1
+
 //! One shared run of an async computation per key ("single flight").
 //!
 //! Callers that ask for the same key while a run is in progress wait for
