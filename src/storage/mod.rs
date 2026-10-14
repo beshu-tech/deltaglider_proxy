@@ -24,7 +24,7 @@ mod traits;
 #[cfg(unix)]
 pub(crate) mod xattr_meta;
 
-pub use encrypting::{EncryptingBackend, EncryptionConfig, EncryptionKey, WriteMode};
+pub use encrypting::{BucketKeys, EncryptingBackend, EncryptionConfig, EncryptionKey, WriteMode};
 #[cfg(test)]
 pub(crate) use filesystem::fault::{fail_io, Fault, FaultPoint, Faults, FaultyFs, Hook};
 pub use filesystem::FilesystemBackend;

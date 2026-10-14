@@ -36,6 +36,16 @@ impl DynEngine {
         // The two layers are mutually exclusive on a given backend: you
         // get ONE of {proxy AES-GCM, SSE-KMS, SSE-S3, none}. The
         // encryption config enum enforces this by construction.
+        // Per-bucket overrides (issue #116), handed to the wrapper of the
+        // raw backend that stores each bucket, under its REAL bucket name.
+        let overrides = config.bucket_encryption_overrides();
+        let on = |backend: &str| -> Vec<crate::config::BucketOverride<'_>> {
+            overrides
+                .iter()
+                .filter(|o| o.backend == backend)
+                .cloned()
+                .collect()
+        };
         let storage: Box<DynStorageBackend<'static>> = if config.backends.is_empty() {
             // Singleton backend path. Synthetic name "default" matches
             // what `apply_backend_encryption_env` uses for this entry.
@@ -45,6 +55,7 @@ impl DynEngine {
                 "default",
                 raw,
                 &config.backend_encryption,
+                &on("default"),
                 &mut KeyIdCollisionCheck::new(),
             )?
         } else {
@@ -60,6 +71,7 @@ impl DynEngine {
                     &named.name,
                     raw,
                     &named.encryption,
+                    &on(&named.name),
                     &mut kid_collisions,
                 )?;
                 backends.insert(named.name.clone(), Arc::new(wrapped));
@@ -157,7 +169,7 @@ impl KeyIdCollisionCheck {
         if let Some(prev) = self.seen.get(key_id) {
             if prev != key_bytes {
                 return Err(StorageError::Encryption(format!(
-                    "backend '{}' declares key_id='{}' but a prior backend uses the SAME \
+                    "{} declares key_id='{}' but a prior backend or bucket uses the SAME \
                      key_id with DIFFERENT key bytes — the read-side key_id mismatch check \
                      would then fire on every cross-backend read. Give each backend a \
                      distinct key_id, or set both to the same key (documented portability \
@@ -193,6 +205,7 @@ pub(super) fn wrap_backend_with_encryption(
     backend_name: &str,
     inner: Box<DynStorageBackend<'static>>,
     enc: &crate::config::BackendEncryptionConfig,
+    buckets: &[crate::config::BucketOverride<'_>],
     collisions: &mut KeyIdCollisionCheck,
 ) -> Result<Box<DynStorageBackend<'static>>, StorageError> {
     use crate::config::BackendEncryptionConfig as E;
@@ -216,7 +229,7 @@ pub(super) fn wrap_backend_with_encryption(
                 Some(explicit) => explicit.clone(),
                 None => derive_key_id(backend_name, &parsed.0),
             };
-            collisions.record(backend_name, &kid, &parsed.0)?;
+            collisions.record(&format!("backend '{backend_name}'"), &kid, &parsed.0)?;
             tracing::info!(
                 "backend '{}' encryption: ENABLED (AES-256-GCM proxy, key_id={})",
                 backend_name,
@@ -284,16 +297,97 @@ pub(super) fn wrap_backend_with_encryption(
         );
     }
 
+    let (bucket_keys, keyring) = resolve_bucket_keys(backend_name, buckets, collisions)?;
     let enc_config = Arc::new(ArcSwap::new(Arc::new(crate::storage::EncryptionConfig {
         key: primary_key,
         key_id: primary_kid,
         write_mode,
         legacy_key: legacy_key_opt,
         legacy_key_id: legacy_kid_opt,
+        buckets: bucket_keys,
+        keyring,
     })));
     Ok(DynStorageBackend::new_box(
         crate::storage::EncryptingBackend::new(inner, enc_config),
     ))
+}
+
+/// The per-bucket write policies and the keyring of one raw backend
+/// (issue #116): each override's write key under its REAL bucket name,
+/// and every override key and legacy key by its explicit id. A bucket key
+/// id joins the process-wide collision check, so one id names one key.
+/// `Config::check_fatal` refuses the shapes this rejects (native SSE on a
+/// bucket, a missing id); the errors here are the last line.
+#[allow(clippy::type_complexity)]
+pub(super) fn resolve_bucket_keys(
+    backend_name: &str,
+    buckets: &[crate::config::BucketOverride<'_>],
+    collisions: &mut KeyIdCollisionCheck,
+) -> Result<
+    (
+        std::collections::HashMap<String, crate::storage::BucketKeys>,
+        std::collections::HashMap<String, crate::storage::EncryptionKey>,
+    ),
+    StorageError,
+> {
+    use crate::config::BackendEncryptionConfig as E;
+    let mut policies = std::collections::HashMap::new();
+    let mut keyring = std::collections::HashMap::new();
+    for o in buckets {
+        let label = format!("bucket '{}'", o.bucket);
+        let parse = |hex: &str, what: &str| {
+            crate::storage::EncryptionKey::from_hex(hex)
+                .map_err(|e| StorageError::Encryption(format!("{label} {what}: {e}")))
+        };
+        let explicit = |id: Option<&str>, what: &str| {
+            id.map(str::to_string).ok_or_else(|| {
+                StorageError::Encryption(format!("{label}: {what} is required on a bucket"))
+            })
+        };
+        let mut keys = crate::storage::BucketKeys::default();
+        match o.config {
+            E::Aes256GcmProxy {
+                key: Some(hex),
+                key_id,
+                ..
+            } => {
+                let key = parse(hex, "key")?;
+                let kid = explicit(key_id.as_deref(), "encryption.key_id")?;
+                collisions.record(&label, &kid, &key.0)?;
+                keyring.insert(kid.clone(), key.clone());
+                keys.key = Some(key);
+                keys.key_id = Some(kid.clone());
+                tracing::info!(
+                    "backend '{backend_name}': {label} (real bucket '{}') encrypts with its own \
+                     key (AES-256-GCM proxy, key_id={kid})",
+                    o.real_bucket
+                );
+            }
+            E::Aes256GcmProxy { key: None, .. } => {
+                tracing::error!(
+                    "{label} has encryption mode aes256-gcm-proxy but no key: every write to \
+                     it is REFUSED (the proxy never stores plaintext there). Reads keep working."
+                );
+                keys.write_mode = crate::storage::WriteMode::Refuse;
+            }
+            E::None { .. } => {}
+            E::SseKms { .. } | E::SseS3 { .. } => {
+                return Err(StorageError::Encryption(format!(
+                    "{label}: encryption mode '{}' is not supported on a bucket",
+                    o.config.mode_tag()
+                )));
+            }
+        }
+        if let Some(hex) = o.config.legacy_key() {
+            let key = parse(hex, "legacy_key")?;
+            let kid = explicit(o.config.legacy_key_id(), "encryption.legacy_key_id")?;
+            collisions.record(&label, &kid, &key.0)?;
+            keyring.insert(kid.clone(), key);
+            keys.legacy_key_id = Some(kid);
+        }
+        policies.insert(o.real_bucket.clone(), keys);
+    }
+    Ok((policies, keyring))
 }
 
 /// Pull the legacy_key / legacy_key_id pair out of the per-backend

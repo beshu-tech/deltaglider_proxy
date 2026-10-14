@@ -785,21 +785,31 @@ impl RoutingBackend {
     /// bucket's backend is not known yet, so the caller takes the safe
     /// answer. The default backend is not a guess: an unrouted bucket can
     /// live on any backend.
+    ///
+    /// `hint` gets the REAL bucket name, as every routed call does: a
+    /// backend's answer can depend on the bucket (the encrypting wrapper
+    /// writes per real bucket, issue #116).
     fn backend_hint<T: PartialEq>(
         &self,
         bucket: &str,
-        hint: impl Fn(&DynStorageBackend<'static>) -> T,
+        hint: impl Fn(&DynStorageBackend<'static>, &str) -> T,
     ) -> Option<T> {
-        let known = match self.routes.get(bucket) {
-            Some(route) => Some(route.backend_name.clone()),
-            None => self.resolver.last_known_resolution(bucket),
+        let (known, real) = match self.routes.get(bucket) {
+            Some(route) => (
+                Some(route.backend_name.clone()),
+                route.real_bucket.as_deref().unwrap_or(bucket),
+            ),
+            None => (self.resolver.last_known_resolution(bucket), bucket),
         };
         if let Some(name) = known {
             if let Some(backend) = self.backends.get(&name) {
-                return Some(hint(backend.as_ref().as_ref()));
+                return Some(hint(backend.as_ref().as_ref(), real));
             }
         }
-        let mut answers = self.backends.values().map(|b| hint(b.as_ref().as_ref()));
+        let mut answers = self
+            .backends
+            .values()
+            .map(|b| hint(b.as_ref().as_ref(), real));
         let first = answers.next()?;
         answers.all(|a| a == first).then_some(first)
     }
@@ -1612,14 +1622,14 @@ impl StorageBackend for RoutingBackend {
     fn multipart_storage_label(&self, bucket: &str) -> &'static str {
         // The label only feeds `destination_supports_native_multipart`,
         // which also asks `supports_native_multipart` (safe when unknown).
-        self.backend_hint(bucket, |b| b.multipart_storage_label(bucket))
+        self.backend_hint(bucket, |b, real| b.multipart_storage_label(real))
             .unwrap_or_else(|| self.default_backend().multipart_storage_label(bucket))
     }
 
     fn supports_native_multipart(&self, bucket: &str) -> bool {
         // Unknown: no. A streaming multipart copy into a backend that cannot
         // take it fails; the buffered copy works everywhere.
-        self.backend_hint(bucket, |b| b.supports_native_multipart(bucket))
+        self.backend_hint(bucket, |b, real| b.supports_native_multipart(real))
             .unwrap_or(false)
     }
 
@@ -1645,7 +1655,7 @@ impl StorageBackend for RoutingBackend {
     fn lite_list_carries_logical_facts(&self, bucket: &str) -> bool {
         // Unknown: no. Parity then HEADs the keys it compares (slower);
         // trusting an S3 or encrypted lite list gives wrong facts.
-        self.backend_hint(bucket, |b| b.lite_list_carries_logical_facts(bucket))
+        self.backend_hint(bucket, |b, real| b.lite_list_carries_logical_facts(real))
             .unwrap_or(false)
     }
 
@@ -3401,6 +3411,51 @@ mod tests {
         );
         assert!(routing.supports_native_multipart("b"));
         assert_eq!(routing.multipart_storage_label("b"), "none");
+    }
+
+    /// Issue #116: the capability hints of a routed bucket ask the backend
+    /// about the REAL bucket, as every routed call does. The encrypting
+    /// wrapper decides per real bucket; asked about the virtual name, it
+    /// answered for a bucket without an override and a native multipart
+    /// copy would have stored plaintext in an encrypted bucket.
+    #[tokio::test]
+    async fn capability_hints_ask_about_the_real_bucket() {
+        let mut buckets = std::collections::HashMap::new();
+        buckets.insert(
+            "real-archive".to_string(),
+            crate::storage::BucketKeys {
+                key: Some(crate::storage::EncryptionKey::from_hex(&"ab".repeat(32)).unwrap()),
+                key_id: Some("db-archive-2026".into()),
+                ..Default::default()
+            },
+        );
+        let cfg = Arc::new(arc_swap::ArcSwap::new(Arc::new(
+            crate::storage::EncryptionConfig {
+                buckets,
+                ..Default::default()
+            },
+        )));
+        let mut backends = HashMap::new();
+        backends.insert(
+            "local-disk".to_string(),
+            Arc::new(DynStorageBackend::new_box(
+                crate::storage::EncryptingBackend::new(TestBackend::default(), cfg),
+            )),
+        );
+        let routes = HashMap::from([(
+            "db-archive".to_string(),
+            ("local-disk".to_string(), Some("real-archive".to_string())),
+        )]);
+        let routing = RoutingBackend::new(backends, routes, "local-disk".to_string())
+            .expect("routing backend");
+        assert_eq!(
+            routing.multipart_storage_label("db-archive"),
+            "aes256-gcm-proxy"
+        );
+        assert!(!routing.supports_native_multipart("db-archive"));
+        assert!(!routing.lite_list_carries_logical_facts("db-archive"));
+        // Another bucket on the same raw backend has no override.
+        assert_eq!(routing.multipart_storage_label("releases"), "none");
     }
 
     /// Hard expiry: a resolution older than 5 x RESOLVE_TTL is not served;

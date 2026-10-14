@@ -320,6 +320,7 @@ fn test_wrap_backend_with_none_mode_wraps_anyway() {
         "some-backend",
         inner,
         &crate::config::BackendEncryptionConfig::default(),
+        &[],
         &mut coll,
     );
     assert!(wrapped.is_ok());
@@ -338,6 +339,7 @@ fn test_wrap_backend_with_aes_mode_accepts_hex_key() {
             legacy_key: None,
             legacy_key_id: None,
         },
+        &[],
         &mut coll,
     );
     assert!(
@@ -359,6 +361,7 @@ fn test_wrap_backend_with_aes_mode_rejects_malformed_hex() {
             legacy_key: None,
             legacy_key_id: None,
         },
+        &[],
         &mut coll,
     );
     // Box<DynStorageBackend<'static>> doesn't impl Debug, so we can't use
@@ -391,6 +394,7 @@ fn test_key_id_collision_detected_at_construction() {
             legacy_key: None,
             legacy_key_id: None,
         },
+        &[],
         &mut coll,
     );
     assert!(first.is_ok());
@@ -403,6 +407,7 @@ fn test_key_id_collision_detected_at_construction() {
             legacy_key: None,
             legacy_key_id: None,
         },
+        &[],
         &mut coll,
     );
     let err = match second {
@@ -432,6 +437,7 @@ fn test_key_id_collision_allowed_with_same_key() {
             legacy_key: None,
             legacy_key_id: None,
         },
+        &[],
         &mut coll,
     );
     assert!(first.is_ok());
@@ -444,6 +450,7 @@ fn test_key_id_collision_allowed_with_same_key() {
             legacy_key: None,
             legacy_key_id: None,
         },
+        &[],
         &mut coll,
     );
     match second {
@@ -471,6 +478,7 @@ fn test_wrap_backend_sse_modes_wrap_for_sniffer_defense() {
             legacy_key: None,
             legacy_key_id: None,
         },
+        &[],
         &mut coll,
     );
     assert!(wrapped.is_ok());
@@ -482,6 +490,7 @@ fn test_wrap_backend_sse_modes_wrap_for_sniffer_defense() {
             legacy_key: None,
             legacy_key_id: None,
         },
+        &[],
         &mut coll,
     );
     assert!(wrapped2.is_ok());
@@ -876,6 +885,7 @@ async fn a_proxy_backend_without_a_key_refuses_writes_and_keeps_reads() {
             legacy_key: None,
             legacy_key_id: None,
         },
+        &[],
         &mut coll,
     ) {
         Ok(w) => w,

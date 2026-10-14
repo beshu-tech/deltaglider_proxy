@@ -55,6 +55,8 @@
 //! `format.rs` holds the formats (key, markers, v1 blob, chunked framing and
 //! decoder); this file holds the wrapper backend; `tests.rs` the tests.
 
+#[cfg(test)]
+mod bucket_tests;
 mod format;
 #[cfg(test)]
 mod tests;
@@ -183,6 +185,27 @@ pub struct EncryptionConfig {
     /// `key_id` but DOES match `legacy_key_id`.
     pub legacy_key: Option<EncryptionKey>,
     /// Id paired with `legacy_key`. Same shape rules as `key_id`.
+    pub legacy_key_id: Option<String>,
+    /// Per-bucket write policy (issue #116), indexed by the REAL bucket
+    /// name that this wrapper receives (the router has already mapped a
+    /// virtual name or an alias to it). A bucket that is not here writes
+    /// with the backend's own `key` / `write_mode` above.
+    pub buckets: std::collections::HashMap<String, BucketKeys>,
+    /// Every other key on this raw backend (the bucket overrides' keys and
+    /// legacy keys), indexed by key id. A read picks the key by the id
+    /// stamped on the object, so a bucket reads its history under the
+    /// backend's key, a rotated key, or a removed override.
+    pub keyring: std::collections::HashMap<String, EncryptionKey>,
+}
+
+/// The write policy of one bucket with its own `encryption` override.
+#[derive(Clone, Default)]
+pub struct BucketKeys {
+    /// The key new writes use (`None` with `WriteMode::Encrypt` = plaintext).
+    pub key: Option<EncryptionKey>,
+    pub key_id: Option<String>,
+    pub write_mode: WriteMode,
+    /// The bucket's decrypt-only key id, if any (its key is in the keyring).
     pub legacy_key_id: Option<String>,
 }
 
@@ -351,21 +374,37 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             .await
     }
 
-    /// `Err` under [`WriteMode::Refuse`]: the write must fail, never
-    /// fall back to plaintext.
-    fn write_key(&self) -> Result<Option<(EncryptionKey, Option<String>)>, StorageError> {
+    /// THE write-side decision for one REAL bucket: the bucket's own
+    /// override when it has one (issue #116), else the backend's. `Err`
+    /// under [`WriteMode::Refuse`]: the write must fail, never fall back
+    /// to plaintext.
+    fn write_key(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<(EncryptionKey, Option<String>)>, StorageError> {
         let cfg = self.config.load();
-        match cfg.write_mode {
+        let (mode, key, key_id) = match cfg.buckets.get(bucket) {
+            Some(b) => (b.write_mode, &b.key, &b.key_id),
+            None => (cfg.write_mode, &cfg.key, &cfg.key_id),
+        };
+        match mode {
             WriteMode::PassThrough => Ok(None),
+            WriteMode::Refuse if cfg.buckets.contains_key(bucket) => {
+                Err(StorageError::Encryption(format!(
+                    "bucket '{bucket}' is in aes256-gcm-proxy mode but no key is configured, \
+                     so the proxy refuses the write instead of storing plaintext. Set the \
+                     bucket's encryption.key, or change its mode"
+                )))
+            }
             WriteMode::Refuse => Err(StorageError::Encryption(NO_KEY_WRITE_REFUSAL.to_string())),
-            WriteMode::Encrypt => Ok(cfg.key.clone().map(|key| (key, cfg.key_id.clone()))),
+            WriteMode::Encrypt => Ok(key.clone().map(|key| (key, key_id.clone()))),
         }
     }
 
-    /// True when a write stores its bytes as they are (no key, or
-    /// native SSE). False when it encrypts or is refused.
-    fn writes_plaintext(&self) -> bool {
-        matches!(self.write_key(), Ok(None))
+    /// True when a write to `bucket` stores its bytes as they are (no
+    /// key, or native SSE). False when it encrypts or is refused.
+    fn writes_plaintext(&self, bucket: &str) -> bool {
+        matches!(self.write_key(bucket), Ok(None))
     }
 
     /// True when this wrapper holds any key (primary or decrypt-only
@@ -571,27 +610,39 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         Ok((plain, plaintext_len))
     }
 
-    fn has_any_key(&self) -> bool {
+    /// True when `bucket` may hold proxy-encrypted bodies: the backend's
+    /// own key or legacy key, or the bucket's override key or legacy key.
+    /// (A key of ANOTHER bucket on this backend can still decrypt an
+    /// object that was moved here at the storage level: the read path
+    /// sees its marker and takes the keyed route; only its listed size
+    /// may then be the ciphertext size.)
+    fn has_any_key(&self, bucket: &str) -> bool {
         let cfg = self.config.load();
-        cfg.key.is_some() || cfg.legacy_key.is_some()
+        cfg.key.is_some()
+            || cfg.legacy_key.is_some()
+            || cfg
+                .buckets
+                .get(bucket)
+                .is_some_and(|b| b.key.is_some() || b.legacy_key_id.is_some())
     }
 
-    /// True when this wrapper encrypts object bodies in-process. Gates the
-    /// streaming multipart path OFF — whole-object GCM framing doesn't map
-    /// onto independent S3 parts — so those copies fall back to the
-    /// buffered/chunked path.
-    fn actively_encrypts(&self) -> bool {
-        !self.writes_plaintext()
+    /// True when this wrapper encrypts `bucket`'s object bodies in-process.
+    /// Gates the streaming multipart path OFF — whole-object GCM framing
+    /// doesn't map onto independent S3 parts — so those copies fall back to
+    /// the buffered/chunked path.
+    fn actively_encrypts(&self, bucket: &str) -> bool {
+        !self.writes_plaintext(bucket)
     }
 
     /// The stored body: the ciphertext, or `data` itself (shared, not
-    /// copied) when this backend does not encrypt.
+    /// copied) when `bucket` does not encrypt.
     fn encrypt_if_enabled(
         &self,
+        bucket: &str,
         data: &bytes::Bytes,
         metadata: &mut FileMetadata,
     ) -> Result<bytes::Bytes, StorageError> {
-        match self.write_key()? {
+        match self.write_key(bucket)? {
             Some((key, key_id)) => {
                 let encrypted = encrypt(&key, data)?;
                 mark_encrypted(metadata, key_id.as_deref());
@@ -617,6 +668,9 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             (Some(k), Some(kid)) => Some((k, kid)),
             _ => None,
         };
+        // Every other key on this raw backend (issue #116).
+        let ring = object_kid.and_then(|id| cfg.keyring.get(id).cloned());
+        let has_ring = !cfg.keyring.is_empty();
         drop(cfg); // release the guard early
 
         match object_kid {
@@ -637,6 +691,10 @@ impl<B: StorageBackend> EncryptingBackend<B> {
                         return Ok(lk);
                     }
                 }
+                // A bucket override's key or legacy key on this backend.
+                if let Some(key) = ring {
+                    return Ok(key);
+                }
                 // Neither primary nor legacy matches. Split the
                 // error text by root cause — an "actually no key
                 // at all" state looks like "<unset>" vs X on the
@@ -650,7 +708,7 @@ impl<B: StorageBackend> EncryptingBackend<B> {
                 // operators whose actual problem was "the backend
                 // was wrongly flipped to mode: none + no shim".
                 let cfg_has_primary = primary_kid.is_some() || primary_key.is_some();
-                if !cfg_has_primary {
+                if !cfg_has_primary && !has_ring {
                     return Err(StorageError::Encryption(format!(
                         "object was encrypted with key id '{obj_id}', but this backend has \
                          NO encryption key configured. The object can't be decrypted until \
@@ -741,7 +799,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
         let mut meta = without_markers(metadata);
-        let enc = self.encrypt_if_enabled(&data, &mut meta)?;
+        let enc = self.encrypt_if_enabled(bucket, &data, &mut meta)?;
         self.inner
             .put_reference(bucket, prefix, enc, &meta, proof)
             .await
@@ -761,7 +819,8 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         source: &FileMetadata,
         metadata: &FileMetadata,
     ) -> Result<super::traits::CopyOutcome, StorageError> {
-        let write_key_id = self.write_key()?.map(|(_, id)| id);
+        // The destination bucket's own write policy (issue #116).
+        let write_key_id = self.write_key(dst.bucket)?.map(|(_, id)| id);
         let same_form = match (&write_key_id, is_encrypted(source)) {
             (None, false) => true,
             (Some(Some(id)), true) => stamped_key_id(source) == Some(id.as_str()),
@@ -786,7 +845,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
         let mut meta = without_markers(metadata);
-        let enc = self.encrypt_if_enabled(&data, &mut meta)?;
+        let enc = self.encrypt_if_enabled(bucket, &data, &mut meta)?;
         self.inner
             .put_delta(bucket, prefix, filename, enc, &meta, proof)
             .await
@@ -801,7 +860,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         let mut meta = without_markers(metadata);
-        let enc = self.encrypt_if_enabled(&data, &mut meta)?;
+        let enc = self.encrypt_if_enabled(bucket, &data, &mut meta)?;
         self.inner
             .put_passthrough(bucket, prefix, filename, enc, &meta)
             .await
@@ -824,7 +883,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         metadata: &FileMetadata,
         spool: SpoolBudget<'_>,
     ) -> Result<(), StorageError> {
-        let Some((key, key_id)) = self.write_key()? else {
+        let Some((key, key_id)) = self.write_key(bucket)? else {
             return self
                 .inner
                 .put_passthrough_file(
@@ -873,7 +932,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         metadata: &FileMetadata,
         spool: SpoolBudget<'_>,
     ) -> Result<(), StorageError> {
-        let Some(write_key) = self.write_key()? else {
+        let Some(write_key) = self.write_key(bucket)? else {
             return self
                 .inner
                 .put_passthrough_parts(
@@ -924,7 +983,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     }
 
     async fn file_put_spool_bytes(&self, bucket: &str, bytes: u64, parts: bool) -> u64 {
-        if self.writes_plaintext() {
+        if self.writes_plaintext(bucket) {
             return self.inner.file_put_spool_bytes(bucket, bytes, parts).await;
         }
         // The ciphertext file, plus the joined plaintext for parts.
@@ -950,7 +1009,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         chunks: &[Bytes],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        let Some((key, key_id)) = self.write_key()? else {
+        let Some((key, key_id)) = self.write_key(bucket)? else {
             return self
                 .inner
                 .put_passthrough_chunked(
@@ -1141,10 +1200,10 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         metadata: &FileMetadata,
     ) -> Result<MultipartUpload, StorageError> {
         // A refused write names its cause, not "multipart unsupported".
-        self.write_key()?;
-        if self.actively_encrypts() {
+        self.write_key(bucket)?;
+        if self.actively_encrypts(bucket) {
             return Err(StorageError::Other(
-                "multipart upload unsupported on a proxy-AES-encrypting backend".to_string(),
+                "multipart upload unsupported on a proxy-AES-encrypting bucket".to_string(),
             ));
         }
         self.inner
@@ -1174,6 +1233,24 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         assembled: &[Bytes],
         metadata: &FileMetadata,
     ) -> Result<String, StorageError> {
+        // The bucket's write policy NOW (a config apply can change it
+        // between create and complete). A bucket that encrypts never
+        // stores the parts as plaintext: buffered parts are encrypted like
+        // any chunked write; native parts already sit on the backend in
+        // plaintext, so the upload is refused.
+        if self.write_key(&upload.bucket)?.is_some() {
+            if upload.native {
+                return Err(StorageError::Encryption(format!(
+                    "bucket '{}' encrypts at rest, but this multipart upload stored its \
+                     parts natively (unencrypted): the encryption of the bucket changed \
+                     during the upload. Start the upload again",
+                    upload.bucket
+                )));
+            }
+            self.put_passthrough_chunked(&upload.bucket, prefix, filename, assembled, metadata)
+                .await?;
+            return Ok(format!("\"{}\"", metadata.md5));
+        }
         self.inner
             .complete_multipart_upload(
                 upload,
@@ -1198,7 +1275,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     }
 
     fn multipart_storage_label(&self, bucket: &str) -> &'static str {
-        if self.actively_encrypts() {
+        if self.actively_encrypts(bucket) {
             return "aes256-gcm-proxy";
         }
         self.inner.multipart_storage_label(bucket)
@@ -1207,7 +1284,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     fn supports_native_multipart(&self, bucket: &str) -> bool {
         // Proxy-AES rewrites each part's bytes, so the passthrough streaming
         // multipart path can't be used regardless of the inner backend.
-        if self.actively_encrypts() {
+        if self.actively_encrypts(bucket) {
             return false;
         }
         self.inner.supports_native_multipart(bucket)
@@ -1216,7 +1293,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     fn lite_list_carries_logical_facts(&self, bucket: &str) -> bool {
         // When actively encrypting, the lite list reports CIPHERTEXT size/etag —
         // parity must HEAD for plaintext logical facts.
-        if self.actively_encrypts() {
+        if self.actively_encrypts(bucket) {
             return false;
         }
         self.inner.lite_list_carries_logical_facts(bucket)
@@ -1248,7 +1325,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         start: u64,
         end: u64,
     ) -> Result<(ByteStream, u64, FileMetadata), StorageError> {
-        if self.has_any_key() {
+        if self.has_any_key(bucket) {
             return self.keyed_range(bucket, prefix, filename, start, end).await;
         }
         let (stream, len, meta) = self
@@ -1407,7 +1484,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         match op {
             RefWrite::Put { data, metadata } => {
                 let mut meta = without_markers(metadata);
-                let enc = self.encrypt_if_enabled(data, &mut meta)?;
+                let enc = self.encrypt_if_enabled(b, data, &mut meta)?;
                 self.inner
                     .write_reference_fenced(
                         b,
@@ -1426,7 +1503,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
             RefWrite::PutFile { path, metadata } => {
                 let data = bytes::Bytes::from(tokio::fs::read(path).await?);
                 let mut meta = without_markers(metadata);
-                let enc = self.encrypt_if_enabled(&data, &mut meta)?;
+                let enc = self.encrypt_if_enabled(b, &data, &mut meta)?;
                 self.inner
                     .write_reference_fenced(
                         b,
@@ -1547,7 +1624,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
                 b,
                 objects,
                 ResolveListed {
-                    passthrough_may_differ: how.passthrough_may_differ || self.has_any_key(),
+                    passthrough_may_differ: how.passthrough_may_differ || self.has_any_key(b),
                     ..how
                 },
             )
@@ -1556,12 +1633,12 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         // passthrough object: without a cache hit, only that is known. A
         // decrypt-only key (write mode passthrough, or a legacy key) still
         // reads ciphertext written before.
-        if self.has_any_key() && !self.inner.lite_list_carries_logical_facts(b) {
+        if self.has_any_key(b) && !self.inner.lite_list_carries_logical_facts(b) {
             downgrade_ciphertext_listings(objects, &mut sizes);
         }
         // A listed delta may be ciphertext whenever a key exists: its
         // listed `.delta` size is not the delta size a HEAD shows.
-        if self.has_any_key() && !self.inner.lite_list_carries_logical_facts(b) {
+        if self.has_any_key(b) && !self.inner.lite_list_carries_logical_facts(b) {
             mark_encrypted_deltas(objects, &mut sizes);
         }
         sizes

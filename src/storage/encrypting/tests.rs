@@ -1595,6 +1595,7 @@ mod wrapper_tests {
             write_mode: s.write_mode,
             legacy_key: s.legacy_key,
             legacy_key_id: s.legacy_kid,
+            ..Default::default()
         })));
         (EncryptingBackend::new(backend, cfg), plaintext)
     }
@@ -1711,7 +1712,7 @@ mod wrapper_tests {
         );
         let plaintext = b"no encrypt for me";
         let out = wrapper
-            .encrypt_if_enabled(&bytes::Bytes::from_static(plaintext), &mut meta)
+            .encrypt_if_enabled("b", &bytes::Bytes::from_static(plaintext), &mut meta)
             .unwrap();
         assert_eq!(
             &out[..],
@@ -1753,7 +1754,7 @@ mod wrapper_tests {
             crate::types::StorageInfo::Passthrough,
         );
         let out = wrapper
-            .encrypt_if_enabled(&bytes::Bytes::from_static(b"secret"), &mut meta)
+            .encrypt_if_enabled("b", &bytes::Bytes::from_static(b"secret"), &mut meta)
             .unwrap();
         assert_ne!(&out[..], &b"secret"[..], "Encrypt must actually encrypt");
         assert!(is_encrypted(&meta), "Encrypt must stamp dg-encrypted");
