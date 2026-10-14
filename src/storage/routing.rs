@@ -778,6 +778,32 @@ impl RoutingBackend {
         self.default_backend()
     }
 
+    /// What `hint` says about the backend that serves `bucket`, with no
+    /// I/O: the route's backend; else the backend where the bucket was last
+    /// found (the backend that its requests resolve to); else the answer
+    /// that every backend gives. `None`: the backends disagree and the
+    /// bucket's backend is not known yet, so the caller takes the safe
+    /// answer. The default backend is not a guess: an unrouted bucket can
+    /// live on any backend.
+    fn backend_hint<T: PartialEq>(
+        &self,
+        bucket: &str,
+        hint: impl Fn(&DynStorageBackend<'static>) -> T,
+    ) -> Option<T> {
+        let known = match self.routes.get(bucket) {
+            Some(route) => Some(route.backend_name.clone()),
+            None => self.resolver.last_known_resolution(bucket),
+        };
+        if let Some(name) = known {
+            if let Some(backend) = self.backends.get(&name) {
+                return Some(hint(backend.as_ref().as_ref()));
+            }
+        }
+        let mut answers = self.backends.values().map(|b| hint(b.as_ref().as_ref()));
+        let first = answers.next()?;
+        answers.all(|a| a == first).then_some(first)
+    }
+
     /// Resolve a virtual bucket to `(backend_name, backend, real_bucket)`.
     /// Name-aware variant of `resolve_existing` used by the multipart path
     /// (the name is stamped into `MultipartUpload` for re-targeting).
@@ -1584,26 +1610,17 @@ impl StorageBackend for RoutingBackend {
     }
 
     fn multipart_storage_label(&self, bucket: &str) -> &'static str {
-        // Route by explicit policy only (sync, no head probing). For
-        // unrouted buckets fall back to the default backend's label. This
-        // is a conservative capability hint, not a correctness boundary.
-        if let Some(route) = self.routes.get(bucket) {
-            return self.backends[&route.backend_name]
-                .as_ref()
-                .as_ref()
-                .multipart_storage_label(bucket);
-        }
-        self.default_backend().multipart_storage_label(bucket)
+        // The label only feeds `destination_supports_native_multipart`,
+        // which also asks `supports_native_multipart` (safe when unknown).
+        self.backend_hint(bucket, |b| b.multipart_storage_label(bucket))
+            .unwrap_or_else(|| self.default_backend().multipart_storage_label(bucket))
     }
 
     fn supports_native_multipart(&self, bucket: &str) -> bool {
-        if let Some(route) = self.routes.get(bucket) {
-            return self.backends[&route.backend_name]
-                .as_ref()
-                .as_ref()
-                .supports_native_multipart(bucket);
-        }
-        self.default_backend().supports_native_multipart(bucket)
+        // Unknown: no. A streaming multipart copy into a backend that cannot
+        // take it fails; the buffered copy works everywhere.
+        self.backend_hint(bucket, |b| b.supports_native_multipart(bucket))
+            .unwrap_or(false)
     }
 
     fn storage_identity(&self, bucket: &str) -> String {
@@ -1626,14 +1643,10 @@ impl StorageBackend for RoutingBackend {
     }
 
     fn lite_list_carries_logical_facts(&self, bucket: &str) -> bool {
-        if let Some(route) = self.routes.get(bucket) {
-            return self.backends[&route.backend_name]
-                .as_ref()
-                .as_ref()
-                .lite_list_carries_logical_facts(bucket);
-        }
-        self.default_backend()
-            .lite_list_carries_logical_facts(bucket)
+        // Unknown: no. Parity then HEADs the keys it compares (slower);
+        // trusting an S3 or encrypted lite list gives wrong facts.
+        self.backend_hint(bucket, |b| b.lite_list_carries_logical_facts(bucket))
+            .unwrap_or(false)
     }
 
     // === Scanning operations ===
@@ -3349,6 +3362,45 @@ mod tests {
                 "{bucket}: a twin was created on the default backend"
             );
         }
+    }
+
+    /// Review 2d: the capability hints of an unrouted bucket name the
+    /// backend that serves it (where it was found), not the default
+    /// backend. While its home is not known and the backends disagree,
+    /// they give the safe answer: the lite list is not authoritative, and
+    /// a copy does not use native multipart.
+    #[tokio::test]
+    async fn capability_hints_follow_the_resolved_backend() {
+        let (endpoint, _fake) = crate::storage::fake_s3::start().await;
+        let mut backends = HashMap::new();
+        // The default: filesystem-like (lite list authoritative, no native
+        // multipart). It does not have `b`, so `b` resolves to `s3`.
+        backends.insert(
+            "primary".to_string(),
+            Arc::new(DynStorageBackend::new_box(TestBackend::default())),
+        );
+        backends.insert(
+            "s3".to_string(),
+            Arc::new(DynStorageBackend::new_box(
+                crate::storage::s3_test_support::for_test_endpoint(&endpoint),
+            )),
+        );
+        let routing = RoutingBackend::new(backends, HashMap::new(), "primary".to_string())
+            .expect("routing backend");
+
+        assert!(
+            !routing.lite_list_carries_logical_facts("b"),
+            "unknown home"
+        );
+        assert!(!routing.supports_native_multipart("b"), "unknown home");
+
+        assert_eq!(routing.resolve_existing_named("b").await.0, "s3");
+        assert!(
+            !routing.lite_list_carries_logical_facts("b"),
+            "an S3 lite list carries no user metadata"
+        );
+        assert!(routing.supports_native_multipart("b"));
+        assert_eq!(routing.multipart_storage_label("b"), "none");
     }
 
     /// Hard expiry: a resolution older than 5 x RESOLVE_TTL is not served;
