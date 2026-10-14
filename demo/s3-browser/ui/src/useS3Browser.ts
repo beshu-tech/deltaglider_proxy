@@ -182,6 +182,10 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
   // guard, which silently dropped concurrent loads (e.g. fast prefix/bucket
   // changes), letting the older request commit stale data into state.
   const loadSeq = useRef(0);
+  // The seq of the full listing in flight (0 = none). A first-page tick never
+  // replaces it: the tick's rows after page 1 come from the listing before the
+  // change, so a file uploaded onto page 2 would vanish until the next reload.
+  const fullLoadSeq = useRef(0);
   const queryClient = useQueryClient();
 
   const load = useCallback(() => {
@@ -214,10 +218,13 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
       setConnected(true);
       return;
     }
-    const seq = ++loadSeq.current;
     // A first listing of the folder lists everything, also on a tick.
     const pageOne = firstPageOnly.current && !isInitialLoad.current;
     firstPageOnly.current = false;
+    // A full listing in flight is newer than the tick: skip the tick.
+    if (pageOne && fullLoadSeq.current !== 0) return;
+    const seq = ++loadSeq.current;
+    fullLoadSeq.current = pageOne ? 0 : seq;
 
     // On initial load or prefix/bucket change, show full loading spinner.
     // On background refresh, show subtle refreshing indicator.
@@ -263,6 +270,7 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
       })
       .finally(() => {
         if (seq !== loadSeq.current) return; // stale settle — newer load owns the spinners
+        fullLoadSeq.current = 0;
         isInitialLoad.current = false;
         setLoading(false);
         setRefreshing(false);
@@ -271,15 +279,32 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
 
   useEffect(load, [load, refreshTrigger]);
 
-  // Smart auto-refresh: 60s interval, only on the browser view, skip when tab is hidden
+  // Smart auto-refresh: 60s interval, only on the browser view, skip when tab
+  // is hidden. A tick missed while hidden runs as soon as the tab shows again.
   useEffect(() => {
     if (!active) return;
-    const id = setInterval(() => {
-      if (document.hidden) return;
+    let missed = false;
+    const tick = () => {
       firstPageOnly.current = true;
       refresh();
+    };
+    const id = setInterval(() => {
+      if (document.hidden) {
+        missed = true;
+        return;
+      }
+      tick();
     }, 60000);
-    return () => clearInterval(id);
+    const onVisible = () => {
+      if (document.hidden || !missed) return;
+      missed = false;
+      tick();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   }, [refresh, active]);
 
   // The storage facts of each row, from the listing (`metadata=true`): no
