@@ -147,11 +147,23 @@ pub struct AppState {
 /// multipart verbs, the bucket sub-resource verbs, DeleteObject(s), the
 /// `NoSuchKey`-or-`NoSuchBucket` check of a read miss and of a copy source,
 /// and a LIST that finds nothing. DeleteBucket on this instance forgets the bucket
-/// ([`forget_bucket`]); a bucket deleted elsewhere can pass for up to
-/// [`BUCKET_SEEN_TTL`], and a write into it still fails at the backend
-/// (`require_bucket_exists` on the filesystem, `NoSuchBucket` on S3). A
-/// missing bucket is asked again every time: one created a moment later is
-/// usable at once.
+/// ([`forget_bucket`]). A missing bucket is asked again every time: one
+/// created a moment later is usable at once.
+///
+/// Two windows apply to a change that another instance (or another client
+/// of the backend) makes:
+///
+/// - **This check** ([`BUCKET_SEEN_TTL`], 5 s): a bucket deleted elsewhere
+///   can pass for up to 5 s. A write into it still fails at the backend
+///   (`require_bucket_exists` on the filesystem, `NoSuchBucket` on S3).
+/// - **Multi-backend routing** (`storage/routing.rs`, `Resolver`): for a
+///   bucket with no route, the backend where it was found is trusted for
+///   30 s (`RESOLVE_TTL`), then served stale for up to 150 s
+///   (`RESOLVE_HARD_EXPIRY`) while one background probe refreshes it; "no
+///   backend has it" is trusted for 5 s (`MISS_TTL`). The HeadBucket of
+///   this check goes to that backend: a bucket that moved to another
+///   backend reads as missing until the window ends. CreateBucket never
+///   uses these caches.
 pub(crate) async fn ensure_bucket_exists(
     state: &Arc<AppState>,
     bucket: &str,
