@@ -5,6 +5,8 @@
 pub mod advisories;
 mod bucket_encryption;
 pub use bucket_encryption::{BucketOverride, EncryptionSite};
+mod keys;
+pub(crate) use keys::*;
 mod check;
 pub use check::{DocumentRefusal, RuleGateRefusal};
 mod env;
@@ -661,6 +663,21 @@ pub struct BucketEncryption<'a> {
     /// True when `config` is the bucket's own `encryption` override, false
     /// when the bucket inherits the backend's encryption.
     pub from_bucket: bool,
+    /// The configured bucket whose `encryption` block this is (another
+    /// name of the same stored bucket for an alias); `None` when inherited.
+    pub owner: Option<String>,
+}
+
+impl BucketEncryption<'_> {
+    /// The keys of this config, resolved with the right id rules (the
+    /// bucket's when it is an override, the backend's when inherited).
+    pub(crate) fn site_keys(&self) -> SiteKeys {
+        let scope = match &self.owner {
+            Some(bucket) => KeyScope::Bucket(bucket),
+            None => KeyScope::Backend(&self.backend),
+        };
+        resolve_site_keys(scope, self.config)
+    }
 }
 
 /// A named storage backend with its connection configuration.
@@ -1831,6 +1848,7 @@ impl Config {
                 backend,
                 config,
                 from_bucket: true,
+                owner: Some(bucket.to_ascii_lowercase()),
             });
         }
         let config = self.backend_encryption_by_name(&backend)?;
@@ -1838,6 +1856,7 @@ impl Config {
             backend,
             config,
             from_bucket: false,
+            owner: None,
         })
     }
 

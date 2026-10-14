@@ -209,26 +209,24 @@ pub(super) fn wrap_backend_with_encryption(
     collisions: &mut KeyIdCollisionCheck,
 ) -> Result<Box<DynStorageBackend<'static>>, StorageError> {
     use crate::config::BackendEncryptionConfig as E;
+    // THE key resolution (config::resolve_site_keys): the same ids and
+    // the same parse as the config rules.
+    let site =
+        crate::config::resolve_site_keys(crate::config::KeyScope::Backend(backend_name), enc);
     // Resolve primary (key, key_id) + pick the write_mode.
     let (primary_key, primary_kid, write_mode): (
         Option<crate::storage::EncryptionKey>,
         Option<String>,
         crate::storage::WriteMode,
     ) = match enc {
-        E::Aes256GcmProxy {
-            key: Some(hex),
-            key_id,
-            ..
-        } => {
-            let parsed =
-                crate::storage::EncryptionKey::from_hex(hex).map_err(StorageError::Encryption)?;
-            // Resolve the id: explicit wins over derived. Derivation
-            // mixes the backend name in so same-key/different-name
-            // backends get distinct ids (see derive_key_id comment).
-            let kid = match key_id {
-                Some(explicit) => explicit.clone(),
-                None => derive_key_id(backend_name, &parsed.0),
-            };
+        E::Aes256GcmProxy { key: Some(_), .. } => {
+            let crate::config::SiteKey {
+                key: parsed,
+                key_id: kid,
+            } = site
+                .primary
+                .expect("a proxy key resolves to a primary slot")
+                .map_err(StorageError::Encryption)?;
             collisions.record(&format!("backend '{backend_name}'"), &kid, &parsed.0)?;
             tracing::info!(
                 "backend '{}' encryption: ENABLED (AES-256-GCM proxy, key_id={})",
@@ -284,7 +282,7 @@ pub(super) fn wrap_backend_with_encryption(
     // Both halves must be present; otherwise the shim silently
     // ignores itself (matches the "needs both id + key to fire"
     // invariant in `pick_decrypt_key`).
-    let (legacy_key_opt, legacy_kid_opt) = resolve_legacy_shim(backend_name, enc)?;
+    let (legacy_key_opt, legacy_kid_opt) = shim_of(site.legacy)?;
     if let (Some(_), Some(ref kid)) = (&legacy_key_opt, &legacy_kid_opt) {
         tracing::info!(
             "backend '{}' decrypt-only shim active (legacy key_id='{}') — reads of \
@@ -335,24 +333,16 @@ pub(super) fn resolve_bucket_keys(
     let mut keyring = std::collections::HashMap::new();
     for o in buckets {
         let label = format!("bucket '{}'", o.bucket);
-        let parse = |hex: &str, what: &str| {
-            crate::storage::EncryptionKey::from_hex(hex)
-                .map_err(|e| StorageError::Encryption(format!("{label} {what}: {e}")))
-        };
-        let explicit = |id: Option<&str>, what: &str| {
-            id.map(str::to_string).ok_or_else(|| {
-                StorageError::Encryption(format!("{label}: {what} is required on a bucket"))
-            })
-        };
+        // THE key resolution, with the bucket's rules (explicit ids only).
+        let site =
+            crate::config::resolve_site_keys(crate::config::KeyScope::Bucket(o.bucket), o.config);
         let mut keys = crate::storage::BucketKeys::default();
         match o.config {
-            E::Aes256GcmProxy {
-                key: Some(hex),
-                key_id,
-                ..
-            } => {
-                let key = parse(hex, "key")?;
-                let kid = explicit(key_id.as_deref(), "encryption.key_id")?;
+            E::Aes256GcmProxy { key: Some(_), .. } => {
+                let crate::config::SiteKey { key, key_id: kid } = site
+                    .primary
+                    .expect("a proxy key resolves to a primary slot")
+                    .map_err(StorageError::Encryption)?;
                 collisions.record(&label, &kid, &key.0)?;
                 keyring.insert(kid.clone(), key.clone());
                 keys.key = Some(key);
@@ -378,9 +368,9 @@ pub(super) fn resolve_bucket_keys(
                 )));
             }
         }
-        if let Some(hex) = o.config.legacy_key() {
-            let key = parse(hex, "legacy_key")?;
-            let kid = explicit(o.config.legacy_key_id(), "encryption.legacy_key_id")?;
+        if let Some(slot) = site.legacy {
+            let crate::config::SiteKey { key, key_id: kid } =
+                slot.map_err(StorageError::Encryption)?;
             collisions.record(&label, &kid, &key.0)?;
             keyring.insert(kid.clone(), key);
             keys.legacy_key_id = Some(kid);
@@ -390,55 +380,45 @@ pub(super) fn resolve_bucket_keys(
     Ok((policies, keyring))
 }
 
-/// Pull the legacy_key / legacy_key_id pair out of the per-backend
-/// encryption config, parse the hex key, and derive the id if the
-/// operator left it implicit. Returns a pair of Options — BOTH
-/// present means "shim active"; either one alone is silently
-/// ignored (matches the wrapper's bilateral check).
-///
-/// Unlike the primary key path, the legacy key_id uses a reserved
-/// backend-name suffix `{backend_name}::legacy` so an operator who
-/// derives both from the same key material (rotation-shaped transition)
-/// still gets distinct primary and legacy ids.
+/// The decrypt-only shim of one resolved legacy slot: BOTH halves or
+/// neither.
+fn shim_of(
+    slot: Option<Result<crate::config::SiteKey, String>>,
+) -> Result<(Option<crate::storage::EncryptionKey>, Option<String>), StorageError> {
+    match slot {
+        Some(slot) => {
+            let k = slot.map_err(StorageError::Encryption)?;
+            Ok((Some(k.key), Some(k.key_id)))
+        }
+        None => Ok((None, None)),
+    }
+}
+
+/// The legacy key pair of a backend's encryption config, as the wrapper
+/// resolves it (`config::resolve_site_keys`; a missing id is derived from
+/// `{backend_name}::legacy`, so a rotation-shaped transition still gets a
+/// legacy id distinct from the primary's).
+#[cfg(test)]
 pub(super) fn resolve_legacy_shim(
     backend_name: &str,
     enc: &crate::config::BackendEncryptionConfig,
 ) -> Result<(Option<crate::storage::EncryptionKey>, Option<String>), StorageError> {
-    let Some(hex) = enc.legacy_key() else {
-        return Ok((None, None));
-    };
-    let parsed = crate::storage::EncryptionKey::from_hex(hex).map_err(|e| {
-        StorageError::Encryption(format!("backend '{}' legacy_key: {}", backend_name, e))
-    })?;
-    let kid = legacy_key_id_for(backend_name, enc.legacy_key_id(), &parsed);
-    Ok((Some(parsed), Some(kid)))
-}
-
-/// The id stamped on objects written under a backend's legacy key: the
-/// explicit `legacy_key_id`, else derived from `{backend_name}::legacy`.
-fn legacy_key_id_for(
-    backend_name: &str,
-    explicit: Option<&str>,
-    key: &crate::storage::EncryptionKey,
-) -> String {
-    match explicit {
-        Some(explicit) => explicit.to_string(),
-        None => derive_key_id(&format!("{backend_name}::legacy"), &key.0),
-    }
+    shim_of(
+        crate::config::resolve_site_keys(crate::config::KeyScope::Backend(backend_name), enc)
+            .legacy,
+    )
 }
 
 /// The legacy (decrypt-only) key id of a backend, as the wrapper resolves
-/// it; `None` when no legacy key is configured or it does not parse.
+/// it (`config::resolve_site_keys`); `None` when no legacy key is
+/// configured or it does not parse.
 pub(crate) fn effective_legacy_key_id(
     backend_name: &str,
     enc: &crate::config::BackendEncryptionConfig,
 ) -> Option<String> {
-    let parsed = crate::storage::EncryptionKey::from_hex(enc.legacy_key()?).ok()?;
-    Some(legacy_key_id_for(
-        backend_name,
-        enc.legacy_key_id(),
-        &parsed,
-    ))
+    crate::config::resolve_site_keys(crate::config::KeyScope::Backend(backend_name), enc)
+        .legacy_id()
+        .map(str::to_string)
 }
 
 /// Derive the per-object `key_id` from the backend name + the 32 key

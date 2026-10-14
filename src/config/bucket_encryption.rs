@@ -38,18 +38,6 @@ impl EncryptionSite {
     }
 }
 
-/// One key that a config site holds, as the engine resolves its id.
-#[derive(Debug, Clone)]
-pub(crate) struct ResolvedKey {
-    pub site: EncryptionSite,
-    /// The raw backend that the key decrypts on (the site's backend).
-    pub backend: String,
-    pub key_id: String,
-    pub bytes: [u8; 32],
-    /// True for a decrypt-only `legacy_key`.
-    pub legacy: bool,
-}
-
 /// One bucket override with the storage it applies to.
 #[derive(Debug, Clone)]
 pub struct BucketOverride<'a> {
@@ -96,8 +84,10 @@ impl Config {
         out
     }
 
-    /// The bucket policies with every override's key material removed (a
-    /// `${env:NAME}` reference stays): the form an API response carries.
+    /// The bucket policies with every override's key material removed: the
+    /// form an API response carries. The running config holds EXPANDED
+    /// values, so a key that came from `${env:NAME}` is removed too (no
+    /// reference is put back here; the export does that).
     /// `GET /config` hands the policies out on their own, outside the
     /// whole-config redactors.
     pub fn redacted_bucket_policies(
@@ -162,61 +152,6 @@ impl Config {
             .collect()
     }
 
-    /// The raw backend of an encryption site (`None`: a bucket whose
-    /// storage the config does not fix).
-    fn site_backend(&self, site: &EncryptionSite) -> Option<String> {
-        match site {
-            EncryptionSite::Singleton => Some("default".to_string()),
-            EncryptionSite::Backend(name) => Some(name.clone()),
-            EncryptionSite::Bucket(name) => self.bucket_storage(name).map(|(b, _)| b),
-        }
-    }
-
-    /// Every key the config holds, with the id the engine stamps for it:
-    /// a backend's explicit id or the derived one (`derive_key_id`), a
-    /// bucket's explicit id (a bucket has no derived id). A key that does
-    /// not parse, or a bucket key without its id, is left out (other
-    /// rules report it). The singleton counts only while it is the
-    /// engine's backend (no named backends).
-    pub(crate) fn resolved_keys(&self) -> Vec<ResolvedKey> {
-        let mut out = Vec::new();
-        for (site, enc) in self.encryption_sites() {
-            if site == EncryptionSite::Singleton && !self.backends.is_empty() {
-                continue;
-            }
-            let Some(backend) = self.site_backend(&site) else {
-                continue;
-            };
-            let derive_scope = match &site {
-                EncryptionSite::Bucket(_) => None,
-                _ => Some(backend.clone()),
-            };
-            let primary = enc.primary_key().map(|k| (k, enc_key_id(enc), false));
-            let legacy = enc.legacy_key().map(|k| (k, enc.legacy_key_id(), true));
-            for (hex, explicit, legacy_slot) in primary.into_iter().chain(legacy) {
-                let Ok(parsed) = crate::storage::EncryptionKey::from_hex(hex) else {
-                    continue;
-                };
-                let key_id = match (explicit, &derive_scope) {
-                    (Some(id), _) => id.to_string(),
-                    (None, Some(scope)) if legacy_slot => {
-                        crate::deltaglider::derive_key_id(&format!("{scope}::legacy"), &parsed.0)
-                    }
-                    (None, Some(scope)) => crate::deltaglider::derive_key_id(scope, &parsed.0),
-                    (None, None) => continue,
-                };
-                out.push(ResolvedKey {
-                    site: site.clone(),
-                    backend: backend.clone(),
-                    key_id,
-                    bytes: parsed.0,
-                    legacy: legacy_slot,
-                });
-            }
-        }
-        out
-    }
-
     /// FATAL errors of the bucket overrides (part of [`Self::check_fatal`]):
     /// a config the proxy must never run with.
     pub(super) fn bucket_encryption_errors(&self) -> Vec<String> {
@@ -255,30 +190,31 @@ impl Config {
                         enc.mode_tag()
                     ));
                 }
-                BackendEncryptionConfig::Aes256GcmProxy { key, key_id, .. } => {
-                    match key_id {
-                        None => errors.push(format!(
-                            "{at}: encryption.key_id is required on a bucket override. The id \
+                BackendEncryptionConfig::Aes256GcmProxy { key_id, .. } => match key_id {
+                    None => errors.push(format!(
+                        "{at}: encryption.key_id is required on a bucket override. The id \
                              is stamped on every object, so it must not depend on a name; \
                              choose a stable id such as '{bucket}-2026'"
-                        )),
-                        Some(id) if !is_valid_key_id(id) => errors.push(format!(
-                            "{at}: encryption.key_id='{id}' must match [A-Za-z0-9_.-]{{1,64}}"
-                        )),
-                        Some(_) => {}
-                    }
-                    if let Some(k) = key {
-                        if let Err(e) = crate::storage::EncryptionKey::from_hex(k) {
-                            errors.push(format!("{at}: encryption.key: {e}"));
-                        }
-                    }
-                }
+                    )),
+                    Some(id) if !is_valid_key_id(id) => errors.push(format!(
+                        "{at}: encryption.key_id='{id}' must match [A-Za-z0-9_.-]{{1,64}}"
+                    )),
+                    Some(_) => {}
+                },
                 BackendEncryptionConfig::None { .. } => {}
             }
-            if let Some(legacy) = enc.legacy_key() {
-                if let Err(e) = crate::storage::EncryptionKey::from_hex(legacy) {
-                    errors.push(format!("{at}: encryption.legacy_key: {e}"));
+            // A key that does not parse: THE key resolution's error (a
+            // missing id is reported above and below, once).
+            let site = resolve_site_keys(KeyScope::Bucket(bucket), enc);
+            for (slot, has_id) in [
+                (&site.primary, enc_has_key_id(enc)),
+                (&site.legacy, enc.legacy_key_id().is_some()),
+            ] {
+                if let (Some(Err(e)), true) = (slot, has_id) {
+                    errors.push(e.clone());
                 }
+            }
+            if enc.legacy_key().is_some() {
                 match enc.legacy_key_id() {
                     None => errors.push(format!(
                         "{at}: encryption.legacy_key needs an explicit legacy_key_id on a \
@@ -336,13 +272,13 @@ impl Config {
     /// a bucket override. (Two backends with that conflict are refused when
     /// the engine is built and warned about by `check`.)
     fn bucket_key_id_collisions(&self) -> Vec<String> {
-        let keys = self.resolved_keys();
+        let keys = self.resolved_keys().keys;
         let mut errors = Vec::new();
         for (i, a) in keys.iter().enumerate() {
             for b in &keys[i + 1..] {
                 let involves_bucket = matches!(a.site, EncryptionSite::Bucket(_))
                     || matches!(b.site, EncryptionSite::Bucket(_));
-                if involves_bucket && a.key_id == b.key_id && a.bytes != b.bytes {
+                if involves_bucket && a.key_id == b.key_id && a.key.0 != b.key.0 {
                     errors.push(format!(
                         "{} and {} use key id '{}' with DIFFERENT keys. A key id names one \
                          key everywhere (objects carry it to pick their key on read); give \
@@ -420,7 +356,7 @@ impl Config {
     /// legacy-key usage scan of the bucket finds no object, the removal.
     /// Migrate's transient routes (`__dgmigrate_*`) are internal and skipped.
     pub fn dropped_bucket_keys(&self, old: &Config) -> Vec<String> {
-        let now = self.resolved_keys();
+        let now = self.resolved_keys().keys;
         // Kept: on the same raw backend, or by the same bucket (a migrate
         // flip moves a bucket and its override to another backend).
         let kept: std::collections::HashSet<(String, String)> = now
@@ -435,7 +371,7 @@ impl Config {
             })
             .collect();
         let mut errors = Vec::new();
-        for k in old.resolved_keys() {
+        for k in old.resolved_keys().keys {
             let EncryptionSite::Bucket(name) = &k.site else {
                 continue;
             };
@@ -477,18 +413,7 @@ impl Config {
                 continue;
             };
             let id = |e: &BucketEncryption<'_>| {
-                let kid = match e.config {
-                    BackendEncryptionConfig::Aes256GcmProxy {
-                        key: Some(hex),
-                        key_id,
-                        ..
-                    } => key_id.clone().or_else(|| {
-                        crate::storage::EncryptionKey::from_hex(hex)
-                            .ok()
-                            .map(|k| crate::deltaglider::derive_key_id(&e.backend, &k.0))
-                    }),
-                    _ => None,
-                };
+                let kid = e.site_keys().primary_id().map(str::to_string);
                 (e.config.mode_tag(), kid)
             };
             let (b, a) = (id(&before), id(&after));
@@ -511,10 +436,13 @@ impl Config {
     }
 }
 
-/// The explicit primary key id of a proxy-AES config.
-fn enc_key_id(enc: &BackendEncryptionConfig) -> Option<&str> {
-    match enc {
-        BackendEncryptionConfig::Aes256GcmProxy { key_id, .. } => key_id.as_deref(),
-        _ => None,
-    }
+/// Does a proxy-AES config name its primary key id?
+fn enc_has_key_id(enc: &BackendEncryptionConfig) -> bool {
+    matches!(
+        enc,
+        BackendEncryptionConfig::Aes256GcmProxy {
+            key_id: Some(_),
+            ..
+        }
+    )
 }

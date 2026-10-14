@@ -151,15 +151,15 @@ impl BackendEncryptionSummary {
                 ..
             } => {
                 // Surface the same id the engine stamps on written
-                // objects. Explicit wins; otherwise derive from the
-                // name + key (same logic as the engine's
-                // `derive_key_id`).
-                let resolved_kid: Option<String> = match key_id {
-                    Some(explicit) => Some(explicit.clone()),
-                    None => key
-                        .as_deref()
-                        .and_then(|hex| derive_key_id_for_summary(backend_name, hex)),
-                };
+                // objects: THE key resolution (config::resolve_site_keys).
+                // With no key, the explicit id still shows.
+                let resolved_kid: Option<String> = crate::config::resolve_site_keys(
+                    crate::config::KeyScope::Backend(backend_name),
+                    enc,
+                )
+                .primary_id()
+                .map(str::to_string)
+                .or_else(|| key_id.clone());
                 Self {
                     mode: "aes256-gcm-proxy".into(),
                     has_key: key.is_some(),
@@ -188,17 +188,6 @@ impl BackendEncryptionSummary {
             },
         }
     }
-}
-
-/// Decode hex → 32 bytes and call the engine's `derive_key_id` so
-/// the summary ALWAYS matches the id stamped on disk by the
-/// EncryptingBackend wrapper. Returns None on malformed hex (the
-/// engine would reject that at startup; the summary just elides
-/// the id).
-fn derive_key_id_for_summary(backend_name: &str, hex_key: &str) -> Option<String> {
-    let bytes = hex::decode(hex_key).ok()?;
-    let arr: [u8; 32] = bytes.try_into().ok()?;
-    Some(crate::deltaglider::derive_key_id(backend_name, &arr))
 }
 
 /// Sanitized backend info (no secrets) for the admin API.

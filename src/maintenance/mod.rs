@@ -81,34 +81,27 @@ pub fn resolve_desired(config: &Config, bucket: &str) -> Result<DesiredEncryptio
     let resolved = config
         .encryption_for_bucket(bucket)
         .ok_or_else(|| format!("bucket '{bucket}' routes to an unknown backend"))?;
-    let backend_name = resolved.backend;
     let enc = resolved.config.clone();
     // Who owns the encryption, for the messages: a bucket override (issue
     // #116; its key id is always explicit) or the backend.
-    let owner = if resolved.from_bucket {
-        format!("bucket '{bucket}'")
-    } else {
-        format!("backend '{backend_name}'")
+    let owner = match &resolved.owner {
+        Some(b) => format!("bucket '{b}'"),
+        None => format!("backend '{}'", resolved.backend),
     };
 
     match enc {
         BackendEncryptionConfig::None { .. } => Ok(DesiredEncryption::Plain),
-        BackendEncryptionConfig::Aes256GcmProxy { key, key_id, .. } => {
-            let Some(hex) = key else {
-                return Err(format!(
+        BackendEncryptionConfig::Aes256GcmProxy { .. } => {
+            // THE key resolution (config::resolve_site_keys): the id the
+            // wrapper stamps.
+            match resolved.site_keys().primary {
+                None => Err(format!(
                     "{owner} is in aes256-gcm-proxy mode but has no key configured — \
                      writes are refused; fix the key before re-encrypting"
-                ));
-            };
-            let key_id = match key_id {
-                Some(explicit) => explicit,
-                None => {
-                    let parsed = crate::storage::EncryptionKey::from_hex(&hex)
-                        .map_err(|e| format!("{owner} key: {e}"))?;
-                    crate::deltaglider::derive_key_id(&backend_name, &parsed.0)
-                }
-            };
-            Ok(DesiredEncryption::Proxy { key_id })
+                )),
+                Some(Err(e)) => Err(e),
+                Some(Ok(k)) => Ok(DesiredEncryption::Proxy { key_id: k.key_id }),
+            }
         }
         BackendEncryptionConfig::SseKms { .. } | BackendEncryptionConfig::SseS3 { .. } => {
             Err(format!(

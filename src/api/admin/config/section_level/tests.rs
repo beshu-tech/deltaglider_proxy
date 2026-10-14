@@ -201,7 +201,8 @@ fn preserve_same_mode_doesnt_promote_anywhere() {
 }
 
 fn derived(name: &str, hex: &str) -> String {
-    derive_hex_key_id(name, hex).unwrap()
+    let key = crate::storage::EncryptionKey::from_hex(hex).unwrap();
+    crate::deltaglider::derive_key_id(name, &key.0)
 }
 
 #[test]
@@ -453,4 +454,24 @@ fn a_null_key_is_refused_while_the_legacy_slot_holds_another_key() {
     };
     let err = preserve_backend_encryption_secrets("b", &mut new, &old, probe).unwrap_err();
     assert!(err.contains("legacy"), "{err}");
+}
+
+/// Review H: a bucket key id is never derived, so a rotation that keeps
+/// the bucket's id must tell the operator to set a new one (before, the
+/// message said "remove `key_id`", which the config rules then refuse).
+#[test]
+fn a_bucket_rotation_with_the_same_id_asks_for_a_new_id() {
+    let yaml = |key: &str| {
+        format!(
+            "storage:\n  filesystem: /tmp/p116-rot\n  buckets:\n    db-archive:\n      \
+             encryption: {{ mode: aes256-gcm-proxy, key: \"{key}\", key_id: db-archive-2026 }}\n"
+        )
+    };
+    let old = crate::config::Config::from_yaml_str(&yaml(&"a".repeat(64))).unwrap();
+    let mut new = crate::config::Config::from_yaml_str(&yaml(&"b".repeat(64))).unwrap();
+    let err = preserve_all_backend_encryption(&mut new, &old, &BackendEncryptionKeyProbe::empty())
+        .unwrap_err();
+    assert!(err.contains("bucket 'db-archive'"), "{err}");
+    assert!(err.contains("Set a new `key_id`"), "{err}");
+    assert!(!err.contains("Remove `key_id`"), "{err}");
 }

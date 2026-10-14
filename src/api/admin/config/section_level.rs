@@ -903,7 +903,7 @@ pub(crate) fn preserve_backend_encryption_secrets(
     probe: BackendKeyPresence,
 ) -> Result<(), String> {
     preserve_encryption_secrets(
-        backend_name,
+        crate::config::KeyScope::Backend(backend_name),
         &format!("backend '{backend_name}'"),
         new,
         old,
@@ -912,10 +912,10 @@ pub(crate) fn preserve_backend_encryption_secrets(
 }
 
 /// [`preserve_backend_encryption_secrets`] for any encryption site:
-/// `backend_name` is the key-id derivation scope, `owner` names the site
-/// in the messages (`backend 'x'`, `bucket 'y'`).
+/// `scope` gives the key-id rules (config::resolve_site_keys), `owner`
+/// names the site in the messages (`backend 'x'`, `bucket 'y'`).
 fn preserve_encryption_secrets(
-    backend_name: &str,
+    scope: crate::config::KeyScope<'_>,
     owner: &str,
     new: &mut crate::config::BackendEncryptionConfig,
     old: &crate::config::BackendEncryptionConfig,
@@ -968,7 +968,7 @@ fn preserve_encryption_secrets(
     // this every historical object reads as "encrypted with key id X,
     // backend configured with key id Y".
     if let Some(old_primary) = &old_primary_ok {
-        let old_kid = effective_proxy_key_id(backend_name, old).unwrap_or_default();
+        let old_kid = effective_proxy_key_id(scope, old).unwrap_or_default();
         // A `key: null` that stays in proxy mode retires the key too
         // (issue #116): the objects written under it still need it. An
         // absent `key` was restored above, so it is not retired.
@@ -977,13 +977,20 @@ fn preserve_encryption_secrets(
             _ => true,
         };
         if retired {
-            if let Some(new_kid) = effective_proxy_key_id(backend_name, new) {
+            if let Some(new_kid) = effective_proxy_key_id(scope, new) {
                 if new_kid == old_kid {
+                    // A bucket's id is never derived (review H): only a
+                    // new explicit id fixes it there.
+                    let fix = match scope {
+                        crate::config::KeyScope::Bucket(_) => "Set a new `key_id`.",
+                        crate::config::KeyScope::Backend(_) => {
+                            "Remove `key_id` (the id is then derived from the key) or set a new one."
+                        }
+                    };
                     return Err(format!(
                         "{owner}: the encryption key changes but the key id \
                          stays '{old_kid}'. Objects written under the old key would be decrypted \
-                         with the new key and fail. Remove `key_id` (the id is then derived from \
-                         the key) or set a new one."
+                         with the new key and fail. {fix}"
                     ));
                 }
             }
@@ -993,8 +1000,10 @@ fn preserve_encryption_secrets(
                 || (new.legacy_key().is_some() && new.legacy_key() != old.legacy_key());
             if probe.legacy_key != Presence::Null && !body_sets_legacy {
                 if old_legacy_ok.as_deref().is_some_and(|l| l != old_primary) {
-                    let held_kid = crate::deltaglider::effective_legacy_key_id(backend_name, old)
-                        .unwrap_or_default();
+                    let held_kid = crate::config::resolve_site_keys(scope, old)
+                        .legacy_id()
+                        .unwrap_or_default()
+                        .to_string();
                     return Err(format!(
                         "{owner}: the current key must become the legacy \
                          (decrypt-only) key, but the legacy slot still holds key id \
@@ -1045,11 +1054,12 @@ pub(crate) fn preserve_all_backend_encryption(
             continue;
         };
         let scope = match &site {
-            S::Singleton => "default".to_string(),
-            S::Backend(name) | S::Bucket(name) => name.clone(),
+            S::Singleton => crate::config::KeyScope::Backend("default"),
+            S::Backend(name) => crate::config::KeyScope::Backend(name),
+            S::Bucket(name) => crate::config::KeyScope::Bucket(name),
         };
         preserve_encryption_secrets(
-            &scope,
+            scope,
             &site.label(),
             new_enc,
             old_enc,
@@ -1059,30 +1069,16 @@ pub(crate) fn preserve_all_backend_encryption(
     Ok(())
 }
 
-/// The id a proxy-AES backend stamps on the objects it writes: the
-/// explicit `key_id`, else derived from the backend name and the key
-/// (same rule as the engine wrapper). None for other modes or an
-/// unparseable key.
+/// The id a proxy-AES config stamps on the objects it writes (THE key
+/// resolution, config::resolve_site_keys). None for other modes, an
+/// unparseable key, or a bucket key without its id.
 fn effective_proxy_key_id(
-    backend_name: &str,
+    scope: crate::config::KeyScope<'_>,
     enc: &crate::config::BackendEncryptionConfig,
 ) -> Option<String> {
-    match enc {
-        crate::config::BackendEncryptionConfig::Aes256GcmProxy {
-            key: Some(hex),
-            key_id,
-            ..
-        } => match key_id {
-            Some(explicit) => Some(explicit.clone()),
-            None => derive_hex_key_id(backend_name, hex),
-        },
-        _ => None,
-    }
-}
-
-fn derive_hex_key_id(name: &str, hex: &str) -> Option<String> {
-    let parsed = crate::storage::EncryptionKey::from_hex(hex).ok()?;
-    Some(crate::deltaglider::derive_key_id(name, &parsed.0))
+    crate::config::resolve_site_keys(scope, enc)
+        .primary_id()
+        .map(str::to_string)
 }
 
 fn set_legacy_key_id(enc: &mut crate::config::BackendEncryptionConfig, id: Option<String>) {

@@ -83,3 +83,51 @@ fn every_encryption_site_goes_through_the_visitor() {
         );
     }
 }
+
+/// Review G: a key id has one resolver, `config::resolve_site_keys`. In
+/// production code, only it derives an id and parses a configured key (the
+/// preserve step keeps its hex-validity filter, which resolves nothing).
+#[test]
+fn key_ids_have_one_resolver() {
+    use crate::source_scan::{prod_lines, rel, rust_files};
+    let allowed: &[(&str, &str, usize)] = &[
+        ("src/config/keys.rs", "derive_key_id(", 2),
+        // The definition.
+        (
+            "src/deltaglider/engine/construction.rs",
+            "derive_key_id(",
+            1,
+        ),
+        ("src/config/keys.rs", "EncryptionKey::from_hex(", 1),
+        (
+            "src/api/admin/config/section_level.rs",
+            "EncryptionKey::from_hex(",
+            2,
+        ),
+    ];
+    let mut offenders = Vec::new();
+    for path in rust_files("src") {
+        let r = rel(&path);
+        if r.ends_with("tests.rs") || r.contains("/tests/") || r.ends_with("_tests.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        for needle in ["derive_key_id(", "EncryptionKey::from_hex("] {
+            let n = prod_lines(&text)
+                .iter()
+                .filter(|(_, l)| l.contains(needle) && !l.trim_start().starts_with("//"))
+                .count();
+            let limit = allowed
+                .iter()
+                .find(|(f, nd, _)| *f == r && *nd == needle)
+                .map_or(0, |(_, _, n)| *n);
+            if n > limit {
+                offenders.push(format!("{r}: {needle} x{n} (allowed {limit})"));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "resolve key ids with config::resolve_site_keys: {offenders:?}"
+    );
+}
