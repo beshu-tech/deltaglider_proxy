@@ -47,6 +47,9 @@ import { formatBytesIec } from '../utils';
 import { bytesFromGib, gibFromBytes } from '../savings';
 import { activateOnKey } from '../keyboard';
 import RowActionsMenu from './RowActionsMenu';
+import { useNavigation } from '../NavigationContext';
+import { buildViewUrl } from '../urlState';
+import { WITNESS_CARD_ID } from './EncryptionWitnessCard';
 
 const { Text } = Typography;
 
@@ -90,6 +93,9 @@ interface CardProps {
   maintenanceJob?: JobRow | null;
   /** Start the one-off re-encrypt job for this bucket (the [Later] path). */
   onReencrypt?: () => void;
+  /** The encryption witness (several instances) refuses writes to this
+   *  bucket on this instance: its encryption differs from the cluster's. */
+  witnessRefused?: boolean;
 }
 
 /** Small status chip used in the collapsed row. */
@@ -141,9 +147,12 @@ export default function BucketCard({
   inputRadius,
   maintenanceJob = null,
   onReencrypt,
+  witnessRefused = false,
 }: CardProps) {
   const uid = useId();
   const colors = useColors();
+  const { navigate } = useNavigation();
+  const witnessUrl = buildViewUrl('admin', 'system', { focus: WITNESS_CARD_ID });
   const [migrateOpen, setMigrateOpen] = useState(false);
   // Whether the job blocks writes is the server's answer (its write gate),
   // read only while a job runs on this bucket.
@@ -402,6 +411,41 @@ export default function BucketCard({
           {chips}
         </span>
       </div>
+
+      {/* ── Encryption witness: its own line, outside the clickable row ── */}
+      {witnessRefused && (
+        <div style={{ padding: '0 14px 10px' }}>
+          <span
+            data-testid="witness-refused-chip"
+            title="Several instances share this cluster. This instance encrypts new writes to this bucket differently from the setting that the cluster published, so it refuses them. Reads keep working."
+            style={{
+              display: 'inline-flex',
+              flexWrap: 'wrap',
+              alignItems: 'center',
+              gap: 6,
+              fontSize: 11.5,
+              fontWeight: 600,
+              padding: '3px 10px',
+              borderRadius: 10,
+              background: `${colors.ACCENT_RED}1a`,
+              color: colors.ACCENT_RED,
+            }}
+          >
+            <span style={{ width: 6, height: 6, borderRadius: '50%', background: colors.ACCENT_RED }} />
+            Writes refused on this instance: encryption differs from the cluster.
+            <a
+              href={witnessUrl}
+              onClick={(e) => {
+                e.preventDefault();
+                navigate(witnessUrl);
+              }}
+              style={{ color: 'inherit', textDecoration: 'underline' }}
+            >
+              Open the encryption witness
+            </a>
+          </span>
+        </div>
+      )}
 
       {/* ── Maintenance progress: visible on every render of the row ── */}
       {maintenanceJob && (

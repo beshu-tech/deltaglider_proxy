@@ -52,6 +52,9 @@ export const qk = {
       (bucket ? ['legacy-key-usage', name, bucket] : ['legacy-key-usage', name]) as readonly string[],
   },
 
+  // The multi-instance encryption witness verdict (null on one instance).
+  encryptionWitness: () => ['encryption-witness'] as const,
+
   // ── Diagnostics ─────────────────────────────────────────────────
   bucketUsage: (bucket: string) => ['bucket-usage', bucket] as const,
 

@@ -31,6 +31,8 @@ import { LoadingState } from './StatePlaceholders';
 import type { AdminConfig } from '../adminApi';
 import { useQueryClient } from '@tanstack/react-query';
 import { useAdminConfig } from '../queries/config';
+import { useEncryptionWitness } from '../queries/encryptionWitness';
+import { bucketMismatch } from '../encryptionWitness';
 import { useBackends, useBucketNames, useBucketOrigins } from '../queries/backends';
 import { qk } from '../queries/keys';
 import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
@@ -126,6 +128,8 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
 
   // Config (backends + default backend + global compression) from the cache.
   const { data: cfg } = useAdminConfig({ onSessionExpired });
+  // Several instances: the buckets that this instance refuses to write.
+  const witnessMismatches = useEncryptionWitness().data?.mismatches ?? [];
   const queryClient = useQueryClient();
   // Backends + real bucket names from the SHARED query cache — not a per-mount
   // Promise.all. `useBucketNames` derives names from the cached origins map, so
@@ -359,6 +363,15 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
                 maintenanceJob={busyJobForBucket(maintenanceJobs, name)}
                 onReencrypt={
                   effectiveByName.get(name)?.reencrypt ? () => openReencrypt(name) : undefined
+                }
+                witnessRefused={
+                  !!cfg &&
+                  bucketMismatch(
+                    witnessMismatches,
+                    cfg,
+                    name,
+                    effectiveByName.get(name)?.backend ?? originBackendByName.get(name),
+                  ) !== null
                 }
               />
             );

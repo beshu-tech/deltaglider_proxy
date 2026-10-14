@@ -3,6 +3,11 @@
 ## Unreleased
 
 ### Added — A bucket can have its own encryption (issue #116)
+### Added — The admin UI shows the encryption witness
+
+On several instances, the **System** page has an **Encryption witness** card. It shows the state of this instance (agree, mismatch, unknown or unavailable) and each bucket whose encryption on this instance differs from the shared one, with both encryptions and the instance that published the shared one. **Publish this instance's setting** (per bucket, or **Publish all**) calls `POST /_/api/admin/encryption-witness/publish`; a plaintext setting asks for the downgrade confirmation first. On **Storage → Buckets**, a bucket that this instance refuses to write carries the warning **Writes refused on this instance: encryption differs from the cluster.**, with a link to the card. A single instance shows neither.
+
+### Changed — The encryption witness never takes over an entry by itself
 
 A bucket policy (`storage.buckets.<name>`) can now carry an `encryption` block with the same schema as a backend's: `aes256-gcm-proxy` with the bucket's own key, `sse-kms` or `sse-s3` on an S3 backend, or `none`. The writes to that bucket use the block; the other buckets on the same backend keep the backend's encryption. Before, encryption was a backend setting only, and a second key on one disk needed a second backend definition.
 

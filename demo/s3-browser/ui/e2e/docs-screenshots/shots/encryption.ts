@@ -262,6 +262,32 @@ async function bucketKeyReady(page: Page): Promise<void> {
   await page.mouse.move(1, 1);
 }
 
+// Several instances (issue #116 P3): this instance gave db-archive its key
+// (a restart rollout that no apply announced), and the cluster still has the
+// plaintext setting. Faked GET answers: the seed is a single instance.
+
+const WITNESS = '/_/api/admin/encryption-witness';
+
+async function witnessDisagrees(page: Page): Promise<void> {
+  await fakeJson(page, WITNESS, 'GET', {
+    status: 'mismatch',
+    mismatches: [
+      {
+        backend: 'hetzner-fsn1',
+        bucket: 'db-archive',
+        local: { mode: 'aes256-gcm-proxy', key_id: 'db-archive-2026-10', kcv: '3f9a1c0e7b2d4a65' },
+        published: { mode: 'none' },
+        set_by: 'dgp-reader-1',
+      },
+    ],
+  });
+  // The seed routes db-archive to local-disk; the example has it on hetzner-fsn1.
+  await patchJson(page, '/_/api/admin/config', 'GET', (body) => {
+    const policies = (body.bucket_policies ?? {}) as Record<string, Json>;
+    return { ...body, bucket_policies: { ...policies, 'db-archive': { ...policies['db-archive'], backend: 'hetzner-fsn1' } } };
+  });
+}
+
 export const BUCKET_ENCRYPTION_SHOTS: Shot[] = [
   {
     id: 'bucket-encryption-choose',
@@ -351,5 +377,37 @@ export const BUCKET_ENCRYPTION_SHOTS: Shot[] = [
     // The seed routes db-archive to local-disk; the example has it on hetzner-fsn1.
     mask: [{ text: /LOCAL-DISK/i }],
     annotations: [{ target: { text: 'Encrypted · bucket key db-archive-2026-10' }, kind: 'box' }],
+  },
+  {
+    id: 'bucket-encryption-witness-chip',
+    route: '/_/admin/storage/buckets',
+    alt: 'The Buckets page; a box marks the warning Writes refused on this instance on the db-archive card, and callout 1 marks its link Open the encryption witness.',
+    setup: async (page) => {
+      await witnessDisagrees(page);
+      await exampleOrigins(page, () => true);
+      await page.getByTestId('witness-refused-chip').waitFor();
+    },
+    // The seed routes db-archive to local-disk; the example has it on hetzner-fsn1.
+    mask: [{ text: /LOCAL-DISK/i }],
+    annotations: [
+      { target: { testId: 'witness-refused-chip' }, kind: 'box' },
+      { target: { role: 'link', name: 'Open the encryption witness' }, kind: 'callout', label: '1', side: 'right' },
+    ],
+  },
+  {
+    id: 'bucket-encryption-witness-publish',
+    route: '/_/admin/system',
+    alt: 'The Encryption witness card on the System page with the db-archive mismatch; callout 2 marks Publish this instance\'s setting.',
+    setup: async (page) => {
+      await witnessDisagrees(page);
+      await page.reload();
+      const publish = page.getByRole('button', { name: /^Publish this instance's setting for db-archive/ });
+      await publish.waitFor();
+      await page.locator('#encryption-witness').evaluate((el) => el.scrollIntoView({ block: 'start' }));
+      await page.mouse.move(1, 1);
+    },
+    annotations: [
+      { target: { role: 'button', name: /^Publish this instance's setting for db-archive/ }, kind: 'callout', label: '2' },
+    ],
   },
 ];

@@ -1,7 +1,8 @@
 /**
  * System — ONE page for the platform/runtime knobs that used to be five
  * separate Advanced screens plus Backup: Listener & TLS, Caches, runtime
- * Limits (read-only env vars), Logging, Config DB sync, and Backup.
+ * Limits (read-only env vars), Logging, Config DB sync, the encryption
+ * witness (several instances only), and Backup.
  *
  * Each card keeps its OWN section editor (independent dirty key + apply
  * dialog — the sidebar dot lights when any of them is dirty). The dirty
@@ -16,6 +17,7 @@ import {
   LoggingPanel,
 } from './advancedPanels';
 import RecoveryPanel from './RecoveryPanel';
+import EncryptionWitnessCard from './EncryptionWitnessCard';
 
 interface Props {
   onSessionExpired?: () => void;
@@ -31,6 +33,7 @@ export default function SystemPanel({ onSessionExpired, onExportBackup, onImport
       <LimitsPanel onSessionExpired={onSessionExpired} />
       <LoggingPanel onSessionExpired={onSessionExpired} />
       <ConfigDbSyncPanel onSessionExpired={onSessionExpired} />
+      <EncryptionWitnessCard />
       <RecoveryPanel onExportBackup={onExportBackup} onImportBackup={onImportBackup} />
     </div>
   );

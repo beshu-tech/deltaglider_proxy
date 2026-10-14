@@ -47,6 +47,7 @@ beforeEach(() => {
   );
   http.on('GET', '/_/api/admin/config/section/advanced', json({}));
   http.on('GET', '/_/api/admin/jobs', json({ jobs: [] }));
+  http.on('GET', '/_/api/admin/encryption-witness', json(null));
   http.on('POST', '/_/api/admin/config/section/storage/validate', json({ ok: true, diff: { storage: { 'buckets.db-archive.encryption': { before: null, after: 'x' } } } }));
   http.on('PUT', SECTION, (req) => {
     const b = (req.body as { buckets: Record<string, unknown> }).buckets;

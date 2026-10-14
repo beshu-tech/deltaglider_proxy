@@ -209,7 +209,7 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
         icon: <SettingOutlined />,
         section: 'advanced',
         dirtyKeys: ['system/listener', 'system/caches', 'system/logging', 'system/sync'],
-        description: 'Listener & TLS, caches and limits, logging, config DB sync, backup.',
+        description: 'Listener & TLS, caches and limits, logging, config DB sync, encryption witness, backup.',
       },
     ],
   },

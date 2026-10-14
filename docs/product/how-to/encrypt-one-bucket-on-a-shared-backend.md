@@ -103,6 +103,24 @@ One legacy slot exists per bucket. While it holds a key, **Rotate key** and **Of
 
 [How to rotate or change encryption keys](rotate-encryption-keys.md) explains the legacy slot in detail.
 
+## Several instances
+
+With `config_sync_bucket` set, the instances share the encryption of each bucket through the encryption witness in the sync bucket. Each instance compares the encryption that it uses for new writes to a bucket with the encryption that the witness holds for that bucket. When the two differ, that instance refuses writes to the bucket with `503 SlowDown`. Reads keep working, and so do writes to the other buckets. A config apply that changes the encryption of a bucket publishes the new encryption, so the change in section 1 needs nothing more: apply it on every instance. A restart with a new config publishes nothing, so after such a rollout you publish the encryption of the instances that have the new config.
+
+In the admin UI, on an instance that has the new config:
+
+1. Open **Storage → Buckets** (`/_/admin/storage/buckets`). A bucket that this instance refuses to write carries the warning **Writes refused on this instance: encryption differs from the cluster.** Click **Open the encryption witness** in the warning.
+
+   ![The Buckets page; a box marks the warning Writes refused on this instance on the db-archive card, and callout 1 marks its link Open the encryption witness.](/_/screenshots/bucket-encryption-witness-chip.webp)
+
+2. The link opens the **Encryption witness** card on **System → System** (`/_/admin/system`). The card shows the state of this instance: **Agree**, **Mismatch**, **Unknown** (the sync bucket did not answer) or **Unavailable** (this instance has no client for the sync bucket). For each mismatch, it shows the bucket, the backend, the encryption of this instance, the encryption that the witness holds, and the instance that published it. A row for **All buckets without their own setting** stands for the buckets of the backend that have no entry of their own. Check that this instance has the encryption that you want for the bucket, and click **Publish this instance's setting** in its row. **Publish all** publishes every row at once.
+
+   ![The Encryption witness card on the System page with the db-archive mismatch; callout 2 marks Publish this instance's setting.](/_/screenshots/bucket-encryption-witness-publish.webp)
+
+   When this instance stores the bucket in plaintext, the publish is a downgrade for every instance. The page asks you to confirm with **Publish plaintext**, and the request carries the header `X-DGP-Confirm-Encryption-Downgrade`.
+
+After the publish, the instances that have the same encryption write the bucket again. An instance that still has the old config refuses writes until you give it the new config. The card is not on the page of a single instance, because a single instance has no witness. To publish from the command line (`deltaglider_proxy witness publish`), and for the rules of the witness, see [How to run multiple instances](run-multiple-instances.md#8-keep-the-encryption-of-each-bucket-the-same-on-every-instance).
+
 ## Verify
 
 1. On **Storage → Buckets**, check the encryption chip of each row. `db-archive` shows **Encrypted · bucket key db-archive-2026-10**, and `downloads` shows **Not encrypted**. A bucket that takes the encryption of an encrypting backend shows **Encrypted · from hetzner-fsn1**.

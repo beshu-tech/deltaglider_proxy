@@ -27,3 +27,4 @@ export * from './adminApi/sessions';
 export * from './adminApi/bulkObjects';
 export * from './adminApi/deltaEfficiency';
 export * from './adminApi/bucketScan';
+export * from './adminApi/encryptionWitness';
