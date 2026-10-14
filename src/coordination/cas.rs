@@ -125,6 +125,22 @@ impl KeptEtags {
     }
 }
 
+/// Pure: may a release that READ the lock or lease first delete it? Only
+/// when it is ours (`lock_owner == owner`) and still LIVE on the server
+/// clock (`expires_at >= now`, the renew predicate). The read-first path
+/// serves a bucket that may ignore `If-Match` on DELETE, where the delete
+/// removes whatever is there. An expired object is free to every peer,
+/// which may steal it between the read and the delete; skipping the delete
+/// costs nothing, because the object is already free.
+pub(crate) fn read_first_release_may_delete(
+    lock_owner: &str,
+    expires_at: i64,
+    owner: &str,
+    now: i64,
+) -> bool {
+    lock_owner == owner && expires_at >= now
+}
+
 /// `DELETE If-Match: etag`. A 412 means that the object is no longer the
 /// one we wrote (a peer stole it after our hold lapsed): nothing of ours
 /// is left to delete. Best-effort; errors are logged at debug.
@@ -185,6 +201,16 @@ mod tests {
             "service error: AccessDenied (status 403)"
         ));
         assert!(!is_precondition_failed(""));
+    }
+
+    #[test]
+    fn read_first_release_deletes_only_a_live_own_object() {
+        assert!(read_first_release_may_delete("me", 100, "me", 100));
+        assert!(read_first_release_may_delete("me", 160, "me", 100));
+        // Expired: a peer may be stealing it right now.
+        assert!(!read_first_release_may_delete("me", 99, "me", 100));
+        // Another owner's: never.
+        assert!(!read_first_release_may_delete("peer", 160, "me", 100));
     }
 
     #[test]

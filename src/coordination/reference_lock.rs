@@ -474,10 +474,13 @@ impl ReferenceLock for S3ReferenceLock {
             return Ok(());
         }
         // No kept ETag (our last write of it lost or failed), or a bucket
-        // that may ignore `If-Match` on DELETE: read first, delete only our own.
+        // that may ignore `If-Match` on DELETE: read first, delete only our
+        // own LIVE lock. An expired one is free to every peer, which may
+        // steal it between this read and the delete, and a bucket that
+        // ignores the condition would then delete the peer's lock.
         let now = crate::event_outbox::current_unix_seconds();
         if let Observed::Held { lock, etag } = self.read_lock(key, now).await? {
-            if lock.owner == owner {
+            if super::cas::read_first_release_may_delete(&lock.owner, lock.expires_at, owner, now) {
                 let delete = self
                     .client
                     .delete_object()
@@ -1280,6 +1283,32 @@ mod tests {
             None,
             "the lock of the failed hold stayed"
         );
+    }
+
+    /// A release that must read first (the bucket did not prove `If-Match`
+    /// on DELETE, which it may ignore) deletes only a LIVE lock of ours.
+    /// An expired one is free to every peer: a peer may steal it between
+    /// our read and our delete, and the delete would then remove the
+    /// peer's lock. Leaving it costs nothing, because it is already free.
+    #[tokio::test]
+    async fn a_read_first_release_leaves_an_expired_lock() {
+        let (lock, fake) = fake_lock().await;
+        fake.set_delete_if_match_ignored(true);
+        let now = crate::event_outbox::current_unix_seconds();
+        let lapsed = serde_json::json!({
+            "owner": "holder", "node_id": "node", "epoch": 1, "expires_at": now - 1
+        });
+        lock.client
+            .put_object()
+            .bucket("coord")
+            .key("k")
+            .body(ByteStream::from(serde_json::to_vec(&lapsed).unwrap()))
+            .send()
+            .await
+            .unwrap();
+        fake.clear();
+        lock.release("k", "holder").await.unwrap();
+        assert_eq!(methods(&fake), ["GET"], "an expired lock was deleted");
     }
 
     #[tokio::test]

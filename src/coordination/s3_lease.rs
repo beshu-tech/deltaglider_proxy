@@ -460,10 +460,12 @@ impl CoordinationLease for S3Lease {
             return Ok(());
         }
         // No kept ETag (our last write of it lost or failed), or a bucket
-        // that may ignore `If-Match` on DELETE: read first, delete only our own.
+        // that may ignore `If-Match` on DELETE: read first, delete only our
+        // own LIVE lease (see `cas::read_first_release_may_delete`).
         let now = crate::event_outbox::current_unix_seconds();
         if let LeaseRead::Valid { lease, etag } = self.read_lease(&key, now).await? {
-            if lease.owner == owner {
+            if super::cas::read_first_release_may_delete(&lease.owner, lease.expires_at, owner, now)
+            {
                 let _ = self
                     .client
                     .delete_object()
@@ -646,6 +648,35 @@ mod tests {
         lossy.seen.lock().unwrap().clear();
         lease.release(sub, "r", "o").await.unwrap();
         assert_eq!(lossy.seen(), ["DELETE"]);
+    }
+
+    /// A release that reads first deletes only a LIVE lease of ours. An
+    /// expired one is free to every peer, which may steal it between the
+    /// read and the delete; on a bucket that ignores `If-Match` on DELETE,
+    /// the delete then removed the peer's lease.
+    #[tokio::test]
+    async fn a_read_first_release_leaves_an_expired_lease() {
+        let (lease, fake) = fake_lease().await;
+        fake.set_delete_if_match_ignored(true);
+        let sub = LeaseSubsystem::Replication;
+        let now = crate::event_outbox::current_unix_seconds();
+        let lapsed = serde_json::json!({
+            "owner": "old", "node_id": "node", "epoch": 1, "expires_at": now - 1
+        });
+        lease
+            .client
+            .put_object()
+            .bucket("coord")
+            .key(S3Lease::object_key(sub, "r"))
+            .body(aws_sdk_s3::primitives::ByteStream::from(
+                serde_json::to_vec(&lapsed).unwrap(),
+            ))
+            .send()
+            .await
+            .unwrap();
+        fake.clear();
+        lease.release(sub, "r", "old").await.unwrap();
+        assert_eq!(methods(&fake), ["GET"], "an expired lease was deleted");
     }
 
     fn canned_lease(body: serde_json::Value, age: i64) -> crate::coordination::test_s3::Canned {

@@ -63,6 +63,16 @@ listing, and the folder listing of the file browser failed the same way. The
 proxy now skips a prefix that sorts completely before the continuation
 token, with no request, and skips a folder entry that the user cannot see
 before it checks the limit.
+### Fixed — A release that reads first leaves an expired lock in place
+
+On a coordination bucket that does not enforce `If-Match` on DELETE, an
+instance reads its lock (or lease) before it releases it, and deletes it
+when the owner is its own. It deleted an expired lock of its own too. A
+peer can take over an expired lock between that read and the delete, and
+the delete, which the bucket does not make conditional, then removed the
+peer's live lock, so two instances held it. The release now deletes only a
+lock that is its own and still live.
+
 ### Fixed — A lock write whose response was lost no longer blocks the deltaspace
 
 A multi-instance proxy takes a lock object in the coordination bucket
