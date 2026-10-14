@@ -348,48 +348,88 @@ impl Config {
             .collect()
     }
 
-    /// The apply gate of a bucket override's ACTIVE key: an error for each
-    /// key that a bucket wrote with in `old` and that no site of the same
-    /// raw backend keeps in `self`. The objects written under it would
-    /// become unreadable. The operator stops using a key in two steps:
-    /// first `mode: none` (or a new key) with the old key kept as
-    /// `legacy_key` (the admin API does this when the body leaves
-    /// `legacy_key` out), then, once the re-encrypt job ran and the
-    /// legacy-key usage scan of the bucket finds no object, the removal.
+    /// The key ids that `bucket` can still decrypt with under this config:
+    /// its own block's slots, and the slots of the backend it is stored on.
+    /// NOT the keys of other buckets on that backend: a bucket must never
+    /// depend on another bucket's block to read its own objects (review A:
+    /// two buckets that shared a key id could drop it one after the other,
+    /// each step looking safe because the other still held it).
+    fn key_ids_readable_by(&self, bucket: &str) -> std::collections::HashSet<String> {
+        let mut ids = std::collections::HashSet::new();
+        if let Some(enc) = self.buckets.get(bucket).and_then(|p| p.encryption.as_ref()) {
+            let own = resolve_site_keys(KeyScope::Bucket(bucket), enc);
+            ids.extend(own.primary_id().map(str::to_string));
+            ids.extend(own.legacy_id().map(str::to_string));
+        }
+        let backend = self
+            .bucket_storage(bucket)
+            .map(|(b, _)| b)
+            .or_else(|| self.effective_backend_for_bucket(bucket).map(|(b, _)| b));
+        if let Some(backend) = backend {
+            let site = if self.backends.is_empty() {
+                EncryptionSite::Singleton
+            } else {
+                EncryptionSite::Backend(backend.clone())
+            };
+            if let Some(enc) = self.encryption_at(&site) {
+                let keys = resolve_site_keys(KeyScope::Backend(&backend), enc);
+                ids.extend(keys.primary_id().map(str::to_string));
+                ids.extend(keys.legacy_id().map(str::to_string));
+            }
+        }
+        ids
+    }
+
+    /// The apply gate of every key a bucket override held in `old`
+    /// (review A). For each bucket, a key id of its own block (primary or
+    /// legacy) must stay readable BY THAT BUCKET in `self`: in its own
+    /// block, or in the slots of the backend it is stored on.
+    ///
+    /// * An ACTIVE key never leaves in one step: keep it as the bucket's
+    ///   `legacy_key` (the admin API does that when the body leaves
+    ///   `legacy_key` out). A migrate flip keeps the bucket's block, so it
+    ///   passes.
+    /// * A LEGACY key leaves only when the request confirms its id
+    ///   (`confirmed`, from the `X-DGP-Confirm-Key-Removal` header or
+    ///   `config apply --confirm-key-removal`), after the operator checked
+    ///   `GET /backends/<backend>/legacy-key-usage?bucket=<bucket>`, which
+    ///   scans every bucket stored on that backend.
+    ///
     /// Migrate's transient routes (`__dgmigrate_*`) are internal and skipped.
-    pub fn dropped_bucket_keys(&self, old: &Config) -> Vec<String> {
-        let now = self.resolved_keys().keys;
-        // Kept: on the same raw backend, or by the same bucket (a migrate
-        // flip moves a bucket and its override to another backend).
-        let kept: std::collections::HashSet<(String, String)> = now
-            .iter()
-            .map(|k| (k.backend.clone(), k.key_id.clone()))
-            .collect();
-        let kept_by_bucket: std::collections::HashSet<(String, String)> = now
-            .iter()
-            .filter_map(|k| match &k.site {
-                EncryptionSite::Bucket(b) => Some((b.clone(), k.key_id.clone())),
-                _ => None,
-            })
-            .collect();
+    pub fn dropped_bucket_keys(&self, old: &Config, confirmed: &[String]) -> Vec<String> {
         let mut errors = Vec::new();
-        for k in old.resolved_keys().keys {
-            let EncryptionSite::Bucket(name) = &k.site else {
+        for (name, policy) in &old.buckets {
+            let Some(enc) = policy.encryption.as_ref() else {
                 continue;
             };
-            if k.legacy || name.starts_with(crate::maintenance::migrate::TRANSIENT_PREFIX) {
+            if name.starts_with(crate::maintenance::migrate::TRANSIENT_PREFIX) {
                 continue;
             }
-            if !kept.contains(&(k.backend.clone(), k.key_id.clone()))
-                && !kept_by_bucket.contains(&(name.clone(), k.key_id.clone()))
+            let keys = resolve_site_keys(KeyScope::Bucket(name), enc);
+            let readable = self.key_ids_readable_by(name);
+            let backend = old.bucket_storage(name).map(|(b, _)| b).unwrap_or_default();
+            if let Some(id) = keys.primary_id().filter(|id| !readable.contains(*id)) {
+                errors.push(format!(
+                    "bucket '{name}': this change removes key id '{id}', which the bucket \
+                     writes with, from the keys the bucket can read. Objects written under \
+                     it would become unreadable. Keep it as the bucket's `legacy_key` / \
+                     `legacy_key_id` (set `mode: none` or a new key first, and leave \
+                     `legacy_key` out: the old key moves there), run the re-encrypt job for \
+                     the bucket, and remove the legacy key later"
+                ));
+            }
+            if let Some(id) = keys
+                .legacy_id()
+                .filter(|id| !readable.contains(*id) && !confirmed.iter().any(|c| c == id))
             {
                 errors.push(format!(
-                    "bucket '{name}': this change removes key id '{}', which the bucket writes \
-                     with, from backend '{}'. Objects written under it would become \
-                     unreadable. Keep it as `legacy_key` / `legacy_key_id` (set `mode: none` or \
-                     a new key first), run the re-encrypt job for the bucket, and remove the \
-                     legacy key once the legacy-key usage scan finds no object under it",
-                    k.key_id, k.backend
+                    "bucket '{name}': this change removes the legacy (decrypt-only) key id \
+                     '{id}' from the keys the bucket can read. Objects that still carry it \
+                     would become unreadable. Check GET \
+                     /_/api/admin/backends/{backend}/legacy-key-usage?bucket={name} (it scans \
+                     every bucket on the backend); when it answers safe_to_clear, send the \
+                     change again with the header `X-DGP-Confirm-Key-Removal: {id}` \
+                     (`config apply --confirm-key-removal {id}`)"
                 ));
             }
         }

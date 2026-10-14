@@ -100,12 +100,8 @@ pub(crate) fn resolve_site_keys(scope: KeyScope<'_>, enc: &BackendEncryptionConf
 #[derive(Clone)]
 pub(crate) struct ResolvedKey {
     pub site: EncryptionSite,
-    /// The raw backend that the key decrypts on (the site's backend).
-    pub backend: String,
     pub key_id: String,
     pub key: EncryptionKey,
-    /// True for a decrypt-only `legacy_key`.
-    pub legacy: bool,
 }
 
 /// Every key of a config, and the slots that do not resolve.
@@ -124,8 +120,7 @@ impl Config {
         }
     }
 
-    /// Every key the config holds (through [`resolve_site_keys`]), with
-    /// its raw backend. The singleton counts only while it is the engine's
+    /// Every key the config holds (through [`resolve_site_keys`]). The singleton counts only while it is the engine's
     /// backend (no named backends); a bucket counts when the config fixes
     /// its storage. The engine builds its keyrings and runs its collision
     /// check on exactly these keys.
@@ -138,23 +133,18 @@ impl Config {
             if site == EncryptionSite::Singleton && !self.backends.is_empty() {
                 continue;
             }
-            let backend = match &site {
-                EncryptionSite::Singleton => "default".to_string(),
-                EncryptionSite::Backend(n) => n.clone(),
-                EncryptionSite::Bucket(n) => match self.bucket_storage(n) {
-                    Some((b, _)) => b,
-                    None => continue,
-                },
-            };
+            if let EncryptionSite::Bucket(n) = &site {
+                if self.bucket_storage(n).is_none() {
+                    continue;
+                }
+            }
             let keys = resolve_site_keys(self.key_scope(&site), enc);
-            for (slot, legacy) in [(keys.primary, false), (keys.legacy, true)] {
+            for slot in [keys.primary, keys.legacy] {
                 match slot {
                     Some(Ok(k)) => out.keys.push(ResolvedKey {
                         site: site.clone(),
-                        backend: backend.clone(),
                         key_id: k.key_id,
                         key: k.key,
-                        legacy,
                     }),
                     Some(Err(e)) => out.errors.push(e),
                     None => {}

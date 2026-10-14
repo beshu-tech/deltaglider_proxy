@@ -453,7 +453,7 @@ impl CliError {
 /// |  5   | persist failed after apply succeeded (runtime OK, disk stale) |
 /// |  7   | missing/wrong `DGP_BOOTSTRAP_PASSWORD` |
 /// |  3   | local IO error (file not found, unreadable, …) |
-pub fn apply(input: &str, opts: AdminClientOpts) -> i32 {
+pub fn apply(input: &str, opts: AdminClientOpts, confirm_key_removal: &[String]) -> i32 {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -461,7 +461,7 @@ pub fn apply(input: &str, opts: AdminClientOpts) -> i32 {
             return EXIT_IO;
         }
     };
-    match runtime.block_on(apply_async(input, opts)) {
+    match runtime.block_on(apply_async(input, opts, confirm_key_removal)) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("{}", e.user_message());
@@ -470,7 +470,11 @@ pub fn apply(input: &str, opts: AdminClientOpts) -> i32 {
     }
 }
 
-async fn apply_async(input: &str, opts: AdminClientOpts) -> Result<i32, CliError> {
+async fn apply_async(
+    input: &str,
+    opts: AdminClientOpts,
+    confirm_key_removal: &[String],
+) -> Result<i32, CliError> {
     let yaml =
         std::fs::read_to_string(input).map_err(|e| CliError::Io(format!("read {input}: {e}")))?;
     // Expand ${VAR} / ${VAR:-default} against the OPERATOR's environment before
@@ -494,9 +498,13 @@ async fn apply_async(input: &str, opts: AdminClientOpts) -> Result<i32, CliError
         opts.server.trim_end_matches('/')
     );
 
-    let resp = client
-        .post(&url)
-        .json(&serde_json::json!({ "yaml": yaml }))
+    let mut req = client.post(&url).json(&serde_json::json!({ "yaml": yaml }));
+    if !confirm_key_removal.is_empty() {
+        // Issue #116 review A: the server refuses to drop a bucket's
+        // legacy key id unless the request confirms it.
+        req = req.header("x-dgp-confirm-key-removal", confirm_key_removal.join(","));
+    }
+    let resp = req
         .send()
         .await
         .map_err(|e| CliError::Http(format!("POST {url}: {e}")))?;

@@ -473,9 +473,77 @@ async fn removing_a_bucket_override_takes_two_steps() {
 
     env.reencrypt("releases").await;
     assert_eq!(env.at_rest("releases", "old.txt").await, None);
-    env.storage_patch_ok(json!({ "buckets": { "releases": { "encryption": null } } }))
-        .await;
+    // Removing the legacy key needs its id confirmed (review A); the scan
+    // covers every bucket on the backend and says it is safe.
+    let remove = json!({ "buckets": { "releases": { "encryption": null } } });
+    let (code, v) = env.storage_patch(remove.clone()).await;
+    assert!(
+        code >= 400
+            && v.to_string()
+                .contains("X-DGP-Confirm-Key-Removal: releases-a"),
+        "{code} {v}"
+    );
+    let endpoint = env.server.endpoint();
+    let scan: serde_json::Value = env
+        .admin
+        .get(format!(
+            "{endpoint}/_/api/admin/backends/local-disk/legacy-key-usage?bucket=releases&fresh=true"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(scan["legacy_key_id"], "releases-a", "{scan}");
+    assert_eq!(scan["safe_to_clear"], true, "{scan}");
+    let resp = env
+        .admin
+        .put(format!("{endpoint}/_/api/admin/config/section/storage"))
+        .header("X-DGP-Confirm-Key-Removal", "releases-a")
+        .json(&remove)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "{:?}", resp.text().await);
     assert_eq!(env.get("releases", "old.txt").await, b"under key A");
+}
+
+/// Review A: the legacy-key usage scan of a bucket's key id counts EVERY
+/// bucket stored on the backend. `downloads` keeps objects under the id
+/// `shared-a` that `releases` retires: the scan for `releases` must not
+/// say safe_to_clear.
+#[tokio::test]
+async fn a_bucket_legacy_scan_counts_its_neighbours() {
+    let a = format!("{{ mode: aes256-gcm-proxy, key: \"{KA}\", key_id: shared-a }}");
+    let env = spawn(
+        Shape::NamedFs,
+        None,
+        &format!(
+            "    releases: {{ backend: local-disk, encryption: {{ mode: none, legacy_key: \"{KA}\", legacy_key_id: shared-a }} }}\n    \
+             downloads: {{ backend: local-disk, encryption: {a} }}\n"
+        ),
+        "",
+        "releases",
+    )
+    .await;
+    env.create("downloads").await;
+    env.put("downloads", "x.txt", b"under shared-a").await;
+    let endpoint = env.server.endpoint();
+    let scan: serde_json::Value = env
+        .admin
+        .get(format!(
+            "{endpoint}/_/api/admin/backends/local-disk/legacy-key-usage?bucket=releases&fresh=true"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(scan["legacy_key_id"], "shared-a", "{scan}");
+    assert_eq!(scan["objects_under_legacy_key"], 1, "{scan}");
+    assert_eq!(scan["safe_to_clear"], false, "{scan}");
 }
 
 // ── Scenario: buckets in different modes on one raw backend ─────────────

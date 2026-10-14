@@ -268,9 +268,27 @@ pub(crate) async fn apply_config_transition(
 /// The gates of [`transition_gates`] that need no I/O. The validate
 /// endpoints run them too, so a validate answers what the apply would (the
 /// backend probes and the declarative DB validation run on apply only).
+/// The request header that confirms the removal of a bucket's legacy
+/// key ids (comma-separated), after a legacy-key usage scan (issue #116
+/// review A). `config apply --confirm-key-removal` sends it.
+pub(crate) const CONFIRM_KEY_REMOVAL_HEADER: &str = "x-dgp-confirm-key-removal";
+
+/// Pure: the key ids that `headers` confirm for removal.
+pub(crate) fn confirmed_key_removals(headers: Option<&HeaderMap>) -> Vec<String> {
+    headers
+        .into_iter()
+        .flat_map(|h| h.get_all(CONFIRM_KEY_REMOVAL_HEADER))
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect()
+}
+
 pub(super) fn static_transition_gates(
     old_cfg: &crate::config::Config,
     new_cfg: &crate::config::Config,
+    confirmed_key_removals: &[String],
 ) -> Result<(), String> {
     // FATAL config-graph errors (bucket → undefined backend, duplicate
     // backend names): un-runnable states that boot refuses too.
@@ -280,7 +298,7 @@ pub(super) fn static_transition_gates(
     fatal.extend(new_cfg.newly_keyless_proxy_backends(old_cfg));
     // A bucket's active key never leaves the keyring in one step (issue
     // #116): its objects would become unreadable.
-    fatal.extend(new_cfg.dropped_bucket_keys(old_cfg));
+    fatal.extend(new_cfg.dropped_bucket_keys(old_cfg, confirmed_key_removals));
     // A webhook URL that every delivery would refuse: refuse the apply that
     // adds it, instead of failing (and retrying) every event later.
     fatal.extend(
@@ -310,7 +328,12 @@ async fn transition_gates(
     new_cfg: &crate::config::Config,
 ) -> Result<(), String> {
     let app = ctx.app();
-    static_transition_gates(old_cfg, new_cfg)?;
+    // A background change (migrate) never confirms a key removal.
+    let confirmed = match ctx {
+        TransitionCtx::Admin { headers, .. } => confirmed_key_removals(Some(headers)),
+        TransitionCtx::Background { .. } => Vec::new(),
+    };
+    static_transition_gates(old_cfg, new_cfg, &confirmed)?;
 
     // Backend write-capability gate (guard B, hot-apply half): refuse routing
     // a client-writable bucket onto a non-CAS backend under multi-instance.
@@ -848,7 +871,7 @@ mod keyless_proxy_gate_tests {
         let old = Config::default();
         let mut keyless = old.clone();
         keyless.backend_encryption = proxy(None);
-        let err = static_transition_gates(&old, &keyless)
+        let err = static_transition_gates(&old, &keyless, &[])
             .expect_err("a keyless proxy backend must be refused");
         assert!(
             err.contains("backend 'default'") && err.contains("DGP_ENCRYPTION_KEY"),
@@ -857,11 +880,11 @@ mod keyless_proxy_gate_tests {
 
         let mut keyed = old.clone();
         keyed.backend_encryption = proxy(Some(&"ab".repeat(32)));
-        static_transition_gates(&old, &keyed).expect("a keyed proxy backend applies");
+        static_transition_gates(&old, &keyed, &[]).expect("a keyed proxy backend applies");
 
         let mut unrelated = keyless.clone();
         unrelated.log_level = "warn".into();
-        static_transition_gates(&keyless, &unrelated)
+        static_transition_gates(&keyless, &unrelated, &[])
             .expect("a backend that was keyless before does not block another edit");
     }
 

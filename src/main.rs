@@ -158,6 +158,11 @@ enum ConfigCommand {
         /// Per-request timeout in seconds. Defaults to 30.
         #[arg(long, value_name = "SECS")]
         timeout: Option<u64>,
+        /// Confirm that the apply may remove this legacy (decrypt-only)
+        /// key id of a bucket, after the legacy-key usage scan found no
+        /// object under it. Repeat for several ids.
+        #[arg(long = "confirm-key-removal", value_name = "KEY_ID")]
+        confirm_key_removal: Vec<String>,
     },
     /// Validate a config file without applying or hitting a server.
     ///
@@ -233,6 +238,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     file,
                     server,
                     timeout,
+                    confirm_key_removal,
                 } => {
                     let mut opts = AdminClientOpts::default();
                     if let Some(s) = server.as_deref() {
@@ -241,7 +247,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(t) = timeout {
                         opts.timeout_secs = *t;
                     }
-                    apply(file, opts)
+                    apply(file, opts, confirm_key_removal)
                 }
                 ConfigCommand::Lint { file } => lint(file),
                 ConfigCommand::Defaults { out } => defaults(out.as_deref()),

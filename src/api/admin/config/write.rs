@@ -247,7 +247,11 @@ pub(super) async fn run(
         let outcome = match build(&old).and_then(|b| prepare_with_refs(&old, b, &write, &mut refs))
         {
             Err(r) => Outcome::Rejected(r),
-            Ok(mut p) => match super::transition::static_transition_gates(&old, &p.new_cfg) {
+            Ok(mut p) => match super::transition::static_transition_gates(
+                &old,
+                &p.new_cfg,
+                &super::transition::confirmed_key_removals(write.headers),
+            ) {
                 // What the apply would refuse, a validate refuses too.
                 Err(error) => Outcome::Rejected(Rejection {
                     stage: Stage::Transition,

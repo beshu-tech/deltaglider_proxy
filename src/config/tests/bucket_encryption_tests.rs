@@ -195,7 +195,7 @@ fn an_active_bucket_key_never_leaves_in_one_step() {
     // The whole block removed: refused.
     let mut gone = old.clone();
     gone.buckets.get_mut("db-archive").unwrap().encryption = None;
-    let errs = gone.dropped_bucket_keys(&old);
+    let errs = gone.dropped_bucket_keys(&old, &[]);
     assert!(
         errs.iter().any(|e| e.contains("key id 'db-archive-2026'")),
         "{errs:?}"
@@ -204,15 +204,54 @@ fn an_active_bucket_key_never_leaves_in_one_step() {
     let kept = with_override(&format!(
         "{{ mode: none, legacy_key: \"{KB}\", legacy_key_id: db-archive-2026 }}"
     ));
-    assert!(kept.dropped_bucket_keys(&old).is_empty());
-    // Removing a decrypt-only key is the operator's step (after the scan).
+    assert!(kept.dropped_bucket_keys(&old, &[]).is_empty());
+    // Removing a decrypt-only key needs the confirmation of its id
+    // (review A: before, it had no gate at all).
     let mut no_legacy = kept.clone();
     no_legacy.buckets.get_mut("db-archive").unwrap().encryption = None;
-    assert!(no_legacy.dropped_bucket_keys(&kept).is_empty());
+    let errs = no_legacy.dropped_bucket_keys(&kept, &[]);
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("legacy")
+                && e.contains("X-DGP-Confirm-Key-Removal: db-archive-2026")),
+        "{errs:?}"
+    );
+    assert!(no_legacy
+        .dropped_bucket_keys(&kept, &["db-archive-2026".to_string()])
+        .is_empty());
     // A bucket that moves to another backend keeps its key (migrate flip).
     let mut moved = old.clone();
     moved.buckets.get_mut("db-archive").unwrap().backend = Some("hetzner-fsn1".into());
-    assert!(moved.dropped_bucket_keys(&old).is_empty());
+    assert!(moved.dropped_bucket_keys(&old, &[]).is_empty());
+}
+
+/// Review A, the executed probe: `releases` and `downloads` share the key
+/// id `shared-a`. Before, each step passed because the OTHER bucket still
+/// held the id: `releases` dropped its block, then `downloads` rotated and
+/// dropped its legacy key, and the objects of `releases` under
+/// `shared-a` became unreadable. A bucket's keys are now judged on that
+/// bucket alone (its block and its backend's), never on a neighbour.
+#[test]
+fn a_bucket_never_relies_on_a_neighbours_key() {
+    let a = format!("{{ mode: aes256-gcm-proxy, key: \"{KB}\", key_id: shared-a }}");
+    let yaml = |releases: &str, downloads: &str| {
+        format!(
+            "{}    downloads: {{ backend: local-disk, encryption: {downloads} }}\n",
+            named("{ backend: local-disk }").replace(
+                "releases: { backend: hetzner-fsn1 }",
+                &format!("releases: {{ backend: local-disk, encryption: {releases} }}")
+            )
+        )
+    };
+    let old = Config::from_yaml_str(&yaml(&a, &a)).unwrap();
+    let mut step1 = old.clone();
+    step1.buckets.get_mut("releases").unwrap().encryption = None;
+    let errs = step1.dropped_bucket_keys(&old, &[]);
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("bucket 'releases'") && e.contains("shared-a")),
+        "releases drops shared-a while downloads still holds it: {errs:?}"
+    );
 }
 
 #[test]

@@ -734,17 +734,22 @@ pub struct LegacyKeyUsageQuery {
     /// Scan again instead of answering from the server cache.
     #[serde(default)]
     pub fresh: bool,
-    /// Scan the legacy key of this BUCKET's own `encryption` override
-    /// (issue #116) instead of the backend's: only that bucket is scanned.
+    /// Scan for the legacy key id of this BUCKET's own `encryption`
+    /// override (issue #116) instead of the backend's. Every bucket stored
+    /// on the backend is scanned all the same: an object moved at the
+    /// storage level, or written by another bucket that shared the id,
+    /// can carry it too.
     #[serde(default)]
     pub bucket: Option<super::path_guard::AdminBucket>,
 }
 
 /// `GET /backends/:name/legacy-key-usage` — how many objects and delta
 /// references of this backend still carry the legacy key id. With
-/// `?bucket=<name>`, the legacy key of that bucket's override, in that
-/// bucket only: an object carries the key id of the bucket it was written
-/// to, so its own objects are the ones that can need it. The count is
+/// `?bucket=<name>`, the legacy key id of that bucket's override, counted
+/// in EVERY bucket stored on the backend (review A: a scan of the bucket
+/// alone said safe_to_clear while a neighbour that shared the id still
+/// held objects under it). The removal of a bucket's legacy key is then
+/// gated by `Config::dropped_bucket_keys` (confirmation header). The count is
 /// EXACT (every object and reference is HEADed once) until `limit` objects
 /// are scanned; then the scan stops and `complete` is false.
 #[derive(Serialize, Debug, Default, PartialEq, Clone)]
@@ -816,44 +821,36 @@ pub async fn legacy_key_usage(
         Some(b) => Some(b.admit(&state)?.into_string()),
         None => None,
     };
-    if let Some(bucket) = bucket {
-        // A bucket override's legacy key: scan that bucket only.
+    {
         let cfg = state.config.read().await;
-        let bucket = bucket.to_ascii_lowercase();
-        let resolved = cfg
-            .encryption_for_bucket(&bucket)
-            .filter(|e| e.from_bucket && e.backend == name)
-            .ok_or(AdminError::not_found(format!(
-                "bucket '{bucket}' has no encryption override on backend '{name}'"
-            )))?;
-        usage.legacy_key_id = resolved
-            .config
-            .legacy_key()
-            .and(resolved.config.legacy_key_id())
-            .map(str::to_string);
-        usage.bucket = Some(bucket.clone());
-        if let Some(b) = origins.iter().find(|b| b.name == bucket) {
-            if let Some(e) = &b.unavailable {
-                usage.error(format!("{}: {e}", b.name));
-            }
+        if let Some(bucket) = bucket {
+            // A bucket override's legacy key id (THE key resolution).
+            let bucket = bucket.to_ascii_lowercase();
+            let resolved = cfg
+                .encryption_for_bucket(&bucket)
+                .filter(|e| e.from_bucket && e.backend == name)
+                .ok_or(AdminError::not_found(format!(
+                    "bucket '{bucket}' has no encryption override on backend '{name}'"
+                )))?;
+            usage.legacy_key_id = resolved.site_keys().legacy_id().map(str::to_string);
+            usage.bucket = Some(bucket);
+        } else {
+            // Backend-level: the legacy key is the backend's own (allowed by
+            // `bucket_encryption_rule_has_one_home`).
+            let enc = cfg
+                .backend_encryption_by_name(&name)
+                .ok_or(AdminError::not_found(format!("no backend named '{name}'")))?;
+            usage.legacy_key_id = crate::deltaglider::effective_legacy_key_id(&name, enc);
         }
-        usage.buckets.push(bucket);
-    } else {
-        let cfg = state.config.read().await;
-        // Backend-level: the legacy key is the backend's own (allowed by
-        // `bucket_encryption_rule_has_one_home`). Every bucket STORED on
-        // this backend counts, also one with its own override: its objects
-        // from before the override carry the backend's key ids.
-        let enc = cfg
-            .backend_encryption_by_name(&name)
-            .ok_or(AdminError::not_found(format!("no backend named '{name}'")))?;
-        usage.legacy_key_id = crate::deltaglider::effective_legacy_key_id(&name, enc);
+        // Both scopes count every bucket STORED on this backend: a bucket
+        // with its own override still holds its pre-override objects under
+        // the backend's ids, and a bucket key id can sit in a neighbour.
         let registry = engine.bucket_policy_registry();
         for b in &origins {
             if registry.is_reserved(&b.name) {
                 continue;
             }
-            // The buckets whose encryption comes from this backend.
+            // The buckets stored on this backend.
             if cfg
                 .encryption_for_bucket(&b.name)
                 .is_some_and(|e| e.backend == name)

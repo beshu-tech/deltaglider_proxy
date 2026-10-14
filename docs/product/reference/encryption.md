@@ -161,12 +161,19 @@ A bucket block in `aes256-gcm-proxy` mode with no key makes the proxy refuse eve
 
 When an apply changes the encryption that a bucket writes with, the proxy does not rewrite the objects that the bucket already holds. They keep the form they were written in, and they stay readable, because each object carries the id of its key. The response of the apply has a warning for each such bucket. The warning names the re-encrypt job (`POST /_/api/admin/jobs/reencrypt` with `{"buckets": ["<bucket>"]}`), which rewrites the objects and the delta references into the new form. The proxy does not start the job by itself.
 
-A key that a bucket writes with cannot leave the config in one step. An apply that removes the bucket's `encryption` block, or its key, is refused while that key id is not kept somewhere else on the same backend. The objects written under that key would otherwise become unreadable. To stop using a bucket key, do these steps:
+The proxy judges every key of a bucket's block on that bucket alone. After an apply, the bucket must still be able to read each key id that its block held: in its own block, or in the encryption of the backend that stores it. A key that another bucket on the same backend holds does not count, because that bucket can change its own block later.
+
+- A key that a bucket writes with cannot leave in one step. An apply that removes it is refused. The objects written under that key would otherwise become unreadable.
+- A legacy (decrypt-only) key of a bucket leaves only when the request confirms its id. Send the header `X-DGP-Confirm-Key-Removal: <key id>` with the apply, or `config apply --confirm-key-removal <key id>`. Without the confirmation, the apply is refused.
+
+To stop using a bucket key, do these steps:
 
 1. Set the bucket's `mode` to `none`, or give the bucket a new key and key id. An apply that leaves `legacy_key` out keeps the old key as the bucket's `legacy_key`, with its id as `legacy_key_id`.
 2. Run the re-encrypt job for the bucket.
-3. Check that no object of the bucket still uses the old key: `GET /_/api/admin/backends/<backend>/legacy-key-usage?bucket=<bucket>`.
-4. Remove the bucket's `legacy_key` and `legacy_key_id`, or the whole `encryption` block when its mode is `none`.
+3. Check that no object still uses the old key: `GET /_/api/admin/backends/<backend>/legacy-key-usage?bucket=<bucket>`. This scan counts the objects under that key id in every bucket stored on the backend, because an object can carry the id in another bucket too (for example, when two buckets shared the key, or when an object was moved at the storage level).
+4. When the scan answers `"safe_to_clear": true`, remove the bucket's `legacy_key` and `legacy_key_id`, or the whole `encryption` block when its mode is `none`, and confirm the key id as described above.
+
+These gates run on an apply through the admin API. A proxy that starts from an edited file has no previous config to compare with, so the gates do not run at boot.
 
 ### The keyring
 

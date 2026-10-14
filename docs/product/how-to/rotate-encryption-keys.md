@@ -160,14 +160,19 @@ A bucket can have its own key on a shared backend ([per-bucket encryption](../re
    ```
 
 3. Run the re-encrypt job for `db-archive`, as in step 4 above.
-4. Check that no object of the bucket still uses the old key. The scan reads the metadata of every object of the bucket:
+4. Check that no object still uses the old key. The scan reads the metadata of every object of every bucket stored on `local-disk`, because another bucket can hold objects under the same key id:
 
    ```bash
    curl -b cookies.txt 'https://s3.acme.example/_/api/admin/backends/local-disk/legacy-key-usage?bucket=db-archive'
    ```
 
    The answer has `"safe_to_clear": true` when the scan read every object and found none under the legacy key id.
-5. Remove `legacy_key` and `legacy_key_id` from the bucket, and apply again.
+5. Remove `legacy_key` and `legacy_key_id` from the bucket, and apply again with the confirmation of the key id. Without the confirmation, the proxy refuses the apply:
+
+   ```bash
+   deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example \
+     --confirm-key-removal db-archive-2026
+   ```
 
 ### Stop encrypting the bucket
 
@@ -175,7 +180,7 @@ The proxy refuses an apply that removes the key that a bucket writes with, becau
 
 1. Set the bucket's `mode` to `none`, and apply. The proxy keeps the old key as the bucket's `legacy_key`. New writes to the bucket are plaintext, and the old objects stay readable.
 2. Run the re-encrypt job for the bucket. Under `mode: none`, it decrypts the old objects.
-3. Check the scan, as in step 4 of the rotation. When `safe_to_clear` is `true`, remove the bucket's `encryption` block, and apply. The bucket then uses the encryption of its backend again.
+3. Check the scan, as in step 4 of the rotation. When `safe_to_clear` is `true`, remove the bucket's `encryption` block, and apply with `--confirm-key-removal` and the old key id, as in step 5 of the rotation. The bucket then uses the encryption of its backend again.
 
 ## Two questions that come up
 
