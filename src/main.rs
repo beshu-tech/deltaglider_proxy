@@ -551,7 +551,10 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Cross-instance reference lock (multi-instance only; None single-instance).
     // Built from config before the engine so it can be attached at construction
     // and re-attached on every rebuild via AppState, exactly like bucket_usage.
-    let reference_lock = build_reference_lock(&config).await;
+    // The coordination bucket is validated once; the reference lock, the
+    // job-plane lease and the config sync share the verdict.
+    let coordination_check = validate_coordination_once(&config).await;
+    let reference_lock = build_reference_lock(&config, &coordination_check).await;
     let engine = DynEngine::new(&config, Some(metrics.clone()))
         .await?
         .with_bucket_usage(bucket_usage.clone())
@@ -863,7 +866,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let job_plane = match jobs_db.as_ref() {
         Some(db) => Some(deltaglider_proxy::api::admin::JobPlane {
             db: db.clone(),
-            lease: build_coordination_lease(&config, db, &db_keys).await,
+            lease: build_coordination_lease(&config, db, &db_keys, &coordination_check).await,
         }),
         None => None,
     };
@@ -1010,6 +1013,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         &iam_state,
         &external_auth,
         &session_store,
+        &coordination_check,
     )
     .await;
 

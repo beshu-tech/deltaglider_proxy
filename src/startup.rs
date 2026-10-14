@@ -1088,6 +1088,32 @@ fn coordination_backend(config: &Config) -> &BackendConfig {
     config.coordination_backend().unwrap_or(&config.backend)
 }
 
+/// The boot validation of the coordination bucket, run ONCE and shared by
+/// the reference lock, the job-plane lease and the config sync (each of
+/// them validated the bucket again). `None`: no coordination bucket, or no
+/// client could be built; a builder that needs the verdict then validates
+/// through its own client.
+pub type CoordinationCheck =
+    Option<Result<deltaglider_proxy::config_db_sync::CoordinationValidation, String>>;
+
+/// Validate the coordination bucket of `config` (see [`CoordinationCheck`]).
+pub async fn validate_coordination_once(config: &Config) -> CoordinationCheck {
+    let bucket = config
+        .config_sync_bucket
+        .as_ref()
+        .filter(|b| !b.is_empty())?;
+    let client = match ConfigDbSync::build_client(coordination_backend(config)).await {
+        Ok(client) => client,
+        Err(e) => {
+            warn!("Coordination bucket '{bucket}': client build failed ({e}); not validated yet");
+            return None;
+        }
+    };
+    Some(
+        deltaglider_proxy::config_db_sync::validate_coordination_bucket_with(&client, bucket).await,
+    )
+}
+
 /// Build the job-plane leader lease, selecting the impl by whether a
 /// CAS-capable coordination bucket is configured. Called BEFORE the schedulers
 /// spawn so they receive a live handle.
@@ -1100,12 +1126,13 @@ fn coordination_backend(config: &Config) -> &BackendConfig {
 ///   If the bucket/client can't be built at all, LOG and fall back to
 ///   [`LocalLease`] rather than block startup (edge case E6 — never a SPOF).
 ///
-/// The validation here is idempotent with `init_config_sync`'s later call (the
-/// witness fast-path makes the second a single cheap GET).
+/// It uses the boot's one validation (`check`); it validates the bucket
+/// itself only when that did not run.
 pub async fn build_coordination_lease(
     config: &Config,
     jobs_db: &Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::JobsDb>>,
     db_keys: &deltaglider_proxy::config_db::ConfigDbKeys,
+    check: &CoordinationCheck,
 ) -> Arc<deltaglider_proxy::coordination::DynCoordinationLease<'static>> {
     use deltaglider_proxy::coordination::{
         durable_node_id, process_boot_ids, DynCoordinationLease, LocalLease, S3Lease,
@@ -1128,8 +1155,7 @@ pub async fn build_coordination_lease(
     );
 
     // Build the coordination client + validate the bucket enforces CAS. The
-    // validation CRASHES on a silent-clobber backend (data-loss trap); it is
-    // idempotent with init_config_sync's later call (witness fast-path).
+    // validation CRASHES on a silent-clobber backend (data-loss trap).
     let sync = match ConfigDbSync::new(
         coordination_backend(config),
         sync_bucket.clone(),
@@ -1156,7 +1182,11 @@ pub async fn build_coordination_lease(
         }
     };
 
-    let conditional_delete = match sync.validate_coordination_bucket().await {
+    let validation = match check {
+        Some(done) => done.clone(),
+        None => sync.validate_coordination_bucket().await,
+    };
+    let conditional_delete = match validation {
         Ok(v) => v.conditional_delete(),
         Err(e) => {
             error!("FATAL: coordination bucket validation failed (lease build): {e}");
@@ -1193,17 +1223,18 @@ pub async fn build_coordination_lease(
 /// Gated exactly like the job-plane lease: no `config_sync_bucket` → `None`
 /// (single-instance; the engine's in-process prefix mutex is the whole story,
 /// zero S3 traffic). With a coordination bucket set, build a CAS client against
-/// it and return an [`S3ReferenceLock`]. It validates the bucket (a fresh
-/// witness makes this one GET): the lock must know whether the bucket
+/// it and return an [`S3ReferenceLock`]. It takes the boot's one validation
+/// of the bucket (`check`): the lock must know whether the bucket
 /// enforces `If-Match` on DELETE before it releases by a kept ETag with no
-/// read. A failed validation is not fatal HERE: the lock then reads before
-/// each release, and the later gates ([`build_coordination_lease`],
+/// read. A failed (or missing) validation is not fatal HERE: the lock then
+/// reads before each release, and the later gates ([`build_coordination_lease`],
 /// `init_config_sync`, after the backend capability gate) `exit(1)` on it.
 /// A client-build failure is non-fatal (`None`, warn):
 /// same "never a SPOF" stance as the lease builder — a transient blip must not
 /// wedge startup, and the single-writer routing contract still applies.
 pub async fn build_reference_lock(
     config: &Config,
+    check: &CoordinationCheck,
 ) -> Option<Arc<deltaglider_proxy::coordination::DynReferenceLock<'static>>> {
     use deltaglider_proxy::coordination::{durable_node_id, DynReferenceLock, S3ReferenceLock};
 
@@ -1227,22 +1258,23 @@ pub async fn build_reference_lock(
     );
     match ConfigDbSync::build_client(coordination_backend(config)).await {
         Ok(client) => {
-            let conditional_delete =
-                match deltaglider_proxy::config_db_sync::validate_coordination_bucket_with(
-                    &client,
-                    &sync_bucket,
-                )
-                .await
-                {
-                    Ok(v) => v.conditional_delete(),
-                    Err(e) => {
-                        warn!(
-                            "Reference lock: coordination bucket validation failed ({e}); \
-                             releases read the lock first"
-                        );
-                        false
-                    }
-                };
+            let conditional_delete = match check {
+                Some(Ok(v)) => v.conditional_delete(),
+                Some(Err(e)) => {
+                    warn!(
+                        "Reference lock: coordination bucket validation failed ({e}); \
+                         releases read the lock first"
+                    );
+                    false
+                }
+                None => {
+                    warn!(
+                        "Reference lock: coordination bucket not validated; releases read the \
+                         lock first"
+                    );
+                    false
+                }
+            };
             info!(
                 "Reference lock: S3-CAS on bucket '{sync_bucket}' (cross-node reference.bin \
                  protection, node_id={node_id}, conditional DELETE {})",
@@ -1429,6 +1461,7 @@ pub async fn init_config_sync(
     iam_state: &SharedIamState,
     external_auth: &Option<Arc<deltaglider_proxy::iam::external_auth::ExternalAuthManager>>,
     sessions: &Arc<deltaglider_proxy::session::SessionStore>,
+    check: &CoordinationCheck,
 ) -> Option<Arc<ConfigDbSync>> {
     let sync_bucket = match &config.config_sync_bucket {
         Some(b) if !b.is_empty() => b.clone(),
@@ -1478,8 +1511,13 @@ pub async fn init_config_sync(
     // Boot gate: PROVE the coordination bucket enforces atomic conditional
     // writes before any HA feature (leases, single-writer locks) hinges on it.
     // A silent-clobber bucket is a data-loss trap — crash rather than run unsafe.
-    // Skips itself on the fast path when a fresh witness from a prior boot exists.
-    match sync.validate_coordination_bucket().await {
+    // Skips itself on the fast path when a fresh witness from a prior boot
+    // exists; the boot's one validation (`check`) is reused when it ran.
+    let validation = match check {
+        Some(done) => done.clone(),
+        None => sync.validate_coordination_bucket().await,
+    };
+    match validation {
         Ok(deltaglider_proxy::config_db_sync::CoordinationValidation::CachedWitness {
             validated_at_unix,
             validated_by,
