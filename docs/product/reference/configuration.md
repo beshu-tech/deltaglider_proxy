@@ -965,7 +965,7 @@ storage:
 
 The proxy refuses a bucket `encryption` block without `key_id`, with `legacy_key` but without `legacy_key_id`, in a native SSE mode, without `backend:` when `storage.backends` is used, with a key id that another key already uses, on an alias that disagrees with the other names of its stored bucket, or while `config_sync_bucket` is set. The [encryption reference](encryption.md#per-bucket-encryption) explains each rule.
 
-`key` / `legacy_key` are 64-character lowercase hex strings (256 bits). `kms_key_id` is a KMS ARN or alias. `key_id` (optional) must match `[A-Za-z0-9_.-]{1,64}` (S3 user-metadata header-safe).
+`key` / `legacy_key` are 64-character lowercase hex strings (256 bits). `kms_key_id` is a KMS key ARN or alias ARN, an alias name (`alias/<name>`), a key id (UUID) or a multi-Region key id (`mrk-...`); on MinIO, `arn:aws:kms:<key name>`. Any other value is a fatal config error. `key_id` (optional) must match `[A-Za-z0-9_.-]{1,64}` (S3 user-metadata header-safe).
 
 The proxy does not automate key rotation within a single mode. To rotate, use the `legacy_key` / `legacy_key_id` shim fields (decrypt-only, for proxy→native transitions), or copy the objects to a new backend. See the [encryption reference](encryption.md) for the full wire format, key-id mismatch mechanics, and the shim lifecycle.
 

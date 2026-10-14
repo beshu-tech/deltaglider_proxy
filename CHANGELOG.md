@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added — A bucket can use native SSE (`sse-kms`, `sse-s3`)
+
+A bucket on an S3 backend can now set `mode: sse-kms` or `mode: sse-s3` in its own `encryption` block. The S3 backend keeps one client and picks the SSE headers of each request (PutObject, CreateMultipartUpload, CopyObject, UploadPartCopy, folder markers, listing facts) from the bucket that the request writes to. One backend can hold proxy-AES, SSE and plaintext buckets side by side: a bucket that encrypts in the proxy gets no SSE headers (never encrypted twice), and `mode: none` on a bucket means plaintext also on a backend with native SSE. A server-side copy takes the SSE headers of the destination bucket. A bucket in a native mode on a filesystem backend is refused. The KMS permissions that the backend's credentials need are in the encryption reference.
+
+### Changed — A malformed `kms_key_id` stops the start
+
+`kms_key_id` must now be a KMS key ARN or alias ARN, an alias name (`alias/<name>`), a key id (UUID) or a multi-Region key id (`mrk-...`), on a backend and on a bucket. An empty or other value was accepted before and failed every write with an S3 error; now the start, `config lint` and an apply refuse it. **Upgrade note:** on MinIO, a bare key name (`my-key`) is refused; write it as `arn:aws:kms:my-key`, which MinIO accepts.
+
 ### Added — A bucket can have its own encryption key (YAML)
 
 A bucket policy can now carry an `encryption` block with the same fields as the `encryption` block of a backend. The writes to that bucket then use the bucket's own proxy-AES key, or no encryption, while the other buckets on the same backend keep the backend's encryption. Before, encryption was a backend setting only, and a second key on one disk needed a second backend definition.

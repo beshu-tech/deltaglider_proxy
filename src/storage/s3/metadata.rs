@@ -551,60 +551,61 @@ impl S3Backend {
     }
 }
 
-/// Apply native S3 encryption headers to a PutObject builder in
-/// accordance with the configured mode.
+/// A request builder that stores bytes and so carries SSE headers:
+/// PutObject, CreateMultipartUpload and CopyObject.
+pub(super) trait SseRequest: Sized {
+    fn sse(self, v: aws_sdk_s3::types::ServerSideEncryption) -> Self;
+    fn kms_key(self, v: String) -> Self;
+    fn bucket_key(self, v: bool) -> Self;
+}
+
+macro_rules! sse_request {
+    ($($builder:ty),* $(,)?) => {$(
+        impl SseRequest for $builder {
+            fn sse(self, v: aws_sdk_s3::types::ServerSideEncryption) -> Self {
+                self.server_side_encryption(v)
+            }
+            fn kms_key(self, v: String) -> Self {
+                self.ssekms_key_id(v)
+            }
+            fn bucket_key(self, v: bool) -> Self {
+                self.bucket_key_enabled(v)
+            }
+        }
+    )*};
+}
+
+sse_request!(
+    aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder,
+    aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder,
+    aws_sdk_s3::operation::copy_object::builders::CopyObjectFluentBuilder,
+);
+
+/// THE SSE headers of one request, from the native mode of its bucket
+/// (`NativeEncryptionPolicy::for_bucket`). Every request that stores bytes
+/// goes through here.
 ///
 /// Kept as a free function (not a method on `S3Backend`) so the
 /// signature doesn't get borrowed-self awkward during retry loops
 /// that rebuild the request object on each attempt. Takes the
 /// `NativeEncryptionConfig` by reference — the builder absorbs the
 /// `String` clone only when SseKms is actually in use.
-pub(super) fn apply_native_encryption(
-    mut request: aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder,
+pub(super) fn apply_native_encryption<R: SseRequest>(
+    request: R,
     cfg: &NativeEncryptionConfig,
-) -> aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder {
+) -> R {
     use aws_sdk_s3::types::ServerSideEncryption;
     match cfg {
-        NativeEncryptionConfig::None => {}
-        NativeEncryptionConfig::SseS3 => {
-            request = request.server_side_encryption(ServerSideEncryption::Aes256);
-        }
+        NativeEncryptionConfig::None => request,
+        NativeEncryptionConfig::SseS3 => request.sse(ServerSideEncryption::Aes256),
         NativeEncryptionConfig::SseKms {
             kms_key_id,
             bucket_key_enabled,
-        } => {
-            request = request
-                .server_side_encryption(ServerSideEncryption::AwsKms)
-                .ssekms_key_id(kms_key_id.clone())
-                .bucket_key_enabled(*bucket_key_enabled);
-        }
+        } => request
+            .sse(ServerSideEncryption::AwsKms)
+            .kms_key(kms_key_id.clone())
+            .bucket_key(*bucket_key_enabled),
     }
-    request
-}
-
-/// Apply native SSE to a `create_multipart_upload` request (Phase B).
-/// Mirrors `apply_native_encryption` for the multipart builder shape.
-pub(super) fn apply_native_encryption_mpu(
-    mut request: aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder,
-    cfg: &NativeEncryptionConfig,
-) -> aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder {
-    use aws_sdk_s3::types::ServerSideEncryption;
-    match cfg {
-        NativeEncryptionConfig::None => {}
-        NativeEncryptionConfig::SseS3 => {
-            request = request.server_side_encryption(ServerSideEncryption::Aes256);
-        }
-        NativeEncryptionConfig::SseKms {
-            kms_key_id,
-            bucket_key_enabled,
-        } => {
-            request = request
-                .server_side_encryption(ServerSideEncryption::AwsKms)
-                .ssekms_key_id(kms_key_id.clone())
-                .bucket_key_enabled(*bucket_key_enabled);
-        }
-    }
-    request
 }
 
 /// S3's limit on the user metadata of one object, in bytes (keys + values).

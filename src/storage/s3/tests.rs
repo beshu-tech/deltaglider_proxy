@@ -1578,7 +1578,7 @@ pub(crate) mod test_support {
         S3Backend {
             facts_cleanup: super::super::super::facts_cleanup::FactsCleanupQueue::start(
                 client.clone(),
-                NativeEncryptionConfig::None,
+                NativeEncryptionConfig::None.into(),
             ),
             healer: super::heal::FactsHealer::new(client.clone()),
             acl_support: Default::default(),
@@ -1587,7 +1587,7 @@ pub(crate) mod test_support {
             health_key: None,
             request_label: Default::default(),
             client,
-            native_encryption: NativeEncryptionConfig::None,
+            native_encryption: NativeEncryptionConfig::None.into(),
             list_cache_scope: endpoint.to_string(),
         }
     }
@@ -1809,7 +1809,7 @@ mod lost_response_tests {
         S3Backend {
             facts_cleanup: super::super::super::facts_cleanup::FactsCleanupQueue::start(
                 client.clone(),
-                NativeEncryptionConfig::None,
+                NativeEncryptionConfig::None.into(),
             ),
             healer: super::heal::FactsHealer::new(client.clone()),
             acl_support: Default::default(),
@@ -1818,7 +1818,7 @@ mod lost_response_tests {
             health_key: None,
             request_label: Default::default(),
             client,
-            native_encryption: NativeEncryptionConfig::None,
+            native_encryption: NativeEncryptionConfig::None.into(),
             list_cache_scope: endpoint.to_string(),
         }
     }
@@ -2067,7 +2067,7 @@ mod conditional_delete_tests {
         S3Backend {
             facts_cleanup: super::super::super::facts_cleanup::FactsCleanupQueue::start(
                 client.clone(),
-                NativeEncryptionConfig::None,
+                NativeEncryptionConfig::None.into(),
             ),
             healer: super::heal::FactsHealer::new(client.clone()),
             acl_support: Default::default(),
@@ -2076,7 +2076,7 @@ mod conditional_delete_tests {
             health_key: None,
             request_label: Default::default(),
             client,
-            native_encryption: NativeEncryptionConfig::None,
+            native_encryption: NativeEncryptionConfig::None.into(),
             list_cache_scope: endpoint.to_string(),
         }
     }

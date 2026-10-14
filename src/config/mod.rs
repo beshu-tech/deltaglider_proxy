@@ -485,6 +485,12 @@ impl BackendEncryptionConfig {
         }
     }
 
+    /// True for the native S3 modes (`sse-kms`, `sse-s3`): S3 encrypts,
+    /// the proxy stores the bytes as they are.
+    pub fn is_native(&self) -> bool {
+        matches!(self, Self::SseKms { .. } | Self::SseS3 { .. })
+    }
+
     /// Strip every secret key material (used by redactors). Preserves
     /// mode + non-secret identifiers (`key_id`, `kms_key_id`) so the
     /// redacted surface still conveys "this backend is encrypted with
@@ -578,6 +584,62 @@ pub(crate) fn is_valid_key_id(s: &str) -> bool {
         && s.len() <= 64
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
+/// Pure: why `id` is not a usable SSE-KMS `kms_key_id`, or `None` when it
+/// is one. Accepted: a key ARN or alias ARN (`arn:<partition>:kms:...`,
+/// which MinIO also takes as `arn:aws:kms:<key name>`), an alias name
+/// (`alias/<name>`), a key id (UUID) or a multi-Region key id
+/// (`mrk-<32 hex>`). A typo here fails every write with an S3 error, so
+/// the config refuses it first (issue #116 P3).
+pub fn kms_key_id_problem(id: &str) -> Option<&'static str> {
+    const SHAPES: &str = "kms_key_id must be a KMS key ARN or alias ARN \
+        (arn:aws:kms:<region>:<account>:key/<id>; on MinIO arn:aws:kms:<key name>), an alias \
+        name (alias/<name>), a key id (a UUID) or a multi-Region key id (mrk-<32 hex digits>)";
+    if id.trim().is_empty() {
+        return Some("kms_key_id is empty: SSE-KMS needs the KMS key to encrypt with");
+    }
+    if id.len() > 2048 || id.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Some(SHAPES);
+    }
+    let is_hex = |s: &str, n: usize| s.len() == n && s.chars().all(|c| c.is_ascii_hexdigit());
+    let is_uuid = |s: &str| {
+        let parts: Vec<&str> = s.split('-').collect();
+        parts.len() == 5
+            && [8, 4, 4, 4, 12]
+                .iter()
+                .zip(&parts)
+                .all(|(n, p)| is_hex(p, *n))
+    };
+    let alias_ok = |name: &str| {
+        !name.is_empty()
+            && name.len() <= 256
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-'))
+    };
+    let ok = if let Some(rest) = id.strip_prefix("arn:") {
+        // arn:<partition>:kms:<anything non-empty>
+        let mut parts = rest.splitn(3, ':');
+        let partition = parts.next().unwrap_or("");
+        let service = parts.next().unwrap_or("");
+        let resource = parts.next().unwrap_or("");
+        partition.starts_with("aws")
+            && partition
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c == '-')
+            && service == "kms"
+            && !resource.is_empty()
+            && !resource.ends_with(':')
+            && !resource.ends_with('/')
+    } else if let Some(name) = id.strip_prefix("alias/") {
+        alias_ok(name)
+    } else if let Some(hex) = id.strip_prefix("mrk-") {
+        is_hex(hex, 32)
+    } else {
+        is_uuid(id)
+    };
+    (!ok).then_some(SHAPES)
 }
 
 /// Normalise a backend name into an env-var-safe suffix: uppercase,

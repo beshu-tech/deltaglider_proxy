@@ -260,6 +260,18 @@ pub struct BucketKeys {
     pub write_mode: WriteMode,
     /// The bucket's decrypt-only key id, if any (its key is in the keyring).
     pub legacy_key_id: Option<String>,
+    /// The native SSE headers of the bucket's writes (an S3 backend reads
+    /// them per request through [`EncryptionConfig::native_for`]).
+    /// `None` for a proxy-AES or plaintext override.
+    pub native: crate::storage::NativeEncryptionConfig,
+}
+
+impl EncryptionConfig {
+    /// The native SSE mode of a bucket with its own override, or `None`
+    /// when the bucket follows the backend.
+    pub fn native_for(&self, bucket: &str) -> Option<crate::storage::NativeEncryptionConfig> {
+        self.buckets.get(bucket).map(|b| b.native.clone())
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────

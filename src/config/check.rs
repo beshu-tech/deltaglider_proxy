@@ -541,6 +541,7 @@ impl Config {
         }
         errors.extend(self.coordination_bucket_exposures());
         errors.extend(self.bucket_encryption_errors());
+        errors.extend(self.kms_key_id_errors());
         errors
     }
 

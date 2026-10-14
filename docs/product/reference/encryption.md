@@ -20,7 +20,7 @@ A backend with no `encryption` block has `mode: none`. `Config::check` rejects `
 | `mode` | all | `none` \| `aes256-gcm-proxy` \| `sse-kms` \| `sse-s3` |
 | `key` | `aes256-gcm-proxy` | 32-byte hex AES-256 key. Treated as an infrastructure secret: stripped from canonical exports (`/config/export`). |
 | `key_id` | `aes256-gcm-proxy` | Stable identifier stamped on written objects. On a backend, optional: derived from backend name + key when absent. On a bucket, required. |
-| `kms_key_id` | `sse-kms` | KMS key ARN. |
+| `kms_key_id` | `sse-kms` | The KMS key: a key ARN or alias ARN (`arn:aws:kms:<region>:<account>:key/<id>`), an alias name (`alias/<name>`), a key id (a UUID) or a multi-Region key id (`mrk-<32 hex digits>`). On MinIO, write a key name as `arn:aws:kms:<key name>`. The proxy refuses to start with an empty or malformed value, on a backend and on a bucket, because every write would fail with an S3 error. |
 | `bucket_key_enabled` | `sse-kms` | S3 Bucket Keys; reduces per-request KMS cost. |
 | `legacy_key`, `legacy_key_id` | any mode | Decrypt-only shim for objects written under a previous proxy-AES key. Valid under every mode, including `none`. |
 
@@ -145,7 +145,8 @@ The proxy refuses to start with a config that breaks one of these rules, and it 
 
 | Rule | Reason |
 |---|---|
-| The mode is `aes256-gcm-proxy` or `none`. | Native SSE per bucket (`sse-kms`, `sse-s3`) is not supported yet. Set native SSE on the backend instead. |
+| A bucket in `sse-kms` or `sse-s3` mode is stored on an S3 backend. | Native SSE is done by S3. A filesystem backend would store the bytes as they are, so the proxy refuses the block. |
+| `kms_key_id` has the shape of a KMS key. | See [Configuration fields](#configuration-fields). A malformed value would fail every write to the bucket. |
 | `key_id` is set explicitly. | Every object carries the id of its key, and the proxy picks the key by that id when it reads the object. A bucket key id is therefore never derived from a name: a renamed bucket or an alias would otherwise change the id. |
 | `legacy_key_id` is set explicitly when `legacy_key` is set. | The same reason. |
 | The bucket has `backend:` when `storage.backends` is used. | A bucket without a route can live on any backend, so the proxy cannot tell which storage the block applies to. With a single backend (`storage.backend`), the bucket is always on that backend, and `backend:` is not needed. |
@@ -180,6 +181,63 @@ These gates run on an apply through the admin API. A proxy that starts from an e
 Each backend has one encrypting layer, which holds every key that the config gives to that backend: the key and legacy key of the backend, and the key and legacy key of each bucket on it. When the proxy reads an object, it picks the key by the `dg-encryption-key-id` of the object. A bucket therefore reads the objects that it wrote under the backend key before it got its own key, and it reads them again after its own key is retired into `legacy_key`. An object without a key id (written before key ids existed) is decrypted with the key of the backend.
 
 When the proxy writes an object, it picks the key of the stored bucket that the object goes to. A server-side copy inside one backend keeps the stored bytes only when the destination bucket writes with the same key id as the source object. Otherwise the proxy decrypts the object and encrypts it again with the key of the destination.
+
+### Native SSE per bucket
+
+A bucket on an S3 backend can use `sse-kms` or `sse-s3` in its own block. The proxy uses one S3 client for each backend. It does not use a second client for these buckets. Instead, it sets the SSE headers of each request from the bucket that the request writes to. These requests are PutObject, CreateMultipartUpload, CopyObject, UploadPartCopy and the empty objects that the proxy writes for folders and listing facts. The headers are `x-amz-server-side-encryption`, and for SSE-KMS also `x-amz-server-side-encryption-aws-kms-key-id` and `x-amz-server-side-encryption-bucket-key-enabled`.
+
+```yaml
+# validate
+storage:
+  backends:
+    - name: aws-dr
+      type: s3
+      region: eu-west-1
+      encryption:
+        mode: sse-s3
+  buckets:
+    db-archive:
+      backend: aws-dr
+      encryption:
+        mode: sse-kms
+        kms_key_id: arn:aws:kms:eu-west-1:123456789012:alias/db-archive
+        bucket_key_enabled: true
+    releases:
+      backend: aws-dr
+      encryption:
+        mode: aes256-gcm-proxy
+        key: "${env:RELEASES_AES_KEY}"
+        key_id: releases-2026
+    downloads:
+      backend: aws-dr
+      encryption:
+        mode: none
+```
+
+In this example, each bucket on `aws-dr` gets exactly one layer of encryption:
+
+| Bucket | What the proxy sends to S3 |
+|---|---|
+| `db-archive` | The bytes as they are, with the SSE-KMS headers of its key. |
+| `releases` | AES-256-GCM ciphertext, with no SSE headers. The SSE-S3 mode of the backend does not apply, so the bytes are not encrypted twice. |
+| `downloads` | The bytes as they are, with no SSE headers. `mode: none` on a bucket means plaintext, also on a backend with native SSE. |
+| A bucket with no block | The bytes as they are, with the SSE-S3 headers of the backend. |
+
+A server-side copy between two buckets on one backend sends the SSE headers of the destination bucket. A copy from an SSE-KMS bucket into a plaintext bucket therefore stores plaintext, and a copy from a plaintext bucket into an SSE-KMS bucket stores an SSE-KMS object. A copy from or into a bucket that encrypts in the proxy goes through the proxy, which decrypts and encrypts the bytes as the destination asks.
+
+A multipart upload into an SSE bucket uses native S3 multipart. The SSE headers go on CreateMultipartUpload, and S3 encrypts every part.
+
+#### KMS permissions
+
+S3 calls KMS with the credentials of the request, so the credentials of the backend (`access_key_id` of `aws-dr`, or the role of the proxy) need these KMS permissions on each key that a bucket or backend names:
+
+| Permission | Why |
+|---|---|
+| `kms:GenerateDataKey` | Every write. S3 asks KMS for a data key to encrypt the object. |
+| `kms:Decrypt` | Every read, every server-side copy from the bucket, and every multipart upload into it (S3 reads the encrypted data key to finish the upload). |
+| `kms:DescribeKey` | Optional. S3 uses it to resolve an alias. |
+
+Give these permissions in the key policy, or in an IAM policy when the key policy allows IAM. With `bucket_key_enabled: true`, S3 calls KMS less often, but it needs the same permissions. SSE-S3 needs no KMS permission.
 
 ### Multipart uploads, migrate and replication
 

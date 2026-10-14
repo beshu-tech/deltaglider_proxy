@@ -805,3 +805,160 @@ async fn an_apply_refuses_alias_disagreement_and_key_id_collision() {
         "{code} {v}"
     );
 }
+
+// ── Scenario: native SSE per bucket (issue #116 P3) ─────────────────────
+
+/// The SSE mode and the proxy form of a blob on the test MinIO.
+async fn minio_sse(bucket: &str, stored: &str) -> (Option<String>, Option<String>, bool) {
+    let head = common::minio_client()
+        .await
+        .head_object()
+        .bucket(bucket)
+        .key(stored)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("MinIO HEAD {bucket}/{stored}: {e:?}"));
+    let meta = head.metadata().cloned().unwrap_or_default();
+    (
+        head.server_side_encryption()
+            .map(|s| s.as_str().to_string()),
+        head.ssekms_key_id().map(str::to_string),
+        meta.contains_key("user-dg-encrypted"),
+    )
+}
+
+/// One S3 backend (own mode SSE-S3) holds four buckets: `kms` (SSE-KMS),
+/// `aes` (proxy AES), `plain` (`mode: none`) and `inherit` (no override).
+/// Every request that stores bytes takes the SSE headers of ITS bucket:
+/// PUT, the delta's reference and delta, a server-side copy between modes
+/// and a multipart upload. Nothing is encrypted twice and nothing is
+/// skipped. Needs the KMS-capable MinIO (key `dgp-test-key`).
+#[tokio::test]
+async fn native_sse_per_bucket_minio() {
+    skip_unless_minio!();
+    let names = ["sse-kms", "sse-aes", "sse-plain", "sse-inh"].map(common::unique_bucket);
+    let [kms, aes, plain, inherit] = [&names[0], &names[1], &names[2], &names[3]];
+    let buckets = format!(
+        "    {kms}: {{ backend: local-disk, encryption: {{ mode: sse-kms, kms_key_id: \"arn:aws:kms:dgp-test-key\" }} }}\n    \
+         {aes}: {{ backend: local-disk, encryption: {{ mode: aes256-gcm-proxy, key: \"{KB}\", key_id: sse-aes-b }} }}\n    \
+         {plain}: {{ backend: local-disk, encryption: {{ mode: none }} }}\n    \
+         {inherit}: {{ backend: local-disk }}\n"
+    );
+    let env = spawn(
+        Shape::NamedMinio,
+        Some("{ mode: sse-s3 }"),
+        &buckets,
+        "",
+        kms,
+    )
+    .await;
+    for b in [aes, plain, inherit] {
+        env.create(b).await;
+    }
+    let kms_form = (Some("aws:kms".to_string()), true, false);
+    let form = |(sse, kid, proxy): (Option<String>, Option<String>, bool)| {
+        (sse, kid.is_some_and(|k| k.ends_with("dgp-test-key")), proxy)
+    };
+    for b in [kms, aes, plain, inherit] {
+        env.put(b, "x.txt", format!("body of {b}").as_bytes()).await;
+        assert_eq!(env.get(b, "x.txt").await, format!("body of {b}").as_bytes());
+    }
+    assert_eq!(form(minio_sse(kms, "x.txt").await), kms_form);
+    assert_eq!(
+        form(minio_sse(aes, "x.txt").await),
+        (None, false, true),
+        "proxy AES and no SSE: never encrypted twice"
+    );
+    assert_eq!(form(minio_sse(plain, "x.txt").await), (None, false, false));
+    assert_eq!(
+        form(minio_sse(inherit, "x.txt").await),
+        (Some("AES256".to_string()), false, false),
+        "a bucket without an override takes the backend's SSE-S3"
+    );
+
+    // A delta: the reference and the delta take the bucket's SSE.
+    let v1 = generate_binary(120_000, 11);
+    let v2 = mutate_binary(&v1, 0.05);
+    env.put(kms, "app.zip", &v1).await;
+    env.put(kms, "app2.zip", &v2).await;
+    assert_eq!(env.get(kms, "app2.zip").await, v2);
+    assert_eq!(form(minio_sse(kms, "reference.bin").await), kms_form);
+    assert_eq!(form(minio_sse(kms, "app2.zip.delta").await), kms_form);
+
+    // Copies between modes write the DESTINATION's form.
+    env.copy((kms, "x.txt"), (plain, "from-kms.txt")).await;
+    env.copy((plain, "x.txt"), (kms, "from-plain.txt")).await;
+    env.copy((aes, "x.txt"), (kms, "from-aes.txt")).await;
+    env.copy((kms, "x.txt"), (aes, "from-kms.txt")).await;
+    assert_eq!(
+        form(minio_sse(plain, "from-kms.txt").await),
+        (None, false, false)
+    );
+    assert_eq!(form(minio_sse(kms, "from-plain.txt").await), kms_form);
+    assert_eq!(form(minio_sse(kms, "from-aes.txt").await), kms_form);
+    assert_eq!(
+        form(minio_sse(aes, "from-kms.txt").await),
+        (None, false, true)
+    );
+    assert_eq!(
+        env.get(plain, "from-kms.txt").await,
+        format!("body of {kms}").as_bytes()
+    );
+    assert_eq!(
+        env.get(kms, "from-aes.txt").await,
+        format!("body of {aes}").as_bytes()
+    );
+    assert_eq!(
+        env.get(aes, "from-kms.txt").await,
+        format!("body of {kms}").as_bytes()
+    );
+
+    // A multipart upload: the native upload carries the bucket's SSE.
+    let client = env.server.s3_client().await;
+    let part1 = vec![7u8; 5 * 1024 * 1024];
+    let part2 = b"tail".to_vec();
+    let up = client
+        .create_multipart_upload()
+        .bucket(kms)
+        .key("big.bin")
+        .send()
+        .await
+        .unwrap();
+    let id = up.upload_id().unwrap();
+    let mut done = Vec::new();
+    for (n, body) in [(1, part1.clone()), (2, part2.clone())] {
+        let p = client
+            .upload_part()
+            .bucket(kms)
+            .key("big.bin")
+            .upload_id(id)
+            .part_number(n)
+            .body(ByteStream::from(body))
+            .send()
+            .await
+            .unwrap();
+        done.push(
+            aws_sdk_s3::types::CompletedPart::builder()
+                .part_number(n)
+                .e_tag(p.e_tag().unwrap())
+                .build(),
+        );
+    }
+    client
+        .complete_multipart_upload()
+        .bucket(kms)
+        .key("big.bin")
+        .upload_id(id)
+        .multipart_upload(
+            aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                .set_parts(Some(done))
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(form(minio_sse(kms, "big.bin").await), kms_form);
+    let mut want = part1;
+    want.extend_from_slice(&part2);
+    assert_eq!(env.get(kms, "big.bin").await, want);
+}

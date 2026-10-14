@@ -155,10 +155,11 @@ pub static LISTING_FACTS_MISSES: std::sync::LazyLock<prometheus::IntCounter> =
 /// `EncryptingBackend` decrypt pass; native ones come back already-
 /// decrypted from the SDK and the wrapper's `dg-encrypted` marker
 /// check is (correctly) false.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum NativeEncryptionConfig {
     /// No S3-side encryption headers — proxy-mode encryption or
     /// plaintext. Default.
+    #[default]
     None,
     /// SSE-S3 (AES256, AWS-managed keys). No KMS cost; minimal
     /// control. Stamps `dg-encrypted-native: sse-s3`.
@@ -186,6 +187,61 @@ impl NativeEncryptionConfig {
     }
 }
 
+/// The per-bucket half of a [`NativeEncryptionPolicy`]: `Some(mode)` for
+/// a REAL bucket with its own `encryption` override (an override that is
+/// not native answers `Some(None)`: the bucket gets no SSE headers),
+/// `None` for a bucket that follows the backend.
+pub type NativeOverrides =
+    std::sync::Arc<dyn Fn(&str) -> Option<NativeEncryptionConfig> + Send + Sync>;
+
+/// The native SSE mode of each request, picked by its bucket (issue #116):
+/// the bucket's own override, else the backend's mode. One S3 client
+/// serves every bucket; only the headers of a request differ.
+#[derive(Clone)]
+pub struct NativeEncryptionPolicy {
+    backend: NativeEncryptionConfig,
+    overrides: Option<NativeOverrides>,
+}
+
+impl NativeEncryptionPolicy {
+    /// The backend's mode with per-bucket overrides.
+    pub fn with_overrides(backend: NativeEncryptionConfig, overrides: NativeOverrides) -> Self {
+        Self {
+            backend,
+            overrides: Some(overrides),
+        }
+    }
+
+    /// THE native mode of a write to the real bucket `bucket`. Every
+    /// request that stores bytes (PUT, CreateMultipartUpload, CopyObject,
+    /// UploadPartCopy, directory marker, facts object) takes its SSE
+    /// headers from here.
+    pub fn for_bucket(&self, bucket: &str) -> NativeEncryptionConfig {
+        self.overrides
+            .as_ref()
+            .and_then(|f| f(bucket))
+            .unwrap_or_else(|| self.backend.clone())
+    }
+}
+
+impl From<NativeEncryptionConfig> for NativeEncryptionPolicy {
+    fn from(backend: NativeEncryptionConfig) -> Self {
+        Self {
+            backend,
+            overrides: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for NativeEncryptionPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeEncryptionPolicy")
+            .field("backend", &self.backend)
+            .field("per_bucket", &self.overrides.is_some())
+            .finish()
+    }
+}
+
 pub struct S3Backend {
     /// Client for requests without a large body: every operation is capped
     /// at [`backend_request_timeout`], so a hung backend fails fast.
@@ -203,9 +259,9 @@ pub struct S3Backend {
     /// The `backend` label of both clients' request timing, set by
     /// [`S3Backend::with_health_name`].
     request_label: timing::BackendLabel,
-    /// Per-backend native S3 server-side encryption mode. Applied to
-    /// every `put_object`/`put_directory_marker` call.
-    native_encryption: NativeEncryptionConfig,
+    /// Native S3 server-side encryption, per bucket. Every request that
+    /// stores bytes takes its headers from `native_encryption.for_bucket`.
+    native_encryption: NativeEncryptionPolicy,
     /// Scope of this backend's entries in the listing-size cache: the
     /// endpoint that holds the buckets (see `list_size_cache`).
     list_cache_scope: String,
@@ -229,8 +285,9 @@ impl S3Backend {
     /// wrapper handles those at a layer above us).
     pub async fn new(
         config: &BackendConfig,
-        native_encryption: NativeEncryptionConfig,
+        native_encryption: impl Into<NativeEncryptionPolicy>,
     ) -> Result<Self, StorageError> {
+        let native_encryption: NativeEncryptionPolicy = native_encryption.into();
         // One retry partition and one timing label for both clients of
         // this backend.
         let partition = client::backend_retry_partition(config);
@@ -1094,7 +1151,8 @@ impl StorageBackend for S3Backend {
     ) -> Result<MultipartUpload, StorageError> {
         let key = self.passthrough_key(prefix, filename);
         let mut headers = self.metadata_to_headers(metadata);
-        if let Some(marker) = self.native_encryption.marker() {
+        let native = self.native_encryption.for_bucket(bucket);
+        if let Some(marker) = native.marker() {
             headers.insert("dg-encrypted-native".to_string(), marker.to_string());
         }
         check_metadata_size(&headers, bucket, &key)?;
@@ -1108,7 +1166,7 @@ impl StorageBackend for S3Backend {
         for (k, v) in &headers {
             request = request.metadata(k.clone(), v.clone());
         }
-        request = apply_native_encryption_mpu(request, &self.native_encryption);
+        request = apply_native_encryption(request, &native);
 
         let resp = request
             .send()
@@ -1640,10 +1698,11 @@ impl StorageBackend for S3Backend {
         // decrypt". Without it, a future read-side sniffer that
         // distinguishes "plaintext" from "native-encrypted" via the
         // marker would misclassify directory markers.
-        if let Some(marker) = self.native_encryption.marker() {
+        let native = self.native_encryption.for_bucket(bucket);
+        if let Some(marker) = native.marker() {
             request = request.metadata("dg-encrypted-native", marker);
         }
-        request = apply_native_encryption(request, &self.native_encryption);
+        request = apply_native_encryption(request, &native);
         request
             .send()
             .await

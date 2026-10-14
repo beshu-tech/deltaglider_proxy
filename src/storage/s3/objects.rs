@@ -174,11 +174,13 @@ impl S3Backend {
             }
         }
         let acl = self.object_acl_for_copy(bucket, key).await;
+        // The bucket's own native mode (issue #116).
+        let native = self.native_encryption.for_bucket(bucket);
         let plan = self_copy_plan(
             head,
             acl.as_ref(),
             self.metadata_to_headers(metadata),
-            !matches!(self.native_encryption, NativeEncryptionConfig::None),
+            !matches!(native, NativeEncryptionConfig::None),
             std::time::SystemTime::now(),
         );
 
@@ -212,24 +214,7 @@ impl S3Backend {
         if let Some(ct) = metadata.content_type.as_deref() {
             request = request.content_type(ct);
         }
-        {
-            use aws_sdk_s3::types::ServerSideEncryption;
-            match &self.native_encryption {
-                NativeEncryptionConfig::None => {}
-                NativeEncryptionConfig::SseS3 => {
-                    request = request.server_side_encryption(ServerSideEncryption::Aes256);
-                }
-                NativeEncryptionConfig::SseKms {
-                    kms_key_id,
-                    bucket_key_enabled,
-                } => {
-                    request = request
-                        .server_side_encryption(ServerSideEncryption::AwsKms)
-                        .ssekms_key_id(kms_key_id.clone())
-                        .bucket_key_enabled(*bucket_key_enabled);
-                }
-            }
-        }
+        request = apply_native_encryption(request, &native);
 
         let wanted_meta = plan.metadata.clone();
         for (k, v) in plan.metadata {
@@ -357,7 +342,8 @@ impl S3Backend {
         // does NOT encrypt `x-amz-meta-*` headers, only the body.
         // This is acceptable because DG metadata is never considered
         // secret (see docs/product/reference/encryption-at-rest.md).
-        if let Some(marker) = self.native_encryption.marker() {
+        let native = self.native_encryption.for_bucket(bucket);
+        if let Some(marker) = native.marker() {
             headers.insert("dg-encrypted-native".to_string(), marker.to_string());
         }
 
@@ -377,7 +363,7 @@ impl S3Backend {
             for (k, v) in &headers {
                 request = request.metadata(k.clone(), v.clone());
             }
-            request = apply_native_encryption(request, &self.native_encryption);
+            request = apply_native_encryption(request, &native);
             request = apply_put_fence(request, &fence);
             let sent = match self.upload_config(data.len() as u64) {
                 Some(c) => request.customize().config_override(c).send().await,
@@ -525,7 +511,8 @@ impl S3Backend {
     ) -> Result<Option<String>, StorageError> {
         let mut fence = fence.clone();
         let mut headers = self.metadata_to_headers(metadata);
-        if let Some(marker) = self.native_encryption.marker() {
+        let native = self.native_encryption.for_bucket(bucket);
+        if let Some(marker) = native.marker() {
             headers.insert("dg-encrypted-native".to_string(), marker.to_string());
         }
         check_metadata_size(&headers, bucket, key)?;
@@ -549,7 +536,7 @@ impl S3Backend {
             for (k, v) in &headers {
                 request = request.metadata(k.clone(), v.clone());
             }
-            request = apply_native_encryption(request, &self.native_encryption);
+            request = apply_native_encryption(request, &native);
             request = apply_put_fence(request, &fence);
             let sent = match self.upload_config(stored_size.unwrap_or(0)) {
                 Some(c) => request.customize().config_override(c).send().await,

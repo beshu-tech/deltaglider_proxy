@@ -31,7 +31,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use super::listing_facts::{self, CleanupRead};
-use super::s3::{put_facts_object, NativeEncryptionConfig, LISTING_FACTS_REQUESTS};
+#[cfg(test)]
+use super::s3::NativeEncryptionConfig;
+use super::s3::{put_facts_object, NativeEncryptionPolicy, LISTING_FACTS_REQUESTS};
 
 /// How long the task waits for more deletes before it flushes a batch.
 const DEBOUNCE: Duration = Duration::from_millis(200);
@@ -297,7 +299,7 @@ impl FactsCleanupQueue {
     /// backend is built in one). The cleanup task ends when the queue is
     /// dropped, the write task when the queue and every writer are, each
     /// after a last batch.
-    pub(super) fn start(client: Client, native: NativeEncryptionConfig) -> Self {
+    pub(super) fn start(client: Client, native: NativeEncryptionPolicy) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let (deleted, deleted_rx) = mpsc::unbounded_channel();
         let rewritten: Rewritten = Default::default();
@@ -387,7 +389,7 @@ async fn next_batch<T>(rx: &mut mpsc::UnboundedReceiver<T>) -> Option<Vec<T>> {
 /// Send the queued facts writes.
 async fn write_drain(
     client: Client,
-    native: NativeEncryptionConfig,
+    native: NativeEncryptionPolicy,
     mut rx: mpsc::UnboundedReceiver<Write>,
 ) {
     while let Some(batch) = next_batch(&mut rx).await {
@@ -398,7 +400,9 @@ async fn write_drain(
             .for_each_concurrent(FACTS_WRITE_CONCURRENCY, |(bucket, facts_key)| {
                 let (client, native) = (&client, &native);
                 async move {
-                    if let Err(e) = put_facts_object(client, native, &bucket, &facts_key).await {
+                    // The bucket's own SSE mode (issue #116).
+                    let native = native.for_bucket(&bucket);
+                    if let Err(e) = put_facts_object(client, &native, &bucket, &facts_key).await {
                         warn!("listing facts {bucket}/{facts_key} not written: {e}");
                     }
                 }
@@ -623,7 +627,7 @@ mod tests {
         for _ in 0..5 {
             drop(FactsCleanupQueue::start(
                 client.clone(),
-                NativeEncryptionConfig::None,
+                NativeEncryptionConfig::None.into(),
             ));
         }
         // Aborted and closed tasks end on their next poll.
@@ -653,7 +657,8 @@ mod tests {
             .endpoint_url(endpoint)
             .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
             .build();
-        let queue = FactsCleanupQueue::start(Client::from_conf(conf), NativeEncryptionConfig::None);
+        let queue =
+            FactsCleanupQueue::start(Client::from_conf(conf), NativeEncryptionConfig::None.into());
         const N: usize = 32;
         let started = std::time::Instant::now();
         for i in 0..N {
@@ -710,7 +715,8 @@ mod tests {
     async fn a_slow_delete_cleanup_does_not_hold_up_facts_writes() {
         let (endpoint, fake) = crate::storage::fake_s3::start().await;
         fake.set_delay_ms("LIST", 300);
-        let queue = FactsCleanupQueue::start(fake_client(&endpoint), NativeEncryptionConfig::None);
+        let queue =
+            FactsCleanupQueue::start(fake_client(&endpoint), NativeEncryptionConfig::None.into());
         // One key in each of 20 directories: 20 facts LISTs, 6 s.
         for i in 0..20 {
             queue.enqueue("b", &format!("d{i:02}/k.html"), None);

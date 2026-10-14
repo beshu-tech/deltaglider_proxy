@@ -152,6 +152,20 @@ impl Config {
             .collect()
     }
 
+    /// FATAL: an SSE-KMS `kms_key_id` that no KMS accepts, at every
+    /// encryption site (backends and buckets; part of [`Self::check_fatal`]).
+    pub(super) fn kms_key_id_errors(&self) -> Vec<String> {
+        self.encryption_sites()
+            .into_iter()
+            .filter_map(|(site, enc)| match enc {
+                BackendEncryptionConfig::SseKms { kms_key_id, .. } => {
+                    kms_key_id_problem(kms_key_id).map(|p| format!("{}: {p}", site.label()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// FATAL errors of the bucket overrides (part of [`Self::check_fatal`]):
     /// a config the proxy must never run with.
     pub(super) fn bucket_encryption_errors(&self) -> Vec<String> {
@@ -182,13 +196,22 @@ impl Config {
         for (bucket, enc) in &overrides {
             let at = format!("bucket '{bucket}'");
             match enc {
+                // Native SSE needs S3: a filesystem backend would store the
+                // bytes as they are (issue #116 P3).
                 BackendEncryptionConfig::SseKms { .. } | BackendEncryptionConfig::SseS3 { .. } => {
-                    errors.push(format!(
-                        "{at}: encryption mode '{}' is not supported on a bucket yet. A bucket \
-                         override takes 'aes256-gcm-proxy' or 'none'; set native SSE on the \
-                         backend instead",
-                        enc.mode_tag()
-                    ));
+                    let on_filesystem = self
+                        .bucket_storage(bucket)
+                        .and_then(|(backend, _)| self.backend_by_name(&backend))
+                        .is_some_and(|def| matches!(def, BackendConfig::Filesystem { .. }));
+                    if on_filesystem {
+                        errors.push(format!(
+                            "{at}: encryption mode '{}' is native S3 encryption, but the \
+                             bucket is stored on a filesystem backend, which would store \
+                             the bytes as they are. Use 'aes256-gcm-proxy' for this bucket, \
+                             or store it on an S3 backend",
+                            enc.mode_tag()
+                        ));
+                    }
                 }
                 BackendEncryptionConfig::Aes256GcmProxy { key_id, .. } => match key_id {
                     None => errors.push(format!(

@@ -80,16 +80,114 @@ fn a_bucket_override_needs_an_explicit_key_id() {
     assert!(errs.iter().any(|e| e.contains("legacy_key_id")), "{errs:?}");
 }
 
+/// Two named backends, one of them S3, with `db-archive` on `s3-bucket`.
+fn on_s3(db_archive: &str, backend_enc: &str) -> String {
+    format!(
+        r#"
+storage:
+  backends:
+    - name: hetzner-fsn1
+      type: filesystem
+      path: /tmp/dgp-bucket-enc-a
+    - name: aws-dr
+      type: s3
+      endpoint: http://127.0.0.1:9
+      access_key_id: k
+      secret_access_key: s
+      region: us-east-1
+{backend_enc}
+  buckets:
+    db-archive: {db_archive}
+"#
+    )
+}
+
+/// Issue #116 P3: a bucket on an S3 backend takes native SSE; on a
+/// filesystem backend it is refused (the bytes would be stored as they are).
 #[test]
-fn native_sse_on_a_bucket_is_refused() {
+fn native_sse_on_a_bucket_needs_an_s3_backend() {
+    let ok = fatal(&on_s3(
+        "{ backend: aws-dr, encryption: { mode: sse-kms, kms_key_id: \"alias/db-archive\" } }",
+        "",
+    ));
+    assert!(ok.is_empty(), "{ok:?}");
+    let ok = fatal(&on_s3(
+        "{ backend: aws-dr, encryption: { mode: sse-s3 } }",
+        "",
+    ));
+    assert!(ok.is_empty(), "{ok:?}");
     let errs = fatal(&named(
         "{ backend: local-disk, encryption: { mode: sse-s3 } }",
     ));
     assert!(
-        errs.iter()
-            .any(|e| e.contains("'sse-s3' is not supported on a bucket")),
+        errs.iter().any(|e| e.contains("bucket 'db-archive'")
+            && e.contains("'sse-s3' is native S3 encryption")
+            && e.contains("filesystem")),
         "{errs:?}"
     );
+}
+
+/// A `kms_key_id` that no KMS accepts is fatal, on a bucket AND on a backend.
+#[test]
+fn a_malformed_kms_key_id_is_fatal_on_buckets_and_backends() {
+    let errs = fatal(&on_s3(
+        "{ backend: aws-dr, encryption: { mode: sse-kms, kms_key_id: \"my key\" } }",
+        "",
+    ));
+    assert!(
+        errs.iter()
+            .any(|e| e.starts_with("bucket 'db-archive': kms_key_id must be")),
+        "{errs:?}"
+    );
+    let errs = fatal(&on_s3(
+        "{ backend: aws-dr }",
+        "      encryption:\n        mode: sse-kms\n        kms_key_id: \"\"\n",
+    ));
+    assert!(
+        errs.iter()
+            .any(|e| e.starts_with("backend 'aws-dr': kms_key_id is empty")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn kms_key_id_shapes() {
+    for ok in [
+        "arn:aws:kms:eu-central-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab",
+        "arn:aws:kms:eu-central-1:123456789012:alias/db-archive",
+        "arn:aws-us-gov:kms:us-gov-west-1:123456789012:key/mrk-1234abcd12ab34cd56ef1234567890ab",
+        "arn:aws:kms:dgp-test-key",
+        "alias/db-archive",
+        "alias/aws/s3",
+        "1234abcd-12ab-34cd-56ef-1234567890ab",
+        "mrk-1234abcd12ab34cd56ef1234567890ab",
+    ] {
+        assert_eq!(kms_key_id_problem(ok), None, "{ok}");
+    }
+    for bad in [
+        "",
+        "  ",
+        "my-key",
+        "alias/",
+        "alias/has space",
+        "arn:aws:s3:::bucket",
+        "arn:aws:kms:",
+        "arn:aws:kms:eu-central-1:123456789012:key/",
+        "1234abcd-12ab-34cd-56ef",
+        "mrk-123",
+        "arn:aws:kms:eu-central-1:1:key/a\nb",
+    ] {
+        assert!(kms_key_id_problem(bad).is_some(), "{bad:?}");
+    }
+}
+
+proptest::proptest! {
+    /// Anything with whitespace is never a key id.
+    #[test]
+    fn kms_key_id_with_whitespace_is_refused(a in "[a-z0-9/:-]{0,20}", b in "[a-z0-9/:-]{0,20}") {
+        let with_space = format!("{a} {b}");
+        proptest::prop_assert!(kms_key_id_problem(&with_space).is_some());
+    }
 }
 
 #[test]

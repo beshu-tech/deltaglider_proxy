@@ -116,7 +116,9 @@ impl S3Backend {
         };
         let size = u64::try_from(size).unwrap_or(0);
         let mut headers = self.metadata_to_headers(metadata);
-        if let Some(marker) = self.native_encryption.marker() {
+        // The DESTINATION bucket's native mode (issue #116): a copy between
+        // an SSE bucket and a plain one takes the destination's headers.
+        if let Some(marker) = self.native_encryption.for_bucket(dst.bucket).marker() {
             headers.insert("dg-encrypted-native".to_string(), marker.to_string());
         }
         check_metadata_size(&headers, dst.bucket, &dst_key)?;
@@ -169,7 +171,6 @@ impl S3Backend {
         source_etag: &str,
         headers: &HashMap<String, String>,
     ) -> Result<String, (CopyFailure, StorageError)> {
-        use aws_sdk_s3::types::ServerSideEncryption;
         let mut request = self
             .bulk_client
             .copy_object()
@@ -182,21 +183,7 @@ impl S3Backend {
         for (k, v) in headers {
             request = request.metadata(k.clone(), v.clone());
         }
-        match &self.native_encryption {
-            NativeEncryptionConfig::None => {}
-            NativeEncryptionConfig::SseS3 => {
-                request = request.server_side_encryption(ServerSideEncryption::Aes256);
-            }
-            NativeEncryptionConfig::SseKms {
-                kms_key_id,
-                bucket_key_enabled,
-            } => {
-                request = request
-                    .server_side_encryption(ServerSideEncryption::AwsKms)
-                    .ssekms_key_id(kms_key_id.clone())
-                    .bucket_key_enabled(*bucket_key_enabled);
-            }
-        }
+        request = apply_native_encryption(request, &self.native_encryption.for_bucket(bucket));
         match request.send().await {
             Ok(resp) => Ok(resp
                 .copy_object_result()
@@ -231,7 +218,7 @@ impl S3Backend {
         for (k, v) in headers {
             create = create.metadata(k.clone(), v.clone());
         }
-        create = apply_native_encryption_mpu(create, &self.native_encryption);
+        create = apply_native_encryption(create, &self.native_encryption.for_bucket(bucket));
         let created = create.send().await.map_err(|e| {
             (
                 failure_of(&e),

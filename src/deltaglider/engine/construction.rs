@@ -67,19 +67,24 @@ impl DynEngine {
         let storage: Box<DynStorageBackend<'static>> = if config.backends.is_empty() {
             // Singleton backend path. Synthetic name "default" matches
             // what `apply_backend_encryption_env` uses for this entry.
-            let raw =
-                build_raw_backend("default", &config.backend, &config.backend_encryption).await?;
             let cfg = resolve_encryption_config(
                 "default",
                 &config.backend_encryption,
                 &on("default"),
                 &mut KeyIdCollisionCheck::new(),
             )?;
+            refuse_native_overrides_off_s3("default", &config.backend, &on("default"))?;
             let slot = policies.slot(
                 &policy_slot_key("default", &config.backend, &config.backend_encryption),
                 cfg,
                 &mut published,
             );
+            let raw = build_raw_backend_native(
+                "default",
+                &config.backend,
+                native_policy(&config.backend_encryption, &slot),
+            )
+            .await?;
             DynStorageBackend::new_box(crate::storage::EncryptingBackend::new(raw, slot))
         } else {
             // Multi-backend routing. Each named entry is constructed
@@ -89,18 +94,24 @@ impl DynEngine {
             let mut backends = std::collections::HashMap::new();
             let mut kid_collisions = KeyIdCollisionCheck::new();
             for named in &config.backends {
-                let raw = build_raw_backend(&named.name, &named.backend, &named.encryption).await?;
                 let cfg = resolve_encryption_config(
                     &named.name,
                     &named.encryption,
                     &on(&named.name),
                     &mut kid_collisions,
                 )?;
+                refuse_native_overrides_off_s3(&named.name, &named.backend, &on(&named.name))?;
                 let slot = policies.slot(
                     &policy_slot_key(&named.name, &named.backend, &named.encryption),
                     cfg,
                     &mut published,
                 );
+                let raw = build_raw_backend_native(
+                    &named.name,
+                    &named.backend,
+                    native_policy(&named.encryption, &slot),
+                )
+                .await?;
                 let wrapped =
                     DynStorageBackend::new_box(crate::storage::EncryptingBackend::new(raw, slot));
                 backends.insert(named.name.clone(), Arc::new(wrapped));
@@ -194,28 +205,72 @@ pub(super) fn native_encryption_for(
     }
 }
 
+/// The native SSE policy of one raw S3 backend: the backend's own mode,
+/// and each bucket override's mode read from the shared policy slot per
+/// request (issue #116). The slot is the one the encrypting wrapper reads,
+/// so the SSE headers and the proxy-AES decision of a write come from one
+/// published config, also on an engine that drains after an apply.
+fn native_policy(
+    enc: &crate::config::BackendEncryptionConfig,
+    slot: &Arc<arc_swap::ArcSwap<crate::storage::EncryptionConfig>>,
+) -> crate::storage::NativeEncryptionPolicy {
+    let slot = slot.clone();
+    crate::storage::NativeEncryptionPolicy::with_overrides(
+        native_encryption_for(enc),
+        Arc::new(move |bucket: &str| slot.load().native_for(bucket)),
+    )
+}
+
+/// A native SSE bucket override on a filesystem backend would store
+/// plaintext: refuse the engine (`Config::check_fatal` refuses the config
+/// first; this is the last line).
+fn refuse_native_overrides_off_s3(
+    backend_name: &str,
+    backend: &BackendConfig,
+    buckets: &[crate::config::BucketOverride<'_>],
+) -> Result<(), StorageError> {
+    if matches!(backend, BackendConfig::S3 { .. }) {
+        return Ok(());
+    }
+    match buckets.iter().find(|o| o.config.is_native()) {
+        Some(o) => Err(StorageError::Encryption(format!(
+            "bucket '{}' uses native S3 encryption ({}) but backend '{backend_name}' is a              filesystem backend: native modes need S3",
+            o.bucket,
+            o.config.mode_tag()
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Build ONE storage backend from a `BackendConfig` variant + its
-/// encryption config. Native SSE modes are baked into the S3 client
-/// here; proxy-AES encryption is layered on top by
-/// `wrap_backend_with_encryption`. Filesystem backends ignore native
-/// modes (rejected at `Config::check` time).
+/// encryption config, with no per-bucket SSE (a raw read-only client).
+/// Native SSE modes are baked into the S3 client here; proxy-AES
+/// encryption is layered on top by `wrap_backend_with_encryption`.
+/// Filesystem backends ignore native modes (rejected at `Config::check`
+/// time).
 pub(crate) async fn build_raw_backend(
     name: &str,
     cfg: &BackendConfig,
     enc: &crate::config::BackendEncryptionConfig,
 ) -> Result<Box<DynStorageBackend<'static>>, StorageError> {
+    build_raw_backend_native(name, cfg, native_encryption_for(enc).into()).await
+}
+
+/// [`build_raw_backend`] with a native SSE policy.
+async fn build_raw_backend_native(
+    name: &str,
+    cfg: &BackendConfig,
+    native: crate::storage::NativeEncryptionPolicy,
+) -> Result<Box<DynStorageBackend<'static>>, StorageError> {
     match cfg {
         BackendConfig::Filesystem { path } => Ok(DynStorageBackend::new_box(
             FilesystemBackend::new(path.clone()).await?,
         )),
-        BackendConfig::S3 { .. } => {
-            let native = native_encryption_for(enc);
-            Ok(DynStorageBackend::new_box(
-                S3Backend::new(cfg, native)
-                    .await?
-                    .with_health_name(name, cfg),
-            ))
-        }
+        BackendConfig::S3 { .. } => Ok(DynStorageBackend::new_box(
+            S3Backend::new(cfg, native)
+                .await?
+                .with_health_name(name, cfg),
+        )),
     }
 }
 
@@ -404,8 +459,8 @@ pub(super) fn resolve_encryption_config(
 /// (issue #116): each override's write key under its REAL bucket name,
 /// and every override key and legacy key by its explicit id. A bucket key
 /// id joins the process-wide collision check, so one id names one key.
-/// `Config::check_fatal` refuses the shapes this rejects (native SSE on a
-/// bucket, a missing id); the errors here are the last line.
+/// `Config::check_fatal` refuses the shapes this rejects (a missing id);
+/// the errors here are the last line.
 #[allow(clippy::type_complexity)]
 pub(super) fn resolve_bucket_keys(
     backend_name: &str,
@@ -451,13 +506,22 @@ pub(super) fn resolve_bucket_keys(
                 keys.write_mode = crate::storage::WriteMode::Refuse;
             }
             E::None { .. } => {}
+            // Native SSE (issue #116 P3): the S3 backend sets the headers
+            // per request from `keys.native` (below); the wrapper stores
+            // the bytes as they are, so nothing is encrypted twice.
             E::SseKms { .. } | E::SseS3 { .. } => {
-                return Err(StorageError::Encryption(format!(
-                    "{label}: encryption mode '{}' is not supported on a bucket",
+                keys.write_mode = crate::storage::WriteMode::PassThrough;
+                tracing::info!(
+                    "backend '{backend_name}': {label} (real bucket '{}') uses native {}",
+                    o.real_bucket,
                     o.config.mode_tag()
-                )));
+                );
             }
         }
+        // Every override names its native mode, `None` included: an
+        // override that is not native gets no SSE headers on a backend
+        // whose own mode is native.
+        keys.native = native_encryption_for(o.config);
         if let Some(slot) = site.legacy {
             let crate::config::SiteKey { key, key_id: kid } =
                 slot.map_err(StorageError::Encryption)?;
