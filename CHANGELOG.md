@@ -112,6 +112,15 @@ lock failed. An instance now recognises its own live lock by its owner
 token (unique to each hold, so two instances never match), and a renew
 that fails reads the lock once to see whether it is still its own. An
 acquire that fails also removes a lock that it may have written.
+### Fixed — A Refresh during writes no longer holds a bucket over its quota
+
+The quota check trusts the usage counter of a bucket once a full scan has
+stamped it. A Refresh that ran while clients wrote to the bucket stamped
+the counter too, but a write that the scan listed and that also arrived as
+a write counted twice, so the bucket could stay over its quota with no
+further scan. Now only a scan during which the bucket did not change
+stamps the counter. A busy Refresh still shows its numbers, marked as not
+reconciled; refresh again when the bucket is quiet.
 
 ### Fixed — A copy during a re-encryption no longer serves ciphertext
 

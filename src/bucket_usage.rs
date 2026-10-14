@@ -50,7 +50,10 @@ pub struct BucketUsageRow {
     pub object_count: u64,
     pub logical_bytes: u64,
     pub stored_bytes: u64,
-    /// Unix secs of the last authoritative full scan; `None` = never scanned.
+    /// Unix secs of the last full scan during which the bucket did not
+    /// change (the counter is then exact, and the quota gate trusts it).
+    /// `None`: never scanned, the last scan was busy, or a write since then
+    /// changed the bucket by an unknown amount.
     pub last_scan_at: Option<i64>,
 }
 
@@ -531,9 +534,9 @@ impl BucketUsage {
         Ok(rows)
     }
 
-    /// Overwrite a bucket's row with full-scan ground truth + stamp
-    /// `last_scan_at` (left empty when a write during the scan has an
-    /// unknown change: see [`Self::mark_for_recount`]).
+    /// Overwrite a bucket's row with full-scan ground truth, and stamp
+    /// `last_scan_at` only when the scan was quiet: no write changed the
+    /// bucket while it ran (see below, and [`Self::mark_for_recount`]).
     ///
     /// The row becomes the scan totals PLUS every delta since the scan
     /// started (the ticket's journal): a PUT or DELETE that lands while the
@@ -542,7 +545,12 @@ impl BucketUsage {
     /// is dropped: its part from before the scan is superseded, its part
     /// from during the scan is in the journal. A write whose key the scan
     /// passes after the write can count twice; a Refresh repairs it, which
-    /// is better than losing writes on every Refresh of a busy bucket.
+    /// is better than losing writes on every Refresh of a busy bucket. So
+    /// a busy scan leaves `last_scan_at` empty: its totals show, but the
+    /// quota gate (`quota_used`) and the job progress total
+    /// (`trusted_object_count`) do not trust them. Before, a busy Refresh
+    /// stamped the row, and its double count held the bucket over its quota
+    /// with no further scan.
     pub fn overwrite_from_scan(
         &self,
         ticket: ScanTicket<'_>,
@@ -568,14 +576,17 @@ impl BucketUsage {
         let bucket = std::mem::take(&mut ticket.bucket);
         let journal = self.end_scan(&bucket, ticket.id).unwrap_or_default();
         ticket.consumed = true;
-        if quiet_only && (journal.delta != (0, 0, 0) || journal.recount) {
+        // Quiet: the bucket did not change while the scan ran. Only a quiet
+        // scan stamps `last_scan_at`, the mark that the quota gate trusts.
+        let quiet = journal.delta == (0, 0, 0) && !journal.recount;
+        if quiet_only && !quiet {
             return Ok(false);
         }
         let (jc, jl, js) = journal.delta;
         let _ = self.take_delta(&bucket);
         self.pending
             .remove_if(&bucket, |_, p| p.scans.is_empty() && p.delta == (0, 0, 0));
-        let scanned_at = (!journal.recount).then_some(now);
+        let scanned_at = quiet.then_some(now);
         // object_count = user-visible only (delta + passthrough); logical =
         // original_bytes; stored = stored_bytes (incl references). Same
         // interpretation as usage_delta_for, so inline + scan agree.
@@ -891,8 +902,11 @@ mod tests {
     /// A write that reaches storage before a scan lists, but records its
     /// delta after the scan started, is in the listing AND in the journal.
     /// `overwrite_from_scan` (an operator's Refresh, which they can repeat)
-    /// counts it twice; the quota scan's `overwrite_from_quiet_scan` writes
-    /// nothing instead, so the trusted counter is never stamped wrong.
+    /// counts it twice, for display, but does not stamp the row: the quota
+    /// gate trusts only a stamped row, and a double count must not hold a
+    /// bucket over its quota (review 2d: the Refresh stamped it). The quota
+    /// scan's `overwrite_from_quiet_scan` writes nothing instead. One rule
+    /// for both: only a quiet scan stamps.
     #[test]
     fn a_quiet_scan_never_stamps_a_double_count() {
         let mut totals = SavingsTotals::default();
@@ -908,8 +922,8 @@ mod tests {
         let row = db.read("b").unwrap().unwrap();
         assert_eq!(
             (row.logical_bytes, row.last_scan_at),
-            (200, Some(7)),
-            "the Refresh trade-off"
+            (200, None),
+            "a busy Refresh shows its totals but is not trusted"
         );
 
         let db = BucketUsage::in_memory().unwrap();
@@ -957,7 +971,7 @@ mod tests {
         let row = db.read("b").unwrap().unwrap();
         assert_eq!(row.object_count, 3, "scan (1) + two writes during it");
         assert_eq!(row.logical_bytes, 100 + 7 + 11);
-        assert_eq!(row.last_scan_at, Some(42));
+        assert_eq!(row.last_scan_at, None, "writes ran during the scan");
         // Nothing double-applies at the next flush; other buckets keep theirs.
         db.flush_pending();
         let row = db.read("b").unwrap().unwrap();
