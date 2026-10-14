@@ -1741,7 +1741,8 @@ async fn the_bucket_list_reports_each_buckets_encryption() {
         (&json!("bucket"), &json!("downloads-2026-10"), &json!(true)),
         "{dl}"
     );
-    env.put("downloads", "new.txt", b"under the bucket key").await;
+    env.put("downloads", "new.txt", b"under the bucket key")
+        .await;
     assert_eq!(
         env.at_rest("downloads", "new.txt").await.as_deref(),
         Some("downloads-2026-10")
@@ -1752,17 +1753,32 @@ async fn the_bucket_list_reports_each_buckets_encryption() {
     );
 
     // "Off for this bucket": plaintext writes, the key becomes legacy.
-    env.storage_patch_ok(json!({ "buckets": { "downloads": { "encryption": { "mode": "none" } } } }))
-        .await;
+    env.storage_patch_ok(
+        json!({ "buckets": { "downloads": { "encryption": { "mode": "none" } } } }),
+    )
+    .await;
     let dl = effective(&env, "downloads").await;
     assert_eq!(
-        (&dl["mode"], &dl["source"], &dl["legacy_key_id"], &dl["encrypts"]),
-        (&json!("none"), &json!("bucket"), &json!("downloads-2026-10"), &json!(false)),
+        (
+            &dl["mode"],
+            &dl["source"],
+            &dl["legacy_key_id"],
+            &dl["encrypts"]
+        ),
+        (
+            &json!("none"),
+            &json!("bucket"),
+            &json!("downloads-2026-10"),
+            &json!(false)
+        ),
         "{dl}"
     );
     assert_eq!(dl["inherited"]["mode"], "aes256-gcm-proxy", "{dl}");
     assert_eq!(dl["reencrypt"], true, "{dl}");
-    assert_eq!(env.get("downloads", "new.txt").await, b"under the bucket key");
+    assert_eq!(
+        env.get("downloads", "new.txt").await,
+        b"under the bucket key"
+    );
 
     // The create dialog: the policy first, then POST /buckets.
     env.storage_patch_ok(json!({ "buckets": { "db-archive": {
@@ -1786,4 +1802,135 @@ async fn the_bucket_list_reports_each_buckets_encryption() {
     );
     let db = effective(&env, "db-archive").await;
     assert_eq!(db["source"], "bucket", "{db}");
+}
+
+/// The storage section's policy of `bucket` (`null` when it has none).
+async fn policy(env: &Env, bucket: &str) -> serde_json::Value {
+    let v: serde_json::Value = env
+        .admin
+        .get(format!(
+            "{}/_/api/admin/config/section/storage",
+            env.server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    v["buckets"][bucket].clone()
+}
+
+async fn create_with_key(env: &Env, bucket: &str, backend: &str) -> (u16, String) {
+    let resp = env
+        .admin
+        .post(format!("{}/_/api/admin/buckets", env.server.endpoint()))
+        .json(&json!({
+            "name": bucket,
+            "backend_name": backend,
+            "encryption": override_json(KB, &format!("{bucket}-2026-10")),
+        }))
+        .send()
+        .await
+        .unwrap();
+    (
+        resp.status().as_u16(),
+        resp.text().await.unwrap_or_default(),
+    )
+}
+
+/// Review P2, defect 1 (the probe): the create dialog wrote the policy of
+/// the typed name before POST /buckets. For an EXISTING bucket the create
+/// then answered 409, but the route to another backend stayed, and the
+/// bucket's objects were gone (NoSuchBucket). The create endpoint now
+/// takes the block, and checks the name before it changes anything.
+#[tokio::test]
+async fn creating_an_existing_bucket_with_a_key_changes_nothing() {
+    let env = spawn(Shape::NamedFs, None, "", "", "downloads").await;
+    env.create("downloads").await;
+    env.put("downloads", "old.txt", b"still here").await;
+    let (code, body) = create_with_key(&env, "downloads", "aws-dr").await;
+    assert_eq!(code, 409, "{body}");
+    assert_eq!(env.get("downloads", "old.txt").await, b"still here");
+    assert!(
+        policy(&env, "downloads").await.is_null(),
+        "no policy was written"
+    );
+}
+
+/// One request creates the bucket with its own key: the first object is
+/// encrypted under it.
+#[tokio::test]
+async fn a_bucket_created_with_a_key_writes_its_first_object_under_it() {
+    let env = spawn(Shape::NamedFs, None, "", "", "releases").await;
+    let (code, body) = create_with_key(&env, "db-archive", "local-disk").await;
+    assert_eq!(code, 200, "{body}");
+    env.put("db-archive", "dump.sql", b"first object").await;
+    assert_eq!(
+        env.at_rest("db-archive", "dump.sql").await.as_deref(),
+        Some("db-archive-2026-10")
+    );
+    assert_eq!(policy(&env, "db-archive").await["backend"], "local-disk");
+}
+
+/// A create that fails takes the route AND the key back: the bucket does
+/// not exist, so no object can need the key (defect 2's gate).
+#[tokio::test]
+async fn a_failed_create_takes_the_key_back() {
+    let env = spawn(Shape::NamedFs, None, "", "", "releases").await;
+    // aws-dr cannot create the bucket: a FILE holds its name (the engine
+    // still builds, so the create fails AFTER the config write).
+    let dr = env.dr.clone().unwrap();
+    std::fs::create_dir_all(&dr).unwrap();
+    std::fs::write(dr.join("db-archive"), b"not a bucket").unwrap();
+    let (code, body) = create_with_key(&env, "db-archive", "aws-dr").await;
+    assert!(
+        code >= 400 && !body.contains("rebuild engine"),
+        "{code} {body}"
+    );
+    assert!(
+        policy(&env, "db-archive").await.is_null(),
+        "the failed create left a policy behind"
+    );
+}
+
+/// Review P2, defect 2: settings with a key for a bucket that does not
+/// exist (pre-provisioned, or left by an old failed create) can be removed
+/// without a scan or a confirmation: no object can need the key.
+#[tokio::test]
+async fn settings_of_a_bucket_that_does_not_exist_can_be_removed() {
+    let env = spawn(Shape::NamedFs, None, "", "", "releases").await;
+    env.storage_patch_ok(json!({ "buckets": { "ghost": {
+        "backend": "local-disk",
+        "encryption": override_json(KB, "ghost-2026-10"),
+    } } }))
+    .await;
+    // No key-removal confirmation; the removal of the block is a confirmed
+    // downgrade (P3's gate), as the UI's "Remove these settings" sends it.
+    let resp = env
+        .admin
+        .put(format!(
+            "{}/_/api/admin/config/section/storage",
+            env.server.endpoint()
+        ))
+        .header("X-DGP-Confirm-Encryption-Downgrade", "ghost")
+        .json(&json!({ "buckets": { "ghost": null } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "{:?}", resp.text().await);
+    assert!(policy(&env, "ghost").await.is_null());
+    // An existing bucket keeps the gate.
+    env.storage_patch_ok(json!({ "buckets": { "releases": {
+        "backend": "local-disk",
+        "encryption": override_json(KA, "releases-2026-10"),
+    } } }))
+    .await;
+    let (code, v) = env
+        .storage_patch(json!({ "buckets": { "releases": null } }))
+        .await;
+    assert!(
+        code >= 400,
+        "removing a key of an existing bucket: {code} {v}"
+    );
 }

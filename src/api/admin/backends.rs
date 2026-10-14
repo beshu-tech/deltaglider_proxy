@@ -53,6 +53,11 @@ pub struct BucketOriginListResponse {
 pub struct CreateBucketOnBackendRequest {
     pub name: String,
     pub backend_name: String,
+    /// The new bucket's own `encryption` block (issue #116). The route,
+    /// this block and the create are one config write: the existing-name
+    /// check runs first, and a failed create takes both back.
+    #[serde(default)]
+    pub encryption: Option<crate::config::BackendEncryptionConfig>,
 }
 
 #[derive(Serialize)]
@@ -323,8 +328,9 @@ pub async fn create_bucket_on_backend(
     // on a non-CAS backend under multi-instance makes the next boot exit(1).
     // Checked first for its 409; the transition runs the gate again under
     // the lock. No-op single-instance.
+    let encryption = body.encryption;
     let mut probe = state.config.read().await.clone();
-    route_bucket(&mut probe, &bucket_key, &backend_name)?;
+    route_bucket(&mut probe, &bucket_key, &backend_name, encryption.as_ref())?;
     if let Err(e) = crate::coordination::capability::hot_apply_capability_gate(
         &probe,
         &state.s3_state.backend_capabilities,
@@ -345,7 +351,7 @@ pub async fn create_bucket_on_backend(
             on_persist_error: OnPersistError::Report,
         },
         std::future::ready(()),
-        |cfg, _| route_bucket(cfg, &bucket_key, &backend_name),
+        |cfg, _| route_bucket(cfg, &bucket_key, &backend_name, encryption.as_ref()),
         // Create using the SAME key the route is stored under (`bucket_key`,
         // lowercased). The route is keyed lowercase, so creating with the
         // original case would miss the explicit route in resolve_existing()
@@ -392,9 +398,15 @@ pub async fn create_bucket_on_backend(
     }))
 }
 
-/// Route `bucket_key` to `backend_name` in `cfg` (the edit of
+/// Route `bucket_key` to `backend_name` in `cfg`, with the bucket's own
+/// encryption block when one is given (the edit of
 /// [`create_bucket_on_backend`]).
-fn route_bucket(cfg: &mut Config, bucket_key: &str, backend_name: &str) -> Result<(), AdminError> {
+fn route_bucket(
+    cfg: &mut Config,
+    bucket_key: &str,
+    backend_name: &str,
+    encryption: Option<&crate::config::BackendEncryptionConfig>,
+) -> Result<(), AdminError> {
     let backend_exists = if cfg.backends.is_empty() {
         backend_name == "default"
     } else {
@@ -409,6 +421,9 @@ fn route_bucket(cfg: &mut Config, bucket_key: &str, backend_name: &str) -> Resul
     let named = !cfg.backends.is_empty();
     let policy = cfg.buckets.entry(bucket_key.to_string()).or_default();
     policy.backend = named.then(|| backend_name.to_string());
+    if let Some(enc) = encryption {
+        policy.encryption = Some(enc.clone());
+    }
     Ok(())
 }
 

@@ -293,7 +293,7 @@ fn an_active_bucket_key_never_leaves_in_one_step() {
     // The whole block removed: refused.
     let mut gone = old.clone();
     gone.buckets.get_mut("db-archive").unwrap().encryption = None;
-    let errs = gone.dropped_bucket_keys(&old, &[]);
+    let errs = gone.dropped_bucket_keys(&old, &[], &[]);
     assert!(
         errs.iter().any(|e| e.contains("key id 'db-archive-2026'")),
         "{errs:?}"
@@ -302,12 +302,12 @@ fn an_active_bucket_key_never_leaves_in_one_step() {
     let kept = with_override(&format!(
         "{{ mode: none, legacy_key: \"{KB}\", legacy_key_id: db-archive-2026 }}"
     ));
-    assert!(kept.dropped_bucket_keys(&old, &[]).is_empty());
+    assert!(kept.dropped_bucket_keys(&old, &[], &[]).is_empty());
     // Removing a decrypt-only key needs the confirmation of its id
     // (review A: before, it had no gate at all).
     let mut no_legacy = kept.clone();
     no_legacy.buckets.get_mut("db-archive").unwrap().encryption = None;
-    let errs = no_legacy.dropped_bucket_keys(&kept, &[]);
+    let errs = no_legacy.dropped_bucket_keys(&kept, &[], &[]);
     assert!(
         errs.iter()
             .any(|e| e.contains("legacy")
@@ -315,12 +315,12 @@ fn an_active_bucket_key_never_leaves_in_one_step() {
         "{errs:?}"
     );
     assert!(no_legacy
-        .dropped_bucket_keys(&kept, &["db-archive-2026".to_string()])
+        .dropped_bucket_keys(&kept, &["db-archive-2026".to_string()], &[])
         .is_empty());
     // A bucket that moves to another backend keeps its key (migrate flip).
     let mut moved = old.clone();
     moved.buckets.get_mut("db-archive").unwrap().backend = Some("hetzner-fsn1".into());
-    assert!(moved.dropped_bucket_keys(&old, &[]).is_empty());
+    assert!(moved.dropped_bucket_keys(&old, &[], &[]).is_empty());
 }
 
 /// Review A, the executed probe: `releases` and `downloads` share the key
@@ -344,7 +344,7 @@ fn a_bucket_never_relies_on_a_neighbours_key() {
     let old = Config::from_yaml_str(&yaml(&a, &a)).unwrap();
     let mut step1 = old.clone();
     step1.buckets.get_mut("releases").unwrap().encryption = None;
-    let errs = step1.dropped_bucket_keys(&old, &[]);
+    let errs = step1.dropped_bucket_keys(&old, &[], &[]);
     assert!(
         errs.iter()
             .any(|e| e.contains("bucket 'releases'") && e.contains("shared-a")),
@@ -560,4 +560,25 @@ fn a_listed_bucket_takes_the_encryption_of_the_backend_that_holds_it() {
         .encryption_for_listed_bucket("stray", Some("gone"))
         .unwrap();
     assert_eq!(e.backend, "hetzner-fsn1");
+}
+
+/// Review P2 (defects 1 and 2): a bucket that does not exist on its
+/// storage holds no object, so its keys can leave without a scan or a
+/// confirmation: the rollback of a failed create, and the removal of a
+/// policy whose bucket was never created.
+#[test]
+fn the_keys_of_a_bucket_that_does_not_exist_can_leave() {
+    let old = with_override(&format!(
+        "{{ mode: aes256-gcm-proxy, key: \"{KB}\", key_id: db-archive-2026 }}"
+    ));
+    let mut gone = old.clone();
+    gone.buckets.remove("db-archive");
+    assert!(!gone.dropped_bucket_keys(&old, &[], &[]).is_empty());
+    assert!(gone
+        .dropped_bucket_keys(&old, &[], &["db-archive".to_string()])
+        .is_empty());
+    // Another absent bucket does not excuse this one.
+    assert!(!gone
+        .dropped_bucket_keys(&old, &[], &["releases".to_string()])
+        .is_empty());
 }

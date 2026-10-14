@@ -344,6 +344,7 @@ pub(super) fn static_transition_gates(
     new_cfg: &crate::config::Config,
     confirmed_key_removals: &[String],
     confirmed_downgrades: Option<&[String]>,
+    absent_buckets: &[String],
 ) -> Result<(), String> {
     // FATAL config-graph errors (bucket → undefined backend, duplicate
     // backend names): un-runnable states that boot refuses too.
@@ -353,7 +354,7 @@ pub(super) fn static_transition_gates(
     fatal.extend(new_cfg.newly_keyless_proxy_backends(old_cfg));
     // A bucket's active key never leaves the keyring in one step (issue
     // #116): its objects would become unreadable.
-    fatal.extend(new_cfg.dropped_bucket_keys(old_cfg, confirmed_key_removals));
+    fatal.extend(new_cfg.dropped_bucket_keys(old_cfg, confirmed_key_removals, absent_buckets));
     // A bucket that would store plaintext where it encrypted needs an
     // explicit confirmation (issue #116 P3).
     fatal.extend(new_cfg.unconfirmed_encryption_downgrades(old_cfg, confirmed_downgrades));
@@ -375,6 +376,31 @@ pub(super) fn static_transition_gates(
         crate::config::process_env(crate::config_db::key::CONFIG_DB_KEY_ENV).as_deref(),
     )
     .map_err(|e| format!("config refused: {e}"))
+}
+
+/// The configured buckets with their own encryption block that the storage
+/// listing does not show: they hold no object (see
+/// `Config::dropped_bucket_keys`). A failed listing, or a backend that did
+/// not answer (an `unavailable` placeholder lists the bucket), counts every
+/// bucket as present, so the key gate stays on.
+pub(super) async fn absent_buckets(app: &AppState, cfg: &crate::config::Config) -> Vec<String> {
+    let with_block: Vec<&String> = cfg
+        .buckets
+        .iter()
+        .filter(|(_, p)| p.encryption.is_some())
+        .map(|(n, _)| n)
+        .collect();
+    if with_block.is_empty() {
+        return Vec::new();
+    }
+    let Ok(listed) = app.engine.load().list_bucket_origins().await else {
+        return Vec::new();
+    };
+    with_block
+        .into_iter()
+        .filter(|n| !listed.iter().any(|b| b.name.eq_ignore_ascii_case(n)))
+        .cloned()
+        .collect()
 }
 
 /// The pre-commit gates of [`apply_config_transition`] that need no plan
@@ -402,7 +428,8 @@ async fn transition_gates(
         } => Some(crate::config::confirmed_downgrades(Some(headers))),
         _ => None,
     };
-    static_transition_gates(old_cfg, new_cfg, &confirmed, downgrades.as_deref())?;
+    let absent = absent_buckets(app, old_cfg).await;
+    static_transition_gates(old_cfg, new_cfg, &confirmed, downgrades.as_deref(), &absent)?;
 
     // Backend write-capability gate (guard B, hot-apply half): refuse routing
     // a client-writable bucket onto a non-CAS backend under multi-instance.
@@ -940,7 +967,7 @@ mod keyless_proxy_gate_tests {
         let old = Config::default();
         let mut keyless = old.clone();
         keyless.backend_encryption = proxy(None);
-        let err = static_transition_gates(&old, &keyless, &[], Some(&[]))
+        let err = static_transition_gates(&old, &keyless, &[], Some(&[]), &[])
             .expect_err("a keyless proxy backend must be refused");
         assert!(
             err.contains("backend 'default'") && err.contains("DGP_ENCRYPTION_KEY"),
@@ -949,12 +976,12 @@ mod keyless_proxy_gate_tests {
 
         let mut keyed = old.clone();
         keyed.backend_encryption = proxy(Some(&"ab".repeat(32)));
-        static_transition_gates(&old, &keyed, &[], Some(&[]))
+        static_transition_gates(&old, &keyed, &[], Some(&[]), &[])
             .expect("a keyed proxy backend applies");
 
         let mut unrelated = keyless.clone();
         unrelated.log_level = "warn".into();
-        static_transition_gates(&keyless, &unrelated, &[], Some(&[]))
+        static_transition_gates(&keyless, &unrelated, &[], Some(&[]), &[])
             .expect("a backend that was keyless before does not block another edit");
     }
 

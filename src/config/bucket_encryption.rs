@@ -431,13 +431,26 @@ impl Config {
     ///   scans every bucket stored on that backend.
     ///
     /// Migrate's transient routes (`__dgmigrate_*`) are internal and skipped.
-    pub fn dropped_bucket_keys(&self, old: &Config, confirmed: &[String]) -> Vec<String> {
+    ///
+    /// `absent` names configured buckets that do not exist on their storage
+    /// (the caller lists the storage). Such a bucket holds no object, so
+    /// its keys leave with no gate: the rollback of a create that failed,
+    /// and the removal of settings for a bucket that was never created.
+    pub fn dropped_bucket_keys(
+        &self,
+        old: &Config,
+        confirmed: &[String],
+        absent: &[String],
+    ) -> Vec<String> {
         let mut errors = Vec::new();
         for (name, policy) in &old.buckets {
             let Some(enc) = policy.encryption.as_ref() else {
                 continue;
             };
             if name.starts_with(crate::maintenance::migrate::TRANSIENT_PREFIX) {
+                continue;
+            }
+            if absent.iter().any(|a| a == name) {
                 continue;
             }
             let keys = resolve_site_keys(KeyScope::Bucket(name), enc);
