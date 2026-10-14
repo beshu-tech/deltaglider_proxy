@@ -36,11 +36,17 @@ afterAll(async () => {
   });
 });
 
+// The test browser asks for reduced motion: a count-up (useTweenedCount)
+// then shows its final value at once. Its requestAnimationFrame tween took
+// 450 ms of frames, and a loaded host stretched that past the wait of a
+// findByText (the VerifyTab progress line read "0 of 40" for seconds).
+const REDUCED_MOTION_QUERY = '(prefers-reduced-motion: reduce)';
+
 if (!window.matchMedia) {
   Object.defineProperty(window, 'matchMedia', {
     writable: true,
     value: (query: string) => ({
-      matches: false,
+      matches: query === REDUCED_MOTION_QUERY,
       media: query,
       onchange: null,
       addListener: vi.fn(),

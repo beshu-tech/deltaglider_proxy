@@ -48,7 +48,8 @@ test('a re-audit keeps the previous verdict in view and names its phase in objec
   });
   renderWithQuery(<VerifyTab ruleName={RULE} />);
   expect(await screen.findByText('Listing the destination…')).toBeInTheDocument();
-  expect(await screen.findByText(/1,200 of about 4,000 objects listed/, {}, { timeout: 3000 })).toBeInTheDocument();
+  // The count is in place with the phase: no wait on a count-up animation.
+  expect(screen.getByText(/1,200 of about 4,000 objects listed/)).toBeInTheDocument();
   // The previous verdict, dimmed under the live progress.
   expect(screen.getByText('All 4,000 objects are present and verified identical.')).toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument();
@@ -58,7 +59,7 @@ test('a first audit shows its phase without a previous verdict', async () => {
   serve({ status: 'running', phase: 'reading', progress_scanned: 10, progress_total: 40 });
   renderWithQuery(<VerifyTab ruleName={RULE} />);
   expect(await screen.findByText('Reading object metadata…')).toBeInTheDocument();
-  expect(await screen.findByText(/10 of 40 objects read/, {}, { timeout: 3000 })).toBeInTheDocument();
+  expect(screen.getByText(/10 of 40 objects read/)).toBeInTheDocument();
 });
 
 test('a cancelled audit says so above the last complete result', async () => {
