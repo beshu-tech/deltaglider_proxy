@@ -239,6 +239,9 @@ pub(crate) async fn apply_config_transition(
     // `requires_restart_warnings` is the single source (the section dry-run
     // uses it too).
     warnings.extend(requires_restart_warnings(old_cfg, &new_cfg));
+    // A bucket whose write encryption changes: existing objects keep their
+    // form; the response names the re-encrypt job (issue #116).
+    warnings.extend(new_cfg.bucket_encryption_notes(old_cfg));
 
     // The engine store and the config swap are the LAST steps: every check
     // above passed, and the write guard is held across both.
@@ -275,6 +278,9 @@ pub(super) fn static_transition_gates(
     // A backend set to encrypt with no key refuses every write (issue
     // #116): refuse the apply that makes one, instead of the writes later.
     fatal.extend(new_cfg.newly_keyless_proxy_backends(old_cfg));
+    // A bucket's active key never leaves the keyring in one step (issue
+    // #116): its objects would become unreadable.
+    fatal.extend(new_cfg.dropped_bucket_keys(old_cfg));
     // A webhook URL that every delivery would refuse: refuse the apply that
     // adds it, instead of failing (and retrying) every event later.
     fatal.extend(

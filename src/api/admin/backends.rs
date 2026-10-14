@@ -734,15 +734,25 @@ pub struct LegacyKeyUsageQuery {
     /// Scan again instead of answering from the server cache.
     #[serde(default)]
     pub fresh: bool,
+    /// Scan the legacy key of this BUCKET's own `encryption` override
+    /// (issue #116) instead of the backend's: only that bucket is scanned.
+    #[serde(default)]
+    pub bucket: Option<super::path_guard::AdminBucket>,
 }
 
 /// `GET /backends/:name/legacy-key-usage` — how many objects and delta
-/// references of this backend still carry the legacy key id. The count is
+/// references of this backend still carry the legacy key id. With
+/// `?bucket=<name>`, the legacy key of that bucket's override, in that
+/// bucket only: an object carries the key id of the bucket it was written
+/// to, so its own objects are the ones that can need it. The count is
 /// EXACT (every object and reference is HEADed once) until `limit` objects
 /// are scanned; then the scan stops and `complete` is false.
 #[derive(Serialize, Debug, Default, PartialEq, Clone)]
 pub struct LegacyKeyUsage {
     pub backend: String,
+    /// The bucket whose override's legacy key was scanned (`?bucket=`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
     /// The id the legacy key stamps (`None`: no legacy key configured).
     pub legacy_key_id: Option<String>,
     /// Buckets that route to this backend (all scanned when `complete`).
@@ -802,10 +812,38 @@ pub async fn legacy_key_usage(
         limit,
         ..Default::default()
     };
-    {
+    let bucket = match q.bucket {
+        Some(b) => Some(b.admit(&state)?.into_string()),
+        None => None,
+    };
+    if let Some(bucket) = bucket {
+        // A bucket override's legacy key: scan that bucket only.
+        let cfg = state.config.read().await;
+        let bucket = bucket.to_ascii_lowercase();
+        let resolved = cfg
+            .encryption_for_bucket(&bucket)
+            .filter(|e| e.from_bucket && e.backend == name)
+            .ok_or(AdminError::not_found(format!(
+                "bucket '{bucket}' has no encryption override on backend '{name}'"
+            )))?;
+        usage.legacy_key_id = resolved
+            .config
+            .legacy_key()
+            .and(resolved.config.legacy_key_id())
+            .map(str::to_string);
+        usage.bucket = Some(bucket.clone());
+        if let Some(b) = origins.iter().find(|b| b.name == bucket) {
+            if let Some(e) = &b.unavailable {
+                usage.error(format!("{}: {e}", b.name));
+            }
+        }
+        usage.buckets.push(bucket);
+    } else {
         let cfg = state.config.read().await;
         // Backend-level: the legacy key is the backend's own (allowed by
-        // `bucket_encryption_rule_has_one_home`).
+        // `bucket_encryption_rule_has_one_home`). Every bucket STORED on
+        // this backend counts, also one with its own override: its objects
+        // from before the override carry the backend's key ids.
         let enc = cfg
             .backend_encryption_by_name(&name)
             .ok_or(AdminError::not_found(format!("no backend named '{name}'")))?;
@@ -831,7 +869,11 @@ pub async fn legacy_key_usage(
         usage.complete = true;
         return Ok(Json(usage));
     };
-    let key = format!("{name}\0{limit}\0{kid}\0{}", usage.buckets.join("\0"));
+    let key = format!(
+        "{name}\0{limit}\0{kid}\0{}\0{}",
+        usage.bucket.as_deref().unwrap_or(""),
+        usage.buckets.join("\0")
+    );
     let usage = legacy_usage_single_flight(key, q.fresh, || {
         scan_legacy_usage(engine.clone(), usage, kid)
     })

@@ -3,6 +3,8 @@
 //! Configuration for DeltaGlider Proxy S3 server
 
 pub mod advisories;
+mod bucket_encryption;
+pub use bucket_encryption::{BucketOverride, EncryptionSite};
 mod check;
 pub use check::{DocumentRefusal, RuleGateRefusal};
 mod env;
@@ -649,11 +651,16 @@ pub(crate) fn backend_encryption_env_names(backend_name: &str) -> (String, Strin
 /// What [`Config::encryption_for_bucket`] resolves for one bucket.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BucketEncryption<'a> {
-    /// The backend the encryption comes from. A derived key id mixes this
-    /// name in (`derive_key_id`), so it is also the key-id scope.
+    /// The raw backend that stores the bucket. A derived key id of the
+    /// backend's own key mixes this name in (`derive_key_id`), so it is
+    /// also the key-id scope of an inherited config. A bucket override
+    /// always has an explicit key id.
     pub backend: String,
     /// The encryption config that the bucket's writes use.
     pub config: &'a BackendEncryptionConfig,
+    /// True when `config` is the bucket's own `encryption` override, false
+    /// when the bucket inherits the backend's encryption.
+    pub from_bucket: bool,
 }
 
 /// A named storage backend with its connection configuration.
@@ -1806,16 +1813,32 @@ impl Config {
 
     /// THE encryption that applies to `bucket`'s objects: the one every
     /// "how is this bucket encrypted" question (the re-encrypt target,
-    /// legacy-key usage, summaries) asks. Today it is the encryption of the
-    /// bucket's effective backend; per-bucket encryption (issue #116) will
-    /// plug in here. `None` = the bucket routes to an undefined backend.
-    /// The source test `bucket_encryption_rule_has_one_home` refuses
+    /// legacy-key usage, summaries) asks. The bucket's own `encryption`
+    /// override when it has one (issue #116), else the encryption of the
+    /// bucket's effective backend. `None` = the bucket routes to an
+    /// undefined backend. The source test
+    /// `bucket_encryption_rule_has_one_home` refuses
     /// [`Self::backend_encryption_by_name`] outside the allowed
     /// backend-level views.
     pub fn encryption_for_bucket(&self, bucket: &str) -> Option<BucketEncryption<'_>> {
         let (backend, _) = self.effective_backend_for_bucket(bucket)?;
+        if let Some(config) = self
+            .buckets
+            .get(&bucket.to_ascii_lowercase())
+            .and_then(|p| p.encryption.as_ref())
+        {
+            return Some(BucketEncryption {
+                backend,
+                config,
+                from_bucket: true,
+            });
+        }
         let config = self.backend_encryption_by_name(&backend)?;
-        Some(BucketEncryption { backend, config })
+        Some(BucketEncryption {
+            backend,
+            config,
+            from_bucket: false,
+        })
     }
 
     /// `(name, definition)` of the backend a bucket routes to by config: its
@@ -2416,11 +2439,9 @@ impl Config {
     /// flag at export time that the (non-secret but account-revealing)
     /// `kms_key_id` ARN survives redaction.
     fn has_kms_encryption(&self) -> bool {
-        matches!(self.backend_encryption.mode_tag(), "sse-kms")
-            || self
-                .backends
-                .iter()
-                .any(|b| b.encryption.mode_tag() == "sse-kms")
+        self.encryption_sites()
+            .iter()
+            .any(|(_, e)| e.mode_tag() == "sse-kms")
     }
 
     /// Export variant: strips infra secrets AND every per-backend
@@ -2443,9 +2464,10 @@ impl Config {
                  key alias; scrub before sharing if that is sensitive"
             );
         }
-        export.backend_encryption.redact_secrets();
-        for named in &mut export.backends {
-            named.encryption.redact_secrets();
+        // Every encryption config: backends AND bucket overrides (one
+        // visitor, so a new site cannot be skipped).
+        for (_, enc) in export.encryption_sites_mut() {
+            enc.redact_secrets();
         }
         // Phase 3c.3: strip declarative-IAM secrets — per-user
         // secret_access_key and per-provider client_secret. These are

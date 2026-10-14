@@ -1,0 +1,520 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Per-bucket encryption at rest (issue #116): the config side.
+//!
+//! * [`EncryptionSite`] and the ONE visitor over every encryption config in
+//!   a [`Config`] (the singleton backend, each named backend, each bucket
+//!   override). Every secrets surface (redaction, preservation, backup,
+//!   the apply diff) walks the config through it, so a site cannot be
+//!   skipped (source guard `every_encryption_site_goes_through_the_visitor`).
+//! * Where a bucket's writes land ([`Config::bucket_storage`]): the real
+//!   bucket on a raw backend. The override belongs to that storage, so the
+//!   engine looks it up by the real bucket name.
+//! * The fatal rules of an override ([`Config::bucket_encryption_errors`])
+//!   and the apply-time rules ([`Config::dropped_bucket_keys`],
+//!   [`Config::bucket_encryption_notes`]).
+
+use super::*;
+
+/// Where one encryption config lives in a [`Config`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EncryptionSite {
+    /// `storage.backend_encryption`: the singleton backend (`default`).
+    Singleton,
+    /// `storage.backends[name].encryption`.
+    Backend(String),
+    /// `storage.buckets.<name>.encryption` (issue #116).
+    Bucket(String),
+}
+
+impl EncryptionSite {
+    /// Operator-facing name, for messages.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Singleton => "backend 'default'".to_string(),
+            Self::Backend(name) => format!("backend '{name}'"),
+            Self::Bucket(name) => format!("bucket '{name}'"),
+        }
+    }
+}
+
+/// One key that a config site holds, as the engine resolves its id.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedKey {
+    pub site: EncryptionSite,
+    /// The raw backend that the key decrypts on (the site's backend).
+    pub backend: String,
+    pub key_id: String,
+    pub bytes: [u8; 32],
+    /// True for a decrypt-only `legacy_key`.
+    pub legacy: bool,
+}
+
+/// One bucket override with the storage it applies to.
+#[derive(Debug, Clone)]
+pub struct BucketOverride<'a> {
+    /// The configured (virtual) bucket name.
+    pub bucket: &'a str,
+    /// The raw backend that stores the bucket.
+    pub backend: String,
+    /// The bucket name on that backend (the alias, else the name).
+    pub real_bucket: String,
+    pub config: &'a BackendEncryptionConfig,
+}
+
+impl Config {
+    /// THE list of every encryption config in this config: the singleton,
+    /// every named backend, every bucket override. Read-only visitor.
+    pub fn encryption_sites(&self) -> Vec<(EncryptionSite, &BackendEncryptionConfig)> {
+        let mut out = vec![(EncryptionSite::Singleton, &self.backend_encryption)];
+        out.extend(
+            self.backends
+                .iter()
+                .map(|b| (EncryptionSite::Backend(b.name.clone()), &b.encryption)),
+        );
+        out.extend(self.buckets.iter().filter_map(|(name, p)| {
+            p.encryption
+                .as_ref()
+                .map(|e| (EncryptionSite::Bucket(name.clone()), e))
+        }));
+        out
+    }
+
+    /// [`Self::encryption_sites`], mutable.
+    pub fn encryption_sites_mut(&mut self) -> Vec<(EncryptionSite, &mut BackendEncryptionConfig)> {
+        let mut out = vec![(EncryptionSite::Singleton, &mut self.backend_encryption)];
+        out.extend(
+            self.backends
+                .iter_mut()
+                .map(|b| (EncryptionSite::Backend(b.name.clone()), &mut b.encryption)),
+        );
+        out.extend(self.buckets.iter_mut().filter_map(|(name, p)| {
+            p.encryption
+                .as_mut()
+                .map(|e| (EncryptionSite::Bucket(name.clone()), e))
+        }));
+        out
+    }
+
+    /// The bucket policies with every override's key material removed (a
+    /// `${env:NAME}` reference stays): the form an API response carries.
+    /// `GET /config` hands the policies out on their own, outside the
+    /// whole-config redactors.
+    pub fn redacted_bucket_policies(
+        &self,
+    ) -> std::collections::BTreeMap<String, crate::bucket_policy::BucketPolicyConfig> {
+        let mut out = self.buckets.clone();
+        for enc in out.values_mut().filter_map(|p| p.encryption.as_mut()) {
+            enc.redact_secrets();
+        }
+        out
+    }
+
+    /// The encryption config at `site`, if this config has that site.
+    pub fn encryption_at(&self, site: &EncryptionSite) -> Option<&BackendEncryptionConfig> {
+        match site {
+            EncryptionSite::Singleton => Some(&self.backend_encryption),
+            EncryptionSite::Backend(name) => self
+                .backends
+                .iter()
+                .find(|b| &b.name == name)
+                .map(|b| &b.encryption),
+            EncryptionSite::Bucket(name) => {
+                self.buckets.get(name).and_then(|p| p.encryption.as_ref())
+            }
+        }
+    }
+
+    /// The `(raw backend, real bucket)` that a CONFIGURED bucket's writes
+    /// land on, when the config fixes it. Single backend: always the
+    /// singleton `default`, under the bucket's own name (an alias needs a
+    /// route, which a single backend does not build). Named backends: only
+    /// with an explicit `backend:`, under the alias or the name; an
+    /// unrouted bucket can live on any backend (the router probes).
+    pub fn bucket_storage(&self, bucket: &str) -> Option<(String, String)> {
+        let name = bucket.to_ascii_lowercase();
+        let policy = self.buckets.get(&name);
+        if self.backends.is_empty() {
+            return Some(("default".to_string(), name));
+        }
+        let policy = policy?;
+        let backend = policy.backend.clone()?;
+        let real = policy.alias.clone().unwrap_or(name);
+        Some((backend, real))
+    }
+
+    /// Every bucket override whose storage the config fixes (see
+    /// [`Self::bucket_storage`]). An override without one is a fatal error
+    /// (`Config::check_fatal`).
+    pub fn bucket_encryption_overrides(&self) -> Vec<BucketOverride<'_>> {
+        self.buckets
+            .iter()
+            .filter_map(|(name, p)| {
+                let config = p.encryption.as_ref()?;
+                let (backend, real_bucket) = self.bucket_storage(name)?;
+                Some(BucketOverride {
+                    bucket: name,
+                    backend,
+                    real_bucket,
+                    config,
+                })
+            })
+            .collect()
+    }
+
+    /// The raw backend of an encryption site (`None`: a bucket whose
+    /// storage the config does not fix).
+    fn site_backend(&self, site: &EncryptionSite) -> Option<String> {
+        match site {
+            EncryptionSite::Singleton => Some("default".to_string()),
+            EncryptionSite::Backend(name) => Some(name.clone()),
+            EncryptionSite::Bucket(name) => self.bucket_storage(name).map(|(b, _)| b),
+        }
+    }
+
+    /// Every key the config holds, with the id the engine stamps for it:
+    /// a backend's explicit id or the derived one (`derive_key_id`), a
+    /// bucket's explicit id (a bucket has no derived id). A key that does
+    /// not parse, or a bucket key without its id, is left out (other
+    /// rules report it). The singleton counts only while it is the
+    /// engine's backend (no named backends).
+    pub(crate) fn resolved_keys(&self) -> Vec<ResolvedKey> {
+        let mut out = Vec::new();
+        for (site, enc) in self.encryption_sites() {
+            if site == EncryptionSite::Singleton && !self.backends.is_empty() {
+                continue;
+            }
+            let Some(backend) = self.site_backend(&site) else {
+                continue;
+            };
+            let derive_scope = match &site {
+                EncryptionSite::Bucket(_) => None,
+                _ => Some(backend.clone()),
+            };
+            let primary = enc.primary_key().map(|k| (k, enc_key_id(enc), false));
+            let legacy = enc.legacy_key().map(|k| (k, enc.legacy_key_id(), true));
+            for (hex, explicit, legacy_slot) in primary.into_iter().chain(legacy) {
+                let Ok(parsed) = crate::storage::EncryptionKey::from_hex(hex) else {
+                    continue;
+                };
+                let key_id = match (explicit, &derive_scope) {
+                    (Some(id), _) => id.to_string(),
+                    (None, Some(scope)) if legacy_slot => {
+                        crate::deltaglider::derive_key_id(&format!("{scope}::legacy"), &parsed.0)
+                    }
+                    (None, Some(scope)) => crate::deltaglider::derive_key_id(scope, &parsed.0),
+                    (None, None) => continue,
+                };
+                out.push(ResolvedKey {
+                    site: site.clone(),
+                    backend: backend.clone(),
+                    key_id,
+                    bytes: parsed.0,
+                    legacy: legacy_slot,
+                });
+            }
+        }
+        out
+    }
+
+    /// FATAL errors of the bucket overrides (part of [`Self::check_fatal`]):
+    /// a config the proxy must never run with.
+    pub(super) fn bucket_encryption_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        let overrides: Vec<(&String, &BackendEncryptionConfig)> = self
+            .buckets
+            .iter()
+            .filter_map(|(n, p)| p.encryption.as_ref().map(|e| (n, e)))
+            .collect();
+        if overrides.is_empty() {
+            return errors;
+        }
+        let sync = self
+            .config_sync_bucket
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty());
+        if let Some(sync) = sync {
+            let names: Vec<&str> = overrides.iter().map(|(n, _)| n.as_str()).collect();
+            errors.push(format!(
+                "buckets {names:?} set their own encryption, but config_sync_bucket '{sync}' \
+                 makes this a multi-instance deployment. Per-bucket encryption is \
+                 single-instance only in this release: the YAML is per node, so nodes could \
+                 write one bucket with different keys. Remove the buckets' `encryption` \
+                 blocks (the backend's encryption then applies), or remove config_sync_bucket"
+            ));
+        }
+        for (bucket, enc) in &overrides {
+            let at = format!("bucket '{bucket}'");
+            match enc {
+                BackendEncryptionConfig::SseKms { .. } | BackendEncryptionConfig::SseS3 { .. } => {
+                    errors.push(format!(
+                        "{at}: encryption mode '{}' is not supported on a bucket yet. A bucket \
+                         override takes 'aes256-gcm-proxy' or 'none'; set native SSE on the \
+                         backend instead",
+                        enc.mode_tag()
+                    ));
+                }
+                BackendEncryptionConfig::Aes256GcmProxy { key, key_id, .. } => {
+                    match key_id {
+                        None => errors.push(format!(
+                            "{at}: encryption.key_id is required on a bucket override. The id \
+                             is stamped on every object, so it must not depend on a name; \
+                             choose a stable id such as '{bucket}-2026'"
+                        )),
+                        Some(id) if !is_valid_key_id(id) => errors.push(format!(
+                            "{at}: encryption.key_id='{id}' must match [A-Za-z0-9_.-]{{1,64}}"
+                        )),
+                        Some(_) => {}
+                    }
+                    if let Some(k) = key {
+                        if let Err(e) = crate::storage::EncryptionKey::from_hex(k) {
+                            errors.push(format!("{at}: encryption.key: {e}"));
+                        }
+                    }
+                }
+                BackendEncryptionConfig::None { .. } => {}
+            }
+            if let Some(legacy) = enc.legacy_key() {
+                if let Err(e) = crate::storage::EncryptionKey::from_hex(legacy) {
+                    errors.push(format!("{at}: encryption.legacy_key: {e}"));
+                }
+                match enc.legacy_key_id() {
+                    None => errors.push(format!(
+                        "{at}: encryption.legacy_key needs an explicit legacy_key_id on a \
+                         bucket override: the id that the objects written under that key carry"
+                    )),
+                    Some(id) if !is_valid_key_id(id) => errors.push(format!(
+                        "{at}: encryption.legacy_key_id='{id}' must match [A-Za-z0-9_.-]{{1,64}}"
+                    )),
+                    Some(_) => {}
+                }
+            }
+            if self.bucket_storage(bucket).is_none() {
+                errors.push(format!(
+                    "{at} sets its own encryption but has no `backend:`. With named backends, \
+                     a bucket without a route can live on any backend, so the proxy cannot \
+                     tell which storage the override applies to. Add `backend: <name>` to the \
+                     bucket"
+                ));
+            }
+        }
+        errors.extend(self.alias_encryption_disagreements());
+        errors.extend(self.bucket_key_id_collisions());
+        errors
+    }
+
+    /// Two configured names on one `(backend, real bucket)` whose effective
+    /// encryption differs: one deltaspace would be written in two forms.
+    fn alias_encryption_disagreements(&self) -> Vec<String> {
+        let mut by_storage: std::collections::BTreeMap<(String, String), Vec<&String>> =
+            Default::default();
+        for name in self.buckets.keys() {
+            if let Some(storage) = self.bucket_storage(name) {
+                by_storage.entry(storage).or_default().push(name);
+            }
+        }
+        let mut errors = Vec::new();
+        for ((backend, real), names) in by_storage {
+            if names.len() < 2 {
+                continue;
+            }
+            let effective = |n: &str| self.encryption_for_bucket(n).map(|e| e.config.clone());
+            let first = effective(names[0]);
+            if names[1..].iter().any(|n| effective(n) != first) {
+                errors.push(format!(
+                    "buckets {names:?} all store into bucket '{real}' on backend '{backend}' but \
+                     do not agree on its encryption. The encryption belongs to the storage, so \
+                     give every one of these names the same `encryption` block (or none)"
+                ));
+            }
+        }
+        errors
+    }
+
+    /// A key id that two sites give DIFFERENT key bytes, when one of them is
+    /// a bucket override. (Two backends with that conflict are refused when
+    /// the engine is built and warned about by `check`.)
+    fn bucket_key_id_collisions(&self) -> Vec<String> {
+        let keys = self.resolved_keys();
+        let mut errors = Vec::new();
+        for (i, a) in keys.iter().enumerate() {
+            for b in &keys[i + 1..] {
+                let involves_bucket = matches!(a.site, EncryptionSite::Bucket(_))
+                    || matches!(b.site, EncryptionSite::Bucket(_));
+                if involves_bucket && a.key_id == b.key_id && a.bytes != b.bytes {
+                    errors.push(format!(
+                        "{} and {} use key id '{}' with DIFFERENT keys. A key id names one \
+                         key everywhere (objects carry it to pick their key on read); give \
+                         one of them another key id",
+                        a.site.label(),
+                        b.site.label(),
+                        a.key_id
+                    ));
+                }
+            }
+        }
+        errors.dedup();
+        errors
+    }
+
+    /// Advisory warnings of the bucket overrides (part of `check`).
+    pub(super) fn bucket_encryption_warnings(&self) -> Vec<String> {
+        let mut warnings: Vec<String> = self
+            .keyless_proxy_buckets()
+            .into_iter()
+            .map(|b| {
+                format!(
+                    "bucket '{b}' uses aes256-gcm-proxy but no key is configured: the proxy \
+                     refuses every write to it (it never stores plaintext there). Set the \
+                     bucket's encryption.key"
+                )
+            })
+            .collect();
+        // Owner decision 4: replication from an encrypted bucket into a
+        // plaintext one is allowed, with a warning.
+        let encrypts = |bucket: &str| {
+            self.encryption_for_bucket(bucket)
+                .is_some_and(|e| e.config.mode_tag() != "none")
+        };
+        let plaintext = |bucket: &str| {
+            self.encryption_for_bucket(bucket)
+                .is_some_and(|e| e.config.mode_tag() == "none")
+        };
+        for rule in &self.replication.rules {
+            if encrypts(&rule.source.bucket) && plaintext(&rule.destination.bucket) {
+                warnings.push(format!(
+                    "replication rule '{}' copies the encrypted bucket '{}' into bucket '{}', \
+                     which stores plaintext: the copies are not encrypted at rest. Give the \
+                     destination an encryption (on the bucket or its backend) if that is not \
+                     what you want",
+                    rule.name, rule.source.bucket, rule.destination.bucket
+                ));
+            }
+        }
+        warnings
+    }
+
+    /// Bucket overrides in proxy mode with no key (the engine refuses every
+    /// write to those buckets).
+    pub fn keyless_proxy_buckets(&self) -> Vec<String> {
+        self.buckets
+            .iter()
+            .filter(|(_, p)| {
+                matches!(
+                    p.encryption,
+                    Some(BackendEncryptionConfig::Aes256GcmProxy { key: None, .. })
+                )
+            })
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    /// The apply gate of a bucket override's ACTIVE key: an error for each
+    /// key that a bucket wrote with in `old` and that no site of the same
+    /// raw backend keeps in `self`. The objects written under it would
+    /// become unreadable. The operator stops using a key in two steps:
+    /// first `mode: none` (or a new key) with the old key kept as
+    /// `legacy_key` (the admin API does this when the body leaves
+    /// `legacy_key` out), then, once the re-encrypt job ran and the
+    /// legacy-key usage scan of the bucket finds no object, the removal.
+    /// Migrate's transient routes (`__dgmigrate_*`) are internal and skipped.
+    pub fn dropped_bucket_keys(&self, old: &Config) -> Vec<String> {
+        let now = self.resolved_keys();
+        // Kept: on the same raw backend, or by the same bucket (a migrate
+        // flip moves a bucket and its override to another backend).
+        let kept: std::collections::HashSet<(String, String)> = now
+            .iter()
+            .map(|k| (k.backend.clone(), k.key_id.clone()))
+            .collect();
+        let kept_by_bucket: std::collections::HashSet<(String, String)> = now
+            .iter()
+            .filter_map(|k| match &k.site {
+                EncryptionSite::Bucket(b) => Some((b.clone(), k.key_id.clone())),
+                _ => None,
+            })
+            .collect();
+        let mut errors = Vec::new();
+        for k in old.resolved_keys() {
+            let EncryptionSite::Bucket(name) = &k.site else {
+                continue;
+            };
+            if k.legacy || name.starts_with(crate::maintenance::migrate::TRANSIENT_PREFIX) {
+                continue;
+            }
+            if !kept.contains(&(k.backend.clone(), k.key_id.clone()))
+                && !kept_by_bucket.contains(&(name.clone(), k.key_id.clone()))
+            {
+                errors.push(format!(
+                    "bucket '{name}': this change removes key id '{}', which the bucket writes \
+                     with, from backend '{}'. Objects written under it would become \
+                     unreadable. Keep it as `legacy_key` / `legacy_key_id` (set `mode: none` or \
+                     a new key first), run the re-encrypt job for the bucket, and remove the \
+                     legacy key once the legacy-key usage scan finds no object under it",
+                    k.key_id, k.backend
+                ));
+            }
+        }
+        errors
+    }
+
+    /// For the apply response: one note per configured bucket whose
+    /// effective write encryption (mode and key id) changes from `old`.
+    /// Existing objects keep the form they were written in; the
+    /// re-encrypt job rewrites them. Migrate's transient routes are skipped.
+    pub fn bucket_encryption_notes(&self, old: &Config) -> Vec<String> {
+        let names: std::collections::BTreeSet<&String> =
+            self.buckets.keys().chain(old.buckets.keys()).collect();
+        let mut notes = Vec::new();
+        for name in names {
+            if name.starts_with(crate::maintenance::migrate::TRANSIENT_PREFIX) {
+                continue;
+            }
+            let (Some(before), Some(after)) = (
+                old.encryption_for_bucket(name),
+                self.encryption_for_bucket(name),
+            ) else {
+                continue;
+            };
+            let id = |e: &BucketEncryption<'_>| {
+                let kid = match e.config {
+                    BackendEncryptionConfig::Aes256GcmProxy {
+                        key: Some(hex),
+                        key_id,
+                        ..
+                    } => key_id.clone().or_else(|| {
+                        crate::storage::EncryptionKey::from_hex(hex)
+                            .ok()
+                            .map(|k| crate::deltaglider::derive_key_id(&e.backend, &k.0))
+                    }),
+                    _ => None,
+                };
+                (e.config.mode_tag(), kid)
+            };
+            let (b, a) = (id(&before), id(&after));
+            if b == a {
+                continue;
+            }
+            let describe = |(mode, kid): &(&str, Option<String>)| match kid {
+                Some(kid) => format!("{mode} (key id '{kid}')"),
+                None => mode.to_string(),
+            };
+            notes.push(format!(
+                "bucket '{name}': new writes use {} instead of {}. Objects stored before keep \
+                 their old form and stay readable. To rewrite them, start the re-encrypt job: \
+                 POST /_/api/admin/jobs/reencrypt with {{\"buckets\": [\"{name}\"]}}",
+                describe(&a),
+                describe(&b)
+            ));
+        }
+        notes
+    }
+}
+
+/// The explicit primary key id of a proxy-AES config.
+fn enc_key_id(enc: &BackendEncryptionConfig) -> Option<&str> {
+    match enc {
+        BackendEncryptionConfig::Aes256GcmProxy { key_id, .. } => key_id.as_deref(),
+        _ => None,
+    }
+}

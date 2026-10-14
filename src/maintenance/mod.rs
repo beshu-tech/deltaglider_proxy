@@ -83,21 +83,28 @@ pub fn resolve_desired(config: &Config, bucket: &str) -> Result<DesiredEncryptio
         .ok_or_else(|| format!("bucket '{bucket}' routes to an unknown backend"))?;
     let backend_name = resolved.backend;
     let enc = resolved.config.clone();
+    // Who owns the encryption, for the messages: a bucket override (issue
+    // #116; its key id is always explicit) or the backend.
+    let owner = if resolved.from_bucket {
+        format!("bucket '{bucket}'")
+    } else {
+        format!("backend '{backend_name}'")
+    };
 
     match enc {
         BackendEncryptionConfig::None { .. } => Ok(DesiredEncryption::Plain),
         BackendEncryptionConfig::Aes256GcmProxy { key, key_id, .. } => {
             let Some(hex) = key else {
                 return Err(format!(
-                    "backend '{backend_name}' is in aes256-gcm-proxy mode but has no key configured — \
-                     new writes would be plaintext; fix the key before re-encrypting"
+                    "{owner} is in aes256-gcm-proxy mode but has no key configured — \
+                     writes are refused; fix the key before re-encrypting"
                 ));
             };
             let key_id = match key_id {
                 Some(explicit) => explicit,
                 None => {
                     let parsed = crate::storage::EncryptionKey::from_hex(&hex)
-                        .map_err(|e| format!("backend '{backend_name}' key: {e}"))?;
+                        .map_err(|e| format!("{owner} key: {e}"))?;
                     crate::deltaglider::derive_key_id(&backend_name, &parsed.0)
                 }
             };
@@ -105,7 +112,7 @@ pub fn resolve_desired(config: &Config, bucket: &str) -> Result<DesiredEncryptio
         }
         BackendEncryptionConfig::SseKms { .. } | BackendEncryptionConfig::SseS3 { .. } => {
             Err(format!(
-                "backend '{backend_name}' uses {} — AWS-side encryption leaves no per-object \
+                "{owner} uses {} — AWS-side encryption leaves no per-object \
                  proxy marker, so the re-encrypt job cannot verify object state (unsupported in v1)",
                 enc.mode_tag()
             ))

@@ -82,6 +82,18 @@ pub struct BucketPolicyConfig {
     /// Reads are unaffected.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub replication_target_only: bool,
+
+    /// Per-bucket encryption at rest (issue #116): the same schema as a
+    /// backend's `encryption`. When set, it replaces the backend's
+    /// encryption for this bucket's writes. It belongs to the REAL bucket
+    /// (backend + real name), so every virtual name of that storage must
+    /// agree. Rules (`Config::check_fatal`): proxy AES only (native SSE
+    /// per bucket is not supported yet), an explicit `key_id` (and an
+    /// explicit `legacy_key_id` with a `legacy_key`), an explicit
+    /// `backend:` when named backends exist, and no `config_sync_bucket`.
+    /// `None` = the bucket inherits the backend's encryption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<crate::config::BackendEncryptionConfig>,
 }
 
 /// Why a `public_prefix` was rejected during validation. Carries enough
@@ -651,14 +663,14 @@ mod tests {
     #[test]
     fn an_unknown_bucket_field_is_refused_and_named() {
         let sectioned = "storage:\n  filesystem: /tmp/p116\n  buckets:\n    db-archive:\n      \
-                         encryption:\n        mode: aes256-gcm-proxy\n";
-        let flat = "buckets:\n  db-archive:\n    encryption: {mode: none}\n";
+                         retention_days: 30\n";
+        let flat = "buckets:\n  db-archive:\n    retention_days: 30\n";
         for yaml in [sectioned, flat] {
             let err = crate::config::Config::from_yaml_str(yaml)
                 .expect_err("an unknown bucket field must not load")
                 .to_string();
             assert!(
-                err.contains("encryption"),
+                err.contains("retention_days"),
                 "the error names the field: {err}"
             );
         }
@@ -673,7 +685,8 @@ mod tests {
                     compression: false\n      max_delta_ratio: 0.5\n      backend: local-disk\n      \
                     alias: releases-2026\n      public_prefixes: [builds/]\n      \
                     quota_bytes: 1000\n    downloads:\n      public: true\n      \
-                    replication_target_only: true\n";
+                    replication_target_only: true\n    db-archive:\n      \
+                    backend: local-disk\n      encryption: {mode: none}\n";
         let cfg = crate::config::Config::from_yaml_str(yaml).unwrap();
         let r = &cfg.buckets["releases"];
         assert_eq!(r.compression, Some(false));

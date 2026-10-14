@@ -773,13 +773,14 @@ storage:
 
     /// Issue #116 P0.3: an unknown bucket field is a parse error that
     /// names the field (a newer release's field must not be dropped).
+    /// (`encryption` itself is a known field since P1.)
     #[test]
     fn lint_refuses_an_unknown_bucket_field() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cfg.yaml");
         std::fs::write(
             &path,
-            "storage:\n  buckets:\n    db-archive:\n      encryption: {mode: none}\n",
+            "storage:\n  buckets:\n    db-archive:\n      retention_days: 30\n",
         )
         .unwrap();
         assert_eq!(lint(path.to_str().unwrap()), EXIT_PARSE);

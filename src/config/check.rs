@@ -456,6 +456,7 @@ impl Config {
             &self.replication,
         ));
         warnings.extend(crate::config_sections::validate_lifecycle(&self.lifecycle));
+        warnings.extend(self.bucket_encryption_warnings());
         warnings.extend(crate::config_sections::validate_jobs(&self.jobs));
         warnings.extend(crate::config_sections::validate_event_delivery(
             &self.event_delivery,
@@ -539,6 +540,7 @@ impl Config {
             }
         }
         errors.extend(self.coordination_bucket_exposures());
+        errors.extend(self.bucket_encryption_errors());
         errors
     }
 
@@ -576,7 +578,8 @@ impl Config {
     /// the key of a valid config often comes from `DGP_*_ENCRYPTION_KEY`.
     pub fn newly_keyless_proxy_backends(&self, old: &Config) -> Vec<String> {
         let before = old.keyless_proxy_backends();
-        self.keyless_proxy_backends()
+        let mut out: Vec<String> = self
+            .keyless_proxy_backends()
             .into_iter()
             .filter(|name| !before.contains(name))
             .map(|name| {
@@ -587,7 +590,24 @@ impl Config {
                      encryption.key or {env}, or choose another mode"
                 )
             })
-            .collect()
+            .collect();
+        // The same rule for a bucket override (issue #116). A bucket key has
+        // no DGP_* variable: it comes from the YAML or a `${env:NAME}` ref.
+        let before = old.keyless_proxy_buckets();
+        out.extend(
+            self.keyless_proxy_buckets()
+                .into_iter()
+                .filter(|name| !before.contains(name))
+                .map(|name| {
+                    format!(
+                        "bucket '{name}' uses aes256-gcm-proxy but has no key: the proxy would \
+                         refuse every write to it rather than store plaintext. Set the \
+                         bucket's encryption.key (a literal or a ${{env:NAME}} reference), or \
+                         choose another mode"
+                    )
+                }),
+        );
+        out
     }
 
     /// Ways the config would make the coordination bucket
