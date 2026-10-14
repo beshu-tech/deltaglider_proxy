@@ -436,12 +436,14 @@ pub fn env_overrides(cfg: &Config, env: EnvLookup) -> Vec<EnvOverride> {
     }
 
     // Per-backend encryption: the variable applies only in the matching mode.
-    let singleton = std::iter::once((None, "default", &cfg.backend_encryption));
-    let named = cfg
-        .backends
-        .iter()
-        .map(|b| (Some(b.name.as_str()), b.name.as_str(), &b.encryption));
-    for (path_name, env_name, enc) in singleton.chain(named) {
+    // Walks every encryption site; a bucket override has no DGP_* variable
+    // (its key is a literal or a `${env:NAME}` reference, issue #116).
+    for (site, enc) in cfg.encryption_sites() {
+        let (path_name, env_name) = match &site {
+            super::EncryptionSite::Singleton => (None, "default"),
+            super::EncryptionSite::Backend(name) => (Some(name.as_str()), name.as_str()),
+            super::EncryptionSite::Bucket(_) => continue,
+        };
         let (key_env, kms_env) = backend_encryption_env_names(env_name);
         let (var, field, secret) = match enc {
             BackendEncryptionConfig::Aes256GcmProxy { .. } => (key_env, "key", true),

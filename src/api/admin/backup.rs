@@ -347,6 +347,10 @@ struct BackupSecrets {
     /// Same, per named backend, keyed by backend name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     backend_encryption_named: BTreeMap<String, SecretsEncryption>,
+    /// Same, per bucket `encryption` override (issue #116), keyed by bucket
+    /// name. Absent in older backups; older servers ignore it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    bucket_encryption: BTreeMap<String, SecretsEncryption>,
     /// Declarative IAM (`access.iam_users`): each user's secret access key,
     /// keyed by user name. config.yaml has them redacted, so without these a
     /// restore onto a fresh instance refuses the users. (iam.json already
@@ -874,13 +878,26 @@ fn harvest_config_secrets(
         oauth_client_secrets: Default::default(),
         event_delivery: None,
         iam_user_secrets: Default::default(),
-        backend_encryption: SecretsEncryption::harvest(&cfg.backend_encryption),
-        backend_encryption_named: cfg
-            .backends
-            .iter()
-            .filter_map(|b| Some((b.name.clone(), SecretsEncryption::harvest(&b.encryption)?)))
-            .collect(),
+        backend_encryption: None,
+        backend_encryption_named: Default::default(),
+        bucket_encryption: Default::default(),
     };
+    // Every encryption config (backends AND bucket overrides), through the
+    // one visitor so a new site cannot be skipped.
+    for (site, enc) in cfg.encryption_sites() {
+        let Some(secrets) = SecretsEncryption::harvest(enc) else {
+            continue;
+        };
+        match site {
+            crate::config::EncryptionSite::Singleton => s.backend_encryption = Some(secrets),
+            crate::config::EncryptionSite::Backend(name) => {
+                s.backend_encryption_named.insert(name, secrets);
+            }
+            crate::config::EncryptionSite::Bucket(name) => {
+                s.bucket_encryption.insert(name, secrets);
+            }
+        }
+    }
     // Access-section bootstrap SigV4 pair.
     let (ak, sk) = (literal(&cfg.access_key_id), literal(&cfg.secret_access_key));
     if ak.is_some() || sk.is_some() {
@@ -1135,12 +1152,16 @@ fn hydrate_config_with_backup_secrets(cfg: &mut Config, secrets: &BackupSecrets)
         }
     }
 
-    if let Some(e) = &secrets.backend_encryption {
-        e.hydrate(&mut cfg.backend_encryption);
-    }
-    for named in &mut cfg.backends {
-        if let Some(e) = secrets.backend_encryption_named.get(&named.name) {
-            e.hydrate(&mut named.encryption);
+    for (site, enc) in cfg.encryption_sites_mut() {
+        let saved = match &site {
+            crate::config::EncryptionSite::Singleton => secrets.backend_encryption.as_ref(),
+            crate::config::EncryptionSite::Backend(name) => {
+                secrets.backend_encryption_named.get(name)
+            }
+            crate::config::EncryptionSite::Bucket(name) => secrets.bucket_encryption.get(name),
+        };
+        if let Some(e) = saved {
+            e.hydrate(enc);
         }
     }
 
@@ -2059,6 +2080,32 @@ mod tests {
         // Old secrets.json (no key fields) still parses.
         let old: BackupSecrets = serde_json::from_str("{}").unwrap();
         assert!(config_yaml_hydrated_for_restore(&exported, Some(&old)).is_ok());
+    }
+
+    /// Issue #116: a bucket override's key and legacy key ride in
+    /// secrets.json (`bucket_encryption`) and come back on restore.
+    #[test]
+    fn full_backup_round_trips_bucket_encryption_keys() {
+        const K4: &str = "4444444444444444444444444444444444444444444444444444444444444444";
+        const K5: &str = "5555555555555555555555555555555555555555555555555555555555555555";
+        let yaml = format!(
+            "storage:\n  filesystem: /tmp/d13\n  buckets:\n    db-archive:\n      encryption:\n        mode: aes256-gcm-proxy\n        key: \"{K4}\"\n        key_id: db-archive-2026\n        legacy_key: \"{K5}\"\n        legacy_key_id: db-archive-2025\n"
+        );
+        let cfg = crate::config::Config::from_yaml_str(&yaml).unwrap();
+        let secrets = harvest_config_secrets(&cfg).unwrap();
+        assert!(secrets.bucket_encryption.contains_key("db-archive"));
+        let exported = cfg.redact_all_secrets().to_canonical_yaml().unwrap();
+        assert!(
+            !exported.contains(K4) && !exported.contains(K5),
+            "{exported}"
+        );
+        let restored = config_yaml_hydrated_for_restore(&exported, Some(&secrets)).unwrap();
+        for k in [K4, K5] {
+            assert!(
+                restored.contains(k),
+                "restore lost a bucket key:\n{restored}"
+            );
+        }
     }
 
     /// B039: a full backup restores Slack incoming-webhook URLs. The export

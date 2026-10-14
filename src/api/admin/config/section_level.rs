@@ -629,7 +629,6 @@ fn fingerprint_secrets_for_diff(cfg: &crate::config::Config) -> crate::config::C
     {
         fp_opt(secret_access_key);
     }
-    fp_enc(&mut out.backend_encryption);
     for nb in &mut out.backends {
         if let crate::config::BackendConfig::S3 {
             ref mut secret_access_key,
@@ -638,7 +637,10 @@ fn fingerprint_secrets_for_diff(cfg: &crate::config::Config) -> crate::config::C
         {
             fp_opt(secret_access_key);
         }
-        fp_enc(&mut nb.encryption);
+    }
+    // Every encryption config: backends AND bucket overrides.
+    for (_, enc) in out.encryption_sites_mut() {
+        fp_enc(enc);
     }
     for u in &mut out.iam_users {
         if !u.secret_access_key.is_empty() {
@@ -781,6 +783,8 @@ pub(crate) struct BackendEncryptionKeyProbe {
     /// name — matches the way preserve_backend_encryption_secrets
     /// walks the list.
     named: std::collections::HashMap<String, BackendKeyPresence>,
+    /// Per-bucket results: `storage.buckets.<name>.encryption` (issue #116).
+    buckets: std::collections::HashMap<String, BackendKeyPresence>,
 }
 
 impl BackendEncryptionKeyProbe {
@@ -790,6 +794,8 @@ impl BackendEncryptionKeyProbe {
     pub(crate) fn from_section(section: SectionName, body: &serde_json::Value) -> Self {
         let mut singleton = BackendKeyPresence::default();
         let mut named: std::collections::HashMap<String, BackendKeyPresence> =
+            std::collections::HashMap::new();
+        let mut buckets: std::collections::HashMap<String, BackendKeyPresence> =
             std::collections::HashMap::new();
         if matches!(section, SectionName::Storage) {
             if let Some(obj) = body.as_object() {
@@ -812,17 +818,36 @@ impl BackendEncryptionKeyProbe {
                         }
                     }
                 }
+                // Map: storage.buckets.<name> — each with an optional
+                // `encryption` object.
+                if let Some(map) = obj.get("buckets").and_then(|v| v.as_object()) {
+                    for (name, policy) in map {
+                        if let Some(enc) = policy.get("encryption") {
+                            buckets.insert(name.to_ascii_lowercase(), probe_enc_body(enc));
+                        }
+                    }
+                }
             }
         }
-        Self { singleton, named }
-    }
-
-    pub(crate) fn for_singleton(&self) -> BackendKeyPresence {
-        self.singleton
+        Self {
+            singleton,
+            named,
+            buckets,
+        }
     }
 
     pub(crate) fn for_named(&self, name: &str) -> BackendKeyPresence {
         self.named.get(name).copied().unwrap_or_default()
+    }
+
+    /// The probe of one encryption site.
+    pub(crate) fn for_site(&self, site: &crate::config::EncryptionSite) -> BackendKeyPresence {
+        use crate::config::EncryptionSite as S;
+        match site {
+            S::Singleton => self.singleton,
+            S::Backend(name) => self.for_named(name),
+            S::Bucket(name) => self.buckets.get(name).copied().unwrap_or_default(),
+        }
     }
 }
 
@@ -861,8 +886,28 @@ fn probe_enc_body(enc: &serde_json::Value) -> BackendKeyPresence {
 ///
 /// `backend_name` feeds the key-id derivation (`"default"` for the
 /// singleton backend, as in the engine).
+#[cfg(test)]
 pub(crate) fn preserve_backend_encryption_secrets(
     backend_name: &str,
+    new: &mut crate::config::BackendEncryptionConfig,
+    old: &crate::config::BackendEncryptionConfig,
+    probe: BackendKeyPresence,
+) -> Result<(), String> {
+    preserve_encryption_secrets(
+        backend_name,
+        &format!("backend '{backend_name}'"),
+        new,
+        old,
+        probe,
+    )
+}
+
+/// [`preserve_backend_encryption_secrets`] for any encryption site:
+/// `backend_name` is the key-id derivation scope, `owner` names the site
+/// in the messages (`backend 'x'`, `bucket 'y'`).
+fn preserve_encryption_secrets(
+    backend_name: &str,
+    owner: &str,
     new: &mut crate::config::BackendEncryptionConfig,
     old: &crate::config::BackendEncryptionConfig,
     probe: BackendKeyPresence,
@@ -926,7 +971,7 @@ pub(crate) fn preserve_backend_encryption_secrets(
             if let Some(new_kid) = effective_proxy_key_id(backend_name, new) {
                 if new_kid == old_kid {
                     return Err(format!(
-                        "backend '{backend_name}': the encryption key changes but the key id \
+                        "{owner}: the encryption key changes but the key id \
                          stays '{old_kid}'. Objects written under the old key would be decrypted \
                          with the new key and fail. Remove `key_id` (the id is then derived from \
                          the key) or set a new one."
@@ -942,7 +987,7 @@ pub(crate) fn preserve_backend_encryption_secrets(
                     let held_kid = crate::deltaglider::effective_legacy_key_id(backend_name, old)
                         .unwrap_or_default();
                     return Err(format!(
-                        "backend '{backend_name}': the current key must become the legacy \
+                        "{owner}: the current key must become the legacy \
                          (decrypt-only) key, but the legacy slot still holds key id \
                          '{held_kid}', and objects can still need it. Re-encrypt the buckets \
                          on this backend, then remove `legacy_key` / `legacy_key_id` and change \
@@ -974,29 +1019,33 @@ pub(crate) fn preserve_backend_encryption_secrets(
     Ok(())
 }
 
-/// [`preserve_backend_encryption_secrets`] over the singleton and every
-/// named backend (matched by name). Shared by the section PUT and the
-/// document apply so both write paths keep the same key rules.
+/// [`preserve_backend_encryption_secrets`] over every encryption site of
+/// the incoming config (the singleton, every named backend, every bucket
+/// override), matched to the running config's site of the same name.
+/// Shared by the section PUT and the document apply so both write paths
+/// keep the same key rules. A bucket override's key id is explicit, so the
+/// derivation scope (the site name) only shapes the messages there.
 pub(crate) fn preserve_all_backend_encryption(
     new_cfg: &mut crate::config::Config,
     old_cfg: &crate::config::Config,
     probe: &BackendEncryptionKeyProbe,
 ) -> Result<(), String> {
-    preserve_backend_encryption_secrets(
-        "default",
-        &mut new_cfg.backend_encryption,
-        &old_cfg.backend_encryption,
-        probe.for_singleton(),
-    )?;
-    for new_named in &mut new_cfg.backends {
-        if let Some(old_named) = old_cfg.backends.iter().find(|n| n.name == new_named.name) {
-            preserve_backend_encryption_secrets(
-                &new_named.name,
-                &mut new_named.encryption,
-                &old_named.encryption,
-                probe.for_named(&new_named.name),
-            )?;
-        }
+    use crate::config::EncryptionSite as S;
+    for (site, new_enc) in new_cfg.encryption_sites_mut() {
+        let Some(old_enc) = old_cfg.encryption_at(&site) else {
+            continue;
+        };
+        let scope = match &site {
+            S::Singleton => "default".to_string(),
+            S::Backend(name) | S::Bucket(name) => name.clone(),
+        };
+        preserve_encryption_secrets(
+            &scope,
+            &site.label(),
+            new_enc,
+            old_enc,
+            probe.for_site(&site),
+        )?;
     }
     Ok(())
 }

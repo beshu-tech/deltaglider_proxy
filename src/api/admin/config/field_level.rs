@@ -574,7 +574,8 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
             debug_headers: tuning.debug_headers,
             // Sync
             config_sync_bucket: cfg.config_sync_bucket.clone(),
-            bucket_policies: cfg.buckets.clone(),
+            // Bucket overrides carry keys (issue #116): redacted.
+            bucket_policies: cfg.redacted_bucket_policies(),
             // Logging
             log_level,
             backend_has_credentials,
