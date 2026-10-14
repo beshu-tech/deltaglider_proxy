@@ -12,16 +12,9 @@
 //! version.
 
 use super::*;
+use crate::storage::traits::object_changed_while_read;
 use aws_sdk_s3::error::DisplayErrorContext;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
-
-/// The error of a read whose follow-up request found another version of
-/// the object: a 503 SlowDown, which clients retry.
-pub(crate) fn object_changed_while_read(bucket: &str, key: &str) -> StorageError {
-    StorageError::Throttled(format!(
-        "{bucket}/{key} changed while it was read; retry the request"
-    ))
-}
 
 /// Resumes of one GET body before its read fails.
 pub(super) const BODY_RESUMES: u32 = 3;

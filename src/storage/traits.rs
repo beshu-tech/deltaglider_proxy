@@ -256,6 +256,27 @@ pub fn same_stored_generation(pin: &FileMetadata, current: &FileMetadata) -> boo
     }
 }
 
+/// Pure: do two reads of one stored object show the same version? Their
+/// raw stored metadata must be equal: the content hash and size, the
+/// created-at, the encryption markers and key id, and the user metadata.
+/// Every write stores a new created-at (a foreign object's is its
+/// LastModified, and its `md5` is its ETag), so a follow-up read that
+/// another write overtook shows other metadata. Used where one logical
+/// read needs a second request (the encrypting wrapper's range reads):
+/// that request must serve the version that the first one decided on.
+pub fn same_stored_version(first: &FileMetadata, again: &FileMetadata) -> bool {
+    first.file_size == again.file_size
+        && first.to_bare_metadata_map() == again.to_bare_metadata_map()
+}
+
+/// The error of a read whose follow-up request found another version of
+/// the object: 503 SlowDown, which clients retry.
+pub fn object_changed_while_read(bucket: &str, key: &str) -> StorageError {
+    StorageError::Throttled(format!(
+        "{bucket}/{key} changed while it was read; retry the request"
+    ))
+}
+
 /// One fenced write to `reference.bin` (see
 /// [`StorageBackend::write_reference_fenced`]).
 #[derive(Debug, Clone, Copy)]

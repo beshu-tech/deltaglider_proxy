@@ -2506,3 +2506,355 @@ mod read_request_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod pinned_follow_up_tests {
+    use super::*;
+    use crate::storage::fake_s3;
+    use futures::TryStreamExt;
+
+    fn cfg(key: Option<EncryptionKey>) -> Arc<ArcSwap<EncryptionConfig>> {
+        Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
+            key_id: key.as_ref().map(|_| "kid-a".to_string()),
+            key,
+            ..Default::default()
+        })))
+    }
+
+    fn meta(data: &[u8]) -> FileMetadata {
+        FileMetadata::new_passthrough(
+            "x.bin".into(),
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(data)),
+            hex::encode(<md5::Md5 as md5::Digest>::digest(data)),
+            data.len() as u64,
+            None,
+        )
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Form {
+        Plain,
+        Chunked,
+        V1,
+    }
+
+    async fn put<B: StorageBackend>(
+        plain: &EncryptingBackend<B>,
+        keyed: &EncryptingBackend<B>,
+        form: Form,
+        name: &str,
+        data: &[u8],
+    ) {
+        let b = Bytes::from(data.to_vec());
+        match form {
+            Form::Plain => plain.put_passthrough("b", "p", name, b, &meta(data)).await,
+            Form::Chunked => {
+                keyed
+                    .put_passthrough_chunked("b", "p", name, &[b], &meta(data))
+                    .await
+            }
+            Form::V1 => keyed.put_passthrough("b", "p", name, b, &meta(data)).await,
+        }
+        .unwrap();
+    }
+
+    #[test]
+    fn same_stored_version_truth_table() {
+        use crate::storage::traits::same_stored_version;
+        let a = meta(b"hello");
+        assert!(same_stored_version(&a, &a.clone()));
+        let mut later = a.clone();
+        later.created_at += chrono::Duration::microseconds(1);
+        assert!(!same_stored_version(&a, &later), "another write");
+        let mut other = a.clone();
+        other.md5 = "00".repeat(16);
+        assert!(!same_stored_version(&a, &other), "other content");
+        let mut sized = a.clone();
+        sized.file_size += 1;
+        assert!(!same_stored_version(&a, &sized), "other size");
+        let mut marked = a.clone();
+        mark_chunked_encrypted(&mut marked, Some("kid-a"));
+        assert!(!same_stored_version(&a, &marked), "other format");
+    }
+
+    /// A keyed range read takes the object's metadata (and its format)
+    /// from its first GET, and may need a second GET for the bytes. When
+    /// another version replaces the object between the two, the read fails
+    /// with a retryable 503 SlowDown. Before, the second GET was not tied
+    /// to the first: a plaintext object replaced by a chunked one served
+    /// the new ciphertext as plaintext under the old ETag, and the other
+    /// pairs failed with an opaque decryption error.
+    #[tokio::test]
+    async fn a_follow_up_read_of_another_version_is_slow_down() {
+        let key = EncryptionKey::from_hex(&"aa".repeat(32)).unwrap();
+        let a: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let b: Vec<u8> = (0..200_000u32).map(|i| (i % 13) as u8).collect();
+        for (from, to, start) in [
+            (Form::Plain, Form::Chunked, 70_000),
+            (Form::Chunked, Form::Plain, 70_000),
+            (Form::Chunked, Form::Chunked, 140_000),
+            (Form::V1, Form::V1, 0),
+        ] {
+            let (ep, fake) = fake_s3::start().await;
+            let mk = || crate::storage::s3::test_support::for_test_endpoint(&ep);
+            let plain = EncryptingBackend::new(mk(), cfg(None));
+            let keyed = EncryptingBackend::new(mk(), cfg(Some(key.clone())));
+            put(&plain, &keyed, from, "x.bin", &a).await;
+            put(&plain, &keyed, to, "y.bin", &b).await;
+            fake.overwrite_after_gets("b/p/x.bin", "b/p/y.bin", 1);
+            let label = format!("{from:?} -> {to:?} at {start}");
+            let read = async {
+                let (s, _, m) = keyed
+                    .open_passthrough_range("b", "p", "x.bin", start, start + 99)
+                    .await?;
+                let body: Vec<Bytes> = s.try_collect().await?;
+                Ok::<_, StorageError>((body.concat(), m))
+            };
+            match read.await {
+                Err(StorageError::Throttled(_)) => {}
+                Ok((body, m)) => panic!(
+                    "{label}: served {} bytes, A's: {}, B's: {}, etag {}",
+                    body.len(),
+                    body == a[start as usize..start as usize + 100],
+                    body == b[start as usize..start as usize + 100],
+                    m.etag()
+                ),
+                Err(e) => panic!("{label}: {e}"),
+            }
+        }
+    }
+}
+
+/// THE rule: a range read of this wrapper that needs a second request
+/// reads it with `pinned_range` (the response's own metadata checked
+/// against the first read's), never with a bare
+/// `get_passthrough_stream_range` / `get_passthrough` of the inner
+/// backend, which carries no metadata and so cannot tell another version.
+#[test]
+fn follow_up_reads_are_pinned_to_the_first_read() {
+    let text = std::fs::read_to_string("src/storage/encrypting/mod.rs").unwrap();
+    let prod = crate::source_scan::prod_text(&text);
+    let squashed: String = prod.split_whitespace().collect();
+    for bare in [
+        "inner.get_passthrough_stream_range(",
+        "inner.get_passthrough(",
+    ] {
+        assert!(
+            !squashed.contains(bare),
+            "encrypting/mod.rs calls {bare}: use pinned_range"
+        );
+    }
+}
+
+#[cfg(test)]
+mod range_matrix_tests {
+    use super::*;
+    use crate::storage::fake_s3;
+    use futures::TryStreamExt;
+
+    fn k(b: &str) -> EncryptionKey {
+        EncryptionKey::from_hex(&b.repeat(32)).unwrap()
+    }
+    fn cfg(
+        key: Option<EncryptionKey>,
+        kid: Option<&str>,
+        legacy: Option<(EncryptionKey, &str)>,
+    ) -> Arc<ArcSwap<EncryptionConfig>> {
+        Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
+            key,
+            key_id: kid.map(str::to_string),
+            legacy_key: legacy.as_ref().map(|l| l.0.clone()),
+            legacy_key_id: legacy.map(|l| l.1.to_string()),
+            ..Default::default()
+        })))
+    }
+    fn meta(data: &[u8]) -> FileMetadata {
+        FileMetadata::new_passthrough(
+            "a.bin".into(),
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(data)),
+            hex::encode(<md5::Md5 as md5::Digest>::digest(data)),
+            data.len() as u64,
+            None,
+        )
+    }
+
+    async fn outcome<B: StorageBackend>(
+        w: &EncryptingBackend<B>,
+        name: &str,
+        start: u64,
+        end: u64,
+        open: bool,
+    ) -> String {
+        let r = if open {
+            match w.open_passthrough_range("b", "p", name, start, end).await {
+                Ok((s, len, m)) => Ok((s, len, Some(m))),
+                Err(e) => Err(e),
+            }
+        } else {
+            match w
+                .get_passthrough_stream_range("b", "p", name, start, end)
+                .await
+            {
+                Ok((s, len)) => Ok((s, len, None)),
+                Err(e) => Err(e),
+            }
+        };
+        match r {
+            Ok((s, len, m)) => match s.try_collect::<Vec<Bytes>>().await {
+                Ok(parts) => {
+                    let body = parts.concat();
+                    let md = m
+                        .map(|m| format!("size={} etag={}", m.file_size, m.etag()))
+                        .unwrap_or_default();
+                    format!(
+                        "OK len={} bodylen={} body_md5={} {}",
+                        len,
+                        body.len(),
+                        hex::encode(<md5::Md5 as md5::Digest>::digest(&body)),
+                        md
+                    )
+                }
+                Err(e) => format!("STREAM-ERR {e}"),
+            },
+            Err(e) => format!(
+                "ERR {}",
+                match e {
+                    StorageError::InvalidRange(_) => "InvalidRange".to_string(),
+                    other => format!("{other}"),
+                }
+            ),
+        }
+    }
+
+    async fn run<B: StorageBackend, F: Fn() -> B>(mk: F) -> Vec<String> {
+        let (a, p) = (k("aa"), k("bb"));
+        let writer_a = EncryptingBackend::new(mk(), cfg(Some(a.clone()), Some("kid-a"), None));
+        let writer_nokid = EncryptingBackend::new(mk(), cfg(Some(a.clone()), None, None));
+        let writer_prev = EncryptingBackend::new(mk(), cfg(Some(p.clone()), Some("kid-p"), None));
+        let plain_w = EncryptingBackend::new(mk(), cfg(None, None, None));
+        let reader = EncryptingBackend::new(
+            mk(),
+            cfg(Some(a.clone()), Some("kid-a"), Some((p.clone(), "kid-p"))),
+        );
+        let unkeyed = EncryptingBackend::new(mk(), cfg(None, None, None));
+        let _ = plain_w.create_bucket("b").await;
+        let mut mismatches = Vec::new();
+        // The chunk edges: empty, one byte, the header length, one frame
+        // and one byte more, two frames and one byte more.
+        let sizes: [u64; 6] = [0, 1, 16, 65536, 65537, 131073];
+        for size in sizes {
+            let body: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let m = meta(&body);
+            let b = Bytes::from(body.clone());
+            plain_w
+                .put_passthrough("b", "p", "plain", b.clone(), &m)
+                .await
+                .unwrap();
+            writer_a
+                .put_passthrough_chunked("b", "p", "chunked", std::slice::from_ref(&b), &m)
+                .await
+                .unwrap();
+            writer_a
+                .put_passthrough("b", "p", "v1", b.clone(), &m)
+                .await
+                .unwrap();
+            writer_nokid
+                .put_passthrough_chunked("b", "p", "nokid-chunked", std::slice::from_ref(&b), &m)
+                .await
+                .unwrap();
+            writer_nokid
+                .put_passthrough("b", "p", "nokid-v1", b.clone(), &m)
+                .await
+                .unwrap();
+            writer_prev
+                .put_passthrough_chunked("b", "p", "prev-chunked", std::slice::from_ref(&b), &m)
+                .await
+                .unwrap();
+            writer_prev
+                .put_passthrough("b", "p", "prev-v1", b.clone(), &m)
+                .await
+                .unwrap();
+            let last = size.saturating_sub(1);
+            let max = u64::MAX - 1;
+            let mut ranges: Vec<(u64, u64)> = vec![
+                (0, 0),
+                (0, max),
+                (0, last),
+                (last, last),
+                (last, max),
+                (65530, 65545),
+                (65535, 65536),
+                (65536, 65536),
+                (65536, max),
+                (131071, 131072),
+                (70000, max),
+                (size, max),
+                (size + 10, size + 20),
+                (1, 1),
+                (15, 16),
+                (16, 16),
+            ];
+            // suffix bytes=-N as the adapter resolves it (HEAD-first)
+            for n in [1u64, 10, 65536, 70000] {
+                if size > 0 {
+                    ranges.push((size.saturating_sub(n), last));
+                }
+            }
+            for (i, (s, e)) in ranges.into_iter().enumerate() {
+                // `get_passthrough_stream_range` is `open_passthrough_range`
+                // without the metadata: the ranges alternate the two.
+                let open = i % 2 == 0;
+                let twin = outcome(&unkeyed, "plain", s, e, open).await;
+                for name in [
+                    "plain",
+                    "chunked",
+                    "v1",
+                    "nokid-chunked",
+                    "nokid-v1",
+                    "prev-chunked",
+                    "prev-v1",
+                ] {
+                    let got = outcome(&reader, name, s, e, open).await;
+                    if got != twin {
+                        mismatches.push(format!(
+                            "size={size} range={s}-{e} open={open} {name}: twin=[{twin}] got=[{got}]"
+                        ));
+                    }
+                }
+            }
+        }
+        mismatches
+    }
+
+    /// Every wire format behind a keyed wrapper (plaintext, chunked, v1,
+    /// each with and without a key id, and under the previous key) answers
+    /// every range shape exactly as an unkeyed read of the plaintext twin:
+    /// the same length, bytes and metadata, or the same error. On S3 also
+    /// with a store that sends GET bodies chunked (no Content-Length).
+    #[tokio::test]
+    async fn every_format_answers_ranges_as_its_plaintext_twin_on_s3() {
+        for chunked in [false, true] {
+            let (ep, fake) = fake_s3::start().await;
+            fake.set_chunked_gets(chunked);
+            let mm = run(|| crate::storage::s3::test_support::for_test_endpoint(&ep)).await;
+            assert!(mm.is_empty(), "chunked GETs {chunked}: {mm:#?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn every_format_answers_ranges_as_its_plaintext_twin_on_the_filesystem() {
+        use crate::storage::filesystem::FilesystemBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let mut backends = Vec::new();
+        for _ in 0..6 {
+            backends.push(
+                FilesystemBackend::new(dir.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            );
+        }
+        let cell = std::sync::Mutex::new(backends);
+        let mm = run(|| cell.lock().unwrap().pop().unwrap()).await;
+        assert!(mm.is_empty(), "{mm:#?}");
+    }
+}

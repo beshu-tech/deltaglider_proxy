@@ -63,6 +63,9 @@ pub(crate) struct FakeS3 {
     /// Object DELETEs ignore `If-Match`, as on a backend that honours the
     /// condition on PUT only ([`FakeS3::set_delete_if_match_ignored`]).
     delete_if_match_ignored: std::sync::atomic::AtomicBool,
+    /// Overwrites armed by [`FakeS3::overwrite_after_gets`]: (object,
+    /// source, GETs of the object still to answer first).
+    overwrites: parking_lot::Mutex<Vec<(String, String, u32)>>,
 }
 
 impl FakeS3 {
@@ -200,6 +203,39 @@ impl FakeS3 {
         let stored = objects.get_mut(path).expect("the object exists");
         stored.body = body.to_vec();
         stored.etag = format!("\"{}\"", hex::encode(md5::Md5::digest(body)));
+    }
+
+    /// After `gets` more GETs of `path` are answered, `path` becomes a copy
+    /// of `source` (its body, metadata and ETag), as a concurrent writer
+    /// would make it: a test reads one version, then another, with no
+    /// timing. The copy happens when the last of those GETs has read the
+    /// object, before its response leaves.
+    pub(crate) fn overwrite_after_gets(&self, path: &str, source: &str, gets: u32) {
+        self.overwrites
+            .lock()
+            .push((path.to_string(), source.to_string(), gets));
+    }
+
+    /// One GET of `path` read the object: run the overwrites it arms.
+    fn after_get(&self, path: &str) {
+        let mut due = Vec::new();
+        self.overwrites.lock().retain_mut(|(at, source, left)| {
+            if at != path {
+                return true;
+            }
+            *left = left.saturating_sub(1);
+            if *left == 0 {
+                due.push(source.clone());
+                return false;
+            }
+            true
+        });
+        for source in due {
+            let mut objects = self.objects.lock();
+            if let Some(o) = objects.get(&source).cloned() {
+                objects.insert(path.to_string(), o);
+            }
+        }
     }
 
     /// Answer object ACL requests (`?acl`) with 501 NotImplemented.
@@ -546,6 +582,9 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                             return object_acl(&f, &method);
                         }
                         let current = f.objects.lock().get(&path).cloned();
+                        if method == Method::GET {
+                            f.after_get(&path);
+                        }
                         // Conditional writes (`If-None-Match: *`, `If-Match`)
                         // answer 412 like S3 when the condition does not hold.
                         let if_match = headers.get("if-match").and_then(|v| v.to_str().ok());

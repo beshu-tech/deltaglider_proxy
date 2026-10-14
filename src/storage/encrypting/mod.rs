@@ -183,7 +183,6 @@ pub struct EncryptionConfig {
 // Streaming decoder
 // ─────────────────────────────────────────────────────────────────────
 
-/// First `n` bytes of an object (fewer for a shorter object), by range.
 /// A whole stream in one buffer.
 async fn collect_stream(stream: ByteStream) -> Result<Vec<u8>, StorageError> {
     use futures::TryStreamExt;
@@ -193,88 +192,6 @@ async fn collect_stream(stream: ByteStream) -> Result<Vec<u8>, StorageError> {
         buf.extend_from_slice(&p);
     }
     Ok(buf)
-}
-
-async fn read_prefix<B: StorageBackend + ?Sized>(
-    inner: &B,
-    bucket: &str,
-    prefix: &str,
-    filename: &str,
-    n: usize,
-) -> Result<Vec<u8>, StorageError> {
-    use futures::StreamExt;
-    let (mut stream, _) = inner
-        .get_passthrough_stream_range(bucket, prefix, filename, 0, n as u64 - 1)
-        .await?;
-    let mut buf = Vec::with_capacity(n);
-    while buf.len() < n {
-        match stream.next().await {
-            Some(chunk) => buf.extend_from_slice(&chunk?),
-            None => break,
-        }
-    }
-    buf.truncate(n);
-    Ok(buf)
-}
-
-/// Fetch the 16-byte `[magic][base_iv]` header via a short range request
-/// and return the parsed `base_iv`. Errors on bad magic or truncation
-/// — the caller should propagate those unchanged.
-///
-/// Small enough that the overhead of an extra backend call is
-/// negligible vs. the gain of bounded-cost range reads on large
-/// objects. Used only by the range-read path; the full-file stream
-/// decoder parses the header from its own byte stream in phase 1.
-async fn fetch_chunked_header<B: StorageBackend + ?Sized>(
-    inner: &B,
-    bucket: &str,
-    prefix: &str,
-    filename: &str,
-) -> Result<[u8; IV_LEN], StorageError> {
-    use futures::StreamExt;
-    let (mut stream, content_length) = inner
-        .get_passthrough_stream_range(bucket, prefix, filename, 0, CHUNK_HEADER_LEN as u64 - 1)
-        .await?;
-    // H5: the default `get_passthrough_stream_range` impl (for backends
-    // that don't override — custom third-party backends) returns the
-    // FULL stream with `content_length = 0`. The range-read path would
-    // then invoke the backend TWICE for what should be a bounded
-    // request — once here (header) + once for the body — each fetching
-    // the entire object. Detect the signal and refuse: the encrypted
-    // range-read path REQUIRES a native-range-capable backend to
-    // avoid unbounded memory use on large objects. S3 + filesystem
-    // both override the default and work correctly.
-    if content_length == 0 {
-        return Err(StorageError::Other(
-            "chunked-encrypted range reads require a backend with native range support; \
-             this backend falls through to the default trait impl. Implement \
-             `get_passthrough_stream_range` on your StorageBackend to fix."
-                .into(),
-        ));
-    }
-    let mut buf: Vec<u8> = Vec::with_capacity(CHUNK_HEADER_LEN);
-    while buf.len() < CHUNK_HEADER_LEN {
-        match stream.next().await {
-            Some(Ok(b)) => buf.extend_from_slice(&b),
-            Some(Err(e)) => return Err(e),
-            None => {
-                return Err(StorageError::Encryption(format!(
-                    "stream ended before encryption header (got {} of {} bytes)",
-                    buf.len(),
-                    CHUNK_HEADER_LEN
-                )));
-            }
-        }
-    }
-    if buf[..4] != CHUNK_MAGIC {
-        return Err(StorageError::Encryption(format!(
-            "bad chunked-encryption magic: {:02x?}",
-            &buf[..4]
-        )));
-    }
-    let mut base_iv = [0u8; IV_LEN];
-    base_iv.copy_from_slice(&buf[4..CHUNK_HEADER_LEN]);
-    Ok(base_iv)
 }
 
 /// `take` bytes of `stream` after its first `skip` bytes.
@@ -481,14 +398,7 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             let mut wire = collect_stream(stream).await?;
             if !whole {
                 match self
-                    .inner
-                    .get_passthrough_stream_range(
-                        bucket,
-                        prefix,
-                        filename,
-                        guess_end + 1,
-                        u64::MAX - 1,
-                    )
+                    .pinned_range(bucket, prefix, filename, guess_end + 1, u64::MAX - 1, &meta)
                     .await
                 {
                     Ok((rest, _)) => wire.extend_from_slice(&collect_stream(rest).await?),
@@ -532,8 +442,7 @@ impl<B: StorageBackend> EncryptingBackend<B> {
                 return Err(stripped_marker_error());
             }
             let (stream, len) = self
-                .inner
-                .get_passthrough_stream_range(bucket, prefix, filename, start, end)
+                .pinned_range(bucket, prefix, filename, start, end, &meta)
                 .await?;
             return Ok((stream, len, meta));
         }
@@ -557,30 +466,53 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         drop(frames);
         let (plain, len) = self
             .chunked_frames_range(
-                bucket,
-                prefix,
-                filename,
+                (bucket, prefix, filename),
                 (start, effective_end),
-                key,
-                base_iv,
-                final_idx,
+                (key, base_iv, final_idx),
+                &meta,
             )
             .await?;
         Ok((plain, len, meta))
     }
 
-    /// The plaintext `start..=end` (clamped already) of a chunked object
-    /// whose header is known: one ranged GET of the frames that hold it.
-    #[allow(clippy::too_many_arguments)]
-    async fn chunked_frames_range(
+    /// A follow-up read of `start..=end` of the stored (raw) object whose
+    /// first read gave the metadata `pin`. Its response carries the stored
+    /// metadata too: when it shows another version (a write replaced the
+    /// object between the two requests), the read fails with a retryable
+    /// 503 SlowDown, so the bytes of one version never go out with the
+    /// metadata (the ETag, the format) of another. Every follow-up read of
+    /// this wrapper goes through here.
+    async fn pinned_range(
         &self,
         bucket: &str,
         prefix: &str,
         filename: &str,
+        start: u64,
+        end: u64,
+        pin: &FileMetadata,
+    ) -> Result<(ByteStream, u64), StorageError> {
+        let (stream, len, again) = self
+            .inner
+            .open_passthrough_range(bucket, prefix, filename, start, end)
+            .await?;
+        if !super::traits::same_stored_version(pin, &again) {
+            return Err(super::traits::object_changed_while_read(
+                bucket,
+                &format!("{prefix}/{filename}"),
+            ));
+        }
+        Ok((stream, len))
+    }
+
+    /// The plaintext `start..=end` (clamped already) of a chunked object
+    /// whose header is known: one ranged GET of the frames that hold it,
+    /// pinned to the version whose metadata is `pin`.
+    async fn chunked_frames_range(
+        &self,
+        (bucket, prefix, filename): (&str, &str, &str),
         (start, effective_end): (u64, u64),
-        key: EncryptionKey,
-        base_iv: [u8; IV_LEN],
-        final_idx: u32,
+        (key, base_iv, final_idx): (EncryptionKey, [u8; IV_LEN], u32),
+        pin: &FileMetadata,
     ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError> {
         let (first_chunk, _) = chunk_index_for_plaintext_offset(start);
         let (last_chunk, _) = chunk_index_for_plaintext_offset(effective_end);
@@ -597,8 +529,7 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             u64::MAX - 1
         };
         let (ct_stream, _) = self
-            .inner
-            .get_passthrough_stream_range(bucket, prefix, filename, wire_start, wire_end)
+            .pinned_range(bucket, prefix, filename, wire_start, wire_end, pin)
             .await?;
         // Skip any plaintext bytes before `start` within the
         // first fetched chunk. E.g. for start=70000 and chunk
@@ -618,96 +549,6 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             Some(plaintext_len),
         );
         Ok((plain, plaintext_len))
-    }
-
-    /// A range of a passthrough object whose raw stored metadata is `meta`.
-    async fn range_with_meta(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        start: u64,
-        end: u64,
-        meta: &FileMetadata,
-    ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError> {
-        // Chunked path: fetch only the wire bytes covering the target
-        // chunks, using O(1) offset math — every non-final chunk is
-        // exactly `CHUNK_FRAME_WIRE_LEN` bytes. We issue TWO backend
-        // reads:
-        //
-        //   1. Header fetch: wire bytes `[0, CHUNK_HEADER_LEN)` — 16
-        //      bytes for the magic + base_iv. Tiny, always needed.
-        //   2. Body fetch: wire bytes from `wire_offset_of_chunk(
-        //      first_chunk)` through the end of `last_chunk`. For
-        //      non-final `last_chunk` this is a bounded window; for
-        //      `last_chunk == final_idx` we ask for EOF (the final
-        //      chunk may be shorter than a full frame).
-        //
-        // The alternative — fetching from wire-offset 0 through
-        // last_chunk and relying on the decoder to discard the
-        // leading chunks — is O(N) for reads near the end of large
-        // objects (before this fix: "last 100 bytes of a 10 GiB file"
-        // pulled all 10 GiB). The two-fetch approach trades one extra
-        // tiny request for bounded cost on every range shape.
-        if is_chunked_encrypted(meta) {
-            // Shim-aware key selection; same behaviour as the full-
-            // stream path. Surfaces the specific error before any
-            // backend range reads fire.
-            let key = self.pick_decrypt_key(stamped_key_id(meta))?;
-            let final_idx = final_chunk_index_for_plaintext_size(meta.file_size);
-            // Out-of-range for this object (the caller's size can be stale):
-            // an error, never the pre-B3 `(empty, 0)` "not a range" signal.
-            let (start, effective_end) = super::clamp_range(start, end, meta.file_size)?;
-
-            // Fetch #1: just the header. Size is tiny
-            // (CHUNK_HEADER_LEN = 16 bytes). Fetch #2: the frames.
-            let base_iv = fetch_chunked_header(&self.inner, bucket, prefix, filename).await?;
-            return self
-                .chunked_frames_range(
-                    bucket,
-                    prefix,
-                    filename,
-                    (start, effective_end),
-                    key,
-                    base_iv,
-                    final_idx,
-                )
-                .await;
-        }
-
-        // v1 single-shot path (bounded by max_object_size). Same as
-        // before — buffer-and-slice.
-        if is_encrypted(meta) {
-            let data = self.inner.get_passthrough(bucket, prefix, filename).await?;
-            let plain = self.decrypt_if_needed(data, meta)?;
-            // Clamp against the decrypted length, not a (maybe stale) size.
-            let (s, e) = super::clamp_range(start, end, plain.len() as u64)?;
-            let slice = Bytes::from(plain[s as usize..=e as usize].to_vec());
-            let len = slice.len() as u64;
-            return Ok((Box::pin(futures::stream::once(async { Ok(slice) })), len));
-        }
-
-        // Not encrypted per metadata. Same DGE1 belt-and-suspenders as the
-        // full-stream path (a stripped marker must not serve ciphertext).
-        // A range from 0 carries the magic itself: sniff it for free. A
-        // later range needs a 4-byte probe; only a backend with a key
-        // (primary or legacy) can hold such bodies, so a plain backend pays
-        // no extra request.
-        if start > 0 && self.has_any_key() {
-            let magic =
-                read_prefix(&self.inner, bucket, prefix, filename, CHUNK_MAGIC.len()).await?;
-            if magic == CHUNK_MAGIC {
-                return Err(stripped_marker_error());
-            }
-        }
-        let (stream, len) = self
-            .inner
-            .get_passthrough_stream_range(bucket, prefix, filename, start, end)
-            .await?;
-        if start == 0 {
-            return Ok((sniff_dge1_magic(stream), len));
-        }
-        Ok((stream, len))
     }
 
     fn has_any_key(&self) -> bool {
@@ -1393,12 +1234,12 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
             .open_passthrough_range(bucket, prefix, filename, start, end)
             .await?;
         if is_chunked_encrypted(&meta) || is_encrypted(&meta) {
-            // Encrypted, and no key to read it: the range read names why.
+            // Encrypted, and no key to read it: the key choice names why,
+            // with no more requests. A key that a reload added since the
+            // check above reads the object the keyed way.
             drop(stream);
-            let (stream, len) = self
-                .range_with_meta(bucket, prefix, filename, start, end, &meta)
-                .await?;
-            return Ok((stream, len, meta));
+            self.pick_decrypt_key(stamped_key_id(&meta))?;
+            return self.keyed_range(bucket, prefix, filename, start, end).await;
         }
         if start == 0 {
             return Ok((sniff_dge1_magic(stream), len, meta));

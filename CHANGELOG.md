@@ -148,6 +148,16 @@ a write counted twice, so the bucket could stay over its quota with no
 further scan. Now only a scan during which the bucket did not change
 stamps the counter. A busy Refresh still shows its numbers, marked as not
 reconciled; refresh again when the bucket is quiet.
+### Fixed — A ranged read of an encrypted backend never mixes two versions
+
+A range read on a backend with an encryption key can need two requests:
+the first one reads the object's format, and the second one reads the
+bytes. When a write replaced the object between the two requests, a
+plaintext object that was replaced by an encrypted one was served as
+ciphertext under the old ETag. Now the second request must find the same
+version as the first, or the read answers 503 SlowDown, and clients retry
+it.
+
 ### Fixed — Ranged reads from stores that send no Content-Length
 
 Some S3-compatible stores send the body of a GET in chunks, with no
