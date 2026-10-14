@@ -589,6 +589,9 @@ impl Metrics {
         registry
             .register(Box::new(crate::event_outbox::OUTBOX_QUEUE_FULL.clone()))
             .expect("duplicate metric name");
+        registry
+            .register(Box::new(crate::event_outbox::OUTBOX_QUEUED_EVENTS.clone()))
+            .expect("duplicate metric name");
         // Connections the listener closed at its cap (a static: the
         // listener has no Metrics handle).
         registry
@@ -793,6 +796,10 @@ pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     metrics
         .multipart_uploads_inflight
         .set(state.multipart.count_uploads() as f64);
+    if let Some(db) = &state.jobs_db {
+        crate::event_outbox::OUTBOX_QUEUED_EVENTS
+            .set(crate::event_outbox::queued_events(db) as i64);
+    }
 
     let encoder = TextEncoder::new();
     let metric_families = metrics.registry.gather();

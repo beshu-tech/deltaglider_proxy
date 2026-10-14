@@ -399,10 +399,11 @@ pub async fn readiness_check(
         }
     };
     // The config DB and the jobs DB: if configured, confirm we can take the
-    // lock (a wedged mutex means the control plane is stuck). Every S3
-    // mutation holds the jobs DB lock for a moment (the event outbox), so
-    // the probe waits briefly: a busy mutex is ready, only one held past the
-    // wait is not. `None` = legacy/open mode.
+    // lock (a wedged mutex means the control plane is stuck). Requests do
+    // not take the jobs DB lock (they queue their outbox events), but the
+    // outbox writer task and the job workers hold it for a moment at a
+    // time, so the probe waits briefly: a busy mutex is ready, only one
+    // held past the wait is not. `None` = legacy/open mode.
     let config_db = match &state.config_db {
         Some(db) => lock_readiness(db).await,
         None => "absent",

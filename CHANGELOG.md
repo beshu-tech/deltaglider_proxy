@@ -63,6 +63,15 @@ listing, and the folder listing of the file browser failed the same way. The
 proxy now skips a prefix that sorts completely before the continuation
 token, with no request, and skips a folder entry that the user cannot see
 before it checks the limit.
+### Fixed — The event log documents what a crash can lose, and shows it
+
+The docs said that a crash of the process loses "the last few milliseconds"
+of object events. The real bound is the queue in front of the outbox
+writer: when the jobs DB is slower than the write traffic, the queue grows
+up to 65,536 appends, and a crash loses all of them. The new gauge
+`deltaglider_outbox_queued_events` shows how many events are in the queue
+now. The objects themselves are never lost, only their events.
+
 ### Fixed — The listener closes a connection that does not send its request head
 
 Neither listener (plain HTTP nor HTTPS) had a time limit on the request

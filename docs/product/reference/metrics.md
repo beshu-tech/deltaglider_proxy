@@ -237,7 +237,8 @@ Auth metrics stay at zero when SigV4 is disabled.
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `deltaglider_outbox_queue_full_total` | Counter | — | Object events that had to wait because the queue in front of the outbox writer was full. Each wait delays the response of one write request; no event is dropped. A rising value means that the config DB cannot keep up with the write traffic |
+| `deltaglider_outbox_queue_full_total` | Counter | — | Object events that had to wait because the queue in front of the outbox writer was full. Each wait delays the response of one write request; no event is dropped. A rising value means that the jobs DB cannot keep up with the write traffic |
+| `deltaglider_outbox_queued_events` | Gauge | — | Object events in the queue in front of the outbox writer that are not written to the jobs DB yet. A crash of the process loses these events (the objects themselves are stored). The value is usually close to 0; a high value means that the jobs DB cannot keep up with the write traffic |
 
 ## Config DB sync
 

@@ -1180,6 +1180,28 @@ pub static OUTBOX_QUEUE_FULL: std::sync::LazyLock<prometheus::IntCounter> =
         .expect("valid metric")
     });
 
+/// Events in the writer's queue, not written yet: the events that a crash
+/// of the process would lose. Set at each scrape from [`queued_events`].
+pub static OUTBOX_QUEUED_EVENTS: std::sync::LazyLock<prometheus::IntGauge> =
+    std::sync::LazyLock::new(|| {
+        prometheus::IntGauge::new(
+            "deltaglider_outbox_queued_events",
+            "Object events in the event outbox writer queue, not yet written to the jobs DB (a crash loses them)",
+        )
+        .expect("valid metric")
+    });
+
+/// Events queued for `db`'s writer and not written yet (0 when no writer
+/// started). Starts no writer.
+pub fn queued_events(db: &std::sync::Arc<tokio::sync::Mutex<JobsDb>>) -> usize {
+    let weak = std::sync::Arc::downgrade(db);
+    APPENDERS
+        .lock()
+        .iter()
+        .find(|a| a.db.ptr_eq(&weak))
+        .map_or(0, |a| a.queued.load(std::sync::atomic::Ordering::SeqCst))
+}
+
 /// The writer task of one jobs DB (see [`append_events`]).
 struct Appender {
     db: std::sync::Weak<tokio::sync::Mutex<JobsDb>>,
@@ -1316,9 +1338,11 @@ fn insert_logged(db: &JobsDb, events: &[NewEvent]) {
 /// The queue is bounded (65,536 appends). When it is full, the append
 /// waits for room (and counts [`OUTBOX_QUEUE_FULL`]); it never drops.
 ///
-/// A crash loses the events still in the queue (owner decision D2: about
-/// the last milliseconds of writes); [`flush_appends`] writes them at a
-/// graceful shutdown.
+/// A crash loses the events still in the queue (owner decision D2). That
+/// is usually the last milliseconds of writes, but a jobs DB that cannot
+/// keep up lets the queue grow to its cap, so the bound is the queue, not
+/// a time: [`OUTBOX_QUEUED_EVENTS`] shows it. [`flush_appends`] writes the
+/// queue at a graceful shutdown.
 pub async fn append_events(db: &std::sync::Arc<tokio::sync::Mutex<JobsDb>>, events: Vec<NewEvent>) {
     append_events_capped(db, events, APPEND_QUEUE_CAP).await
 }
@@ -2082,6 +2106,22 @@ mod tests {
         waiting.await.unwrap();
         flush_appends(&db).await;
         assert_eq!(outbox_keys(&*db.lock().await), ["k0", "k1", "k2", "k3"]);
+    }
+
+    /// The gauge source: the events queued and not written yet, which a
+    /// crash would lose. It grows while the writer waits for the DB.
+    #[tokio::test]
+    async fn queued_events_counts_what_a_crash_would_lose() {
+        let db = shared(JobsDb::in_memory("pw").unwrap());
+        assert_eq!(queued_events(&db), 0);
+        let held = db.lock().await; // the writer blocks on the DB
+        for i in 0..3 {
+            append_events(&db, vec![event_at(1, &format!("k{i}"))]).await;
+        }
+        assert_eq!(queued_events(&db), 3);
+        drop(held);
+        flush_appends(&db).await;
+        assert_eq!(queued_events(&db), 0);
     }
 
     /// P4.2: with no reader the append writes nothing; a reader turns it on.
