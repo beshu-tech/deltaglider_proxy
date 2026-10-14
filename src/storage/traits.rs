@@ -77,9 +77,11 @@ pub struct ReferenceSource {
 enum ReferenceBody {
     /// Bytes to write (an S3 GET body, a decrypted buffer).
     Stream(ByteStream),
-    /// A local file to hardlink, or copy where a hardlink fails (the
-    /// filesystem backend).
-    Local(PathBuf),
+    /// The local file that the read opened (the filesystem backend), and
+    /// its path: hardlinked while the path still names that file, else
+    /// copied from the open file. A write that renames a new file over
+    /// the path after the open never changes what is written.
+    Local { path: PathBuf, file: std::fs::File },
 }
 
 impl ReferenceSource {
@@ -92,24 +94,36 @@ impl ReferenceSource {
         }
     }
 
-    /// A source that is a local file of `size` bytes.
-    pub fn local(path: PathBuf, size: u64, metadata: FileMetadata) -> Self {
+    /// A source that is the open local `file` of `size` bytes (from its
+    /// fstat), found at `path`.
+    pub fn local(path: PathBuf, file: std::fs::File, size: u64, metadata: FileMetadata) -> Self {
         Self {
             size,
             metadata,
-            content: ReferenceBody::Local(path),
+            content: ReferenceBody::Local { path, file },
         }
     }
 
     /// The whole body in memory (the encrypting wrapper decrypts it).
     pub async fn read_all(self) -> Result<Vec<u8>, StorageError> {
         use futures::TryStreamExt;
+        use tokio::io::AsyncReadExt;
         match self.content {
             ReferenceBody::Stream(stream) => {
                 let chunks: Vec<Bytes> = stream.try_collect().await?;
                 Ok(chunks.concat())
             }
-            ReferenceBody::Local(path) => Ok(tokio::fs::read(&path).await?),
+            ReferenceBody::Local { file, .. } => {
+                let mut out = Vec::new();
+                tokio::fs::File::from_std(file)
+                    .take(self.size.saturating_add(1))
+                    .read_to_end(&mut out)
+                    .await?;
+                if out.len() as u64 != self.size {
+                    return Err(reference_size_mismatch(self.size, out.len() as u64));
+                }
+                Ok(out)
+            }
         }
     }
 
@@ -119,14 +133,34 @@ impl ReferenceSource {
     /// bytes written.
     pub async fn write_to(self, dest: &Path) -> Result<u64, StorageError> {
         use futures::StreamExt;
+        use std::os::unix::fs::MetadataExt;
         use tokio::io::AsyncWriteExt;
         match self.content {
-            ReferenceBody::Local(src) => {
+            ReferenceBody::Local { path, file } => {
                 let _ = tokio::fs::remove_file(dest).await;
-                if tokio::fs::hard_link(&src, dest).await.is_err() {
-                    tokio::fs::copy(&src, dest).await?;
+                let opened = file.metadata()?;
+                if tokio::fs::hard_link(&path, dest).await.is_ok() {
+                    let linked = tokio::fs::metadata(dest).await?;
+                    if (linked.dev(), linked.ino()) == (opened.dev(), opened.ino()) {
+                        return Ok(opened.len());
+                    }
+                    // Another file is at the path now: copy the opened one.
+                    tokio::fs::remove_file(dest).await?;
                 }
-                Ok(tokio::fs::metadata(dest).await?.len())
+                let mut out = tokio::fs::File::create(dest).await?;
+                let written = tokio::io::copy(
+                    &mut tokio::io::AsyncReadExt::take(
+                        tokio::fs::File::from_std(file),
+                        self.size.saturating_add(1),
+                    ),
+                    &mut out,
+                )
+                .await?;
+                out.flush().await?;
+                if written != self.size {
+                    return Err(reference_size_mismatch(self.size, written));
+                }
+                Ok(written)
             }
             ReferenceBody::Stream(mut stream) => {
                 let mut file = tokio::fs::File::create(dest).await?;
@@ -147,6 +181,14 @@ impl ReferenceSource {
             }
         }
     }
+}
+
+/// The error of a local reference file whose length is not the size its
+/// open file had.
+fn reference_size_mismatch(size: u64, got: u64) -> StorageError {
+    StorageError::Other(format!(
+        "reference file holds {got} bytes, not its declared {size}"
+    ))
 }
 
 /// `open_passthrough_range` from the metadata read, then the range read.

@@ -679,6 +679,68 @@ async fn the_filesystem_reference_source_hardlinks() {
     assert_eq!(linked.nlink(), 2, "the reference is hardlinked, not copied");
 }
 
+/// The filesystem reference source is the file opened by the read: a
+/// write that replaced `reference.bin` after the open (a new baseline)
+/// does not change what it writes. Before, it hardlinked the path, so the
+/// spool got the new file under the old metadata and size, and its
+/// returned length came from the new file.
+#[tokio::test]
+async fn the_filesystem_reference_source_writes_the_file_it_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = crate::storage::FilesystemBackend::new(dir.path().join("data"))
+        .await
+        .unwrap();
+    let backend: Backend = Arc::new(DynStorageBackend::new_box(fs));
+    let engine = engine_on(&backend, None);
+    engine.create_bucket("b").await.unwrap();
+    let base = rnd(64 * 1024, 21);
+    engine
+        .store("b", "dir/v0.zip", &base, None, Default::default())
+        .await
+        .unwrap();
+    let opened = backend.get_reference("b", "dir").await.unwrap();
+    for read_all in [false, true] {
+        let source = backend.open_reference_source("b", "dir").await.unwrap();
+        let meta = backend.get_reference_metadata("b", "dir").await.unwrap();
+        let newer = rnd(80 * 1024, 22 + u64::from(read_all));
+        backend
+            .put_reference(
+                "b",
+                "dir",
+                bytes::Bytes::from(newer),
+                &meta,
+                crate::deltaglider::RefWriteProof::for_tests(),
+            )
+            .await
+            .unwrap();
+        let got = if read_all {
+            source.read_all().await.unwrap()
+        } else {
+            let dest = dir.path().join("spooled-reference");
+            let written = source.write_to(&dest).await.unwrap();
+            let got = std::fs::read(&dest).unwrap();
+            assert_eq!(written, got.len() as u64);
+            got
+        };
+        assert_eq!(got.len(), opened.len(), "read_all {read_all}");
+        assert!(
+            got == opened,
+            "read_all {read_all}: the bytes of the opened file"
+        );
+        // Back to the first version for the next round.
+        backend
+            .put_reference(
+                "b",
+                "dir",
+                bytes::Bytes::from(opened.clone()),
+                &meta,
+                crate::deltaglider::RefWriteProof::for_tests(),
+            )
+            .await
+            .unwrap();
+    }
+}
+
 /// A body longer than its declared size fails before it overruns the
 /// spool reservation.
 #[tokio::test]
