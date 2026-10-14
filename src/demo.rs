@@ -349,6 +349,12 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             "/_/api/admin/encryption-witness",
             get(admin::get_encryption_witness),
         )
+        // The operator publishes this instance's encryption of named
+        // storages (after a restart rollout). Audited.
+        .route(
+            "/_/api/admin/encryption-witness/publish",
+            post(admin::publish_encryption_witness),
+        )
         // Live admin session list + force-logout (revoke a stolen cookie / all
         // sessions of a compromised IAM key) without restarting the proxy.
         .route("/_/api/admin/sessions", get(admin::list_sessions))

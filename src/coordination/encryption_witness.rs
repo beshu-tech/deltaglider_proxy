@@ -7,48 +7,44 @@
 //! key). The witness makes such a node refuse WRITES to that bucket: two
 //! nodes never write one bucket in two forms.
 //!
-//! ## Objects in the coordination bucket
+//! ## The manifest
 //!
-//! * `_dgp/encryption/intent.json` — THE manifest: for each stored bucket
-//!   (raw backend + real bucket name; the bucket `*` stands for every
-//!   bucket of the backend with no entry of its own) the published write
-//!   encryption `{mode, key_id, kcv}`, the node that set it and when
-//!   (`set_at`, on the S3 server clock). Never key material: the key id is
-//!   the public id that every object already carries, and the key check
-//!   value is a truncated HMAC of the key. Written with the CAS rules of
-//!   the rest of coordination: create with `If-None-Match: *`, replace with
-//!   `If-Match: <etag>`, re-read and merge on a lost race.
-//! * `_dgp/encryption/nodes/<node id>-<boot id>.json` — each node's
-//!   heartbeat: its own write encryption for every witnessed storage.
-//!   Liveness is judged on the S3 server clock (the GET's `Date` minus the
-//!   object's `Last-Modified`, against the body's `ttl_secs`).
+//! `_dgp/encryption/intent.json` in the coordination bucket holds, for each
+//! stored bucket (raw backend + real bucket name; the bucket `*` stands for
+//! every bucket of the backend with no entry of its own), the published
+//! write encryption `{mode, key_id, kcv}`, who set it and when. Never key
+//! material: the key id is the public id that every object carries, and
+//! the key check value is a truncated HMAC of the key. Written with the CAS
+//! rules of the rest of coordination: create with `If-None-Match: *`,
+//! replace with `If-Match: <etag>`, re-read and merge on a lost race.
 //!
-//! ## Who sets the intent
+//! ## Who changes an entry (owner decision: no automatic takeover)
 //!
-//! * **Seeding** (boot and every poll): each node adds, create-only, every
-//!   storage that it ENCRYPTS (its bucket blocks, the buckets it names that
-//!   inherit an encrypting backend, and each encrypting backend's `*`).
-//!   Plaintext is never seeded, so a node that boots with `mode: none` for
-//!   a bucket that others encrypt is a mismatch, never a first writer.
-//! * **Compare** (boot and every poll): a node whose write encryption for a
-//!   witnessed storage differs from the manifest refuses writes to it
-//!   (`503 SlowDown` naming the mismatch; reads keep working).
-//! * **A config apply** on a node publishes that node's write encryption
-//!   for every storage whose encryption the apply changed on the node (the
-//!   transition gated a downgrade with its confirmation), and for every
-//!   storage that the request confirmed as a downgrade (the supported path
-//!   to finish a downgrade that the nodes got by restart).
-//! * **Takeover**: a mismatched node publishes its own encryption only when
-//!   no live node holds the published one, its config is NEWER than the
-//!   published entry (its config file changed after `set_at`, so a lagging
-//!   node that restarts with its old file never wins), its own state is not
-//!   a refusal (a missing key), and it is not a downgrade. Every takeover
-//!   is audited.
-//! * **Freshness**: a node whose last successful sync is older than two
-//!   polls refuses writes to every witnessed storage (it stops before its
-//!   heartbeat lapses after three polls and a peer may take over). At boot
-//!   the gate starts closed for the witnessed storages until a sync
-//!   succeeds.
+//! 1. **Seeding**, create-only: each node adds every storage that it
+//!    ENCRYPTS (its bucket blocks, the buckets it names that inherit an
+//!    encrypting backend, each encrypting backend's `*`) when the manifest
+//!    lacks it. Never plaintext, never a refusal (a proxy mode, no key).
+//! 2. **A config apply** that CHANGES a storage's encryption on a node
+//!    publishes that storage (per changed storage). A downgrade needs the
+//!    apply's confirmation; a confirmed subject whose intent is plaintext
+//!    is published also when the config did not change.
+//! 3. **`witness publish`** (`POST /_/api/admin/encryption-witness/publish`,
+//!    CLI `deltaglider_proxy witness publish <subject>...`): the operator
+//!    publishes this node's current encryption of named storages, e.g.
+//!    after a restart rollout (a ConfigMap, an env key). Plaintext needs the
+//!    downgrade confirmation. Audited (`bucket_encryption_witness_publish`).
+//!
+//! Every other disagreement fails CLOSED: a node whose encryption of a
+//! witnessed storage differs from the published one refuses writes to it
+//! (`503 SlowDown` naming the mismatch and the publish command; reads keep
+//! working). A node that takes the verdict from the backend's `*` entry
+//! (a bucket block with no entry of its own) is judged against it too.
+//!
+//! **Freshness**: a verdict holds two polls, measured from the START of the
+//! sync that produced it; then the node refuses writes to every witnessed
+//! storage until a sync succeeds. At boot the gate starts closed for them.
+//! Residual: a write admitted before the gate closes (a large upload) can
+//! finish after it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -60,8 +56,6 @@ use crate::storage::{WitnessGate, WitnessGateState, WITNESS_BACKEND_DEFAULT};
 
 /// The manifest object.
 pub const MANIFEST_KEY: &str = "_dgp/encryption/intent.json";
-/// The prefix of the node heartbeat objects.
-pub const NODES_PREFIX: &str = "_dgp/encryption/nodes/";
 /// Default poll interval (`DGP_ENCRYPTION_WITNESS_POLL_SECS`).
 pub const DEFAULT_POLL_SECS: u64 = 30;
 
@@ -116,23 +110,6 @@ impl Manifest {
     }
 }
 
-/// One node's heartbeat.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NodeRecord {
-    pub node: String,
-    pub boot_id: String,
-    pub ttl_secs: i64,
-    /// backend → real bucket → this node's write encryption.
-    #[serde(default)]
-    pub storages: BTreeMap<String, BTreeMap<String, WriteEncryption>>,
-}
-
-impl NodeRecord {
-    fn get(&self, s: &Storage) -> Option<&WriteEncryption> {
-        self.storages.get(&s.0).and_then(|b| b.get(&s.1))
-    }
-}
-
 /// A storage where this node and the manifest disagree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Mismatch {
@@ -160,8 +137,10 @@ impl Mismatch {
             self.local.mode == self.published.mode && self.local.key_id == self.published.key_id;
         format!(
             "{which}: this instance writes with {}, but the encryption that the instances share \
-             (coordination bucket) is {}{}, set by '{}'. This instance refuses writes until its \
-             config agrees: apply the same config on every instance. Reads keep working",
+             (coordination bucket) is {}{}, set by '{}'. This instance refuses writes until they \
+             agree: apply the same config here, or, if this instance has the encryption that \
+             you want, run `deltaglider_proxy witness publish {}` (POST \
+             /_/api/admin/encryption-witness/publish). Reads keep working",
             self.local.describe(),
             self.published.describe(),
             if keys_differ {
@@ -169,8 +148,18 @@ impl Mismatch {
             } else {
                 ""
             },
-            self.set_by
+            self.set_by,
+            self.subject()
         )
+    }
+
+    /// The `witness publish` subject that publishes this storage.
+    pub fn subject(&self) -> String {
+        if self.bucket == WITNESS_BACKEND_DEFAULT {
+            format!("backend:{}", self.backend)
+        } else {
+            self.bucket.clone()
+        }
     }
 }
 
@@ -240,22 +229,41 @@ pub fn witnessed(cfg: &Config, manifest: &Manifest) -> BTreeSet<Storage> {
     out
 }
 
-/// Every manifest entry that this node can write and disagrees with.
+/// Every manifest entry that this node can write and disagrees with, and
+/// every storage of this node with no entry of its own that disagrees with
+/// its backend's `*` entry (the gate judges such a bucket by `*`, so the
+/// verdict must too: a bucket block `mode: none` on a backend that the
+/// others encrypt is a mismatch, never an agreement).
 pub fn mismatches(cfg: &Config, manifest: &Manifest) -> Vec<Mismatch> {
-    manifest
+    let judged = |s: Storage, p: &Published| {
+        let local = intent_of(cfg, &s)?;
+        (local != p.intent).then(|| Mismatch {
+            backend: s.0.clone(),
+            bucket: s.1.clone(),
+            local,
+            published: p.intent.clone(),
+            set_by: p.set_by.clone(),
+        })
+    };
+    let mut out: Vec<Mismatch> = manifest
         .keys()
         .filter_map(|s| {
-            let local = intent_of(cfg, &s)?;
-            let p = manifest.get(&s)?;
-            (local != p.intent).then(|| Mismatch {
-                backend: s.0.clone(),
-                bucket: s.1.clone(),
-                local,
-                published: p.intent.clone(),
-                set_by: p.set_by.clone(),
-            })
+            let p = manifest.get(&s)?.clone();
+            judged(s, &p)
         })
-        .collect()
+        .collect();
+    let mut own: BTreeSet<Storage> = override_storages(cfg);
+    own.extend(config_storages(cfg));
+    for s in own {
+        if s.1 == WITNESS_BACKEND_DEFAULT || manifest.get(&s).is_some() {
+            continue;
+        }
+        let star = (s.0.clone(), WITNESS_BACKEND_DEFAULT.to_string());
+        if let Some(p) = manifest.get(&star).cloned() {
+            out.extend(judged(s, &p));
+        }
+    }
+    out
 }
 
 /// The gate state of a judgement.
@@ -285,9 +293,10 @@ pub fn changed_storages(
         .collect()
 }
 
-/// The storages that the downgrade confirmations of a request name: a
-/// bucket name (its storage), `backend:<name>` (every storage on it), and
-/// `route:default` (the default backend's `*`).
+/// The storages that a list of subjects names (downgrade confirmations,
+/// `witness publish`): a bucket name (its storage), `backend:<name>` (every
+/// candidate storage on it), and `route:default` (the default backend's
+/// `*`).
 pub fn confirmed_storages(
     cfg: &Config,
     candidates: &BTreeSet<Storage>,
@@ -312,34 +321,113 @@ pub fn confirmed_storages(
         .collect()
 }
 
-/// What a takeover is judged on.
-#[derive(Debug, Clone, Copy)]
-pub struct TakeoverFacts<'a> {
-    pub local: &'a WriteEncryption,
-    pub published: &'a Published,
-    /// A live node writes with the published encryption.
-    pub live_holder: bool,
-    /// When this node's config last changed (its config file, or its last
-    /// apply), in unix ms on the S3 server clock. `None`: unknown.
-    pub config_changed_at: Option<i64>,
+/// PURE: what an apply publishes (see `EncryptionWitness::publish_changes`).
+pub fn changes_to_publish(
+    old: &Config,
+    new: &Config,
+    cached: &Manifest,
+    confirmed: &[String],
+) -> Vec<(Storage, WriteEncryption)> {
+    let mut candidates: BTreeSet<Storage> = cached.keys().collect();
+    candidates.extend(config_storages(old));
+    candidates.extend(config_storages(new));
+    candidates.extend(override_storages(old));
+    candidates.extend(override_storages(new));
+    let mut publish = changed_storages(old, new, &candidates);
+    for s in confirmed_storages(new, &candidates, confirmed) {
+        // A confirmation publishes a downgrade, never an arbitrary
+        // intent over the one that the others write with.
+        if let Some(i) = intent_of(new, &s).filter(|i| !i.encrypts()) {
+            if !publish.iter().any(|(p, _)| *p == s) {
+                publish.push((s, i));
+            }
+        }
+    }
+    // A plaintext storage that nothing witnesses (no entry of its own
+    // and no `*` of its backend) needs no entry.
+    publish.retain(|(s, i)| {
+        i.encrypts()
+            || cached.get(s).is_some()
+            || cached
+                .get(&(s.0.clone(), WITNESS_BACKEND_DEFAULT.to_string()))
+                .is_some()
+    });
+    publish
 }
 
-/// May a mismatched node publish its own intent over the published one?
-/// Only when no live node holds the published intent, this node's config
-/// changed AFTER the entry was set (a lagging node, restarted with the
-/// file it had, never wins), this node does not refuse writes itself (a
-/// missing key), and it is not a downgrade (encrypting → plaintext).
-pub fn takeover_allowed(f: TakeoverFacts<'_>) -> bool {
-    !f.live_holder
-        && !f.local.refuses_writes()
-        && !(f.published.intent.encrypts() && !f.local.encrypts())
-        && f.config_changed_at.is_some_and(|t| t > f.published.set_at)
+/// The storages of this node that a publish may name: the manifest's that
+/// it can write, and every storage of its config.
+fn publish_candidates(cfg: &Config, manifest: &Manifest) -> BTreeSet<Storage> {
+    let mut out: BTreeSet<Storage> = manifest
+        .keys()
+        .filter(|s| intent_of(cfg, s).is_some())
+        .collect();
+    out.extend(config_storages(cfg));
+    out.extend(override_storages(cfg));
+    out
 }
 
-/// Is a heartbeat live? `age` is its server-clock age; an unknown age
-/// counts as live (never take over on a guess).
-pub fn heartbeat_live(age: Option<i64>, ttl_secs: i64) -> bool {
-    age.is_none_or(|a| a <= ttl_secs)
+/// Why an operator publish is refused before any write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishRefusal {
+    /// No storage of this node matches a subject.
+    Unknown(Vec<String>),
+    /// A storage would be published as plaintext without its confirmation.
+    Downgrade(Vec<String>),
+}
+
+impl std::fmt::Display for PublishRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown(s) => write!(
+                f,
+                "no storage of this instance matches {s:?}: name a configured bucket, \
+                 `backend:<name>` or `route:default`"
+            ),
+            Self::Downgrade(s) => write!(
+                f,
+                "this instance stores {s:?} in plaintext: publishing that is a downgrade. \
+                 Send the request again with the header `X-DGP-Confirm-Encryption-Downgrade: \
+                 <subject>` (`witness publish --confirm-encryption-downgrade <subject>`)"
+            ),
+        }
+    }
+}
+
+/// PURE plan of an operator publish: every storage the subjects name, with
+/// this node's intent; refused when a subject names nothing or a plaintext
+/// intent lacks its confirmation.
+pub fn plan_publish(
+    cfg: &Config,
+    manifest: &Manifest,
+    subjects: &[String],
+    confirmed: &[String],
+) -> Result<Vec<(Storage, WriteEncryption)>, PublishRefusal> {
+    let candidates = publish_candidates(cfg, manifest);
+    let unknown: Vec<String> = subjects
+        .iter()
+        .filter(|sub| confirmed_storages(cfg, &candidates, std::slice::from_ref(*sub)).is_empty())
+        .cloned()
+        .collect();
+    if !unknown.is_empty() {
+        return Err(PublishRefusal::Unknown(unknown));
+    }
+    let plan: Vec<(Storage, WriteEncryption)> = confirmed_storages(cfg, &candidates, subjects)
+        .into_iter()
+        .filter_map(|s| intent_of(cfg, &s).map(|i| (s, i)))
+        .collect();
+    let unconfirmed: Vec<String> = plan
+        .iter()
+        .filter(|(s, i)| {
+            !i.encrypts()
+                && confirmed_storages(cfg, &BTreeSet::from([s.clone()]), confirmed).is_empty()
+        })
+        .map(|(s, _)| format!("{}/{}", s.0, s.1))
+        .collect();
+    if !unconfirmed.is_empty() {
+        return Err(PublishRefusal::Downgrade(unconfirmed));
+    }
+    Ok(plan)
 }
 
 fn unix_ms() -> i64 {
@@ -355,9 +443,10 @@ fn unix_ms() -> i64 {
 /// (`GET /_/api/admin/encryption-witness`) shows all of it.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct WitnessStatus {
-    /// `agree`, `mismatch`, or `unknown` (the coordination bucket did not
+    /// `agree`, `mismatch`, `unknown` (the coordination bucket did not
     /// answer; the gate refuses the witnessed buckets once the last good
-    /// verdict is older than two polls).
+    /// verdict is older than two polls), or `unavailable` (the witness has
+    /// no client: the witnessed buckets refuse writes).
     pub status: &'static str,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mismatches: Vec<Mismatch>,
@@ -367,59 +456,57 @@ pub struct WitnessStatus {
 
 /// The witness of one node.
 pub struct EncryptionWitness {
-    client: aws_sdk_s3::Client,
+    /// `None`: the coordination client could not be built (`unavailable`;
+    /// the gate stays closed for the witnessed storages, judged at each
+    /// apply).
+    client: Option<aws_sdk_s3::Client>,
     bucket: String,
     node_id: String,
-    boot_id: String,
-    previous_boot_id: Option<String>,
-    ttl_secs: i64,
     gate: Arc<WitnessGate>,
     /// The last manifest read, to judge a config change at once.
     manifest: parking_lot::Mutex<Manifest>,
     /// S3 server clock minus local clock, in ms, from the last read.
     server_offset_ms: std::sync::atomic::AtomicI64,
-    /// When this node's config last changed, local unix ms.
-    config_changed_at: std::sync::atomic::AtomicI64,
     status: arc_swap::ArcSwap<WitnessStatus>,
-    /// One sync at a time (a poll and an apply).
+    /// One sync at a time (a poll, an apply, a publish).
     running: tokio::sync::Mutex<()>,
 }
 
 /// How many times a CAS write re-reads and merges after a lost race.
 const CAS_ATTEMPTS: usize = 8;
 
+/// The status error of a witness with no client.
+const UNAVAILABLE: &str = "the coordination client could not be built";
+
 impl EncryptionWitness {
     /// A witness whose gate starts CLOSED for the storages that `cfg`
-    /// witnesses, until the first sync succeeds. `config_changed_at`: the
-    /// config file's mtime (local unix ms), `None` when there is no file.
-    #[allow(clippy::too_many_arguments)]
+    /// witnesses, until the first sync succeeds. `client: None` = the
+    /// coordination client could not be built: the status is `unavailable`
+    /// and the gate stays closed (each apply judges the new config).
     pub fn new(
-        client: aws_sdk_s3::Client,
+        client: Option<aws_sdk_s3::Client>,
         bucket: String,
         node_id: String,
-        boot: crate::coordination::BootIds,
         poll: std::time::Duration,
         gate: Arc<WitnessGate>,
         cfg: &Config,
-        config_changed_at: Option<i64>,
     ) -> Self {
         Self::close_gate(&gate, cfg, poll);
+        let unavailable = client.is_none();
         Self {
             client,
             bucket,
             node_id,
-            boot_id: boot.current,
-            previous_boot_id: boot.previous,
-            // Three missed polls before a node counts as gone.
-            ttl_secs: (poll.as_secs().max(1) * 3) as i64,
             gate,
             manifest: Default::default(),
             server_offset_ms: Default::default(),
-            config_changed_at: std::sync::atomic::AtomicI64::new(
-                config_changed_at.unwrap_or(i64::MIN),
-            ),
             status: arc_swap::ArcSwap::from_pointee(WitnessStatus {
-                status: "unknown",
+                status: if unavailable {
+                    "unavailable"
+                } else {
+                    "unknown"
+                },
+                error: unavailable.then(|| UNAVAILABLE.to_string()),
                 ..Default::default()
             }),
             running: tokio::sync::Mutex::new(()),
@@ -427,10 +514,8 @@ impl EncryptionWitness {
     }
 
     /// Turn `gate` on with nothing synced: every storage that `cfg`
-    /// witnesses is refused until a sync succeeds. A verdict holds for two
-    /// polls, one less than a heartbeat: this node stops before a peer may
-    /// take over its storages. Also the fail-closed state of a node whose
-    /// witness cannot be built.
+    /// witnesses is refused until a sync succeeds. A verdict holds two
+    /// polls from the start of the sync that made it.
     pub fn close_gate(gate: &WitnessGate, cfg: &Config, poll: std::time::Duration) {
         gate.activate(poll.max(std::time::Duration::from_secs(1)) * 2);
         gate.set(gate_state(cfg, &Manifest::default(), &[]));
@@ -441,12 +526,8 @@ impl EncryptionWitness {
         (**self.status.load()).clone()
     }
 
-    fn node_label(&self) -> String {
-        format!("{}-{}", self.node_id, self.boot_id)
-    }
-
-    fn record_key(&self, boot_id: &str) -> String {
-        format!("{NODES_PREFIX}{}-{boot_id}.json", self.node_id)
+    fn client(&self) -> Result<&aws_sdk_s3::Client, String> {
+        self.client.as_ref().ok_or_else(|| UNAVAILABLE.to_string())
     }
 
     /// Now, in unix ms on the S3 server clock (estimated).
@@ -455,19 +536,6 @@ impl EncryptionWitness {
             + self
                 .server_offset_ms
                 .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// When this node's config last changed, on the server clock.
-    fn config_changed_at_server(&self) -> Option<i64> {
-        let local = self
-            .config_changed_at
-            .load(std::sync::atomic::Ordering::Relaxed);
-        (local != i64::MIN).then(|| {
-            local
-                + self
-                    .server_offset_ms
-                    .load(std::sync::atomic::Ordering::Relaxed)
-        })
     }
 
     /// Judge `cfg` against the last manifest read, with no I/O: the gate
@@ -482,6 +550,7 @@ impl EncryptionWitness {
 
     fn publish_status(&self, found: Vec<Mismatch>, error: Option<String>) {
         let status = match (&error, found.is_empty()) {
+            (Some(_), _) if self.client.is_none() => "unavailable",
             (Some(_), _) => "unknown",
             (None, true) => "agree",
             (None, false) => "mismatch",
@@ -495,10 +564,10 @@ impl EncryptionWitness {
 
     async fn read_manifest(&self) -> Result<(Manifest, Option<String>), String> {
         use super::cas::{is_object_absent, sdk_error_signal};
+        let client = self.client()?;
         let date = super::server_clock::ServerDate::default();
         let sent_at = unix_ms();
-        let got = self
-            .client
+        let got = client
             .get_object()
             .bucket(&self.bucket)
             .key(MANIFEST_KEY)
@@ -507,8 +576,6 @@ impl EncryptionWitness {
             .send()
             .await;
         if let Some(server_secs) = date.get() {
-            // The Date header has 1 s resolution: the offset is good to
-            // about a second, which the takeover rule allows for.
             self.server_offset_ms.store(
                 server_secs * 1000 - sent_at,
                 std::sync::atomic::Ordering::Relaxed,
@@ -538,6 +605,7 @@ impl EncryptionWitness {
         &self,
         mut edit: impl FnMut(&mut Manifest, i64) -> bool,
     ) -> Result<Manifest, String> {
+        let client = self.client()?;
         for _ in 0..CAS_ATTEMPTS {
             let (mut manifest, etag) = self.read_manifest().await?;
             if !edit(&mut manifest, self.server_now()) {
@@ -545,7 +613,7 @@ impl EncryptionWitness {
             }
             let body = serde_json::to_vec(&manifest).map_err(|e| e.to_string())?;
             match super::cas::conditional_put_etag(
-                &self.client,
+                client,
                 &self.bucket,
                 MANIFEST_KEY,
                 body.into(),
@@ -567,115 +635,39 @@ impl EncryptionWitness {
         ))
     }
 
-    /// The live heartbeats of the other nodes (dead ones far past their TTL
-    /// are removed on the way).
-    async fn live_peers(&self) -> Result<Vec<NodeRecord>, String> {
-        use super::cas::sdk_error_signal;
-        let mut keys = Vec::new();
-        let mut token = None;
-        loop {
-            let page = self
-                .client
-                .list_objects_v2()
-                .bucket(&self.bucket)
-                .prefix(NODES_PREFIX)
-                .set_continuation_token(token)
-                .send()
-                .await
-                .map_err(|e| format!("LIST {NODES_PREFIX}: {}", sdk_error_signal(&e)))?;
-            keys.extend(
-                page.contents()
-                    .iter()
-                    .filter_map(|o| o.key().map(str::to_string)),
-            );
-            match page.next_continuation_token() {
-                Some(t) if page.is_truncated() == Some(true) => token = Some(t.to_string()),
-                _ => break,
-            }
-        }
-        let own = self.record_key(&self.boot_id);
-        let mut live = Vec::new();
-        for key in keys.into_iter().filter(|k| *k != own) {
-            let Ok((out, age)) =
-                super::server_clock::get_with_server_age(&self.client, &self.bucket, &key).await
-            else {
-                continue; // gone between the LIST and the GET
-            };
-            let Ok(body) = out.body.collect().await else {
-                continue;
-            };
-            let Ok(record) = serde_json::from_slice::<NodeRecord>(&body.into_bytes()) else {
-                continue;
-            };
-            if heartbeat_live(age, record.ttl_secs) {
-                live.push(record);
-            } else if age.is_some_and(|a| a > record.ttl_secs.saturating_mul(10)) {
-                // Long dead: housekeeping, best effort.
-                let _ = self
-                    .client
-                    .delete_object()
-                    .bucket(&self.bucket)
-                    .key(&key)
-                    .send()
-                    .await;
-            }
-        }
-        Ok(live)
-    }
-
-    async fn heartbeat(&self, cfg: &Config, manifest: &Manifest) -> Result<(), String> {
-        let mut record = NodeRecord {
-            node: self.node_id.clone(),
-            boot_id: self.boot_id.clone(),
-            ttl_secs: self.ttl_secs,
-            storages: BTreeMap::new(),
-        };
-        for s in witnessed(cfg, manifest) {
-            if let Some(i) = intent_of(cfg, &s) {
-                record.storages.entry(s.0).or_default().insert(s.1, i);
-            }
-        }
-        let body = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(self.record_key(&self.boot_id))
-            .content_type("application/json")
-            .body(body.into())
-            .send()
-            .await
-            .map_err(|e| format!("PUT node heartbeat: {}", super::cas::sdk_error_signal(&e)))?;
-        Ok(())
-    }
-
-    /// One full sync against `cfg`: seed, take over storages whose writers
-    /// are gone, heartbeat, and set the gate.
+    /// One full sync against `cfg`: seed, then judge and set the gate.
     pub async fn sync(&self, cfg: &Config) -> Result<(), String> {
         let _one = self.running.lock().await;
         self.sync_locked(cfg).await
     }
 
     async fn sync_locked(&self, cfg: &Config) -> Result<(), String> {
+        // The verdict holds from the START of the sync: a slow sync cannot
+        // stretch the window in which a stale verdict lets writes through.
+        let started = unix_ms();
         let result = self.sync_inner(cfg).await;
-        if let Err(e) = &result {
-            // The last verdict, judged against the current config; the
-            // gate refuses the witnessed storages once it is stale.
-            let manifest = self.manifest.lock().clone();
-            let found = mismatches(cfg, &manifest);
-            self.gate.set(gate_state(cfg, &manifest, &found));
-            self.publish_status(found, Some(e.clone()));
+        match &result {
+            Ok(()) => self.gate.synced_at(started),
+            Err(e) => {
+                // The last verdict, judged against the current config; the
+                // gate refuses the witnessed storages once it is stale.
+                let manifest = self.manifest.lock().clone();
+                let found = mismatches(cfg, &manifest);
+                self.gate.set(gate_state(cfg, &manifest, &found));
+                self.publish_status(found, Some(e.clone()));
+            }
         }
         result
     }
 
     async fn sync_inner(&self, cfg: &Config) -> Result<(), String> {
-        let label = self.node_label();
+        let label = self.node_id.clone();
         let read = self.read_manifest().await?.0;
         let missing: Vec<(Storage, WriteEncryption)> = seeds(cfg)
             .into_iter()
             .filter(|(s, _)| read.get(s).is_none())
             .collect();
-        let mut manifest = if missing.is_empty() {
+        let manifest = if missing.is_empty() {
             read
         } else {
             self.update_manifest(|m, now| {
@@ -690,62 +682,6 @@ impl EncryptionWitness {
             })
             .await?
         };
-        let found = mismatches(cfg, &manifest);
-        if !found.is_empty() {
-            let peers = self.live_peers().await?;
-            let changed_at = self.config_changed_at_server();
-            let takeovers: Vec<(Storage, Published, WriteEncryption)> = found
-                .iter()
-                .filter_map(|m| {
-                    let s = (m.backend.clone(), m.bucket.clone());
-                    let published = manifest.get(&s)?.clone();
-                    let held = peers.iter().any(|p| p.get(&s) == Some(&m.published));
-                    takeover_allowed(TakeoverFacts {
-                        local: &m.local,
-                        published: &published,
-                        live_holder: held,
-                        config_changed_at: changed_at,
-                    })
-                    .then(|| (s, published, m.local.clone()))
-                })
-                .collect();
-            if !takeovers.is_empty() {
-                manifest = self
-                    .update_manifest(|m, now| {
-                        let mut changed = false;
-                        for (s, seen, mine) in &takeovers {
-                            // Only over the entry that we judged.
-                            if m.get(s) == Some(seen) {
-                                m.set(s, mine.clone(), &label, now);
-                                changed = true;
-                            }
-                        }
-                        changed
-                    })
-                    .await?;
-                for (s, seen, mine) in &takeovers {
-                    if manifest.get(s).map(|p| &p.intent) != Some(mine) {
-                        continue; // a peer changed it first
-                    }
-                    let target = format!(
-                        "{}/{}: {} -> {} (no live instance writes the old encryption)",
-                        s.0,
-                        s.1,
-                        seen.intent.describe(),
-                        mine.describe()
-                    );
-                    tracing::warn!("encryption witness: takeover of {target}");
-                    crate::audit::audit_log(
-                        "bucket_encryption_witness_takeover",
-                        "background",
-                        &target,
-                        &axum::http::HeaderMap::new(),
-                        &s.1,
-                        "",
-                    );
-                }
-            }
-        }
         *self.manifest.lock() = manifest.clone();
         let found = mismatches(cfg, &manifest);
         // Log a mismatch when it starts, not at every poll.
@@ -754,64 +690,34 @@ impl EncryptionWitness {
             tracing::error!("encryption witness: {}", m.refusal());
         }
         self.gate.set(gate_state(cfg, &manifest, &found));
-        if !witnessed(cfg, &manifest).is_empty() {
-            self.heartbeat(cfg, &manifest).await?;
-        }
-        self.gate.synced();
         self.publish_status(found, None);
         Ok(())
     }
 
     /// After a config apply on this node: publish this node's write
-    /// encryption for every witnessed storage whose encryption the apply
-    /// changed, and for every storage that the request confirmed as a
-    /// downgrade (`confirmed`, the `X-DGP-Confirm-Encryption-Downgrade`
-    /// subjects), then sync. The gate follows `new` at once, before any I/O.
+    /// encryption for every storage whose encryption the apply CHANGED,
+    /// and the PLAINTEXT intent of every storage that the request confirmed
+    /// as a downgrade (`confirmed`, the `X-DGP-Confirm-Encryption-Downgrade`
+    /// subjects; also when the config did not change, to finish a downgrade
+    /// that the nodes got by restart). Then sync. The gate follows `new` at
+    /// once, before any I/O.
     pub async fn publish_changes(
         &self,
         old: &Config,
         new: &Config,
         confirmed: &[String],
     ) -> Result<(), String> {
-        self.config_changed_at
-            .store(unix_ms(), std::sync::atomic::Ordering::Relaxed);
         self.judge(new);
-        let label = self.node_label();
         let _one = self.running.lock().await;
         let cached = self.manifest.lock().clone();
-        let mut candidates: BTreeSet<Storage> = cached.keys().collect();
-        candidates.extend(config_storages(old));
-        candidates.extend(config_storages(new));
-        let mut publish = changed_storages(old, new, &candidates);
-        for s in confirmed_storages(new, &candidates, confirmed) {
-            if let Some(i) = intent_of(new, &s) {
-                if !publish.iter().any(|(p, _)| *p == s) {
-                    publish.push((s, i));
-                }
-            }
+        let publish = changes_to_publish(old, new, &cached, confirmed);
+        if self.client.is_none() {
+            return Err(UNAVAILABLE.to_string());
         }
-        // A plaintext storage that nobody witnesses needs no entry.
-        publish.retain(|(s, i)| i.encrypts() || cached.get(s).is_some());
         if !publish.is_empty() {
-            let published = self
-                .update_manifest(|m, now| {
-                    let mut edited = false;
-                    for (s, i) in &publish {
-                        if m.get(s).map(|p| &p.intent) != Some(i) {
-                            m.set(s, i.clone(), &label, now);
-                            edited = true;
-                        }
-                    }
-                    edited
-                })
-                .await;
-            match published {
-                Ok(m) => *self.manifest.lock() = m,
-                Err(e) => {
-                    self.judge(new);
-                    return Err(e);
-                }
-            }
+            self.write_entries(&publish)
+                .await
+                .inspect_err(|_| self.judge(new))?;
             for (s, i) in &publish {
                 tracing::info!(
                     "encryption witness: published {} for {}/{}",
@@ -824,17 +730,60 @@ impl EncryptionWitness {
         self.sync_locked(new).await
     }
 
-    /// Remove the heartbeat of this node's previous process (a restart).
-    pub async fn forget_previous_boot(&self) {
-        if let Some(prev) = &self.previous_boot_id {
-            let _ = self
-                .client
-                .delete_object()
-                .bucket(&self.bucket)
-                .key(self.record_key(prev))
-                .send()
-                .await;
+    async fn write_entries(&self, entries: &[(Storage, WriteEncryption)]) -> Result<(), String> {
+        let label = self.node_id.clone();
+        let m = self
+            .update_manifest(|m, now| {
+                let mut edited = false;
+                for (s, i) in entries {
+                    if m.get(s).map(|p| &p.intent) != Some(i) {
+                        m.set(s, i.clone(), &label, now);
+                        edited = true;
+                    }
+                }
+                edited
+            })
+            .await?;
+        *self.manifest.lock() = m;
+        Ok(())
+    }
+
+    /// The operator's publish (`witness publish`): this node's current
+    /// encryption of the storages that `subjects` name becomes the shared
+    /// one. Plaintext needs its downgrade confirmation (`confirmed`). Each
+    /// published storage writes the audit entry
+    /// `bucket_encryption_witness_publish`. Returns the published storages.
+    pub async fn publish_subjects(
+        &self,
+        cfg: &Config,
+        subjects: &[String],
+        confirmed: &[String],
+        headers: &axum::http::HeaderMap,
+    ) -> Result<Vec<(Storage, WriteEncryption)>, PublishError> {
+        let _one = self.running.lock().await;
+        let manifest = self.read_manifest().await.map_err(PublishError::Failed)?.0;
+        let plan =
+            plan_publish(cfg, &manifest, subjects, confirmed).map_err(PublishError::Refused)?;
+        let before = manifest;
+        self.write_entries(&plan)
+            .await
+            .map_err(PublishError::Failed)?;
+        for (s, i) in &plan {
+            let was = before
+                .get(s)
+                .map(|p| p.intent.describe())
+                .unwrap_or_else(|| "no entry".to_string());
+            crate::audit::audit_log(
+                "bucket_encryption_witness_publish",
+                "admin",
+                &format!("{}/{}: {was} -> {}", s.0, s.1, i.describe()),
+                headers,
+                &s.1,
+                "",
+            );
         }
+        self.sync_locked(cfg).await.map_err(PublishError::Failed)?;
+        Ok(plan)
     }
 
     /// Poll every `interval`, judging the live config each time.
@@ -843,6 +792,9 @@ impl EncryptionWitness {
         config: crate::config::SharedConfig,
         interval: std::time::Duration,
     ) {
+        if self.client.is_none() {
+            return; // nothing to poll: applies keep judging
+        }
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -862,6 +814,15 @@ impl EncryptionWitness {
             }
         });
     }
+}
+
+/// Why an operator publish failed.
+#[derive(Debug)]
+pub enum PublishError {
+    /// Refused before any write (400).
+    Refused(PublishRefusal),
+    /// The coordination bucket did not answer (503).
+    Failed(String),
 }
 
 #[cfg(test)]
@@ -908,14 +869,6 @@ mod tests {
             mode: "none".into(),
             key_id: None,
             kcv: None,
-        }
-    }
-
-    fn published(i: WriteEncryption, at: i64) -> Published {
-        Published {
-            intent: i,
-            set_by: "node-a".into(),
-            set_at: at,
         }
     }
 
@@ -1002,67 +955,96 @@ mod tests {
         assert!(confirmed_storages(&a, &all, &[]).is_empty());
     }
 
-    /// Review of P3 (probe-verified): a lagging node reverted a rotation
-    /// when the up-to-date node restarted, and a node with a missing key
-    /// could take over. A takeover needs a config NEWER than the entry,
-    /// a usable key, no live holder, and no downgrade.
-    #[test]
-    fn takeover_needs_a_newer_config_a_key_and_no_live_holder() {
-        let p = published(aes("a"), 1_000);
-        fn facts<'a>(
-            local: &'a WriteEncryption,
-            p: &'a Published,
-            held: bool,
-            at: Option<i64>,
-        ) -> TakeoverFacts<'a> {
-            TakeoverFacts {
-                local,
-                published: p,
-                live_holder: held,
-                config_changed_at: at,
-            }
-        }
-        let newer = Some(2_000);
-        assert!(takeover_allowed(facts(&aes("b"), &p, false, newer)));
-        assert!(
-            !takeover_allowed(facts(&aes("b"), &p, true, newer)),
-            "a live holder"
-        );
-        assert!(
-            !takeover_allowed(facts(&aes("b"), &p, false, Some(999))),
-            "a lagging config"
-        );
-        assert!(
-            !takeover_allowed(facts(&aes("b"), &p, false, None)),
-            "no config time"
-        );
-        assert!(
-            !takeover_allowed(facts(&none(), &p, false, newer)),
-            "never a downgrade"
-        );
-        let refusing = WriteEncryption {
-            mode: "aes256-gcm-proxy".into(),
-            key_id: None,
-            kcv: None,
-        };
-        assert!(
-            !takeover_allowed(facts(&refusing, &p, false, newer)),
-            "a missing key"
-        );
-        let p0 = published(none(), 1_000);
-        assert!(takeover_allowed(TakeoverFacts {
-            local: &aes("a"),
-            published: &p0,
-            live_holder: false,
-            config_changed_at: newer,
-        }));
+    fn backend_aes() -> String {
+        format!("      encryption: {{ mode: aes256-gcm-proxy, key: \"{KA}\", key_id: local-a }}\n")
     }
 
+    /// Second review, finding 1 (probe-verified): a bucket encrypted only
+    /// through the backend's `*` entry was downgraded by a node that booted
+    /// with `mode: none` for it: `mismatches` compared only storages with an
+    /// entry of their own, so both nodes agreed and the node wrote
+    /// plaintext. Such a storage is judged against `*`, as the gate does.
     #[test]
-    fn heartbeat_liveness_is_judged_on_the_server_clock() {
-        assert!(heartbeat_live(Some(90), 90));
-        assert!(!heartbeat_live(Some(91), 90));
-        assert!(heartbeat_live(None, 90), "an unknown age is live");
+    fn a_bucket_block_with_no_entry_is_judged_against_the_backends_star() {
+        let mut m = Manifest::default();
+        m.set(&star(), aes("local-a"), "node-a", 1);
+        let downgrading = cfg_with(
+            &backend_aes(),
+            "{ backend: local-disk, encryption: { mode: none } }",
+        );
+        let found = mismatches(&downgrading, &m);
+        assert!(
+            found
+                .iter()
+                .any(|f| f.bucket == "releases" && f.local == none()),
+            "{found:?}"
+        );
+        let gate = WitnessGate::default();
+        gate.activate(std::time::Duration::from_secs(60));
+        gate.synced();
+        gate.set(gate_state(&downgrading, &m, &found));
+        assert!(gate.refusal("local-disk", "releases").is_some());
+    }
+
+    /// Second review, finding 4 (probe-verified): a lagging node with the
+    /// downgrade header and an empty patch republished its OLD key over the
+    /// rotation. A confirmation publishes plaintext intents only.
+    #[test]
+    fn a_confirmation_publishes_plaintext_only() {
+        let lagging = with_key(); // rel-a
+        let mut m = Manifest::default();
+        m.set(&rel(), aes("rel-c"), "node-a", 1);
+        let confirmed = vec!["releases".to_string()];
+        assert!(changes_to_publish(&lagging, &lagging, &m, &confirmed).is_empty());
+        let plain = cfg("{ backend: local-disk, encryption: { mode: none } }");
+        assert_eq!(
+            changes_to_publish(&plain, &plain, &m, &confirmed),
+            vec![(rel(), none())]
+        );
+        assert!(changes_to_publish(&plain, &plain, &m, &[]).is_empty());
+    }
+
+    /// The operator's `witness publish`: a subject must name a storage of
+    /// this node, and plaintext needs its downgrade confirmation.
+    #[test]
+    fn an_operator_publish_names_storages_and_confirms_plaintext() {
+        let m = Manifest::default();
+        let a = with_key();
+        let plan = plan_publish(&a, &m, &["releases".into()], &[]).unwrap();
+        assert_eq!(plan, vec![(rel(), intent_of(&a, &rel()).unwrap())]);
+        assert!(matches!(
+            plan_publish(&a, &m, &["nope".into()], &[]),
+            Err(PublishRefusal::Unknown(_))
+        ));
+        let plain = cfg("{ backend: local-disk, encryption: { mode: none } }");
+        assert!(matches!(
+            plan_publish(&plain, &m, &["releases".into()], &[]),
+            Err(PublishRefusal::Downgrade(_))
+        ));
+        assert!(plan_publish(&plain, &m, &["releases".into()], &["releases".into()]).is_ok());
+        let all = plan_publish(
+            &a,
+            &m,
+            &["backend:local-disk".into()],
+            &["backend:local-disk".into()],
+        )
+        .unwrap();
+        assert!(all.iter().any(|(s, _)| *s == star()), "{all:?}");
+    }
+
+    /// Finding 6: a verdict ages from the START of its sync.
+    #[test]
+    fn a_verdict_ages_from_the_start_of_its_sync() {
+        let gate = WitnessGate::default();
+        let cfg = with_key();
+        EncryptionWitness::close_gate(&gate, &cfg, std::time::Duration::from_secs(1));
+        gate.synced_at(unix_ms() - 2_500); // a sync that took 2.5 s
+        assert!(
+            gate.refusal("local-disk", "releases").is_some(),
+            "older than 2 polls"
+        );
+        gate.synced_at(unix_ms() - 500);
+        assert!(gate.refusal("local-disk", "releases").is_none());
     }
 
     #[test]
@@ -1101,6 +1083,7 @@ mod tests {
         assert_eq!(gate.refusal("local-disk", "releases"), None);
         let mut m = Manifest::default();
         m.set(&star(), aes("local-a"), "node-a", 1);
+        m.set(&rel(), intent_of(&cfg, &rel()).unwrap(), "node-a", 1);
         let found = mismatches(&cfg, &m);
         gate.set(gate_state(&cfg, &m, &found));
         assert!(

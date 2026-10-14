@@ -1315,16 +1315,16 @@ pub fn encryption_witness_poll_interval() -> Duration {
 /// first sync, before anything serves. No `config_sync_bucket` → `None`
 /// (single instance: nothing to agree with). The gate starts CLOSED for the
 /// buckets this node witnesses (the buckets it encrypts and its bucket
-/// blocks): a client that cannot be built, or a first sync that fails,
-/// leaves those buckets refusing writes until a sync succeeds (owner
-/// decision: fail closed; other buckets are not affected).
+/// blocks) until a sync succeeds (owner decision: fail closed; other
+/// buckets are not affected). A coordination client that cannot be built
+/// gives a witness with status `unavailable`: the gate stays closed, and
+/// each apply judges the new config, so buckets added later are covered.
 pub async fn build_encryption_witness(
     config: &Config,
     check: &CoordinationCheck,
     gate: Arc<deltaglider_proxy::storage::WitnessGate>,
-    config_path: Option<&str>,
 ) -> Option<Arc<deltaglider_proxy::coordination::EncryptionWitness>> {
-    use deltaglider_proxy::coordination::{durable_node_id, process_boot_ids, EncryptionWitness};
+    use deltaglider_proxy::coordination::{durable_node_id, EncryptionWitness};
     let sync_bucket = config
         .config_sync_bucket
         .as_ref()
@@ -1340,39 +1340,31 @@ pub async fn build_encryption_witness(
         (_, Ok(c)) => Ok(c),
     };
     let client = match client {
-        Ok(c) => c,
+        Ok(c) => Some(c),
         Err(e) => {
-            EncryptionWitness::close_gate(&gate, config, poll);
             error!(
-                "Encryption witness: {e}. The buckets whose encryption the instances must \
-                 agree on REFUSE WRITES until a restart with a working coordination bucket"
+                "Encryption witness UNAVAILABLE: {e}. The buckets whose encryption the \
+                 instances must agree on REFUSE WRITES until a restart with a working \
+                 coordination bucket"
             );
-            return None;
+            None
         }
     };
     let dir = config_db_path()
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .to_path_buf();
-    // When this node's config last changed: the file's mtime. A takeover
-    // needs a config newer than the published entry, so a lagging node that
-    // restarts with its old file never reverts a newer intent.
-    let changed_at = config_path
-        .and_then(|p| std::fs::metadata(p).ok())
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64);
     let witness = Arc::new(EncryptionWitness::new(
         client,
         sync_bucket.clone(),
         durable_node_id(&dir),
-        process_boot_ids(&dir),
         poll,
         gate,
         config,
-        changed_at,
     ));
-    witness.forget_previous_boot().await;
+    if witness.status().status == "unavailable" {
+        return Some(witness);
+    }
     let mut last = Ok(());
     for attempt in 0..3 {
         if attempt > 0 {

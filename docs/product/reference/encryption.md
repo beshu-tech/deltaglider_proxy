@@ -201,7 +201,7 @@ Every change of a bucket's write encryption writes one audit entry per subject, 
 | `bucket_encryption_cleared` | From an encrypting mode to plaintext (a downgrade). |
 | `bucket_encryption_key_rotated` | The same mode with another key id (`kms_key_id` for SSE-KMS). |
 
-A change of a backend's own encryption therefore writes one entry for `backend:<name>` and one entry for each bucket that the config names and that inherits that encryption (1 + N entries). A change of `default_backend` writes one entry for `route:default`. With `config_sync_bucket` set, a takeover by the encryption witness writes `bucket_encryption_witness_takeover`.
+A change of a backend's own encryption therefore writes one entry for `backend:<name>` and one entry for each bucket that the config names and that inherits that encryption (1 + N entries). A change of `default_backend` writes one entry for `route:default`. With `config_sync_bucket` set, `witness publish` writes `bucket_encryption_witness_publish`.
 
 The target of the entry is `<subject>: <before> -> <after>`, for example `db-archive: aes256-gcm-proxy (key id 'db-archive-2026') -> none`. The subject is the bucket name, or `backend:<name>` for a change of the backend's own encryption. A change that the proxy makes by itself (the flip of a migrate) has the user `background`.
 

@@ -658,7 +658,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_ENCRYPTION_WITNESS_POLL_SECS",
-        description: "How often each instance compares its per-bucket encryption with the one that the instances share in the sync bucket, and refreshes its heartbeat; an instance counts as gone after three intervals (default: 30)",
+        description: "How often each instance compares its per-bucket encryption with the one that the instances share in the sync bucket; a verdict holds two intervals, then the witnessed buckets refuse writes until a check succeeds (default: 30)",
         example: "30",
         category: "Config Sync",
     },

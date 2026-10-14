@@ -407,8 +407,14 @@ impl WitnessGate {
 
     /// Record a successful sync (the verdict is fresh from now).
     pub fn synced(&self) {
+        self.synced_at(unix_ms());
+    }
+
+    /// Record a successful sync that STARTED at `started_ms` (unix ms): the
+    /// verdict's age counts from there, so a slow sync does not stretch it.
+    pub fn synced_at(&self, started_ms: i64) {
         self.last_ok_ms
-            .store(unix_ms(), std::sync::atomic::Ordering::Relaxed);
+            .store(started_ms, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Pure lookup of `(backend, bucket)` in `map`, with the backend's `*`

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Changed — The encryption witness never takes over an entry by itself
+
+A second review showed that no automatic takeover rule is safe: an unrelated apply, or a lagging instance restarted with its old config in a re-rendered file, reverted a key rotation, and a rotation of an environment key by restart never converged. Now an entry of the witness changes only when an instance first adds a bucket that it encrypts, when a config apply changes the encryption of a bucket, or when the operator runs the new `deltaglider_proxy witness publish <subject>...` (`POST /_/api/admin/encryption-witness/publish`, audited as `bucket_encryption_witness_publish`; plaintext needs `--confirm-encryption-downgrade`). Every other disagreement refuses writes, and the `503 SlowDown` names the command. After a restart rollout that changes a bucket's encryption, run `witness publish` once. The heartbeat objects are gone.
+
+### Fixed — More encryption witness defects
+
+- A bucket that the backend's `*` entry covers was downgraded by an instance that started with `mode: none` for it. Such a bucket is now judged against `*`.
+- The downgrade confirmation of an apply republished any encryption of the confirmed bucket, also an old key over a rotation. It now publishes plaintext only.
+- A section PUT that named a bucket `type` or `mode` wiped the other buckets (the merge treated the bucket name as a tag). The replace-on-tag-change rule now applies only to the backend's `type` and the `mode` of encryption blocks.
+- A verdict now ages from the start of the check that made it, so a slow check does not stretch it.
+- When the client for the sync bucket cannot be built, `/_/ready` shows `encryption_witness.status: "unavailable"` instead of nothing, and each apply still judges the new config.
+
 ### Fixed — A bucket that the encryption witness refuses defers the background writers
 
 A replication or lifecycle run that wrote into a bucket that the encryption witness refuses on this instance failed object after object (each refusal counted as a throttled copy), and a maintenance job recorded each object as failed and moved its cursor past it. Now the gate check of these writers asks the witness too (`MaintenanceGate::write_blocked`, source guard), memory only: the scheduler does not start a run, a running replication or lifecycle run stops as `deferred` at its next control boundary or at the first refused write (cursor kept, no failure, due again a minute later), and a maintenance job waits like for an unavailable backend and redoes the page from its cursor.
@@ -11,8 +23,8 @@ A replication or lifecycle run that wrote into a bucket that the encryption witn
 A review of the encryption witness found these defects, now fixed:
 
 - An instance that started with `mode: none` for a bucket that the others encrypted by inheritance set the shared entry, so the encrypting instances refused writes and the downgrading one wrote plaintext. Now every instance seeds each bucket that it encrypts (its blocks, the buckets it names that inherit an encrypting backend, and each encrypting backend's buckets with no entry), and plaintext is never seeded.
-- When the only up-to-date instance stopped, a lagging instance took over and reverted a key rotation, and an instance with a missing key could take over too. A takeover now needs a config that changed after the shared entry, a usable key, no live writer of the shared encryption, and no downgrade. Each takeover writes the audit entry `bucket_encryption_witness_takeover`.
-- An instance whose check failed kept writing while its heartbeat expired. Now it refuses writes to the witnessed buckets once its last good check is two polls old, and an instance that cannot check at start refuses them until the first check succeeds.
+- When the only up-to-date instance stopped, a lagging instance took over and reverted a key rotation. There is no automatic takeover any more (see above).
+- An instance whose check failed kept writing. Now it refuses writes to the witnessed buckets once its last good check is two polls old, and an instance that cannot check at start refuses them until the first check succeeds.
 - A folder marker and a metadata rewrite went past the witness. Every write of the encrypting layer now checks it first (source guard).
 - Two instances with one key id and different keys agreed. The shared entry now carries a key check value (a truncated HMAC of the key).
 - A downgrade that the instances got by restart could not finish. An apply with `X-DGP-Confirm-Encryption-Downgrade` now publishes the confirmed buckets also when the config does not change.
@@ -30,7 +42,7 @@ A change of `default_backend`, or the move from an encrypting `storage.backend` 
 
 ### Added — Per-bucket encryption on several instances (the encryption witness)
 
-Per-bucket encryption now works with `config_sync_bucket` set; the start no longer refuses it. The YAML is per instance, so the instances keep a witness in the sync bucket: `_dgp/encryption/intent.json` holds the mode and key id (never a key) of each bucket with its own encryption, and each instance writes a heartbeat under `_dgp/encryption/nodes/`. An instance whose encryption of a bucket differs from the published one refuses writes to that bucket with `503 SlowDown` that names the mismatch; reads and other buckets keep working, and `/_/ready` shows the verdict in `encryption_witness` (the instance stays ready). A config apply that changes a bucket's encryption publishes it, so applying the same config on every instance converges. When no live instance writes a bucket with the published encryption any more (a rollout that restarted every instance), an instance publishes its own, but never a downgrade to plaintext. New setting: `DGP_ENCRYPTION_WITNESS_POLL_SECS` (default 30).
+Per-bucket encryption now works with `config_sync_bucket` set; the start no longer refuses it. The YAML is per instance, so the instances keep a witness in the sync bucket: `_dgp/encryption/intent.json` holds the mode and key id (never a key) of each bucket that an instance encrypts. An instance whose encryption of a bucket differs from the published one refuses writes to that bucket with `503 SlowDown` that names the mismatch; reads and other buckets keep working, and `/_/ready` shows the verdict in `encryption_witness` (the instance stays ready). A config apply that changes a bucket's encryption publishes it, so applying the same config on every instance converges. New setting: `DGP_ENCRYPTION_WITNESS_POLL_SECS` (default 30).
 
 ### Added — Audit entries for a bucket's encryption, and a confirmed downgrade
 

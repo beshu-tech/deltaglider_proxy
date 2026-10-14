@@ -1213,12 +1213,25 @@ async fn ha_node(node: &str, coord: &str, data: &str, policy: &str) -> Env {
 
 /// [`ha_node`] with extra `storage:` lines (2-space indented).
 async fn ha_node_with(node: &str, coord: &str, data: &str, policy: &str, storage: &str) -> Env {
+    ha_node_raw(
+        node,
+        coord,
+        data,
+        &format!("    {data}: {policy}\n"),
+        storage,
+    )
+    .await
+}
+
+/// One instance whose `storage.buckets` is `buckets` (4-space indented
+/// lines); `data` is the bucket the harness creates.
+async fn ha_node_raw(node: &str, coord: &str, data: &str, buckets: &str, storage: &str) -> Env {
     let tmp = tempfile::TempDir::new().unwrap();
     let doc = format!(
         "access:\n  access_key_id: {}\n  secret_access_key: {}\n\
          storage:\n  backend:\n    type: s3\n    endpoint: \"{}\"\n    region: us-east-1\n    \
          force_path_style: true\n    access_key_id: {}\n    secret_access_key: {}\n{storage}  \
-         buckets:\n    {data}: {policy}\n\
+         buckets:\n{buckets}\
          advanced:\n  listen_addr: {}\n  bootstrap_password_hash: \"{}\"\n  config_sync_bucket: {coord}\n",
         AUTH.0,
         AUTH.1,
@@ -1244,6 +1257,24 @@ async fn ha_node_with(node: &str, coord: &str, data: &str, policy: &str, storage
         store: Store::Minio,
         dr: None,
     }
+}
+
+/// `deltaglider_proxy witness publish <subjects> [--confirm…]` against `env`.
+fn cli_publish(env: &Env, subjects: &[&str], confirm: &[&str]) -> std::process::Output {
+    let mut args = vec!["witness".to_string(), "publish".to_string()];
+    args.extend(subjects.iter().map(|s| s.to_string()));
+    for c in confirm {
+        args.push("--confirm-encryption-downgrade".into());
+        args.push(c.to_string());
+    }
+    args.push("--server".into());
+    args.push(env.server.endpoint());
+    std::process::Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
+        .current_dir(std::env::temp_dir())
+        .args(args)
+        .env("DGP_BOOTSTRAP_PASSWORD", common::TEST_BOOTSTRAP_PASSWORD)
+        .output()
+        .unwrap()
 }
 
 impl Env {
@@ -1420,12 +1451,13 @@ async fn the_witness_makes_a_disagreeing_instance_refuse_writes_minio() {
     );
 }
 
-/// A restart-based rollout: the instance that published `ha-b` stops; the
-/// instance that writes `ha-c` refuses while the publisher is live, and
-/// publishes its own encryption once no live instance holds `ha-b`
-/// (the heartbeat TTL is three polls, judged on the S3 server clock).
+/// A restart-based rollout (an env key, a ConfigMap): the instance that
+/// published `ha-b` stops, and the new instance with `ha-c` keeps refusing
+/// writes: there is no automatic takeover (second review, owner decision;
+/// before, it took over once the old writer was gone). `witness publish`
+/// converges, and its plaintext form needs the downgrade confirmation.
 #[tokio::test]
-async fn the_witness_follows_a_rollout_when_the_old_writers_are_gone_minio() {
+async fn a_restart_rollout_converges_by_witness_publish_minio() {
     skip_unless_minio!();
     let coord = common::unique_bucket("enc-witness");
     common::minio_client()
@@ -1443,20 +1475,36 @@ async fn the_witness_follows_a_rollout_when_the_old_writers_are_gone_minio() {
         format!("{{ encryption: {{ mode: aes256-gcm-proxy, key: \"{KB}\", key_id: ha-b }} }}");
     let a = ha_node("node-a", &coord, &data, &old).await;
     a.wait_witness("agree").await;
-    // B's config file is written after A's entry: newer (a takeover needs
-    // that; the server clock has 1 s resolution).
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let b = ha_node("node-b", &coord, &data, &block(KC, "ha-c")).await;
     b.wait_witness("mismatch").await;
-    // Still refused a few polls later: A is live and holds `ha-b`.
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    assert_eq!(b.witness().await["status"], "mismatch");
-    assert_eq!(b.raw_put(&data, "x.txt", b"refused").await.0, 503);
     drop(a);
+    // Well past any heartbeat: still refused, and the 503 names the command.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    assert_eq!(b.witness().await["status"], "mismatch");
+    let (code, body) = b.raw_put(&data, "x.txt", b"refused").await;
+    assert_eq!(code, 503, "{body}");
+    assert!(body.contains("witness publish"), "{body}");
+    // The operator publishes B's encryption.
+    let out = cli_publish(&b, &[&data], &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     b.wait_witness("agree").await;
     let (code, body) = b.raw_put(&data, "x.txt", b"after the rollout").await;
     assert_eq!(code, 200, "{body}");
     assert_eq!(b.at_rest(&data, "x.txt").await.as_deref(), Some("ha-c"));
+    let published = audit_targets(&b, "bucket_encryption_witness_publish").await;
+    assert!(
+        published.iter().any(|t| t.contains("ha-c")),
+        "{published:?}"
+    );
+    // A subject that names no storage is refused (exit 6).
+    let out = cli_publish(&b, &["nope-not-a-bucket"], &[]);
+    assert_eq!(out.status.code(), Some(6));
 }
 
 /// Review of P3 (probe-verified): a node that booted with `mode: none` on
@@ -1544,7 +1592,6 @@ async fn a_lagging_instance_never_reverts_a_rotation_minio() {
     a.wait_witness("agree").await;
     let b = ha_node("node-b", &coord, &data, &old).await;
     b.wait_witness("agree").await;
-    // A rotates (after B's config was written).
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     a.storage_patch_ok(
         json!({ "buckets": { data.as_str(): { "encryption": override_json(KC, "ha-c") } } }),
@@ -1552,10 +1599,70 @@ async fn a_lagging_instance_never_reverts_a_rotation_minio() {
     .await;
     b.wait_witness("mismatch").await;
     drop(a);
-    // Well past A's heartbeat TTL (3 polls of 1 s).
-    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    // (1) An unrelated, engine-rebuilding apply on the lagging node.
+    b.storage_patch_ok(json!({ "buckets": { "unrelated-bucket": { "quota_bytes": 1000 } } }))
+        .await;
+    // (2) The downgrade header with an empty patch republishes nothing:
+    // B's intent encrypts.
+    let (code, v) = b
+        .storage_patch_with(
+            json!({}),
+            &[("X-DGP-Confirm-Encryption-Downgrade", data.as_str())],
+        )
+        .await;
+    assert_eq!(code, 200, "{v}");
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     let w = b.witness().await;
     assert_eq!(w["status"], "mismatch", "{w}");
     assert_eq!(w["mismatches"][0]["published"]["key_id"], "ha-c", "{w}");
     assert_eq!(b.raw_put(&data, "x.txt", b"refused").await.0, 503);
+    // (3) The lagging config restarted in a re-rendered (new) file.
+    let c = ha_node("node-c", &coord, &data, &old).await;
+    c.wait_witness("mismatch").await;
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    assert_eq!(c.witness().await["status"], "mismatch");
+    assert_eq!(c.raw_put(&data, "y.txt", b"refused").await.0, 503);
+}
+
+/// Second review, finding 1 (probe-verified): A encrypts the bucket only
+/// through the singleton's `backend_encryption` (the `*` entry; A does not
+/// name the bucket). B boots with `buckets.<b>.encryption: {mode: none}`.
+/// Both agreed and B wrote plaintext; now B is judged against `*` and
+/// refuses.
+#[tokio::test]
+async fn a_bucket_block_downgrade_against_the_backends_star_refuses_minio() {
+    skip_unless_minio!();
+    let coord = common::unique_bucket("enc-witness");
+    common::minio_client()
+        .await
+        .create_bucket()
+        .bucket(&coord)
+        .send()
+        .await
+        .expect("create the coordination bucket");
+    let data = common::unique_bucket("enc-data");
+    let backend_aes = format!(
+        "  backend_encryption: {{ mode: aes256-gcm-proxy, key: \"{KB}\", key_id: ha-b }}\n"
+    );
+    let a = ha_node_raw(
+        "node-a",
+        &coord,
+        &data,
+        "    other-bucket: {}\n",
+        &backend_aes,
+    )
+    .await;
+    a.wait_witness("agree").await;
+    let b = ha_node_raw(
+        "node-b",
+        &coord,
+        &data,
+        &format!("    {data}: {{ encryption: {{ mode: none, legacy_key: \"{KB}\", legacy_key_id: ha-b }} }}\n"),
+        &backend_aes,
+    )
+    .await;
+    let w = b.wait_witness("mismatch").await;
+    assert_eq!(w["mismatches"][0]["bucket"], data.as_str(), "{w}");
+    assert_eq!(b.raw_put(&data, "x.txt", b"plaintext?").await.0, 503);
+    assert_eq!(a.raw_put(&data, "x.txt", b"encrypted").await.0, 200);
 }

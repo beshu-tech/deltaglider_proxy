@@ -58,6 +58,16 @@ The command reads the password from the `DGP_BOOTSTRAP_PASSWORD` environment var
 
 Exit: `0` applied and persisted (with a stderr note when a restart-only field changed); `5` applied in memory but not persisted (also HTTP errors and login rate-limiting); `6` server rejected the apply; `7` missing/wrong `DGP_BOOTSTRAP_PASSWORD`; `3` local I/O error.
 
+## `witness publish`
+
+```text
+deltaglider_proxy witness publish <SUBJECT>... [--confirm-encryption-downgrade <SUBJECT>]... [--server <URL>] [--timeout <SECS>]
+```
+
+With `config_sync_bucket` set, publishes the encryption that this instance uses for the named storages as the encryption that every instance must use. Use it after a rollout that restarted the instances with a changed config (a ConfigMap, a new environment key): a restart does not publish, so the changed buckets refuse writes until you run it. A subject is a bucket name, `backend:<name>` or `route:default`. A storage that this instance stores in plaintext needs `--confirm-encryption-downgrade <SUBJECT>`. The command reads the password from `DGP_BOOTSTRAP_PASSWORD`, like `config apply`, and prints the published storages as JSON. See [run multiple instances](../how-to/run-multiple-instances.md#change-the-encryption-of-a-bucket).
+
+Exit: `0` published; `6` refused (a subject that names no storage, an unconfirmed downgrade, or a single instance); `5` the sync bucket did not answer, or another HTTP error; `7` missing/wrong `DGP_BOOTSTRAP_PASSWORD`.
+
 ## `admission trace`
 
 ```text

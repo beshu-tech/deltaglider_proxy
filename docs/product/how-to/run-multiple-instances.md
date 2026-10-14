@@ -190,32 +190,38 @@ The YAML config is per instance. When a bucket has its own `encryption` block, t
 ### How the witness works
 
 - The object `_dgp/encryption/intent.json` in the sync bucket holds, for each stored bucket (the backend and the real bucket name), the encryption that the instances share: the mode, the key id, and for a proxy key a key check value (`kcv`). It never holds a key. A key id is the public name of a key, and every object already carries it. The key check value tells two keys with the same key id apart (see [the encryption reference](../reference/encryption.md#key-check-value)). An entry for the bucket `*` stands for every bucket of the backend that has no entry of its own.
-- At start, and every 30 seconds after that (`DGP_ENCRYPTION_WITNESS_POLL_SECS`), each instance adds the entries that it encrypts and that the object does not list yet: its bucket blocks, the buckets that it names and that inherit an encrypting backend, and each encrypting backend's `*`. The first instance that adds an entry sets it. An instance never adds plaintext, so an instance that starts with `mode: none` for a bucket that the others encrypt does not set the entry.
-- An instance whose encryption of a bucket differs from the shared one refuses writes to that bucket with `503 SlowDown`. The message names the bucket and both encryptions. Reads of the bucket, and writes to every other bucket, keep working. Background writers on that instance stop instead of failing object after object. A replication or lifecycle run that writes into the bucket stops as `deferred`: it keeps its cursor, writes no failure for the refused objects, and is due again a minute later; the scheduler checks the witness before it starts the next run. A maintenance job (re-encrypt, migrate, metadata backfill) that writes into the bucket waits like a job whose backend is unavailable, and resumes from its cursor.
-- A config apply on an instance (the admin GUI, the admin API or `config apply`) that changes the encryption of a bucket publishes the new encryption. The other instances then refuse writes to that bucket until they get the same change.
-- Each instance also writes a heartbeat object under `_dgp/encryption/nodes/`. An instance takes over an entry (publishes its own encryption) only when all of these are true: no live instance writes the bucket with the shared encryption any more; the config of the instance changed after the entry was set (its config file is newer, or it applied a config later), so an instance that restarts with an older file never reverts a newer change; the instance has the key that its config names; and the change is not a downgrade to plaintext. Every takeover writes the audit entry `bucket_encryption_witness_takeover`.
-- An instance that cannot read the sync bucket keeps its last verdict for two polls. After that it refuses writes to every bucket that the witness covers, until a check succeeds. It stops before its heartbeat (three polls) expires, so it never writes while another instance takes over its buckets. An instance that cannot check at start refuses writes to those buckets until the first check succeeds. Buckets that the witness does not cover are not affected.
+- At start, and every 30 seconds after that (`DGP_ENCRYPTION_WITNESS_POLL_SECS`), each instance adds the entries that it encrypts and that the object does not list yet: its bucket blocks, the buckets that it names and that inherit an encrypting backend, and each encrypting backend's `*`. The first instance that adds an entry sets it. An instance never adds plaintext, and never an entry for a key that it does not have.
+- An instance whose encryption of a bucket differs from the shared one refuses writes to that bucket with `503 SlowDown`. A bucket with no entry of its own is compared with its backend's `*` entry. The message names the bucket, both encryptions, and the command that publishes this instance's encryption. Reads of the bucket, and writes to every other bucket, keep working. Background writers on that instance stop instead of failing object after object. A replication or lifecycle run that writes into the bucket stops as `deferred`: it keeps its cursor, writes no failure for the refused objects, and is due again a minute later; the scheduler checks the witness before it starts the next run. A maintenance job (re-encrypt, migrate, metadata backfill) that writes into the bucket waits like a job whose backend is unavailable, and resumes from its cursor.
+- An entry changes only in three ways: the first instance that encrypts a bucket adds it; a config apply on an instance that CHANGES the encryption of a bucket publishes the new encryption of that bucket; or the operator publishes an instance's encryption with `witness publish`. No instance takes over an entry by itself.
+- An instance that cannot read the sync bucket keeps its last verdict for two polls, counted from the start of the last check that succeeded. After that it refuses writes to every bucket that the witness covers, until a check succeeds. An instance that cannot check at start refuses writes to those buckets until the first check succeeds. When the instance cannot build its client for the sync bucket at all, the witness is `unavailable`, and those buckets refuse writes until a restart with a working sync bucket. Buckets that the witness does not cover are not affected. A write that the proxy admitted before the gate closed (for example a large upload) can still finish after it.
 
 ### Change the encryption of a bucket
 
-Apply the same config on every instance, one instance after the other. Between the first and the last apply, the instances that do not have the change yet refuse writes to that bucket, and clients retry their `503 SlowDown` answers. When the last instance has the change, every instance writes the bucket again.
+There are two supported ways:
 
-A rollout that restarts every instance with an edited file also converges: when the last instance with the old file stops, an instance with the new file takes over the entry. This does not work for a downgrade to plaintext.
+1. **Apply the change on every instance.** Apply the new config on one instance (the admin GUI, the admin API or `config apply`). The apply publishes the new encryption. Then apply the same config on the other instances, one after the other. Between the first and the last apply, the instances that do not have the change yet refuse writes to that bucket, and clients retry their `503 SlowDown` answers. When the last instance has the change, every instance writes the bucket again. Nothing else is needed.
+2. **Restart every instance with the new config** (an edited ConfigMap, a new environment key). A restart does not publish anything. After the rollout, every instance with the new config refuses writes to the changed buckets, because the shared entry still names the old encryption. The `503 SlowDown` names the command. Run it once, on any instance that has the new config:
+
+   ```bash
+   deltaglider_proxy witness publish db-archive --server https://dgp-1:9000
+   ```
+
+   The subject is a bucket name, `backend:<name>` (every bucket of that backend, including its `*` entry), or `route:default`. The command calls `POST /_/api/admin/encryption-witness/publish` and writes the audit entry `bucket_encryption_witness_publish`. Until you run it, the changed buckets refuse writes on the new instances.
 
 ### Finish a downgrade to plaintext
 
-A downgrade needs a confirmation, also across the instances. When every instance restarted with a file that sets a bucket to `mode: none`, the instances refuse writes to the bucket, because the shared entry still encrypts. To finish the downgrade, send one apply with the confirmation to any instance. The apply may leave the config as it is:
+A downgrade needs a confirmation, also across the instances. With way 1, the apply that sets `mode: none` carries the confirmation and publishes the plaintext entry. With way 2, publish with the confirmation:
 
 ```bash
-deltaglider_proxy config apply deltaglider_proxy.yaml --server https://dgp-1:9000 \
-  --confirm-encryption-downgrade db-archive
+deltaglider_proxy witness publish db-archive --confirm-encryption-downgrade db-archive \
+  --server https://dgp-1:9000
 ```
 
-The confirmed apply publishes the plaintext entry, and the other instances agree on their next check.
+An apply with the confirmation header also publishes the confirmed buckets whose encryption on that instance is plaintext, even when the apply changes nothing else. A confirmation never publishes an encrypting entry.
 
 ### Check the verdict
 
-`/_/ready` shows `encryption_witness.status`: `agree`, `mismatch`, or `unknown` when the sync bucket did not answer. It shows nothing more, because it needs no login. The details (the buckets, both encryptions, the instance that published the entry, and the last error) are in `GET /_/api/admin/encryption-witness`, which needs an admin session. An instance with a mismatch stays ready. It refuses writes to some buckets only, and it still serves their reads and every other bucket. A load balancer that removed it would take all of that traffic away.
+`/_/ready` shows `encryption_witness.status`: `agree`, `mismatch`, `unknown` when the sync bucket did not answer, or `unavailable` when the instance has no client for it. It shows nothing more, because it needs no login. The details (the buckets, both encryptions, the instance that published the entry, and the last error) are in `GET /_/api/admin/encryption-witness`, which needs an admin session. An instance with a mismatch stays ready. It refuses writes to some buckets only, and it still serves their reads and every other bucket. A load balancer that removed it would take all of that traffic away.
 
 ## 9. Mind upgrades across the fleet
 

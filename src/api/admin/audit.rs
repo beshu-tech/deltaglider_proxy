@@ -58,3 +58,56 @@ pub async fn get_encryption_witness(
         .map(|w| w.status());
     (StatusCode::OK, Json(status))
 }
+
+/// Body of `POST /_/api/admin/encryption-witness/publish`.
+#[derive(Deserialize)]
+pub struct WitnessPublishRequest {
+    /// Subjects: bucket names, `backend:<name>`, `route:default`.
+    pub storages: Vec<String>,
+}
+
+/// POST /_/api/admin/encryption-witness/publish — the operator publishes
+/// THIS instance's current encryption of the named storages to the
+/// multi-instance encryption witness (issue #116 P3), e.g. after a restart
+/// rollout (a ConfigMap, an env key) that no apply announced. A plaintext
+/// intent needs `X-DGP-Confirm-Encryption-Downgrade: <subject>`. Audited
+/// (`bucket_encryption_witness_publish`). 409 on a single instance.
+pub async fn publish_encryption_witness(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<super::AdminState>>,
+    headers: axum::http::HeaderMap,
+    super::extract::AdminJson(body): super::extract::AdminJson<WitnessPublishRequest>,
+) -> Result<impl IntoResponse, super::AdminError> {
+    use crate::coordination::encryption_witness::PublishError;
+    let Some(witness) = state.s3_state.encryption_witness.clone() else {
+        return Err(super::AdminError::conflict(
+            "no encryption witness: config_sync_bucket is not set (single instance)",
+        ));
+    };
+    if body.storages.is_empty() {
+        return Err(super::AdminError::invalid("name at least one storage"));
+    }
+    let cfg = state.config.read().await.clone();
+    let confirmed = crate::config::confirmed_downgrades(Some(&headers));
+    match witness
+        .publish_subjects(&cfg, &body.storages, &confirmed, &headers)
+        .await
+    {
+        Ok(plan) => Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "published": plan
+                    .iter()
+                    .map(|((backend, bucket), intent)| serde_json::json!({
+                        "backend": backend,
+                        "bucket": bucket,
+                        "mode": intent.mode,
+                        "key_id": intent.key_id,
+                    }))
+                    .collect::<Vec<_>>(),
+                "status": witness.status().status,
+            })),
+        )),
+        Err(PublishError::Refused(r)) => Err(super::AdminError::invalid(r.to_string())),
+        Err(PublishError::Failed(e)) => Err(super::AdminError::unavailable(e)),
+    }
+}

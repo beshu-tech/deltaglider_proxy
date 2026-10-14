@@ -101,6 +101,11 @@ enum Command {
         #[command(subcommand)]
         action: AdmissionCommand,
     },
+    /// Multi-instance encryption witness tooling (publish).
+    Witness {
+        #[command(subcommand)]
+        action: WitnessCommand,
+    },
     /// AWS-CLI-shaped S3 client commands. See `s3 --help`.
     S3 {
         #[command(subcommand)]
@@ -200,6 +205,29 @@ enum ConfigCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum WitnessCommand {
+    /// Publish the encryption of the named storages on THIS instance as the
+    /// encryption that every instance must use (after a restart rollout,
+    /// e.g. a ConfigMap or an env key, that no apply announced). Requires
+    /// the admin bootstrap password in `DGP_BOOTSTRAP_PASSWORD`.
+    Publish {
+        /// A bucket name, `backend:<name>` or `route:default`. Repeatable.
+        #[arg(value_name = "SUBJECT", required = true)]
+        subjects: Vec<String>,
+        /// Confirm that publishing this subject's plaintext is intended (a
+        /// downgrade). Repeatable.
+        #[arg(long = "confirm-encryption-downgrade", value_name = "SUBJECT")]
+        confirm_encryption_downgrade: Vec<String>,
+        /// Server URL. Defaults to http://127.0.0.1:9000.
+        #[arg(long, value_name = "URL")]
+        server: Option<String>,
+        /// Per-request timeout in seconds. Defaults to 30.
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum AdmissionCommand {
     /// Dry-run a synthetic request through the admission chain.
     ///
@@ -262,6 +290,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 ConfigCommand::Lint { file } => lint(file),
                 ConfigCommand::Defaults { out } => defaults(out.as_deref()),
+            },
+            Command::Witness { action } => match action {
+                WitnessCommand::Publish {
+                    subjects,
+                    confirm_encryption_downgrade,
+                    server,
+                    timeout,
+                } => {
+                    let mut opts = AdminClientOpts::default();
+                    if let Some(s) = server.as_deref() {
+                        opts.server = s.to_string();
+                    }
+                    if let Some(t) = timeout {
+                        opts.timeout_secs = *t;
+                    }
+                    deltaglider_proxy::cli::config::witness_publish(
+                        subjects,
+                        confirm_encryption_downgrade,
+                        opts,
+                    )
+                }
             },
             Command::Admission { action } => match action {
                 AdmissionCommand::Trace {
@@ -798,12 +847,10 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Multi-instance encryption witness (issue #116 P3): the first sync
     // runs before anything serves, so a node that disagrees with the
     // others about a bucket's encryption never takes a write to it.
-    let witness_config_path = cli.config.clone().or_else(Config::resolve_config_path);
     let encryption_witness = startup::build_encryption_witness(
         &config,
         &coordination_check,
         engine.encryption_policies().witness_gate(),
-        witness_config_path.as_deref(),
     )
     .await;
     let state = Arc::new(AppState {

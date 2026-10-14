@@ -586,6 +586,69 @@ async fn apply_async(
     Ok(EXIT_OK)
 }
 
+/// `witness publish <subject>... [--confirm-encryption-downgrade S]...`
+///
+/// Publish THIS instance's encryption of the named storages to the
+/// multi-instance encryption witness
+/// (`POST /_/api/admin/encryption-witness/publish`). Exit: `0` published;
+/// `6` refused (unknown subject, unconfirmed downgrade, single instance);
+/// `5` HTTP error (the coordination bucket did not answer); `7` password.
+pub fn witness_publish(subjects: &[String], confirm: &[String], opts: AdminClientOpts) -> i32 {
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("error: failed to start tokio runtime: {e}");
+            return EXIT_IO;
+        }
+    };
+    match runtime.block_on(witness_publish_async(subjects, confirm, opts)) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("{}", e.user_message());
+            e.exit_code()
+        }
+    }
+}
+
+async fn witness_publish_async(
+    subjects: &[String],
+    confirm: &[String],
+    opts: AdminClientOpts,
+) -> Result<i32, CliError> {
+    let client = admin_login(&opts).await?;
+    let url = format!(
+        "{}/_/api/admin/encryption-witness/publish",
+        opts.server.trim_end_matches('/')
+    );
+    let mut req = client
+        .post(&url)
+        .json(&serde_json::json!({ "storages": subjects }));
+    if !confirm.is_empty() {
+        req = req.header(
+            crate::config::CONFIRM_ENCRYPTION_DOWNGRADE_HEADER,
+            confirm.join(","),
+        );
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| CliError::Http(format!("POST {url}: {e}")))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        println!("{text}");
+        return Ok(EXIT_OK);
+    }
+    let error = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+        .unwrap_or(text);
+    if status.is_server_error() {
+        return Err(CliError::Http(format!("{status}: {error}")));
+    }
+    Err(CliError::Rejected(format!("{status}: {error}")))
+}
+
 /// `admission trace --method M --path P [--authenticated] [--query Q] [--server URL]`
 ///
 /// Dry-run a synthetic request through the server's admission chain via
