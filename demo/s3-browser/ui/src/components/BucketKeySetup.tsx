@@ -69,8 +69,20 @@ export default function BucketKeySetup({ bucket, backend, usedKeyIds = [], onCha
   const keyOk = isAesKeyHex(key);
   const idTaken = usedKeyIds.includes(keyId);
   const idOk = isValidKeyId(keyId) && !idTaken;
+  // The confirmation covers the key, its id and the bucket together: a
+  // change of any of them clears it (review P2, defect 3: an id edited
+  // after the confirmation left a key file with another id).
+  const binding = `${bucket}\u0000${keyId}\u0000${key}`;
+  const [tailFor, setTailFor] = useState(binding);
+  if (tailFor !== binding) {
+    setTailFor(binding);
+    if (tail) setTail('');
+  }
+  // A key file downloaded before such a change names the wrong bucket or id.
+  const [downloadedFor, setDownloadedFor] = useState<string | null>(null);
+  const staleFile = downloadedFor !== null && downloadedFor !== binding;
   const confirmed = source === 'paste' || keyTailMatches(key, tail);
-  const ready = keyOk && idOk && confirmed;
+  const ready = keyOk && idOk && confirmed && !staleFile;
 
   useEffect(() => {
     onChange({ key, keyId, ready });
@@ -153,9 +165,10 @@ export default function BucketKeySetup({ bucket, backend, usedKeyIds = [], onCha
             <Button
               size="small"
               icon={<DownloadOutlined />}
-              onClick={() =>
-                downloadText(keyFileText({ bucket, backend, keyId, key: generated }), keyFileName(bucket, keyId))
-              }
+              onClick={() => {
+                downloadText(keyFileText({ bucket, backend, keyId, key: generated }), keyFileName(bucket, keyId));
+                setDownloadedFor(binding);
+              }}
             >
               Download key file
             </Button>
@@ -170,6 +183,11 @@ export default function BucketKeySetup({ bucket, backend, usedKeyIds = [], onCha
               Generate another
             </Button>
           </Space>
+          {staleFile && (
+            <Text type="danger" role="alert" style={{ fontSize: 11, display: 'block', marginTop: 6 }}>
+              The key file that you downloaded names another bucket or key id. Download it again.
+            </Text>
+          )}
           <label htmlFor={`${uid}-tail`} style={label}>
             To confirm that you stored the key, type its last 6 characters
           </label>

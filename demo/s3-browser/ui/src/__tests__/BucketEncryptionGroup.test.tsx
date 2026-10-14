@@ -202,3 +202,26 @@ test('a refusal of the server shows in the group', async () => {
   // The apply dialog shows the server's error and offers no apply.
   expect(await screen.findByText(/needs a witness/)).toBeInTheDocument();
 });
+
+/** Review P2, defect 3: the confirmation covers the key id too. */
+test('a key id edited after the confirmation clears it, and a stale key file must be downloaded again', async () => {
+  const user = userEvent.setup();
+  const create = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:x');
+  vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+  renderGroup(eff());
+  await user.click(screen.getByText('Encrypt with a bucket key'));
+  const key = (screen.getByLabelText('Generated key') as HTMLTextAreaElement).value;
+  await user.click(screen.getByRole('button', { name: /Download key file/ }));
+  expect(create).toHaveBeenCalled();
+  await user.type(screen.getByLabelText('Last 6 characters of the key'), key.slice(-6));
+  const review = screen.getByRole('button', { name: 'Review & apply' });
+  await waitFor(() => expect(review).toBeEnabled());
+  await user.type(screen.getByLabelText('Key id'), 'x');
+  expect(screen.getByLabelText('Last 6 characters of the key')).toHaveValue('');
+  expect(review).toBeDisabled();
+  expect(screen.getByText(/names another bucket or key id/)).toBeInTheDocument();
+  await user.type(screen.getByLabelText('Last 6 characters of the key'), key.slice(-6));
+  expect(review).toBeDisabled();
+  await user.click(screen.getByRole('button', { name: /Download key file/ }));
+  await waitFor(() => expect(review).toBeEnabled());
+});
