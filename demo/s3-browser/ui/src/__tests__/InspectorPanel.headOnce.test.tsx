@@ -48,3 +48,18 @@ test('one HEAD per opened object; a refreshed row for the same key sends none', 
   view.rerender(<InspectorPanel {...props} object={row('builds/other.zip')} />);
   await waitFor(() => expect(s3.heads).toEqual(['builds/app.zip', 'builds/other.zip']));
 });
+
+test('an overwrite (same key, new ETag) sends a new HEAD; a stub that gains its ETag does not', async () => {
+  s3.heads = [];
+  // A deep link opens a stub without an ETag; the listing then gives the row.
+  const stub = { key: 'builds/app.zip', size: 0, lastModified: '' } as S3Object;
+  const view = renderWithQuery(<InspectorPanel {...props} object={stub} />);
+  await waitFor(() => expect(s3.heads).toEqual(['builds/app.zip']));
+  view.rerender(<InspectorPanel {...props} object={row('builds/app.zip')} />);
+  await new Promise((r) => setTimeout(r, 50));
+  expect(s3.heads).toHaveLength(1);
+
+  // Someone overwrites the object: the listing shows a new ETag.
+  view.rerender(<InspectorPanel {...props} object={{ ...row('builds/app.zip'), etag: '"e2"' }} />);
+  await waitFor(() => expect(s3.heads).toEqual(['builds/app.zip', 'builds/app.zip']));
+});

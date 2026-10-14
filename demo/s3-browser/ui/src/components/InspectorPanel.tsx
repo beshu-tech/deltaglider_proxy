@@ -259,6 +259,17 @@ export default function InspectorPanel({
   // hands over a new row object for the same key.
   const listedFacts = useRef<{ storageType?: string; storedSize?: number }>({});
   listedFacts.current = { storageType: object?.storageType, storedSize: object?.storedSize };
+  // Bumps when the listing shows a new ETag for the open key (an overwrite):
+  // the HEAD runs again, or the stored size and storage type stay the old
+  // object's. A stub row (deep link) that gains its first ETag is no change.
+  const etagSeen = useRef<{ key?: string; etag?: string; rev: number }>({ rev: 0 });
+  {
+    const seen = etagSeen.current;
+    const etag = object?.etag || undefined;
+    if (seen.key !== objectKey) etagSeen.current = { key: objectKey, etag, rev: 0 };
+    else if (etag && etag !== seen.etag) etagSeen.current = { key: objectKey, etag, rev: seen.etag ? seen.rev + 1 : seen.rev };
+  }
+  const overwriteRev = etagSeen.current.rev;
 
   // Request-identity guard for the async button handlers (download / share /
   // delete). Same root cause and fix as the headObject + bucketPolicy effect
@@ -328,7 +339,7 @@ export default function InspectorPanel({
       })
       .finally(() => { if (!cancelled) setHeadLoading(false); });
     return () => { cancelled = true; };
-  }, [objectKey]);
+  }, [objectKey, overwriteRev]);
 
   const closeModal = useCallback(() => {
     setModalState(null);
