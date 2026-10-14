@@ -13,7 +13,7 @@ import { relativeTime } from '../utils';
  * PUT/DELETE so it's instant even on huge buckets. The ⟳ button forces an
  * authoritative full scan (the only O(n) path). Auto-hides without an admin
  * session (the endpoint 403s → null). `last_scan_at` shows when a scan last
- * reconciled the running total.
+ * reconciled the running total; only a scan that no write overlapped sets it.
  */
 export default function BucketUsageChip({
   bucket,
@@ -83,7 +83,7 @@ export default function BucketUsageChip({
     scope +
     (data.last_scan_at != null
       ? `Last full scan ${relativeTime(data.last_scan_at * 1000)}`
-      : 'Not reconciled — the running total of writes and deletes may be off (never scanned, or a write could not read the object it replaced); ⟳ to reconcile');
+      : 'Not reconciled — the running total of writes and deletes may be off (never scanned, the last scan ran while writes changed the bucket, or a write could not read the object it replaced); ⟳ to reconcile when no writes are running');
 
   return (
     <span
