@@ -9,7 +9,6 @@ use crate::config::Config;
 use crate::deltaglider::DynEngine;
 use crate::storage::StorageBackend;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 const KB: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 

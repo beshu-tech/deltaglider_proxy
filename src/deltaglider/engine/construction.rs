@@ -286,7 +286,10 @@ pub(super) fn wrap_backend_with_encryption(
 ) -> Result<Box<DynStorageBackend<'static>>, StorageError> {
     let cfg = resolve_encryption_config(backend_name, enc, buckets, collisions)?;
     Ok(DynStorageBackend::new_box(
-        crate::storage::EncryptingBackend::new(inner, Arc::new(ArcSwap::new(Arc::new(cfg)))),
+        crate::storage::EncryptingBackend::new(
+            inner,
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(cfg))),
+        ),
     ))
 }
 

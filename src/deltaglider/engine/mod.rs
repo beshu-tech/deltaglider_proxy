@@ -3,7 +3,6 @@
 //! DeltaGlider engine - main orchestrator for delta-based storage
 
 use crate::storage::DynStorageBackend;
-use arc_swap::ArcSwap;
 
 use super::cache::ReferenceCache;
 use super::codec::{CodecError, DeltaCodec};
