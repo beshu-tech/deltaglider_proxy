@@ -105,16 +105,16 @@ pub async fn run_now(
             .lock()
             .await
             .replication_ensure_state(&rule.name, now);
-        let acquired = lease
-            .try_acquire(
-                crate::coordination::LeaseSubsystem::Replication,
-                &rule.name,
-                &lease_owner,
-                now,
-                replication::scheduler::lease_ttl_secs(&repl),
-            )
-            .await
-            .map_err(|e| AdminError::internal(e.to_string()))?;
+        let acquired = crate::coordination::lease::try_acquire_one_shot(
+            &*lease,
+            crate::coordination::LeaseSubsystem::Replication,
+            &rule.name,
+            &lease_owner,
+            now,
+            replication::scheduler::lease_ttl_secs(&repl),
+        )
+        .await
+        .map_err(|e| AdminError::internal(e.to_string()))?;
         if !acquired {
             return Err(AdminError::conflict(
                 "rule is already running; wait for the current run to finish",

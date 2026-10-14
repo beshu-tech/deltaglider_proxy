@@ -187,6 +187,31 @@ impl CoordinationLease for LocalLease {
     }
 }
 
+/// Take the lease for a task whose owner is new for this one call
+/// (`run-now:<uuid>`, `delete:<uuid>`). An `Err` does not prove that no
+/// lease landed: on S3 the conditional PUT can land while its response is
+/// lost. Nobody would use that owner again, so the lease would block the
+/// rule for its whole TTL. On `Err` this sends a best-effort, owner-scoped
+/// release (it deletes only a lease that is still this owner's) before it
+/// returns the error. A task that keeps its owner (the scheduler, the
+/// event consumer) adopts its own lease on the next tick instead.
+pub async fn try_acquire_one_shot(
+    lease: &(impl CoordinationLease + ?Sized),
+    subsystem: LeaseSubsystem,
+    rule: &str,
+    owner: &str,
+    now: i64,
+    ttl_secs: i64,
+) -> Result<bool, LeaseError> {
+    let acquired = lease
+        .try_acquire(subsystem, rule, owner, now, ttl_secs)
+        .await;
+    if acquired.is_err() {
+        let _ = lease.release(subsystem, rule, owner).await;
+    }
+    acquired
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,5 +303,107 @@ mod tests {
     fn subsystem_slug_is_stable() {
         // The slug is part of the S3 lease object key: never rename it.
         assert_eq!(LeaseSubsystem::Replication.slug(), "replication");
+    }
+
+    /// A lease whose acquire lands while its response is lost: the write
+    /// is done, and the caller gets an error.
+    #[derive(Default)]
+    struct LostResponseLease {
+        holder: std::sync::Mutex<Option<String>>,
+    }
+
+    impl CoordinationLease for LostResponseLease {
+        async fn try_acquire(
+            &self,
+            _: LeaseSubsystem,
+            _: &str,
+            owner: &str,
+            _: i64,
+            _: i64,
+        ) -> Result<bool, LeaseError> {
+            let mut holder = self.holder.lock().unwrap();
+            if holder.is_some() {
+                return Ok(false);
+            }
+            *holder = Some(owner.to_string());
+            Err(LeaseError::Backend("response lost".into()))
+        }
+        async fn renew(
+            &self,
+            _: LeaseSubsystem,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: i64,
+        ) -> Result<(), LeaseError> {
+            Ok(())
+        }
+        async fn release(&self, _: LeaseSubsystem, _: &str, owner: &str) -> Result<(), LeaseError> {
+            let mut holder = self.holder.lock().unwrap();
+            if holder.as_deref() == Some(owner) {
+                *holder = None;
+            }
+            Ok(())
+        }
+        async fn is_held(&self, _: LeaseSubsystem, _: &str, _: i64) -> Result<bool, LeaseError> {
+            Ok(self.holder.lock().unwrap().is_some())
+        }
+    }
+
+    /// A one-shot acquire whose lease landed with a lost response releases
+    /// it: the rule is not blocked for the TTL by an owner nobody uses again.
+    #[tokio::test]
+    async fn a_one_shot_acquire_that_errs_releases_its_lease() {
+        let lease = LostResponseLease::default();
+        let r = LeaseSubsystem::Replication;
+        let got = try_acquire_one_shot(&lease, r, "rule1", "run-now:1", 100, 300).await;
+        assert!(got.is_err());
+        assert!(
+            !lease.is_held(r, "rule1", 100).await.unwrap(),
+            "the lease of the failed acquire still blocks the rule"
+        );
+        *lease.holder.lock().unwrap() = Some("peer".into());
+        let _ = try_acquire_one_shot(&lease, r, "rule1", "run-now:2", 100, 300).await;
+        assert_eq!(
+            lease.holder.lock().unwrap().as_deref(),
+            Some("peer"),
+            "the release is owner-scoped"
+        );
+    }
+
+    /// Source guard: an acquire whose owner is new for each call
+    /// (`format!("...:{}", uuid)`) goes through `try_acquire_one_shot`.
+    /// The scheduler and the event consumer keep one owner for their life
+    /// (`scheduler:<uuid>`, the instance id), so their next tick adopts a
+    /// lease that landed with a lost response.
+    #[test]
+    fn one_shot_lease_owners_use_the_releasing_acquire() {
+        const OWNER_KEPT: &[&str] = &[
+            "src/replication/event_consumer.rs",
+            "src/replication/scheduler.rs",
+        ];
+        let mut offenders = Vec::new();
+        for (rel, text) in crate::source_scan::prod_sources("src") {
+            if OWNER_KEPT.contains(&rel.as_str()) {
+                continue;
+            }
+            let text = crate::source_scan::prod_text(&text);
+            if !text.contains("Uuid::new_v4()") {
+                continue;
+            }
+            for (n, line) in text.lines().enumerate() {
+                if line.contains(".try_acquire(") {
+                    let window: String = text.lines().skip(n).take(3).collect();
+                    if window.contains("LeaseSubsystem::") {
+                        offenders.push(format!("{rel}:{}: {}", n + 1, line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "use coordination::lease::try_acquire_one_shot:\n{}",
+            offenders.join("\n")
+        );
     }
 }

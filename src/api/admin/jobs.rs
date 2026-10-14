@@ -1176,18 +1176,18 @@ async fn delete_rule(
                     .jobs
                     .lease_timing(crate::config_sections::LeaseTiming::RULE_DELETE)
                     .ttl_secs;
-                let held = lease
-                    .try_acquire(
-                        crate::coordination::LeaseSubsystem::Replication,
-                        name,
-                        &owner,
-                        now,
-                        ttl_secs,
-                    )
-                    .await
-                    .map_err(|e| {
-                        AdminError::unavailable(format!("could not take the rule lease: {e}"))
-                    })?;
+                let held = crate::coordination::lease::try_acquire_one_shot(
+                    &**lease,
+                    crate::coordination::LeaseSubsystem::Replication,
+                    name,
+                    &owner,
+                    now,
+                    ttl_secs,
+                )
+                .await
+                .map_err(|e| {
+                    AdminError::unavailable(format!("could not take the rule lease: {e}"))
+                })?;
                 if !held {
                     return Err(AdminError::conflict(format!(
                         "rule '{name}' has a run or verify in progress — stop it before deleting"
