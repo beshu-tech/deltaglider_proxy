@@ -1053,3 +1053,65 @@ async fn a_conditional_range_serves_the_version_it_judged() {
         }
     }
 }
+
+/// The filesystem's ranged read takes the metadata and the bytes from one
+/// open file. Before, it read the xattr by path and then opened the path:
+/// a write that renamed a new file over it in between paired one
+/// version's metadata (its ETag) with another version's bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_filesystem_range_reads_one_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+        .await
+        .unwrap();
+    let backend: Backend = Arc::new(DynStorageBackend::new_box(fs));
+    backend.create_bucket("b").await.unwrap();
+    let version = |i: u64| {
+        let body = rnd(1024 + (i as usize % 7) * 512, i + 1);
+        let meta = crate::types::FileMetadata::new_passthrough(
+            "x.bin".into(),
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&body)),
+            md5_hex(&body),
+            body.len() as u64,
+            None,
+        );
+        (bytes::Bytes::from(body), meta)
+    };
+    let (body, meta) = version(0);
+    backend
+        .put_passthrough("b", "p", "x.bin", body, &meta)
+        .await
+        .unwrap();
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let (backend, done) = (backend.clone(), done.clone());
+        tokio::spawn(async move {
+            for i in 1..400 {
+                let (body, meta) = version(i);
+                backend
+                    .put_passthrough("b", "p", "x.bin", body, &meta)
+                    .await
+                    .unwrap();
+            }
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+    };
+    let mut reads = 0;
+    let mut mixed = 0;
+    while !done.load(std::sync::atomic::Ordering::SeqCst) {
+        use futures::TryStreamExt;
+        let (stream, len, meta) = backend
+            .open_passthrough_range("b", "p", "x.bin", 0, u64::MAX - 1)
+            .await
+            .unwrap();
+        let body: Vec<bytes::Bytes> = stream.try_collect().await.unwrap();
+        let body = body.concat();
+        reads += 1;
+        if md5_hex(&body) != meta.md5 || len != meta.file_size {
+            mixed += 1;
+        }
+    }
+    writer.await.unwrap();
+    assert!(reads > 0);
+    assert_eq!(mixed, 0, "{mixed} of {reads} reads mixed two versions");
+}

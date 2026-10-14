@@ -434,6 +434,45 @@ impl FilesystemBackend {
     /// reference check is skipped, and the SHA-256 of each object still
     /// checks its reconstruction. Refusing it failed every delta GET of
     /// the deltaspace. Other errors pass through.
+    /// Open the object file at `path` and read the metadata of the OPEN
+    /// file (fgetxattr; fstat for an unmanaged file, described as `name`),
+    /// in one blocking task: the metadata and the bytes are one file's,
+    /// even if a write renames another file over the path between the two.
+    /// Returns the file and whether the metadata came from the xattr.
+    async fn open_with_metadata(
+        path: PathBuf,
+        what: String,
+        name: &str,
+        is_reference: bool,
+    ) -> Result<(std::fs::File, (FileMetadata, bool)), StorageError> {
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || {
+            use xattr::FileExt;
+            let file = fsio::open_blocking(&path).map_err(|e| fsio::storage_error(e, || what))?;
+            let found = file
+                .get_xattr(xattr_meta::XATTR_NAME)
+                .map_err(io_to_storage_error)?;
+            let meta = match found {
+                Some(json) if is_reference => (
+                    Self::reference_metadata_or_stat(
+                        serde_json::from_slice(&json).map_err(StorageError::from),
+                        &path,
+                        file.metadata().ok(),
+                    )?,
+                    true,
+                ),
+                Some(json) => (serde_json::from_slice(&json)?, true),
+                None => (
+                    Self::fallback_metadata_from_stat(&path, file.metadata().ok(), &name)?,
+                    false,
+                ),
+            };
+            Ok::<_, StorageError>((file, meta))
+        })
+        .await
+        .map_err(super::join_error)?
+    }
+
     fn reference_metadata_or_stat(
         parsed: Result<FileMetadata, StorageError>,
         path: &Path,
@@ -1719,36 +1758,8 @@ impl StorageBackend for FilesystemBackend {
             }
         };
         let what = format!("{label}: {prefix}/{name}");
-        let name = name.to_string();
         let is_reference = matches!(object, StoredObject::Reference);
-        // One blocking task: open, then the metadata of the OPEN file
-        // (fgetxattr; fstat for an unmanaged file), so the metadata and the
-        // bytes are one file's even if a write renames over the path.
-        let (file, meta) = tokio::task::spawn_blocking(move || {
-            use xattr::FileExt;
-            let file = fsio::open_blocking(&path).map_err(|e| fsio::storage_error(e, || what))?;
-            let found = file
-                .get_xattr(xattr_meta::XATTR_NAME)
-                .map_err(io_to_storage_error)?;
-            let meta = match found {
-                Some(json) if is_reference => (
-                    Self::reference_metadata_or_stat(
-                        serde_json::from_slice(&json).map_err(StorageError::from),
-                        &path,
-                        file.metadata().ok(),
-                    )?,
-                    true,
-                ),
-                Some(json) => (serde_json::from_slice(&json)?, true),
-                None => (
-                    Self::fallback_metadata_from_stat(&path, file.metadata().ok(), &name)?,
-                    false,
-                ),
-            };
-            Ok::<_, StorageError>((file, meta))
-        })
-        .await
-        .map_err(super::join_error)??;
+        let (file, meta) = Self::open_with_metadata(path, what, name, is_reference).await?;
         let meta = match object {
             StoredObject::Reference => meta.0,
             StoredObject::Delta(f) | StoredObject::Passthrough(f) => keyed(meta, f),
@@ -1758,7 +1769,8 @@ impl StorageBackend for FilesystemBackend {
         Ok((Box::pin(stream), meta))
     }
 
-    /// The metadata read (xattr), then the range read of the file.
+    /// The file opened once: its metadata (fgetxattr) and the range read
+    /// from the same open file, so both are one version's.
     async fn open_passthrough_range(
         &self,
         bucket: &str,
@@ -1767,7 +1779,18 @@ impl StorageBackend for FilesystemBackend {
         start: u64,
         end: u64,
     ) -> Result<(super::ByteStream, u64, FileMetadata), StorageError> {
-        super::open_passthrough_range_by_parts(self, bucket, prefix, filename, start, end).await
+        use futures::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let path = self.passthrough_path(bucket, prefix, filename)?;
+        let what = format!("passthrough: {prefix}/{filename}");
+        let (file, meta) = Self::open_with_metadata(path, what, filename, false).await?;
+        let meta = keyed(meta, filename);
+        let mut file = tokio::fs::File::from_std(file);
+        let (start, end) = super::clamp_range(start, end, file.metadata().await?.len())?;
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+        let range_len = end - start + 1;
+        let stream = ReaderStream::new(file.take(range_len)).map(|r| r.map_err(StorageError::Io));
+        Ok((Box::pin(stream), range_len, meta))
     }
 
     #[instrument(skip(self))]
