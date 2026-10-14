@@ -112,6 +112,33 @@ lock failed. An instance now recognises its own live lock by its owner
 token (unique to each hold, so two instances never match), and a renew
 that fails reads the lock once to see whether it is still its own. An
 acquire that fails also removes a lock that it may have written.
+### Fixed — Fewer bucket checks during a backend outage
+
+When the check of a bucket failed (a `503` or a timeout from the backend),
+every request that waited for that check sent its own check afterwards, and
+a HeadBucket with multi-backend routing sent a second one to the same
+failing backend. Now all waiting requests share the one answer, the error
+included. A request that the client cancelled during the check no longer
+leaves an entry in memory.
+
+### Fixed — CreateBucket with several backends checks where the bucket lives
+
+With several storage backends, CreateBucket for a bucket without a route
+used the remembered location of the bucket for 30 seconds, and a
+remembered "no backend has it" for 5 seconds. A bucket that another
+instance created on another backend in that time got a second bucket of the
+same name on the default backend, which hid the objects of the first one.
+CreateBucket now always asks the backends.
+
+### Fixed — Replication facts and copies follow the backend of an unrouted bucket
+
+With several storage backends, replication, parity checks and copies
+judged a bucket without a route by the default backend, while its requests
+went to the backend where the bucket was found. With a filesystem default
+and the bucket on S3, replication trusted listing facts that S3 does not
+carry. They now judge the backend where the bucket was found, and take the
+safe choice while that backend is not known yet.
+
 ### Fixed — A Refresh during writes no longer holds a bucket over its quota
 
 The quota check trusts the usage counter of a bucket once a full scan has
