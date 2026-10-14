@@ -283,3 +283,28 @@ fn a_keyless_bucket_override_is_refused_on_apply() {
         .iter()
         .any(|w| w.contains("bucket 'db-archive'") && w.contains("refuses every write")),);
 }
+
+/// Review E: the override belongs to the stored bucket, so a client that
+/// names the REAL bucket `real-archive` of `db-archive: { alias:
+/// real-archive }` gets the override from the resolver, as the engine
+/// wrapper (indexed by real bucket) writes it. Before, the resolver
+/// looked up the policy NAME and answered with the backend's encryption.
+#[test]
+fn the_resolver_finds_the_override_by_real_bucket() {
+    let mut cfg = Config::from_yaml_str(&named(&format!(
+        "{{ backend: local-disk, alias: real-archive, encryption: {{ mode: aes256-gcm-proxy, key: \"{KB}\", key_id: db-archive-b }} }}"
+    )))
+    .unwrap();
+    // `real-archive` has no policy; it routes to the default `local-disk`.
+    cfg.default_backend = Some("local-disk".into());
+    let e = cfg.encryption_for_bucket("real-archive").unwrap();
+    assert!(e.from_bucket, "the real name resolves to the override");
+    assert_eq!(e.owner.as_deref(), Some("db-archive"));
+    assert_eq!(e.site_keys().primary_id(), Some("db-archive-b"));
+    assert_eq!(
+        crate::maintenance::resolve_desired(&cfg, "real-archive").unwrap(),
+        crate::maintenance::DesiredEncryption::Proxy {
+            key_id: "db-archive-b".into()
+        }
+    );
+}

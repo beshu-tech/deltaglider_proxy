@@ -255,9 +255,11 @@ impl Config {
             if names.len() < 2 {
                 continue;
             }
-            let effective = |n: &str| self.encryption_for_bucket(n).map(|e| e.config.clone());
-            let first = effective(names[0]);
-            if names[1..].iter().any(|n| effective(n) != first) {
+            // Each name's own block (the resolver answers by storage, so
+            // it would hide a name that carries no block or another one).
+            let own = |n: &str| self.buckets.get(n).and_then(|p| p.encryption.clone());
+            let first = own(names[0]);
+            if names[1..].iter().any(|n| own(n) != first) {
                 errors.push(format!(
                     "buckets {names:?} all store into bucket '{real}' on backend '{backend}' but \
                      do not agree on its encryption. The encryption belongs to the storage, so \

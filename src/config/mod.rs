@@ -1839,16 +1839,32 @@ impl Config {
     /// backend-level views.
     pub fn encryption_for_bucket(&self, bucket: &str) -> Option<BucketEncryption<'_>> {
         let (backend, _) = self.effective_backend_for_bucket(bucket)?;
-        if let Some(config) = self
-            .buckets
-            .get(&bucket.to_ascii_lowercase())
-            .and_then(|p| p.encryption.as_ref())
-        {
+        let name = bucket.to_ascii_lowercase();
+        // The override belongs to the STORED bucket (review E): match on
+        // (raw backend, real bucket), as the engine wrapper does, so the
+        // real name of an alias resolves to the alias's override.
+        let storage = self
+            .bucket_storage(&name)
+            .unwrap_or_else(|| (backend.clone(), name.clone()));
+        let by_storage = self
+            .bucket_encryption_overrides()
+            .into_iter()
+            .find(|o| o.backend == storage.0 && o.real_bucket == storage.1)
+            .map(|o| (o.bucket.to_string(), o.config));
+        // An override whose storage the config does not fix (a fatal
+        // config) still answers for its own name.
+        let own = || {
+            self.buckets
+                .get(&name)
+                .and_then(|p| p.encryption.as_ref())
+                .map(|c| (name.clone(), c))
+        };
+        if let Some((owner, config)) = by_storage.or_else(own) {
             return Some(BucketEncryption {
                 backend,
                 config,
                 from_bucket: true,
-                owner: Some(bucket.to_ascii_lowercase()),
+                owner: Some(owner),
             });
         }
         let config = self.backend_encryption_by_name(&backend)?;
