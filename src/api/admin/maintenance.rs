@@ -514,8 +514,9 @@ pub async fn cancel_job(
         let db = db.lock().await;
         let job = db.maintenance_job_by_id(id)?;
         let outcome = db.maintenance_request_cancel(id)?;
-        // A queued job that never ran settles now, and its gate (bucket AND,
-        // for migrate, the staging route) goes with the row.
+        // A job that never ran settles now, and its gate (bucket AND, for
+        // migrate, the staging route) goes with the row. A migrate that
+        // ran turns `cancelling`: the worker unwinds it.
         state.s3_state.maintenance_gate.sync_from(&db);
         (outcome, job)
     };

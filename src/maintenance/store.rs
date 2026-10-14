@@ -69,10 +69,11 @@ pub struct MaintenanceFailure {
 /// Outcome of a cancel request — the caller's follow-up differs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelOutcome {
-    /// Job was still queued: cancelled immediately, gate can be released.
+    /// Job never ran: cancelled immediately, gate can be released.
     CancelledImmediately,
-    /// Job is running: marked `cancelling`; the worker finishes the
-    /// current page, then settles it to `cancelled` and releases the gate.
+    /// Job is running, or is a migrate that ran: marked `cancelling`; the
+    /// worker finishes the current page (or claims the row), then settles
+    /// it to `cancelled` and releases the gate.
     CancelRequested,
     /// No active job with that id.
     NotActive,
@@ -439,14 +440,19 @@ impl JobsDb {
         Ok(())
     }
 
-    /// Request cancellation. Queued jobs cancel immediately; running jobs
-    /// flip to `cancelling` and the worker settles them.
+    /// Request cancellation. A queued job that never ran cancels at once;
+    /// a running job flips to `cancelling` and the worker settles it. A
+    /// queued migrate that already ran (deferred, or handed back at a
+    /// shutdown: `started_at` is set) flips to `cancelling` too: its
+    /// cancel must unwind the staging route and the copies it made, and
+    /// only the worker does that (the claim takes a `cancelling` migrate).
     pub fn maintenance_request_cancel(&self, job_id: i64) -> Result<CancelOutcome, ConfigDbError> {
         let now = current_unix_seconds();
         let n = self.conn.execute(
             "UPDATE maintenance_jobs
                 SET status = 'cancelled', finished_at = ?, updated_at = ?
-              WHERE id = ? AND status = 'queued'",
+              WHERE id = ? AND status = 'queued'
+                AND NOT (kind = 'migrate' AND started_at IS NOT NULL)",
             params![now, now, job_id],
         )?;
         if n > 0 {
@@ -455,7 +461,10 @@ impl JobsDb {
         let n = self.conn.execute(
             "UPDATE maintenance_jobs
                 SET status = 'cancelling', updated_at = ?
-              WHERE id = ? AND status = 'running'",
+              WHERE id = ?
+                AND (status = 'running'
+                     OR (status = 'queued' AND kind = 'migrate'
+                         AND started_at IS NOT NULL))",
             params![now, job_id],
         )?;
         if n > 0 {
@@ -1137,6 +1146,80 @@ mod tests {
             .maintenance_claim_next_job("w3", current_unix_seconds(), 60)
             .unwrap()
             .is_none());
+    }
+
+    /// A migrate that waits for its backend (deferred: `queued` again, its
+    /// phase and cursor kept) cancelled at once: no worker ran its unwind,
+    /// so the staging route and the copies it made stayed. It must go
+    /// through `cancelling`, which the claim takes.
+    #[test]
+    fn a_cancel_of_a_migrate_that_ran_waits_for_its_unwind() {
+        let db = db();
+        let now = current_unix_seconds();
+        let id = db
+            .maintenance_create_job("migrate", "b", "stage", None, "admin", now)
+            .unwrap()
+            .unwrap();
+        db.maintenance_claim_next_job("w", now, 60)
+            .unwrap()
+            .unwrap();
+        db.maintenance_update_progress(id, "copy", Some(10), 5, 0, 0, 0, Some("k5"))
+            .unwrap();
+        assert!(db
+            .maintenance_defer(id, "w", now - 1, "backend gated")
+            .unwrap());
+        assert_eq!(
+            db.maintenance_job_by_id(id).unwrap().unwrap().status,
+            "queued"
+        );
+
+        assert_eq!(
+            db.maintenance_request_cancel(id).unwrap(),
+            CancelOutcome::CancelRequested
+        );
+
+        let claimed = db
+            .maintenance_claim_next_job("w2", now, 60)
+            .unwrap()
+            .expect("the worker claims the cancel");
+        assert_eq!(
+            (claimed.id, claimed.status.as_str(), claimed.phase.as_str()),
+            (id, "cancelling", "copy")
+        );
+    }
+
+    /// A job that never ran, and a deferred job of a kind with nothing to
+    /// unwind, still cancel at once.
+    #[test]
+    fn a_cancel_of_a_job_with_nothing_to_unwind_settles_at_once() {
+        let db = db();
+        let now = current_unix_seconds();
+        let fresh = db
+            .maintenance_create_job("migrate", "a", "stage", None, "admin", now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.maintenance_request_cancel(fresh).unwrap(),
+            CancelOutcome::CancelledImmediately
+        );
+        let reencrypt = db
+            .maintenance_create_job("reencrypt", "b", "counting", None, "admin", now)
+            .unwrap()
+            .unwrap();
+        db.maintenance_claim_next_job("w", now, 60)
+            .unwrap()
+            .unwrap();
+        assert!(db
+            .maintenance_defer(reencrypt, "w", now + 300, "gated")
+            .unwrap());
+        assert_eq!(
+            db.maintenance_request_cancel(reencrypt).unwrap(),
+            CancelOutcome::CancelledImmediately
+        );
+        assert_eq!(
+            db.maintenance_job_by_id(reencrypt).unwrap().unwrap().status,
+            "cancelled"
+        );
     }
 
     #[test]
