@@ -30,6 +30,14 @@ page is truncated. The remaining leak, for runs of more than about 50,000
 hidden keys in a row, is described in the IAM permissions reference. The
 file browser's folder listing reads pages of 1000 keys too, and goes on from
 its scan position, so it no longer reads a backend page twice.
+### Fixed — A negative multipart list argument gets `400 InvalidArgument`
+
+A `ListParts` request with a negative `max-parts` got a page of one part,
+and one with a negative `part-number-marker` got an empty page. A
+`ListMultipartUploads` request with a negative `max-uploads` got a page of
+one upload. S3 and MinIO refuse such a request, so the proxy now answers
+`400 InvalidArgument`, as it does for a negative `max-keys`.
+
 ### Fixed — DeleteBucket deletes a bucket that lists empty
 
 A delete that stopped before its last step can leave a delta baseline

@@ -79,13 +79,29 @@ pub(super) async fn abort_multipart_upload(
     ))
 }
 
+/// Pure: an integer argument of a multipart LIST (`max-parts`,
+/// `part-number-marker`, `max-uploads`), `default` when absent. A negative
+/// value is 400 InvalidArgument, as on S3 and MinIO: a clamp gave the
+/// client a page it did not ask for. The LIST twin is `client_max_keys`
+/// (its 0 means an empty page, so it is not shared).
+fn non_negative_arg(value: Option<i32>, default: i32, name: &str) -> s3s::S3Result<u32> {
+    let value = value.unwrap_or(default);
+    u32::try_from(value).map_err(|_| {
+        s3s::s3_error!(
+            InvalidArgument,
+            "Argument {} must be an integer between 0 and 2147483647",
+            name
+        )
+    })
+}
+
 pub(super) async fn list_parts(
     svc: &DeltaGliderS3Service,
     req: s3s::S3Request<s3s::dto::ListPartsInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::ListPartsOutput>> {
     let input = req.input;
-    let max_parts = input.max_parts.unwrap_or(1000).clamp(1, 1000) as u32;
-    let marker = input.part_number_marker.unwrap_or(0) as u32;
+    let max_parts = non_negative_arg(input.max_parts, 1000, "max-parts")?.clamp(1, 1000);
+    let marker = non_negative_arg(input.part_number_marker, 0, "part-number-marker")?;
     let (parts, is_truncated, next_marker) = svc.state.multipart.list_parts_paginated(
         &input.upload_id,
         &input.bucket,
@@ -265,7 +281,7 @@ pub(super) async fn list_multipart_uploads(
     let list_scope = req.extensions.get::<ListScope>().cloned();
     let input = req.input;
     crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
-    let max_uploads = input.max_uploads.unwrap_or(1000).clamp(1, 1000) as u32;
+    let max_uploads = non_negative_arg(input.max_uploads, 1000, "max-uploads")?.clamp(1, 1000);
     let enc = ListKeyEncoding::of(input.encoding_type.as_ref());
     // A bucket-level LIST like ListObjects: a Filtered caller sees only the
     // uploads of keys it may list.
@@ -493,6 +509,52 @@ mod multipart_cost_tests {
             ))))
             .build()
             .unwrap()
+    }
+
+    /// A negative `max-parts`, `part-number-marker` or `max-uploads` is
+    /// 400 InvalidArgument, as on S3 and MinIO. It was clamped to 1 (or cast
+    /// to a huge marker), so the client got a page it did not ask for.
+    #[tokio::test]
+    async fn a_negative_page_argument_is_invalid() {
+        let (engine, _fake) = crate::deltaglider::s3_engine().await;
+        let state = AppState::for_tests(engine);
+        let svc = service(state.clone());
+        let id = state
+            .multipart
+            .create("b", "a/photo.jpg", None, Default::default())
+            .unwrap();
+        let parts = |max: Option<i32>, marker: Option<i32>| {
+            s3s::dto::ListPartsInput::builder()
+                .bucket("b".into())
+                .key("a/photo.jpg".into())
+                .upload_id(id.clone())
+                .max_parts(max)
+                .part_number_marker(marker)
+                .build()
+                .unwrap()
+        };
+        for (max, marker) in [(Some(-1), None), (Some(i32::MIN), None), (None, Some(-1))] {
+            let err = list_parts(&svc, request(parts(max, marker)))
+                .await
+                .expect_err("a negative argument is refused");
+            assert_eq!(
+                *err.code(),
+                s3s::S3ErrorCode::InvalidArgument,
+                "{max:?} {marker:?}"
+            );
+        }
+        list_parts(&svc, request(parts(Some(0), Some(0))))
+            .await
+            .expect("zero is a valid value");
+        let uploads = s3s::dto::ListMultipartUploadsInput::builder()
+            .bucket("b".into())
+            .max_uploads(Some(-1))
+            .build()
+            .unwrap();
+        let err = list_multipart_uploads(&svc, request(uploads))
+            .await
+            .expect_err("a negative max-uploads is refused");
+        assert_eq!(*err.code(), s3s::S3ErrorCode::InvalidArgument);
     }
 
     /// UploadPart checks its bucket with one HeadBucket per bucket per short

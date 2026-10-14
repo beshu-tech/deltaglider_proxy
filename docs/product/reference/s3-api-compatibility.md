@@ -78,8 +78,8 @@ The S3 backend stores keys as S3 keys, so there both objects can exist.
 | `UploadPartCopy` | ✅ Full | Copies a (ranged) slice of a source object into the upload; source authorization checked. A ranged part of an object that is stored as-is reads only that range, from the version that the copy-source conditions checked. A ranged part of a delta object reads its range from a rebuilt copy of the object in a spool file. The proxy rebuilds the object once and keeps the rebuilt copy for a short time (`DGP_RANGE_SPOOL_TTL_SECS`), so the other parts of the same source read the same file and do not rebuild the object again. Only the part, not the whole source, must fit `max_object_size`. A copy without a range reads the whole source. |
 | `CompleteMultipartUpload` | ✅ Full | Delta or passthrough chosen by size/eligibility; multipart ETag preserved; quota enforced. An upload that is always stored as a plain object is stored from its parts, without assembling them in memory. A completion of an upload that is already complete, with another part list, gets `404 NoSuchUpload`, as on S3. A retry that joins a completion in flight gets the same answer as the first request. |
 | `AbortMultipartUpload` | ✅ Full | Cancels the upload and reclaims state. |
-| `ListParts` | ✅ Full | `part-number-marker` continuation; `max-parts` 1 to 1000. |
-| `ListMultipartUploads` | ✅ Full | `key-marker` + `upload-id-marker` continuation; prefix / delimiter. |
+| `ListParts` | ✅ Full | `part-number-marker` continuation; `max-parts` 1 to 1000. A negative `max-parts` or `part-number-marker` gets `400 InvalidArgument`, as on S3. |
+| `ListMultipartUploads` | ✅ Full | `key-marker` + `upload-id-marker` continuation; prefix / delimiter. A negative `max-uploads` gets `400 InvalidArgument`, as on S3. |
 
 ## Bucket operations
 
