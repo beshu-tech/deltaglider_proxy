@@ -50,9 +50,11 @@ import {
   buildBucketPayload,
   freshId,
   isAllDefaultRow,
+  policyMustSurvive,
   policyToRow,
-  unmodeledFields,
 } from './bucketPolicyPayload';
+import { bucketsWhoseEncryptionChanged, dominantTransition, type ReencryptTransition } from '../bucketEncryption';
+import type { EffectiveEncryption } from '../adminApi';
 import { numericCompare } from '../utils';
 
 interface Props {
@@ -73,8 +75,8 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
   // deletions. Updated inside `pick`, which runs on mount and after every
   // successful apply (the editor refreshes from server truth).
   const baselineNamesRef = useRef<string[]>([]);
-  // Baseline buckets with policy fields this panel does not model (the
-  // bucket `encryption` block): never deleted by an apply.
+  // Baseline buckets whose policy must survive every apply (the bucket's
+  // own `encryption` block, or fields this panel does not model).
   const unmodeledNamesRef = useRef<string[]>([]);
 
   const {
@@ -90,6 +92,7 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
     confirmApply,
     loading,
     error,
+    refresh,
   } = useSectionEditor<BucketWire, BucketPolicyRow[]>({
     section: 'storage',
     dirtyKey: 'storage/buckets',
@@ -100,7 +103,7 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
       const policies = body.buckets || {};
       baselineNamesRef.current = Object.keys(policies);
       unmodeledNamesRef.current = Object.entries(policies)
-        .filter(([, p]) => p != null && Object.keys(unmodeledFields(p)).length > 0)
+        .filter(([, p]) => p != null && policyMustSurvive(p))
         .map(([name]) => name);
       const nextRows = Object.entries(policies)
         .filter((e): e is [string, PolicyGet] => e[1] != null)
@@ -125,18 +128,25 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
   // this panel no longer re-fetches /buckets that other consumers already hold.
   const fallbackBackends = useBackends().data?.backends ?? [];
   const realBuckets = useBucketNames();
-  // The backend that holds each bucket now: a bucket without an explicit
-  // route can still live on a non-default backend.
-  const originsData = useBucketOrigins().data;
+  // The backend that holds each bucket now (the server resolves routes,
+  // aliases and buckets that live only on a non-default backend), and the
+  // server's answer to how each bucket is encrypted.
+  const originsQuery = useBucketOrigins();
+  const originsData = originsQuery.data;
   const originBackendByName = useMemo(
     () => new Map((originsData?.buckets ?? []).map((o) => [o.name, o.backend_name ?? null] as const)),
+    [originsData]
+  );
+  const effectiveByName = useMemo(
+    () => new Map((originsData?.buckets ?? []).map((o) => [o.name, o.effective_encryption ?? null] as const)),
     [originsData]
   );
   const [createOpen, setCreateOpen] = useState(false);
   /** Expanded row: `real:<name>` for buckets, the row `_id` for drafts. */
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
-  /** Manual "[Later]" re-encrypt action target. */
-  const [reencryptBucket, setReencryptBucket] = useState<string | null>(null);
+  /** Re-encrypt proposal: the manual "Re-encrypt existing objects" action
+   *  of a card, or the offer after an encryption change of a bucket. */
+  const [reencrypt, setReencrypt] = useState<{ buckets: string[]; transition: ReencryptTransition } | null>(null);
   // Active jobs drive the busy chip + progress bar; the query self-polls
   // every 2s while any job is active and goes quiet otherwise.
   const maintenanceJobs = useJobs().data?.jobs ?? [];
@@ -229,6 +239,26 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
     );
   };
 
+  // An encryption change of one bucket applied at once (its own section
+  // PUT): re-read the section and the origins, then offer the re-encrypt
+  // job when the server's answer for the bucket changed.
+  const onEncryptionApplied = async (bucket: string, before: EffectiveEncryption) => {
+    await refresh();
+    const res = await originsQuery.refetch();
+    const after = res.data?.buckets.find((o) => o.name === bucket)?.effective_encryption ?? null;
+    const changed = bucketsWhoseEncryptionChanged(
+      [{ name: bucket, effective_encryption: before }],
+      [{ name: bucket, effective_encryption: after }]
+    );
+    if (changed.length > 0) setReencrypt({ buckets: [bucket], transition: dominantTransition(changed) });
+  };
+  /** The manual action: the words follow what the job would do now. */
+  const openReencrypt = (bucket: string) => {
+    const eff = effectiveByName.get(bucket);
+    const transition: ReencryptTransition = !eff?.encrypts ? 'decrypt' : eff.legacy_key_id ? 'rotate' : 'encrypt';
+    setReencrypt({ buckets: [bucket], transition });
+  };
+
   const addDraft = () => {
     const id = freshId();
     setRows((cur) => [...cur, { _id: id, name: '', ...DEFAULT_ROW_FIELDS }]);
@@ -284,13 +314,20 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
                 backends={backends}
                 defaultBackend={defaultBackend}
                 originBackend={originBackendByName.get(name) ?? null}
+                effectiveEncryption={effectiveByName.get(name) ?? null}
+                encryptionBlockedReason={
+                  dirty ? 'Apply or discard the unsaved bucket changes first: an encryption change applies at once.' : null
+                }
+                onEncryptionApplied={(before) => void onEncryptionApplied(name, before)}
                 globalCompressionOn={globalCompressionOn}
                 globalRatio={globalRatio}
                 onPatch={(patch) => patchBucket(name, patch)}
                 onPrefixesChange={prefixChangeFor(name)}
                 inputRadius={inputRadius}
                 maintenanceJob={busyJobForBucket(maintenanceJobs, name)}
-                onReencrypt={() => setReencryptBucket(name)}
+                onReencrypt={
+                  effectiveByName.get(name)?.reencrypt ? () => openReencrypt(name) : undefined
+                }
               />
             );
           })}
@@ -357,18 +394,10 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
       />
 
       <ReencryptProposalModal
-        open={reencryptBucket !== null}
-        transition="encrypt"
-        backendName={
-          reencryptBucket
-            ? (rowByName.get(reencryptBucket)?.backend ||
-              originBackendByName.get(reencryptBucket) ||
-              defaultBackend ||
-              'default')
-            : ''
-        }
-        buckets={reencryptBucket ? [reencryptBucket] : []}
-        onClose={() => setReencryptBucket(null)}
+        open={reencrypt !== null}
+        transition={reencrypt?.transition ?? 'encrypt'}
+        buckets={reencrypt?.buckets ?? []}
+        onClose={() => setReencrypt(null)}
       />
       <CreateBucketModal
         open={createOpen}

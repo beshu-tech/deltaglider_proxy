@@ -7,9 +7,11 @@
  *     showing the EFFECTIVE state (backend incl. the default, encryption,
  *     public access, quota, compression override). A read task costs zero
  *     form controls.
- *   * EXPANDED (click): three groups — Public access (the dangerous one,
- *     amber), Placement (backend + migrate), and Advanced (compression /
- *     delta cutoff / real-name alias / quota behind a disclosure).
+ *   * EXPANDED (click): four groups — Public access (the dangerous one,
+ *     amber), Encryption (the server's `effective_encryption` and the
+ *     bucket's own block, BucketEncryptionGroup), Placement (backend +
+ *     migrate), and Advanced (compression / delta cutoff / real-name alias /
+ *     quota behind a disclosure).
  *
  * Every inherited value renders RESOLVED with provenance ("Default —
  * hetzner", "0.75 — global default") so the user never computes the
@@ -25,13 +27,14 @@ import { useState, useId } from 'react';
 import { CAPABILITY_DOC_URL, docsUrlToInAppHref } from '../linkifyDocUrl';
 import { Button, Collapse, Input, InputNumber, Modal, Progress, Radio, Select, Typography } from 'antd';
 import { DownOutlined, RightOutlined, SyncOutlined } from '@ant-design/icons';
-import type { BackendInfo } from '../adminApi';
-import { resolveBackendFor, describeEncryption } from '../encryptionUi';
+import type { BackendInfo, EffectiveEncryption } from '../adminApi';
+import { describeBucketEncryption } from '../bucketEncryption';
+import BucketEncryptionGroup from './BucketEncryptionGroup';
 import { useColors } from '../ThemeContext';
 import SimpleAutoComplete from './SimpleAutoComplete';
 import { formRow } from './ruleEditorHelpers';
 import type { BucketPolicyRow, PrefixEntry } from './bucketPolicyPayload';
-import { DEFAULT_ROW_FIELDS, freshId, isAllDefaultRow } from './bucketPolicyPayload';
+import { DEFAULT_ROW_FIELDS, freshId, hasOwnEncryption, isAllDefaultRow, resetRowFields } from './bucketPolicyPayload';
 import PrefixListEditor from './PrefixListEditor';
 import MigrateBucketModal from './MigrateBucketModal';
 import type { JobRow } from '../jobsView';
@@ -62,6 +65,14 @@ interface CardProps {
    *  differ from the default without an explicit route: a bucket that lives
    *  only on another backend. */
   originBackend?: string | null;
+  /** The server's answer to how the bucket's new writes are encrypted
+   *  (GET /api/admin/buckets `effective_encryption`). Undefined for a
+   *  policy whose bucket does not exist. */
+  effectiveEncryption?: EffectiveEncryption | null;
+  /** Why the Encryption group cannot apply now (unsaved staged edits). */
+  encryptionBlockedReason?: string | null;
+  /** After the Encryption group applied a change. */
+  onEncryptionApplied?: (before: EffectiveEncryption) => void;
   /** Global compression default — for resolved labels. */
   globalCompressionOn: boolean;
   globalRatio: number;
@@ -117,6 +128,9 @@ export default function BucketCard({
   backends,
   defaultBackend,
   originBackend = null,
+  effectiveEncryption,
+  encryptionBlockedReason = null,
+  onEncryptionApplied,
   globalCompressionOn,
   globalRatio,
   onPatch,
@@ -154,6 +168,16 @@ export default function BucketCard({
   const handleBackendChange = (next: string) => {
     const value = next ?? '';
     const prev = eff.backend;
+    // The bucket's own encryption block belongs to its storage: it needs an
+    // explicit backend (the server refuses a block without one).
+    if (!value && hasOwnEncryption(row)) {
+      Modal.info({
+        title: `${name} keeps an explicit backend`,
+        content:
+          'This bucket has its own encryption, and that setting belongs to the backend that stores it. To follow the default backend, first set the Encryption group to Inherit.',
+      });
+      return;
+    }
     if (!prev || value === prev) {
       onPatch({ backend: value });
       return;
@@ -176,10 +200,9 @@ export default function BucketCard({
   };
 
   // ── Collapsed status chips (effective state, always resolved) ──
-  const encryptionInfo = (() => {
-    const info = resolveBackendFor(eff.backend || originBackend, backends, defaultBackend);
-    return describeEncryption(info?.encryption);
-  })();
+  // The server's answer, never a client-side resolution (a bucket's own
+  // block overrides its backend).
+  const encryptionInfo = describeBucketEncryption(effectiveEncryption);
   const advancedActive =
     eff.compression !== null || eff.max_delta_ratio !== null || eff.alias !== '' || eff.quota_bytes !== null;
 
@@ -229,15 +252,17 @@ export default function BucketCard({
       </Chip>
     )
   );
-  chips.push(
-    <Chip
-      key="enc"
-      tone={encryptionInfo.isEncrypted ? colors.ACCENT_GREEN : colors.TEXT_MUTED}
-      title={encryptionInfo.tooltip}
-    >
-      {encryptionInfo.label}
-    </Chip>
-  );
+  if (real) {
+    chips.push(
+      <Chip
+        key="enc"
+        tone={encryptionInfo.isEncrypted ? colors.ACCENT_GREEN : colors.TEXT_MUTED}
+        title={encryptionInfo.tooltip}
+      >
+        {encryptionInfo.label}
+      </Chip>
+    );
+  }
   chips.push(
     eff.publicMode === 'none' ? (
       <Chip key="pub" tone={colors.TEXT_MUTED} title="Authenticated requests only">
@@ -518,6 +543,26 @@ export default function BucketCard({
             </Radio.Group>
           </div>
 
+          {/* Encryption — the server's answer and the bucket's own block. */}
+          {real && onEncryptionApplied && (
+            <BucketEncryptionGroup
+              bucket={name}
+              eff={effectiveEncryption}
+              blockedReason={encryptionBlockedReason}
+              onApplied={onEncryptionApplied}
+            />
+          )}
+          {!real && hasOwnEncryption(row) && (
+            <div style={{ marginTop: 14 }}>
+              <Text style={{ ...groupLabel, color: colors.TEXT_MUTED }}>Encryption</Text>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                These settings carry the bucket&apos;s own encryption ({String(row?.encryption?.mode ?? '')}
+                {row?.encryption?.key_id ? `, key id ${String(row.encryption.key_id)}` : ''}). It applies
+                when the bucket is created.
+              </Text>
+            </div>
+          )}
+
           {/* Placement — backend routing + the honest move. */}
           {backends.length > 0 && (
             <div style={{ marginTop: 14 }}>
@@ -693,14 +738,15 @@ export default function BucketCard({
                           label: 'Reset to defaults…',
                           confirm: {
                             title: `Reset ${name || 'this bucket'} to defaults?`,
-                            content:
-                              'Public access, routing, quota, and compression go back to the defaults. Nothing changes until you review and apply.',
+                            content: hasOwnEncryption(row)
+                              ? 'Public access, quota, and compression go back to the defaults. The bucket keeps its own encryption and its backend: a bucket key that objects use cannot be removed here. To change the encryption, use the Encryption group. Nothing changes until you review and apply.'
+                              : 'Public access, routing, quota, and compression go back to the defaults. Nothing changes until you review and apply.',
                             okText: 'Reset',
                           },
-                          onSelect: () => onPatch({ ...DEFAULT_ROW_FIELDS }),
+                          onSelect: () => onPatch(resetRowFields(row)),
                         }]
                       : []),
-                    ...(onRemoveDraft
+                    ...(onRemoveDraft && !hasOwnEncryption(row)
                       ? [{
                           key: 'remove',
                           danger: true as const,

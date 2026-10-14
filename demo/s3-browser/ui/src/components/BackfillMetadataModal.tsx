@@ -17,7 +17,6 @@ import { startBackfillMetadata } from '../adminApi';
 import { qk } from '../queries/keys';
 import { useColors } from '../ThemeContext';
 import { useBucketOrigins } from '../queries/backends';
-import { originBackendOf } from '../backendFacts';
 import { normalizeUiError } from '../errorHandling';
 
 const { Text } = Typography;
@@ -31,10 +30,10 @@ export default function BackfillMetadataModal({ open, onClose }: Props) {
   const colors = useColors();
   const qc = useQueryClient();
   const originsQuery = useBucketOrigins({ enabled: open });
-  // No default backend name here: a bucket without `backend_name` shows "default".
+  // The server resolves `backend_name` (routes, aliases, the default).
   const candidates = (originsQuery.data?.buckets ?? []).map((b) => ({
     name: b.name,
-    backend: originBackendOf(b, null) ?? 'default',
+    backend: b.backend_name?.trim() || 'default',
   }));
   const [search, setSearch] = useState('');
   const needle = search.trim().toLowerCase();

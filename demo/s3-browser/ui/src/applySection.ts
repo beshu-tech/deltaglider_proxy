@@ -12,7 +12,7 @@
  * wording); other transport errors throw as usual.
  */
 import type { QueryClient } from '@tanstack/react-query';
-import type { SectionApplyResponse, SectionName } from './adminApi';
+import type { ConfirmHeaders, SectionApplyResponse, SectionName } from './adminApi';
 import { ConfigConflictError, putSection } from './adminApi';
 import { normalizeUiError } from './errorHandling';
 import { qk } from './queries/keys';
@@ -26,8 +26,9 @@ export async function applySection<Wire>(
   section: SectionName,
   body: Wire,
   version: string | null,
+  confirm?: ConfirmHeaders,
 ): Promise<SectionApplyResponse & { version?: string | null }> {
-  const resp = await putSection<Wire>(section, body, version);
+  const resp = await putSection<Wire>(section, body, version, confirm);
   if (!resp.ok) return resp;
   if (version && resp.version) sectionVersionAdvanced(section, version, resp.version);
   // Other panels read the full config through the cached `qk.config()`

@@ -62,9 +62,17 @@ export interface BucketPolicyRow {
    *  policy is the marker doesn't round-trip as "all default" and get its
    *  policy DELETED on apply (the silent-field-loss bug class). */
   replication_target_only: boolean;
-  /** The server policy's fields that this panel does NOT model (today the
-   *  bucket `encryption` block, issue #116; any field a later server adds),
-   *  carried verbatim. Never serialised: the merge-patch keeps an absent
+  /** The bucket's own `encryption` block as the server returns it (keys
+   *  redacted), issue #116. Read-only here: the card's Encryption group
+   *  changes it with its own immediate apply (BucketEncryptionGroup), so it
+   *  is never serialised by this panel; the merge-patch keeps an absent key.
+   *  A row with a block is never all-default (a `null` policy would remove
+   *  the bucket's key, which the server refuses), and "Reset to defaults"
+   *  keeps it and the backend route that it needs. Optional and outside
+   *  `DEFAULT_ROW_FIELDS`. */
+  encryption?: Readonly<Record<string, unknown>> | null;
+  /** The server policy's fields that this panel does NOT model (any field
+   *  a later server adds), carried verbatim. Never serialised: the merge-patch keeps an absent
    *  key, so the server keeps them. A row with such a field is never
    *  all-default, so it is never sent as `null` (which would delete the
    *  policy, its key with it). Optional and outside `DEFAULT_ROW_FIELDS`,
@@ -82,10 +90,11 @@ const MODELED_KEYS: ReadonlySet<string> = new Set([
   'public_prefixes',
   'quota_bytes',
   'replication_target_only',
+  'encryption',
 ]);
 
 /** The fields of a server policy that this panel does not model. */
-export function unmodeledFields(p: object): Record<string, unknown> {
+function unmodeledFields(p: object): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(p)) {
     if (!MODELED_KEYS.has(k) && v !== undefined && v !== null) out[k] = v;
@@ -95,6 +104,27 @@ export function unmodeledFields(p: object): Record<string, unknown> {
 
 function hasUnmodeled(row: BucketPolicyRow): boolean {
   return Object.keys(row.unmodeled ?? {}).length > 0;
+}
+
+/** The row holds the bucket's own encryption block. */
+export function hasOwnEncryption(row: Pick<BucketPolicyRow, 'encryption'> | null | undefined): boolean {
+  return row?.encryption != null;
+}
+
+/** Whether a server policy must survive every apply of this panel: it has
+ *  the bucket's own encryption (its keys) or a field this panel does not
+ *  model. Such a policy is never sent as `null`. */
+export function policyMustSurvive(p: object): boolean {
+  return Object.keys(unmodeledFields(p)).length > 0 || (p as { encryption?: unknown }).encryption != null;
+}
+
+/** "Reset to defaults" of a row: every field this panel edits goes back to
+ *  its default, except the bucket's own encryption and the backend route
+ *  that the block needs (the key must stay readable). */
+export function resetRowFields(row: BucketPolicyRow | null): Partial<BucketPolicyRow> {
+  const out: Partial<BucketPolicyRow> = { ...DEFAULT_ROW_FIELDS, public_prefixes: [] };
+  if (row && hasOwnEncryption(row)) out.backend = row.backend;
+  return out;
 }
 
 /** One bucket's merge-patch: every clearable field present (value or null). */
@@ -167,6 +197,7 @@ export function policyToRow(
     public_prefixes: prefixes.map((value) => ({ id: freshId(), value })),
     quota_bytes: p.quota_bytes ?? null,
     replication_target_only: p.replication_target_only ?? false,
+    encryption: (p as { encryption?: Record<string, unknown> | null }).encryption ?? null,
     unmodeled: unmodeledFields(p),
   };
 }
@@ -185,6 +216,7 @@ function cleanedPrefixes(row: BucketPolicyRow): string[] {
 export function isAllDefaultRow(row: BucketPolicyRow): boolean {
   return (
     !hasUnmodeled(row) &&
+    !hasOwnEncryption(row) &&
     row.compression === null &&
     row.max_delta_ratio === null &&
     row.backend === '' &&
@@ -244,9 +276,10 @@ type BucketPayloadResult =
 export function buildBucketPayload(
   rows: BucketPolicyRow[],
   baselineNames: readonly string[] = [],
-  /** Baseline buckets whose server policy has fields this panel does not
-   *  model: a removed row of one of them clears the modeled fields only,
-   *  never `null` (issue #116 review C). */
+  /** Baseline buckets whose server policy must survive (`policyMustSurvive`:
+   *  the bucket's own encryption, or fields this panel does not model): a
+   *  removed row of one of them clears the edited fields only, never
+   *  `null` (issue #116 review C). */
   unmodeledNames: readonly string[] = []
 ): BucketPayloadResult {
   const cleaned = rows.filter((r) => r.name.trim());

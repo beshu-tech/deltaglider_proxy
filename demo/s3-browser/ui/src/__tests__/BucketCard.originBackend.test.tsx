@@ -10,6 +10,8 @@ import { expect, test } from 'vitest';
 import BucketCard from '../components/BucketCard';
 import type { BackendInfo } from '../adminApi';
 import { renderWithQuery } from '../test/render';
+import type { EffectiveEncryption } from '../adminApi';
+import { eff, inheritedAesEff } from '../test/encryption';
 
 const backend = (name: string, encryption: BackendInfo['encryption']): BackendInfo => ({
   name, backend_type: 's3', path: null, endpoint: null, region: null, force_path_style: null, has_credentials: true, encryption,
@@ -19,7 +21,7 @@ const BACKENDS = [
   backend('hetzner-fsn1', { mode: 'aes256-gcm-proxy', has_key: true, key_id: 'k1', shim_active: false }),
 ];
 
-function renderCard(originBackend: string | null) {
+function renderCard(originBackend: string | null, effectiveEncryption: EffectiveEncryption) {
   renderWithQuery(
     <BucketCard
       name="releases"
@@ -30,6 +32,7 @@ function renderCard(originBackend: string | null) {
       backends={BACKENDS}
       defaultBackend="local-disk"
       originBackend={originBackend}
+      effectiveEncryption={effectiveEncryption}
       globalCompressionOn
       globalRatio={0.75}
       onPatch={() => {}}
@@ -40,14 +43,14 @@ function renderCard(originBackend: string | null) {
 }
 
 test('a bucket on a non-default backend without a route names that backend and its encryption', () => {
-  renderCard('hetzner-fsn1');
+  renderCard('hetzner-fsn1', inheritedAesEff('hetzner-fsn1', 'k1'));
   expect(screen.getByText('on hetzner-fsn1')).toBeInTheDocument();
   expect(screen.queryByText(/default — local-disk/)).toBeNull();
-  expect(screen.getByText('Encrypted (proxy, AES-256-GCM)')).toBeInTheDocument();
+  expect(screen.getByText('Encrypted · from hetzner-fsn1')).toBeInTheDocument();
 });
 
 test('a bucket on the default backend keeps the default label', () => {
-  renderCard('local-disk');
+  renderCard('local-disk', eff({ backend: 'local-disk' }));
   expect(screen.getByText('default — local-disk')).toBeInTheDocument();
   expect(screen.getByText('Not encrypted')).toBeInTheDocument();
 });

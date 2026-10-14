@@ -47,7 +47,9 @@ export const qk = {
     origins: () => ['backends', 'origins'] as const,
     // NOT under the `backends` prefix: every scan HEADs every object, so a
     // list invalidation must not start one.
-    legacyKeyUsage: (name: string) => ['legacy-key-usage', name] as const,
+    /** `bucket` set: the check of one bucket's own legacy key. */
+    legacyKeyUsage: (name: string, bucket?: string) =>
+      (bucket ? ['legacy-key-usage', name, bucket] : ['legacy-key-usage', name]) as readonly string[],
   },
 
   // ── Diagnostics ─────────────────────────────────────────────────

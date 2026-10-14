@@ -3,8 +3,9 @@ import { test } from 'vitest';
 import {
   buildBucketPayload,
   isAllDefaultRow,
+  policyMustSurvive,
   policyToRow,
-  DEFAULT_ROW_FIELDS,
+  resetRowFields,
   type BucketPolicyRow,
 } from '../components/bucketPolicyPayload';
 
@@ -41,16 +42,40 @@ test('named backends: clearing `backend` keeps an encryption policy', () => {
   } as unknown as PolicyGet);
   const cleared: BucketPolicyRow = { ...row, backend: '' };
   assert.equal(isAllDefaultRow(cleared), false);
-  // "Reset to defaults" spreads the defaults over the row.
-  const reset: BucketPolicyRow = { ...row, ...DEFAULT_ROW_FIELDS };
+  const res = buildBucketPayload([cleared], ['db-archive']);
+  assert.ok(res.ok);
+  assert.notEqual(res.body.buckets['db-archive'], null);
+});
+
+// P2: "Reset to defaults" keeps the bucket's own encryption AND the backend
+// route that it needs (the server refuses a block without `backend:` on
+// named backends, and refuses to drop a key in use).
+test('reset to defaults keeps the encryption block and its backend', () => {
+  const row = policyToRow('db-archive', {
+    backend: 'local-disk',
+    quota_bytes: 5,
+    encryption: { mode: 'aes256-gcm-proxy', key_id: 'db-archive-2026' },
+  } as unknown as PolicyGet);
+  const reset: BucketPolicyRow = { ...row, ...resetRowFields(row) };
   assert.equal(isAllDefaultRow(reset), false);
-  for (const r of [cleared, reset]) {
-    const res = buildBucketPayload([r], ['db-archive']);
-    assert.ok(res.ok);
-    const patch = res.body.buckets['db-archive'];
-    assert.notEqual(patch, null);
-    assert.equal(patch?.backend, null, 'the modeled field is cleared');
-  }
+  assert.deepEqual(reset.encryption, { mode: 'aes256-gcm-proxy', key_id: 'db-archive-2026' });
+  const res = buildBucketPayload([reset], ['db-archive']);
+  assert.ok(res.ok);
+  const patch = res.body.buckets['db-archive'];
+  assert.equal(patch?.backend, 'local-disk');
+  assert.equal(patch?.quota_bytes, null);
+  assert.equal('encryption' in (patch ?? {}), false, 'the block is never sent by this panel');
+  // Without a block, reset clears the route as before.
+  const plain = policyToRow('releases', { backend: 'local-disk' } as unknown as PolicyGet);
+  assert.equal(resetRowFields(plain).backend, '');
+});
+
+test('encryption is a modeled field: not in `unmodeled`, but the policy must survive', () => {
+  const row = policyToRow('db-archive', encryptionOnly);
+  assert.deepEqual(row.unmodeled, {});
+  assert.notEqual(row.encryption, null);
+  assert.equal(policyMustSurvive(encryptionOnly), true);
+  assert.equal(policyMustSurvive({ compression: false }), false);
 });
 
 test('a removed row whose server policy has unmodeled fields is cleared, not deleted', () => {

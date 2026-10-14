@@ -14,6 +14,8 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { json, mockFetch } from '../test/fetchMock';
 import { renderWithQuery } from '../test/render';
 import MigrateBucketModal from '../components/MigrateBucketModal';
+import type { EffectiveEncryption } from '../adminApi';
+import { bucketKeyEff, eff, inheritedAesEff } from '../test/encryption';
 
 const PLAIN = { mode: 'none', has_key: false, shim_active: false };
 const AES = { mode: 'aes256-gcm-proxy', has_key: true, key_id: 'k1', shim_active: false };
@@ -36,9 +38,20 @@ function backend(name: string, type: string, encryption: object, health?: object
 const MIGRATE = '/_/api/admin/buckets/releases/migrate';
 let http: ReturnType<typeof mockFetch>;
 
-function serve(backends: object[], originBackend = 'hetzner-fsn1') {
+/** The server's answer for `releases`: by default it inherits the
+ *  encryption of the backend that holds it. */
+function serve(backends: object[], originBackend = 'hetzner-fsn1', own?: EffectiveEncryption) {
   http.on('GET', '/_/api/admin/backends', json({ default_backend: 'hetzner-fsn1', backends }));
-  http.on('GET', '/_/api/admin/buckets', json({ buckets: [{ name: 'releases', backend_name: originBackend }] }));
+  const holder = backends.find((b) => (b as { name: string }).name === originBackend) as
+    | { encryption: { mode: string } }
+    | undefined;
+  const inherited =
+    holder?.encryption.mode === 'aes256-gcm-proxy' ? inheritedAesEff(originBackend, 'k1') : eff({ backend: originBackend });
+  http.on(
+    'GET',
+    '/_/api/admin/buckets',
+    json({ buckets: [{ name: 'releases', backend_name: originBackend, effective_encryption: own ?? inherited }] }),
+  );
 }
 
 beforeEach(() => {
@@ -140,6 +153,21 @@ describe('MigrateBucketModal target facts', () => {
     expect(startButton()).toBeEnabled();
     fireEvent.click(startButton());
     await waitFor(() => expect(http.callsTo('POST', MIGRATE)).toHaveLength(1));
+  });
+
+  /** Issue #116: a bucket's own encryption block moves with the bucket, so
+   *  a plaintext target backend does not make it plaintext. */
+  test("a bucket with its own key keeps it on a plaintext target: no acknowledgement", async () => {
+    serve(
+      [backend('hetzner-fsn1', 's3', AES, { status: 'healthy' }), backend('local-disk', 'filesystem', PLAIN, { status: 'healthy' })],
+      'hetzner-fsn1',
+      bucketKeyEff({ key_id: 'releases-2026-10' }),
+    );
+    renderWithQuery(<MigrateBucketModal open bucket="releases" onClose={() => {}} />);
+    expect(await screen.findByText(/own encryption moves with it/)).toBeInTheDocument();
+    await pickTarget(/^local-disk \(filesystem\)/);
+    expect(screen.queryByText(/stored unencrypted at rest/)).toBeNull();
+    expect(startButton()).toBeEnabled();
   });
 
   test('encrypted to encrypted needs no acknowledgement', async () => {

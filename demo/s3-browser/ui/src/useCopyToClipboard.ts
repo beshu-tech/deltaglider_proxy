@@ -31,7 +31,8 @@ interface CopyOptions {
   resetMs?: number;
 }
 
-function downloadText(text: string, filename: string, mimeType: string): void {
+/** Save `text` as a file through a Blob download. */
+export function downloadText(text: string, filename: string, mimeType = 'text/plain'): void {
   const blob = new Blob([text], { type: mimeType });
   const url = URL.createObjectURL(blob);
   try {

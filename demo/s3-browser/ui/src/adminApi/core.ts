@@ -347,6 +347,9 @@ export interface BackendInfo {
    * Absent when probing is disabled (DGP_BOOT_BACKEND_PROBE=off).
    */
   health?: BackendHealthEntry;
+  /** The modes that a bucket's own encryption block accepts on this
+   *  backend (GET /backends only). */
+  bucket_encryption_modes?: BackendEncryptionMode[];
 }
 
 /** Mirror of the server's coordination::CapabilityVerdict (kebab-case tag). */
@@ -674,10 +677,13 @@ export class ConfigConflictError extends Error {
 export async function putSection<T = unknown>(
   section: SectionName,
   body: T,
-  ifMatch?: string | null
+  ifMatch?: string | null,
+  /** Confirmation headers (see `ConfirmHeaders`). */
+  confirm?: ConfirmHeaders
 ): Promise<SectionApplyResponse & { version?: string | null }> {
   const path = `/api/admin/config/section/${section}`;
-  const res = await adminFetch(path, 'PUT', body, undefined, ifMatch ? { 'If-Match': ifMatch } : undefined);
+  const headers = { ...confirmHeaderMap(confirm), ...(ifMatch ? { 'If-Match': ifMatch } : {}) };
+  const res = await adminFetch(path, 'PUT', body, undefined, Object.keys(headers).length > 0 ? headers : undefined);
   if (res.status === 409) {
     const data = (await res.json().catch(() => ({}))) as { error?: string };
     throw new ConfigConflictError(
@@ -703,9 +709,46 @@ export async function putSection<T = unknown>(
  */
 export async function validateSection<T = unknown>(
   section: SectionName,
-  body: T
+  body: T,
+  confirm?: ConfirmHeaders
 ): Promise<SectionApplyResponse> {
-  return adminJson(`/api/admin/config/section/${section}/validate`, { method: 'POST', body });
+  const headers = confirmHeaderMap(confirm);
+  return adminJson(`/api/admin/config/section/${section}/validate`, {
+    method: 'POST',
+    body,
+    ...(Object.keys(headers).length > 0 ? { headers } : {}),
+  });
+}
+
+/**
+ * Confirmations that a config change carries as request headers, because
+ * the server refuses the change without them (issue #116):
+ *   * `keyRemovals`: key ids whose removal the operator confirmed after a
+ *     legacy-key scan found no object under them
+ *     (`X-DGP-Confirm-Key-Removal`).
+ *   * `downgrades`: buckets whose new writes the operator confirmed to
+ *     store with weaker encryption (`X-DGP-Confirm-Encryption-Downgrade`).
+ * The validate request carries the same headers, so a validate answers
+ * what the apply would.
+ */
+export interface ConfirmHeaders {
+  keyRemovals?: string[];
+  downgrades?: string[];
+}
+
+const CONFIRM_KEY_REMOVAL_HEADER = 'X-DGP-Confirm-Key-Removal';
+const CONFIRM_DOWNGRADE_HEADER = 'X-DGP-Confirm-Encryption-Downgrade';
+
+/** Pure: the request headers of `confirm` (empty lists send nothing). */
+function confirmHeaderMap(confirm?: ConfirmHeaders): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (confirm?.keyRemovals && confirm.keyRemovals.length > 0) {
+    out[CONFIRM_KEY_REMOVAL_HEADER] = confirm.keyRemovals.join(',');
+  }
+  if (confirm?.downgrades && confirm.downgrades.length > 0) {
+    out[CONFIRM_DOWNGRADE_HEADER] = confirm.downgrades.join(',');
+  }
+  return out;
 }
 
 interface PasswordChangeResponse {

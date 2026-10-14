@@ -54,12 +54,12 @@ export function useBucketNames(): string[] {
  * proxy keeps a check for 60 s; a check after the first ("Check again")
  * asks for a fresh one.
  */
-export function useLegacyKeyUsage(name: string) {
+export function useLegacyKeyUsage(name: string, bucket?: string) {
   const qc = useQueryClient();
-  const key = qk.backends.legacyKeyUsage(name);
+  const key = qk.backends.legacyKeyUsage(name, bucket);
   return useQuery({
     queryKey: key,
-    queryFn: () => getLegacyKeyUsage(name, qc.getQueryData(key) !== undefined),
+    queryFn: () => getLegacyKeyUsage(name, qc.getQueryData(key) !== undefined, bucket),
     enabled: false,
     staleTime: Infinity,
   });

@@ -1,6 +1,6 @@
 // === Multi-Backend Management ===
 import { adminJson } from './core';
-import type { BackendInfo } from './core';
+import type { BackendEncryptionMode, BackendInfo } from './core';
 
 interface BackendListResponse {
   backends: BackendInfo[];
@@ -18,6 +18,41 @@ interface BucketOriginResponse {
   real_bucket?: string | null;
   /** Verbatim backend error when this bucket's backend couldn't be listed (503/throttle). */
   unavailable?: string | null;
+  /** The server's answer to "how are this bucket's new writes encrypted".
+   *  null only when the bucket routes to an undefined backend. */
+  effective_encryption?: EffectiveEncryption | null;
+}
+
+/**
+ * `effective_encryption` of one bucket (issue #116), computed by the
+ * server's one resolver. The UI shows it; it never resolves a bucket's
+ * encryption from the backend list itself (source guard
+ * `noClientEncryptionResolution.test.ts`).
+ */
+export interface EffectiveEncryption {
+  mode: BackendEncryptionMode;
+  /** `bucket`: the bucket's own block. `backend`: inherited from `backend`. */
+  source: 'bucket' | 'backend';
+  /** The raw backend that stores the bucket. */
+  backend: string;
+  has_key: boolean;
+  key_id?: string;
+  /** Decrypt-only legacy key id of the site (the bucket's or the backend's). */
+  legacy_key_id?: string;
+  kms_key_id?: string;
+  /** The bucket's own key comes from this environment variable. */
+  key_env?: string;
+  /** New writes are stored encrypted. */
+  encrypts: boolean;
+  /** A re-encrypt job can change objects of this bucket. */
+  reencrypt: boolean;
+  /** The config fixes the bucket's backend; an edit that adds the bucket's
+   *  own block must also set `backend:` when false. */
+  pinned: boolean;
+  /** The modes that the bucket's own block accepts. */
+  bucket_modes: BackendEncryptionMode[];
+  /** What "Inherit" gives the bucket: the backend's own encryption. */
+  inherited: { mode: BackendEncryptionMode; encrypts: boolean; key_id?: string };
 }
 
 interface BucketOriginListResponse {
@@ -83,6 +118,8 @@ export async function probeBackend(
  */
 export interface LegacyKeyUsage {
   backend: string;
+  /** Set when the check was for one bucket's own legacy key. */
+  bucket?: string | null;
   legacy_key_id: string | null;
   buckets: string[];
   objects_scanned: number;
@@ -105,9 +142,16 @@ export interface LegacyKeyUsage {
 export const LEGACY_KEY_SCAN_LIMIT = 50_000;
 
 /** `fresh` skips the proxy's 60 s cache of the last check. */
-export async function getLegacyKeyUsage(name: string, fresh = false): Promise<LegacyKeyUsage> {
-  const query = `?limit=${LEGACY_KEY_SCAN_LIMIT}${fresh ? '&fresh=true' : ''}`;
+export async function getLegacyKeyUsage(
+  name: string,
+  fresh = false,
+  /** Scope the check to this bucket's own legacy key id. */
+  bucket?: string,
+): Promise<LegacyKeyUsage> {
+  const query = `?limit=${LEGACY_KEY_SCAN_LIMIT}${fresh ? '&fresh=true' : ''}${
+    bucket ? `&bucket=${encodeURIComponent(bucket)}` : ''
+  }`;
   return adminJson(`/api/admin/backends/${encodeURIComponent(name)}/legacy-key-usage${query}`, {
-    context: `Check the legacy key of ${name}`,
+    context: bucket ? `Check the legacy key of bucket ${bucket}` : `Check the legacy key of ${name}`,
   });
 }

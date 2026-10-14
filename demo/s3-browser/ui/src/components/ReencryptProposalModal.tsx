@@ -1,6 +1,6 @@
 /**
  * Post-encryption-change proposal: offer the one-off "re-encrypt existing
- * objects" maintenance job for the buckets on the changed backend.
+ * objects" maintenance job for the buckets whose encryption changed.
  *
  * Shown by BackendsPanel right after a successful encryption apply
  * (enable / rotate / disable). The job itself is uniform — "rewrite every
@@ -13,31 +13,32 @@
  * Jobs-page mode (`pickBuckets`) ignores `transition`: the job has nothing
  * to do with a key change there, so the copy says what the job does to each
  * object. It lists only buckets whose backend a re-encrypt can change
- * (proxy AES with a key, or a legacy key still set), each with its backend
- * and encryption, behind a search box.
+ * (the server's `effective_encryption.reencrypt`), each with its backend
+ * and encryption, behind a search box. Every per-bucket fact comes from
+ * the server's `effective_encryption`: a bucket with its own encryption
+ * block is listed by its own setting, not by its backend's.
  */
 import { useEffect, useMemo, useState } from 'react';
 import { Alert, Button, Checkbox, Input, Modal, Typography, message } from 'antd';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQueryClient } from '@tanstack/react-query';
 import { SyncOutlined } from '@ant-design/icons';
-import { getBackends, startReencrypt } from '../adminApi';
+import { startReencrypt } from '../adminApi';
 import { qk } from '../queries/keys';
 import { useColors } from '../ThemeContext';
 import { useBucketOrigins } from '../queries/backends';
 import { normalizeUiError } from '../errorHandling';
-import { encryptionWord, originBackendOf, reencryptHasWork } from '../backendFacts';
+import { describeBucketEncryption, type ReencryptTransition } from '../bucketEncryption';
 
 const { Text } = Typography;
 
-export type ReencryptTransition = 'encrypt' | 'rotate' | 'decrypt';
 
 interface Props {
   open: boolean;
   transition: ReencryptTransition;
-  /** Buckets eligible for the job (the changed backend's buckets). */
+  /** Buckets eligible for the job (the buckets whose encryption changed). */
   buckets: string[];
-  /** Context line, e.g. the backend name. */
-  backendName: string;
+  /** Context: the backend whose change this proposal follows, if any. */
+  backendName?: string;
   /** Jobs-page mode: ignore the preset list and pick from ALL buckets. */
   pickBuckets?: boolean;
   onClose: () => void;
@@ -51,7 +52,7 @@ const TITLES: Record<ReencryptTransition, string> = {
 
 const PICK_TITLE = 'Re-encrypt existing objects';
 const PICK_EXPLAIN =
-  "A one-off background job rewrites each object that is not stored under its backend's current setting. A plaintext object gets encrypted, and an object under an older key gets re-encrypted with the current key. On a backend whose encryption is off but whose legacy key is still set, an encrypted object gets decrypted. Objects that already match are skipped, and the job resumes automatically if the proxy restarts.";
+  "A one-off background job rewrites each object that is not stored under its bucket's current setting (the bucket's own encryption, or its backend's). A plaintext object gets encrypted, and an object under an older key gets re-encrypted with the current key. In a bucket whose encryption is off but that can still read an older key, an encrypted object gets decrypted. Objects that already match are skipped, and the job resumes automatically if the proxy restarts.";
 
 interface PickRow {
   bucket: string;
@@ -61,7 +62,7 @@ interface PickRow {
 
 const EXPLAIN: Record<ReencryptTransition, string> = {
   encrypt:
-    'Encryption applies to NEW writes only. Objects already stored on this backend are still plaintext on disk until rewritten.',
+    'Encryption applies to NEW writes only. Objects already stored in these buckets are still plaintext on disk until rewritten.',
   rotate:
     'The new key applies to NEW writes only. Existing objects remain encrypted under the previous key until rewritten.',
   decrypt:
@@ -79,35 +80,25 @@ export default function ReencryptProposalModal({
   const colors = useColors();
   const qc = useQueryClient();
   const originsQuery = useBucketOrigins({ enabled: open && pickBuckets });
-  // Same cache entry as useBackends, fetched only while the picker is open.
-  const backendsQuery = useQuery({
-    queryKey: qk.backends.list(),
-    queryFn: getBackends,
-    enabled: open && pickBuckets,
-  });
   const [search, setSearch] = useState('');
   const { pickRows, skippedPlaintext } = useMemo(() => {
-    const backends = backendsQuery.data?.backends ?? [];
-    const defaultBackend = backendsQuery.data?.default_backend ?? null;
     const rows: PickRow[] = [];
     let skipped = 0;
-    if (!backendsQuery.data) return { pickRows: rows, skippedPlaintext: skipped };
     for (const o of originsQuery.data?.buckets ?? []) {
-      const backend = originBackendOf(o, defaultBackend);
-      const info = backends.find((b) => b.name === backend);
-      if (!reencryptHasWork(info)) {
+      const eff = o.effective_encryption;
+      if (!eff?.reencrypt) {
         skipped += 1;
         continue;
       }
-      const enc = encryptionWord(info?.encryption);
+      const enc = describeBucketEncryption(eff).label;
       rows.push({
         bucket: o.name,
-        backend,
-        encryption: info?.encryption.shim_active ? `${enc}, legacy key set` : enc,
+        backend: eff.backend,
+        encryption: eff.legacy_key_id ? `${enc}, legacy key ${eff.legacy_key_id}` : enc,
       });
     }
     return { pickRows: rows, skippedPlaintext: skipped };
-  }, [originsQuery.data, backendsQuery.data]);
+  }, [originsQuery.data]);
   const needle = search.trim().toLowerCase();
   const visibleRows = needle
     ? pickRows.filter(
@@ -188,8 +179,10 @@ export default function ReencryptProposalModal({
       ) : (
         <Text type="secondary" style={{ fontSize: 13, display: 'block', marginBottom: 12 }}>
           {EXPLAIN[transition]} A one-off background job rewrites every object whose at-rest
-          state doesn't match the new setting on <Text code>{backendName}</Text>. Already-matching
-          objects are skipped, and the job resumes automatically if the proxy restarts.
+          state doesn't match its bucket's current setting
+          {backendName ? <> (after the change on <Text code>{backendName}</Text>)</> : null}.
+          Already-matching objects are skipped, and the job resumes automatically if the proxy
+          restarts.
         </Text>
       )}
       <Alert
@@ -217,13 +210,13 @@ export default function ReencryptProposalModal({
           />
           {skippedPlaintext > 0 && (
             <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
-              {skippedPlaintext} bucket{skippedPlaintext === 1 ? ' is' : 's are'} not listed: on a
-              plaintext backend, there is nothing to encrypt.
+              {skippedPlaintext} bucket{skippedPlaintext === 1 ? ' is' : 's are'} not listed: the
+              job has nothing to change there (plaintext with no older key, or a native mode).
             </Text>
           )}
           {visibleRows.length === 0 ? (
             <Text type="secondary">
-              {pickRows.length === 0 ? 'No bucket is on an encrypting backend.' : 'No bucket matches the search.'}
+              {pickRows.length === 0 ? 'No bucket has objects that the job can change.' : 'No bucket matches the search.'}
             </Text>
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 320, overflowY: 'auto' }}>

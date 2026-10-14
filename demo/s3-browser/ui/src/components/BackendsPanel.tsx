@@ -12,7 +12,14 @@ import { useAdminConfig } from '../queries/config';
 import { useBackends, useBucketOrigins } from '../queries/backends';
 import CreateBucketModal from './CreateBucketModal';
 import { backendSummary } from '../backendSummary';
-import ReencryptProposalModal, { type ReencryptTransition } from './ReencryptProposalModal';
+import ReencryptProposalModal from './ReencryptProposalModal';
+import {
+  backendBucketCountText,
+  backendBucketCounts,
+  bucketsWhoseEncryptionChanged,
+  dominantTransition,
+  type ReencryptTransition,
+} from '../bucketEncryption';
 import { useColors } from '../ThemeContext';
 import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
 import SectionHeader from './SectionHeader';
@@ -93,17 +100,21 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
 
   // Bucket counts per backend, from the authoritative virtual→backend origin
   // map (works for filesystem AND s3; testS3Connection is s3-only + transient).
-  // Buckets with no explicit backend_name route to the default backend.
+  // The server resolves `backend_name` (routes, aliases, the default).
   const originsQuery = useBucketOrigins();
   const countByBackend = useMemo(() => {
     const counts: Record<string, number> = {};
     for (const o of originsQuery.data?.buckets ?? []) {
-      const key = o.backend_name ?? defaultBackend ?? '';
-      if (!key) continue;
-      counts[key] = (counts[key] ?? 0) + 1;
+      if (!o.backend_name) continue;
+      counts[o.backend_name] = (counts[o.backend_name] ?? 0) + 1;
     }
     return counts;
-  }, [originsQuery.data, defaultBackend]);
+  }, [originsQuery.data]);
+  // Per backend: buckets that take its encryption and buckets with their own.
+  const encryptionCounts = useMemo(
+    () => backendBucketCounts(originsQuery.data?.buckets ?? []),
+    [originsQuery.data]
+  );
 
   // "Create bucket here" → opens the shared CreateBucketModal pre-targeted to a
   // specific backend. This panel only renders for admins (admin route).
@@ -326,27 +337,20 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
         ok: true,
         message: [`Encryption updated on backend '${backendName}'`, persistFailureText(result)].filter(Boolean).join('. '),
       });
+      // Existing objects keep their OLD at-rest state. Propose the canned
+      // re-encrypt job for the buckets whose effective encryption (the
+      // server's answer per bucket) changed: a bucket with its own block is
+      // not touched by a backend change, so it is not offered.
+      const before = originsQuery.data?.buckets ?? [];
       await refresh();
-      // Existing objects keep their OLD at-rest state — propose the canned
-      // migration when the transition changes what "correct" looks like.
-      // prevMode comes from the pre-apply backends snapshot (render closure).
-      const prevMode = backends.find((b) => b.name === backendName)?.encryption?.mode;
-      const transition: ReencryptTransition | null =
-        patch.mode === 'aes256-gcm-proxy'
-          ? prevMode === 'aes256-gcm-proxy'
-            ? patch.key
-              ? 'rotate'
-              : null // settings-only change (e.g. legacy shim) — nothing to rewrite
-            : 'encrypt'
-          : patch.mode === 'none' && prevMode === 'aes256-gcm-proxy'
-            ? 'decrypt'
-            : null;
-      if (transition) {
-        const bucketsHere = (originsQuery.data?.buckets ?? [])
-          .filter((o) => (o.backend_name ?? defaultBackend) === backendName)
-          .map((o) => o.name)
-          .sort();
-        setReencryptProposal({ transition, backendName, buckets: bucketsHere });
+      const after = (await originsQuery.refetch()).data?.buckets ?? [];
+      const changed = bucketsWhoseEncryptionChanged(before, after);
+      if (changed.length > 0) {
+        setReencryptProposal({
+          transition: dominantTransition(changed),
+          backendName,
+          buckets: changed.map((c) => c.bucket),
+        });
       }
     } catch (e) {
       if (e instanceof Error && !resultSet) {
@@ -476,6 +480,15 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                         : `${n} bucket${n === 1 ? '' : 's'} routed here`;
                     })()}
                   </div>
+                  {backendBucketCountText(encryptionCounts[b.name]) && (
+                    <div
+                      data-testid="backend-encryption-counts"
+                      style={{ fontSize: 11, color: colors.TEXT_MUTED, marginTop: 2 }}
+                      title="Encryption: buckets without their own encryption block use this backend's setting; a bucket with its own block overrides it."
+                    >
+                      Encryption: {backendBucketCountText(encryptionCounts[b.name])}
+                    </div>
+                  )}
                 </div>
                 <Button
                   size="small"

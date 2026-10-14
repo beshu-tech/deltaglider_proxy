@@ -1,20 +1,11 @@
 /**
- * Pure backend facts for the job dialogs (migrate, re-encrypt, backfill)
- * and the bucket cards: which backend holds a bucket, whether the backend
- * encrypts at rest, and whether the health loop gates it.
+ * Pure BACKEND facts for the job dialogs (migrate, backfill) and the
+ * backend pickers: whether a backend encrypts at rest on its own, and
+ * whether the health loop gates it. Which backend holds a bucket, and how a
+ * bucket is encrypted, are the server's answers (`backend_name` and
+ * `effective_encryption` of GET /api/admin/buckets; see bucketEncryption.ts).
  */
-import type { BackendEncryptionSummary, BackendHealthEntry, BackendInfo } from './adminApi';
-
-/** The backend that holds a bucket: the origins `backend_name` (the server
- *  resolves routes, aliases and buckets that exist only on a non-default
- *  backend), else the default backend. */
-export function originBackendOf(
-  origin: { backend_name?: string | null } | undefined,
-  defaultBackend: string | null,
-): string | null {
-  const name = origin?.backend_name?.trim();
-  return name ? name : defaultBackend;
-}
+import type { BackendEncryptionSummary, BackendHealthEntry } from './adminApi';
 
 /** True when new writes to the backend are encrypted at rest. A proxy-AES
  *  backend without a key writes plaintext. */
@@ -36,7 +27,7 @@ export function encryptionWord(enc: BackendEncryptionSummary | undefined): strin
   if (!enc) return 'encryption unknown';
   switch (enc.mode) {
     case 'aes256-gcm-proxy':
-      return enc.has_key ? 'proxy AES-256-GCM' : 'plaintext (no key set)';
+      return enc.has_key ? 'proxy AES-256-GCM' : 'proxy AES-256-GCM, no key: writes refused';
     case 'sse-kms':
       return 'SSE-KMS';
     case 'sse-s3':
@@ -65,14 +56,6 @@ export function healthWord(h: BackendHealthEntry | undefined): string {
  *  endpoint does not answer: every request to it fails until it recovers. */
 export function isGated(h: BackendHealthEntry | undefined): boolean {
   return h?.status === 'auth-rejected' || h?.status === 'unreachable';
-}
-
-/** True when a re-encrypt job can have work on the backend: it encrypts
- *  with the proxy key, or a legacy key is still set (objects under it get
- *  rewritten). A plaintext backend without a legacy key has nothing to do. */
-export function reencryptHasWork(b: BackendInfo | undefined): boolean {
-  if (!b) return false;
-  return (b.encryption.mode === 'aes256-gcm-proxy' && b.encryption.has_key) || b.encryption.shim_active;
 }
 
 /** The migrate dialog's label for the mirror option. The server's 409 names
