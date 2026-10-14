@@ -1361,6 +1361,7 @@ pub async fn build_encryption_witness(
         poll,
         gate,
         config,
+        Some(&dir),
     ));
     if witness.status().status == "unavailable" {
         return Some(witness);

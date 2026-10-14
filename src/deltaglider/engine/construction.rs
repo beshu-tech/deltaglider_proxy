@@ -229,7 +229,7 @@ fn native_policy(
 /// A native SSE bucket override on a filesystem backend would store
 /// plaintext: refuse the engine (`Config::check_fatal` refuses the config
 /// first; this is the last line).
-fn refuse_native_overrides_off_s3(
+pub(super) fn refuse_native_overrides_off_s3(
     backend_name: &str,
     backend: &BackendConfig,
     buckets: &[crate::config::BucketOverride<'_>],
@@ -239,7 +239,8 @@ fn refuse_native_overrides_off_s3(
     }
     match buckets.iter().find(|o| o.config.is_native()) {
         Some(o) => Err(StorageError::Encryption(format!(
-            "bucket '{}' uses native S3 encryption ({}) but backend '{backend_name}' is a              filesystem backend: native modes need S3",
+            "bucket '{}' uses native S3 encryption ({}) but backend '{backend_name}' is a \
+             filesystem backend: native modes need S3",
             o.bucket,
             o.config.mode_tag()
         ))),

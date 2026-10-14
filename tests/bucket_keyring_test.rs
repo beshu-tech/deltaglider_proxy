@@ -1987,3 +1987,179 @@ async fn the_encryption_preview_of_a_new_bucket() {
     let (code, _) = preview("db-archive", "gone").await;
     assert_eq!(code, 400);
 }
+
+// ── The witness at the library level, against MinIO (final review) ──────
+
+mod witness_lib {
+    use super::*;
+    use deltaglider_proxy::config::Config;
+    use deltaglider_proxy::coordination::EncryptionWitness;
+    use deltaglider_proxy::storage::WitnessGate;
+    use std::sync::Arc;
+
+    fn cfg(data: &str, block: &str) -> Config {
+        Config::from_yaml_str(&format!(
+            "storage:\n  filesystem: /tmp/dgp-witness-lib\n  buckets:\n    {data}: {block}\n"
+        ))
+        .unwrap()
+    }
+
+    fn aes(key: &str, id: &str) -> String {
+        format!("{{ encryption: {{ mode: aes256-gcm-proxy, key: \"{key}\", key_id: {id} }} }}")
+    }
+
+    async fn witness(
+        bucket: &str,
+        node: &str,
+        cfg: &Config,
+        cache: Option<&std::path::Path>,
+    ) -> (EncryptionWitness, Arc<WitnessGate>) {
+        let gate = Arc::new(WitnessGate::default());
+        let w = EncryptionWitness::new(
+            Some(common::minio_client().await),
+            bucket.to_string(),
+            node.to_string(),
+            std::time::Duration::from_secs(30),
+            gate.clone(),
+            cfg,
+            cache,
+        );
+        (w, gate)
+    }
+
+    async fn new_bucket(prefix: &str) -> String {
+        let b = common::unique_bucket(prefix);
+        common::minio_client()
+            .await
+            .create_bucket()
+            .bucket(&b)
+            .send()
+            .await
+            .unwrap();
+        b
+    }
+
+    async fn manifest_text(bucket: &str) -> String {
+        let out = common::minio_client()
+            .await
+            .get_object()
+            .bucket(bucket)
+            .key("_dgp/encryption/intent.json")
+            .send()
+            .await
+            .unwrap();
+        String::from_utf8(out.body.collect().await.unwrap().to_vec()).unwrap()
+    }
+
+    /// Final review, follow-up 4: a node with a lagging PLAINTEXT config
+    /// that starts while the coordination bucket does not answer (here: it
+    /// is missing, which was read as "no manifest") witnessed nothing and
+    /// wrote plaintext into a bucket that the others encrypt. Now a missing
+    /// bucket is an error, and the node judges against the manifest that it
+    /// saved at its last good sync: the bucket refuses writes.
+    #[tokio::test]
+    async fn a_node_that_starts_during_an_outage_judges_its_saved_manifest_minio() {
+        skip_unless_minio!();
+        let coord = new_bucket("enc-wlib").await;
+        let data = common::unique_bucket("enc-data");
+        let (enc, plain) = (cfg(&data, &aes(KB, "lib-b")), cfg(&data, "{}"));
+        let (wa, _) = witness(&coord, "node-a", &enc, None).await;
+        wa.sync(&enc).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (wb, _) = witness(&coord, "node-b", &plain, Some(dir.path())).await;
+        wb.sync(&plain).await.unwrap();
+        assert_eq!(wb.status().status, "mismatch");
+        let saved = dir.path().join("encryption-witness.json");
+        assert!(saved.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&saved).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        // B restarts; its coordination bucket is missing.
+        let missing = common::unique_bucket("enc-missing");
+        let (wb2, gate) = witness(&missing, "node-b", &plain, Some(dir.path())).await;
+        let err = wb2
+            .sync(&plain)
+            .await
+            .expect_err("NoSuchBucket is an error");
+        assert!(err.contains("NoSuchBucket"), "{err}");
+        assert_eq!(wb2.status().status, "unknown");
+        assert!(
+            gate.refusal("default", &data).is_some(),
+            "the saved manifest still covers the bucket"
+        );
+    }
+
+    /// Final review, follow-up 5: a publish that failed during an apply was
+    /// never retried (a sync writes only absent entries), so the applying
+    /// node refused its own change forever. The failed publish is kept and
+    /// retried at the next sync.
+    #[tokio::test]
+    async fn a_failed_apply_publish_is_retried_at_the_next_sync_minio() {
+        skip_unless_minio!();
+        let coord = new_bucket("enc-wlib").await;
+        let data = common::unique_bucket("enc-data");
+        let (old, new) = (cfg(&data, &aes(KB, "lib-b")), cfg(&data, &aes(KC, "lib-c")));
+        let (w, gate) = witness(&coord, "node-a", &old, None).await;
+        w.sync(&old).await.unwrap();
+        let before = manifest_text(&coord).await;
+        assert!(before.contains("lib-b"), "{before}");
+        // The coordination bucket goes away for the apply.
+        let s3 = common::minio_client().await;
+        s3.delete_object()
+            .bucket(&coord)
+            .key("_dgp/encryption/intent.json")
+            .send()
+            .await
+            .unwrap();
+        s3.delete_bucket().bucket(&coord).send().await.unwrap();
+        assert!(w.publish_changes(&old, &new, &[]).await.is_err());
+        // It comes back with the old manifest.
+        s3.create_bucket().bucket(&coord).send().await.unwrap();
+        s3.put_object()
+            .bucket(&coord)
+            .key("_dgp/encryption/intent.json")
+            .body(ByteStream::from(before.into_bytes()))
+            .send()
+            .await
+            .unwrap();
+        w.sync(&new).await.unwrap();
+        assert_eq!(w.status().status, "agree", "{:?}", w.status());
+        assert!(manifest_text(&coord).await.contains("lib-c"));
+        assert_eq!(gate.refusal("default", &data), None);
+    }
+
+    /// Final review, follow-up 6 (probe): the rollback of a failed create
+    /// (a restoring transition) ran the apply's publish from the config
+    /// with the block to the one without: it published PLAINTEXT with no
+    /// confirmation. A rollback restores what the failed change published:
+    /// a new entry is removed, a replaced one is put back.
+    #[tokio::test]
+    async fn a_rollback_restores_what_the_failed_change_published_minio() {
+        skip_unless_minio!();
+        let coord = new_bucket("enc-wlib").await;
+        let data = common::unique_bucket("enc-data");
+        let (without, with_block) = (cfg(&data, "{}"), cfg(&data, &aes(KB, "lib-b")));
+        let (w, _) = witness(&coord, "node-a", &without, None).await;
+        w.sync(&without).await.unwrap();
+        w.publish_changes(&without, &with_block, &[]).await.unwrap();
+        assert!(manifest_text(&coord).await.contains("lib-b"));
+        w.restore_last_publish(&without).await.unwrap();
+        let after = manifest_text(&coord).await;
+        assert!(!after.contains(&data), "the new entry is removed: {after}");
+        assert_eq!(w.status().status, "agree");
+        // A replaced entry is put back.
+        let rotated = cfg(&data, &aes(KC, "lib-c"));
+        w.publish_changes(&without, &with_block, &[]).await.unwrap();
+        w.publish_changes(&with_block, &rotated, &[]).await.unwrap();
+        assert!(manifest_text(&coord).await.contains("lib-c"));
+        w.restore_last_publish(&with_block).await.unwrap();
+        let after = manifest_text(&coord).await;
+        assert!(
+            after.contains("lib-b") && !after.contains("lib-c"),
+            "{after}"
+        );
+    }
+}

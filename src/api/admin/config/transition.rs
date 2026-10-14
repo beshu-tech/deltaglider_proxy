@@ -263,8 +263,12 @@ pub(crate) async fn apply_config_transition(
     // supported way to finish a downgrade that the nodes got by restart),
     // so the other instances refuse writes until they agree. The gate of
     // this node follows the new config before any request. A failed
-    // publish is a warning: the change is live, and this node refuses the
-    // buckets it now disagrees on until a sync succeeds.
+    // publish is a warning: the change is live, the witness retries the
+    // publish at each check, and until one succeeds this node refuses the
+    // changed buckets. A ROLLBACK (a failed create, a failed persist)
+    // publishes nothing: it puts back what the failed change published (a
+    // rollback to plaintext would otherwise publish a downgrade that no
+    // request confirmed).
     let confirmed_downgrades = match &ctx {
         TransitionCtx::Admin {
             headers,
@@ -273,18 +277,32 @@ pub(crate) async fn apply_config_transition(
         } => crate::config::confirmed_downgrades(Some(headers)),
         _ => Vec::new(),
     };
+    let rollback = match &ctx {
+        TransitionCtx::Admin { restoring, .. } => *restoring,
+        TransitionCtx::Background { context, .. } => {
+            *context == crate::config_apply::ROLLBACK_CONTEXT
+        }
+    };
     if let Some(witness) = &ctx.app().encryption_witness {
-        if engine_rebuilt || !confirmed_downgrades.is_empty() {
-            if let Err(e) = witness
-                .publish_changes(old_cfg, &new_cfg, &confirmed_downgrades)
-                .await
-            {
-                warnings.push(format!(
-                    "the encryption witness in the sync bucket was not updated ({e}); this \
-                     instance refuses writes to the buckets whose encryption now differs \
-                     from the shared one until a sync succeeds"
-                ));
-            }
+        let published = if rollback {
+            Some(witness.restore_last_publish(&new_cfg).await)
+        } else if engine_rebuilt || !confirmed_downgrades.is_empty() {
+            Some(
+                witness
+                    .publish_changes(old_cfg, &new_cfg, &confirmed_downgrades)
+                    .await,
+            )
+        } else {
+            None
+        };
+        if let Some(Err(e)) = published {
+            warnings.push(format!(
+                "the encryption witness in the sync bucket was not updated ({e}). The change \
+                 is live; the witness tries again at each check (every \
+                 DGP_ENCRYPTION_WITNESS_POLL_SECS), and until it succeeds this instance \
+                 refuses writes to the buckets whose encryption the change moved away from \
+                 the shared one"
+            ));
         }
     }
     // Event delivery or replication may have started or stopped reading the

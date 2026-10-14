@@ -376,8 +376,8 @@ pub struct WitnessGateState {
     /// Storages this node refuses, with the refusal message.
     pub refused: std::collections::HashMap<(String, String), String>,
     /// Storages the witness covers: when the last successful sync is older
-    /// than the TTL, writes to them are refused (the holder stops before
-    /// its heartbeat lapses and a peer may take over).
+    /// than the TTL, writes to them are refused (a stale verdict must not
+    /// let this node write a form that the others may have changed).
     pub witnessed: std::collections::HashSet<(String, String)>,
 }
 

@@ -103,6 +103,15 @@ impl Manifest {
         );
     }
 
+    pub fn remove(&mut self, s: &Storage) {
+        if let Some(b) = self.storages.get_mut(&s.0) {
+            b.remove(&s.1);
+            if b.is_empty() {
+                self.storages.remove(&s.0);
+            }
+        }
+    }
+
     pub fn keys(&self) -> impl Iterator<Item = Storage> + '_ {
         self.storages
             .iter()
@@ -470,6 +479,45 @@ pub struct EncryptionWitness {
     status: arc_swap::ArcSwap<WitnessStatus>,
     /// One sync at a time (a poll, an apply, a publish).
     running: tokio::sync::Mutex<()>,
+    /// The last manifest read, saved next to the config DB: a node that
+    /// starts while the coordination bucket does not answer judges against
+    /// it (it holds no key material).
+    cache_path: Option<std::path::PathBuf>,
+    /// The publishes of an apply that failed: retried at each sync while
+    /// they are still this node's intent.
+    pending: parking_lot::Mutex<Vec<(Storage, WriteEncryption)>>,
+    /// What the last apply's publish replaced: `(storage, previous entry,
+    /// published intent)`. A rollback of that apply puts it back.
+    last_publish: parking_lot::Mutex<Vec<(Storage, Option<Published>, WriteEncryption)>>,
+}
+
+/// The file of the saved manifest, in the config-DB directory.
+pub const MANIFEST_CACHE_FILE: &str = "encryption-witness.json";
+
+/// Write `manifest` to `path`: a 0600 temp file renamed over it.
+fn save_manifest(path: &std::path::Path, manifest: &Manifest) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        f.write_all(&serde_json::to_vec(manifest).map_err(std::io::Error::other)?)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
+/// The saved manifest at `path`, if one parses.
+fn load_manifest(path: &std::path::Path) -> Option<Manifest> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
 /// How many times a CAS write re-reads and merges after a lost race.
@@ -483,6 +531,11 @@ impl EncryptionWitness {
     /// witnesses, until the first sync succeeds. `client: None` = the
     /// coordination client could not be built: the status is `unavailable`
     /// and the gate stays closed (each apply judges the new config).
+    ///
+    /// `cache_dir`: where the last good manifest is saved. A saved manifest
+    /// is judged at once: until the first sync succeeds, every storage in
+    /// it is refused as well (a node with a lagging plaintext config that
+    /// starts during a coordination outage seeds nothing of its own).
     pub fn new(
         client: Option<aws_sdk_s3::Client>,
         bucket: String,
@@ -490,15 +543,26 @@ impl EncryptionWitness {
         poll: std::time::Duration,
         gate: Arc<WitnessGate>,
         cfg: &Config,
+        cache_dir: Option<&std::path::Path>,
     ) -> Self {
         Self::close_gate(&gate, cfg, poll);
+        let cache_path = cache_dir.map(|d| d.join(MANIFEST_CACHE_FILE));
+        let cached = cache_path
+            .as_deref()
+            .and_then(load_manifest)
+            .unwrap_or_default();
+        let found = mismatches(cfg, &cached);
+        gate.set(gate_state(cfg, &cached, &found));
         let unavailable = client.is_none();
         Self {
             client,
             bucket,
             node_id,
             gate,
-            manifest: Default::default(),
+            cache_path,
+            pending: Default::default(),
+            last_publish: Default::default(),
+            manifest: parking_lot::Mutex::new(cached),
             server_offset_ms: Default::default(),
             status: arc_swap::ArcSwap::from_pointee(WitnessStatus {
                 status: if unavailable {
@@ -563,7 +627,7 @@ impl EncryptionWitness {
     }
 
     async fn read_manifest(&self) -> Result<(Manifest, Option<String>), String> {
-        use super::cas::{is_object_absent, sdk_error_signal};
+        use super::cas::sdk_error_signal;
         let client = self.client()?;
         let date = super::server_clock::ServerDate::default();
         let sent_at = unix_ms();
@@ -594,7 +658,13 @@ impl EncryptionWitness {
                     .map_err(|e| format!("{MANIFEST_KEY} is not a valid manifest: {e}"))?;
                 Ok((manifest, etag))
             }
-            Err(e) if is_object_absent(&sdk_error_signal(&e)) => Ok((Manifest::default(), None)),
+            // Only a missing OBJECT is an empty manifest. A missing
+            // coordination BUCKET (NoSuchBucket) is a failure: read as "no
+            // manifest", a node with a lagging plaintext config would
+            // witness nothing and write plaintext.
+            Err(e) if e.as_service_error().is_some_and(|se| se.is_no_such_key()) => {
+                Ok((Manifest::default(), None))
+            }
             Err(e) => Err(format!("GET {MANIFEST_KEY}: {}", sdk_error_signal(&e))),
         }
     }
@@ -662,6 +732,22 @@ impl EncryptionWitness {
 
     async fn sync_inner(&self, cfg: &Config) -> Result<(), String> {
         let label = self.node_id.clone();
+        // The publishes of a failed apply, while they are still this
+        // node's intent: retried before anything else.
+        let pending: Vec<(Storage, WriteEncryption)> = std::mem::take(&mut *self.pending.lock())
+            .into_iter()
+            .filter(|(s, i)| intent_of(cfg, s).as_ref() == Some(i))
+            .collect();
+        if !pending.is_empty() {
+            if let Err(e) = self.write_entries(&pending).await {
+                self.pending.lock().extend(pending);
+                return Err(e);
+            }
+            tracing::info!(
+                "encryption witness: published {} change(s) that an apply could not",
+                pending.len()
+            );
+        }
         let read = self.read_manifest().await?.0;
         let missing: Vec<(Storage, WriteEncryption)> = seeds(cfg)
             .into_iter()
@@ -683,6 +769,14 @@ impl EncryptionWitness {
             .await?
         };
         *self.manifest.lock() = manifest.clone();
+        if let Some(path) = &self.cache_path {
+            if let Err(e) = save_manifest(path, &manifest) {
+                tracing::warn!(
+                    "encryption witness: could not save the manifest to {}: {e}",
+                    path.display()
+                );
+            }
+        }
         let found = mismatches(cfg, &manifest);
         // Log a mismatch when it starts, not at every poll.
         let before = self.status.load();
@@ -714,10 +808,27 @@ impl EncryptionWitness {
         if self.client.is_none() {
             return Err(UNAVAILABLE.to_string());
         }
+        self.last_publish.lock().clear();
         if !publish.is_empty() {
-            self.write_entries(&publish)
-                .await
-                .inspect_err(|_| self.judge(new))?;
+            match self.write_entries(&publish).await {
+                Ok(previous) => {
+                    *self.last_publish.lock() = previous
+                        .into_iter()
+                        .zip(publish.iter().map(|(_, i)| i.clone()))
+                        .map(|((s, prev), i)| (s, prev, i))
+                        .collect();
+                }
+                Err(e) => {
+                    // Kept and retried at each sync (the poller), so the
+                    // node does not refuse its own change forever.
+                    let mut pending = self.pending.lock();
+                    pending.retain(|(s, _)| !publish.iter().any(|(p, _)| p == s));
+                    pending.extend(publish.iter().cloned());
+                    drop(pending);
+                    self.judge(new);
+                    return Err(e);
+                }
+            }
             for (s, i) in &publish {
                 tracing::info!(
                     "encryption witness: published {} for {}/{}",
@@ -730,10 +841,20 @@ impl EncryptionWitness {
         self.sync_locked(new).await
     }
 
-    async fn write_entries(&self, entries: &[(Storage, WriteEncryption)]) -> Result<(), String> {
+    /// Write `entries`; returns each storage's entry before the write (in
+    /// the order of `entries`).
+    async fn write_entries(
+        &self,
+        entries: &[(Storage, WriteEncryption)],
+    ) -> Result<Vec<(Storage, Option<Published>)>, String> {
         let label = self.node_id.clone();
+        let mut previous = Vec::new();
         let m = self
             .update_manifest(|m, now| {
+                previous = entries
+                    .iter()
+                    .map(|(s, _)| (s.clone(), m.get(s).cloned()))
+                    .collect();
                 let mut edited = false;
                 for (s, i) in entries {
                     if m.get(s).map(|p| &p.intent) != Some(i) {
@@ -745,7 +866,45 @@ impl EncryptionWitness {
             })
             .await?;
         *self.manifest.lock() = m;
-        Ok(())
+        Ok(previous)
+    }
+
+    /// The rollback of the last apply (a failed create, a failed persist):
+    /// put back the entries that its publish replaced, where they still
+    /// hold what it published. Never publishes this node's intent (that
+    /// would publish a downgrade without its confirmation), then syncs.
+    pub async fn restore_last_publish(&self, cfg: &Config) -> Result<(), String> {
+        self.judge(cfg);
+        let _one = self.running.lock().await;
+        let undo = std::mem::take(&mut *self.last_publish.lock());
+        self.pending
+            .lock()
+            .retain(|(s, _)| !undo.iter().any(|(u, _, _)| u == s));
+        if self.client.is_none() {
+            return Err(UNAVAILABLE.to_string());
+        }
+        if !undo.is_empty() {
+            let m = self
+                .update_manifest(|m, _| {
+                    let mut edited = false;
+                    for (s, prev, published) in &undo {
+                        if m.get(s).map(|p| &p.intent) != Some(published) {
+                            continue; // changed since: not ours to undo
+                        }
+                        match prev {
+                            Some(p) => {
+                                m.set(s, p.intent.clone(), &p.set_by, p.set_at);
+                            }
+                            None => m.remove(s),
+                        }
+                        edited = true;
+                    }
+                    edited
+                })
+                .await?;
+            *self.manifest.lock() = m;
+        }
+        self.sync_locked(cfg).await
     }
 
     /// The operator's publish (`witness publish`): this node's current
@@ -768,6 +927,9 @@ impl EncryptionWitness {
         self.write_entries(&plan)
             .await
             .map_err(PublishError::Failed)?;
+        self.pending
+            .lock()
+            .retain(|(s, _)| !plan.iter().any(|(p, _)| p == s));
         for (s, i) in &plan {
             let was = before
                 .get(s)

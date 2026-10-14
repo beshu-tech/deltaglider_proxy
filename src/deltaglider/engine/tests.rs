@@ -923,3 +923,24 @@ async fn a_proxy_backend_without_a_key_refuses_writes_and_keeps_reads() {
     let got = wrapped.get_passthrough("b", "", "old.bin").await.unwrap();
     assert_eq!(got, b"old");
 }
+
+/// Final review: the refusal of a native SSE bucket on a filesystem
+/// backend had a broken string continuation ("is a              filesystem").
+#[test]
+fn a_native_bucket_on_a_filesystem_backend_names_it_in_one_sentence() {
+    let cfg = crate::config::Config::from_yaml_str(
+        "storage:\n  filesystem: /tmp/dgp-native-fs\n  buckets:\n    db-archive: { encryption: { mode: sse-s3 } }\n",
+    )
+    .unwrap();
+    let err = super::construction::refuse_native_overrides_off_s3(
+        "default",
+        &cfg.backend,
+        &cfg.bucket_encryption_overrides(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("backend 'default' is a filesystem backend: native modes need S3"),
+        "{err}"
+    );
+}
