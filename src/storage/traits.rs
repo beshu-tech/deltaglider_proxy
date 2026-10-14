@@ -397,6 +397,14 @@ pub enum StorageError {
     #[error("Backend throttled: {0}")]
     Throttled(String),
 
+    /// This node refuses writes to the bucket: its encryption of it
+    /// disagrees with the one that the instances share (the encryption
+    /// witness, issue #116 P3). Maps to 503 SlowDown WITH the message, so
+    /// the client and the operator see the mismatch. Clears when the
+    /// configs agree.
+    #[error("Writes refused: {0}")]
+    WritesRefused(String),
+
     /// The key cannot be stored or read on this backend as written (for
     /// example a `.` segment on the filesystem). Maps to 400 InvalidArgument.
     #[error("Invalid key: {0}")]
@@ -481,6 +489,7 @@ impl StorageError {
             E::Encryption(s) => E::Encryption(s.clone()),
             E::BucketNotEmpty(s) => E::BucketNotEmpty(s.clone()),
             E::Throttled(s) => E::Throttled(s.clone()),
+            E::WritesRefused(s) => E::WritesRefused(s.clone()),
             E::InvalidKey(s) => E::InvalidKey(s.clone()),
             E::KeyTooLong(s) => E::KeyTooLong(s.clone()),
             E::MetadataTooLarge(s) => E::MetadataTooLarge(s.clone()),

@@ -944,7 +944,7 @@ impl CopyClass {
     pub(crate) fn of_storage(e: &crate::storage::StorageError) -> Self {
         use crate::storage::StorageError as S;
         match e {
-            S::Throttled(_) => CopyClass::Throttled,
+            S::Throttled(_) | S::WritesRefused(_) => CopyClass::Throttled,
             S::Unavailable(_) | S::Transient(_) => CopyClass::Transient,
             S::Contended(_) => CopyClass::Busy,
             S::PreconditionFailed(_) => CopyClass::SourceChanged,

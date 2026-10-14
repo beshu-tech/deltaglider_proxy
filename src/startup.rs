@@ -1300,6 +1300,85 @@ pub async fn build_reference_lock(
     }
 }
 
+/// `DGP_ENCRYPTION_WITNESS_POLL_SECS` (default 30, at least 1).
+pub fn encryption_witness_poll_interval() -> Duration {
+    Duration::from_secs(
+        deltaglider_proxy::config::env_parse_with_default(
+            "DGP_ENCRYPTION_WITNESS_POLL_SECS",
+            deltaglider_proxy::coordination::encryption_witness::DEFAULT_POLL_SECS,
+        )
+        .max(1),
+    )
+}
+
+/// Build the multi-instance encryption witness (issue #116 P3) and run its
+/// first sync, before anything serves. No `config_sync_bucket` → `None`
+/// (single instance: nothing to agree with). The bucket was validated as
+/// CAS-capable once (`check`); a failed validation exits later, in the
+/// lease builder. A client that cannot be built, or a first sync that
+/// fails, is logged: the node then serves without a verdict (`/_/ready`
+/// reports `unknown`) and the poller tries again.
+pub async fn build_encryption_witness(
+    config: &Config,
+    check: &CoordinationCheck,
+    gate: Arc<deltaglider_proxy::storage::WitnessGate>,
+) -> Option<Arc<deltaglider_proxy::coordination::EncryptionWitness>> {
+    use deltaglider_proxy::coordination::{durable_node_id, process_boot_ids, EncryptionWitness};
+    let sync_bucket = config
+        .config_sync_bucket
+        .as_ref()
+        .filter(|b| !b.is_empty())?
+        .clone();
+    if matches!(check, Some(Err(_))) {
+        warn!("Encryption witness: the coordination bucket failed validation; not started");
+        return None;
+    }
+    let dir = config_db_path()
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let client = match ConfigDbSync::build_client(coordination_backend(config)).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!(
+                "Encryption witness: coordination client build failed ({e}); per-bucket \
+                 encryption is NOT compared across instances"
+            );
+            return None;
+        }
+    };
+    let witness = Arc::new(EncryptionWitness::new(
+        client,
+        sync_bucket.clone(),
+        durable_node_id(&dir),
+        process_boot_ids(&dir),
+        encryption_witness_poll_interval(),
+        gate,
+    ));
+    witness.forget_previous_boot().await;
+    let mut last = Ok(());
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        last = witness.sync(config).await;
+        if last.is_ok() {
+            break;
+        }
+    }
+    match last {
+        Ok(()) => info!(
+            "Encryption witness: on bucket '{sync_bucket}' ({})",
+            witness.status().status
+        ),
+        Err(e) => error!(
+            "Encryption witness: first sync on bucket '{sync_bucket}' failed ({e}); the \
+             poller tries again"
+        ),
+    }
+    Some(witness)
+}
+
 /// Startup gate (guard B): under multi-instance, every NAMED S3 backend that
 /// hosts a client-writable routed bucket must enforce conditional writes —
 /// without CAS, two nodes' concurrent same-deltaspace PUTs can corrupt

@@ -255,6 +255,21 @@ pub(crate) async fn apply_config_transition(
             TransitionCtx::Background { context, .. } => context,
         };
         crate::config_apply::install_engine(ctx.app(), engine, context);
+        // Multi-instance (issue #116 P3): publish this node's encryption of
+        // every bucket that the change re-encrypted, so the other instances
+        // refuse writes to it until they apply the same change. The gate
+        // of this node follows the new config before any request. A failed
+        // publish is a warning: the change is live, and this node refuses
+        // the buckets it now disagrees on until the next sync.
+        if let Some(witness) = &ctx.app().encryption_witness {
+            if let Err(e) = witness.publish_changes(old_cfg, &new_cfg).await {
+                warnings.push(format!(
+                    "the encryption witness in the sync bucket was not updated ({e}); this \
+                     instance refuses writes to the buckets whose encryption now differs \
+                     from the shared one until the next sync succeeds"
+                ));
+            }
+        }
     }
     // Event delivery or replication may have started or stopped reading the
     // outbox: the append path skips its write while nothing reads it.

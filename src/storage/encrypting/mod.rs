@@ -216,9 +216,16 @@ pub type PolicySlot = (
 #[derive(Default)]
 pub struct EncryptionPolicies {
     slots: parking_lot::Mutex<std::collections::HashMap<String, Arc<ArcSwap<EncryptionConfig>>>>,
+    /// The witness gate that every wrapper of the lineage consults.
+    witness: Arc<WitnessGate>,
 }
 
 impl EncryptionPolicies {
+    /// The witness gate of every engine that shares these slots.
+    pub fn witness_gate(&self) -> Arc<WitnessGate> {
+        self.witness.clone()
+    }
+
     /// The slot of `key` and remember `cfg` for [`Self::publish`]. A new
     /// slot starts with `cfg` (no engine reads it yet); an existing one
     /// keeps the value that the running engine uses until the publish.
@@ -350,15 +357,55 @@ async fn split_chunked_header(
     Ok((base_iv, Box::pin(frames)))
 }
 
+/// The stored buckets whose writes this node refuses, because its
+/// encryption of them disagrees with the one that the instances share
+/// (the multi-instance encryption witness, issue #116 P3). Indexed by
+/// `(raw backend, real bucket)`; the value is the refusal message. Empty
+/// on a single instance.
+#[derive(Default)]
+pub struct WitnessGate {
+    refused: ArcSwap<std::collections::HashMap<(String, String), String>>,
+}
+
+impl WitnessGate {
+    /// Replace the refused set.
+    pub fn set(&self, refused: std::collections::HashMap<(String, String), String>) {
+        self.refused.store(Arc::new(refused));
+    }
+
+    /// The refusal of a write to `bucket` on `backend`, if any.
+    pub fn refusal(&self, backend: &str, bucket: &str) -> Option<String> {
+        let refused = self.refused.load();
+        if refused.is_empty() {
+            return None;
+        }
+        refused
+            .get(&(backend.to_string(), bucket.to_string()))
+            .cloned()
+    }
+}
+
 /// Transparent encryption wrapper around any `StorageBackend`.
 pub struct EncryptingBackend<B: StorageBackend> {
     inner: B,
     config: Arc<ArcSwap<EncryptionConfig>>,
+    /// The raw backend's name and the witness gate (multi-instance).
+    witness: Option<(String, Arc<WitnessGate>)>,
 }
 
 impl<B: StorageBackend> EncryptingBackend<B> {
     pub fn new(inner: B, config: Arc<ArcSwap<EncryptionConfig>>) -> Self {
-        Self { inner, config }
+        Self {
+            inner,
+            config,
+            witness: None,
+        }
+    }
+
+    /// Refuse the writes that the witness gate names for raw backend `name`.
+    pub fn with_witness(mut self, name: &str, gate: Arc<WitnessGate>) -> Self {
+        self.witness = Some((name.to_string(), gate));
+        self
     }
 
     /// THE write-side decision: the (key, key_id) to encrypt a write with,
@@ -447,6 +494,15 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         &self,
         bucket: &str,
     ) -> Result<Option<(EncryptionKey, Option<String>)>, StorageError> {
+        // A node whose encryption of this bucket disagrees with the other
+        // instances never writes it (issue #116 P3): one bucket, one form.
+        if let Some(msg) = self
+            .witness
+            .as_ref()
+            .and_then(|(name, gate)| gate.refusal(name, bucket))
+        {
+            return Err(StorageError::WritesRefused(msg));
+        }
         let cfg = self.config.load();
         let (mode, key, key_id) = match cfg.buckets.get(bucket) {
             Some(b) => (b.write_mode, &b.key, &b.key_id),

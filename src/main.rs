@@ -795,6 +795,15 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let backend_health = Arc::new(deltaglider_proxy::coordination::BackendHealthCache::default());
     startup::boot_backend_health_gate(&config, &backend_health).await;
 
+    // Multi-instance encryption witness (issue #116 P3): the first sync
+    // runs before anything serves, so a node that disagrees with the
+    // others about a bucket's encryption never takes a write to it.
+    let encryption_witness = startup::build_encryption_witness(
+        &config,
+        &coordination_check,
+        engine.encryption_policies().witness_gate(),
+    )
+    .await;
     let state = Arc::new(AppState {
         engine: ArcSwap::from_pointee(engine),
         multipart,
@@ -808,7 +817,14 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         maintenance_notify: maintenance_notify.clone(),
         backend_capabilities: backend_capabilities.clone(),
         backend_health: backend_health.clone(),
+        encryption_witness: encryption_witness.clone(),
     });
+    if let Some(witness) = &encryption_witness {
+        witness.clone().spawn_poller(
+            shared_config.clone(),
+            startup::encryption_witness_poll_interval(),
+        );
+    }
 
     // Re-arm the maintenance write-gate for jobs that survived a restart
     // (boot reconcile re-queued them). MUST happen before the S3 router

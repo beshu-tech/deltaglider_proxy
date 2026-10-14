@@ -1201,3 +1201,229 @@ async fn a_migrate_onto_plaintext_needs_confirmation() {
         "the background flip is audited: {cleared:?}"
     );
 }
+
+// ── Scenario: the multi-instance encryption witness (issue #116 P3) ─────
+
+/// One instance of a two-instance deployment: the singleton S3 backend on
+/// the test MinIO, the coordination bucket `coord`, and the data bucket
+/// `data` with the bucket policy `policy` (a YAML flow map).
+async fn ha_node(node: &str, coord: &str, data: &str, policy: &str) -> Env {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let doc = format!(
+        "access:\n  access_key_id: {}\n  secret_access_key: {}\n\
+         storage:\n  backend:\n    type: s3\n    endpoint: \"{}\"\n    region: us-east-1\n    \
+         force_path_style: true\n    access_key_id: {}\n    secret_access_key: {}\n  \
+         buckets:\n    {data}: {policy}\n\
+         advanced:\n  listen_addr: {}\n  bootstrap_password_hash: \"{}\"\n  config_sync_bucket: {coord}\n",
+        AUTH.0,
+        AUTH.1,
+        common::minio_endpoint_url(),
+        common::MINIO_ACCESS_KEY,
+        common::MINIO_SECRET_KEY,
+        common::LISTEN_ADDR_PLACEHOLDER,
+        common::TEST_BOOTSTRAP_PASSWORD_HASH
+    );
+    let env = vec![
+        (
+            "DGP_CONFIG_DB_KEY".to_string(),
+            common::TEST_CONFIG_DB_KEY.to_string(),
+        ),
+        ("DGP_ENCRYPTION_WITNESS_POLL_SECS".into(), "1".into()),
+        ("DGP_NODE_ID".into(), node.to_string()),
+    ];
+    let server = TestServer::from_config_document(&doc, tmp, AUTH, data, env).await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    Env {
+        server,
+        admin,
+        store: Store::Minio,
+        dr: None,
+    }
+}
+
+impl Env {
+    /// A raw signed PUT: `(status, body)`. No SDK retry hides a 503.
+    async fn raw_put(&self, bucket: &str, key: &str, body: &[u8]) -> (u16, String) {
+        let resp = self
+            .server
+            .http()
+            .put(format!("{}/{bucket}/{key}", self.server.endpoint()))
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        (
+            resp.status().as_u16(),
+            resp.text().await.unwrap_or_default(),
+        )
+    }
+
+    /// The `encryption_witness.status` of `/_/ready`.
+    async fn witness(&self) -> serde_json::Value {
+        reqwest::get(format!("{}/_/ready", self.server.endpoint()))
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()["encryption_witness"]
+            .clone()
+    }
+
+    /// Wait until the witness verdict is `status` (the poll runs every 1 s).
+    async fn wait_witness(&self, status: &str) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let w = self.witness().await;
+            if w["status"] == status {
+                return w;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "witness never became {status}: {w}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+}
+
+/// Two instances share a coordination bucket. They agree → both write.
+/// One disagrees (it stores the bucket in plaintext; it can still read the
+/// ciphertext through its legacy key) → it refuses writes with a 503 that
+/// names the mismatch, reads keep working, and `/_/ready` reports it while
+/// the node stays ready. An apply of the same encryption on it converges.
+/// A rotation applied on one instance publishes; the other refuses until
+/// it applies the rotation too.
+#[tokio::test]
+async fn the_witness_makes_a_disagreeing_instance_refuse_writes_minio() {
+    skip_unless_minio!();
+    let coord = common::unique_bucket("enc-witness");
+    common::minio_client()
+        .await
+        .create_bucket()
+        .bucket(&coord)
+        .send()
+        .await
+        .expect("create the coordination bucket");
+    let data = common::unique_bucket("enc-data");
+    let aes_b =
+        format!("{{ encryption: {{ mode: aes256-gcm-proxy, key: \"{KB}\", key_id: ha-b }} }}");
+    let a = ha_node("node-a", &coord, &data, &aes_b).await;
+    assert_eq!(a.wait_witness("agree").await["status"], "agree");
+    let (code, body) = a.raw_put(&data, "a.txt", b"written by A").await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(a.at_rest(&data, "a.txt").await.as_deref(), Some("ha-b"));
+
+    // B stores the bucket in plaintext: it disagrees.
+    let stale =
+        format!("{{ encryption: {{ mode: none, legacy_key: \"{KB}\", legacy_key_id: ha-b }} }}");
+    let b = ha_node("node-b", &coord, &data, &stale).await;
+    let w = b.wait_witness("mismatch").await;
+    assert_eq!(w["mismatches"][0]["bucket"], data.as_str(), "{w}");
+    assert_eq!(w["mismatches"][0]["published"]["key_id"], "ha-b", "{w}");
+    let ready = reqwest::get(format!("{}/_/ready", b.server.endpoint()))
+        .await
+        .unwrap();
+    assert_eq!(
+        ready.status().as_u16(),
+        200,
+        "a mismatch keeps the node ready"
+    );
+    let (code, body) = b.raw_put(&data, "b.txt", b"written by B").await;
+    assert_eq!(code, 503, "{body}");
+    assert!(
+        body.contains("SlowDown") && body.contains("key id &apos;ha-b&apos;") && !body.contains(KB),
+        "{body}"
+    );
+    assert_eq!(
+        b.get(&data, "a.txt").await,
+        b"written by A",
+        "reads keep working"
+    );
+    // A is not affected.
+    assert_eq!(a.raw_put(&data, "a2.txt", b"A again").await.0, 200);
+
+    // Converge: B applies A's encryption.
+    b.storage_patch_ok(
+        json!({ "buckets": { data.as_str(): { "encryption": override_json(KB, "ha-b") } } }),
+    )
+    .await;
+    b.wait_witness("agree").await;
+    let (code, body) = b.raw_put(&data, "b.txt", b"written by B").await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(b.at_rest(&data, "b.txt").await.as_deref(), Some("ha-b"));
+
+    // A rotation applied on A publishes; B refuses until it applies it too.
+    a.storage_patch_ok(
+        json!({ "buckets": { data.as_str(): { "encryption": override_json(KC, "ha-c") } } }),
+    )
+    .await;
+    assert_eq!(a.wait_witness("agree").await["status"], "agree");
+    let w = b.wait_witness("mismatch").await;
+    assert_eq!(w["mismatches"][0]["published"]["key_id"], "ha-c", "{w}");
+    assert_eq!(b.raw_put(&data, "b2.txt", b"refused").await.0, 503);
+    assert_eq!(a.raw_put(&data, "a3.txt", b"A rotated").await.0, 200);
+    b.storage_patch_ok(
+        json!({ "buckets": { data.as_str(): { "encryption": override_json(KC, "ha-c") } } }),
+    )
+    .await;
+    b.wait_witness("agree").await;
+    assert_eq!(b.raw_put(&data, "b2.txt", b"converged").await.0, 200);
+    assert_eq!(b.at_rest(&data, "b2.txt").await.as_deref(), Some("ha-c"));
+    assert_eq!(b.get(&data, "a3.txt").await, b"A rotated");
+
+    // The manifest holds key ids only.
+    let manifest = common::minio_client()
+        .await
+        .get_object()
+        .bucket(&coord)
+        .key("_dgp/encryption/intent.json")
+        .send()
+        .await
+        .unwrap()
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .to_vec();
+    let text = String::from_utf8(manifest).unwrap();
+    assert!(
+        text.contains("ha-c") && !text.contains(KB) && !text.contains(KC),
+        "{text}"
+    );
+}
+
+/// A restart-based rollout: the instance that published `ha-b` stops; the
+/// instance that writes `ha-c` refuses while the publisher is live, and
+/// publishes its own encryption once no live instance holds `ha-b`
+/// (the heartbeat TTL is three polls, judged on the S3 server clock).
+#[tokio::test]
+async fn the_witness_follows_a_rollout_when_the_old_writers_are_gone_minio() {
+    skip_unless_minio!();
+    let coord = common::unique_bucket("enc-witness");
+    common::minio_client()
+        .await
+        .create_bucket()
+        .bucket(&coord)
+        .send()
+        .await
+        .expect("create the coordination bucket");
+    let data = common::unique_bucket("enc-data");
+    let block = |key: &str, id: &str| {
+        format!("{{ encryption: {{ mode: aes256-gcm-proxy, key: \"{key}\", key_id: {id}, legacy_key: \"{KB}\", legacy_key_id: ha-b }} }}")
+    };
+    let old =
+        format!("{{ encryption: {{ mode: aes256-gcm-proxy, key: \"{KB}\", key_id: ha-b }} }}");
+    let a = ha_node("node-a", &coord, &data, &old).await;
+    a.wait_witness("agree").await;
+    let b = ha_node("node-b", &coord, &data, &block(KC, "ha-c")).await;
+    b.wait_witness("mismatch").await;
+    // Still refused a few polls later: A is live and holds `ha-b`.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(b.witness().await["status"], "mismatch");
+    assert_eq!(b.raw_put(&data, "x.txt", b"refused").await.0, 503);
+    drop(a);
+    b.wait_witness("agree").await;
+    let (code, body) = b.raw_put(&data, "x.txt", b"after the rollout").await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(b.at_rest(&data, "x.txt").await.as_deref(), Some("ha-c"));
+}

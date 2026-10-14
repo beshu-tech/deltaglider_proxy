@@ -203,6 +203,13 @@ pub struct ReadinessResponse {
     /// health probe and from requests that found a backend unavailable.
     /// Empty when no probe ran (`DGP_BOOT_BACKEND_PROBE=off`).
     pub backends: std::collections::BTreeMap<String, String>,
+    /// Multi-instance only: the encryption witness verdict (`agree`,
+    /// `mismatch` with the buckets whose writes this node refuses, or
+    /// `unknown`). A mismatch leaves the node READY: it refuses writes to
+    /// those buckets only, and still serves their reads and every other
+    /// bucket; a load balancer that removed it would drop all of that.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encryption_witness: Option<crate::coordination::WitnessStatus>,
 }
 
 /// Pure: the node is not ready when every backend with a verdict is gated
@@ -440,6 +447,7 @@ pub async fn readiness_check(
             config_db,
             jobs_db,
             backends,
+            encryption_witness: state.encryption_witness.as_ref().map(|w| w.status()),
         }),
     )
 }

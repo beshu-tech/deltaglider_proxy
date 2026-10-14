@@ -657,6 +657,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Config Sync",
     },
     EnvVarEntry {
+        name: "DGP_ENCRYPTION_WITNESS_POLL_SECS",
+        description: "How often each instance compares its per-bucket encryption with the one that the instances share in the sync bucket, and refreshes its heartbeat; an instance counts as gone after three intervals (default: 30)",
+        example: "30",
+        category: "Config Sync",
+    },
+    EnvVarEntry {
         name: "DGP_NODE_ID",
         description: "Stable node label for coordination leases (default: derived and saved next to the config DB)",
         example: "dgp-0",

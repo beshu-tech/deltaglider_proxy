@@ -152,7 +152,8 @@ The proxy refuses to start with a config that breaks one of these rules, and it 
 | The bucket has `backend:` when `storage.backends` is used. | A bucket without a route can live on any backend, so the proxy cannot tell which storage the block applies to. With a single backend (`storage.backend`), the bucket is always on that backend, and `backend:` is not needed. |
 | Every name of one stored bucket has the same effective encryption. | The encryption belongs to the stored bucket (the backend and the real bucket name), not to a name. When two bucket names reach the same real bucket through `alias`, they must carry the same `encryption` block, or none. |
 | A key id names one key. | Two keys with the same `key_id` and different key bytes are refused, across all backends and all buckets. The same key with the same id in two places is allowed. |
-| `config_sync_bucket` is not set. | The YAML config is per node. In a multi-instance deployment, two nodes could write one bucket with different keys, so per-bucket encryption is single-instance only in this release. |
+
+With `config_sync_bucket` set (several instances), the encryption witness makes an instance that disagrees with the others about a bucket's encryption refuse writes to that bucket. See [How to run multiple instances](../how-to/run-multiple-instances.md#8-keep-the-encryption-of-each-bucket-the-same-on-every-instance).
 
 A bucket key has no `DGP_*` environment variable. Put the key in the YAML file, or reference any environment variable with `${env:NAME}`, as in the example.
 

@@ -1354,6 +1354,7 @@ mod tests {
             maintenance_notify: Arc::new(tokio::sync::Notify::new()),
             backend_capabilities: Default::default(),
             backend_health: Default::default(),
+            encryption_witness: None,
         });
         let db = JobsDb::in_memory("testpass").unwrap();
         let id = db

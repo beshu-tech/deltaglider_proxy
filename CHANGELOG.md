@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added — Per-bucket encryption on several instances (the encryption witness)
+
+Per-bucket encryption now works with `config_sync_bucket` set; the start no longer refuses it. The YAML is per instance, so the instances keep a witness in the sync bucket: `_dgp/encryption/intent.json` holds the mode and key id (never a key) of each bucket with its own encryption, and each instance writes a heartbeat under `_dgp/encryption/nodes/`. An instance whose encryption of a bucket differs from the published one refuses writes to that bucket with `503 SlowDown` that names the mismatch; reads and other buckets keep working, and `/_/ready` shows the verdict in `encryption_witness` (the instance stays ready). A config apply that changes a bucket's encryption publishes it, so applying the same config on every instance converges. When no live instance writes a bucket with the published encryption any more (a rollout that restarted every instance), an instance publishes its own, but never a downgrade to plaintext. New setting: `DGP_ENCRYPTION_WITNESS_POLL_SECS` (default 30).
+
 ### Added — Audit entries for a bucket's encryption, and a confirmed downgrade
 
 Every change of a bucket's write encryption now writes one audit entry: `bucket_encryption_set`, `bucket_encryption_cleared` or `bucket_encryption_key_rotated`. The target names the mode and the key id before and after the change, never key material. The config transition writes them, so every write path does: a config apply, a section PUT, a field PATCH, the backend endpoints, a backup restore, and the flip of a migrate (user `background`).

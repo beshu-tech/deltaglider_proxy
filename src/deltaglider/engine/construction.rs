@@ -85,7 +85,10 @@ impl DynEngine {
                 native_policy(&config.backend_encryption, &slot),
             )
             .await?;
-            DynStorageBackend::new_box(crate::storage::EncryptingBackend::new(raw, slot))
+            DynStorageBackend::new_box(
+                crate::storage::EncryptingBackend::new(raw, slot)
+                    .with_witness("default", policies.witness_gate()),
+            )
         } else {
             // Multi-backend routing. Each named entry is constructed
             // raw (with native-SSE config already baked in), wrapped
@@ -112,8 +115,10 @@ impl DynEngine {
                     native_policy(&named.encryption, &slot),
                 )
                 .await?;
-                let wrapped =
-                    DynStorageBackend::new_box(crate::storage::EncryptingBackend::new(raw, slot));
+                let wrapped = DynStorageBackend::new_box(
+                    crate::storage::EncryptingBackend::new(raw, slot)
+                        .with_witness(&named.name, policies.witness_gate()),
+                );
                 backends.insert(named.name.clone(), Arc::new(wrapped));
             }
             let default_name = config.default_backend_name();

@@ -178,21 +178,9 @@ impl Config {
         if overrides.is_empty() {
             return errors;
         }
-        let sync = self
-            .config_sync_bucket
-            .as_deref()
-            .map(str::trim)
-            .filter(|b| !b.is_empty());
-        if let Some(sync) = sync {
-            let names: Vec<&str> = overrides.iter().map(|(n, _)| n.as_str()).collect();
-            errors.push(format!(
-                "buckets {names:?} set their own encryption, but config_sync_bucket '{sync}' \
-                 makes this a multi-instance deployment. Per-bucket encryption is \
-                 single-instance only in this release: the YAML is per node, so nodes could \
-                 write one bucket with different keys. Remove the buckets' `encryption` \
-                 blocks (the backend's encryption then applies), or remove config_sync_bucket"
-            ));
-        }
+        // Multi-instance (config_sync_bucket) is allowed: the encryption
+        // witness (`coordination::encryption_witness`) makes a node that
+        // disagrees about a bucket refuse writes to it (issue #116 P3).
         for (bucket, enc) in &overrides {
             let at = format!("bucket '{bucket}'");
             match enc {

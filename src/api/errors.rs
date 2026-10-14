@@ -373,6 +373,9 @@ impl From<crate::storage::StorageError> for S3Error {
             // contract. Pre-fix this fell into the catch-all below,
             // surfacing as a 500 InternalError that SDKs treat as
             // permanent.
+            // The encryption witness refused the write: the message names
+            // the mismatch, and a retry succeeds once the configs agree.
+            crate::storage::StorageError::WritesRefused(msg) => S3Error::SlowDown(msg),
             crate::storage::StorageError::Throttled(_) => S3Error::SlowDown(
                 "Backend signalled transient pressure; please retry with backoff.".to_string(),
             ),

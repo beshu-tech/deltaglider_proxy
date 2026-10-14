@@ -310,6 +310,7 @@ async fn harness() -> Harness {
         maintenance_notify: Arc::new(tokio::sync::Notify::new()),
         backend_capabilities: Default::default(),
         backend_health: Default::default(),
+        encryption_witness: None,
     });
     let rate_limiter = crate::rate_limiter::RateLimiter::new(
         100,

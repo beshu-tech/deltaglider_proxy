@@ -263,7 +263,8 @@ fn a_key_id_names_one_key_across_backends_and_buckets() {
 
 /// Owner decision 3: no per-bucket encryption while config sync is on.
 #[test]
-fn a_bucket_override_is_refused_with_a_sync_bucket() {
+fn a_bucket_override_is_allowed_with_a_sync_bucket() {
+    // Issue #116 P3: the encryption witness replaces P1's refusal.
     let yaml = format!(
         "{}advanced:\n  config_sync_bucket: dgp-sync\n",
         named(&format!(
@@ -272,8 +273,7 @@ fn a_bucket_override_is_refused_with_a_sync_bucket() {
     );
     let errs = fatal(&yaml);
     assert!(
-        errs.iter()
-            .any(|e| e.contains("config_sync_bucket") && e.contains("single-instance")),
+        !errs.iter().any(|e| e.contains("config_sync_bucket")),
         "{errs:?}"
     );
 }

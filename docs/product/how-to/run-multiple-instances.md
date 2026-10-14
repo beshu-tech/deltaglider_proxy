@@ -181,7 +181,23 @@ correctness, but both change behaviour compared to a single instance:
   accordingly, and remember that the admin GUI's source-IP stickiness concentrates
   everyone behind one NAT gateway onto a single instance's budget.
 
-## 8. Mind upgrades across the fleet
+## 8. Keep the encryption of each bucket the same on every instance
+
+The YAML config is per instance. When a bucket has its own `encryption` block, two instances could disagree about it: one instance could lack the block, or have another key. Those two instances would then write one bucket in two forms. The proxy prevents this with an encryption witness in the coordination bucket.
+
+The witness works in this way:
+
+- The object `_dgp/encryption/intent.json` in the sync bucket holds, for each stored bucket (the backend and the real bucket name), the mode and the key id that the instances agreed on. It never holds a key: a key id is the public name of a key, and every object already carries it.
+- At start, and every 30 seconds after that (`DGP_ENCRYPTION_WITNESS_POLL_SECS`), each instance compares its own encryption of every bucket in that object with the published one. When an instance has a bucket block that the object does not list yet, it adds it. The first instance that adds a bucket sets its entry.
+- An instance whose encryption of a bucket differs from the published one refuses writes to that bucket with `503 SlowDown`. The message names the bucket, the encryption of the instance and the published encryption. Reads of the bucket, and writes to every other bucket, keep working. The proxy also stops background writes into the bucket on that instance (replication, lifecycle, re-encrypt).
+- A config apply on an instance (the admin GUI, the admin API or `config apply`) that changes the encryption of a bucket publishes the new encryption. The other instances then refuse writes to that bucket until they get the same change.
+- Each instance also writes a heartbeat object under `_dgp/encryption/nodes/`. When no live instance writes a bucket with the published encryption any more, an instance with another encryption publishes its own. This lets a rollout that restarts every instance with an edited file converge. An instance never publishes a downgrade (from an encrypting mode to plaintext) in this way: a downgrade needs an apply with its confirmation.
+
+To change the encryption of a bucket on a running deployment, apply the same config on every instance, one instance after the other. Between the first and the last apply, the instances that do not have the change yet refuse writes to that bucket, and clients retry their `503 SlowDown` answers. When the last instance has the change, every instance writes the bucket again.
+
+`/_/ready` shows the verdict of the witness in `encryption_witness`: `agree`, `mismatch` (with the buckets, the local encryption and the published one), or `unknown` when the sync bucket did not answer. An instance with a mismatch stays ready. It refuses writes to one bucket only, and it still serves reads and every other bucket; a load balancer that removed it would take all of that traffic away. When the sync bucket does not answer, the last verdict holds.
+
+## 9. Mind upgrades across the fleet
 
 During a rolling upgrade, a newer binary may migrate the DB schema forward; older instances still running will download a DB they can't fully read. Upgrade all instances before making IAM mutations, or accept that mid-rollout mutations are lost on older readers. Details: [How to upgrade the proxy](upgrade.md).
 

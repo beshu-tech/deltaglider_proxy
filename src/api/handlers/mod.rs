@@ -76,6 +76,7 @@ impl AppState {
             maintenance_notify: Arc::new(tokio::sync::Notify::new()),
             backend_capabilities: Default::default(),
             backend_health: Default::default(),
+            encryption_witness: None,
         })
     }
 }
@@ -111,6 +112,10 @@ pub struct AppState {
     /// loop. Gates S3 requests to buckets on unhealthy backends (503) and
     /// feeds the admin backends API. See `src/coordination/health.rs`.
     pub backend_health: Arc<crate::coordination::BackendHealthCache>,
+    /// The multi-instance encryption witness (issue #116 P3); `None` on a
+    /// single instance. A config apply publishes through it; `/_/ready`
+    /// reports its verdict.
+    pub encryption_witness: Option<Arc<crate::coordination::EncryptionWitness>>,
 }
 
 // ---------------------------------------------------------------------------

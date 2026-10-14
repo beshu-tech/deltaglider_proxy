@@ -370,6 +370,7 @@ mod tests {
             maintenance_notify: Arc::new(tokio::sync::Notify::new()),
             backend_capabilities: Default::default(),
             backend_health: Default::default(),
+            encryption_witness: None,
         });
         let db = Arc::new(Mutex::new(JobsDb::in_memory("test").unwrap()));
         Env {

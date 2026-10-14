@@ -24,6 +24,7 @@
 pub mod capability;
 pub mod cas;
 pub mod cas_probe;
+pub mod encryption_witness;
 pub mod health;
 pub mod lease;
 pub mod reference_lock;
@@ -31,6 +32,7 @@ pub mod s3_lease;
 pub mod server_clock;
 
 pub use capability::{BackendCapabilityCache, CapabilityVerdict, VerifiedVia};
+pub use encryption_witness::{EncryptionWitness, WitnessStatus};
 pub use health::{BackendHealthCache, HealthVerdict};
 pub use lease::{CoordinationLease, DynCoordinationLease, LeaseError, LeaseSubsystem, LocalLease};
 pub use reference_lock::{DynReferenceLock, ReferenceLock, S3ReferenceLock};
