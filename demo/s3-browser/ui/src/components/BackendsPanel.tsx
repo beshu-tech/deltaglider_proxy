@@ -5,7 +5,8 @@ import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
 import { Button, Input, Radio, Switch, Typography, Space, Alert, Spin, message } from 'antd';
 import { PlusOutlined, DeleteOutlined, DatabaseOutlined, CloudOutlined, CheckCircleOutlined, ApiOutlined } from '@ant-design/icons';
-import type { BackendEncryptionMode, BackendHealthEntry, BackendInfo, CreateBackendRequest } from '../adminApi';
+import type { BackendEncryptionMode, BackendHealthEntry, BackendInfo, ConfirmHeaders, CreateBackendRequest } from '../adminApi';
+import { confirmDialog } from '../confirmDialog';
 import { createBackend, deleteBackend, probeBackend, testS3Connection, updateAdminConfig, getSectionVersioned } from '../adminApi';
 import { applySection, persistFailureText, sectionApplyErrorText } from '../applySection';
 import { useAdminConfig } from '../queries/config';
@@ -210,7 +211,22 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
           return;
         }
       }
-      const result = await createBackend(req);
+      // A new backend starts plaintext. As the new default it makes every
+      // bucket without a route store plaintext where the current default
+      // encrypts: confirm that first, then send `route:default`.
+      const defaultEncrypts = backends.some((b) => b.name === defaultBackend && b.encryption.mode !== 'none');
+      let confirm: ConfirmHeaders | undefined;
+      if (req.set_default && defaultEncrypts) {
+        const ok = await confirmDialog({
+          title: `Make ${req.name} the default backend?`,
+          content: `The default backend ${defaultBackend} encrypts. ${req.name} starts without encryption, so new writes to every bucket without its own route or encryption are stored as plaintext.`,
+          okText: 'Make it the default',
+          danger: true,
+        });
+        if (!ok) return;
+        confirm = { routeDefault: true };
+      }
+      const result = await createBackend(req, confirm);
       if (result.success) {
         const name = formName.trim();
         // A toast is visible wherever the page is scrolled; then bring the

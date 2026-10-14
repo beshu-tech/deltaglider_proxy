@@ -77,7 +77,7 @@ test('the guard sees the shapes it refuses', () => {
 
 /** Files that may read `.encryption`, with the number of reads and why. */
 const ENCRYPTION_READS: Record<string, [number, string]> = {
-  'components/BackendsPanel.tsx': [2, 'a backend card edits that backend\'s own encryption'],
+  'components/BackendsPanel.tsx': [3, 'a backend card edits that backend\'s own encryption; the default backend\'s own mode'],
   'components/CreateBucketModal.tsx': [1, 'the backend picker labels each backend with its own mode'],
   'components/MigrateBucketModal.tsx': [2, 'the target picker and the target backend\'s own mode'],
   'components/bucketPolicyPayload.ts': [4, 'the bucket policy\'s own block, not a backend'],

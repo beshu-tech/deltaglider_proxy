@@ -111,8 +111,17 @@ export async function getBucketEncryptionPreview(name: string, backend: string):
 
 
 
-export async function createBackend(req: CreateBackendRequest): Promise<{ success: boolean; error?: string }> {
-  return adminJson('/api/admin/backends', { method: 'POST', body: req });
+export async function createBackend(
+  req: CreateBackendRequest,
+  /** `routeDefault` when the new default backend makes unrouted buckets plaintext. */
+  confirm?: ConfirmHeaders,
+): Promise<{ success: boolean; error?: string }> {
+  const headers = confirmHeaderMap(confirm);
+  return adminJson('/api/admin/backends', {
+    method: 'POST',
+    body: req,
+    ...(Object.keys(headers).length > 0 ? { headers } : {}),
+  });
 }
 
 export async function deleteBackend(name: string): Promise<{ success: boolean; error?: string }> {

@@ -739,6 +739,9 @@ export interface ConfirmHeaders {
   keyRemovals?: string[];
   downgrades?: string[];
   backendDowngrades?: string[];
+  /** A change of `default_backend` that makes the buckets without a route
+   *  store plaintext (token `route:default`). */
+  routeDefault?: boolean;
 }
 
 const CONFIRM_KEY_REMOVAL_HEADER = 'X-DGP-Confirm-Key-Removal';
@@ -750,7 +753,11 @@ export function confirmHeaderMap(confirm?: ConfirmHeaders): Record<string, strin
   if (confirm?.keyRemovals && confirm.keyRemovals.length > 0) {
     out[CONFIRM_KEY_REMOVAL_HEADER] = confirm.keyRemovals.join(',');
   }
-  const downgrades = [...(confirm?.downgrades ?? []), ...(confirm?.backendDowngrades ?? []).map((b) => `backend:${b}`)];
+  const downgrades = [
+    ...(confirm?.downgrades ?? []),
+    ...(confirm?.backendDowngrades ?? []).map((b) => `backend:${b}`),
+    ...(confirm?.routeDefault ? ['route:default'] : []),
+  ];
   if (downgrades.length > 0) out[CONFIRM_DOWNGRADE_HEADER] = downgrades.join(',');
   return out;
 }

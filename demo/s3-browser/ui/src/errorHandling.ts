@@ -196,7 +196,9 @@ function describeS3Error(err: unknown, context: string): Error {
   if (
     status === 503 &&
     typeof serverMessage === 'string' &&
-    /backend|read-only|unavailable/i.test(serverMessage)
+    // The encryption witness refuses writes of a bucket whose encryption
+    // this instance disagrees on, or that it cannot check now (issue #116).
+    /backend|read-only|unavailable|encryption|witness/i.test(serverMessage)
   ) {
     const reqPart = requestIdSuffix(requestId);
     return new Error(`${context} failed (503): ${serverMessage}${reqPart}`);

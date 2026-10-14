@@ -88,3 +88,23 @@ test('after a backend change, only the buckets whose encryption changed are prop
   // buckets that inherit from it.
   expect(http.callsTo('PUT', SECTION)[0].headers['x-dgp-confirm-encryption-downgrade']).toBe('backend:hetzner-fsn1');
 });
+
+/** P3 contract: a new default backend that makes unrouted buckets
+ *  plaintext is confirmed first, and only then sends `route:default`. */
+test('a plaintext new default backend is confirmed and sends route:default', async () => {
+  const user = userEvent.setup();
+  http.on('POST', '/_/api/admin/backends', json({ success: true }));
+  renderWithQuery(<BackendsPanel />);
+  await user.click(await screen.findByTestId('backends-add'));
+  await user.type(screen.getByTestId('backend-name'), 'local-disk');
+  await user.type(screen.getByTestId('backend-path'), '/var/lib/dgp-local');
+  await user.click(document.getElementById('backend-set-default')!);
+  await user.click(screen.getByTestId('backend-create'));
+  const dialogs = await screen.findAllByRole('dialog');
+  const confirm = dialogs[dialogs.length - 1];
+  expect(confirm).toHaveTextContent(/default backend hetzner-fsn1 encrypts/);
+  expect(http.callsTo('POST', '/_/api/admin/backends')).toHaveLength(0);
+  await user.click(within(confirm).getByRole('button', { name: 'Make it the default' }));
+  await waitFor(() => expect(http.callsTo('POST', '/_/api/admin/backends')).toHaveLength(1));
+  expect(http.callsTo('POST', '/_/api/admin/backends')[0].headers['x-dgp-confirm-encryption-downgrade']).toBe('route:default');
+});
