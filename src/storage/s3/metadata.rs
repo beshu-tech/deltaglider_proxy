@@ -222,6 +222,9 @@ pub(super) struct ObjectHeaders<'a> {
     pub(super) user: Option<&'a HashMap<String, String>>,
     pub(super) last_modified: Option<&'a aws_sdk_s3::primitives::DateTime>,
     pub(super) e_tag: Option<&'a str>,
+    /// The STORED object's size: a HEAD's Content-Length, or the size a
+    /// GET caller resolved (`S3Backend::object_size_of`). Never a ranged
+    /// GET's Content-Length, and `None` only when no response named it.
     pub(super) content_length: Option<i64>,
     pub(super) content_type: Option<&'a str>,
 }
@@ -434,6 +437,7 @@ impl S3Backend {
         key: &str,
         response: &ObjectHeaders<'_>,
     ) -> FileMetadata {
+        let stored_size = response.content_length.and_then(|n| u64::try_from(n).ok());
         let headers: HashMap<String, String> = response
             .user
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
@@ -472,10 +476,13 @@ impl S3Backend {
         if !headers.is_empty() {
             match Self::headers_to_metadata(&headers, s3_last_modified) {
                 Ok(meta) => {
-                    let stored_etag = response.e_tag.unwrap_or_default();
-                    let stored_size = response.content_length.unwrap_or(0).max(0) as u64;
-                    self.remember_listed_facts(bucket, key, stored_etag, stored_size, &meta);
-                    self.backfill_listing_facts(bucket, key, stored_etag, stored_size, &meta);
+                    // No size, no facts: a wrong stored size would make the
+                    // listing facts disagree with the object.
+                    if let Some(stored_size) = stored_size {
+                        let stored_etag = response.e_tag.unwrap_or_default();
+                        self.remember_listed_facts(bucket, key, stored_etag, stored_size, &meta);
+                        self.backfill_listing_facts(bucket, key, stored_etag, stored_size, &meta);
+                    }
                     return meta;
                 }
                 Err(e) if delta_critical => {
@@ -511,7 +518,15 @@ impl S3Backend {
             );
         }
         // Treat as passthrough with best-effort metadata from HEAD response.
-        let file_size = response.content_length.unwrap_or(0).max(0) as u64;
+        // Every GET caller resolves the size (`object_size_of`); only a HEAD
+        // without Content-Length, which S3 always sends, leaves it unknown.
+        let file_size = match stored_size {
+            Some(size) => size,
+            None => {
+                warn!("{bucket}/{key}: the response names no size; reporting 0");
+                0
+            }
+        };
         let last_modified = s3_last_modified;
         // Upstream S3 returns the ETag already wrapped in quotes (e.g.
         // `"abc123"`). FileMetadata.md5 must hold the BARE value — the

@@ -72,12 +72,6 @@ use std::collections::{HashMap, HashSet};
 
 use tracing::{debug, instrument, warn};
 
-/// Pure: the total object size in a `Content-Range: bytes a-b/total`
-/// header (`None` for `*` or a malformed value).
-fn content_range_total(header: &str) -> Option<u64> {
-    header.rsplit_once('/')?.1.trim().parse().ok()
-}
-
 /// Upstream `ListObjectsV2` pages fetched by `list_objects_delegated`'s loop.
 /// Observable request-amplification counter (issue #82): a healthy anchored
 /// listing costs ~1 page per served page; a subtree drain costs O(subtree).
@@ -592,9 +586,9 @@ impl StorageBackend for S3Backend {
         Ok(written)
     }
 
-    /// One GET: the size from its Content-Length, the metadata from its
-    /// headers, the body streamed by the caller. A response without
-    /// Content-Length (a chunked body) takes the size from a HEAD: the
+    /// One GET: the size and the metadata from its headers, the body
+    /// streamed by the caller. A response without Content-Length (a
+    /// chunked body) takes the size from a HEAD of the same ETag: the
     /// caller reserves spool at this size, and a body longer than it fails.
     async fn open_reference_source(
         &self,
@@ -610,13 +604,7 @@ impl StorageBackend for S3Backend {
             .send()
             .await
             .map_err(|e| self.classify_get(bucket, &key, &e))?;
-        let size = match response.content_length() {
-            Some(len) => len.max(0) as u64,
-            None => {
-                let (_, head) = self.head_object_response(bucket, &key).await?;
-                head.content_length().unwrap_or(0).max(0) as u64
-            }
-        };
+        let size = self.object_size_of(bucket, &key, &response).await?;
         let meta = self.metadata_of_response(
             bucket,
             &key,
@@ -624,7 +612,7 @@ impl StorageBackend for S3Backend {
                 user: response.metadata(),
                 last_modified: response.last_modified(),
                 e_tag: response.e_tag(),
-                content_length: response.content_length(),
+                content_length: Some(i64::try_from(size).unwrap_or(i64::MAX)),
                 content_type: response.content_type(),
             },
         );
@@ -1025,6 +1013,9 @@ impl StorageBackend for S3Backend {
             .send()
             .await
             .map_err(|e| self.classify_get(bucket, &key, &e))?;
+        // The stored size, not a missing Content-Length read as 0: a foreign
+        // object's metadata (and the metadata cache) takes its size from it.
+        let size = self.object_size_of(bucket, &key, &response).await?;
         let meta = self.metadata_of_response(
             bucket,
             &key,
@@ -1032,7 +1023,7 @@ impl StorageBackend for S3Backend {
                 user: response.metadata(),
                 last_modified: response.last_modified(),
                 e_tag: response.e_tag(),
-                content_length: response.content_length(),
+                content_length: Some(i64::try_from(size).unwrap_or(i64::MAX)),
                 content_type: response.content_type(),
             },
         );
@@ -1052,32 +1043,7 @@ impl StorageBackend for S3Backend {
         end: u64,
     ) -> Result<(super::ByteStream, u64, FileMetadata), StorageError> {
         let key = self.passthrough_key(prefix, filename);
-        let range_header = if end >= u64::MAX - 1 {
-            format!("bytes={start}-")
-        } else {
-            format!("bytes={start}-{end}")
-        };
-        let response = self
-            .client
-            .get_object()
-            .bucket(bucket)
-            .key(&key)
-            .range(&range_header)
-            .send()
-            .await
-            .map_err(|e| self.classify_get(bucket, &key, &e))?;
-        let content_length = response.content_length().unwrap_or(0).max(0) as u64;
-        let total = match response.content_range().and_then(content_range_total) {
-            Some(total) => total,
-            // No Content-Range: the backend sent the whole object. That is
-            // the range only when the range covers the whole object.
-            None if start == 0 && end.saturating_add(1) >= content_length => content_length,
-            None => {
-                return Err(StorageError::Other(format!(
-                    "backend ignored {range_header} for {bucket}/{key}"
-                )))
-            }
-        };
+        let (response, len, total) = self.ranged_get(bucket, &key, start, end).await?;
         let meta = self.metadata_of_response(
             bucket,
             &key,
@@ -1089,15 +1055,7 @@ impl StorageBackend for S3Backend {
                 content_type: response.content_type(),
             },
         );
-        debug!(
-            "S3 GET range {}/{} ({}, {} of {} bytes, with its metadata)",
-            bucket, key, range_header, content_length, total
-        );
-        Ok((
-            self.body_stream(bucket, &key, response),
-            content_length,
-            meta,
-        ))
+        Ok((self.body_stream(bucket, &key, response), len, meta))
     }
 
     #[instrument(skip(self))]
@@ -1110,24 +1068,8 @@ impl StorageBackend for S3Backend {
         end: u64,
     ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError> {
         let key = self.passthrough_key(prefix, filename);
-        let range_header = format!("bytes={}-{}", start, end);
-        let response = self
-            .client
-            .get_object()
-            .bucket(bucket)
-            .key(&key)
-            .range(&range_header)
-            .send()
-            .await
-            .map_err(|e| self.classify_get(bucket, &key, &e))?;
-
-        let content_length = response.content_length.unwrap_or(0) as u64;
-        debug!(
-            "S3 GET range stream {}/{} ({}, {} bytes)",
-            bucket, key, range_header, content_length
-        );
-
-        Ok((self.body_stream(bucket, &key, response), content_length))
+        let (response, len, _) = self.ranged_get(bucket, &key, start, end).await?;
+        Ok((self.body_stream(bucket, &key, response), len))
     }
 
     // === Multipart upload (Phase B native streaming copy) ===

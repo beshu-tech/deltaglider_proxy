@@ -148,6 +148,16 @@ a write counted twice, so the bucket could stay over its quota with no
 further scan. Now only a scan during which the bucket did not change
 stamps the counter. A busy Refresh still shows its numbers, marked as not
 reconciled; refresh again when the bucket is quiet.
+### Fixed — Ranged reads from stores that send no Content-Length
+
+Some S3-compatible stores send the body of a GET in chunks, with no
+`Content-Length` header. The proxy read the missing header as a length of
+0. A ranged GET then answered a wrong `Content-Range`, a ranged GET of an
+encrypted backend failed with InternalError, a suffix range loaded the
+whole object, and a GET of an object that was not written through the
+proxy answered `Content-Length: 0`. Now the proxy takes the length of a
+ranged body from its `Content-Range` header. When a response names no
+size at all, the proxy asks for it with one HEAD request.
 
 ### Fixed — A copy during a re-encryption no longer serves ciphertext
 

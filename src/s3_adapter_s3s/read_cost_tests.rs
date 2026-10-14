@@ -868,3 +868,59 @@ async fn suffix_and_conditional_ranges_keep_head_first() {
     assert_eq!(body, fx.photo[..10]);
     assert_eq!(count(&key_requests(&fx.fake), "HEAD"), 2);
 }
+
+/// A store that answers GET with a chunked body (no Content-Length) gets
+/// the same ranged answers as one that sends it: the length of a ranged
+/// body comes from its Content-Range. Before, a missing Content-Length
+/// read as 0: a wrong Content-Range (`bytes 0-0/...`), an InternalError
+/// behind the encrypting wrapper, and a suffix range that loaded the
+/// whole object.
+#[tokio::test]
+async fn ranges_without_content_length_answer_as_with_it() {
+    for kind in KINDS {
+        let fx = fixture(kind).await;
+        let size = fx.photo.len() as u64;
+        fx.fake.set_chunked_gets(true);
+        for (first, last) in [(0, Some(99)), (140_000, Some(140_099)), (199_000, None)] {
+            let svc = svc_on(engine_on(&fx.backend, None));
+            let end = last.unwrap_or(u64::MAX).min(size - 1);
+            let (body, _, range) = run_range(&svc, ranged("pics/a.jpg", first, last))
+                .await
+                .unwrap_or_else(|e| panic!("{kind:?} {first}: {e}"));
+            assert_eq!(
+                body,
+                fx.photo[first as usize..=end as usize],
+                "{kind:?} {first}"
+            );
+            assert_eq!(range, format!("bytes {first}-{end}/{size}"), "{kind:?}");
+        }
+        let svc = svc_on(engine_on(&fx.backend, None));
+        let mut g = get("pics/a.jpg");
+        g.range = Some(s3s::dto::Range::Suffix { length: 100 });
+        let (body, _, range) = run_range(&svc, g)
+            .await
+            .unwrap_or_else(|e| panic!("{kind:?} suffix: {e}"));
+        assert_eq!(body, fx.photo[(size - 100) as usize..], "{kind:?} suffix");
+        assert_eq!(range, format!("bytes {}-{}/{size}", size - 100, size - 1));
+    }
+}
+
+/// A foreign object (no DG metadata) read from a store that sends no
+/// Content-Length: the GET answers its real size, and the metadata cache
+/// does not keep a size of 0.
+#[tokio::test]
+async fn a_foreign_object_without_content_length_keeps_its_size() {
+    let fx = fixture(Kind::Plain).await;
+    let body = rnd(5000, 3);
+    fx.fake.insert_object("b/pics/foreign.jpg", &body, &[]);
+    fx.fake.set_chunked_gets(true);
+    let svc = svc_on(engine_on(&fx.backend, None));
+    let resp = get_object(&svc, request(get("pics/foreign.jpg")))
+        .await
+        .unwrap();
+    assert_eq!(resp.output.content_length, Some(5000));
+    let engine = svc.state.engine.load();
+    let (data, meta) = engine.retrieve("b", "pics/foreign.jpg").await.unwrap();
+    assert_eq!(data, body);
+    assert_eq!(meta.file_size, 5000, "the cached size");
+}
