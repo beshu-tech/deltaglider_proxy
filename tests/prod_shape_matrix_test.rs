@@ -142,7 +142,7 @@ async fn boot(default_backend: DefaultBackend) -> ProdShape {
     let local_disk = data.path().join("local-disk");
     let server = TestServer::from_config_document(&doc, data, ADMIN, "releases", Vec::new()).await;
     let s3 = server.s3_client().await;
-    for b in ["db-archive", "pippo", "scratch", "downloads"] {
+    for b in ["db-archive", "pippo", "scratch", "downloads", "reenc-demo"] {
         s3.create_bucket()
             .bucket(b)
             .send()
@@ -293,7 +293,7 @@ async fn object_matrix(ps: &ProdShape, bucket: &str) {
 async fn encrypted_at_rest(ps: &ProdShape) {
     let marker = b"PLAINTEXT-MUST-NOT-REACH-DISK-0123456789".to_vec();
     let body = [marker.as_slice(), &generate_binary(10_000, 9)].concat();
-    for bucket in ["db-archive", "scratch"] {
+    for bucket in ["db-archive", "scratch", "reenc-demo"] {
         common::put_object(
             &ps.admin_http,
             &ps.server.endpoint(),
@@ -320,6 +320,37 @@ async fn encrypted_at_rest(ps: &ProdShape) {
             f.display()
         );
     }
+    // Issue #116: `reenc-demo` has its own key; its neighbours use the
+    // backend's (derived) key id.
+    let stamp = |bucket: &str| {
+        let path = ps
+            .local_disk
+            .join(bucket)
+            .join("deltaspaces/enc/secret.bin");
+        let raw = xattr::get(&path, "user.dg.metadata")
+            .unwrap()
+            .unwrap_or_else(|| panic!("{}: no metadata", path.display()));
+        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        v["user_metadata"]["dg-encryption-key-id"]
+            .as_str()
+            .map(str::to_string)
+    };
+    assert_eq!(stamp("reenc-demo").as_deref(), Some("reenc-demo-2026"));
+    let neighbour = stamp("db-archive");
+    assert!(
+        neighbour.is_some() && neighbour.as_deref() != Some("reenc-demo-2026"),
+        "db-archive uses the backend key: {neighbour:?}"
+    );
+    assert_eq!(
+        get_bytes(
+            &ps.admin_http,
+            &ps.server.endpoint(),
+            "reenc-demo",
+            "enc/secret.bin"
+        )
+        .await,
+        body
+    );
 }
 
 /// Declarative IAM users of the fixture: allowed and denied operations.

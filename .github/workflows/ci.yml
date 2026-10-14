@@ -348,6 +348,7 @@ jobs:
               admin_handlers_test::
               admin_section_test::
               bootstrap_password_hash_invariant_test::
+              bucket_keyring_test::
               cli_admin_test::
               cli_s3_bucket_acl_test::
               cli_s3_cp_test::

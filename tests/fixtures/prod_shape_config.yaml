@@ -226,6 +226,10 @@ storage:
       compression: null
       max_delta_ratio: null
       backend: local-disk
+      encryption:
+        mode: aes256-gcm-proxy
+        key: "1111111111111111111111111111111111111111111111111111111111111111"
+        key_id: reenc-demo-2026
     scratch:
       compression: null
       max_delta_ratio: null

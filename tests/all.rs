@@ -42,6 +42,8 @@ mod bootstrap_password_hash_invariant_test;
 mod browser_session_connect_test;
 #[path = "bucket_existence_test.rs"]
 mod bucket_existence_test;
+#[path = "bucket_keyring_test.rs"]
+mod bucket_keyring_test;
 #[path = "bucket_usage_test.rs"]
 mod bucket_usage_test;
 #[path = "cli_admin_test.rs"]

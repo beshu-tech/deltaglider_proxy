@@ -92,6 +92,20 @@ fn storage_shape_is_intact() {
         "public prefix preserved"
     );
 
+    // Issue #116: one bucket on the encrypted backend has its own key.
+    let enc = cfg.encryption_for_bucket("reenc-demo").unwrap();
+    assert!(enc.from_bucket, "reenc-demo carries its own encryption");
+    assert_eq!(enc.backend, "local-disk");
+    match enc.config {
+        BackendEncryptionConfig::Aes256GcmProxy { key_id, key, .. } => {
+            assert_eq!(key_id.as_deref(), Some("reenc-demo-2026"));
+            assert!(key.is_some());
+        }
+        other => panic!("expected a proxy-AES override, got {other:?}"),
+    }
+    assert!(!cfg.encryption_for_bucket("db-archive").unwrap().from_bucket);
+    assert!(cfg.check_fatal().is_empty(), "{:?}", cfg.check_fatal());
+
     assert!(cfg.replication.enabled);
     assert_eq!(cfg.replication.rules.len(), 1);
     assert_eq!(cfg.replication.rules[0].name, "mirror-releases-to-dr");
