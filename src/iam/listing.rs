@@ -291,6 +291,15 @@ fn scan_cost(requests: u32) -> usize {
     (requests as usize).max(1)
 }
 
+/// Pure: `true` when no key under `prefix` sorts after `cursor`, so a scan
+/// of `prefix` cannot add to a page that starts after `cursor`. A key under
+/// `prefix` starts with `prefix`; a cursor that sorts after `prefix` and
+/// does not start with it differs from it at an earlier byte, where it is
+/// greater, so it sorts after every such key.
+fn range_is_past(prefix: &str, cursor: Option<&str>) -> bool {
+    cursor.is_some_and(|c| c > prefix && !c.starts_with(prefix))
+}
+
 /// [`list_page_for_caller`] spending a caller-owned request budget, so a
 /// multi-page walk shares one budget.
 #[allow(clippy::too_many_arguments)]
@@ -339,6 +348,19 @@ async fn list_page_within<L: Lister>(
         if objects.len() + prefixes.len() >= want {
             break;
         }
+        // A target that cannot add to this page spends no request and no
+        // budget: the cursor is past it (an earlier page listed it), or its
+        // roll-up entry is one the user may not see.
+        let adds_nothing = match &target {
+            ListTarget::Scan(scan_prefix) => range_is_past(scan_prefix, cursor),
+            ListTarget::Rollup { common_prefix, .. } => {
+                cursor.is_some_and(|c| common_prefix.as_str() <= c)
+                    || !user_can_see_common_prefix(user, bucket, common_prefix, context)
+            }
+        };
+        if adds_nothing {
+            continue;
+        }
         if *budget == 0 {
             // Stopped before this target: the listing goes on after the
             // last visible entry.
@@ -350,11 +372,6 @@ async fn list_page_within<L: Lister>(
                 common_prefix,
                 probes,
             } => {
-                if cursor.is_some_and(|c| common_prefix.as_str() <= c)
-                    || !user_can_see_common_prefix(user, bucket, &common_prefix, context)
-                {
-                    continue;
-                }
                 for probe in probes {
                     if *budget == 0 {
                         more = true;
@@ -1042,6 +1059,82 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((keys.len(), truncated), (4, true));
+    }
+
+    /// A visible prefix whose whole range is at or before the cursor holds
+    /// nothing for the page: it costs no request. Before, every earlier
+    /// prefix sent one LIST, so a user with more visible prefixes than the
+    /// budget could not page past about `budget` of them.
+    #[tokio::test]
+    async fn prefixes_before_the_cursor_cost_no_request() {
+        let lister = counting((0..60).map(|i| format!("t{i:02}/k")).collect());
+        let res: Vec<String> = (0..60).map(|i| format!("b/t{i:02}/*")).collect();
+        let res: Vec<&str> = res.iter().map(String::as_str).collect();
+        let scope = scoped(vec![rule("Allow", &res)]);
+        let mut cursor: Option<String> = None;
+        let mut seen = Vec::new();
+        loop {
+            let page = list_page_for_caller(
+                &lister,
+                "b",
+                "",
+                None,
+                1,
+                cursor.as_deref(),
+                false,
+                Some(&scope),
+                50,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("after {} keys at {cursor:?}: {e:?}", seen.len()));
+            seen.extend(page.objects.into_iter().map(|(k, _)| k));
+            if !page.is_truncated {
+                break;
+            }
+            cursor = page.next_continuation_token;
+        }
+        assert_eq!(seen.len(), 60);
+        // The folder walk shares one budget over its pages: page 2 must not
+        // read again the prefixes that page 1 finished.
+        let mut keys: Vec<String> = (0..4)
+            .flat_map(|p| (0..250).map(move |i| format!("t{p:02}/{i:03}")))
+            .collect();
+        keys.extend((4..10).map(|p| format!("t{p:02}/k")));
+        let lister = counting(keys);
+        let res: Vec<String> = (0..10).map(|i| format!("b/t{i:02}/*")).collect();
+        let res: Vec<&str> = res.iter().map(String::as_str).collect();
+        let scope = scoped(vec![rule("Allow", &res)]);
+        let (keys, truncated) = list_keys_for_caller(&lister, "b", "", Some(&scope), 5000, 12)
+            .await
+            .unwrap();
+        assert_eq!((keys.len(), truncated), (1006, false));
+        assert_eq!(calls(&lister), 12);
+    }
+
+    #[test]
+    fn a_scan_range_is_past_only_when_every_key_sorts_at_or_before_the_cursor() {
+        assert!(!range_is_past("a/", None));
+        assert!(!range_is_past("a/", Some("a/")));
+        assert!(!range_is_past("a/", Some("a/zz")));
+        assert!(!range_is_past("a/", Some("a")));
+        assert!(!range_is_past("", Some("zzz")));
+        assert!(range_is_past("a/", Some("a0")));
+        assert!(range_is_past("a/", Some("b")));
+    }
+
+    proptest::proptest! {
+        /// No key of a skipped range sorts after the cursor.
+        #[test]
+        fn a_skipped_range_holds_no_key_after_the_cursor(
+            prefix in "[ab/]{0,3}",
+            suffix in "[ab/]{0,3}",
+            cursor in "[ab/]{0,5}",
+        ) {
+            let key = format!("{prefix}{suffix}");
+            if range_is_past(&prefix, Some(&cursor)) {
+                proptest::prop_assert!(key.as_str() <= cursor.as_str());
+            }
+        }
     }
 
     /// The scan budget counts the backend requests of the scan, not its

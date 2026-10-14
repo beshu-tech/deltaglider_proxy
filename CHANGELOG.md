@@ -44,6 +44,18 @@ The inspector read the object's headers once, when it opened. When the
 object was overwritten under the same key, the inspector kept the stored
 size, the storage type and the headers of the old object. It now reads the
 headers again when the listing shows a new ETag for the object.
+### Fixed — A filtered LIST pages past more than 50 visible prefixes
+
+A user whose policy allows many key prefixes gets a LIST that reads each of
+those prefixes. On every page after the first, the proxy also sent one
+backend request for each prefix that an earlier page already finished, and
+each such request used one unit of the scan limit
+(`advanced.filtered_list_max_engine_pages`, default 50). So a user with more
+than about 50 visible prefixes got `400 InvalidRequest` in the middle of the
+listing, and the folder listing of the file browser failed the same way. The
+proxy now skips a prefix that sorts completely before the continuation
+token, with no request, and skips a folder entry that the user cannot see
+before it checks the limit.
 
 ### Fixed — A copy during a re-encryption no longer serves ciphertext
 
