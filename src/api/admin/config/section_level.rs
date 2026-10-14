@@ -468,7 +468,8 @@ fn merge_patch_section(
             sectioned.access = merge_into_typed(&sectioned.access, body, "access")?;
         }
         SectionName::Storage => {
-            sectioned.storage = merge_into_typed(&sectioned.storage, body, "storage")?;
+            sectioned.storage =
+                merge_into_typed_with(&sectioned.storage, body, "storage", replace_retagged)?;
         }
         SectionName::Advanced => {
             sectioned.advanced = merge_into_typed(&sectioned.advanced, body, "advanced")?;
@@ -496,8 +497,63 @@ fn merge_into_typed<T>(
 where
     T: serde::Serialize + serde::de::DeserializeOwned,
 {
+    merge_into_typed_with(current, patch, label, |_, _| {})
+}
+
+/// The storage section's tagged objects: the singleton backend (`type`),
+/// the singleton's encryption and each bucket's `encryption` (`mode`). A
+/// patch that changes the tag of one replaces it, so the old variant's
+/// fields (`key` under `mode: none`) do not stay behind: those structs
+/// refuse unknown fields. Only these paths, and only a string tag: a bucket
+/// NAMED `type` or `mode` is a key of `buckets`, not a tag.
+pub(super) fn replace_retagged(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    fn retag(target: Option<&mut serde_json::Value>, patch: Option<&serde_json::Value>, tag: &str) {
+        let (Some(target), Some(patch)) = (target, patch) else {
+            return;
+        };
+        let new = patch.get(tag).and_then(|v| v.as_str());
+        let old = target.get(tag).and_then(|v| v.as_str());
+        if let (Some(new), Some(old)) = (new, old) {
+            if new != old {
+                *target = serde_json::Value::Object(serde_json::Map::new());
+            }
+        }
+    }
+    retag(target.get_mut("backend"), patch.get("backend"), "type");
+    retag(
+        target.get_mut("backend_encryption"),
+        patch.get("backend_encryption"),
+        "mode",
+    );
+    let names: Vec<String> = patch
+        .get("buckets")
+        .and_then(|b| b.as_object())
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    for name in names {
+        let p = patch["buckets"][&name].get("encryption");
+        let t = target
+            .get_mut("buckets")
+            .and_then(|b| b.get_mut(&name))
+            .and_then(|b| b.get_mut("encryption"));
+        retag(t, p, "mode");
+    }
+}
+
+/// [`merge_into_typed`] with a `prepare` step on the projected section
+/// before the patch is applied.
+fn merge_into_typed_with<T>(
+    current: &T,
+    patch: &serde_json::Value,
+    label: &'static str,
+    prepare: impl FnOnce(&mut serde_json::Value, &serde_json::Value),
+) -> Result<T, String>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
     let mut merged = serde_json::to_value(current)
         .map_err(|e| format!("internal: failed to project {} section: {}", label, e))?;
+    prepare(&mut merged, patch);
     apply_merge_patch(&mut merged, patch);
     // Deserialize with field-path tracking so a type error names the exact
     // offending field ("buckets.beshu-b2.public_prefixes: invalid type …")
@@ -529,17 +585,7 @@ where
 /// — the `public_prefixes: null` → "expected a sequence" incident).
 fn apply_merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
     if let serde_json::Value::Object(patch_map) = patch {
-        // A tagged object whose tag changes (`mode` of an encryption block,
-        // `type` of a backend) is another variant: the patch replaces it,
-        // so the old variant's fields (`key` under `mode: none`) do not
-        // stay behind. Those structs refuse unknown fields.
-        let tag_changes = ["mode", "type"].iter().any(|tag| {
-            matches!(
-                (patch_map.get(*tag), target.get(*tag)),
-                (Some(new), Some(old)) if !new.is_null() && new != old
-            )
-        });
-        if !target.is_object() || tag_changes {
+        if !target.is_object() {
             *target = serde_json::Value::Object(serde_json::Map::new());
         }
         let target_map = target

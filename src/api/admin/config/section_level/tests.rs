@@ -476,27 +476,48 @@ fn a_bucket_rotation_with_the_same_id_asks_for_a_new_id() {
     assert!(!err.contains("Remove `key_id`"), "{err}");
 }
 
-/// A merge patch that changes the tag of a tagged object (`mode`, `type`)
-/// replaces the object: the old variant's fields would be unknown fields.
+/// A storage patch that changes the tag of a tagged object (`mode` of an
+/// encryption block, `type` of the singleton backend) replaces it: the old
+/// variant's fields would be unknown fields. Second review, finding 5
+/// (probe-verified): the first version did this for ANY object with a
+/// `type`/`mode` key, so a bucket NAMED `type` wiped its sibling buckets.
 #[test]
-fn merge_patch_replaces_an_object_whose_tag_changes() {
+fn a_storage_patch_replaces_only_a_retagged_tagged_object() {
     use serde_json::json;
-    let mut t = json!({"enc": {"mode": "aes256-gcm-proxy", "key": "k", "key_id": "i"}});
-    apply_merge_patch(&mut t, &json!({"enc": {"mode": "none"}}));
-    assert_eq!(t, json!({"enc": {"mode": "none"}}));
-    let mut t = json!({"enc": {"mode": "aes256-gcm-proxy", "key": "k", "key_id": "i"}});
-    apply_merge_patch(
-        &mut t,
-        &json!({"enc": {"mode": "aes256-gcm-proxy", "key_id": "j"}}),
+    let merged = |mut t: serde_json::Value, p: serde_json::Value| {
+        replace_retagged(&mut t, &p);
+        apply_merge_patch(&mut t, &p);
+        t
+    };
+    let t = json!({"buckets": {"releases": {"encryption": {"mode": "aes256-gcm-proxy", "key": "k", "key_id": "i"}}}});
+    assert_eq!(
+        merged(
+            t.clone(),
+            json!({"buckets": {"releases": {"encryption": {"mode": "none"}}}})
+        ),
+        json!({"buckets": {"releases": {"encryption": {"mode": "none"}}}})
     );
     assert_eq!(
-        t,
-        json!({"enc": {"mode": "aes256-gcm-proxy", "key": "k", "key_id": "j"}})
+        merged(
+            t,
+            json!({"buckets": {"releases": {"encryption": {"mode": "aes256-gcm-proxy", "key_id": "j"}}}})
+        ),
+        json!({"buckets": {"releases": {"encryption": {"mode": "aes256-gcm-proxy", "key": "k", "key_id": "j"}}}})
     );
-    let mut t = json!({"backend": {"type": "s3", "region": "eu"}});
-    apply_merge_patch(
-        &mut t,
-        &json!({"backend": {"type": "filesystem", "path": "/x"}}),
+    assert_eq!(
+        merged(
+            json!({"backend": {"type": "s3", "region": "eu"}}),
+            json!({"backend": {"type": "filesystem", "path": "/x"}})
+        ),
+        json!({"backend": {"type": "filesystem", "path": "/x"}})
     );
-    assert_eq!(t, json!({"backend": {"type": "filesystem", "path": "/x"}}));
+    // Buckets named `type` and `mode` are bucket names, not tags.
+    let t = json!({"buckets": {"releases": {"quota_bytes": 1}, "type": {"quota_bytes": 2}}});
+    assert_eq!(
+        merged(
+            t,
+            json!({"buckets": {"type": {"quota_bytes": 3}, "mode": {"quota_bytes": 4}}})
+        ),
+        json!({"buckets": {"releases": {"quota_bytes": 1}, "type": {"quota_bytes": 3}, "mode": {"quota_bytes": 4}}})
+    );
 }
