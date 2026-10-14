@@ -727,27 +727,31 @@ export async function validateSection<T = unknown>(
  *     legacy-key scan found no object under them
  *     (`X-DGP-Confirm-Key-Removal`).
  *   * `downgrades`: buckets whose new writes the operator confirmed to
- *     store with weaker encryption (`X-DGP-Confirm-Encryption-Downgrade`).
+ *     store as plaintext (`X-DGP-Confirm-Encryption-Downgrade: <bucket>`).
+ *   * `backendDowngrades`: backends whose own encryption the operator
+ *     confirmed to turn off; the token `backend:<name>` covers the buckets
+ *     that inherit from the backend. Without the confirmation the server
+ *     answers 422 (a migrate start 400), naming the token.
  * The validate request carries the same headers, so a validate answers
  * what the apply would.
  */
 export interface ConfirmHeaders {
   keyRemovals?: string[];
   downgrades?: string[];
+  backendDowngrades?: string[];
 }
 
 const CONFIRM_KEY_REMOVAL_HEADER = 'X-DGP-Confirm-Key-Removal';
 const CONFIRM_DOWNGRADE_HEADER = 'X-DGP-Confirm-Encryption-Downgrade';
 
 /** Pure: the request headers of `confirm` (empty lists send nothing). */
-function confirmHeaderMap(confirm?: ConfirmHeaders): Record<string, string> {
+export function confirmHeaderMap(confirm?: ConfirmHeaders): Record<string, string> {
   const out: Record<string, string> = {};
   if (confirm?.keyRemovals && confirm.keyRemovals.length > 0) {
     out[CONFIRM_KEY_REMOVAL_HEADER] = confirm.keyRemovals.join(',');
   }
-  if (confirm?.downgrades && confirm.downgrades.length > 0) {
-    out[CONFIRM_DOWNGRADE_HEADER] = confirm.downgrades.join(',');
-  }
+  const downgrades = [...(confirm?.downgrades ?? []), ...(confirm?.backendDowngrades ?? []).map((b) => `backend:${b}`)];
+  if (downgrades.length > 0) out[CONFIRM_DOWNGRADE_HEADER] = downgrades.join(',');
   return out;
 }
 

@@ -89,7 +89,14 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
     setStarting(true);
     setStartError(null);
     try {
-      await createMigrateJob(effectiveBucket, target, deleteSource, mirror ? 'mirror' : 'empty');
+      await createMigrateJob(
+        effectiveBucket,
+        target,
+        deleteSource,
+        mirror ? 'mirror' : 'empty',
+        // The acknowledged move to plaintext carries the server's confirmation.
+        dropsEncryption ? { downgrades: [effectiveBucket] } : undefined,
+      );
       messageApi.success(
         `Migration of ${effectiveBucket} → ${target} started — track progress on the Jobs page`
       );

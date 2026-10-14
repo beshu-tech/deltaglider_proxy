@@ -82,6 +82,7 @@ describe('MigrateBucketModal destination mode', () => {
     await pickTarget(/^local-disk \(filesystem\)/);
     fireEvent.click(startButton());
     await waitFor(() => expect(http.callsTo('POST', MIGRATE)).toHaveLength(1));
+    expect(http.callsTo('POST', MIGRATE)[0].headers['x-dgp-confirm-encryption-downgrade']).toBeUndefined();
     expect(http.callsTo('POST', MIGRATE)[0].body).toEqual({ target_backend: 'local-disk', delete_source: false, target: 'empty' });
   });
 
@@ -153,6 +154,8 @@ describe('MigrateBucketModal target facts', () => {
     expect(startButton()).toBeEnabled();
     fireEvent.click(startButton());
     await waitFor(() => expect(http.callsTo('POST', MIGRATE)).toHaveLength(1));
+    // The acknowledgement goes to the server as the downgrade confirmation.
+    expect(http.callsTo('POST', MIGRATE)[0].headers['x-dgp-confirm-encryption-downgrade']).toBe('releases');
   });
 
   /** Issue #116: a bucket's own encryption block moves with the bucket, so

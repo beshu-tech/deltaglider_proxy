@@ -5,7 +5,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
 import { Button, Input, Radio, Switch, Typography, Space, Alert, Spin, message } from 'antd';
 import { PlusOutlined, DeleteOutlined, DatabaseOutlined, CloudOutlined, CheckCircleOutlined, ApiOutlined } from '@ant-design/icons';
-import type { BackendHealthEntry, BackendInfo, CreateBackendRequest } from '../adminApi';
+import type { BackendEncryptionMode, BackendHealthEntry, BackendInfo, CreateBackendRequest } from '../adminApi';
 import { createBackend, deleteBackend, probeBackend, testS3Connection, updateAdminConfig, getSectionVersioned } from '../adminApi';
 import { applySection, persistFailureText, sectionApplyErrorText } from '../applySection';
 import { useAdminConfig } from '../queries/config';
@@ -309,6 +309,8 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
    */
   const handleEncryptionApply = async (
     backendName: string,
+    /** The backend's own mode before the change. */
+    prevMode: BackendEncryptionMode,
     patch: BackendEncryptionPatch,
   ): Promise<void> => {
     // Tracks whether the try-block already set a precise result message this
@@ -324,7 +326,10 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
       // another editor changed the section in between.
       const { body: storage, version } = await getSectionVersioned<StorageSectionBackends>('storage');
       const body = buildEncryptionSectionBody(backendName, patch, storage);
-      const result = await applySection(qc, 'storage', body, version);
+      // Turning a backend's encryption off confirms the downgrade for the
+      // buckets that inherit from it (`backend:<name>`).
+      const confirm = patch.mode === 'none' && prevMode !== 'none' ? { backendDowngrades: [backendName] } : undefined;
+      const result = await applySection(qc, 'storage', body, version, confirm);
       if (!result.ok) {
         setSaveResult({
           ok: false,
@@ -598,7 +603,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
               <BackendEncryptionEditor
                 backendName={b.name}
                 current={b.encryption}
-                onApply={(patch) => handleEncryptionApply(b.name, patch)}
+                onApply={(patch) => handleEncryptionApply(b.name, b.encryption.mode, patch)}
                 onClearLegacy={() => handleClearLegacy(b.name)}
                 readOnly={!!encryptionEnv(b)}
               />

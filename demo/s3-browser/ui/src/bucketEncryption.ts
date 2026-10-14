@@ -269,9 +269,11 @@ function encryptsAfter(eff: EffectiveEncryption, change: BucketEncryptionChange)
   }
 }
 
-/** A change after which new writes of an encrypted bucket are plaintext. */
+/** A change after which new writes of a bucket that is set to encrypt are
+ *  plaintext (also a proxy mode without a key, whose writes are refused
+ *  today: the server asks for the confirmation there too). */
 export function isDowngrade(eff: EffectiveEncryption, change: BucketEncryptionChange): boolean {
-  return eff.encrypts && !encryptsAfter(eff, change);
+  return eff.mode !== 'none' && !encryptsAfter(eff, change);
 }
 
 /** The confirmation headers that a change needs. */

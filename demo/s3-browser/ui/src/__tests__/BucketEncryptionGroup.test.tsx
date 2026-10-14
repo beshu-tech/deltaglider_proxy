@@ -99,6 +99,16 @@ test('off on an encrypted bucket is confirmed and carries the downgrade header',
   expect(http.callsTo('PUT', SECTION)[0].headers['x-dgp-confirm-encryption-downgrade']).toBe('db-archive');
 });
 
+test('off on a keyless proxy bucket also confirms the downgrade', async () => {
+  const user = userEvent.setup();
+  renderGroup(bucketKeyEff({ has_key: false, encrypts: false }));
+  await user.click(screen.getByText('Off for this bucket'));
+  await user.click(screen.getByRole('button', { name: 'Review & apply' }));
+  await user.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Store as plaintext' }));
+  await waitFor(() => expect(http.callsTo('POST', VALIDATE)).toHaveLength(1));
+  expect(http.callsTo('POST', VALIDATE)[0].headers['x-dgp-confirm-encryption-downgrade']).toBe('db-archive');
+});
+
 test('a declined downgrade sends nothing', async () => {
   const user = userEvent.setup();
   renderGroup(bucketKeyEff());

@@ -84,4 +84,7 @@ test('after a backend change, only the buckets whose encryption changed are prop
   expect(within(dialog).getByRole('checkbox', { name: 'releases' })).toBeChecked();
   expect(within(dialog).queryByRole('checkbox', { name: 'db-archive' })).toBeNull();
   await waitFor(() => expect(http.callsTo('PUT', SECTION)).toHaveLength(1));
+  // Turning the backend's encryption off confirms the downgrade for the
+  // buckets that inherit from it.
+  expect(http.callsTo('PUT', SECTION)[0].headers['x-dgp-confirm-encryption-downgrade']).toBe('backend:hetzner-fsn1');
 });

@@ -1,5 +1,6 @@
 // === Unified jobs API (replication / lifecycle / reencrypt / migrate) ===
-import { adminJson, adminRequest, safeJson } from './core';
+import { adminJson, adminRequest, confirmHeaderMap, safeJson } from './core';
+import type { ConfirmHeaders } from './core';
 import type { JobAction, JobRow } from '../jobsView';
 
 interface JobsOverview {
@@ -376,11 +377,15 @@ export async function createMigrateJob(
   bucket: string,
   targetBackend: string,
   deleteSource: boolean,
-  target: MigrateTargetMode = 'empty'
+  target: MigrateTargetMode = 'empty',
+  /** The operator confirmed that the move stores the bucket as plaintext. */
+  confirm?: ConfirmHeaders
 ): Promise<{ job_id: number; id: string; bucket: string; from_backend: string; to_backend: string }> {
+  const headers = confirmHeaderMap(confirm);
   return adminJson(`/api/admin/buckets/${encodeURIComponent(bucket)}/migrate`, {
     method: 'POST',
     body: { target_backend: targetBackend, delete_source: deleteSource, target },
+    ...(Object.keys(headers).length > 0 ? { headers } : {}),
     context: `Migrate ${bucket}`,
   });
 }
