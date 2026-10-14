@@ -1241,6 +1241,7 @@ dependencies = [
  "hmac 0.12.1",
  "http",
  "humantime",
+ "hyper-util",
  "iam-rs",
  "ipnet",
  "jsonwebtoken",

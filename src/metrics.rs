@@ -589,6 +589,11 @@ impl Metrics {
         registry
             .register(Box::new(crate::event_outbox::OUTBOX_QUEUE_FULL.clone()))
             .expect("duplicate metric name");
+        // Connections the listener closed at its cap (a static: the
+        // listener has no Metrics handle).
+        registry
+            .register(Box::new(crate::serve::CONNECTIONS_REFUSED.clone()))
+            .expect("duplicate metric name");
         // Config DB sync health (a static: the sync has no Metrics handle).
         registry
             .register(Box::new(crate::config_db_sync::SYNC_HEALTHY.clone()))

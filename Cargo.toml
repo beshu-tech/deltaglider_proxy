@@ -38,6 +38,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 # Web framework
 axum = "0.7"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+# Direct only for `rt::TokioTimer`: hyper applies the listener's header read
+# timeout only with a timer (serve.rs). Already in the tree via axum-server.
+hyper-util = { version = "0.1", features = ["tokio"] }
 # Direct only to install ONE process-default crypto provider (tls.rs): the tree
 # enables both `ring` and `aws-lc-rs`, and rustls then refuses to guess.
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }

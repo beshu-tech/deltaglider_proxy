@@ -1083,6 +1083,9 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     // --- Start server ---
+    let limits = deltaglider_proxy::serve::ListenerLimits::for_request_cap(
+        config.tuning.max_concurrent_requests,
+    );
     if let Some(rustls_config) = rustls_config {
         let handle = axum_server::Handle::new();
         let shutdown_handle = handle.clone();
@@ -1103,14 +1106,14 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         // be silently inert in the default deployment (no reverse proxy
         // setting X-Forwarded-For). See adversarial review of Phase 3b.2.b
         // for the failure mode.
-        deltaglider_proxy::serve::serve_tls(listener, rustls_config, handle, app).await?;
+        deltaglider_proxy::serve::serve_tls(listener, rustls_config, handle, app, limits).await?;
     } else {
         let listener = TcpListener::bind(&config.listen_addr).await?;
         info!(
             "DeltaGlider Proxy listening on http://{}",
             config.listen_addr
         );
-        deltaglider_proxy::serve::serve_plain(listener, app, shutdown_signal()).await?;
+        deltaglider_proxy::serve::serve_plain(listener, app, shutdown_signal(), limits).await?;
     }
 
     // Let a running maintenance job reach its stop point and hand its row

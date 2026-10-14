@@ -63,6 +63,21 @@ listing, and the folder listing of the file browser failed the same way. The
 proxy now skips a prefix that sorts completely before the continuation
 token, with no request, and skips a folder entry that the user cannot see
 before it checks the limit.
+### Fixed — The listener closes a connection that does not send its request head
+
+Neither listener (plain HTTP nor HTTPS) had a time limit on the request
+head, because hyper applies its header read timeout only with a timer, and
+none was set. A client that sent half a request and then nothing kept its
+connection open for as long as it liked (measured: 95 s and counting), and
+nothing capped the number of open connections, so such clients could use up
+the file descriptors of the process. The request concurrency cap
+(`DGP_MAX_CONCURRENT_REQUESTS`) does not help here, because it counts only
+complete requests. A client now has 30 seconds to send each request head;
+the same limit closes a keep-alive connection that is idle for 30 seconds.
+The listener keeps at most four connections per request slot open, and at
+least 4096; a connection above that is closed at once, before the TLS
+handshake, and `deltaglider_connections_refused_total` counts it.
+
 ### Fixed — A release that reads first leaves an expired lock in place
 
 On a coordination bucket that does not enforce `If-Match` on DELETE, an

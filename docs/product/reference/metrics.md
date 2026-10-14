@@ -36,6 +36,7 @@ The endpoint is public by default so that any Prometheus can scrape it. Set `DGP
 | `deltaglider_http_request_duration_seconds` | Histogram | `method`, `operation` | Request latency distribution |
 | `deltaglider_http_request_size_bytes` | Histogram | `method` | Request body size distribution |
 | `deltaglider_http_response_size_bytes` | Histogram | `method` | Response body size distribution |
+| `deltaglider_connections_refused_total` | Counter | — | Connections that the listener closed at once because it had its maximum of open connections (see [connection limits](rate-limits.md#connection-limits)) |
 
 ### `operation` label values (bounded)
 

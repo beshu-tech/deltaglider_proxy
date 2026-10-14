@@ -8,33 +8,114 @@
 //! (about 40 ms on Linux), so every response after the first on a
 //! keep-alive connection waited about 40 ms.
 //!
-//! `axum::serve` does not set nodelay unless asked, and the `axum-server`
-//! TLS acceptor wraps `DefaultAcceptor`, which does not set it either
-//! (axum-server 0.7.3, `accept.rs`). Source guard:
+//! Both apply the same [`ListenerLimits`]. A client has
+//! `header_read_timeout` to send the head of each request (hyper measures
+//! it only when it has a timer, and neither `axum::serve` nor
+//! `axum-server` gives it one): without it, a connection that sent half a
+//! request stayed open for as long as the client wanted. The same timeout
+//! closes a keep-alive connection that is idle between requests. And at
+//! most `max_connections` connections are open at once: a connection
+//! above the cap is closed at once, before the TLS handshake, and counted
+//! in `deltaglider_connections_refused_total`. The request concurrency
+//! cap (`DGP_MAX_CONCURRENT_REQUESTS`) limits requests in flight; it does
+//! not limit connections that send no complete request.
+//!
+//! `axum::serve` sets no timer, and the `axum-server` TLS acceptor wraps
+//! `DefaultAcceptor`, which does not set nodelay (axum-server 0.7.3,
+//! `accept.rs`). So both listeners go through `axum-server` with the
+//! acceptor and the HTTP builder set here. Source guard:
 //! `listeners_are_served_only_through_serve_rs`.
 
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use axum::Router;
-use axum_server::accept::NoDelayAcceptor;
+use axum_server::accept::{Accept, NoDelayAcceptor};
 use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// Serve `app` over plain HTTP on `listener` until `shutdown` resolves.
+/// The time a client has to send the head of a request (hyper's own
+/// default, which it applies only with a timer).
+pub const DEFAULT_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The least connection cap. The cap is four connections per request slot
+/// (`DGP_MAX_CONCURRENT_REQUESTS`), because most connections of a client
+/// pool are idle between requests, and never less than this.
+pub const MIN_MAX_CONNECTIONS: usize = 4096;
+
+/// Connections closed at accept because the listener was at its cap.
+pub static CONNECTIONS_REFUSED: std::sync::LazyLock<prometheus::IntCounter> =
+    std::sync::LazyLock::new(|| {
+        prometheus::IntCounter::new(
+            "deltaglider_connections_refused_total",
+            "Connections closed at accept because the listener had its maximum of open connections",
+        )
+        .expect("valid metric")
+    });
+
+/// The limits of one listener (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListenerLimits {
+    /// The time a client has to send the head of a request, and the most
+    /// time a keep-alive connection stays idle between requests.
+    pub header_read_timeout: Duration,
+    /// The most connections open at once.
+    pub max_connections: usize,
+}
+
+impl ListenerLimits {
+    /// The limits for a proxy that serves `max_concurrent_requests`
+    /// requests at once.
+    pub fn for_request_cap(max_concurrent_requests: usize) -> Self {
+        Self {
+            header_read_timeout: DEFAULT_HEADER_READ_TIMEOUT,
+            max_connections: max_concurrent_requests
+                .saturating_mul(4)
+                .max(MIN_MAX_CONNECTIONS),
+        }
+    }
+}
+
+impl Default for ListenerLimits {
+    fn default() -> Self {
+        Self::for_request_cap(crate::config::RuntimeTuning::default().max_concurrent_requests)
+    }
+}
+
+/// Serve `app` over plain HTTP on `listener` until `shutdown` resolves,
+/// then wait for the requests in flight.
 /// Middlewares see the peer address through `ConnectInfo<SocketAddr>`.
-pub async fn serve_plain<F>(listener: TcpListener, app: Router, shutdown: F) -> io::Result<()>
+pub async fn serve_plain<F>(
+    listener: TcpListener,
+    app: Router,
+    shutdown: F,
+    limits: ListenerLimits,
+) -> io::Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .tcp_nodelay(true)
-    .with_graceful_shutdown(shutdown)
-    .await
+    let handle = axum_server::Handle::new();
+    let on_shutdown = handle.clone();
+    let stop = tokio::spawn(async move {
+        shutdown.await;
+        on_shutdown.graceful_shutdown(None);
+    });
+    let mut server = axum_server::from_tcp(listener.into_std()?)
+        .acceptor(Capped::new(NoDelayAcceptor::new(), limits))
+        .handle(handle);
+    configure(server.http_builder(), limits);
+    let served = server
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+        .await;
+    stop.abort();
+    served
 }
 
 /// Serve `app` over HTTPS on `listener` until `handle` shuts it down.
@@ -44,12 +125,124 @@ pub async fn serve_tls(
     config: RustlsConfig,
     handle: axum_server::Handle,
     app: Router,
+    limits: ListenerLimits,
 ) -> io::Result<()> {
-    axum_server::from_tcp(listener.into_std()?)
-        .acceptor(RustlsAcceptor::new(config).acceptor(NoDelayAcceptor::new()))
-        .handle(handle)
+    let mut server = axum_server::from_tcp(listener.into_std()?)
+        .acceptor(RustlsAcceptor::new(config).acceptor(Capped::new(NoDelayAcceptor::new(), limits)))
+        .handle(handle);
+    configure(server.http_builder(), limits);
+    server
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await
+}
+
+/// The HTTP settings that both listeners share.
+fn configure(
+    builder: &mut hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor>,
+    limits: ListenerLimits,
+) {
+    // hyper applies the header read timeout only with a timer.
+    builder
+        .http1()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(limits.header_read_timeout);
+}
+
+/// An acceptor that holds one connection slot for the life of each
+/// connection, and closes a connection that finds no slot free. It runs
+/// before the inner acceptor (so before a TLS handshake).
+#[derive(Clone)]
+struct Capped<A> {
+    inner: A,
+    slots: Arc<Semaphore>,
+}
+
+impl<A> Capped<A> {
+    fn new(inner: A, limits: ListenerLimits) -> Self {
+        Self {
+            inner,
+            slots: Arc::new(Semaphore::new(limits.max_connections.max(1))),
+        }
+    }
+}
+
+impl<A, S> Accept<TcpStream, S> for Capped<A>
+where
+    A: Accept<TcpStream, S> + Clone + Send + 'static,
+    A::Future: Send,
+    S: Send + 'static,
+{
+    type Stream = Slotted<A::Stream>;
+    type Service = A::Service;
+    type Future = Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send>>;
+
+    fn accept(&self, stream: TcpStream, service: S) -> Self::Future {
+        let slot = self.slots.clone().try_acquire_owned();
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            let Ok(slot) = slot else {
+                CONNECTIONS_REFUSED.inc();
+                // Dropping the stream closes the connection.
+                return Err(io::Error::other(
+                    "the listener has its maximum of open connections",
+                ));
+            };
+            let (stream, service) = inner.accept(stream, service).await?;
+            Ok((
+                Slotted {
+                    inner: stream,
+                    _slot: slot,
+                },
+                service,
+            ))
+        })
+    }
+}
+
+/// A connection stream that holds its connection slot until it is dropped.
+struct Slotted<T> {
+    inner: T,
+    _slot: OwnedSemaphorePermit,
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for Slotted<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for Slotted<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
 }
 
 #[cfg(test)]
@@ -152,6 +345,7 @@ mod tests {
             listener,
             app(peers.clone()),
             std::future::pending(),
+            ListenerLimits::default(),
         ));
 
         let elapsed = tokio::task::spawn_blocking(move || timed_gets(&mut connect(addr)))
@@ -179,6 +373,7 @@ mod tests {
             config,
             handle.clone(),
             app(peers.clone()),
+            ListenerLimits::default(),
         ));
 
         let elapsed = tokio::task::spawn_blocking(move || {
@@ -195,6 +390,191 @@ mod tests {
         handle.shutdown();
         let _ = server.await;
         assert_fast(elapsed, &peers, "TLS");
+    }
+
+    /// Limits with a short header timeout, for the tests.
+    fn short(header_secs: u64, max_connections: usize) -> ListenerLimits {
+        ListenerLimits {
+            header_read_timeout: Duration::from_secs(header_secs),
+            max_connections,
+        }
+    }
+
+    /// Read until the server closes `conn`; how long that took. A test
+    /// read timeout ends it (and fails the test) when the server never
+    /// closes it.
+    fn time_to_close(conn: &mut impl Read) -> Duration {
+        let start = Instant::now();
+        let mut buf = [0u8; 1024];
+        loop {
+            match conn.read(&mut buf) {
+                Ok(0) => return start.elapsed(),
+                Ok(_) => continue,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    panic!(
+                        "the server kept the connection open for {:?}",
+                        start.elapsed()
+                    )
+                }
+                // A reset is a close too.
+                Err(_) => return start.elapsed(),
+            }
+        }
+    }
+
+    const HALF_REQUEST: &[u8] = b"GET / HTTP/1.1\r\nhost: test\r\nx-slow: ";
+
+    /// A client that sends half a request head and then nothing held its
+    /// connection (and a task) for as long as it liked: measured 95 s
+    /// live. With the header timeout, the server closes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plain_closes_a_half_sent_request_after_the_header_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_plain(
+            listener,
+            app(Default::default()),
+            std::future::pending(),
+            short(1, 16),
+        ));
+        let took = tokio::task::spawn_blocking(move || {
+            let mut conn = connect(addr);
+            conn.write_all(HALF_REQUEST).unwrap();
+            time_to_close(&mut conn)
+        })
+        .await
+        .unwrap();
+        server.abort();
+        assert!(took < Duration::from_secs(5), "closed after {took:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tls_closes_a_half_sent_request_after_the_header_timeout() {
+        let (addr, handle, server) = tls_server(short(1, 16)).await;
+        let took = tokio::task::spawn_blocking(move || {
+            let mut conn = tls_connect(addr);
+            conn.write_all(HALF_REQUEST).unwrap();
+            conn.flush().unwrap();
+            time_to_close(&mut conn)
+        })
+        .await
+        .unwrap();
+        handle.shutdown();
+        let _ = server.await;
+        assert!(took < Duration::from_secs(5), "closed after {took:?}");
+    }
+
+    /// Open connections were not capped: each idle or half-sent connection
+    /// holds a socket and a task. Above the cap, a new connection is closed
+    /// at once; a slot frees when its connection closes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connections_above_the_cap_are_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_plain(
+            listener,
+            app(Default::default()),
+            std::future::pending(),
+            short(30, 1),
+        ));
+        let refused_before = CONNECTIONS_REFUSED.get();
+        tokio::task::spawn_blocking(move || {
+            let mut first = connect(addr);
+            get_once(&mut first);
+            let mut second = connect(addr);
+            let _ = second.write_all(b"GET / HTTP/1.1\r\nhost: test\r\n\r\n");
+            assert!(
+                time_to_close(&mut second) < Duration::from_secs(5),
+                "the connection above the cap was served"
+            );
+            // The first one is still served.
+            get_once(&mut first);
+            drop(first);
+            // Its slot frees when the server sees the close.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let mut third = connect(addr);
+                third
+                    .set_read_timeout(Some(Duration::from_millis(500)))
+                    .unwrap();
+                let served = third
+                    .write_all(b"GET / HTTP/1.1\r\nhost: test\r\n\r\n")
+                    .is_ok()
+                    && {
+                        let mut byte = [0u8; 1];
+                        matches!(third.read(&mut byte), Ok(1))
+                    };
+                if served {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "the slot was never freed");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+        .await
+        .unwrap();
+        server.abort();
+        assert!(CONNECTIONS_REFUSED.get() > refused_before, "not counted");
+    }
+
+    #[test]
+    fn the_connection_cap_follows_the_request_cap() {
+        assert_eq!(
+            ListenerLimits::for_request_cap(1024).max_connections,
+            MIN_MAX_CONNECTIONS
+        );
+        assert_eq!(
+            ListenerLimits::for_request_cap(4096).max_connections,
+            16_384
+        );
+        assert_eq!(
+            ListenerLimits::default().header_read_timeout,
+            Duration::from_secs(30)
+        );
+    }
+
+    async fn tls_server(
+        limits: ListenerLimits,
+    ) -> (
+        SocketAddr,
+        axum_server::Handle,
+        tokio::task::JoinHandle<io::Result<()>>,
+    ) {
+        crate::tls::install_crypto_provider();
+        let tls = crate::config::TlsConfig {
+            enabled: true,
+            cert_path: None,
+            key_path: None,
+        };
+        let config = crate::tls::build_rustls_config(&tls).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = axum_server::Handle::new();
+        let server = tokio::spawn(serve_tls(
+            listener,
+            config,
+            handle.clone(),
+            app(Default::default()),
+            limits,
+        ));
+        (addr, handle, server)
+    }
+
+    fn tls_connect(
+        addr: SocketAddr,
+    ) -> rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream> {
+        let client = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AnyCert))
+            .with_no_client_auth();
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let conn = rustls::ClientConnection::new(Arc::new(client), name).unwrap();
+        rustls::StreamOwned::new(conn, connect(addr))
     }
 
     /// Accepts the self-signed test certificate: the test measures latency,
