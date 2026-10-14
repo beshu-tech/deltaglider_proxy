@@ -337,7 +337,7 @@ impl Resolver {
                     "resolve_existing_named: default backend head_bucket({virtual_bucket}) failed \
                      transiently ({e}); routing to default rather than mis-routing"
                 );
-                return (self.default_backend.clone(), Probed::No);
+                return (self.default_backend.clone(), Probed::Failed(Arc::new(e)));
             }
             Ok(false) => {}
         }
@@ -362,7 +362,7 @@ impl Resolver {
                         "resolve_existing_named: backend '{name}' head_bucket({virtual_bucket}) \
                          failed transiently ({e}); routing here rather than mis-routing to default"
                     );
-                    return (name.clone(), Probed::No);
+                    return (name.clone(), Probed::Failed(Arc::new(e)));
                 }
                 Ok(false) => {}
             }
@@ -426,10 +426,13 @@ pub struct RoutingBackend {
 
 /// What a bucket resolution's own HeadBuckets learned about the bucket on
 /// the backend it chose.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 enum Probed {
-    /// A route or a cached answer chose the backend, or its probe failed.
+    /// A route or a cached answer chose the backend.
     No,
+    /// The probe's HeadBucket to the chosen backend failed with this error
+    /// (shared by every participant of the probe's flight).
+    Failed(Arc<StorageError>),
     /// The chosen backend answered just now that it has the bucket.
     Found,
     /// Every backend answered just now that it does not have the bucket.
@@ -1053,11 +1056,13 @@ impl StorageBackend for RoutingBackend {
         if !self.routes.contains_key(bucket) && self.alias_owns_real_bucket(&name, &real_bucket) {
             return Ok(false);
         }
-        // The resolution's own HeadBucket answered just now: a second one to
-        // the same backend only doubles the exposure to a slow backend.
+        // The resolution's own HeadBucket answered just now, or failed just
+        // now: a second one to the same backend only doubles the exposure
+        // to a slow or failing backend.
         match probed {
             Probed::Found => Ok(true),
             Probed::Absent => Ok(false),
+            Probed::Failed(e) => Err(e.duplicate()),
             Probed::No => backend.head_bucket(&real_bucket).await,
         }
     }
@@ -3272,6 +3277,18 @@ mod tests {
             "CreateBucket used the stale resolution ({:?})",
             started.elapsed()
         );
+    }
+
+    /// Review 2d: a HeadBucket of an unrouted bucket whose probe failed
+    /// answers the probe's error. Before, it sent a second HeadBucket to
+    /// the same failing backend.
+    #[tokio::test]
+    async fn head_bucket_answers_the_failed_probe_without_a_second_head() {
+        let (routing, fake) = fake_routing(0).await;
+        fake.fail("HEAD_BUCKET", "/b", 503, "SlowDown", 100);
+        let answer = routing.head_bucket("b").await;
+        assert!(answer.is_err(), "{answer:?}");
+        assert_eq!(bucket_heads(&fake), 1, "{:?}", fake.requests());
     }
 
     /// Hard expiry: a resolution older than 5 x RESOLVE_TTL is not served;
