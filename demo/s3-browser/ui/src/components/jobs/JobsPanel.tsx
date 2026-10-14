@@ -29,7 +29,7 @@ import {
 } from '@ant-design/icons';
 import { useQueryClient } from '@tanstack/react-query';
 import type { LifecycleConfig, ReplicationConfig, StorageSectionBody } from '../../adminApi';
-import { runJobAction } from '../../adminApi';
+import { getJobRuns, runJobAction } from '../../adminApi';
 import type { JobAction, JobDisplayRow, JobRow, JobWatch } from '../../jobsView';
 import {
   availableActions,
@@ -81,6 +81,7 @@ import BackfillMetadataModal from '../BackfillMetadataModal';
 import MigrateBucketModal from '../MigrateBucketModal';
 import JobDrawer from './JobDrawer';
 import LifecycleRunConfirm from './LifecycleRunConfirm';
+import { lifecycleRunResultText, newestSettledRun } from './lifecycleText';
 import {
   buildReplicationPayload,
   DEFAULT_REPLICATION,
@@ -217,10 +218,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
         // A run the operator started: say how it ended. The row of a rule
         // carries the counts of the run in progress only, so the words come
         // from its status.
-        if (w.announce && row && watchSettled(w, row)) {
-          const m = runEndedMessage(row, ruleVerb(row));
-          messageApi[m.type](m.text);
-        }
+        if (w.announce && row && watchSettled(w, row)) void announceRunEnd(row);
         return stepJobWatch(w, row, now);
       })
       .filter((w): w is JobWatch => w !== null);
@@ -228,6 +226,30 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
     // Each new list sample steps the watches; `watches` itself is not a trigger.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobsQuery.dataUpdatedAt]);
+  // The ONE toast for a run that the operator started. A lifecycle run reads
+  // its run record, which names what it did ("deleted 80"); the row may no
+  // longer carry the counts once the run ended.
+  const announceRunEnd = async (row: JobRow) => {
+    if (row.kind === 'lifecycle') {
+      try {
+        const data = await qc.fetchQuery({
+          queryKey: qk.jobs.runs(row.id),
+          queryFn: () => getJobRuns(row.id),
+          staleTime: 0,
+        });
+        const run = newestSettledRun(data.runs);
+        if (run) {
+          const m = lifecycleRunResultText(row.name, run);
+          void messageApi.open({ type: m.type, content: m.text, duration: 8 });
+          return;
+        }
+      } catch {
+        // Fall back to the row's words below.
+      }
+    }
+    const m = runEndedMessage(row, ruleVerb(row));
+    messageApi[m.type](m.text);
+  };
   const watchJobs = useCallback(
     (ids: Iterable<string>, announce = false) => {
       const now = Date.now();

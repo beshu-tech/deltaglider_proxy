@@ -69,8 +69,24 @@ export function confirmNeedsFreshPreview(computedAt: string | undefined, nowMs: 
 }
 
 /** The terminal statuses of a lifecycle run. */
-export function isSettledRunStatus(status: string): boolean {
+function isSettledRunStatus(status: string): boolean {
   return !['running', 'queued', 'cancelling'].includes(status);
+}
+
+/**
+ * The run that the run-now toast reports: the newest settled run. The
+ * toast is shown when the job row settles, so the newest settled run is the
+ * one that just ended. Newest = highest start time, then highest id.
+ */
+export function newestSettledRun<R extends { id: number; started_at: number; status: string }>(
+  runs: readonly R[],
+): R | null {
+  let best: R | null = null;
+  for (const r of runs) {
+    if (!isSettledRunStatus(r.status)) continue;
+    if (!best || r.started_at > best.started_at || (r.started_at === best.started_at && r.id > best.id)) best = r;
+  }
+  return best;
 }
 
 /** The toast after a run-now settles. */

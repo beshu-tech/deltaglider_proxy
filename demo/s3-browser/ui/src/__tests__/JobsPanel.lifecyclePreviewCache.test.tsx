@@ -202,6 +202,13 @@ test("Run now's confirmation walks again when its preview is old, and says how o
 
 /** #15: when the run that the operator started ends, a toast says what it did. */
 test('a run-now ends with a toast that counts what it did', async () => {
+  // The run ends at once: the row's last run moves past the one at click time.
+  let ran = false;
+  http.on('POST', RUN_NOW, () => {
+    ran = true;
+    return json({ started: true }, 202);
+  });
+  http.on('GET', JOBS, () => json({ jobs: [ran ? { ...row, last_run_at: Math.floor(Date.now() / 1000) } : row] }));
   http.on('GET', `/_/api/admin/jobs/${ID}/runs`, () => json({
     runs: [{
       id: 7, triggered_by: 'run-now', started_at: Math.floor(Date.now() / 1000), finished_at: Math.floor(Date.now() / 1000),

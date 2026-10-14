@@ -8,6 +8,7 @@ import {
   lifecycleActionLabel,
   lifecycleRunResultText,
   lifecycleSkipText,
+  newestSettledRun,
   parseTickMs,
   previewAgeText,
   ruleGlobError,
@@ -96,5 +97,19 @@ describe('first run of a new rule (#6)', () => {
   test('says when', () => {
     expect(firstRunText('1h', Date.parse('2026-10-13T10:00:00Z'))).toMatch(/^first scheduled run about 1h after you apply/);
     expect(firstRunText('nope', 0)).toBeNull();
+  });
+});
+
+describe('newestSettledRun', () => {
+  test('the newest settled run, by start time then id; a running one is skipped', () => {
+    const runs = [
+      { id: 1, started_at: 100, status: 'succeeded' },
+      { id: 3, started_at: 200, status: 'running' },
+      { id: 2, started_at: 150, status: 'failed' },
+      { id: 4, started_at: 150, status: 'succeeded' },
+    ];
+    expect(newestSettledRun(runs)?.id).toBe(4);
+    expect(newestSettledRun([{ id: 1, started_at: 1, status: 'queued' }])).toBeNull();
+    expect(newestSettledRun([])).toBeNull();
   });
 });
