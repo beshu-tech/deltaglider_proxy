@@ -549,32 +549,54 @@ async fn ensure_route(
     bucket: &str,
     context: &str,
 ) -> Result<(), String> {
-    let (present, alias_bucket) = {
+    let (present, route) = {
         let cfg = mutator.read().await;
         let real = real_bucket_name(&cfg.buckets, bucket).to_string();
-        let present = cfg.buckets.get(route_key).is_some_and(|p| {
-            p.backend.as_deref() == Some(backend) && p.alias.as_deref() == Some(real.as_str())
-        });
-        (present, real)
+        let route = route_policy(cfg.buckets.get(bucket), backend, &real);
+        let present = cfg
+            .buckets
+            .get(route_key)
+            .is_some_and(|p| same_route(p, &route));
+        (present, route)
     };
     if present {
         return Ok(());
     }
     let route_key = route_key.to_string();
-    let backend = backend.to_string();
-    let alias = alias_bucket.to_string();
     mutator
         .mutate_and_apply(context, move |cfg| {
-            cfg.buckets.insert(
-                route_key,
-                crate::bucket_policy::BucketPolicyConfig {
-                    backend: Some(backend),
-                    alias: Some(alias),
-                    ..Default::default()
-                },
-            );
+            cfg.buckets.insert(route_key, route);
         })
         .await
+}
+
+/// Pure: the policy of a route to the real bucket `alias` on `backend`.
+/// It stores objects as the bucket `source` does (its compression and its
+/// delta ratio): with the defaults, a migrate of a bucket that has
+/// compression off stored its files as deltas.
+fn route_policy(
+    source: Option<&crate::bucket_policy::BucketPolicyConfig>,
+    backend: &str,
+    alias: &str,
+) -> crate::bucket_policy::BucketPolicyConfig {
+    crate::bucket_policy::BucketPolicyConfig {
+        backend: Some(backend.to_string()),
+        alias: Some(alias.to_string()),
+        compression: source.and_then(|p| p.compression),
+        max_delta_ratio: source.and_then(|p| p.max_delta_ratio),
+        ..Default::default()
+    }
+}
+
+/// Pure: does the existing route `p` already hold `want`?
+fn same_route(
+    p: &crate::bucket_policy::BucketPolicyConfig,
+    want: &crate::bucket_policy::BucketPolicyConfig,
+) -> bool {
+    p.backend == want.backend
+        && p.alias == want.alias
+        && p.compression == want.compression
+        && p.max_delta_ratio == want.max_delta_ratio
 }
 
 async fn remove_routes(mutator: &ConfigMutator, keys: &[String], context: &str) {
@@ -1725,6 +1747,28 @@ mod tests {
         assert_eq!(real_bucket_name(&m, "routed"), "real");
         assert_eq!(real_bucket_name(&m, "inert"), "inert");
         assert_eq!(real_bucket_name(&m, "absent"), "absent");
+    }
+
+    #[test]
+    fn a_route_stores_objects_as_its_source_bucket_does() {
+        let source = crate::bucket_policy::BucketPolicyConfig {
+            compression: Some(false),
+            max_delta_ratio: Some(0.5),
+            public: Some(true),
+            ..Default::default()
+        };
+        let route = route_policy(Some(&source), "dst", "real");
+        assert_eq!(route.backend.as_deref(), Some("dst"));
+        assert_eq!(route.alias.as_deref(), Some("real"));
+        assert_eq!(route.compression, Some(false));
+        assert_eq!(route.max_delta_ratio, Some(0.5));
+        assert_eq!(route.public, None, "a route grants no access");
+        assert!(same_route(
+            &route,
+            &route_policy(Some(&source), "dst", "real")
+        ));
+        let old = route_policy(None, "dst", "real");
+        assert!(!same_route(&old, &route), "an older route is rewritten");
     }
 
     #[test]

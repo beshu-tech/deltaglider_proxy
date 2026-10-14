@@ -314,12 +314,18 @@ async fn copy_object_once(
     // Delta fast path: when the source is delta-stored, try shipping the
     // `.delta` blob verbatim (seeding the dest reference if needed). Any
     // `Ok(None)` = the gate said fall back → the buffered reconstruct path
-    // below runs unchanged (no duplication).
+    // below runs unchanged (no duplication). Only when the destination
+    // would store this object as a delta itself: a bucket with compression
+    // off (or a key that is not delta-eligible) gets the plain object.
+    let fields = DestinationFields::of_transfer(&request, source_head);
     if matches!(
         source_head.storage_info,
         crate::types::StorageInfo::Delta { .. }
+    ) && engine.write_tries_delta(
+        request.destination_bucket,
+        request.destination_key,
+        &fields.user_metadata,
     ) {
-        let fields = DestinationFields::of_transfer(&request, source_head);
         if let Some(shipped) =
             delta_passthrough_copy(engine, lock, request, source_head, prior, fields).await?
         {
@@ -1919,6 +1925,56 @@ mod tests {
             engine.create_bucket(b).await.unwrap();
         }
         engine
+    }
+
+    /// A background copy of a delta into a bucket with compression off
+    /// stores the plain object: the delta fast path shipped the stored
+    /// delta and seeded a reference there, so tools that read that bucket
+    /// without the proxy found `.delta` files.
+    #[tokio::test]
+    async fn a_delta_copied_into_a_bucket_without_compression_is_stored_plain() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(
+            crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let mut config = Config::default();
+        config.buckets.insert(
+            "plain".into(),
+            crate::bucket_policy::BucketPolicyConfig {
+                compression: Some(false),
+                ..Default::default()
+            },
+        );
+        let engine: Arc<DynEngine> = Arc::new(DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &config,
+            None,
+        ));
+        for b in ["b", "plain"] {
+            engine.create_bucket(b).await.unwrap();
+        }
+        let keys = crate::deltaglider::store_deltas(&engine, "run", 2).await;
+        let request = ObjectTransferRequest {
+            source_bucket: "b",
+            source_key: &keys[1],
+            destination_bucket: "plain",
+            destination_key: &keys[1],
+            provenance: None,
+            strip_user_metadata_keys: &[],
+            operation: "replication",
+            upload_concurrency: None,
+            keep_created_at: true,
+        };
+
+        let outcome = copy_object_with_retries(&engine, request).await.unwrap();
+
+        assert_ne!(outcome.strategy, CopyStrategy::DeltaPassthrough);
+        let (body, meta) = engine.retrieve("plain", &keys[1]).await.unwrap();
+        assert!(!meta.is_delta(), "a bucket without compression got a delta");
+        let (source, _) = engine.retrieve("b", &keys[1]).await.unwrap();
+        assert_eq!(body, source);
     }
 
     /// The spooled copy trusted the HEAD's size: a source overwritten with a
