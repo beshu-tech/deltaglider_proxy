@@ -28,7 +28,7 @@ In the admin UI:
 
    The admin UI sends only the new key. The proxy moves the current key and its id into the legacy slot. New writes now use the new key. Reads check the key id of the new key first, and they fall back to the legacy slot. The admin UI cannot set `key_id`, so the new key gets an id that the proxy derives from the backend name and the key (16 hex characters).
 
-5. The dialog **Re-encrypt existing objects with the new key?** lists the buckets of the backend. Click **Start now**.
+5. The dialog **Re-encrypt existing objects with the new key?** lists the buckets whose encryption changed: the buckets of the backend that have no encryption block of their own. Click **Start now**.
 
    ![After the rotation, the dialog Re-encrypt existing objects with the new key? lists the buckets of hetzner-fsn1; the arrow points at Start now.](/_/screenshots/rotate-reencrypt.webp)
 
@@ -75,7 +75,7 @@ A YAML change cannot do step 2, because a change of `storage.buckets.<bucket>.ba
 
 The re-encrypt job cannot make this change. It refuses a bucket whose backend uses `sse-kms` or `sse-s3`, because AWS encrypts those objects and leaves no proxy marker that the job can check. So on a backend that you switch to SSE-KMS, the job never rewrites the old proxy-side AES objects. Use a migrate job to a new SSE-KMS backend instead.
 
-1. Add a new backend on AWS with the encryption mode **SSE-KMS (AWS KMS)**, and route no buckets to it yet. The steps are in [How to encrypt data at rest](encrypt-data-at-rest.md#4-or-use-sse-kms-or-sse-s3-on-aws).
+1. Add a new backend on AWS with the encryption mode **SSE-KMS (AWS KMS)**, and route no buckets to it yet. The steps are in [How to encrypt data at rest](encrypt-data-at-rest.md#5-or-use-sse-kms-or-sse-s3-on-aws).
 2. Move each bucket to the new backend with the migrate job, as in recipe B. The migrate job reads every object through the old backend, which decrypts it with the proxy key. Then it writes the object through the new backend, where AWS encrypts it with the KMS key. As in recipe B, the migrate request gets `409 Conflict` while `config_sync_bucket` is set.
 3. When every bucket has moved, delete the old backend. The old proxy key is then no longer needed.
 
@@ -110,7 +110,7 @@ New writes are plaintext. The encrypted objects stay readable through the shim (
 
 ## Recipe E: a key for one bucket
 
-A bucket can have its own key on a shared backend ([per-bucket encryption](../reference/encryption.md#per-bucket-encryption)). The admin UI does not show or edit bucket keys in this release, so you make every change of this recipe in the YAML file. The examples give the bucket `db-archive` on the backend `local-disk` its own key.
+A bucket can have its own key on a shared backend ([per-bucket encryption](../reference/encryption.md#per-bucket-encryption)). The admin UI makes each change of this recipe in the **Encryption** group of the bucket row on **Storage → Buckets**: **Encrypt with a bucket key**, **Rotate key**, **Off for this bucket** and **Clear legacy key** ([How to encrypt one bucket on a shared backend](encrypt-one-bucket-on-a-shared-backend.md) shows the steps). This recipe shows the same changes in the YAML file. The examples give the bucket `db-archive` on the backend `local-disk` its own key.
 
 ### Give the bucket its own key
 

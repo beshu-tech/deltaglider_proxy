@@ -111,6 +111,8 @@ You can also set keys in the admin GUI (**Storage → Backends**). The browser g
 
 A bucket policy can carry its own `encryption` block. The block uses the same fields as the `encryption` block of a backend. When a bucket has this block, the writes to that bucket use it instead of the encryption of the backend. A bucket without the block uses the encryption of its backend, as before.
 
+The admin UI edits the block in the **Encryption** group of the bucket row on **Storage → Buckets**, and `GET /_/api/admin/buckets` reports the effective encryption of every bucket (`effective_encryption`, see the [admin API reference](admin-api.md)). [How to encrypt one bucket on a shared backend](../how-to/encrypt-one-bucket-on-a-shared-backend.md) shows the steps.
+
 ```yaml
 # validate
 storage:

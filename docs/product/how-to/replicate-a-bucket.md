@@ -33,7 +33,7 @@ In the admin UI:
 
 Replication has two triggers. The event-driven trigger copies each PUT, DELETE and COPY in near real time, and it is the primary path. The **Interval** of the rule schedules a periodic full reconcile. The reconcile is the backstop that repairs anything that the event path missed. Both triggers always run, and the interval only sets how often the backstop sweeps ([details](../reference/replication.md#triggers)).
 
-Every copy goes through the engine, so each side applies its own encryption and compression. You can therefore replicate from an encrypted backend to a plaintext one, and the other way around.
+Every copy goes through the engine, so each side applies its own encryption and compression. The encryption of each side is the encryption of its bucket: the bucket's own `encryption` block when it has one, else the encryption of its backend (see [How to encrypt one bucket on a shared backend](encrypt-one-bucket-on-a-shared-backend.md)). You can therefore replicate from an encrypted bucket to a plaintext one, and the other way around. A rule that copies an encrypted bucket into a plaintext bucket is allowed, but the config check reports a warning for it, because the copies are not encrypted at rest. The **Storage → Buckets** page shows the encryption of both buckets on their rows.
 
 ## 3. Scope what replicates
 

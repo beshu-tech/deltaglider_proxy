@@ -90,6 +90,10 @@ The same page has one more limit, in the card **Object size limit**. **Maximum o
 
 To make a bucket read-only, for example during a manual migration, set its quota to `0`. The proxy then rejects every upload to the bucket with `403 AccessDenied` and the message `Bucket is frozen (quota = 0)`. Reads and lists keep working. In the admin UI, type `0` in **Quota**. An empty **Quota** field removes the quota, so it does not freeze the bucket.
 
+## Reset a bucket to the defaults
+
+To remove every setting that this page changes, open the bucket row, open the **⋯** menu at the bottom of the row, and select **Reset to defaults…**. Compression, the delta cutoff, the quota, public access and the backend route go back to the defaults when you review and apply. A bucket with its own encryption block keeps that block and its backend: the proxy never drops a bucket key that objects use, and the dialog says so. To change a bucket's encryption, use the **Encryption** group of the row (see [How to encrypt one bucket on a shared backend](encrypt-one-bucket-on-a-shared-backend.md)).
+
 ## The same change in YAML
 
 The steps above write this configuration into the `storage` section of `deltaglider_proxy.yaml` ([why the UI and the file hold the same configuration](../explanation/two-ways-to-configure.md)):

@@ -6,7 +6,7 @@
 import type { Page } from '@playwright/test';
 import type { Shot, Target } from '../shot';
 import { nav } from './common';
-import { at, ENCRYPTION_SHOTS, fakeJson, patchJson } from './encryption';
+import { at, BUCKET_ENCRYPTION_SHOTS, ENCRYPTION_SHOTS, fakeJson, patchJson } from './encryption';
 
 type Json = Record<string, unknown>;
 const JOBS = '/_/api/admin/jobs';
@@ -384,4 +384,5 @@ export const JOBS_SHOTS: Shot[] = [
     annotations: [{ target: { role: 'button', name: /^Start now/ }, kind: 'arrow', side: 'bottom' }],
   },
   ...ENCRYPTION_SHOTS,
+  ...BUCKET_ENCRYPTION_SHOTS,
 ];

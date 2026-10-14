@@ -50,6 +50,8 @@ In the admin UI:
 
 If the bucket does not exist yet, open the menu next to **Create bucket** and select **Add settings for a bucket that does not exist yet**. Type the bucket name, and continue with step 3. Any bucket without an explicit backend goes to `default_backend`.
 
+A bucket with its own encryption block (see [How to encrypt one bucket on a shared backend](encrypt-one-bucket-on-a-shared-backend.md)) always keeps an explicit backend, because the block belongs to the storage that holds the bucket. The **Backend** list does not let you choose **Default** for such a bucket; set its **Encryption** group to **Inherit** first. A re-route moves no objects, and the objects on the old backend stay under their old keys. To move a bucket with its own key, run a migrate job: the bucket's block moves with it.
+
 ## 3. Alias an upstream bucket name
 
 If the real bucket on the backend has a different name from the one that clients should see, give the bucket an alias. In the admin UI:

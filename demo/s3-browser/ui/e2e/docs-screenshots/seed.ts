@@ -219,13 +219,16 @@ export async function seed(): Promise<void> {
     );
   await s3Backend('hetzner-fsn1', 'fsn1', true);
   await s3Backend('aws-dr', 'eu-west-1', false);
-  for (const [name, backend] of [
-    ['releases', 'hetzner-fsn1'],
-    ['releases-dr', 'aws-dr'],
-    ['db-archive', 'local-disk'],
-  ]) {
-    await ok(ctx.post('/_/api/admin/buckets', { data: { name, backend_name: backend } }), `bucket ${name}`);
-  }
+  // releases and releases-dr exist in MinIO already (both S3 backends see
+  // them), and POST /buckets refuses an existing bucket: route them with a
+  // storage section update. db-archive is new, so POST creates it.
+  await ok(
+    ctx.put('/_/api/admin/config/section/storage', {
+      data: { buckets: { releases: { backend: 'hetzner-fsn1' }, 'releases-dr': { backend: 'aws-dr' } } },
+    }),
+    'route releases and releases-dr',
+  );
+  await ok(ctx.post('/_/api/admin/buckets', { data: { name: 'db-archive', backend_name: 'local-disk' } }), 'bucket db-archive');
   // `downloads` is created the way a client creates a bucket, so it has no
   // explicit route and follows the default backend (hetzner-fsn1): the
   // route-a-bucket shots route it to local-disk.

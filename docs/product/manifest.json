@@ -172,6 +172,11 @@
       "order": 60
     },
     {
+      "path": "how-to/encrypt-one-bucket-on-a-shared-backend",
+      "group": "Guides: storage & data",
+      "order": 65
+    },
+    {
       "path": "how-to/rotate-encryption-keys",
       "group": "Guides: storage & data",
       "order": 70

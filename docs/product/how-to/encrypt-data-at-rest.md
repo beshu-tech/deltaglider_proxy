@@ -1,8 +1,15 @@
 # How to encrypt data at rest
 
-This guide shows you how to turn on at-rest encryption on a storage backend. Encryption belongs to a backend, so every bucket that routes to the backend inherits it. For the threat model behind each mode, see [encryption at rest](../explanation/encryption-at-rest.md). The example encrypts `hetzner-fsn1`, which holds the buckets `releases` and `downloads`, and it shows SSE-KMS on `aws-dr`.
+This guide shows you how to turn on at-rest encryption on a storage backend. The encryption of a backend is the default for its buckets: every bucket on the backend uses it, unless the bucket has its own `encryption` block. To encrypt only some buckets of a backend, give those buckets their own key instead, as [How to encrypt one bucket on a shared backend](encrypt-one-bucket-on-a-shared-backend.md) shows. For the threat model behind each mode, see [encryption at rest](../explanation/encryption-at-rest.md). The example encrypts `hetzner-fsn1`, which holds the buckets `releases` and `downloads`, and it shows SSE-KMS on `aws-dr`.
 
-## 1. Pick a mode
+## 1. Choose where the encryption goes
+
+- **On the backend** (this guide): every bucket on the backend that has no block of its own is encrypted. The Backends page shows, on each backend card, how many buckets take its setting and how many set their own, for example "Encryption: Default for 2 buckets · 1 bucket overrides".
+- **On one bucket** ([How to encrypt one bucket on a shared backend](encrypt-one-bucket-on-a-shared-backend.md)): only that bucket is encrypted, with a key that only it uses. Choose this when one storage account holds both data that must be encrypted and data that must stay plaintext, for example a replication target that an external reader expects in plaintext.
+
+The bucket list on **Storage → Buckets** shows where each bucket's encryption comes from: **Encrypted · from hetzner-fsn1** for a bucket that takes the backend's encryption, and **Encrypted · bucket key db-archive-2026-10** for a bucket with its own key.
+
+## 2. Pick a mode
 
 The admin UI names the four modes in the **Encryption mode** list of each backend:
 
@@ -13,9 +20,9 @@ The admin UI names the four modes in the **Encryption mode** list of each backen
 
 The two SSE modes work only on S3 backends; the proxy refuses them on a filesystem backend. The full mode matrix, the field list and the wire format are in the [encryption reference](../reference/encryption.md).
 
-**If you lose a proxy-side AES key, the encrypted objects on that backend are unrecoverable.** The proxy does not escrow keys, and there is no recovery path. Store every key off the proxy host, for example in a secrets manager or an operator vault.
+**If you lose a proxy-side AES key, the encrypted objects on that backend are unrecoverable.** A full backup (the **Backup** card on the **System** page) includes a key that is in the config file, but it does not include a key that an environment variable supplies, and a backup on the same host is lost with the host. Store every key off the proxy host as well, for example in a secrets manager or an operator vault.
 
-## 2. Turn on proxy-side AES with a key from the admin UI
+## 3. Turn on proxy-side AES with a key from the admin UI
 
 In the admin UI:
 
@@ -33,9 +40,9 @@ In the admin UI:
 
    ![The encryption editor of hetzner-fsn1 holds a generated key, which is hidden here; callout 4 marks Copy to clipboard, callout 5 marks the I have stored this key safely checkbox, and callout 6 marks Apply.](/_/screenshots/encrypt-key.webp)
 
-**Apply** sends a `storage` section update at once; it has no separate **Review & apply** step. New writes to `hetzner-fsn1` are encrypted from this moment. Section 5 covers the objects that the backend already holds.
+**Apply** sends a `storage` section update at once; it has no separate **Review & apply** step. New writes to the buckets of `hetzner-fsn1` that have no encryption block of their own are encrypted from this moment. A bucket with its own block keeps its own setting. Section 6 covers the objects that the backend already holds.
 
-The proxy stores a key from the admin UI **in the config file, in plain text**, as the `key` field of the backend. The proxy writes the file with no access for other users (mode `0600` for a new file), and it never returns the key: `GET /_/api/admin/config/export` and the section reads leave it out, and a full backup keeps it in `secrets.json`. Anyone who can read the config file can still read the key. To keep the key out of the file, use an environment variable instead (section 3).
+The proxy stores a key from the admin UI **in the config file, in plain text**, as the `key` field of the backend. The proxy writes the file with no access for other users (mode `0600` for a new file), and it never returns the key: `GET /_/api/admin/config/export` and the section reads leave it out, and a full backup keeps it in `secrets.json`. Anyone who can read the config file can still read the key. To keep the key out of the file, use an environment variable instead (section 4).
 
 ## The same change in YAML
 
@@ -58,7 +65,7 @@ storage:
 
 After you edit the file, restart the proxy, or apply the file to the running proxy with `POST /_/api/admin/config/apply` or with `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example`.
 
-## 3. Or keep the key in an environment variable
+## 4. Or keep the key in an environment variable
 
 The admin UI cannot set an environment variable, so you set this up outside the proxy and in `deltaglider_proxy.yaml`. The proxy derives the name of the variable from the name of the backend: `DGP_BACKEND_<NAME>_ENCRYPTION_KEY`, where `<NAME>` is the backend name in upper case with `-` and `.` replaced by `_`. For the singleton `storage.backend`, the variable is `DGP_ENCRYPTION_KEY`.
 
@@ -94,7 +101,7 @@ storage:
 
 `key_id` is the name that the proxy stamps on every object that it encrypts. When you leave it out, the proxy derives an id from the backend name and the key. A readable id helps later, when you rotate the key ([How to rotate or change encryption keys](rotate-encryption-keys.md)). While the variable is set, the encryption editor of the backend in the admin UI is read-only, and a note names the variable.
 
-## 4. Or use SSE-KMS or SSE-S3 on AWS
+## 5. Or use SSE-KMS or SSE-S3 on AWS
 
 In SSE mode, the proxy never handles key material: AWS does the cryptography. In the admin UI:
 
@@ -140,11 +147,11 @@ storage:
 
 The environment variable `DGP_BACKEND_<NAME>_SSE_KMS_KEY_ID` overrides `kms_key_id`.
 
-## 5. Encrypt the objects that the backend already holds
+## 6. Encrypt the objects that the backend already holds
 
 Encryption is **not retroactive**. The proxy encrypts only new writes, and the existing objects stay in their stored form. After an **Apply** that changes the proxy-side encryption of a backend, the Backends page proposes a job that rewrites these objects:
 
-1. In the dialog **Encrypt existing objects?**, check the list of buckets on the backend.
+1. In the dialog **Encrypt existing objects?**, check the list of buckets. The dialog preselects only the buckets whose encryption changed. A bucket with its own encryption block is not listed, because a change of the backend does not change it.
 2. Click **Start now**. The proxy starts one re-encrypt job for each selected bucket.
 
    ![After the apply, the dialog Encrypt existing objects? lists the buckets of hetzner-fsn1; the arrow points at Start now.](/_/screenshots/encrypt-reencrypt-proposal.webp)
@@ -153,7 +160,8 @@ If you click **Later**, start the job when you are ready from **Storage → Jobs
 
 ## Verify
 
-1. Write an object and read it back through the proxy. Clients must notice nothing:
+1. On **Storage → Buckets**, check that the buckets of the backend show **Encrypted · from hetzner-fsn1**. The same answer is in the `effective_encryption` field of `GET /_/api/admin/buckets` (see [the admin API reference](../reference/admin-api.md)).
+2. Write an object and read it back through the proxy. Clients must notice nothing:
 
    ```bash
    aws --endpoint-url https://s3.acme.example s3 cp release-notes.md s3://releases/reports/release-notes.md
@@ -162,7 +170,7 @@ If you click **Later**, start the job when you are ready from **Storage → Jobs
 
    The hash must match the hash of the original file.
 
-2. Check that the stored object is ciphertext. Look at it on the raw backend, without the proxy. In proxy-side AES mode, the body starts with the `DGE1` magic (chunked) or is opaque GCM ciphertext. The user metadata on the backend carries the `dg-encrypted` marker (an `aes-256-gcm-*` value) and `dg-encryption-key-id`:
+3. Check that the stored object is ciphertext. Look at it on the raw backend, without the proxy. In proxy-side AES mode, the body starts with the `DGE1` magic (chunked) or is opaque GCM ciphertext. The user metadata on the backend carries the `dg-encrypted` marker (an `aes-256-gcm-*` value) and `dg-encryption-key-id`:
 
    ```bash
    aws s3api head-object --bucket releases --key reports/release-notes.md --profile hetzner
@@ -172,12 +180,13 @@ If you click **Later**, start the job when you are ready from **Storage → Jobs
 
    The SSE modes stamp `dg-encrypted-native: sse-kms` (or `sse-s3`) instead. That marker is harmless to expose.
 
-3. Check that the old plaintext objects still read correctly. The decrypt path acts on the marker, and an object without a marker is served as it is.
-4. If you ran a re-encrypt job, check that its row on **Storage → Jobs** shows `succeeded`, and that an *old* object on the raw backend now carries the marker too.
-5. Check that the key is stored somewhere safe **outside** the proxy host.
+4. Check that the old plaintext objects still read correctly. The decrypt path acts on the marker, and an object without a marker is served as it is.
+5. If you ran a re-encrypt job, check that its row on **Storage → Jobs** shows `succeeded`, and that an *old* object on the raw backend now carries the marker too.
+6. Check that the key is stored somewhere safe **outside** the proxy host.
 
 ## Related
 
+- [How to encrypt one bucket on a shared backend](encrypt-one-bucket-on-a-shared-backend.md): a key for one bucket, while the other buckets on the backend stay as they are.
 - [How to rotate or change encryption keys](rotate-encryption-keys.md): rotation recipes, the `legacy_key` shim, and the re-encrypt job in detail.
 - [Encryption reference](../reference/encryption.md): modes, fields, environment variables, markers, wire format, and limits.
 - [Encryption at rest](../explanation/encryption-at-rest.md): which mode fits which threat model, and why.

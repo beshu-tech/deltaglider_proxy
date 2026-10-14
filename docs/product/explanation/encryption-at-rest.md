@@ -55,7 +55,7 @@ Flipping a backend to `aes256-gcm-proxy` encrypts *new writes only*. Existing ob
 
 Reads dispatch on a per-object metadata marker (`dg-encrypted`), not on the backend's current mode. The proxy serves an object without the marker as-is, and it decrypts an object with the marker. This makes it safe and instant to turn on encryption. Nothing breaks at flip time, you do not have to run a migration, and backends with mixed plaintext and ciphertext work. The alternative is to rewrite every existing object synchronously when you apply the config. That would turn a config change into an unbounded, failure-prone bulk operation hidden inside an apply button.
 
-Instead, you bring history under the new mode with an explicit, visible operation: the **re-encrypt job**. It is a durable one-off job that rewrites every object whose markers do not match the configured mode of the backend. It resumes across restarts, and it gates writes to the bucket while it runs. The Backends page proposes one whenever you change encryption settings. See [how to encrypt data at rest](../how-to/encrypt-data-at-rest.md) for the procedure.
+Instead, you bring history under the new mode with an explicit, visible operation: the **re-encrypt job**. It is a durable one-off job that rewrites every object whose markers do not match the configured mode of the backend. It resumes across restarts, and it gates writes to the bucket while it runs. After an encryption change, the admin UI proposes one for each bucket whose effective encryption changed: on the Backends page for a backend change, and in the bucket row for a bucket change. See [how to encrypt data at rest](../how-to/encrypt-data-at-rest.md) for the procedure.
 
 ## Why in-place rotation is unsupported, and the shim that designs around it
 
@@ -63,7 +63,7 @@ A proxy-AES backend cannot simply swap its `key`. If the old key were gone, ever
 
 Instead, the proxy offers a deliberately minimal mechanism: a decrypt-only `legacy_key` shim that holds exactly one previous key generation per backend, and one per bucket that has its own key. Every proxy-AES write stamps a `dg-encryption-key-id` on the object. Reads check the stamped id against the current key, then against the legacy slot. Writes never use the legacy key. So during a rotation, old objects stay readable while every new object lands under the new key, and the population converges in one direction only. Run the re-encrypt job to rewrite the remaining old objects, and then clear the shim. One legacy slot is a constraint, but it also forces each rotation to finish, so key generations do not pile up. The key-id mechanism also gives clear errors. A mismatch tells you *which* key an object wanted, instead of an opaque GCM authentication failure. The full procedure is in [how to rotate encryption keys](../how-to/rotate-encryption-keys.md).
 
-**Key loss in proxy-AES mode is data loss.** The proxy does not escrow keys, and there is no recovery path. Back up the key off-box (in a secrets manager, a vault, or a sealed envelope) before the first encrypted write.
+**Key loss in proxy-AES mode is data loss.** There is no recovery path without the key. A full backup carries a key that is in the config file, but not a key that an environment variable supplies, and a backup on the same host is lost with the host. Back up the key off-box (in a secrets manager, a vault, or a sealed envelope) before the first encrypted write.
 
 ## Why metadata stays plaintext
 
