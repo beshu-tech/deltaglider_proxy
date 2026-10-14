@@ -64,15 +64,14 @@ pub async fn run_now(
 
     // Same deferral the scheduler and event consumer apply: run-now must
     // not write into a destination a maintenance job is rewriting.
-    if state
+    if let Some(why) = state
         .s3_state
         .maintenance_gate
-        .is_busy(&rule.destination.bucket)
+        .write_blocked(&rule.destination.bucket)
     {
         return Err(AdminError::conflict(format!(
-            "destination bucket '{}' has an active maintenance job — run the rule \
-                 again when it finishes",
-            rule.destination.bucket
+            "the rule cannot write into its destination now: {why}. Run the rule again \
+             when that ends"
         )));
     }
 

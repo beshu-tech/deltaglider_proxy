@@ -1307,6 +1307,16 @@ pub trait StorageBackend: Send + Sync {
         None
     }
 
+    /// Why this node refuses writes to `bucket` now, from memory only (the
+    /// multi-instance encryption witness, issue #116 P3), or `None`. The
+    /// background writers (replication, lifecycle, maintenance jobs) ask it
+    /// at each control boundary and stop as deferred instead of failing
+    /// object after object. Only the encrypting wrapper knows; the router
+    /// asks the backend that stores the bucket.
+    fn write_refusal(&self, _bucket: &str) -> Option<String> {
+        None
+    }
+
     /// A name for the STORAGE behind `bucket`: two bucket names that store
     /// into the same real bucket (policy aliases) get the same identity, so
     /// the engine's deltaspace locks serialise them. An unrouted bucket is

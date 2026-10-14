@@ -141,10 +141,13 @@ async fn run_due_rules(
             continue;
         }
 
-        if state.maintenance_gate.is_busy(&rule.destination.bucket) {
+        if let Some(why) = state
+            .maintenance_gate
+            .write_blocked(&rule.destination.bucket)
+        {
             info!(
-                "Replication scheduler deferring rule '{}': destination '{}' is under maintenance",
-                rule.name, rule.destination.bucket
+                "Replication scheduler deferring rule '{}': {why}",
+                rule.name
             );
             // Release the just-acquired lease — leaking it blocks run-now AND
             // (via the lease-anchored liveness check) rule deletion for a TTL.

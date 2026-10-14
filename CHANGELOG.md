@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed — A bucket that the encryption witness refuses defers the background writers
+
+A replication or lifecycle run that wrote into a bucket that the encryption witness refuses on this instance failed object after object (each refusal counted as a throttled copy), and a maintenance job recorded each object as failed and moved its cursor past it. Now the gate check of these writers asks the witness too (`MaintenanceGate::write_blocked`, source guard), memory only: the scheduler does not start a run, a running replication or lifecycle run stops as `deferred` at its next control boundary or at the first refused write (cursor kept, no failure, due again a minute later), and a maintenance job waits like for an unavailable backend and redoes the page from its cursor.
+
 ### Fixed — The encryption witness never lets a downgrade, a lagging instance or a stale check win
 
 A review of the encryption witness found these defects, now fixed:

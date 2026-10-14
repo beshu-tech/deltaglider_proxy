@@ -196,16 +196,13 @@ async fn run_due_rules(
 
         // Source AND transition destination: a transition PUT landing on
         // a gated bucket is the racing write the gate exists to stop.
-        if let Some(busy) = super::planner::rule_write_buckets(rule)
+        if let Some(why) = super::planner::rule_write_buckets(rule)
             .into_iter()
-            .find(|b| state.maintenance_gate.is_busy(b))
+            .find_map(|b| state.maintenance_gate.write_blocked(b))
         {
             // Shown on the rule's Jobs row; logged once, not every check.
-            if super::live::set_deferred(&rule.name, Some(maintenance_deferral(busy))) {
-                info!(
-                    "Lifecycle scheduler deferring rule '{}': bucket '{}' is under maintenance",
-                    rule.name, busy
-                );
+            if super::live::set_deferred(&rule.name, Some(maintenance_deferral(&why))) {
+                info!("Lifecycle scheduler deferring rule '{}': {why}", rule.name);
             }
             // Release the just-acquired lease — leaking it blocks run-now
             // for a full TTL after the maintenance window.
@@ -284,8 +281,10 @@ async fn run_due_rules(
 
 /// The deferral a rule's row shows while a maintenance job gates one of
 /// its write buckets. Run-now refuses with the same words.
-pub(crate) fn maintenance_deferral(bucket: &str) -> String {
-    format!("bucket '{bucket}' has an active maintenance job; the rule runs when it ends")
+/// The deferral note of a rule whose write bucket is blocked (`why`, from
+/// `MaintenanceGate::write_blocked`).
+pub(crate) fn maintenance_deferral(why: &str) -> String {
+    format!("{why}; the rule runs when it ends")
 }
 
 pub(crate) fn scheduler_tick(lifecycle: &LifecycleConfig) -> Duration {
@@ -538,7 +537,15 @@ mod tests {
         run(&env, &cfg).await;
         assert_eq!(
             crate::lifecycle::live::deferred("sched-gated-rule").as_deref(),
-            Some(maintenance_deferral("sched-gated").as_str()),
+            Some(
+                maintenance_deferral(
+                    &env.state
+                        .maintenance_gate
+                        .write_blocked("sched-gated")
+                        .unwrap()
+                )
+                .as_str()
+            ),
             "#13: the row can say why the rule did not run"
         );
         assert!(

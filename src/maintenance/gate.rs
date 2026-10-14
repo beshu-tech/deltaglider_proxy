@@ -64,6 +64,20 @@ pub struct MaintenanceGate {
     /// last store wins (H36). Reads stay lock-free.
     unwinding: parking_lot::Mutex<HashSet<i64>>,
     inflight_writes: DashMap<String, i64>,
+    /// The encryption witness of this node (multi-instance only): why it
+    /// refuses writes to a bucket now. Set once at boot.
+    write_refusal: std::sync::OnceLock<ProbeCell>,
+}
+
+/// Why this node refuses writes to a bucket (memory only).
+pub type WriteRefusalProbe = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+struct ProbeCell(WriteRefusalProbe);
+
+impl std::fmt::Debug for ProbeCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WriteRefusalProbe")
+    }
 }
 
 impl Default for MaintenanceGate {
@@ -72,6 +86,7 @@ impl Default for MaintenanceGate {
             busy: ArcSwap::from_pointee(HashMap::new()),
             unwinding: parking_lot::Mutex::new(HashSet::new()),
             inflight_writes: DashMap::new(),
+            write_refusal: std::sync::OnceLock::new(),
         }
     }
 }
@@ -113,6 +128,25 @@ impl MaintenanceGate {
     /// the same normalization the routing layer uses.)
     pub fn is_busy(&self, bucket: &str) -> bool {
         self.busy.load().contains_key(&bucket.to_ascii_lowercase())
+    }
+
+    /// Install the encryption witness probe (boot, multi-instance only).
+    pub fn set_write_refusal_probe(&self, probe: WriteRefusalProbe) {
+        let _ = self.write_refusal.set(ProbeCell(probe));
+    }
+
+    /// THE check of a background writer before it writes into `bucket`:
+    /// why it must stop as deferred (a maintenance job rewrites the bucket,
+    /// or the encryption witness refuses this node's writes to it), or
+    /// `None`. Memory only. Every replication / lifecycle gate check goes
+    /// through here (source guard `background_writers_ask_write_blocked`).
+    pub fn write_blocked(&self, bucket: &str) -> Option<String> {
+        if let Some(kind) = self.busy_kind(bucket) {
+            return Some(format!(
+                "bucket '{bucket}' has an active maintenance job ({kind})"
+            ));
+        }
+        self.write_refusal.get().and_then(|probe| (probe.0)(bucket))
     }
 
     /// The kind of the job that gates this bucket, if one does.
@@ -342,6 +376,14 @@ impl BackendCheck {
     /// `None`. Fail-open like the request gate: no unhealthy backend, a
     /// config that an apply holds, an unknown backend or no verdict.
     pub(crate) fn gated(&self) -> Option<String> {
+        // The encryption witness refuses this node's writes into a bucket of
+        // the job: wait like for a gated backend (memory only).
+        if let Some(why) = self.buckets.iter().find_map(|b| {
+            use crate::storage::StorageBackend;
+            self.state.engine.load().storage().write_refusal(b)
+        }) {
+            return Some(why);
+        }
         let health = &self.state.backend_health;
         if health.unhealthy_names().is_empty() {
             return None;
@@ -373,6 +415,73 @@ impl BackendCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Source guard: replication and lifecycle ask `write_blocked` (the
+    /// maintenance job AND the encryption witness), never `is_busy` alone.
+    #[test]
+    fn background_writers_ask_write_blocked() {
+        let mut offenders = Vec::new();
+        for (rel, text) in crate::source_scan::prod_sources("src") {
+            if !(rel.starts_with("src/replication") || rel.starts_with("src/lifecycle")) {
+                continue;
+            }
+            if crate::source_scan::prod_text(&text).contains(".is_busy(") {
+                offenders.push(rel);
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "use MaintenanceGate::write_blocked: {offenders:?}"
+        );
+    }
+
+    /// Owner decision (#10 of the P3 review): a maintenance job (re-encrypt,
+    /// migrate, backfill) whose bucket the encryption witness refuses waits
+    /// like for a gated backend (the worker defers the row with its
+    /// cursor), and the background writers' gate check names it.
+    #[tokio::test]
+    async fn a_witness_refusal_gates_jobs_and_background_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::from_yaml_str(&format!(
+            "storage:\n  filesystem: {}\n",
+            dir.path().display()
+        ))
+        .unwrap();
+        let engine = crate::deltaglider::DynEngine::new(&cfg, None)
+            .await
+            .unwrap();
+        let witness = engine.encryption_policies().witness_gate();
+        witness.activate(std::time::Duration::from_secs(60));
+        witness.synced();
+        witness.set(crate::storage::WitnessGateState {
+            refused: HashMap::from([(
+                ("default".to_string(), "b".to_string()),
+                "witness mismatch".to_string(),
+            )]),
+            witnessed: Default::default(),
+        });
+        let state = crate::api::handlers::AppState::for_tests(engine);
+        let check = BackendCheck::new(
+            state.clone(),
+            cfg.into_shared(),
+            vec!["b".to_string()],
+            Vec::new(),
+        );
+        assert_eq!(check.gated().as_deref(), Some("witness mismatch"));
+        let gate = MaintenanceGate::new();
+        assert_eq!(gate.write_blocked("b"), None, "no probe: single instance");
+        let probe_state = state.clone();
+        gate.set_write_refusal_probe(Arc::new(move |b: &str| {
+            probe_state.engine.load().write_refusal(b)
+        }));
+        assert_eq!(gate.write_blocked("b").as_deref(), Some("witness mismatch"));
+        assert_eq!(gate.write_blocked("other"), None);
+        gate.set_busy("other");
+        assert!(gate
+            .write_blocked("other")
+            .unwrap()
+            .contains("has an active maintenance job"));
+    }
 
     use crate::maintenance::store::current_unix_seconds;
 

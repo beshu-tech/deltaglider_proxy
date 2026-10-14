@@ -887,6 +887,17 @@ async fn run_or_preview(
             break 'pages;
         }
 
+        // A write bucket that became blocked during the page (a maintenance
+        // job, or the encryption witness) defers the run BEFORE the cursor
+        // passes this page: the objects it held back are done on resume.
+        if execute && maintenance_write_bucket_busy(rule, maintenance_gate.as_ref()) {
+            info!(
+                "lifecycle rule '{}' deferring after a page — a write bucket is blocked",
+                rule.name
+            );
+            deferred = true;
+            break 'pages;
+        }
         let more = pager.advance(page.is_truncated, page.next_continuation_token);
         if execute {
             if let Some(db) = db.as_ref() {
@@ -1502,6 +1513,12 @@ async fn plan_action(
                     }
                 }
             }
+            // The encryption witness refuses this node's writes to the
+            // destination: no copy (no failure either). The page-end check
+            // defers the run and the page is done again on resume.
+            if engine.write_refusal(destination_bucket).is_some() {
+                return Ok(Planned::Skipped);
+            }
             let copied = copy_object_with_retries(
                 engine,
                 ObjectTransferRequest {
@@ -1877,7 +1894,7 @@ fn maintenance_write_bucket_busy(
     };
     super::planner::rule_write_buckets(rule)
         .into_iter()
-        .any(|b| gate.is_busy(b))
+        .any(|b| gate.write_blocked(b).is_some())
 }
 
 /// Register this rule's write buckets with the maintenance gate for the
@@ -2496,6 +2513,74 @@ mod tests {
     /// A run that a maintenance job stops is `deferred`, not `succeeded`:
     /// it did not finish its scan. It keeps its cursor and is due again a
     /// minute later, not one rule delay later.
+    /// Owner decision (#10 of the P3 review): a transition whose destination
+    /// the encryption witness refuses stops the run as DEFERRED (cursor
+    /// kept, no failure), not one failed copy per object. The page is done
+    /// again on the next run, after the gate opens.
+    #[tokio::test]
+    async fn a_witness_refused_destination_defers_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::from_yaml_str(&format!(
+            "storage:\n  filesystem: {}\n",
+            dir.path().display()
+        ))
+        .unwrap();
+        let engine = Arc::new(DynEngine::new(&cfg, None).await.unwrap());
+        for b in ["b", "dst"] {
+            engine.create_bucket(b).await.unwrap();
+        }
+        store_all(&engine, &["x/1.bin", "x/2.bin", "x/3.bin"]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let rule = LifecycleRule {
+            name: "to-dst".into(),
+            expire_after: Some("1ms".into()),
+            action: crate::config_sections::LifecycleAction::Transition(
+                crate::config_sections::LifecycleTransitionAction {
+                    destination: crate::config_sections::LifecycleDestination {
+                        bucket: "dst".into(),
+                        prefix: "cold/".into(),
+                    },
+                    delete_source_after_success: false,
+                },
+            ),
+            ..rule()
+        };
+        let witness = engine.encryption_policies().witness_gate();
+        witness.activate(std::time::Duration::from_secs(60));
+        witness.synced();
+        witness.set(crate::storage::WitnessGateState {
+            refused: std::collections::HashMap::from([(
+                ("default".to_string(), "dst".to_string()),
+                "witness mismatch".to_string(),
+            )]),
+            witnessed: Default::default(),
+        });
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
+        let probe = engine.clone();
+        gate.set_write_refusal_probe(Arc::new(move |b: &str| probe.write_refusal(b)));
+        let db = jobs_db();
+        db.lock()
+            .await
+            .lifecycle_ensure_state(&rule.name, 0)
+            .unwrap();
+        let run = |gate| {
+            let (db, engine, rule) = (db.clone(), engine.clone(), rule.clone());
+            async move {
+                super::run_rule(Some(db), &engine, &rule, 10, "scheduler", 3600, None, gate)
+                    .await
+                    .unwrap()
+            }
+        };
+        let out = run(Some(gate.clone())).await;
+        assert_eq!(out.status, "deferred", "{out:?}");
+        assert_eq!((out.objects_copied, out.errors), (0, 0), "{out:?}");
+        // The gate opens: the next run does the deferred page.
+        witness.set(Default::default());
+        let out = run(Some(gate)).await;
+        assert_eq!(out.status, "succeeded", "{out:?}");
+        assert_eq!(out.objects_copied, 3, "{out:?}");
+    }
+
     #[tokio::test]
     async fn a_run_that_maintenance_stops_is_deferred_and_due_soon() {
         let dir = tempfile::tempdir().unwrap();

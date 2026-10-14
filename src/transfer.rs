@@ -906,6 +906,10 @@ pub(crate) enum CopyClass {
     /// The backend throttles (503 SlowDown, 429). Retryable, and the
     /// replication run counts it apart (a throttle is not about the object).
     Throttled,
+    /// This node refuses writes to the destination (the multi-instance
+    /// encryption witness). Not about the object: a replication or
+    /// lifecycle run stops as deferred (cursor kept) at the first one.
+    Refused,
     /// The source changed under the copy's generation pin. Fatal for one
     /// part (the pin is fixed); the whole-copy retry re-HEADs.
     SourceChanged,
@@ -928,6 +932,7 @@ impl CopyClass {
             self,
             CopyClass::Transient
                 | CopyClass::Throttled
+                | CopyClass::Refused
                 | CopyClass::SourceChanged
                 | CopyClass::Busy
         )
@@ -944,7 +949,8 @@ impl CopyClass {
     pub(crate) fn of_storage(e: &crate::storage::StorageError) -> Self {
         use crate::storage::StorageError as S;
         match e {
-            S::Throttled(_) | S::WritesRefused(_) => CopyClass::Throttled,
+            S::Throttled(_) => CopyClass::Throttled,
+            S::WritesRefused(_) => CopyClass::Refused,
             S::Unavailable(_) | S::Transient(_) => CopyClass::Transient,
             S::Contended(_) => CopyClass::Busy,
             S::PreconditionFailed(_) => CopyClass::SourceChanged,

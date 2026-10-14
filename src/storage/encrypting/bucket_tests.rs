@@ -322,8 +322,9 @@ async fn a_witness_refusal_stops_every_write_also_a_folder_marker() {
 fn every_write_method_checks_the_witness() {
     let traits = std::fs::read_to_string("src/storage/traits.rs").unwrap();
     let wrapper = std::fs::read_to_string("src/storage/encrypting/mod.rs").unwrap();
-    // Trait defaults that only delegate to a checked method.
-    let delegating = ["put_reference_from_file"];
+    // Trait defaults that only delegate to a checked method, and
+    // `write_refusal`, the witness query itself (it writes nothing).
+    let delegating = ["put_reference_from_file", "write_refusal"];
     let prefixes = [
         "put_",
         "write_",

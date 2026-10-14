@@ -1652,6 +1652,13 @@ impl StorageBackend for RoutingBackend {
         self.resolver.last_known_resolution(bucket)
     }
 
+    fn write_refusal(&self, bucket: &str) -> Option<String> {
+        // Unknown backend: `None`; the write itself is still checked by the
+        // wrapper that stores it.
+        self.backend_hint(bucket, |b, real| b.write_refusal(real))
+            .flatten()
+    }
+
     fn lite_list_carries_logical_facts(&self, bucket: &str) -> bool {
         // Unknown: no. Parity then HEADs the keys it compares (slower);
         // trusting an S3 or encrypted lite list gives wrong facts.

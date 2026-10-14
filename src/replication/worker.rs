@@ -695,6 +695,9 @@ struct PerObjectResult {
     // aborts the run when a whole page throttles instead of grinding the
     // remaining key list against a backend that is shedding load.
     throttled: bool,
+    // This node refuses writes to the destination (the encryption witness):
+    // the driver stops the run as deferred, cursor kept.
+    gated: bool,
     // Error text for the driver to persist (failure ring + poison ledger).
     // In-flight futures are DB-FREE by contract — the driver owns all DB
     // effects (see the walk-driver notes on the fair-mutex deadlock).
@@ -820,6 +823,7 @@ async fn copy_one_object(
             // must not count it toward the poison-skip ledger, or a throttling
             // backend would mass-poison healthy objects into permanent skip.
             out.throttled = e.class == crate::transfer::CopyClass::Throttled;
+            out.gated = e.class == crate::transfer::CopyClass::Refused;
             // A dead destination (bucket gone, access refused, cap used up)
             // fails every object; the page-level zero-success gate aborts the
             // run instead of grinding through the rest (the prod B2-over-cap
@@ -1087,11 +1091,17 @@ impl RunControl {
         // minute later (the scheduler re-checks the gate before it runs the
         // rule). Not suppressed by a waived pause:
         // a one-off must NOT write into a bucket being rewritten either.
-        let maint_busy = self
+        let maint_busy = match self
             .maintenance_gate
             .as_ref()
-            .map(|g| g.is_busy(&self.dest_bucket))
-            .unwrap_or(false);
+            .and_then(|g| g.write_blocked(&self.dest_bucket))
+        {
+            Some(why) => {
+                info!("replication rule '{}' defers: {why}", self.rule_name);
+                true
+            }
+            None => false,
+        };
         let health_gated = match &self.health {
             Some((gate, engine, rule)) => match gate.gated(engine, rule).await {
                 Some(cause) => {
@@ -1866,6 +1876,103 @@ mod request_count_tests {
         .await
         .unwrap()
         .1
+    }
+
+    /// A filesystem engine (singleton backend `default`, so its encrypting
+    /// wrapper consults the witness gate) with buckets `src` and `dst`.
+    async fn witnessed_engine() -> (Arc<DynEngine>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::from_yaml_str(&format!(
+            "storage:\n  filesystem: {}\n",
+            dir.path().display()
+        ))
+        .unwrap();
+        let engine = Arc::new(DynEngine::new(&cfg, None).await.unwrap());
+        for b in ["src", "dst"] {
+            engine.create_bucket(b).await.unwrap();
+        }
+        (engine, dir)
+    }
+
+    fn refuse_dst(engine: &DynEngine) -> Arc<crate::storage::WitnessGate> {
+        let gate = engine.encryption_policies().witness_gate();
+        gate.activate(std::time::Duration::from_secs(60));
+        gate.synced();
+        gate.set(crate::storage::WitnessGateState {
+            refused: std::collections::HashMap::from([(
+                ("default".to_string(), "dst".to_string()),
+                "witness mismatch".to_string(),
+            )]),
+            witnessed: Default::default(),
+        });
+        gate
+    }
+
+    /// Owner decision (#10 of the P3 review): a witness refusal on the
+    /// destination stops the run as DEFERRED at the first refused write
+    /// (cursor kept, no poison entry), not object after object; the next
+    /// run after the gate opens copies everything.
+    #[tokio::test]
+    async fn a_witness_refusal_defers_the_run_at_the_first_write() {
+        let (engine, _dir) = witnessed_engine().await;
+        for i in 0..20 {
+            engine
+                .store(
+                    "src",
+                    &format!("k{i:02}.txt"),
+                    b"x",
+                    None,
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let gate = refuse_dst(&engine);
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("t").unwrap()));
+        let outcome = run(&db, &engine, &rule(false)).await;
+        assert_eq!(outcome.status, DEFERRED_STOP_STATUS, "{outcome:?}");
+        assert_eq!(outcome.totals.objects_copied, 0, "{outcome:?}");
+        assert!(
+            outcome.totals.errors <= RunConcurrency::default().transfers as i64,
+            "stopped at the first refusal, not after every object: {outcome:?}"
+        );
+        gate.set(Default::default());
+        let outcome = run(&db, &engine, &rule(false)).await;
+        assert_eq!(outcome.totals.objects_copied, 20, "{outcome:?}");
+    }
+
+    /// With the maintenance gate's witness probe (the production wiring),
+    /// the control boundary defers the run before any write.
+    #[tokio::test]
+    async fn a_witness_refusal_defers_the_run_before_any_write() {
+        let (engine, _dir) = witnessed_engine().await;
+        engine
+            .store("src", "k.txt", b"x", None, Default::default())
+            .await
+            .unwrap();
+        refuse_dst(&engine);
+        let mgate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
+        let probe_engine = engine.clone();
+        mgate.set_write_refusal_probe(Arc::new(move |b: &str| probe_engine.write_refusal(b)));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("t").unwrap()));
+        let (_, outcome) = run_rule(
+            db.clone(),
+            &engine,
+            &rule(false),
+            10,
+            None,
+            0,
+            "scheduler",
+            None,
+            RunConcurrency::default(),
+            Some(mgate),
+            DynCoordinationLease::from_arc(Arc::new(FreeLease)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.status, DEFERRED_STOP_STATUS, "{outcome:?}");
+        assert_eq!(outcome.totals.errors, 0, "{outcome:?}");
+        assert_eq!(outcome.totals.objects_copied, 0, "{outcome:?}");
     }
 
     fn count(fake: &FakeS3, pred: impl Fn(&str) -> bool) -> usize {

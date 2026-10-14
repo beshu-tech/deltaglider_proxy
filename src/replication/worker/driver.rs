@@ -458,7 +458,7 @@ impl<'a> WalkDriver<'a> {
                 if let Some(err_msg) = &r.error_message {
                     let abs_src = format!("{}{rel_key}", s.source_prefix);
                     let abs_dest = format!("{}{rel_key}", s.dest_prefix);
-                    if !r.throttled {
+                    if !r.throttled && !r.gated {
                         let db = s.db.lock().await;
                         let _ = db.replication_record_object_failure(
                             &rule.name,
@@ -467,10 +467,27 @@ impl<'a> WalkDriver<'a> {
                             current_unix_seconds(),
                         );
                     }
-                    ring_failure(s, &abs_src, &abs_dest, err_msg).await;
+                    if !r.gated {
+                        ring_failure(s, &abs_src, &abs_dest, err_msg).await;
+                    }
                 }
                 if let Some(k) = r.clear_failure_key.clone() {
                     self.clear_failure_keys.push(k);
+                }
+                // A write that the encryption witness refused is not a
+                // failure of the object: it stays UNSETTLED (the resume
+                // cursor cannot pass it), and the run stops as deferred.
+                if r.gated {
+                    if !flags.stopped_deferred {
+                        info!(
+                            "replication rule '{}' deferred: {}",
+                            rule.name,
+                            r.error_message.as_deref().unwrap_or_default()
+                        );
+                        flags.stopped_deferred = true;
+                        machine.drain(walk::DrainReason::Paused);
+                    }
+                    return;
                 }
                 totals.objects_copied += r.objects_copied;
                 self.poison_skipped += r.objects_skipped;
@@ -484,6 +501,7 @@ impl<'a> WalkDriver<'a> {
                 if r.throttled {
                     self.window.throttled += 1;
                 }
+
                 if r.had_error {
                     flags.had_any_error = true;
                 }

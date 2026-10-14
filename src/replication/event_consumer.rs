@@ -1065,7 +1065,9 @@ impl DrainWindow {
         match class {
             None => self.ok += 1,
             Some(CopyClass::DestinationFatal) => self.dest_fatal = true,
-            Some(CopyClass::Throttled | CopyClass::Transient) => self.throttled += 1,
+            Some(CopyClass::Throttled | CopyClass::Transient | CopyClass::Refused) => {
+                self.throttled += 1
+            }
             Some(_) => {}
         }
     }
@@ -1162,11 +1164,8 @@ async fn drain_rule_rows(
         // Maintenance gate: the destination bucket is being rewritten in
         // place (re-encryption). Stall this key's events — the cursor does
         // not advance past them, so they replay after the job ends.
-        if gate.is_busy(&w.rule.destination.bucket) {
-            debug!(
-                "event consumer: rule '{}' deferred — destination '{}' under maintenance",
-                w.rule.name, w.rule.destination.bucket
-            );
+        if let Some(why) = gate.write_blocked(&w.rule.destination.bucket) {
+            debug!("event consumer: rule '{}' deferred — {why}", w.rule.name);
             hold(failed_ids, w);
             continue;
         }

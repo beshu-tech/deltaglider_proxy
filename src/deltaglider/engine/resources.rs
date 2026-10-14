@@ -230,6 +230,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.storage.lite_list_carries_logical_facts(bucket)
     }
 
+    /// Why this node refuses writes to `bucket` now (the encryption
+    /// witness), from memory; `None` when it writes.
+    pub fn write_refusal(&self, bucket: &str) -> Option<String> {
+        self.storage.write_refusal(bucket)
+    }
+
     /// Return the number of entries in the reference cache (O(1) atomic read).
     pub fn cache_entry_count(&self) -> u64 {
         self.cache.entry_count()

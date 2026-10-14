@@ -821,6 +821,15 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         backend_health: backend_health.clone(),
         encryption_witness: encryption_witness.clone(),
     });
+    if encryption_witness.is_some() {
+        // The background writers (replication, lifecycle) ask the witness
+        // through the maintenance gate: a refused destination defers them.
+        let weak = Arc::downgrade(&state);
+        maintenance_gate.set_write_refusal_probe(Arc::new(move |bucket: &str| {
+            weak.upgrade()
+                .and_then(|s| s.engine.load().write_refusal(bucket))
+        }));
+    }
     if let Some(witness) = &encryption_witness {
         witness.clone().spawn_poller(
             shared_config.clone(),

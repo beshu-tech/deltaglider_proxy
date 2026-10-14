@@ -476,21 +476,22 @@ fn backend_check(
     state: &Arc<AppState>,
     job: &MaintenanceJob,
 ) -> super::gate::BackendCheck {
-    let backends = match job.kind.as_str() {
-        "migrate" => job
-            .params
-            .as_deref()
-            .and_then(|p| super::migrate::parse_params(p).ok())
-            .map(|p| vec![p.from_backend, p.target_backend])
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    };
-    super::gate::BackendCheck::new(
-        state.clone(),
-        config.clone(),
-        vec![job.bucket.clone()],
-        backends,
-    )
+    let migrate = (job.kind == "migrate")
+        .then(|| {
+            job.params
+                .as_deref()
+                .and_then(|p| super::migrate::parse_params(p).ok())
+        })
+        .flatten();
+    let backends = migrate
+        .as_ref()
+        .map(|p| vec![p.from_backend.clone(), p.target_backend.clone()])
+        .unwrap_or_default();
+    // A migrate writes its copies through the staging route (the target
+    // storage): the encryption witness is asked about it too.
+    let mut buckets = vec![job.bucket.clone()];
+    buckets.extend(migrate.map(|p| p.transient_key));
+    super::gate::BackendCheck::new(state.clone(), config.clone(), buckets, backends)
 }
 
 /// The three phases, resumable at page granularity. Returns Err(reason)

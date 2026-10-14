@@ -279,6 +279,10 @@ pub(crate) async fn paged_phase<S: PageStep>(
             }
             run_objects(step, part, spec.concurrency).await?;
         }
+        // A gate that closed during the page (a backend, or the encryption
+        // witness refusing writes) defers the job BEFORE the page is saved:
+        // the objects it refused are done again on resume, never skipped.
+        ctx.holder.check_backend()?;
         step.end_page().await?;
         let more = pager.advance(page.is_truncated, page.next_token);
         step.save(pager.token()).await?;

@@ -1798,6 +1798,12 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     async fn total_size(&self, b: Option<&str>) -> Result<u64, StorageError> {
         self.inner.total_size(b).await
     }
+    fn write_refusal(&self, bucket: &str) -> Option<String> {
+        match self.check_witness(bucket) {
+            Err(StorageError::WritesRefused(m)) => Some(m),
+            _ => None,
+        }
+    }
     async fn put_directory_marker(&self, b: &str, k: &str) -> Result<(), StorageError> {
         self.check_witness(b)?;
         self.inner.put_directory_marker(b, k).await
