@@ -263,6 +263,9 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
     /// Env-only settings, copied from the config at build (see
     /// [`crate::config::RuntimeTuning`]).
     tuning: crate::config::RuntimeTuning,
+    /// The encryption-policy slots of the raw backends (issue #116 review
+    /// D): shared with the engine this one replaces.
+    encryption: construction::EngineEncryption,
 }
 
 /// Type alias for engine with dynamic backend dispatch
@@ -272,6 +275,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     const INTERNAL_REFERENCE_NAME: &'static str = "__reference__";
 }
 
+#[cfg(test)]
+mod encryption_publish_tests;
 #[cfg(test)]
 mod fault_tests;
 #[cfg(test)]

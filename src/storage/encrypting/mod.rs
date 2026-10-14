@@ -198,6 +198,59 @@ pub struct EncryptionConfig {
     pub keyring: std::collections::HashMap<String, EncryptionKey>,
 }
 
+/// One raw backend's policy slot and the config an engine publishes into it.
+pub type PolicySlot = (
+    String,
+    Arc<ArcSwap<EncryptionConfig>>,
+    Arc<EncryptionConfig>,
+);
+
+/// The encryption-policy slots of the raw backends, shared by an engine
+/// and the engine that replaces it (issue #116 review D). An engine
+/// rebuild (a config apply) builds new wrappers; without a shared slot, a
+/// copy that still runs on the old engine (a replication or lifecycle
+/// run, a multipart upload) kept writing a bucket in the form it had
+/// before the apply. The new engine publishes its configs into the shared
+/// slots when it is installed, so every engine of the lineage writes with
+/// the current per-bucket policy.
+#[derive(Default)]
+pub struct EncryptionPolicies {
+    slots: parking_lot::Mutex<std::collections::HashMap<String, Arc<ArcSwap<EncryptionConfig>>>>,
+}
+
+impl EncryptionPolicies {
+    /// The slot of `key` and remember `cfg` for [`Self::publish`]. A new
+    /// slot starts with `cfg` (no engine reads it yet); an existing one
+    /// keeps the value that the running engine uses until the publish.
+    pub fn slot(
+        &self,
+        key: &str,
+        cfg: EncryptionConfig,
+        published: &mut Vec<PolicySlot>,
+    ) -> Arc<ArcSwap<EncryptionConfig>> {
+        let cfg = Arc::new(cfg);
+        let slot = self
+            .slots
+            .lock()
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(ArcSwap::new(cfg.clone())))
+            .clone();
+        published.push((key.to_string(), slot.clone(), cfg));
+        slot
+    }
+
+    /// Store each config into its slot, and forget the slots that are not
+    /// in `published` (an engine that still holds one keeps its `Arc`).
+    pub fn publish(&self, published: &[PolicySlot]) {
+        for (_, slot, cfg) in published {
+            slot.store(cfg.clone());
+        }
+        self.slots
+            .lock()
+            .retain(|k, _| published.iter().any(|(p, _, _)| p == k));
+    }
+}
+
 /// The write policy of one bucket with its own `encryption` override.
 #[derive(Clone, Default)]
 pub struct BucketKeys {
@@ -1233,8 +1286,11 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         assembled: &[Bytes],
         metadata: &FileMetadata,
     ) -> Result<String, StorageError> {
-        // The bucket's write policy NOW (a config apply can change it
-        // between create and complete). A bucket that encrypts never
+        // The bucket's write policy NOW. A config apply can change it
+        // between create and complete: the new engine publishes its policy
+        // into the slot that this (older) wrapper shares
+        // (`EncryptionPolicies`), and a multipart upload completes on the
+        // engine it started on. A bucket that encrypts never
         // stores the parts as plaintext: buffered parts are encrypted like
         // any chunked write; native parts already sit on the backend in
         // plaintext, so the upload is refused.

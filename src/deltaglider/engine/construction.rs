@@ -13,6 +13,24 @@ impl DynEngine {
     /// routes calls to the correct underlying backend per bucket. Otherwise,
     /// uses the legacy single-backend path from `config.backend`.
     pub async fn new(config: &Config, metrics: Option<Arc<Metrics>>) -> Result<Self, StorageError> {
+        Self::new_sharing(config, metrics, Arc::default()).await
+    }
+
+    /// [`Self::new`], with the encryption-policy slots of `policies` (the
+    /// registry of the engine this one replaces, `encryption_policies()`).
+    /// A raw backend whose definition and own encryption did not change
+    /// gets the SAME slot as in the old engine, so a copy that still runs
+    /// on the old engine (a replication or lifecycle run, a multipart
+    /// upload) writes with the per-bucket policy that this engine
+    /// publishes ([`DeltaGliderEngine::publish_encryption`], called when
+    /// the engine is installed). Review D: each engine had its own slot,
+    /// and a long run kept writing an overridden bucket in its old form.
+    pub async fn new_sharing(
+        config: &Config,
+        metrics: Option<Arc<Metrics>>,
+        policies: Arc<crate::storage::EncryptionPolicies>,
+    ) -> Result<Self, StorageError> {
+        let mut published = Vec::new();
         // Per-backend encryption wrapping.
         //
         // Every backend ends up wrapped by `EncryptingBackend`, whether
@@ -51,13 +69,18 @@ impl DynEngine {
             // what `apply_backend_encryption_env` uses for this entry.
             let raw =
                 build_raw_backend("default", &config.backend, &config.backend_encryption).await?;
-            wrap_backend_with_encryption(
+            let cfg = resolve_encryption_config(
                 "default",
-                raw,
                 &config.backend_encryption,
                 &on("default"),
                 &mut KeyIdCollisionCheck::new(),
-            )?
+            )?;
+            let slot = policies.slot(
+                &policy_slot_key("default", &config.backend, &config.backend_encryption),
+                cfg,
+                &mut published,
+            );
+            DynStorageBackend::new_box(crate::storage::EncryptingBackend::new(raw, slot))
         } else {
             // Multi-backend routing. Each named entry is constructed
             // raw (with native-SSE config already baked in), wrapped
@@ -67,13 +90,19 @@ impl DynEngine {
             let mut kid_collisions = KeyIdCollisionCheck::new();
             for named in &config.backends {
                 let raw = build_raw_backend(&named.name, &named.backend, &named.encryption).await?;
-                let wrapped = wrap_backend_with_encryption(
+                let cfg = resolve_encryption_config(
                     &named.name,
-                    raw,
                     &named.encryption,
                     &on(&named.name),
                     &mut kid_collisions,
                 )?;
+                let slot = policies.slot(
+                    &policy_slot_key(&named.name, &named.backend, &named.encryption),
+                    cfg,
+                    &mut published,
+                );
+                let wrapped =
+                    DynStorageBackend::new_box(crate::storage::EncryptingBackend::new(raw, slot));
                 backends.insert(named.name.clone(), Arc::new(wrapped));
             }
             let default_name = config.default_backend_name();
@@ -91,7 +120,53 @@ impl DynEngine {
             )?)
         };
 
-        Ok(Self::new_with_backend(Arc::new(storage), config, metrics))
+        let mut engine = Self::new_with_backend(Arc::new(storage), config, metrics);
+        engine.encryption = EngineEncryption {
+            policies,
+            published,
+        };
+        Ok(engine)
+    }
+}
+
+/// The key of a raw backend's policy slot: its name AND a fingerprint of
+/// its definition and its own encryption. A change of those builds a new
+/// raw backend with its own slot (the old engine keeps the old backend
+/// policy while it drains, as before); a change of the bucket overrides
+/// alone keeps the slot, so it is shared.
+fn policy_slot_key(
+    name: &str,
+    backend: &BackendConfig,
+    enc: &crate::config::BackendEncryptionConfig,
+) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(serde_json::to_vec(&(backend, enc)).unwrap_or_default());
+    format!("{name}\0{}", hex::encode(&h.finalize()[..16]))
+}
+
+/// The encryption-policy slots an engine uses, and the configs it
+/// publishes into them when it is installed.
+#[derive(Default)]
+pub struct EngineEncryption {
+    policies: Arc<crate::storage::EncryptionPolicies>,
+    published: Vec<crate::storage::PolicySlot>,
+}
+
+impl<S: StorageBackend> DeltaGliderEngine<S> {
+    /// The policy-slot registry, to build the engine that replaces this one
+    /// with [`DynEngine::new_sharing`].
+    pub fn encryption_policies(&self) -> Arc<crate::storage::EncryptionPolicies> {
+        self.encryption.policies.clone()
+    }
+
+    /// Store this engine's encryption configs into its slots, so every
+    /// engine that shares a slot (the one this replaces, still draining
+    /// its runs) writes with them from now on, and drop the slots this
+    /// engine does not use. Called when the engine is installed (also on
+    /// a rollback, which installs the previous engine again). Infallible.
+    pub fn publish_encryption(&self) {
+        self.encryption.policies.publish(&self.encryption.published);
     }
 }
 
@@ -201,6 +276,7 @@ impl KeyIdCollisionCheck {
 ///     wrapper config when the YAML carries them. Used by the
 ///     shim-aware read path to decrypt proxy-AES objects while the
 ///     backend is running in native or no-key mode.
+#[cfg(test)]
 pub(super) fn wrap_backend_with_encryption(
     backend_name: &str,
     inner: Box<DynStorageBackend<'static>>,
@@ -208,6 +284,20 @@ pub(super) fn wrap_backend_with_encryption(
     buckets: &[crate::config::BucketOverride<'_>],
     collisions: &mut KeyIdCollisionCheck,
 ) -> Result<Box<DynStorageBackend<'static>>, StorageError> {
+    let cfg = resolve_encryption_config(backend_name, enc, buckets, collisions)?;
+    Ok(DynStorageBackend::new_box(
+        crate::storage::EncryptingBackend::new(inner, Arc::new(ArcSwap::new(Arc::new(cfg)))),
+    ))
+}
+
+/// The wrapper config of one raw backend: its own key, write mode and
+/// legacy key, the per-bucket write policies and the keyring.
+pub(super) fn resolve_encryption_config(
+    backend_name: &str,
+    enc: &crate::config::BackendEncryptionConfig,
+    buckets: &[crate::config::BucketOverride<'_>],
+    collisions: &mut KeyIdCollisionCheck,
+) -> Result<crate::storage::EncryptionConfig, StorageError> {
     use crate::config::BackendEncryptionConfig as E;
     // THE key resolution (config::resolve_site_keys): the same ids and
     // the same parse as the config rules.
@@ -296,7 +386,7 @@ pub(super) fn wrap_backend_with_encryption(
     }
 
     let (bucket_keys, keyring) = resolve_bucket_keys(backend_name, buckets, collisions)?;
-    let enc_config = Arc::new(ArcSwap::new(Arc::new(crate::storage::EncryptionConfig {
+    Ok(crate::storage::EncryptionConfig {
         key: primary_key,
         key_id: primary_kid,
         write_mode,
@@ -304,10 +394,7 @@ pub(super) fn wrap_backend_with_encryption(
         legacy_key_id: legacy_kid_opt,
         buckets: bucket_keys,
         keyring,
-    })));
-    Ok(DynStorageBackend::new_box(
-        crate::storage::EncryptingBackend::new(inner, enc_config),
-    ))
+    })
 }
 
 /// The per-bucket write policies and the keyring of one raw backend
@@ -507,6 +594,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             spool,
             range_spools,
             tuning: config.tuning.clone(),
+            encryption: EngineEncryption::default(),
         }
     }
 

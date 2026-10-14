@@ -27,7 +27,11 @@ use crate::deltaglider::DynEngine;
 /// Build an engine from `cfg` WITHOUT installing it. The admin transition
 /// builds in its pre-commit phase and installs last (review 4 config-1).
 pub async fn build_engine(app: &AppState, cfg: &Config) -> Result<DynEngine, String> {
-    let new_engine = DynEngine::new(cfg, Some(app.metrics.clone()))
+    // The new engine shares the encryption-policy slots of the running
+    // one, so the runs that drain on the old engine follow the per-bucket
+    // policy it publishes at install (issue #116 review D).
+    let policies = app.engine.load().encryption_policies();
+    let new_engine = DynEngine::new_sharing(cfg, Some(app.metrics.clone()), policies)
         .await
         .map_err(|e| e.to_string())?;
     // Re-attach the usage counter and cross-instance reference lock — a
@@ -80,6 +84,7 @@ pub fn reconcile_job_rules(db: &crate::config_db::JobsDb, cfg: &Config) {
 
 /// Hot-swap an engine built by [`build_engine`] into `app.engine`.
 pub fn install_engine(app: &AppState, engine: DynEngine, context: &str) {
+    engine.publish_encryption();
     app.engine.store(Arc::new(engine));
     tracing::info!("{}", context);
 }
@@ -165,6 +170,8 @@ impl ConfigMutator {
                     // it, and so must the engine (the new one routes the
                     // way the file does not).
                     *cfg = rollback;
+                    // Its policies go back into the shared slots too.
+                    rollback_engine.publish_encryption();
                     self.app.engine.store(rollback_engine);
                 }
                 return Err(format!(
