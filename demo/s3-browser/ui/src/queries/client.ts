@@ -1,9 +1,9 @@
 import { QueryClient } from '@tanstack/react-query';
 
 // Single process-wide query client. Defaults are tuned for an internal
-// admin tool: data refetches on focus (operators expect liveness when
-// they tab back in) but not in the background, and stale time is short
-// so mutations consistently invalidate within the session.
+// admin tool: no refetch on window focus and no polling in a background
+// tab (the explicit pollers resume when the tab shows again), and stale
+// time is short so mutations consistently invalidate within the session.
 //
 // Per-query overrides (longer staleTime, polling intervals) live on
 // the query definitions in src/queries/. Code outside React (s3client's
