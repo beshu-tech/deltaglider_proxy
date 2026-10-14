@@ -45,7 +45,14 @@ import { useSectionEditor } from '../useSectionEditor';
 import { useJobs } from '../queries/jobs';
 import { busyJobForBucket } from '../jobsView';
 import type { BucketPolicyRow, BucketPolicyPatch, PrefixEntry } from './bucketPolicyPayload';
-import { DEFAULT_ROW_FIELDS, buildBucketPayload, freshId, isAllDefaultRow, policyToRow } from './bucketPolicyPayload';
+import {
+  DEFAULT_ROW_FIELDS,
+  buildBucketPayload,
+  freshId,
+  isAllDefaultRow,
+  policyToRow,
+  unmodeledFields,
+} from './bucketPolicyPayload';
 import { numericCompare } from '../utils';
 
 interface Props {
@@ -66,6 +73,9 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
   // deletions. Updated inside `pick`, which runs on mount and after every
   // successful apply (the editor refreshes from server truth).
   const baselineNamesRef = useRef<string[]>([]);
+  // Baseline buckets with policy fields this panel does not model (the
+  // bucket `encryption` block): never deleted by an apply.
+  const unmodeledNamesRef = useRef<string[]>([]);
 
   const {
     value: rows,
@@ -89,6 +99,9 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
     pick: (body) => {
       const policies = body.buckets || {};
       baselineNamesRef.current = Object.keys(policies);
+      unmodeledNamesRef.current = Object.entries(policies)
+        .filter(([, p]) => p != null && Object.keys(unmodeledFields(p)).length > 0)
+        .map(([name]) => name);
       const nextRows = Object.entries(policies)
         .filter((e): e is [string, PolicyGet] => e[1] != null)
         .map(([name, p]) => policyToRow(name, p));
@@ -99,7 +112,7 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
     // so this only runs for a valid set of rows; the `{}` fallback is
     // unreachable in practice but keeps the type non-null.
     toPayload: (v) => {
-      const res = buildBucketPayload(v, baselineNamesRef.current);
+      const res = buildBucketPayload(v, baselineNamesRef.current, unmodeledNamesRef.current);
       return res.ok ? res.body : { buckets: {} };
     },
   });
@@ -141,7 +154,7 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
   // validate → ApplyDialog → PUT flow (which re-derives the same body via
   // `toPayload`, keeping the validate/PUT body byte-identical).
   const runApply = useCallback(async () => {
-    const res = buildBucketPayload(rows, baselineNamesRef.current);
+    const res = buildBucketPayload(rows, baselineNamesRef.current, unmodeledNamesRef.current);
     if (!res.ok) {
       message.error(res.error);
       return;

@@ -62,6 +62,39 @@ export interface BucketPolicyRow {
    *  policy is the marker doesn't round-trip as "all default" and get its
    *  policy DELETED on apply (the silent-field-loss bug class). */
   replication_target_only: boolean;
+  /** The server policy's fields that this panel does NOT model (today the
+   *  bucket `encryption` block, issue #116; any field a later server adds),
+   *  carried verbatim. Never serialised: the merge-patch keeps an absent
+   *  key, so the server keeps them. A row with such a field is never
+   *  all-default, so it is never sent as `null` (which would delete the
+   *  policy, its key with it). Optional and outside `DEFAULT_ROW_FIELDS`,
+   *  so "reset to defaults" keeps it. */
+  unmodeled?: Readonly<Record<string, unknown>>;
+}
+
+/** The policy fields this panel models (everything else is `unmodeled`). */
+const MODELED_KEYS: ReadonlySet<string> = new Set([
+  'compression',
+  'max_delta_ratio',
+  'backend',
+  'alias',
+  'public',
+  'public_prefixes',
+  'quota_bytes',
+  'replication_target_only',
+]);
+
+/** The fields of a server policy that this panel does not model. */
+export function unmodeledFields(p: object): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(p)) {
+    if (!MODELED_KEYS.has(k) && v !== undefined && v !== null) out[k] = v;
+  }
+  return out;
+}
+
+function hasUnmodeled(row: BucketPolicyRow): boolean {
+  return Object.keys(row.unmodeled ?? {}).length > 0;
 }
 
 /** One bucket's merge-patch: every clearable field present (value or null). */
@@ -85,7 +118,7 @@ export interface BucketPolicyPatch {
 type BucketsPatchBody = { buckets: Record<string, BucketPolicyPatch | null> };
 
 /** Default (no-override) field values — what a bucket without a policy means. */
-export const DEFAULT_ROW_FIELDS: Omit<BucketPolicyRow, '_id' | 'name'> = Object.freeze({
+export const DEFAULT_ROW_FIELDS: Omit<BucketPolicyRow, '_id' | 'name' | 'unmodeled'> = Object.freeze({
   compression: null,
   max_delta_ratio: null,
   backend: '',
@@ -134,6 +167,7 @@ export function policyToRow(
     public_prefixes: prefixes.map((value) => ({ id: freshId(), value })),
     quota_bytes: p.quota_bytes ?? null,
     replication_target_only: p.replication_target_only ?? false,
+    unmodeled: unmodeledFields(p),
   };
 }
 
@@ -150,6 +184,7 @@ function cleanedPrefixes(row: BucketPolicyRow): string[] {
  */
 export function isAllDefaultRow(row: BucketPolicyRow): boolean {
   return (
+    !hasUnmodeled(row) &&
     row.compression === null &&
     row.max_delta_ratio === null &&
     row.backend === '' &&
@@ -208,7 +243,11 @@ type BucketPayloadResult =
  */
 export function buildBucketPayload(
   rows: BucketPolicyRow[],
-  baselineNames: readonly string[] = []
+  baselineNames: readonly string[] = [],
+  /** Baseline buckets whose server policy has fields this panel does not
+   *  model: a removed row of one of them clears the modeled fields only,
+   *  never `null` (issue #116 review C). */
+  unmodeledNames: readonly string[] = []
 ): BucketPayloadResult {
   const cleaned = rows.filter((r) => r.name.trim());
   const names = cleaned.map((r) => r.name);
@@ -227,7 +266,10 @@ export function buildBucketPayload(
     }
   }
   for (const name of baselineNames) {
-    if (!cleaned.some((r) => r.name === name)) bp[name] = null;
+    if (cleaned.some((r) => r.name === name)) continue;
+    bp[name] = unmodeledNames.includes(name)
+      ? rowToPolicy({ _id: '', name, ...DEFAULT_ROW_FIELDS, public_prefixes: [] })
+      : null;
   }
   return { ok: true, body: { buckets: bp } };
 }
