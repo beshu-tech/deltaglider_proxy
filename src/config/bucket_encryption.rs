@@ -356,7 +356,7 @@ impl Config {
     }
 
     /// The modes that the own `encryption` block of a bucket stored on
-    /// `backend` accepts (see [`BUCKET_ENCRYPTION_MODES`]).
+    /// `backend` accepts (see `BUCKET_ENCRYPTION_MODES`).
     pub fn bucket_encryption_modes(&self, backend: &str) -> Vec<&'static str> {
         let on_filesystem = self
             .backend_by_name(backend)
