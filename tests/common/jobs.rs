@@ -175,17 +175,9 @@ pub async fn wait_for_run_after(
         }) {
             let id = run["id"].as_i64().unwrap_or(0);
             let st = run["status"].as_str().unwrap_or("");
-            if id > after_id
-                && matches!(
-                    st,
-                    "succeeded"
-                        | "failed"
-                        | "completed_with_errors"
-                        | "cancelled"
-                        | "stopped"
-                        | "paused"
-                )
-            {
+            // Settled = no longer active. A list of final statuses missed
+            // each new one (`deferred`) and waited for the next run.
+            if id > after_id && !matches!(st, "" | "idle" | "running" | "queued" | "cancelling") {
                 return run.clone();
             }
         }
