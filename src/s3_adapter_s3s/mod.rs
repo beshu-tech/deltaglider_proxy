@@ -31,6 +31,7 @@ use std::time::SystemTime;
 mod bucket;
 mod copy;
 mod list;
+mod list_token;
 mod multipart;
 mod object;
 
@@ -41,6 +42,7 @@ use self::{copy::*, multipart::*};
 #[cfg(test)]
 pub(crate) use copy::copy_source_bucket_key;
 pub use list::{ListMetadataXmlExtensions, LEGACY_V2_TOKENS};
+pub use list_token::install_list_token_keys;
 
 /// The `s3s::S3` service. Each verb is a one-line delegation to its verb
 /// group (`bucket`, `object`, `list`, `multipart`, `copy`); a verb that is

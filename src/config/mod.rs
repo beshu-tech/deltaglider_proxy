@@ -158,8 +158,9 @@ pub struct Config {
     #[serde(default = "default_metadata_cache_mb")]
     pub metadata_cache_mb: usize,
 
-    /// Engine pages one filtered LIST (a policy the proxy cannot narrow to
-    /// prefixes) may scan before it answers "use a narrower prefix".
+    /// Backend requests one filtered LIST (a policy the proxy cannot narrow
+    /// to prefixes) may send, in engine pages of 1000 keys, before it
+    /// answers a truncated page with a sealed continuation token.
     #[serde(default = "default_filtered_list_max_engine_pages")]
     pub filtered_list_max_engine_pages: usize,
 

@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Fixed — A filtered LIST no longer reveals hidden key names
+
+A user who may see only some keys of a bucket, through an `Allow` on the
+whole bucket with `Deny` exceptions, could learn the names of keys that the
+policy hides. The client chooses where a LIST starts (`start-after`, a
+continuation token, or a V1 `marker`), and the answer depended on the hidden
+keys after that point in two ways. First, the scan read backend pages of
+`max-keys + 1` keys, so with `max-keys=1` the request failed with "use a
+narrower prefix" after only 100 hidden keys, and a search over `start-after`
+found the hidden key where the error started. Second, a page with one visible
+entry was served short, so the number of keys on a page told how many hidden
+keys followed `start-after`. Now the scan reads backend pages of 1000 keys
+whatever `max-keys` is, and a filtered page is exact: it holds `max-keys`
+visible entries whenever that many exist. When a request uses up
+`advanced.filtered_list_max_engine_pages` (about 50,000 hidden keys with the
+default), it no longer fails: it returns the visible entries that it found
+(possibly none) as a truncated page with a sealed continuation token (`dg2.`,
+also the V1 `NextMarker`). The token holds the scan position, encrypted and
+authenticated with a key derived from the config DB key, so the client cannot
+read or change it, and every instance that shares `DGP_CONFIG_DB_KEY` opens
+it. A changed or foreign token gets `400 InvalidArgument`. Tokens of the
+previous release (`dg1.`) still work. A full filtered page now costs one more
+backend page than before (2,500 visible keys: 6 backend LIST requests instead
+of 4), because the proxy must find one more visible entry to know that the
+page is truncated. The remaining leak, for runs of more than about 50,000
+hidden keys in a row, is described in the IAM permissions reference. The
+file browser's folder listing reads pages of 1000 keys too, and goes on from
+its scan position, so it no longer reads a backend page twice.
+
 ### Fixed — The Jobs editor no longer mixes up two rules with the same name
 
 The Jobs screen found a rule in the editor by its name. When you typed the

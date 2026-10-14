@@ -1713,7 +1713,7 @@ pub async fn list_all(
     .await
     {
         Ok((keys, truncated)) => Ok(Json(ListAllResponse { keys, truncated })),
-        Err(crate::iam::listing::ListingError::NoVisibleKeyInBudget) => Err(AdminError::invalid(
+        Err(crate::iam::listing::ListingError::ScanBudgetSpent) => Err(AdminError::invalid(
             "the folder holds more objects you cannot see than one listing may read \
              (advanced.filtered_list_max_engine_pages); select a narrower folder",
         )),

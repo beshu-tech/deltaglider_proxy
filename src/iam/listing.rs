@@ -104,12 +104,13 @@ impl<S: crate::storage::StorageBackend> Lister for crate::deltaglider::DeltaGlid
     }
 }
 
-/// Why a filtered listing gave no page.
+/// Why a folder walk gave no key list.
 #[derive(Debug)]
 pub(crate) enum ListingError {
-    /// The scan budget ran out before one visible entry, and a hidden key
-    /// must never be a token: the caller must list a narrower prefix.
-    NoVisibleKeyInBudget,
+    /// The walk spent its scan budget before the end of the folder, and a
+    /// partial folder must never be acted on: the caller must select a
+    /// narrower folder.
+    ScanBudgetSpent,
     Engine(EngineError),
 }
 
@@ -117,6 +118,23 @@ impl From<EngineError> for ListingError {
     fn from(e: EngineError) -> Self {
         ListingError::Engine(e)
     }
+}
+
+/// Keys per engine page of a filtered scan, whatever `max-keys` is. The
+/// engine windows of the scan then never depend on the client page size,
+/// and the scan budget (`advanced.filtered_list_max_engine_pages`) reads
+/// about `budget × 1000` keys: 50,000 by default.
+pub(crate) const FILTERED_SCAN_PAGE_KEYS: u32 = 1000;
+
+/// One LIST page for a caller, and what its continuation token is.
+#[derive(Debug)]
+pub(crate) struct CallerPage {
+    pub page: ListObjectsPage,
+    /// `true` when `page.next_continuation_token` is a scan position where
+    /// the scan budget ran out. It can be a key the caller may not see, so
+    /// it leaves the process only sealed. When `false`, the token is the
+    /// last entry of the page, which the caller sees anyway.
+    pub hidden_cursor: bool,
 }
 
 /// One part of a filtered LIST (review S12). A prefix-scoped user's listing
@@ -181,25 +199,35 @@ fn list_targets(prefix: &str, delimiter: Option<&str>, visible: &[String]) -> Ve
 
 /// One LIST page as the caller may see it. THE listing path for V1 and V2.
 ///
-/// For a `ListScope::Filtered` caller, the engine's next-token is the last
-/// key of the UNFILTERED page, so returning it leaks a hidden key (review
-/// S12: `max-keys=1` walks the whole bucket through tokens). The token is
-/// always the last VISIBLE entry.
+/// For a `ListScope::Filtered` caller, the listing reads only the prefixes
+/// the user's policy can see (`list_targets`), so hidden keys outside them
+/// cost nothing and every visible key stays reachable. Only a policy that
+/// cannot be narrowed to prefixes (a bucket-wide Allow with Deny
+/// carve-outs) scans hidden keys, under a budget of `budget` backend
+/// requests (`advanced.filtered_list_max_engine_pages`).
 ///
-/// The listing reads only the prefixes the user's policy can see
-/// (`list_targets`), so hidden keys outside them cost nothing and every
-/// visible key stays reachable. Only a policy that cannot be narrowed to
-/// prefixes (a bucket-wide Allow with Deny carve-outs) scans hidden keys,
-/// under a budget of `budget` backend requests
-/// (`advanced.filtered_list_max_engine_pages`): a prefix-scoped user can
-/// ask for a prefix where every key is hidden, and the scan must end. Each
-/// engine page spends the requests it sent ([`scan_cost`]), so a page that
-/// needs a second backend page or a probe costs more than one. The scan
-/// reads lite pages ([`Lister::list_lite`]):
-/// an engine page of the scan costs its LIST requests only, never a
-/// listing-facts request or a HEAD for a key the filter then drops. The
-/// logical sizes, and with `metadata` the HEADs, are read once, for the
-/// page the caller gets ([`Lister::finish`]).
+/// The client picks where the scan starts (`start-after`, a token, a V1
+/// `marker`), so the answer must not depend on the hidden keys after that
+/// point (review 2d: a bisection on `start-after` recovered hidden names
+/// from the answer). So:
+///
+/// - The scan reads engine pages of [`FILTERED_SCAN_PAGE_KEYS`] keys,
+///   whatever `max_keys` is.
+/// - The page is EXACT: it holds `max_keys` visible entries whenever that
+///   many exist, and it is truncated only when a visible entry follows it.
+///   Its token is then its last entry.
+/// - When the budget runs out first (about `budget × 1000` hidden keys in
+///   a row), the page holds the visible entries found so far (maybe none),
+///   it is truncated, and its token is the scan position
+///   ([`CallerPage::hidden_cursor`]), which the S3 adapter seals. A restart
+///   from the last visible entry would read the same hidden keys again and
+///   never end.
+///
+/// The scan reads lite pages ([`Lister::list_lite`]): an engine page of the
+/// scan costs its LIST requests only, never a listing-facts request or a
+/// HEAD for a key the filter then drops. The logical sizes, and with
+/// `metadata` the HEADs, are read once, for the page the caller gets
+/// ([`Lister::finish`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn list_page_for_caller<L: Lister>(
     lister: &L,
@@ -211,30 +239,74 @@ pub(crate) async fn list_page_for_caller<L: Lister>(
     metadata: bool,
     scope: Option<&ListScope>,
     budget: usize,
-) -> Result<ListObjectsPage, ListingError> {
+) -> Result<CallerPage, EngineError> {
+    let Some(Visibility { user, context }) = Visibility::of(scope) else {
+        return Ok(CallerPage {
+            page: lister
+                .list(bucket, prefix, delimiter, max_keys, cursor, metadata)
+                .await?,
+            hidden_cursor: false,
+        });
+    };
     let mut budget = budget;
-    list_page_within(
+    // One entry past the page tells whether the listing goes on.
+    let want = max_keys as usize + 1;
+    let scan = scan_visible(
         lister,
         bucket,
         prefix,
         delimiter,
-        max_keys,
         cursor,
-        metadata,
-        scope,
+        user,
+        context,
+        want,
         &mut budget,
     )
-    .await
+    .await?;
+    let found = scan.objects.len() + scan.prefixes.len();
+    let budget_spent = scan.resume.is_some() && found < want;
+    let mut page = crate::deltaglider::interleave_and_paginate(
+        scan.objects,
+        scan.prefixes.into_iter().collect(),
+        max_keys,
+        None,
+    );
+    if budget_spent {
+        // Fewer than `max_keys + 1` visible entries, and the scan stopped
+        // before the end: the next page starts at the scan position.
+        page.is_truncated = true;
+        page.next_continuation_token = scan.resume;
+    }
+    // Only the entries this page shows: a hidden key is never counted.
+    let facts_missing_keys = page
+        .objects
+        .iter()
+        .filter(|(k, _)| scan.facts_missing.contains(k))
+        .map(|(k, _)| k.clone())
+        .collect();
+    let page = ListObjectsPage {
+        objects: page.objects,
+        common_prefixes: page.common_prefixes,
+        is_truncated: page.is_truncated,
+        next_continuation_token: page.next_continuation_token,
+        facts_missing_keys,
+    };
+    // Sizes and metadata for the visible page only.
+    Ok(CallerPage {
+        page: lister.finish(bucket, page, metadata).await?,
+        hidden_cursor: budget_spent,
+    })
 }
 
 /// Every visible key under `prefix` (no delimiter), at most `max_keys`, and
 /// whether a visible key past them exists (review D7: the admin folder
 /// listing walked a whole prefix of hidden keys with no budget). For a
 /// filtered caller the walk spends at most `budget` backend requests IN
-/// ALL (see [`list_page_for_caller`]); a
-/// walk that spends it before the end is `NoVisibleKeyInBudget`, because a
-/// partial folder must never be acted on. An unrestricted caller is bounded
-/// by `max_keys`.
+/// ALL, in engine pages of [`FILTERED_SCAN_PAGE_KEYS`] keys (see
+/// [`list_page_for_caller`]). It goes on from its scan position, so it
+/// reads each engine page once. A walk that spends the budget before the
+/// end is `ScanBudgetSpent`, because a partial folder must never be acted
+/// on. An unrestricted caller is bounded by `max_keys`.
 pub(crate) async fn list_keys_for_caller<L: Lister>(
     lister: &L,
     bucket: &str,
@@ -246,26 +318,43 @@ pub(crate) async fn list_keys_for_caller<L: Lister>(
     let mut budget = budget;
     let mut keys = Vec::new();
     let mut cursor: Option<String> = None;
+    let visibility = Visibility::of(scope);
     loop {
-        let page = list_page_within(
-            lister,
-            bucket,
-            prefix,
-            None,
-            1000,
-            cursor.as_deref(),
-            false,
-            scope,
-            &mut budget,
-        )
-        .await?;
-        for (key, _) in page.objects {
+        let (objects, next) = match &visibility {
+            None => {
+                let page = lister
+                    .list(bucket, prefix, None, 1000, cursor.as_deref(), false)
+                    .await?;
+                let next = page.next_continuation_token.filter(|_| page.is_truncated);
+                (page.objects, next)
+            }
+            Some(Visibility { user, context }) => {
+                let want = max_keys.saturating_sub(keys.len()) + 1;
+                let scan = scan_visible(
+                    lister,
+                    bucket,
+                    prefix,
+                    None,
+                    cursor.as_deref(),
+                    user,
+                    context,
+                    want,
+                    &mut budget,
+                )
+                .await?;
+                if scan.resume.is_some() && scan.objects.len() < want {
+                    return Err(ListingError::ScanBudgetSpent);
+                }
+                (scan.objects, scan.resume)
+            }
+        };
+        for (key, _) in objects {
             if push_listed_key(&mut keys, key, max_keys) {
                 return Ok((keys, true));
             }
         }
-        match page.next_continuation_token.filter(|_| page.is_truncated) {
-            Some(token) => cursor = Some(token),
+        match next {
+            Some(position) => cursor = Some(position),
             None => return Ok((keys, false)),
         }
     }
@@ -300,28 +389,60 @@ fn range_is_past(prefix: &str, cursor: Option<&str>) -> bool {
     cursor.is_some_and(|c| c > prefix && !c.starts_with(prefix))
 }
 
-/// [`list_page_for_caller`] spending a caller-owned request budget, so a
-/// multi-page walk shares one budget.
+/// The policy a filtered listing filters with.
+struct Visibility<'a> {
+    user: &'a crate::iam::AuthenticatedUser,
+    context: &'a iam_rs::Context,
+}
+
+impl<'a> Visibility<'a> {
+    fn of(scope: Option<&'a ListScope>) -> Option<Self> {
+        match scope {
+            Some(ListScope::Filtered { user, context }) => Some(Self { user, context }),
+            _ => None,
+        }
+    }
+}
+
+/// What a filtered scan read.
+struct Scanned {
+    /// The visible objects and common prefixes, in key order. There can be
+    /// more than `want`: the scan keeps every visible entry of the engine
+    /// pages it read.
+    objects: Vec<(String, crate::types::FileMetadata)>,
+    prefixes: std::collections::BTreeSet<String>,
+    facts_missing: std::collections::HashSet<String>,
+    /// `None`: the listing ended. Otherwise the scan position: every key at
+    /// or before it was read, and keys after it may remain. The scan stops
+    /// with a position when it holds `want` visible entries, or when the
+    /// budget runs out first.
+    resume: Option<String>,
+}
+
+/// The scan of a filtered listing: the visible entries after `cursor`,
+/// until it holds `want` of them, the listing ends, or `budget` runs out.
+///
+/// ONE request budget for the whole request (or folder walk), shared by
+/// every target (scans and roll-up probes): per target, N visible prefixes
+/// read N budgets for one LIST.
+///
+/// The scan position always moves past `cursor` before the budget can stop
+/// the scan, so a client that follows the tokens always gets to the end. A
+/// roll-up target that the scan starts is finished: its probes are bounded
+/// by the policy, not by the data, and a position inside it cannot be
+/// written as a key.
 #[allow(clippy::too_many_arguments)]
-async fn list_page_within<L: Lister>(
+async fn scan_visible<L: Lister>(
     lister: &L,
     bucket: &str,
     prefix: &str,
     delimiter: Option<&str>,
-    max_keys: u32,
     cursor: Option<&str>,
-    metadata: bool,
-    scope: Option<&ListScope>,
+    user: &crate::iam::AuthenticatedUser,
+    context: &iam_rs::Context,
+    want: usize,
     budget: &mut usize,
-) -> Result<ListObjectsPage, ListingError> {
-    let (user, context) = match scope {
-        Some(ListScope::Filtered { user, context }) => (user, context),
-        _ => {
-            return Ok(lister
-                .list(bucket, prefix, delimiter, max_keys, cursor, metadata)
-                .await?);
-        }
-    };
+) -> Result<Scanned, EngineError> {
     let visible = crate::iam::permissions::visible_key_prefixes(user, bucket);
     let mut targets = list_targets(prefix, delimiter, &visible);
     let engine_takes = |t: &ListTarget| match t {
@@ -335,37 +456,37 @@ async fn list_page_within<L: Lister>(
         // `b/a/..*`): fall back to the budgeted scan of the request.
         targets = vec![ListTarget::Scan(prefix.to_string())];
     }
-    // One entry past the page tells whether the listing goes on.
-    let want = max_keys as usize + 1;
-    let mut objects = Vec::new();
-    let mut prefixes = std::collections::BTreeSet::new();
-    let mut facts_missing = std::collections::HashSet::new();
-    let mut more = false;
-    // ONE request budget for the whole request, shared by every target
-    // (scans and roll-up probes): per target, N visible prefixes read N
-    // budgets for one LIST.
+    let mut scan = Scanned {
+        objects: Vec::new(),
+        prefixes: std::collections::BTreeSet::new(),
+        facts_missing: std::collections::HashSet::new(),
+        resume: None,
+    };
+    // Where the scan is: every key at or before it was read.
+    let mut position: Option<String> = cursor.map(str::to_string);
+    let moved = |position: &Option<String>| position.as_deref() != cursor;
+    let found = |scan: &Scanned| scan.objects.len() + scan.prefixes.len();
     for target in targets {
-        if objects.len() + prefixes.len() >= want {
-            break;
-        }
         // A target that cannot add to this page spends no request and no
         // budget: the cursor is past it (an earlier page listed it), or its
         // roll-up entry is one the user may not see.
         let adds_nothing = match &target {
-            ListTarget::Scan(scan_prefix) => range_is_past(scan_prefix, cursor),
+            ListTarget::Scan(scan_prefix) => range_is_past(scan_prefix, position.as_deref()),
             ListTarget::Rollup { common_prefix, .. } => {
-                cursor.is_some_and(|c| common_prefix.as_str() <= c)
+                position
+                    .as_deref()
+                    .is_some_and(|c| common_prefix.as_str() <= c)
                     || !user_can_see_common_prefix(user, bucket, common_prefix, context)
             }
         };
         if adds_nothing {
             continue;
         }
-        if *budget == 0 {
+        if found(&scan) >= want || (*budget == 0 && moved(&position)) {
             // Stopped before this target: the listing goes on after the
-            // last visible entry.
-            more = true;
-            break;
+            // scan position.
+            scan.resume = position;
+            return Ok(scan);
         }
         match target {
             ListTarget::Rollup {
@@ -373,106 +494,68 @@ async fn list_page_within<L: Lister>(
                 probes,
             } => {
                 for probe in probes {
-                    if *budget == 0 {
-                        more = true;
-                        break;
-                    }
                     let (page, requests) =
                         lister.list_lite(bucket, &probe, delimiter, 1, None).await?;
                     *budget = budget.saturating_sub(scan_cost(requests));
                     if !page.objects.is_empty() || !page.common_prefixes.is_empty() {
-                        prefixes.insert(common_prefix);
+                        scan.prefixes.insert(common_prefix.clone());
                         break;
                     }
                 }
+                position = Some(common_prefix);
             }
-            ListTarget::Scan(scan_prefix) => {
-                let need = want - objects.len() - prefixes.len();
-                let had = objects.len() + prefixes.len();
-                let mut scan_cursor = cursor.map(str::to_string);
-                while *budget > 0 {
-                    // Lite: no listing facts and no HEAD for the hidden keys.
-                    let (page, requests) = lister
-                        .list_lite(
-                            bucket,
-                            &scan_prefix,
-                            delimiter,
-                            need as u32,
-                            scan_cursor.as_deref(),
-                        )
-                        .await?;
-                    *budget = budget.saturating_sub(scan_cost(requests));
-                    facts_missing.extend(page.facts_missing_keys);
-                    objects.extend(
-                        page.objects
-                            .into_iter()
-                            .filter(|(key, _)| user_can_see_listed_key(user, bucket, key, context)),
-                    );
-                    prefixes.extend(
-                        page.common_prefixes
-                            .into_iter()
-                            .filter(|p| user_can_see_common_prefix(user, bucket, p, context)),
-                    );
-                    more = page.is_truncated && page.next_continuation_token.is_some();
-                    scan_cursor = page.next_continuation_token;
-                    // A page with a visible entry is served short, like the
-                    // unfiltered listing (S3 allows a short truncated page):
-                    // reading the next engine page to fill it made the next
-                    // client page read that engine page again. A page with
-                    // no visible entry reads on (an empty truncated page
-                    // would carry no token, and a token on an earlier
-                    // target's entry would read these hidden keys again).
-                    if !more || objects.len() + prefixes.len() > had {
-                        break;
-                    }
+            ListTarget::Scan(scan_prefix) => loop {
+                if found(&scan) >= want || (*budget == 0 && moved(&position)) {
+                    // Stopped inside this scan: the listing goes on after
+                    // the scan position.
+                    scan.resume = position;
+                    return Ok(scan);
                 }
+                // Lite: no listing facts and no HEAD for the hidden keys.
+                let (page, requests) = lister
+                    .list_lite(
+                        bucket,
+                        &scan_prefix,
+                        delimiter,
+                        FILTERED_SCAN_PAGE_KEYS,
+                        position.as_deref(),
+                    )
+                    .await?;
+                *budget = budget.saturating_sub(scan_cost(requests));
+                let more = page.is_truncated && page.next_continuation_token.is_some();
+                // The last entry of the page, in key order: the engine's
+                // token on a truncated page.
+                let last = page
+                    .objects
+                    .last()
+                    .map(|(k, _)| k.clone())
+                    .into_iter()
+                    .chain(page.common_prefixes.last().cloned())
+                    .max();
+                scan.facts_missing.extend(page.facts_missing_keys);
+                scan.objects.extend(
+                    page.objects
+                        .into_iter()
+                        .filter(|(key, _)| user_can_see_listed_key(user, bucket, key, context)),
+                );
+                scan.prefixes.extend(
+                    page.common_prefixes
+                        .into_iter()
+                        .filter(|p| user_can_see_common_prefix(user, bucket, p, context)),
+                );
                 if more {
-                    // Stopped inside this scan (page full or budget spent):
-                    // later targets come after its remaining keys.
+                    position = page.next_continuation_token;
+                } else {
+                    if last.is_some() {
+                        position = last;
+                    }
                     break;
                 }
-            }
+            },
         }
     }
-    if more && objects.is_empty() && prefixes.is_empty() {
-        // No visible entry to anchor a token on, and a hidden key must never
-        // be one. Fail instead of pretending the listing ended.
-        return Err(ListingError::NoVisibleKeyInBudget);
-    }
-    let mut page = crate::deltaglider::interleave_and_paginate(
-        objects,
-        prefixes.into_iter().collect(),
-        max_keys,
-        None,
-    );
-    if more && !page.is_truncated {
-        // At most `max_keys` visible entries and the scan stopped early: the
-        // token is the last visible entry.
-        page.is_truncated = true;
-        page.next_continuation_token = page
-            .objects
-            .last()
-            .map(|(k, _)| k.clone())
-            .into_iter()
-            .chain(page.common_prefixes.last().cloned())
-            .max();
-    }
-    // Only the entries this page shows: a hidden key is never counted.
-    let facts_missing_keys = page
-        .objects
-        .iter()
-        .filter(|(k, _)| facts_missing.contains(k))
-        .map(|(k, _)| k.clone())
-        .collect();
-    let page = ListObjectsPage {
-        objects: page.objects,
-        common_prefixes: page.common_prefixes,
-        is_truncated: page.is_truncated,
-        next_continuation_token: page.next_continuation_token,
-        facts_missing_keys,
-    };
-    // Sizes and metadata for the visible page only.
-    Ok(lister.finish(bucket, page, metadata).await?)
+    // Every target read to its end.
+    Ok(scan)
 }
 
 #[cfg(test)]
@@ -531,32 +614,136 @@ mod tests {
         }
     }
 
-    /// The budget is exactly `budget` engine requests: a scan of hidden keys
-    /// stops after them with `NoVisibleKeyInBudget`, and one more page of
-    /// budget reaches the visible key.
+    /// The budget is exactly `budget` engine requests of 1000 keys,
+    /// whatever `max_keys` is: a scan of hidden keys stops after them with
+    /// an empty truncated page whose cursor is the scan position, and a
+    /// budget that reaches the visible key returns it.
     #[tokio::test]
     async fn the_scan_makes_exactly_budget_engine_requests() {
-        // `max_keys=1` reads two entries per engine request.
-        let mut keys: Vec<String> = (0..20).map(|i| format!("h/{i:02}")).collect();
+        let mut keys: Vec<String> = (0..5000).map(|i| format!("h/{i:04}")).collect();
         keys.push("v".into());
-        let lister = CountingLister {
-            keys,
-            calls: Default::default(),
-        };
+        let lister = counting(keys);
         let read = |effect: &str, res: &str| crate::iam::Permission {
             actions: vec!["read".into()],
             ..rule(effect, &[res])
         };
         let scope = scoped(vec![read("Allow", "b/*"), read("Deny", "b/h/*")]);
-        let err = list_page_for_caller(&lister, "b", "", None, 1, None, false, Some(&scope), 10)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ListingError::NoVisibleKeyInBudget), "{err:?}");
-        assert_eq!(lister.calls.load(std::sync::atomic::Ordering::SeqCst), 10);
-        let page = list_page_for_caller(&lister, "b", "", None, 1, None, false, Some(&scope), 11)
+        let got = list_page_for_caller(&lister, "b", "", None, 1, None, false, Some(&scope), 2)
             .await
             .unwrap();
-        assert_eq!(page.objects[0].0, "v");
+        assert!(got.page.objects.is_empty() && got.page.is_truncated);
+        assert!(got.hidden_cursor);
+        assert_eq!(got.page.next_continuation_token.as_deref(), Some("h/1999"));
+        assert_eq!(calls(&lister), 2);
+        let got = list_page_for_caller(&lister, "b", "", None, 1, None, false, Some(&scope), 6)
+            .await
+            .unwrap();
+        assert_eq!(got.page.objects[0].0, "v");
+        assert!(!got.page.is_truncated && !got.hidden_cursor);
+        assert_eq!(calls(&lister), 2 + 6);
+    }
+
+    /// What a client sees of one LIST answer: the key count and the
+    /// truncation flag (an error counts as its own shape).
+    async fn shape<L: Lister>(
+        lister: &L,
+        scope: &ListScope,
+        max_keys: u32,
+        start_after: &str,
+        budget: usize,
+    ) -> Option<(usize, bool)> {
+        list_page_for_caller(
+            lister,
+            "b",
+            "",
+            None,
+            max_keys,
+            Some(start_after),
+            false,
+            Some(scope),
+            budget,
+        )
+        .await
+        .ok()
+        .map(|p| p.page)
+        .map(|p| (p.objects.len() + p.common_prefixes.len(), p.is_truncated))
+    }
+
+    /// Every `start-after` an attacker bisects with: `h/` followed by one
+    /// to three characters of the key alphabet.
+    fn bisection_points() -> Vec<String> {
+        let alphabet: Vec<char> = "/0123456789".chars().collect();
+        let mut out = vec!["h/".to_string()];
+        for a in &alphabet {
+            out.push(format!("h/{a}"));
+            for b in &alphabet {
+                out.push(format!("h/{a}{b}"));
+                for c in &alphabet {
+                    out.push(format!("h/{a}{b}{c}"));
+                }
+            }
+        }
+        out
+    }
+
+    /// Oracle 1 (budget bisection): the budget error came after
+    /// `budget × (max_keys + 1)` hidden keys, so a bisection on
+    /// `start-after` found the hidden key where it started to fire. Below
+    /// the threshold (`budget × 1000` hidden keys) every `start-after`
+    /// inside the hidden run must give the same answer.
+    #[tokio::test]
+    async fn bisecting_start_after_on_the_scan_budget_gives_no_signal() {
+        let mut keys: Vec<String> = (0..3000).map(|i| format!("h/{i:04}")).collect();
+        keys.push("v".into());
+        let lister = counting(keys);
+        let read = |effect: &str, res: &str| crate::iam::Permission {
+            actions: vec!["read".into()],
+            ..rule(effect, &[res])
+        };
+        let scope = scoped(vec![read("Allow", "b/*"), read("Deny", "b/h/*")]);
+        let mut shapes = std::collections::BTreeMap::new();
+        for point in bisection_points() {
+            let s = shape(&lister, &scope, 1, &point, 10).await;
+            shapes.entry(s).or_insert_with(Vec::new).push(point);
+        }
+        assert_eq!(
+            shapes.keys().collect::<Vec<_>>(),
+            vec![&Some((1, false))],
+            "the answer depends on the hidden keys: {:?}",
+            shapes
+                .iter()
+                .map(|(s, p)| (s, p.first(), p.len()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Oracle 2 (page-size flip): a filtered page with one visible entry
+    /// was served short, so the key count of a page told how many hidden
+    /// keys sat in the engine window after `start-after`.
+    #[tokio::test]
+    async fn bisecting_start_after_on_the_page_size_gives_no_signal() {
+        let mut keys: Vec<String> = (0..10).map(|i| format!("h/{i:02}")).collect();
+        keys.extend(["v".to_string(), "w".to_string()]);
+        let lister = counting(keys);
+        let read = |effect: &str, res: &str| crate::iam::Permission {
+            actions: vec!["read".into()],
+            ..rule(effect, &[res])
+        };
+        let scope = scoped(vec![read("Allow", "b/*"), read("Deny", "b/h/*")]);
+        let mut shapes = std::collections::BTreeMap::new();
+        for point in bisection_points() {
+            let s = shape(&lister, &scope, 2, &point, 1000).await;
+            shapes.entry(s).or_insert_with(Vec::new).push(point);
+        }
+        assert_eq!(
+            shapes.keys().collect::<Vec<_>>(),
+            vec![&Some((2, false))],
+            "the answer depends on the hidden keys: {:?}",
+            shapes
+                .iter()
+                .map(|(s, p)| (s, p.first(), p.len()))
+                .collect::<Vec<_>>()
+        );
     }
 
     /// A lister whose entries all lack listing facts.
@@ -596,7 +783,8 @@ mod tests {
         let scope = scoped(vec![read("Allow", "b/*"), read("Deny", "b/h/*")]);
         let page = list_page_for_caller(&lister, "b", "", None, 10, None, false, Some(&scope), 10)
             .await
-            .unwrap();
+            .unwrap()
+            .page;
         assert_eq!(
             page.facts_missing_keys,
             vec!["v/1".to_string(), "v/2".to_string()]
@@ -683,7 +871,8 @@ mod tests {
             TEST_BUDGET,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .page;
         assert_eq!(p1.common_prefixes, vec!["d/a/".to_string()]);
         let p2 = list_page_for_caller(
             &engine,
@@ -698,7 +887,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            p2.expect("d/z/ must stay reachable").common_prefixes,
+            p2.expect("d/z/ must stay reachable").page.common_prefixes,
             vec!["d/z/".to_string()]
         );
     }
@@ -794,7 +983,8 @@ mod tests {
                 TEST_BUDGET,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .page;
             let mut entries: Vec<String> = page.objects.into_iter().map(|(k, _)| k).collect();
             entries.extend(page.common_prefixes);
             entries.sort();
@@ -849,13 +1039,14 @@ mod tests {
     }
 
     /// A bucket-wide Allow cannot be narrowed to prefixes: the budgeted scan
-    /// stays the fallback, and a run of hidden keys past the budget fails
-    /// the request instead of leaking a hidden key as the token.
+    /// stays the fallback. On the real engine, a run of hidden keys past the
+    /// budget gives an empty truncated page whose cursor is the scan
+    /// position (sealed by the S3 adapter), and that cursor reaches the
+    /// visible key behind the run.
     #[tokio::test]
     async fn bucket_wide_allow_with_a_large_deny_keeps_the_budget() {
-        // `max_keys=1` reads two entries per engine page.
-        let mut keys: Vec<String> = (0..=2 * TEST_BUDGET)
-            .map(|i| format!("h/{i:03}.png"))
+        let mut keys: Vec<String> = (0..=FILTERED_SCAN_PAGE_KEYS)
+            .map(|i| format!("h/{i:04}.png"))
             .collect();
         keys.push("v.png".into());
         let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
@@ -866,20 +1057,28 @@ mod tests {
             ..rule(effect, &[res])
         };
         let scope = scoped(vec![read("Allow", "b/*"), read("Deny", "b/h/*")]);
-        let err = list_page_for_caller(
+        let first = list_page_for_caller(&engine, "b", "", None, 1, None, false, Some(&scope), 1)
+            .await
+            .unwrap();
+        assert!(first.page.objects.is_empty() && first.page.is_truncated);
+        assert!(first.hidden_cursor);
+        let cursor = first.page.next_continuation_token.unwrap();
+        let next = list_page_for_caller(
             &engine,
             "b",
             "",
             None,
             1,
-            None,
+            Some(&cursor),
             false,
             Some(&scope),
-            TEST_BUDGET,
+            1,
         )
         .await
-        .unwrap_err();
-        assert!(matches!(err, ListingError::NoVisibleKeyInBudget), "{err:?}");
+        .unwrap();
+        let keys: Vec<&str> = next.page.objects.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["v.png"]);
+        assert!(!next.page.is_truncated);
     }
 
     /// The page budget is one per REQUEST, not one per visible prefix: a
@@ -889,13 +1088,9 @@ mod tests {
     /// hidden keys, so `b/` must not be read.
     #[tokio::test]
     async fn review3_one_page_budget_per_request() {
-        // `max_keys=1` reads two entries per engine page.
-        let mut keys: Vec<String> = (0..2 * TEST_BUDGET)
-            .map(|i| format!("a/{i:03}.png"))
-            .collect();
+        let mut keys: Vec<String> = (0..3000).map(|i| format!("a/{i:04}.png")).collect();
         keys.push("b/v.png".into());
-        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-        let (_dir, engine) = fs_engine(&refs).await;
+        let lister = counting(keys);
         let read = |effect: &str, res: &str| crate::iam::Permission {
             actions: vec!["read".into()],
             ..rule(effect, &[res])
@@ -905,23 +1100,15 @@ mod tests {
             read("Allow", "b/b/*"),
             read("Deny", "b/a/*"),
         ]);
-        let got = list_page_for_caller(
-            &engine,
-            "b",
-            "",
-            None,
-            1,
-            None,
-            false,
-            Some(&scope),
-            TEST_BUDGET,
-        )
-        .await;
+        let got = list_page_for_caller(&lister, "b", "", None, 1, None, false, Some(&scope), 2)
+            .await
+            .unwrap();
         assert!(
-            got.is_err(),
+            got.page.objects.is_empty() && got.hidden_cursor,
             "the request read past its page budget: {:?}",
-            got.map(|p| p.objects.into_iter().map(|(k, _)| k).collect::<Vec<_>>())
+            got.page.objects.iter().map(|(k, _)| k).collect::<Vec<_>>()
         );
+        assert_eq!(calls(&lister), 2);
     }
 
     fn perm(actions: &[&str], resources: &[&str]) -> crate::iam::Permission {
@@ -990,7 +1177,8 @@ mod tests {
             TEST_BUDGET,
         )
         .await
-        .expect("the listing must not fail on the write-only prefix");
+        .expect("the listing must not fail on the write-only prefix")
+        .page;
         assert_eq!(
             page.objects.first().map(|(k, _)| k.as_str()),
             Some("releases/a.png")
@@ -1025,7 +1213,7 @@ mod tests {
         let err = list_keys_for_caller(&lister, "b", "", Some(&scope), 5000, 2)
             .await
             .unwrap_err();
-        assert!(matches!(err, ListingError::NoVisibleKeyInBudget), "{err:?}");
+        assert!(matches!(err, ListingError::ScanBudgetSpent), "{err:?}");
         assert_eq!(calls(&lister), 2, "the budget is for the whole walk");
         let (keys, truncated) = list_keys_for_caller(&lister, "b", "", Some(&scope), 5000, 10)
             .await
@@ -1086,7 +1274,8 @@ mod tests {
                 50,
             )
             .await
-            .unwrap_or_else(|e| panic!("after {} keys at {cursor:?}: {e:?}", seen.len()));
+            .unwrap_or_else(|e| panic!("after {} keys at {cursor:?}: {e:?}", seen.len()))
+            .page;
             seen.extend(page.objects.into_iter().map(|(k, _)| k));
             if !page.is_truncated {
                 break;
@@ -1108,7 +1297,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((keys.len(), truncated), (1006, false));
-        assert_eq!(calls(&lister), 12);
+        // One engine page per prefix: the walk goes on from its scan
+        // position, so it reads no engine page twice.
+        assert_eq!(calls(&lister), 10);
     }
 
     #[test]
@@ -1146,16 +1337,16 @@ mod tests {
         use crate::usage_scanner::test_support::{fake_s3_engine, put_raw_many, scope_lists};
         let (engine, fake, endpoint) = fake_s3_engine().await;
         // Hidden keys whose first page probes for `h/a.delta`.
-        put_raw_many(&endpoint, (0..300).map(|i| format!("h/a-{i:04}"))).await;
+        put_raw_many(&endpoint, (0..5000).map(|i| format!("h/a-{i:04}"))).await;
         put_raw_many(&endpoint, ["v/x".to_string()]).await;
         let scope = scoped(vec![rule("Allow", &["b/*"]), rule("Deny", &["b/h/*"])]);
         fake.clear();
         let budget = 4;
-        let err =
+        let got =
             list_page_for_caller(&engine, "b", "", None, 1, None, false, Some(&scope), budget)
                 .await
-                .unwrap_err();
-        assert!(matches!(err, ListingError::NoVisibleKeyInBudget), "{err:?}");
+                .unwrap();
+        assert!(got.page.objects.is_empty() && got.hidden_cursor);
         let lists = scope_lists(&fake);
         eprintln!(
             "a budget of {budget}: {} backend LISTs: {lists:?}",
@@ -1192,7 +1383,8 @@ mod tests {
                 50,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .page;
             per_page.push(crate::usage_scanner::test_support::scope_lists(fake).len());
             entries += page.objects.len();
             if !page.is_truncated {
@@ -1203,12 +1395,18 @@ mod tests {
         panic!("listing did not end");
     }
 
-    /// A filtered scan serves a short page, like the unfiltered listing: it
-    /// read a second backend page to fill the client page, and the next
-    /// client page then read that backend page again. 2,500 keys cost 6
-    /// backend LISTs filtered and 4 unfiltered.
+    /// The cost of a filtered page (review 2d). A filtered page is exact:
+    /// it holds `max_keys` visible entries whenever that many exist, so its
+    /// size never tells how many hidden keys sat in an engine window. To
+    /// know that the page is truncated, the scan must see one visible
+    /// entry past it, so a full page of 1000 reads one more engine page of
+    /// 1000 keys, and the next page reads that engine page again. Before,
+    /// a filtered page was served short to save that read, and the short
+    /// page was the oracle. 2,500 visible keys cost 6 backend LISTs
+    /// filtered and 4 unfiltered, in the same 3 client pages: at most one
+    /// more engine page (a LIST, and maybe a probe) per truncated page.
     #[tokio::test]
-    async fn a_filtered_scan_costs_what_the_unfiltered_listing_costs() {
+    async fn a_filtered_scan_costs_one_engine_page_more_per_truncated_page() {
         use crate::usage_scanner::test_support::{fake_s3_engine, put_raw_many};
         let (engine, fake, endpoint) = fake_s3_engine().await;
         put_raw_many(&endpoint, (0..2500).map(|i| format!("rel/img-{i:05}.jpg"))).await;
@@ -1218,19 +1416,20 @@ mod tests {
         let (filtered, n_filtered) =
             walk_counting_lists(&engine, &fake, "rel/", Some(&scope)).await;
         assert_eq!((n_plain, n_filtered), (2500, 2500));
-        assert_eq!(
-            filtered.iter().sum::<usize>(),
-            plain.iter().sum::<usize>(),
+        assert_eq!(filtered.len(), plain.len(), "the same client pages");
+        let truncated_pages = filtered.len() - 1;
+        assert!(
+            filtered.iter().sum::<usize>() <= plain.iter().sum::<usize>() + 2 * truncated_pages,
             "backend LISTs per page: filtered {filtered:?}, unfiltered {plain:?}"
         );
     }
 
     /// Hidden keys interleaved with visible ones, around every page
-    /// boundary: each page is short or full, never empty while truncated,
-    /// its token is the last visible key it shows, and the walk returns
-    /// exactly the visible keys.
+    /// boundary: each truncated page is FULL (review 2d: a short page told
+    /// how many hidden keys followed `start-after`), its token is the last
+    /// visible key it shows, and the walk returns exactly the visible keys.
     #[tokio::test]
-    async fn short_filtered_pages_never_anchor_on_a_hidden_key() {
+    async fn filtered_pages_are_exact_and_never_anchor_on_a_hidden_key() {
         // Hidden `a/1/` between visible `a/0/` and `a/2/`, and so on: the
         // lister serves keys in this (sorted) order.
         let keys: Vec<String> = (0..40)
@@ -1250,7 +1449,7 @@ mod tests {
             let mut got = Vec::new();
             let mut token: Option<String> = None;
             for _ in 0..200 {
-                let page = list_page_for_caller(
+                let listed = list_page_for_caller(
                     &lister,
                     "b",
                     "",
@@ -1263,11 +1462,14 @@ mod tests {
                 )
                 .await
                 .unwrap();
+                assert!(!listed.hidden_cursor);
+                let page = listed.page;
                 let shown: Vec<String> = page.objects.into_iter().map(|(k, _)| k).collect();
-                assert!(shown.len() <= max_keys as usize);
                 if page.is_truncated {
-                    assert!(!shown.is_empty(), "an empty truncated page");
+                    assert_eq!(shown.len(), max_keys as usize, "a short truncated page");
                     assert_eq!(page.next_continuation_token.as_ref(), shown.last());
+                } else {
+                    assert!(shown.len() <= max_keys as usize);
                 }
                 got.extend(shown);
                 if !page.is_truncated {
@@ -1276,6 +1478,66 @@ mod tests {
                 token = page.next_continuation_token;
             }
             assert_eq!(got, visible, "max_keys={max_keys}");
+        }
+    }
+
+    /// Clients loop on `IsTruncated` and the token: past runs of hidden
+    /// keys longer than the budget, every token moves forward and the
+    /// listing ends with exactly the visible keys, whatever `max_keys` is.
+    #[tokio::test]
+    async fn a_filtered_listing_past_the_budget_always_moves_forward_and_ends() {
+        let mut keys: Vec<String> = vec!["a".into(), "m".into(), "z".into()];
+        keys.extend((0..2500).map(|i| format!("h/{i:04}")));
+        keys.extend((0..1500).map(|i| format!("n/{i:04}")));
+        keys.sort();
+        let lister = counting(keys);
+        let read = |effect: &str, res: &str| crate::iam::Permission {
+            actions: vec!["read".into()],
+            ..rule(effect, &[res])
+        };
+        let scope = scoped(vec![
+            read("Allow", "b/*"),
+            read("Deny", "b/h/*"),
+            read("Deny", "b/n/*"),
+        ]);
+        for max_keys in [1, 2, 1000] {
+            for budget in [0, 1, 2] {
+                let mut got = Vec::new();
+                let mut token: Option<String> = None;
+                let mut sealed_pages = 0;
+                for round in 0.. {
+                    assert!(round < 100, "the listing did not end");
+                    let listed = list_page_for_caller(
+                        &lister,
+                        "b",
+                        "",
+                        None,
+                        max_keys,
+                        token.as_deref(),
+                        false,
+                        Some(&scope),
+                        budget,
+                    )
+                    .await
+                    .unwrap();
+                    sealed_pages += usize::from(listed.hidden_cursor);
+                    let page = listed.page;
+                    got.extend(page.objects.into_iter().map(|(k, _)| k));
+                    if !page.is_truncated {
+                        break;
+                    }
+                    let next = page
+                        .next_continuation_token
+                        .expect("a truncated page has a token");
+                    assert!(
+                        token.as_deref().is_none_or(|t| next.as_str() > t),
+                        "the token did not move: {token:?} -> {next:?}"
+                    );
+                    token = Some(next);
+                }
+                assert_eq!(got, ["a", "m", "z"], "max_keys={max_keys} budget={budget}");
+                assert!(sealed_pages > 0, "max_keys={max_keys} budget={budget}");
+            }
         }
     }
 
@@ -1294,7 +1556,8 @@ mod tests {
         fake.clear();
         let page = list_page_for_caller(&engine, "b", "", None, 2, None, true, Some(&scope), 64)
             .await
-            .unwrap();
+            .unwrap()
+            .page;
         let keys: Vec<&str> = page.objects.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, ["v/0.zip", "v/1.zip"]);
         assert!(

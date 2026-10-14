@@ -86,20 +86,29 @@ pub(super) async fn list_objects(
     let input = req.input;
     let max_keys = client_max_keys(input.max_keys)?;
     let enc = ListKeyEncoding::of(input.encoding_type.as_ref());
-    let page = client_list_page(
+    let binding = list_token::TokenBinding {
+        bucket: &input.bucket,
+        prefix: input.prefix.as_deref().unwrap_or(""),
+        delimiter: input.delimiter.as_deref(),
+    };
+    let marker = v1_marker_cursor(input.marker.as_deref(), binding)?;
+    let listed = client_list_page(
         &svc.state.engine.load(),
         &input.bucket,
-        input.prefix.as_deref().unwrap_or(""),
+        binding.prefix,
         input.delimiter.as_deref(),
         max_keys,
-        list_cursor(input.marker.as_deref(), None),
+        list_cursor(marker.as_deref(), None),
         false,
         list_scope.as_ref(),
         svc.list_budget().await,
     )
     .await?;
-    let next_marker = page.next_continuation_token.clone();
-    let is_truncated = page.next_continuation_token.is_some();
+    // V1 clients send back NextMarker (or, without one, their last <Key>):
+    // a visible entry goes in clear, a scan position only sealed.
+    let next_marker = client_token(&listed, binding, |key| key.to_string());
+    let page = listed.page;
+    let is_truncated = next_marker.is_some();
     let contents: Vec<s3s::dto::Object> = page
         .objects
         .iter()
@@ -147,21 +156,26 @@ pub(super) async fn list_objects_v2(
     let include_metadata = query_flag(&req.uri, "metadata", "true");
     let input = req.input;
     let max_keys = client_max_keys(input.max_keys)?;
-    let page = client_list_page(
+    let binding = list_token::TokenBinding {
+        bucket: &input.bucket,
+        prefix: input.prefix.as_deref().unwrap_or(""),
+        delimiter: input.delimiter.as_deref(),
+    };
+    let token_cursor = v2_cursor(input.continuation_token.as_deref(), binding)?;
+    let listed = client_list_page(
         &svc.state.engine.load(),
         &input.bucket,
-        input.prefix.as_deref().unwrap_or(""),
+        binding.prefix,
         input.delimiter.as_deref(),
         max_keys,
-        list_cursor(
-            v2_cursor(&input.bucket, input.continuation_token.as_deref()).as_deref(),
-            input.start_after.as_deref(),
-        ),
+        list_cursor(token_cursor.as_deref(), input.start_after.as_deref()),
         include_metadata,
         list_scope.as_ref(),
         svc.list_budget().await,
     )
     .await?;
+    let next_token = client_token(&listed, binding, encode_v2_token);
+    let page = listed.page;
     let enc = ListKeyEncoding::of(input.encoding_type.as_ref());
     let metadata_ext = include_metadata.then(|| {
         ListMetadataXmlExtensions(
@@ -175,7 +189,9 @@ pub(super) async fn list_objects_v2(
         )
     });
     let facts_misses = page.facts_missing_keys.len();
-    let mut resp = s3s::S3Response::new(list_objects_v2_output_from_page(&input, max_keys, page)?);
+    let mut resp = s3s::S3Response::new(list_objects_v2_output_from_page(
+        &input, max_keys, page, next_token,
+    )?);
     add_listing_debug_headers(svc, &mut resp.headers, facts_misses);
     if let Some(metadata_ext) = metadata_ext {
         resp.extensions.insert(metadata_ext);
@@ -228,6 +244,23 @@ pub(super) fn decode_v2_token(token: Option<&str>) -> Option<V2Cursor> {
     })
 }
 
+/// Pure: the client token for the next page of `listed`, if any. The last
+/// entry of the page (the caller saw it) goes through `visible`; a scan
+/// position where the filtered scan budget ran out can name a hidden key,
+/// so it goes out sealed.
+pub(super) fn client_token(
+    listed: &crate::iam::listing::CallerPage,
+    binding: list_token::TokenBinding<'_>,
+    visible: impl Fn(&str) -> String,
+) -> Option<String> {
+    let cursor = listed.page.next_continuation_token.as_deref()?;
+    Some(if listed.hidden_cursor {
+        list_token::seal(cursor, binding)
+    } else {
+        visible(cursor)
+    })
+}
+
 /// ListObjectsV2 requests whose continuation token took the raw-key
 /// fallback. When it stays at zero, a later release can refuse such tokens.
 pub static LEGACY_V2_TOKENS: std::sync::LazyLock<prometheus::IntCounter> =
@@ -239,18 +272,46 @@ pub static LEGACY_V2_TOKENS: std::sync::LazyLock<prometheus::IntCounter> =
         .expect("valid metric")
     });
 
-/// [`decode_v2_token`], with a log line and a count for the fallback.
-pub(super) fn v2_cursor(bucket: &str, token: Option<&str>) -> Option<String> {
-    let cursor = decode_v2_token(token)?;
+/// The engine cursor of a V2 continuation token. A sealed token (`dg2.`)
+/// must open for this listing, else `InvalidArgument`: it never falls back
+/// to another start. Otherwise [`decode_v2_token`], with a log line and a
+/// count for the raw-key fallback.
+pub(super) fn v2_cursor(
+    token: Option<&str>,
+    binding: list_token::TokenBinding<'_>,
+) -> s3s::S3Result<Option<String>> {
+    let Some(token) = token else {
+        return Ok(None);
+    };
+    if token.starts_with(list_token::SEALED_TOKEN_PREFIX) {
+        return list_token::open(token, binding).map(Some);
+    }
+    let Some(cursor) = decode_v2_token(Some(token)) else {
+        return Ok(None);
+    };
     if cursor.legacy {
         LEGACY_V2_TOKENS.inc();
         tracing::info!(
-            bucket,
+            bucket = binding.bucket,
             "ListObjectsV2 continuation token in the old raw-key form (not `{V2_TOKEN_PREFIX}`); \
              accepted in this release only"
         );
     }
-    Some(cursor.key)
+    Ok(Some(cursor.key))
+}
+
+/// The engine cursor of a V1 `marker`. A marker is a key, except one with
+/// the shape of a sealed token (the NextMarker of a page where the filtered
+/// scan budget ran out): that one must open for this listing, else
+/// `InvalidArgument`.
+pub(super) fn v1_marker_cursor(
+    marker: Option<&str>,
+    binding: list_token::TokenBinding<'_>,
+) -> s3s::S3Result<Option<String>> {
+    match marker {
+        Some(m) if list_token::looks_sealed(m) => list_token::open(m, binding).map(Some),
+        other => Ok(other.map(str::to_string)),
+    }
 }
 
 /// The engine cursor for a LIST. S3 rule: a continuation token wins, and
@@ -338,32 +399,28 @@ pub(super) async fn client_list_page(
     metadata: bool,
     scope: Option<&ListScope>,
     budget: usize,
-) -> s3s::S3Result<crate::deltaglider::ListObjectsPage> {
+) -> s3s::S3Result<crate::iam::listing::CallerPage> {
     if max_keys == 0 {
         ensure_listed_bucket(engine, bucket).await?;
-        return Ok(crate::deltaglider::ListObjectsPage {
-            objects: Vec::new(),
-            common_prefixes: Vec::new(),
-            is_truncated: false,
-            next_continuation_token: None,
-            facts_missing_keys: Vec::new(),
+        return Ok(crate::iam::listing::CallerPage {
+            page: crate::deltaglider::ListObjectsPage {
+                objects: Vec::new(),
+                common_prefixes: Vec::new(),
+                is_truncated: false,
+                next_continuation_token: None,
+                facts_missing_keys: Vec::new(),
+            },
+            hidden_cursor: false,
         });
     }
-    let page = crate::iam::listing::list_page_for_caller(
+    let listed = crate::iam::listing::list_page_for_caller(
         &**engine, bucket, prefix, delimiter, max_keys, cursor, metadata, scope, budget,
     )
-    .await
-    .map_err(|e| match e {
-        crate::iam::listing::ListingError::NoVisibleKeyInBudget => s3s::s3_error!(
-            InvalidRequest,
-            "no visible key within the listing scan budget; use a narrower prefix"
-        ),
-        crate::iam::listing::ListingError::Engine(e) => s3s::S3Error::from(e),
-    })?;
-    if page.objects.is_empty() && page.common_prefixes.is_empty() {
+    .await?;
+    if listed.page.objects.is_empty() && listed.page.common_prefixes.is_empty() {
         ensure_listed_bucket(engine, bucket).await?;
     }
-    Ok(page)
+    Ok(listed)
 }
 
 /// The bucket check of a LIST that finds nothing: the write paths' cached
@@ -405,6 +462,7 @@ pub(super) fn list_objects_v2_output_from_page(
     input: &s3s::dto::ListObjectsV2Input,
     max_keys: u32,
     page: crate::deltaglider::ListObjectsPage,
+    next_token: Option<String>,
 ) -> s3s::S3Result<s3s::dto::ListObjectsV2Output> {
     let enc = ListKeyEncoding::of(input.encoding_type.as_ref());
     let contents: s3s::dto::ObjectList = page
@@ -428,7 +486,7 @@ pub(super) fn list_objects_v2_output_from_page(
         key_count: Some(i32::try_from(key_count).unwrap_or(i32::MAX)),
         continuation_token: input.continuation_token.clone(),
         is_truncated: Some(page.is_truncated),
-        next_continuation_token: page.next_continuation_token.as_deref().map(encode_v2_token),
+        next_continuation_token: next_token,
         contents: Some(contents),
         common_prefixes: Some(common_prefixes),
         encoding_type: input.encoding_type.clone(),

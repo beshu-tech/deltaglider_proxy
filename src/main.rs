@@ -737,6 +737,9 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let db_keys = resolve_config_db_keys_or_exit(&config, &admin_password_hash);
     // Config versions (ETags) keyed from the DB key: stable across restarts.
     deltaglider_proxy::api::admin::install_config_version_key(db_keys.primary.expose());
+    // LIST continuation tokens that carry a scan position are sealed with a
+    // key derived from the DB key, so every node that shares it opens them.
+    deltaglider_proxy::s3_adapter_s3s::install_list_token_keys(&db_keys);
     let (config_db, config_db_mismatch) = init_config_db(&db_keys, &iam_state, &config);
     // The node-local job state, in its own unsynced file next to the config DB.
     let jobs_db = init_jobs_db(&db_keys, &config_db, config_db_mismatch, &config);

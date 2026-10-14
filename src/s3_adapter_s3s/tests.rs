@@ -127,10 +127,121 @@ fn the_raw_token_fallback_is_counted() {
     let counter = &*super::list::LEGACY_V2_TOKENS;
     let before = counter.get();
     assert_eq!(
-        super::list::v2_cursor("b", Some("p/a.txt")).as_deref(),
+        super::list::v2_cursor(Some("p/a.txt"), BINDING)
+            .unwrap()
+            .as_deref(),
         Some("p/a.txt")
     );
     assert!(counter.get() > before, "the fallback must be counted");
+}
+
+const BINDING: super::list_token::TokenBinding<'static> = super::list_token::TokenBinding {
+    bucket: "b",
+    prefix: "",
+    delimiter: None,
+};
+
+/// Review 2d: a scan position leaves the proxy sealed. It opens only for
+/// its own listing; a changed or foreign token is `InvalidArgument`, never
+/// a restart from somewhere else. The `dg1.` tokens of the previous release
+/// (a visible key in clear) still work.
+#[test]
+fn v2_tokens_open_sealed_positions_and_refuse_bad_ones() {
+    use super::list_token::{seal, seal_with, TokenBinding};
+    let sealed = seal("h/10", BINDING);
+    assert_eq!(
+        super::list::v2_cursor(Some(&sealed), BINDING).unwrap(),
+        Some("h/10".to_string())
+    );
+    let code = |r: s3s::S3Result<Option<String>>| r.unwrap_err().code().as_str().to_string();
+    let mut changed = sealed.clone().into_bytes();
+    let last = changed.len() - 1;
+    changed[last] = if changed[last] == b'A' { b'B' } else { b'A' };
+    let changed = String::from_utf8(changed).unwrap();
+    assert_eq!(
+        code(super::list::v2_cursor(Some(&changed), BINDING)),
+        "InvalidArgument"
+    );
+    let foreign = seal_with(&[7u8; 32], "h/10", BINDING);
+    assert_eq!(
+        code(super::list::v2_cursor(Some(&foreign), BINDING)),
+        "InvalidArgument"
+    );
+    let other = TokenBinding {
+        prefix: "h/",
+        ..BINDING
+    };
+    assert_eq!(
+        code(super::list::v2_cursor(Some(&sealed), other)),
+        "InvalidArgument"
+    );
+    assert_eq!(
+        code(super::list::v2_cursor(Some("dg2.!!"), BINDING)),
+        "InvalidArgument"
+    );
+    // The previous release's token form.
+    assert_eq!(
+        super::list::v2_cursor(Some(&encode_v2_token("v/1")), BINDING).unwrap(),
+        Some("v/1".to_string())
+    );
+}
+
+/// A V1 `marker` is a key; only one with the shape of a sealed token (a
+/// NextMarker where the scan budget ran out) must open.
+#[test]
+fn v1_markers_open_sealed_positions_and_keep_plain_keys() {
+    use super::list::v1_marker_cursor;
+    use super::list_token::{seal, seal_with};
+    assert_eq!(v1_marker_cursor(None, BINDING).unwrap(), None);
+    for key in ["v/1", "dg2.", "dg2.!!", "dg1.abc"] {
+        assert_eq!(
+            v1_marker_cursor(Some(key), BINDING).unwrap().as_deref(),
+            Some(key)
+        );
+    }
+    let sealed = seal("h/10", BINDING);
+    assert_eq!(
+        v1_marker_cursor(Some(&sealed), BINDING).unwrap().as_deref(),
+        Some("h/10")
+    );
+    let foreign = seal_with(&[7u8; 32], "h/10", BINDING);
+    assert_eq!(
+        v1_marker_cursor(Some(&foreign), BINDING)
+            .unwrap_err()
+            .code()
+            .as_str(),
+        "InvalidArgument"
+    );
+}
+
+/// The token of a page: its last entry in clear (`dg1.` for V2, the raw
+/// key for V1), or the sealed scan position when the budget ran out.
+#[test]
+fn a_hidden_cursor_leaves_only_sealed() {
+    let listed = |token: &str, hidden: bool| crate::iam::listing::CallerPage {
+        page: crate::deltaglider::ListObjectsPage {
+            objects: Vec::new(),
+            common_prefixes: Vec::new(),
+            is_truncated: true,
+            next_continuation_token: Some(token.to_string()),
+            facts_missing_keys: Vec::new(),
+        },
+        hidden_cursor: hidden,
+    };
+    let v2 = super::list::client_token(&listed("v/1", false), BINDING, encode_v2_token);
+    assert_eq!(v2, Some(encode_v2_token("v/1")));
+    let v1 = super::list::client_token(&listed("v/1", false), BINDING, |k| k.to_string());
+    assert_eq!(v1.as_deref(), Some("v/1"));
+    for visible in [encode_v2_token, |k: &str| k.to_string()] {
+        let t = super::list::client_token(&listed("h/10", true), BINDING, visible).unwrap();
+        assert!(t.starts_with("dg2.") && !t.contains("h/10"), "{t}");
+        assert_eq!(
+            super::list::v2_cursor(Some(&t), BINDING)
+                .unwrap()
+                .as_deref(),
+            Some("h/10")
+        );
+    }
 }
 
 #[test]
@@ -373,7 +484,8 @@ fn list_output_maps_objects_and_common_prefixes() {
         facts_missing_keys: Vec::new(),
     };
 
-    let out = list_objects_v2_output_from_page(&input, 100, page).unwrap();
+    let out = list_objects_v2_output_from_page(&input, 100, page, Some(encode_v2_token("p/a.txt")))
+        .unwrap();
     assert_eq!(out.name.as_deref(), Some("bucket"));
     assert_eq!(out.key_count, Some(2));
     assert_eq!(out.is_truncated, Some(true));

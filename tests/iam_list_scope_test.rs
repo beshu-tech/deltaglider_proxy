@@ -652,20 +652,26 @@ async fn review3_a_bucket_wide_allow_with_a_deny_carve_out_hides_the_denied_keys
 /// and return a client whose policy (bucket-wide Allow, Deny on `h/*`) the
 /// proxy cannot narrow to prefixes, so a LIST scans the hidden keys.
 async fn scan_budget_client(h: &ScopeHarness, hidden: usize) -> aws_sdk_s3::Client {
+    use futures::StreamExt as _;
     let admin = h.admin_client().await;
     let _ = admin.create_bucket().bucket("scan").send().await;
     let mut keys: Vec<String> = (0..hidden).map(|i| format!("h/{i:04}.txt")).collect();
     keys.push("v.txt".into());
-    for key in &keys {
-        admin
-            .put_object()
-            .bucket("scan")
-            .key(key)
-            .body(ByteStream::from(b"d".to_vec()))
-            .send()
-            .await
-            .expect("seed");
-    }
+    futures::stream::iter(keys)
+        .for_each_concurrent(16, |key| {
+            let admin = admin.clone();
+            async move {
+                admin
+                    .put_object()
+                    .bucket("scan")
+                    .key(&key)
+                    .body(ByteStream::from(b"d".to_vec()))
+                    .send()
+                    .await
+                    .expect("seed");
+            }
+        })
+        .await;
     let (key, secret) = h
         .create_user(
             "scanner",
@@ -678,49 +684,130 @@ async fn scan_budget_client(h: &ScopeHarness, hidden: usize) -> aws_sdk_s3::Clie
     h.user_client(&key, &secret).await
 }
 
-/// s3surface-11: the filtered-LIST scan budget of the PRODUCTION binary
-/// (default 50 engine pages, `advanced.filtered_list_max_engine_pages`).
-/// `max-keys=1` reads two entries per engine page, so 110 hidden keys need
-/// 55 pages: past the default budget the request fails with the "narrow the
-/// prefix" 400 instead of scanning on (the old budget was 10,000 pages).
+/// Review 2d: the scan reads engine pages of 1000 keys, whatever
+/// `max-keys` is, so the default budget (50) reads about 50,000 keys. A
+/// `max-keys=1` LIST behind 110 hidden keys failed with "use a narrower
+/// prefix" (two keys per engine page), and the point where it started to
+/// fail told a bisection on `start-after` where the hidden keys were.
 #[tokio::test]
-async fn filtered_list_stops_at_the_default_page_budget() {
+async fn filtered_list_reads_engine_pages_of_1000_keys() {
     let h = ScopeHarness::setup().await;
     let user = scan_budget_client(&h, 110).await;
+    for start_after in [None, Some("h/"), Some("h/0050"), Some("h/0109.txt")] {
+        let page = user
+            .list_objects_v2()
+            .bucket("scan")
+            .max_keys(1)
+            .set_start_after(start_after.map(str::to_string))
+            .send()
+            .await
+            .expect("the visible key is inside the budget");
+        let keys: Vec<&str> = page.contents().iter().filter_map(|o| o.key()).collect();
+        assert_eq!(keys, vec!["v.txt"], "start-after {start_after:?}");
+        assert_eq!(page.is_truncated(), Some(false));
+    }
+}
+
+/// Review 2d: when the budget runs out inside a run of hidden keys, the
+/// page is empty and truncated, and its token is the scan position SEALED:
+/// the client cannot read the hidden key in it, a changed token is refused
+/// with `InvalidArgument`, and the token reaches the visible key behind
+/// the run. V1 carries the same sealed cursor in `NextMarker`. The budget
+/// is a config field (here 1 engine page, by its env var).
+#[tokio::test]
+async fn filtered_list_past_the_budget_answers_a_sealed_token() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .env("DGP_FILTERED_LIST_MAX_ENGINE_PAGES", "1")
+        .build()
+        .await;
+    let h = ScopeHarness::with_server(server).await;
+    let user = scan_budget_client(&h, 1001).await;
+
+    // V2.
+    let first = user
+        .list_objects_v2()
+        .bucket("scan")
+        .max_keys(1)
+        .send()
+        .await
+        .expect("an empty truncated page, not an error");
+    assert!(first.contents().is_empty());
+    assert_eq!(first.is_truncated(), Some(true));
+    let token = first
+        .next_continuation_token()
+        .expect("a token")
+        .to_string();
+    assert!(
+        token.starts_with("dg2.") && !token.contains("h/"),
+        "{token}"
+    );
+    let next = user
+        .list_objects_v2()
+        .bucket("scan")
+        .max_keys(1)
+        .continuation_token(&token)
+        .send()
+        .await
+        .expect("the sealed token opens");
+    let keys: Vec<&str> = next.contents().iter().filter_map(|o| o.key()).collect();
+    assert_eq!(keys, vec!["v.txt"]);
+    assert_eq!(next.is_truncated(), Some(false));
+    let mut changed = token.clone().into_bytes();
+    let last = changed.len() - 1;
+    changed[last] = if changed[last] == b'A' { b'B' } else { b'A' };
     let err = user
         .list_objects_v2()
         .bucket("scan")
         .max_keys(1)
+        .continuation_token(String::from_utf8(changed).unwrap())
         .send()
         .await
-        .expect_err("the scan must stop at 50 engine pages");
+        .expect_err("a changed token must not open");
     let code = err
         .as_service_error()
         .and_then(|e| aws_sdk_s3::error::ProvideErrorMetadata::code(e))
         .map(str::to_string);
-    assert_eq!(code.as_deref(), Some("InvalidRequest"), "{err:?}");
-}
-
-/// The budget is a config field: raised by its env var, the same listing
-/// reaches the visible key.
-#[tokio::test]
-async fn filtered_list_budget_follows_the_config() {
-    let server = TestServer::builder()
-        .auth("bootstrap_key", "bootstrap_secret")
-        .env("DGP_FILTERED_LIST_MAX_ENGINE_PAGES", "100")
-        .build()
-        .await;
-    let h = ScopeHarness::with_server(server).await;
-    let user = scan_budget_client(&h, 110).await;
-    let page = user
+    assert_eq!(code.as_deref(), Some("InvalidArgument"), "{err:?}");
+    // The token belongs to its listing: another prefix refuses it.
+    let err = user
         .list_objects_v2()
+        .bucket("scan")
+        .prefix("v")
+        .continuation_token(&token)
+        .send()
+        .await
+        .expect_err("a token of another listing must not open");
+    let code = err
+        .as_service_error()
+        .and_then(|e| aws_sdk_s3::error::ProvideErrorMetadata::code(e))
+        .map(str::to_string);
+    assert_eq!(code.as_deref(), Some("InvalidArgument"), "{err:?}");
+
+    // V1: NextMarker carries the sealed cursor, and sending it back as
+    // `marker` goes on from it.
+    let first = user
+        .list_objects()
         .bucket("scan")
         .max_keys(1)
         .send()
         .await
-        .expect("a budget of 100 pages reaches v.txt");
-    let keys: Vec<&str> = page.contents().iter().filter_map(|o| o.key()).collect();
+        .expect("V1 page");
+    assert!(first.contents().is_empty());
+    assert_eq!(first.is_truncated(), Some(true));
+    let marker = first.next_marker().expect("NextMarker").to_string();
+    assert!(marker.starts_with("dg2."), "{marker}");
+    let next = user
+        .list_objects()
+        .bucket("scan")
+        .max_keys(1)
+        .marker(&marker)
+        .send()
+        .await
+        .expect("the sealed marker opens");
+    let keys: Vec<&str> = next.contents().iter().filter_map(|o| o.key()).collect();
     assert_eq!(keys, vec!["v.txt"]);
+    assert_eq!(next.is_truncated(), Some(false));
 }
 
 /// B026: ListMultipartUploads is a bucket-level LIST. Under a Filtered scope
