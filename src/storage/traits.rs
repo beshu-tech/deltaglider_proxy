@@ -391,6 +391,47 @@ pub enum StorageError {
     Other(String),
 }
 
+impl StorageError {
+    /// A second error of the same variant and text, for an error that one
+    /// single flight hands to each of its waiters (`crate::single_flight`).
+    /// An I/O error keeps its OS error code (or its kind) and text; a JSON
+    /// error keeps its text. The match is exhaustive, so a new variant must
+    /// say how it is copied.
+    pub(crate) fn duplicate(&self) -> Self {
+        use StorageError as E;
+        match self {
+            E::NotFound(s) => E::NotFound(s.clone()),
+            E::AlreadyExists(s) => E::AlreadyExists(s.clone()),
+            E::Io(e) => E::Io(match e.raw_os_error() {
+                Some(code) => std::io::Error::from_raw_os_error(code),
+                None => std::io::Error::new(e.kind(), e.to_string()),
+            }),
+            E::DiskFull => E::DiskFull,
+            E::Serialization(e) => E::Serialization(serde::de::Error::custom(e.to_string())),
+            E::TooLarge { size, max } => E::TooLarge {
+                size: *size,
+                max: *max,
+            },
+            E::S3(s) => E::S3(s.clone()),
+            E::AccessDenied(s) => E::AccessDenied(s.clone()),
+            E::BucketNotFound(s) => E::BucketNotFound(s.clone()),
+            E::Encryption(s) => E::Encryption(s.clone()),
+            E::BucketNotEmpty(s) => E::BucketNotEmpty(s.clone()),
+            E::Throttled(s) => E::Throttled(s.clone()),
+            E::InvalidKey(s) => E::InvalidKey(s.clone()),
+            E::KeyTooLong(s) => E::KeyTooLong(s.clone()),
+            E::MetadataTooLarge(s) => E::MetadataTooLarge(s.clone()),
+            E::Unavailable(s) => E::Unavailable(s.clone()),
+            E::Transient(s) => E::Transient(s.clone()),
+            E::Contended(s) => E::Contended(s.clone()),
+            E::PreconditionFailed(s) => E::PreconditionFailed(s.clone()),
+            E::QuotaExceeded(s) => E::QuotaExceeded(s.clone()),
+            E::InvalidRange(s) => E::InvalidRange(s.clone()),
+            E::Other(s) => E::Other(s.clone()),
+        }
+    }
+}
+
 /// `reference_fence` of a backend that does not fence: existence only.
 pub async fn unfenced_reference_fence<B: StorageBackend + ?Sized>(
     backend: &B,

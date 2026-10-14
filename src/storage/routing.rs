@@ -95,9 +95,6 @@ fn alias_owns_real_bucket(
 /// within `RESOLVE_TTL` (found) or `MISS_TTL` (absent). A config apply
 /// that changes routes or backends builds a new `RoutingBackend`, so a new
 /// `Resolver` with empty caches.
-/// One cold resolution's probe, shared by its participants.
-type Flight = Arc<tokio::sync::OnceCell<(String, Probed)>>;
-
 struct Resolver {
     backends: HashMap<String, Arc<Box<DynStorageBackend<'static>>>>,
     routes: HashMap<String, BucketRoute>,
@@ -112,9 +109,8 @@ struct Resolver {
     /// that no backend holds does not send a HeadBucket to each backend
     /// every time. Cleared on create/delete bucket.
     missed: parking_lot::Mutex<HashMap<String, std::time::Instant>>,
-    /// Unrouted bucket → the probe its cold resolution waits for. The entry
-    /// goes when a participant of that probe ends, however it ends.
-    flights: parking_lot::Mutex<HashMap<String, Flight>>,
+    /// Unrouted bucket → the probe its cold resolution waits for.
+    flights: crate::single_flight::SingleFlight<String, (String, Probed)>,
     /// Buckets whose stale resolution a background probe is refreshing:
     /// one refresher per bucket.
     refreshing: Arc<parking_lot::Mutex<HashSet<String>>>,
@@ -239,28 +235,10 @@ impl Resolver {
     /// request arriving while it runs shares. Its participants all get the
     /// probe's answer, so a failing backend costs one probe per flight, not
     /// one per waiting request in turn. A cancelled first participant hands
-    /// the probe to the next (`OnceCell`).
+    /// the probe to the next (`crate::single_flight`).
     async fn probe_once(&self, virtual_bucket: &str) -> (String, Probed) {
-        let flight = self
-            .flights
-            .lock()
-            .entry(virtual_bucket.to_string())
-            .or_default()
-            .clone();
-        /// Removes this flight's entry however the participant ends, so a
-        /// cancelled request leaves nothing behind.
-        struct EndFlight<'r>(&'r Resolver, &'r str, Flight);
-        impl Drop for EndFlight<'_> {
-            fn drop(&mut self) {
-                let mut map = self.0.flights.lock();
-                if map.get(self.1).is_some_and(|f| Arc::ptr_eq(f, &self.2)) {
-                    map.remove(self.1);
-                }
-            }
-        }
-        let end = EndFlight(self, virtual_bucket, flight);
-        end.2
-            .get_or_init(|| async {
+        self.flights
+            .run(virtual_bucket.to_string(), || async {
                 // A flight that ended just before this one may have answered.
                 match self.cached(virtual_bucket) {
                     Some(hit) => hit,
@@ -268,7 +246,6 @@ impl Resolver {
                 }
             })
             .await
-            .clone()
     }
 
     /// Resolve an unrouted bucket: the cached answer, a stale one (and a
@@ -3261,7 +3238,7 @@ mod tests {
             futures::future::join_all((0..8).map(|_| routing.resolve_existing_named("b"))).await;
         assert!(all.iter().all(|(name, _, _)| name == "primary"));
         assert_eq!(bucket_heads(&fake), 1, "{:?}", fake.requests());
-        assert!(routing.resolver.flights.lock().is_empty());
+        assert!(routing.resolver.flights.is_idle());
     }
 
     /// A request cancelled during the probe leaves no flight behind.
@@ -3273,7 +3250,7 @@ mod tests {
             routing.resolve_existing_named("b"),
         )
         .await;
-        assert!(routing.resolver.flights.lock().is_empty());
+        assert!(routing.resolver.flights.is_idle());
     }
 
     /// CreateBucket never follows a stale resolution: it probes, so a

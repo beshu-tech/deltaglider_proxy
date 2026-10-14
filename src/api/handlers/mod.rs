@@ -168,50 +168,30 @@ pub(crate) async fn ensure_bucket_exists_on(
         return Ok(());
     }
     // Single flight: N first requests to a bucket send one HeadBucket and
-    // share its answer (found / missing). A failed one is not shared: each
-    // waiter then asks on its own and reports its own error.
+    // share its answer: found, missing, or the error.
     let key = (Arc::as_ptr(engine) as usize, bucket.to_string());
-    let flight = BUCKET_FLIGHTS
-        .lock()
-        .entry(key.clone())
-        .or_default()
-        .clone();
-    let mut own = None;
-    let shared = *flight
-        .get_or_init(|| async {
-            let answer = engine.head_bucket(bucket).await;
-            let found = answer.as_ref().ok().copied();
-            own = Some(answer);
-            found
+    let answer = BUCKET_FLIGHTS
+        .run(key, || async {
+            use crate::storage::StorageBackend;
+            engine.storage().head_bucket(bucket).await.map_err(Arc::new)
         })
         .await;
-    {
-        let mut flights = BUCKET_FLIGHTS.lock();
-        if flights.get(&key).is_some_and(|f| Arc::ptr_eq(f, &flight)) {
-            flights.remove(&key);
-        }
-    }
-    let answer = match (shared, own) {
-        (Some(found), _) => Ok(found),
-        (None, Some(answer)) => answer,
-        (None, None) => engine.head_bucket(bucket).await,
-    };
     match answer {
         Ok(true) => {
             remember_bucket(engine, bucket);
             Ok(())
         }
         Ok(false) => Err(S3Error::NoSuchBucket(bucket.to_string())),
-        Err(e) => Err(S3Error::from(e)),
+        Err(e) => Err(S3Error::from(e.duplicate())),
     }
 }
 
-/// The cold bucket checks in flight, by (engine address, bucket): `Some`
-/// = the HeadBucket answered found / missing, `None` = it failed.
+/// The cold bucket checks in flight, by (engine address, bucket).
 #[allow(clippy::type_complexity)]
 static BUCKET_FLIGHTS: std::sync::LazyLock<
-    parking_lot::Mutex<
-        std::collections::HashMap<(usize, String), Arc<tokio::sync::OnceCell<Option<bool>>>>,
+    crate::single_flight::SingleFlight<
+        (usize, String),
+        Result<bool, Arc<crate::storage::StorageError>>,
     >,
 > = std::sync::LazyLock::new(Default::default);
 
@@ -295,6 +275,40 @@ mod bucket_exists_tests {
         // Missing is not remembered: the next check asks again.
         assert!(ensure_bucket_exists(&state, "nope").await.is_err());
         assert_eq!(head_buckets(&fake, "nope"), 2);
+    }
+
+    /// Review 2d: when the shared HeadBucket fails, every waiter gets its
+    /// error. Before, each waiter then sent its own HeadBucket.
+    #[tokio::test]
+    async fn a_failed_cold_check_answers_all_its_waiters() {
+        let (engine, fake) = crate::deltaglider::s3_engine().await;
+        let state = AppState::for_tests(engine);
+        fake.clear();
+        fake.set_delay_ms("HEAD_BUCKET", 100);
+        fake.fail("HEAD_BUCKET", "/zb", 503, "SlowDown", u32::MAX);
+        let checks = (0..8).map(|_| ensure_bucket_exists(&state, "zb"));
+        let all = futures::future::join_all(checks).await;
+        assert!(all.iter().all(|r| r.is_err()), "{all:?}");
+        assert_eq!(head_buckets(&fake, "zb"), 1, "{:?}", fake.requests());
+        // The error is not kept: the next check asks again.
+        assert!(ensure_bucket_exists(&state, "zb").await.is_err());
+        assert_eq!(head_buckets(&fake, "zb"), 2);
+    }
+
+    /// Review 2d: a check cancelled during its HeadBucket (the client went
+    /// away) leaves no flight behind. Before, each one stayed for good.
+    #[tokio::test]
+    async fn a_cancelled_cold_check_leaves_no_flight() {
+        let (engine, fake) = crate::deltaglider::s3_engine().await;
+        let state = AppState::for_tests(engine);
+        fake.set_delay_ms("HEAD_BUCKET", 300);
+        for i in 0..5 {
+            let name = format!("gone{i}");
+            let check = ensure_bucket_exists(&state, &name);
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(50), check).await;
+        }
+        let left = BUCKET_FLIGHTS.count(|(_, b)| b.starts_with("gone"));
+        assert_eq!(left, 0, "cancelled checks left their flights");
     }
 
     /// The write paths check a bucket with one HeadBucket per bucket per

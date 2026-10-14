@@ -44,6 +44,7 @@ pub mod security;
 pub mod serve;
 pub mod session;
 pub mod shutdown;
+pub(crate) mod single_flight;
 pub mod slack_format;
 pub mod sqlite_open;
 pub mod storage;
