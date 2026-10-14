@@ -8,7 +8,755 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-10-13_
+_Last updated: 2026-10-14_
+
+## v2.0.13 — 2026-10-14
+
+### Added — A bucket can have its own encryption (issue #116)
+### Added — The admin UI shows the encryption witness
+
+On several instances, the **System** page has an **Encryption witness** card. It shows the state of this instance (agree, mismatch, unknown or unavailable) and each bucket whose encryption on this instance differs from the shared one, with both encryptions and the instance that published the shared one. **Publish this instance's setting** (per bucket, or **Publish all**) calls `POST /_/api/admin/encryption-witness/publish`; a plaintext setting asks for the downgrade confirmation first. On **Storage → Buckets**, a bucket that this instance refuses to write carries the warning **Writes refused on this instance: encryption differs from the cluster.**, with a link to the card. A single instance shows neither.
+
+### Changed — The encryption witness never takes over an entry by itself
+
+A bucket policy (`storage.buckets.<name>`) can now carry an `encryption` block with the same schema as a backend's: `aes256-gcm-proxy` with the bucket's own key, `sse-kms` or `sse-s3` on an S3 backend, or `none`. The writes to that bucket use the block; the other buckets on the same backend keep the backend's encryption. Before, encryption was a backend setting only, and a second key on one disk needed a second backend definition.
+
+- Each backend keeps one encrypting layer with a keyring: the keys of the backend and of every bucket on it. A read picks the key by the key id that the object carries, so a bucket still reads the objects and delta references that it wrote under the backend key before it got its own key.
+- Native SSE is chosen per request: one S3 client per backend sets the SSE headers of each PutObject, CreateMultipartUpload, CopyObject, UploadPartCopy, folder marker and listing-facts object from the bucket that it writes to. A bucket that encrypts in the proxy gets no SSE headers (never encrypted twice), `mode: none` on a bucket means plaintext also on an SSE backend, and a server-side copy takes the destination's headers. The KMS permissions that the backend's credentials need are in the encryption reference.
+- Rules (the start, `config lint` and an apply refuse a violation): an explicit `key_id` (and `legacy_key_id`); an explicit `backend:` when `storage.backends` is used; a native mode only on an S3 backend; two names of one stored bucket (an alias) agree; one key id names one key everywhere. The key comes from the YAML file or any `${env:NAME}` reference.
+- An apply that changes a bucket's encryption answers with a warning that names the re-encrypt job for that bucket. An apply that removes the key that a bucket writes with is refused: set `mode: none` first (the old key stays as `legacy_key`), run the re-encrypt job, then remove the block. Each bucket is judged on its own block and its backend's keys. The removal of a bucket's legacy key needs the confirmation of its id (`X-DGP-Confirm-Key-Removal`, or `config apply --confirm-key-removal`), after `GET /_/api/admin/backends/<backend>/legacy-key-usage?bucket=<bucket>`.
+- The migrate job carries the bucket's block to the target backend and verifies the at-rest form of every copy. A replication rule from an encrypted bucket into a plaintext one gives a `config lint` warning.
+- Bucket keys are redacted from `GET /config`, the section GET and the export, survive a round trip through the admin UI, and ride in the backup's `secrets.json` (`bucket_encryption`).
+- A run that started before an apply (a replication or lifecycle run, a multipart upload) writes with the bucket encryption of that apply from then on.
+- With `config_sync_bucket` set, the encryption witness keeps the instances in agreement (next entry).
+
+### Added — Per-bucket encryption in the admin UI
+
+The bucket list and the bucket card now show and change a bucket's own encryption (issue #116, P2).
+
+- `GET /_/api/admin/buckets` reports `effective_encryption` for each bucket: the mode, the key id, the legacy key id, and whether it comes from the bucket's own block (`source: bucket`) or from its backend (`source: backend`). The server computes it with the one resolver that the engine and the jobs use; the admin UI no longer resolves a bucket's encryption itself, and a source test refuses a client-side copy. `GET /_/api/admin/backends` lists, per backend, the modes that a bucket's own block accepts.
+- The bucket card has an **Encryption** group between Public access and Placement: **Inherit — <backend>: <mode>**, **Encrypt with a bucket key**, native **SSE-KMS** / **SSE-S3** on an S3 backend, and **Off for this bucket** (plaintext; the bucket key stays as a decrypt-only legacy key). The key is generated in the browser or pasted, shown once with Copy, a key-file download and the YAML / environment snippet, and confirmed by typing its last 6 characters. The key id is explicit (`<bucket>-<yyyy>-<mm>` suggested). An environment-sourced key shows read-only with a **from env** badge. **Rotate key**, the per-bucket legacy-key check, and **Clear legacy key** (with `X-DGP-Confirm-Key-Removal`) work per bucket. A change that makes new writes plaintext is confirmed and sends `X-DGP-Confirm-Encryption-Downgrade: <bucket>`.
+- The collapsed row names where the encryption comes from: **Encrypted · from hetzner-fsn1** or **Encrypted · bucket key db-archive-2026-10**.
+- **Create bucket** asks for the encryption (the server's answer is the default: "Same as backend (<mode>)", or the settings that the name already has). `POST /_/api/admin/buckets` takes the bucket's `encryption` block, and the route, the block and the create are one config write: an existing name is refused before any change, and a failed create takes everything back. "Off" asks before it sends the downgrade confirmation. `GET /_/api/admin/buckets/<bucket>/encryption-preview?backend=<b>` answers what a new bucket would get.
+- The keys of a bucket that does not exist on its storage leave without a key-removal confirmation (no object can use them): the rollback of a failed create, and **Remove these settings…** for settings with a key whose bucket was never created.
+- The re-encrypt proposals, the Jobs picker and the migrate dialog decide per bucket: after a backend change, only the buckets whose effective encryption changed are preselected; a bucket's own key that moves with a migration needs no plaintext acknowledgement.
+- **Reset to defaults** keeps a bucket's own encryption block and its backend, and says so. The Backends card shows "Encryption: Default for N buckets · M buckets override".
+- The key dialog no longer says that DeltaGlider does not back up the key: a full backup carries a key that is in the config file, not a key that an environment variable supplies.
+- New how-to: [How to encrypt one bucket on a shared backend](docs/product/how-to/encrypt-one-bucket-on-a-shared-backend.md).
+
+### Added — The encryption witness keeps several instances in agreement
+
+With `config_sync_bucket` set, the YAML is still per instance, so two instances could write one bucket in two forms. The instances now keep a witness in the sync bucket, and an instance that disagrees refuses writes instead.
+
+- `_dgp/encryption/intent.json` holds, for each stored bucket (backend + real bucket name; `*` = the backend's buckets with no entry of their own), the shared encryption: mode, key id, and for a proxy key a key check value (the first 8 bytes of HMAC-SHA256(key, "dgp-witness-kcv-v1")). It never holds key material.
+- Each instance adds, create-only, every bucket that it encrypts: its bucket blocks, the buckets it names that inherit an encrypting backend, and each encrypting backend's `*`. Plaintext and a missing key are never added.
+- An instance whose encryption of a bucket differs from the shared entry (a bucket with no entry of its own is compared with its backend's `*`) refuses writes to it with `503 SlowDown` that names the mismatch and the command that publishes; reads and other buckets keep working. Replication and lifecycle runs that write into such a bucket stop as `deferred` (cursor kept), and maintenance jobs wait, instead of failing object after object.
+- An entry changes only in three ways: the first instance that encrypts a bucket adds it; a config apply that CHANGES a bucket's encryption publishes it (a downgrade needs its confirmation; an apply with the confirmation also publishes a confirmed plaintext bucket whose config did not change); or the operator runs the new `deltaglider_proxy witness publish <bucket|backend:name|route:default>...` (`POST /_/api/admin/encryption-witness/publish`, audited as `bucket_encryption_witness_publish`; plaintext needs `--confirm-encryption-downgrade`). No instance takes over an entry by itself. A publish that fails during an apply is retried at each check; the rollback of a failed change puts back what that change published.
+- Every write of the encrypting layer checks the witness first, also a folder marker and a metadata rewrite.
+- A verdict holds two polls (`DGP_ENCRYPTION_WITNESS_POLL_SECS`, default 30), counted from the start of the check that made it; then the witnessed buckets refuse writes until a check succeeds. Each instance saves the last shared manifest next to its config DB (`encryption-witness.json`, mode 0600, no key material), and at start it refuses writes to the buckets it encrypts, its bucket blocks and every bucket in that saved manifest until the first check succeeds. A missing sync bucket counts as a failed check, not as an empty manifest. An instance that cannot build its client for the sync bucket reports `unavailable` and keeps those buckets refused.
+- `/_/ready` shows `encryption_witness.status` only (`agree`, `mismatch`, `unknown`, `unavailable`); a mismatch keeps the instance ready. The details are in `GET /_/api/admin/encryption-witness` (admin session).
+
+**Upgrade notes:**
+
+- Upgrade every instance before you add a bucket `encryption` block while `config_sync_bucket` is set: an older release ignores the witness.
+- This also changes clusters that use BACKEND-level encryption only, because each encrypting backend's `*` is witnessed. A backend key or mode changed by editing the file or an environment variable and restarting the instances is not published: after the restart, every instance with the new key refuses all writes to that backend until you run `deltaglider_proxy witness publish backend:<name>` once (or make the change with a config apply instead). An instance that starts while the sync bucket does not answer refuses writes to every encrypting backend until its first check succeeds. See [How to upgrade](docs/product/how-to/upgrade.md) and [How to run multiple instances](docs/product/how-to/run-multiple-instances.md).
+
+### Added — Audit entries for a bucket's encryption
+
+Every change of a bucket's write encryption writes one audit entry per subject: `bucket_encryption_set`, `bucket_encryption_cleared` or `bucket_encryption_key_rotated`. The target names the mode and the key id before and after the change, never key material. The config transition writes them, so every write path does: a config apply, a section PUT, a field PATCH, the backend endpoints, a backup restore, and the flip of a migrate (user `background`). A backend change writes one entry for `backend:<name>` and one for each named bucket that inherits it.
+
+### Changed — A change that makes a bucket store plaintext needs a confirmation
+
+A config write that makes a bucket store new objects in plaintext where it encrypted them before (`mode: none`, a removed block on a plaintext backend, a move to a plaintext backend, the backend's own `mode: none`, or a new `default_backend` that stores plaintext) is refused unless the request carries `X-DGP-Confirm-Encryption-Downgrade: <subject>`: the bucket name, `backend:<name>` for a backend's own change, or `route:default` for the buckets that the config does not name. `config apply` has the new flag `--confirm-encryption-downgrade`. The migrate start runs the same gate. A start from an edited file is not gated. **Upgrade note:** a script that sets `mode: none` must now send the confirmation.
+
+### Changed — A malformed `kms_key_id` stops the start
+
+`kms_key_id` must now be a KMS key ARN or alias ARN, an alias name (`alias/<name>`), a key id (UUID) or a multi-Region key id (`mrk-...`), on a backend and on a bucket. An empty or other value was accepted before and failed every write with an S3 error; now the start, `config lint` and an apply refuse it. **Upgrade note:** on MinIO, a bare key name (`my-key`) is refused; write it as `arn:aws:kms:my-key`, which MinIO accepts.
+
+### Fixed — An unknown field in a backend or an encryption block is a load error
+
+`storage.backend.encryption:` (the singleton's encryption is `storage.backend_encryption`) and any other unknown field in a backend definition or an `encryption` block were dropped without a word, so a backend meant to encrypt stored plaintext. They now stop the start, fail `config lint` and refuse an apply, and the error names the field. A section PUT that changes the `mode` of an encryption block (or the `type` of `storage.backend`) replaces the block, so the old mode's fields do not stay behind. **Upgrade note:** a config with such a field no longer starts; run `config lint` with the new binary first.
+
+### Fixed — An unknown bucket policy field is refused, not ignored
+
+A bucket policy (`storage.buckets.<name>`) accepted any field and dropped the
+ones that it did not know: `config lint` reported `ok`, and the proxy ran
+without the setting. A misspelled field (for example `quota_byte`) therefore
+did nothing, and a field that a newer release adds (per-bucket `encryption`,
+which ships in this release) would be lost after a downgrade to an older
+release, so the bucket could store plaintext.
+Now an unknown bucket field stops the start, makes `config lint` exit with
+code `4`, and refuses an apply, and each error names the field. **Upgrade
+note:** a config with a misspelled bucket field, which this release's
+predecessors accepted, no longer starts. Run `config lint` with the new
+binary before you upgrade. Every documented field, and the `public: true`
+shorthand, loads as before.
+
+### Fixed — `key: null` on a proxy-encrypted backend no longer drops the key
+
+A section update or a YAML apply that set `key: null` on a backend that
+stayed in `aes256-gcm-proxy` mode removed the key without keeping it
+anywhere. A key change or a mode change moves the previous key into
+`legacy_key`, but this case was missed, so every object written under the
+key became unreadable. Now `key: null` is handled like any other key change:
+the previous key moves into `legacy_key` with the key id that the objects
+carry, or the apply is refused while `legacy_key` holds a different key. The
+admin GUI never sent `key: null`, so only API and YAML users were affected.
+
+### Fixed — A proxy-encrypted backend with no key refuses writes instead of storing plaintext
+
+A backend in `aes256-gcm-proxy` mode with no key (for example, because the
+`DGP_BACKEND_<NAME>_ENCRYPTION_KEY` env var was not set after a restart)
+logged a warning and then stored every new object as plaintext. The operator
+asked for encryption, so this was a silent downgrade. Now the proxy refuses
+every write to such a backend with an error (`500 InternalError` to the
+client; the log names the backend and the env var), and it never stores
+plaintext there. Reads keep working, so the objects already stored stay
+available while you fix the key. A config apply (GUI, section PUT, YAML
+apply) that would leave a backend in this state is refused with an error that
+names the backend and the env var. A running config that is already in this
+state does not block other applies. The proxy still starts with such a
+config, and `config lint` still only warns, because the key of a valid
+config often comes from an env var that lint does not see.
+
+### Fixed — A filtered LIST no longer reveals hidden key names
+
+A user who may see only some keys of a bucket, through an `Allow` on the
+whole bucket with `Deny` exceptions, could learn the names of keys that the
+policy hides. The client chooses where a LIST starts (`start-after`, a
+continuation token, or a V1 `marker`), and the answer depended on the hidden
+keys after that point in two ways. First, the scan read backend pages of
+`max-keys + 1` keys, so with `max-keys=1` the request failed with "use a
+narrower prefix" after only 100 hidden keys, and a search over `start-after`
+found the hidden key where the error started. Second, a page with one visible
+entry was served short, so the number of keys on a page told how many hidden
+keys followed `start-after`. Now the scan reads backend pages of 1000 keys
+whatever `max-keys` is, and a filtered page is exact: it holds `max-keys`
+visible entries whenever that many exist. When a request uses up
+`advanced.filtered_list_max_engine_pages` (about 50,000 hidden keys with the
+default), it no longer fails: it returns the visible entries that it found
+(possibly none) as a truncated page with a sealed continuation token (`dg2.`,
+also the V1 `NextMarker`). The token holds the scan position, encrypted and
+authenticated with a key derived from the config DB key, so the client cannot
+read or change it, and every instance that shares `DGP_CONFIG_DB_KEY` opens
+it. A changed or foreign token gets `400 InvalidArgument`. Tokens of the
+previous release (`dg1.`) still work. A full filtered page now costs one more
+backend page than before (2,500 visible keys: 6 backend LIST requests instead
+of 4), because the proxy must find one more visible entry to know that the
+page is truncated. The remaining leak, for runs of more than about 50,000
+hidden keys in a row, is described in the IAM permissions reference. The
+file browser's folder listing reads pages of 1000 keys too, and goes on from
+its scan position, so it no longer reads a backend page twice.
+### Fixed — The listener limits can be set: `DGP_HEADER_READ_TIMEOUT_SECS` and `DGP_MAX_CONNECTIONS`
+
+The listener limits were fixed values. Two environment variables now set
+them: `DGP_HEADER_READ_TIMEOUT_SECS` is the time that a client has to send
+the head of a request, and also the idle limit of a keep-alive connection
+(default 30 seconds). `DGP_MAX_CONNECTIONS` is the most client connections
+that are open at the same time (default 4 × `DGP_MAX_CONCURRENT_REQUESTS`,
+at least 4096). The proxy reads both at startup. The defaults do not
+change.
+
+### Fixed — A negative multipart list argument gets `400 InvalidArgument`
+
+A `ListParts` request with a negative `max-parts` got a page of one part,
+and one with a negative `part-number-marker` got an empty page. A
+`ListMultipartUploads` request with a negative `max-uploads` got a page of
+one upload. S3 and MinIO refuse such a request, so the proxy now answers
+`400 InvalidArgument`, as it does for a negative `max-keys`.
+
+### Fixed — DeleteBucket deletes a bucket that lists empty
+
+A delete that stopped before its last step can leave a delta baseline
+(`reference.bin`) in a folder after all the objects in the folder are
+gone. A client cannot see or delete this file. On an S3 backend, a
+`DeleteBucket` request for such a bucket got `409 BucketNotEmpty`, but the
+bucket listed empty. Now the proxy deletes each such baseline before it
+deletes the bucket. It holds the folder's lock and checks again that no
+object uses the baseline, so an upload in progress keeps its baseline, and
+the request gets `BucketNotEmpty`. For the same reason, the filesystem
+backend no longer deletes a baseline on its own when it deletes a bucket.
+
+### Fixed — The Jobs editor no longer mixes up two rules with the same name
+
+The Jobs screen found a rule in the editor by its name. When you typed the
+name of a new rule through the name of a rule that already existed
+("nightly" on the way to "nightly-eu"), the drawer moved onto the existing
+rule, the next keys renamed that rule, and **Review & apply** swapped the
+two definitions. A draft whose name you cleared disappeared from the table
+and left an empty drawer. Each rule in the editor now has an identity of
+its own that the browser keeps and never sends to the proxy. The drawer,
+the table and **Remove draft** use it. A draft with an empty name shows as
+"(unnamed)". A rename shows as a removed rule and a draft, because the
+proxy deletes the old rule and creates the new one, and after the apply
+the drawer follows the rule to its new name. The cached result of a
+replication rule's **Verify** tab is dropped when the rule is deleted,
+renamed or changed, so a new rule with the same name does not show it.
+
+### Fixed — One toast when a lifecycle Run now ends
+
+A lifecycle **Run now** showed two toasts when the run ended: one from the
+Jobs screen and one from the confirmation dialog. The dialog compared the
+browser clock with the start time that the proxy recorded, so with a clock
+difference its toast did not show at all. The Jobs screen now shows one
+toast. It waits for the job row to settle, which compares only times from
+the proxy, and then reads the run record, so the toast names what the run
+did, for example "finished: deleted 80".
+
+### Fixed — The object browser shows an upload on a later page at once
+
+After an upload, a delete or a copy, the object browser lists the whole
+folder again. When the 60-second refresh started during that listing, it
+replaced it. The refresh lists the first page only and keeps the later
+pages from before, so an object that sorted onto a later page did not show
+until the next full reload. A refresh no longer starts while a full listing
+is in progress. Also, a refresh that a hidden browser tab skipped now runs
+as soon as the tab shows again.
+
+### Fixed — The object inspector shows the new object after an overwrite
+
+The inspector read the object's headers once, when it opened. When the
+object was overwritten under the same key, the inspector kept the stored
+size, the storage type and the headers of the old object. It now reads the
+headers again when the listing shows a new ETag for the object.
+### Fixed — A negative `max-keys` gets `400 InvalidArgument`
+
+A `ListObjects` or `ListObjectsV2` request with a negative `max-keys` got an
+empty `200` page with `IsTruncated=false`. That page told the client that the
+listing was complete. S3 refuses such a request, so the proxy now answers
+`400 InvalidArgument`, with the same message as S3.
+
+### Fixed — A filtered LIST pages past more than 50 visible prefixes
+
+A user whose policy allows many key prefixes gets a LIST that reads each of
+those prefixes. On every page after the first, the proxy also sent one
+backend request for each prefix that an earlier page already finished, and
+each such request used one unit of the scan limit
+(`advanced.filtered_list_max_engine_pages`, default 50). So a user with more
+than about 50 visible prefixes got `400 InvalidRequest` in the middle of the
+listing, and the folder listing of the file browser failed the same way. The
+proxy now skips a prefix that sorts completely before the continuation
+token, with no request, and skips a folder entry that the user cannot see
+before it checks the limit.
+### Fixed — The event log documents what a crash can lose, and shows it
+
+The docs said that a crash of the process loses "the last few milliseconds"
+of object events. The real bound is the queue in front of the outbox
+writer: when the jobs DB is slower than the write traffic, the queue grows
+up to 65,536 appends, and a crash loses all of them. The new gauge
+`deltaglider_outbox_queued_events` shows how many events are in the queue
+now. The objects themselves are never lost, only their events.
+
+### Fixed — The listener closes a connection that does not send its request head
+
+Neither listener (plain HTTP nor HTTPS) had a time limit on the request
+head, because hyper applies its header read timeout only with a timer, and
+none was set. A client that sent half a request and then nothing kept its
+connection open for as long as it liked (measured: 95 s and counting), and
+nothing capped the number of open connections, so such clients could use up
+the file descriptors of the process. The request concurrency cap
+(`DGP_MAX_CONCURRENT_REQUESTS`) does not help here, because it counts only
+complete requests. A client now has 30 seconds to send each request head;
+the same limit closes a keep-alive connection that is idle for 30 seconds.
+The listener keeps at most four connections per request slot open, and at
+least 4096; a connection above that is closed at once, before the TLS
+handshake, and `deltaglider_connections_refused_total` counts it.
+
+### Fixed — A release that reads first leaves an expired lock in place
+
+On a coordination bucket that does not enforce `If-Match` on DELETE, an
+instance reads its lock (or lease) before it releases it, and deletes it
+when the owner is its own. It deleted an expired lock of its own too. A
+peer can take over an expired lock between that read and the delete, and
+the delete, which the bucket does not make conditional, then removed the
+peer's live lock, so two instances held it. The release now deletes only a
+lock that is its own and still live.
+
+### Fixed — A lock write whose response was lost no longer blocks the deltaspace
+
+A multi-instance proxy takes a lock object in the coordination bucket
+before it writes a delta, and a lease object before it runs a replication
+rule. When the PUT of that object landed but its response was lost, the S3
+client sent the PUT again, and the retry failed (412) against the
+instance's own write. The instance then read a live lock that it did not
+recognise as its own, so every delta write to that deltaspace failed on
+every instance until the lock expired (120 s), and the replication rule
+waited for the lease to expire (300 s). A renew of the lock that met the
+same lost response reported the lock as lost, so a write that held the
+lock failed. An instance now recognises its own live lock by its owner
+token (unique to each hold, so two instances never match), and a renew
+that fails reads the lock once to see whether it is still its own. An
+acquire that fails also removes a lock that it may have written.
+### Fixed — Fewer bucket checks during a backend outage
+
+When the check of a bucket failed (a `503` or a timeout from the backend),
+every request that waited for that check sent its own check afterwards, and
+a HeadBucket with multi-backend routing sent a second one to the same
+failing backend. Now all waiting requests share the one answer, the error
+included. A request that the client cancelled during the check no longer
+leaves an entry in memory.
+
+### Fixed — CreateBucket with several backends checks where the bucket lives
+
+With several storage backends, CreateBucket for a bucket without a route
+used the remembered location of the bucket for 30 seconds, and a
+remembered "no backend has it" for 5 seconds. A bucket that another
+instance created on another backend in that time got a second bucket of the
+same name on the default backend, which hid the objects of the first one.
+CreateBucket now always asks the backends.
+
+### Fixed — Replication facts and copies follow the backend of an unrouted bucket
+
+With several storage backends, replication, parity checks and copies
+judged a bucket without a route by the default backend, while its requests
+went to the backend where the bucket was found. With a filesystem default
+and the bucket on S3, replication trusted listing facts that S3 does not
+carry. They now judge the backend where the bucket was found, and take the
+safe choice while that backend is not known yet.
+
+### Fixed — A Refresh during writes no longer holds a bucket over its quota
+
+The quota check trusts the usage counter of a bucket once a full scan has
+stamped it. A Refresh that ran while clients wrote to the bucket stamped
+the counter too, but a write that the scan listed and that also arrived as
+a write counted twice, so the bucket could stay over its quota with no
+further scan. Now only a scan during which the bucket did not change
+stamps the counter. A busy Refresh still shows its numbers, marked as not
+reconciled; refresh again when the bucket is quiet.
+### Fixed — A GET serves the ETag of the bytes it sends
+
+A GET often needs two requests to the backend: one that reads the
+object's metadata and one that reads its bytes. When a write replaced the
+object between the two requests, the response could carry the ETag and
+the size of the old version and the bytes of the new one. This happened
+in three places: a plain GET whose first guess of the stored form was
+wrong, a conditional GET (`If-Match`, `If-None-Match`, `If-Modified-Since`,
+`If-Unmodified-Since`), and a ranged GET with a condition or `If-Range`. A
+download that resumed with `If-Range` could so join two versions into one
+file. Now the metadata that a GET serves comes from the response that
+carries the bytes. A conditional GET judges its conditions again when that
+version differs from the one that its first read saw, so an `If-Match` on
+the old ETag answers 412. A ranged GET whose object changed between the
+two requests answers 503 SlowDown, and clients retry it.
+
+### Fixed — A ranged read of an encrypted backend never mixes two versions
+
+A range read on a backend with an encryption key can need two requests:
+the first one reads the object's format, and the second one reads the
+bytes. When a write replaced the object between the two requests, a
+plaintext object that was replaced by an encrypted one was served as
+ciphertext under the old ETag. Now the second request must find the same
+version as the first, or the read answers 503 SlowDown, and clients retry
+it.
+
+### Fixed — Ranged reads from stores that send no Content-Length
+
+Some S3-compatible stores send the body of a GET in chunks, with no
+`Content-Length` header. The proxy read the missing header as a length of
+0. A ranged GET then answered a wrong `Content-Range`, a ranged GET of an
+encrypted backend failed with InternalError, a suffix range loaded the
+whole object, and a GET of an object that was not written through the
+proxy answered `Content-Length: 0`. Now the proxy takes the length of a
+ranged body from its `Content-Range` header. When a response names no
+size at all, the proxy asks for it with one HEAD request.
+
+### Fixed — A copy during a re-encryption no longer serves ciphertext
+
+A server-side copy checks that its source did not change after the copy
+read it. The check compared the content and the creation time, but not the
+encryption of the stored bytes. A re-encryption job rewrites an object in
+place with the same content and the same creation time. So a copy that ran
+between the two steps, for example a replication run from a bucket that a
+re-encryption job rewrote, copied the encrypted bytes without their
+encryption markers, and the destination served the ciphertext as the
+object. After a key rotation, the same copy made the destination
+unreadable. The check now also compares the encryption markers. A copy of
+a source that changed fails, and its retry reads the source again.
+
+### Fixed — A background copy honours a destination with compression off
+
+A replication, lifecycle or migration copy of a delta-stored object shipped
+the stored delta and seeded a `reference.bin`, also into a bucket with
+`compression: false`. Tools that read that bucket without the proxy found
+`.delta` files. The copy now ships the delta only when the destination
+would store the object as a delta itself, as the client CopyObject already
+did. A migration also stores the objects as its source bucket does: its
+staging route takes the `compression` and `max_delta_ratio` of the source
+bucket. Before, a migration of a bucket with compression off stored its
+files as deltas.
+
+### Fixed — A cancel of a waiting migration deletes the copies it made
+
+A migration waits, with the status `queued`, while its backend is unhealthy
+or after a transient error, and a graceful stop hands it back the same way.
+A cancel then marked it `cancelled` at once, as if it had never run. The
+cancel did not delete the copies that the job had made on the destination,
+and the staging route stayed until the next boot. Now a cancel of a
+migration that already ran turns it `cancelling`, and the worker runs the
+same unwind as for a cancel of a running migration.
+
+### Changed — A run that the proxy stopped reads "deferred"
+
+A replication run that a maintenance job or a failed backend health check
+stopped ended with the status `paused`, although nobody paused the rule,
+and the next run waited a full interval (a day on a daily rule). A
+lifecycle run that a maintenance job stopped ended `succeeded`, although it
+did not finish its scan. Both now end `deferred`, keep their cursor, and
+are due again about a minute later; the scheduler runs them when the gate
+is clear. The Jobs screen shows "deferred · continues shortly". A
+replication pass that ran out of its page budget (raw status `stopped`)
+also reads `deferred` instead of `cancelled`, because it continues from its
+cursor a minute later.
+
+### Fixed — A settled rule row says what its last run did
+
+A rule row showed counts only while its run went on; afterwards it said
+only "succeeded". It now keeps the counts of its last run ("14 copied · 1
+deleted · 3 already in sync · 2 failed"), its failure count and its last
+error. A replication rule row also says when its last live copy landed and
+how many objects the live copies copied, deleted and failed on. A run that
+a pause stopped reads "stopped · resumes where it left off" instead of
+"cancelled", because it kept its position. In the drawer, each run says
+when it finished, and each replication failure says whether a run or a
+live copy hit it. On a phone, the job cards are denser, so the screen
+shows more than one job at a time.
+
+### Fixed — The Buckets page shows a bucket as busy only while writes are refused
+
+The busy chip on the Buckets page, the busy banner of the object browser
+and its Upload button now follow `writes_blocked`, the state of the write
+gate that `GET /_/api/admin/jobs/bucket/:bucket` reports. Before, the chip
+said "busy" for the whole life of the job, also while a cancelled migration
+had already opened the bucket again. The Cancel button on the Buckets page
+now asks for confirmation, because a migration that is cancelled before the
+switch deletes the copies it made.
+
+### Fixed — The run-now confirmation shows the count that the run acts on
+
+The confirmation of a lifecycle run-now could name a count from a preview
+that the proxy had computed up to a minute earlier, or that the GUI had
+kept for five minutes. A confirmation said "delete 46", and the run deleted
+80. When the preview at hand is older than 10 seconds, the confirmation now
+asks the proxy for a new walk of the scope, and the run button stays off
+until the walk ends. The dialog says when the proxy scanned the scope and
+how long ago, and **Refresh preview** always asks for a new walk. When the
+run ends, a message says what it did ("finished: deleted 80").
+
+### Changed — The lifecycle preview and editor say more
+
+The preview now says "copy to" or "move to" for a transition, with the
+destination key, instead of "move to" for both. It says how many of the
+skipped objects are not old enough yet and how many a glob keeps out, it
+shows the creation date of each object, and it shows the space that the
+objects use on the backend when that differs from their size. The Jobs
+screen has a field for `tick_interval` next to the lifecycle switch, a row
+says why the scheduler did not run a due rule, and a running lifecycle run
+has **Kill**. The review step names the time of the first run of a new
+rule. The rule editor marks an invalid include or exclude glob under the
+field, with the name of the rule, and its help says that the age of an
+object that was written without the proxy comes from its modification
+time.
+
+### Fixed — Pause stops a running lifecycle run, and Kill is new
+
+Before, **Pause** on a lifecycle rule only set a flag that the scheduler
+reads before it starts a run. A run that was already in progress went on
+to its end, and the Jobs page showed "paused" while the run still deleted
+objects. Now a pause also stops the run in progress at the next object.
+The run keeps its cursor and ends with the status `paused`. When you
+resume the rule, the scheduler continues the run at its next check. The
+new **Kill** action (`POST /_/api/admin/jobs/lifecycle:<name>/kill`) stops
+a run in progress in the same way, but drops the cursor, so the next run
+starts from the top. The run ends with the status `cancelled`. Like a
+replication kill, it reaches only the run on the instance that you send
+the request to.
+
+### Fixed — A lifecycle run shows its progress while it runs
+
+The Jobs row of a lifecycle rule showed zeros until the run ended, because
+the run wrote its counters only at the end. A run now publishes its
+counters after each object. `GET /_/api/admin/jobs` gives them in
+`progress` (`processed`, `skipped`, `failed`, `bytes` and `deleted`) and in
+`detail.live`. The running entry of `GET /jobs/lifecycle:<name>/runs` shows
+the same live counters.
+
+### Fixed — A lifecycle transition reports the bytes that it archived
+
+A transition inside one backend is a server-side copy, which sends no byte
+through the proxy. The run reported the bytes that went through the
+proxy, so such a run, its Jobs row and the lifetime total all said 0 B.
+A run now reports the logical (uncompressed) size of every object that it
+deleted, moved or copied.
+
+### Added — A lifecycle run says what it did with each object
+
+A lifecycle run entry now has `objects_deleted`, `objects_moved` (the
+source was deleted after the copy), `objects_copied` (the source was kept),
+`objects_excluded` (an include or exclude glob keeps the object out of the
+rule) and `objects_not_due` (the object is not old enough yet). The preview
+response has the same fields, and also `stored_bytes_affected`, which is
+the space that the affected objects use on the backend. A delta is much
+smaller than the object that it stores, so this number can be much smaller
+than `bytes_affected`. Every preview object has a `stored_size` field for
+the same reason.
+
+### Changed — A new lifecycle rule first runs one tick after you apply it
+
+A new enabled rule ran at the next scheduler tick after you applied it, so
+it could delete objects less than a minute later, without a warning. Now
+the proxy schedules the first run of a new enabled rule one
+`tick_interval` after it first sees the rule (the apply, or the boot). The
+`next_due_at` field of the Jobs row says when. Use that time to open the
+Preview tab and see what the rule will do. A rule that you enable again
+after it ran before keeps its old schedule.
+
+### Fixed — The lifecycle scheduler checks for due rules every 30 seconds
+
+The scheduler slept a whole `tick_interval` between two checks. After a
+boot, the first check came one tick late. A run-now moves the next due
+time of the rule, and a due time that fell just after a check waited for
+the next tick, so the next run could come up to two ticks late. The
+scheduler now checks every 30 seconds (or every tick, if the tick is
+shorter), so a rule runs at most 30 seconds after it is due. The tick
+still sets how often each rule runs.
+
+### Added — The Jobs row says why a due lifecycle rule did not run
+
+When a maintenance job gates a bucket of a due rule, or the health check
+closed one of its backends, the scheduler does not run the rule. Before,
+only a log line said so. The Jobs row now has `detail.deferred`, for
+example "bucket 'releases' has an active maintenance job; the rule runs
+when it ends". The proxy logs the deferral once, not at every check.
+
+### Fixed — A failed lifecycle row says why
+
+A lifecycle row with the status `failed` had no `last_error`. The row now
+has the last failure of the latest run in `last_error`, and the number of
+failures of that run in `failed_total`. A failed transition copy
+names the destination bucket and key. `GET /jobs/lifecycle:<name>/failures`
+has a `total` field: the number of failures that the proxy keeps for the
+rule, of which the response lists the most recent. A run whose first 20
+writes all fail now stops with an error that says so, instead of trying
+the same write on every object of the scope.
+### Fixed — The Jobs screen shows the runs that the proxy starts on its own
+
+After **Review & apply** or **Resume**, the scheduler starts the run of a
+rule less than a second later. The list went back to its 60-second refresh
+at once, so a short run was never seen running, and the drawer's Runs tab
+said "No runs yet" while the run had already finished. Now the list reads
+every 2 seconds after **Review & apply**, **Resume**, **Run now** and
+**Cancel**, until the run that follows is seen and finishes. With nothing
+running, it reads every 10 seconds instead of every 60, so a job that another
+tab or the scheduler starts shows up within 10 seconds. The Runs and
+Failures tabs read again whenever a run starts or finishes.
+
+### Fixed — The Jobs screen says what a job is doing, in the words of its kind
+
+A queued or cancelling job read "running · 0 copied…". A rule that was
+paused during a run read "paused" while the run went on. Every kind used
+the words of replication, so a backfill read "4,003 copied → straight copy"
+and a lifecycle run that deleted 8,000 objects read "8,000 copied". Now
+`queued` reads "waiting to start" and `cancelling` reads "cancelling". A
+paused rule in the middle of a run reads "running · pauses after this run".
+Each kind has its own words: replication copies and deletes, lifecycle
+deletes, moves or copies, backfill stamps, re-encrypt re-encrypts, and a
+migration names its phase. The meter also counts the objects that a run
+deleted and the objects that it skipped. Rule rows show live progress, the
+failure count and the last error, and a finished one-off keeps its counts.
+The **Last run** column shows when the last run finished, how long a run in
+progress has run, and when a scheduled rule runs next. Relative times now
+move between refreshes. Runs show how long they took and how much data they
+wrote. The Failures tab says how many failures the proxy recorded in total,
+folds repeated errors, and wraps long errors.
+
+### Fixed — Cancel of a one-off job asks first, and the drawer shows the job
+
+Cancel was a bare icon on the row, and a migration that is cancelled before
+the switch deletes every copy that it made. Cancel now sits in the row's
+"⋯" menu and in the drawer, and it asks for confirmation that says what the
+cancel deletes. The Definition tab of a one-off now shows its parameters
+(for a migration: source and target backend, destination mode, and the fate
+of the source copy), its counts, the data it wrote and how long it ran. A
+link to a one-off that the list no longer carries opened as "Lifecycle ·
+3 [draft]"; the new request `GET /_/api/admin/jobs/:id` reads one job by id,
+and the drawer uses it.
+
+### Fixed — The object browser lets you upload while a migration is cancelled
+
+When a migration is cancelled before the switch, the proxy opens the bucket
+for writes at once. The busy banner still said that uploads were
+unavailable and hid the Upload button for about 30 seconds. The banner now
+says that uploads and deletes work, and the Upload button returns. The
+banner names the phase of a migration, and it comes back after an expired
+session without a reload.
+
+### Fixed — Unsaved rule edits block only their own rule
+
+**Run now** and **Preview** waited while any rule of the same kind had
+unsaved edits. Now they wait only on the rule that has them, and that rule
+shows an **edited** tag. A draft row shows its bucket. The review dialog
+names the rule and the field that changed, instead of two copies of the
+whole rule list, and each of two queued dialogs says "Step 1 of 2". Escape
+in a bucket field of the job drawer closes the suggestions only, not the
+drawer, and the unsaved-changes bar no longer covers the last fields of the
+drawer.
+### Fixed — The Verify tab keeps the operator informed
+
+The Verify tab now names the step of a running audit and counts the objects
+of that step. Its rate decays when the count stands still, and after 30
+seconds it says "no progress for N s". A re-audit keeps the previous verdict
+on the screen, dimmed, instead of hiding it. An audit that did not finish
+says so above the last complete result: "cancelled", or "failed" with the
+error of the server. The audit buttons are off while a run of the rule is in
+progress, and a note says why, where a click used to fail with a raw 409.
+When an audit could not read some objects, the headline no longer says
+"(scanned portion)" next to a body that says that the whole mirror was
+listed. The panel lists those objects with the error of their last read,
+and it suggests `DGP_PARITY_HEAD_CONCURRENCY` only when the backend
+throttled the reads. An empty Differences table no longer shows.
+
+### Fixed — Turning on delete replication asks first
+
+The switch for delete replication in the rule editor had no name for a
+screen reader, and one click turned it on. It now has a name and a visible
+state, and turning it on asks for confirmation, because the rule then
+deletes every object on the destination that is not on the source.
+
+### Fixed — The progress of a replication audit counts objects
+
+The progress of a parity audit counted listed entries of both sides plus
+metadata reads, so a mirror of 4,000 objects showed "10,327 of 16,000" and
+then "All 4000 objects". The audit now reports a `phase`
+(`listing_source`, `listing_destination`, `reading`, `comparing`), and
+each phase counts objects against its own total. A listing phase starts
+from the object count of the previous audit, as an estimate. The `reading`
+phase counts an object that it reads on both sides once. While an audit
+runs, `GET …/verify` returns the previous result as `previous_outcome` (and
+`previous_scanned_at`), so the screen can keep the last verdict in view.
+Each object that an audit could not read now keeps the error of its last
+read (`unresolved_keys[].error`), so the cause (a timeout, a throttle) is
+visible. The verdict sentence writes counts with thousands separators and
+agrees in number ("1 object", "3 objects", not "3 object(s)").
+
+### Fixed — Pause stops a replication run that is in progress
+
+A pause stopped only the runs that the scheduler started. A run that
+**Run now** started went on copying, while the row already said "paused".
+Now a pause stops any run of the rule at the end of the object that it
+copies. A rule that is already paused when **Run now** starts its run still
+runs once. The run that a pause stopped has the status `paused`, and no
+longer `cancelled`, which stays the status of a kill. Resume used to drop
+the position of that run, so the next run listed the whole source again.
+The next run now continues from that position. When it finishes, the rule
+is due again at once, and that full pass copies the objects that changed
+during the pause.
+
+### Fixed — A replication rule's row shows the progress of its run
+
+The row of a replication rule in `GET /_/api/admin/jobs` always reported
+zero progress and no error, so the Jobs screen could not show how far a
+run was or why it failed. The row now carries the counters of the newest
+run (copied, already in sync, failed, bytes, deleted), which the run writes
+while it runs. It also has `failed_total` and `last_error` for the failures
+of that run, and `started_at` and `finished_at`. Events copy objects between
+runs, and before, such a copy changed nothing on the row. The row now has
+`detail.events` (objects that events copied and deleted, and events that
+failed, since the proxy started) and `detail.last_event_applied_at`.
+
+### Fixed — Runs report the size of what they copied
+
+A replication run counted the bytes that went through the proxy. A copy on
+one backend is server-side, so the run reported 0 B for objects that it did
+copy, and a delta that the destination stores as it is counted only its
+delta size. Runs, rows and the lifetime counter now count the logical size
+of each copied object. The saved egress stays its own counter.
+
+### Fixed — The failures of event-driven replication no longer flood the ring
+
+The event-driven path tries a failing object again on every drain, and it
+wrote one failure row per attempt. One object could push every other failure
+out of the ring. It now keeps one row per object, with the newest error, and
+the message says that the event path made it. `GET …/failures` of a
+replication rule now also returns `total`, the number of failures that the
+ring keeps, and each failure has `trigger` (`run` or `event`).
+
+### Fixed — Maintenance jobs show their progress, and refuse a bad start at once
+
+A migrate row had no percent for the whole job, and a re-encrypt or backfill
+row had none until the job reached the end of the bucket, unless a usage scan
+had counted the bucket before. These jobs now count the objects with a second
+listing that runs next to their work, so the bar becomes determinate when the
+count ends. A migrate shows its copy as 0 to 49 percent and its verify phase
+as 50 to 98 percent. A re-encrypt or backfill job now saves its progress, and
+checks for a cancel, every 20 objects instead of once per 1,000-object page,
+so a page of large objects no longer hides its progress for minutes. A
+completed one-off row no longer reports the phase it ended in, and the run
+entry of a one-off job counts its failed objects as scanned.
+
+A migrate to a non-empty destination now fails at the start request with
+`409 Conflict`, which the dialog shows, instead of a job that fails a moment
+later. A migrate to a backend that the health check marks as unavailable is
+refused the same way. A migrate to a backend with wrong credentials said
+"Bucket not found", because the proxy read every `403` on a bucket request as
+a hidden missing bucket. A refused `CreateBucket`, and a `403` whose error
+code names the credentials, now read as access denied.
+
+The `503 SlowDown` of a gated bucket now names the job that holds it (a
+re-encryption, a migration, or a metadata backfill); before, it always said
+"re-encryption or migration". `GET /_/api/admin/jobs/bucket/:bucket` now has
+a `writes_blocked` field that follows the write gate, which a cancelled migrate
+releases before its row settles. `GET /_/api/admin/jobs` now lists the 200
+newest one-off jobs instead of 50, and its `older_oneoffs` field counts the
+ones that it leaves out. The failures of a one-off job now carry a `total`.
+
+### Fixed — The migrate, re-encrypt and backfill dialogs say what a job will do
+
+The migrate dialog now shows the health and the encryption mode of every
+target backend. It does not offer a backend that is unavailable, and it asks
+for a confirmation before it moves a bucket from an encrypting backend to a
+plaintext one, because the objects are then stored unencrypted. The
+re-encrypt dialog of **Jobs → New job** said "Encrypt existing objects" also
+after a key rotation, and it offered every bucket. It now lists only the
+buckets on a backend with something to rewrite, with the backend and its
+encryption, and a search box. The backfill dialog has a search box and the
+backend of each bucket, and after a partial start it keeps only the buckets
+that did not start selected. The Buckets page labelled every bucket without
+an explicit route with the default backend, also when the bucket lives on
+another backend. The legacy-key usage check now asks for up to 50,000
+objects.
+
+### Fixed — A draft job can be removed on its own
+
+A rule that you add with "New job" stays a draft until you apply it. A draft
+row had no actions, so the only way to remove it was Discard, which also
+dropped every other unsaved edit. The "⋯" menu of a draft row, and of the
+draft's drawer, now has "Remove draft". It asks for confirmation, removes
+only that rule, and keeps your other unsaved edits.
+
+### Added — A lifecycle preview says when the next object becomes due
+
+A preview that matched no object said only "0 of 12,148 scanned objects
+would be affected", so a rule that already deleted every old object looked
+broken. The preview response now has a `next_due_at` field. It is the
+earliest time at which a scanned object that the rule does not match now
+will match: the creation time of the object plus `expire_after`. The proxy
+reads these times from the metadata that the walk already has, so the
+field costs no extra request. The Preview tab now says "Nothing to do now.
+The first object becomes due on <date> (in ~13 h)." When some objects
+match, the tab also says when the next of the others becomes due. The line
+"Computed at" is now "Scanned 12,148 objects at <time>", which makes clear
+that the proxy walked the scope at that time.
+
+### Added — A lifecycle preview shows its progress while it runs
+
+A preview walks the whole scope of the rule, which can take a while on a
+large prefix. Before, **Refresh preview** showed only a spinner until the
+walk ended, so a running walk could not be told apart from a stuck one.
+The walk now publishes its counters after each listing page, and the new
+request `GET /_/api/admin/jobs/lifecycle:<name>/preview` reads them without
+starting a walk. While a preview request waits, the Preview tab and the
+Run-now dialog read these counters every second and show "Scanning… 4,210
+objects so far."
 
 ## v2.0.12 — 2026-10-13
 

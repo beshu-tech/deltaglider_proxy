@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.13 — 2026-10-14
+
 ### Added — A bucket can have its own encryption (issue #116)
 ### Added — The admin UI shows the encryption witness
 
