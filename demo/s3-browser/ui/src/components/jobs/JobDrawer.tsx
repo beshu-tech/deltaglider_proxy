@@ -15,7 +15,10 @@ import type { JobRow, LifecycleVerb } from '../../jobsView';
 import {
   availableActions,
   cancelConfirmText,
+  DRAFT_KEY_MARK,
   failuresCountText,
+  findEditorRule,
+  UNNAMED_RULE,
   groupFailureErrors,
   isActiveJobStatus,
   jobInFlight,
@@ -53,11 +56,12 @@ interface Props {
   rows: JobRow[];
   replication: ReplicationConfig;
   lifecycle: LifecycleConfig;
+  /** The editors' last server snapshots: a server job id names the saved
+   *  rule, and the editor rule is the one with that rule's uid. */
+  replicationSaved: ReplicationConfig;
+  lifecycleSaved: LifecycleConfig;
   onReplicationChange: (fn: (cur: ReplicationConfig) => ReplicationConfig) => void;
   onLifecycleChange: (fn: (cur: LifecycleConfig) => LifecycleConfig) => void;
-  /** Rename support: the drawer is keyed by `<kind>:<name>`, so a rename
-   *  must retarget the key or the lookup loses the rule mid-keystroke. */
-  onJobIdChange: (next: string) => void;
   /** Drop a draft (a rule that exists only in the unsaved edits). */
   onRemoveDraft: (draft: Pick<JobRow, 'id' | 'kind' | 'name'>) => void;
   /** Cancel a running one-off (asked for confirmation here first). */
@@ -90,9 +94,10 @@ export default function JobDrawer({
   rows,
   replication,
   lifecycle,
+  replicationSaved,
+  lifecycleSaved,
   onReplicationChange,
   onLifecycleChange,
-  onJobIdChange,
   onRemoveDraft,
   onCancelJob,
   lifecycleVerbOf,
@@ -148,14 +153,21 @@ export default function JobDrawer({
   const liveRuns = overlayLiveRun(runsQuery.data?.runs ?? [], serverRow);
   const runKind = serverRow?.kind ?? ruleKind ?? 'replication';
 
+  // The editor rule this drawer shows: by uid, never by name (a name
+  // changes while the operator types it, and can match another rule).
   const replIndex =
     parsed?.subsystem === 'replication'
-      ? replication.rules.findIndex((r) => r.name === parsed.key)
+      ? findEditorRule(parsed.key, replication.rules, replicationSaved.rules)
       : -1;
   const lcIndex =
     parsed?.subsystem === 'lifecycle'
-      ? lifecycle.rules.findIndex((r) => r.name === parsed.key)
+      ? findEditorRule(parsed.key, lifecycle.rules, lifecycleSaved.rules)
       : -1;
+  const editorRuleName =
+    replIndex >= 0 ? replication.rules[replIndex].name : lcIndex >= 0 ? lifecycle.rules[lcIndex].name : null;
+  // What the title calls a rule that the server does not know yet.
+  const draftName = editorRuleName ?? (parsed && !parsed.key.startsWith(DRAFT_KEY_MARK) ? parsed.key : '');
+  const draftLabel = draftName || UNNAMED_RULE;
 
   const definition = (() => {
     if (replIndex >= 0) {
@@ -171,13 +183,12 @@ export default function JobDrawer({
               rules: cur.rules.map((r, i) => (i === replIndex ? { ...r, ...patch } : r)),
             }))
           }
-          onRename={(next) => {
+          onRename={(next) =>
             onReplicationChange((cur) => ({
               ...cur,
               rules: cur.rules.map((r, i) => (i === replIndex ? { ...r, name: next } : r)),
-            }));
-            onJobIdChange(`replication:${next}`);
-          }}
+            }))
+          }
         />
       );
     }
@@ -194,13 +205,12 @@ export default function JobDrawer({
               rules: cur.rules.map((r, i) => (i === lcIndex ? { ...r, ...patch } : r)),
             }))
           }
-          onRename={(next) => {
+          onRename={(next) =>
             onLifecycleChange((cur) => ({
               ...cur,
               rules: cur.rules.map((r, i) => (i === lcIndex ? { ...r, name: next } : r)),
-            }));
-            onJobIdChange(`lifecycle:${next}`);
-          }}
+            }))
+          }
         />
       );
     }
@@ -457,13 +467,13 @@ export default function JobDrawer({
       extra={
         !serverRow && parsed && ruleKind ? (
           <RowActionsMenu
-            label={`More actions for ${parsed.key}`}
+            label={`More actions for ${draftLabel}`}
             actions={[
               draftRemoveAction(
                 {
                   id: jobId ?? '',
                   kind: ruleKind,
-                  name: parsed.key,
+                  name: draftLabel,
                 },
                 onRemoveDraft,
               ),
@@ -481,7 +491,7 @@ export default function JobDrawer({
           </span>
         ) : parsed && ruleKind ? (
           <span>
-            {kindLabel(ruleKind)} · <span style={{ fontFamily: 'var(--font-mono)' }}>{parsed.key}</span>{' '}
+            {kindLabel(ruleKind)} · <span style={{ fontFamily: 'var(--font-mono)' }}>{draftLabel}</span>{' '}
             <Tag color="warning" style={{ marginLeft: 8 }}>
               draft
             </Tag>

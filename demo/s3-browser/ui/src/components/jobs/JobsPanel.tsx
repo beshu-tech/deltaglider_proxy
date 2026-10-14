@@ -36,6 +36,11 @@ import {
   cancelConfirmText,
   editedRuleIds,
   editorAfterDiscard,
+  editorRuleJobId,
+  findEditorRule,
+  ruleIdsChangedByApply,
+  savedRulesChangedByApply,
+  DRAFT_KEY_MARK,
   isActiveJobStatus,
   jobStatusLabel,
   jobStatusTone,
@@ -59,7 +64,9 @@ import {
   stepJobWatch,
   triggerLabel,
   watchSettled,
+  parseJobId,
 } from '../../jobsView';
+import { carryRuleUids, ruleUid } from '../../ruleUid';
 import { tickPeriodMs, useNow } from '../../hooks/useNow';
 import { qk } from '../../queries/keys';
 import { useJobs } from '../../queries/jobs';
@@ -261,13 +268,22 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
   );
 
   // ── The two rule-definition editors (disjoint storage merge-patches). ──
+  // Each re-read keeps the rule uids (by name) of the rules the editor holds,
+  // then of its last snapshot: after an apply, the rules the editor holds must
+  // still match their saved twins. The value comes first because the re-read
+  // after the PUT can resolve before React renders the new snapshot.
+  const replKnown = useRef<ReplicationConfig['rules']>([]);
+  const lcKnown = useRef<LifecycleConfig['rules']>([]);
   const repl = useSectionEditor<StorageSectionBody, ReplicationConfig>({
     section: 'storage',
     dirtyKey: 'jobs/replication',
     initial: DEFAULT_REPLICATION,
     onSessionExpired,
     noun: 'replication',
-    pick: (body) => normalizeReplication(body.replication),
+    pick: (body) => {
+      const next = normalizeReplication(body.replication);
+      return { ...next, rules: carryRuleUids(next.rules, replKnown.current) };
+    },
     toPayload: (v) => {
       const res = buildReplicationPayload(v);
       return res.ok ? res.body : {};
@@ -279,12 +295,18 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
     initial: DEFAULT_LIFECYCLE,
     onSessionExpired,
     noun: 'lifecycle',
-    pick: (body) => normalizeLifecycle(body.lifecycle),
+    pick: (body) => {
+      const next = normalizeLifecycle(body.lifecycle);
+      return { ...next, rules: carryRuleUids(next.rules, lcKnown.current) };
+    },
     toPayload: (v) => {
       const res = buildLifecyclePayload(v);
       return res.ok ? res.body : {};
     },
   });
+
+  replKnown.current = [...repl.value.rules, ...repl.baseline.rules];
+  lcKnown.current = [...lc.value.rules, ...lc.baseline.rules];
 
   // What a lifecycle rule does to an object, from its saved definition.
   const ruleVerb = (row: JobRow) => {
@@ -300,20 +322,25 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
   const lcBaselineStale = useRef(false);
 
   const syncEditorAfterDelete = (row: JobRow) => {
+    // The Verify tab's cached parity result belongs to the deleted rule: a
+    // new rule with the same name must not show it.
+    if (row.kind === 'replication') qc.removeQueries({ queryKey: qk.jobs.verify(row.name) });
     if (row.kind === 'replication') {
-      const plan = planRuleDeleteSync(repl.isDirty, repl.value.rules, row.name);
+      const plan = planRuleDeleteSync(repl.isDirty, repl.value.rules, repl.baseline.rules, row.name);
       if (plan.action === 'refresh') {
         void repl.refresh();
       } else {
-        repl.setValue((cur) => ({ ...cur, rules: cur.rules.filter((r) => r.name !== row.name) }));
+        const keep = new Set(plan.rules.map(ruleUid));
+        repl.setValue((cur) => ({ ...cur, rules: cur.rules.filter((r) => keep.has(ruleUid(r))) }));
         replBaselineStale.current = true;
       }
     } else if (row.kind === 'lifecycle') {
-      const plan = planRuleDeleteSync(lc.isDirty, lc.value.rules, row.name);
+      const plan = planRuleDeleteSync(lc.isDirty, lc.value.rules, lc.baseline.rules, row.name);
       if (plan.action === 'refresh') {
         void lc.refresh();
       } else {
-        lc.setValue((cur) => ({ ...cur, rules: cur.rules.filter((r) => r.name !== row.name) }));
+        const keep = new Set(plan.rules.map(ruleUid));
+        lc.setValue((cur) => ({ ...cur, rules: cur.rules.filter((r) => keep.has(ruleUid(r))) }));
         lcBaselineStale.current = true;
       }
     }
@@ -321,13 +348,22 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
 
   // A draft (staged, never applied) leaves the editor alone: the other
   // unsaved edits stay, and the dirty bar goes away if it was the only one.
-  const removeDraft = (row: Pick<JobRow, 'id' | 'kind' | 'name'>) => {
-    const drop = <T extends { rules: { name: string }[] }>(cur: T): T => ({
-      ...cur,
-      rules: cur.rules.filter((r) => r.name !== row.name),
-    });
-    if (row.kind === 'replication') repl.setValue(drop);
-    else if (row.kind === 'lifecycle') lc.setValue(drop);
+  // The draft is found by its id (a uid), never by its name: another rule
+  // can have the same name, and a draft's name can be empty.
+  const removeDraft = (row: Pick<JobRow, 'id' | 'kind'>) => {
+    const key = parseJobId(row.id)?.key ?? '';
+    const ed = row.kind === 'replication' ? repl : row.kind === 'lifecycle' ? lc : null;
+    if (!ed) return;
+    const idx = findEditorRule(key, ed.value.rules, ed.baseline.rules);
+    if (idx >= 0) {
+      const uid = ruleUid(ed.value.rules[idx]);
+      const drop = <T extends { rules: object[] }>(cur: T): T => ({
+        ...cur,
+        rules: cur.rules.filter((r) => ruleUid(r) !== uid),
+      });
+      if (row.kind === 'replication') repl.setValue(drop);
+      else lc.setValue(drop);
+    }
     if (drawerJobId === row.id) handleDrawerClose();
   };
 
@@ -389,17 +425,25 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
   // After an apply the scheduler starts the changed rules within a second:
   // watch them so their runs show up without waiting for the idle poll.
   const watchApplied = useCallback(
-    (kind: 'replication' | 'lifecycle') =>
-      watchJobs([...edited].filter((id) => id.startsWith(`${kind}:`))),
-    [edited, watchJobs],
+    (kind: 'replication' | 'lifecycle') => {
+      const ed = kind === 'replication' ? repl : lc;
+      watchJobs(ruleIdsChangedByApply(kind, ed.value.rules, ed.baseline.rules));
+    },
+    [repl, lc, watchJobs],
   );
 
   const anyDirty = repl.isDirty || lc.isDirty;
   useApplyHandler('jobs', startApplyQueue, anyDirty);
 
   const confirmReplApply = useCallback(async () => {
+    // Before the apply moves the snapshot: the saved rules it deletes or changes.
+    const staleVerify = savedRulesChangedByApply(repl.value.rules, repl.baseline.rules);
     const ok = await repl.confirmApply();
-    if (ok) watchApplied('replication');
+    if (ok) {
+      watchApplied('replication');
+      // A deleted, renamed or changed rule's parity result is not the new rule's.
+      for (const name of staleVerify) qc.removeQueries({ queryKey: qk.jobs.verify(name) });
+    }
     qc.invalidateQueries({ queryKey: qk.jobs.list() });
     if (!ok) {
       // Replication PUT failed: abort the queue. The lifecycle edits stay
@@ -436,8 +480,14 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
 
   // ── Display rows: server rows + drafts/pending-deletes overlay. ──
   const displayRows: JobDisplayRow[] = useMemo(
-    () => mergeDraftRules(serverRows, repl.value.rules, lc.value.rules, edited),
-    [serverRows, repl.value.rules, lc.value.rules, edited]
+    () =>
+      mergeDraftRules(
+        serverRows,
+        { rules: repl.value.rules, baseline: repl.baseline.rules },
+        { rules: lc.value.rules, baseline: lc.baseline.rules },
+        edited,
+      ),
+    [serverRows, repl.value.rules, repl.baseline.rules, lc.value.rules, lc.baseline.rules, edited]
   );
 
   // ── Drawer + creation modals ──
@@ -487,9 +537,8 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
     [navigate, markPushed],
   );
 
-  // Rename retarget: same as openDrawer but REPLACE (not push) so typing
-  // 5 characters doesn't create 5 history entries.  The drawer is already
-  // open; we're just updating which job it points at.
+  // Retarget: same as openDrawer but REPLACE (not push). The drawer is
+  // already open on the same rule; only its job id changes.
   const retargetDrawer = useCallback(
     (jobId: string) => {
       setDrawerJobId(jobId);
@@ -498,6 +547,38 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
     },
     [navigate, drawerTab],
   );
+
+  // The drawer holds ONE rule while its id changes under it. A draft id
+  // stays the same while the operator types the name (also through the
+  // name of another rule). After an apply, the drawer moves to the rule's
+  // server id: a draft becomes a server rule, and a renamed rule is now
+  // known by its new name.
+  const drawerRule = useRef<{ jobId: string; uid: string } | null>(null);
+  useEffect(() => {
+    const parsed = drawerJobId ? parseJobId(drawerJobId) : null;
+    const kind = parsed?.subsystem;
+    if (!drawerJobId || !parsed || (kind !== 'replication' && kind !== 'lifecycle')) {
+      drawerRule.current = null;
+      return;
+    }
+    const ed = kind === 'replication' ? repl : lc;
+    const idx = findEditorRule(parsed.key, ed.value.rules, ed.baseline.rules);
+    let rule = idx >= 0 ? ed.value.rules[idx] : undefined;
+    if (!rule && drawerRule.current?.jobId === drawerJobId) {
+      const uid = drawerRule.current.uid;
+      rule = ed.value.rules.find((r) => ruleUid(r) === uid);
+    }
+    if (!rule) {
+      drawerRule.current = null;
+      return;
+    }
+    const canonical = editorRuleJobId(kind, rule, ed.baseline.rules);
+    // A server id stays while it resolves (a rename in progress keeps its
+    // Runs tab); a draft id moves once the rule is applied.
+    const move = canonical !== drawerJobId && (idx < 0 || parsed.key.startsWith(DRAFT_KEY_MARK));
+    drawerRule.current = { jobId: move ? canonical : drawerJobId, uid: ruleUid(rule) };
+    if (move) retargetDrawer(canonical);
+  }, [drawerJobId, repl, lc, retargetDrawer]);
 
   const handleDrawerClose = useCallback(() => {
     setDrawerJobId(null);
@@ -572,11 +653,11 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
       if (key === 'replication') {
         const rule = emptyReplicationRule(repl.value.rules);
         repl.setValue((cur) => ({ ...cur, rules: [...cur.rules, rule] }));
-        openDrawer(`replication:${rule.name}`);
+        openDrawer(editorRuleJobId('replication', rule, repl.baseline.rules));
       } else if (key === 'lifecycle') {
         const rule = emptyLifecycleRule(lc.value.rules);
         lc.setValue((cur) => ({ ...cur, rules: [...cur.rules, rule] }));
-        openDrawer(`lifecycle:${rule.name}`);
+        openDrawer(editorRuleJobId('lifecycle', rule, lc.baseline.rules));
       } else if (key === 'reencrypt') {
         setReencryptOpen(true);
       } else if (key === 'backfill') {
@@ -832,9 +913,10 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
         rows={serverRows}
         replication={repl.value}
         lifecycle={lc.value}
+        replicationSaved={repl.baseline}
+        lifecycleSaved={lc.baseline}
         onReplicationChange={repl.setValue}
         onLifecycleChange={lc.setValue}
-        onJobIdChange={retargetDrawer}
         onRemoveDraft={removeDraft}
         onCancelJob={(row) => runAction(row, 'cancel')}
         lifecycleVerbOf={ruleVerb}

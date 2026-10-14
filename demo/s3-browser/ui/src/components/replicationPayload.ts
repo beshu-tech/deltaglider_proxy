@@ -17,6 +17,7 @@ import type {
 } from '../adminApi';
 import { normalizePrefix } from '../storagePath';
 import { nextUniqueRuleName } from './ruleNames';
+import { withRuleUid } from '../ruleUid';
 
 // Serde defaults of src/config_sections.rs (parity test there).
 export const DEFAULT_REPLICATION: ReplicationConfig = {
@@ -29,7 +30,8 @@ export const DEFAULT_REPLICATION: ReplicationConfig = {
 };
 
 export function emptyRule(existing: ReplicationRuleConfig[]): ReplicationRuleConfig {
-  return {
+  // Each new rule gets its own uid (see ruleUid.ts); JSON drops it.
+  return withRuleUid({
     name: nextUniqueRuleName(existing, 'rule'),
     enabled: true,
     source: { bucket: '', prefix: '' },
@@ -40,7 +42,7 @@ export function emptyRule(existing: ReplicationRuleConfig[]): ReplicationRuleCon
     conflict: 'newer-wins',
     include_globs: [],
     exclude_globs: ['.deltaglider/**'],
-  };
+  });
 }
 
 export function normalizeReplication(

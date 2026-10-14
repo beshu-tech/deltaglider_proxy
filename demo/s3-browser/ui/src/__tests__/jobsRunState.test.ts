@@ -30,6 +30,7 @@ import {
   watchSettled,
   type JobRow,
 } from '../jobsView';
+import { ruleUid, withRuleUid } from '../ruleUid';
 
 const row = (over: Partial<JobRow> = {}): JobRow => ({
   id: 'replication:r1',
@@ -201,15 +202,12 @@ test('availableActions: cancel only while it can still act; no Run now while a r
 
 test('editedRuleIds: changed and new rules only, key order ignored', () => {
   const saved = [
-    { name: 'a', source: { bucket: 'x', prefix: '' } },
-    { name: 'b', bucket: 'y' },
+    withRuleUid({ name: 'a', source: { bucket: 'x', prefix: '' } }),
+    withRuleUid({ name: 'b', bucket: 'y' }),
   ];
-  const now = [
-    { name: 'a', source: { prefix: '', bucket: 'x' } },
-    { name: 'b', bucket: 'z' },
-    { name: 'c', bucket: 'w' },
-  ];
-  assert.deepEqual([...editedRuleIds('lifecycle', now, saved)].sort(), ['lifecycle:b', 'lifecycle:c']);
+  const c = withRuleUid({ name: 'c', bucket: 'w' });
+  const now = [{ ...saved[0], source: { prefix: '', bucket: 'x' } }, { ...saved[1], bucket: 'z' }, c];
+  assert.deepEqual([...editedRuleIds('lifecycle', now, saved)].sort(), [`lifecycle:#${ruleUid(c)}`, 'lifecycle:b']);
   assert.equal(editedRuleIds('replication', saved, saved).size, 0);
 });
 

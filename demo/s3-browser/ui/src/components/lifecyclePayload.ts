@@ -18,6 +18,7 @@ import type {
 } from '../adminApi';
 import { normalizePrefix } from '../storagePath';
 import { nextUniqueRuleName } from './ruleNames';
+import { withRuleUid } from '../ruleUid';
 
 export const DEFAULT_LIFECYCLE: LifecycleConfig = {
   enabled: false,
@@ -27,7 +28,8 @@ export const DEFAULT_LIFECYCLE: LifecycleConfig = {
 };
 
 export function emptyRule(existing: LifecycleRuleConfig[]): LifecycleRuleConfig {
-  return {
+  // Each new rule gets its own uid (see ruleUid.ts); JSON drops it.
+  return withRuleUid({
     name: nextUniqueRuleName(existing, 'expire-old'),
     enabled: false,
     bucket: '',
@@ -37,7 +39,7 @@ export function emptyRule(existing: LifecycleRuleConfig[]): LifecycleRuleConfig 
     include_globs: [],
     exclude_globs: ['.deltaglider/**'],
     batch_size: 100,
-  };
+  });
 }
 
 export function actionKind(

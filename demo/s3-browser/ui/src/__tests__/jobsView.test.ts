@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'vitest';
 import {
+  savedRulesChangedByApply,
+  ruleIdsChangedByApply,
+  findEditorRule,
+  editorRuleJobId,
+  editedRuleIds,
   approxTimeUntil,
   parseJobId,
   isActiveJobStatus,
@@ -33,6 +38,7 @@ import {
   lifecycleRunLabel,
   type JobRow,
 } from '../jobsView';
+import { ruleUid, withRuleUid } from '../ruleUid';
 import type { ConflictPolicy, FixAction, JobRunEntry } from '../adminApi';
 
 const row = (over: Partial<JobRow> = {}): JobRow => ({
@@ -89,8 +95,8 @@ test('status helpers', () => {
 });
 
 test('draftBlocksAction: preview/run-now never run a stale definition — of THAT rule only', () => {
-  const lc = { kind: 'lifecycle', name: 'expire' };
-  const repl = { kind: 'replication', name: 'mirror' };
+  const lc = { id: 'lifecycle:expire' };
+  const repl = { id: 'replication:mirror' };
   const none = new Set<string>();
   assert.equal(draftBlocksAction('preview', lc, none), null);
   assert.match(draftBlocksAction('preview', lc, new Set(['lifecycle:expire'])) ?? '', /saved rule/);
@@ -221,22 +227,30 @@ test('mergeDraftRules', () => {
     row({ id: 'lifecycle:lc', kind: 'lifecycle', name: 'lc', trigger: 'scheduled' }),
     row({ id: 'maintenance:9', kind: 'reencrypt', trigger: 'oneoff', name: 'b' }),
   ];
-  const merged = mergeDraftRules(server, [{ name: 'keep' }, { name: 'fresh' }], [{ name: 'lc' }]);
+  const keep = withRuleUid({ name: 'keep' });
+  const gone = withRuleUid({ name: 'gone' });
+  const lcRule = withRuleUid({ name: 'lc' });
+  const fresh = withRuleUid({ name: 'fresh' });
+  const replSaved = [keep, gone];
+  const lcEd = { rules: [lcRule], baseline: [lcRule] };
+  const merged = mergeDraftRules(server, { rules: [keep, fresh], baseline: replSaved }, lcEd);
   const byId = Object.fromEntries(merged.map((d) => [d.row.id, d]));
+  const freshId = `replication:#${ruleUid(fresh)}`;
   assert.equal(byId['replication:keep'].pendingDelete, false);
   assert.equal(byId['replication:gone'].pendingDelete, true, 'editor-removed rule flagged');
-  assert.equal(byId['replication:fresh'].draft, true, 'editor-only rule is a draft');
-  assert.equal(byId['replication:fresh'].row.status, 'idle');
+  assert.equal(byId[freshId].draft, true, 'editor-only rule is a draft');
+  assert.equal(byId[freshId].row.name, 'fresh');
+  assert.equal(byId[freshId].row.status, 'idle');
   // Regression: a draft row showed scope "—" though the editor held a bucket.
   const scoped = mergeDraftRules(
     [],
-    [{ name: 'r', source: { bucket: 'releases', prefix: 'v1' }, destination: { bucket: 'downloads' } }],
-    [{ name: 'l', bucket: 'db-archive', prefix: '' }],
+    { rules: [{ name: 'r', source: { bucket: 'releases', prefix: 'v1' }, destination: { bucket: 'downloads' } }], baseline: [] },
+    { rules: [{ name: 'l', bucket: 'db-archive', prefix: '' }], baseline: [] },
   );
   assert.deepEqual(scoped[0].row.scope, { bucket: 'releases', prefix: 'v1', target: 'downloads' });
   assert.deepEqual(scoped[1].row.scope, { bucket: 'db-archive', prefix: undefined });
   // A server rule with unapplied edits carries the marker.
-  const marked = mergeDraftRules(server, [{ name: 'keep' }], [{ name: 'lc' }], new Set(['replication:keep']));
+  const marked = mergeDraftRules(server, { rules: [keep], baseline: replSaved }, lcEd, new Set(['replication:keep']));
   assert.equal(marked.find((d) => d.row.id === 'replication:keep')?.edited, true);
   assert.equal(marked.find((d) => d.row.id === 'lifecycle:lc')?.edited, false);
   assert.equal(byId['lifecycle:lc'].pendingDelete, false);
@@ -452,24 +466,92 @@ test('jobStrategyMix', () => {
 });
 
 test('planRuleDeleteSync (deleted rule must not resurrect as a draft)', () => {
-  const rules = [{ name: 'keep' }, { name: 'gone' }];
+  const rules = [withRuleUid({ name: 'keep' }), withRuleUid({ name: 'gone' })];
   // Clean editor → re-fetch server truth (value AND baseline lose the rule).
-  assert.deepEqual(planRuleDeleteSync(false, rules, 'gone'), { action: 'refresh' });
+  assert.deepEqual(planRuleDeleteSync(false, rules, rules, 'gone'), { action: 'refresh' });
   // Dirty editor → filter the rule out of the value; the other edits stay.
-  const plan = planRuleDeleteSync(true, rules, 'gone');
+  const plan = planRuleDeleteSync(true, rules, rules, 'gone');
   assert.equal(plan.action, 'filter');
-  assert.deepEqual(plan.action === 'filter' ? plan.rules : null, [{ name: 'keep' }]);
+  assert.deepEqual(plan.action === 'filter' ? plan.rules : null, [rules[0]]);
   // Regression: after the delete, the server list no longer has the rule.
   // Without the sync the editor still carries it and mergeDraftRules shows it
   // as a DRAFT, which the next Apply re-creates.
   const server = [row({ id: 'replication:keep', name: 'keep' })];
-  const stale = mergeDraftRules(server, rules, []);
+  const none = { rules: [], baseline: [] };
+  const stale = mergeDraftRules(server, { rules, baseline: rules }, none);
   assert.ok(stale.some((d) => d.draft && d.row.name === 'gone'), 'stale editor resurrects the rule');
-  const synced = mergeDraftRules(server, plan.action === 'filter' ? plan.rules : rules, []);
+  const synced = mergeDraftRules(server, { rules: plan.action === 'filter' ? plan.rules : rules, baseline: rules }, none);
   assert.equal(synced.some((d) => d.row.name === 'gone'), false, 'synced editor drops the rule');
   // Deleting a rule the editor does not have is a no-op filter.
-  const noop = planRuleDeleteSync(true, rules, 'other');
+  const noop = planRuleDeleteSync(true, rules, rules, 'other');
   assert.deepEqual(noop.action === 'filter' ? noop.rules : null, rules);
+  // A draft that only has the deleted name stays, and so does a rename of
+  // the deleted rule: only the saved rule under its saved name goes.
+  const draft = withRuleUid({ name: 'gone' });
+  const renamed = { ...rules[1], name: 'gone-eu' };
+  const kept = planRuleDeleteSync(true, [rules[0], renamed, draft], rules, 'gone');
+  assert.deepEqual(kept.action === 'filter' ? kept.rules : null, [rules[0], renamed, draft]);
+});
+
+test('rule identity: the editor matches a rule to its saved twin by uid, never by name', () => {
+  const nightly = withRuleUid({ name: 'nightly', source: { bucket: 'releases' } });
+  const saved = [nightly];
+  // A new rule whose name is typed through "nightly" on the way to "nightly-eu".
+  const draft = withRuleUid({ name: 'nightly', source: { bucket: '' } });
+  const rules = [nightly, draft];
+  const draftId = `replication:#${ruleUid(draft)}`;
+  assert.equal(editorRuleJobId('replication', draft, saved), draftId);
+  assert.equal(editorRuleJobId('replication', nightly, saved), 'replication:nightly');
+  // The server id opens the saved rule; the draft id opens the draft.
+  assert.equal(findEditorRule('nightly', rules, saved), 0);
+  assert.equal(findEditorRule(`#${ruleUid(draft)}`, rules, saved), 1);
+  // The saved rule is not "edited" because a draft has its name.
+  assert.deepEqual([...editedRuleIds('replication', rules, saved)], [draftId]);
+  const server = [row({ id: 'replication:nightly', name: 'nightly' })];
+  const none = { rules: [], baseline: [] };
+  const merged = mergeDraftRules(server, { rules, baseline: saved }, none, editedRuleIds('replication', rules, saved));
+  assert.deepEqual(
+    merged.map((d) => [d.row.id, d.row.name, d.draft, d.pendingDelete, !!d.edited]),
+    [
+      ['replication:nightly', 'nightly', false, false, false],
+      [draftId, 'nightly', true, false, false],
+    ],
+  );
+  // A draft with an empty name stays in the table, as "(unnamed)".
+  const nameless = { ...draft, name: '' };
+  const blank = mergeDraftRules([], { rules: [nameless], baseline: [] }, none);
+  assert.deepEqual(blank.map((d) => [d.row.id, d.row.name]), [[draftId, '(unnamed)']]);
+  assert.equal(findEditorRule(`#${ruleUid(draft)}`, [nameless], []), 0);
+  // A rename is a delete and a create on the server: the saved row is
+  // removed, the renamed rule is a draft, and the server id still opens it.
+  const renamed = { ...nightly, name: 'nightly-eu' };
+  const ren = mergeDraftRules(server, { rules: [renamed], baseline: saved }, none);
+  assert.deepEqual(
+    ren.map((d) => [d.row.id, d.row.name, d.draft, d.pendingDelete]),
+    [
+      ['replication:nightly', 'nightly', false, true],
+      [`replication:#${ruleUid(nightly)}`, 'nightly-eu', true, false],
+    ],
+  );
+  assert.equal(findEditorRule('nightly', [renamed], saved), 0);
+  // An applied rule that the jobs list does not show yet is a draft row
+  // under its server id.
+  const early = mergeDraftRules([], { rules: saved, baseline: saved }, none);
+  assert.deepEqual(early.map((d) => [d.row.id, d.draft]), [['replication:nightly', true]]);
+});
+
+test('ruleIdsChangedByApply / savedRulesChangedByApply', () => {
+  const a = withRuleUid({ name: 'a', bucket: 'x' });
+  const b = withRuleUid({ name: 'b', bucket: 'y' });
+  const c = withRuleUid({ name: 'c', bucket: 'z' });
+  const saved = [a, b, c];
+  const fresh = withRuleUid({ name: 'new', bucket: 'w' });
+  // a unchanged, b changed, c renamed, plus a new rule.
+  const rules = [a, { ...b, bucket: 'q' }, { ...c, name: 'c2' }, fresh];
+  assert.deepEqual(ruleIdsChangedByApply('lifecycle', rules, saved), ['lifecycle:b', 'lifecycle:c2', 'lifecycle:new']);
+  assert.deepEqual(savedRulesChangedByApply(rules, saved), ['b', 'c']);
+  // A deleted rule; a new rule that takes a saved name is not that rule.
+  assert.deepEqual(savedRulesChangedByApply([withRuleUid({ name: 'a', bucket: 'x' }), b, c], saved), ['a']);
 });
 
 test('editorAfterDiscard: after a dirty delete the baseline still holds it', () => {

@@ -12,6 +12,7 @@
 
 import type { ConflictPolicy, FixAction, JobRunEntry, RerunVerdict } from './adminApi';
 import { formatBytes, formatDuration } from './utils';
+import { ruleUid } from './ruleUid';
 
 export type JobKind = 'replication' | 'lifecycle' | 'reencrypt' | 'migrate' | string;
 export type JobAction = 'pause' | 'resume' | 'run-now' | 'preview' | 'cancel' | 'delete' | 'kill';
@@ -421,31 +422,115 @@ export function lifecycleRunNowBlock(row: JobRow, schedulerOn: boolean): string 
  */
 export function draftBlocksAction(
   action: JobAction,
-  row: Pick<JobRow, 'kind' | 'name'>,
+  row: Pick<JobRow, 'id'>,
   edited: ReadonlySet<string>,
 ): string | null {
   if (action !== 'preview' && action !== 'run-now') return null;
-  return edited.has(`${row.kind}:${row.name}`)
+  return edited.has(row.id)
     ? 'Apply or discard your unsaved edits to this rule first — this would use the saved rule.'
     : null;
 }
 
 /**
- * Ids (`<kind>:<name>`) of the rules whose editor value differs from the
- * saved one, plus rules that exist only in the editor. Only those rules
- * block Run now and Preview, and only those show the "edited" marker.
+ * Ids of the rules whose editor value differs from the saved one: the
+ * server id (`<kind>:<name>`) of an applied rule with edits, and the draft
+ * id (see `editorRuleJobId`) of a rule that exists only in the editor. Only
+ * those rules block Run now and Preview, and only those show the "edited"
+ * marker. A rule is matched to its saved twin by its uid, never by name.
  */
 export function editedRuleIds(
   kind: 'replication' | 'lifecycle',
   rules: readonly NamedRule[],
   baseline: readonly NamedRule[],
 ): Set<string> {
-  const saved = new Map(baseline.map((r) => [r.name, stableJson(r)]));
+  const saved = new Map(baseline.map((r) => [ruleUid(r), r]));
+  const applied = appliedUidByName(baseline);
   const out = new Set<string>();
   for (const r of rules) {
-    if (saved.get(r.name) !== stableJson(r)) out.add(`${kind}:${r.name}`);
+    if (!isAppliedRule(r, applied)) out.add(editorRuleJobId(kind, r, baseline));
+    else if (stableJson(saved.get(ruleUid(r))) !== stableJson(r)) out.add(`${kind}:${r.name}`);
   }
   return out;
+}
+
+/**
+ * The server ids (`<kind>:<name>`) that an apply of this editor creates or
+ * changes: the jobs to watch after the apply, because the scheduler starts
+ * them a moment later.
+ */
+export function ruleIdsChangedByApply(
+  kind: 'replication' | 'lifecycle',
+  rules: readonly NamedRule[],
+  baseline: readonly NamedRule[],
+): string[] {
+  const edited = editedRuleIds(kind, rules, baseline);
+  return rules
+    .filter((r) => r.name && edited.has(editorRuleJobId(kind, r, baseline)))
+    .map((r) => `${kind}:${r.name}`);
+}
+
+/**
+ * Names of saved rules that an apply of this editor deletes or changes. Data
+ * cached for such a name (the Verify tab's parity result) describes a rule
+ * that will not exist any more.
+ */
+export function savedRulesChangedByApply(rules: readonly NamedRule[], baseline: readonly NamedRule[]): string[] {
+  const now = new Map(rules.map((r) => [ruleUid(r), r]));
+  return baseline
+    .filter((b) => {
+      const r = now.get(ruleUid(b));
+      return !r || r.name !== b.name || stableJson(r) !== stableJson(b);
+    })
+    .map((b) => b.name);
+}
+
+/** Marks the key of a draft job id: rule names never contain it. */
+export const DRAFT_KEY_MARK = '#';
+
+/** What the table and the drawer call a draft whose name is empty. */
+export const UNNAMED_RULE = '(unnamed)';
+
+/** Saved rule name → uid. */
+function appliedUidByName(baseline: readonly NamedRule[]): Map<string, string> {
+  return new Map(baseline.map((r) => [r.name, ruleUid(r)]));
+}
+
+/** The editor rule still carries the name it has on the server. */
+function isAppliedRule(rule: NamedRule, applied: Map<string, string>): boolean {
+  return !!rule.name && applied.get(rule.name) === ruleUid(rule);
+}
+
+/**
+ * The job id of an editor rule. A rule that carries its saved name has the
+ * server id `<kind>:<name>`. Every other rule (new, renamed, or with an
+ * empty name) has a draft id `<kind>:#<uid>`, which stays the same while
+ * the operator types its name.
+ */
+export function editorRuleJobId(
+  kind: 'replication' | 'lifecycle',
+  rule: NamedRule,
+  baseline: readonly NamedRule[],
+): string {
+  return isAppliedRule(rule, appliedUidByName(baseline))
+    ? `${kind}:${rule.name}`
+    : `${kind}:${DRAFT_KEY_MARK}${ruleUid(rule)}`;
+}
+
+/**
+ * The index in `rules` of the editor rule that a job-id key names, or -1. A
+ * draft key names the rule by uid. A server key names the saved rule, and
+ * the editor rule is the one with that rule's uid — also when the operator
+ * renamed it, and never a draft that only has the same name.
+ */
+export function findEditorRule(key: string, rules: readonly NamedRule[], baseline: readonly NamedRule[]): number {
+  if (key.startsWith(DRAFT_KEY_MARK)) {
+    const uid = key.slice(DRAFT_KEY_MARK.length);
+    return rules.findIndex((r) => ruleUid(r) === uid);
+  }
+  const saved = baseline.find((r) => r.name === key);
+  if (!saved) return -1;
+  const uid = ruleUid(saved);
+  return rules.findIndex((r) => ruleUid(r) === uid);
 }
 
 /** JSON with sorted object keys: equal values give equal strings. */
@@ -702,24 +787,38 @@ export function scopeText(scope: JobRow['scope']): string {
   return `${scope.bucket}${scope.prefix ? `/${scope.prefix}` : ''}${scope.target ? ` → ${scope.target}` : ''}`;
 }
 
+/** One rule editor's staged rules and its last server snapshot. */
+export interface RuleEditorRules {
+  rules: readonly NamedRule[];
+  baseline: readonly NamedRule[];
+}
+
 /**
- * Merge server job rows with the two editors' staged rule lists:
- * editor-only rules surface as DRAFT rows (synthetic JobRow, idle, with the
- * scope the editor holds); server rules absent from the editor get
- * `pendingDelete` (they vanish on Apply); server rules in `edited` get the
- * edited marker. One-off jobs pass through untouched.
+ * Merge server job rows with the two editors' staged rule lists. Editor
+ * rules are matched to server rows by uid (`isAppliedRule`), not by name:
+ * - a server rule that no editor rule carries under its saved name gets
+ *   `pendingDelete` (Apply deletes it; a rename is a delete and a create,
+ *   because the server knows a rule by its name only);
+ * - every other editor rule (new, renamed, nameless) is a DRAFT row with a
+ *   draft id (`editorRuleJobId`); a nameless one shows as "(unnamed)";
+ * - server rules in `edited` get the edited marker.
+ * One-off jobs pass through untouched.
  */
 export function mergeDraftRules(
   serverRows: JobRow[],
-  replicationRules: NamedRule[],
-  lifecycleRules: NamedRule[],
+  replication: RuleEditorRules,
+  lifecycle: RuleEditorRules,
   edited: ReadonlySet<string> = new Set(),
 ): JobDisplayRow[] {
   const out: JobDisplayRow[] = [];
-  const editorNames = {
-    replication: new Set(replicationRules.map((r) => r.name)),
-    lifecycle: new Set(lifecycleRules.map((r) => r.name)),
+  const editors = { replication, lifecycle };
+  const applied = {
+    replication: appliedUidByName(replication.baseline),
+    lifecycle: appliedUidByName(lifecycle.baseline),
   };
+  const carried = (kind: 'replication' | 'lifecycle') =>
+    new Set(editors[kind].rules.filter((r) => isAppliedRule(r, applied[kind])).map((r) => r.name));
+  const editorNames = { replication: carried('replication'), lifecycle: carried('lifecycle') };
   const serverNames = { replication: new Set<string>(), lifecycle: new Set<string>() };
 
   for (const row of serverRows) {
@@ -733,16 +832,19 @@ export function mergeDraftRules(
   }
 
   for (const kind of ['replication', 'lifecycle'] as const) {
-    const rules = kind === 'replication' ? replicationRules : lifecycleRules;
+    const { rules, baseline } = editors[kind];
     for (const rule of rules) {
-      if (!rule.name || serverNames[kind].has(rule.name)) continue;
+      const isApplied = isAppliedRule(rule, applied[kind]);
+      // An applied rule shows as its server row. Until the jobs list has it
+      // (the moment after an apply), it shows as a draft.
+      if (isApplied && serverNames[kind].has(rule.name)) continue;
       out.push({
         draft: true,
         pendingDelete: false,
         row: {
-          id: `${kind}:${rule.name}`,
+          id: editorRuleJobId(kind, rule, baseline),
           kind,
-          name: rule.name,
+          name: rule.name || UNNAMED_RULE,
           scope: ruleScope(rule),
           trigger: kind === 'replication' ? 'continuous' : 'scheduled',
           enabled: undefined,
@@ -770,10 +872,16 @@ export function mergeDraftRules(
 export function planRuleDeleteSync<T extends NamedRule>(
   dirty: boolean,
   rules: T[],
+  baseline: readonly T[],
   name: string,
 ): { action: 'refresh' } | { action: 'filter'; rules: T[] } {
   if (!dirty) return { action: 'refresh' };
-  return { action: 'filter', rules: rules.filter((r) => r.name !== name) };
+  // Drop the rule that IS the deleted one (by uid, still under that name):
+  // a draft that only has the same name stays, and so does a rename of the
+  // deleted rule (the operator's new rule).
+  const idx = findEditorRule(name, rules, baseline);
+  if (idx < 0 || rules[idx].name !== name) return { action: 'filter', rules };
+  return { action: 'filter', rules: rules.filter((_, i) => i !== idx) };
 }
 
 /**
