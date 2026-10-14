@@ -322,7 +322,7 @@ export default function BackendEncryptionEditor({ backendName, current, onApply,
                 icon={<WarningOutlined />}
                 style={{ borderRadius: 6, fontSize: 12, marginBottom: 8 }}
                 title="If you lose this key, encrypted objects on this backend are unrecoverable."
-                description="DeltaGlider does not back up your encryption key. Copy it to a password manager / secrets vault BEFORE clicking Apply."
+                description="Copy the key to a password manager or a secrets vault BEFORE you click Apply. The full backup (the Backup card on the System page) includes this key while it is in the config file, but not a key that an environment variable supplies, and a backup on the same host is lost with the host."
               />
               <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
                 When you apply, the proxy writes this key in plain text into the config file. A new
