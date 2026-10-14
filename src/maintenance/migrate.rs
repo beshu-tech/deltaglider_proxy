@@ -375,14 +375,20 @@ async fn head_retrying(
 /// listing proved (the write gate freezes the source): one HEAD, not two.
 async fn copy_verdict_for(
     engine: &DynEngine,
-    source_bucket: &str,
-    target_bucket: &str,
+    (source_bucket, target_bucket): (&str, &str),
     key: &str,
     source_form: Option<crate::storage::ObjectVariant>,
-) -> Result<ContentVerdict, HeadFailed> {
-    copy_check(engine, source_bucket, target_bucket, key, source_form)
-        .await
-        .map(|check| check.verdict)
+    desired: Option<&super::DesiredEncryption>,
+) -> Result<(ContentVerdict, bool), HeadFailed> {
+    copy_check(
+        engine,
+        (source_bucket, target_bucket),
+        key,
+        source_form,
+        desired,
+    )
+    .await
+    .map(|check| (check.verdict, check.at_rest_ok))
 }
 
 /// What the skip check of a copy read ([`copy_check`]).
@@ -394,23 +400,31 @@ struct CopyCheck {
     target: CounterPrior,
     /// The source's metadata, when the check read it.
     source: Option<crate::types::FileMetadata>,
+    /// The target object is stored in the at-rest form that the staging
+    /// route's encryption asks for (true when the check has no desired
+    /// form, e.g. native SSE). A copy that a different config wrote (the
+    /// bucket's encryption changed mid-job, or a mirror destination) is
+    /// copied again; verify refuses one that still differs.
+    at_rest_ok: bool,
 }
 
 /// [`copy_verdict_for`], and what it read.
 async fn copy_check(
     engine: &DynEngine,
-    source_bucket: &str,
-    target_bucket: &str,
+    (source_bucket, target_bucket): (&str, &str),
     key: &str,
     source_form: Option<crate::storage::ObjectVariant>,
+    desired: Option<&super::DesiredEncryption>,
 ) -> Result<CopyCheck, HeadFailed> {
     let Some((dst, forms)) = head_retrying(engine, target_bucket, key).await? else {
         return Ok(CopyCheck {
             verdict: ContentVerdict::Missing,
             target: CounterPrior::Absent,
             source: None,
+            at_rest_ok: true,
         });
     };
+    let at_rest_ok = desired.is_none_or(|d| !super::needs_rewrite(&dst.user_metadata, d));
     let (verdict, source) = match engine.head_listed(source_bucket, key, source_form).await {
         Ok((src, _)) => (content_verdict(&src, Some(&dst)), Some(src)),
         // The copy (or verify) reports the source error itself.
@@ -423,6 +437,7 @@ async fn copy_check(
             forms,
         },
         source,
+        at_rest_ok,
     })
 }
 
@@ -571,9 +586,12 @@ async fn ensure_route(
 }
 
 /// Pure: the policy of a route to the real bucket `alias` on `backend`.
-/// It stores objects as the bucket `source` does (its compression and its
-/// delta ratio): with the defaults, a migrate of a bucket that has
-/// compression off stored its files as deltas.
+/// It stores objects as the bucket `source` does (its compression, its
+/// delta ratio and its own encryption): with the defaults, a migrate of a
+/// bucket that has compression off stored its files as deltas. A bucket's
+/// `encryption` override travels with it (issue #116, owner decision): the
+/// copies on the target are written with the bucket's key, and the flip
+/// moves the override with the bucket.
 fn route_policy(
     source: Option<&crate::bucket_policy::BucketPolicyConfig>,
     backend: &str,
@@ -584,6 +602,7 @@ fn route_policy(
         alias: Some(alias.to_string()),
         compression: source.and_then(|p| p.compression),
         max_delta_ratio: source.and_then(|p| p.max_delta_ratio),
+        encryption: source.and_then(|p| p.encryption.clone()),
         ..Default::default()
     }
 }
@@ -597,6 +616,7 @@ fn same_route(
         && p.alias == want.alias
         && p.compression == want.compression
         && p.max_delta_ratio == want.max_delta_ratio
+        && p.encryption == want.encryption
 }
 
 async fn remove_routes(mutator: &ConfigMutator, keys: &[String], context: &str) {
@@ -934,6 +954,14 @@ impl MigrateRun<'_> {
     /// Re-assert the staging route: an admin config apply mid-job replaces
     /// cfg.buckets wholesale; without the route the copies would silently
     /// land on the DEFAULT backend.
+    /// The at-rest form that the staging route asks for (the bucket's
+    /// encryption on the target, issue #116), or `None` when it cannot be
+    /// checked per object (native SSE).
+    async fn desired_at_rest(&self) -> Option<super::DesiredEncryption> {
+        let cfg = self.mutator.read().await;
+        super::resolve_desired(&cfg, &self.params.transient_key).ok()
+    }
+
     async fn ensure_staging_route(&self, context: &str) -> Result<(), String> {
         ensure_route(
             self.mutator,
@@ -995,6 +1023,7 @@ impl MigrateRun<'_> {
             engine: None,
             forms: Default::default(),
             page_token: None,
+            desired: None,
         };
         paged_phase(
             self.ctx(),
@@ -1027,6 +1056,7 @@ impl MigrateRun<'_> {
             engine: None,
             forms: Default::default(),
             verified: 0,
+            desired: None,
         };
         let verified = paged_phase(
             self.ctx(),
@@ -1300,6 +1330,8 @@ struct CopyStep<'a, 'r> {
     forms: crate::deltaglider::ListedPageForms,
     /// The cursor of the page in progress (where a failed page resumes).
     page_token: Option<String>,
+    /// The at-rest form of the target, read per page.
+    desired: Option<super::DesiredEncryption>,
 }
 
 impl CopyStep<'_, '_> {
@@ -1332,6 +1364,7 @@ impl PageStep for CopyStep<'_, '_> {
             .ensure_staging_route("Migration staging route re-asserted after config change")
             .await?;
         self.engine = Some(self.m.state.engine.load().clone());
+        self.desired = self.m.desired_at_rest().await;
         Ok(())
     }
 
@@ -1375,10 +1408,10 @@ impl PageStep for CopyStep<'_, '_> {
         } else {
             copy_check(
                 engine,
-                bucket,
-                &params.transient_key,
+                (bucket, &params.transient_key),
                 key,
                 self.forms.of(key),
+                self.desired.as_ref(),
             )
             .await
             .ok()
@@ -1386,6 +1419,7 @@ impl PageStep for CopyStep<'_, '_> {
         let (source, prior) = match check {
             Some(CopyCheck {
                 verdict: ContentVerdict::Same,
+                at_rest_ok: true,
                 ..
             }) => return CopyDone::Skipped,
             Some(check) => (check.source, Some(check.target)),
@@ -1475,6 +1509,8 @@ struct VerifyStep<'a, 'r> {
     forms: crate::deltaglider::ListedPageForms,
     /// Objects checked so far in this run of the phase.
     verified: i64,
+    /// The at-rest form of the target, read per page.
+    desired: Option<super::DesiredEncryption>,
 }
 
 impl PageStep for VerifyStep<'_, '_> {
@@ -1482,6 +1518,7 @@ impl PageStep for VerifyStep<'_, '_> {
 
     async fn begin_page(&mut self) -> Result<(), PhaseStop> {
         self.engine = Some(self.m.state.engine.load().clone());
+        self.desired = self.m.desired_at_rest().await;
         Ok(())
     }
 
@@ -1501,22 +1538,29 @@ impl PageStep for VerifyStep<'_, '_> {
         let engine = self.engine.as_ref().expect("begin_page runs first");
         match copy_verdict_for(
             engine,
-            &self.m.job.bucket,
-            &self.m.params.transient_key,
+            (&self.m.job.bucket, &self.m.params.transient_key),
             key,
             self.forms.of(key),
+            self.desired.as_ref(),
         )
         .await
         {
-            Ok(ContentVerdict::Missing) => Err(PhaseStop::from(format!(
+            Ok((ContentVerdict::Missing, _)) => Err(PhaseStop::from(format!(
                 "verification failed: '{key}' missing on target"
             ))),
-            Ok(ContentVerdict::Differs) => Err(PhaseStop::from(format!(
+            Ok((ContentVerdict::Differs, _)) => Err(PhaseStop::from(format!(
                 "verification failed: '{key}' on target differs from the source"
+            ))),
+            // The bytes match, but the target stores them in another
+            // at-rest form than the bucket's encryption asks for.
+            Ok((_, false)) => Err(PhaseStop::from(format!(
+                "verification failed: '{key}' on target is not stored in the bucket's \
+                 at-rest form ({:?}); run the migrate again so the copy rewrites it",
+                self.desired
             ))),
             // Unknown = no common fingerprint (foreign object); the copy
             // phase re-copied it, so it is current.
-            Ok(ContentVerdict::Same | ContentVerdict::Unknown) => Ok(()),
+            Ok((ContentVerdict::Same | ContentVerdict::Unknown, true)) => Ok(()),
             Err(e) => Err(e.stop()),
         }
     }
