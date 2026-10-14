@@ -228,6 +228,11 @@ pub struct BackendInfoResponse {
     /// `GET /backends` only — drives the BackendsPanel health column.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub health: Option<crate::coordination::health::HealthEntry>,
+    /// The modes that a bucket's own `encryption` block accepts on this
+    /// backend (issue #116): the create-bucket dialog offers these.
+    /// Populated by `GET /backends` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bucket_encryption_modes: Option<Vec<&'static str>>,
 }
 
 impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
@@ -247,6 +252,7 @@ impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
                 is_synthesized: false,
                 capability: None,
                 health: None,
+                bucket_encryption_modes: None,
             },
             crate::config::BackendConfig::S3 {
                 endpoint,
@@ -267,6 +273,7 @@ impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
                 is_synthesized: false,
                 capability: None,
                 health: None,
+                bucket_encryption_modes: None,
             },
         }
     }

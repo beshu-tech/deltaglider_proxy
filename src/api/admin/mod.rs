@@ -6,6 +6,7 @@ mod audit;
 mod auth;
 pub(crate) mod backends;
 mod backup;
+pub(crate) mod bucket_encryption_view;
 mod bucket_scan;
 mod config;
 pub mod csrf;

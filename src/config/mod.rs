@@ -1984,8 +1984,27 @@ impl Config {
     /// [`Self::backend_encryption_by_name`] outside the allowed
     /// backend-level views.
     pub fn encryption_for_bucket(&self, bucket: &str) -> Option<BucketEncryption<'_>> {
-        let (backend, _) = self.effective_backend_for_bucket(bucket)?;
+        self.encryption_for_listed_bucket(bucket, None)
+    }
+
+    /// [`Self::encryption_for_bucket`] for a bucket that the storage listing
+    /// found on backend `held_by`. A bucket without a fixed storage (named
+    /// backends, no `backend:`) can live on a backend other than the
+    /// default; the router then sends its requests there, and that
+    /// backend's encryption writes it. A bucket whose storage the config
+    /// fixes ignores `held_by`. The admin bucket list uses this form.
+    pub fn encryption_for_listed_bucket(
+        &self,
+        bucket: &str,
+        held_by: Option<&str>,
+    ) -> Option<BucketEncryption<'_>> {
+        let (mut backend, _) = self.effective_backend_for_bucket(bucket)?;
         let name = bucket.to_ascii_lowercase();
+        if let Some(held) = held_by {
+            if self.bucket_storage(&name).is_none() && self.backend_by_name(held).is_some() {
+                backend = held.to_string();
+            }
+        }
         // The override belongs to the STORED bucket (review E): match on
         // (raw backend, real bucket), as the engine wrapper does, so the
         // real name of an alias resolves to the alias's override.

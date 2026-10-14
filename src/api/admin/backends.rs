@@ -37,6 +37,11 @@ pub struct BucketBackendOriginResponse {
     /// flagged unavailable — never silently dropped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unavailable: Option<String>,
+    /// How the bucket's new writes are encrypted, and whether that is the
+    /// bucket's own block or its backend's (issue #116). `None` only when
+    /// the bucket routes to an undefined backend. The admin UI shows this
+    /// and never resolves a bucket's encryption itself.
+    pub effective_encryption: Option<super::bucket_encryption_view::EffectiveEncryption>,
 }
 
 #[derive(Serialize)]
@@ -160,6 +165,7 @@ pub async fn list_backends(State(state): State<Arc<AdminState>>) -> impl IntoRes
     for b in &mut backends {
         b.capability = verdicts.get(&b.name).cloned();
         b.health = health.get(&b.name).cloned();
+        b.bucket_encryption_modes = Some(cfg.bucket_encryption_modes(&b.name));
     }
 
     Json(BackendListResponse {
@@ -236,6 +242,7 @@ pub async fn list_bucket_origins(
 
     // The coordination bucket is not a client bucket.
     let registry = engine.bucket_policy_registry();
+    let cfg = state.config.read().await;
     let buckets = bucket_list
         .into_iter()
         .filter(|bucket| !registry.is_reserved(&bucket.name))
@@ -247,7 +254,13 @@ pub async fn list_bucket_origins(
             let backend = backend_name
                 .as_deref()
                 .and_then(|name| backend_by_name.get(name).copied());
+            let effective_encryption = super::bucket_encryption_view::effective_encryption(
+                &cfg,
+                &bucket.name,
+                backend_name.as_deref(),
+            );
             BucketBackendOriginResponse {
+                effective_encryption,
                 name: bucket.name,
                 creation_date: bucket.creation_date.map(|d| d.to_rfc3339()),
                 backend_name,

@@ -1666,3 +1666,124 @@ async fn a_bucket_block_downgrade_against_the_backends_star_refuses_minio() {
     assert_eq!(b.raw_put(&data, "x.txt", b"plaintext?").await.0, 503);
     assert_eq!(a.raw_put(&data, "x.txt", b"encrypted").await.0, 200);
 }
+
+// ── P2: the admin bucket list and the UI's request bodies ────────────────
+
+/// The bucket list (`GET /_/api/admin/buckets`) of `bucket`.
+async fn effective(env: &Env, bucket: &str) -> serde_json::Value {
+    let v: serde_json::Value = env
+        .admin
+        .get(format!("{}/_/api/admin/buckets", env.server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        !v.to_string().contains(KA) && !v.to_string().contains(KB),
+        "the bucket list never carries a key: {v}"
+    );
+    v["buckets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["name"] == bucket)
+        .unwrap_or_else(|| panic!("{bucket} not listed: {v}"))["effective_encryption"]
+        .clone()
+}
+
+/// Issue #116 P2: the bucket list reports each bucket's encryption as the
+/// engine writes it (the bucket's own block, the backend that holds it), and
+/// the request bodies of the bucket card's Encryption group do what the UI
+/// says: a bucket key with a backend pin, Off (the key stays as legacy),
+/// and the create dialog's policy written before the bucket exists.
+#[tokio::test]
+async fn the_bucket_list_reports_each_buckets_encryption() {
+    let env = spawn(
+        Shape::NamedFs,
+        Some(BACKEND_A),
+        "    releases: { backend: local-disk }\n",
+        "",
+        "releases",
+    )
+    .await;
+    // A bucket without a route that lives on aws-dr only.
+    std::fs::create_dir_all(env.dr.as_ref().unwrap().join("stray")).unwrap();
+    env.create("downloads").await;
+
+    let rel = effective(&env, "releases").await;
+    assert_eq!(rel["source"], "backend", "{rel}");
+    assert_eq!(rel["backend"], "local-disk", "{rel}");
+    assert_eq!(rel["key_id"], "local-a", "{rel}");
+    assert_eq!(rel["encrypts"], true, "{rel}");
+    assert_eq!(rel["pinned"], true, "{rel}");
+    let stray = effective(&env, "stray").await;
+    assert_eq!(
+        (&stray["backend"], &stray["mode"], &stray["pinned"]),
+        (&json!("aws-dr"), &json!("none"), &json!(false)),
+        "an unrouted bucket takes the encryption of the backend that holds it: {stray}"
+    );
+    // downloads has no route: the UI pins the backend that holds it.
+    let dl = effective(&env, "downloads").await;
+    assert_eq!(dl["pinned"], false, "{dl}");
+    env.put("downloads", "old.txt", b"under local-a").await;
+
+    // The Encryption group's "Encrypt with a bucket key" body.
+    env.storage_patch_ok(json!({ "buckets": { "downloads": {
+        "backend": "local-disk",
+        "encryption": { "mode": "aes256-gcm-proxy", "key": KB, "key_id": "downloads-2026-10" }
+    } } }))
+    .await;
+    let dl = effective(&env, "downloads").await;
+    assert_eq!(
+        (&dl["source"], &dl["key_id"], &dl["pinned"]),
+        (&json!("bucket"), &json!("downloads-2026-10"), &json!(true)),
+        "{dl}"
+    );
+    env.put("downloads", "new.txt", b"under the bucket key").await;
+    assert_eq!(
+        env.at_rest("downloads", "new.txt").await.as_deref(),
+        Some("downloads-2026-10")
+    );
+    assert_eq!(
+        env.at_rest("downloads", "old.txt").await.as_deref(),
+        Some("local-a")
+    );
+
+    // "Off for this bucket": plaintext writes, the key becomes legacy.
+    env.storage_patch_ok(json!({ "buckets": { "downloads": { "encryption": { "mode": "none" } } } }))
+        .await;
+    let dl = effective(&env, "downloads").await;
+    assert_eq!(
+        (&dl["mode"], &dl["source"], &dl["legacy_key_id"], &dl["encrypts"]),
+        (&json!("none"), &json!("bucket"), &json!("downloads-2026-10"), &json!(false)),
+        "{dl}"
+    );
+    assert_eq!(dl["inherited"]["mode"], "aes256-gcm-proxy", "{dl}");
+    assert_eq!(dl["reencrypt"], true, "{dl}");
+    assert_eq!(env.get("downloads", "new.txt").await, b"under the bucket key");
+
+    // The create dialog: the policy first, then POST /buckets.
+    env.storage_patch_ok(json!({ "buckets": { "db-archive": {
+        "backend": "local-disk",
+        "encryption": { "mode": "aes256-gcm-proxy", "key": KB, "key_id": "downloads-2026-10" }
+    } } }))
+    .await;
+    let resp = env
+        .admin
+        .post(format!("{}/_/api/admin/buckets", env.server.endpoint()))
+        .json(&json!({ "name": "db-archive", "backend_name": "local-disk" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "{:?}", resp.text().await);
+    env.put("db-archive", "dump.sql", b"first object").await;
+    assert_eq!(
+        env.at_rest("db-archive", "dump.sql").await.as_deref(),
+        Some("downloads-2026-10"),
+        "the first object of a new bucket is written with its own key"
+    );
+    let db = effective(&env, "db-archive").await;
+    assert_eq!(db["source"], "bucket", "{db}");
+}

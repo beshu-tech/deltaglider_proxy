@@ -38,6 +38,14 @@ impl EncryptionSite {
     }
 }
 
+/// The `encryption.mode` values that a bucket override accepts in this
+/// release. The admin UI offers exactly these on the bucket card (the
+/// response field `effective_encryption.bucket_modes`), so a mode that the
+/// server learns to accept appears in the UI with no client change. The
+/// test `bucket_modes_match_the_fatal_rules` ties this list to
+/// [`Config::bucket_encryption_errors`].
+pub const BUCKET_ENCRYPTION_MODES: &[&str] = &["none", "aes256-gcm-proxy"];
+
 /// One bucket override with the storage it applies to.
 #[derive(Debug, Clone)]
 pub struct BucketOverride<'a> {
@@ -344,6 +352,12 @@ impl Config {
         warnings
     }
 
+    /// The modes that the own `encryption` block of a bucket stored on
+    /// `backend` accepts (see [`BUCKET_ENCRYPTION_MODES`]).
+    pub fn bucket_encryption_modes(&self, _backend: &str) -> Vec<&'static str> {
+        BUCKET_ENCRYPTION_MODES.to_vec()
+    }
+
     /// Bucket overrides in proxy mode with no key (the engine refuses every
     /// write to those buckets).
     pub fn keyless_proxy_buckets(&self) -> Vec<String> {
@@ -365,7 +379,7 @@ impl Config {
     /// depend on another bucket's block to read its own objects (review A:
     /// two buckets that shared a key id could drop it one after the other,
     /// each step looking safe because the other still held it).
-    fn key_ids_readable_by(&self, bucket: &str) -> std::collections::HashSet<String> {
+    pub(crate) fn key_ids_readable_by(&self, bucket: &str) -> std::collections::HashSet<String> {
         let mut ids = std::collections::HashSet::new();
         if let Some(enc) = self.buckets.get(bucket).and_then(|p| p.encryption.as_ref()) {
             let own = resolve_site_keys(KeyScope::Bucket(bucket), enc);

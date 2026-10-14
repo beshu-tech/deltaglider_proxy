@@ -478,3 +478,64 @@ fn an_unknown_backend_or_encryption_field_is_a_load_error() {
         Config::from_yaml_str(&ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
     }
 }
+
+/// The modes that the admin UI offers on a bucket (`BUCKET_ENCRYPTION_MODES`)
+/// are exactly the modes that `check_fatal` accepts on a bucket override.
+#[test]
+fn bucket_modes_match_the_fatal_rules() {
+    let blocks = [
+        ("none", "{ mode: none }".to_string()),
+        (
+            "aes256-gcm-proxy",
+            format!("{{ mode: aes256-gcm-proxy, key: \"{KB}\", key_id: db-archive-2026 }}"),
+        ),
+        (
+            "sse-kms",
+            "{ mode: sse-kms, kms_key_id: \"arn:aws:kms:eu-central-1:1:key/x\" }".to_string(),
+        ),
+        ("sse-s3", "{ mode: sse-s3 }".to_string()),
+    ];
+    let cfg = Config::from_yaml_str(&named("{ backend: local-disk }")).unwrap();
+    let offered = cfg.bucket_encryption_modes("local-disk");
+    for (mode, block) in blocks {
+        let errs = fatal(&named(&format!(
+            "{{ backend: local-disk, encryption: {block} }}"
+        )));
+        let accepted = !errs.iter().any(|e| e.contains("bucket 'db-archive'"));
+        assert_eq!(
+            accepted,
+            offered.contains(&mode),
+            "mode {mode}: the server accepts it = {accepted}, the UI offers it = {}: {errs:?}",
+            offered.contains(&mode)
+        );
+    }
+}
+
+/// A bucket without a fixed storage that the listing finds on a
+/// non-default backend is written with that backend's encryption.
+#[test]
+fn a_listed_bucket_takes_the_encryption_of_the_backend_that_holds_it() {
+    let cfg = Config::from_yaml_str(&named("{ backend: local-disk }")).unwrap();
+    // `stray` has no route: by config it is on the default (hetzner-fsn1).
+    let e = cfg.encryption_for_bucket("stray").unwrap();
+    assert_eq!(
+        (e.backend.as_str(), e.config.mode_tag()),
+        ("hetzner-fsn1", "none")
+    );
+    let e = cfg
+        .encryption_for_listed_bucket("stray", Some("local-disk"))
+        .unwrap();
+    assert_eq!(e.backend, "local-disk");
+    assert_eq!(e.config.mode_tag(), "aes256-gcm-proxy");
+    assert!(!e.from_bucket);
+    // A routed bucket ignores the listing.
+    let e = cfg
+        .encryption_for_listed_bucket("releases", Some("local-disk"))
+        .unwrap();
+    assert_eq!(e.backend, "hetzner-fsn1");
+    // An unknown backend name changes nothing.
+    let e = cfg
+        .encryption_for_listed_bucket("stray", Some("gone"))
+        .unwrap();
+    assert_eq!(e.backend, "hetzner-fsn1");
+}

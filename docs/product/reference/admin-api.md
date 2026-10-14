@@ -102,6 +102,28 @@ deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.e
 
 `GET /_/api/admin/backends/:name/legacy-key-usage` answers whether the backend's decrypt-only `legacy_key` is still needed. The proxy reads the metadata of every object (one `HEAD` per object) and of every delta reference (one `HEAD` per reference, at most 8 at a time) in the buckets that route to the backend, and counts those stamped with the legacy key id. The count is exact, not sampled. The scan stops after `limit` objects (default 10000, maximum 1000000); it then returns `complete: false`, and the counts are only a lower bound. The proxy keeps each result for 60 seconds, and requests that arrive while a scan runs wait for that same scan instead of starting another one. Send `fresh=true` to scan again, for example after a re-encrypt job finished. The response is `{backend, legacy_key_id, buckets, objects_scanned, objects_under_legacy_key, references_scanned, references_under_legacy_key, examples, errors, complete, limit, safe_to_clear, computed_at}`, where `computed_at` is the time of the scan. `safe_to_clear` is true only when the scan is complete, read every object without an error, and found no object and no delta reference under the legacy key id. `legacy_key_id` is `null` when the backend has no legacy key. `:name` is a named backend or `default` for the singleton backend; an unknown name returns `404`. The backend scan covers every bucket stored on the backend, also a bucket with its own `encryption` block, because the objects that such a bucket wrote before it got its own key carry the backend's key ids.
 
+`GET /_/api/admin/buckets` lists every bucket with the backend that holds it: `{buckets: [{name, creation_date, backend_name, backend_type, backend_endpoint, backend_region, backend_path, real_bucket, unavailable?, effective_encryption}]}`. `effective_encryption` is the server's answer to how the bucket's new writes are encrypted. The proxy computes it with the same resolver that the re-encrypt job, the legacy-key scan and the apply warnings use, and the admin UI shows it without a resolution of its own. It is `null` only when the bucket routes to a backend that is not defined. Its fields:
+
+| Field | Meaning |
+|---|---|
+| `mode` | `none`, `aes256-gcm-proxy`, `sse-kms` or `sse-s3`. |
+| `source` | `bucket` when the bucket has its own `encryption` block, `backend` when it takes the encryption of its backend. |
+| `backend` | The raw backend that stores the bucket. For a bucket without a route, this is the backend that the listing found it on. |
+| `has_key` | Proxy mode: a key is configured. Native modes: always `true`. |
+| `key_id` | The key id that new writes carry (proxy mode). |
+| `legacy_key_id` | The decrypt-only legacy key id of the bucket's block, or of the backend when `source` is `backend`. Absent when there is none. |
+| `kms_key_id` | The KMS key of SSE-KMS (an identifier, not a secret). |
+| `key_env` | The environment variable that supplies the bucket's own key (`key: ${env:NAME}`). The admin UI shows the bucket's encryption read-only then. |
+| `encrypts` | New writes are stored encrypted. A proxy mode without a key is `false`: the proxy refuses those writes. |
+| `reencrypt` | A re-encrypt job can change objects of this bucket: it encrypts with a proxy key, or it is plaintext and can still read an older key. |
+| `pinned` | The config fixes the bucket's backend (`backend:`, or a single backend). A bucket's own block needs it, so a change that adds a block to a bucket where this is `false` also sets `backend:`. |
+| `bucket_modes` | The modes that the bucket's own block accepts. |
+| `inherited` | `{mode, encrypts, key_id?}`: what the backend does on its own, which is what the bucket gets without its own block. |
+
+The response never carries a key. `GET /_/api/admin/backends` also lists, per backend, `bucket_encryption_modes`: the modes that a bucket's own block accepts on that backend.
+
+A change of a bucket's encryption is a storage-section update (`PUT /_/api/admin/config/section/storage`) with a merge-patch of the bucket, for example `{"buckets": {"db-archive": {"backend": "hetzner-fsn1", "encryption": {"mode": "aes256-gcm-proxy", "key": "<64 hex>", "key_id": "db-archive-2026-10"}}}}`. The admin UI sends the header `X-DGP-Confirm-Encryption-Downgrade: <bucket>` (comma-separated for several buckets) on such a request and on its validate request when the operator confirmed that new writes of an encrypted bucket become plaintext.
+
 With `bucket=B`, the scan answers for the legacy key id of bucket `B`'s own `encryption` block instead. It still reads the objects and delta references of every bucket stored on the backend, because another bucket can hold objects under the same key id (two buckets that shared a key, or an object moved at the storage level). The response then also has `bucket`. A bucket without its own `encryption` block on backend `:name` returns `404`. An apply that removes a bucket's legacy key is refused unless the request confirms the key id with the header `X-DGP-Confirm-Key-Removal: <key id>` (comma-separated for several ids); `config apply --confirm-key-removal <key id>` sends it.
 
 A config write that makes a bucket store new objects in plaintext where it encrypted them before is refused (`422`, or `400` on the migrate start) unless the request carries the header `X-DGP-Confirm-Encryption-Downgrade: <subject>` (comma-separated for several subjects). The subject is the bucket name, or `backend:<name>` for a change of a backend's own encryption. The refusal names the subjects that it needs. See [a downgrade needs a confirmation](encryption.md#a-downgrade-needs-a-confirmation).
