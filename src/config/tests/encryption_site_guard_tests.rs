@@ -9,34 +9,36 @@
 /// here until the visitor covers it.
 #[test]
 fn every_encryption_site_goes_through_the_visitor() {
-    use crate::source_scan::{prod_lines, rel, rust_files};
-    // (file, field): the flat Config's singleton, NamedBackendConfig, the
-    // bucket policy; config_sections' wire copy collapses into the first.
-    let known: &[(&str, &str)] = &[
-        ("src/config/mod.rs", "backend_encryption"),
-        ("src/config/mod.rs", "encryption"),
-        ("src/bucket_policy.rs", "encryption"),
-        ("src/config_sections.rs", "backend_encryption"),
+    use crate::source_scan::prod_lines;
+    // (file, enclosing type, field): the flat Config's singleton,
+    // NamedBackendConfig, the bucket policy; the sectioned wire shape's
+    // StorageSection collapses into the first (`into_flat`).
+    let known: &[(&str, &str, &str)] = &[
+        ("src/config/mod.rs", "Config", "backend_encryption"),
+        ("src/config/mod.rs", "NamedBackendConfig", "encryption"),
+        ("src/bucket_policy.rs", "BucketPolicyConfig", "encryption"),
+        (
+            "src/config_sections.rs",
+            "StorageSection",
+            "backend_encryption",
+        ),
     ];
-    let field = regex_lite::Regex::new(
-        r"^\s*(pub(\([a-z]+\))?\s+)?([a-z_]+):\s*(Option<)?(crate::config::|super::)?BackendEncryptionConfig>?,?\s*$",
-    )
-    .unwrap();
-    let mut found = Vec::new();
-    for path in rust_files("src") {
-        let r = rel(&path);
-        let text = std::fs::read_to_string(&path).unwrap();
-        for (_, line) in prod_lines(&text) {
-            if let Some(c) = field.captures(line) {
-                found.push((r.clone(), c[3].to_string()));
-            }
-        }
-    }
-    for (file, name) in &found {
+    let found = encryption_config_fields();
+    for (file, ty, field) in &found {
         assert!(
-            known.iter().any(|(f, n)| f == file && n == name),
-            "new encryption-config field {file}:{name}: add it to Config::encryption_sites \
-             and to this list"
+            known
+                .iter()
+                .any(|(f, t, n)| f == file && t == ty && n == field),
+            "new encryption-config field {file}: {ty}.{field}: add it to \
+             Config::encryption_sites and to this list"
+        );
+    }
+    for (f, t, n) in known {
+        assert!(
+            found
+                .iter()
+                .any(|(ff, tt, nn)| ff == f && tt == t && nn == n),
+            "{f}: {t}.{n} no longer found: the scan may be blind, fix it"
         );
     }
     // The secrets surfaces call the per-config helpers only from inside the
@@ -130,4 +132,106 @@ fn key_ids_have_one_resolver() {
         offenders.is_empty(),
         "resolve key ids with config::resolve_site_keys: {offenders:?}"
     );
+}
+
+/// Review F: every field of every struct or enum (production code) whose
+/// TYPE mentions `BackendEncryptionConfig` anywhere (bare, `Option<..>`,
+/// `Vec<..>`, `BTreeMap<_, ..>`, a tuple), as `(file, type, field)`. Enum
+/// tuple variants count with the variant name as the field.
+fn encryption_config_fields() -> Vec<(String, String, String)> {
+    use crate::source_scan::{prod_lines, rel, rust_files};
+    let head = regex_lite::Regex::new(
+        r"^(\s*)(pub(\([a-z]+\))?\s+)?(struct|enum)\s+([A-Za-z0-9_]+)[^;]*\{\s*$",
+    )
+    .unwrap();
+    let field =
+        regex_lite::Regex::new(r"^\s*(pub(\([a-z]+\))?\s+)?([A-Za-z0-9_]+)\s*[:(]").unwrap();
+    let mut out = Vec::new();
+    for path in rust_files("src") {
+        let r = rel(&path);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines = prod_lines(&text);
+        let mut open: Option<(String, String)> = None; // (type name, indent)
+        for (_, line) in &lines {
+            if let Some((ty, indent)) = &open {
+                if line.starts_with(&format!("{indent}}}")) {
+                    open = None;
+                    continue;
+                }
+                let code = line.split("//").next().unwrap_or("");
+                // A borrowed field (`&'a BackendEncryptionConfig`) is a VIEW
+                // of a site (BucketOverride, BucketEncryption), not a site.
+                let ty_part = code.split_once(':').map_or(code, |(_, t)| t);
+                if code.contains("BackendEncryptionConfig")
+                    && !ty_part.trim_start().starts_with('&')
+                {
+                    let name = field
+                        .captures(code)
+                        .map(|c| c[3].to_string())
+                        .unwrap_or_else(|| code.trim().to_string());
+                    out.push((r.clone(), ty.clone(), name));
+                }
+            } else if let Some(c) = head.captures(line) {
+                open = Some((c[5].to_string(), c[1].to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// Review F, the serde level: a recognisable key in EVERY slot of every
+/// site (backend key and legacy key, singleton, named backend, bucket
+/// override) never reaches a redacted surface: GET /config's policies,
+/// the redacted config, the canonical export.
+#[test]
+fn no_key_survives_a_redacted_surface() {
+    let key = |n: u8| format!("{n:x}c0ffee{n:x}").repeat(8);
+    let yaml = format!(
+        "storage:\n  backend_encryption: {{ mode: aes256-gcm-proxy, key: \"{}\", legacy_key: \"{}\" }}\n  \
+         backends:\n    - name: local-disk\n      type: filesystem\n      path: /tmp/p116-f\n      \
+         encryption: {{ mode: aes256-gcm-proxy, key: \"{}\", legacy_key: \"{}\" }}\n    \
+         - name: aws-dr\n      type: filesystem\n      path: /tmp/p116-f2\n      \
+         encryption: {{ mode: none, legacy_key: \"{}\" }}\n  \
+         buckets:\n    db-archive:\n      backend: local-disk\n      encryption: {{ mode: \
+         aes256-gcm-proxy, key: \"{}\", key_id: db-archive-b, legacy_key: \"{}\", legacy_key_id: \
+         db-archive-a }}\n",
+        key(1),
+        key(2),
+        key(3),
+        key(4),
+        key(5),
+        key(6),
+        key(7)
+    );
+    let cfg = crate::config::Config::from_yaml_str(&yaml).unwrap();
+    assert_eq!(key(1).len(), 64);
+    let hex64 = regex_lite::Regex::new("[0-9a-f]{64}").unwrap();
+    let redacted = cfg.redact_all_secrets();
+    let surfaces = [
+        (
+            "redact_all_secrets (json)",
+            serde_json::to_string(&redacted).unwrap(),
+        ),
+        (
+            "redact_all_secrets (sectioned yaml)",
+            serde_yaml::to_string(&crate::config_sections::SectionedConfig::from_flat(
+                &redacted,
+            ))
+            .unwrap(),
+        ),
+        (
+            "canonical export",
+            cfg.to_canonical_yaml_with(&|_| None).unwrap(),
+        ),
+        (
+            "GET /config bucket_policies",
+            serde_json::to_string(&cfg.redacted_bucket_policies()).unwrap(),
+        ),
+    ];
+    for (what, text) in surfaces {
+        assert!(
+            !hex64.is_match(&text),
+            "{what} carries a 64-hex key:\n{text}"
+        );
+    }
 }
