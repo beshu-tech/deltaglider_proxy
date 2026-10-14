@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed — `key: null` on a proxy-encrypted backend no longer drops the key
+
+A section update or a YAML apply that set `key: null` on a backend that
+stayed in `aes256-gcm-proxy` mode removed the key without keeping it
+anywhere. A key change or a mode change moves the previous key into
+`legacy_key`, but this case was missed, so every object written under the
+key became unreadable. Now `key: null` is handled like any other key change:
+the previous key moves into `legacy_key` with the key id that the objects
+carry, or the apply is refused while `legacy_key` holds a different key. The
+admin GUI never sent `key: null`, so only API and YAML users were affected.
+
 ### Fixed — A proxy-encrypted backend with no key refuses writes instead of storing plaintext
 
 A backend in `aes256-gcm-proxy` mode with no key (for example, because the

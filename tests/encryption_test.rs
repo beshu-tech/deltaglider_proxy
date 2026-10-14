@@ -965,6 +965,44 @@ async fn test_invalid_per_backend_encryption_key_rejected() {
     );
 }
 
+/// Issue #116 P0.2: `key: null` on a backend that stays in proxy mode
+/// never drops the key. The key moves to the legacy slot, and the result
+/// (a proxy backend with no key) is refused, so the running key stays and
+/// objects written under it stay readable.
+#[tokio::test]
+async fn test_section_put_null_key_in_proxy_mode_keeps_the_key() {
+    let server = yaml_keyed_builder().build().await;
+    put_object(&server, "before.txt", b"written under the key").await;
+    let http = common::admin_http_client(&server.endpoint()).await;
+    let resp = http
+        .put(format!(
+            "{}/_/api/admin/config/section/storage",
+            server.endpoint()
+        ))
+        .json(&serde_json::json!({
+            "backend_encryption": { "mode": "aes256-gcm-proxy", "key": null }
+        }))
+        .send()
+        .await
+        .expect("section PUT");
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        status.is_client_error() && body.contains("no key"),
+        "a keyless proxy backend must be refused, got {status} {body}"
+    );
+    let entry = get_singleton_encryption_summary(&http, &server.endpoint()).await;
+    assert_eq!(
+        entry["encryption"]["has_key"].as_bool(),
+        Some(true),
+        "the key must survive: {entry:#}"
+    );
+    assert_eq!(
+        get_object(&server, "before.txt").await,
+        b"written under the key"
+    );
+}
+
 /// Step 6 — per-backend encryption summary surfaces in the field-
 /// level GET `/api/admin/config`. This is the shape the UI uses to
 /// render per-backend badges in Step 7.

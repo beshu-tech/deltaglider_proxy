@@ -760,7 +760,8 @@ pub(crate) fn merge_kept_field(
 /// What the operator said about each kept encryption field for one
 /// backend, from the raw PUT body. The fields are independent: a PATCH
 /// that sets `key: null` and leaves `legacy_key` absent clears the
-/// primary but keeps the old shim.
+/// primary and moves it into the legacy slot (refused when that slot
+/// holds another key).
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct BackendKeyPresence {
     pub key: Presence,
@@ -847,10 +848,10 @@ fn probe_enc_body(enc: &serde_json::Value) -> BackendKeyPresence {
 ///   * body null, new==None → leave None (explicit clear).
 ///   * new==Some → operator rotated; validate hex, keep as-is.
 ///
-/// A proxy key that goes out of use (rotation to a new key, or a mode
-/// flip away from `aes256-gcm-proxy`) moves into the decrypt-only
-/// `legacy_key` slot, with the id the objects carry, unless the body
-/// sets `legacy_key` itself or nulls it. The objects written under
+/// A proxy key that goes out of use (rotation to a new key, an explicit
+/// `key: null`, or a mode flip away from `aes256-gcm-proxy`) moves into
+/// the decrypt-only `legacy_key` slot, with the id the objects carry,
+/// unless the body sets `legacy_key` itself or nulls it. The objects written under
 /// that key stay readable, and the re-encrypt job can rewrite them.
 ///
 /// Errors when the change would lose a key that objects can still
@@ -914,9 +915,11 @@ pub(crate) fn preserve_backend_encryption_secrets(
     // backend configured with key id Y".
     if let Some(old_primary) = &old_primary_ok {
         let old_kid = effective_proxy_key_id(backend_name, old).unwrap_or_default();
+        // A `key: null` that stays in proxy mode retires the key too
+        // (issue #116): the objects written under it still need it. An
+        // absent `key` was restored above, so it is not retired.
         let retired = match &*new {
             E::Aes256GcmProxy { key: Some(k), .. } => k != old_primary,
-            E::Aes256GcmProxy { key: None, .. } => false,
             _ => true,
         };
         if retired {

@@ -419,3 +419,38 @@ fn unchanged_key_keeps_the_existing_legacy_pair() {
     assert_eq!(new.legacy_key(), Some(HEX32));
     assert_eq!(new.legacy_key_id(), Some("k-old"));
 }
+
+/// Issue #116 P0.2: `key: null` on a proxy backend that stays in proxy
+/// mode retires the key like a rotation does: it moves into the free
+/// legacy slot with the id the objects carry, so they stay readable.
+#[test]
+fn a_null_key_moves_the_old_key_to_the_legacy_slot() {
+    let old = proxy(Some(HEX32), None);
+    let mut new = proxy(None, None);
+    let probe = BackendKeyPresence {
+        key: Presence::Null,
+        ..Default::default()
+    };
+    preserve_backend_encryption_secrets("b", &mut new, &old, probe).unwrap();
+    assert_eq!(new.primary_key(), None);
+    assert_eq!(
+        new.legacy_key(),
+        Some(HEX32),
+        "the old key must not be lost"
+    );
+    assert_eq!(new.legacy_key_id(), Some(derived("b", HEX32).as_str()));
+}
+
+/// The legacy slot holds another key: removing the primary would lose
+/// one of the two, so the write is refused.
+#[test]
+fn a_null_key_is_refused_while_the_legacy_slot_holds_another_key() {
+    let old = proxy(Some(HEX32), Some(HEX32_B));
+    let mut new = proxy(None, Some(HEX32_B)); // merge-patch kept the legacy key
+    let probe = BackendKeyPresence {
+        key: Presence::Null,
+        ..Default::default()
+    };
+    let err = preserve_backend_encryption_secrets("b", &mut new, &old, probe).unwrap_err();
+    assert!(err.contains("legacy"), "{err}");
+}

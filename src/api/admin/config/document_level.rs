@@ -1072,8 +1072,13 @@ access:
         super::super::preserve_runtime_secrets(&mut incoming, &current, &document_probe(yaml))
             .unwrap();
         match incoming.backend_encryption {
-            E::Aes256GcmProxy { key, .. } => {
-                assert_eq!(key, None, "explicit null must NOT be preserved")
+            E::Aes256GcmProxy {
+                key, legacy_key, ..
+            } => {
+                assert_eq!(key, None, "explicit null must NOT be preserved");
+                // Issue #116 P0.2: the cleared key is retired into the
+                // legacy slot, never dropped (objects may still use it).
+                assert_eq!(legacy_key, Some("b".repeat(64)));
             }
             other => panic!("unexpected: {other:?}"),
         }
