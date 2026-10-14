@@ -730,12 +730,14 @@ mod tests {
             .unwrap_err();
         assert_eq!(samples("timing-unfinished", "GetObject", "error"), 1);
 
+        // The caller gives up while the LIST is in flight.
         fake.set_delay_ms("LIST", 2_000);
-        let dropped = tokio::time::timeout(
-            Duration::from_millis(50),
-            client.list_objects_v2().bucket("b").send(),
-        );
-        assert!(dropped.await.is_err(), "the caller gave up");
+        let dropped = fake
+            .cut_at(client.list_objects_v2().bucket("b").send(), |r| {
+                r.contains("list-type=2")
+            })
+            .await;
+        assert!(dropped, "the caller gave up");
         assert_eq!(
             samples("timing-unfinished", "ListObjectsV2", "cancelled"),
             1

@@ -996,13 +996,14 @@ mod delete_objects_tests {
         let keys = store_deltas(&svc.state().engine.load(), "run", 3).await;
         fake.set_delete_delay_ms(300);
 
-        let cut = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            delete_objects(&svc, request(&keys)),
-        )
-        .await;
+        // Cut while the first DELETE is in flight.
+        let cut = fake
+            .cut_at(delete_objects(&svc, request(&keys)), |r| {
+                r.starts_with("DELETE /b/run/")
+            })
+            .await;
 
-        assert!(cut.is_err(), "the request was cut");
+        assert!(cut, "the request was cut");
         assert!(reclaimed(&svc, "run").await, "run/reference.bin stays");
         let engine = svc.state().engine.load_full();
         for key in &keys {

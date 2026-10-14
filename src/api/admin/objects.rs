@@ -2608,8 +2608,11 @@ mod tests {
                     assert!(first.starts_with(b"{\"done\":1,"), "{first:?}");
                     drop(body);
                 } else {
-                    let cut = tokio::time::timeout(Duration::from_millis(40), request).await;
-                    assert!(cut.is_err(), "the request answered before the cut");
+                    // Cut while the first DELETE is in flight.
+                    let cut = fake
+                        .cut_at(request, |r| r.starts_with("DELETE /b/e2e/"))
+                        .await;
+                    assert!(cut, "the request answered before the cut");
                 }
 
                 assert!(

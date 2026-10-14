@@ -708,9 +708,11 @@ mod write_path_tests {
         let f = fixture(u64::MAX).await;
         let db = f.state.jobs_db.clone().unwrap();
         let held = db.lock().await;
+        // The mutex stays held: an append that waits for it never ends, so
+        // the bound only tells "never" from "eventually".
         for key in ["a.zip", "b.zip"] {
             tokio::time::timeout(
-                Duration::from_millis(500),
+                Duration::from_secs(10),
                 enqueue_object_events(&f.state, &[event(key)]),
             )
             .await

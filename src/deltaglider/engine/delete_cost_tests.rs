@@ -317,15 +317,19 @@ async fn a_delete_cut_in_its_reclaim_check_is_still_counted() {
     let usage = Arc::new(BucketUsage::in_memory().unwrap());
     let engine = engine.with_bucket_usage(Some(usage.clone()));
     let keys = store_deltas(&engine, "run", 1).await;
-    fake.set_delay_ms("LIST", 5_000);
+    // The reclaim check's LIST never answers; the delete is cut there.
+    fake.set_delay_ms("LIST", 3_600_000);
+    let reclaim_check = |r: &str| {
+        r.contains("list-type=2")
+            && !r.contains("prefix=.dg")
+            && crate::storage::fake_s3::list_prefix(r) == "run/"
+    };
 
-    let cut = tokio::time::timeout(
-        std::time::Duration::from_millis(1_000),
-        engine.delete("b", &keys[0]),
-    )
-    .await;
+    let cut = fake
+        .cut_at(engine.delete("b", &keys[0]), reclaim_check)
+        .await;
 
-    assert!(cut.is_err(), "the delete was cut in its reclaim check");
+    assert!(cut, "the delete was cut in its reclaim check");
     assert!(engine.head("b", &keys[0]).await.unwrap_err().is_not_found());
     usage.flush_pending();
     assert_eq!(usage.read("b").unwrap().unwrap().object_count, 0);

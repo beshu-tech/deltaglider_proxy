@@ -253,15 +253,41 @@ impl FakeS3 {
 
     /// Wait until a request matches `pred` (up to 10 s).
     pub(crate) async fn wait_for(&self, pred: impl Fn(&str) -> bool) -> bool {
+        self.wait_for_from(0, pred).await
+    }
+
+    /// Wait until a request after the first `skip` matches `pred` (up to 10 s).
+    async fn wait_for_from(&self, skip: usize, pred: impl Fn(&str) -> bool) -> bool {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let notified = self.changed.notified();
-            if self.requests().iter().any(|r| pred(r)) {
+            if self.requests().iter().skip(skip).any(|r| pred(r)) {
                 return true;
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
                 return false;
             }
+        }
+    }
+
+    /// Run `fut` until it sends a request that matches `pred`, then drop
+    /// it, as a client that goes away or the request timeout does. True
+    /// when the cut came there; false when `fut` ended first or sent no
+    /// such request in 10 s.
+    ///
+    /// A cut at a wall-clock instant (`tokio::time::timeout`) assumes how
+    /// far the request gets in that time: on a loaded host it got less far,
+    /// and the assertions after the cut failed.
+    pub(crate) async fn cut_at<F: std::future::Future>(
+        &self,
+        fut: F,
+        pred: impl Fn(&str) -> bool,
+    ) -> bool {
+        let skip = self.requests.lock().len();
+        tokio::select! {
+            biased;
+            _ = fut => false,
+            seen = self.wait_for_from(skip, pred) => seen,
         }
     }
 
@@ -879,6 +905,63 @@ mod tests {
         assert!(
             body.contains("<Name>empty</Name>") && body.contains("<Name>b</Name>"),
             "{body}"
+        );
+    }
+
+    /// A test that drops a request to a FakeS3 midway (the test sets the
+    /// fake up, `fake.`, before its timeout) drops it at a request
+    /// ([`FakeS3::cut_at`]), not at an instant: a sub-second
+    /// `tokio::time::timeout` assumed how far the request got, and on a
+    /// loaded host it got less far (the reclaim-check test failed with the
+    /// object still present). A bound that only has to tell "never" from
+    /// "eventually" takes a second or more.
+    #[test]
+    fn fake_s3_tests_cut_requests_at_a_request() {
+        use crate::source_scan::{out_of_line_test_modules, rel, rust_files, test_module_lines};
+        let files = rust_files("src");
+        let whole_test_files = out_of_line_test_modules(&files);
+        let mut found = Vec::new();
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap();
+            let lines: Vec<(usize, &str)> = if whole_test_files.contains(file) {
+                text.lines().enumerate().map(|(i, l)| (i + 1, l)).collect()
+            } else {
+                test_module_lines(&text)
+            };
+            for (i, (n, line)) in lines.iter().enumerate() {
+                if !line.contains("time::timeout(") {
+                    continue;
+                }
+                // Only a test whose requests go to a FakeS3.
+                let start = lines[..i]
+                    .iter()
+                    .rposition(|(_, l)| l.contains("fn "))
+                    .unwrap_or(0);
+                if !lines[start..i].iter().any(|(_, l)| l.contains("fake.")) {
+                    continue;
+                }
+                let call: String = lines[i..(i + 4).min(lines.len())]
+                    .iter()
+                    .map(|(_, l)| *l)
+                    .collect();
+                let short = call
+                    .split("from_millis(")
+                    .skip(1)
+                    .filter_map(|rest| rest.split(')').next())
+                    .any(|ms| {
+                        ms.replace('_', "")
+                            .parse::<u64>()
+                            .is_ok_and(|ms| ms < 1_000)
+                    });
+                if short {
+                    found.push(format!("{}:{n}", rel(file)));
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "a sub-second timeout in a FakeS3 test: cut with FakeS3::cut_at, or bound \
+             with a second or more: {found:#?}"
         );
     }
 }

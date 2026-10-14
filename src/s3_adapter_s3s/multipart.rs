@@ -616,13 +616,15 @@ mod multipart_cost_tests {
             }))
             .build()
             .unwrap();
-        fake.set_delay_ms("PUT", 500);
-        let cut = tokio::time::timeout(
-            std::time::Duration::from_millis(150),
-            complete_multipart_upload(&svc, request(input)),
-        )
-        .await;
-        assert!(cut.is_err(), "the store ended before the request was cut");
+        // Cut while the object's PUT is in flight; it stays in flight long
+        // enough for the next assertion.
+        fake.set_delay_ms("PUT", 2_000);
+        let cut = fake
+            .cut_at(complete_multipart_upload(&svc, request(input)), |r| {
+                r.starts_with("PUT /b/a/photo.jpg")
+            })
+            .await;
+        assert!(cut, "the store ended before the request was cut");
         assert_eq!(state.maintenance_gate.inflight_writes("b"), 1);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while state.maintenance_gate.inflight_writes("b") > 0 {

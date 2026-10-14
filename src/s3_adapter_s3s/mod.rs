@@ -836,8 +836,10 @@ mod list_budget_tests {
         assert_eq!(svc.list_budget().await, 7);
 
         let apply = config.write().await;
-        let got =
-            tokio::time::timeout(std::time::Duration::from_millis(100), svc.list_budget()).await;
+        // The lock stays held: a LIST that waits for it never ends, so the
+        // bound only tells "never" from "eventually" (100 ms failed on a
+        // loaded host).
+        let got = tokio::time::timeout(std::time::Duration::from_secs(10), svc.list_budget()).await;
         drop(apply);
         assert_eq!(got.ok(), Some(7), "a LIST waited for the config write lock");
     }

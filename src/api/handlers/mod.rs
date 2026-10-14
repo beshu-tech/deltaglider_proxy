@@ -322,7 +322,8 @@ mod bucket_exists_tests {
         for i in 0..5 {
             let name = format!("gone{i}");
             let check = ensure_bucket_exists(&state, &name);
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(50), check).await;
+            let head = format!("HEAD /{name}");
+            assert!(fake.cut_at(check, |r| r.starts_with(&head)).await);
         }
         let left = BUCKET_FLIGHTS.count(|(_, b)| b.starts_with("gone"));
         assert_eq!(left, 0, "cancelled checks left their flights");
