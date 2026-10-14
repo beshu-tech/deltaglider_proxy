@@ -44,6 +44,13 @@
 //! which two live replicas can share, and an engine rebuild runs two engines
 //! in one process. A lock that a crashed node leaves behind frees at its TTL.
 //!
+//! A live lock whose `owner` is the caller's own token is not a steal: it
+//! is a write of this same hold whose response was lost (the SDK retry of
+//! the PUT then answers 412 against our own write). The acquire holds it,
+//! and a renew that gets 412 reads the lock once to see whether the 412 is
+//! against its own write. Because the token is per hold, no twin, engine
+//! or earlier hold can match it.
+//!
 //! ## Holding for a long time
 //!
 //! A streaming encode can outlast the TTL. The holder renews the lock
@@ -138,15 +145,22 @@ pub enum LockAction {
     /// carrying `next_epoch`. (A create-if-absent on an existing key 412s on
     /// every pass: a corrupt body wedged the deltaspace forever.)
     Steal { etag: String, next_epoch: u64 },
-    /// A live lock → cannot acquire this pass, whoever holds it.
+    /// A live lock of this same owner: a write of ours whose response was
+    /// lost. We hold it; `etag` is its current ETag.
+    Adopt { etag: String },
+    /// A live lock of another owner → cannot acquire this pass.
     Blocked,
 }
 
 /// Pure acquire decision. Stealable only when EXPIRED (`expires_at < now`,
 /// STRICT — the exact-expiry instant is never both live and stealable) or
-/// corrupt. There is no same-node self-reclaim (see the module doc).
-pub fn plan_lock_acquire(current: &Observed, now: i64) -> LockAction {
+/// corrupt. There is no same-node self-reclaim (see the module doc); only a
+/// live lock of this same `owner` (a per-hold token) is ours.
+pub fn plan_lock_acquire(current: &Observed, now: i64, owner: &str) -> LockAction {
     match current {
+        Observed::Held { lock, etag } if lock.owner == owner && lock.expires_at >= now => {
+            LockAction::Adopt { etag: etag.clone() }
+        }
         Observed::Absent => LockAction::Create,
         Observed::Corrupt { etag } => LockAction::Steal {
             etag: etag.clone(),
@@ -422,8 +436,12 @@ impl ReferenceLock for S3ReferenceLock {
             return Ok(true);
         }
         let current = self.read_lock(key, now).await?;
-        match plan_lock_acquire(&current, now) {
+        match plan_lock_acquire(&current, now, owner) {
             LockAction::Blocked => Ok(false),
+            LockAction::Adopt { etag } => {
+                self.kept.note(key, owner, &Ok::<_, ()>(Some(etag)));
+                Ok(true)
+            }
             LockAction::Create => {
                 self.put_lock(key, owner, self.body_for(owner, 1, expires_at), None)
                     .await
@@ -475,21 +493,32 @@ impl ReferenceLock for S3ReferenceLock {
 
     async fn renew(&self, key: &str, owner: &str, now: i64) -> Result<(), LeaseError> {
         let current = self.read_lock(key, now).await?;
-        match plan_lock_renew(&current, now, owner) {
-            RenewLockAction::Lost => Err(LeaseError::Lost),
-            // A 412 here means the object moved under us: lost.
-            RenewLockAction::Renew { etag, epoch } => {
-                let expires_at = now.saturating_add(self.ttl_secs.max(1));
-                LeaseError::from_renewal(
-                    self.put_lock(
-                        key,
-                        owner,
-                        self.body_for(owner, epoch, expires_at),
-                        Some(&etag),
-                    )
-                    .await,
-                )
+        let RenewLockAction::Renew { etag, epoch } = plan_lock_renew(&current, now, owner) else {
+            return Err(LeaseError::Lost);
+        };
+        let expires_at = now.saturating_add(self.ttl_secs.max(1));
+        let written = self
+            .put_lock(
+                key,
+                owner,
+                self.body_for(owner, epoch, expires_at),
+                Some(&etag),
+            )
+            .await?;
+        if written {
+            return Ok(());
+        }
+        // A 412: the object moved since our read. Either a peer stole it
+        // (lost), or the PUT landed and its response was lost, so the SDK
+        // retry got 412 against our own write. Read once to tell them
+        // apart (as `S3Lease::renew` does): still ours and live = renewed,
+        // by that write.
+        match plan_lock_renew(&self.read_lock(key, now).await?, now, owner) {
+            RenewLockAction::Renew { etag, .. } => {
+                self.kept.note(key, owner, &Ok::<_, ()>(Some(etag)));
+                Ok(())
             }
+            RenewLockAction::Lost => Err(LeaseError::Lost),
         }
     }
 
@@ -532,15 +561,26 @@ pub async fn acquire_blocking(
             .saturating_duration_since(std::time::Instant::now())
             .max(MIN_ATTEMPT_TIME);
         let attempt = tokio::time::timeout(left, lock.try_acquire(key, owner, now_fn())).await;
-        let Ok(acquired) = attempt else {
-            return Err(LeaseError::Backend(
+        let acquired = attempt.unwrap_or_else(|_| {
+            Err(LeaseError::Backend(
                 "the coordination bucket did not answer the lock request before the acquire \
                  timeout"
                     .into(),
-            ));
-        };
-        if acquired? {
-            return Ok(true);
+            ))
+        });
+        match acquired {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(e) => {
+                // The attempt may have written the lock before it failed (a
+                // PUT that landed while its response was lost or timed out).
+                // The caller fails the write and holds nothing, so nothing
+                // else releases that lock: it blocked the deltaspace on every
+                // node for a whole TTL. The release is owner-scoped (this
+                // hold's token only) and best-effort.
+                let _ = tokio::time::timeout(MIN_ATTEMPT_TIME, lock.release(key, owner)).await;
+                return Err(e);
+            }
         }
         if std::time::Instant::now() >= deadline {
             return Ok(false);
@@ -621,7 +661,7 @@ mod tests {
     #[test]
     fn acquire_free_creates() {
         assert_eq!(
-            plan_lock_acquire(&Observed::Absent, 100),
+            plan_lock_acquire(&Observed::Absent, 100, "me"),
             LockAction::Create
         );
     }
@@ -630,7 +670,7 @@ mod tests {
     fn acquire_expired_steals_with_bumped_epoch() {
         let l = obj("old", "nodeB", 5, 90); // expired at now=100
         assert_eq!(
-            plan_lock_acquire(&held(l), 100),
+            plan_lock_acquire(&held(l), 100, "me"),
             LockAction::Steal {
                 etag: "e1".into(),
                 next_epoch: 6
@@ -641,7 +681,7 @@ mod tests {
     #[test]
     fn acquire_live_foreign_blocks() {
         let l = obj("held", "nodeB", 5, 160); // live at now=100
-        assert_eq!(plan_lock_acquire(&held(l), 100), LockAction::Blocked);
+        assert_eq!(plan_lock_acquire(&held(l), 100, "me"), LockAction::Blocked);
     }
 
     /// No same-node self-reclaim: two replicas can share a HOSTNAME-derived
@@ -650,7 +690,31 @@ mod tests {
     #[test]
     fn acquire_live_lock_blocks_even_the_same_node() {
         let l = obj("old-token", "nodeA", 5, 160);
-        assert_eq!(plan_lock_acquire(&held(l), 100), LockAction::Blocked);
+        assert_eq!(plan_lock_acquire(&held(l), 100, "me"), LockAction::Blocked);
+    }
+
+    /// Our own live lock (a write of this hold whose response was lost) is
+    /// held, with its ETag. Owners are per hold, so a twin or an earlier
+    /// hold on the same node has another owner and stays blocked.
+    #[test]
+    fn acquire_adopts_only_its_own_live_lock() {
+        let l = obj("hold-1", "nodeA", 5, 160);
+        assert_eq!(
+            plan_lock_acquire(&held(l.clone()), 100, "hold-1"),
+            LockAction::Adopt { etag: "e1".into() }
+        );
+        assert_eq!(
+            plan_lock_acquire(&held(l), 100, "hold-2"),
+            LockAction::Blocked
+        );
+        // Our own EXPIRED lock is stolen like any other (a new epoch).
+        assert_eq!(
+            plan_lock_acquire(&held(obj("hold-1", "nodeA", 5, 90)), 100, "hold-1"),
+            LockAction::Steal {
+                etag: "e1".into(),
+                next_epoch: 6
+            }
+        );
     }
 
     /// An unparsable body at the key is not a lock. Create-if-absent 412s on
@@ -661,7 +725,7 @@ mod tests {
             etag: "junk".into(),
         };
         assert_eq!(
-            plan_lock_acquire(&c, 100),
+            plan_lock_acquire(&c, 100, "me"),
             LockAction::Steal {
                 etag: "junk".into(),
                 next_epoch: 1
@@ -674,7 +738,7 @@ mod tests {
         // expires_at == now → NOT expired (strict <), so a foreign live lock
         // still blocks — the exact instant is never both live and stealable.
         let l = obj("held", "nodeB", 5, 100);
-        assert_eq!(plan_lock_acquire(&held(l), 100), LockAction::Blocked);
+        assert_eq!(plan_lock_acquire(&held(l), 100, "me"), LockAction::Blocked);
     }
 
     #[test]
@@ -1079,6 +1143,142 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "took {:?}",
             started.elapsed()
+        );
+    }
+
+    /// A lock over [`crate::coordination::test_s3::Lossy`]: a PUT can land
+    /// while its response is lost, and the SDK retry then gets 412 against
+    /// our own write.
+    fn lossy_lock() -> (S3ReferenceLock, crate::coordination::test_s3::Lossy) {
+        let lossy = crate::coordination::test_s3::Lossy::default();
+        let client = crate::coordination::test_s3::lossy_client(&lossy);
+        let lock = S3ReferenceLock::new(client, "coord".into(), "node".into())
+            .with_conditional_delete(true);
+        (lock, lossy)
+    }
+
+    /// The create PUT lands, its response is lost, and the retry answers
+    /// 412 against our own write. The read then finds a live lock whose
+    /// owner is this hold. That is our lock: the acquire must hold it (and
+    /// keep its ETag for the release). It answered "blocked", so every
+    /// write to the deltaspace failed on every node until the TTL.
+    #[tokio::test]
+    async fn a_create_whose_response_was_lost_is_held() {
+        let (lock, lossy) = lossy_lock();
+        *lossy.lose_puts.lock().unwrap() = 1;
+        let now = crate::event_outbox::current_unix_seconds();
+        assert!(
+            lock.try_acquire("k", "hold-1", now).await.unwrap(),
+            "our own lock blocked us: {:?}",
+            lossy.seen()
+        );
+        assert_eq!(lossy.body("k").unwrap()["owner"], "hold-1");
+        // Another hold (a twin on the same node id) is still blocked.
+        assert!(!lock.try_acquire("k", "hold-2", now).await.unwrap());
+        // The release deletes it by the kept ETag, with no read.
+        lossy.seen.lock().unwrap().clear();
+        lock.release("k", "hold-1").await.unwrap();
+        assert_eq!(lossy.seen(), ["DELETE"]);
+        assert!(lossy.body("k").is_none());
+    }
+
+    /// The same on the steal path: the `If-Match` PUT over an expired lock
+    /// lands, its response is lost, the retry gets 412. The next attempt
+    /// must find the lock ours.
+    #[tokio::test]
+    async fn a_steal_whose_response_was_lost_is_held_on_the_next_attempt() {
+        let (lock, lossy) = lossy_lock();
+        let now = crate::event_outbox::current_unix_seconds();
+        let expired = serde_json::json!({
+            "owner": "dead", "node_id": "other", "epoch": 4, "expires_at": now - 5
+        });
+        lossy.objects.lock().unwrap().insert(
+            "k".into(),
+            (serde_json::to_vec(&expired).unwrap(), "\"e0\"".into()),
+        );
+        *lossy.lose_puts.lock().unwrap() = 1;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let now_fn = move || now;
+        assert!(acquire_blocking(&lock, "k", "hold-1", deadline, &now_fn)
+            .await
+            .unwrap());
+        let body = lossy.body("k").unwrap();
+        assert_eq!(
+            (body["owner"].as_str(), body["epoch"].as_u64()),
+            (Some("hold-1"), Some(5))
+        );
+    }
+
+    /// A renew PUT lands and its response is lost; the retry gets 412.
+    /// The lock is still ours (the 412 is against our own renew), so the
+    /// renew is confirmed. It reported "lost" and the holder dropped a
+    /// write that it held the lock for. The lease renew already re-reads.
+    #[tokio::test]
+    async fn a_renew_whose_response_was_lost_is_confirmed() {
+        let (lock, lossy) = lossy_lock();
+        let now = crate::event_outbox::current_unix_seconds();
+        assert!(lock.try_acquire("k", "hold-1", now).await.unwrap());
+        *lossy.lose_puts.lock().unwrap() = 1;
+        lock.renew("k", "hold-1", now + 10)
+            .await
+            .unwrap_or_else(|e| panic!("renew of our own lock: {e:?} {:?}", lossy.seen()));
+        // The kept ETag is the renewed write: the release deletes it.
+        lossy.seen.lock().unwrap().clear();
+        lock.release("k", "hold-1").await.unwrap();
+        assert_eq!(lossy.seen(), ["DELETE"]);
+        assert!(lossy.body("k").is_none());
+    }
+
+    /// A renew 412 whose re-read shows another owner is still lost.
+    #[tokio::test]
+    async fn a_renew_of_a_stolen_lock_is_lost() {
+        let (lock, lossy) = lossy_lock();
+        let now = crate::event_outbox::current_unix_seconds();
+        assert!(lock.try_acquire("k", "hold-1", now).await.unwrap());
+        let peer = serde_json::json!({
+            "owner": "peer", "node_id": "other", "epoch": 2, "expires_at": now + 100
+        });
+        lossy.objects.lock().unwrap().insert(
+            "k".into(),
+            (serde_json::to_vec(&peer).unwrap(), "\"p1\"".into()),
+        );
+        assert_eq!(lock.renew("k", "hold-1", now).await, Err(LeaseError::Lost));
+    }
+
+    /// An attempt that fails (a timeout, a lost response whose retries
+    /// also failed) may have written the lock. The acquire fails the
+    /// write, so nothing releases that lock: it blocked the deltaspace on
+    /// every node for a whole TTL. The failed acquire releases it
+    /// (owner-scoped, so only a lock of this hold).
+    #[tokio::test]
+    async fn a_failed_attempt_releases_what_it_may_have_written() {
+        struct WroteThenFailed(TokioMutex<Option<String>>);
+        impl ReferenceLock for WroteThenFailed {
+            async fn try_acquire(&self, _k: &str, o: &str, _n: i64) -> Result<bool, LeaseError> {
+                *self.0.lock().await = Some(o.to_string());
+                Err(LeaseError::Backend("the response was lost".into()))
+            }
+            async fn release(&self, _k: &str, o: &str) -> Result<(), LeaseError> {
+                let mut h = self.0.lock().await;
+                if h.as_deref() == Some(o) {
+                    *h = None;
+                }
+                Ok(())
+            }
+            async fn renew(&self, _k: &str, _o: &str, _n: i64) -> Result<(), LeaseError> {
+                Ok(())
+            }
+        }
+        let lock = WroteThenFailed(TokioMutex::new(None));
+        let now_fn = || 1000i64;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        assert!(acquire_blocking(&lock, "k", "hold-1", deadline, &now_fn)
+            .await
+            .is_err());
+        assert_eq!(
+            *lock.0.lock().await,
+            None,
+            "the lock of the failed hold stayed"
         );
     }
 

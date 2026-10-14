@@ -63,6 +63,21 @@ listing, and the folder listing of the file browser failed the same way. The
 proxy now skips a prefix that sorts completely before the continuation
 token, with no request, and skips a folder entry that the user cannot see
 before it checks the limit.
+### Fixed — A lock write whose response was lost no longer blocks the deltaspace
+
+A multi-instance proxy takes a lock object in the coordination bucket
+before it writes a delta, and a lease object before it runs a replication
+rule. When the PUT of that object landed but its response was lost, the S3
+client sent the PUT again, and the retry failed (412) against the
+instance's own write. The instance then read a live lock that it did not
+recognise as its own, so every delta write to that deltaspace failed on
+every instance until the lock expired (120 s), and the replication rule
+waited for the lease to expire (300 s). A renew of the lock that met the
+same lost response reported the lock as lost, so a write that held the
+lock failed. An instance now recognises its own live lock by its owner
+token (unique to each hold, so two instances never match), and a renew
+that fails reads the lock once to see whether it is still its own. An
+acquire that fails also removes a lock that it may have written.
 
 ### Fixed — A copy during a re-encryption no longer serves ciphertext
 

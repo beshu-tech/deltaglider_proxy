@@ -151,8 +151,12 @@ impl World {
                 let observed = self.observed(&seen);
                 match step {
                     Step::Acquire => {
-                        let won = match plan_lock_acquire(&observed, read_at) {
+                        let won = match plan_lock_acquire(&observed, read_at, &owner) {
                             LockAction::Blocked => None,
+                            // Our own live lock (a write whose response was
+                            // lost): held as it is, by its ETag.
+                            LockAction::Adopt { etag } if self.etag_is(&etag) => etag.parse().ok(),
+                            LockAction::Adopt { .. } => None,
                             LockAction::Create if self.obj.is_none() => Some(self.put(owner, 1)),
                             LockAction::Create => None,
                             LockAction::Steal { etag, next_epoch } if self.etag_is(&etag) => {

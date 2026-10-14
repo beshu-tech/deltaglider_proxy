@@ -65,6 +65,10 @@ pub enum AcquireAction {
     /// A lease exists but is expired/reclaimable → steal with `If-Match(etag)`,
     /// carrying `next_epoch`.
     Steal { etag: String, next_epoch: u64 },
+    /// A live lease of this same owner: a write of ours whose response
+    /// was lost (the SDK retry of the PUT answered 412 against it). We
+    /// hold it; `etag` is its current ETag.
+    Adopt { etag: String },
     /// A live lease held by someone else → do not acquire.
     Blocked,
 }
@@ -80,14 +84,25 @@ pub enum AcquireAction {
 /// process (another worker in it), by a DIFFERENT node, or by a LIVE twin
 /// that shares the node id (docker `--network host`, a shared `DGP_NODE_ID`):
 /// a twin's boot id is not this node's previous one.
+///
+/// A live lease whose `owner` is the caller's is ours already: a write of
+/// this owner whose response was lost. Owners carry a per-task uuid
+/// (`scheduler:<uuid>`, `run-now:<uuid>`, ...), and each task takes a rule's
+/// lease one hold at a time, so no other worker or process matches it.
 pub fn plan_acquire(
     current: Option<(&Lease, &str)>,
     now: i64,
+    owner: &str,
     my_node_id: &str,
     previous_boot_id: Option<&str>,
 ) -> AcquireAction {
     match current {
         None => AcquireAction::Create,
+        Some((lease, etag)) if lease.owner == owner && lease.expires_at >= now => {
+            AcquireAction::Adopt {
+                etag: etag.to_string(),
+            }
+        }
         Some((lease, etag)) => {
             let expired = lease.expires_at < now;
             let from_my_previous_boot = lease.node_id == my_node_id
@@ -134,6 +149,7 @@ impl LeaseRead {
 pub fn plan_acquire_read(
     current: &LeaseRead,
     now: i64,
+    owner: &str,
     my_node_id: &str,
     previous_boot_id: Option<&str>,
 ) -> AcquireAction {
@@ -142,7 +158,7 @@ pub fn plan_acquire_read(
             etag: etag.clone(),
             next_epoch: 1,
         },
-        other => plan_acquire(other.valid(), now, my_node_id, previous_boot_id),
+        other => plan_acquire(other.valid(), now, owner, my_node_id, previous_boot_id),
     }
 }
 
@@ -331,10 +347,15 @@ impl CoordinationLease for S3Lease {
         match plan_acquire_read(
             &current,
             now,
+            owner,
             &self.node_id,
             self.previous_boot_id.as_deref(),
         ) {
             AcquireAction::Blocked => Ok(false),
+            AcquireAction::Adopt { etag } => {
+                self.kept.note(&key, owner, &Ok::<_, ()>(Some(etag)));
+                Ok(true)
+            }
             AcquireAction::Create => {
                 self.put_lease(
                     &key,
@@ -574,6 +595,59 @@ mod tests {
         );
     }
 
+    fn lossy_lease() -> (S3Lease, crate::coordination::test_s3::Lossy) {
+        let lossy = crate::coordination::test_s3::Lossy::default();
+        let client = crate::coordination::test_s3::lossy_client(&lossy);
+        let lease =
+            S3Lease::new(client, "coord".into(), "node".into()).with_conditional_delete(true);
+        (lease, lossy)
+    }
+
+    /// The create PUT lands, its response is lost, the SDK retry gets 412
+    /// against our own write. The read finds a live lease of this owner:
+    /// ours. It answered "blocked", and the rule stalled for the lease TTL
+    /// (300 s) on every node.
+    #[tokio::test]
+    async fn a_create_whose_response_was_lost_is_held() {
+        let (lease, lossy) = lossy_lease();
+        let sub = LeaseSubsystem::Replication;
+        let key = S3Lease::object_key(sub, "r");
+        *lossy.lose_puts.lock().unwrap() = 1;
+        let now = crate::event_outbox::current_unix_seconds();
+        assert!(
+            lease
+                .try_acquire(sub, "r", "scheduler:1", now, 300)
+                .await
+                .unwrap(),
+            "our own lease blocked us: {:?}",
+            lossy.seen()
+        );
+        // Another worker of this process is still blocked.
+        assert!(!lease
+            .try_acquire(sub, "r", "event-consumer:1", now, 300)
+            .await
+            .unwrap());
+        lossy.seen.lock().unwrap().clear();
+        lease.release(sub, "r", "scheduler:1").await.unwrap();
+        assert_eq!(lossy.seen(), ["DELETE"], "the kept ETag was not kept");
+        assert!(lossy.body(&key).is_none());
+    }
+
+    /// Twin of the reference lock's renew: a renew whose response was lost
+    /// re-reads, finds the lease still ours, and is confirmed.
+    #[tokio::test]
+    async fn a_renew_whose_response_was_lost_is_confirmed() {
+        let (lease, lossy) = lossy_lease();
+        let sub = LeaseSubsystem::Replication;
+        let now = crate::event_outbox::current_unix_seconds();
+        assert!(lease.try_acquire(sub, "r", "o", now, 300).await.unwrap());
+        *lossy.lose_puts.lock().unwrap() = 1;
+        lease.renew(sub, "r", "o", now + 10, 300).await.unwrap();
+        lossy.seen.lock().unwrap().clear();
+        lease.release(sub, "r", "o").await.unwrap();
+        assert_eq!(lossy.seen(), ["DELETE"]);
+    }
+
     fn canned_lease(body: serde_json::Value, age: i64) -> crate::coordination::test_s3::Canned {
         let now = crate::event_outbox::current_unix_seconds();
         crate::coordination::test_s3::Canned {
@@ -632,7 +706,7 @@ mod tests {
     #[test]
     fn acquire_free_lease_creates() {
         assert_eq!(
-            plan_acquire(None, 100, "nodeA", None),
+            plan_acquire(None, 100, "me", "nodeA", None),
             AcquireAction::Create
         );
     }
@@ -641,7 +715,7 @@ mod tests {
     fn acquire_expired_lease_steals_with_bumped_epoch() {
         let l = lease("old", "nodeB", 5, 90); // expired at now=100
         assert_eq!(
-            plan_acquire(Some((&l, "etag1")), 100, "nodeA", None),
+            plan_acquire(Some((&l, "etag1")), 100, "me", "nodeA", None),
             AcquireAction::Steal {
                 etag: "etag1".into(),
                 next_epoch: 6
@@ -653,7 +727,7 @@ mod tests {
     fn acquire_live_foreign_lease_blocks() {
         let l = lease("held", "nodeB", 5, 160); // live at now=100
         assert_eq!(
-            plan_acquire(Some((&l, "etag1")), 100, "nodeA", None),
+            plan_acquire(Some((&l, "etag1")), 100, "me", "nodeA", None),
             AcquireAction::Blocked
         );
     }
@@ -664,7 +738,7 @@ mod tests {
         // reclaimable without waiting for expiry.
         let l = lease("old-task", "nodeA", 5, 160); // live, written by boot-old
         assert_eq!(
-            plan_acquire(Some((&l, "etag1")), 100, "nodeA", Some("boot-old")),
+            plan_acquire(Some((&l, "etag1")), 100, "me", "nodeA", Some("boot-old")),
             AcquireAction::Steal {
                 etag: "etag1".into(),
                 next_epoch: 6
@@ -679,7 +753,7 @@ mod tests {
     fn acquire_live_lease_of_this_process_blocks() {
         let l = lease("scheduler", "nodeA", 5, 160);
         assert_eq!(
-            plan_acquire(Some((&l, "etag1")), 100, "nodeA", Some("boot-before")),
+            plan_acquire(Some((&l, "etag1")), 100, "me", "nodeA", Some("boot-before")),
             AcquireAction::Blocked
         );
         // A lease body from an older release has no boot id: never ours.
@@ -688,7 +762,7 @@ mod tests {
             ..l.clone()
         };
         assert_eq!(
-            plan_acquire(Some((&old, "etag1")), 100, "nodeA", Some("")),
+            plan_acquire(Some((&old, "etag1")), 100, "me", "nodeA", Some("")),
             AcquireAction::Blocked
         );
     }
@@ -707,16 +781,22 @@ mod tests {
             ttl_secs: Some(300),
         };
         assert_eq!(
-            plan_acquire(Some((&p1, "e1")), 100, "shared-host", Some("boot-p2-prev")),
+            plan_acquire(
+                Some((&p1, "e1")),
+                100,
+                "me",
+                "shared-host",
+                Some("boot-p2-prev")
+            ),
             AcquireAction::Blocked
         );
         assert_eq!(
-            plan_acquire(Some((&p1, "e1")), 100, "shared-host", None),
+            plan_acquire(Some((&p1, "e1")), 100, "me", "shared-host", None),
             AcquireAction::Blocked
         );
         // It expires as usual.
         assert!(matches!(
-            plan_acquire(Some((&p1, "e1")), 401, "shared-host", None),
+            plan_acquire(Some((&p1, "e1")), 401, "me", "shared-host", None),
             AcquireAction::Steal { .. }
         ));
     }
@@ -727,7 +807,7 @@ mod tests {
         // still blocks (mirrors the job_store `< now` steal predicate).
         let l = lease("held", "nodeB", 5, 100);
         assert_eq!(
-            plan_acquire(Some((&l, "e")), 100, "nodeA", None),
+            plan_acquire(Some((&l, "e")), 100, "me", "nodeA", None),
             AcquireAction::Blocked
         );
     }
@@ -738,7 +818,7 @@ mod tests {
             etag: "junk".into(),
         };
         assert_eq!(
-            plan_acquire_read(&c, 100, "nodeA", None),
+            plan_acquire_read(&c, 100, "me", "nodeA", None),
             AcquireAction::Steal {
                 etag: "junk".into(),
                 next_epoch: 1
@@ -750,7 +830,7 @@ mod tests {
             etag: "e".into(),
         };
         assert_eq!(
-            plan_acquire_read(&live, 100, "nodeA", None),
+            plan_acquire_read(&live, 100, "me", "nodeA", None),
             AcquireAction::Blocked
         );
     }

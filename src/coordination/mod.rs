@@ -243,6 +243,154 @@ pub(crate) mod test_s3 {
         }
     }
 
+    /// An in-memory bucket with real conditional-write semantics whose
+    /// next PUTs can LOSE their response: the write lands, the client sees
+    /// a connection reset, and the SDK sends the same PUT again, which
+    /// answers 412 against our own write. Holds any number of keys.
+    /// key -> (body, etag)
+    pub type Objects = std::collections::HashMap<String, (Vec<u8>, String)>;
+
+    #[derive(Debug, Clone, Default)]
+    pub struct Lossy {
+        pub objects: Arc<Mutex<Objects>>,
+        writes: Arc<Mutex<u32>>,
+        /// How many of the next successful PUTs lose their response.
+        pub lose_puts: Arc<Mutex<u32>>,
+        /// Methods of the requests seen, in order (`PUT 412` for a lost race).
+        pub seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Lossy {
+        /// The body of `key`, parsed as JSON.
+        pub fn body(&self, key: &str) -> Option<serde_json::Value> {
+            let objects = self.objects.lock().unwrap();
+            objects
+                .get(key)
+                .map(|(b, _)| serde_json::from_slice(b).unwrap())
+        }
+
+        pub fn seen(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+
+        fn status(code: u16, error: Option<&str>) -> HttpResponse {
+            let body = error.map_or_else(SdkBody::empty, |c| {
+                SdkBody::from(format!(
+                    "<Error><Code>{c}</Code><Message>x</Message></Error>"
+                ))
+            });
+            HttpResponse::new(code.try_into().unwrap(), body)
+        }
+    }
+
+    impl HttpConnector for Lossy {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            let key = request
+                .uri()
+                .split('?')
+                .next()
+                .unwrap_or_default()
+                .rsplit("/coord/")
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let mut objects = self.objects.lock().unwrap();
+            let current = objects.get(&key).map(|(_, e)| e.clone());
+            let if_match = request.headers().get("if-match").map(str::to_string);
+            let if_none = request.headers().get("if-none-match").is_some();
+            let failed = (if_none && current.is_some())
+                || if_match
+                    .as_ref()
+                    .is_some_and(|m| Some(m) != current.as_ref());
+            let method = request.method().to_string();
+            let resp = match method.as_str() {
+                "PUT" if failed => {
+                    self.seen.lock().unwrap().push("PUT 412".into());
+                    Self::status(412, Some("PreconditionFailed"))
+                }
+                "PUT" => {
+                    self.seen.lock().unwrap().push("PUT".into());
+                    let body = request.body().bytes().unwrap_or_default().to_vec();
+                    let mut writes = self.writes.lock().unwrap();
+                    *writes += 1;
+                    let etag = format!("\"e{writes}\"");
+                    objects.insert(key, (body, etag.clone()));
+                    let mut lose = self.lose_puts.lock().unwrap();
+                    if *lose > 0 {
+                        *lose -= 1;
+                        return HttpConnectorFuture::ready(Err(
+                            aws_smithy_runtime_api::client::result::ConnectorError::io(Box::new(
+                                std::io::Error::new(
+                                    std::io::ErrorKind::ConnectionReset,
+                                    "the response was lost",
+                                ),
+                            )),
+                        ));
+                    }
+                    let mut r = Self::status(200, None);
+                    r.headers_mut().insert("etag", etag);
+                    r
+                }
+                "GET" => {
+                    self.seen.lock().unwrap().push("GET".into());
+                    match objects.get(&key) {
+                        Some((body, etag)) => {
+                            let mut r = HttpResponse::new(
+                                200.try_into().unwrap(),
+                                SdkBody::from(body.clone()),
+                            );
+                            r.headers_mut().insert("etag", etag.clone());
+                            r
+                        }
+                        None => Self::status(404, Some("NoSuchKey")),
+                    }
+                }
+                "DELETE" if failed => {
+                    self.seen.lock().unwrap().push("DELETE 412".into());
+                    Self::status(412, Some("PreconditionFailed"))
+                }
+                "DELETE" => {
+                    self.seen.lock().unwrap().push("DELETE".into());
+                    objects.remove(&key);
+                    Self::status(204, None)
+                }
+                _ => Self::status(501, Some("NotImplemented")),
+            };
+            HttpConnectorFuture::ready(Ok(resp))
+        }
+    }
+
+    impl HttpClient for Lossy {
+        fn http_connector(
+            &self,
+            _: &HttpConnectorSettings,
+            _: &RuntimeComponents,
+        ) -> SharedHttpConnector {
+            SharedHttpConnector::new(self.clone())
+        }
+    }
+
+    /// A client over [`Lossy`], bucket `coord`, that retries a lost
+    /// response at once (as the SDK does, without the backoff).
+    pub fn lossy_client(lossy: &Lossy) -> aws_sdk_s3::Client {
+        let conf = aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(aws_credential_types::Credentials::new(
+                "k", "s", None, None, "test",
+            ))
+            .endpoint_url("http://127.0.0.1:1")
+            .force_path_style(true)
+            .http_client(lossy.clone())
+            .retry_config(
+                aws_sdk_s3::config::retry::RetryConfig::standard()
+                    .with_max_attempts(3)
+                    .with_initial_backoff(std::time::Duration::from_millis(1)),
+            )
+            .build();
+        aws_sdk_s3::Client::from_conf(conf)
+    }
+
     pub fn client(canned: &Canned) -> aws_sdk_s3::Client {
         let conf = aws_sdk_s3::Config::builder()
             .behavior_version(BehaviorVersion::latest())
