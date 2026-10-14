@@ -411,12 +411,12 @@ pub struct EncryptionPreviewQuery {
 /// resolving it itself (issue #116 P2, review defect 5).
 pub async fn bucket_encryption_preview(
     State(state): State<Arc<AdminState>>,
-    Path(bucket): Path<String>,
+    Path(bucket): Path<super::path_guard::AdminBucket>,
     crate::api::admin::extract::AdminQuery(q): crate::api::admin::extract::AdminQuery<
         EncryptionPreviewQuery,
     >,
 ) -> Result<Json<super::bucket_encryption_view::EffectiveEncryption>, AdminError> {
-    let bucket = super::admit_bucket::<super::Text>(&state, bucket.trim())?.into_string();
+    let bucket = bucket.admit(&state)?.into_string();
     let key = bucket.to_ascii_lowercase();
     let mut cfg = state.config.read().await.clone();
     // The config the create would make (route only), then THE resolver.

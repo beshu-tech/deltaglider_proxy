@@ -23,7 +23,22 @@ fn every_encryption_site_goes_through_the_visitor() {
             "backend_encryption",
         ),
     ];
-    let found = encryption_config_fields();
+    // Request bodies that carry an encryption block into the config: the
+    // handler writes it into a site (BucketPolicyConfig.encryption) before
+    // anything reads it, and the body is never stored, logged or returned.
+    let request_bodies: &[(&str, &str, &str)] = &[(
+        "src/api/admin/backends.rs",
+        "CreateBucketOnBackendRequest",
+        "encryption",
+    )];
+    let found: Vec<_> = encryption_config_fields()
+        .into_iter()
+        .filter(|(file, ty, field)| {
+            !request_bodies
+                .iter()
+                .any(|(f, t, n)| f == file && t == ty && n == field)
+        })
+        .collect();
     for (file, ty, field) in &found {
         assert!(
             known

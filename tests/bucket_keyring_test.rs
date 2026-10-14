@@ -1752,11 +1752,20 @@ async fn the_bucket_list_reports_each_buckets_encryption() {
         Some("local-a")
     );
 
-    // "Off for this bucket": plaintext writes, the key becomes legacy.
-    env.storage_patch_ok(
-        json!({ "buckets": { "downloads": { "encryption": { "mode": "none" } } } }),
-    )
-    .await;
+    // "Off for this bucket": plaintext writes, the key becomes legacy. The
+    // UI sends the downgrade confirmation after its dialog (P3's gate).
+    let resp = env
+        .admin
+        .put(format!(
+            "{}/_/api/admin/config/section/storage",
+            env.server.endpoint()
+        ))
+        .header("X-DGP-Confirm-Encryption-Downgrade", "downloads")
+        .json(&json!({ "buckets": { "downloads": { "encryption": { "mode": "none" } } } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "{:?}", resp.text().await);
     let dl = effective(&env, "downloads").await;
     assert_eq!(
         (
@@ -1780,24 +1789,13 @@ async fn the_bucket_list_reports_each_buckets_encryption() {
         b"under the bucket key"
     );
 
-    // The create dialog: the policy first, then POST /buckets.
-    env.storage_patch_ok(json!({ "buckets": { "db-archive": {
-        "backend": "local-disk",
-        "encryption": { "mode": "aes256-gcm-proxy", "key": KB, "key_id": "downloads-2026-10" }
-    } } }))
-    .await;
-    let resp = env
-        .admin
-        .post(format!("{}/_/api/admin/buckets", env.server.endpoint()))
-        .json(&json!({ "name": "db-archive", "backend_name": "local-disk" }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status().as_u16(), 200, "{:?}", resp.text().await);
+    // The create dialog: the bucket and its block in one request.
+    let (code, body) = create_with_key(&env, "db-archive", "local-disk").await;
+    assert_eq!(code, 200, "{body}");
     env.put("db-archive", "dump.sql", b"first object").await;
     assert_eq!(
         env.at_rest("db-archive", "dump.sql").await.as_deref(),
-        Some("downloads-2026-10"),
+        Some("db-archive-2026-10"),
         "the first object of a new bucket is written with its own key"
     );
     let db = effective(&env, "db-archive").await;
