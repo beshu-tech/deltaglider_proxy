@@ -470,3 +470,78 @@ async fn passthrough_writes_into_one_folder_run_at_once() {
     );
     eprintln!("passthrough writes in flight in one folder: {distinct} (one key: 1)");
 }
+
+/// A bucket whose only object left is an orphan reference.bin (a delete
+/// cut before its reclaim) deletes: a client cannot see or delete that
+/// reference, so it must not keep the bucket.
+#[tokio::test]
+async fn delete_bucket_reclaims_an_orphan_reference() {
+    let (dir, engine, _) = faulty_engine().await;
+    let base = noise(7, 200_000);
+    for (key, seed) in [("rel/a.zip", 1u8), ("rel/b.zip", 2)] {
+        engine
+            .store("b", key, &near(&base, seed), None, HashMap::new())
+            .await
+            .unwrap();
+    }
+    engine.delete_in_sweep("b", "rel/a.zip").await.unwrap();
+    engine.delete_in_sweep("b", "rel/b.zip").await.unwrap();
+    assert!(
+        engine.storage().has_reference("b", "rel").await.unwrap(),
+        "fixture: the folder keeps its reference.bin alone"
+    );
+    engine.delete_bucket("b").await.unwrap();
+    assert!(
+        !dir.path().join("b").exists(),
+        "the bucket is still on disk"
+    );
+}
+
+/// A DeleteBucket that meets a PUT in flight (the PUT holds the deltaspace
+/// lock, encoded against reference.bin, and has not yet written its delta)
+/// must not delete that reference: it answers BucketNotEmpty after the
+/// PUT, and the new object reads back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_bucket_keeps_the_reference_of_a_put_in_flight() {
+    let (_dir, engine, faults) = faulty_engine().await;
+    let engine = Arc::new(engine);
+    let base = noise(8, 200_000);
+    engine
+        .store("b", "rel/a.zip", &near(&base, 1), None, HashMap::new())
+        .await
+        .unwrap();
+    engine.delete_in_sweep("b", "rel/a.zip").await.unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
+    let e = engine.clone();
+    faults.hook(
+        FaultPoint::PutDelta,
+        "b/rel/b.zip",
+        Arc::new(move || {
+            let (e, tx) = (e.clone(), tx.clone());
+            Box::pin(async move {
+                let task = tokio::spawn(async move { e.delete_bucket("b").await });
+                // Room for a DeleteBucket that does not wait for the lock
+                // to finish before the PUT writes its delta.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let _ = tx.lock().unwrap().take().unwrap().send(task);
+            })
+        }),
+    );
+    let v2 = near(&base, 2);
+    let put = engine
+        .store("b", "rel/b.zip", &v2, None, HashMap::new())
+        .await;
+    assert_eq!(faults.fired(FaultPoint::PutDelta, "b/rel/b.zip"), 1);
+    let deleted = rx.await.unwrap().await.unwrap();
+    assert!(
+        matches!(
+            deleted,
+            Err(EngineError::Storage(StorageError::BucketNotEmpty(_)))
+        ),
+        "DeleteBucket during a PUT: {deleted:?}"
+    );
+    put.unwrap();
+    engine.metadata_cache.invalidate("b", "rel/b.zip");
+    assert_eq!(engine.retrieve("b", "rel/b.zip").await.unwrap().0, v2);
+}

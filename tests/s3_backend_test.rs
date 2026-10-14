@@ -1060,3 +1060,75 @@ async fn test_s3_leading_space_key_serves_its_own_bytes() {
         "GET of a leading-space key served another object's bytes"
     );
 }
+
+/// DeleteBucket of a bucket whose only keys are proxy internals (an orphan
+/// reference.bin, listing facts) succeeds: LIST shows the bucket empty, and
+/// a client cannot delete those keys. Before, MinIO answered 409
+/// BucketNotEmpty because of the reference.
+#[tokio::test]
+async fn delete_bucket_reclaims_an_orphan_reference() {
+    skip_unless_minio!();
+    let bucket = review3_bucket("orphanref").await;
+    let server = TestServer::builder()
+        .s3_endpoint(&common::minio_endpoint_url())
+        .bucket(&bucket)
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    let base = generate_binary(100_000, 7);
+    for (key, body) in [
+        ("rel/a.zip", base.clone()),
+        ("rel/b.zip", mutate_binary(&base, 0.01)),
+    ] {
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from(body))
+            .send()
+            .await
+            .unwrap();
+    }
+    // A delete cut before its reclaim: the deltas go, the reference stays.
+    let raw = minio_client().await;
+    let keys: Vec<String> = raw
+        .list_objects_v2()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap()
+        .contents()
+        .iter()
+        .filter_map(|o| o.key().map(String::from))
+        .collect();
+    assert!(
+        keys.iter().any(|k| k.ends_with("reference.bin")),
+        "fixture: a reference exists: {keys:?}"
+    );
+    for k in keys.iter().filter(|k| k.ends_with(".delta")) {
+        raw.delete_object()
+            .bucket(&bucket)
+            .key(k)
+            .send()
+            .await
+            .unwrap();
+    }
+    let listed = client
+        .list_objects_v2()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap();
+    assert!(listed.contents().is_empty(), "the bucket lists empty");
+
+    client
+        .delete_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("DeleteBucket of a bucket that lists empty");
+    assert!(
+        raw.head_bucket().bucket(&bucket).send().await.is_err(),
+        "the bucket is still on MinIO"
+    );
+}

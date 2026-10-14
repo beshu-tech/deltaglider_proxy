@@ -44,6 +44,9 @@ pub(crate) enum FaultPoint {
     ListDeltaspaces,
     /// The key is `"bucket/scope/"`.
     ListReferencePrefixes,
+    /// A delta write, before it writes: the writer holds its deltaspace
+    /// lock and encoded against reference.bin.
+    PutDelta,
 }
 
 /// Work a test runs inside a storage call, before the call goes on: a
@@ -503,6 +506,8 @@ impl StorageBackend for FaultyFs {
         metadata: &FileMetadata,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
+        self.armed(FaultPoint::PutDelta, bucket, prefix, filename)
+            .await?;
         self.inner
             .put_delta(bucket, prefix, filename, data, metadata, proof)
             .await

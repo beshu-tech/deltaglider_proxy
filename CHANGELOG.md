@@ -30,6 +30,17 @@ page is truncated. The remaining leak, for runs of more than about 50,000
 hidden keys in a row, is described in the IAM permissions reference. The
 file browser's folder listing reads pages of 1000 keys too, and goes on from
 its scan position, so it no longer reads a backend page twice.
+### Fixed — DeleteBucket deletes a bucket that lists empty
+
+A delete that stopped before its last step can leave a delta baseline
+(`reference.bin`) in a folder after all the objects in the folder are
+gone. A client cannot see or delete this file. On an S3 backend, a
+`DeleteBucket` request for such a bucket got `409 BucketNotEmpty`, but the
+bucket listed empty. Now the proxy deletes each such baseline before it
+deletes the bucket. It holds the folder's lock and checks again that no
+object uses the baseline, so an upload in progress keeps its baseline, and
+the request gets `BucketNotEmpty`. For the same reason, the filesystem
+backend no longer deletes a baseline on its own when it deletes a bucket.
 
 ### Fixed — The Jobs editor no longer mixes up two rules with the same name
 

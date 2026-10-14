@@ -81,9 +81,21 @@ async fn test_delete_bucket_succeeds_with_internal_residue_only() {
     std::fs::create_dir_all(bucket_dir.join("tmp-residue/subdir")).expect("create residue dirs");
     std::fs::write(bucket_dir.join("tmp-residue/subdir/work.bin"), b"junk")
         .expect("write residue file");
-    std::fs::create_dir_all(bucket_dir.join("deltaspaces/ghost")).expect("create ghost deltaspace");
-    std::fs::write(bucket_dir.join("deltaspaces/ghost/reference.bin"), b"ref")
-        .expect("write reference residue");
+    // An orphan reference.bin, made by the write path: a delete cut before
+    // its reclaim leaves the reference alone in its folder. The engine
+    // reclaims it under the deltaspace lock (the storage never deletes a
+    // reference on its own).
+    client
+        .put_object()
+        .bucket(bucket)
+        .key("ghost/app.zip")
+        .body(vec![7u8; 4096].into())
+        .send()
+        .await
+        .expect("put");
+    let ghost = bucket_dir.join("deltaspaces/ghost");
+    assert!(ghost.join("reference.bin").exists(), "fixture: a reference");
+    std::fs::remove_file(ghost.join("app.zip.delta")).expect("orphan the reference");
     // A temp file of an interrupted atomic write (a plain dot-file such as
     // `.env` is a user object and blocks the delete).
     std::fs::write(bucket_dir.join("deltaspaces/ghost/.dg-tmp.Stale0"), b"tmp")

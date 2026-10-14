@@ -655,8 +655,11 @@ mod backend_tests {
         assert_eq!(inner_keys, vec![".well-known/cert.txt"]);
     }
 
+    /// The storage keeps a reference.bin: only the engine deletes one,
+    /// under its deltaspace lock (a PUT in flight may encode against it).
+    /// Temp files and empty folders go.
     #[tokio::test]
-    async fn test_delete_bucket_removes_reference_only_and_empty_dirs() {
+    async fn test_delete_bucket_keeps_a_reference_and_removes_empty_dirs() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let backend = FilesystemBackend::new(tmp.path().to_path_buf())
             .await
@@ -696,6 +699,20 @@ mod backend_tests {
         .await
         .expect("create empty prefix");
 
+        let kept = backend.delete_bucket("bucket").await;
+        assert!(
+            matches!(kept, Err(StorageError::BucketNotEmpty(_))),
+            "{kept:?}"
+        );
+        assert!(backend.has_reference("bucket", "ghost").await.unwrap());
+        backend
+            .delete_reference(
+                "bucket",
+                "ghost",
+                crate::deltaglider::RefWriteProof::for_tests(),
+            )
+            .await
+            .expect("delete reference");
         backend
             .delete_bucket("bucket")
             .await

@@ -2,6 +2,7 @@
 
 //! Bucket operations (delegate to storage).
 
+use super::delete::ReferenceHint;
 use super::*;
 
 impl<S: StorageBackend> DeltaGliderEngine<S> {
@@ -19,7 +20,27 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// Delete a real bucket on the storage backend (must be empty).
+    ///
+    /// An orphan reference.bin (its deltas are gone, but a delete was cut
+    /// before its reclaim) is invisible to clients, so it must not keep the
+    /// bucket. Each one goes through the reclaim of a delete: it takes the
+    /// deltaspace lock (and the cross-instance lock), checks again that the
+    /// reference is alone, and only then deletes it. A PUT in flight holds
+    /// that lock while it encodes against the reference, so the reclaim
+    /// waits for it, finds its delta, and keeps the reference; the storage
+    /// then answers BucketNotEmpty. The storage never deletes a reference
+    /// on its own.
     pub async fn delete_bucket(&self, bucket: &str) -> Result<(), EngineError> {
+        for prefix in self.storage.list_reference_prefixes(bucket, "").await? {
+            match self
+                .reclaim_empty_deltaspace(bucket, &prefix, ReferenceHint::Present)
+                .await
+            {
+                Ok(()) => {}
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e),
+            }
+        }
         Ok(self.storage.delete_bucket(bucket).await?)
     }
 

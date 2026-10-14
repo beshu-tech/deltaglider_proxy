@@ -666,10 +666,11 @@ impl FilesystemBackend {
         })
     }
 
-    /// Remove hidden temp files, reference-only data, and empty directories
-    /// from an otherwise empty bucket subtree.
+    /// Remove hidden temp files and empty directories from an otherwise
+    /// empty bucket subtree. A reference.bin stays and counts as data: only
+    /// the engine deletes it, under its deltaspace lock.
     ///
-    /// Returns `true` only when the subtree contains no user-visible data.
+    /// Returns `true` only when the subtree contains no data.
     /// Bucket deletion uses this before a non-recursive `remove_dir`, so a
     /// concurrent object creation turns into `BucketNotEmpty` instead of being
     /// erased by `remove_dir_all`.
@@ -709,7 +710,11 @@ impl FilesystemBackend {
                         has_visible_data = true;
                     }
                 } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if is_internal_temp_name(name) || name == "reference.bin" {
+                    // reference.bin stays: only the engine deletes it, under
+                    // the deltaspace lock (a PUT in flight may encode
+                    // against it). An orphan one is reclaimed by
+                    // `DeltaGliderEngine::delete_bucket` before this runs.
+                    if is_internal_temp_name(name) {
                         match fsio::remove_file(&path).await {
                             Ok(()) => {}
                             Err(e) if fsio::absent(&e) => {}

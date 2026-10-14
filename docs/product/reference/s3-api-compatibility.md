@@ -86,7 +86,7 @@ The S3 backend stores keys as S3 keys, so there both objects can exist.
 | Operation | Status | Notes |
 |---|---|---|
 | `CreateBucket` | ✅ Full | Returns the location header. |
-| `DeleteBucket` | ✅ Full | Requires the bucket to be empty; purges orphaned multipart state; blocks while uploads are completing. |
+| `DeleteBucket` | ✅ Full | Requires the bucket to be empty; purges orphaned multipart state; blocks while uploads are completing. A bucket that holds only proxy-internal objects (a delta baseline that no object uses any more, listing facts) counts as empty, and the proxy deletes those objects first. |
 | `HeadBucket` | ✅ Full | `200` if the bucket exists, else `404 NoSuchBucket`. Region header is `us-east-1`. |
 | `GetBucketLocation` | ◑ Stub | Returns an empty location-constraint (interpreted as `us-east-1`). |
 | `GetBucketVersioning` | ◑ Stub | Returns an empty status. The proxy does **not** implement S3 object versioning. See [Versioning vs S3 versioning](../explanation/versioning-vs-s3-versioning.md). |
