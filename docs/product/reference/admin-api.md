@@ -274,7 +274,7 @@ maintenance one-offs are DB-born. See [replication.md](replication.md) and
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/_/api/admin/jobs` | Every job as one normalized row: kind, scope, status (`idle` / `queued` / `running` / `cancelling` / `succeeded` / `completed_with_errors` / `failed` / `cancelled`), pause flag, progress, last run. |
+| `GET` | `/_/api/admin/jobs` | Every job as one normalized row: kind, scope, status (`idle` / `queued` / `running` / `cancelling` / `paused` / `deferred` / `succeeded` / `completed_with_errors` / `failed` / `cancelled`), pause flag, progress, last run. |
 | `GET` | `/_/api/admin/jobs/:id` | One job row with the same shape as a row of `GET /jobs`. It also answers for a one-off job that the list no longer carries. `404` for an unknown id. |
 | `GET` | `/_/api/admin/jobs/:id/runs?limit=N` | Recent runs, newest first. A maintenance one-off synthesizes a single run, because the job is its own run. |
 | `GET` | `/_/api/admin/jobs/:id/failures?limit=N` | Recent per-object failures, newest first. |

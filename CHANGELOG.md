@@ -2,6 +2,54 @@
 
 ## Unreleased
 
+### Fixed — A copy during a re-encryption no longer serves ciphertext
+
+A server-side copy checks that its source did not change after the copy
+read it. The check compared the content and the creation time, but not the
+encryption of the stored bytes. A re-encryption job rewrites an object in
+place with the same content and the same creation time. So a copy that ran
+between the two steps, for example a replication run from a bucket that a
+re-encryption job rewrote, copied the encrypted bytes without their
+encryption markers, and the destination served the ciphertext as the
+object. After a key rotation, the same copy made the destination
+unreadable. The check now also compares the encryption markers. A copy of
+a source that changed fails, and its retry reads the source again.
+
+### Fixed — A background copy honours a destination with compression off
+
+A replication, lifecycle or migration copy of a delta-stored object shipped
+the stored delta and seeded a `reference.bin`, also into a bucket with
+`compression: false`. Tools that read that bucket without the proxy found
+`.delta` files. The copy now ships the delta only when the destination
+would store the object as a delta itself, as the client CopyObject already
+did. A migration also stores the objects as its source bucket does: its
+staging route takes the `compression` and `max_delta_ratio` of the source
+bucket. Before, a migration of a bucket with compression off stored its
+files as deltas.
+
+### Fixed — A cancel of a waiting migration deletes the copies it made
+
+A migration waits, with the status `queued`, while its backend is unhealthy
+or after a transient error, and a graceful stop hands it back the same way.
+A cancel then marked it `cancelled` at once, as if it had never run. The
+cancel did not delete the copies that the job had made on the destination,
+and the staging route stayed until the next boot. Now a cancel of a
+migration that already ran turns it `cancelling`, and the worker runs the
+same unwind as for a cancel of a running migration.
+
+### Changed — A run that the proxy stopped reads "deferred"
+
+A replication run that a maintenance job or a failed backend health check
+stopped ended with the status `paused`, although nobody paused the rule,
+and the next run waited a full interval (a day on a daily rule). A
+lifecycle run that a maintenance job stopped ended `succeeded`, although it
+did not finish its scan. Both now end `deferred`, keep their cursor, and
+are due again about a minute later; the scheduler runs them when the gate
+is clear. The Jobs screen shows "deferred · continues shortly". A
+replication pass that ran out of its page budget (raw status `stopped`)
+also reads `deferred` instead of `cancelled`, because it continues from its
+cursor a minute later.
+
 ### Fixed — A settled rule row says what its last run did
 
 A rule row showed counts only while its run went on; afterwards it said
