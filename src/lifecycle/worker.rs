@@ -490,7 +490,7 @@ pub async fn run_begun_rule(
             &outcome.status,
             finished_at,
             totals,
-            finished_at.saturating_add(next_due_delay_secs.max(1)),
+            finished_at.saturating_add(next_due_delay(&outcome.status, next_due_delay_secs)),
         )
         .map_err(|err| err.to_string())?;
     }
@@ -642,6 +642,8 @@ async fn run_or_preview(
     }
     let mut pager = Pager::resuming(resume_token);
     let mut next_due = None;
+    // A maintenance job stopped the run: it did not finish its scan.
+    let mut deferred = false;
     let mut out = LifecycleRunOutcome {
         run_id: ctx.as_ref().and_then(|c| c.run_id),
         rule_name: rule.name.clone(),
@@ -685,6 +687,7 @@ async fn run_or_preview(
                 "lifecycle rule '{}' deferring mid-run — a write bucket is under maintenance",
                 rule.name
             );
+            deferred = true;
             break 'pages;
         }
         if execute
@@ -903,6 +906,8 @@ async fn run_or_preview(
     out.next_due_at = next_due.map(|at| at.to_rfc3339());
     if out.errors > 0 {
         out.status = "failed".to_string();
+    } else if deferred {
+        out.status = DEFERRED_RUN_STATUS.to_string();
     }
     if let Some(stop) = stopped_by {
         settle_stopped(&db, rule, &cursor_scope, stop, &mut out).await;
@@ -912,6 +917,27 @@ async fn run_or_preview(
     }
     Ok(out)
 }
+
+/// The status of a run that a maintenance job stopped (a write bucket
+/// became gated): nobody paused the rule, and the run did not finish.
+/// Same word as replication's (`DEFERRED_STOP_STATUS`).
+pub(crate) const DEFERRED_RUN_STATUS: &str = crate::replication::worker::DEFERRED_STOP_STATUS;
+
+/// Why retain-newest stopped its collect when a maintenance job started.
+const MAINTENANCE_DEFER_REASON: &str = "a write bucket is under maintenance";
+
+/// A deferred run is due again a minute later: the scheduler checks the
+/// gate before it runs the rule, so a closed gate defers it again at no
+/// cost. Any other run waits the rule's delay.
+fn next_due_delay(status: &str, delay_secs: i64) -> i64 {
+    if status == DEFERRED_RUN_STATUS {
+        DEFERRED_RETRY_SECS
+    } else {
+        delay_secs.max(1)
+    }
+}
+
+const DEFERRED_RETRY_SECS: i64 = 60;
 
 /// A run that an operator pause or kill stopped: status `paused` (the
 /// cursor stays, a resume continues there) or `cancelled` (the cursor is
@@ -1025,7 +1051,7 @@ async fn run_or_preview_retain_newest(
                 "lifecycle rule '{}' deferring mid-run — a write bucket is under maintenance",
                 rule.name
             );
-            incomplete_collect = Some("a write bucket is under maintenance");
+            incomplete_collect = Some(MAINTENANCE_DEFER_REASON);
             break 'pages;
         }
         if execute
@@ -1109,6 +1135,8 @@ async fn run_or_preview_retain_newest(
             );
             if out.errors > 0 {
                 out.status = "failed".to_string();
+            } else if reason == MAINTENANCE_DEFER_REASON {
+                out.status = DEFERRED_RUN_STATUS.to_string();
             }
             if let Some(stop) = stop_of(ctx.as_ref()) {
                 out.status = stop.run_status().to_string();
@@ -2463,6 +2491,69 @@ mod tests {
                 "{status}: cursor {cursor:?}"
             );
         }
+    }
+
+    /// A run that a maintenance job stops is `deferred`, not `succeeded`:
+    /// it did not finish its scan. It keeps its cursor and is due again a
+    /// minute later, not one rule delay later.
+    #[tokio::test]
+    async fn a_run_that_maintenance_stops_is_deferred_and_due_soon() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = fs_engine(dir.path()).await;
+        store_all(&engine, &["x/1.bin", "x/2.bin"]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let rule = LifecycleRule {
+            name: "gated".into(),
+            expire_after: Some("1ms".into()),
+            ..rule()
+        };
+        let db = jobs_db();
+        {
+            let db = db.lock().await;
+            db.lifecycle_ensure_state(&rule.name, 0).unwrap();
+            db.lifecycle_set_continuation_token(&rule.name, Some("tok"), "b|")
+                .unwrap();
+        }
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
+        gate.set_busy("b");
+        let before = crate::lifecycle::current_unix_seconds();
+
+        let out = super::run_rule(
+            Some(db.clone()),
+            &engine,
+            &rule,
+            10,
+            "scheduler",
+            3600,
+            None,
+            Some(gate),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.status, "deferred");
+        assert_eq!(out.objects_deleted, 0);
+        assert!(engine.head("b", "x/1.bin").await.is_ok());
+        let state = db
+            .lock()
+            .await
+            .lifecycle_load_state(&rule.name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.last_status, "deferred");
+        assert!(state.continuation_token.is_some(), "the cursor is kept");
+        assert!(
+            state.next_due_at <= before + 120,
+            "due again soon, not one delay later: {}",
+            state.next_due_at - before
+        );
+    }
+
+    #[test]
+    fn only_a_deferred_run_is_due_again_soon() {
+        assert_eq!(super::next_due_delay("deferred", 3600), 60);
+        assert_eq!(super::next_due_delay("succeeded", 3600), 3600);
+        assert_eq!(super::next_due_delay("paused", 0), 1);
     }
 
     /// An unchanged object is still deleted (the guard must not block the rule).

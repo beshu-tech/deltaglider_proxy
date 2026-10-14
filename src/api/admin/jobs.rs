@@ -62,7 +62,7 @@ pub fn parse_job_id(id: &str) -> Option<(JobSubsystem, &str)> {
 }
 
 /// One status vocabulary:
-/// `idle | queued | running | cancelling | paused | succeeded |
+/// `idle | queued | running | cancelling | paused | deferred | succeeded |
 /// completed_with_errors | failed | cancelled`.
 /// The raw subsystem value is reported alongside (`status_raw`); unknown
 /// raw values normalize to `idle` (total function — never panics).
@@ -80,13 +80,15 @@ pub fn normalize_status(raw: &str) -> &'static str {
         "succeeded" | "completed" => "succeeded",
         "completed_with_errors" => "completed_with_errors",
         "failed" => "failed",
-        // A run halted mid-sweep by an operator pause is terminal-but-interrupted —
-        // surface it as `cancelled` (same vocabulary as an explicit cancel) so the
-        // UI stops showing it as `running`. Cursor is preserved; resume continues.
-        "cancelled" | "stopped" => "cancelled",
+        "cancelled" => "cancelled",
         // A run that an operator pause stopped: its cursor is kept and the
         // next run continues from it — not the same as a kill (`cancelled`).
         "paused" => "paused",
+        // A run that the proxy stopped (a maintenance job or a failed health
+        // check gates its bucket; `stopped`: a replication pass ran out of
+        // its page budget). Nobody paused or killed it: its cursor is kept,
+        // and the next run, about a minute later, continues from it.
+        "deferred" | "stopped" => "deferred",
         _ => "idle",
     }
 }
@@ -1404,6 +1406,9 @@ mod tests {
             ("cancelled", "cancelled"),
             // A pause stop keeps its cursor: it is not a kill.
             ("paused", "paused"),
+            // The proxy stopped it (a gate, a page budget): no operator did.
+            ("deferred", "deferred"),
+            ("stopped", "deferred"),
             ("something-new", "idle"),
             ("", "idle"),
         ] {

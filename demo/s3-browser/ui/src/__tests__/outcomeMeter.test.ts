@@ -93,6 +93,7 @@ test('cancelled → calm muted', () => {
   assert.equal(v.label, 'cancelled · 3 copied', 'says how far the run got');
   assert.equal(m({ status: 'cancelled' }).label, 'cancelled');
   assert.equal(m({ status: 'paused', copied: 2, scanned: 2 }).label, 'stopped · 2 copied', 'a pause keeps the cursor: not "cancelled"');
+  assert.equal(m({ status: 'deferred', copied: 2, scanned: 2 }).label, 'deferred · 2 copied', 'the proxy stopped it: not "cancelled"');
 });
 
 test('huge numbers → thousands separators', () => {

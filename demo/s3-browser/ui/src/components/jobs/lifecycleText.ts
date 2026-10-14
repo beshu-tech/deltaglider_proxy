@@ -94,6 +94,11 @@ export function lifecycleRunResultText(
   const did = parts.length > 0 ? parts.join(', ') : 'nothing to do';
   const failed = run.errors > 0 ? `, ${n(run.errors)} failed` : '';
   if (run.status === 'paused') return { type: 'warning', text: `Lifecycle rule "${rule}" paused: ${did}${failed}.` };
+  if (run.status === 'deferred')
+    return {
+      type: 'warning',
+      text: `Lifecycle rule "${rule}" deferred by a maintenance job: ${did}${failed}. It goes on in about a minute.`,
+    };
   if (run.status === 'cancelled') return { type: 'warning', text: `Lifecycle rule "${rule}" killed: ${did}${failed}.` };
   if (run.status === 'failed') return { type: 'error', text: `Lifecycle rule "${rule}" failed: ${did}${failed}.` };
   return { type: run.errors > 0 ? 'warning' : 'success', text: `Lifecycle rule "${rule}" finished: ${did}${failed}.` };

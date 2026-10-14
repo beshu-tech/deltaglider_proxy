@@ -2607,7 +2607,7 @@ async fn test_replication_budget_truncation_keeps_cursor_and_resumes() {
     // the walk's uniform both-sides accounting → truncated after 2 copies.
     // Must be "stopped" — and the cursor kept.
     let run = fire_run_now(&admin, &ep, "trunc-rule").await;
-    // The jobs view folds stopped→cancelled for display; the RAW status is the
+    // The jobs view folds stopped→deferred for display; the RAW status is the
     // settle contract under test.
     assert_eq!(
         run["status_raw"].as_str(),

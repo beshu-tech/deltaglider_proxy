@@ -24,7 +24,7 @@ export interface JobRow {
   trigger: 'continuous' | 'scheduled' | 'oneoff' | string;
   enabled?: boolean;
   paused?: boolean;
-  /** normalized: idle|queued|running|cancelling|paused|succeeded|completed_with_errors|failed|cancelled */
+  /** normalized: idle|queued|running|cancelling|paused|deferred|succeeded|completed_with_errors|failed|cancelled */
   status: string;
   status_raw: string;
   phase?: string;
@@ -142,6 +142,8 @@ export function runEndedMessage(row: JobRow, verb?: LifecycleVerb): { type: 'suc
   if (row.status === 'completed_with_errors' || row.progress.failed > 0)
     return { type: 'warning', text: `${what}: the run finished with errors — ${label}` };
   if (row.status === 'cancelled' || row.status === 'paused') return { type: 'warning', text: `${what}: the run stopped — ${label}` };
+  if (row.status === 'deferred')
+    return { type: 'warning', text: `${what}: the proxy stopped the run; it goes on from there in about a minute — ${label}` };
   return { type: 'success', text: `${what}: the run finished — ${label}` };
 }
 
@@ -282,7 +284,7 @@ export function jobStrategyMix(
 export function jobStatusTone(row: Pick<JobRow, 'status' | 'paused' | 'enabled'>): string {
   if (row.status === 'running' || row.status === 'cancelling') return 'processing';
   if (row.enabled === false) return 'default';
-  if (row.paused || row.status === 'paused') return 'warning';
+  if (row.paused || row.status === 'paused' || row.status === 'deferred') return 'warning';
   switch (row.status) {
     case 'queued':
       return 'default';
@@ -315,6 +317,10 @@ export function jobStatusLabel(row: Pick<JobRow, 'status' | 'paused' | 'enabled'
   // A run that a pause stopped; it kept its position, so it is not
   // "cancelled": the next run goes on from there.
   if (row.status === 'paused') return 'stopped · resumes where it left off';
+  // A run that the proxy stopped (a maintenance job or an unhealthy backend
+  // gates its bucket, or a page budget): nobody paused it, and the next run,
+  // about a minute later, goes on from where it stopped.
+  if (row.status === 'deferred') return 'deferred · continues shortly';
   // Shorten the verbose backend status for the chip; the run's error count is
   // shown separately in the Runs table.
   if (row.status === 'completed_with_errors') return 'completed · errors';
@@ -975,10 +981,11 @@ export function deriveMeter(p: OutcomeMeterInput): MeterView {
       aria,
     };
   }
-  if (status === 'cancelled' || status === 'paused') {
+  if (status === 'cancelled' || status === 'paused' || status === 'deferred') {
     const so = parts(false);
     // `paused`: a pause stopped the run and it kept its position.
-    const word = status === 'paused' ? 'stopped' : 'cancelled';
+    // `deferred`: the proxy stopped it; it kept its position too.
+    const word = status === 'paused' ? 'stopped' : status === 'deferred' ? 'deferred' : 'cancelled';
     return {
       state: 'idle',
       greenPct: 0,

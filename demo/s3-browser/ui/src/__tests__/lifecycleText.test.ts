@@ -58,6 +58,12 @@ describe('run result toast (#15)', () => {
       lifecycleRunResultText('expire', { status: 'paused', objects_deleted: 4, objects_processed: 4, errors: 1 }),
     ).toEqual({ type: 'warning', text: 'Lifecycle rule "expire" paused: deleted 4, 1 failed.' });
     expect(
+      lifecycleRunResultText('expire', { status: 'deferred', objects_deleted: 4, objects_processed: 4, errors: 0 }),
+    ).toEqual({
+      type: 'warning',
+      text: 'Lifecycle rule "expire" deferred by a maintenance job: deleted 4. It goes on in about a minute.',
+    });
+    expect(
       lifecycleRunResultText('expire', { status: 'succeeded', objects_deleted: 0, objects_processed: 0, errors: 0 }).text,
     ).toBe('Lifecycle rule "expire" finished: nothing to do.');
   });

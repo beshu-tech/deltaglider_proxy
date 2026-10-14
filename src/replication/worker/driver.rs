@@ -46,6 +46,10 @@ pub(super) struct RunFlags {
     /// each control boundary). Not an error: the cursor is kept for resume,
     /// the run settles "paused".
     pub stopped_paused: bool,
+    /// The proxy stopped the run: a maintenance job gates the destination,
+    /// or its backend failed a health check. The cursor is kept; the run
+    /// settles "deferred" and is due again shortly.
+    pub stopped_deferred: bool,
     /// Operator KILL: the run flipped to 'cancelling' mid-flight.
     pub killed: bool,
     /// The poison-cursor guard cleared a stale resume cursor: the settle
@@ -739,6 +743,16 @@ pub(super) async fn drive_walk(
                         s.rule.name
                     );
                     flags.stopped_paused = true;
+                    machine.drain(walk::DrainReason::Paused);
+                    break 'walk;
+                }
+                Ok(ControlVerdict::Deferred) => {
+                    info!(
+                        "replication rule '{}' deferred mid-walk: its destination is gated \
+                         (cursor preserved for resume)",
+                        s.rule.name
+                    );
+                    flags.stopped_deferred = true;
                     machine.drain(walk::DrainReason::Paused);
                     break 'walk;
                 }

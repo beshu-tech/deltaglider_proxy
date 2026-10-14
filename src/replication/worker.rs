@@ -565,7 +565,11 @@ pub async fn run_rule_gated(
     // resumes the tail (never reported as a clean pass).
     let truncated = machine.as_ref().is_some_and(|m| {
         m.truncated_by_budget()
-            || (!flags.killed && !flags.stopped_paused && !flags.hit_fatal_error && !m.is_done())
+            || (!flags.killed
+                && !flags.stopped_paused
+                && !flags.stopped_deferred
+                && !flags.hit_fatal_error
+                && !m.is_done())
     });
     let final_cursor_json = if flags.poison_cleared_any {
         // The poison guard already cleared the stale cursor inline — never
@@ -615,6 +619,7 @@ pub async fn run_rule_gated(
         let decision = settle_run(SettleInput {
             killed: flags.killed,
             stopped_paused: flags.stopped_paused,
+            stopped_deferred: flags.stopped_deferred,
             hit_fatal_error: flags.hit_fatal_error,
             had_any_error: flags.had_any_error,
             objects_copied: totals.objects_copied,
@@ -918,6 +923,8 @@ impl Drop for RunLeaseGuard {
 struct SettleInput {
     killed: bool,
     stopped_paused: bool,
+    /// A maintenance job or a failed backend health check stopped the run.
+    stopped_deferred: bool,
     hit_fatal_error: bool,
     had_any_error: bool,
     objects_copied: i64,
@@ -935,6 +942,12 @@ struct SettleDecision {
 /// is kept, and the next run continues from it — unlike `cancelled` (kill).
 pub(crate) const PAUSED_STOP_STATUS: &str = "paused";
 
+/// The terminal status of a run that the proxy itself stopped: a
+/// maintenance job started on the destination, or its backend failed a
+/// health check. Nobody paused the rule; the cursor is kept, and the next
+/// run (about a minute later, once the gate is clear) continues from it.
+pub(crate) const DEFERRED_STOP_STATUS: &str = "deferred";
+
 /// Terminal status + cursor decision, pure so the truth table is unit-tested.
 /// Precedence: killed > paused > fatal > budget-truncation ("stopped": halted
 /// mid-sweep, cursor kept, next tick resumes the tail) > errors > clean.
@@ -945,6 +958,8 @@ fn settle_run(i: SettleInput) -> SettleDecision {
         "cancelled"
     } else if i.stopped_paused {
         PAUSED_STOP_STATUS
+    } else if i.stopped_deferred {
+        DEFERRED_STOP_STATUS
     } else if i.hit_fatal_error || (i.had_any_error && i.objects_copied == 0) {
         "failed"
     } else if i.truncated {
@@ -954,7 +969,8 @@ fn settle_run(i: SettleInput) -> SettleDecision {
     } else {
         "succeeded"
     };
-    let clear_cursor = !i.killed && !i.stopped_paused && !i.hit_fatal_error && !i.truncated;
+    let clear_cursor =
+        !i.killed && !i.stopped_paused && !i.stopped_deferred && !i.hit_fatal_error && !i.truncated;
     SettleDecision {
         status,
         clear_cursor,
@@ -967,6 +983,8 @@ enum ControlVerdict {
     Continue,
     Killed,
     Paused,
+    /// A maintenance job or a failed health check gates the destination.
+    Deferred,
     LeaseLost,
 }
 
@@ -1005,7 +1023,7 @@ fn control_verdict_with_maintenance(
 ) -> ControlVerdict {
     let base = control_verdict(cancel_requested, paused, pause_waived, lease_ok);
     if base == ControlVerdict::Continue && maint_busy {
-        ControlVerdict::Paused
+        ControlVerdict::Deferred
     } else {
         base
     }
@@ -1065,8 +1083,9 @@ impl RunControl {
         // in `lease_alive`): a renew here cost one S3 GET + conditional PUT
         // per listing page and per 32 events.
         // Mid-run maintenance deferral: a dest bucket that became write-gated
-        // (migrate / re-encrypt) must stop the run like a pause — cursor kept,
-        // resumes when the maintenance job clears. Not suppressed by a waived pause:
+        // (migrate / re-encrypt) must stop the run — cursor kept, due again a
+        // minute later (the scheduler re-checks the gate before it runs the
+        // rule). Not suppressed by a waived pause:
         // a one-off must NOT write into a bucket being rewritten either.
         let maint_busy = self
             .maintenance_gate
@@ -1188,9 +1207,11 @@ fn next_due_after(
         // needs breathing room — back off to the rule's normal cadence
         // (but never faster than 60s) instead of hammering every minute.
         compute_next_due(rule, finished_at).max(finished_at + 60)
-    } else if flags.hit_fatal_error || truncated {
-        // Tight retry on fatal errors AND budget truncation: the persisted
-        // cursor resumes the tail promptly instead of waiting a full cadence.
+    } else if flags.hit_fatal_error || truncated || flags.stopped_deferred {
+        // Tight retry on fatal errors, budget truncation AND a gate stop: the
+        // persisted cursor resumes the tail promptly instead of waiting a
+        // full cadence (a gate that is still closed defers the next run
+        // again before it starts).
         finished_at + 60
     } else {
         compute_next_due(rule, finished_at)
@@ -1261,15 +1282,16 @@ mod tests {
     #[test]
     fn maintenance_overlay_defers_only_from_continue() {
         use ControlVerdict::*;
-        // maint_busy turns a Continue into Paused (mid-run defer) — even for a
-        // one-off (must not write into a bucket being rewritten).
+        // maint_busy turns a Continue into Deferred (mid-run defer, not an
+        // operator pause) — even for a one-off (must not write into a bucket
+        // being rewritten).
         assert_eq!(
             control_verdict_with_maintenance(false, false, false, true, true),
-            Paused
+            Deferred
         );
         assert_eq!(
             control_verdict_with_maintenance(false, false, true, true, true),
-            Paused,
+            Deferred,
             "one-off is NOT exempt from the maintenance defer"
         );
         // Without maint_busy, base verdict is unchanged.
@@ -1300,6 +1322,7 @@ mod tests {
         let base = SettleInput {
             killed: false,
             stopped_paused: false,
+            stopped_deferred: false,
             hit_fatal_error: false,
             had_any_error: false,
             objects_copied: 0,
@@ -1329,6 +1352,19 @@ mod tests {
             ..base
         });
         assert_eq!((d.status, d.clear_cursor), ("paused", false));
+
+        // A gate stop is "deferred" (cursor kept): nobody paused the rule.
+        let d = settle_run(SettleInput {
+            stopped_deferred: true,
+            ..base
+        });
+        assert_eq!((d.status, d.clear_cursor), ("deferred", false));
+        let d = settle_run(SettleInput {
+            stopped_paused: true,
+            stopped_deferred: true,
+            ..base
+        });
+        assert_eq!(d.status, "paused", "an operator pause names the stop");
 
         let d = settle_run(SettleInput {
             hit_fatal_error: true,
@@ -1678,6 +1714,12 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(next_due_after(&throttled, true, &rule, at), at + 3600);
+        // A gate stop is due again soon, not one interval later.
+        let deferred = driver::RunFlags {
+            stopped_deferred: true,
+            ..Default::default()
+        };
+        assert_eq!(next_due_after(&deferred, false, &rule, at), at + 60);
     }
 
     #[test]
