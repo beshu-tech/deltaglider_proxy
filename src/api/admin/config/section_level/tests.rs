@@ -475,3 +475,28 @@ fn a_bucket_rotation_with_the_same_id_asks_for_a_new_id() {
     assert!(err.contains("Set a new `key_id`"), "{err}");
     assert!(!err.contains("Remove `key_id`"), "{err}");
 }
+
+/// A merge patch that changes the tag of a tagged object (`mode`, `type`)
+/// replaces the object: the old variant's fields would be unknown fields.
+#[test]
+fn merge_patch_replaces_an_object_whose_tag_changes() {
+    use serde_json::json;
+    let mut t = json!({"enc": {"mode": "aes256-gcm-proxy", "key": "k", "key_id": "i"}});
+    apply_merge_patch(&mut t, &json!({"enc": {"mode": "none"}}));
+    assert_eq!(t, json!({"enc": {"mode": "none"}}));
+    let mut t = json!({"enc": {"mode": "aes256-gcm-proxy", "key": "k", "key_id": "i"}});
+    apply_merge_patch(
+        &mut t,
+        &json!({"enc": {"mode": "aes256-gcm-proxy", "key_id": "j"}}),
+    );
+    assert_eq!(
+        t,
+        json!({"enc": {"mode": "aes256-gcm-proxy", "key": "k", "key_id": "j"}})
+    );
+    let mut t = json!({"backend": {"type": "s3", "region": "eu"}});
+    apply_merge_patch(
+        &mut t,
+        &json!({"backend": {"type": "filesystem", "path": "/x"}}),
+    );
+    assert_eq!(t, json!({"backend": {"type": "filesystem", "path": "/x"}}));
+}

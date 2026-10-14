@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed — An unknown field in a backend or an encryption block is a load error
+
+`storage.backend.encryption:` (the singleton's encryption is `storage.backend_encryption`) and any other unknown field in a backend definition or an `encryption` block were dropped without a word, so a backend meant to encrypt stored plaintext. They now stop the start, fail `config lint` and refuse an apply, and the error names the field. **Upgrade note:** a config with such a field no longer starts; run `config lint` with the new binary first.
+
 ### Added — Per-bucket encryption on several instances (the encryption witness)
 
 Per-bucket encryption now works with `config_sync_bucket` set; the start no longer refuses it. The YAML is per instance, so the instances keep a witness in the sync bucket: `_dgp/encryption/intent.json` holds the mode and key id (never a key) of each bucket with its own encryption, and each instance writes a heartbeat under `_dgp/encryption/nodes/`. An instance whose encryption of a bucket differs from the published one refuses writes to that bucket with `503 SlowDown` that names the mismatch; reads and other buckets keep working, and `/_/ready` shows the verdict in `encryption_witness` (the instance stays ready). A config apply that changes a bucket's encryption publishes it, so applying the same config on every instance converges. When no live instance writes a bucket with the published encryption any more (a rollout that restarted every instance), an instance publishes its own, but never a downgrade to plaintext. New setting: `DGP_ENCRYPTION_WITNESS_POLL_SECS` (default 30).

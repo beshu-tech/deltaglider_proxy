@@ -445,3 +445,36 @@ fn the_resolver_finds_the_override_by_real_bucket() {
         }
     );
 }
+
+/// Review of P3: `storage.backend.encryption:` (the singleton's encryption
+/// is `storage.backend_encryption`) was dropped without a word, so the
+/// backend stored plaintext. An unknown field in a backend definition or
+/// an encryption block is a load error that names it, also in a named
+/// backend (where the definition is flattened) and in the flat shape.
+#[test]
+fn an_unknown_backend_or_encryption_field_is_a_load_error() {
+    let cases = [
+        format!(
+            "storage:\n  backend:\n    type: filesystem\n    path: /tmp/x\n    encryption:\n      mode: aes256-gcm-proxy\n      key: \"{KA}\"\n"
+        ),
+        "storage:\n  backends:\n    - name: local-disk\n      type: filesystem\n      path: /tmp/x\n      encrypton: { mode: none }\n".to_string(),
+        "storage:\n  backends:\n    - name: aws-dr\n      type: s3\n      regoin: eu-west-1\n".to_string(),
+        "storage:\n  backend_encryption:\n    mode: sse-kms\n    kms_key: alias/x\n".to_string(),
+        "backend:\n  type: filesystem\n  path: /tmp/x\n  encryption: { mode: none }\n".to_string(),
+    ];
+    for yaml in &cases {
+        let err = Config::from_yaml_str(yaml)
+            .err()
+            .unwrap_or_else(|| panic!("loaded: {yaml}"));
+        assert!(err.to_string().contains("unknown field"), "{yaml}: {err}");
+    }
+    // The documented shapes still load.
+    for ok in [
+        format!(
+            "storage:\n  backends:\n    - name: local-disk\n      type: filesystem\n      path: /tmp/x\n      encryption: {{ mode: aes256-gcm-proxy, key: \"{KA}\", key_id: k }}\n"
+        ),
+        "storage:\n  backend:\n    type: s3\n    region: eu-west-1\n    force_path_style: \"true\"\n  backend_encryption: { mode: sse-s3 }\n".to_string(),
+    ] {
+        Config::from_yaml_str(&ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+    }
+}

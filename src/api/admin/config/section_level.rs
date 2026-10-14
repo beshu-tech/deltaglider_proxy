@@ -529,7 +529,17 @@ where
 /// — the `public_prefixes: null` → "expected a sequence" incident).
 fn apply_merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
     if let serde_json::Value::Object(patch_map) = patch {
-        if !target.is_object() {
+        // A tagged object whose tag changes (`mode` of an encryption block,
+        // `type` of a backend) is another variant: the patch replaces it,
+        // so the old variant's fields (`key` under `mode: none`) do not
+        // stay behind. Those structs refuse unknown fields.
+        let tag_changes = ["mode", "type"].iter().any(|tag| {
+            matches!(
+                (patch_map.get(*tag), target.get(*tag)),
+                (Some(new), Some(old)) if !new.is_null() && new != old
+            )
+        });
+        if !target.is_object() || tag_changes {
             *target = serde_json::Value::Object(serde_json::Map::new());
         }
         let target_map = target

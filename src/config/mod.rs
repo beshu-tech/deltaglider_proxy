@@ -380,7 +380,8 @@ pub struct Config {
 /// them. Operators who want portability set an explicit identical
 /// `key_id` on both.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "mode", rename_all = "kebab-case")]
+// A misspelled field (`kms_key`) is a load error, not a silent default.
+#[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum BackendEncryptionConfig {
     /// Objects stored plaintext on this backend.
     ///
@@ -783,7 +784,12 @@ pub struct TlsConfig {
 
 /// Storage backend configuration
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "type", rename_all = "lowercase")]
+// Deserialized through `StrictBackendConfig` (`from`): a misspelled or
+// misplaced field (`storage.backend.encryption`, whose singleton form is
+// `storage.backend_encryption`) is a load error. It was dropped silently,
+// so a backend meant to encrypt stored plaintext. The JSON schema stays
+// open: a named backend flattens this enum next to `name` and `encryption`.
+#[serde(tag = "type", rename_all = "lowercase", from = "StrictBackendConfig")]
 pub enum BackendConfig {
     /// Filesystem backend for local storage/development
     Filesystem {
@@ -842,6 +848,73 @@ pub enum BackendConfig {
         #[schemars(skip)]
         session_token: Option<String>,
     },
+}
+
+/// The deserialization shape of [`BackendConfig`]: the same fields, with
+/// `deny_unknown_fields`. Its lenient fields carry no schema: the served
+/// schema is `BackendConfig`'s, which has them. A field added to `BackendConfig` must be added
+/// here too (the loader then refuses it, and the config tests fail).
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+enum StrictBackendConfig {
+    Filesystem {
+        path: PathBuf,
+    },
+
+    S3 {
+        #[serde(default)]
+        endpoint: Option<String>,
+
+        #[serde(default = "default_region")]
+        region: String,
+
+        #[serde(
+            default = "default_force_path_style",
+            deserialize_with = "crate::config::lenient::bool_or_string"
+        )]
+        force_path_style: bool,
+
+        #[serde(default)]
+        access_key_id: Option<String>,
+
+        #[serde(default)]
+        secret_access_key: Option<String>,
+
+        #[serde(
+            default,
+            skip_serializing_if = "is_false",
+            deserialize_with = "crate::config::lenient::bool_or_string"
+        )]
+        allow_local: bool,
+
+        #[serde(skip)]
+        session_token: Option<String>,
+    },
+}
+
+impl From<StrictBackendConfig> for BackendConfig {
+    fn from(s: StrictBackendConfig) -> Self {
+        match s {
+            StrictBackendConfig::Filesystem { path } => Self::Filesystem { path },
+            StrictBackendConfig::S3 {
+                endpoint,
+                region,
+                force_path_style,
+                access_key_id,
+                secret_access_key,
+                allow_local,
+                session_token,
+            } => Self::S3 {
+                endpoint,
+                region,
+                force_path_style,
+                access_key_id,
+                secret_access_key,
+                allow_local,
+                session_token,
+            },
+        }
+    }
 }
 
 #[inline]
