@@ -958,12 +958,12 @@ storage:
     db-archive:
       backend: local-disk               # required when storage.backends is used
       encryption:
-        mode: aes256-gcm-proxy          # or none; native SSE is not supported on a bucket
+        mode: aes256-gcm-proxy          # or sse-kms / sse-s3 (S3 backends), or none
         key: "${env:DB_ARCHIVE_AES_KEY}"    # any variable name; no DGP_* variable exists for a bucket
         key_id: db-archive-2026         # required on a bucket
 ```
 
-The proxy refuses a bucket `encryption` block without `key_id`, with `legacy_key` but without `legacy_key_id`, in a native SSE mode, without `backend:` when `storage.backends` is used, with a key id that another key already uses, on an alias that disagrees with the other names of its stored bucket, or while `config_sync_bucket` is set. The [encryption reference](encryption.md#per-bucket-encryption) explains each rule.
+The proxy refuses a bucket `encryption` block in `aes256-gcm-proxy` mode without `key_id`, with `legacy_key` but without `legacy_key_id`, in a native SSE mode on a filesystem backend, without `backend:` when `storage.backends` is used, with a key id that another key already uses, or on an alias that disagrees with the other names of its stored bucket. With `config_sync_bucket` set, the encryption witness keeps the instances in agreement ([run multiple instances](../how-to/run-multiple-instances.md#8-keep-the-encryption-of-each-bucket-the-same-on-every-instance)). The [encryption reference](encryption.md#per-bucket-encryption) explains each rule.
 
 `key` / `legacy_key` are 64-character lowercase hex strings (256 bits). `kms_key_id` is a KMS key ARN or alias ARN, an alias name (`alias/<name>`), a key id (UUID) or a multi-Region key id (`mrk-...`); on MinIO, `arn:aws:kms:<key name>`. Any other value is a fatal config error. `key_id` (optional) must match `[A-Za-z0-9_.-]{1,64}` (S3 user-metadata header-safe).
 

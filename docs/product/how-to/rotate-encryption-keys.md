@@ -59,6 +59,17 @@ The steps above write the keys into the `storage` section of `deltaglider_proxy.
 
 After you edit the file, restart the proxy, or apply the file with `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example`. The CLI expands the `${env:...}` references from your own environment before it sends the file. When every re-encrypt job shows `succeeded`, remove `legacy_key` and `legacy_key_id`, and apply again.
 
+**Several instances (`config_sync_bucket` set).** The encryption witness keeps the key of the backend the same on every instance ([How to run multiple instances](run-multiple-instances.md#change-the-encryption-of-a-bucket)). Rotate in one of two ways:
+
+- Apply the new file on one instance with `config apply` (or the GUI). The apply publishes the new key. Then apply the same file on every other instance. Until an instance gets the new key, it refuses writes to the backend.
+- Or edit the file (or the environment variable) on every instance and restart them. A restart publishes nothing: after the rollout, every instance with the new key refuses writes to the backend. Run this once, on any instance with the new key:
+
+  ```bash
+  deltaglider_proxy witness publish backend:hetzner-fsn1 --server https://s3.acme.example
+  ```
+
+  For a bucket's own key, name the bucket instead (`witness publish db-archive`).
+
 **Caveat:** the shim holds exactly one legacy generation. Do not rotate again while a shim is live. Rotate to the final key, not through intermediate keys. The proxy refuses a key change that would push a different key out of a live legacy slot, because objects can still need that key. It also refuses a key change that keeps the same `key_id`, because the proxy would then decrypt the old objects with the new key. To drop a legacy key on purpose, send `legacy_key: null` in the same apply.
 
 ## Recipe B: rotation through a data migration (no shim)

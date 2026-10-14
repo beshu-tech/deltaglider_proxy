@@ -2,69 +2,25 @@
 
 ## Unreleased
 
-### Changed — The encryption witness never takes over an entry by itself
+### Added — A bucket can have its own encryption (issue #116)
 
-A second review showed that no automatic takeover rule is safe: an unrelated apply, or a lagging instance restarted with its old config in a re-rendered file, reverted a key rotation, and a rotation of an environment key by restart never converged. Now an entry of the witness changes only when an instance first adds a bucket that it encrypts, when a config apply changes the encryption of a bucket, or when the operator runs the new `deltaglider_proxy witness publish <subject>...` (`POST /_/api/admin/encryption-witness/publish`, audited as `bucket_encryption_witness_publish`; plaintext needs `--confirm-encryption-downgrade`). Every other disagreement refuses writes, and the `503 SlowDown` names the command. After a restart rollout that changes a bucket's encryption, run `witness publish` once. The heartbeat objects are gone.
+A bucket policy (`storage.buckets.<name>`) can now carry an `encryption` block with the same schema as a backend's: `aes256-gcm-proxy` with the bucket's own key, `sse-kms` or `sse-s3` on an S3 backend, or `none`. The writes to that bucket use the block; the other buckets on the same backend keep the backend's encryption. Before, encryption was a backend setting only, and a second key on one disk needed a second backend definition.
 
-### Fixed — More encryption witness defects
+- Each backend keeps one encrypting layer with a keyring: the keys of the backend and of every bucket on it. A read picks the key by the key id that the object carries, so a bucket still reads the objects and delta references that it wrote under the backend key before it got its own key.
+- Native SSE is chosen per request: one S3 client per backend sets the SSE headers of each PutObject, CreateMultipartUpload, CopyObject, UploadPartCopy, folder marker and listing-facts object from the bucket that it writes to. A bucket that encrypts in the proxy gets no SSE headers (never encrypted twice), `mode: none` on a bucket means plaintext also on an SSE backend, and a server-side copy takes the destination's headers. The KMS permissions that the backend's credentials need are in the encryption reference.
+- Rules (the start, `config lint` and an apply refuse a violation): an explicit `key_id` (and `legacy_key_id`); an explicit `backend:` when `storage.backends` is used; a native mode only on an S3 backend; two names of one stored bucket (an alias) agree; one key id names one key everywhere. The key comes from the YAML file or any `${env:NAME}` reference.
+- An apply that changes a bucket's encryption answers with a warning that names the re-encrypt job for that bucket. An apply that removes the key that a bucket writes with is refused: set `mode: none` first (the old key stays as `legacy_key`), run the re-encrypt job, then remove the block. Each bucket is judged on its own block and its backend's keys. The removal of a bucket's legacy key needs the confirmation of its id (`X-DGP-Confirm-Key-Removal`, or `config apply --confirm-key-removal`), after `GET /_/api/admin/backends/<backend>/legacy-key-usage?bucket=<bucket>`.
+- The migrate job carries the bucket's block to the target backend and verifies the at-rest form of every copy. A replication rule from an encrypted bucket into a plaintext one gives a `config lint` warning.
+- Bucket keys are redacted from `GET /config`, the section GET and the export, survive a round trip through the admin UI, and ride in the backup's `secrets.json` (`bucket_encryption`).
+- A run that started before an apply (a replication or lifecycle run, a multipart upload) writes with the bucket encryption of that apply from then on.
+- With `config_sync_bucket` set, the encryption witness keeps the instances in agreement (next entry).
 
-- A bucket that the backend's `*` entry covers was downgraded by an instance that started with `mode: none` for it. Such a bucket is now judged against `*`.
-- The downgrade confirmation of an apply republished any encryption of the confirmed bucket, also an old key over a rotation. It now publishes plaintext only.
-- A section PUT that named a bucket `type` or `mode` wiped the other buckets (the merge treated the bucket name as a tag). The replace-on-tag-change rule now applies only to the backend's `type` and the `mode` of encryption blocks.
-- A verdict now ages from the start of the check that made it, so a slow check does not stretch it.
-- When the client for the sync bucket cannot be built, `/_/ready` shows `encryption_witness.status: "unavailable"` instead of nothing, and each apply still judges the new config.
-
-### Fixed — A bucket that the encryption witness refuses defers the background writers
-
-A replication or lifecycle run that wrote into a bucket that the encryption witness refuses on this instance failed object after object (each refusal counted as a throttled copy), and a maintenance job recorded each object as failed and moved its cursor past it. Now the gate check of these writers asks the witness too (`MaintenanceGate::write_blocked`, source guard), memory only: the scheduler does not start a run, a running replication or lifecycle run stops as `deferred` at its next control boundary or at the first refused write (cursor kept, no failure, due again a minute later), and a maintenance job waits like for an unavailable backend and redoes the page from its cursor.
-
-### Fixed — The encryption witness never lets a downgrade, a lagging instance or a stale check win
-
-A review of the encryption witness found these defects, now fixed:
-
-- An instance that started with `mode: none` for a bucket that the others encrypted by inheritance set the shared entry, so the encrypting instances refused writes and the downgrading one wrote plaintext. Now every instance seeds each bucket that it encrypts (its blocks, the buckets it names that inherit an encrypting backend, and each encrypting backend's buckets with no entry), and plaintext is never seeded.
-- When the only up-to-date instance stopped, a lagging instance took over and reverted a key rotation. There is no automatic takeover any more (see above).
-- An instance whose check failed kept writing. Now it refuses writes to the witnessed buckets once its last good check is two polls old, and an instance that cannot check at start refuses them until the first check succeeds.
-- A folder marker and a metadata rewrite went past the witness. Every write of the encrypting layer now checks it first (source guard).
-- Two instances with one key id and different keys agreed. The shared entry now carries a key check value (a truncated HMAC of the key).
-- A downgrade that the instances got by restart could not finish. An apply with `X-DGP-Confirm-Encryption-Downgrade` now publishes the confirmed buckets also when the config does not change.
-- `/_/ready` showed bucket names, key ids, KMS key ARNs, instance ids and SDK error dumps without a login. It now shows the status only; the details are in `GET /_/api/admin/encryption-witness`.
-
-**Upgrade note:** upgrade every instance before you add a per-bucket `encryption` block while `config_sync_bucket` is set. An older release ignores the witness.
-
-### Fixed — A new default backend is an encryption change
-
-A change of `default_backend`, or the move from an encrypting `storage.backend` to named backends, changes the encryption of every bucket that the config does not name. It had no subject, so the downgrade gate and the audit did not see it. Its subject is now `route:default`.
-
-### Fixed — An unknown field in a backend or an encryption block is a load error
-
-`storage.backend.encryption:` (the singleton's encryption is `storage.backend_encryption`) and any other unknown field in a backend definition or an `encryption` block were dropped without a word, so a backend meant to encrypt stored plaintext. They now stop the start, fail `config lint` and refuse an apply, and the error names the field. **Upgrade note:** a config with such a field no longer starts; run `config lint` with the new binary first.
-
-### Added — Per-bucket encryption on several instances (the encryption witness)
-
-Per-bucket encryption now works with `config_sync_bucket` set; the start no longer refuses it. The YAML is per instance, so the instances keep a witness in the sync bucket: `_dgp/encryption/intent.json` holds the mode and key id (never a key) of each bucket that an instance encrypts. An instance whose encryption of a bucket differs from the published one refuses writes to that bucket with `503 SlowDown` that names the mismatch; reads and other buckets keep working, and `/_/ready` shows the verdict in `encryption_witness` (the instance stays ready). A config apply that changes a bucket's encryption publishes it, so applying the same config on every instance converges. New setting: `DGP_ENCRYPTION_WITNESS_POLL_SECS` (default 30).
-
-### Added — Audit entries for a bucket's encryption, and a confirmed downgrade
-
-Every change of a bucket's write encryption now writes one audit entry: `bucket_encryption_set`, `bucket_encryption_cleared` or `bucket_encryption_key_rotated`. The target names the mode and the key id before and after the change, never key material. The config transition writes them, so every write path does: a config apply, a section PUT, a field PATCH, the backend endpoints, a backup restore, and the flip of a migrate (user `background`).
-
-### Changed — A change that makes a bucket store plaintext needs a confirmation
-
-A config write that makes a bucket store new objects in plaintext where it encrypted them before (`mode: none`, a removed block on a plaintext backend, a move to a plaintext backend, or the backend's own `mode: none`) is refused unless the request carries `X-DGP-Confirm-Encryption-Downgrade: <bucket>` (or `backend:<name>` for a backend's own change). `config apply` has the new flag `--confirm-encryption-downgrade`. The migrate start runs the same gate. A start from an edited file is not gated. **Upgrade note:** a script or the admin UI that sets `mode: none` must now send the confirmation.
-
-### Added — A bucket can use native SSE (`sse-kms`, `sse-s3`)
-
-A bucket on an S3 backend can now set `mode: sse-kms` or `mode: sse-s3` in its own `encryption` block. The S3 backend keeps one client and picks the SSE headers of each request (PutObject, CreateMultipartUpload, CopyObject, UploadPartCopy, folder markers, listing facts) from the bucket that the request writes to. One backend can hold proxy-AES, SSE and plaintext buckets side by side: a bucket that encrypts in the proxy gets no SSE headers (never encrypted twice), and `mode: none` on a bucket means plaintext also on a backend with native SSE. A server-side copy takes the SSE headers of the destination bucket. A bucket in a native mode on a filesystem backend is refused. The KMS permissions that the backend's credentials need are in the encryption reference.
-
-### Changed — A malformed `kms_key_id` stops the start
-
-`kms_key_id` must now be a KMS key ARN or alias ARN, an alias name (`alias/<name>`), a key id (UUID) or a multi-Region key id (`mrk-...`), on a backend and on a bucket. An empty or other value was accepted before and failed every write with an S3 error; now the start, `config lint` and an apply refuse it. **Upgrade note:** on MinIO, a bare key name (`my-key`) is refused; write it as `arn:aws:kms:my-key`, which MinIO accepts.
 ### Added — Per-bucket encryption in the admin UI
 
 The bucket list and the bucket card now show and change a bucket's own encryption (issue #116, P2).
 
 - `GET /_/api/admin/buckets` reports `effective_encryption` for each bucket: the mode, the key id, the legacy key id, and whether it comes from the bucket's own block (`source: bucket`) or from its backend (`source: backend`). The server computes it with the one resolver that the engine and the jobs use; the admin UI no longer resolves a bucket's encryption itself, and a source test refuses a client-side copy. `GET /_/api/admin/backends` lists, per backend, the modes that a bucket's own block accepts.
-- The bucket card has an **Encryption** group between Public access and Placement: **Inherit — <backend>: <mode>**, **Encrypt with a bucket key**, and **Off for this bucket** (plaintext; the bucket key stays as a decrypt-only legacy key). The key is generated in the browser or pasted, shown once with Copy, a key-file download and the YAML / environment snippet, and confirmed by typing its last 6 characters. The key id is explicit (`<bucket>-<yyyy>-<mm>` suggested). An environment-sourced key shows read-only with a **from env** badge. **Rotate key**, the per-bucket legacy-key check, and **Clear legacy key** (with `X-DGP-Confirm-Key-Removal`) work per bucket. A change that makes new writes plaintext is confirmed and sends `X-DGP-Confirm-Encryption-Downgrade: <bucket>`.
+- The bucket card has an **Encryption** group between Public access and Placement: **Inherit — <backend>: <mode>**, **Encrypt with a bucket key**, native **SSE-KMS** / **SSE-S3** on an S3 backend, and **Off for this bucket** (plaintext; the bucket key stays as a decrypt-only legacy key). The key is generated in the browser or pasted, shown once with Copy, a key-file download and the YAML / environment snippet, and confirmed by typing its last 6 characters. The key id is explicit (`<bucket>-<yyyy>-<mm>` suggested). An environment-sourced key shows read-only with a **from env** badge. **Rotate key**, the per-bucket legacy-key check, and **Clear legacy key** (with `X-DGP-Confirm-Key-Removal`) work per bucket. A change that makes new writes plaintext is confirmed and sends `X-DGP-Confirm-Encryption-Downgrade: <bucket>`.
 - The collapsed row names where the encryption comes from: **Encrypted · from hetzner-fsn1** or **Encrypted · bucket key db-archive-2026-10**.
 - **Create bucket** asks for the encryption (the server's answer is the default: "Same as backend (<mode>)", or the settings that the name already has). `POST /_/api/admin/buckets` takes the bucket's `encryption` block, and the route, the block and the create are one config write: an existing name is refused before any change, and a failed create takes everything back. "Off" asks before it sends the downgrade confirmation. `GET /_/api/admin/buckets/<bucket>/encryption-preview?backend=<b>` answers what a new bucket would get.
 - The keys of a bucket that does not exist on its storage leave without a key-removal confirmation (no object can use them): the rollback of a failed create, and **Remove these settings…** for settings with a key whose bucket was never created.
@@ -73,25 +29,47 @@ The bucket list and the bucket card now show and change a bucket's own encryptio
 - The key dialog no longer says that DeltaGlider does not back up the key: a full backup carries a key that is in the config file, not a key that an environment variable supplies.
 - New how-to: [How to encrypt one bucket on a shared backend](docs/product/how-to/encrypt-one-bucket-on-a-shared-backend.md).
 
-### Added — A bucket can have its own encryption key (YAML)
+### Added — The encryption witness keeps several instances in agreement
 
-A bucket policy can now carry an `encryption` block with the same fields as the `encryption` block of a backend. The writes to that bucket then use the bucket's own proxy-AES key, or no encryption, while the other buckets on the same backend keep the backend's encryption. Before, encryption was a backend setting only, and a second key on one disk needed a second backend definition.
+With `config_sync_bucket` set, the YAML is still per instance, so two instances could write one bucket in two forms. The instances now keep a witness in the sync bucket, and an instance that disagrees refuses writes instead.
 
-- Each backend keeps one encrypting layer with a keyring: the keys of the backend and of every bucket on it. A read picks the key by the key id that the object carries, so a bucket still reads the objects and delta references that it wrote under the backend key before it got its own key.
-- A bucket block needs an explicit `key_id`, an explicit `backend:` when `storage.backends` is used, and the mode `aes256-gcm-proxy` or `none`. Two names of one stored bucket (an alias) must agree, a key id names one key everywhere, and the block is refused while `config_sync_bucket` is set. The key comes from the YAML file or from any `${env:NAME}` reference.
-- An apply that changes the encryption of a bucket answers with a warning that names the re-encrypt job for that bucket. An apply that removes the key that a bucket writes with is refused; set `mode: none` first (the old key stays as `legacy_key`), run the re-encrypt job, and then remove the block. Each bucket is judged on its own block and its backend's keys, never on a neighbour that shares the key id. The removal of a bucket's legacy key needs the confirmation of its id (`X-DGP-Confirm-Key-Removal`, or `config apply --confirm-key-removal`), after `GET /_/api/admin/backends/<backend>/legacy-key-usage?bucket=<bucket>`, which counts that key id in every bucket stored on the backend.
-- The migrate job carries the bucket's block to the target backend, and its verify phase checks the at-rest form of every copy. A replication rule from an encrypted bucket into a plaintext one gives a `config lint` warning.
-- Bucket keys are redacted from `GET /config`, the section GET and the export, survive a round trip through the admin UI, and ride in the backup's `secrets.json` (`bucket_encryption`).
-- A run that started before an apply (a replication or lifecycle run, a multipart upload) writes with the bucket encryption of that apply from then on: the engine that the apply builds publishes its per-bucket policy into the encrypting layer that the running engine shares.
-- The admin UI shows and edits bucket keys (see the entry above).
+- `_dgp/encryption/intent.json` holds, for each stored bucket (backend + real bucket name; `*` = the backend's buckets with no entry of their own), the shared encryption: mode, key id, and for a proxy key a key check value (the first 8 bytes of HMAC-SHA256(key, "dgp-witness-kcv-v1")). It never holds key material.
+- Each instance adds, create-only, every bucket that it encrypts: its bucket blocks, the buckets it names that inherit an encrypting backend, and each encrypting backend's `*`. Plaintext and a missing key are never added.
+- An instance whose encryption of a bucket differs from the shared entry (a bucket with no entry of its own is compared with its backend's `*`) refuses writes to it with `503 SlowDown` that names the mismatch and the command that publishes; reads and other buckets keep working. Replication and lifecycle runs that write into such a bucket stop as `deferred` (cursor kept), and maintenance jobs wait, instead of failing object after object.
+- An entry changes only in three ways: the first instance that encrypts a bucket adds it; a config apply that CHANGES a bucket's encryption publishes it (a downgrade needs its confirmation; an apply with the confirmation also publishes a confirmed plaintext bucket whose config did not change); or the operator runs the new `deltaglider_proxy witness publish <bucket|backend:name|route:default>...` (`POST /_/api/admin/encryption-witness/publish`, audited as `bucket_encryption_witness_publish`; plaintext needs `--confirm-encryption-downgrade`). No instance takes over an entry by itself. A publish that fails during an apply is retried at each check; the rollback of a failed change puts back what that change published.
+- Every write of the encrypting layer checks the witness first, also a folder marker and a metadata rewrite.
+- A verdict holds two polls (`DGP_ENCRYPTION_WITNESS_POLL_SECS`, default 30), counted from the start of the check that made it; then the witnessed buckets refuse writes until a check succeeds. Each instance saves the last shared manifest next to its config DB (`encryption-witness.json`, mode 0600, no key material), and at start it refuses writes to the buckets it encrypts, its bucket blocks and every bucket in that saved manifest until the first check succeeds. A missing sync bucket counts as a failed check, not as an empty manifest. An instance that cannot build its client for the sync bucket reports `unavailable` and keeps those buckets refused.
+- `/_/ready` shows `encryption_witness.status` only (`agree`, `mismatch`, `unknown`, `unavailable`); a mismatch keeps the instance ready. The details are in `GET /_/api/admin/encryption-witness` (admin session).
+
+**Upgrade notes:**
+
+- Upgrade every instance before you add a bucket `encryption` block while `config_sync_bucket` is set: an older release ignores the witness.
+- This also changes clusters that use BACKEND-level encryption only, because each encrypting backend's `*` is witnessed. A backend key or mode changed by editing the file or an environment variable and restarting the instances is not published: after the restart, every instance with the new key refuses all writes to that backend until you run `deltaglider_proxy witness publish backend:<name>` once (or make the change with a config apply instead). An instance that starts while the sync bucket does not answer refuses writes to every encrypting backend until its first check succeeds. See [How to upgrade](docs/product/how-to/upgrade.md) and [How to run multiple instances](docs/product/how-to/run-multiple-instances.md).
+
+### Added — Audit entries for a bucket's encryption
+
+Every change of a bucket's write encryption writes one audit entry per subject: `bucket_encryption_set`, `bucket_encryption_cleared` or `bucket_encryption_key_rotated`. The target names the mode and the key id before and after the change, never key material. The config transition writes them, so every write path does: a config apply, a section PUT, a field PATCH, the backend endpoints, a backup restore, and the flip of a migrate (user `background`). A backend change writes one entry for `backend:<name>` and one for each named bucket that inherits it.
+
+### Changed — A change that makes a bucket store plaintext needs a confirmation
+
+A config write that makes a bucket store new objects in plaintext where it encrypted them before (`mode: none`, a removed block on a plaintext backend, a move to a plaintext backend, the backend's own `mode: none`, or a new `default_backend` that stores plaintext) is refused unless the request carries `X-DGP-Confirm-Encryption-Downgrade: <subject>`: the bucket name, `backend:<name>` for a backend's own change, or `route:default` for the buckets that the config does not name. `config apply` has the new flag `--confirm-encryption-downgrade`. The migrate start runs the same gate. A start from an edited file is not gated. **Upgrade note:** a script that sets `mode: none` must now send the confirmation.
+
+### Changed — A malformed `kms_key_id` stops the start
+
+`kms_key_id` must now be a KMS key ARN or alias ARN, an alias name (`alias/<name>`), a key id (UUID) or a multi-Region key id (`mrk-...`), on a backend and on a bucket. An empty or other value was accepted before and failed every write with an S3 error; now the start, `config lint` and an apply refuse it. **Upgrade note:** on MinIO, a bare key name (`my-key`) is refused; write it as `arn:aws:kms:my-key`, which MinIO accepts.
+
+### Fixed — An unknown field in a backend or an encryption block is a load error
+
+`storage.backend.encryption:` (the singleton's encryption is `storage.backend_encryption`) and any other unknown field in a backend definition or an `encryption` block were dropped without a word, so a backend meant to encrypt stored plaintext. They now stop the start, fail `config lint` and refuse an apply, and the error names the field. A section PUT that changes the `mode` of an encryption block (or the `type` of `storage.backend`) replaces the block, so the old mode's fields do not stay behind. **Upgrade note:** a config with such a field no longer starts; run `config lint` with the new binary first.
 
 ### Fixed — An unknown bucket policy field is refused, not ignored
 
 A bucket policy (`storage.buckets.<name>`) accepted any field and dropped the
 ones that it did not know: `config lint` reported `ok`, and the proxy ran
 without the setting. A misspelled field (for example `quota_byte`) therefore
-did nothing, and a field that a later release adds (per-bucket encryption is
-planned) would be lost after a downgrade, so the bucket could store plaintext.
+did nothing, and a field that a newer release adds (per-bucket `encryption`,
+which ships in this release) would be lost after a downgrade to an older
+release, so the bucket could store plaintext.
 Now an unknown bucket field stops the start, makes `config lint` exit with
 code `4`, and refuses an apply, and each error names the field. **Upgrade
 note:** a config with a misspelled bucket field, which this release's
