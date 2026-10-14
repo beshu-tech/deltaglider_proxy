@@ -148,6 +148,22 @@ a write counted twice, so the bucket could stay over its quota with no
 further scan. Now only a scan during which the bucket did not change
 stamps the counter. A busy Refresh still shows its numbers, marked as not
 reconciled; refresh again when the bucket is quiet.
+### Fixed — A GET serves the ETag of the bytes it sends
+
+A GET often needs two requests to the backend: one that reads the
+object's metadata and one that reads its bytes. When a write replaced the
+object between the two requests, the response could carry the ETag and
+the size of the old version and the bytes of the new one. This happened
+in three places: a plain GET whose first guess of the stored form was
+wrong, a conditional GET (`If-Match`, `If-None-Match`, `If-Modified-Since`,
+`If-Unmodified-Since`), and a ranged GET with a condition or `If-Range`. A
+download that resumed with `If-Range` could so join two versions into one
+file. Now the metadata that a GET serves comes from the response that
+carries the bytes. A conditional GET judges its conditions again when that
+version differs from the one that its first read saw, so an `If-Match` on
+the old ETag answers 412. A ranged GET whose object changed between the
+two requests answers 503 SlowDown, and clients retry it.
+
 ### Fixed — A ranged read of an encrypted backend never mixes two versions
 
 A range read on a backend with an encryption key can need two requests:

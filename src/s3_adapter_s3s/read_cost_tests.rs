@@ -577,6 +577,25 @@ fn the_get_verb_opens_the_object_with_its_metadata() {
     );
 }
 
+/// THE rule of the engine's reads: the bytes of an object are read with
+/// the metadata of the same response (`open_object`,
+/// `open_passthrough_range`), and that metadata is what the GET serves.
+/// The metadata-less reads (`get_passthrough_stream`,
+/// `get_passthrough_stream_range`) paired an earlier read's ETag with the
+/// bytes of a version that a write put in between.
+#[test]
+fn the_engine_reads_bytes_with_their_metadata() {
+    let text = std::fs::read_to_string("src/deltaglider/engine/retrieve.rs").unwrap();
+    let prod = crate::source_scan::prod_text(&text);
+    let squashed: String = prod.split_whitespace().collect();
+    for bare in [".get_passthrough_stream(", ".get_passthrough_stream_range("] {
+        assert!(
+            !squashed.contains(bare),
+            "retrieve.rs calls {bare}: use open_object / open_passthrough_range"
+        );
+    }
+}
+
 /// Routing: the two parallel reads of a cold GET share one bucket
 /// resolution (one HeadBucket), as do concurrent GETs.
 #[tokio::test]
@@ -923,4 +942,114 @@ async fn a_foreign_object_without_content_length_keeps_its_size() {
     let (data, meta) = engine.retrieve("b", "pics/foreign.jpg").await.unwrap();
     assert_eq!(data, body);
     assert_eq!(meta.file_size, 5000, "the cached size");
+}
+
+fn md5_hex(data: &[u8]) -> String {
+    hex::encode(<md5::Md5 as md5::Digest>::digest(data))
+}
+
+/// A wrong guess of a plain GET reads the other form after its HEAD.
+/// When a write replaces the object between the HEAD and that read, the
+/// response pairs the ETag and the body of ONE version. Before, the ETag
+/// came from the HEAD (version A) and the body from the GET (version B).
+#[tokio::test]
+async fn a_wrong_guess_serves_the_etag_of_its_bytes() {
+    let fx = fixture(Kind::Plain).await;
+    let writer = engine_on(&fx.backend, None);
+    let a = rnd(64 * 1024, 99);
+    let b = rnd(64 * 1024, 1234);
+    writer
+        .store("b", "dir/other.zip", &a, None, Default::default())
+        .await
+        .unwrap();
+    let stored = writer
+        .store("b", "dir/bsrc.zip", &b, None, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(stored.metadata.storage_info.label(), "passthrough");
+    let svc = svc_on(engine_on(&fx.backend, None));
+    // The HEAD of the passthrough form reads A; the GET after it reads B.
+    fx.fake
+        .overwrite_after_reads("b/dir/other.zip", "b/dir/bsrc.zip", 1);
+    let (body, etag) = run_get(&svc, get("dir/other.zip")).await;
+    assert!(body == a || body == b, "a body of one version");
+    assert_eq!(etag, md5_hex(&body), "the ETag of the body served");
+}
+
+/// The overwrite of `pics/a.jpg` by another photo that the HEAD-first
+/// GET paths race: the HEAD (the first read of the key) sees version A,
+/// every later read sees B.
+async fn photo_overwritten_after_its_head(fx: &Fixture) -> Vec<u8> {
+    let writer = engine_on(&fx.backend, None);
+    let b = rnd(fx.photo.len(), 4321);
+    writer
+        .store("b", "pics/b.jpg", &b, None, Default::default())
+        .await
+        .unwrap();
+    fx.fake
+        .overwrite_after_reads("b/pics/a.jpg", "b/pics/b.jpg", 1);
+    b
+}
+
+/// A conditional GET judges If-Match on its HEAD, then reads the bytes.
+/// When a write replaces the object between the two, the judgement must
+/// hold for the bytes served: a 412 (the served version does not match),
+/// never a 200 of version B for an If-Match on version A.
+#[tokio::test]
+async fn a_conditional_get_judges_the_version_it_serves() {
+    for kind in KINDS {
+        let fx = fixture(kind).await;
+        let svc = svc_on(engine_on(&fx.backend, None));
+        let etag_a = md5_hex(&fx.photo);
+        let b = photo_overwritten_after_its_head(&fx).await;
+        let mut g = get("pics/a.jpg");
+        g.if_match = Some(s3s::dto::ETagCondition::ETag(s3s::dto::ETag::Strong(
+            etag_a.clone(),
+        )));
+        match run_range(&svc, g).await {
+            Err(code) => assert!(
+                code == "PreconditionFailed" || code == "SlowDown",
+                "{kind:?}: {code}"
+            ),
+            Ok((body, etag, _)) => panic!(
+                "{kind:?}: 200 with ETag {etag} (A: {}, B: {}) for If-Match {etag_a}",
+                body == fx.photo,
+                body == b
+            ),
+        }
+    }
+}
+
+/// A ranged GET with a conditional reads the HEAD first, then the range.
+/// When a write replaces the object between the two, the range must not
+/// join version B's bytes to version A's ETag and size (a resumed
+/// download would join two versions). An If-Match on A answers 412 from
+/// B; an If-Match that B passes too (`*`) answers 503 SlowDown, which
+/// clients retry: the range was resolved against A.
+#[tokio::test]
+async fn a_conditional_range_serves_the_version_it_judged() {
+    for kind in KINDS {
+        let etag_a = md5_hex(&fixture(kind).await.photo);
+        for (condition, want) in [
+            (
+                s3s::dto::ETagCondition::ETag(s3s::dto::ETag::Strong(etag_a.clone())),
+                "PreconditionFailed",
+            ),
+            (s3s::dto::ETagCondition::Any, "SlowDown"),
+        ] {
+            let fx = fixture(kind).await;
+            let svc = svc_on(engine_on(&fx.backend, None));
+            let b = photo_overwritten_after_its_head(&fx).await;
+            let mut g = ranged("pics/a.jpg", 100, Some(199));
+            g.if_match = Some(condition);
+            match run_range(&svc, g).await {
+                Err(code) => assert_eq!(code, want, "{kind:?}"),
+                Ok((body, etag, _)) => panic!(
+                    "{kind:?}: 206 with ETag {etag} (A: {etag_a}), A's bytes: {}, B's: {}",
+                    body == fx.photo[100..200],
+                    body == b[100..200]
+                ),
+            }
+        }
+    }
 }

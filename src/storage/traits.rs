@@ -1092,8 +1092,10 @@ pub trait StorageBackend: Send + Sync {
     /// a backend with no native range support must still provide an explicit
     /// (even if full-stream) impl so the choice is VISIBLE, not silently inherited.
     ///
-    /// Returns `(stream, content_length)` where `content_length` is the number of
-    /// bytes in the range (0 signals "full stream, not a range").
+    /// Returns `(stream, content_length)` where `content_length` is the exact
+    /// number of bytes in the range (never 0: an empty range is
+    /// [`StorageError::InvalidRange`]). There is no "not a range" answer: a
+    /// backend that cannot read a range must read the object and slice it.
     fn get_passthrough_stream_range(
         &self,
         bucket: &str,

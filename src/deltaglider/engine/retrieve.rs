@@ -152,8 +152,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// - Cold: open the form that the key's file type and the bucket's
     ///   compression setting make likely, and in parallel HEAD the other
     ///   form. Newest-wins decides as in `resolve_stored_forms`. A wrong
-    ///   guess (or a losing form) drops the opened stream unread and reads
-    ///   the winner: the cost of the HEAD-first path.
+    ///   guess (or a losing form) drops the opened stream unread and opens
+    ///   the winner, whose GET gives the metadata served with its bytes:
+    ///   the cost of the HEAD-first path.
     /// - Opened metadata that names another layout (a `.delta` copied in
     ///   without its DG metadata, a passthrough object whose metadata says
     ///   delta), a folder marker: the HEAD-first path.
@@ -246,19 +247,34 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 .await;
         }
         // The other form wins (or the guess is absent): the opened stream,
-        // if any, dropped unread above.
-        let Some(meta) = other else {
+        // if any, dropped unread above. Open the other form: its GET
+        // carries the metadata that is served with its bytes, so a write
+        // that replaced it after the HEAD cannot pair the HEAD's ETag
+        // with the new bytes.
+        if other.is_none() {
             return Err(EngineError::NotFound(obj_key.full_key()));
-        };
-        info!(
-            "Retrieving {}/{} (stored as {})",
-            bucket,
-            key,
-            meta.storage_info.label()
-        );
-        self.metadata_cache.insert(bucket, key, meta.clone());
-        self.retrieve_with_metadata(bucket, &deltaspace_id, &obj_key, meta, None)
+        }
+        match self
+            .storage
+            .open_object(bucket, &deltaspace_id, stored_object(other_form, filename))
             .await
+        {
+            Ok((stream, meta)) => {
+                self.serve_opened(
+                    bucket,
+                    key,
+                    &deltaspace_id,
+                    &obj_key,
+                    other_form,
+                    stream,
+                    meta,
+                )
+                .await
+            }
+            // Gone since the HEAD: the HEAD-first read decides again.
+            Err(StorageError::NotFound(_)) => self.retrieve_stream_headed(bucket, key).await,
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// A ranged GET (no If-Range, no conditional headers) of a passthrough
@@ -393,15 +409,25 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ) -> Result<RetrieveResponse, EngineError> {
         match &metadata.storage_info {
             StorageInfo::Passthrough => {
+                // The metadata served is the one of the response that
+                // carries the bytes, not the earlier read's: a write between
+                // the two would pair one version's ETag with another's body.
                 let stored_name = passthrough_stored_name(&obj_key.filename, &metadata);
-                let stream = self
+                let (stream, served) = self
                     .storage
-                    .get_passthrough_stream(bucket, deltaspace_id, stored_name)
+                    .open_object(
+                        bucket,
+                        deltaspace_id,
+                        crate::storage::StoredObject::Passthrough(stored_name),
+                    )
                     .await?;
+                if !matches!(served.storage_info, StorageInfo::Passthrough) {
+                    return Err(changed_while_read(bucket, obj_key));
+                }
                 debug!("Streaming passthrough file for {}", obj_key.full_key());
                 Ok(RetrieveResponse::Streamed {
                     stream,
-                    metadata,
+                    metadata: served,
                     cache_hit: None,
                 })
             }
@@ -875,12 +901,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         match &metadata.storage_info {
             StorageInfo::Passthrough => {
+                // One read gives the range and the metadata of the version
+                // it carries; that metadata is returned (and checked
+                // against the pin), never the earlier read's.
                 let stored_name = passthrough_stored_name(&obj_key.filename, &metadata);
                 let range_result = self
                     .storage
-                    .get_passthrough_stream_range(bucket, &deltaspace_id, stored_name, start, end)
+                    .open_passthrough_range(bucket, &deltaspace_id, stored_name, start, end)
                     .await;
-                let (stream, content_length) = match range_result {
+                let (stream, content_length, served) = match range_result {
                     Ok(v) => v,
                     Err(StorageError::NotFound(_)) if from_cache => {
                         warn!(
@@ -895,38 +924,34 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                             return Ok(None);
                         };
                         self.metadata_cache.insert(bucket, key, fresh_meta.clone());
-                        match &fresh_meta.storage_info {
-                            StorageInfo::Passthrough => {
-                                let (stream, content_length) = self
-                                    .storage
-                                    .get_passthrough_stream_range(
-                                        bucket,
-                                        &deltaspace_id,
-                                        passthrough_stored_name(&obj_key.filename, &fresh_meta),
-                                        start,
-                                        end,
-                                    )
-                                    .await?;
-                                return if content_length == 0 {
-                                    Ok(None)
-                                } else {
-                                    Ok(Some((stream, content_length, fresh_meta)))
-                                };
-                            }
-                            StorageInfo::Reference { .. } | StorageInfo::Delta { .. } => {
-                                return Ok(None);
-                            }
+                        if !matches!(fresh_meta.storage_info, StorageInfo::Passthrough) {
+                            return Ok(None);
                         }
+                        self.storage
+                            .open_passthrough_range(
+                                bucket,
+                                &deltaspace_id,
+                                passthrough_stored_name(&obj_key.filename, &fresh_meta),
+                                start,
+                                end,
+                            )
+                            .await?
                     }
                     Err(e) => return Err(e.into()),
                 };
-
-                if content_length == 0 {
-                    // Backend returned full stream (default impl), signal caller
-                    // to fall back to the buffered slicing path.
-                    return Ok(None);
+                if !matches!(served.storage_info, StorageInfo::Passthrough) {
+                    return Err(changed_while_read(bucket, &obj_key));
                 }
-
+                if let Some(expected) = expected_source {
+                    if !Self::same_generation(expected, &served) {
+                        return Err(EngineError::Storage(StorageError::PreconditionFailed(
+                            format!(
+                                "source changed during copy: {}/{} (size {} -> {})",
+                                bucket, key, expected.file_size, served.file_size
+                            ),
+                        )));
+                    }
+                }
                 debug!(
                     "Streaming passthrough range for {} (bytes {}-{}, {} bytes)",
                     obj_key.full_key(),
@@ -934,7 +959,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     end,
                     content_length
                 );
-                Ok(Some((stream, content_length, metadata)))
+                Ok(Some((stream, content_length, served)))
             }
             StorageInfo::Delta { .. } if metadata.file_size > self.spool_threshold() => {
                 // Large delta range: reconstruct once to a spool file (verified),
@@ -1274,37 +1299,30 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Ok((data, cache_hit))
     }
 
-    /// Try to stream an unmanaged object (no DG metadata) with best-effort metadata.
-    /// First tries `get_passthrough_metadata` for proper size/etag, then falls back
-    /// to streaming with minimal metadata if the metadata lookup fails.
+    /// Stream an unmanaged object (no DG metadata): one read gives the
+    /// bytes and the metadata of the same version (its size and ETag).
     async fn try_unmanaged_passthrough(
         &self,
         bucket: &str,
         deltaspace_id: &str,
         obj_key: &ObjectKey,
     ) -> Result<RetrieveResponse, EngineError> {
-        // Try metadata first (same source as HEAD) for consistent Content-Length/ETag
-        let meta = match self
+        let (stream, mut meta) = match self
             .storage
-            .get_passthrough_metadata(bucket, deltaspace_id, &obj_key.filename)
+            .open_object(
+                bucket,
+                deltaspace_id,
+                crate::storage::StoredObject::Passthrough(&obj_key.filename),
+            )
             .await
         {
-            Ok(m) => m,
+            Ok(opened) => opened,
             Err(StorageError::NotFound(_)) => {
-                // No metadata at all — use minimal fallback
-                FileMetadata::new_passthrough(
-                    obj_key.filename.clone(),
-                    String::new(),
-                    String::new(),
-                    0,
-                    None,
-                )
+                return Err(EngineError::NotFound(obj_key.full_key()))
             }
             Err(e) => return Err(EngineError::Storage(e)),
         };
-
         // Inject warning into metadata for UI display if this looks like a delta artifact
-        let mut meta = meta;
         if obj_key.filename.ends_with(".delta") || obj_key.filename == "reference.bin" {
             meta.user_metadata.insert(
                 "dg-warning".to_string(),
@@ -1312,21 +1330,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     .to_string(),
             );
         }
-
-        // Stream the object
-        match self
-            .storage
-            .get_passthrough_stream(bucket, deltaspace_id, &obj_key.filename)
-            .await
-        {
-            Ok(stream) => Ok(RetrieveResponse::Streamed {
-                stream,
-                metadata: meta,
-                cache_hit: None,
-            }),
-            Err(StorageError::NotFound(_)) => Err(EngineError::NotFound(obj_key.full_key())),
-            Err(e) => Err(EngineError::Storage(e)),
-        }
+        Ok(RetrieveResponse::Streamed {
+            stream,
+            metadata: meta,
+            cache_hit: None,
+        })
     }
 
     /// PURE: do two metadata snapshots describe the same object generation?
@@ -1428,6 +1436,16 @@ fn opened_form(filename: &str, metadata: &FileMetadata) -> Option<ObjectVariant>
         }
         _ => None,
     }
+}
+
+/// The 503 SlowDown of a read whose byte read found another version
+/// than its metadata read (the text of the storage layer's
+/// `object_changed_while_read`, which `crate::storage` does not export).
+fn changed_while_read(bucket: &str, obj_key: &ObjectKey) -> EngineError {
+    EngineError::Storage(StorageError::Throttled(format!(
+        "{bucket}/{} changed while it was read; retry the request",
+        obj_key.full_key()
+    )))
 }
 
 fn stored_object(form: ObjectVariant, filename: &str) -> crate::storage::StoredObject<'_> {

@@ -63,8 +63,8 @@ pub(crate) struct FakeS3 {
     /// Object DELETEs ignore `If-Match`, as on a backend that honours the
     /// condition on PUT only ([`FakeS3::set_delete_if_match_ignored`]).
     delete_if_match_ignored: std::sync::atomic::AtomicBool,
-    /// Overwrites armed by [`FakeS3::overwrite_after_gets`]: (object,
-    /// source, GETs of the object still to answer first).
+    /// Overwrites armed by [`FakeS3::overwrite_after_reads`]: (object,
+    /// source, GETs and HEADs of the object still to answer first).
     overwrites: parking_lot::Mutex<Vec<(String, String, u32)>>,
 }
 
@@ -205,19 +205,20 @@ impl FakeS3 {
         stored.etag = format!("\"{}\"", hex::encode(md5::Md5::digest(body)));
     }
 
-    /// After `gets` more GETs of `path` are answered, `path` becomes a copy
-    /// of `source` (its body, metadata and ETag), as a concurrent writer
-    /// would make it: a test reads one version, then another, with no
-    /// timing. The copy happens when the last of those GETs has read the
-    /// object, before its response leaves.
-    pub(crate) fn overwrite_after_gets(&self, path: &str, source: &str, gets: u32) {
+    /// After `reads` more GETs or HEADs of `path` are answered, `path`
+    /// becomes a copy of `source` (its body, metadata and ETag), as a
+    /// concurrent writer would make it: a test reads one version, then
+    /// another, with no timing. The copy happens when the last of those
+    /// reads has read the object, before its response leaves.
+    pub(crate) fn overwrite_after_reads(&self, path: &str, source: &str, reads: u32) {
         self.overwrites
             .lock()
-            .push((path.to_string(), source.to_string(), gets));
+            .push((path.to_string(), source.to_string(), reads));
     }
 
-    /// One GET of `path` read the object: run the overwrites it arms.
-    fn after_get(&self, path: &str) {
+    /// One GET or HEAD of `path` read the object: run the overwrites it
+    /// arms.
+    fn after_read(&self, path: &str) {
         let mut due = Vec::new();
         self.overwrites.lock().retain_mut(|(at, source, left)| {
             if at != path {
@@ -582,8 +583,8 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                             return object_acl(&f, &method);
                         }
                         let current = f.objects.lock().get(&path).cloned();
-                        if method == Method::GET {
-                            f.after_get(&path);
+                        if method == Method::GET || method == Method::HEAD {
+                            f.after_read(&path);
                         }
                         // Conditional writes (`If-None-Match: *`, `If-Match`)
                         // answer 412 like S3 when the condition does not hold.

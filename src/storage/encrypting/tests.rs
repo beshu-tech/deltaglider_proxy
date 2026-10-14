@@ -2601,7 +2601,7 @@ mod pinned_follow_up_tests {
             let keyed = EncryptingBackend::new(mk(), cfg(Some(key.clone())));
             put(&plain, &keyed, from, "x.bin", &a).await;
             put(&plain, &keyed, to, "y.bin", &b).await;
-            fake.overwrite_after_gets("b/p/x.bin", "b/p/y.bin", 1);
+            fake.overwrite_after_reads("b/p/x.bin", "b/p/y.bin", 1);
             let label = format!("{from:?} -> {to:?} at {start}");
             let read = async {
                 let (s, _, m) = keyed

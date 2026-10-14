@@ -154,6 +154,7 @@ pub(super) async fn get_object(
             .retrieve_stream_range(&input.bucket, &input.key, start, end_inclusive, None)
             .await?
         {
+            served_the_judged_version(&head, &metadata, &input, true)?;
             return ranged_response(
                 svc,
                 &input,
@@ -166,6 +167,7 @@ pub(super) async fn get_object(
         }
 
         let (data, metadata) = engine.retrieve(&input.bucket, &input.key).await?;
+        served_the_judged_version(&head, &metadata, &input, true)?;
         // `checked` was validated against the HEAD `file_size`, but we
         // slice into the freshly-reconstructed `data`. If stored
         // `file_size` metadata is stale / larger than the actual bytes
@@ -202,7 +204,50 @@ pub(super) async fn get_object(
             )
         }
     };
+    let served = match &response {
+        RetrieveResponse::Streamed { metadata, .. }
+        | RetrieveResponse::Buffered { metadata, .. } => metadata,
+    };
+    served_the_judged_version(&head, served, &input, false)?;
     finish_get(svc, &input, reader, response)
+}
+
+/// Pure: do two reads describe the same version, as a client sees it
+/// (ETag, size, Last-Modified)?
+fn same_client_version(a: &FileMetadata, b: &FileMetadata) -> bool {
+    a.etag() == b.etag() && a.file_size == b.file_size && a.created_at == b.created_at
+}
+
+/// The HEAD-first GET judged its conditionals (and its range) on the
+/// HEAD's metadata `judged`; `served` is the metadata of the response that
+/// carries the bytes. When a write replaced the object between the two,
+/// the conditionals are judged again on the served version (a 412 or 304
+/// from it), and a ranged answer, whose range and If-Range were resolved
+/// against the HEAD's version, is a retryable 503 SlowDown: the response
+/// never joins one version's bytes to another version's ETag or size.
+fn served_the_judged_version(
+    judged: &FileMetadata,
+    served: &FileMetadata,
+    input: &s3s::dto::GetObjectInput,
+    ranged: bool,
+) -> s3s::S3Result<()> {
+    if same_client_version(judged, served) {
+        return Ok(());
+    }
+    evaluate_read_conditionals_s3s(
+        served,
+        input.if_match.as_ref(),
+        input.if_none_match.as_ref(),
+        input.if_modified_since.as_ref(),
+        input.if_unmodified_since.as_ref(),
+    )?;
+    if ranged {
+        return Err(s3s::s3_error!(
+            SlowDown,
+            "The object changed while it was read; retry the request"
+        ));
+    }
+    Ok(())
 }
 
 /// The 206 response of a ranged GET served from a backend range stream.
