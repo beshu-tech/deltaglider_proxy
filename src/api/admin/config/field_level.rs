@@ -766,6 +766,17 @@ fn build_patch(
         crate::config::normalize_bucket_policies(&mut new_buckets)
             .map_err(|e| Rejection::new(Stage::Build, axum::http::StatusCode::BAD_REQUEST, e))?;
         cfg.buckets = new_buckets;
+        // `GET /config` redacts the bucket keys, so a round trip sends the
+        // policies back without them. The same preservation as a section
+        // PUT keeps them (issue #116): an absent `key` / `legacy_key` keeps
+        // the running value. The PATCH body has no presence probe, so it
+        // cannot clear a key; a section PUT with `null` does that.
+        super::section_level::preserve_all_backend_encryption(
+            &mut cfg,
+            old,
+            &super::section_level::BackendEncryptionKeyProbe::empty(),
+        )
+        .map_err(|e| Rejection::new(Stage::Build, axum::http::StatusCode::BAD_REQUEST, e))?;
     }
 
     // Operator-authored admission blocks: PATCH replaces the full list. An
@@ -923,6 +934,36 @@ pub(super) fn apply_backend_patch(
 mod tests {
     use super::*;
     use crate::config::{BackendConfig, Config};
+
+    /// Issue #116 review B: `GET /config` redacts bucket keys; a PATCH that
+    /// sends those policies back keeps the keys (before: the patch replaced
+    /// the policies as they came, and every `legacy_key` was lost while its
+    /// `legacy_key_id` stayed).
+    #[test]
+    fn a_bucket_policies_patch_keeps_the_redacted_keys() {
+        const K: &str = "4444444444444444444444444444444444444444444444444444444444444444";
+        const L: &str = "5555555555555555555555555555555555555555555555555555555555555555";
+        let old = Config::from_yaml_str(&format!(
+            "storage:\n  filesystem: /tmp/p116-patch\n  buckets:\n    db-archive:\n      \
+             encryption: {{ mode: aes256-gcm-proxy, key: \"{K}\", key_id: db-archive-2026, \
+             legacy_key: \"{L}\", legacy_key_id: db-archive-2025 }}\n"
+        ))
+        .unwrap();
+        let body: ConfigUpdateRequest = serde_json::from_value(serde_json::json!({
+            "bucket_policies": old.redacted_bucket_policies(),
+        }))
+        .unwrap();
+        let built = match build_patch(&old, &body) {
+            Ok(b) => b,
+            Err(_) => panic!("the patch is refused"),
+        };
+        let enc = built.incoming.buckets["db-archive"]
+            .encryption
+            .clone()
+            .unwrap();
+        assert_eq!(enc.primary_key(), Some(K));
+        assert_eq!(enc.legacy_key(), Some(L));
+    }
 
     #[test]
     fn tainted_fields_diff_the_given_file() {

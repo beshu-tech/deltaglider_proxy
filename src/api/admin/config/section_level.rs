@@ -840,6 +840,15 @@ impl BackendEncryptionKeyProbe {
         self.named.get(name).copied().unwrap_or_default()
     }
 
+    /// No body to probe: every field reads as absent (keep).
+    pub(crate) fn empty() -> Self {
+        Self {
+            singleton: BackendKeyPresence::default(),
+            named: Default::default(),
+            buckets: Default::default(),
+        }
+    }
+
     /// The probe of one encryption site.
     pub(crate) fn for_site(&self, site: &crate::config::EncryptionSite) -> BackendKeyPresence {
         use crate::config::EncryptionSite as S;
