@@ -80,7 +80,7 @@ const ENCRYPTION_READS: Record<string, [number, string]> = {
   'components/BackendsPanel.tsx': [2, 'a backend card edits that backend\'s own encryption'],
   'components/CreateBucketModal.tsx': [1, 'the backend picker labels each backend with its own mode'],
   'components/MigrateBucketModal.tsx': [2, 'the target picker and the target backend\'s own mode'],
-  'components/bucketPolicyPayload.ts': [3, 'the bucket policy\'s own block, not a backend'],
+  'components/bucketPolicyPayload.ts': [4, 'the bucket policy\'s own block, not a backend'],
   'components/BucketCard.tsx': [3, 'a draft policy\'s own block, not a backend'],
   'adminApi/backends.ts': [2, 'the create request body'],
   'backendEncryptionPayload.ts': [1, 'the storage section body of a backend change'],

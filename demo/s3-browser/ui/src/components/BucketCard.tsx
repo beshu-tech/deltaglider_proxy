@@ -558,7 +558,8 @@ export default function BucketCard({
               <Text type="secondary" style={{ fontSize: 12 }}>
                 These settings carry the bucket&apos;s own encryption ({String(row?.encryption?.mode ?? '')}
                 {row?.encryption?.key_id ? `, key id ${String(row.encryption.key_id)}` : ''}). It applies
-                when the bucket is created.
+                when the bucket is created. The name cannot change while the settings hold a key;
+                to drop them, use Remove these settings in the menu below.
               </Text>
             </div>
           )}
@@ -746,16 +747,23 @@ export default function BucketCard({
                           onSelect: () => onPatch(resetRowFields(row)),
                         }]
                       : []),
-                    ...(onRemoveDraft && !hasOwnEncryption(row)
+                    ...(onRemoveDraft
                       ? [{
                           key: 'remove',
                           danger: true as const,
                           label: 'Remove these settings…',
-                          confirm: {
-                            title: 'Remove these settings?',
-                            content: 'The settings for this bucket name are removed when you review and apply.',
-                            okText: 'Remove',
-                          },
+                          confirm: hasOwnEncryption(row)
+                            ? {
+                                title: `Remove the settings and the encryption key of ${name}?`,
+                                content:
+                                  'No bucket with this name exists, so no object uses its key. The settings and the key are removed from the configuration at once (not when you review and apply). If you create this bucket later and want this key again, keep a copy of the key.',
+                                okText: 'Remove settings and key',
+                              }
+                            : {
+                                title: 'Remove these settings?',
+                                content: 'The settings for this bucket name are removed when you review and apply.',
+                                okText: 'Remove',
+                              },
                           onSelect: onRemoveDraft,
                         }]
                       : []),

@@ -50,9 +50,13 @@ import {
   buildBucketPayload,
   freshId,
   isAllDefaultRow,
+  hasOwnEncryption,
+  ownEncryptionMode,
   policyMustSurvive,
   policyToRow,
 } from './bucketPolicyPayload';
+import { getSectionVersioned } from '../adminApi';
+import { applySection, sectionApplyErrorText } from '../applySection';
 import { bucketsWhoseEncryptionChanged, dominantTransition, type ReencryptTransition } from '../bucketEncryption';
 import type { EffectiveEncryption } from '../adminApi';
 import { numericCompare } from '../utils';
@@ -92,7 +96,7 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
     confirmApply,
     loading,
     error,
-    refresh,
+    rebase,
   } = useSectionEditor<BucketWire, BucketPolicyRow[]>({
     section: 'storage',
     dirtyKey: 'storage/buckets',
@@ -243,7 +247,8 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
   // PUT): re-read the section and the origins, then offer the re-encrypt
   // job when the server's answer for the bucket changed.
   const onEncryptionApplied = async (bucket: string, before: EffectiveEncryption) => {
-    await refresh();
+    // Rebase, not reset: staged edits (if any appeared meanwhile) survive.
+    await rebase();
     const res = await originsQuery.refetch();
     const after = res.data?.buckets.find((o) => o.name === bucket)?.effective_encryption ?? null;
     const changed = bucketsWhoseEncryptionChanged(
@@ -257,6 +262,33 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
     const eff = effectiveByName.get(bucket);
     const transition: ReencryptTransition = !eff?.encrypts ? 'decrypt' : eff.legacy_key_id ? 'rotate' : 'encrypt';
     setReencrypt({ buckets: [bucket], transition });
+  };
+
+  // Settings with the bucket's own encryption for a bucket that does not
+  // exist: removed at once (the staged path would keep the block, see
+  // `policyMustSurvive`). No bucket, so no object uses the key, and the
+  // server lets it go without a key-removal confirmation. Removing a block
+  // that encrypts is a confirmed downgrade (the row's confirm dialog).
+  const removeSettingsWithKey = async (row: BucketPolicyRow) => {
+    const mode = ownEncryptionMode(row);
+    try {
+      const { version } = await getSectionVersioned('storage');
+      const resp = await applySection(
+        queryClient,
+        'storage',
+        { buckets: { [row.name]: null } },
+        version,
+        mode && mode !== 'none' ? { downgrades: [row.name] } : undefined
+      );
+      if (!resp.ok) {
+        message.error(resp.error || 'The proxy refused to remove the settings');
+        return;
+      }
+      message.success(`Settings of ${row.name} removed`);
+      await rebase();
+    } catch (e) {
+      message.error(sectionApplyErrorText(e, 'Failed to remove the settings'));
+    }
   };
 
   const addDraft = () => {
@@ -346,9 +378,13 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
               globalRatio={globalRatio}
               onPatch={(patch) => patchDraft(row._id, patch)}
               onPrefixesChange={prefixChangeForDraft(row._id)}
-              onDraftNameChange={(name) => handleDraftRename(row, name)}
-              onRemoveDraft={() =>
-                setRows((cur) => cur.filter((r) => r._id !== row._id))
+              // A policy with its own key keeps its name: a rename would
+              // move the key to another name (the server refuses it).
+              onDraftNameChange={hasOwnEncryption(row) ? undefined : (name) => handleDraftRename(row, name)}
+              onRemoveDraft={
+                hasOwnEncryption(row)
+                  ? () => void removeSettingsWithKey(row)
+                  : () => setRows((cur) => cur.filter((r) => r._id !== row._id))
               }
               availableBuckets={sortedReal.filter((b) => !rowByName.has(b))}
               inputRadius={inputRadius}

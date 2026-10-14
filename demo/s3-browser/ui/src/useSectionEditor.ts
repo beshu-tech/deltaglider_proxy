@@ -128,6 +128,13 @@ export interface UseSectionEditorResult<Local, Wire = Local> {
   confirmApply: () => Promise<boolean>;
   /** Manually re-fetch the section (rare — useful when external state changes). */
   refresh: () => Promise<void>;
+  /**
+   * Re-read server truth after a change that THIS tab applied through
+   * another request (a one-shot PUT of the same section): the snapshot
+   * moves to the server's value, and staged edits stay as dirty edits on
+   * top of it. `refresh` would drop them.
+   */
+  rebase: () => Promise<void>;
 }
 
 export function useSectionEditor<Wire, Local = Wire>(
@@ -373,5 +380,6 @@ export function useSectionEditor<Wire, Local = Wire>(
     cancelApply,
     confirmApply,
     refresh,
+    rebase: rebaseAfterApply,
   };
 }

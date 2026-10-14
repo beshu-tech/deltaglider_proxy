@@ -349,8 +349,11 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
               size="small"
               type="primary"
               loading={busy}
-              disabled={!change}
-              onClick={() => change && void review(change)}
+              // Staged edits elsewhere on the page wait for nothing: this
+              // change applies at once, so it waits for them instead.
+              disabled={!change || !!blockedReason}
+              title={blockedReason ?? undefined}
+              onClick={() => change && !blockedReason && void review(change)}
             >
               Review &amp; apply
             </Button>
@@ -369,6 +372,12 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
         onApply={() => {
           const c = dialog?.change;
           if (!c) return;
+          // Staged edits appeared while the dialog was open: do not apply.
+          if (blockedReason) {
+            setDialog(null);
+            setError(blockedReason);
+            return;
+          }
           void apply(c).then(() => setDialog(null));
         }}
       />

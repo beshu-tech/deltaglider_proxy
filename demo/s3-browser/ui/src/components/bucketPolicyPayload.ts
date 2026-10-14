@@ -111,6 +111,12 @@ export function hasOwnEncryption(row: Pick<BucketPolicyRow, 'encryption'> | null
   return row?.encryption != null;
 }
 
+/** The mode of the row's own encryption block, if it has one. */
+export function ownEncryptionMode(row: Pick<BucketPolicyRow, 'encryption'>): string | null {
+  const mode = (row.encryption as { mode?: unknown } | null | undefined)?.mode;
+  return typeof mode === 'string' ? mode : null;
+}
+
 /** Whether a server policy must survive every apply of this panel: it has
  *  the bucket's own encryption (its keys) or a field this panel does not
  *  model. Such a policy is never sent as `null`. */

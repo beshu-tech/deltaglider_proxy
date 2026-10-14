@@ -21,8 +21,10 @@ const BACKEND = {
 
 let http: ReturnType<typeof mockFetch>;
 let applied = false;
+let ghostRemoved = false;
 beforeEach(() => {
   applied = false;
+  ghostRemoved = false;
   http = mockFetch();
   http.on('GET', '/_/api/admin/config', json({ env_overrides: [], max_delta_ratio: 0.75, backends: [BACKEND], default_backend: 'hetzner-fsn1' }));
   http.on('GET', '/_/api/admin/backends', json({ backends: [BACKEND], default_backend: 'hetzner-fsn1' }));
@@ -35,13 +37,21 @@ beforeEach(() => {
     }),
   );
   http.on('GET', SECTION, () =>
-    json(applied ? { buckets: { 'db-archive': { backend: 'hetzner-fsn1', encryption: { mode: 'aes256-gcm-proxy', key_id: 'db-archive-2026-10' } } } } : { buckets: {} }),
+    json({
+      buckets: {
+        ...(applied ? { 'db-archive': { backend: 'hetzner-fsn1', encryption: { mode: 'aes256-gcm-proxy', key_id: 'db-archive-2026-10' } } } : {}),
+        // Settings with a key for a bucket that does not exist.
+        ...(ghostRemoved ? {} : { ghost: { backend: 'hetzner-fsn1', encryption: { mode: 'aes256-gcm-proxy', key_id: 'ghost-2026-10' } } }),
+      },
+    }),
   );
   http.on('GET', '/_/api/admin/config/section/advanced', json({}));
   http.on('GET', '/_/api/admin/jobs', json({ jobs: [] }));
   http.on('POST', '/_/api/admin/config/section/storage/validate', json({ ok: true, diff: { storage: { 'buckets.db-archive.encryption': { before: null, after: 'x' } } } }));
-  http.on('PUT', SECTION, () => {
-    applied = true;
+  http.on('PUT', SECTION, (req) => {
+    const b = (req.body as { buckets: Record<string, unknown> }).buckets;
+    if ('ghost' in b && b.ghost === null) ghostRemoved = true;
+    else applied = true;
     return json({ ok: true });
   });
 });
@@ -87,4 +97,37 @@ test('after enabling a bucket key, the page offers the re-encrypt job for that b
   expect(within(modal).queryByRole('checkbox', { name: 'downloads' })).toBeNull();
   // The card shows the server's new answer.
   await waitFor(() => expect(screen.getAllByText('Encrypted · bucket key db-archive-2026-10').length).toBeGreaterThan(0));
+});
+
+/** Review P2, defect 4: an open editor cannot apply while staged edits wait. */
+test('review & apply waits for staged edits', async () => {
+  renderWithQuery(<BucketsPanel />);
+  const user = await expand('db-archive');
+  await user.click(await screen.findByText('Encrypt with a bucket key'));
+  const key = (screen.getByLabelText('Generated key') as HTMLTextAreaElement).value;
+  await user.type(screen.getByLabelText('Last 6 characters of the key'), key.slice(-6));
+  const review = screen.getByRole('button', { name: 'Review & apply' });
+  await waitFor(() => expect(review).toBeEnabled());
+  await user.click(screen.getByText('Entire bucket public'));
+  await waitFor(() => expect(review).toBeDisabled());
+});
+
+/** Review P2, defect 2: settings with a key for a bucket that does not
+ *  exist can be removed, at once, with a confirmation that says so; the
+ *  name cannot change (a rename would move the key). */
+test('settings with a key for a missing bucket can be removed', async () => {
+  renderWithQuery(<BucketsPanel />);
+  const user = await expand('ghost');
+  expect(screen.queryByRole('combobox', { name: 'Bucket name' })).toBeNull();
+  await user.click(screen.getByRole('button', { name: 'More actions for bucket ghost' }));
+  await user.click(await screen.findByText('Remove these settings…'));
+  const dialogs = await screen.findAllByRole('dialog');
+  const dialog = dialogs[dialogs.length - 1];
+  expect(dialog).toHaveTextContent(/No bucket with this name exists, so no object uses its key/);
+  await user.click(within(dialog).getByRole('button', { name: 'Remove settings and key' }));
+  await waitFor(() => expect(http.callsTo('PUT', SECTION)).toHaveLength(1));
+  const put = http.callsTo('PUT', SECTION)[0];
+  expect(put.body).toEqual({ buckets: { ghost: null } });
+  expect(put.headers['x-dgp-confirm-encryption-downgrade']).toBe('ghost');
+  expect(put.headers['x-dgp-confirm-key-removal']).toBeUndefined();
 });
