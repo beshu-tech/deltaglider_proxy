@@ -26,7 +26,7 @@ pub(crate) mod xattr_meta;
 
 pub use encrypting::{
     BucketKeys, EncryptingBackend, EncryptionConfig, EncryptionKey, EncryptionPolicies, PolicySlot,
-    WitnessGate, WriteMode,
+    WitnessGate, WitnessGateState, WriteMode, WITNESS_BACKEND_DEFAULT,
 };
 #[cfg(test)]
 pub(crate) use filesystem::fault::{fail_io, Fault, FaultPoint, Faults, FaultyFs, Hook};

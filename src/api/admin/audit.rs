@@ -42,3 +42,19 @@ pub async fn get_audit(AdminQuery(q): AdminQuery<AuditQuery>) -> impl IntoRespon
         })),
     )
 }
+
+/// GET /_/api/admin/encryption-witness — the full verdict of the
+/// multi-instance encryption witness (issue #116 P3): status, the buckets
+/// this instance refuses with both encryptions, and the last sync error.
+/// `/_/ready` shows the status only (it is unauthenticated). `null` on a
+/// single instance.
+pub async fn get_encryption_witness(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<super::AdminState>>,
+) -> impl IntoResponse {
+    let status = state
+        .s3_state
+        .encryption_witness
+        .as_ref()
+        .map(|w| w.status());
+    (StatusCode::OK, Json(status))
+}

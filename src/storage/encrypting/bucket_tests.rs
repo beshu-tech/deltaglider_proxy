@@ -272,3 +272,91 @@ async fn multipart_complete_follows_the_buckets_policy() {
         "{err}"
     );
 }
+
+/// Review of P3: the witness gate lived in `write_key`, so the writes that
+/// do not encrypt (a folder marker, a metadata rewrite: on S3 a self-copy
+/// with this node's SSE headers) went through on a refused bucket.
+#[tokio::test]
+async fn a_witness_refusal_stops_every_write_also_a_folder_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = FilesystemBackend::new(dir.path().to_path_buf())
+        .await
+        .unwrap();
+    let gate = Arc::new(WitnessGate::default());
+    let wrapper = EncryptingBackend::new(fs, Arc::new(ArcSwap::new(Arc::new(two_keys()))))
+        .with_witness("local-disk", gate.clone());
+    wrapper.create_bucket("releases").await.unwrap();
+    gate.activate(std::time::Duration::from_secs(60));
+    gate.synced();
+    gate.set(WitnessGateState {
+        refused: HashMap::from([(
+            ("local-disk".to_string(), "releases".to_string()),
+            "mismatch".to_string(),
+        )]),
+        witnessed: Default::default(),
+    });
+    let marker = wrapper.put_directory_marker("releases", "dir/").await;
+    assert!(
+        matches!(marker, Err(StorageError::WritesRefused(ref m)) if m == "mismatch"),
+        "{marker:?}"
+    );
+    let put = wrapper
+        .put_passthrough(
+            "releases",
+            "",
+            "x.txt",
+            bytes::Bytes::from_static(b"x"),
+            &meta("x.txt", 1),
+        )
+        .await;
+    assert!(
+        matches!(put, Err(StorageError::WritesRefused(_))),
+        "{put:?}"
+    );
+}
+
+/// Source guard: every write method of `StorageBackend` is overridden by
+/// the encrypting wrapper and calls the witness check first. A new write
+/// method fails here until it does.
+#[test]
+fn every_write_method_checks_the_witness() {
+    let traits = std::fs::read_to_string("src/storage/traits.rs").unwrap();
+    let wrapper = std::fs::read_to_string("src/storage/encrypting/mod.rs").unwrap();
+    // Trait defaults that only delegate to a checked method.
+    let delegating = ["put_reference_from_file"];
+    let prefixes = [
+        "put_",
+        "write_",
+        "copy_",
+        "create_multipart",
+        "upload_part",
+        "complete_multipart",
+    ];
+    let mut missing = Vec::new();
+    for line in traits.lines() {
+        let t = line.trim_start();
+        let Some(rest) = t
+            .strip_prefix("fn ")
+            .or_else(|| t.strip_prefix("async fn "))
+        else {
+            continue;
+        };
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !prefixes.iter().any(|p| name.starts_with(p)) || delegating.contains(&name.as_str()) {
+            continue;
+        }
+        let Some(at) = wrapper.find(&format!("    async fn {name}(")) else {
+            missing.push(format!("{name}: not overridden"));
+            continue;
+        };
+        let body_start = wrapper[at..].find("{\n").map(|i| at + i).unwrap();
+        let first = wrapper[body_start + 2..].lines().next().unwrap_or("");
+        if !first.contains("self.check_witness(") {
+            missing.push(format!("{name}: first line is `{}`", first.trim()));
+        }
+    }
+    assert!(missing.is_empty(), "{missing:?}");
+}

@@ -357,31 +357,101 @@ async fn split_chunked_header(
     Ok((base_iv, Box::pin(frames)))
 }
 
-/// The stored buckets whose writes this node refuses, because its
-/// encryption of them disagrees with the one that the instances share
-/// (the multi-instance encryption witness, issue #116 P3). Indexed by
-/// `(raw backend, real bucket)`; the value is the refusal message. Empty
-/// on a single instance.
+/// The stored buckets whose writes this node refuses (the multi-instance
+/// encryption witness, issue #116 P3). Indexed by `(raw backend, real
+/// bucket)`; the bucket `*` stands for every bucket on the backend that has
+/// no entry of its own. Inactive (refuses nothing) on a single instance.
 #[derive(Default)]
 pub struct WitnessGate {
-    refused: ArcSwap<std::collections::HashMap<(String, String), String>>,
+    state: ArcSwap<WitnessGateState>,
+    /// Unix ms of the last successful sync; 0 = never.
+    last_ok_ms: std::sync::atomic::AtomicI64,
+    /// How long a sync verdict holds; 0 = gate inactive.
+    ttl_ms: std::sync::atomic::AtomicI64,
+}
+
+/// What the witness decided at its last judgement.
+#[derive(Default, Clone, Debug)]
+pub struct WitnessGateState {
+    /// Storages this node refuses, with the refusal message.
+    pub refused: std::collections::HashMap<(String, String), String>,
+    /// Storages the witness covers: when the last successful sync is older
+    /// than the TTL, writes to them are refused (the holder stops before
+    /// its heartbeat lapses and a peer may take over).
+    pub witnessed: std::collections::HashSet<(String, String)>,
+}
+
+/// The bucket name that stands for a backend's buckets with no entry.
+pub const WITNESS_BACKEND_DEFAULT: &str = "*";
+
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 impl WitnessGate {
-    /// Replace the refused set.
-    pub fn set(&self, refused: std::collections::HashMap<(String, String), String>) {
-        self.refused.store(Arc::new(refused));
+    /// Turn the gate on with a verdict lifetime of `ttl`. Until the first
+    /// successful sync, every witnessed storage is refused (fail closed).
+    pub fn activate(&self, ttl: std::time::Duration) {
+        use std::sync::atomic::Ordering;
+        self.ttl_ms
+            .store((ttl.as_millis() as i64).max(1), Ordering::Relaxed);
+    }
+
+    /// Replace the judgement.
+    pub fn set(&self, state: WitnessGateState) {
+        self.state.store(Arc::new(state));
+    }
+
+    /// Record a successful sync (the verdict is fresh from now).
+    pub fn synced(&self) {
+        self.last_ok_ms
+            .store(unix_ms(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Pure lookup of `(backend, bucket)` in `map`, with the backend's `*`
+    /// entry standing for a bucket that has none of its own.
+    fn lookup<'a, V>(
+        map: impl Fn(&(String, String)) -> Option<&'a V>,
+        has_own: impl Fn(&(String, String)) -> bool,
+        backend: &str,
+        bucket: &str,
+    ) -> Option<&'a V> {
+        let own = (backend.to_string(), bucket.to_string());
+        if has_own(&own) {
+            return map(&own);
+        }
+        map(&(backend.to_string(), WITNESS_BACKEND_DEFAULT.to_string()))
     }
 
     /// The refusal of a write to `bucket` on `backend`, if any.
     pub fn refusal(&self, backend: &str, bucket: &str) -> Option<String> {
-        let refused = self.refused.load();
-        if refused.is_empty() {
+        use std::sync::atomic::Ordering;
+        let ttl = self.ttl_ms.load(Ordering::Relaxed);
+        if ttl == 0 {
             return None;
         }
-        refused
-            .get(&(backend.to_string(), bucket.to_string()))
-            .cloned()
+        let st = self.state.load();
+        let key = |b: &str| (backend.to_string(), b.to_string());
+        let own = key(bucket);
+        let witnessed_own = st.witnessed.contains(&own);
+        let has_own = |k: &(String, String)| st.refused.contains_key(k) || st.witnessed.contains(k);
+        if let Some(msg) = Self::lookup(|k| st.refused.get(k), has_own, backend, bucket) {
+            return Some(msg.clone());
+        }
+        let witnessed = witnessed_own || st.witnessed.contains(&key(WITNESS_BACKEND_DEFAULT));
+        let age = unix_ms() - self.last_ok_ms.load(Ordering::Relaxed);
+        (witnessed && age > ttl).then(|| {
+            format!(
+                "bucket '{bucket}' on backend '{backend}': this instance cannot confirm that \
+                 its encryption of the bucket agrees with the other instances (no successful \
+                 check of the coordination bucket for {}s), so it refuses writes to the bucket \
+                 until a check succeeds. Reads keep working",
+                age / 1000
+            )
+        })
     }
 }
 
@@ -399,6 +469,23 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             inner,
             config,
             witness: None,
+        }
+    }
+
+    /// THE witness check (issue #116 P3): a node whose encryption of this
+    /// bucket disagrees with the other instances (or cannot confirm that it
+    /// agrees) never writes it, also not a metadata rewrite or a folder
+    /// marker (an S3 self-copy carries this node's SSE headers). Every
+    /// mutating method calls it first (source guard
+    /// `every_write_method_checks_the_witness`).
+    fn check_witness(&self, bucket: &str) -> Result<(), StorageError> {
+        match self
+            .witness
+            .as_ref()
+            .and_then(|(name, gate)| gate.refusal(name, bucket))
+        {
+            Some(msg) => Err(StorageError::WritesRefused(msg)),
+            None => Ok(()),
         }
     }
 
@@ -494,15 +581,7 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         &self,
         bucket: &str,
     ) -> Result<Option<(EncryptionKey, Option<String>)>, StorageError> {
-        // A node whose encryption of this bucket disagrees with the other
-        // instances never writes it (issue #116 P3): one bucket, one form.
-        if let Some(msg) = self
-            .witness
-            .as_ref()
-            .and_then(|(name, gate)| gate.refusal(name, bucket))
-        {
-            return Err(StorageError::WritesRefused(msg));
-        }
+        self.check_witness(bucket)?;
         let cfg = self.config.load();
         let (mode, key, key_id) = match cfg.buckets.get(bucket) {
             Some(b) => (b.write_mode, &b.key, &b.key_id),
@@ -919,6 +998,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         metadata: &FileMetadata,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
+        self.check_witness(bucket)?;
         let mut meta = without_markers(metadata);
         let enc = self.encrypt_if_enabled(bucket, &data, &mut meta)?;
         self.inner
@@ -940,6 +1020,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         source: &FileMetadata,
         metadata: &FileMetadata,
     ) -> Result<super::traits::CopyOutcome, StorageError> {
+        self.check_witness(dst.bucket)?;
         // The destination bucket's own write policy (issue #116).
         let write_key_id = self.write_key(dst.bucket)?.map(|(_, id)| id);
         let same_form = match (&write_key_id, is_encrypted(source)) {
@@ -965,6 +1046,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         metadata: &FileMetadata,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
+        self.check_witness(bucket)?;
         let mut meta = without_markers(metadata);
         let enc = self.encrypt_if_enabled(bucket, &data, &mut meta)?;
         self.inner
@@ -980,6 +1062,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         data: bytes::Bytes,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
+        self.check_witness(bucket)?;
         let mut meta = without_markers(metadata);
         let enc = self.encrypt_if_enabled(bucket, &data, &mut meta)?;
         self.inner
@@ -1004,6 +1087,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         metadata: &FileMetadata,
         spool: SpoolBudget<'_>,
     ) -> Result<(), StorageError> {
+        self.check_witness(bucket)?;
         let Some((key, key_id)) = self.write_key(bucket)? else {
             return self
                 .inner
@@ -1053,6 +1137,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         metadata: &FileMetadata,
         spool: SpoolBudget<'_>,
     ) -> Result<(), StorageError> {
+        self.check_witness(bucket)?;
         let Some(write_key) = self.write_key(bucket)? else {
             return self
                 .inner
@@ -1130,6 +1215,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         chunks: &[Bytes],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
+        self.check_witness(bucket)?;
         let Some((key, key_id)) = self.write_key(bucket)? else {
             return self
                 .inner
@@ -1320,6 +1406,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         filename: &str,
         metadata: &FileMetadata,
     ) -> Result<MultipartUpload, StorageError> {
+        self.check_witness(bucket)?;
         // A refused write names its cause, not "multipart unsupported".
         self.write_key(bucket)?;
         if self.actively_encrypts(bucket) {
@@ -1340,6 +1427,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         part_number: i32,
         data: Bytes,
     ) -> Result<UploadedPart, StorageError> {
+        self.check_witness(&upload.bucket)?;
         self.inner
             .upload_part(upload, prefix, filename, part_number, data)
             .await
@@ -1354,6 +1442,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         assembled: &[Bytes],
         metadata: &FileMetadata,
     ) -> Result<String, StorageError> {
+        self.check_witness(&upload.bucket)?;
         // The bucket's write policy NOW. A config apply can change it
         // between create and complete: the new engine publishes its policy
         // into the slot that this (older) wrapper shares
@@ -1533,6 +1622,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         m: &FileMetadata,
         basis: &super::RewriteBasis,
     ) -> Result<(), StorageError> {
+        self.check_witness(b)?;
         // Metadata itself is not encrypted, but the RAW object carries the
         // encryption markers, and a caller-supplied FileMetadata built from a
         // decrypted read may lack them. Re-assert the markers from the raw
@@ -1560,6 +1650,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         m: &FileMetadata,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
+        self.check_witness(b)?;
         // Same rule as put_passthrough_metadata: the body is not rewritten,
         // so its markers stay those of the stored reference.
         let raw = self.inner.get_reference_metadata(b, p).await?;
@@ -1604,6 +1695,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         fence: &super::traits::RefFence,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<super::traits::RefFence, StorageError> {
+        self.check_witness(b)?;
         use super::traits::RefWrite;
         match op {
             RefWrite::Put { data, metadata } => {
@@ -1707,6 +1799,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         self.inner.total_size(b).await
     }
     async fn put_directory_marker(&self, b: &str, k: &str) -> Result<(), StorageError> {
+        self.check_witness(b)?;
         self.inner.put_directory_marker(b, k).await
     }
     async fn bulk_list_objects(

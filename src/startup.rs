@@ -1313,15 +1313,16 @@ pub fn encryption_witness_poll_interval() -> Duration {
 
 /// Build the multi-instance encryption witness (issue #116 P3) and run its
 /// first sync, before anything serves. No `config_sync_bucket` → `None`
-/// (single instance: nothing to agree with). The bucket was validated as
-/// CAS-capable once (`check`); a failed validation exits later, in the
-/// lease builder. A client that cannot be built, or a first sync that
-/// fails, is logged: the node then serves without a verdict (`/_/ready`
-/// reports `unknown`) and the poller tries again.
+/// (single instance: nothing to agree with). The gate starts CLOSED for the
+/// buckets this node witnesses (the buckets it encrypts and its bucket
+/// blocks): a client that cannot be built, or a first sync that fails,
+/// leaves those buckets refusing writes until a sync succeeds (owner
+/// decision: fail closed; other buckets are not affected).
 pub async fn build_encryption_witness(
     config: &Config,
     check: &CoordinationCheck,
     gate: Arc<deltaglider_proxy::storage::WitnessGate>,
+    config_path: Option<&str>,
 ) -> Option<Arc<deltaglider_proxy::coordination::EncryptionWitness>> {
     use deltaglider_proxy::coordination::{durable_node_id, process_boot_ids, EncryptionWitness};
     let sync_bucket = config
@@ -1329,31 +1330,47 @@ pub async fn build_encryption_witness(
         .as_ref()
         .filter(|b| !b.is_empty())?
         .clone();
-    if matches!(check, Some(Err(_))) {
-        warn!("Encryption witness: the coordination bucket failed validation; not started");
-        return None;
-    }
-    let dir = config_db_path()
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .to_path_buf();
-    let client = match ConfigDbSync::build_client(coordination_backend(config)).await {
+    let poll = encryption_witness_poll_interval();
+    let client = match (
+        check,
+        ConfigDbSync::build_client(coordination_backend(config)).await,
+    ) {
+        (Some(Err(e)), _) => Err(format!("the coordination bucket failed validation ({e})")),
+        (_, Err(e)) => Err(format!("the coordination client could not be built ({e})")),
+        (_, Ok(c)) => Ok(c),
+    };
+    let client = match client {
         Ok(c) => c,
         Err(e) => {
+            EncryptionWitness::close_gate(&gate, config, poll);
             error!(
-                "Encryption witness: coordination client build failed ({e}); per-bucket \
-                 encryption is NOT compared across instances"
+                "Encryption witness: {e}. The buckets whose encryption the instances must \
+                 agree on REFUSE WRITES until a restart with a working coordination bucket"
             );
             return None;
         }
     };
+    let dir = config_db_path()
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    // When this node's config last changed: the file's mtime. A takeover
+    // needs a config newer than the published entry, so a lagging node that
+    // restarts with its old file never reverts a newer intent.
+    let changed_at = config_path
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64);
     let witness = Arc::new(EncryptionWitness::new(
         client,
         sync_bucket.clone(),
         durable_node_id(&dir),
         process_boot_ids(&dir),
-        encryption_witness_poll_interval(),
+        poll,
         gate,
+        config,
+        changed_at,
     ));
     witness.forget_previous_boot().await;
     let mut last = Ok(());
@@ -1373,7 +1390,7 @@ pub async fn build_encryption_witness(
         ),
         Err(e) => error!(
             "Encryption witness: first sync on bucket '{sync_bucket}' failed ({e}); the \
-             poller tries again"
+             witnessed buckets refuse writes until a sync succeeds (the poller tries again)"
         ),
     }
     Some(witness)

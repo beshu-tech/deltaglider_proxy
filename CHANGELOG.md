@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Fixed — The encryption witness never lets a downgrade, a lagging instance or a stale check win
+
+A review of the encryption witness found these defects, now fixed:
+
+- An instance that started with `mode: none` for a bucket that the others encrypted by inheritance set the shared entry, so the encrypting instances refused writes and the downgrading one wrote plaintext. Now every instance seeds each bucket that it encrypts (its blocks, the buckets it names that inherit an encrypting backend, and each encrypting backend's buckets with no entry), and plaintext is never seeded.
+- When the only up-to-date instance stopped, a lagging instance took over and reverted a key rotation, and an instance with a missing key could take over too. A takeover now needs a config that changed after the shared entry, a usable key, no live writer of the shared encryption, and no downgrade. Each takeover writes the audit entry `bucket_encryption_witness_takeover`.
+- An instance whose check failed kept writing while its heartbeat expired. Now it refuses writes to the witnessed buckets once its last good check is two polls old, and an instance that cannot check at start refuses them until the first check succeeds.
+- A folder marker and a metadata rewrite went past the witness. Every write of the encrypting layer now checks it first (source guard).
+- Two instances with one key id and different keys agreed. The shared entry now carries a key check value (a truncated HMAC of the key).
+- A downgrade that the instances got by restart could not finish. An apply with `X-DGP-Confirm-Encryption-Downgrade` now publishes the confirmed buckets also when the config does not change.
+- `/_/ready` showed bucket names, key ids, KMS key ARNs, instance ids and SDK error dumps without a login. It now shows the status only; the details are in `GET /_/api/admin/encryption-witness`.
+
+**Upgrade note:** upgrade every instance before you add a per-bucket `encryption` block while `config_sync_bucket` is set. An older release ignores the witness.
+
+### Fixed — A new default backend is an encryption change
+
+A change of `default_backend`, or the move from an encrypting `storage.backend` to named backends, changes the encryption of every bucket that the config does not name. It had no subject, so the downgrade gate and the audit did not see it. Its subject is now `route:default`.
+
 ### Fixed — An unknown field in a backend or an encryption block is a load error
 
 `storage.backend.encryption:` (the singleton's encryption is `storage.backend_encryption`) and any other unknown field in a backend definition or an `encryption` block were dropped without a word, so a backend meant to encrypt stored plaintext. They now stop the start, fail `config lint` and refuse an apply, and the error names the field. **Upgrade note:** a config with such a field no longer starts; run `config lint` with the new binary first.

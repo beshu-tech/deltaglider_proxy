@@ -183,6 +183,7 @@ A change that makes a bucket store new objects in plaintext, where it encrypted 
 - The bucket's block is removed, and the backend of the bucket stores plaintext.
 - The bucket moves to a backend that stores plaintext (a changed `backend:`, or a migrate).
 - The backend's own encryption becomes `mode: none`. This is a downgrade for every bucket on that backend without its own block.
+- `default_backend` changes to a backend that stores plaintext, or the config moves from an encrypting `storage.backend` to named backends that store plaintext. This is a downgrade for every bucket that the config does not name. Its subject is `route:default`.
 
 To confirm, send the header `X-DGP-Confirm-Encryption-Downgrade: <subject>` with the request (comma-separated for several subjects), or use `config apply --confirm-encryption-downgrade <subject>`. The subject is the bucket name. For a backend's own downgrade, the subject is `backend:<name>`, and that one confirmation covers every bucket that inherits the backend's encryption. The refusal names the subject that it needs. Every config write runs this gate: the document apply, a section PUT, a field PATCH, the backend endpoints, a backup restore, and `config apply`. The migrate start (`POST /_/api/admin/buckets/<bucket>/migrate`) runs it too, and answers `400` without the confirmation; the flip at the end of the migrate is then not checked again. Objects stored before a downgrade keep their encryption, and they stay readable.
 
@@ -192,13 +193,15 @@ These gates run on an apply through the admin API. A proxy that starts from an e
 
 #### Audit entries
 
-Every change of a bucket's write encryption writes one audit entry, whatever the write path: a config apply, a section PUT, a field PATCH, the backend endpoints, a backup restore, or the flip of a migrate. The entry names the mode and the key id before and after the change, never key material. The action is one of these:
+Every change of a bucket's write encryption writes one audit entry per subject, whatever the write path: a config apply, a section PUT, a field PATCH, the backend endpoints, a backup restore, or the flip of a migrate. The entry names the mode and the key id before and after the change, never key material. The action is one of these:
 
 | Action | Change |
 |---|---|
 | `bucket_encryption_set` | From plaintext to an encrypting mode, or from one encrypting mode to another. |
 | `bucket_encryption_cleared` | From an encrypting mode to plaintext (a downgrade). |
 | `bucket_encryption_key_rotated` | The same mode with another key id (`kms_key_id` for SSE-KMS). |
+
+A change of a backend's own encryption therefore writes one entry for `backend:<name>` and one entry for each bucket that the config names and that inherits that encryption (1 + N entries). A change of `default_backend` writes one entry for `route:default`. With `config_sync_bucket` set, a takeover by the encryption witness writes `bucket_encryption_witness_takeover`.
 
 The target of the entry is `<subject>: <before> -> <after>`, for example `db-archive: aes256-gcm-proxy (key id 'db-archive-2026') -> none`. The subject is the bucket name, or `backend:<name>` for a change of the backend's own encryption. A change that the proxy makes by itself (the flip of a migrate) has the user `background`.
 
@@ -272,6 +275,10 @@ A multipart upload into a bucket with its own key is encrypted with that key. Th
 When a bucket moves to another backend (`POST /_/api/admin/buckets/<bucket>/migrate`), its `encryption` block moves with it. The copies on the target backend are written under the bucket's key, and the verify phase checks the at-rest form of each copy.
 
 A replication rule from a bucket that encrypts into a bucket that stores plaintext is allowed. `Config::check` reports a warning for it, because the copies are not encrypted at rest.
+
+## Key check value
+
+With `config_sync_bucket` set, the encryption witness publishes, for each proxy-AES key that a bucket writes with, a key check value (`kcv`) next to the key id: the first 8 bytes, in hex, of HMAC-SHA256 with the key as the HMAC key and the text `dgp-witness-kcv-v1` as the message. Two instances that use the same key id with different key bytes then disagree, and the witness refuses writes on the instance that differs. The value is a one-way function of the key, and only 64 bits of it are published, so it reveals nothing practical about a random 256-bit key. It also changes the audit entry of a change that keeps the key id but changes the key: that change is a `bucket_encryption_key_rotated`.
 
 ## Key IDs
 

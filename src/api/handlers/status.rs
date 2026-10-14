@@ -208,8 +208,17 @@ pub struct ReadinessResponse {
     /// `unknown`). A mismatch leaves the node READY: it refuses writes to
     /// those buckets only, and still serves their reads and every other
     /// bucket; a load balancer that removed it would drop all of that.
+    /// Public: the status only (`{"status": ...}`); bucket names, key ids
+    /// and errors are behind the admin session
+    /// (`GET /_/api/admin/encryption-witness`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub encryption_witness: Option<crate::coordination::WitnessStatus>,
+    pub encryption_witness: Option<WitnessReadiness>,
+}
+
+/// The public part of the encryption witness verdict.
+#[derive(Debug, Serialize)]
+pub struct WitnessReadiness {
+    pub status: &'static str,
 }
 
 /// Pure: the node is not ready when every backend with a verdict is gated
@@ -447,7 +456,9 @@ pub async fn readiness_check(
             config_db,
             jobs_db,
             backends,
-            encryption_witness: state.encryption_witness.as_ref().map(|w| w.status()),
+            encryption_witness: state.encryption_witness.as_ref().map(|w| WitnessReadiness {
+                status: w.status().status,
+            }),
         }),
     )
 }

@@ -8,7 +8,8 @@ pub use bucket_encryption::{BucketOverride, EncryptionSite};
 mod encryption_state;
 pub(crate) use encryption_state::confirmed_downgrades;
 pub use encryption_state::{
-    EncryptionChange, EncryptionChangeKind, WriteEncryption, CONFIRM_ENCRYPTION_DOWNGRADE_HEADER,
+    key_check_value, EncryptionChange, EncryptionChangeKind, WriteEncryption,
+    CONFIRM_ENCRYPTION_DOWNGRADE_HEADER, DEFAULT_ROUTE_SUBJECT,
 };
 mod keys;
 pub(crate) use keys::*;
@@ -749,7 +750,7 @@ impl BucketEncryption<'_> {
 
     /// The mode and the public key id that new writes use.
     pub fn write_encryption(&self) -> WriteEncryption {
-        WriteEncryption::of(self.config, self.site_keys().primary_id())
+        WriteEncryption::of(self.config, &self.site_keys())
     }
 }
 

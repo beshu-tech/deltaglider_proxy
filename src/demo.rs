@@ -343,6 +343,12 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         // (all admins see the same log so there's no per-identity
         // filtering to do at this layer).
         .route("/_/api/admin/audit", get(admin::get_audit))
+        // Encryption witness details (bucket names, key ids, errors): the
+        // unauthenticated `/_/ready` shows the status only.
+        .route(
+            "/_/api/admin/encryption-witness",
+            get(admin::get_encryption_witness),
+        )
         // Live admin session list + force-logout (revoke a stolen cookie / all
         // sessions of a compromised IAM key) without restarting the proxy.
         .route("/_/api/admin/sessions", get(admin::list_sessions))

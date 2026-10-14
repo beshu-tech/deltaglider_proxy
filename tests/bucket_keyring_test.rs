@@ -1208,11 +1208,16 @@ async fn a_migrate_onto_plaintext_needs_confirmation() {
 /// the test MinIO, the coordination bucket `coord`, and the data bucket
 /// `data` with the bucket policy `policy` (a YAML flow map).
 async fn ha_node(node: &str, coord: &str, data: &str, policy: &str) -> Env {
+    ha_node_with(node, coord, data, policy, "").await
+}
+
+/// [`ha_node`] with extra `storage:` lines (2-space indented).
+async fn ha_node_with(node: &str, coord: &str, data: &str, policy: &str, storage: &str) -> Env {
     let tmp = tempfile::TempDir::new().unwrap();
     let doc = format!(
         "access:\n  access_key_id: {}\n  secret_access_key: {}\n\
          storage:\n  backend:\n    type: s3\n    endpoint: \"{}\"\n    region: us-east-1\n    \
-         force_path_style: true\n    access_key_id: {}\n    secret_access_key: {}\n  \
+         force_path_style: true\n    access_key_id: {}\n    secret_access_key: {}\n{storage}  \
          buckets:\n    {data}: {policy}\n\
          advanced:\n  listen_addr: {}\n  bootstrap_password_hash: \"{}\"\n  config_sync_bucket: {coord}\n",
         AUTH.0,
@@ -1258,15 +1263,38 @@ impl Env {
         )
     }
 
-    /// The `encryption_witness.status` of `/_/ready`.
+    /// The witness verdict from the admin API (`/_/ready` shows the status
+    /// only, and no bucket name).
     async fn witness(&self) -> serde_json::Value {
-        reqwest::get(format!("{}/_/ready", self.server.endpoint()))
+        let ready = reqwest::get(format!("{}/_/ready", self.server.endpoint()))
             .await
             .unwrap()
             .json::<serde_json::Value>()
             .await
             .unwrap()["encryption_witness"]
-            .clone()
+            .clone();
+        let full: serde_json::Value = self
+            .admin
+            .get(format!(
+                "{}/_/api/admin/encryption-witness",
+                self.server.endpoint()
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            ready
+                .as_object()
+                .map(|o| o.keys().cloned().collect::<Vec<_>>()),
+            Some(vec!["status".to_string()]),
+            "/_/ready shows the status only: {ready}"
+        );
+        // The two answers can straddle a poll; the status of the full one
+        // is what the caller judges.
+        full
     }
 
     /// Wait until the witness verdict is `status` (the poll runs every 1 s).
@@ -1415,6 +1443,9 @@ async fn the_witness_follows_a_rollout_when_the_old_writers_are_gone_minio() {
         format!("{{ encryption: {{ mode: aes256-gcm-proxy, key: \"{KB}\", key_id: ha-b }} }}");
     let a = ha_node("node-a", &coord, &data, &old).await;
     a.wait_witness("agree").await;
+    // B's config file is written after A's entry: newer (a takeover needs
+    // that; the server clock has 1 s resolution).
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let b = ha_node("node-b", &coord, &data, &block(KC, "ha-c")).await;
     b.wait_witness("mismatch").await;
     // Still refused a few polls later: A is live and holds `ha-b`.
@@ -1426,4 +1457,105 @@ async fn the_witness_follows_a_rollout_when_the_old_writers_are_gone_minio() {
     let (code, body) = b.raw_put(&data, "x.txt", b"after the rollout").await;
     assert_eq!(code, 200, "{body}");
     assert_eq!(b.at_rest(&data, "x.txt").await.as_deref(), Some("ha-c"));
+}
+
+/// Review of P3 (probe-verified): a node that booted with `mode: none` on
+/// a bucket that the other node encrypts by INHERITANCE (no block) was the
+/// first writer of its entry, the encrypting node went mismatch, and the
+/// downgrading node wrote plaintext. Now the inheriting node seeds the
+/// entry, so the downgrading node is the one that refuses. The supported
+/// path to finish a downgrade: an apply with the confirmation publishes it
+/// even when the node's config does not change.
+#[tokio::test]
+async fn the_witness_never_lets_a_downgrade_win_by_boot_minio() {
+    skip_unless_minio!();
+    let coord = common::unique_bucket("enc-witness");
+    common::minio_client()
+        .await
+        .create_bucket()
+        .bucket(&coord)
+        .send()
+        .await
+        .expect("create the coordination bucket");
+    let data = common::unique_bucket("enc-data");
+    // A: the bucket inherits an encrypting singleton backend.
+    let a = ha_node_with(
+        "node-a",
+        &coord,
+        &data,
+        "{}",
+        &format!(
+            "  backend_encryption: {{ mode: aes256-gcm-proxy, key: \"{KB}\", key_id: ha-b }}\n"
+        ),
+    )
+    .await;
+    a.wait_witness("agree").await;
+    // B boots later with the bucket set to plaintext.
+    let b = ha_node_with(
+        "node-b",
+        &coord,
+        &data,
+        &format!("{{ encryption: {{ mode: none, legacy_key: \"{KB}\", legacy_key_id: ha-b }} }}"),
+        &format!(
+            "  backend_encryption: {{ mode: aes256-gcm-proxy, key: \"{KB}\", key_id: ha-b }}\n"
+        ),
+    )
+    .await;
+    b.wait_witness("mismatch").await;
+    assert_eq!(b.raw_put(&data, "b.txt", b"plaintext?").await.0, 503);
+    assert_eq!(a.witness().await["status"], "agree");
+    assert_eq!(a.raw_put(&data, "a.txt", b"encrypted").await.0, 200);
+    assert_eq!(a.at_rest(&data, "a.txt").await.as_deref(), Some("ha-b"));
+
+    // The supported downgrade: an apply on B with the confirmation, and no
+    // config change, publishes plaintext; A then refuses until it agrees.
+    let (code, v) = b
+        .storage_patch_with(
+            json!({}),
+            &[("X-DGP-Confirm-Encryption-Downgrade", data.as_str())],
+        )
+        .await;
+    assert!(code == 200, "{code} {v}");
+    b.wait_witness("agree").await;
+    assert_eq!(b.raw_put(&data, "b.txt", b"plaintext").await.0, 200);
+    a.wait_witness("mismatch").await;
+    assert_eq!(a.raw_put(&data, "a2.txt", b"refused").await.0, 503);
+}
+
+/// Review of P3 (probe-verified): when the only up-to-date node stopped,
+/// a lagging node took over and reverted a key rotation. A takeover needs
+/// a config newer than the published entry: the lagging node's config is
+/// older than the rotation, so it keeps refusing.
+#[tokio::test]
+async fn a_lagging_instance_never_reverts_a_rotation_minio() {
+    skip_unless_minio!();
+    let coord = common::unique_bucket("enc-witness");
+    common::minio_client()
+        .await
+        .create_bucket()
+        .bucket(&coord)
+        .send()
+        .await
+        .expect("create the coordination bucket");
+    let data = common::unique_bucket("enc-data");
+    let old =
+        format!("{{ encryption: {{ mode: aes256-gcm-proxy, key: \"{KB}\", key_id: ha-b }} }}");
+    let a = ha_node("node-a", &coord, &data, &old).await;
+    a.wait_witness("agree").await;
+    let b = ha_node("node-b", &coord, &data, &old).await;
+    b.wait_witness("agree").await;
+    // A rotates (after B's config was written).
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    a.storage_patch_ok(
+        json!({ "buckets": { data.as_str(): { "encryption": override_json(KC, "ha-c") } } }),
+    )
+    .await;
+    b.wait_witness("mismatch").await;
+    drop(a);
+    // Well past A's heartbeat TTL (3 polls of 1 s).
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    let w = b.witness().await;
+    assert_eq!(w["status"], "mismatch", "{w}");
+    assert_eq!(w["mismatches"][0]["published"]["key_id"], "ha-c", "{w}");
+    assert_eq!(b.raw_put(&data, "x.txt", b"refused").await.0, 503);
 }

@@ -798,10 +798,12 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Multi-instance encryption witness (issue #116 P3): the first sync
     // runs before anything serves, so a node that disagrees with the
     // others about a bucket's encryption never takes a write to it.
+    let witness_config_path = cli.config.clone().or_else(Config::resolve_config_path);
     let encryption_witness = startup::build_encryption_witness(
         &config,
         &coordination_check,
         engine.encryption_policies().witness_gate(),
+        witness_config_path.as_deref(),
     )
     .await;
     let state = Arc::new(AppState {

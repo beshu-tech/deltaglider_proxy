@@ -44,7 +44,7 @@ use crate::usage_scanner::UsageScanner;
 pub use error::{AdminError, Bare, CodedJson, ErrorBody, JsonError, Text};
 
 // Re-export everything so external code doesn't need import changes.
-pub use audit::get_audit;
+pub use audit::{get_audit, get_encryption_witness};
 pub use auth::{
     browser_session_connect, check_session, clear_s3_session_creds, get_s3_session_creds, login,
     login_as, logout, open_browser_connect, require_admin_gui_session, require_bulk_session,

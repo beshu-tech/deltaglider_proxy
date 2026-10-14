@@ -26,21 +26,51 @@ pub struct WriteEncryption {
     /// key (every write is refused then).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_id: Option<String>,
+    /// The key check value of a proxy key ([`key_check_value`]): two
+    /// configs with one key id and different key bytes differ here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kcv: Option<String>,
+}
+
+/// The key check value of a proxy key: the first 8 bytes of
+/// HMAC-SHA256(key, "dgp-witness-kcv-v1"), in hex. It tells two keys
+/// apart and reveals nothing practical about a random 256-bit key (a
+/// one-way function of it, and only 64 bits of the output).
+pub fn key_check_value(key: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(key).expect("HMAC takes any key");
+    mac.update(b"dgp-witness-kcv-v1");
+    hex::encode(&mac.finalize().into_bytes()[..8])
 }
 
 impl WriteEncryption {
-    /// The write encryption of `enc`, whose primary key resolves to
-    /// `primary_id` (see `resolve_site_keys`).
-    pub fn of(enc: &BackendEncryptionConfig, primary_id: Option<&str>) -> Self {
-        let key_id = match enc {
-            BackendEncryptionConfig::Aes256GcmProxy { .. } => primary_id.map(str::to_string),
-            BackendEncryptionConfig::SseKms { kms_key_id, .. } => Some(kms_key_id.clone()),
-            BackendEncryptionConfig::None { .. } | BackendEncryptionConfig::SseS3 { .. } => None,
+    /// The write encryption of `enc`, whose keys resolve to `keys` (see
+    /// `resolve_site_keys`).
+    pub(crate) fn of(enc: &BackendEncryptionConfig, keys: &SiteKeys) -> Self {
+        let primary = match &keys.primary {
+            Some(Ok(k)) => Some(k),
+            _ => None,
+        };
+        let (key_id, kcv) = match enc {
+            BackendEncryptionConfig::Aes256GcmProxy { .. } => (
+                primary.map(|k| k.key_id.clone()),
+                primary.map(|k| key_check_value(&k.key.0)),
+            ),
+            BackendEncryptionConfig::SseKms { kms_key_id, .. } => (Some(kms_key_id.clone()), None),
+            BackendEncryptionConfig::None { .. } | BackendEncryptionConfig::SseS3 { .. } => {
+                (None, None)
+            }
         };
         Self {
             mode: enc.mode_tag().to_string(),
             key_id,
+            kcv,
         }
+    }
+
+    /// A proxy mode with no usable key: every write is refused.
+    pub fn refuses_writes(&self) -> bool {
+        self.mode == "aes256-gcm-proxy" && self.key_id.is_none()
     }
 
     /// False only for plaintext writes (`mode: none`). A proxy mode with no
@@ -107,6 +137,10 @@ impl EncryptionChange {
     }
 }
 
+/// The subject of the buckets that no config names and that follow the
+/// default route (`default_backend`).
+pub const DEFAULT_ROUTE_SUBJECT: &str = "route:default";
+
 /// The request header that confirms a downgrade: subjects, comma-separated.
 /// `config apply --confirm-encryption-downgrade <subject>` sends it.
 pub const CONFIRM_ENCRYPTION_DOWNGRADE_HEADER: &str = "x-dgp-confirm-encryption-downgrade";
@@ -145,7 +179,7 @@ impl Config {
                     _ => return None,
                 };
                 let keys = resolve_site_keys(KeyScope::Backend(&name), enc);
-                Some((name, WriteEncryption::of(enc, keys.primary_id())))
+                Some((name, WriteEncryption::of(enc, &keys)))
             })
             .collect()
     }
@@ -172,6 +206,23 @@ impl Config {
                     after: a.clone(),
                     kind,
                 });
+            }
+        }
+        // The buckets that no config names follow the default route: a new
+        // default backend (or the move from the singleton to named
+        // backends) changes their encryption with no backend subject.
+        let (od, nd) = (old.default_backend_name(), self.default_backend_name());
+        if od != nd {
+            if let (Some(b), Some(a)) = (before.get(&od), after.get(&nd)) {
+                if let Some(kind) = change_kind(b, a) {
+                    out.push(EncryptionChange {
+                        subject: DEFAULT_ROUTE_SUBJECT.to_string(),
+                        bucket: None,
+                        before: b.clone(),
+                        after: a.clone(),
+                        kind,
+                    });
+                }
             }
         }
         let names: std::collections::BTreeSet<&String> =
@@ -244,6 +295,11 @@ impl Config {
             }
             let what = match &c.bucket {
                 Some(b) => format!("bucket '{b}'"),
+                None if c.subject == DEFAULT_ROUTE_SUBJECT => {
+                    "every bucket that the config does not name (they follow the default \
+                     backend)"
+                        .to_string()
+                }
                 None => format!(
                     "every bucket on backend '{}' without its own encryption block",
                     c.subject.trim_start_matches("backend:")
@@ -288,6 +344,16 @@ mod tests {
             "storage:\n  backends:\n    - name: local-disk\n      type: filesystem\n      path: /tmp/dgp-enc-state-a\n{local_enc}    - name: hetzner-fsn1\n      type: filesystem\n      path: /tmp/dgp-enc-state-b\n  default_backend: local-disk\n  buckets:\n{buckets}"
         ))
         .unwrap()
+    }
+
+    trait WithDefault {
+        fn with_default(self, name: &str) -> Config;
+    }
+    impl WithDefault for Config {
+        fn with_default(mut self, name: &str) -> Config {
+            self.default_backend = Some(name.to_string());
+            self
+        }
     }
 
     fn aes(key: &str, id: &str) -> String {
@@ -391,6 +457,68 @@ mod tests {
         assert!(none
             .unconfirmed_encryption_downgrades(&old, None)
             .is_empty());
+    }
+
+    /// Review of P3: the buckets that no config names had no subject, so a
+    /// new default backend or the move from an encrypted singleton to
+    /// plaintext named backends passed with no change and no gate.
+    #[test]
+    fn the_default_route_is_a_subject() {
+        let enc_default = cfg(
+            &local_aes(KA, "local-a"),
+            "    releases: { backend: local-disk }\n",
+        )
+        .with_default("local-disk");
+        let plain_default = enc_default.clone().with_default("hetzner-fsn1");
+        let changes = plain_default.encryption_changes(&enc_default);
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.subject == DEFAULT_ROUTE_SUBJECT
+                    && c.kind == EncryptionChangeKind::Cleared),
+            "{changes:?}"
+        );
+        let errs = plain_default.unconfirmed_encryption_downgrades(&enc_default, Some(&[]));
+        assert!(errs.iter().any(|e| e.contains("route:default")), "{errs:?}");
+        assert!(plain_default
+            .unconfirmed_encryption_downgrades(&enc_default, Some(&["route:default".into()]))
+            .is_empty());
+        // Singleton `backend_encryption: aes` → named plaintext backends.
+        let singleton = Config::from_yaml_str(&format!(
+            "storage:\n  filesystem: /tmp/dgp-enc-state-s\n  backend_encryption: {}\n",
+            aes(KA, "single-a")
+        ))
+        .unwrap();
+        let named = cfg("", "    releases: { backend: local-disk }\n");
+        let errs = named.unconfirmed_encryption_downgrades(&singleton, Some(&[]));
+        assert!(errs.iter().any(|e| e.contains("route:default")), "{errs:?}");
+    }
+
+    /// Two configs with one key id and different key bytes differ (KCV).
+    #[test]
+    fn the_key_check_value_tells_keys_apart() {
+        let a = cfg(
+            "",
+            &format!(
+                "    releases: {{ backend: local-disk, encryption: {} }}\n",
+                aes(KA, "rel")
+            ),
+        );
+        let b = cfg(
+            "",
+            &format!(
+                "    releases: {{ backend: local-disk, encryption: {} }}\n",
+                aes(KB, "rel")
+            ),
+        );
+        let (wa, wb) = (
+            a.write_encryption_for_bucket("releases").unwrap(),
+            b.write_encryption_for_bucket("releases").unwrap(),
+        );
+        assert_eq!(wa.key_id, wb.key_id);
+        assert_ne!(wa, wb);
+        assert_eq!(wa.kcv.as_deref().map(str::len), Some(16));
+        assert!(!wa.kcv.as_deref().unwrap().contains(&KA[..16]));
     }
 
     #[test]
