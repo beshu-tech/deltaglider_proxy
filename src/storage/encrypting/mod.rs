@@ -138,7 +138,18 @@ pub enum WriteMode {
     /// unencrypted (the inner `S3Backend` is already configured with
     /// native SSE and encrypts server-side on its own).
     PassThrough,
+    /// The backend's mode encrypts (`aes256-gcm-proxy`) but no key is
+    /// configured. Every object write fails with
+    /// [`StorageError::Encryption`]: a backend that the operator set to
+    /// encrypt never stores plaintext (issue #116). Reads keep working
+    /// (plaintext objects, and the legacy key when one is set).
+    Refuse,
 }
+
+/// The error of a write under [`WriteMode::Refuse`].
+pub(crate) const NO_KEY_WRITE_REFUSAL: &str = "this backend is in aes256-gcm-proxy mode but no \
+     key is configured, so the proxy refuses the write instead of storing plaintext. Set \
+     encryption.key (or the DGP_*_ENCRYPTION_KEY env var) for the backend, or change its mode";
 
 /// Hot-reloadable encryption configuration.
 ///
@@ -340,12 +351,21 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             .await
     }
 
-    fn write_key(&self) -> Option<(EncryptionKey, Option<String>)> {
+    /// `Err` under [`WriteMode::Refuse`]: the write must fail, never
+    /// fall back to plaintext.
+    fn write_key(&self) -> Result<Option<(EncryptionKey, Option<String>)>, StorageError> {
         let cfg = self.config.load();
-        if cfg.write_mode == WriteMode::PassThrough {
-            return None;
+        match cfg.write_mode {
+            WriteMode::PassThrough => Ok(None),
+            WriteMode::Refuse => Err(StorageError::Encryption(NO_KEY_WRITE_REFUSAL.to_string())),
+            WriteMode::Encrypt => Ok(cfg.key.clone().map(|key| (key, cfg.key_id.clone()))),
         }
-        cfg.key.clone().map(|key| (key, cfg.key_id.clone()))
+    }
+
+    /// True when a write stores its bytes as they are (no key, or
+    /// native SSE). False when it encrypts or is refused.
+    fn writes_plaintext(&self) -> bool {
+        matches!(self.write_key(), Ok(None))
     }
 
     /// True when this wrapper holds any key (primary or decrypt-only
@@ -561,7 +581,7 @@ impl<B: StorageBackend> EncryptingBackend<B> {
     /// onto independent S3 parts — so those copies fall back to the
     /// buffered/chunked path.
     fn actively_encrypts(&self) -> bool {
-        self.write_key().is_some()
+        !self.writes_plaintext()
     }
 
     /// The stored body: the ciphertext, or `data` itself (shared, not
@@ -571,7 +591,7 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         data: &bytes::Bytes,
         metadata: &mut FileMetadata,
     ) -> Result<bytes::Bytes, StorageError> {
-        match self.write_key() {
+        match self.write_key()? {
             Some((key, key_id)) => {
                 let encrypted = encrypt(&key, data)?;
                 mark_encrypted(metadata, key_id.as_deref());
@@ -741,7 +761,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         source: &FileMetadata,
         metadata: &FileMetadata,
     ) -> Result<super::traits::CopyOutcome, StorageError> {
-        let write_key_id = self.write_key().map(|(_, id)| id);
+        let write_key_id = self.write_key()?.map(|(_, id)| id);
         let same_form = match (&write_key_id, is_encrypted(source)) {
             (None, false) => true,
             (Some(Some(id)), true) => stamped_key_id(source) == Some(id.as_str()),
@@ -804,7 +824,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         metadata: &FileMetadata,
         spool: SpoolBudget<'_>,
     ) -> Result<(), StorageError> {
-        let Some((key, key_id)) = self.write_key() else {
+        let Some((key, key_id)) = self.write_key()? else {
             return self
                 .inner
                 .put_passthrough_file(
@@ -853,7 +873,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         metadata: &FileMetadata,
         spool: SpoolBudget<'_>,
     ) -> Result<(), StorageError> {
-        let Some(write_key) = self.write_key() else {
+        let Some(write_key) = self.write_key()? else {
             return self
                 .inner
                 .put_passthrough_parts(
@@ -904,7 +924,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     }
 
     async fn file_put_spool_bytes(&self, bucket: &str, bytes: u64, parts: bool) -> u64 {
-        if self.write_key().is_none() {
+        if self.writes_plaintext() {
             return self.inner.file_put_spool_bytes(bucket, bytes, parts).await;
         }
         // The ciphertext file, plus the joined plaintext for parts.
@@ -930,7 +950,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         chunks: &[Bytes],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        let Some((key, key_id)) = self.write_key() else {
+        let Some((key, key_id)) = self.write_key()? else {
             return self
                 .inner
                 .put_passthrough_chunked(
@@ -1120,6 +1140,8 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         filename: &str,
         metadata: &FileMetadata,
     ) -> Result<MultipartUpload, StorageError> {
+        // A refused write names its cause, not "multipart unsupported".
+        self.write_key()?;
         if self.actively_encrypts() {
             return Err(StorageError::Other(
                 "multipart upload unsupported on a proxy-AES-encrypting backend".to_string(),

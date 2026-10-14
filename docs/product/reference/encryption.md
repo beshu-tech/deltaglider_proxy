@@ -35,6 +35,10 @@ Env vars override only the secret fields (`key`, `kms_key_id`); the mode itself 
 | `DGP_ENCRYPTION_KEY` | `key` on the singleton backend |
 | `DGP_SSE_KMS_KEY_ID` | `kms_key_id` on the singleton backend |
 
+### A proxy-AES backend with no key
+
+When a backend is in `aes256-gcm-proxy` mode and neither the YAML nor the env var supplies a `key`, the proxy cannot encrypt. It does not fall back to plaintext. Instead, every write to that backend fails with `500 InternalError`, and the log names the backend and the env var to set. Reads keep working: plaintext objects, and objects that the `legacy_key` can decrypt, stay readable while you fix the key. The proxy starts with such a config, so that the stored data stays available. A config apply that would put a backend into this state is refused. `config lint` only warns about it, because lint does not see the env vars of the deployment.
+
 ### Examples
 
 Proxy-AES on a named S3 backend, key supplied by env var:

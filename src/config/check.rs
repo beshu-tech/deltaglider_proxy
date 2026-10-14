@@ -303,9 +303,9 @@ impl Config {
         // legacy singleton gets checked against:
         //   * native modes (SseKms / SseS3) on filesystem backends → error.
         //   * Aes256GcmProxy with no key configured (after env-var
-        //     resolution) → warning (key must come from env at runtime;
-        //     this is informational so operators notice a missing
-        //     DGP_*_ENCRYPTION_KEY before a read fails).
+        //     resolution) → warning: the engine refuses every write to
+        //     that backend (`keyless_proxy_backends`). Not fatal: `config
+        //     lint` has no deploy env, where the key often comes from.
         //   * key_id charset: must match `[A-Za-z0-9_.-]{1,64}`.
         //   * collisions: two backends declaring the same `key_id`
         //     but different `key` bytes → error.
@@ -349,8 +349,9 @@ impl Config {
             {
                 if key.is_none() {
                     warnings.push(format!(
-                        "backend '{}' uses aes256-gcm-proxy but no key is configured in \
-                         YAML — set it via env var ({}).",
+                        "backend '{}' uses aes256-gcm-proxy but no key is configured. \
+                         Unless the env var {} supplies it, the proxy refuses every write \
+                         to this backend (it never stores plaintext there).",
                         label,
                         if label == "default" {
                             "DGP_ENCRYPTION_KEY".to_string()
@@ -539,6 +540,54 @@ impl Config {
         }
         errors.extend(self.coordination_bucket_exposures());
         errors
+    }
+
+    /// Backends that the engine wraps (the singleton `default` only while
+    /// no named backends exist) whose mode is `aes256-gcm-proxy` with no
+    /// key, after the `DGP_*` env overrides. The engine refuses every write
+    /// to them (`WriteMode::Refuse`) so that they never store plaintext.
+    pub fn keyless_proxy_backends(&self) -> Vec<String> {
+        let keyless = |enc: &BackendEncryptionConfig| {
+            matches!(
+                enc,
+                BackendEncryptionConfig::Aes256GcmProxy { key: None, .. }
+            )
+        };
+        if self.backends.is_empty() {
+            return if keyless(&self.backend_encryption) {
+                vec!["default".to_string()]
+            } else {
+                Vec::new()
+            };
+        }
+        self.backends
+            .iter()
+            .filter(|b| keyless(&b.encryption))
+            .map(|b| b.name.clone())
+            .collect()
+    }
+
+    /// The apply gate for [`Self::keyless_proxy_backends`]: an error per
+    /// backend that this transition leaves in `aes256-gcm-proxy` mode with
+    /// no key while `old` did not. A backend that was keyless already (a
+    /// running config from before this rule) does not block an unrelated
+    /// apply; its writes stay refused at runtime. Not part of
+    /// [`Self::check_fatal`]: `config lint` runs without the deploy env, and
+    /// the key of a valid config often comes from `DGP_*_ENCRYPTION_KEY`.
+    pub fn newly_keyless_proxy_backends(&self, old: &Config) -> Vec<String> {
+        let before = old.keyless_proxy_backends();
+        self.keyless_proxy_backends()
+            .into_iter()
+            .filter(|name| !before.contains(name))
+            .map(|name| {
+                let (env, _) = backend_encryption_env_names(&name);
+                format!(
+                    "backend '{name}' uses aes256-gcm-proxy but has no key: the proxy would \
+                     refuse every write to it rather than store plaintext. Set \
+                     encryption.key or {env}, or choose another mode"
+                )
+            })
+            .collect()
     }
 
     /// Ways the config would make the coordination bucket

@@ -178,7 +178,8 @@ impl KeyIdCollisionCheck {
 /// audit).
 ///
 /// Resolves:
-///   * `Aes256GcmProxy` → proxy key + key_id, write_mode Encrypt.
+///   * `Aes256GcmProxy` → proxy key + key_id, write_mode Encrypt; with
+///     no key, write_mode Refuse (every write fails, reads work).
 ///   * `SseKms` / `SseS3` → primary key None, write_mode PassThrough.
 ///     Inner S3Backend does the encryption (Step 4); wrapper stays
 ///     in the stack for read-side sniffer defense + legacy shim.
@@ -233,14 +234,18 @@ pub(super) fn wrap_backend_with_encryption(
             }
             (Some(parsed), Some(kid), crate::storage::WriteMode::Encrypt)
         }
+        // Fail closed (issue #116): a backend set to encrypt never stores
+        // plaintext. Writes are refused; reads keep working, so a missing
+        // env var on upgrade does not take the stored data offline.
         E::Aes256GcmProxy { key: None, .. } => {
-            tracing::warn!(
+            tracing::error!(
                 "backend '{}' has encryption mode aes256-gcm-proxy but no key is \
-                 configured — writes will NOT be encrypted on this backend. Check YAML \
-                 or env var.",
-                backend_name
+                 configured: every write to this backend is REFUSED (the proxy never \
+                 stores plaintext on it). Reads keep working. Set encryption.key or {}.",
+                backend_name,
+                env_name_for_backend(backend_name)
             );
-            (None, None, crate::storage::WriteMode::Encrypt)
+            (None, None, crate::storage::WriteMode::Refuse)
         }
         E::SseKms { .. } | E::SseS3 { .. } => {
             // Native S3-side encryption — the S3Backend constructor

@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Fixed — A proxy-encrypted backend with no key refuses writes instead of storing plaintext
+
+A backend in `aes256-gcm-proxy` mode with no key (for example, because the
+`DGP_BACKEND_<NAME>_ENCRYPTION_KEY` env var was not set after a restart)
+logged a warning and then stored every new object as plaintext. The operator
+asked for encryption, so this was a silent downgrade. Now the proxy refuses
+every write to such a backend with an error (`500 InternalError` to the
+client; the log names the backend and the env var), and it never stores
+plaintext there. Reads keep working, so the objects already stored stay
+available while you fix the key. A config apply (GUI, section PUT, YAML
+apply) that would leave a backend in this state is refused with an error that
+names the backend and the env var. A running config that is already in this
+state does not block other applies. The proxy still starts with such a
+config, and `config lint` still only warns, because the key of a valid
+config often comes from an env var that lint does not see.
+
 ### Fixed — A filtered LIST no longer reveals hidden key names
 
 A user who may see only some keys of a bucket, through an `Allow` on the

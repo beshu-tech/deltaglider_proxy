@@ -272,6 +272,9 @@ pub(super) fn static_transition_gates(
     // FATAL config-graph errors (bucket → undefined backend, duplicate
     // backend names): un-runnable states that boot refuses too.
     let mut fatal = new_cfg.check_fatal();
+    // A backend set to encrypt with no key refuses every write (issue
+    // #116): refuse the apply that makes one, instead of the writes later.
+    fatal.extend(new_cfg.newly_keyless_proxy_backends(old_cfg));
     // A webhook URL that every delivery would refuse: refuse the apply that
     // adds it, instead of failing (and retrying) every event later.
     fatal.extend(
@@ -814,5 +817,76 @@ mod transition_order_tests {
             !after_write.contains(")?") && !after_write.contains("return Err"),
             "commit_iam can fail after the reconcile committed:\n{after_write}"
         );
+    }
+}
+
+#[cfg(test)]
+mod keyless_proxy_gate_tests {
+    use super::static_transition_gates;
+    use crate::config::{BackendEncryptionConfig, Config};
+
+    fn proxy(key: Option<&str>) -> BackendEncryptionConfig {
+        BackendEncryptionConfig::Aes256GcmProxy {
+            key: key.map(str::to_string),
+            key_id: None,
+            legacy_key: None,
+            legacy_key_id: None,
+        }
+    }
+
+    /// Issue #116 P0.1: an apply that leaves a backend in proxy mode with
+    /// no key is refused (its writes would all fail); a keyed one passes,
+    /// and a backend that was keyless before does not block other edits.
+    #[test]
+    fn an_apply_that_makes_a_keyless_proxy_backend_is_refused() {
+        let old = Config::default();
+        let mut keyless = old.clone();
+        keyless.backend_encryption = proxy(None);
+        let err = static_transition_gates(&old, &keyless)
+            .expect_err("a keyless proxy backend must be refused");
+        assert!(
+            err.contains("backend 'default'") && err.contains("DGP_ENCRYPTION_KEY"),
+            "the refusal names the backend and the env var: {err}"
+        );
+
+        let mut keyed = old.clone();
+        keyed.backend_encryption = proxy(Some(&"ab".repeat(32)));
+        static_transition_gates(&old, &keyed).expect("a keyed proxy backend applies");
+
+        let mut unrelated = keyless.clone();
+        unrelated.log_level = "warn".into();
+        static_transition_gates(&keyless, &unrelated)
+            .expect("a backend that was keyless before does not block another edit");
+    }
+
+    /// The documented shape keeps working: the YAML names the mode, the
+    /// `DGP_BACKEND_<NAME>_ENCRYPTION_KEY` env var supplies the key.
+    #[test]
+    fn a_key_from_the_env_var_is_not_keyless() {
+        let yaml = "storage:\n  backends:\n  - name: hetzner-fsn1\n    type: filesystem\n    \
+                    path: /tmp/x\n    encryption:\n      mode: aes256-gcm-proxy\n";
+        let mut cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.keyless_proxy_backends(), ["hetzner-fsn1"]);
+        let key = "cd".repeat(32);
+        cfg.apply_env_overrides_at_load(&|n: &str| {
+            (n == "DGP_BACKEND_HETZNER_FSN1_ENCRYPTION_KEY").then(|| key.clone())
+        });
+        assert!(cfg.keyless_proxy_backends().is_empty());
+    }
+
+    /// Only the backends the engine wraps count: the singleton block is
+    /// unused once named backends exist.
+    #[test]
+    fn only_wrapped_backends_count_as_keyless() {
+        let mut cfg = Config {
+            backend_encryption: proxy(None),
+            ..Default::default()
+        };
+        cfg.backends.push(crate::config::NamedBackendConfig {
+            name: "local-disk".into(),
+            backend: cfg.backend.clone(),
+            encryption: proxy(None),
+        });
+        assert_eq!(cfg.keyless_proxy_backends(), ["local-disk"]);
     }
 }

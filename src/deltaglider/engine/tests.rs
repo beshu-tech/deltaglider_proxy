@@ -842,3 +842,74 @@ fn unresolved_delta_stub_is_detected() {
     );
     assert!(!DeltaGliderEngine::<FilesystemBackend>::is_unresolved_delta_stub(&pt));
 }
+
+/// Issue #116 P0.1: a backend in `aes256-gcm-proxy` mode with no key must
+/// never store plaintext. Every object write fails closed; reads (of a
+/// plaintext object written before, here) keep working.
+#[tokio::test]
+async fn a_proxy_backend_without_a_key_refuses_writes_and_keeps_reads() {
+    use crate::storage::StorageBackend;
+    let tmp = tempfile::tempdir().unwrap();
+    let fs = crate::storage::FilesystemBackend::new(tmp.path().to_path_buf())
+        .await
+        .unwrap();
+    fs.create_bucket("b").await.unwrap();
+    let meta = crate::types::FileMetadata::fallback(
+        "old.bin".into(),
+        3,
+        "md5".into(),
+        chrono::Utc::now(),
+        None,
+        crate::types::StorageInfo::Passthrough,
+    );
+    // An object stored before the key went missing (plaintext).
+    fs.put_passthrough("b", "", "old.bin", bytes::Bytes::from_static(b"old"), &meta)
+        .await
+        .unwrap();
+    let mut coll = KeyIdCollisionCheck::new();
+    let wrapped = match wrap_backend_with_encryption(
+        "keyless",
+        DynStorageBackend::new_box(fs),
+        &crate::config::BackendEncryptionConfig::Aes256GcmProxy {
+            key: None,
+            key_id: None,
+            legacy_key: None,
+            legacy_key_id: None,
+        },
+        &mut coll,
+    ) {
+        Ok(w) => w,
+        Err(e) => panic!("construction must succeed (reads stay available): {e}"),
+    };
+    let put = wrapped
+        .put_passthrough(
+            "b",
+            "",
+            "new.bin",
+            bytes::Bytes::from_static(b"secret"),
+            &meta,
+        )
+        .await;
+    let err = put.expect_err("a keyless proxy backend must refuse the write");
+    assert!(
+        format!("{err}").contains("no key"),
+        "the error must name the cause: {err}"
+    );
+    let chunked = wrapped
+        .put_passthrough_chunked(
+            "b",
+            "",
+            "new2.bin",
+            &[bytes::Bytes::from_static(b"s")],
+            &meta,
+        )
+        .await;
+    assert!(chunked.is_err(), "the chunked write must be refused too");
+    assert!(
+        !tmp.path().join("b").join("new.bin").exists(),
+        "no plaintext object may reach the disk"
+    );
+    // The read path is untouched.
+    let got = wrapped.get_passthrough("b", "", "old.bin").await.unwrap();
+    assert_eq!(got, b"old");
+}
