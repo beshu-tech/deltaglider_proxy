@@ -95,6 +95,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
 #[cfg(test)]
 mod tests {
+    use crate::storage::encrypting::{ENCRYPTION_KEY_ID_KEY, ENCRYPTION_MARKER_KEY};
     use crate::storage::{
         same_stored_generation, CopyOutcome, DynStorageBackend, EncryptingBackend,
         EncryptionConfig, EncryptionKey, FilesystemBackend, ObjectAt, ObjectVariant,
@@ -116,6 +117,23 @@ mod tests {
         let mut later = a.clone();
         later.created_at += chrono::Duration::seconds(1);
         assert!(!same_stored_generation(&a, &later), "rewritten");
+        let encrypted = |id: &str| {
+            let mut e = a.clone();
+            e.user_metadata
+                .insert(ENCRYPTION_MARKER_KEY.into(), "aes-256-gcm-v1".into());
+            e.user_metadata
+                .insert(ENCRYPTION_KEY_ID_KEY.into(), id.into());
+            e
+        };
+        assert!(
+            !same_stored_generation(&a, &encrypted("k1")),
+            "re-encrypted in place"
+        );
+        assert!(
+            !same_stored_generation(&encrypted("k1"), &encrypted("k2")),
+            "re-encrypted under another key"
+        );
+        assert!(same_stored_generation(&encrypted("k1"), &encrypted("k1")));
         let delta = |r: &str, size: u64| {
             let mut d = FileMetadata::new_delta(
                 "a.jpg".into(),
@@ -273,5 +291,53 @@ mod tests {
         };
         assert_eq!(copy("downloads").await, CopyOutcome::Copied);
         assert_eq!(copy("db-archive").await, CopyOutcome::Unsupported);
+    }
+
+    /// A re-encrypt between the copy's HEAD and the copy rewrites the
+    /// source in place with the same content and created-at. The copy
+    /// must see that the stored bytes changed: copied under the HEAD's
+    /// plaintext markers, the ciphertext was served as the object.
+    #[tokio::test]
+    async fn a_source_re_encrypted_after_its_head_is_not_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = || FilesystemBackend::new(dir.path().to_path_buf());
+        let plain = EncryptingBackend::new(
+            fs().await.unwrap(),
+            Arc::new(arc_swap::ArcSwap::new(
+                Arc::new(EncryptionConfig::default()),
+            )),
+        );
+        let encrypting = EncryptingBackend::new(fs().await.unwrap(), keyed("kid"));
+        let head = put(&plain, "b").await;
+        plain.create_bucket("c").await.unwrap();
+        encrypting
+            .put_passthrough(
+                "b",
+                "pics",
+                "a.jpg",
+                bytes::Bytes::from_static(b"data"),
+                &head,
+            )
+            .await
+            .unwrap();
+
+        let copied = plain
+            .copy_within(
+                ObjectVariant::Passthrough,
+                at("b"),
+                at("c"),
+                &head,
+                &meta("aa"),
+            )
+            .await;
+
+        assert!(
+            matches!(
+                copied,
+                Err(crate::storage::StorageError::PreconditionFailed(_))
+            ),
+            "{copied:?}"
+        );
+        assert!(plain.get_passthrough("c", "pics", "a.jpg").await.is_err());
     }
 }

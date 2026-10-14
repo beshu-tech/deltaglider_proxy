@@ -208,10 +208,16 @@ pub enum CopyOutcome {
 /// plaintext. The encrypting wrapper restates the source's markers when it
 /// forwards a copy, so a copy that no wrapper checked fails here.
 pub fn copy_keeps_encryption(source: &FileMetadata, metadata: &FileMetadata) -> bool {
+    same_at_rest_encryption(source, metadata)
+}
+
+/// Pure: do `a` and `b` name the same at-rest encryption (the same marker
+/// and key id, or none)?
+fn same_at_rest_encryption(a: &FileMetadata, b: &FileMetadata) -> bool {
     use crate::storage::encrypting::{ENCRYPTION_KEY_ID_KEY, ENCRYPTION_MARKER_KEY};
     [ENCRYPTION_MARKER_KEY, ENCRYPTION_KEY_ID_KEY]
         .iter()
-        .all(|k| source.user_metadata.get(*k) == metadata.user_metadata.get(*k))
+        .all(|k| a.user_metadata.get(*k) == b.user_metadata.get(*k))
 }
 
 /// Pure: does `current` (the source as the backend holds it now) still
@@ -220,11 +226,15 @@ pub fn copy_keeps_encryption(source: &FileMetadata, metadata: &FileMetadata) -> 
 /// and so must the created-at and, for a delta, the reference and the
 /// delta size: a delta re-encoded against another reference has the same
 /// content but other bytes. Copying such bytes under the pin's metadata
-/// would make the destination unreadable.
+/// would make the destination unreadable. The at-rest encryption must
+/// match too: a re-encrypt rewrites an object in place with the same
+/// content and created-at, and its ciphertext copied under the pin's
+/// plaintext markers would be served as the object.
 pub fn same_stored_generation(pin: &FileMetadata, current: &FileMetadata) -> bool {
     use crate::types::StorageInfo;
     if !crate::deltaglider::DynEngine::same_generation(pin, current)
         || pin.created_at != current.created_at
+        || !same_at_rest_encryption(pin, current)
     {
         return false;
     }
