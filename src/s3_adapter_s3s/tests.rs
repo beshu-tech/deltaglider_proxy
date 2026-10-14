@@ -682,12 +682,19 @@ fn list_metadata_is_the_storage_facts_of_the_head() {
 }
 
 #[test]
-fn client_max_keys_keeps_zero() {
-    assert_eq!(client_max_keys(None), 1000);
-    assert_eq!(client_max_keys(Some(0)), 0);
-    assert_eq!(client_max_keys(Some(-3)), 0);
-    assert_eq!(client_max_keys(Some(7)), 7);
-    assert_eq!(client_max_keys(Some(5000)), 1000);
+fn client_max_keys_keeps_zero_and_refuses_a_negative_value() {
+    let ok = |v| client_max_keys(v).unwrap();
+    assert_eq!(ok(None), 1000);
+    assert_eq!(ok(Some(0)), 0);
+    assert_eq!(ok(Some(7)), 7);
+    assert_eq!(ok(Some(5000)), 1000);
+    assert_eq!(ok(Some(i32::MAX)), 1000);
+    // S3 (and MinIO) answer a negative max-keys with 400 InvalidArgument,
+    // not with an empty page that says the listing ended.
+    for v in [-1, -3, i32::MIN] {
+        let err = client_max_keys(Some(v)).expect_err("a negative max-keys is refused");
+        assert_eq!(*err.code(), s3s::S3ErrorCode::InvalidArgument, "{v}");
+    }
 }
 
 #[test]

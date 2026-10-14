@@ -84,7 +84,7 @@ pub(super) async fn list_objects(
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::ListObjectsOutput>> {
     let list_scope = req.extensions.get::<ListScope>().cloned();
     let input = req.input;
-    let max_keys = client_max_keys(input.max_keys);
+    let max_keys = client_max_keys(input.max_keys)?;
     let enc = ListKeyEncoding::of(input.encoding_type.as_ref());
     let page = client_list_page(
         &svc.state.engine.load(),
@@ -146,7 +146,7 @@ pub(super) async fn list_objects_v2(
     let reader = Reader::of(&req.extensions);
     let include_metadata = query_flag(&req.uri, "metadata", "true");
     let input = req.input;
-    let max_keys = client_max_keys(input.max_keys);
+    let max_keys = client_max_keys(input.max_keys)?;
     let page = client_list_page(
         &svc.state.engine.load(),
         &input.bucket,
@@ -308,10 +308,19 @@ impl ListKeyEncoding {
     }
 }
 
-/// Pure: the page size of a client LIST. S3 takes `max-keys` from 0 to 1000;
-/// 0 is an empty page, which the engine (at least one key) cannot give.
-pub(super) fn client_max_keys(max_keys: Option<i32>) -> u32 {
-    max_keys.unwrap_or(1000).clamp(0, 1000) as u32
+/// Pure: the page size of a client LIST. S3 takes `max-keys` from 0 to 1000
+/// (a larger value lists 1000); 0 is an empty page, which the engine (at
+/// least one key) cannot give. A negative value is `InvalidArgument`, as on
+/// S3: an empty page said that the listing ended.
+pub(super) fn client_max_keys(max_keys: Option<i32>) -> s3s::S3Result<u32> {
+    let max_keys = max_keys.unwrap_or(1000);
+    if max_keys < 0 {
+        return Err(s3s::s3_error!(
+            InvalidArgument,
+            "Argument maxKeys must be an integer between 0 and 2147483647"
+        ));
+    }
+    Ok(max_keys.min(1000) as u32)
 }
 
 /// A client LIST page: `iam::listing::list_page_for_caller` with the S3 edges. `max-keys=0`

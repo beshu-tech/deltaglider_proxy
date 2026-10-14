@@ -350,6 +350,18 @@ async fn max_keys_zero_lists_nothing() {
         assert!(!body.contains("<Contents>"), "{query}: {body}");
         assert!(body.contains("<MaxKeys>0</MaxKeys>"), "{query}: {body}");
     }
+    // A negative max-keys is refused, as on S3, in V1 and V2.
+    for query in ["list-type=2&max-keys=-1", "max-keys=-1"] {
+        let resp = http
+            .get(format!("{endpoint}/{bucket}?{query}"))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap();
+        assert_eq!(status, 400, "{query}: {body}");
+        assert!(body.contains("InvalidArgument"), "{query}: {body}");
+    }
 }
 
 /// A copy onto itself that changes nothing is `400 InvalidRequest`, as on S3;

@@ -44,6 +44,13 @@ The inspector read the object's headers once, when it opened. When the
 object was overwritten under the same key, the inspector kept the stored
 size, the storage type and the headers of the old object. It now reads the
 headers again when the listing shows a new ETag for the object.
+### Fixed — A negative `max-keys` gets `400 InvalidArgument`
+
+A `ListObjects` or `ListObjectsV2` request with a negative `max-keys` got an
+empty `200` page with `IsTruncated=false`. That page told the client that the
+listing was complete. S3 refuses such a request, so the proxy now answers
+`400 InvalidArgument`, with the same message as S3.
+
 ### Fixed — A filtered LIST pages past more than 50 visible prefixes
 
 A user whose policy allows many key prefixes gets a LIST that reads each of
