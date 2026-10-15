@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.14 — 2026-10-15
+
 ### Fixed — DeleteBucket right after an upload
 
 On an S3 backend, a PUT writes its listing-facts marker in the background. A DeleteBucket sent right after the PUT could run before that write: S3 then answered `BucketNotEmpty`, and a single-disk MinIO brought the deleted bucket back. DeleteBucket now waits (up to 30 s) until the bucket has no marker write queued or in flight.

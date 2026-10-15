@@ -8,7 +8,20 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-10-14_
+_Last updated: 2026-10-15_
+
+## v2.0.14 — 2026-10-15
+
+### Fixed — DeleteBucket right after an upload
+
+On an S3 backend, a PUT writes its listing-facts marker in the background. A DeleteBucket sent right after the PUT could run before that write: S3 then answered `BucketNotEmpty`, and a single-disk MinIO brought the deleted bucket back. DeleteBucket now waits (up to 30 s) until the bucket has no marker write queued or in flight.
+
+### Changed — The admin UI for backends and buckets
+
+- **Storage → Backends**: each backend card has three bands. The header shows the icon, the name with its status pills (**Default**, the connection health) and its kind, the **Test connection** and **Create bucket here** buttons, and the **⋯** menu. Below it, the endpoint, region, access key id (or the path) and the bucket count are a labelled list, so a long endpoint no longer wraps beside the buttons. The encryption row says which buckets take the backend's setting ("Applies to 2 buckets · 1 bucket has its own setting"). The card follows its own width: below 720 px the buttons take their own row, and the **⋯** menu stays in the corner.
+- **Create bucket** has a second button for admins, **Create and open settings**: it creates the bucket, then opens its settings card on the Buckets page.
+- The browser sidebar: a bucket's **⋯** menu has **Edit settings** (admins only), which opens the bucket's card on the Buckets page (`/_/admin/storage/buckets?bucket=<name>`). A padlock marks a bucket whose new writes are encrypted; its hover text says how. A short backend chip ("b2") no longer sits in a wide frame.
+- **Storage → Buckets**: **Create bucket** sits in the page header, not under the list, where it looked like the save button of an open bucket card.
 
 ## v2.0.13 — 2026-10-14
 
