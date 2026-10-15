@@ -911,7 +911,7 @@ storage:
       encryption:
         mode: aes256-gcm-proxy
         key: "${env:DGP_BACKEND_HETZNER_FSN1_ENCRYPTION_KEY}"
-        key_id: hetzner-2026-06   # optional; derived from SHA-256(name + key) when absent
+        key_id: hetzner-2026-06   # optional; fp-<16 hex> from the key's fingerprint when absent
     - name: aws-dr
       type: s3
       # region, credentials …
@@ -965,9 +965,11 @@ storage:
 
 The proxy refuses a bucket `encryption` block in `aes256-gcm-proxy` mode without `key_id`, with `legacy_key` but without `legacy_key_id`, in a native SSE mode on a filesystem backend, without `backend:` when `storage.backends` is used, with a key id that another key already uses, or on an alias that disagrees with the other names of its stored bucket. With `config_sync_bucket` set, the encryption witness keeps the instances in agreement ([run multiple instances](../how-to/run-multiple-instances.md#8-keep-the-encryption-of-each-bucket-the-same-on-every-instance)). The [encryption reference](encryption.md#per-bucket-encryption) explains each rule.
 
-`key` / `legacy_key` are 64-character lowercase hex strings (256 bits). `kms_key_id` is a KMS key ARN or alias ARN, an alias name (`alias/<name>`), a key id (UUID) or a multi-Region key id (`mrk-...`); on MinIO, `arn:aws:kms:<key name>`. Any other value is a fatal config error. `key_id` (optional) must match `[A-Za-z0-9_.-]{1,64}` (S3 user-metadata header-safe).
+`key` / `legacy_key` are 64-character lowercase hex strings (256 bits). `kms_key_id` is a KMS key ARN or alias ARN, an alias name (`alias/<name>`), a key id (UUID) or a multi-Region key id (`mrk-...`); on MinIO, `arn:aws:kms:<key name>`. Any other value is a fatal config error. `key_id` (optional) must match `[A-Za-z0-9_.-]{1,64}`. Without it, a backend key gets the id `fp-` followed by the 16 hexadecimal characters of the key's fingerprint. One key has one id on a backend: the proxy refuses a config that gives the same key bytes two ids on one backend.
 
-The proxy does not automate key rotation within a single mode. To rotate, use the `legacy_key` / `legacy_key_id` shim fields (decrypt-only, for proxy→native transitions), or copy the objects to a new backend. See the [encryption reference](encryption.md) for the full wire format, key-id mismatch mechanics, and the shim lifecycle.
+`plaintext_reads` (only in `aes256-gcm-proxy` mode, on a backend or a bucket) is `refuse` (the default) or `serve`. It decides what a read does with an object that is not encrypted in a bucket that encrypts. Under `refuse`, the read fails with `500 InternalError`, because a writer with access to the backend could have planted the object. Under `serve`, the proxy serves the object, so that the re-encrypt job can convert the plaintext history of a bucket that starts to encrypt. An apply that makes an existing bucket start to encrypt with `refuse` is refused, unless the request confirms it with `X-DGP-Confirm-Plaintext-Refusal: <subject>` (`config apply --confirm-plaintext-refusal <subject>`). The admin UI sets `serve` by itself when it turns on proxy-side AES. See [Plaintext objects in a bucket that encrypts](encryption.md#plaintext-objects-in-a-bucket-that-encrypts).
+
+The proxy does not automate key rotation within a single mode. To rotate, use the `legacy_key` / `legacy_key_id` shim fields (decrypt-only, for proxy→native transitions), or copy the objects to a new backend. See the [encryption reference](encryption.md) for the format, the key fingerprints, the read rule, and the shim lifecycle.
 
 ## CLI subcommands
 

@@ -179,6 +179,27 @@ With `config_sync_bucket` set, this release keeps a witness of each bucket's enc
 - A backend key or mode that you change by editing the file or an environment variable and restarting the instances is not published by the restart. After such a rollout, every instance with the new key refuses all writes to that backend until you run `deltaglider_proxy witness publish backend:<name>` once on one of them. A change made with a config apply is published at once and needs nothing else.
 - An instance that starts while the sync bucket does not answer refuses writes to every encrypting backend and to every bucket with its own `encryption` block until its first check succeeds.
 
+## Encryption at rest, format v2 (the release after 2.0.14)
+
+This release replaces the format of proxy-side encryption (`aes256-gcm-proxy`). The earlier formats, `aes-256-gcm-v1` and `aes-256-gcm-chunked-v1` (body magic `DGE1`), have no reader and no migration path in this release, because no deployment used them. If a backend or a bucket of yours encrypted objects with an earlier release, those objects fail to read after the upgrade. Decrypt them before the upgrade, for example with a migrate job to a plaintext backend, and encrypt them again after it. Deployments without `aes256-gcm-proxy` have nothing to do for this change. The changes that you can see:
+
+- **Fail closed.** In a bucket that encrypts, the proxy refuses every object that it cannot authenticate, with `500 InternalError`. That includes a plaintext object, unless the `encryption` block has `plaintext_reads: serve` ([why](../explanation/encryption-at-rest.md#why-enabling-isnt-retroactive)).
+- **Starting to encrypt.** An apply that makes an existing bucket start to encrypt with `plaintext_reads: refuse` is refused, unless the block sets `plaintext_reads: serve` or the request confirms it (`X-DGP-Confirm-Plaintext-Refusal: <subject>`, `config apply --confirm-plaintext-refusal <subject>`). The admin UI sets `serve` by itself and offers **Refuse unencrypted objects** after the re-encrypt job. A script that turns on encryption through the admin API must add one of the two.
+- **Key ids.** A backend key without `key_id` gets the id `fp-` followed by 16 hexadecimal characters of the key's fingerprint. The backend name no longer takes part in the id. One key can have only one id on a backend; the proxy refuses to start with a config that gives one key two ids.
+- **Stored metadata.** An encrypted object stores no `dg-md5`, no `dg-encryption-key-id`, and no SHA-256 of its content in clear. It stores `dg-encrypted: aes-256-gcm-chunked-v1` and a `dg-sealed` value instead ([Metadata markers](../reference/encryption.md#metadata-markers)). A script that reads `dg-encryption-key-id` on the raw backend must read the key fingerprint in `dg-sealed` instead.
+- **Copies outside the proxy.** An encrypted object that the backend copies to another bucket name or key no longer reads ([Copies outside the proxy](../reference/encryption.md#copies-outside-the-proxy)).
+- **Downgrade.** A release before this one refuses to read the objects that this release encrypts. The objects are not damaged, and they read again after you upgrade once more.
+
+With several instances and encryption, stop every instance and start all of them on the new release together. Do not roll the instances one by one, because an instance on the old release cannot read the objects that a new instance writes. Without a sync bucket, nothing stops an old instance from writing in the old format.
+
+With `config_sync_bucket` set, the key check value of the encryption witness is now the key fingerprint, and a generated key id now starts with `fp-`. The witness entries that the old release published therefore differ from what the new release computes, and every new instance refuses writes to the encrypted buckets. When every instance runs the new release, publish the encryption once, on any instance, for each backend and each bucket with its own key:
+
+```bash
+deltaglider_proxy witness publish backend:hetzner-fsn1 db-archive --server https://s3.acme.example
+```
+
+The **Encryption witness** card on **System → System** lists the subjects that differ, and **Publish all** does the same. After the publish, an instance on the old release disagrees with the witness and refuses writes. Deployments without `aes256-gcm-proxy` can upgrade one instance at a time, as before.
+
 ## Common gotchas
 
 - **`$` in Docker env.** Bcrypt hashes contain `$`. Use the base64-wrapped form (`DGP_BOOTSTRAP_PASSWORD_HASH=JDJ5JDEyJGV...`) or single-quote the value in compose files.
@@ -223,7 +244,7 @@ storage:
 
 Keep `DGP_ENCRYPTION_KEY` in the environment unchanged.
 
-The upgrade does not change the objects on disk. v0.9 reads objects that a pre-v0.9 release encrypted, because the wire format did not change. Only the config location changed. v0.9 adds the `dg-encryption-key-id` stamp, but the stamp is optional. Older objects without the stamp still decrypt when the key material matches.
+The upgrade to v0.9 did not change the objects on disk. Only the config location changed. Current releases no longer read the objects that v0.9 to 2.0.14 encrypted (see [Encryption at rest, format v2](#encryption-at-rest-format-v2-the-release-after-2014)).
 
 If you did not configure encryption before v0.9, you have nothing to do. Your backends default to `encryption: none`.
 

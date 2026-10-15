@@ -1,6 +1,6 @@
 # How to encrypt one bucket on a shared backend
 
-This guide shows you how to encrypt one bucket with its own key while the other buckets on the same backend stay as they are. A bucket can carry its own `encryption` block, and that block replaces the encryption of its backend for that bucket only. For the mechanism (one keyring per backend, one key id per object), see [encryption at rest](../explanation/encryption-at-rest.md).
+This guide shows you how to encrypt one bucket with its own key while the other buckets on the same backend stay as they are. A bucket can carry its own `encryption` block, and that block replaces the encryption of its backend for that bucket only. For the mechanism (one keyring per backend, one key fingerprint per object), see [encryption at rest](../explanation/encryption-at-rest.md).
 
 The example encrypts `db-archive`, where `backup-bot` writes nightly database dumps, on the backend `hetzner-fsn1`. The bucket `downloads` on the same backend holds public installers, and it stays plaintext. You keep one backend for one storage account, and you do not define a second backend with the same credentials.
 
@@ -19,29 +19,38 @@ In the admin UI:
    ![The open db-archive row on the Buckets page; callout 1 marks the db-archive row, and callout 2 marks the Encrypt with a bucket key option in the Encryption group.](/_/screenshots/bucket-encryption-choose.webp)
 
 4. Leave **Generate a key** selected. The browser generates a random 256-bit key and shows it once, under **Generated key (64 hexadecimal characters, shown once)**. To use a key that you already have, select **Paste a key** and paste the 64 hexadecimal characters.
-5. Check the **Key id**. The proxy stamps this id on every object that the key encrypts, and it picks the key by this id when it reads the object. The page suggests `db-archive-2026-10` (the bucket name, the year and the month). A bucket key id is always explicit, because an id that depends on a name would change when the bucket is renamed.
+5. Check the **Key id**. The admin UI, the audit log and the jobs show the key under this id. The objects themselves store only a fingerprint of the key, and the proxy picks the key by that fingerprint when it reads an object. The page suggests `db-archive-2026-10` (the bucket name, the year and the month). A bucket key id is always explicit. Give each key its own id: one key cannot have two ids on one backend.
 6. Click **Download key file**, and store the file in your secrets manager. The file holds the bucket name, the backend, the key id, the date, the key and a recovery note. **Copy** puts only the key on the clipboard.
 7. In **To confirm that you stored the key, type its last 6 characters**, type the last 6 characters of the key. **Review & apply** stays disabled until they match. This check replaces an "I stored it" checkbox: you can only type the characters when you have a copy of the key.
 8. Click **Review & apply**.
 
    ![The key setup of db-archive with the generated key hidden; callout 5 marks the Key id field, a box marks Download key file (step 6), callout 7 marks the field for the last 6 characters, and callout 8 marks Review & apply.](/_/screenshots/bucket-encryption-key.webp)
 
-9. Read the dialog, check the diff, and then click **Apply and Persist**. The dialog says that only new writes change. It also says that the re-encrypt job, which the page offers next, gives the bucket a temporary `503` for uploads and deletes while it runs.
+9. Read the dialog, check the diff, and then click **Apply and Persist**. The dialog says that only new writes change. For a bucket that did not encrypt before, it also says that the proxy keeps serving the objects that are already in the bucket until the re-encrypt job converts them. It also says that the re-encrypt job, which the page offers next, gives the bucket a temporary `503` for uploads and deletes while it runs.
 
 The change applies at once, with its own request. It is not staged with the other fields of the bucket, so the **Encryption** group waits while the page has unsaved changes: apply or discard them first. When the bucket has no explicit backend yet, the page also sets `backend: hetzner-fsn1`, because a bucket's own block belongs to the storage that holds the bucket, and the server refuses a block without a backend when named backends exist.
+
+The objects that `db-archive` already holds are plaintext, because `hetzner-fsn1` does not encrypt. In a bucket that encrypts, the proxy refuses a plaintext object by default, because it cannot tell the history of the bucket from an object that someone planted on the backend ([why](../explanation/encryption-at-rest.md#why-enabling-isnt-retroactive)). For a bucket that did not encrypt before, the page therefore also sets `plaintext_reads: serve` in the bucket's block, so that the existing objects stay readable until section 2 converts them.
 
 When you apply here, the proxy writes the key into the config file, in plain text, in the `key` field of the bucket. The key setup shows the YAML and the environment variable that keep the key out of the file (see the next section).
 
 ## 2. Encrypt the objects that the bucket already holds
 
-The new key encrypts new writes only. The objects that `db-archive` already holds stay in the form that they were written in, and they stay readable, because each object names the key that wrote it. After the apply, the page asks **Encrypt existing objects?** and lists `db-archive` only. The other buckets on `hetzner-fsn1` are not listed, because their encryption did not change.
+The new key encrypts new writes only. The objects that `db-archive` already holds stay in the form that they were written in. An object that the backend key encrypted stays readable, because the keyring of the backend holds that key. A plaintext object stays readable while the bucket's block has `plaintext_reads: serve`, and the re-encrypt job encrypts it.
 
-1. Check that `db-archive` is selected.
+In the admin UI:
+
+1. After the apply, the page asks **Encrypt existing objects?** and lists `db-archive` only. The other buckets on `hetzner-fsn1` are not listed, because their encryption did not change. Check that `db-archive` is selected.
 2. Click **Start now**. The proxy starts a re-encrypt job for the bucket.
 
    ![The dialog Encrypt existing objects? lists only db-archive; the arrow points at Start now.](/_/screenshots/bucket-encryption-reencrypt.webp)
 
-While the job runs, reads of `db-archive` work, and uploads and deletes get `503 SlowDown`, which S3 clients retry. The other buckets on the backend are not affected. If you click **Later**, start the job when you are ready with **Re-encrypt existing objects** in the open bucket row, or from **Storage → Jobs**.
+   While the job runs, reads of `db-archive` work, and uploads and deletes get `503 SlowDown`, which S3 clients retry. The other buckets on the backend are not affected. If you click **Later**, start the job when you are ready with **Re-encrypt existing objects** in the open bucket row, or from **Storage → Jobs**.
+
+3. Open **Storage → Jobs** (`/_/admin/jobs`), and wait until the re-encrypt job of `db-archive` shows `succeeded`, with no rows on its **Failures** tab.
+4. On **Storage → Buckets**, open the `db-archive` row. The **Encryption** group shows the box **Unencrypted objects are served**. Click **Refuse unencrypted objects**. From now on, the proxy refuses every object in `db-archive` that it did not encrypt.
+
+While `plaintext_reads: serve` is set, the proxy trusts every plaintext object in the bucket as it is, and the job seals it as part of the bucket's history. Keep that window short.
 
 ## 3. Create a bucket that is encrypted from its first object
 
@@ -81,7 +90,12 @@ storage:
         mode: aes256-gcm-proxy
         key_id: db-archive-2026-10
         key: ${env:DB_ARCHIVE_ENCRYPTION_KEY}
+        plaintext_reads: serve      # step 4 of section 2 removes this line
 ```
+
+The admin UI writes `plaintext_reads: serve` because the bucket did not encrypt before. **Refuse unencrypted objects** in section 2 removes the line again (the default is `refuse`). Remove it in the file only when the re-encrypt job of the bucket succeeded.
+
+An apply that makes an existing bucket start to encrypt without `plaintext_reads: serve` is refused, because its plaintext objects would become unreadable. When the bucket holds no plaintext that anyone needs, leave the line out and confirm instead: `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example --confirm-plaintext-refusal db-archive`, or the header `X-DGP-Confirm-Plaintext-Refusal: db-archive` with `POST /_/api/admin/config/apply`. A bucket that the create dialog of section 3 makes needs neither, because it holds no objects.
 
 Set the variable in the environment of the proxy, for example `DB_ARCHIVE_ENCRYPTION_KEY=<64 hexadecimal characters>`. While the key comes from a variable, the **Encryption** group of the bucket is read-only and shows a **from env DB_ARCHIVE_ENCRYPTION_KEY** badge: change the key in the deployment, not in the admin UI.
 
@@ -136,16 +150,17 @@ After the publish, the instances that have the same encryption write the bucket 
 
    `db-archive` has `"source": "bucket"` and `"key_id": "db-archive-2026-10"`; `downloads` has `"source": "backend"` and `"mode": "none"`.
 
-3. Write an object through the proxy, and look at the stored copy on the backend, without the proxy. The user metadata carries the `dg-encrypted` marker and `dg-encryption-key-id: db-archive-2026-10`:
+3. Write an object through the proxy, and look at the stored copy on the backend, without the proxy. The user metadata carries `dg-encrypted: aes-256-gcm-chunked-v1` and a `dg-sealed` value that starts with `2.`. The proxy does not store the key id: the `dg-sealed` value starts with the fingerprint of the bucket key, and the [encryption reference](../reference/encryption.md#key-ids) shows how to compare it with your key:
 
    ```bash
    aws --endpoint-url https://s3.acme.example s3 cp nightly.dump s3://db-archive/nightly/2026-10-14.dump
    aws s3api head-object --bucket db-archive --key nightly/2026-10-14.dump --profile hetzner
    ```
 
-   An object in `downloads` has no `dg-encrypted` marker.
+   An object in `downloads` has no `dg-encrypted` marker and no `dg-sealed` value.
 
 4. Read the object back through the proxy, and compare its hash with the original file. Clients notice nothing.
+5. Check that `db-archive` no longer serves unencrypted objects: the box **Unencrypted objects are served** is gone from its **Encryption** group, and `GET /_/api/admin/buckets` shows `"serves_plaintext": false` in its `effective_encryption`. Then read an old object through the proxy again.
 
 ## Related
 

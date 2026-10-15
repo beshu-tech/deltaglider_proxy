@@ -110,7 +110,11 @@ If you back up a **filesystem backend's data directory** with file copies, your 
 rsync -aX /var/lib/deltaglider_proxy/data/ /backup/dgp-data/   # -X = preserve xattrs
 ```
 
-The usual symptom after a bad restore is that reads return 500 with "xattrs may have been stripped during backup/restore". See [Troubleshooting](troubleshooting.md).
+The usual symptom after a bad restore is that reads return 500 with "the object body is proxy-encrypted but its metadata names no encryption". See [Troubleshooting](troubleshooting.md).
+
+### Restore encrypted objects under the same names
+
+The sealed metadata of an object that the proxy encrypts is bound to its real bucket name, its folder and its name. A backup of the backend data therefore restores readable encrypted objects only under the same bucket names and the same keys. An encrypted object that you restore into another bucket, or under another key, fails to read with "the sealed metadata of … failed authentication" ([Copies outside the proxy](../reference/encryption.md#copies-outside-the-proxy)). To move restored objects to another bucket, restore them under their original names first, and then copy them through the proxy.
 
 ## Verify
 

@@ -322,6 +322,11 @@
       "order": 30
     },
     {
+      "path": "explanation/encryption-threat-model",
+      "group": "Concepts",
+      "order": 35
+    },
+    {
       "path": "explanation/jobs-and-durability",
       "group": "Concepts",
       "order": 40

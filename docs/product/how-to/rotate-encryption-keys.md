@@ -1,6 +1,6 @@
 # How to rotate or change encryption keys
 
-This guide shows you how to change the encryption key or the encryption mode of a backend without losing access to the objects that it already holds. Every safe path goes through either the `legacy_key` read shim or a rewrite of the data. When you change `key` and do not set `legacy_key` yourself, the proxy moves the previous key into the `legacy_key` slot, together with the key id that the old objects carry, so that those objects stay readable. The background is in [encryption at rest](../explanation/encryption-at-rest.md), and the shim semantics are in the [encryption reference](../reference/encryption.md#the-legacy_key-shim).
+This guide shows you how to change the encryption key or the encryption mode of a backend without losing access to the objects that it already holds. Every safe path goes through either the `legacy_key` read shim or a rewrite of the data. When you change `key` and do not set `legacy_key` yourself, the proxy moves the previous key into the `legacy_key` slot, together with its key id, so that the objects under the old key stay readable. The background is in [encryption at rest](../explanation/encryption-at-rest.md), and the shim semantics are in the [encryption reference](../reference/encryption.md#the-legacy_key-shim).
 
 The examples use the backend `hetzner-fsn1`, which holds the buckets `releases` and `downloads` and uses proxy-side AES with the key id `hetzner-2026-06`.
 
@@ -26,7 +26,7 @@ In the admin UI:
 3. The browser generates a new key and shows it once. Click **Copy to clipboard**, and store the key in your secrets manager. Keep the old key too, because you need both for a while.
 4. Select the checkbox **I have stored this key safely**, and click **Apply**.
 
-   The admin UI sends only the new key. The proxy moves the current key and its id into the legacy slot. New writes now use the new key. Reads check the key id of the new key first, and they fall back to the legacy slot. The admin UI cannot set `key_id`, so the new key gets an id that the proxy derives from the backend name and the key (16 hex characters).
+   The admin UI sends only the new key. The proxy moves the current key and its id into the legacy slot. New writes now use the new key. A read picks the new key or the legacy key by the key fingerprint that each object carries. The admin UI cannot set `key_id`, so the new key gets the id `fp-` followed by the 16 hexadecimal characters of its fingerprint.
 
 5. The dialog **Re-encrypt existing objects with the new key?** lists the buckets whose encryption changed: the buckets of the backend that have no encryption block of their own. Click **Start now**.
 
@@ -54,7 +54,7 @@ The steps above write the keys into the `storage` section of `deltaglider_proxy.
         mode: aes256-gcm-proxy
         key_id: hetzner-2026-09           # the new key comes from DGP_BACKEND_HETZNER_FSN1_ENCRYPTION_KEY
         legacy_key: "${env:HETZNER_OLD_KEY}"
-        legacy_key_id: hetzner-2026-06    # the id stamped on the old objects
+        legacy_key_id: hetzner-2026-06    # the id of the old key
 ```
 
 After you edit the file, restart the proxy, or apply the file with `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example`. The CLI expands the `${env:...}` references from your own environment before it sends the file. When every re-encrypt job shows `succeeded`, remove `legacy_key` and `legacy_key_id`, and apply again.
@@ -70,7 +70,7 @@ After you edit the file, restart the proxy, or apply the file with `deltaglider_
 
   For a bucket's own key, name the bucket instead (`witness publish db-archive`).
 
-**Caveat:** the shim holds exactly one legacy generation. Do not rotate again while a shim is live. Rotate to the final key, not through intermediate keys. The proxy refuses a key change that would push a different key out of a live legacy slot, because objects can still need that key. It also refuses a key change that keeps the same `key_id`, because the proxy would then decrypt the old objects with the new key. To drop a legacy key on purpose, send `legacy_key: null` in the same apply.
+**Caveat:** the shim holds exactly one legacy generation. Do not rotate again while a shim is live. Rotate to the final key, not through intermediate keys. The proxy refuses a key change that would push a different key out of a live legacy slot, because objects can still need that key. It also refuses a key change that keeps the same `key_id`, because one key id names exactly one key. To drop a legacy key on purpose, send `legacy_key: null` in the same apply.
 
 ## Recipe B: rotation through a data migration (no shim)
 
@@ -101,7 +101,7 @@ You can also switch the existing backend in place, with the old key as the shim.
         legacy_key_id: hetzner-2026-06
 ```
 
-New writes then go through SSE-KMS, and reads of the old proxy-side AES objects decrypt through the shim. But no job rewrites the old objects, so they keep the legacy key id until a client uploads them again or you delete them. The shim banner on the backend counts these objects. Its **Clear legacy key** button stays disabled until the count is zero, because an object under the legacy key id cannot be read after the clear. To reach zero, move the buckets with the migrate job as described above.
+New writes then go through SSE-KMS, and reads of the old proxy-side AES objects decrypt through the shim. But no job rewrites the old objects, so they stay under the legacy key until a client uploads them again or you delete them. The shim banner on the backend counts these objects. Its **Clear legacy key** button stays disabled until the count is zero, because an object under the legacy key cannot be read after the clear. To reach zero, move the buckets with the migrate job as described above.
 
 The reverse direction (SSE to proxy-side AES) needs no shim. SSE objects carry `dg-encrypted-native`, so the proxy decrypt path never runs on them.
 
@@ -143,7 +143,7 @@ A bucket can have its own key on a shared backend ([per-bucket encryption](../re
            key_id: db-archive-2026
    ```
 
-3. Apply the file with `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example`, or restart the proxy. The response of the apply has a warning for `db-archive`: new writes use the key id `db-archive-2026`, and the objects stored before keep their old form.
+3. Apply the file with `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example`, or restart the proxy. The response of the apply has a warning for `db-archive`: new writes use the key id `db-archive-2026`, and the objects stored before keep their old form. When `local-disk` stores plaintext, the old objects of `db-archive` are plaintext, and the proxy refuses them under the new block. In that case, add `plaintext_reads: serve` to the block until the re-encrypt job of step 4 succeeded. Without that line, the apply is refused, unless you confirm with `--confirm-plaintext-refusal db-archive` that the bucket holds no plaintext that anyone needs ([How to encrypt one bucket on a shared backend](encrypt-one-bucket-on-a-shared-backend.md#2-encrypt-the-objects-that-the-bucket-already-holds)).
 4. Rewrite the old objects under the new key with the re-encrypt job:
 
    ```bash
@@ -151,7 +151,7 @@ A bucket can have its own key on a shared backend ([per-bucket encryption](../re
      -H 'Content-Type: application/json' -d '{"buckets": ["db-archive"]}'
    ```
 
-   Until the job is done, the old objects stay readable under the backend key, because the proxy picks the key of each object by the key id that the object carries.
+   Until the job is done, the objects that the backend key encrypted stay readable, because the proxy picks the key of each object by the key fingerprint that the object carries.
 
 ### Rotate the bucket key
 
@@ -171,7 +171,7 @@ A bucket can have its own key on a shared backend ([per-bucket encryption](../re
    ```
 
 3. Run the re-encrypt job for `db-archive`, as in step 4 above.
-4. Check that no object still uses the old key. The scan reads the metadata of every object of every bucket stored on `local-disk`, because another bucket can hold objects under the same key id:
+4. Check that no object still uses the old key. The scan reads the metadata of every object of every bucket stored on `local-disk`, because another bucket can hold objects under the same key:
 
    ```bash
    curl -b cookies.txt 'https://s3.acme.example/_/api/admin/backends/local-disk/legacy-key-usage?bucket=db-archive'
@@ -208,10 +208,10 @@ The proxy refuses an apply that removes the key that a bucket writes with, becau
    aws --endpoint-url https://s3.acme.example s3 cp s3://releases/firmware/widget-3000/fw-1.4.0.tar - | sha256sum
    ```
 
-3. On the raw backend, check that the `dg-encryption-key-id` metadata of a rewritten object shows the **new** key id.
+3. On the raw backend, check that the `dg-sealed` value of a rewritten object starts with the fingerprint of the **new** key. The [encryption reference](../reference/encryption.md#key-ids) shows how to read the fingerprint of an object and of a key.
 4. Check that the banner **Decrypt-only shim active** is gone after you clear the legacy key.
-5. If a read fails with "object was encrypted with key id X, but this backend is configured with key id Y", the job missed some objects. Restore the shim and run the job again ([troubleshooting](troubleshooting.md)).
-6. For a bucket key (recipe E), check the stored metadata of a new object in that bucket: its `dg-encryption-key-id` is the bucket's `key_id`, and the objects of the other buckets on the backend keep the backend's key id.
+5. If a read fails with "was encrypted with a key that this backend does not have (fingerprint …)", the job missed some objects before you cleared the legacy key. Restore the old key as the shim, and run the job again ([troubleshooting](troubleshooting.md#encryption-at-rest-symptoms-and-fixes)).
+6. For a bucket key (recipe E), check the stored metadata of a new object in that bucket: its `dg-sealed` value starts with the fingerprint of the bucket key, and the objects of the other buckets on the backend keep the fingerprint of the backend key.
 
 ## Related
 

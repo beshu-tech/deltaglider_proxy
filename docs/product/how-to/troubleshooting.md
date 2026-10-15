@@ -190,25 +190,61 @@ If everything is `passthrough`, usually:
 
 Background and mode mechanics: [Encryption at rest](../explanation/encryption-at-rest.md) and the [encryption reference](../reference/encryption.md).
 
-### Reads return 500 with "object is encrypted but no key is configured"
+Every read failure below is `500 InternalError` for the client, and the proxy log has a line with the full message. The proxy never answers `404 NoSuchKey` for an object that it refuses, and it never serves ciphertext or an unauthenticated object.
 
-The object's metadata carries `dg-encrypted` (it was encrypted) but the backend has no key now. Either the mode was changed to `none`, or proxy-AES mode is missing the `key`. Restore the key through the `DGP_*_ENCRYPTION_KEY` env var, the YAML, or the backend card on **Storage → Backends** in the admin GUI. If the key is lost, the object is unrecoverable.
+### Reads return 500 with "was encrypted with a key that this backend does not have (fingerprint …)"
 
-### Reads return 500 with "object was encrypted with key id 'X', but this backend is configured with key id 'Y'"
+The object carries the fingerprint of a key that the keyring of the backend does not hold. The keyring holds the `key` and `legacy_key` of the backend and of each bucket on it. The usual causes are these:
 
-The cause is a rotation without a shim, a bucket routed to the wrong backend, or two backends that share storage with different keys. In the most common case, restore the old key as `legacy_key: <old-hex>` and `legacy_key_id: <X>` on the backend's encryption block, so that historical reads go through. This is shim-assisted rotation (see the [encryption reference](../reference/encryption.md)). If the mismatch is a routing error, fix `storage.buckets[*].backend`. If two backends share physical storage with different keys, that is a config bug. Pick one key.
+- A key was removed before the re-encrypt job converted every object, for example a cleared `legacy_key` or a mode changed to `none` without `legacy_key`.
+- The bucket is routed to the wrong backend.
+- The key in the environment variable is not the key that wrote the object.
 
-### Reads return 500 with "xattrs may have been stripped during backup/restore"
+Restore the old key as `legacy_key`, with any `legacy_key_id`, so that the object reads again. Then run the re-encrypt job. To find which key you hold has the fingerprint in the message, compute the fingerprint of each candidate key as the [encryption reference](../reference/encryption.md#key-ids) shows. If the key is lost, the object is unrecoverable.
 
-The object body starts with `DGE1` (proxy-AES chunked wire format) but has no `dg-encrypted` metadata marker. This is the typical sign of a backup/restore round-trip that preserved file contents but dropped extended attributes. On filesystem backends, per-object metadata lives in the `user.dg.metadata` xattr; older `rsync` without `-X` and some S3 sync tools strip it. Re-run the backup with xattr support, or rebuild the metadata from a known-good source. See [How to back up and restore](back-up-and-restore.md).
+### Reads return 500 with "is not encrypted, but the bucket encrypts"
+
+The full message is "object '…' in bucket '…' is not encrypted, but the bucket encrypts: the proxy refuses it, because a writer with access to the backend could have planted it". The bucket encrypts, and the object has no encryption at all. Usually it is an object that the bucket held before it started to encrypt, or an object that a tool wrote to the backend directly, around the proxy.
+
+If the object is part of the bucket's history, set `plaintext_reads: serve` in the `encryption` block of the bucket or of its backend, run the re-encrypt job for the bucket, and remove `plaintext_reads: serve` when the job succeeded ([How to encrypt data at rest](encrypt-data-at-rest.md#6-encrypt-the-objects-that-the-backend-already-holds)). If you did not expect a plaintext object in the bucket, treat it as a sign that someone writes to the backend around the proxy.
+
+### Reads return 500 with "carries an encryption marker but no valid sealed metadata"
+
+The object has `dg-encrypted` in its stored metadata, but no `dg-sealed` value. Either an earlier release wrote it in a format that this release does not read (`aes-256-gcm-v1` or `aes-256-gcm-chunked-v1`, body magic `DGE1`), or someone removed the sealed metadata on the backend. This release has no reader for the earlier formats. Restore the object from a backup that this release wrote, or upload it again through the proxy.
+
+### Reads return 500 with "the sealed metadata of … failed authentication"
+
+The full message ends with "it was edited, or the object was moved or copied on the backend". The sealed metadata is bound to the real bucket name, the folder and the name of the object. It fails when someone changed it, and also when the object reached its current name without the proxy: an `rclone` copy, a restore of a backup under another bucket name, or a key moved by hand. Such a copy is unreadable by design ([Copies outside the proxy](../reference/encryption.md#copies-outside-the-proxy)). Copy the object back to its original bucket name and key, and then copy it through the proxy (`CopyObject` or the migrate job), which writes new sealed metadata for the destination.
+
+### Reads return 500 with "the clear metadata of an object in bucket '…' was changed on the backend"
+
+The full message ends with "(content type or user metadata): the proxy refuses it".
+
+The content type or the user metadata of the object differs from the digest in its sealed metadata. Someone changed them on the backend, around the proxy. Restore the object from a backup, or upload it again through the proxy.
+
+### Reads return 500 with a message about the body: "stored size … does not match the sealed size", "frame N failed authentication", "does not belong to its metadata", "bytes after the final frame" or "key commitment mismatch"
+
+The body of the object was cut, extended, changed or replaced on the backend, or the body belongs to another object. Restore the object from a backup. A read that breaks off in the middle of a large download has the same cause: the proxy streams a large object frame by frame and stops at the first frame that fails.
+
+### Reads return 500 with "the object body is proxy-encrypted but its metadata names no encryption"
+
+The object body starts with a `DGE` magic (proxy-AES ciphertext), but its metadata has no encryption marker. This is the typical sign of a backup/restore round-trip that preserved file contents but dropped extended attributes. On filesystem backends, per-object metadata lives in the `user.dg.metadata` xattr; older `rsync` without `-X` and some S3 sync tools strip it. Re-run the backup with xattr support. See [How to back up and restore](back-up-and-restore.md).
+
+### An apply is refused with "this change makes … encrypt, but the objects stored there before are plaintext"
+
+The apply makes an existing bucket, or the buckets of a backend, start to encrypt in `aes256-gcm-proxy` mode with `plaintext_reads: refuse`. The proxy would then refuse every object that the bucket held before. Add `plaintext_reads: serve` to the `encryption` block, run the re-encrypt job, and set the field back to `refuse` when the job succeeded ([How to encrypt data at rest](encrypt-data-at-rest.md#6-encrypt-the-objects-that-the-backend-already-holds)). When the subject holds no plaintext that anyone needs, confirm it instead with the header `X-DGP-Confirm-Plaintext-Refusal: <subject>` or `config apply --confirm-plaintext-refusal <subject>`. The admin UI sets `serve` by itself, so this refusal comes from the admin API or the CLI.
+
+### Startup fails: "one key has two ids"
+
+The full message is "backend 'X': one key has two ids, 'A' and 'B'". An object stores only the fingerprint of its key, so the proxy needs one id for each key on a backend. Two places on one backend use the same key bytes with different `key_id` values, for example the backend key and a bucket key, or the `key` and the `legacy_key`. Give every use of the key the same `key_id`, or use another key.
 
 ### Startup fails: "backends X and Y share key_id but declare DIFFERENT keys"
 
-Two backends pinned the same explicit `key_id`, but the `key` values differ. The server refuses to start when it builds the engine. This is almost always a copy-paste error. Make the ids distinct, or make the keys identical (the documented "portability" escape hatch for two aliases of the same physical bucket).
+Two backends pinned the same explicit `key_id`, but the `key` values differ. The server refuses to start when it builds the engine. This is almost always a copy-paste error. Make the ids distinct, or make the keys identical.
 
 ### Startup warning: "backend 'X' has encryption mode aes256-gcm-proxy but no key is configured"
 
-YAML declares proxy-AES mode but there's no `key` in YAML and no `DGP_*_ENCRYPTION_KEY` in the environment. Writes to this backend are therefore stored as plaintext, despite the declared mode. Set the env var, or put the hex key into the YAML. The proxy treats a key in the YAML as an infra secret and strips it from canonical exports, so it does not leak through `/config/export`.
+YAML declares proxy-AES mode but there's no `key` in YAML and no `DGP_*_ENCRYPTION_KEY` in the environment. The proxy refuses every write to this backend instead of storing plaintext. Reads of encrypted objects keep working while the keyring holds their key. Set the env var, or put the hex key into the YAML. The proxy treats a key in the YAML as an infra secret and strips it from canonical exports, so it does not leak through `/config/export`.
 
 ### Startup warning: "backend 'X' encryption key was loaded from config file (not DGP_*_ENCRYPTION_KEY)"
 
@@ -227,7 +263,7 @@ Expected if you removed the key entirely. The decrypt path errors explicitly (it
 
 ### Reads succeed but return garbage
 
-GET returns 200 with an object that looks like random bytes, and no error. This should not happen, because every backend is always wrapped and a missing key produces an explicit error. If you see it, it is a bug. File a report with the config and the first 16 bytes of the object body.
+GET returns 200 with an object that looks like random bytes, and no error. This should not happen, because every backend is always wrapped, every encrypted body is authenticated, and a missing key produces an explicit error. If you see it, it is a bug. File a report with the config and the first 16 bytes of the object body.
 
 ## Where to look next
 

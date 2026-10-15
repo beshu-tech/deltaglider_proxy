@@ -60,6 +60,8 @@ If you type the name of a bucket that the proxy already lists, the row does not 
 
    ![The dialog Backfill object metadata with the releases bucket selected; the arrow points at Start now.](/_/screenshots/adopt-bucket-backfill.webp)
 
+When the proxy encrypts the bucket in `aes256-gcm-proxy` mode, through the backend or through the bucket's own `encryption` block, it refuses to serve the existing objects, because they are plaintext. Set `plaintext_reads: serve` in that `encryption` block, run the re-encrypt job for the bucket, and then remove the line ([How to encrypt data at rest](encrypt-data-at-rest.md#6-encrypt-the-objects-that-the-backend-already-holds)).
+
 **The limit of this route:** objects that entered the bucket before the proxy never get compressed later. The proxy delta-encodes an object only when it writes it. An object stored as-is stays as-is, unless something writes it again through the proxy. If historical savings matter, use route 2.
 
 ### The same change in YAML
@@ -136,7 +138,7 @@ Both routes end the same way: you change the endpoint.
 2. Give the clients proxy credentials. Clients now sign with the SigV4 credentials of the proxy, not with those of the provider. Create an IAM user for each client, for example `ci-uploader` with write access to `releases/*`, in **Access → Users** (`/_/admin/access/users`). The steps are in [How to create IAM users and groups](create-iam-users.md).
 3. If you used route 2, freeze or retire the old bucket after the traffic moved, so that nothing writes around the proxy.
 
-Do not keep writing to the backend bucket directly, for example with the Python DeltaGlider CLI or with raw AWS credentials. A write with a plain S3 client is not compressed. A tool that writes to the backend directly also does not encrypt with the key of the proxy, so on a backend that the proxy encrypts, such a write is stored in plaintext. Make the proxy the only write path.
+Do not keep writing to the backend bucket directly, for example with the Python DeltaGlider CLI or with raw AWS credentials. A write with a plain S3 client is not compressed. A tool that writes to the backend directly also does not encrypt with the key of the proxy, so on a backend that the proxy encrypts, such a write is stored in plaintext, and the proxy refuses to serve it unless the bucket has `plaintext_reads: serve`. Make the proxy the only write path.
 
 ## Verify
 

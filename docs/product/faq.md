@@ -29,13 +29,16 @@
 ## Encryption
 
 - [Which backend encryption mode should I pick?](explanation/encryption-at-rest.md)
-- [Does enabling encryption re-encrypt my existing objects?](how-to/encrypt-data-at-rest.md)
+- [Does enabling encryption re-encrypt my existing objects?](how-to/encrypt-data-at-rest.md#6-encrypt-the-objects-that-the-backend-already-holds)
+- [Why do my old objects return 500 after I turned on encryption?](how-to/troubleshooting.md#encryption-at-rest-symptoms-and-fixes)
 - [Can I use cheap or untrusted S3-compatible storage safely?](explanation/encryption-at-rest.md)
 - [Can I use different keys for different buckets?](reference/encryption.md)
 - [What happens if I lose my proxy-AES key?](explanation/encryption-at-rest.md)
 - [How do I rotate a proxy-AES key?](how-to/rotate-encryption-keys.md)
 - [Does compression still work with encryption enabled?](explanation/encryption-at-rest.md)
-- [Does encryption apply to object metadata too?](explanation/encryption-at-rest.md)
+- [Does encryption apply to object metadata too?](explanation/encryption-at-rest.md#what-the-sealed-metadata-protects-and-what-stays-readable)
+- [What can my storage provider learn from encrypted objects?](explanation/encryption-threat-model.md)
+- [Can I copy encrypted objects with rclone, or restore them into another bucket?](reference/encryption.md#copies-outside-the-proxy)
 - [Does encryption add latency?](explanation/encryption-at-rest.md)
 - [I see `dg-encrypted-native: sse-kms` in my object metadata. Is that leaking something?](reference/encryption.md)
 - [Can I write objects with the Python DeltaGlider CLI while the backend is encrypted?](explanation/encryption-at-rest.md)

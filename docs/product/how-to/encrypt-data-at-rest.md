@@ -40,13 +40,15 @@ In the admin UI:
 
    ![The encryption editor of hetzner-fsn1 holds a generated key, which is hidden here; callout 4 marks Copy to clipboard, callout 5 marks the I have stored this key safely checkbox, and callout 6 marks Apply.](/_/screenshots/encrypt-key.webp)
 
-**Apply** sends a `storage` section update at once; it has no separate **Review & apply** step. New writes to the buckets of `hetzner-fsn1` that have no encryption block of their own are encrypted from this moment. A bucket with its own block keeps its own setting. Section 6 covers the objects that the backend already holds.
+**Apply** sends a `storage` section update at once; it has no separate **Review & apply** step. New writes to the buckets of `hetzner-fsn1` that have no encryption block of their own are encrypted from this moment. A bucket with its own block keeps its own setting.
+
+The objects that the buckets already hold stay plaintext. In a bucket that encrypts, the proxy refuses a plaintext object by default, because it cannot tell the history of the bucket from an object that someone planted on the backend ([why](../explanation/encryption-at-rest.md#why-enabling-isnt-retroactive)). When a backend starts to encrypt, the admin UI therefore also sets `plaintext_reads: serve`, so that the existing objects stay readable until a re-encrypt job converts them. [Section 6](#6-encrypt-the-objects-that-the-backend-already-holds) converts them and then turns `serve` off.
 
 The proxy stores a key from the admin UI **in the config file, in plain text**, as the `key` field of the backend. The proxy writes the file with no access for other users (mode `0600` for a new file), and it never returns the key: `GET /_/api/admin/config/export` and the section reads leave it out, and a full backup keeps it in `secrets.json`. Anyone who can read the config file can still read the key. To keep the key out of the file, use an environment variable instead (section 4).
 
 ## The same change in YAML
 
-The steps above write this configuration into the `storage` section of `deltaglider_proxy.yaml` ([why the UI and the file hold the same configuration](../explanation/two-ways-to-configure.md)). The key here is an example value; the file holds the key that the browser generated:
+The steps above write this configuration into the `storage` section of `deltaglider_proxy.yaml` ([why the UI and the file hold the same configuration](../explanation/two-ways-to-configure.md)). The key here is an example value; the file holds the key that the browser generated. The admin UI writes `plaintext_reads: serve` because the backend did not encrypt before:
 
 ```yaml
 # validate
@@ -61,9 +63,12 @@ storage:
       encryption:
         mode: aes256-gcm-proxy
         key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef   # 64 hex characters
+        plaintext_reads: serve      # section 6 turns this off after the re-encrypt job
 ```
 
 After you edit the file, restart the proxy, or apply the file to the running proxy with `POST /_/api/admin/config/apply` or with `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example`.
+
+An apply that makes a backend with buckets start to encrypt without `plaintext_reads: serve` is refused, because the existing objects would become unreadable. When the buckets hold no plaintext that anyone needs, leave the line out and confirm instead: `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example --confirm-plaintext-refusal backend:hetzner-fsn1`, or the header `X-DGP-Confirm-Plaintext-Refusal: backend:hetzner-fsn1` with `POST /_/api/admin/config/apply`. A restart from an edited file runs no such check.
 
 ## 4. Or keep the key in an environment variable
 
@@ -99,7 +104,7 @@ storage:
         key_id: hetzner-2026-06    # optional: a stable name for this key generation
 ```
 
-`key_id` is the name that the proxy stamps on every object that it encrypts. When you leave it out, the proxy derives an id from the backend name and the key. A readable id helps later, when you rotate the key ([How to rotate or change encryption keys](rotate-encryption-keys.md)). While the variable is set, the encryption editor of the backend in the admin UI is read-only, and a note names the variable.
+Add `plaintext_reads: serve` to the block when the buckets of the backend already hold objects, as in the section above. `key_id` is the name under which the admin UI, the audit log and the jobs show the key. The objects store only a fingerprint of the key, not the id. When you leave `key_id` out, the id is `fp-` and the 16 hexadecimal characters of that fingerprint. A readable id helps later, when you rotate the key ([How to rotate or change encryption keys](rotate-encryption-keys.md)). While the variable is set, the encryption editor of the backend in the admin UI is read-only, and a note names the variable.
 
 ## 5. Or use SSE-KMS or SSE-S3 on AWS
 
@@ -149,14 +154,47 @@ The environment variable `DGP_BACKEND_<NAME>_SSE_KMS_KEY_ID` overrides `kms_key_
 
 ## 6. Encrypt the objects that the backend already holds
 
-Encryption is **not retroactive**. The proxy encrypts only new writes, and the existing objects stay in their stored form. After an **Apply** that changes the proxy-side encryption of a backend, the Backends page proposes a job that rewrites these objects:
+Encryption is **not retroactive**. The proxy encrypts only new writes, and the existing objects stay plaintext until a re-encrypt job rewrites them. While `plaintext_reads: serve` is set, the proxy trusts every plaintext object in these buckets as it is, and the re-encrypt job seals it as part of the bucket's history. Keep that window short.
 
-1. In the dialog **Encrypt existing objects?**, check the list of buckets. The dialog preselects only the buckets whose encryption changed. A bucket with its own encryption block is not listed, because a change of the backend does not change it.
+In the admin UI:
+
+1. After the **Apply** of section 3, the Backends page shows the dialog **Encrypt existing objects?**. Check the list of buckets. The dialog preselects only the buckets whose encryption changed. A bucket with its own encryption block is not listed, because a change of the backend does not change it.
 2. Click **Start now**. The proxy starts one re-encrypt job for each selected bucket.
 
    ![After the apply, the dialog Encrypt existing objects? lists the buckets of hetzner-fsn1; the arrow points at Start now.](/_/screenshots/encrypt-reencrypt-proposal.webp)
 
-If you click **Later**, start the job when you are ready from **Storage → Jobs** with **New job** → **Re-encrypt buckets… — one-off rewrite**. While the job of a bucket runs, writes to that bucket get `503 SlowDown`, and reads pass. The job survives restarts. [How to rotate or change encryption keys](rotate-encryption-keys.md) explains the mechanics. The re-encrypt job does not handle the SSE modes: on an SSE-KMS or SSE-S3 backend, use the migrate job ([recipe C](rotate-encryption-keys.md#recipe-c-migrate-from-proxy-aes-to-sse-kms)).
+   If you click **Later**, start the jobs when you are ready from **Storage → Jobs** with **New job** → **Re-encrypt buckets… — one-off rewrite**. While the job of a bucket runs, writes to that bucket get `503 SlowDown`, and reads pass. The job survives restarts.
+
+3. Open **Storage → Jobs** (`/_/admin/jobs`), and wait until every re-encrypt job shows `succeeded`, with no rows on its **Failures** tab.
+4. Back on **Storage → Backends**, the encryption editor of `hetzner-fsn1` shows the box **Unencrypted objects are served**. Click **Refuse unencrypted objects**. From now on, the proxy refuses every object in these buckets that it did not encrypt.
+
+The re-encrypt job does not handle the SSE modes: on an SSE-KMS or SSE-S3 backend, use the migrate job ([recipe C](rotate-encryption-keys.md#recipe-c-migrate-from-proxy-aes-to-sse-kms)). [How to rotate or change encryption keys](rotate-encryption-keys.md) explains the mechanics of the job.
+
+### The same change in YAML
+
+Step 4 removes `plaintext_reads: serve` from the backend's block (the default is `refuse`), so the block is the one of section 4 again ([why the UI and the file hold the same configuration](../explanation/two-ways-to-configure.md)):
+
+```yaml
+# validate
+storage:
+  default_backend: hetzner-fsn1
+  backends:
+    - name: hetzner-fsn1
+      type: s3
+      endpoint: https://fsn1.your-objectstorage.com
+      region: fsn1
+      force_path_style: true
+      encryption:
+        mode: aes256-gcm-proxy
+        key_id: hetzner-2026-06
+```
+
+Remove the line only after every job succeeded, and apply the file with `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example`. The jobs themselves are not configuration: start them in the admin UI or with the admin API:
+
+```bash
+curl -b cookies.txt -X POST https://s3.acme.example/_/api/admin/jobs/reencrypt \
+  -H 'Content-Type: application/json' -d '{"buckets": ["releases", "downloads"]}'
+```
 
 ## Verify
 
@@ -170,7 +208,7 @@ If you click **Later**, start the job when you are ready from **Storage → Jobs
 
    The hash must match the hash of the original file.
 
-3. Check that the stored object is ciphertext. Look at it on the raw backend, without the proxy. In proxy-side AES mode, the body starts with the `DGE1` magic (chunked) or is opaque GCM ciphertext. The user metadata on the backend carries the `dg-encrypted` marker (an `aes-256-gcm-*` value) and `dg-encryption-key-id`:
+3. Check that the stored object is ciphertext. Look at it on the raw backend, without the proxy. In proxy-side AES mode, the body starts with the 4 characters `DGE2`. The user metadata on the backend carries `dg-encrypted: aes-256-gcm-chunked-v1` and a `dg-sealed` value that starts with `2.`. It holds no `dg-md5`, and its `dg-file-sha256` starts with `sealed:` instead of a hash:
 
    ```bash
    aws s3api head-object --bucket releases --key reports/release-notes.md --profile hetzner
@@ -178,10 +216,12 @@ If you click **Later**, start the job when you are ready from **Storage → Jobs
 
    On a filesystem backend, the markers live in the `user.dg.metadata` extended attribute of the file, for example `xattr -p user.dg.metadata /var/lib/dgp-local/db-archive/nightly/2026-06-10.dump`.
 
+   The value `aes-256-gcm-chunked-v1` is the name of an older format on purpose, so that an older release refuses the object. The proxy does not store the key id. The `dg-sealed` value starts with the fingerprint of the key, and the [encryption reference](../reference/encryption.md#key-ids) shows how to read it and compare it with the fingerprint of your key.
+
    The SSE modes stamp `dg-encrypted-native: sse-kms` (or `sse-s3`) instead. That marker is harmless to expose.
 
-4. Check that the old plaintext objects still read correctly. The decrypt path acts on the marker, and an object without a marker is served as it is.
-5. If you ran a re-encrypt job, check that its row on **Storage → Jobs** shows `succeeded`, and that an *old* object on the raw backend now carries the marker too.
+4. If you converted existing objects (section 6), check that each re-encrypt job on **Storage → Jobs** shows `succeeded`, and that an *old* object on the raw backend now carries `dg-sealed` too.
+5. Check that the backend no longer serves unencrypted objects: the box **Unencrypted objects are served** is gone, and `GET /_/api/admin/backends` shows `"serves_plaintext": false` in the `encryption` summary of `hetzner-fsn1`. Then read an old object through the proxy. It must read without an error. An error that says that the object "is not encrypted, but the bucket encrypts" means that the job did not convert it ([troubleshooting](troubleshooting.md#encryption-at-rest-symptoms-and-fixes)).
 6. Check that the key is stored somewhere safe **outside** the proxy host.
 
 ## Related

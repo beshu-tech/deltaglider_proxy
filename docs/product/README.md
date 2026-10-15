@@ -54,7 +54,8 @@ The why behind the design, one concept per page:
 - [Compression vs. S3 Object Versioning](explanation/versioning-vs-s3-versioning.md): DeltaGlider does not implement native S3 versioning, and what that means for ransomware rollback.
 - [Multi-backend routing](explanation/multi-backend-architecture.md): one endpoint over many backends, aliasing, and low-cost storage that you do not trust.
 - [Authentication and access control](explanation/security-model.md): the four layers every request passes through, in order.
-- [Encryption at rest](explanation/encryption-at-rest.md): the threat model, the modes, and the costs.
+- [Encryption at rest](explanation/encryption-at-rest.md): the modes, the keyring, and the costs.
+- [The encryption threat model](explanation/encryption-threat-model.md): what proxy-side encryption protects against an attacker who reads the backend, one who writes it, and a user with limited permissions.
 - [Jobs, write gates, and durability](explanation/jobs-and-durability.md): why background work is one surface, and what "durable" means here.
 
 To give a page to an AI assistant, use **Copy page** at the top of the page: it
