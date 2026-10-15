@@ -443,7 +443,7 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
    */
   const expandSelected = useCallback(
     (currentBucket: string, options?: Parameters<typeof expandSelection>[2]) =>
-      expandSelection(selectedKeys, (pfx) => listAllUnderPrefix(currentBucket, pfx), options),
+      expandSelection(selectedKeys, (pfx, after) => listAllUnderPrefix(currentBucket, pfx, after), options),
     [selectedKeys],
   );
 

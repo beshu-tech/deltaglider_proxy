@@ -244,3 +244,40 @@ test('maxKeys counts distinct keys: overlapping folders within the cap pass', as
   assert.equal(items.length, 4);
   await assert.rejects(expandSelection(['folder:x/', 'folder:y/'], lister, { maxKeys: 3 }), /more than 3 objects/);
 });
+
+// ── Paged folder listing: a folder of more than one listing is read page by
+// page (`next_start_after`), so a delete takes a folder of any size. ──────
+function pagedLister(keys: string[], pageSize: number) {
+  const calls: (string | undefined)[] = [];
+  const list: PrefixLister = async (_pfx, startAfter) => {
+    calls.push(startAfter);
+    const from = startAfter === undefined ? 0 : keys.indexOf(startAfter) + 1;
+    const page = keys.slice(from, from + pageSize);
+    const truncated = from + pageSize < keys.length;
+    return { keys: page, truncated, next_start_after: truncated ? page[page.length - 1] : undefined };
+  };
+  return { list, calls };
+}
+
+test('a folder of several listings is read page by page', async () => {
+  const keys = Array.from({ length: 25 }, (_, i) => `huge/${String(i).padStart(3, '0')}`);
+  const l = pagedLister(keys, 10);
+  const seen: number[] = [];
+  const items = await expandSelection(['folder:huge/'], l.list, { onProgress: (p) => seen.push(p.keysFound) });
+  assert.deepEqual(
+    items.map((i) => i.source),
+    keys,
+  );
+  assert.deepEqual(l.calls, [undefined, 'huge/009', 'huge/019']);
+  assert.deepEqual(seen, [0, 10, 20, 25], 'the progress counts each page');
+});
+
+test('paging stops once the selection passes maxKeys', async () => {
+  const keys = Array.from({ length: 50 }, (_, i) => `huge/${String(i).padStart(3, '0')}`);
+  const l = pagedLister(keys, 10);
+  await assert.rejects(
+    expandSelection(['folder:huge/'], l.list, { maxKeys: 15 }),
+    /more than 15 objects/,
+  );
+  assert.equal(l.calls.length, 2, 'no page is read after the limit');
+});

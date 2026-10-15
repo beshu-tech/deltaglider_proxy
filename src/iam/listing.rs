@@ -312,12 +312,14 @@ pub(crate) async fn list_keys_for_caller<L: Lister>(
     bucket: &str,
     prefix: &str,
     scope: Option<&ListScope>,
+    start_after: Option<&str>,
     max_keys: usize,
     budget: usize,
 ) -> Result<(Vec<String>, bool), ListingError> {
     let mut budget = budget;
     let mut keys = Vec::new();
-    let mut cursor: Option<String> = None;
+    // The engine's cursor is a key: the listing starts after it.
+    let mut cursor: Option<String> = start_after.filter(|k| !k.is_empty()).map(String::from);
     let visibility = Visibility::of(scope);
     loop {
         let (objects, next) = match &visibility {
@@ -1210,14 +1212,15 @@ mod tests {
         };
         let scope = scoped(vec![read("Allow", "b/*"), read("Deny", "b/h/*")]);
         let lister = counting(keys);
-        let err = list_keys_for_caller(&lister, "b", "", Some(&scope), 5000, 2)
+        let err = list_keys_for_caller(&lister, "b", "", Some(&scope), None, 5000, 2)
             .await
             .unwrap_err();
         assert!(matches!(err, ListingError::ScanBudgetSpent), "{err:?}");
         assert_eq!(calls(&lister), 2, "the budget is for the whole walk");
-        let (keys, truncated) = list_keys_for_caller(&lister, "b", "", Some(&scope), 5000, 10)
-            .await
-            .unwrap();
+        let (keys, truncated) =
+            list_keys_for_caller(&lister, "b", "", Some(&scope), None, 5000, 10)
+                .await
+                .unwrap();
         assert_eq!(keys.len(), 1001);
         assert_eq!(keys.last().map(String::as_str), Some("z/0"));
         assert!(!truncated);
@@ -1228,9 +1231,10 @@ mod tests {
     async fn a_folder_walk_outside_the_grant_reads_nothing() {
         let lister = counting((0..10).map(|i| format!("y/{i}")).collect());
         let scope = scoped(vec![rule("Allow", &["b/x/*"])]);
-        let (keys, truncated) = list_keys_for_caller(&lister, "b", "y/", Some(&scope), 5000, 10)
-            .await
-            .unwrap();
+        let (keys, truncated) =
+            list_keys_for_caller(&lister, "b", "y/", Some(&scope), None, 5000, 10)
+                .await
+                .unwrap();
         assert!(keys.is_empty() && !truncated);
         assert_eq!(calls(&lister), 0);
     }
@@ -1239,14 +1243,28 @@ mod tests {
     #[tokio::test]
     async fn a_folder_walk_stops_one_key_past_max() {
         let lister = counting((0..5).map(|i| format!("k/{i}")).collect());
-        let (keys, truncated) = list_keys_for_caller(&lister, "b", "k/", None, 5, 1)
+        let (keys, truncated) = list_keys_for_caller(&lister, "b", "k/", None, None, 5, 1)
             .await
             .unwrap();
         assert_eq!((keys.len(), truncated), (5, false));
-        let (keys, truncated) = list_keys_for_caller(&lister, "b", "k/", None, 4, 1)
+        let (keys, truncated) = list_keys_for_caller(&lister, "b", "k/", None, None, 4, 1)
             .await
             .unwrap();
         assert_eq!((keys.len(), truncated), (4, true));
+    }
+
+    /// The next page of a folder starts after the last key of the page
+    /// before: a folder of any size is read page by page.
+    #[tokio::test]
+    async fn a_folder_walk_starts_after_the_given_key() {
+        let lister = counting((0..5).map(|i| format!("k/{i}")).collect());
+        let (keys, truncated) = list_keys_for_caller(&lister, "b", "k/", None, Some("k/1"), 2, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            (keys, truncated),
+            (vec!["k/2".to_string(), "k/3".to_string()], true)
+        );
     }
 
     /// A visible prefix whose whole range is at or before the cursor holds
@@ -1293,9 +1311,10 @@ mod tests {
         let res: Vec<String> = (0..10).map(|i| format!("b/t{i:02}/*")).collect();
         let res: Vec<&str> = res.iter().map(String::as_str).collect();
         let scope = scoped(vec![rule("Allow", &res)]);
-        let (keys, truncated) = list_keys_for_caller(&lister, "b", "", Some(&scope), 5000, 12)
-            .await
-            .unwrap();
+        let (keys, truncated) =
+            list_keys_for_caller(&lister, "b", "", Some(&scope), None, 5000, 12)
+                .await
+                .unwrap();
         assert_eq!((keys.len(), truncated), (1006, false));
         // One engine page per prefix: the walk goes on from its scan
         // position, so it reads no engine page twice.

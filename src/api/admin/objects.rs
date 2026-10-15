@@ -1659,20 +1659,27 @@ fn zip_skip_report(
 // ---------------------------------------------------------------------------
 //
 // Resolves a folder selection into the absolute key list — the server
-// equivalent of the browser's `listAllKeys`. Returns up to MAX_BULK_OBJECTS
-// keys; truncated=true signals the client to narrow the selection.
+// equivalent of the browser's `listAllKeys`. Returns one page of up to
+// MAX_BULK_OBJECTS keys after `start_after`; a truncated page names the key
+// the next page starts after (`next_start_after`).
 
 #[derive(Debug, Deserialize)]
 pub struct ListAllQuery {
     pub bucket: AdminBucket,
     #[serde(default)]
     pub prefix: AdminObjectPath,
+    /// The last key of the page before.
+    #[serde(default)]
+    pub start_after: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ListAllResponse {
     pub keys: Vec<String>,
     pub truncated: bool,
+    /// With `truncated`: the last key of this page, where the next starts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_start_after: Option<String>,
 }
 
 pub async fn list_all(
@@ -1707,12 +1714,20 @@ pub async fn list_all(
         &bucket,
         &q.prefix,
         scope.as_ref(),
+        q.start_after.as_deref(),
         MAX_BULK_OBJECTS,
         budget,
     )
     .await
     {
-        Ok((keys, truncated)) => Ok(Json(ListAllResponse { keys, truncated })),
+        Ok((keys, truncated)) => {
+            let next_start_after = keys.last().filter(|_| truncated).cloned();
+            Ok(Json(ListAllResponse {
+                keys,
+                truncated,
+                next_start_after,
+            }))
+        }
         Err(crate::iam::listing::ListingError::ScanBudgetSpent) => Err(AdminError::invalid(
             "the folder holds more objects you cannot see than one listing may read \
              (advanced.filtered_list_max_engine_pages); select a narrower folder",

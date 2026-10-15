@@ -117,19 +117,26 @@ export async function bulkDeleteObjects(
 interface ListAllResponse {
   keys: string[];
   truncated: boolean;
+  /** With `truncated`: the key the next page starts after. */
+  next_start_after?: string;
 }
 
 /**
- * Recursively expand `prefix` to its absolute key list. Server-side
- * equivalent of the previous browser-side `listAllKeys`.
- * The server stops at 10,000 keys and sets `truncated`; callers go through
- * `expandSelection` (bulkSelection.ts), which refuses a truncated folder.
+ * One page (at most 10,000 keys) of the absolute keys under `prefix`, after
+ * `startAfter`. Server-side equivalent of the previous browser-side
+ * `listAllKeys`. Callers go through `expandSelection` (bulkSelection.ts),
+ * which reads every page of a folder.
  * For a user without admin rights the server lists only the visible keys,
  * and a folder of too many hidden keys answers 400 (an ApiError).
  */
-export async function listAllUnderPrefix(bucket: string, prefix: string): Promise<ListAllResponse> {
+export async function listAllUnderPrefix(
+  bucket: string,
+  prefix: string,
+  startAfter?: string,
+): Promise<ListAllResponse> {
   if (!prefix) throw new Error('listAllUnderPrefix: prefix must be non-empty');
   const qs = new URLSearchParams({ bucket, prefix });
+  if (startAfter !== undefined) qs.set('start_after', startAfter);
   return adminJson(`/api/admin/objects/list?${qs.toString()}`, { context: 'List under prefix' });
 }
 

@@ -581,6 +581,41 @@ async fn test_list_all_expands_folder() {
     assert_eq!(r["truncated"].as_bool(), Some(false));
 }
 
+/// The next page of a folder listing starts after `start_after`, so the
+/// browser reads a folder of any size page by page.
+#[tokio::test]
+async fn test_list_all_starts_after_the_given_key() {
+    let server = TestServer::builder().build().await;
+    let http = server.http();
+    let admin = admin_http_client(&server.endpoint()).await;
+    let bucket = server.bucket();
+    for key in ["folder/a.txt", "folder/b.txt", "folder/c.txt"] {
+        http.put(format!("{}/{}/{}", server.endpoint(), bucket, key))
+            .body(b"x".to_vec())
+            .send()
+            .await
+            .unwrap();
+    }
+    let r: Value = admin
+        .get(format!(
+            "{}/_/api/admin/objects/list?bucket={}&prefix=folder/&start_after=folder/a.txt",
+            server.endpoint(),
+            bucket
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        r["keys"],
+        serde_json::json!(["folder/b.txt", "folder/c.txt"])
+    );
+    assert_eq!(r["truncated"].as_bool(), Some(false));
+    assert!(r.get("next_start_after").is_none(), "{r}");
+}
+
 /// list_all refuses an empty prefix to avoid accidentally walking
 /// the entire bucket via the bulk-resolve helper.
 #[tokio::test]

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed — Deleting a folder of more than 10,000 objects
+
+The browser lists a selected folder before it deletes it. That listing stopped at 10,000 keys, so a delete of a bigger folder failed with "Folder … has more than 10,000 objects". The listing now reads the folder in pages of 10,000 (`GET /_/api/admin/objects/list` takes `start_after` and answers `next_start_after`), so a delete takes a folder of any size. Copy, move and ZIP keep their limit of 10,000 objects.
+
 ### Fixed — DeleteBucket on a versioned backend bucket
 
 A versioned backend bucket keeps the old versions and the delete markers of every deleted object. A Backblaze B2 bucket is always versioned. Clients of the proxy cannot see or delete these versions, so the backend refused DeleteBucket with `BucketNotEmpty`, and the proxy answered `500 InternalError`.

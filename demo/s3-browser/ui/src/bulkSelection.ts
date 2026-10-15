@@ -11,8 +11,14 @@
  */
 export const MAX_BULK_OBJECTS = 10_000;
 
-/** Shape of `GET /api/admin/objects/list`: the server stops at 10,000 keys. */
-export type PrefixLister = (prefix: string) => Promise<{ keys: string[]; truncated: boolean }>;
+/**
+ * Shape of `GET /api/admin/objects/list`: one page of at most 10,000 keys.
+ * A truncated page names the key the next page starts after.
+ */
+export type PrefixLister = (
+  prefix: string,
+  startAfter?: string,
+) => Promise<{ keys: string[]; truncated: boolean; next_start_after?: string }>;
 
 type Listing = Awaited<ReturnType<PrefixLister>>;
 
@@ -53,7 +59,8 @@ interface ExpandOptions {
    * The most distinct keys the selection may hold. Once the folders listed
    * so far pass it, no new folder is listed and the expansion rejects: a
    * copy of 50 big folders used to list 500,000 keys before the server
-   * refused anything over 10,000. Absent: no limit (a delete).
+   * refused anything over 10,000. Absent: no limit (a delete takes a
+   * folder of any size, read page by page).
    */
   maxKeys?: number;
 }
@@ -71,8 +78,9 @@ function tooManyKeysError(maxKeys: number): Error {
 }
 
 /**
- * List `prefixes` with at most `concurrency` requests in flight. A truncated
- * folder, a failed request, or more distinct keys than `maxKeys` (counted
+ * List `prefixes` with at most `concurrency` folders in flight; each folder
+ * is read page by page. A truncated page without a next position (an older
+ * server), a failed request, or more distinct keys than `maxKeys` (counted
  * with `directKeys`, the selected objects) stops new listings; the requests
  * in flight finish, then this rejects. Several truncated folders: the first
  * in `prefixes` order names the error, so the message does not depend on
@@ -95,15 +103,26 @@ async function listFolders(
     while (!stop && !signal?.aborted && next < prefixes.length) {
       const prefix = prefixes[next++];
       try {
-        const listing = await listPrefix(prefix);
-        listed.set(prefix, listing);
-        keysFound += listing.keys.length;
-        onProgress?.({ listed: listed.size, folders: prefixes.length, keysFound });
-        if (listing.truncated) stop = true;
-        if (maxKeys !== undefined) {
-          for (const k of listing.keys) distinct.add(k);
-          if (distinct.size > maxKeys) stop = true;
+        const listing: Listing = { keys: [], truncated: false };
+        let startAfter: string | undefined;
+        for (;;) {
+          const page = await listPrefix(prefix, startAfter);
+          for (const k of page.keys) listing.keys.push(k);
+          keysFound += page.keys.length;
+          if (maxKeys !== undefined) {
+            for (const k of page.keys) distinct.add(k);
+            if (distinct.size > maxKeys) stop = true;
+          }
+          if (page.truncated && page.next_start_after === undefined) {
+            listing.truncated = true;
+            stop = true;
+          }
+          if (stop || signal?.aborted || !page.truncated) break;
+          startAfter = page.next_start_after;
+          onProgress?.({ listed: listed.size, folders: prefixes.length, keysFound });
         }
+        listed.set(prefix, listing);
+        onProgress?.({ listed: listed.size, folders: prefixes.length, keysFound });
       } catch (error) {
         failure ??= { error };
         stop = true;
@@ -113,8 +132,8 @@ async function listFolders(
   const workers = Math.min(Math.max(1, concurrency), prefixes.length);
   await Promise.all(Array.from({ length: workers }, worker));
   const truncated = prefixes.find((p) => listed.get(p)?.truncated);
-  if (truncated) throw truncatedFolderError(truncated, listed.get(truncated)!.keys.length);
   if (maxKeys !== undefined && distinct.size > maxKeys) throw tooManyKeysError(maxKeys);
+  if (truncated) throw truncatedFolderError(truncated, listed.get(truncated)!.keys.length);
   if (failure) throw failure.error;
   signal?.throwIfAborted();
   return listed;
@@ -122,9 +141,10 @@ async function listFolders(
 
 /**
  * Expand a selection (`folder:<prefix>` entries and plain object keys) into
- * absolute keys. Every folder is listed BEFORE the caller mutates anything:
- * when a listing is truncated this throws, so a bulk action never acts on the
- * first 10,000 keys of a folder and silently leaves the rest behind.
+ * absolute keys. Every folder is listed, every page of it, BEFORE the caller
+ * mutates anything: when a listing cannot go on this throws, so a bulk action
+ * never acts on the first 10,000 keys of a folder and silently leaves the
+ * rest behind.
  *
  * Folders are listed a few at a time (`listFolders`), but the result is built
  * in SELECTION order, never in completion order: it dedupes by source key and
