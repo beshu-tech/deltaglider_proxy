@@ -22,10 +22,14 @@
  * the name first, and a failed create takes the route and the block back.
  * "Off" on an encrypting backend asks for a confirmation before it sends
  * the downgrade header.
+ *
+ * "Create and open settings" (admin only) creates the bucket the same way,
+ * then opens its card on the Buckets page: compression, quota, public
+ * access and the rest of its settings.
  */
 import { useEffect, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Alert, Modal, Input, Radio, Select, Typography, message } from 'antd';
+import { Alert, Button, Modal, Input, Radio, Select, Typography, message } from 'antd';
 import type { InputRef } from 'antd';
 import { createBucket } from '../s3client';
 import { getBackends, getBucketEncryptionPreview } from '../adminApi';
@@ -36,6 +40,8 @@ import { encryptionWord } from '../backendFacts';
 import { describeBucketEncryption, modeWord, newBucketEncryptionBlock, type NewBucketEncryption } from '../bucketEncryption';
 import { confirmDialog } from '../confirmDialog';
 import BucketKeySetup, { type BucketKeyValue } from './BucketKeySetup';
+import { useNavigation } from '../NavigationContext';
+import { bucketSettingsUrl } from '../urlState';
 
 const { Text } = Typography;
 
@@ -67,6 +73,7 @@ export default function CreateBucketModal({
   const [encChoice, setEncChoice] = useState<NewBucketEncryption['kind']>('same');
   const [keyValue, setKeyValue] = useState<BucketKeyValue | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
+  const { navigate } = useNavigation();
 
   // Focus the name field shortly after opening.
   useEffect(() => {
@@ -117,6 +124,7 @@ export default function CreateBucketModal({
   const choice: NewBucketEncryption['kind'] =
     (encChoice === 'bucket-key' && !offerKey) || (encChoice === 'off' && !offerOff) ? 'same' : encChoice;
   const keyNotReady = choice === 'bucket-key' && !keyValue?.ready;
+  const createDisabled = !name.trim() || nameError !== null || (showPicker && !selectedBackend) || keyNotReady;
 
   const reset = () => {
     setName('');
@@ -126,7 +134,8 @@ export default function CreateBucketModal({
     setCreateError(null);
   };
 
-  const handleCreate = async () => {
+  /** `openSettings`: after the create, open the bucket's settings card. */
+  const handleCreate = async (openSettings = false) => {
     const trimmed = name.trim();
     // A second Enter while the first create runs must not send another.
     if (creating || !trimmed || keyNotReady) return;
@@ -161,6 +170,7 @@ export default function CreateBucketModal({
       reset();
       onClose();
       onCreated(trimmed);
+      if (openSettings) navigate(bucketSettingsUrl(trimmed));
     } catch (e: unknown) {
       const msg = normalizeUiError(e, "Unknown error");
       if (encryption) setCreateError(`The bucket was not created: ${msg}`);
@@ -177,11 +187,20 @@ export default function CreateBucketModal({
         title="Create bucket"
         open={open}
         okText="Create"
-        onOk={handleCreate}
+        onOk={() => void handleCreate()}
         confirmLoading={creating}
-        okButtonProps={{
-          disabled: !name.trim() || nameError !== null || (showPicker && !selectedBackend) || keyNotReady,
-        }}
+        okButtonProps={{ disabled: createDisabled }}
+        footer={(_, { OkBtn, CancelBtn }) => (
+          <>
+            <CancelBtn />
+            {canAdmin && (
+              <Button disabled={createDisabled || creating} onClick={() => void handleCreate(true)}>
+                Create and open settings
+              </Button>
+            )}
+            <OkBtn />
+          </>
+        )}
         onCancel={() => {
           if (creating) return;
           reset();

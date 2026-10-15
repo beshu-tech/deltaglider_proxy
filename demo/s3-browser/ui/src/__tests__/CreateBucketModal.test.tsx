@@ -146,3 +146,40 @@ describe('encryption of a new bucket', () => {
     expect(await screen.findByText(/The bucket was not created: .*already exists/)).toBeInTheDocument();
   });
 });
+
+/**
+ * "Create and open settings": an admin creates the bucket and lands on its
+ * card on the Buckets page (the full form). A non-admin never sees it.
+ */
+describe('create and open settings', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  test('a non-admin sees no such button', async () => {
+    renderWithQuery(<CreateBucketModal open canAdmin={false} onClose={() => {}} onCreated={() => {}} />);
+    await screen.findByLabelText('Bucket name');
+    expect(screen.queryByRole('button', { name: 'Create and open settings' })).toBeNull();
+  });
+
+  test('an admin creates the bucket, then opens its settings', async () => {
+    const http = mockFetch();
+    http.on('GET', '/_/api/admin/backends', json({ default_backend: 'hetzner-fsn1', backends: [] }));
+    http.on('GET', /\/encryption-preview/, json(null, 404));
+    vi.mocked(createBucket).mockReset().mockResolvedValue(undefined as never);
+    const navigate = vi.fn();
+    const onCreated = vi.fn();
+    const user = userEvent.setup();
+    const { NavigationContext } = await import('../NavigationContext');
+    renderWithQuery(
+      <NavigationContext.Provider value={{ navigate, subPath: '' }}>
+        <CreateBucketModal open canAdmin onClose={() => {}} onCreated={onCreated} />
+      </NavigationContext.Provider>,
+    );
+    const button = screen.getByRole('button', { name: 'Create and open settings' });
+    expect(button).toBeDisabled();
+    await user.type(await screen.findByLabelText('Bucket name'), 'releases');
+    await user.click(button);
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith('/_/admin/storage/buckets?bucket=releases'));
+    expect(createBucket).toHaveBeenCalledWith('releases', undefined, undefined);
+    expect(onCreated).toHaveBeenCalledWith('releases');
+  });
+});
