@@ -1517,11 +1517,35 @@ impl StorageBackend for RoutingBackend {
         f: &str,
         start: u64,
         end: u64,
-    ) -> Result<
-        (crate::storage::ByteStream, u64, crate::types::FileMetadata),
-        crate::storage::StorageError,
-    > {
+    ) -> Result<crate::storage::RangeRead, crate::storage::StorageError> {
         route_existing!(self, b, open_passthrough_range, p, f, start, end)
+    }
+
+    async fn put_listing_token(
+        &self,
+        bucket: &str,
+        stored_key: &str,
+        stored_etag: &str,
+        stored_size: u64,
+        token: &str,
+    ) -> Result<(), StorageError> {
+        route_existing!(
+            self,
+            bucket,
+            put_listing_token,
+            stored_key,
+            stored_etag,
+            stored_size,
+            token
+        )
+    }
+
+    async fn listing_tokens(
+        &self,
+        bucket: &str,
+        objects: &[(String, FileMetadata)],
+    ) -> Vec<Option<String>> {
+        route_existing!(self, bucket, listing_tokens, objects)
     }
 
     async fn get_passthrough_stream_range(
@@ -2055,11 +2079,25 @@ mod tests {
             f: &str,
             start: u64,
             end: u64,
-        ) -> Result<
-            (crate::storage::ByteStream, u64, crate::types::FileMetadata),
-            crate::storage::StorageError,
-        > {
+        ) -> Result<crate::storage::RangeRead, crate::storage::StorageError> {
             crate::storage::open_passthrough_range_by_parts(self, b, p, f, start, end).await
+        }
+        async fn put_listing_token(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: u64,
+            _: &str,
+        ) -> Result<(), crate::storage::StorageError> {
+            Ok(())
+        }
+        async fn listing_tokens(
+            &self,
+            _: &str,
+            objects: &[(String, crate::types::FileMetadata)],
+        ) -> Vec<Option<String>> {
+            vec![None; objects.len()]
         }
         async fn get_passthrough_stream(
             &self,

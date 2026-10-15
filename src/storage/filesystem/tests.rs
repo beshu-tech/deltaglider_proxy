@@ -1308,6 +1308,41 @@ mod backend_tests {
         assert_eq!((len, body.as_slice()), (5, &b"56789"[..]));
     }
 
+    /// Issue #120: a range read names the file's total length, and the
+    /// filesystem keeps no listing tokens.
+    #[tokio::test]
+    async fn a_range_read_names_the_stored_total() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("new backend");
+        backend.create_bucket("bucket").await.expect("create");
+        backend
+            .put_passthrough(
+                "bucket",
+                "p",
+                "o.bin",
+                bytes::Bytes::from_static(b"0123456789"),
+                &dummy_metadata("o.bin"),
+            )
+            .await
+            .unwrap();
+        let read = backend
+            .open_passthrough_range("bucket", "p", "o.bin", 2, 4)
+            .await
+            .unwrap();
+        assert_eq!((read.len, read.stored_total), (3, 10));
+        backend
+            .put_listing_token("bucket", "p/o.bin", "e1", 10, "tok")
+            .await
+            .unwrap();
+        let listed = backend.bulk_list_objects("bucket", "p/").await.unwrap();
+        assert_eq!(
+            backend.listing_tokens("bucket", &listed).await,
+            vec![None; listed.len()]
+        );
+    }
+
     /// storage-5: a write is durable only when its directory entry is: the
     /// Sync path fsyncs the parent directory after the rename, and the
     /// deferred path queues the parent for `flush_pending`.

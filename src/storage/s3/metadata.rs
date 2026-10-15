@@ -424,19 +424,22 @@ impl S3Backend {
                 content_length: response.content_length(),
                 content_type: response.content_type(),
             },
-        );
+        )?;
         Ok((meta, response))
     }
 
     /// The metadata of the object `key` from the headers of a HEAD or GET
     /// response: its DG metadata, or the fallback passthrough metadata of
-    /// an object without it.
+    /// an object without it. An object that carries an encryption marker
+    /// (`dg-sealed`, `dg-encrypted`) but whose DG metadata does not parse is
+    /// an error, never the fallback: the fallback drops the user metadata
+    /// and so the marker, and the ciphertext would then read as plaintext.
     pub(super) fn metadata_of_response(
         &self,
         bucket: &str,
         key: &str,
         response: &ObjectHeaders<'_>,
-    ) -> FileMetadata {
+    ) -> Result<FileMetadata, StorageError> {
         let stored_size = response.content_length.and_then(|n| u64::try_from(n).ok());
         let headers: HashMap<String, String> = response
             .user
@@ -483,7 +486,17 @@ impl S3Backend {
                         self.remember_listed_facts(bucket, key, stored_etag, stored_size, &meta);
                         self.backfill_listing_facts(bucket, key, stored_etag, stored_size, &meta);
                     }
-                    return meta;
+                    return Ok(meta);
+                }
+                Err(e) if carries_encryption_marker(&headers) => {
+                    warn!(
+                        "PATHOLOGICAL | {bucket}/{key} carries an encryption marker but its \
+                         DG metadata does not parse; refusing to serve it as plaintext: {e}"
+                    );
+                    return Err(StorageError::Encryption(format!(
+                        "{bucket}/{key} carries an encryption marker but its metadata \
+                         does not parse: {e}"
+                    )));
                 }
                 Err(e) if delta_critical => {
                     warn!(
@@ -540,15 +553,27 @@ impl S3Backend {
             .trim_matches('"')
             .to_string();
         let content_type = response.content_type.map(|s| s.to_string());
-        FileMetadata::fallback(
+        Ok(FileMetadata::fallback(
             key.rsplit('/').next().unwrap_or(key).to_string(),
             file_size,
             etag,
             last_modified,
             content_type,
             StorageInfo::Passthrough,
-        )
+        ))
     }
+}
+
+/// Pure: do the raw S3 user-metadata headers carry an encryption marker
+/// (`user-dg-sealed` or `user-dg-encrypted`)? Such an object never falls
+/// back to passthrough metadata.
+pub(super) fn carries_encryption_marker(headers: &HashMap<String, String>) -> bool {
+    use crate::types::meta_keys as mk;
+    headers.keys().any(|k| {
+        k.strip_prefix("user-").is_some_and(|m| {
+            m.eq_ignore_ascii_case(mk::SEALED) || m.eq_ignore_ascii_case(mk::ENCRYPTED)
+        })
+    })
 }
 
 /// A request builder that stores bytes and so carries SSE headers:

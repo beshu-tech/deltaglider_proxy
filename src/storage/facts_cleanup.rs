@@ -135,8 +135,9 @@ fn doomed(
             (Some(at), Some((secs, _))) if *secs >= at => match live {
                 LiveNow::Unknown => false,
                 LiveNow::Gone => true,
-                LiveNow::Is(etag, size) => listing_facts::parse_facts_key(k).is_none_or(|e| {
-                    e.stored_etag != etag.trim_matches('"') || e.stored_size != *size
+                LiveNow::Is(etag, size) => listing_facts::parse_marker(k).is_none_or(|m| {
+                    let (_, stored_etag, stored_size) = m.stored();
+                    stored_etag != etag.trim_matches('"') || stored_size != *size
                 }),
             },
             _ => true,
@@ -212,9 +213,12 @@ async fn flush_bucket(
                             done = true;
                             break;
                         }
-                        if let Some(e) = listing_facts::parse_facts_key(&listed.0) {
-                            if wanted.contains(e.stored_key.as_str()) {
-                                by_key.entry(e.stored_key).or_default().push(listed);
+                        if let Some(m) = listing_facts::parse_marker(&listed.0) {
+                            if wanted.contains(m.stored_key()) {
+                                by_key
+                                    .entry(m.stored_key().to_string())
+                                    .or_default()
+                                    .push(listed);
                             }
                         }
                     }
@@ -466,7 +470,7 @@ async fn write_drain(
         }
         // Concurrently, one write per key: one task serves every client, so
         // a sequential loop capped the facts rate at one S3 round-trip each.
-        let writes: HashSet<Write> = batch.into_iter().collect();
+        let writes: HashSet<Write> = last_token_per_key(batch).into_iter().collect();
         futures::stream::iter(writes)
             .for_each_concurrent(FACTS_WRITE_CONCURRENCY, |(bucket, facts_key)| {
                 let (client, native) = (&client, &native);
@@ -475,6 +479,8 @@ async fn write_drain(
                     let native = native.for_bucket(&bucket);
                     if let Err(e) = put_facts_object(client, &native, &bucket, &facts_key).await {
                         warn!("listing facts {bucket}/{facts_key} not written: {e}");
+                    } else if let Some(t) = listing_facts::parse_token_key(&facts_key) {
+                        drop_other_tokens(client, &bucket, &t.stored_key, &facts_key).await;
                     }
                 }
             })
@@ -482,6 +488,60 @@ async fn write_drain(
         for (bucket, n) in queued {
             outstanding.done(&bucket, n);
         }
+    }
+}
+
+/// Of the token writes of one batch, only the last per stored key: two
+/// concurrent writes of one key would each delete the other's marker.
+/// Facts writes pass unchanged.
+fn last_token_per_key(batch: Vec<Write>) -> Vec<Write> {
+    let mut last: HashMap<(String, String), usize> = HashMap::new();
+    for (i, (bucket, key)) in batch.iter().enumerate() {
+        if let Some(t) = listing_facts::parse_token_key(key) {
+            last.insert((bucket.clone(), t.stored_key), i);
+        }
+    }
+    batch
+        .into_iter()
+        .enumerate()
+        .filter(|(i, (bucket, key))| {
+            listing_facts::parse_token_key(key)
+                .is_none_or(|t| last.get(&(bucket.clone(), t.stored_key)) == Some(i))
+        })
+        .map(|(_, w)| w)
+        .collect()
+}
+
+/// A new listing token replaces the older `!!2` markers of its stored key
+/// (one prefix LIST; a DELETE only when there are others). Without this, a
+/// re-sealed object with the same stored ETag and size would carry two
+/// tokens that disagree, and so none. Best effort: a marker left behind
+/// makes a LIST fall back to a HEAD, never shows a wrong size.
+async fn drop_other_tokens(client: &Client, bucket: &str, stored_key: &str, keep: &str) {
+    let prefix = listing_facts::token_prefix(stored_key);
+    LISTING_FACTS_REQUESTS.with_label_values(&["list"]).inc();
+    let others: Vec<String> = match client
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix(&prefix)
+        .max_keys(100)
+        .send()
+        .await
+    {
+        Ok(r) => r
+            .contents()
+            .iter()
+            .filter_map(|o| o.key())
+            .filter(|k| *k != keep)
+            .map(str::to_string)
+            .collect(),
+        Err(e) => {
+            debug!("listing tokens of {bucket}/{stored_key} not read: {e:?}");
+            return;
+        }
+    };
+    if !others.is_empty() {
+        delete_facts_keys(client, bucket, others).await;
     }
 }
 
@@ -596,7 +656,7 @@ pub(super) async fn gc_bucket(
             .iter()
             .filter_map(listed_of)
             .map(|(key, t)| listing_facts::GcCandidate {
-                entry: listing_facts::parse_facts_key(&key),
+                entry: listing_facts::parse_marker(&key),
                 modified: t.map(|(secs, _)| secs),
                 key,
             })
@@ -604,7 +664,7 @@ pub(super) async fn gc_bucket(
         let last_key = candidates.last()?.key.clone();
         let stored: Vec<&str> = candidates
             .iter()
-            .filter_map(|c| c.entry.as_ref().map(|e| e.stored_key.as_str()))
+            .filter_map(|c| c.entry.as_ref().map(listing_facts::Marker::stored_key))
             .collect();
         if let (Some(first), Some(last)) = (stored.iter().min(), stored.iter().max()) {
             let (live, through) = live_objects(client, bucket, first, last).await;
@@ -824,6 +884,86 @@ mod tests {
             "the facts write waited {:?} for the delete cleanup",
             queued.elapsed()
         );
+    }
+
+    /// Token markers are judged like facts by the delete cleanup.
+    #[test]
+    fn a_recent_token_is_judged_by_the_live_object() {
+        let mine = listing_facts::token_key("d/k.delta", "e1", 4, "t1").unwrap();
+        let peer = listing_facts::token_key("d/k.delta", "e2", 5, "t2").unwrap();
+        let entries = vec![(mine.clone(), Some((3, 0))), (peer.clone(), Some((3, 0)))];
+        assert_eq!(
+            doomed(&entries, false, Some(3), &LiveNow::Is("\"e2\"".into(), 5)),
+            vec![mine.clone()]
+        );
+        assert_eq!(
+            doomed(&entries, false, Some(3), &LiveNow::Gone),
+            vec![mine, peer]
+        );
+    }
+
+    #[test]
+    fn a_batch_writes_the_last_token_of_each_key() {
+        let t = |k: &str, tok: &str| listing_facts::token_key(k, "e1", 1, tok).unwrap();
+        let w = |b: &str, k: String| (b.to_string(), k);
+        let batch = vec![
+            w("b", t("d/a.delta", "t1")),
+            w("b", ".dg/facts/x!!1.e.1.2.e".into()),
+            w("b", t("d/a.delta", "t2")),
+            w("c", t("d/a.delta", "t3")),
+        ];
+        assert_eq!(
+            last_token_per_key(batch),
+            vec![
+                w("b", ".dg/facts/x!!1.e.1.2.e".into()),
+                w("b", t("d/a.delta", "t2")),
+                w("c", t("d/a.delta", "t3")),
+            ]
+        );
+    }
+
+    /// A token write replaces the older tokens of its stored key, and
+    /// leaves its facts and other keys' tokens alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_token_replaces_the_older_ones() {
+        let (endpoint, _fake) = crate::storage::fake_s3::start().await;
+        let client = fake_client(&endpoint);
+        let native = NativeEncryptionConfig::None;
+        client.create_bucket().bucket("b").send().await.unwrap();
+        let old = listing_facts::token_key("d/a.delta", "e0", 1, "old").unwrap();
+        let other = listing_facts::token_key("d/ab.delta", "e0", 1, "x").unwrap();
+        let facts = listing_facts::facts_key(
+            "d/a.delta",
+            "e0",
+            1,
+            &super::super::list_size_cache::LogicalFacts {
+                size: 9,
+                etag: "m".into(),
+            },
+        )
+        .unwrap();
+        for k in [&old, &other, &facts] {
+            put_facts_object(&client, &native, "b", k).await.unwrap();
+        }
+        let queue = FactsCleanupQueue::start(client.clone(), native.into());
+        let new = listing_facts::token_key("d/a.delta", "e1", 1, "new").unwrap();
+        queue.write("b", "d/a.delta", new.clone());
+        queue.settle("b").await;
+        let mut keys: Vec<String> = client
+            .list_objects_v2()
+            .bucket("b")
+            .prefix(listing_facts::FACTS_ROOT)
+            .send()
+            .await
+            .unwrap()
+            .contents()
+            .iter()
+            .filter_map(|o| o.key().map(str::to_string))
+            .collect();
+        keys.sort();
+        let mut want = vec![facts, new, other];
+        want.sort();
+        assert_eq!(keys, want);
     }
 
     #[test]

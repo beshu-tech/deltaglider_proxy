@@ -2959,11 +2959,25 @@ mod multipart_abort_tests {
             _: &str,
             _: u64,
             _: u64,
-        ) -> Result<
-            (crate::storage::ByteStream, u64, crate::types::FileMetadata),
-            crate::storage::StorageError,
-        > {
+        ) -> Result<crate::storage::RangeRead, crate::storage::StorageError> {
             Err(nope())
+        }
+        async fn put_listing_token(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: u64,
+            _: &str,
+        ) -> Result<(), crate::storage::StorageError> {
+            Ok(())
+        }
+        async fn listing_tokens(
+            &self,
+            _: &str,
+            objects: &[(String, crate::types::FileMetadata)],
+        ) -> Vec<Option<String>> {
+            vec![None; objects.len()]
         }
         async fn get_passthrough_stream(
             &self,
@@ -3246,11 +3260,25 @@ mod multipart_abort_tests {
             f: &str,
             start: u64,
             end: u64,
-        ) -> Result<
-            (crate::storage::ByteStream, u64, crate::types::FileMetadata),
-            crate::storage::StorageError,
-        > {
+        ) -> Result<crate::storage::RangeRead, crate::storage::StorageError> {
             self.0.open_passthrough_range(b, p, f, start, end).await
+        }
+        async fn put_listing_token(
+            &self,
+            b: &str,
+            k: &str,
+            e: &str,
+            n: u64,
+            t: &str,
+        ) -> Result<(), crate::storage::StorageError> {
+            self.0.put_listing_token(b, k, e, n, t).await
+        }
+        async fn listing_tokens(
+            &self,
+            b: &str,
+            objects: &[(String, crate::types::FileMetadata)],
+        ) -> Vec<Option<String>> {
+            self.0.listing_tokens(b, objects).await
         }
         async fn get_passthrough_stream(
             &self,

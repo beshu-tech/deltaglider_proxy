@@ -686,7 +686,7 @@ impl StorageBackend for S3Backend {
                 content_length: Some(i64::try_from(size).unwrap_or(i64::MAX)),
                 content_type: response.content_type(),
             },
-        );
+        )?;
         debug!("S3 GET reference {}/{} ({} bytes)", bucket, key, size);
         Ok(super::ReferenceSource::stream(
             self.body_stream(bucket, &key, response),
@@ -1097,7 +1097,7 @@ impl StorageBackend for S3Backend {
                 content_length: Some(i64::try_from(size).unwrap_or(i64::MAX)),
                 content_type: response.content_type(),
             },
-        );
+        )?;
         debug!("S3 GET stream {}/{} (with its metadata)", bucket, key);
         Ok((self.body_stream(bucket, &key, response), meta))
     }
@@ -1112,7 +1112,7 @@ impl StorageBackend for S3Backend {
         filename: &str,
         start: u64,
         end: u64,
-    ) -> Result<(super::ByteStream, u64, FileMetadata), StorageError> {
+    ) -> Result<super::RangeRead, StorageError> {
         let key = self.passthrough_key(prefix, filename);
         let (response, len, total) = self.ranged_get(bucket, &key, start, end).await?;
         let meta = self.metadata_of_response(
@@ -1125,8 +1125,13 @@ impl StorageBackend for S3Backend {
                 content_length: Some(i64::try_from(total).unwrap_or(i64::MAX)),
                 content_type: response.content_type(),
             },
-        );
-        Ok((self.body_stream(bucket, &key, response), len, meta))
+        )?;
+        Ok(super::RangeRead {
+            stream: self.body_stream(bucket, &key, response),
+            len,
+            metadata: meta,
+            stored_total: total,
+        })
     }
 
     #[instrument(skip(self))]
@@ -1636,6 +1641,14 @@ impl StorageBackend for S3Backend {
         objects: &mut [(String, FileMetadata)],
         how: ResolveListed,
     ) -> Vec<ListedSize> {
+        if !how.trust_v1_facts {
+            // Neither the `!!1` facts nor the process entries learned from
+            // them: the caller resolves sealed entries from their tokens.
+            return objects
+                .iter()
+                .map(|(key, meta)| Self::listed_size_without_facts(key, meta))
+                .collect();
+        }
         let mut sizes: Vec<ListedSize> = objects
             .iter_mut()
             .map(|(key, meta)| Self::resolve_one_listed(&self.list_cache_scope, bucket, key, meta))
@@ -1657,13 +1670,14 @@ impl StorageBackend for S3Backend {
             })
             .filter(|(i, stored_key)| {
                 let meta = &objects[*i].1;
-                !list_size_cache::missing_recently(&StoredObjectId {
+                let id = StoredObjectId {
                     scope: &self.list_cache_scope,
                     bucket,
                     key: stored_key,
                     etag: &meta.md5,
                     size: meta.stored_size(),
-                })
+                };
+                !list_size_cache::missing_recently(&id) && !list_size_cache::known_sealed(&id)
             })
             .collect();
         if !candidates.is_empty() {
@@ -1675,6 +1689,31 @@ impl StorageBackend for S3Backend {
             }
         }
         sizes
+    }
+
+    async fn put_listing_token(
+        &self,
+        bucket: &str,
+        stored_key: &str,
+        stored_etag: &str,
+        stored_size: u64,
+        token: &str,
+    ) -> Result<(), StorageError> {
+        // Too long for S3's key limit, or no ETag: the object lists without
+        // a token (a HEAD fallback), as an object without facts does.
+        if let Some(marker) = listing_facts::token_key(stored_key, stored_etag, stored_size, token)
+        {
+            self.facts_cleanup.write(bucket, stored_key, marker);
+        }
+        Ok(())
+    }
+
+    async fn listing_tokens(
+        &self,
+        bucket: &str,
+        objects: &[(String, FileMetadata)],
+    ) -> Vec<Option<String>> {
+        self.read_listing_tokens(bucket, objects).await
     }
 
     /// Optimised listing that delegates paging and delimiter collapsing to

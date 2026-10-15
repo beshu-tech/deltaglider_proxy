@@ -183,6 +183,10 @@ impl S3Backend {
             !matches!(native, NativeEncryptionConfig::None),
             std::time::SystemTime::now(),
         );
+        // The copy restates the object's own client metadata next to the
+        // new DG fields: over S3's limit is a clean MetadataTooLarge, not
+        // the backend's error.
+        check_metadata_size(&plan.metadata, bucket, key)?;
 
         let mut request = self
             .bulk_client

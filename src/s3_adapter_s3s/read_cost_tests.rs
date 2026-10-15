@@ -1162,7 +1162,12 @@ async fn a_filesystem_range_reads_one_version() {
     let mut mixed = 0;
     while !done.load(std::sync::atomic::Ordering::SeqCst) {
         use futures::TryStreamExt;
-        let (stream, len, meta) = backend
+        let crate::storage::RangeRead {
+            stream,
+            len,
+            metadata: meta,
+            ..
+        } = backend
             .open_passthrough_range("b", "p", "x.bin", 0, u64::MAX - 1)
             .await
             .unwrap();

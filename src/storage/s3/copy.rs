@@ -104,7 +104,7 @@ impl S3Backend {
                 content_length: head.content_length(),
                 content_type: head.content_type(),
             },
-        );
+        )?;
         if !same_stored_generation(source, &current) {
             return Err(StorageError::PreconditionFailed(format!(
                 "{}/{src_key} changed before the copy",

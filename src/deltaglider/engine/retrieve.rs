@@ -314,7 +314,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         );
         let delta = delta?;
         match ranged {
-            Ok((stream, len, meta)) => {
+            Ok(crate::storage::RangeRead {
+                stream,
+                len,
+                metadata: meta,
+                ..
+            }) => {
                 let passthrough_wins = delta
                     .as_ref()
                     .is_none_or(|d| !super::metadata::delta_is_newest(d, &meta));
@@ -909,7 +914,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     .storage
                     .open_passthrough_range(bucket, &deltaspace_id, stored_name, start, end)
                     .await;
-                let (stream, content_length, served) = match range_result {
+                let crate::storage::RangeRead {
+                    stream,
+                    len: content_length,
+                    metadata: served,
+                    ..
+                } = match range_result {
                     Ok(v) => v,
                     Err(StorageError::NotFound(_)) if from_cache => {
                         warn!(

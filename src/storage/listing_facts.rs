@@ -30,6 +30,17 @@
 //! `facts(a) < facts(b)` exactly when `a < b`, and `/` stays `/`, so a
 //! delimiter listing of the facts mirrors the listing of the objects.
 //!
+//! A sealed (format v2) object has no logical facts in clear. For it the
+//! encrypting wrapper hands the backend an opaque LISTING TOKEN, kept the
+//! same way:
+//!
+//! ```text
+//! .dg/facts/<enc(stored key)>!!2.<stored etag>.<stored size>.<token>
+//! ```
+//!
+//! The token is base64url (no dots); only the wrapper can open it. Both
+//! shapes share the namespace, the scan, the delete cleanup and the GC.
+//!
 //! Everything here is pure; the S3 backend does the requests.
 
 use super::list_size_cache::LogicalFacts;
@@ -43,6 +54,9 @@ const TERMINATOR: &str = "!!";
 
 /// Payload format version, the first payload field.
 const FORMAT: &str = "1";
+
+/// Payload format version of a listing token marker.
+const TOKEN_FORMAT: &str = "2";
 
 /// S3's key length limit. A stored key too long for its facts key gets no
 /// facts object and lists with its stored size.
@@ -198,12 +212,132 @@ pub fn parse_facts_key(key: &str) -> Option<FactsEntry> {
     })
 }
 
+/// A listing token we can put in the last key field: non-empty base64url
+/// (no `.`, the field separator).
+fn token_fits(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// The marker key that holds the opaque listing `token` of the stored
+/// object `stored_key` (with that stored ETag and size). `None` when it
+/// cannot have one: unknown or odd ETag, a token that is not base64url, or
+/// a key past S3's 1024-byte limit (the object then lists without a token).
+pub fn token_key(
+    stored_key: &str,
+    stored_etag: &str,
+    stored_size: u64,
+    token: &str,
+) -> Option<String> {
+    let stored_etag = bare(stored_etag);
+    if !etag_fits(stored_etag) || !token_fits(token) {
+        return None;
+    }
+    let key = format!(
+        "{}{stored_etag}.{stored_size}.{token}",
+        token_prefix(stored_key)
+    );
+    (key.len() <= MAX_KEY_LEN).then_some(key)
+}
+
+/// The prefix that every token marker of `stored_key` (and no other marker)
+/// starts with. A new token replaces the others under it.
+pub fn token_prefix(stored_key: &str) -> String {
+    format!("{}{TERMINATOR}{TOKEN_FORMAT}.", stored_prefix(stored_key))
+}
+
+/// One parsed token marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenEntry {
+    pub stored_key: String,
+    pub stored_etag: String,
+    pub stored_size: u64,
+    pub token: String,
+}
+
+/// Parse a token marker; `None` for anything that is not one.
+pub fn parse_token_key(key: &str) -> Option<TokenEntry> {
+    let rest = key.strip_prefix(FACTS_ROOT)?;
+    let (enc_key, payload) = rest.split_once(TERMINATOR)?;
+    let mut fields = payload.split('.');
+    if fields.next()? != TOKEN_FORMAT {
+        return None;
+    }
+    let stored_etag = fields.next()?.to_string();
+    let stored_size = fields.next()?.parse().ok()?;
+    let token = fields.next()?.to_string();
+    if fields.next().is_some() || !etag_fits(&stored_etag) || !token_fits(&token) {
+        return None;
+    }
+    Some(TokenEntry {
+        stored_key: decode(enc_key)?,
+        stored_etag,
+        stored_size,
+        token,
+    })
+}
+
+/// Any marker of the facts namespace this release knows: `!!1` facts or a
+/// `!!2` listing token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Marker {
+    Facts(FactsEntry),
+    Token(TokenEntry),
+}
+
+impl Marker {
+    /// The stored object the marker describes: `(key, ETag, size)`.
+    pub fn stored(&self) -> (&str, &str, u64) {
+        match self {
+            Marker::Facts(e) => (&e.stored_key, &e.stored_etag, e.stored_size),
+            Marker::Token(e) => (&e.stored_key, &e.stored_etag, e.stored_size),
+        }
+    }
+
+    pub fn stored_key(&self) -> &str {
+        self.stored().0
+    }
+}
+
+/// Parse a marker of either shape. The GC and the delete cleanup treat both
+/// alike: a marker goes with the stored object it describes.
+pub fn parse_marker(key: &str) -> Option<Marker> {
+    parse_facts_key(key)
+        .map(Marker::Facts)
+        .or_else(|| parse_token_key(key).map(Marker::Token))
+}
+
+/// The listing token that applies to one listed stored object. Only a token
+/// with the same stored ETag and size applies; two such tokens that
+/// disagree apply neither.
+pub fn token_for<'a>(
+    entries: impl IntoIterator<Item = &'a TokenEntry>,
+    stored_etag: &str,
+    stored_size: u64,
+) -> Option<String> {
+    let stored_etag = bare(stored_etag);
+    let mut found: Option<&str> = None;
+    for e in entries {
+        if e.stored_etag != stored_etag || e.stored_size != stored_size {
+            continue;
+        }
+        match found {
+            Some(t) if t != e.token => return None,
+            _ => found = Some(&e.token),
+        }
+    }
+    found.map(str::to_string)
+}
+
 /// One facts object the garbage collection read: its key, its parsed form
-/// (`None`: not in this release's format) and its server `LastModified`.
+/// (`None`: not in a format this release knows) and its server
+/// `LastModified`.
 #[derive(Debug, Clone)]
 pub struct GcCandidate {
     pub key: String,
-    pub entry: Option<FactsEntry>,
+    pub entry: Option<Marker>,
     pub modified: Option<i64>,
 }
 
@@ -233,11 +367,11 @@ pub fn gc_doomed(
             c.modified
                 .is_some_and(|m| now.saturating_sub(m) >= grace_secs)
         })
-        .filter_map(|c| Some((c, c.entry.as_ref()?)))
-        .filter(|(_, e)| e.stored_key.as_str() <= through)
-        .filter(|(_, e)| {
-            live.get(&e.stored_key)
-                .is_none_or(|(etag, size)| bare(etag) != e.stored_etag || *size != e.stored_size)
+        .filter_map(|c| Some((c, c.entry.as_ref()?.stored())))
+        .filter(|(_, (key, _, _))| *key <= through)
+        .filter(|(_, (key, stored_etag, stored_size))| {
+            live.get(*key)
+                .is_none_or(|(etag, size)| bare(etag) != *stored_etag || size != stored_size)
         })
         .map(|(c, _)| c.key.clone())
         .collect()
@@ -420,6 +554,99 @@ mod tests {
     }
 
     #[test]
+    fn a_token_key_round_trips() {
+        let token = "AbC-_09xyz";
+        let key = token_key("rel/v1/app zip!.tar.delta", "\"e1-3\"", 46, token).unwrap();
+        assert!(is_facts_key(&key));
+        assert!(key.starts_with(&token_prefix("rel/v1/app zip!.tar.delta")));
+        assert!(key.ends_with("!!2.e1-3.46.AbC-_09xyz"), "{key}");
+        let entry = TokenEntry {
+            stored_key: "rel/v1/app zip!.tar.delta".into(),
+            stored_etag: "e1-3".into(),
+            stored_size: 46,
+            token: token.into(),
+        };
+        assert_eq!(parse_token_key(&key), Some(entry.clone()));
+        assert_eq!(parse_marker(&key), Some(Marker::Token(entry)));
+        // A token marker is not a facts key, and the reverse.
+        assert_eq!(parse_facts_key(&key), None);
+        let facts = facts_key("a.delta", "e1", 5, &facts(9, "m")).unwrap();
+        assert_eq!(parse_token_key(&facts), None);
+        assert!(matches!(parse_marker(&facts), Some(Marker::Facts(_))));
+        // The token prefix covers the tokens of exactly this stored key.
+        assert!(!token_key("rel/a.delta.x", "e1", 1, "t")
+            .unwrap()
+            .starts_with(&token_prefix("rel/a.delta")));
+    }
+
+    #[test]
+    fn a_token_that_cannot_be_a_key_gets_none() {
+        assert_eq!(token_key("a.delta", "", 5, "t"), None, "no ETag");
+        assert_eq!(token_key("a.delta", "e.1", 5, "t"), None, "dotted ETag");
+        assert_eq!(token_key("a.delta", "e1", 5, ""), None, "empty token");
+        assert_eq!(token_key("a.delta", "e1", 5, "a.b"), None, "dotted token");
+        assert_eq!(
+            token_key("a.delta", "e1", 5, "a+b/c="),
+            None,
+            "not base64url"
+        );
+        // S3's 1024-byte key limit: the write is skipped.
+        let fits = token_key(&"k".repeat(900), "e1", 5, &"t".repeat(50));
+        assert!(fits.is_some_and(|k| k.len() <= MAX_KEY_LEN));
+        assert_eq!(token_key(&"k".repeat(1000), "e1", 5, &"t".repeat(50)), None);
+        for key in [
+            ".dg/facts/a.delta!!2.e.1",
+            ".dg/facts/a.delta!!2.e.1.",
+            ".dg/facts/a.delta!!2.e.x.t",
+            ".dg/facts/a.delta!!2.e.1.t.u",
+            ".dg/facts/a.delta!!2..1.t",
+            ".dg/facts/a.delta!!3.e.1.t",
+            "a.delta!!2.e.1.t",
+        ] {
+            assert_eq!(parse_token_key(key), None, "{key}");
+        }
+    }
+
+    /// Only a token of the same stored object applies; two that disagree
+    /// apply neither.
+    #[test]
+    fn a_token_applies_only_to_the_same_stored_object() {
+        let entry = |etag: &str, size: u64, token: &str| TokenEntry {
+            stored_key: "k".into(),
+            stored_etag: etag.into(),
+            stored_size: size,
+            token: token.into(),
+        };
+        let a = entry("e1", 10, "t1");
+        let stale = entry("e0", 10, "t0");
+        assert_eq!(token_for([&a, &stale], "\"e1\"", 10), Some("t1".into()));
+        assert_eq!(token_for([&a], "e1", 11), None);
+        assert_eq!(token_for([&stale], "e1", 10), None);
+        assert_eq!(token_for([&a, &a.clone()], "e1", 10), Some("t1".into()));
+        assert_eq!(token_for([&a, &entry("e1", 10, "t2")], "e1", 10), None);
+    }
+
+    proptest::proptest! {
+        /// Token markers sort and scan like the facts of the same keys.
+        #[test]
+        fn a_scan_covers_the_tokens_of_its_keys(
+            keys in proptest::collection::vec("[ !a-c/]{1,6}", 1..6),
+        ) {
+            let scan = plan_facts_scan(keys.iter().map(String::as_str)).unwrap();
+            for k in &keys {
+                let tk = token_key(k, "e1", 1, "tok_-9").unwrap();
+                proptest::prop_assert!(tk.starts_with(&scan.prefix), "{tk} {scan:?}");
+                proptest::prop_assert!(tk > scan.start_after, "{tk} {scan:?}");
+                proptest::prop_assert!(!scan.is_past(&tk), "{tk} {scan:?}");
+                proptest::prop_assert_eq!(
+                    parse_marker(&tk).map(|m| m.stored_key().to_string()),
+                    Some(k.clone())
+                );
+            }
+        }
+    }
+
+    #[test]
     fn foreign_keys_do_not_parse() {
         for key in [
             ".dg/facts/a.delta",
@@ -585,7 +812,7 @@ mod tests {
             .unwrap()
         };
         let cand = |key: String, modified: i64| GcCandidate {
-            entry: parse_facts_key(&key),
+            entry: parse_marker(&key),
             key,
             modified: Some(modified),
         };
@@ -594,10 +821,17 @@ mod tests {
         let stale = facts("d/over.delta", "old", 3);
         let fresh = facts("d/fresh.delta", "e4", 4);
         let far = facts("z/far.delta", "e5", 5);
+        // Token markers go with their object exactly like facts.
+        let token_gone = token_key("d/gone2.delta", "e6", 6, "tok").unwrap();
+        let token_live = token_key("d/live.delta", "e2", 2, "tok").unwrap();
+        let token_stale = token_key("d/over.delta", "old", 3, "tok").unwrap();
         let cands = vec![
             cand(gone.clone(), 0),
+            cand(token_gone.clone(), 0),
             cand(live_ok.clone(), 0),
+            cand(token_live.clone(), 0),
             cand(stale.clone(), 0),
+            cand(token_stale.clone(), 0),
             cand(fresh.clone(), 99),
             cand(far.clone(), 0),
             GcCandidate {
@@ -613,7 +847,7 @@ mod tests {
         .into_iter()
         .collect();
         let doomed = gc_doomed(&cands, &live, Some("d/zzz"), 100, 10);
-        assert_eq!(doomed, vec![gone, stale]);
+        assert_eq!(doomed, vec![gone, token_gone, stale, token_stale]);
         assert!(gc_doomed(&cands, &live, None, 100, 10).is_empty());
         assert_eq!(start_before("d/a.delta"), "d/a.delt");
     }

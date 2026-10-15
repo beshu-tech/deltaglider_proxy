@@ -2604,3 +2604,294 @@ mod reference_source_tests {
         }
     }
 }
+
+/// Issue #120 C3c: the inner S3 backend is ready for sealed (format v2)
+/// objects. Nothing writes them yet.
+#[cfg(test)]
+mod sealed_shape_tests {
+    use super::*;
+    use crate::storage::list_size_cache::{LogicalFacts, ResolveListed};
+    use crate::storage::listing_facts;
+
+    fn md5_hex(body: &[u8]) -> String {
+        hex::encode(<md5::Md5 as md5::Digest>::digest(body))
+    }
+
+    /// The metadata of a delta as a v2.0.14 proxy stores it.
+    fn delta_meta<'a>(sha: &'a str, extra: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+        let mut m = vec![
+            ("dg-created-at", "2026-03-01T10:00:00.000000Z"),
+            ("dg-delta-size", "333"),
+            ("dg-file-sha256", sha),
+            ("dg-file-size", "100000"),
+            ("dg-md5", "0123456789abcdef0123456789abcdef"),
+            ("dg-original-name", "app.zip"),
+            ("dg-ref-path", "reference.bin"),
+            ("dg-ref-sha256", sha),
+            ("dg-tool", "deltaglider/6.0.0"),
+        ];
+        m.extend_from_slice(extra);
+        m
+    }
+
+    #[test]
+    fn only_the_two_markers_refuse_the_fallback() {
+        let h = |k: &str| HashMap::from([(k.to_string(), "v".to_string())]);
+        assert!(metadata::carries_encryption_marker(&h("user-dg-sealed")));
+        assert!(metadata::carries_encryption_marker(&h("user-dg-encrypted")));
+        assert!(metadata::carries_encryption_marker(&h("user-DG-Sealed")));
+        for k in [
+            "dg-sealed",
+            "user-dg-encrypted-native",
+            "dg-encrypted-native",
+            "user-dg-sealedx",
+            "user-owner",
+        ] {
+            assert!(!metadata::carries_encryption_marker(&h(k)), "{k}");
+        }
+    }
+
+    /// An object with an encryption marker whose DG metadata does not parse
+    /// is an error on every read path; the fallback would drop the marker
+    /// and serve the ciphertext as plaintext. An unmarked object keeps the
+    /// passthrough fallback.
+    #[tokio::test]
+    async fn a_marked_object_that_does_not_parse_is_refused() {
+        let (s3, fake) = crate::storage::fake_s3::backend().await;
+        let broken = [("dg-tool", "deltaglider/6.0.0")]; // no name, no sha
+        for (name, marker) in [
+            ("sealed.bin", "user-dg-sealed"),
+            ("v1.bin", "user-dg-encrypted"),
+        ] {
+            let mut meta = broken.to_vec();
+            meta.push((marker, "2.opaque"));
+            fake.insert_object(&format!("b/p/{name}"), b"ciphertext", &meta);
+            let refused = |r: Result<FileMetadata, StorageError>| match r {
+                Err(StorageError::Encryption(msg)) => assert!(msg.contains(name), "{msg}"),
+                other => panic!("{name}: {other:?}"),
+            };
+            refused(s3.get_passthrough_metadata("b", "p", name).await);
+            refused(
+                s3.open_object("b", "p", StoredObject::Passthrough(name))
+                    .await
+                    .map(|(_, m)| m),
+            );
+            refused(
+                s3.open_passthrough_range("b", "p", name, 0, 3)
+                    .await
+                    .map(|r| r.metadata),
+            );
+        }
+        fake.insert_object("b/p/plain.bin", b"plain", &broken);
+        let meta = s3
+            .get_passthrough_metadata("b", "p", "plain.bin")
+            .await
+            .unwrap();
+        assert_eq!(meta.file_size, 5, "unmarked: the passthrough fallback");
+        assert!(meta.user_metadata.is_empty());
+    }
+
+    /// A sealed object that parses keeps its marker in the user metadata
+    /// and records no listing facts: nothing is learned from its clear
+    /// metadata, and the HEAD marks it sealed.
+    #[tokio::test]
+    async fn a_sealed_head_writes_no_facts() {
+        let (s3, fake) = crate::storage::fake_s3::backend().await;
+        let sha = "e".repeat(64);
+        let body = [3u8; 333];
+        let meta = delta_meta(&sha, &[("user-dg-sealed", "2.opaque")]);
+        fake.insert_object("b/p/app.zip.delta", &body, &meta);
+        let stored_etag = md5_hex(&body);
+        let id = StoredObjectId {
+            scope: &s3.list_cache_scope,
+            bucket: "b",
+            key: "p/app.zip.delta",
+            etag: &stored_etag,
+            size: 333,
+        };
+        list_size_cache::mark_missing_facts(&id);
+        let got = s3.get_delta_metadata("b", "p", "app.zip").await.unwrap();
+        assert_eq!(
+            got.user_metadata.get(crate::types::meta_keys::SEALED),
+            Some(&"2.opaque".to_string())
+        );
+        assert_eq!(LogicalFacts::of(&got), None);
+        assert_eq!(list_size_cache::lookup(&id), None);
+        assert!(list_size_cache::known_sealed(&id));
+        assert!(!list_size_cache::still_missing(&id), "no healer HEAD");
+        s3.facts_cleanup.settle("b").await;
+        assert!(
+            !fake
+                .requests()
+                .iter()
+                .any(|r| r.starts_with("PUT /b/.dg/facts/")),
+            "{:?}",
+            fake.requests()
+        );
+    }
+
+    /// A token is kept per stored object and read back with ONE facts LIST
+    /// for the whole page, for passthroughs and deltas alike; only a token
+    /// of the same stored ETag and size applies.
+    #[tokio::test]
+    async fn listing_tokens_match_on_stored_etag_and_size() {
+        let (s3, fake) = crate::storage::fake_s3::backend().await;
+        let sha = "e".repeat(64);
+        let delta_body = [3u8; 333];
+        fake.insert_object(
+            "b/p/app.zip.delta",
+            &delta_body,
+            &delta_meta(&sha, &[("user-dg-sealed", "2.opaque")]),
+        );
+        fake.insert_object("b/p/a.bin", b"aaaa", &[]);
+        fake.insert_object("b/p/b.bin", b"bbbbbb", &[]);
+        fake.insert_object("b/p/c.bin", b"cc", &[]);
+        let (a, b) = (md5_hex(b"aaaa"), md5_hex(b"bbbbbb"));
+        s3.put_listing_token("b", "p/app.zip.delta", &md5_hex(&delta_body), 333, "dTok")
+            .await
+            .unwrap();
+        s3.put_listing_token("b", "p/a.bin", &format!("\"{a}\""), 4, "aTok")
+            .await
+            .unwrap();
+        // Another stored object at the key (the object was overwritten).
+        s3.put_listing_token("b", "p/b.bin", &b, 7, "stale")
+            .await
+            .unwrap();
+        // Too long for S3's key limit: skipped, not an error.
+        s3.put_listing_token("b", &"k".repeat(1100), &a, 4, "t")
+            .await
+            .unwrap();
+        s3.facts_cleanup.settle("b").await;
+        let token_puts: Vec<String> = fake
+            .requests()
+            .into_iter()
+            .filter(|r| r.starts_with("PUT /b/.dg/facts/"))
+            .collect();
+        assert_eq!(
+            token_puts.len(),
+            3,
+            "the long key is skipped: {token_puts:?}"
+        );
+        let objects = s3.bulk_list_objects("b", "p/").await.unwrap();
+        fake.clear();
+        let tokens = s3.listing_tokens("b", &objects).await;
+        let by_key: HashMap<&str, Option<&str>> = objects
+            .iter()
+            .zip(&tokens)
+            .map(|((k, _), t)| (k.as_str(), t.as_deref()))
+            .collect();
+        assert_eq!(
+            by_key,
+            HashMap::from([
+                ("p/app.zip", Some("dTok")),
+                ("p/a.bin", Some("aTok")),
+                ("p/b.bin", None),
+                ("p/c.bin", None),
+            ])
+        );
+        assert_eq!(
+            fake.requests().len(),
+            1,
+            "one facts LIST: {:?}",
+            fake.requests()
+        );
+    }
+
+    /// With `trust_v1_facts: false` neither the `!!1` facts nor the process
+    /// entries learned from them resolve a listed size, and no facts LIST
+    /// is sent.
+    #[tokio::test]
+    async fn untrusted_v1_facts_are_ignored() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let s3 = test_support::for_test_endpoint_as_node(&endpoint, "trust-v1");
+        let sha = "e".repeat(64);
+        let body = [4u8; 333];
+        fake.insert_object("b/p/app.zip.delta", &body, &delta_meta(&sha, &[]));
+        let facts = listing_facts::facts_key(
+            "p/app.zip.delta",
+            &md5_hex(&body),
+            333,
+            &LogicalFacts {
+                size: 100_000,
+                etag: "0123456789abcdef0123456789abcdef".into(),
+            },
+        )
+        .unwrap();
+        fake.insert_object(&format!("b/{facts}"), b"", &[]);
+        for (trust, size, known) in [
+            (false, 333, false),
+            (true, 100_000, true),
+            (false, 333, false),
+        ] {
+            let mut objects = s3.bulk_list_objects("b", "p/").await.unwrap();
+            fake.clear();
+            let sizes = s3
+                .resolve_listed_sizes(
+                    "b",
+                    &mut objects,
+                    ResolveListed {
+                        trust_v1_facts: trust,
+                        caller_heads_misses: true,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert_eq!(objects[0].1.file_size, size, "trust {trust}");
+            assert_eq!(sizes[0].is_known(), known, "trust {trust}");
+            if !trust {
+                assert!(fake.requests().is_empty(), "{:?}", fake.requests());
+            }
+        }
+    }
+
+    /// A range read names the stored object's total size.
+    #[tokio::test]
+    async fn a_range_read_names_the_stored_total() {
+        let (s3, fake) = crate::storage::fake_s3::backend().await;
+        let body: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+        fake.insert_object("b/p/x.bin", &body, &[]);
+        let read = s3
+            .open_passthrough_range("b", "p", "x.bin", 10, 19)
+            .await
+            .unwrap();
+        assert_eq!((read.len, read.stored_total), (10, 1000));
+        let read = s3
+            .open_passthrough_range("b", "p", "x.bin", 990, u64::MAX - 1)
+            .await
+            .unwrap();
+        assert_eq!((read.len, read.stored_total), (10, 1000));
+    }
+
+    /// The metadata self-copy restates the object's foreign metadata: over
+    /// S3's limit it is a clean MetadataTooLarge, and no copy is sent.
+    #[tokio::test]
+    async fn an_oversized_self_copy_is_metadata_too_large() {
+        let (s3, fake) = crate::storage::fake_s3::backend().await;
+        let big = "v".repeat(1900);
+        fake.insert_object("b/p/x.bin", b"body", &[("owner", big.as_str())]);
+        let meta = FileMetadata::new_passthrough(
+            "x.bin".into(),
+            "s".repeat(64),
+            md5_hex(b"body"),
+            4,
+            None,
+        );
+        fake.clear();
+        let err = s3
+            .put_passthrough_metadata(
+                "b",
+                "p",
+                "x.bin",
+                &meta,
+                &crate::storage::RewriteBasis::none(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::MetadataTooLarge(_)), "{err:?}");
+        assert!(
+            !fake.requests().iter().any(|r| r.starts_with("PUT ")),
+            "{:?}",
+            fake.requests()
+        );
+    }
+}

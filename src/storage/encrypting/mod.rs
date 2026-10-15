@@ -80,8 +80,8 @@ pub fn fingerprint_label(key: &EncryptionKey) -> String {
 use super::io_to_storage_error;
 use super::list_size_cache::{ListedSize, ResolveListed};
 use super::traits::{
-    BulkListing, ByteStream, DelegatedListResult, LiteScanResult, MultipartUpload, ReferenceSource,
-    StorageBackend, StorageError, StoredObject, UploadedPart,
+    BulkListing, ByteStream, DelegatedListResult, LiteScanResult, MultipartUpload, RangeRead,
+    ReferenceSource, StorageBackend, StorageError, StoredObject, UploadedPart,
 };
 use crate::deltaglider::spool::SpoolBudget;
 use crate::types::FileMetadata;
@@ -651,7 +651,7 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         filename: &str,
         start: u64,
         end: u64,
-    ) -> Result<(ByteStream, u64, FileMetadata), StorageError> {
+    ) -> Result<RangeRead, StorageError> {
         let (first_chunk, _) = chunk_index_for_plaintext_offset(start);
         let guess_end = if first_chunk == 0 {
             // Through the frame that holds `end` (or past the object's
@@ -664,7 +664,12 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         } else {
             CHUNK_HEADER_LEN as u64 - 1
         };
-        let (stream, got, meta) = self
+        let RangeRead {
+            stream,
+            len: got,
+            metadata: meta,
+            stored_total,
+        } = self
             .inner
             .open_passthrough_range(bucket, prefix, filename, 0, guess_end)
             .await?;
@@ -689,11 +694,12 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             let (s, e) = super::clamp_range(start, end, plain.len() as u64)?;
             let slice = Bytes::from(plain[s as usize..=e as usize].to_vec());
             let len = slice.len() as u64;
-            return Ok((
-                Box::pin(futures::stream::once(async { Ok(slice) })),
+            return Ok(RangeRead {
+                stream: Box::pin(futures::stream::once(async { Ok(slice) })),
                 len,
-                meta,
-            ));
+                metadata: meta,
+                stored_total,
+            });
         }
         if !is_chunked_encrypted(&meta) {
             // Plaintext per its metadata. The guessed bytes start at 0, so
@@ -710,11 +716,12 @@ impl<B: StorageBackend> EncryptingBackend<B> {
                     )));
                 };
                 let len = effective_end - start + 1;
-                return Ok((
-                    slice_stream(sniff_dge1_magic(stream), start, len),
+                return Ok(RangeRead {
+                    stream: slice_stream(sniff_dge1_magic(stream), start, len),
                     len,
-                    meta,
-                ));
+                    metadata: meta,
+                    stored_total,
+                });
             }
             let head = collect_stream(stream).await?;
             if head.starts_with(&CHUNK_MAGIC) {
@@ -723,7 +730,12 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             let (stream, len) = self
                 .pinned_range(bucket, prefix, filename, start, end, &meta)
                 .await?;
-            return Ok((stream, len, meta));
+            return Ok(RangeRead {
+                stream,
+                len,
+                metadata: meta,
+                stored_total,
+            });
         }
         let key = self.pick_decrypt_key(stamped_key_id(&meta))?;
         let final_idx = final_chunk_index_for_plaintext_size(meta.file_size);
@@ -740,7 +752,12 @@ impl<B: StorageBackend> EncryptingBackend<B> {
                 start,
                 Some(plaintext_len),
             );
-            return Ok((plain, plaintext_len, meta));
+            return Ok(RangeRead {
+                stream: plain,
+                len: plaintext_len,
+                metadata: meta,
+                stored_total,
+            });
         }
         drop(frames);
         let (plain, len) = self
@@ -751,7 +768,12 @@ impl<B: StorageBackend> EncryptingBackend<B> {
                 &meta,
             )
             .await?;
-        Ok((plain, len, meta))
+        Ok(RangeRead {
+            stream: plain,
+            len,
+            metadata: meta,
+            stored_total,
+        })
     }
 
     /// A follow-up read of `start..=end` of the stored (raw) object whose
@@ -770,7 +792,12 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         end: u64,
         pin: &FileMetadata,
     ) -> Result<(ByteStream, u64), StorageError> {
-        let (stream, len, again) = self
+        let RangeRead {
+            stream,
+            len,
+            metadata: again,
+            ..
+        } = self
             .inner
             .open_passthrough_range(bucket, prefix, filename, start, end)
             .await?;
@@ -1540,10 +1567,10 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         start: u64,
         end: u64,
     ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError> {
-        let (stream, len, _) = self
+        let read = self
             .open_passthrough_range(bucket, prefix, filename, start, end)
             .await?;
-        Ok((stream, len))
+        Ok((read.stream, read.len))
     }
 
     /// Without a key, objects here are plaintext: the inner backend's one
@@ -1557,11 +1584,16 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         filename: &str,
         start: u64,
         end: u64,
-    ) -> Result<(ByteStream, u64, FileMetadata), StorageError> {
+    ) -> Result<RangeRead, StorageError> {
         if self.has_any_key(bucket) {
             return self.keyed_range(bucket, prefix, filename, start, end).await;
         }
-        let (stream, len, meta) = self
+        let RangeRead {
+            stream,
+            len,
+            metadata: meta,
+            stored_total,
+        } = self
             .inner
             .open_passthrough_range(bucket, prefix, filename, start, end)
             .await?;
@@ -1573,10 +1605,35 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
             self.pick_decrypt_key(stamped_key_id(&meta))?;
             return self.keyed_range(bucket, prefix, filename, start, end).await;
         }
-        if start == 0 {
-            return Ok((sniff_dge1_magic(stream), len, meta));
-        }
-        Ok((stream, len, meta))
+        let stream = if start == 0 {
+            sniff_dge1_magic(stream)
+        } else {
+            stream
+        };
+        Ok(RangeRead {
+            stream,
+            len,
+            metadata: meta,
+            stored_total,
+        })
+    }
+
+    async fn put_listing_token(
+        &self,
+        b: &str,
+        k: &str,
+        e: &str,
+        n: u64,
+        t: &str,
+    ) -> Result<(), StorageError> {
+        self.inner.put_listing_token(b, k, e, n, t).await
+    }
+    async fn listing_tokens(
+        &self,
+        b: &str,
+        objects: &[(String, FileMetadata)],
+    ) -> Vec<Option<String>> {
+        self.inner.listing_tokens(b, objects).await
     }
 
     // ── Pass-through (no encryption) ──

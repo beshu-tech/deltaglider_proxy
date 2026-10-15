@@ -1779,7 +1779,7 @@ impl StorageBackend for FilesystemBackend {
         filename: &str,
         start: u64,
         end: u64,
-    ) -> Result<(super::ByteStream, u64, FileMetadata), StorageError> {
+    ) -> Result<super::RangeRead, StorageError> {
         use futures::StreamExt;
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
         let path = self.passthrough_path(bucket, prefix, filename)?;
@@ -1787,11 +1787,38 @@ impl StorageBackend for FilesystemBackend {
         let (file, meta) = Self::open_with_metadata(path, what, filename, false).await?;
         let meta = keyed(meta, filename);
         let mut file = tokio::fs::File::from_std(file);
-        let (start, end) = super::clamp_range(start, end, file.metadata().await?.len())?;
+        let stored_total = file.metadata().await?.len();
+        let (start, end) = super::clamp_range(start, end, stored_total)?;
         file.seek(std::io::SeekFrom::Start(start)).await?;
         let range_len = end - start + 1;
         let stream = ReaderStream::new(file.take(range_len)).map(|r| r.map_err(StorageError::Io));
-        Ok((Box::pin(stream), range_len, meta))
+        Ok(super::RangeRead {
+            stream: Box::pin(stream),
+            len: range_len,
+            metadata: meta,
+            stored_total,
+        })
+    }
+
+    /// The filesystem listing reads each object's metadata (xattr): it
+    /// needs no listing tokens, so none are kept.
+    async fn put_listing_token(
+        &self,
+        _bucket: &str,
+        _stored_key: &str,
+        _stored_etag: &str,
+        _stored_size: u64,
+        _token: &str,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    async fn listing_tokens(
+        &self,
+        _bucket: &str,
+        objects: &[(String, FileMetadata)],
+    ) -> Vec<Option<String>> {
+        vec![None; objects.len()]
     }
 
     #[instrument(skip(self))]

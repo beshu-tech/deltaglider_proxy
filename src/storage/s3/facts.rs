@@ -50,8 +50,12 @@ impl S3Backend {
         if key.rsplit('/').next() == Some("reference.bin") {
             return;
         }
-        let Some(facts_key) =
-            listing_facts::facts_key(key, stored_etag, stored_size, &LogicalFacts::of(meta))
+        // A sealed object has no facts in clear: the wrapper writes its
+        // listing token (`put_listing_token`) instead.
+        let Some(facts) = LogicalFacts::of(meta) else {
+            return;
+        };
+        let Some(facts_key) = listing_facts::facts_key(key, stored_etag, stored_size, &facts)
         else {
             return;
         };
@@ -141,22 +145,18 @@ impl S3Backend {
         }
     }
 
-    /// Read the durable listing facts for the unresolved entries of one
-    /// listing page and apply them. `candidates` are indices into `objects`
-    /// with their stored keys. With `heal`, a miss gets a background HEAD
-    /// (the caller sends none of its own). Returns the indices it resolved.
-    pub(super) async fn apply_durable_listing_facts(
+    /// Read the markers (`!!1` facts and `!!2` listing tokens) of the
+    /// stored keys `stored_keys` with one scan of the facts namespace (at
+    /// most [`MAX_FACTS_PAGES`] LIST pages), indexed by stored key.
+    async fn read_markers<'a>(
         &self,
         bucket: &str,
-        objects: &mut [(String, FileMetadata)],
-        candidates: &[(usize, String)],
-        heal: bool,
-    ) -> Vec<usize> {
-        let Some(scan) = listing_facts::plan_facts_scan(candidates.iter().map(|(_, k)| k.as_str()))
-        else {
-            return Vec::new();
+        stored_keys: impl IntoIterator<Item = &'a str>,
+    ) -> HashMap<String, Vec<listing_facts::Marker>> {
+        let mut entries: HashMap<String, Vec<listing_facts::Marker>> = HashMap::new();
+        let Some(scan) = listing_facts::plan_facts_scan(stored_keys) else {
+            return entries;
         };
-        let mut entries: HashMap<String, Vec<listing_facts::FactsEntry>> = HashMap::new();
         let mut token: Option<String> = None;
         for _ in 0..MAX_FACTS_PAGES {
             let mut request = self
@@ -186,8 +186,11 @@ impl S3Backend {
                     past = true;
                     break;
                 }
-                if let Some(e) = listing_facts::parse_facts_key(key) {
-                    entries.entry(e.stored_key.clone()).or_default().push(e);
+                if let Some(m) = listing_facts::parse_marker(key) {
+                    entries
+                        .entry(m.stored_key().to_string())
+                        .or_default()
+                        .push(m);
                 }
             }
             if past || !resp.is_truncated().unwrap_or(false) {
@@ -198,12 +201,66 @@ impl S3Backend {
                 None => break,
             }
         }
+        entries
+    }
+
+    /// The listing tokens of listed entries (see
+    /// `StorageBackend::listing_tokens`): one marker scan, as for the facts.
+    pub(super) async fn read_listing_tokens(
+        &self,
+        bucket: &str,
+        objects: &[(String, FileMetadata)],
+    ) -> Vec<Option<String>> {
+        let stored: Vec<Option<String>> = objects
+            .iter()
+            .map(|(key, meta)| listed_stored_key(key, meta))
+            .collect();
+        let markers = self
+            .read_markers(bucket, stored.iter().flatten().map(String::as_str))
+            .await;
+        stored
+            .iter()
+            .zip(objects)
+            .map(|(stored_key, (_, meta))| {
+                let tokens = markers
+                    .get(stored_key.as_ref()?)?
+                    .iter()
+                    .filter_map(|m| match m {
+                        listing_facts::Marker::Token(t) => Some(t),
+                        listing_facts::Marker::Facts(_) => None,
+                    });
+                listing_facts::token_for(tokens, &meta.md5, meta.stored_size())
+            })
+            .collect()
+    }
+
+    /// Read the durable listing facts for the unresolved entries of one
+    /// listing page and apply them. `candidates` are indices into `objects`
+    /// with their stored keys. With `heal`, a miss gets a background HEAD
+    /// (the caller sends none of its own). Returns the indices it resolved.
+    pub(super) async fn apply_durable_listing_facts(
+        &self,
+        bucket: &str,
+        objects: &mut [(String, FileMetadata)],
+        candidates: &[(usize, String)],
+        heal: bool,
+    ) -> Vec<usize> {
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let entries = self
+            .read_markers(bucket, candidates.iter().map(|(_, k)| k.as_str()))
+            .await;
         let mut resolved = Vec::new();
         for (i, stored_key) in candidates {
             let meta = &mut objects[*i].1;
-            let found = entries
-                .get(stored_key)
-                .and_then(|e| listing_facts::facts_for(e.iter(), &meta.md5, meta.stored_size()));
+            let found = entries.get(stored_key).and_then(|e| {
+                let facts = e.iter().filter_map(|m| match m {
+                    listing_facts::Marker::Facts(f) => Some(f),
+                    listing_facts::Marker::Token(_) => None,
+                });
+                listing_facts::facts_for(facts, &meta.md5, meta.stored_size())
+            });
             let id = StoredObjectId {
                 scope: &self.list_cache_scope,
                 bucket,
@@ -217,6 +274,9 @@ impl S3Backend {
                     list_size_cache::apply(meta, &facts);
                     resolved.push(*i);
                 }
+                // Sealed: no `!!1` facts will ever come, and a HEAD learns
+                // none. Its size comes from the wrapper's listing token.
+                None if list_size_cache::known_sealed(&id) => {}
                 None => {
                     LISTING_FACTS_MISSES.inc();
                     list_size_cache::mark_missing_facts(&id);
@@ -241,6 +301,19 @@ impl S3Backend {
     }
 }
 
+/// The stored key of a listed entry (lite metadata, user key): `{key}.delta`
+/// for a delta, the key itself for a passthrough. `None` for a directory
+/// marker, which has no listing facts.
+pub(super) fn listed_stored_key(user_key: &str, meta: &FileMetadata) -> Option<String> {
+    if user_key.ends_with('/') {
+        None
+    } else if meta.is_delta() {
+        Some(format!("{user_key}.delta"))
+    } else {
+        Some(user_key.to_string())
+    }
+}
+
 /// Record in the listing-size cache what a client must see for the stored
 /// object `id` (see [`S3Backend::remember_listed_facts`]). Baselines are
 /// never listed to clients, so they get no entry.
@@ -248,7 +321,9 @@ pub(super) fn remember_facts(id: &StoredObjectId<'_>, meta: &FileMetadata) {
     if id.key.rsplit('/').next() == Some("reference.bin") {
         return;
     }
-    list_size_cache::record(id, LogicalFacts::of(meta));
+    if let Some(facts) = LogicalFacts::of(meta) {
+        list_size_cache::record(id, facts);
+    }
 }
 
 /// When a LIST marked the stored object `id` as missing its durable facts,
@@ -261,13 +336,19 @@ pub(super) fn backfill_facts(
     meta: &FileMetadata,
     write: impl FnOnce(String),
 ) {
+    // Sealed: a HEAD can never learn its facts. Remember that (and take
+    // the missing mark), so no LIST reads its `!!1` facts again and the
+    // healer sends no HEAD for it.
+    let Some(facts) = LogicalFacts::of(meta) else {
+        list_size_cache::mark_sealed(id);
+        return;
+    };
     if !list_size_cache::take_missing_facts(id) {
         return;
     }
     if id.key.rsplit('/').next() == Some("reference.bin") {
         return;
     }
-    let facts = LogicalFacts::of(meta);
     if let Some(facts_key) = listing_facts::asked_facts_key(id.key, id.etag, id.size, &facts) {
         list_size_cache::record_asked(id, facts);
         write(facts_key);

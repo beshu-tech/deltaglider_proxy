@@ -191,7 +191,24 @@ fn reference_size_mismatch(size: u64, got: u64) -> StorageError {
     ))
 }
 
-/// `open_passthrough_range` from the metadata read, then the range read.
+/// One range read of a passthrough object
+/// ([`StorageBackend::open_passthrough_range`]).
+pub struct RangeRead {
+    /// The bytes of the range.
+    pub stream: ByteStream,
+    /// The exact number of bytes in the range.
+    pub len: u64,
+    /// The metadata stored with the object (raw, markers included).
+    pub metadata: FileMetadata,
+    /// The TOTAL size of the STORED object (S3: from Content-Range;
+    /// filesystem: the file length), so a reader can check the stored
+    /// length before the first byte without another request.
+    pub stored_total: u64,
+}
+
+/// `open_passthrough_range` from the metadata read, then the range read,
+/// for a test double. Its stored total is the metadata's stored size: exact
+/// for a double that stores the bytes it is given and the size of those.
 pub async fn open_passthrough_range_by_parts<B: StorageBackend + ?Sized>(
     backend: &B,
     bucket: &str,
@@ -199,14 +216,19 @@ pub async fn open_passthrough_range_by_parts<B: StorageBackend + ?Sized>(
     filename: &str,
     start: u64,
     end: u64,
-) -> Result<(ByteStream, u64, FileMetadata), StorageError> {
+) -> Result<RangeRead, StorageError> {
     let metadata = backend
         .get_passthrough_metadata(bucket, prefix, filename)
         .await?;
     let (stream, len) = backend
         .get_passthrough_stream_range(bucket, prefix, filename, start, end)
         .await?;
-    Ok((stream, len, metadata))
+    Ok(RangeRead {
+        stream,
+        len,
+        stored_total: metadata.stored_size(),
+        metadata,
+    })
 }
 
 /// `open_reference_source` from the metadata read and the data read, for a
@@ -1120,8 +1142,9 @@ pub trait StorageBackend: Send + Sync {
 
     /// A byte range of a passthrough object and the metadata stored with
     /// it, from ONE read where the backend can (S3: the ranged GET, whose
-    /// Content-Range gives the object's total size). Returns `(stream,
-    /// content_length, metadata)`. An `end` past the object is clamped; a
+    /// Content-Range gives the object's total size). Returns the range,
+    /// its length, the metadata and the stored object's total size
+    /// ([`RangeRead`]; no default for it). An `end` past the object is clamped; a
     /// `start` at or past it is [`StorageError::InvalidRange`]; a missing
     /// object is `NotFound`. No default: a wrapper that forgot it would
     /// read the inner backend's bytes without its own transform.
@@ -1132,7 +1155,7 @@ pub trait StorageBackend: Send + Sync {
         filename: &str,
         start: u64,
         end: u64,
-    ) -> impl Future<Output = Result<(ByteStream, u64, FileMetadata), StorageError>> + Send;
+    ) -> impl Future<Output = Result<RangeRead, StorageError>> + Send;
 
     /// Stream a byte range of a passthrough file without buffering the entire
     /// object. REQUIRED (no default) — same memory-bound rationale as
@@ -1516,6 +1539,35 @@ pub trait StorageBackend: Send + Sync {
                 .collect()
         }
     }
+
+    /// Keep the opaque listing `token` of the stored object `stored_key`
+    /// (with that stored ETag and size), so a LIST on any node can read it
+    /// back ([`Self::listing_tokens`]). Only the encrypting wrapper computes
+    /// tokens; a backend stores them unread. S3: a `!!2` marker in the
+    /// listing-facts namespace, written in the background like the facts,
+    /// replacing the older tokens of the key; skipped when the marker key
+    /// would pass S3's key limit. Filesystem: a no-op (its listing reads the
+    /// metadata). No default: a wrapper must forward it.
+    fn put_listing_token(
+        &self,
+        bucket: &str,
+        stored_key: &str,
+        stored_etag: &str,
+        stored_size: u64,
+        token: &str,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Per listed entry (lite metadata as a listing returns it: `file_size`
+    /// and `md5` are the STORED size and ETag), the listing token kept for
+    /// exactly that stored object (same stored ETag and size), or `None`.
+    /// Two tokens that disagree are `None`. S3: the same one scan of the
+    /// facts namespace that resolves `!!1` facts. Filesystem: all `None`.
+    /// No default: a wrapper must forward it.
+    fn listing_tokens(
+        &self,
+        bucket: &str,
+        objects: &[(String, FileMetadata)],
+    ) -> impl Future<Output = Vec<Option<String>>> + Send;
 
     /// Enrich listed objects with full metadata from HEAD calls.
     /// Used by the `metadata=true` MinIO ListObjectsV2 extension.

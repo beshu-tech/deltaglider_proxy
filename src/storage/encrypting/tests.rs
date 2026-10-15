@@ -858,11 +858,25 @@ mod wrapper_tests {
             f: &str,
             start: u64,
             end: u64,
-        ) -> Result<
-            (crate::storage::ByteStream, u64, crate::types::FileMetadata),
-            crate::storage::StorageError,
-        > {
+        ) -> Result<crate::storage::RangeRead, crate::storage::StorageError> {
             crate::storage::open_passthrough_range_by_parts(self, b, p, f, start, end).await
+        }
+        async fn put_listing_token(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: u64,
+            _: &str,
+        ) -> Result<(), crate::storage::StorageError> {
+            Ok(())
+        }
+        async fn listing_tokens(
+            &self,
+            _: &str,
+            objects: &[(String, crate::types::FileMetadata)],
+        ) -> Vec<Option<String>> {
+            vec![None; objects.len()]
         }
         async fn get_passthrough_stream(
             &self,
@@ -2325,7 +2339,12 @@ mod read_request_tests {
             let e = end.min(last);
             let expected = &body[start as usize..=e as usize];
             fake.clear();
-            let (stream, len, m) = w
+            let crate::storage::RangeRead {
+                stream,
+                len,
+                metadata: m,
+                ..
+            } = w
                 .open_passthrough_range("b", "p", "a.bin", start, end)
                 .await
                 .unwrap();
@@ -2379,7 +2398,7 @@ mod read_request_tests {
             .unwrap();
         for name in ["v1.bin", "plain.bin"] {
             for (start, end) in [(0, u64::MAX - 1), (0, 9), (500, 600)] {
-                let (stream, len, _) = w
+                let crate::storage::RangeRead { stream, len, .. } = w
                     .open_passthrough_range("b", "p", name, start, end)
                     .await
                     .unwrap();
@@ -2405,7 +2424,7 @@ mod read_request_tests {
             .unwrap();
         for (start, end) in [(0, 99), (70_000, 70_100)] {
             let read = async {
-                let (stream, _, _) = w
+                let crate::storage::RangeRead { stream, .. } = w
                     .open_passthrough_range("b", "p", "c.bin", start, end)
                     .await?;
                 stream.try_collect::<Vec<Bytes>>().await
@@ -2437,7 +2456,7 @@ mod read_request_tests {
             .unwrap();
         let wire = w.inner.get_passthrough("b", "p", "v1.bin").await.unwrap();
         assert_eq!(wire.len() as u64, guess, "the v1 wire must fill the guess");
-        let (stream, len, _) = w
+        let crate::storage::RangeRead { stream, len, .. } = w
             .open_passthrough_range("b", "p", "v1.bin", 0, 100)
             .await
             .unwrap();
@@ -2469,7 +2488,7 @@ mod read_request_tests {
             assert!(
                 matches!(res, Err(StorageError::InvalidRange(_))),
                 "start {start}: {:?}",
-                res.map(|(_, l, _)| l)
+                res.map(|r| r.len)
             );
         }
     }
@@ -2605,7 +2624,11 @@ mod pinned_follow_up_tests {
             fake.overwrite_after_reads("b/p/x.bin", "b/p/y.bin", 1);
             let label = format!("{from:?} -> {to:?} at {start}");
             let read = async {
-                let (s, _, m) = keyed
+                let crate::storage::RangeRead {
+                    stream: s,
+                    metadata: m,
+                    ..
+                } = keyed
                     .open_passthrough_range("b", "p", "x.bin", start, start + 99)
                     .await?;
                 let body: Vec<Bytes> = s.try_collect().await?;
@@ -2688,7 +2711,7 @@ mod range_matrix_tests {
     ) -> String {
         let r = if open {
             match w.open_passthrough_range("b", "p", name, start, end).await {
-                Ok((s, len, m)) => Ok((s, len, Some(m))),
+                Ok(r) => Ok((r.stream, r.len, Some(r.metadata))),
                 Err(e) => Err(e),
             }
         } else {

@@ -324,7 +324,13 @@ fn every_write_method_checks_the_witness() {
     let wrapper = std::fs::read_to_string("src/storage/encrypting/mod.rs").unwrap();
     // Trait defaults that only delegate to a checked method, and
     // `write_refusal`, the witness query itself (it writes nothing).
-    let delegating = ["put_reference_from_file", "write_refusal"];
+    // `put_listing_token` (issue #120 C3c) is a plain forward until the
+    // wrapper computes tokens itself (C3d decides its witness check).
+    let delegating = [
+        "put_reference_from_file",
+        "write_refusal",
+        "put_listing_token",
+    ];
     let prefixes = [
         "put_",
         "write_",

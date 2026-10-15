@@ -677,11 +677,25 @@ impl StorageBackend for FaultyFs {
         f: &str,
         start: u64,
         end: u64,
-    ) -> Result<
-        (crate::storage::ByteStream, u64, crate::types::FileMetadata),
-        crate::storage::StorageError,
-    > {
+    ) -> Result<crate::storage::RangeRead, crate::storage::StorageError> {
         self.inner.open_passthrough_range(b, p, f, start, end).await
+    }
+    async fn put_listing_token(
+        &self,
+        b: &str,
+        k: &str,
+        e: &str,
+        n: u64,
+        t: &str,
+    ) -> Result<(), crate::storage::StorageError> {
+        self.inner.put_listing_token(b, k, e, n, t).await
+    }
+    async fn listing_tokens(
+        &self,
+        b: &str,
+        objects: &[(String, crate::types::FileMetadata)],
+    ) -> Vec<Option<String>> {
+        self.inner.listing_tokens(b, objects).await
     }
 
     async fn get_passthrough_stream_range(

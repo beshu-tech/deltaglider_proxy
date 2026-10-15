@@ -56,6 +56,11 @@ pub mod meta_keys {
     pub const H_DELTA_CMD: &str = concat!("x-amz-meta-", "dg-delta-cmd");
     pub const ENCRYPTED: &str = "dg-encrypted";
     pub const H_ENCRYPTED: &str = concat!("x-amz-meta-", "dg-encrypted");
+    /// The seal of a format-v2 encrypted object (issue #120): a user-metadata
+    /// key (stored on S3 as `user-dg-sealed`). Metadata that carries it holds
+    /// no logical facts in clear, so nothing below the encrypting wrapper may
+    /// derive listing facts from it.
+    pub const SEALED: &str = "dg-sealed";
     /// Store hint, not stored: `true` stores a delta-eligible object as
     /// passthrough (the CLI `--no-delta` flag, `x-amz-meta-dg-no-delta`).
     pub const NO_DELTA: &str = "dg-no-delta";

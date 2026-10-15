@@ -70,6 +70,17 @@ impl S3Backend {
 impl S3Backend {
     /// The listing-size-cache resolution of one listed entry. Pure apart from
     /// the cache lookup; see `StorageBackend::resolve_listed_sizes`.
+    /// What a listed entry's size is without any listing facts: the
+    /// listing's own for a directory marker, full metadata or a
+    /// passthrough, `StoredOnly` for a delta stub.
+    pub(super) fn listed_size_without_facts(user_key: &str, meta: &FileMetadata) -> ListedSize {
+        if !user_key.ends_with('/') && meta.is_unresolved_delta_stub() {
+            ListedSize::StoredOnly
+        } else {
+            ListedSize::Listed
+        }
+    }
+
     pub(super) fn resolve_one_listed(
         scope: &str,
         bucket: &str,

@@ -503,6 +503,61 @@ mod tests {
         );
     }
 
+    /// Issue #120: a sealed delta has no `!!1` facts, and its HEAD learns
+    /// none. The heal HEAD marks it sealed and writes nothing; the next LIST
+    /// reads no facts for it and queues no HEAD, also after the one-minute
+    /// "missing" window.
+    #[tokio::test]
+    async fn a_sealed_delta_is_headed_once_and_gets_no_facts() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        fake.insert_object("b/sealed/reference.bin", &[7u8; 4096], &[]);
+        let sha = "e".repeat(64);
+        let meta = [
+            ("dg-created-at", "2026-03-01T10:00:00.000000Z"),
+            ("dg-delta-size", "333"),
+            ("dg-file-sha256", sha.as_str()),
+            ("dg-file-size", "1000"),
+            ("dg-original-name", "app.zip"),
+            ("dg-ref-path", "reference.bin"),
+            ("dg-ref-sha256", sha.as_str()),
+            ("dg-tool", "deltaglider/6.0.0"),
+            ("user-dg-sealed", "2.opaque"),
+        ];
+        fake.insert_object("b/sealed/app.zip.delta", &[1u8; 333], &meta);
+        let engine = reader(&endpoint, "sealed-node");
+        fake.clear();
+        list(&engine, "sealed/").await;
+        assert!(wait_count(&fake, 1, delta_heads).await);
+        let stored_etag = format!("{:x}", <md5::Md5 as md5::Digest>::digest([1u8; 333]));
+        let scope = format!("{endpoint}/sealed-node");
+        let id = StoredObjectId {
+            scope: &scope,
+            bucket: "b",
+            key: "sealed/app.zip.delta",
+            etag: &stored_etag,
+            size: 333,
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !list_size_cache::known_sealed(&id) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(list_size_cache::known_sealed(&id));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !fake
+                .requests()
+                .iter()
+                .any(|r| r.starts_with("PUT /b/.dg/facts/")),
+            "{:?}",
+            fake.requests()
+        );
+        fake.clear();
+        list(&engine, "sealed/").await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(facts_lists(&fake), 0, "{:?}", fake.requests());
+        assert_eq!(fake.requests().iter().filter(|r| delta_heads(r)).count(), 0);
+    }
+
     /// The lifecycle scan's listing: the page, then a HEAD of each delta.
     async fn list_with_heads(
         engine: &DynEngine,

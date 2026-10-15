@@ -51,13 +51,27 @@ pub struct LogicalFacts {
 }
 
 impl LogicalFacts {
-    /// The logical facts a full metadata record carries.
-    pub fn of(meta: &FileMetadata) -> Self {
-        Self {
+    /// The logical facts a full metadata record carries. `None` for a
+    /// sealed (format v2) object: its clear metadata holds no logical
+    /// facts, only the encrypting wrapper can open them. THE one place that
+    /// derives listing facts from metadata (source guard
+    /// `logical_facts_of_is_the_only_constructor_from_metadata`).
+    pub fn of(meta: &FileMetadata) -> Option<Self> {
+        if is_sealed(meta) {
+            return None;
+        }
+        Some(Self {
             size: meta.file_size,
             etag: bare_etag(&meta.etag()).to_string(),
-        }
+        })
     }
+}
+
+/// Does this metadata carry the format-v2 seal
+/// ([`crate::types::meta_keys::SEALED`])?
+pub fn is_sealed(meta: &FileMetadata) -> bool {
+    meta.user_metadata
+        .contains_key(crate::types::meta_keys::SEALED)
 }
 
 fn bare_etag(etag: &str) -> &str {
@@ -172,6 +186,30 @@ pub fn take_missing_facts(id: &StoredObjectId<'_>) -> bool {
     MISSING.remove(&cache_key(id)).is_some()
 }
 
+/// Stored objects whose HEAD showed sealed metadata: their logical facts
+/// cannot be learned from a HEAD (only the encrypting wrapper opens them,
+/// and it writes `!!2` listing tokens instead). A LIST then neither reads
+/// their `!!1` facts nor queues a healer HEAD for them. Exact per stored
+/// object (an overwrite is another entry), so no TTL; bounded.
+static SEALED: LazyLock<Cache<String, ()>> =
+    LazyLock::new(|| Cache::builder().max_capacity(100_000).build());
+
+/// Note that the stored object `id` is sealed. Takes its
+/// [`mark_missing_facts`] mark: the healer then sends no HEAD for it.
+pub fn mark_sealed(id: &StoredObjectId<'_>) {
+    if bare_etag(id.etag).is_empty() {
+        return;
+    }
+    let key = cache_key(id);
+    MISSING.remove(&key);
+    SEALED.insert(key, ());
+}
+
+/// Did a HEAD show that the stored object `id` is sealed?
+pub fn known_sealed(id: &StoredObjectId<'_>) -> bool {
+    SEALED.contains_key(&cache_key(id))
+}
+
 /// Replace the size and ETag of a listed entry with the logical ones. Only
 /// those two fields change: `created_at` stays the listed LastModified, so
 /// consecutive LISTs of an unchanged object report the same timestamp whether
@@ -187,8 +225,8 @@ pub fn apply(meta: &mut FileMetadata, facts: &LogicalFacts) {
 }
 
 /// How [`crate::storage::StorageBackend::resolve_listed_sizes`] treats one
-/// listing.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// listing. `Default` trusts the `!!1` facts (`trust_v1_facts: true`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolveListed {
     /// A passthrough entry may be stored in another form (the
     /// proxy-encryption wrapper sets it), so its facts are looked up too.
@@ -199,6 +237,21 @@ pub struct ResolveListed {
     /// backend queues no background HEAD of its own: two HEADs per object
     /// otherwise.
     pub caller_heads_misses: bool,
+    /// Use the `!!1` listing facts and the in-process entries learned from
+    /// them. `false` in a bucket whose objects are sealed (format v2): any
+    /// `!!1` entry there is unauthenticated, and the wrapper resolves the
+    /// sizes from its `!!2` listing tokens instead.
+    pub trust_v1_facts: bool,
+}
+
+impl Default for ResolveListed {
+    fn default() -> Self {
+        Self {
+            passthrough_may_differ: false,
+            caller_heads_misses: false,
+            trust_v1_facts: true,
+        }
+    }
 }
 
 /// How much of a listed entry's size a LIST knows.
@@ -258,6 +311,87 @@ mod tests {
         assert!(take_missing_facts(&id(key, "e1", 46)));
         assert!(!missing_recently(&id(key, "e1", 46)));
         assert!(!still_missing(&id(key, "e1", 46)));
+    }
+
+    /// A sealed object has no facts in clear: `of` refuses it, so no PUT,
+    /// copy, HEAD backfill or healer path records or writes `!!1` facts.
+    #[test]
+    fn sealed_metadata_has_no_logical_facts() {
+        let mut m = FileMetadata::new_passthrough(
+            "a.bin".into(),
+            "s".repeat(64),
+            "0123456789abcdef0123456789abcdef".into(),
+            10,
+            None,
+        );
+        assert_eq!(
+            LogicalFacts::of(&m),
+            Some(LogicalFacts {
+                size: 10,
+                etag: "0123456789abcdef0123456789abcdef".into(),
+            })
+        );
+        m.user_metadata
+            .insert(crate::types::meta_keys::SEALED.into(), "2.x".into());
+        assert_eq!(LogicalFacts::of(&m), None);
+    }
+
+    /// A sealed stored object is remembered exactly, and the mark takes
+    /// its "missing facts" mark, so the healer sends no HEAD.
+    #[test]
+    fn a_sealed_mark_replaces_the_missing_mark() {
+        let key = "sealed/fw.tar.delta";
+        mark_missing_facts(&id(key, "e1", 46));
+        assert!(!known_sealed(&id(key, "e1", 46)));
+        mark_sealed(&id(key, "\"e1\"", 46));
+        assert!(known_sealed(&id(key, "e1", 46)));
+        assert!(!still_missing(&id(key, "e1", 46)));
+        assert!(!known_sealed(&id(key, "e2", 46)), "overwritten");
+        mark_sealed(&id("sealed/x.delta", "", 1));
+        assert!(!known_sealed(&id("sealed/x.delta", "", 1)), "no ETag");
+    }
+
+    #[test]
+    fn resolve_listed_trusts_v1_facts_by_default() {
+        assert!(ResolveListed::default().trust_v1_facts);
+    }
+
+    /// `LogicalFacts::of` is the only place that derives listing facts from
+    /// metadata, so its seal check covers every facts write. The other
+    /// literal builds them from a parsed `!!1` key.
+    #[test]
+    fn logical_facts_of_is_the_only_constructor_from_metadata() {
+        use crate::source_scan::{prod_sources, prod_text, read};
+        let literal = |text: &str| {
+            prod_text(text)
+                .replace("struct LogicalFacts {", "")
+                .replace("impl LogicalFacts {", "")
+                .matches("LogicalFacts {")
+                .count()
+        };
+        let builders: Vec<(String, usize)> = prod_sources("src")
+            .into_iter()
+            .map(|(file, text)| {
+                let n = literal(&text);
+                (file, n)
+            })
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        assert_eq!(
+            builders,
+            [("src/storage/listing_facts.rs".to_string(), 1)],
+            "build listing facts from metadata only through LogicalFacts::of"
+        );
+        assert!(
+            !prod_text(&read("src/storage/listing_facts.rs")).contains("FileMetadata"),
+            "listing_facts.rs builds facts from keys, never from metadata"
+        );
+        let own = prod_text(&read("src/storage/list_size_cache.rs"));
+        let of = &own[own.find("pub fn of(meta: &FileMetadata)").unwrap()..];
+        let of = &of[..of.find("\n    }\n").unwrap()];
+        assert!(of.contains("if is_sealed(meta) {"), "{of}");
+        let self_literals = own.matches("Self {").count() - own.matches("-> Self {").count();
+        assert_eq!(self_literals, 2, "`of` and `ResolveListed::default`");
     }
 
     #[test]
