@@ -277,9 +277,16 @@ mod tests {
     /// An engine on the fake with its own listing-cache scope (a node that
     /// knows nothing yet).
     fn reader(endpoint: &str, node: &str) -> DynEngine {
+        reader_and_scope(endpoint, node).0
+    }
+
+    /// [`reader`] and its listing-cache scope, for a test that looks up
+    /// the process caches itself.
+    fn reader_and_scope(endpoint: &str, node: &str) -> (DynEngine, String) {
         let mut reader = test_support::for_test_endpoint(endpoint);
-        reader.list_cache_scope = format!("{endpoint}/{node}");
-        engine_on(reader)
+        let scope = test_support::test_scope(endpoint, node);
+        reader.list_cache_scope = scope.clone();
+        (engine_on(reader), scope)
     }
 
     /// Wait (up to 10 s) until `n` requests match `pred`.
@@ -414,7 +421,7 @@ mod tests {
         const N: usize = 20;
         let (_, fake, endpoint) = deltas_without_facts("rel", N).await;
         let mut s3 = test_support::for_test_endpoint(&endpoint);
-        s3.list_cache_scope = format!("{endpoint}/busy-node");
+        s3.list_cache_scope = test_support::test_scope(&endpoint, "busy-node");
         fake.set_delay_ms("LIST", 150);
         // 40 deleted keys, one per directory: 40 facts LISTs, 6 s.
         for i in 0..40 {
@@ -524,12 +531,11 @@ mod tests {
             ("user-dg-sealed", "2.opaque"),
         ];
         fake.insert_object("b/sealed/app.zip.delta", &[1u8; 333], &meta);
-        let engine = reader(&endpoint, "sealed-node");
+        let (engine, scope) = reader_and_scope(&endpoint, "sealed-node");
         fake.clear();
         list(&engine, "sealed/").await;
         assert!(wait_count(&fake, 1, delta_heads).await);
         let stored_etag = format!("{:x}", <md5::Md5 as md5::Digest>::digest([1u8; 333]));
-        let scope = format!("{endpoint}/sealed-node");
         let id = StoredObjectId {
             scope: &scope,
             bucket: "b",
@@ -579,7 +585,7 @@ mod tests {
     fn encrypted_reader(endpoint: &str, node: &str) -> DynEngine {
         use crate::storage::{EncryptingBackend, EncryptionConfig, EncryptionKey};
         let mut s3 = test_support::for_test_endpoint(endpoint);
-        s3.list_cache_scope = format!("{endpoint}/{node}");
+        s3.list_cache_scope = test_support::test_scope(endpoint, node);
         let cfg = Arc::new(arc_swap::ArcSwap::new(Arc::new(EncryptionConfig {
             key: Some(EncryptionKey::from_hex(&"ab".repeat(32)).unwrap()),
             key_id: Some("kid".into()),

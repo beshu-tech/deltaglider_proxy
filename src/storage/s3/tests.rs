@@ -1583,11 +1583,45 @@ pub(crate) mod test_support {
         with_client(endpoint, Client::from_conf(conf.build()))
     }
 
+    /// THE listing-cache scope of a test backend: the endpoint, the node,
+    /// and a number unique in the process. The listing-size caches are
+    /// process-wide, and a fake S3 server can get the port that an earlier
+    /// test's server released: a scope of the endpoint alone then shares
+    /// that test's cache entries (its "missing recently" marks suppressed
+    /// this test's heal HEADs, CI run 38784042714).
+    pub(crate) fn test_scope(endpoint: &str, node: &str) -> String {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("{endpoint}/{node}#{n}")
+    }
+
+    /// No test backend takes a scope built from its endpoint alone (one
+    /// scope of the endpoint leaks cache entries between tests): scopes
+    /// come from [`test_scope`].
+    #[test]
+    fn test_backends_take_a_unique_scope() {
+        for (file, text) in [
+            ("tests.rs", include_str!("tests.rs")),
+            ("heal.rs", include_str!("heal.rs")),
+        ] {
+            for line in text.lines() {
+                let sets = ["list_cache_scope = ", "list_cache_scope: "]
+                    .iter()
+                    .any(|k| line.contains(k));
+                let from_endpoint =
+                    line.contains("format!(") || line.contains("endpoint.to_string()");
+                if sets && from_endpoint {
+                    panic!("{file}: a test scope not from test_scope: {}", line.trim());
+                }
+            }
+        }
+    }
+
     /// [`for_test_endpoint`] with its own listing-cache scope: a node that
     /// shares the bucket but not this process's listing-size cache.
     pub(crate) fn for_test_endpoint_as_node(endpoint: &str, node: &str) -> S3Backend {
         let mut s3 = for_test_endpoint(endpoint);
-        s3.list_cache_scope = format!("{endpoint}/{node}");
+        s3.list_cache_scope = test_scope(endpoint, node);
         s3
     }
 
@@ -1606,7 +1640,7 @@ pub(crate) mod test_support {
             request_label: Default::default(),
             client,
             native_encryption: NativeEncryptionConfig::None.into(),
-            list_cache_scope: endpoint.to_string(),
+            list_cache_scope: crate::storage::s3::tests::test_support::test_scope(endpoint, ""),
         }
     }
 }
@@ -1873,7 +1907,7 @@ mod lost_response_tests {
             request_label: Default::default(),
             client,
             native_encryption: NativeEncryptionConfig::None.into(),
-            list_cache_scope: endpoint.to_string(),
+            list_cache_scope: crate::storage::s3::tests::test_support::test_scope(endpoint, ""),
         }
     }
 
@@ -2131,7 +2165,7 @@ mod conditional_delete_tests {
             request_label: Default::default(),
             client,
             native_encryption: NativeEncryptionConfig::None.into(),
-            list_cache_scope: endpoint.to_string(),
+            list_cache_scope: crate::storage::s3::tests::test_support::test_scope(endpoint, ""),
         }
     }
 
