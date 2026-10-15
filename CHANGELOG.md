@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed — DeleteBucket right after an upload
+
+On an S3 backend, a PUT writes its listing-facts marker in the background. A DeleteBucket sent right after the PUT could run before that write: S3 then answered `BucketNotEmpty`, and a single-disk MinIO brought the deleted bucket back. DeleteBucket now waits (up to 30 s) until the bucket has no marker write queued or in flight.
+
 ### Changed — The admin UI for backends and buckets
 
 - **Storage → Backends**: each backend card has three bands. The header shows the icon, the name with its status pills (**Default**, the connection health) and its kind, the **Test connection** and **Create bucket here** buttons, and the **⋯** menu. Below it, the endpoint, region, access key id (or the path) and the bucket count are a labelled list, so a long endpoint no longer wraps beside the buttons. The encryption row says which buckets take the backend's setting ("Applies to 2 buckets · 1 bucket has its own setting"). The card follows its own width: below 720 px the buttons take their own row, and the **⋯** menu stays in the corner.

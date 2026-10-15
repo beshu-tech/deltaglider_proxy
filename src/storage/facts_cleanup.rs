@@ -271,6 +271,47 @@ type Deleted = (String, String, Option<i64>);
 /// A facts write: the facts object `facts_key` in `bucket`.
 type Write = (String, String);
 
+/// Facts writes per bucket that are queued or in flight. DeleteBucket waits
+/// until its bucket has none ([`FactsCleanupQueue::settle`]): a write that
+/// lands after the facts purge makes S3 answer BucketNotEmpty, and on a
+/// single-disk MinIO it brings the deleted bucket back.
+#[derive(Default)]
+struct Outstanding {
+    per_bucket: Mutex<HashMap<String, usize>>,
+    changed: tokio::sync::Notify,
+}
+
+impl Outstanding {
+    fn add(&self, bucket: &str) {
+        if let Ok(mut m) = self.per_bucket.lock() {
+            *m.entry(bucket.to_string()).or_default() += 1;
+        }
+    }
+
+    fn done(&self, bucket: &str, n: usize) {
+        if let Ok(mut m) = self.per_bucket.lock() {
+            if let Some(c) = m.get_mut(bucket) {
+                *c = c.saturating_sub(n);
+                if *c == 0 {
+                    m.remove(bucket);
+                }
+            }
+        }
+        self.changed.notify_waiters();
+    }
+
+    fn pending(&self, bucket: &str) -> bool {
+        self.per_bucket
+            .lock()
+            .map(|m| m.contains_key(bucket))
+            .unwrap_or(false)
+    }
+}
+
+/// Longest wait of [`FactsCleanupQueue::settle`]: a stuck backend must not
+/// hold a DeleteBucket forever (the delete then reports what S3 answers).
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Queue of facts writes, and of deleted stored keys whose facts the
 /// background task removes.
 ///
@@ -303,11 +344,16 @@ impl FactsCleanupQueue {
         let (tx, rx) = mpsc::unbounded_channel();
         let (deleted, deleted_rx) = mpsc::unbounded_channel();
         let rewritten: Rewritten = Default::default();
-        tokio::spawn(write_drain(client.clone(), native, rx));
+        let outstanding: Arc<Outstanding> = Default::default();
+        tokio::spawn(write_drain(client.clone(), native, rx, outstanding.clone()));
         tokio::spawn(cleanup_drain(client.clone(), deleted_rx, rewritten.clone()));
         let gc = crate::config::env_bool(GC_ENV, true).then(|| tokio::spawn(gc_loop(client)));
         Self {
-            writer: FactsWriter { tx, rewritten },
+            writer: FactsWriter {
+                tx,
+                rewritten,
+                outstanding,
+            },
             deleted,
             gc,
         }
@@ -338,6 +384,23 @@ impl FactsCleanupQueue {
     pub(super) fn write(&self, bucket: &str, stored_key: &str, facts_key: String) {
         self.writer.write(bucket, stored_key, facts_key)
     }
+
+    /// Wait until no facts write of `bucket` is queued or in flight (at most
+    /// [`SETTLE_TIMEOUT`]). DeleteBucket calls it before it purges the facts.
+    pub(super) async fn settle(&self, bucket: &str) {
+        let outstanding = &self.writer.outstanding;
+        let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
+        loop {
+            let changed = outstanding.changed.notified();
+            if !outstanding.pending(bucket) {
+                return;
+            }
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                warn!("DeleteBucket {bucket}: facts writes still pending after {SETTLE_TIMEOUT:?}");
+                return;
+            }
+        }
+    }
 }
 
 /// The write side of a [`FactsCleanupQueue`]. The write task ends when the
@@ -346,6 +409,7 @@ impl FactsCleanupQueue {
 pub(super) struct FactsWriter {
     tx: mpsc::UnboundedSender<Write>,
     rewritten: Rewritten,
+    outstanding: Arc<Outstanding>,
 }
 
 impl FactsWriter {
@@ -360,7 +424,9 @@ impl FactsWriter {
                 st.rewritten.insert(pair);
             }
         }
+        self.outstanding.add(bucket);
         if self.tx.send((bucket.to_string(), facts_key)).is_err() {
+            self.outstanding.done(bucket, 1);
             debug!("facts queue closed; {bucket}/{stored_key} lists its stored size");
         }
     }
@@ -391,8 +457,13 @@ async fn write_drain(
     client: Client,
     native: NativeEncryptionPolicy,
     mut rx: mpsc::UnboundedReceiver<Write>,
+    outstanding: Arc<Outstanding>,
 ) {
     while let Some(batch) = next_batch(&mut rx).await {
+        let mut queued: HashMap<String, usize> = HashMap::new();
+        for (bucket, _) in &batch {
+            *queued.entry(bucket.clone()).or_default() += 1;
+        }
         // Concurrently, one write per key: one task serves every client, so
         // a sequential loop capped the facts rate at one S3 round-trip each.
         let writes: HashSet<Write> = batch.into_iter().collect();
@@ -408,6 +479,9 @@ async fn write_drain(
                 }
             })
             .await;
+        for (bucket, n) in queued {
+            outstanding.done(&bucket, n);
+        }
     }
 }
 

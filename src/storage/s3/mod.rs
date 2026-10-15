@@ -443,7 +443,10 @@ impl StorageBackend for S3Backend {
 
     #[instrument(skip(self))]
     async fn delete_bucket(&self, bucket: &str) -> Result<(), StorageError> {
-        // Listing facts are internal: they must not keep an empty bucket.
+        // Listing facts are internal: they must not keep an empty bucket. A
+        // facts write still queued from a recent PUT would land after the
+        // purge, so wait for it first.
+        self.facts_cleanup.settle(bucket).await;
         self.purge_listing_facts_if_only_ones(bucket).await?;
         self.client
             .delete_bucket()

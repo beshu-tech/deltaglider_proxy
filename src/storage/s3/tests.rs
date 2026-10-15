@@ -1645,6 +1645,42 @@ mod facts_off_the_put_path_tests {
             fake.requests()
         );
     }
+
+    /// CI flake (s3_backend_test::delete_bucket_reclaims_an_orphan_reference):
+    /// a PUT queues its facts write in the background, and a DeleteBucket
+    /// right after it raced that write. A write that lands after the purge
+    /// of the facts makes the delete fail with BucketNotEmpty on S3, and on
+    /// a single-disk MinIO it brings the deleted bucket back. DeleteBucket
+    /// now waits for the bucket's queued facts writes first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_bucket_waits_for_the_bucket_s_queued_facts_writes() {
+        let (ep, fake) = fake_s3::start().await;
+        let s3 = test_support::for_test_endpoint(&ep);
+        s3.put_delta(
+            "b",
+            "v1",
+            "a.zip",
+            bytes::Bytes::from_static(b"0123456789"),
+            &delta_meta(),
+            crate::deltaglider::RefWriteProof::for_tests(),
+        )
+        .await
+        .unwrap();
+        // The facts write is still queued (debounce) or in flight (delay).
+        fake.set_put_delay_ms(300);
+        let _ = s3.delete_bucket("b").await;
+        let requests = fake.requests();
+        let facts = requests
+            .iter()
+            .position(|r| r.starts_with("PUT /b/.dg/facts/"));
+        let delete = requests
+            .iter()
+            .position(|r| r == "DELETE /b" || r.starts_with("DELETE /b?") || r == "DELETE /b/");
+        assert!(
+            matches!((facts, delete), (Some(f), Some(d)) if f < d),
+            "the facts write must land before DeleteBucket: {requests:?}"
+        );
+    }
 }
 
 /// A fenced PUT whose response is lost: the write landed, the retry meets
