@@ -153,6 +153,7 @@ pub(super) async fn list_objects_v2(
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::ListObjectsV2Output>> {
     let list_scope = req.extensions.get::<ListScope>().cloned();
     let reader = Reader::of(&req.extensions);
+    let principal = crate::iam::request_principal(&req.extensions).cloned();
     let include_metadata = query_flag(&req.uri, "metadata", "true");
     let input = req.input;
     let max_keys = client_max_keys(input.max_keys)?;
@@ -178,12 +179,20 @@ pub(super) async fn list_objects_v2(
     let page = listed.page;
     let enc = ListKeyEncoding::of(input.encoding_type.as_ref());
     let metadata_ext = include_metadata.then(|| {
+        // One folder check per folder of the page, not per entry.
+        let mut folders = std::collections::HashMap::new();
         ListMetadataXmlExtensions(
             page.objects
                 .iter()
                 .map(|(key, meta)| {
+                    let entry_reader = *folders
+                        .entry(folder_of(key))
+                        .or_insert_with(|| reader.narrow(principal.as_deref(), &input.bucket, key));
                     // Matched against the rendered <Key>, so encode alike.
-                    (enc.apply(key.clone()), list_metadata_map(meta, reader))
+                    (
+                        enc.apply(key.clone()),
+                        list_metadata_map(meta, entry_reader),
+                    )
                 })
                 .collect(),
         )
@@ -442,13 +451,14 @@ async fn ensure_listed_bucket(
 /// a value never differs from what HeadObject shows. The object's user
 /// metadata and content type are not listed: HeadObject returns them. An
 /// anonymous reader (a public prefix, a presigned link) gets no storage
-/// facts, as it gets no `dg-tool` (`strip_fingerprint_metadata`).
+/// facts, as it gets no `dg-tool` (`strip_fingerprint_metadata`), and
+/// neither does a reader outside the entry's folder (`Reader::for_object`).
 pub(super) fn list_metadata_map(
     meta: &FileMetadata,
     reader: Reader,
 ) -> std::collections::HashMap<String, String> {
     use crate::types::meta_keys as mk;
-    if reader == Reader::Anonymous {
+    if reader != Reader::Authenticated {
         return std::collections::HashMap::new();
     }
     response_metadata_map(meta, reader)

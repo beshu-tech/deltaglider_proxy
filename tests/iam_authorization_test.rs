@@ -863,3 +863,42 @@ async fn test_forged_xff_does_not_satisfy_source_ip_condition() {
         "a forged XFF satisfied aws:SourceIp on the CopyObject source read"
     );
 }
+
+/// #120: the delta facts of an object (`dg-note`, `dg-delta-size`, ...)
+/// depend on its whole folder, so a HEAD shows them only to a reader of
+/// the whole folder. A reader of one key gets the object without them.
+#[tokio::test]
+async fn delta_facts_only_for_a_reader_of_the_whole_folder() {
+    let harness = IamTestHarness::setup().await;
+    let admin_client = admin_http_client(&harness.server.endpoint()).await;
+    let narrow = create_iam_user(
+        &admin_client,
+        &harness.server,
+        "narrow_reader",
+        vec![json!({
+            "effect": "Allow",
+            "actions": ["read"],
+            "resources": ["bucket-a/builds/app*"]
+        })],
+    )
+    .await;
+    seed_object(&harness, "bucket-a", "builds/app.zip").await;
+
+    let head = |client: aws_sdk_s3::Client| async move {
+        client
+            .head_object()
+            .bucket("bucket-a")
+            .key("builds/app.zip")
+            .send()
+            .await
+            .expect("HEAD")
+            .metadata()
+            .cloned()
+            .unwrap_or_default()
+    };
+    let folder_reader = head(harness.client_for(&harness.reader_user).await).await;
+    assert!(folder_reader.contains_key("dg-note"), "{folder_reader:?}");
+    let key_reader = head(harness.client_for(&narrow).await).await;
+    assert!(!key_reader.contains_key("dg-note"), "{key_reader:?}");
+    assert!(key_reader.contains_key("dg-file-size"), "{key_reader:?}");
+}

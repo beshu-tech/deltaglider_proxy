@@ -825,13 +825,10 @@ pub async fn handle_form_post_upload(
         "",
     )
         .into_response();
-    let mut read_context = iam_rs::Context::new();
-    crate::iam::permissions::insert_source_ip(&mut read_context, client_ip);
-    let writer = crate::s3_adapter_s3s::Reader::of_form_writer(
+    let writer = crate::s3_adapter_s3s::Reader::for_form_writer(
         auth_user.as_deref(),
         bucket,
         &parsed.resolved_key,
-        &read_context,
     );
     for (name, value) in crate::s3_adapter_s3s::write_fact_headers(&result, writer) {
         response.headers_mut().insert(name, value);

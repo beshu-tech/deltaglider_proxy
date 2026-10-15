@@ -9,7 +9,7 @@ pub(super) async fn head_object(
     svc: &DeltaGliderS3Service,
     req: s3s::S3Request<s3s::dto::HeadObjectInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::HeadObjectOutput>> {
-    let reader = Reader::of(&req.extensions);
+    let reader = Reader::for_object(&req.extensions, &req.input.bucket, &req.input.key);
     let if_range = req.headers.get(axum::http::header::IF_RANGE).cloned();
     let input = req.input;
     let engine = svc.state.engine.load();
@@ -45,7 +45,7 @@ pub(super) async fn head_object(
     // router turns a HEAD with `Content-Range` into 206
     // (`s3_router::head_range_is_partial`).
     let mut resp = s3s::S3Response::new(output);
-    add_storage_debug_headers(svc, &mut resp.headers, &meta);
+    add_storage_debug_headers(svc, &mut resp.headers, &meta, reader);
     Ok(resp)
 }
 
@@ -53,7 +53,7 @@ pub(super) async fn get_object(
     svc: &DeltaGliderS3Service,
     req: s3s::S3Request<s3s::dto::GetObjectInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::GetObjectOutput>> {
-    let reader = Reader::of(&req.extensions);
+    let reader = Reader::for_object(&req.extensions, &req.input.bucket, &req.input.key);
     let anonymous_principal =
         crate::iam::request_principal(&req.extensions).is_some_and(|u| u.is_anonymous());
     let if_range = req.headers.get(axum::http::header::IF_RANGE).cloned();
@@ -188,7 +188,7 @@ pub(super) async fn get_object(
         output.content_range = Some(content_range);
         apply_get_response_overrides(&input, &mut output);
         let mut resp = s3s::S3Response::new(output);
-        add_storage_debug_headers(svc, &mut resp.headers, &metadata);
+        add_storage_debug_headers(svc, &mut resp.headers, &metadata, reader);
         add_get_object_security_headers(&mut resp);
         return Ok(resp);
     }
@@ -267,7 +267,7 @@ fn ranged_response(
     apply_get_response_overrides(input, &mut output);
     // s3s answers 206 because `content_range` is set.
     let mut resp = s3s::S3Response::new(output);
-    add_storage_debug_headers(svc, &mut resp.headers, metadata);
+    add_storage_debug_headers(svc, &mut resp.headers, metadata, reader);
     add_get_object_security_headers(&mut resp);
     Ok(resp)
 }
@@ -294,7 +294,7 @@ fn finish_get(
     let mut output = get_object_output_from_metadata(&metadata, body, reader)?;
     apply_get_response_overrides(input, &mut output);
     let mut resp = s3s::S3Response::new(output);
-    add_storage_debug_headers(svc, &mut resp.headers, &metadata);
+    add_storage_debug_headers(svc, &mut resp.headers, &metadata, reader);
     add_get_object_security_headers(&mut resp);
     Ok(resp)
 }
@@ -554,7 +554,7 @@ pub(super) async fn put_object(
         .extensions
         .get::<crate::api::auth::SignedPayloadHash>()
         .cloned();
-    let writer = Reader::of_writer(&req.extensions, &req.input.bucket, &req.input.key);
+    let writer = Reader::for_object(&req.extensions, &req.input.bucket, &req.input.key);
     let input = req.input;
     let engine = svc.state.engine.load();
     // Gate BEFORE the bucket check: a marked bucket refuses client bytes

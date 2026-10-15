@@ -844,6 +844,49 @@ pub(crate) fn has_unrestricted_allow_for_bucket_prefix(
     false
 }
 
+/// May this principal read EVERY key under `prefix` of `bucket` (the
+/// folder that a delta shares its reference with)? The delta facts of an
+/// object (storage type, stored size, reference SHA-256) depend on the
+/// other objects of its folder, so only such a reader gets them (issue
+/// #120): for anyone else they are a compression oracle on other users'
+/// data.
+///
+/// True only when an unconditioned Allow that grants read covers the whole
+/// prefix with a trailing `*` (or `*` alone), and no Deny that may refuse a
+/// read can match a key under it (conditions are not evaluated: a Deny
+/// that MAY fire counts). Pure; a write-only or list-only grant, or an
+/// exact grant on the folder marker, is not enough.
+pub(crate) fn can_read_whole_prefix(
+    permissions: &[Permission],
+    bucket: &str,
+    prefix: &str,
+) -> bool {
+    let denied = permissions.iter().any(|perm| {
+        perm.effect == "Deny"
+            && grants_read(perm)
+            && perm.resources.iter().any(|r| {
+                resource_key_prefix(r, bucket)
+                    .is_some_and(|d| d.starts_with(prefix) || prefix.starts_with(d.as_str()))
+            })
+    });
+    if denied {
+        return false;
+    }
+    let path = format!("{bucket}/{prefix}");
+    permissions.iter().any(|perm| {
+        perm.effect == "Allow"
+            && perm.conditions.is_none()
+            && grants_read(perm)
+            && perm.resources.iter().any(|r| {
+                let r = r.strip_prefix("arn:aws:s3:::").unwrap_or(r);
+                match r.strip_suffix('*') {
+                    Some(head) => !head.contains(['*', '?', '$']) && path.starts_with(head),
+                    None => false,
+                }
+            })
+    })
+}
+
 /// Does this statement's action set let a key show in a listing (read or
 /// list)? Write, delete and admin alone do not.
 fn grants_discovery(perm: &Permission) -> bool {
@@ -3005,6 +3048,150 @@ mod tests {
                     visible.iter().any(|p| key.starts_with(p.as_str())),
                     "{key} visible but not under {visible:?}"
                 );
+            }
+        }
+    }
+
+    /// #120: the delta facts of a folder go only to a reader of the whole
+    /// folder. Truth table.
+    #[test]
+    fn can_read_whole_prefix_truth_table() {
+        let cases: &[(&[Permission], &str, bool, &str)] = &[
+            (&[p("Allow", &["*"], &["*"])], "a/", true, "admin"),
+            (
+                &[p("Allow", &["read"], &["b/*"])],
+                "a/",
+                true,
+                "bucket read",
+            ),
+            (
+                &[p("Allow", &["read"], &["b/a/*"])],
+                "a/",
+                true,
+                "folder read",
+            ),
+            (
+                &[p("Allow", &["read"], &["b/a*"])],
+                "a/",
+                true,
+                "wider pattern",
+            ),
+            (
+                &[p("Allow", &["read"], &["arn:aws:s3:::b/*"])],
+                "a/",
+                true,
+                "ARN form",
+            ),
+            (
+                &[p("Allow", &["read"], &["b/a/mine*"])],
+                "a/",
+                false,
+                "narrower grant",
+            ),
+            (
+                &[p("Allow", &["read"], &["b/a/"])],
+                "a/",
+                false,
+                "folder marker only",
+            ),
+            (
+                &[p("Allow", &["read"], &["b"])],
+                "a/",
+                false,
+                "bucket ARN only",
+            ),
+            (
+                &[p("Allow", &["write"], &["b/*"])],
+                "a/",
+                false,
+                "write only",
+            ),
+            (&[p("Allow", &["list"], &["b/*"])], "a/", false, "list only"),
+            (
+                &[p("Allow", &["read"], &["c/*"])],
+                "a/",
+                false,
+                "other bucket",
+            ),
+            (&[p("Allow", &["read"], &["b/*"])], "", true, "root folder"),
+            (
+                &[p("Allow", &["read"], &["b/a/*"])],
+                "",
+                false,
+                "root needs the bucket",
+            ),
+            (
+                &[
+                    p("Allow", &["read"], &["b/*"]),
+                    p("Deny", &["read"], &["b/a/secret*"]),
+                ],
+                "a/",
+                false,
+                "a deny under the folder",
+            ),
+            (
+                &[p("Allow", &["read"], &["b/*"]), p("Deny", &["*"], &["b/*"])],
+                "a/",
+                false,
+                "a deny over the folder",
+            ),
+            (
+                &[
+                    p("Allow", &["read"], &["b/*"]),
+                    p("Deny", &["read"], &["b/c/*"]),
+                ],
+                "a/",
+                true,
+                "a deny elsewhere",
+            ),
+            (
+                &[
+                    p("Allow", &["read"], &["b/*"]),
+                    p("Deny", &["write"], &["b/a/*"]),
+                ],
+                "a/",
+                true,
+                "a write deny",
+            ),
+            (
+                &[with_cond(
+                    p("Allow", &["read"], &["b/*"]),
+                    serde_json::json!({"IpAddress": {"aws:SourceIp": "10.0.0.0/8"}}),
+                )],
+                "a/",
+                false,
+                "a conditioned allow",
+            ),
+        ];
+        for (perms, prefix, want, why) in cases {
+            assert_eq!(can_read_whole_prefix(perms, "b", prefix), *want, "{why}");
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(512))]
+        /// Soundness: when the predicate says "whole folder", every key
+        /// under the folder is readable.
+        #[test]
+        fn a_whole_prefix_reader_reads_every_key_under_it(
+            allows in proptest::collection::vec(
+                (proptest::sample::select(A9_ACTIONS), proptest::sample::select(A9_ALLOW)),
+                1..4),
+            denies in proptest::collection::vec(
+                (proptest::sample::select(A9_ACTIONS), proptest::sample::select(A9_DENY)),
+                0..3),
+            prefix in proptest::sample::select(&["", "a/", "a/b/", "c/"][..]),
+        ) {
+            let mut perms: Vec<Permission> =
+                allows.iter().map(|(a, r)| p("Allow", a, &[r])).collect();
+            perms.extend(denies.iter().map(|(a, r)| p("Deny", a, &[r])));
+            if can_read_whole_prefix(&perms, "b", prefix) {
+                for key in A9_KEYS.iter().filter(|k| k.starts_with(prefix)) {
+                    proptest::prop_assert!(
+                        evaluate(&perms, S3Action::Read, "b", key),
+                        "{key} under {prefix} is not readable: {perms:?}"
+                    );
+                }
             }
         }
     }

@@ -10,7 +10,7 @@ pub(super) async fn copy_object(
     req: s3s::S3Request<s3s::dto::CopyObjectInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::CopyObjectOutput>> {
     let auth_user = crate::iam::request_principal(&req.extensions).cloned();
-    let writer = Reader::of_writer(&req.extensions, &req.input.bucket, &req.input.key);
+    let writer = Reader::for_object(&req.extensions, &req.input.bucket, &req.input.key);
     let input = req.input;
     let (source_bucket, source_key) = copy_source_bucket_key(&input.copy_source)?;
     let client_ip = req

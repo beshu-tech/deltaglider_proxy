@@ -618,6 +618,10 @@ pub(crate) enum Reader {
     /// deliberate dev/test setting where every byte is public already and
     /// the proxy's own tooling reads the `dg-*` keys).
     Authenticated,
+    /// A caller who holds credentials but may not read every key of the
+    /// object's folder: keeps the provenance, gets no delta facts (see
+    /// [`Reader::for_object`]).
+    OutsideFolder,
     /// The synthesized `$anonymous` public-prefix principal, or the holder of
     /// a presigned URL (authenticated as the signer, but the link holder is an
     /// anonymous party — the docs recommend presigned links for third parties).
@@ -645,7 +649,7 @@ fn strip_fingerprint_metadata(
     metadata: &mut std::collections::HashMap<String, String>,
     reader: Reader,
 ) {
-    if reader == Reader::Authenticated {
+    if reader != Reader::Anonymous {
         return;
     }
     metadata.remove(crate::types::meta_keys::TOOL);
@@ -668,6 +672,11 @@ fn response_metadata_map(
         }
     }
     strip_fingerprint_metadata(&mut map, reader);
+    if reader == Reader::OutsideFolder {
+        for key in DELTA_FACT_KEYS {
+            map.remove(key);
+        }
+    }
     map
 }
 
@@ -682,45 +691,60 @@ impl Reader {
         }
     }
 
-    /// The writer of `bucket/key`, as far as the storage facts of the write
-    /// are concerned. A writer that may not also READ the key is
-    /// [`Self::Anonymous`]: the stored size is a delta-similarity oracle and
-    /// the reference SHA-256 is a fingerprint of other users' data, so a
-    /// write-only principal gets neither (#120 point 5). A HEAD shows the
-    /// same facts only to a reader, so this keeps the two in line.
-    pub(crate) fn of_writer(ext: &axum::http::Extensions, bucket: &str, key: &str) -> Self {
-        let client_ip = ext.get::<crate::api::auth::RequestClientIp>().map(|c| c.0);
-        Self::of(ext).unless_cannot_read(
+    /// The reader (or writer) of `bucket/key`, as far as its delta facts
+    /// are concerned. The storage type, the stored size and the reference
+    /// SHA-256 of an object depend on the other objects of its folder (the
+    /// deltaspace that shares one reference), so they are a compression
+    /// oracle on other users' data (issue #120). A caller with credentials
+    /// that may not read every key of the folder is [`Self::OutsideFolder`].
+    pub(crate) fn for_object(ext: &axum::http::Extensions, bucket: &str, key: &str) -> Self {
+        Self::of(ext).narrow(
             crate::iam::request_principal(ext).map(|u| u.as_ref()),
             bucket,
             key,
-            &policy_context_for_ip(client_ip),
         )
     }
 
-    /// [`Self::of_writer`] for a form POST, which has no request extensions.
-    pub(crate) fn of_form_writer(
+    /// [`Self::for_object`] for a form POST, which has no request extensions.
+    pub(crate) fn for_form_writer(
         user: Option<&AuthenticatedUser>,
         bucket: &str,
         key: &str,
-        context: &iam_rs::Context,
     ) -> Self {
-        Self::of_principal(user).unless_cannot_read(user, bucket, key, context)
+        Self::of_principal(user).narrow(user, bucket, key)
     }
 
-    fn unless_cannot_read(
-        self,
-        user: Option<&AuthenticatedUser>,
-        bucket: &str,
-        key: &str,
-        context: &iam_rs::Context,
-    ) -> Self {
+    /// `self`, or [`Self::OutsideFolder`] when `user` may not read the whole
+    /// folder of `key`. Open access (no principal) keeps every fact.
+    pub(crate) fn narrow(self, user: Option<&AuthenticatedUser>, bucket: &str, key: &str) -> Self {
         match user {
-            Some(u) if !u.can_with_context(S3Action::Read, bucket, key, context) => Self::Anonymous,
+            Some(u)
+                if self == Self::Authenticated
+                    && !u.can_read_whole_prefix(bucket, folder_of(key)) =>
+            {
+                Self::OutsideFolder
+            }
             _ => self,
         }
     }
 }
+
+/// The folder of `key`: everything up to and including its last `/`.
+pub(crate) fn folder_of(key: &str) -> &str {
+    key.rfind('/').map_or("", |i| &key[..=i])
+}
+
+/// The metadata keys that describe how an object is stored relative to its
+/// folder: hidden from [`Reader::OutsideFolder`].
+const DELTA_FACT_KEYS: [&str; 7] = [
+    crate::types::meta_keys::NOTE,
+    crate::types::meta_keys::REF_PATH,
+    crate::types::meta_keys::REF_KEY,
+    crate::types::meta_keys::REF_SHA256,
+    crate::types::meta_keys::DELTA_SIZE,
+    crate::types::meta_keys::DELTA_CMD,
+    crate::types::meta_keys::SOURCE_NAME,
+];
 
 /// The response headers that tell a writer how its object was stored.
 /// [`crate::cors`] exposes the same names to cross-origin browsers.
@@ -737,16 +761,16 @@ pub const WRITE_FACT_HEADERS: [&str; 4] = [
 /// `reference.bin`. Every write response (PutObject,
 /// CompleteMultipartUpload, CopyObject, form POST) goes through here.
 ///
-/// An anonymous writer (the `$anonymous` principal, or the holder of a
-/// presigned URL) and a writer that may not read the key get none (see
-/// [`Reader::of_writer`]). A writer that may read the key, and open access,
-/// get them: a HEAD already shows them the same facts.
+/// Only [`Reader::Authenticated`] gets them: an anonymous writer (the
+/// `$anonymous` principal, or the holder of a presigned URL) and a writer
+/// that may not read the whole folder get none (see [`Reader::for_object`]).
+/// A HEAD shows the same facts to the same readers.
 /// `DGP_DEBUG_HEADERS` does not gate them.
 pub(crate) fn write_fact_headers(
     result: &crate::types::StoreResult,
     writer: Reader,
 ) -> Vec<(&'static str, axum::http::HeaderValue)> {
-    if writer == Reader::Anonymous {
+    if writer != Reader::Authenticated {
         return Vec::new();
     }
     let [storage_type, stored_size, ref_sha256, baseline] = WRITE_FACT_HEADERS;
@@ -795,8 +819,9 @@ fn add_storage_debug_headers(
     svc: &DeltaGliderS3Service,
     headers: &mut axum::http::HeaderMap,
     meta: &FileMetadata,
+    reader: Reader,
 ) {
-    if !debug_headers_enabled(svc) {
+    if !debug_headers_enabled(svc) || reader != Reader::Authenticated {
         return;
     }
     if let Ok(value) = axum::http::HeaderValue::from_str(meta.storage_info.label()) {

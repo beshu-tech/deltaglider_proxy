@@ -347,6 +347,13 @@ impl AuthenticatedUser {
         permissions::has_any_on_bucket(&self.permissions, bucket)
     }
 
+    /// May this user read every key under `prefix` of `bucket`? True only
+    /// for an unconditioned Allow on reads whose trailing-`*` pattern covers
+    /// the prefix, with no Deny on reads that can match a key under it.
+    pub fn can_read_whole_prefix(&self, bucket: &str, prefix: &str) -> bool {
+        permissions::can_read_whole_prefix(&self.permissions, bucket, prefix)
+    }
+
     /// Returns true if any of this user's permissions have conditions attached.
     pub fn has_any_conditions(&self) -> bool {
         self.permissions.iter().any(|p| p.conditions.is_some())

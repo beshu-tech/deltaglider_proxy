@@ -20,9 +20,9 @@ A versioned backend bucket keeps the old versions and the delete markers of ever
 - When the bucket has no current object, DeleteBucket now deletes its old versions and then its delete markers, and deletes the bucket. It deletes at most 100 listing pages of each.
 - A `BucketNotEmpty` from the backend is now `409 BucketNotEmpty`, not a 500.
 
-### Security — Write facts only for readers (issue #120)
+### Security — Delta facts only for readers of the whole folder (issue #120)
 
-The storage-fact headers of a write response (`x-amz-storage-type`, `x-deltaglider-stored-size`, `x-deltaglider-ref-sha256`, `x-deltaglider-baseline`) go only to a writer that may also read the key that it wrote. Before, a write-only principal got them: the stored size of a delta told how similar its upload was to other objects in the folder, and the reference SHA-256 identified other users' data.
+A delta is encoded against the reference of its folder, and that reference can hold another user's data. The storage facts of an object therefore tell how similar it is to the other objects in its folder: the storage type, the stored size and the reference SHA-256. The proxy now gives these facts only to a principal that may read every object in the folder (an unconditioned Allow on reads whose pattern covers the folder, and no Deny on reads inside it), and to every caller in open-access mode. The rule applies to the write-response headers (`x-amz-storage-type`, `x-deltaglider-stored-size`, `x-deltaglider-ref-sha256`, `x-deltaglider-baseline`), to the delta keys of a `HeadObject` or `GetObject` response (`x-amz-meta-dg-note`, `x-amz-meta-dg-delta-size`, `x-amz-meta-dg-ref-sha256` and the other delta keys), to the debug headers, and to each entry of a `metadata=true` LIST. Before, a write-only principal got the write facts, and a principal that could read or list only some keys of a folder got the delta facts of every key that it could see.
 
 ## v2.0.14 — 2026-10-15
 

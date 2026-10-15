@@ -1153,38 +1153,83 @@ fn a_form_post_writer_is_anonymous_only_as_the_anonymous_principal() {
     assert_eq!(Reader::of_principal(Some(&anon)), Reader::Anonymous);
 }
 
-/// #120 point 5: a writer that may not read the key gets no storage facts.
+/// #120: only a reader of the whole folder gets the delta facts (write
+/// headers, HEAD/GET delta keys, LIST metadata); open access keeps them.
 #[test]
-fn a_write_only_writer_gets_no_write_facts() {
-    let perm = |actions: &[&str]| crate::iam::Permission {
+fn delta_facts_only_for_a_reader_of_the_whole_folder() {
+    let perm = |actions: &[&str], resource: &str| crate::iam::Permission {
         id: 0,
         effect: "Allow".into(),
         actions: actions.iter().map(|a| a.to_string()).collect(),
-        resources: vec!["releases/*".into()],
+        resources: vec![resource.into()],
         conditions: None,
     };
-    let writer_of = |actions: &[&str]| {
+    let reader_of = |perms: Vec<crate::iam::Permission>, key: &str| {
         let mut ext = axum::http::Extensions::new();
-        let user = AuthenticatedUser::new("ci-uploader", "AK", vec![perm(actions)]);
+        let user = AuthenticatedUser::new("dana", "AK", perms);
         crate::iam::insert_request_principal(&mut ext, std::sync::Arc::new(user));
-        Reader::of_writer(&ext, "releases", "v1/app.zip")
+        Reader::for_object(&ext, "releases", key)
     };
-    assert_eq!(writer_of(&["write"]), Reader::Anonymous);
-    assert_eq!(writer_of(&["write", "read"]), Reader::Authenticated);
+    let folder = "releases/v1/*";
     assert_eq!(
-        Reader::of_writer(&axum::http::Extensions::new(), "releases", "k"),
+        reader_of(vec![perm(&["write"], folder)], "v1/app.zip"),
+        Reader::OutsideFolder
+    );
+    assert_eq!(
+        reader_of(
+            vec![perm(&["read", "write"], "releases/v1/app*")],
+            "v1/app.zip"
+        ),
+        Reader::OutsideFolder,
+        "reading the own key is not enough: the delta depends on the folder"
+    );
+    assert_eq!(
+        reader_of(vec![perm(&["read", "write"], folder)], "v1/app.zip"),
+        Reader::Authenticated
+    );
+    assert_eq!(
+        Reader::for_object(&axum::http::Extensions::new(), "releases", "v1/k"),
         Reader::Authenticated,
         "open access keeps the facts"
     );
-
-    let write_only = AuthenticatedUser::new("ci-uploader", "AK", vec![perm(&["write"])]);
-    let ctx = iam_rs::Context::new();
+    let write_only = AuthenticatedUser::new("ci-uploader", "AK", vec![perm(&["write"], folder)]);
     assert_eq!(
-        Reader::of_form_writer(Some(&write_only), "releases", "k", &ctx),
-        Reader::Anonymous
+        Reader::for_form_writer(Some(&write_only), "releases", "v1/k"),
+        Reader::OutsideFolder
     );
     assert_eq!(
-        Reader::of_form_writer(None, "releases", "k", &ctx),
+        Reader::for_form_writer(None, "releases", "v1/k"),
         Reader::Authenticated
     );
+    assert_eq!(folder_of("a/b/c.zip"), "a/b/");
+    assert_eq!(folder_of("c.zip"), "");
+
+    let meta = FileMetadata::new_delta(
+        "app.zip".into(),
+        "s".into(),
+        "m".into(),
+        100,
+        "reference.bin".into(),
+        "ab".repeat(32),
+        7,
+        None,
+    );
+    let outside = response_metadata_map(&meta, Reader::OutsideFolder);
+    for key in DELTA_FACT_KEYS {
+        assert!(
+            !outside.contains_key(key),
+            "{key} reached an outside reader"
+        );
+    }
+    assert!(
+        outside.contains_key(crate::types::meta_keys::TOOL),
+        "provenance stays"
+    );
+    assert!(outside.contains_key(crate::types::meta_keys::FILE_SIZE));
+    let inside = response_metadata_map(&meta, Reader::Authenticated);
+    assert!(inside.contains_key(crate::types::meta_keys::DELTA_SIZE));
+    assert!(list_metadata_map(&meta, Reader::OutsideFolder).is_empty());
+    let stored = crate::types::StoreResult::new(meta, 7);
+    assert!(write_fact_headers(&stored, Reader::OutsideFolder).is_empty());
+    assert!(!write_fact_headers(&stored, Reader::Authenticated).is_empty());
 }
