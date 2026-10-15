@@ -322,17 +322,42 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
       }}
     >
       <div style={cardStyle}>
-        {/* The page TabHeader already carries the "Buckets" title + description,
-            so this is just the dynamic count line (no duplicate heading). */}
-        <Text type="secondary" style={{ fontSize: 13 }}>
-          {loading
-            ? 'Loading buckets…'
-            : `${sortedReal.length} bucket${sortedReal.length === 1 ? '' : 's'}` +
-              (overrideCount > 0
-                ? ` · ${overrideCount} with custom settings`
-                : ' — all on defaults') +
-              '. Click a bucket to edit its settings.'}
-        </Text>
+        {/* The page TabHeader carries the "Buckets" title, so the header row
+            is the count line and ONE call to action. The action sits here,
+            not after the list: below an expanded card it read as that card's
+            save button. Pre-provisioning (settings for a bucket that does not
+            exist yet) is its secondary option. */}
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+          <Text type="secondary" style={{ fontSize: 13 }}>
+            {loading
+              ? 'Loading buckets…'
+              : `${sortedReal.length} bucket${sortedReal.length === 1 ? '' : 's'}` +
+                (overrideCount > 0
+                  ? ` · ${overrideCount} with custom settings`
+                  : ' — all on defaults') +
+                '. Click a bucket to edit its settings.'}
+          </Text>
+          <Space.Compact>
+            <Button
+              data-testid="buckets-create"
+              aria-label="Create bucket"
+              onClick={() => setCreateOpen(true)}
+              icon={<PlusOutlined />}
+            >
+              Create bucket
+            </Button>
+            <Dropdown
+              menu={{
+                items: [
+                  { key: 'draft', label: 'Add settings for a bucket that does not exist yet' },
+                ],
+                onClick: () => addDraft(),
+              }}
+            >
+              <Button icon={<DownOutlined />} aria-label="More ways to add a bucket" />
+            </Dropdown>
+          </Space.Compact>
+        </div>
 
         <div style={{ marginTop: 16, display: 'flex', flexDirection: 'column', gap: 8 }}>
           {loading && sortedReal.length === 0 && <LoadingState />}
@@ -404,31 +429,6 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
             />
           ))}
 
-          {/* ONE call to action. Pre-provisioning (settings for a bucket
-              that does not exist yet) is its secondary option, not a second
-              competing button. */}
-          <div style={{ marginTop: 4 }}>
-            <Space.Compact>
-              <Button
-                data-testid="buckets-create"
-                aria-label="Create bucket"
-                onClick={() => setCreateOpen(true)}
-                icon={<PlusOutlined />}
-              >
-                Create bucket
-              </Button>
-              <Dropdown
-                menu={{
-                  items: [
-                    { key: 'draft', label: 'Add settings for a bucket that does not exist yet' },
-                  ],
-                  onClick: () => addDraft(),
-                }}
-              >
-                <Button icon={<DownOutlined />} aria-label="More ways to add a bucket" />
-              </Dropdown>
-            </Space.Compact>
-          </div>
         </div>
       </div>
 
