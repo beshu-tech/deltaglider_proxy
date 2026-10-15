@@ -10,7 +10,7 @@
 //! can run on the same bucket. A job that arms the gate (a re-encryption)
 //! makes a running delete wait.
 //!
-//! Each page lists up to [`PAGE_KEYS`] keys of the current folder through
+//! Each page lists up to 1,000 keys (`PAGE_KEYS`) of the current folder through
 //! the S3 LIST's walk ([`crate::iam::listing`]), as the principal that
 //! started the job sees them, and deletes them through the bulk delete of
 //! the admin API (per-key permission check, events, reference reclaim).
