@@ -62,6 +62,9 @@ mod format;
 mod tests;
 // Format v2 (issue #120). Wired into the read and write paths in a later
 // commit; until then only its tests and the fuzz entry use it.
+// Wired in the switch-over commit; some items are unused until then.
+#[allow(dead_code)]
+pub(crate) mod seal;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod v2;
 
