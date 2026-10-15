@@ -338,6 +338,7 @@ fn test_wrap_backend_with_aes_mode_accepts_hex_key() {
             key_id: Some("abc".into()),
             legacy_key: None,
             legacy_key_id: None,
+            plaintext_reads: Default::default(),
         },
         &[],
         &mut coll,
@@ -360,6 +361,7 @@ fn test_wrap_backend_with_aes_mode_rejects_malformed_hex() {
             key_id: None,
             legacy_key: None,
             legacy_key_id: None,
+            plaintext_reads: Default::default(),
         },
         &[],
         &mut coll,
@@ -393,6 +395,7 @@ fn test_key_id_collision_detected_at_construction() {
             key_id: Some("shared-id".into()),
             legacy_key: None,
             legacy_key_id: None,
+            plaintext_reads: Default::default(),
         },
         &[],
         &mut coll,
@@ -406,6 +409,7 @@ fn test_key_id_collision_detected_at_construction() {
             key_id: Some("shared-id".into()),
             legacy_key: None,
             legacy_key_id: None,
+            plaintext_reads: Default::default(),
         },
         &[],
         &mut coll,
@@ -436,6 +440,7 @@ fn test_key_id_collision_allowed_with_same_key() {
             key_id: Some("portable".into()),
             legacy_key: None,
             legacy_key_id: None,
+            plaintext_reads: Default::default(),
         },
         &[],
         &mut coll,
@@ -449,6 +454,7 @@ fn test_key_id_collision_allowed_with_same_key() {
             key_id: Some("portable".into()),
             legacy_key: None,
             legacy_key_id: None,
+            plaintext_reads: Default::default(),
         },
         &[],
         &mut coll,
@@ -511,6 +517,7 @@ fn test_native_encryption_for_maps_modes_correctly() {
             key_id: None,
             legacy_key: None,
             legacy_key_id: None,
+            plaintext_reads: Default::default(),
         }),
         N::None
     ));
@@ -561,6 +568,7 @@ fn test_resolve_legacy_shim_absent_is_none_none() {
             key_id: None,
             legacy_key: None,
             legacy_key_id: None,
+            plaintext_reads: Default::default(),
         },
     )
     .unwrap();
@@ -569,47 +577,34 @@ fn test_resolve_legacy_shim_absent_is_none_none() {
 }
 
 #[test]
-fn test_derive_key_id_shape_invariants() {
-    // Contract: 16 lowercase hex chars (8 bytes of SHA-256).
-    // Integration tests used to assert this shape; now pinned
-    // here so the integration suite can focus on the wiring
-    // (same-backend ⇒ same-kid) rather than the format.
-    let key = [0xab; 32];
-    let id = derive_key_id("my-backend", &key);
-    assert_eq!(id.len(), 16, "derived key_id must be 16 hex chars");
+fn one_key_has_one_id_on_a_backend() {
+    let a = crate::storage::EncryptionKey::from_hex(HEX32_KEY_A).unwrap();
+    let b = crate::storage::EncryptionKey::from_hex(&"cd".repeat(32)).unwrap();
+    assert!(super::construction::one_id_per_key("b", [("x", &a), ("y", &b)].into_iter()).is_ok());
+    assert!(super::construction::one_id_per_key("b", [("x", &a), ("x", &a)].into_iter()).is_ok());
+    let err = super::construction::one_id_per_key("b", [("x", &a), ("y", &a)].into_iter())
+        .unwrap_err()
+        .to_string();
     assert!(
-        id.chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-        "derived key_id must be lowercase hex, got: {id}"
+        err.contains("two ids") && err.contains("'x'") && err.contains("'y'"),
+        "{err}"
     );
 }
 
 #[test]
-fn test_derive_key_id_name_disambiguates_same_key() {
-    // Two backends sharing identical key bytes but distinct
-    // names MUST produce distinct ids. This is the invariant
-    // that lets the read-side key_id check reject "same key,
-    // different backend" without relying on AEAD to fail.
-    let key = [0xcd; 32];
-    let id_a = derive_key_id("backend-a", &key);
-    let id_b = derive_key_id("backend-b", &key);
-    assert_ne!(id_a, id_b);
-}
-
-#[test]
-fn test_derive_key_id_separator_prevents_collision() {
-    // "ab" + "c" vs "a" + "bc": without the 0x00 separator the
-    // SHA-256 pre-image would collide, and operators naming
-    // backends "ab" and "a" with keys that differ only by
-    // prefix alignment could accidentally produce the same id.
-    let key1 = [0x11; 32];
-    let key2 = [0x22; 32];
-    // Names chosen to make the concat-ambiguity visible.
-    assert_ne!(
-        derive_key_id("ab", &key1),
-        derive_key_id("a", &key2),
-        "name/key separator missing — two different (name, key) pairs collided"
-    );
+fn a_derived_key_id_is_the_keys_fingerprint() {
+    // `fp-` + 16 lowercase hex chars; the key alone decides it, so two
+    // backends with one key share it and a rename changes nothing.
+    let key = crate::storage::EncryptionKey::from_hex(&"ab".repeat(32)).unwrap();
+    let id = crate::storage::encrypting::fingerprint_label(&key);
+    let hex = id.strip_prefix("fp-").expect("fp- prefix");
+    assert_eq!(hex.len(), 16, "{id}");
+    assert!(hex
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    assert_eq!(id, crate::storage::encrypting::fingerprint_label(&key));
+    let other = crate::storage::EncryptionKey::from_hex(&"cd".repeat(32)).unwrap();
+    assert_ne!(id, crate::storage::encrypting::fingerprint_label(&other));
 }
 
 #[test]
@@ -687,16 +682,10 @@ legacy_key_id: "old-kid"
 }
 
 #[test]
-fn test_resolve_legacy_shim_derives_distinct_from_primary() {
-    // legacy_key set without legacy_key_id — resolver derives
-    // from `{name}::legacy` + key bytes. This MUST differ from
-    // the primary's derived id so the mismatch check doesn't
-    // accidentally let primary-stamped objects match the
-    // legacy slot (or vice versa).
-    let key_bytes = crate::storage::EncryptionKey::from_hex(HEX32_KEY_A)
-        .unwrap()
-        .0;
-    let primary_id = derive_key_id("b", &key_bytes);
+fn a_legacy_key_without_an_id_gets_its_fingerprint() {
+    // One key, one id: a legacy key with the primary's bytes has the
+    // primary's id, so an object of that key reads with either slot.
+    let key = crate::storage::EncryptionKey::from_hex(HEX32_KEY_A).unwrap();
     let (_, legacy_id) = resolve_legacy_shim(
         "b",
         &crate::config::BackendEncryptionConfig::SseS3 {
@@ -705,13 +694,9 @@ fn test_resolve_legacy_shim_derives_distinct_from_primary() {
         },
     )
     .unwrap();
-    assert!(legacy_id.is_some());
-    assert_ne!(
-        legacy_id.as_deref(),
-        Some(primary_id.as_str()),
-        "legacy-shim derivation MUST differ from primary derivation, \
-             even when the key material is identical — name suffix `::legacy` \
-             keeps them distinct"
+    assert_eq!(
+        legacy_id,
+        Some(crate::storage::encrypting::fingerprint_label(&key))
     );
 }
 
@@ -726,6 +711,7 @@ fn test_resolve_legacy_shim_rejects_bad_hex() {
             key_id: None,
             legacy_key: Some("not-hex".into()),
             legacy_key_id: None,
+            plaintext_reads: Default::default(),
         },
     );
     // EncryptionKey doesn't impl Debug (to prevent key leakage
@@ -884,6 +870,7 @@ async fn a_proxy_backend_without_a_key_refuses_writes_and_keeps_reads() {
             key_id: None,
             legacy_key: None,
             legacy_key_id: None,
+            plaintext_reads: Default::default(),
         },
         &[],
         &mut coll,

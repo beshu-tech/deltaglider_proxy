@@ -27,20 +27,19 @@ pub struct WriteEncryption {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_id: Option<String>,
     /// The key check value of a proxy key ([`key_check_value`]): two
-    /// configs with one key id and different key bytes differ here.
+    /// configs with one key id and different key bytes differ here. Since
+    /// format v2 (issue #120) it is the key's v2 fingerprint, so a node of
+    /// an older release (whose value differs) disagrees and refuses writes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kcv: Option<String>,
 }
 
-/// The key check value of a proxy key: the first 8 bytes of
-/// HMAC-SHA256(key, "dgp-witness-kcv-v1"), in hex. It tells two keys
-/// apart and reveals nothing practical about a random 256-bit key (a
-/// one-way function of it, and only 64 bits of the output).
-pub fn key_check_value(key: &[u8]) -> String {
-    use hmac::{Hmac, Mac};
-    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(key).expect("HMAC takes any key");
-    mac.update(b"dgp-witness-kcv-v1");
-    hex::encode(&mac.finalize().into_bytes()[..8])
+/// The key check value of a proxy key: its v2 fingerprint in hex (8
+/// bytes of an HKDF expansion of the key). It tells two keys apart and
+/// reveals nothing practical about a random 256-bit key. Every v2 object
+/// carries the same value, so the witness and the objects agree.
+pub fn key_check_value(key: &crate::storage::EncryptionKey) -> String {
+    hex::encode(crate::storage::encrypting::v2::SiteKey::new(key).fingerprint())
 }
 
 impl WriteEncryption {
@@ -54,7 +53,7 @@ impl WriteEncryption {
         let (key_id, kcv) = match enc {
             BackendEncryptionConfig::Aes256GcmProxy { .. } => (
                 primary.map(|k| k.key_id.clone()),
-                primary.map(|k| key_check_value(&k.key.0)),
+                primary.map(|k| key_check_value(&k.key)),
             ),
             BackendEncryptionConfig::SseKms { kms_key_id, .. } => (Some(kms_key_id.clone()), None),
             BackendEncryptionConfig::None { .. } | BackendEncryptionConfig::SseS3 { .. } => {

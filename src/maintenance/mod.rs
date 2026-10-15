@@ -428,6 +428,7 @@ mod tests {
             key_id: Some("explicit-id".into()),
             legacy_key: None,
             legacy_key_id: None,
+            plaintext_reads: Default::default(),
         };
         assert_eq!(
             resolve_desired(&cfg, "b").unwrap(),
@@ -436,18 +437,22 @@ mod tests {
             }
         );
 
-        // Derived key id is stable and mixes the backend name ("default").
+        // A derived key id is `fp-` and the key's fingerprint.
         cfg.backend_encryption = BackendEncryptionConfig::Aes256GcmProxy {
             key: Some("00".repeat(32)),
             key_id: None,
             legacy_key: None,
             legacy_key_id: None,
+            plaintext_reads: Default::default(),
         };
         let derived = match resolve_desired(&cfg, "b").unwrap() {
             DesiredEncryption::Proxy { key_id } => key_id,
             other => panic!("expected proxy, got {other:?}"),
         };
-        assert_eq!(derived.len(), 16, "16 hex chars of sha256");
+        assert!(
+            derived.starts_with("fp-") && derived.len() == 19,
+            "{derived}"
+        );
 
         // Proxy without key = reject.
         cfg.backend_encryption = BackendEncryptionConfig::Aes256GcmProxy {
@@ -455,6 +460,7 @@ mod tests {
             key_id: None,
             legacy_key: None,
             legacy_key_id: None,
+            plaintext_reads: Default::default(),
         };
         assert!(resolve_desired(&cfg, "b").unwrap_err().contains("no key"));
 

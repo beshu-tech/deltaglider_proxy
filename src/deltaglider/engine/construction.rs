@@ -450,6 +450,15 @@ pub(super) fn resolve_encryption_config(
     }
 
     let (bucket_keys, keyring) = resolve_bucket_keys(backend_name, buckets, collisions)?;
+    one_id_per_key(
+        backend_name,
+        primary_kid
+            .as_deref()
+            .zip(primary_key.as_ref())
+            .into_iter()
+            .chain(legacy_kid_opt.as_deref().zip(legacy_key_opt.as_ref()))
+            .chain(keyring.iter().map(|(id, k)| (id.as_str(), k))),
+    )?;
     Ok(crate::storage::EncryptionConfig {
         key: primary_key,
         key_id: primary_kid,
@@ -459,6 +468,34 @@ pub(super) fn resolve_encryption_config(
         buckets: bucket_keys,
         keyring,
     })
+}
+
+/// One key has one id within a raw backend (issue #120): a v2 object
+/// stores only the key's fingerprint, and a read names the key by the id
+/// that the fingerprint maps to. Two ids for one key would make that id
+/// depend on which entry a lookup meets first (and the re-encrypt job
+/// would rewrite the same objects on every run). Pure.
+pub(super) fn one_id_per_key<'a>(
+    backend_name: &str,
+    entries: impl Iterator<Item = (&'a str, &'a crate::storage::EncryptionKey)>,
+) -> Result<(), StorageError> {
+    let mut seen: std::collections::BTreeMap<[u8; 8], &str> = std::collections::BTreeMap::new();
+    for (id, key) in entries {
+        let fp = crate::storage::encrypting::v2::SiteKey::new(key).fingerprint();
+        match seen.get(&fp) {
+            Some(prev) if *prev != id => {
+                return Err(StorageError::Encryption(format!(
+                    "backend '{backend_name}': one key has two ids, '{prev}' and '{id}'. Give \
+                     every use of one key on a backend the same key_id (or leave key_id out on \
+                     the backend: its id is then the key's fingerprint)"
+                )))
+            }
+            _ => {
+                seen.insert(fp, id);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The per-bucket write policies and the keyring of one raw backend
@@ -579,34 +616,6 @@ pub(crate) fn effective_legacy_key_id(
     crate::config::resolve_site_keys(crate::config::KeyScope::Backend(backend_name), enc)
         .legacy_id()
         .map(str::to_string)
-}
-
-/// Derive the per-object `key_id` from the backend name + the 32 key
-/// bytes. Name is hashed in first, followed by a 0x00 separator, then
-/// the key bytes. Truncated to 16 hex chars of SHA-256.
-///
-/// Name mixing disambiguates "two backends with the same key material"
-/// so objects don't accidentally decrypt across backends — the read
-/// path's `check_key_id_match` would reject with a specific error
-/// rather than the underlying AEAD having any chance to succeed on
-/// ciphertext that "happened to" come from a different backend.
-///
-/// Operators who WANT cross-backend portability pin an explicit
-/// matching `key_id` on both — that's the documented escape hatch,
-/// exercised by `test_key_id_collision_allowed_with_same_key`.
-///
-/// Shared with the admin-API summary path (`field_level::derive_key_id_for_summary`)
-/// so the stamped id on disk ALWAYS matches the id the operator sees
-/// in the Backends panel; drift between the two surfaces would mean
-/// a "rotated key" badge that doesn't correspond to any real object
-/// metadata.
-pub(crate) fn derive_key_id(backend_name: &str, key_bytes: &[u8; 32]) -> String {
-    use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(backend_name.as_bytes());
-    hasher.update(b"\0"); // separator: "ab"+"c" ≠ "a"+"bc"
-    hasher.update(key_bytes);
-    hex::encode(&hasher.finalize()[..8])
 }
 
 /// Canonical env var name for a backend's encryption key. Matches the

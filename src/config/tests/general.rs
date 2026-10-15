@@ -548,6 +548,7 @@ fn test_canonical_yaml_strips_infra_secrets() {
             key_id: Some("singleton-kid".into()),
             legacy_key: None,
             legacy_key_id: None,
+            plaintext_reads: Default::default(),
         },
         ..Config::default()
     };
@@ -580,6 +581,7 @@ fn test_redact_all_secrets_full_paranoia() {
             key_id: None,
             legacy_key: Some("legacy-deadbeef-should-also-redact".into()),
             legacy_key_id: Some("legacy-kid".into()),
+            plaintext_reads: Default::default(),
         },
         backend: BackendConfig::S3 {
             session_token: None,
@@ -608,6 +610,7 @@ fn test_redact_all_secrets_full_paranoia() {
             key_id: Some("hetzner-kid".into()),
             legacy_key: None,
             legacy_key_id: None,
+            plaintext_reads: Default::default(),
         },
     });
 
@@ -956,6 +959,7 @@ fn test_check_warns_aes_without_key() {
                 key_id: None,
                 legacy_key: None,
                 legacy_key_id: None,
+                plaintext_reads: Default::default(),
             },
         }],
         ..Config::default()
@@ -1188,6 +1192,7 @@ fn test_check_detects_key_id_collision_with_different_keys() {
                     key_id: Some("shared".into()),
                     legacy_key: None,
                     legacy_key_id: None,
+                    plaintext_reads: Default::default(),
                 },
             },
             NamedBackendConfig {
@@ -1200,6 +1205,7 @@ fn test_check_detects_key_id_collision_with_different_keys() {
                     key_id: Some("shared".into()),
                     legacy_key: None,
                     legacy_key_id: None,
+                    plaintext_reads: Default::default(),
                 },
             },
         ],
@@ -1231,6 +1237,7 @@ fn test_check_allows_shared_key_id_with_same_key() {
                     key_id: Some("portable".into()),
                     legacy_key: None,
                     legacy_key_id: None,
+                    plaintext_reads: Default::default(),
                 },
             },
             NamedBackendConfig {
@@ -1243,6 +1250,7 @@ fn test_check_allows_shared_key_id_with_same_key() {
                     key_id: Some("portable".into()),
                     legacy_key: None,
                     legacy_key_id: None,
+                    plaintext_reads: Default::default(),
                 },
             },
         ],
@@ -1271,6 +1279,7 @@ fn test_check_rejects_invalid_key_id_charset() {
                 key_id: Some("has space!".into()),
                 legacy_key: None,
                 legacy_key_id: None,
+                plaintext_reads: Default::default(),
             },
         }],
         ..Config::default()
@@ -2275,39 +2284,6 @@ admission_blocks:
 }
 
 #[test]
-fn test_check_warns_on_env_suffix_collision() {
-    // Correctness x-ray C4: "eu-archive" and "eu.archive" both
-    // normalize to EU_ARCHIVE, so both would read the SAME env
-    // var DGP_BACKEND_EU_ARCHIVE_ENCRYPTION_KEY. With the same
-    // key material but distinct derived key_ids (the raw name
-    // feeds into derive_key_id), objects written by one backend
-    // can't be read by the other. check() now warns loudly.
-    let mut cfg = Config {
-        backends: vec![
-            NamedBackendConfig {
-                name: "eu-archive".into(),
-                backend: BackendConfig::Filesystem { path: "/a".into() },
-                encryption: BackendEncryptionConfig::default(),
-            },
-            NamedBackendConfig {
-                name: "eu.archive".into(),
-                backend: BackendConfig::Filesystem { path: "/b".into() },
-                encryption: BackendEncryptionConfig::default(),
-            },
-        ],
-        ..Config::default()
-    };
-    let warnings = cfg.check();
-    assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("env-var suffix") && w.contains("EU_ARCHIVE")),
-        "expected env-suffix collision warning, got {:?}",
-        warnings
-    );
-}
-
-#[test]
 fn test_check_no_env_suffix_warning_for_distinct_names() {
     let mut cfg = Config {
         backends: vec![
@@ -2364,6 +2340,7 @@ fn test_persist_to_file_preserves_yaml_stored_encryption_keys() {
                     "0202020202020202020202020202020202020202020202020202020202020202".into(),
                 ),
                 legacy_key_id: Some("test-legacy-kid".into()),
+                plaintext_reads: Default::default(),
             },
         }],
         ..Config::default()

@@ -40,7 +40,7 @@ mod usage;
 
 use locking::*;
 
-pub(crate) use construction::{build_raw_backend, derive_key_id, effective_legacy_key_id};
+pub(crate) use construction::{build_raw_backend, effective_legacy_key_id};
 pub use delete::{DeleteHooks, DeleteItem, DeleteOutcome, BULK_DELETE_CONCURRENCY};
 pub(crate) use list::interleave_and_paginate;
 

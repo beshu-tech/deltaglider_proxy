@@ -11,8 +11,7 @@ use super::*;
 use crate::storage::EncryptionKey;
 
 /// Whose id rules apply to a config. A backend derives a missing id from
-/// its name (`derive_key_id`); a bucket never derives one: its ids are
-/// explicit, because a name can change (rename, alias).
+/// the key itself (`fingerprint_label`); a bucket's ids are explicit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KeyScope<'a> {
     Backend(&'a str),
@@ -68,10 +67,7 @@ pub(crate) fn resolve_site_keys(scope: KeyScope<'_>, enc: &BackendEncryptionConf
             .map_err(|e| format!("{} encryption.{field}: {e}", scope.label()))?;
         let key_id = match (explicit, scope) {
             (Some(id), _) => id.to_string(),
-            (None, KeyScope::Backend(name)) if legacy => {
-                crate::deltaglider::derive_key_id(&format!("{name}::legacy"), &key.0)
-            }
-            (None, KeyScope::Backend(name)) => crate::deltaglider::derive_key_id(name, &key.0),
+            (None, KeyScope::Backend(_)) => crate::storage::encrypting::fingerprint_label(&key),
             (None, KeyScope::Bucket(_)) => {
                 return Err(format!(
                     "{}: encryption.{field}_id is required on a bucket",

@@ -67,6 +67,13 @@ pub(crate) mod v2;
 
 pub use format::*;
 
+/// The id of a key that the config does not name: `fp-` and the hex of
+/// its v2 fingerprint (issue #120). It depends on the key alone, so the
+/// same key has the same id on every backend and a rename changes nothing.
+pub fn fingerprint_label(key: &EncryptionKey) -> String {
+    format!("fp-{}", hex::encode(v2::SiteKey::new(key).fingerprint()))
+}
+
 use super::io_to_storage_error;
 use super::list_size_cache::{ListedSize, ResolveListed};
 use super::traits::{

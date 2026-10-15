@@ -374,12 +374,28 @@ pub struct Config {
 ///   AWS before landing on disk; proxy doesn't wrap.
 /// - `SseS3` — delegate to S3 native AES256 (no KMS involvement).
 ///
-/// Name mixing in the default key_id derivation (see
-/// `derive_key_id` in engine/construction.rs) is load-bearing: two
-/// backends with identical `key` bytes but different names produce
-/// DIFFERENT ids, so objects are NOT accidentally portable between
-/// them. Operators who want portability set an explicit identical
-/// `key_id` on both.
+/// A key with no explicit `key_id` gets the id `fp-<hex>` from its v2
+/// fingerprint (`storage::encrypting::fingerprint_label`): the same key
+/// has the same id everywhere, and a backend rename changes nothing.
+/// What a read does with an unencrypted object in a bucket that encrypts
+/// (`encryption.plaintext_reads`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlaintextReads {
+    /// The read fails (500): an unencrypted object may be planted.
+    #[default]
+    Refuse,
+    /// The object is served: the plaintext history of a bucket that starts
+    /// to encrypt, until a re-encrypt job converts it.
+    Serve,
+}
+
+impl PlaintextReads {
+    pub fn is_refuse(&self) -> bool {
+        *self == Self::Refuse
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 // A misspelled field (`kms_key`) is a load error, not a silent default.
 #[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
@@ -401,9 +417,8 @@ pub enum BackendEncryptionConfig {
     },
 
     /// Proxy-side AES-256-GCM. `key` is hex-encoded 256 bits.
-    /// `key_id` is stamped on each object's `dg-encryption-key-id`
-    /// metadata; derived automatically from `SHA-256(backend_name || key)`
-    /// when absent. `legacy_key`/`legacy_key_id` provide a decrypt-only
+    /// `key_id` is the operator's label of the key; `fp-<hex>` of the
+    /// key's fingerprint when absent. `legacy_key`/`legacy_key_id` provide a decrypt-only
     /// shim during mode transitions (see engine/construction.rs resolver).
     Aes256GcmProxy {
         /// 64-char hex key. Infra secret; stripped by redactors.
@@ -422,6 +437,13 @@ pub enum BackendEncryptionConfig {
         legacy_key: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         legacy_key_id: Option<String>,
+        /// What a read does with an object that is not encrypted (issue
+        /// #120). `refuse` (default): it fails, because a backend writer
+        /// could have planted it. `serve`: it is served, for the time a
+        /// re-encrypt job converts the plaintext history of a bucket that
+        /// starts to encrypt.
+        #[serde(default, skip_serializing_if = "PlaintextReads::is_refuse")]
+        plaintext_reads: PlaintextReads,
     },
 
     /// S3 native SSE-KMS. Proxy does not wrap; AWS encrypts on write.
@@ -722,10 +744,8 @@ pub(crate) fn backend_encryption_env_names(backend_name: &str) -> (String, Strin
 /// What [`Config::encryption_for_bucket`] resolves for one bucket.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BucketEncryption<'a> {
-    /// The raw backend that stores the bucket. A derived key id of the
-    /// backend's own key mixes this name in (`derive_key_id`), so it is
-    /// also the key-id scope of an inherited config. A bucket override
-    /// always has an explicit key id.
+    /// The raw backend that stores the bucket: the key-id scope of an
+    /// inherited config. A bucket override always has an explicit key id.
     pub backend: String,
     /// The encryption config that the bucket's writes use.
     pub config: &'a BackendEncryptionConfig,

@@ -1019,6 +1019,7 @@ access:
                 key_id: Some("k1".into()),
                 legacy_key: None,
                 legacy_key_id: None,
+                plaintext_reads: Default::default(),
             },
             ..Default::default()
         };
@@ -1029,6 +1030,7 @@ access:
                 key_id: Some("k1".into()),
                 legacy_key: None,
                 legacy_key_id: None,
+                plaintext_reads: Default::default(),
             },
             ..Default::default()
         };
@@ -1056,6 +1058,7 @@ access:
                 key_id: None,
                 legacy_key: None,
                 legacy_key_id: None,
+                plaintext_reads: Default::default(),
             },
             ..Default::default()
         };
@@ -1065,6 +1068,7 @@ access:
                 key_id: None,
                 legacy_key: None,
                 legacy_key_id: None,
+                plaintext_reads: Default::default(),
             },
             ..Default::default()
         };

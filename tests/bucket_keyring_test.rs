@@ -1826,7 +1826,11 @@ async fn create_with_key(env: &Env, bucket: &str, backend: &str) -> (u16, String
         .json(&json!({
             "name": bucket,
             "backend_name": backend,
-            "encryption": override_json(KB, &format!("{bucket}-2026-10")),
+            // One key per bucket: one key has one id on a backend (#120).
+            "encryption": override_json(
+                if bucket == "db-archive" { KD } else { KB },
+                &format!("{bucket}-2026-10")
+            ),
         }))
         .send()
         .await

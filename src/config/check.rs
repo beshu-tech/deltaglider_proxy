@@ -345,6 +345,7 @@ impl Config {
                 key_id,
                 legacy_key: _,
                 legacy_key_id: _,
+                plaintext_reads: _,
             } = enc
             {
                 if key.is_none() {
@@ -406,44 +407,6 @@ impl Config {
                          Either make the keys identical (intentional cross-backend portability) \
                          or give each backend a distinct key_id.",
                         names, kid
-                    ));
-                }
-            }
-        }
-
-        // Env-var suffix collision check (correctness x-ray C4):
-        // Two backends whose names normalise to the same env suffix
-        // would both read the SAME env var
-        // (`DGP_BACKEND_<SUFFIX>_ENCRYPTION_KEY`). When both land with
-        // the same key material but different derived key_ids (because
-        // the raw backend NAME feeds into `derive_key_id`, not the
-        // suffix), objects written by one cannot be read by the other.
-        // Detectable at config load time; warn loudly so operators
-        // rename one.
-        if self.backends.len() > 1 {
-            let mut suffix_owners: std::collections::BTreeMap<String, Vec<String>> =
-                std::collections::BTreeMap::new();
-            for backend in &self.backends {
-                // Skip names that already normalize to the bare
-                // "DEFAULT" suffix — that collides with the singleton
-                // `DGP_ENCRYPTION_KEY` path, which is an independent
-                // surface; the operator probably meant a DIFFERENT
-                // collision warning which would confuse the signal.
-                let suffix = env_suffix_for_backend_name(&backend.name);
-                suffix_owners
-                    .entry(suffix)
-                    .or_default()
-                    .push(backend.name.clone());
-            }
-            for (suffix, names) in &suffix_owners {
-                if names.len() > 1 {
-                    warnings.push(format!(
-                        "backends {:?} normalize to the same env-var suffix '{}' — \
-                         all would read DGP_BACKEND_{}_ENCRYPTION_KEY, but each has a \
-                         distinct derived key_id. Rename one of them to avoid silent \
-                         cross-backend key sharing (Aes256GcmProxy cross-decrypt will fail \
-                         with 'key id mismatch').",
-                        names, suffix, suffix
                     ));
                 }
             }

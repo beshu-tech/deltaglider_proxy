@@ -108,13 +108,9 @@ fn every_encryption_site_goes_through_the_visitor() {
 fn key_ids_have_one_resolver() {
     use crate::source_scan::{prod_lines, rel, rust_files};
     let allowed: &[(&str, &str, usize)] = &[
-        ("src/config/keys.rs", "derive_key_id(", 2),
+        ("src/config/keys.rs", "fingerprint_label(", 1),
         // The definition.
-        (
-            "src/deltaglider/engine/construction.rs",
-            "derive_key_id(",
-            1,
-        ),
+        ("src/storage/encrypting/mod.rs", "fingerprint_label(", 1),
         ("src/config/keys.rs", "EncryptionKey::from_hex(", 1),
         (
             "src/api/admin/config/section_level.rs",
@@ -129,7 +125,7 @@ fn key_ids_have_one_resolver() {
             continue;
         }
         let text = std::fs::read_to_string(&path).unwrap();
-        for needle in ["derive_key_id(", "EncryptionKey::from_hex("] {
+        for needle in ["fingerprint_label(", "EncryptionKey::from_hex("] {
             let n = prod_lines(&text)
                 .iter()
                 .filter(|(_, l)| l.contains(needle) && !l.trim_start().starts_with("//"))
