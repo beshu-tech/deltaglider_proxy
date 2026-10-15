@@ -554,7 +554,7 @@ pub(super) async fn put_object(
         .extensions
         .get::<crate::api::auth::SignedPayloadHash>()
         .cloned();
-    let writer = Reader::of(&req.extensions);
+    let writer = Reader::of_writer(&req.extensions, &req.input.bucket, &req.input.key);
     let input = req.input;
     let engine = svc.state.engine.load();
     // Gate BEFORE the bucket check: a marked bucket refuses client bytes

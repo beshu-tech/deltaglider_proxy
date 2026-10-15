@@ -1152,3 +1152,39 @@ fn a_form_post_writer_is_anonymous_only_as_the_anonymous_principal() {
     assert_eq!(Reader::of_principal(Some(&alice)), Reader::Authenticated);
     assert_eq!(Reader::of_principal(Some(&anon)), Reader::Anonymous);
 }
+
+/// #120 point 5: a writer that may not read the key gets no storage facts.
+#[test]
+fn a_write_only_writer_gets_no_write_facts() {
+    let perm = |actions: &[&str]| crate::iam::Permission {
+        id: 0,
+        effect: "Allow".into(),
+        actions: actions.iter().map(|a| a.to_string()).collect(),
+        resources: vec!["releases/*".into()],
+        conditions: None,
+    };
+    let writer_of = |actions: &[&str]| {
+        let mut ext = axum::http::Extensions::new();
+        let user = AuthenticatedUser::new("ci-uploader", "AK", vec![perm(actions)]);
+        crate::iam::insert_request_principal(&mut ext, std::sync::Arc::new(user));
+        Reader::of_writer(&ext, "releases", "v1/app.zip")
+    };
+    assert_eq!(writer_of(&["write"]), Reader::Anonymous);
+    assert_eq!(writer_of(&["write", "read"]), Reader::Authenticated);
+    assert_eq!(
+        Reader::of_writer(&axum::http::Extensions::new(), "releases", "k"),
+        Reader::Authenticated,
+        "open access keeps the facts"
+    );
+
+    let write_only = AuthenticatedUser::new("ci-uploader", "AK", vec![perm(&["write"])]);
+    let ctx = iam_rs::Context::new();
+    assert_eq!(
+        Reader::of_form_writer(Some(&write_only), "releases", "k", &ctx),
+        Reader::Anonymous
+    );
+    assert_eq!(
+        Reader::of_form_writer(None, "releases", "k", &ctx),
+        Reader::Authenticated
+    );
+}

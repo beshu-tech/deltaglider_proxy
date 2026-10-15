@@ -20,6 +20,10 @@ A versioned backend bucket keeps the old versions and the delete markers of ever
 - When the bucket has no current object, DeleteBucket now deletes its old versions and then its delete markers, and deletes the bucket. It deletes at most 100 listing pages of each.
 - A `BucketNotEmpty` from the backend is now `409 BucketNotEmpty`, not a 500.
 
+### Security — Write facts only for readers (issue #120)
+
+The storage-fact headers of a write response (`x-amz-storage-type`, `x-deltaglider-stored-size`, `x-deltaglider-ref-sha256`, `x-deltaglider-baseline`) go only to a writer that may also read the key that it wrote. Before, a write-only principal got them: the stored size of a delta told how similar its upload was to other objects in the folder, and the reference SHA-256 identified other users' data.
+
 ## v2.0.14 — 2026-10-15
 
 ### Fixed — DeleteBucket right after an upload

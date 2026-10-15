@@ -681,6 +681,45 @@ impl Reader {
             Self::Authenticated
         }
     }
+
+    /// The writer of `bucket/key`, as far as the storage facts of the write
+    /// are concerned. A writer that may not also READ the key is
+    /// [`Self::Anonymous`]: the stored size is a delta-similarity oracle and
+    /// the reference SHA-256 is a fingerprint of other users' data, so a
+    /// write-only principal gets neither (#120 point 5). A HEAD shows the
+    /// same facts only to a reader, so this keeps the two in line.
+    pub(crate) fn of_writer(ext: &axum::http::Extensions, bucket: &str, key: &str) -> Self {
+        let client_ip = ext.get::<crate::api::auth::RequestClientIp>().map(|c| c.0);
+        Self::of(ext).unless_cannot_read(
+            crate::iam::request_principal(ext).map(|u| u.as_ref()),
+            bucket,
+            key,
+            &policy_context_for_ip(client_ip),
+        )
+    }
+
+    /// [`Self::of_writer`] for a form POST, which has no request extensions.
+    pub(crate) fn of_form_writer(
+        user: Option<&AuthenticatedUser>,
+        bucket: &str,
+        key: &str,
+        context: &iam_rs::Context,
+    ) -> Self {
+        Self::of_principal(user).unless_cannot_read(user, bucket, key, context)
+    }
+
+    fn unless_cannot_read(
+        self,
+        user: Option<&AuthenticatedUser>,
+        bucket: &str,
+        key: &str,
+        context: &iam_rs::Context,
+    ) -> Self {
+        match user {
+            Some(u) if !u.can_with_context(S3Action::Read, bucket, key, context) => Self::Anonymous,
+            _ => self,
+        }
+    }
 }
 
 /// The response headers that tell a writer how its object was stored.
@@ -699,8 +738,9 @@ pub const WRITE_FACT_HEADERS: [&str; 4] = [
 /// CompleteMultipartUpload, CopyObject, form POST) goes through here.
 ///
 /// An anonymous writer (the `$anonymous` principal, or the holder of a
-/// presigned URL) gets none. An authenticated writer, and open access, get
-/// them always: a HEAD already shows the same facts as `x-amz-meta-dg-*`.
+/// presigned URL) and a writer that may not read the key get none (see
+/// [`Reader::of_writer`]). A writer that may read the key, and open access,
+/// get them: a HEAD already shows them the same facts.
 /// `DGP_DEBUG_HEADERS` does not gate them.
 pub(crate) fn write_fact_headers(
     result: &crate::types::StoreResult,

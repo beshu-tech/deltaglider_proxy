@@ -136,7 +136,7 @@ pub(super) async fn complete_multipart_upload(
     svc: &DeltaGliderS3Service,
     req: s3s::S3Request<s3s::dto::CompleteMultipartUploadInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::CompleteMultipartUploadOutput>> {
-    let writer = Reader::of(&req.extensions);
+    let writer = Reader::of_writer(&req.extensions, &req.input.bucket, &req.input.key);
     let input = req.input;
     // Defense-in-depth: the marker can be hot-applied mid-upload, so
     // Complete (the moment bytes reach the backend) re-checks.
