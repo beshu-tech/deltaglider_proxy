@@ -113,12 +113,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// is in the listed key (`k.delta` or `k`), and a delta's stored size is
     /// the listed size of its `.delta` object. A delta-eligible key stored
     /// as a passthrough object needs no HEAD either: the listing proves its
-    /// form. The one exception: a delta on a proxy-encrypted S3 backend
-    /// (`CachedEncryptedDelta`), whose listed size is the ciphertext's while
-    /// `dg-delta-size` is the plaintext delta size. Pure; unit-tested.
+    /// form. A sealed delta's plaintext size comes from its listing token
+    /// with its logical facts. Pure; unit-tested.
     pub(super) fn list_entry_needs_head(size: crate::storage::list_size_cache::ListedSize) -> bool {
-        use crate::storage::list_size_cache::ListedSize;
-        !size.is_known() || size == ListedSize::CachedEncryptedDelta
+        !size.is_known()
     }
 
     /// A delta entry built from LIST data alone (no HEAD) — the `delta_stub`
@@ -385,9 +383,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 // = stored size) as a serviceable listing fallback — but those
                 // must NOT poison the cache, or a later HEAD/GET would serve
                 // the stub's wrong (stored, not original) size. A stub is
-                // identifiable by an empty ref_sha256 on a Delta entry.
+                // identifiable by an empty ref_sha256 on a Delta entry. An
+                // entry whose seal did not open is not cached either: a
+                // HEAD must apply the read rule, not answer from the list.
                 for (key, meta) in &enriched {
-                    if !Self::is_unresolved_delta_stub(meta) {
+                    if !Self::is_unresolved_delta_stub(meta) && !meta.is_unopened_seal() {
                         self.metadata_cache.insert(bucket, key, meta.clone());
                     }
                 }

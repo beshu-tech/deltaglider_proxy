@@ -35,7 +35,7 @@ Dropbox learns everything that Eve learns. Dropbox can also change, add, copy an
 - A changed, cut, extended or reordered body. Every frame is authenticated, and the last frame carries a final flag, so a body that ends early fails even at a frame boundary.
 - A body or a whole object moved to another name, another folder or another bucket, and two objects swapped. The sealed metadata is bound to the real bucket name, the folder and the name of the object. The header of the body is bound to its sealed metadata by a random salt.
 - A changed fact in the sealed metadata, such as the size or the ETag.
-- A changed content type or changed user metadata. The seal holds a digest of these clear fields. A changed `Content-Type` therefore cannot make a browser run a stored file as a web page.
+- A changed content type or changed user metadata of the client. The seal holds a digest of these two clear fields. A changed `Content-Type` therefore cannot make a browser run a stored file as a web page.
 - A removed seal, a removed encryption marker on an encrypted body, or a body under an unknown key.
 - A planted plaintext object, while the bucket has the default `plaintext_reads: refuse`.
 - Forged listing facts. In a backend that holds a key, the proxy ignores the listing facts of the older form, and a listing token that does not open is ignored.
@@ -46,6 +46,7 @@ Dropbox learns everything that Eve learns. Dropbox can also change, add, copy an
 - **Replay between two backends.** The name of the backend is not part of the seal, so that a renamed backend keeps its data. Two backends that share a key and a real bucket name therefore accept each other's objects. When `hetzner-fsn1` and another backend both store a bucket named `db-archive` under the same key, Dropbox can copy an object from one to the other, and the proxy serves it there. Give each backend its own key to close this.
 - **Plaintext that the proxy adopts while `plaintext_reads: serve` is set.** In that window, the proxy serves every unencrypted object in the bucket, and the re-encrypt job encrypts and seals it. An object that Dropbox planted during the window is then sealed like the real history of the bucket, and nothing can tell them apart afterwards. Keep the window short, and remove `serve` when the job succeeded.
 - **Deletion.** Dropbox can delete any object. When Dropbox deletes the reference of a folder, the deltas of that folder can no longer be rebuilt. Encryption protects confidentiality and integrity, not availability. Keep backups of the backend.
+- **Changed proxy fields in clear.** The proxy also keeps some of its own fields in clear: the original name, the tool, the note and the reference path. The digest in the seal covers only the content type and the client's user metadata, so Dropbox can change these other fields, and the proxy shows the changed values in its responses. The body and the sealed facts are not affected.
 - **Removed listing tokens.** When Dropbox deletes a listing token, the proxy reads the metadata of the object instead, so a LIST request becomes slower but stays correct.
 
 **Native SSE gives no authenticity.** Under `sse-kms` and `sse-s3`, AWS encrypts the stored bytes and decrypts them for every request that the backend credentials sign. The proxy keeps no seal for these objects. An attacker who can write to the bucket through S3 can therefore replace any object, and the proxy serves the replacement. The native modes protect against Eve, but not against Dropbox.
@@ -67,6 +68,10 @@ Mallory reads, and perhaps writes, some objects through the proxy. In the exampl
 ## Copies of facts on the proxy host
 
 The proxy host keeps some facts that the backend no longer holds in clear. The node-local jobs database (`deltaglider_jobs.db`) caches, for replication parity and for lifecycle scans, the ETag, the size and, for parity, the SHA-256 of objects. That database is encrypted with the config DB key, and it never leaves the host. It is part of the trusted proxy host, so an attacker with access to the host and to the config DB key can read these facts, together with every encryption key.
+
+## Plaintext in the spool directory
+
+The delta codec (xdelta3) works on plaintext, so the proxy decrypts an object before it computes or applies a delta. For an object larger than the spool threshold (16 MiB by default), it writes the plaintext to files in the spool directory (`DGP_SPOOL_DIR`): the reference of the folder, the new object, and the rebuilt object of a delta GET. The relay parts of a multipart upload and the cache of rebuilt objects for range requests are plaintext files in the same directory. The proxy removes each file when its request ends, and startup removes the files that a crash left behind. These files are part of the trusted proxy host, but they are on a disk, not only in memory. Put the spool directory on a local disk of the proxy host that no backup copies and that no other host mounts, because a copy of that disk holds plaintext of encrypted objects.
 
 ## A copy outside the proxy
 

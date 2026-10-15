@@ -153,13 +153,7 @@ pub fn effective_encryption(
         kms_key_id,
         key_env,
         encrypts,
-        serves_plaintext: matches!(
-            e.config,
-            BackendEncryptionConfig::Aes256GcmProxy {
-                plaintext_reads: crate::config::PlaintextReads::Serve,
-                ..
-            }
-        ),
+        serves_plaintext: e.config.serves_plaintext(),
         reencrypt,
         pinned: cfg.bucket_storage(&name).is_some(),
         bucket_modes: cfg.bucket_encryption_modes(&e.backend),

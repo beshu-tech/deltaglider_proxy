@@ -48,6 +48,7 @@ import { useColors } from '../ThemeContext';
 import ApplyDialog from './ApplyDialog';
 import BucketKeySetup, { type BucketKeyValue } from './BucketKeySetup';
 import LegacyKeyBanner from './LegacyKeyBanner';
+import ServesPlaintextBanner from './ServesPlaintextBanner';
 import { formRow } from './ruleEditorHelpers';
 
 const { Text } = Typography;
@@ -303,23 +304,11 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
       )}
 
       {eff.source === 'bucket' && eff.serves_plaintext && !editing && (
-        <Alert
-          type="info"
-          showIcon
-          style={{ marginTop: 8, borderRadius: 6, fontSize: 12 }}
-          title="Unencrypted objects are served"
-          description="The bucket encrypts new writes, and it also serves objects that are not encrypted, so that its history stays readable until the re-encrypt job converts it. When the job has finished, refuse unencrypted objects: then nobody can put one directly on the storage and have the proxy serve it."
-          action={
-            <Button
-              size="small"
-              disabled={readOnly || !!blockedReason || busy}
-              onClick={async () => {
-                await apply({ kind: 'refuse-plaintext' });
-              }}
-            >
-              Refuse unencrypted objects
-            </Button>
-          }
+        <ServesPlaintextBanner
+          subject="bucket"
+          buckets={[bucket]}
+          disabled={readOnly || !!blockedReason || busy}
+          onRefuse={() => apply({ kind: 'refuse-plaintext' })}
         />
       )}
 

@@ -1860,6 +1860,39 @@ pub async fn shutdown_signal() {
 // The ones covered below are called from main.rs on every boot; a bug
 // here is a boot-path regression that nothing else would catch.
 // ─────────────────────────────────────────────────────────────────────
+/// Issue #120: the apply gate stops an admin apply from turning on
+/// encryption over a bucket's plaintext history with
+/// `plaintext_reads: refuse`, but a restart from an edited file passes no
+/// gate. In the background (boot does not wait), sample each such bucket
+/// and log a warning that names the first object the read rule refuses.
+pub(crate) fn spawn_plaintext_refusal_check(state: &Arc<AppState>, config: &Config) {
+    const SAMPLE: u32 = 100;
+    let state = state.clone();
+    let config = config.clone();
+    tokio::spawn(async move {
+        let engine = state.engine.load_full();
+        let buckets = match engine.list_buckets().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("plaintext check: the bucket list failed: {e}");
+                return;
+            }
+        };
+        for bucket in config.buckets_refusing_plaintext(&buckets) {
+            match engine.first_refused_plaintext(bucket, SAMPLE).await {
+                Ok(Some(key)) => warn!(
+                    "bucket '{bucket}' encrypts with plaintext_reads: refuse, but holds objects \
+                     that are not encrypted (for example '{key}'): every read of them fails \
+                     with 500. Set encryption.plaintext_reads: serve and run a re-encrypt job, \
+                     then set it back to refuse"
+                ),
+                Ok(None) => {}
+                Err(e) => warn!("plaintext check of bucket '{bucket}' failed: {e}"),
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

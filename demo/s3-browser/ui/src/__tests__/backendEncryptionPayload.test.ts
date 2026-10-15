@@ -179,3 +179,32 @@ test('refusing plaintext changes only plaintext_reads of a backend (#120)', () =
     backends: [{ name: 'local-disk', encryption: { mode: 'aes256-gcm-proxy', key_id: 'k', plaintext_reads: 'refuse' } }],
   });
 });
+
+// The three builders share one target rule (`withBackendEncryption`):
+// singleton → `backend_encryption`; named → the section's own list with only
+// the target's block changed; a missing name → an error; no input mutation.
+type Build = (name: string, storage: { backends?: Array<Record<string, unknown>> }) => Record<string, unknown>;
+const builders: Array<[string, Build]> = [
+  ['encryption', (n, s) => buildEncryptionSectionBody(n, { mode: 'sse-s3' }, s)],
+  ['clear legacy', (n, s) => buildClearLegacySectionBody(n, s)],
+  ['refuse plaintext', (n, s) => buildRefusePlaintextSectionBody(n, s)],
+];
+
+test('every builder follows the same target rule', () => {
+  for (const [label, build] of builders) {
+    assert.deepEqual(Object.keys(build('default', {})), ['backend_encryption'], label);
+    assert.throws(() => build('gone', { backends: variants }), /Reload the page/, label);
+    // A non-default name with no list is a stale page, not a singleton patch.
+    assert.throws(() => build('local-enc', {}), /Reload the page/, label);
+    const before = JSON.parse(JSON.stringify(variants));
+    const list = build('local-enc', { backends: variants }).backends as Array<Record<string, unknown>>;
+    assert.equal(list.length, variants.length, label);
+    list.forEach((entry, i) => {
+      const rest = { ...entry, encryption: undefined };
+      const wasRest = { ...variants[i], encryption: undefined };
+      assert.deepEqual(rest, wasRest, `${label}: non-encryption fields of ${String(entry.name)}`);
+      if (entry.name !== 'local-enc') assert.deepEqual(entry, variants[i], `${label}: sibling ${String(entry.name)}`);
+    });
+    assert.deepEqual(variants, before, `${label}: the input must not be mutated`);
+  }
+});

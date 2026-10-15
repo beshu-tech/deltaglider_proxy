@@ -11,7 +11,9 @@
 //!   (the stored size gives these away anyway);
 //! - seals: the logical size, the MD5 and multipart ETag, the SHA-256 of
 //!   the content and of a delta's reference, the creation time, and a
-//!   digest of the clear headers above ([`client_headers`]);
+//!   digest of the content type and the client's user metadata only
+//!   ([`client_headers`]). The tool, the original name, the note and the
+//!   reference path are not covered: a backend writer can change them;
 //! - holds an identity token in `dg-file-sha256` (and `dg-ref-sha256` of a
 //!   delta): unique per seal, never a hash of the content. Older releases
 //!   require a non-empty value there; without one they would treat the
@@ -35,7 +37,7 @@ pub const SEALED_KEY: &str = crate::types::meta_keys::SEALED;
 
 /// The `dg-encrypted` value that callers above the wrapper see on an
 /// encrypted object.
-pub const ENCRYPTION_MARKER_VALUE: &str = "v2";
+pub const PRESENTED_MARKER_VALUE: &str = "v2";
 
 /// The `dg-encrypted` value stored with a v2 object: the previous
 /// format's value, so that an older release refuses the object (see the
@@ -95,14 +97,26 @@ impl Keyring {
     }
 }
 
-/// The location of an object for its seal: the prefix without a trailing
-/// `/`, so one stored key has one encoding.
+/// The location of an object for its seal: the deltaspace prefix exactly
+/// as the key splits at its last `/`. Not trimmed: `v1/app.zip` (prefix
+/// `v1`) and `v1//app.zip` (prefix `v1/`) are two stored keys, and a seal
+/// of one must not open at the other.
 pub fn location<'a>(bucket: &'a str, prefix: &'a str, object: StoredObject<'a>) -> Location<'a> {
     Location {
         bucket,
-        prefix: prefix.trim_end_matches('/'),
+        prefix,
         object,
     }
+}
+
+/// Is `key` one of the wrapper's own markers ([`ENCRYPTION_MARKER_KEYS`])?
+/// THE case rule for them: the digest of the clear headers and the strip
+/// of a caller's copy both use it, so a `Dg-Sealed` key is neither kept
+/// nor digested.
+pub fn is_marker_key(key: &str) -> bool {
+    ENCRYPTION_MARKER_KEYS
+        .iter()
+        .any(|m| key.eq_ignore_ascii_case(m))
 }
 
 /// The clear headers that a seal covers: the content type and every
@@ -115,11 +129,7 @@ pub fn client_headers(meta: &FileMetadata) -> [u8; 16] {
         [(":content-type", ct)].into_iter().chain(
             meta.user_metadata
                 .iter()
-                .filter(|(k, _)| {
-                    !ENCRYPTION_MARKER_KEYS
-                        .iter()
-                        .any(|m| k.eq_ignore_ascii_case(m))
-                })
+                .filter(|(k, _)| !is_marker_key(k))
                 .map(|(k, v)| (k.as_str(), v.as_str())),
         ),
     )
@@ -192,7 +202,11 @@ pub fn identity_token(sealed: &str) -> String {
     let mut h = sha2::Sha256::new();
     h.update(b"DGE2 id");
     h.update(sealed.as_bytes());
-    format!("sealed:{}", &hex::encode(h.finalize())[..32])
+    format!(
+        "{}{}",
+        crate::types::SEAL_IDENTITY_PREFIX,
+        &hex::encode(h.finalize())[..32]
+    )
 }
 
 /// The stored metadata of `meta` sealed under `keys` at `at`.
@@ -202,9 +216,7 @@ pub fn seal(
     keys: &ObjectMeta,
 ) -> Result<FileMetadata, StorageError> {
     let mut stored = meta.clone();
-    for k in ENCRYPTION_MARKER_KEYS {
-        stored.user_metadata.remove(k);
-    }
+    super::strip_encryption_markers(&mut stored.user_metadata);
     let facts = facts_of(&stored)?;
     let sealed = keys.seal(at, &facts)?;
     let token = identity_token(&sealed);
@@ -272,13 +284,23 @@ pub fn refusal(at: &Location<'_>, raw: &FileMetadata) -> StorageError {
         ))
     } else {
         enc_err(format!(
-            "object '{what}' in bucket '{}' is not encrypted, but the bucket encrypts: the proxy \
-             refuses it, because a writer with access to the backend could have planted it. Set \
+            "object '{what}' in bucket '{}' {PLAINTEXT_REFUSAL}: the proxy refuses it, because \
+             a writer with access to the backend could have planted it. Set \
              encryption.plaintext_reads: serve while a re-encrypt job converts the bucket's \
              history",
             at.bucket
         ))
     }
+}
+
+/// The words of the refusal of an unencrypted object ([`refusal`]), by
+/// which [`is_plaintext_refusal`] knows it.
+const PLAINTEXT_REFUSAL: &str = "is not encrypted, but the bucket encrypts";
+
+/// Is `e` the read rule's refusal of an unencrypted object in a bucket
+/// that encrypts (not a seal that fails to open)?
+pub fn is_plaintext_refusal(e: &StorageError) -> bool {
+    matches!(e, StorageError::Encryption(msg) if msg.contains(PLAINTEXT_REFUSAL))
 }
 
 /// Open the seal of `raw` at `at` with a key of `ring`: the facts, and the
@@ -335,7 +357,7 @@ pub fn present(raw: &FileMetadata, facts: &SealedFacts, key_id: &str) -> FileMet
     m.user_metadata.remove(SEALED_KEY);
     m.user_metadata.insert(
         ENCRYPTION_MARKER_KEY.to_string(),
-        ENCRYPTION_MARKER_VALUE.to_string(),
+        PRESENTED_MARKER_VALUE.to_string(),
     );
     m.user_metadata
         .insert(ENCRYPTION_KEY_ID_KEY.to_string(), key_id.to_string());
@@ -498,19 +520,29 @@ mod tests {
         assert!(err.contains("does not have"), "{err}");
     }
 
+    /// `v1/app.zip` and `v1//app.zip` are two S3 keys: a backend writer
+    /// who copies one to the other must not get it served there (a Deny on
+    /// `v1/app*` does not match the copy).
     #[test]
-    fn the_prefix_has_one_encoding() {
+    fn a_seal_does_not_open_under_an_extra_slash() {
         let (ring, site) = ring();
         let (_, keys) = site.fresh_object();
-        let stored = seal(
-            &passthrough(),
-            &location("releases", "v1/", StoredObject::Passthrough("app.zip")),
-            &keys,
-        )
-        .unwrap();
-        let sealed = sealed_of(&stored).unwrap().unwrap();
-        let bare = location("releases", "v1", StoredObject::Passthrough("app.zip"));
-        assert!(open(&stored, &sealed, &bare, &ring).is_ok());
+        for (sealed_at, opened_at) in [("v1", "v1/"), ("v1/", "v1"), ("", "/")] {
+            let stored = seal(
+                &passthrough(),
+                &location("releases", sealed_at, StoredObject::Passthrough("app.zip")),
+                &keys,
+            )
+            .unwrap();
+            let sealed = sealed_of(&stored).unwrap().unwrap();
+            let here = location("releases", sealed_at, StoredObject::Passthrough("app.zip"));
+            assert!(open(&stored, &sealed, &here, &ring).is_ok());
+            let there = location("releases", opened_at, StoredObject::Passthrough("app.zip"));
+            assert!(
+                open(&stored, &sealed, &there, &ring).is_err(),
+                "sealed at {sealed_at:?}, opened at {opened_at:?}"
+            );
+        }
     }
 
     #[test]

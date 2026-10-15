@@ -1745,7 +1745,7 @@ impl StorageBackend for FilesystemBackend {
         bucket: &str,
         prefix: &str,
         object: StoredObject<'_>,
-    ) -> Result<(super::ByteStream, FileMetadata), StorageError> {
+    ) -> Result<super::ObjectRead, StorageError> {
         use futures::StreamExt;
         let (path, label, name) = match object {
             StoredObject::Reference => (
@@ -1766,8 +1766,13 @@ impl StorageBackend for FilesystemBackend {
             StoredObject::Delta(f) | StoredObject::Passthrough(f) => keyed(meta, f),
         };
         let file = tokio::fs::File::from_std(file);
+        let stored_total = file.metadata().await?.len();
         let stream = ReaderStream::new(file).map(|r| r.map_err(StorageError::Io));
-        Ok((Box::pin(stream), meta))
+        Ok(super::ObjectRead {
+            stream: Box::pin(stream),
+            metadata: meta,
+            stored_total,
+        })
     }
 
     /// The file opened once: its metadata (fgetxattr) and the range read
@@ -1798,19 +1803,6 @@ impl StorageBackend for FilesystemBackend {
             metadata: meta,
             stored_total,
         })
-    }
-
-    /// The filesystem listing reads each object's metadata (xattr): it
-    /// needs no listing tokens, so none are kept.
-    async fn put_listing_token(
-        &self,
-        _bucket: &str,
-        _stored_key: &str,
-        _stored_etag: &str,
-        _stored_size: u64,
-        _token: &str,
-    ) -> Result<(), StorageError> {
-        Ok(())
     }
 
     async fn listing_tokens(

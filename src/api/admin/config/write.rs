@@ -250,19 +250,14 @@ pub(super) async fn run(
             Ok(mut p) => match super::transition::static_transition_gates(
                 &old,
                 &p.new_cfg,
-                &super::transition::confirmed_key_removals(write.headers),
-                Some(&crate::config::confirmed_downgrades(write.headers)),
-                &{
-                    let mut absent = super::transition::absent_buckets(&state.s3_state, &old).await;
-                    absent.extend(
-                        super::transition::absent_buckets(&state.s3_state, &p.new_cfg).await,
-                    );
-                    absent
-                },
-                Some(&crate::config::confirmed_subjects(
+                &super::transition::GateInputs::gather(
+                    &state.s3_state,
+                    &old,
+                    &p.new_cfg,
                     write.headers,
-                    crate::config::CONFIRM_PLAINTEXT_REFUSAL_HEADER,
-                )),
+                    true,
+                )
+                .await,
             ) {
                 // What the apply would refuse, a validate refuses too.
                 Err(error) => Outcome::Rejected(Rejection {

@@ -1498,7 +1498,7 @@ impl StorageBackend for RoutingBackend {
         bucket: &str,
         prefix: &str,
         object: crate::storage::StoredObject<'_>,
-    ) -> Result<(crate::storage::ByteStream, FileMetadata), StorageError> {
+    ) -> Result<crate::storage::ObjectRead, StorageError> {
         route_existing!(self, bucket, open_object, prefix, object)
     }
 
@@ -1519,25 +1519,6 @@ impl StorageBackend for RoutingBackend {
         end: u64,
     ) -> Result<crate::storage::RangeRead, crate::storage::StorageError> {
         route_existing!(self, b, open_passthrough_range, p, f, start, end)
-    }
-
-    async fn put_listing_token(
-        &self,
-        bucket: &str,
-        stored_key: &str,
-        stored_etag: &str,
-        stored_size: u64,
-        token: &str,
-    ) -> Result<(), StorageError> {
-        route_existing!(
-            self,
-            bucket,
-            put_listing_token,
-            stored_key,
-            stored_etag,
-            stored_size,
-            token
-        )
     }
 
     async fn listing_tokens(
@@ -2057,10 +2038,7 @@ mod tests {
             b: &str,
             p: &str,
             o: crate::storage::StoredObject<'_>,
-        ) -> Result<
-            (crate::storage::ByteStream, crate::types::FileMetadata),
-            crate::storage::StorageError,
-        > {
+        ) -> Result<crate::storage::ObjectRead, crate::storage::StorageError> {
             crate::storage::open_object_by_parts(self, b, p, o).await
         }
 
@@ -2081,16 +2059,6 @@ mod tests {
             end: u64,
         ) -> Result<crate::storage::RangeRead, crate::storage::StorageError> {
             crate::storage::open_passthrough_range_by_parts(self, b, p, f, start, end).await
-        }
-        async fn put_listing_token(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: u64,
-            _: &str,
-        ) -> Result<(), crate::storage::StorageError> {
-            Ok(())
         }
         async fn listing_tokens(
             &self,

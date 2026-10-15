@@ -458,7 +458,7 @@ pub(super) fn list_metadata_map(
     reader: Reader,
 ) -> std::collections::HashMap<String, String> {
     use crate::types::meta_keys as mk;
-    if reader != Reader::Authenticated {
+    if !reader.sees_delta_facts() {
         return std::collections::HashMap::new();
     }
     response_metadata_map(meta, reader)

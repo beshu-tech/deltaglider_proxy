@@ -718,10 +718,7 @@ impl crate::storage::StorageBackend for FencingFs {
         b: &str,
         p: &str,
         o: crate::storage::StoredObject<'_>,
-    ) -> Result<
-        (crate::storage::ByteStream, crate::types::FileMetadata),
-        crate::storage::StorageError,
-    > {
+    ) -> Result<crate::storage::ObjectRead, crate::storage::StorageError> {
         crate::storage::open_object_by_parts(self, b, p, o).await
     }
 
@@ -742,16 +739,6 @@ impl crate::storage::StorageBackend for FencingFs {
         end: u64,
     ) -> Result<crate::storage::RangeRead, crate::storage::StorageError> {
         crate::storage::open_passthrough_range_by_parts(self, b, p, f, start, end).await
-    }
-    async fn put_listing_token(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-        _: u64,
-        _: &str,
-    ) -> Result<(), crate::storage::StorageError> {
-        Ok(())
     }
     async fn listing_tokens(
         &self,

@@ -62,14 +62,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         object: crate::storage::StoredObject<'_>,
     ) -> Result<(Vec<u8>, FileMetadata), StorageError> {
         use futures::TryStreamExt;
-        let (stream, meta) = self.storage.open_object(bucket, prefix, object).await?;
+        let crate::storage::ObjectRead {
+            stream, metadata, ..
+        } = self.storage.open_object(bucket, prefix, object).await?;
         let data = stream
             .try_fold(Vec::new(), |mut acc, chunk| async move {
                 acc.extend_from_slice(&chunk);
                 Ok(acc)
             })
             .await?;
-        Ok((data, meta))
+        Ok((data, metadata))
     }
 
     /// Write a delta blob + metadata verbatim into a deltaspace. Call it

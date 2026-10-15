@@ -118,6 +118,16 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
     () => backendBucketCounts(originsQuery.data?.buckets ?? []),
     [originsQuery.data]
   );
+  // Per backend: the buckets that take its encryption (and so its
+  // `plaintext_reads`); a bucket with its own block keeps its own.
+  const inheritingBuckets = useMemo(() => {
+    const out: Record<string, string[]> = {};
+    for (const o of originsQuery.data?.buckets ?? []) {
+      const e = o.effective_encryption;
+      if (e && e.source !== 'bucket') (out[e.backend] ??= []).push(o.name);
+    }
+    return out;
+  }, [originsQuery.data]);
 
   // "Create bucket here" → opens the shared CreateBucketModal pre-targeted to a
   // specific backend. This panel only renders for admins (admin route).
@@ -622,6 +632,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 onApply={(patch) => handleEncryptionApply(b.name, b.encryption.mode, patch)}
                 onClearLegacy={() => handleClearLegacy(b.name)}
                 onRefusePlaintext={() => handleRefusePlaintext(b.name)}
+                buckets={inheritingBuckets[b.name]}
                 readOnly={!!encryptionEnv(b)}
                 usage={backendBucketCountText(encryptionCounts[b.name])}
               />

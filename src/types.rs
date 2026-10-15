@@ -22,6 +22,10 @@ pub fn default_true() -> bool {
 ///
 /// The `H_*` constants are the full HTTP header names, derived from the bare
 /// keys via `concat!` so they can never desync.
+/// The prefix of the identity token that a sealed object stores in place
+/// of its content hash (`storage::encrypting::seal::identity_token`).
+pub const SEAL_IDENTITY_PREFIX: &str = "sealed:";
+
 pub mod meta_keys {
     pub const TOOL: &str = "dg-tool";
     pub const ORIGINAL_NAME: &str = "dg-original-name";
@@ -629,6 +633,14 @@ impl FileMetadata {
     /// size, not the original one.
     pub fn is_unresolved_delta_stub(&self) -> bool {
         matches!(&self.storage_info, StorageInfo::Delta { ref_sha256, .. } if ref_sha256.is_empty())
+    }
+
+    /// A listed entry whose seal did not open (its key is not configured,
+    /// or it was moved or edited on the backend): the encrypting wrapper
+    /// lists it as stored, with the identity token in place of its content
+    /// hash. Its facts are not the object's, and a read of it fails.
+    pub fn is_unopened_seal(&self) -> bool {
+        self.file_sha256.starts_with(SEAL_IDENTITY_PREFIX)
     }
 
     /// Get the delta size if this is a delta file

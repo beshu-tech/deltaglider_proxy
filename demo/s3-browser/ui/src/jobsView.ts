@@ -621,6 +621,42 @@ export function busyJobForBucket(rows: JobRow[], bucket: string): JobRow | null 
 }
 
 /**
+ * The latest re-encrypt job of `bucket` in the job list, as one sentence,
+ * and whether it proves that the bucket holds no unencrypted object
+ * (`clean`: it finished, and no object failed). The list carries the
+ * recent one-off jobs only, so "no job" can also mean an old one.
+ */
+export function lastReencryptText(rows: readonly JobRow[], bucket: string): { text: string; clean: boolean } {
+  const key = bucket.toLowerCase();
+  const when = (r: JobRow) => r.created_at ?? r.started_at ?? r.finished_at ?? 0;
+  const last = rows
+    .filter((r) => r.kind === 'reencrypt' && r.scope.bucket.toLowerCase() === key)
+    .reduce<JobRow | null>((best, r) => (best && when(best) >= when(r) ? best : r), null);
+  if (!last) return { text: `${bucket}: no recent re-encrypt job.`, clean: false };
+  const failed = Math.max(last.progress.failed, last.failed_total ?? 0);
+  if (isActiveJobStatus(last.status)) {
+    return { text: `${bucket}: a re-encrypt job is still running. Wait until it finishes.`, clean: false };
+  }
+  switch (last.status) {
+    case 'succeeded':
+      if (failed === 0) return { text: `${bucket}: the last re-encrypt job finished with no failures.`, clean: true };
+      break;
+    case 'failed':
+      return {
+        text: `${bucket}: the last re-encrypt job failed${last.last_error ? ` (${last.last_error})` : ''}.`,
+        clean: false,
+      };
+    case 'cancelled':
+      return { text: `${bucket}: the last re-encrypt job was cancelled before it finished.`, clean: false };
+  }
+  if (failed > 0 || last.status === 'completed_with_errors') {
+    const count = failed > 0 ? `${failed.toLocaleString('en-US')} ${failed === 1 ? 'failure' : 'failures'}` : 'errors';
+    return { text: `${bucket}: the last re-encrypt job finished with ${count}.`, clean: false };
+  }
+  return { text: `${bucket}: the last re-encrypt job is ${jobStatusLabel(last)}.`, clean: false };
+}
+
+/**
  * Tag color + label for a parity finding kind (the Verify tab findings table).
  * Pure so the mapping is unit-tested without rendering. AntD Tag colors:
  * missing=amber/gold, orphan(extra)=blue, mismatch=red.

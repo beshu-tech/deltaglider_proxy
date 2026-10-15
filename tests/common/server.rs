@@ -164,7 +164,11 @@ fn proxy_command(config_path: &std::path::Path, production_security: bool) -> Co
         // tests deliberately spawn against dead/absent endpoints and must
         // not exit(1) or pay probe timeouts. Gate tests opt back in via
         // .env("DGP_BOOT_BACKEND_PROBE", "enforce").
-        .env("DGP_BOOT_BACKEND_PROBE", "off");
+        .env("DGP_BOOT_BACKEND_PROBE", "off")
+        // Boot plaintext sample: OFF by default in the harness — its LIST
+        // and HEADs on the shared MinIO bucket would land in the request
+        // counts of other tests. Its own test opts back in.
+        .env("DGP_BOOT_PLAINTEXT_CHECK", "false");
     if !production_security {
         cmd.env("DGP_BACKEND_ALLOW_LOCAL", "true")
             .env("DGP_REPLAY_WINDOW_SECS", "0");

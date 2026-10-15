@@ -1070,7 +1070,7 @@ impl StorageBackend for S3Backend {
         bucket: &str,
         prefix: &str,
         object: StoredObject<'_>,
-    ) -> Result<(super::ByteStream, FileMetadata), StorageError> {
+    ) -> Result<super::ObjectRead, StorageError> {
         let key = match object {
             StoredObject::Reference => self.reference_key(prefix),
             StoredObject::Delta(f) => self.delta_key(prefix, f),
@@ -1099,7 +1099,11 @@ impl StorageBackend for S3Backend {
             },
         )?;
         debug!("S3 GET stream {}/{} (with its metadata)", bucket, key);
-        Ok((self.body_stream(bucket, &key, response), meta))
+        Ok(super::ObjectRead {
+            stream: self.body_stream(bucket, &key, response),
+            metadata: meta,
+            stored_total: size,
+        })
     }
 
     /// One ranged GET: the bytes, and the metadata from the response's
@@ -1659,13 +1663,8 @@ impl StorageBackend for S3Backend {
             .iter()
             .zip(&sizes)
             .enumerate()
-            .filter_map(|(i, ((key, meta), size))| match size {
+            .filter_map(|(i, ((key, _), size))| match size {
                 ListedSize::StoredOnly => Some((i, format!("{key}.delta"))),
-                ListedSize::Listed
-                    if how.passthrough_may_differ && !key.ends_with('/') && !meta.is_delta() =>
-                {
-                    Some((i, key.clone()))
-                }
                 _ => None,
             })
             .filter(|(i, stored_key)| {
@@ -1689,23 +1688,6 @@ impl StorageBackend for S3Backend {
             }
         }
         sizes
-    }
-
-    async fn put_listing_token(
-        &self,
-        bucket: &str,
-        stored_key: &str,
-        stored_etag: &str,
-        stored_size: u64,
-        token: &str,
-    ) -> Result<(), StorageError> {
-        // Too long for S3's key limit, or no ETag: the object lists without
-        // a token (a HEAD fallback), as an object without facts does.
-        if let Some(marker) = listing_facts::token_key(stored_key, stored_etag, stored_size, token)
-        {
-            self.facts_cleanup.write(bucket, stored_key, marker);
-        }
-        Ok(())
     }
 
     async fn listing_tokens(

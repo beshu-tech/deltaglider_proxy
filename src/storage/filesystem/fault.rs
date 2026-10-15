@@ -658,7 +658,7 @@ impl StorageBackend for FaultyFs {
         bucket: &str,
         prefix: &str,
         object: StoredObject<'_>,
-    ) -> Result<(crate::storage::ByteStream, FileMetadata), StorageError> {
+    ) -> Result<crate::storage::ObjectRead, StorageError> {
         self.inner.open_object(bucket, prefix, object).await
     }
 
@@ -679,16 +679,6 @@ impl StorageBackend for FaultyFs {
         end: u64,
     ) -> Result<crate::storage::RangeRead, crate::storage::StorageError> {
         self.inner.open_passthrough_range(b, p, f, start, end).await
-    }
-    async fn put_listing_token(
-        &self,
-        b: &str,
-        k: &str,
-        e: &str,
-        n: u64,
-        t: &str,
-    ) -> Result<(), crate::storage::StorageError> {
-        self.inner.put_listing_token(b, k, e, n, t).await
     }
     async fn listing_tokens(
         &self,

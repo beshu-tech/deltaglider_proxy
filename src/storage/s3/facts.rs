@@ -39,6 +39,25 @@ impl S3Backend {
     /// facts request on the client's PUT path). Best effort: the object is
     /// stored already; until the facts object lands, a LIST reports the
     /// stored size. Older entries of the key are left to the facts GC.
+    /// Keep the opaque listing `token` of the stored object `key` (with that
+    /// stored ETag and size) as a `!!2` marker in the listing-facts
+    /// namespace, written in the background like the facts and replacing
+    /// the older tokens of the key, so a LIST on any node reads it back
+    /// (`listing_tokens`). Skipped when the marker key would pass S3's key
+    /// limit, or without an ETag: the object then lists without a token.
+    pub(super) fn write_listing_token(
+        &self,
+        bucket: &str,
+        key: &str,
+        stored_etag: &str,
+        stored_size: u64,
+        token: &str,
+    ) {
+        if let Some(marker) = listing_facts::token_key(key, stored_etag, stored_size, token) {
+            self.facts_cleanup.write(bucket, key, marker);
+        }
+    }
+
     pub(super) fn persist_listing_facts(
         &self,
         bucket: &str,
@@ -65,11 +84,7 @@ impl S3Backend {
                     },
                     &token,
                 );
-                if let Some(marker) =
-                    listing_facts::token_key(key, stored_etag, stored_size, &token)
-                {
-                    self.facts_cleanup.write(bucket, key, marker);
-                }
+                self.write_listing_token(bucket, key, stored_etag, stored_size, &token);
             }
             return;
         };

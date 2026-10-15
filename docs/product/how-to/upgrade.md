@@ -200,6 +200,19 @@ deltaglider_proxy witness publish backend:hetzner-fsn1 db-archive --server https
 
 The **Encryption witness** card on **System → System** lists the subjects that differ, and **Publish all** does the same. After the publish, an instance on the old release disagrees with the witness and refuses writes. Deployments without `aes256-gcm-proxy` can upgrade one instance at a time, as before.
 
+## Storage facts only for readers of the whole folder (the release after 2.0.14)
+
+This change applies to every deployment, with or without encryption. A delta is encoded against the reference of its folder, and that reference can hold data that another user uploaded. The storage facts of an object therefore tell how similar the object is to the other objects in its folder. For this reason, the proxy now sends these facts only to a principal that may read every object in the folder of the key.
+
+The facts are these response headers and metadata keys:
+
+- On the responses to `PutObject`, `CompleteMultipartUpload`, `CopyObject` and a browser form upload: the headers `x-amz-storage-type`, `x-deltaglider-stored-size`, `x-deltaglider-ref-sha256` and `x-deltaglider-baseline`.
+- On the responses to `HeadObject` and `GetObject`, and in each entry of a `metadata=true` LIST: the delta keys `x-amz-meta-dg-ref-sha256`, `x-amz-meta-dg-delta-size`, `x-amz-meta-dg-ref-path`, `x-amz-meta-dg-delta-cmd` and `x-amz-meta-dg-note`. Objects that an older toolchain wrote can also carry `x-amz-meta-dg-ref-key` and `x-amz-meta-dg-source-name`, and the proxy treats them in the same way.
+
+A principal may read the whole folder when one of its Allow rules without conditions grants read on a pattern that ends in `*` and covers the folder (for example `releases/*`), and no Deny rule on reads can match a key in the folder. A principal that may only write, or that may read only some keys of the folder, now gets none of these facts. A reader without credentials, such as a reader of a public prefix or the holder of a presigned URL, also gets none of them.
+
+Two kinds of clients see no change. With `authentication: none`, every request still gets the facts. A principal with read on the whole bucket, or on the whole folder of the key, also still gets them. If a script or a CI job reads one of these headers, make sure that its credentials have read on the whole folder. The full rule is in [Storage facts on write responses](../reference/s3-api-compatibility.md#storage-facts-on-write-responses).
+
 ## Common gotchas
 
 - **`$` in Docker env.** Bcrypt hashes contain `$`. Use the base64-wrapped form (`DGP_BOOTSTRAP_PASSWORD_HASH=JDJ5JDEyJGV...`) or single-quote the value in compose files.

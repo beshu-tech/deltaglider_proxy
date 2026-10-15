@@ -9,8 +9,7 @@ use common::TestServer;
 
 const BUCKET: &str = "encbkt";
 const TEST_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-// Reserved for future wrong-key test
-#[allow(dead_code)]
+/// A second key: an object written under `TEST_KEY` does not open with it.
 const OTHER_KEY: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 
 async fn put_object(server: &TestServer, key: &str, body: &[u8]) {
@@ -96,9 +95,9 @@ async fn test_encrypted_head_correct_size() {
         .await
         .expect("HEAD failed");
 
-    // Content-Length should reflect PLAINTEXT size, not encrypted size
-    // (the engine stores plaintext size in metadata)
-    assert!(head.content_length.unwrap_or(0) > 0);
+    // Content-Length is the PLAINTEXT size (from the sealed facts), not
+    // the stored size (DGE2 header + one GCM tag per frame).
+    assert_eq!(head.content_length, Some(data.len() as i64));
 }
 
 // ═══════════════════════════════════════════════════
@@ -178,26 +177,25 @@ async fn test_data_encrypted_on_disk() {
 // ═══════════════════════════════════════════════════
 
 /// B1 regression: the encryption wrapper must always be in the storage
-/// stack, even when no key is configured. Without this, an operator who
+/// stack, even when no key is configured. Without it, an operator who
 /// removes the key (or forgets to set the env var after a restart) would
 /// get historical encrypted-on-disk bytes streamed to clients AS IF they
-/// were plaintext — a silent data-corruption bug that looks like
-/// "DGE1...random bytes..." on the client side with no error.
+/// were plaintext: "DGE2...random bytes..." with no error.
 ///
-/// The fix is in `src/deltaglider/engine/construction.rs`: the EncryptingBackend
-/// is always wrapped, and when the key is None its read path returns
-/// `StorageError::Encryption("object is encrypted but no key is
-/// configured")` on any object whose metadata carries the
-/// `dg-encrypted` marker. The S3 handler surfaces that as 500 — the
+/// `src/deltaglider/engine/construction.rs` always wraps the raw backend.
+/// With no key the wrapper's keyring is empty, so `seal::open` cannot find
+/// the key that the object's `dg-sealed` fingerprint names and returns
+/// `StorageError::Encryption` ("... was encrypted with a key that this
+/// backend does not have ..."). The S3 handler surfaces that as 500: the
 /// client never sees raw ciphertext.
 #[tokio::test]
 async fn test_disable_key_then_read_encrypted_object_errors_not_corrupts() {
     let mut server = encrypted_builder().build().await;
 
     // Write two objects while encryption is ENABLED:
-    //   - a single-shot encrypted one (small object → put_passthrough)
-    //   - a chunked-encrypted one (multipart → put_passthrough_chunked)
-    let small_plaintext = b"classified single-shot payload";
+    //   - a single PUT (put_passthrough)
+    //   - a multipart upload (put_passthrough_chunked)
+    let small_plaintext = b"classified single-put payload";
     put_object(&server, "secret-small.txt", small_plaintext).await;
 
     let big_plaintext: Vec<u8> = (0..200_000u32).map(|i| (i & 0xff) as u8).collect();
@@ -288,6 +286,39 @@ async fn test_disable_key_then_read_encrypted_object_errors_not_corrupts() {
             }
         }
     }
+
+    // The objects that do not open still list (one of them must not fail
+    // the listing of the folder), and a DELETE removes them: an object
+    // that cannot be read can still be deleted.
+    let listed = client
+        .list_objects_v2()
+        .bucket(BUCKET)
+        .send()
+        .await
+        .expect("a listing survives objects whose seal does not open");
+    let mut keys: Vec<String> = listed
+        .contents()
+        .iter()
+        .filter_map(|o| o.key().map(str::to_string))
+        .collect();
+    keys.sort();
+    assert_eq!(keys, ["secret-big.bin", "secret-small.txt"]);
+    for key in &keys {
+        client
+            .delete_object()
+            .bucket(BUCKET)
+            .key(key)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("DELETE {key} of an object that does not open: {e:?}"));
+    }
+    let after = client
+        .list_objects_v2()
+        .bucket(BUCKET)
+        .send()
+        .await
+        .unwrap();
+    assert!(after.contents().is_empty(), "{:?}", after.contents());
 }
 
 #[tokio::test]
@@ -389,11 +420,10 @@ async fn test_sse_s3_roundtrip_through_s3_backend() {
 // ═══════════════════════════════════════════════════
 // Chunked streaming encryption tests
 //
-// These exercise the `aes-256-gcm-chunked-v1` wire format introduced
-// for `put_passthrough_chunked`. To actually HIT that path we must
-// upload via multipart (single-PUT goes through `put_passthrough`,
-// which uses v1 single-shot). The chunked path is invoked by the
-// multipart-completion handler for non-delta-eligible keys.
+// Format v2 (issue #120) has ONE body format: a DGE2 header and 64 KiB
+// GCM frames, for single PUTs and multipart uploads alike. These tests
+// upload via multipart (the wrapped `put_passthrough_chunked`) and check
+// the frame layout through range reads and truncation.
 // ═══════════════════════════════════════════════════
 
 /// Helper: upload via multipart so the wrapped `put_passthrough_chunked`
@@ -460,10 +490,8 @@ async fn multipart_put(server: &TestServer, key: &str, parts_data: &[Vec<u8>]) -
 /// path. 5 MiB in 5×1 MiB parts exercises ~80 × 64-KiB encrypted
 /// chunks on disk and verifies the whole pipeline (encrypt streaming,
 /// decrypt streaming, plaintext byte-for-byte match).
-///
-/// An OOM in the old single-buffer path would manifest here at much
-/// larger sizes; we use 5 MiB to keep test runtime reasonable while
-/// still crossing many chunk boundaries.
+/// 5 MiB keeps the runtime short while it still crosses many frame
+/// boundaries.
 #[tokio::test]
 async fn test_chunked_encryption_multipart_roundtrip() {
     let server = encrypted_builder().build().await;
@@ -494,43 +522,6 @@ async fn test_chunked_encryption_multipart_roundtrip() {
             first_diff, got[first_diff], pattern[first_diff]
         );
     }
-}
-
-/// After a chunked upload, verify the on-disk format has the
-/// `aes-256-gcm-chunked-v1` metadata marker (not v1 single-shot) —
-/// this confirms we actually HIT the chunked code path. Without this
-/// the test above could accidentally be covered by the v1 buffer
-/// path if the wiring were wrong.
-#[tokio::test]
-async fn test_chunked_path_actually_exercised() {
-    let server = encrypted_builder().build().await;
-    let parts = vec![vec![0u8; 1024 * 1024]; 2]; // 2 × 1 MiB
-    multipart_put(&server, "chunked-marker-test.bin", &parts).await;
-
-    // Walk the filesystem looking for the passthrough file + its
-    // xattr marker. The engine stores each object's metadata as an
-    // xattr on the data file.
-    let data_dir = server.data_dir().expect("filesystem backend");
-    let mut found_chunked_marker = false;
-    let mut found_v1_marker = false;
-    for (_, meta) in common::read_xattr_metadata(data_dir) {
-        // Match against the serialised JSON form to catch the
-        // marker no matter which field carries it.
-        let meta_json = meta.to_string();
-        if meta_json.contains("aes-256-gcm-chunked-v1") {
-            found_chunked_marker = true;
-        }
-        if meta_json.contains("\"aes-256-gcm-v1\"") {
-            found_v1_marker = true;
-        }
-    }
-    assert!(
-        found_chunked_marker,
-        "chunked-format marker not found — the chunked write path wasn't exercised"
-    );
-    // v1 marker is allowed (the reference/delta paths still use v1);
-    // but we specifically want the chunked marker to ALSO be present.
-    let _ = found_v1_marker;
 }
 
 /// Every encrypted write seals its facts under the key (format v2, issue
@@ -1084,12 +1075,12 @@ async fn test_section_put_key_rotation_surfaces_fingerprint_diff() {
     );
 }
 
-/// A GET that cannot decrypt because the object's key id does not match the
-/// backend's key logs the precise cause at ERROR (never the key). The
+/// A GET that cannot decrypt because the backend does not have the key that
+/// the object's seal fingerprint names logs the precise cause at ERROR (never the key). The
 /// sanitised 500 used to log it under a target outside the log filter, so
 /// the operator saw only "Internal server error".
 #[tokio::test]
-async fn a_key_id_mismatch_on_get_logs_its_cause() {
+async fn a_key_mismatch_on_get_logs_its_cause() {
     let mut server = encrypted_builder().build().await;
     put_object(&server, "mismatch.bin", b"written under TEST_KEY").await;
     server
@@ -1137,5 +1128,61 @@ async fn a_key_id_mismatch_on_get_logs_its_cause() {
     assert!(
         !text.contains(TEST_KEY) && !text.contains(OTHER_KEY),
         "a key reached the log"
+    );
+}
+
+/// Issue #120: a restart from a file that encrypts a bucket with
+/// `plaintext_reads: refuse` passes no apply gate. The boot check samples
+/// the bucket and logs a warning that names a plaintext object, because
+/// every read of it now fails.
+#[tokio::test]
+async fn boot_warns_about_plaintext_objects_in_a_bucket_that_refuses_them() {
+    let mut server = encrypted_builder().build().await;
+    put_object(&server, "sealed.bin", b"written encrypted").await;
+    // A plaintext object that a backend writer (or an earlier, unencrypted
+    // configuration) left in the bucket: no metadata, no seal.
+    let dir = server
+        .data_dir()
+        .expect("filesystem backend")
+        .join(BUCKET)
+        .join("deltaspaces");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("plain.txt"), b"plaintext history").unwrap();
+    server
+        .respawn_with_env(&[
+            ("DGP_ENCRYPTION_KEY", TEST_KEY),
+            ("DGP_BOOT_PLAINTEXT_CHECK", "true"),
+        ])
+        .await;
+
+    let admin = common::admin_http_client(&server.endpoint()).await;
+    let wanted = format!("bucket '{BUCKET}' encrypts with plaintext_reads: refuse");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let text = loop {
+        let logs: serde_json::Value = admin
+            .get(format!(
+                "{}/_/api/admin/logs?level=warn&limit=500",
+                server.endpoint()
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let text = logs.to_string();
+        if text.contains(&wanted) || std::time::Instant::now() > deadline {
+            break text;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    assert!(text.contains(&wanted), "no boot warning: {text}");
+    assert!(
+        text.contains("plain.txt"),
+        "the warning names the object: {text}"
+    );
+    assert!(
+        !text.contains("sealed.bin"),
+        "a sealed object is not named: {text}"
     );
 }

@@ -67,4 +67,31 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     pub async fn head_bucket(&self, bucket: &str) -> Result<bool, EngineError> {
         Ok(self.storage.head_bucket(bucket).await?)
     }
+
+    /// Issue #120: the first object of `bucket`, among the first `sample`
+    /// that a listing gives, that the read rule refuses because it is not
+    /// encrypted. The boot check warns with it about a bucket that encrypts
+    /// with `plaintext_reads: refuse` and still holds plaintext objects
+    /// (a restart from an edited file passes no apply gate). One listing
+    /// page and one HEAD per sampled object.
+    pub async fn first_refused_plaintext(
+        &self,
+        bucket: &str,
+        sample: u32,
+    ) -> Result<Option<String>, EngineError> {
+        let page = self
+            .list_objects(bucket, "", None, sample, None, false)
+            .await?;
+        for (key, _) in page.objects {
+            if key.ends_with('/') {
+                continue;
+            }
+            if let Err(EngineError::Storage(e)) = self.head(bucket, &key).await {
+                if crate::storage::encrypting::seal::is_plaintext_refusal(&e) {
+                    return Ok(Some(key));
+                }
+            }
+        }
+        Ok(None)
+    }
 }

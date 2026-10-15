@@ -93,7 +93,7 @@ impl Rig {
             .user_metadata
             .get(ENCRYPTION_MARKER_KEY)
             .map(String::as_str)
-            == Some(ENCRYPTION_MARKER_VALUE))
+            == Some(PRESENTED_MARKER_VALUE))
         .then(|| shown.user_metadata[ENCRYPTION_KEY_ID_KEY].clone())
     }
 }

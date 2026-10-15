@@ -68,7 +68,7 @@ storage:
 
 After you edit the file, restart the proxy, or apply the file to the running proxy with `POST /_/api/admin/config/apply` or with `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example`.
 
-An apply that makes a backend with buckets start to encrypt without `plaintext_reads: serve` is refused, because the existing objects would become unreadable. When the buckets hold no plaintext that anyone needs, leave the line out and confirm instead: `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example --confirm-plaintext-refusal backend:hetzner-fsn1`, or the header `X-DGP-Confirm-Plaintext-Refusal: backend:hetzner-fsn1` with `POST /_/api/admin/config/apply`. A restart from an edited file runs no such check.
+An apply that makes a backend with buckets start to encrypt without `plaintext_reads: serve` is refused, because the existing objects would become unreadable. When the buckets hold no plaintext that anyone needs, leave the line out and confirm instead: `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example --confirm-plaintext-refusal backend:hetzner-fsn1`, or the header `X-DGP-Confirm-Plaintext-Refusal: backend:hetzner-fsn1` with `POST /_/api/admin/config/apply`. A restart from an edited file runs no such check. Instead, the proxy samples the first 100 objects of each bucket that refuses plaintext after it starts. When one of them is not encrypted, the proxy logs a warning that names the bucket and the object, because every read of that object now fails.
 
 ## 4. Or keep the key in an environment variable
 

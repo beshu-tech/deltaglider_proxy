@@ -467,20 +467,9 @@ pub(super) fn resolve_encryption_config(
         legacy_key_id: legacy_kid_opt,
         buckets: bucket_keys,
         keyring,
-        serve_plaintext: serves_plaintext(enc),
+        serve_plaintext: enc.serves_plaintext(),
         ..Default::default()
     })
-}
-
-/// `plaintext_reads: serve` of a proxy-AES config (issue #120).
-fn serves_plaintext(enc: &crate::config::BackendEncryptionConfig) -> bool {
-    matches!(
-        enc,
-        crate::config::BackendEncryptionConfig::Aes256GcmProxy {
-            plaintext_reads: crate::config::PlaintextReads::Serve,
-            ..
-        }
-    )
 }
 
 /// One key has one id within a raw backend (issue #120): a v2 object
@@ -578,7 +567,7 @@ pub(super) fn resolve_bucket_keys(
         // override that is not native gets no SSE headers on a backend
         // whose own mode is native.
         keys.native = native_encryption_for(o.config);
-        keys.serve_plaintext = serves_plaintext(o.config);
+        keys.serve_plaintext = o.config.serves_plaintext();
         if let Some(slot) = site.legacy {
             let crate::config::SiteKey { key, key_id: kid } =
                 slot.map_err(StorageError::Encryption)?;

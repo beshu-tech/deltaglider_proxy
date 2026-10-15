@@ -101,11 +101,14 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
                              header + 64 KiB GCM frames, exact stored_len, AES-GCM-SIV listing tokens; pure), seal.rs = sealed metadata
                              (`dg-sealed`: facts bound to bucket/folder/variant/name, no hashes in clear, identity tokens, stored marker
                              `aes-256-gcm-chunked-v1` on purpose so older releases fail closed), the keyring by fingerprint and THE read rule
-                             (unsealed objects only where the bucket writes plaintext or `plaintext_reads: serve`); mod.rs = the wrapper:
-                             every metadata-returning method presents, raw metadata never leaves it (source guards
+                             (unsealed objects only where the bucket writes plaintext or `plaintext_reads: serve`); mod.rs = the wrapper (`witness.rs` = the
+                             witness gate): every metadata-returning method presents, raw metadata never leaves it (source guards
                              `the_seal_key_is_named_only_where_a_sealed_shape_is_handled`, `no_v1_encryption_format_remains`). S3 lists
                              logical facts of sealed objects from `!!2` tokens (`FileMetadata::listing_token` → `put` path; in-process
-                             `list_size_cache::record_token`); `!!1` facts are ignored on a backend with a key
+                             `list_size_cache::record_token`); `!!1` facts are ignored on a backend with a key. The read rule
+                             gates GET/HEAD/copy/range only: a LIST shows an entry whose seal does not open as stored
+                             (`FileMetadata::is_unopened_seal`, never cached), a DELETE removes it (`resolve_forms_to_delete`),
+                             and boot warns about plaintext in a `refuse` bucket (`startup::spawn_plaintext_refusal_check`)
   → storage/routing.rs      Multi-backend routing (virtual bucket → real backend)
   → security.rs             Pure security primitives (validate_bucket_name, bucket_name_is_ip_like, outbound-URL SSRF policy) — unit + proptest, shared by CLI URL parser
   → demo.rs                 Embedded UI + admin API router, mounted under /_/

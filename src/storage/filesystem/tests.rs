@@ -1332,10 +1332,6 @@ mod backend_tests {
             .await
             .unwrap();
         assert_eq!((read.len, read.stored_total), (3, 10));
-        backend
-            .put_listing_token("bucket", "p/o.bin", "e1", 10, "tok")
-            .await
-            .unwrap();
         let listed = backend.bulk_list_objects("bucket", "p/").await.unwrap();
         assert_eq!(
             backend.listing_tokens("bucket", &listed).await,
@@ -1671,19 +1667,22 @@ mod syscall_cost_tests {
         .await
         .unwrap();
         let before = stats_under(tmp.path());
-        let (mut stream, m) = b
+        let read = b
             .open_object("releases", "p", StoredObject::Passthrough("a.png"))
             .await
             .unwrap();
+        let (mut stream, m) = (read.stream, read.metadata);
         assert_eq!(m.original_name, "a.png");
+        assert_eq!(read.stored_total, 3);
         assert_eq!(stream.next().await.unwrap().unwrap().as_ref(), b"xyz");
         assert_eq!(stats_under(tmp.path()) - before, 0);
         // Unmanaged and missing files keep their answers.
         std::fs::write(tmp.path().join("releases/deltaspaces/p/plain.bin"), b"abcd").unwrap();
-        let (_, m) = b
+        let m = b
             .open_object("releases", "p", StoredObject::Passthrough("plain.bin"))
             .await
-            .unwrap();
+            .unwrap()
+            .metadata;
         assert_eq!(m.file_size, 4);
         assert!(matches!(
             b.open_object("releases", "p", StoredObject::Delta("gone.zip"))

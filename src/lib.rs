@@ -668,6 +668,24 @@ mod source_guards {
             "src/storage/s3/metadata.rs",
             "src/storage/s3/heal.rs",
         ];
+        // Any spelling: the string, or the constant under any path or
+        // alias (`mk::SEALED`, `use ...meta_keys::{SEALED}`, `SEALED_KEY`).
+        fn names_the_seal(code: &str) -> bool {
+            code.contains("dg-sealed")
+                || code
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .any(|token| token == "SEALED" || token == "SEALED_KEY")
+        }
+        for (line, names) in [
+            ("let k = mk::SEALED;", true),
+            ("use crate::types::meta_keys::{SEALED, TOOL};", true),
+            ("m.get(seal::SEALED_KEY)", true),
+            ("\"x-amz-meta-dg-sealed\"", true),
+            ("SEAL_IDENTITY_PREFIX", false),
+            ("UNSEALED_COUNT", false),
+        ] {
+            assert_eq!(names_the_seal(line), names, "{line}");
+        }
         let mut bad = Vec::new();
         for (file, text) in crate::source_scan::prod_sources("src") {
             if ALLOWED.contains(&file.as_str()) {
@@ -675,10 +693,7 @@ mod source_guards {
             }
             for (n, line) in crate::source_scan::prod_lines(&text) {
                 let code = line.split("//").next().unwrap_or("");
-                if ["dg-sealed", "SEALED_KEY", "meta_keys::SEALED"]
-                    .iter()
-                    .any(|k| code.contains(k))
-                {
+                if names_the_seal(code) {
                     bad.push(format!("{file}:{n}"));
                 }
             }

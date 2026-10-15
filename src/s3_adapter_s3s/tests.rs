@@ -1215,11 +1215,11 @@ fn delta_facts_only_for_a_reader_of_the_whole_folder() {
         None,
     );
     let outside = response_metadata_map(&meta, Reader::OutsideFolder);
-    for key in DELTA_FACT_KEYS {
-        assert!(
-            !outside.contains_key(key),
-            "{key} reached an outside reader"
-        );
+    for reader in [Reader::OutsideFolder, Reader::Anonymous] {
+        let map = response_metadata_map(&meta, reader);
+        for key in DELTA_FACT_KEYS {
+            assert!(!map.contains_key(key), "{key} reached {reader:?}");
+        }
     }
     assert!(
         outside.contains_key(crate::types::meta_keys::TOOL),

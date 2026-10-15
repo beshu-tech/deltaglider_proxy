@@ -503,6 +503,18 @@ impl Default for BackendEncryptionConfig {
 }
 
 impl BackendEncryptionConfig {
+    /// `plaintext_reads: serve` of a proxy-AES config (issue #120): an
+    /// unencrypted object may be served. THE one reading of the flag.
+    pub fn serves_plaintext(&self) -> bool {
+        matches!(
+            self,
+            Self::Aes256GcmProxy {
+                plaintext_reads: PlaintextReads::Serve,
+                ..
+            }
+        )
+    }
+
     /// Short machine-readable tag for the mode, used by admin API
     /// summaries and diff renderers. Matches the YAML `mode:` tag.
     pub fn mode_tag(&self) -> &'static str {

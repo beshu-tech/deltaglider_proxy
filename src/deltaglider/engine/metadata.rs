@@ -39,6 +39,33 @@ pub struct StoredForms {
     pub(super) passthrough: bool,
 }
 
+/// The stand-in metadata of a stored form whose facts the read rule
+/// refuses: its kind only, and the oldest creation time, so a form that
+/// opens is the newest.
+fn unopened_form(filename: &str, form: ObjectVariant) -> FileMetadata {
+    let mut meta = match form {
+        ObjectVariant::Delta => FileMetadata::new_delta(
+            filename.to_string(),
+            String::new(),
+            String::new(),
+            0,
+            String::new(),
+            String::new(),
+            0,
+            None,
+        ),
+        ObjectVariant::Passthrough => FileMetadata::new_passthrough(
+            filename.to_string(),
+            String::new(),
+            String::new(),
+            0,
+            None,
+        ),
+    };
+    meta.created_at = chrono::DateTime::UNIX_EPOCH;
+    meta
+}
+
 impl StoredForms {
     pub(super) fn has(self, form: ObjectVariant) -> bool {
         match form {
@@ -178,6 +205,33 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         prefix: &str,
         filename: &str,
     ) -> Result<Option<(FileMetadata, StoredForms)>, StorageError> {
+        Ok(self
+            .resolve_forms(bucket, prefix, filename, false)
+            .await?
+            .map(|(meta, forms, _)| (meta, forms)))
+    }
+
+    /// [`Self::resolve_stored_forms`] for a DELETE. A form that the read
+    /// rule refuses (`StorageError::Encryption`: its seal does not open, or
+    /// it is plaintext where the bucket refuses plaintext) counts as present
+    /// with unknown facts, and the refusal comes back with it: an object
+    /// that cannot be read can still be deleted.
+    pub(super) async fn resolve_forms_to_delete(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<Option<(FileMetadata, StoredForms, Option<StorageError>)>, StorageError> {
+        self.resolve_forms(bucket, prefix, filename, true).await
+    }
+
+    async fn resolve_forms(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        refused_is_present: bool,
+    ) -> Result<Option<(FileMetadata, StoredForms, Option<StorageError>)>, StorageError> {
         // Fetch delta and passthrough metadata in parallel — saves one S3
         // round-trip. A folder marker (`dir/`: no file name) has no `.delta`
         // form: only `put_directory_marker` stores it. Its delta HEAD
@@ -192,7 +246,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             },
             self.stored_form_metadata(bucket, prefix, filename, ObjectVariant::Passthrough),
         );
-        let (delta, passthrough) = (delta?, passthrough?);
+        let mut refusal = None;
+        let mut present = |read: Result<Option<FileMetadata>, StorageError>, form| match read {
+            Err(e @ StorageError::Encryption(_)) if refused_is_present => {
+                refusal = Some(e);
+                Ok(Some(unopened_form(filename, form)))
+            }
+            other => other,
+        };
+        let delta = present(delta, ObjectVariant::Delta)?;
+        let passthrough = present(passthrough, ObjectVariant::Passthrough)?;
         let forms = StoredForms {
             delta: delta.is_some(),
             passthrough: passthrough.is_some(),
@@ -201,7 +264,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             (Some(d), Some(p)) => Some(if delta_is_newest(&d, &p) { d } else { p }),
             (one, None) | (None, one) => one,
         };
-        Ok(newest.map(|meta| (meta, forms)))
+        Ok(newest.map(|meta| (meta, forms, refusal)))
     }
 
     /// The metadata of ONE stored form of an object (a HEAD on S3), `None`
@@ -432,7 +495,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // checksum to verify the bytes BEFORE caching — a reference that's
         // corrupt on disk would otherwise be cached on the first miss and
         // poison every subsequent delta GET in the deltaspace.
-        let (stream, recorded) = self
+        let crate::storage::ObjectRead {
+            stream,
+            metadata: recorded,
+            ..
+        } = self
             .storage
             .open_object(
                 bucket,

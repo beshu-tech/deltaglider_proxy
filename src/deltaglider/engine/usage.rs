@@ -133,6 +133,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         u.apply_net(bucket, Some(meta), None, -(reclaimed_ref_bytes as i64));
     }
 
+    /// A change whose size the counter cannot know (the deleted object's
+    /// facts did not open): the bucket is recounted.
+    pub(super) fn record_unknown_change(&self, bucket: &str) {
+        if let Some(u) = &self.bucket_usage {
+            u.mark_for_recount(bucket);
+        }
+    }
+
     /// Resolve the prior object at `bucket/key` for overwrite-net accounting.
     /// Sends no request without a counter or for a bucket that the counter
     /// skips (`is_transient_bucket`): migration staging paid 2 HEADs per

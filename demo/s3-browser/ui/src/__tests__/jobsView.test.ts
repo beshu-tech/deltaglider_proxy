@@ -18,6 +18,7 @@ import {
   lifecycleRunNowBlock,
   progressLabel,
   busyJobForBucket,
+  lastReencryptText,
   mergeDraftRules,
   parityKindMeta,
   conflictPolicyLabel,
@@ -218,6 +219,41 @@ test('busyJobForBucket', () => {
   ];
   assert.equal(busyJobForBucket(jobs, 'pippo')?.id, 'maintenance:1', 'case-insensitive, one-offs only');
   assert.equal(busyJobForBucket(jobs, 'done'), null, 'terminal one-offs are not busy');
+});
+
+test('lastReencryptText: the latest re-encrypt job of the bucket, and whether it is clean', () => {
+  const re = (id: number, status: string, created_at: number, extra: Partial<JobRow> = {}) =>
+    row({ id: `maintenance:${id}`, kind: 'reencrypt', trigger: 'oneoff', status, created_at, scope: { bucket: 'releases' }, ...extra });
+  const progress = (failed: number) => ({ processed: 10, bytes: 0, failed, skipped: 0 });
+
+  assert.deepEqual(lastReencryptText([], 'releases'), { text: 'releases: no recent re-encrypt job.', clean: false });
+  // Another kind or bucket does not count.
+  const other = [
+    row({ id: 'maintenance:1', kind: 'migrate', trigger: 'oneoff', status: 'succeeded', scope: { bucket: 'releases' } }),
+    re(2, 'succeeded', 5, { scope: { bucket: 'downloads' } }),
+  ];
+  assert.equal(lastReencryptText(other, 'releases').clean, false);
+
+  // The newest job wins, whatever its place in the list (case-insensitive).
+  const clean = lastReencryptText([re(3, 'failed', 1), re(4, 'succeeded', 9, { progress: progress(0) })], 'RELEASES');
+  assert.deepEqual(clean, { text: 'RELEASES: the last re-encrypt job finished with no failures.', clean: true });
+  assert.match(lastReencryptText([re(4, 'succeeded', 9), re(3, 'failed', 1)], 'releases').text, /no failures/);
+
+  const cases: Array<[JobRow, RegExp]> = [
+    [re(5, 'running', 1), /still running/],
+    [re(5, 'queued', 1), /still running/],
+    [re(5, 'failed', 1, { last_error: 'backend unreachable' }), /failed \(backend unreachable\)/],
+    [re(5, 'cancelled', 1), /cancelled before it finished/],
+    [re(5, 'completed_with_errors', 1, { progress: progress(3) }), /finished with 3 failures/],
+    [re(5, 'completed_with_errors', 1, { progress: progress(0), failed_total: 1 }), /finished with 1 failure\./],
+    [re(5, 'completed_with_errors', 1, { progress: progress(0) }), /finished with errors/],
+    [re(5, 'succeeded', 1, { progress: progress(2) }), /finished with 2 failures/],
+  ];
+  for (const [job, text] of cases) {
+    const got = lastReencryptText([job], 'releases');
+    assert.match(got.text, text, job.status);
+    assert.equal(got.clean, false, job.status);
+  }
 });
 
 test('mergeDraftRules', () => {

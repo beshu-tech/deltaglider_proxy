@@ -355,6 +355,40 @@ mod wrapper_tests {
         }
     }
 
+    /// A sealed reference streams into the caller's file frame by frame
+    /// (one frame of memory, whatever its size). A changed frame fails the
+    /// write instead of writing what follows it.
+    #[tokio::test]
+    async fn a_sealed_reference_is_written_frame_by_frame_and_checked() {
+        let r = fs(keyed(key(1), "kid-1")).await;
+        let data = body_of(3 * F + 5);
+        r.w.put_reference(
+            "b",
+            "p",
+            Bytes::from(data.clone()),
+            &rmeta(&data),
+            RefWriteProof::for_tests(),
+        )
+        .await
+        .unwrap();
+        let out = r.dir.path().join("ref.out");
+        let source = r.w.open_reference_source("b", "p").await.unwrap();
+        assert_eq!(source.size, data.len() as u64);
+        assert_eq!(source.write_to(&out).await.unwrap(), data.len() as u64);
+        assert_eq!(std::fs::read(&out).unwrap(), data);
+
+        let stored = r.dir.path().join("data/b/deltaspaces/p/reference.bin");
+        let mut wire = std::fs::read(&stored).unwrap();
+        let in_frame_2 = v2::HEADER_LEN + v2::FRAME_WIRE_LEN + 10;
+        wire[in_frame_2] ^= 1;
+        std::fs::write(&stored, &wire).unwrap();
+        let source = r.w.open_reference_source("b", "p").await.unwrap();
+        assert!(
+            source.write_to(&out).await.is_err(),
+            "a changed frame was written"
+        );
+    }
+
     // ── A spy backend: one passthrough object in memory ──
 
     struct CountingBackend {
@@ -455,7 +489,7 @@ mod wrapper_tests {
             b: &str,
             p: &str,
             o: StoredObject<'_>,
-        ) -> Result<(ByteStream, FileMetadata), StorageError> {
+        ) -> Result<crate::storage::ObjectRead, StorageError> {
             crate::storage::open_object_by_parts(self, b, p, o).await
         }
         async fn open_reference_source(
@@ -483,16 +517,6 @@ mod wrapper_tests {
                 metadata,
                 stored_total: self.bytes.lock().unwrap().len() as u64,
             })
-        }
-        async fn put_listing_token(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: u64,
-            _: &str,
-        ) -> Result<(), StorageError> {
-            Ok(())
         }
         async fn listing_tokens(
             &self,
@@ -803,6 +827,28 @@ mod wrapper_tests {
         w.inner.bytes.lock().unwrap()[3] = digit;
     }
 
+    /// A sealed body of the wrong stored size (cut short, or with bytes
+    /// appended) fails when it is opened, before the first byte goes out:
+    /// a full GET never sends a 200 and then breaks the stream.
+    #[tokio::test]
+    async fn a_sealed_body_of_the_wrong_size_fails_before_the_first_byte() {
+        for change in [-1i64, -(F as i64), 1] {
+            let (w, _) = counting(keyed(key(1), "kid-1"), key(1), 3 * F).await;
+            {
+                let mut bytes = w.inner.bytes.lock().unwrap();
+                let len = (bytes.len() as i64 + change) as usize;
+                bytes.resize(len, 0);
+            }
+            let res = w
+                .open_object("b", "p", StoredObject::Passthrough("test.bin"))
+                .await;
+            assert!(
+                matches!(res, Err(StorageError::Encryption(_))),
+                "stored size changed by {change}: opened"
+            );
+        }
+    }
+
     /// B9: a `DGE<digit>` body whose metadata lost its markers is refused,
     /// never served as plaintext, whatever the format digit.
     #[tokio::test]
@@ -832,17 +878,20 @@ mod wrapper_tests {
         );
     }
 
-    /// The range path refuses a stripped body too: from the start of the
-    /// object (the magic is in the range), and in an encrypting bucket
-    /// without `serve` anywhere (an unmarked object is refused there).
+    /// The range path refuses a stripped body too. On a backend with a key
+    /// it does so at every offset: under `serve` the first bytes are read
+    /// as well, and without `serve` an unmarked object is refused anyway.
+    /// On a backend without any key only a range from byte 0 sees the
+    /// magic: nothing there can decrypt it, and a second read per range is
+    /// not worth it for bytes that carry no plaintext.
     #[tokio::test]
     async fn a_dge_body_without_markers_is_refused_on_range_reads() {
-        let mut cases: Vec<(&str, EncryptionConfig, u64)> = plaintext_serving()
-            .into_iter()
-            .map(|(l, c)| (l, c, 0))
-            .collect();
+        let mut cases: Vec<(&str, EncryptionConfig, u64)> =
+            vec![("no key", EncryptionConfig::default(), 0)];
         for start in [0, 100, 70_000] {
             cases.push(("refuse", keyed(key(1), "kid-1"), start));
+            let [_, (_, serve)] = plaintext_serving();
+            cases.push(("serve", serve, start));
         }
         for (label, cfg, start) in cases {
             let (w, _) = counting(cfg, key(1), 2 * F).await;
@@ -1075,7 +1124,7 @@ mod wrapper_tests {
         let shown = r.w.get_passthrough_metadata("b", "p", "x").await.unwrap();
         assert_eq!(
             shown.user_metadata[ENCRYPTION_MARKER_KEY],
-            ENCRYPTION_MARKER_VALUE
+            PRESENTED_MARKER_VALUE
         );
         assert_eq!(shown.user_metadata[ENCRYPTION_KEY_ID_KEY], "kid-a");
         let raw =
@@ -1630,9 +1679,10 @@ mod wrapper_tests {
     // ── copy_within ──
 
     /// A storage-level copy under the same key re-seals for the destination
-    /// (the seal binds the location) and keeps the body. A stale pin, a
-    /// plaintext source into an encrypting bucket, and a sealed source into
-    /// a plaintext bucket are `Unsupported` (the caller copies through).
+    /// (the seal binds the location) and keeps the body. A stale pin is
+    /// `PreconditionFailed`. A plaintext source into an encrypting bucket and
+    /// a sealed source into a plaintext bucket are `Unsupported` (the caller
+    /// copies through).
     #[tokio::test]
     async fn copy_within_reseals_for_the_destination() {
         use crate::storage::{CopyOutcome, ObjectAt, ObjectVariant};
@@ -1691,17 +1741,21 @@ mod wrapper_tests {
 
         let mut stale = source.clone();
         stale.created_at += chrono::Duration::microseconds(1);
-        let unsupported = [
-            w.copy_within(
+        let changed = w
+            .copy_within(
                 ObjectVariant::Passthrough,
                 src,
                 to("b", "s.bin"),
                 &stale,
                 &dst_meta,
             )
-            .await
-            .unwrap(),
-            w.copy_within(
+            .await;
+        assert!(
+            matches!(changed, Err(StorageError::PreconditionFailed(_))),
+            "{changed:?}"
+        );
+        let other_key = w
+            .copy_within(
                 ObjectVariant::Passthrough,
                 src,
                 to("b2", "c.bin"),
@@ -1709,9 +1763,8 @@ mod wrapper_tests {
                 &dst_meta,
             )
             .await
-            .unwrap(),
-        ];
-        assert_eq!(unsupported, [CopyOutcome::Unsupported; 2]);
+            .unwrap();
+        assert_eq!(other_key, CopyOutcome::Unsupported);
         w.inner
             .put_passthrough(
                 "b",
@@ -1739,7 +1792,68 @@ mod wrapper_tests {
         assert_eq!(res, CopyOutcome::Unsupported);
     }
 
+    /// A plaintext copy checks the caller's pin too: a source overwritten
+    /// after the caller read it is `PreconditionFailed`, never a copy of the
+    /// new body under the old body's facts.
+    #[tokio::test]
+    async fn a_plaintext_copy_with_a_stale_pin_fails() {
+        use crate::storage::{ObjectAt, ObjectVariant};
+        let r = fs(EncryptionConfig::default()).await;
+        let w = &r.w;
+        r.put("p", "x", b"old body").await;
+        let pin = w.get_passthrough_metadata("b", "p", "x").await.unwrap();
+        r.put("p", "x", b"NEW BODY, longer").await;
+        let res = w
+            .copy_within(
+                ObjectVariant::Passthrough,
+                ObjectAt {
+                    bucket: "b",
+                    prefix: "p",
+                    filename: "x",
+                },
+                ObjectAt {
+                    bucket: "b",
+                    prefix: "p",
+                    filename: "z",
+                },
+                &pin,
+                &pmeta("z", b"old body"),
+            )
+            .await;
+        assert!(
+            matches!(res, Err(StorageError::PreconditionFailed(_))),
+            "{res:?}"
+        );
+    }
+
     // ── Listings ──
+
+    /// One object whose seal does not open (here: its key left the config)
+    /// does not fail the listing or the scan of its folder. It is listed
+    /// as stored and marked unopened; its neighbour opens; a read of it
+    /// still fails.
+    #[tokio::test]
+    async fn a_listing_survives_an_entry_whose_seal_does_not_open() {
+        let r = fs(keyed(key(0xa1), "kid-a")).await;
+        r.put("d", "x.jpg", b"under key a").await;
+        r.cfg.store(Arc::new(keyed(key(0xb2), "kid-b")));
+        r.put("d", "y.jpg", b"under key b").await;
+
+        let listed = r.w.bulk_list_objects("b", "d").await.unwrap();
+        let scanned = r.w.scan_deltaspace("b", "d").await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(scanned.len(), 2);
+        for meta in listed.iter().map(|(_, m)| m).chain(&scanned) {
+            let opened = meta.original_name == "y.jpg";
+            assert_eq!(!meta.is_unopened_seal(), opened, "{}", meta.original_name);
+            assert!(!meta.user_metadata.contains_key(seal::SEALED_KEY));
+        }
+        assert!(r.w.get_passthrough("b", "d", "x.jpg").await.is_err());
+        assert_eq!(
+            r.w.get_passthrough("b", "d", "y.jpg").await.unwrap(),
+            b"under key b"
+        );
+    }
 
     /// With a key, a listed entry's logical size and ETag come only from a
     /// listing token that opens under a key of this backend for exactly
@@ -2232,12 +2346,7 @@ mod read_request_tests {
                 .put_passthrough("b", "p", "c.bin", Bytes::from(wire), &pmeta("c.bin", &big))
                 .await
                 .unwrap();
-            let ranges: &[(u64, u64)] = if serve {
-                &[(0, 99)]
-            } else {
-                &[(0, 99), (70_000, 70_100)]
-            };
-            for &(start, end) in ranges {
+            for (start, end) in [(0, 99), (500, 600), (70_000, 70_100)] {
                 assert!(
                     read_range(&w, "b", "p", "c.bin", start, end).await.is_err(),
                     "serve {serve}: stripped ciphertext served {start}-{end}"

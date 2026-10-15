@@ -51,6 +51,13 @@ pub struct LogicalFacts {
 }
 
 impl LogicalFacts {
+    /// The logical facts of an opened listing token: authenticated by the
+    /// key that sealed them, never derived from clear metadata. `etag` is
+    /// bare (`md5` or `md5-N`).
+    pub fn of_listing_token(size: u64, etag: String) -> Self {
+        Self { size, etag }
+    }
+
     /// The logical facts a full metadata record carries. `None` for a
     /// sealed (format v2) object: its clear metadata holds no logical
     /// facts, only the encrypting wrapper can open them. THE one place that
@@ -74,7 +81,10 @@ pub fn is_sealed(meta: &FileMetadata) -> bool {
         .contains_key(crate::types::meta_keys::SEALED)
 }
 
-fn bare_etag(etag: &str) -> &str {
+/// An ETag without its quotes. A PUT response quotes the ETag, a listing
+/// does not: THE bare form, which every cache key, marker and listing token
+/// binds, so both sides agree.
+pub(crate) fn bare_etag(etag: &str) -> &str {
     etag.trim_matches('"')
 }
 
@@ -248,9 +258,6 @@ pub fn apply(meta: &mut FileMetadata, facts: &LogicalFacts) {
 /// listing. `Default` trusts the `!!1` facts (`trust_v1_facts: true`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolveListed {
-    /// A passthrough entry may be stored in another form (the
-    /// proxy-encryption wrapper sets it), so its facts are looked up too.
-    pub passthrough_may_differ: bool,
     /// The caller HEADs the entries whose facts stay unknown (a
     /// `metadata=true` LIST, the lifecycle scan, a savings scan that HEADs
     /// its unknowns). That HEAD learns the facts and writes them, so the
@@ -267,7 +274,6 @@ pub struct ResolveListed {
 impl Default for ResolveListed {
     fn default() -> Self {
         Self {
-            passthrough_may_differ: false,
             caller_heads_misses: false,
             trust_v1_facts: true,
         }
@@ -285,11 +291,6 @@ pub enum ListedSize {
     Cached,
     /// Only the stored size is known.
     StoredOnly,
-    /// As `Cached` for a delta whose stored object is a proxy ciphertext:
-    /// the listed `.delta` size is the ciphertext size, while the delta size
-    /// that HeadObject shows (`dg-delta-size`) is the plaintext one, which
-    /// only a HEAD reads (a `metadata=true` LIST sends one).
-    CachedEncryptedDelta,
 }
 
 impl ListedSize {
@@ -411,7 +412,10 @@ mod tests {
         let of = &of[..of.find("\n    }\n").unwrap()];
         assert!(of.contains("if is_sealed(meta) {"), "{of}");
         let self_literals = own.matches("Self {").count() - own.matches("-> Self {").count();
-        assert_eq!(self_literals, 2, "`of` and `ResolveListed::default`");
+        assert_eq!(
+            self_literals, 3,
+            "`of`, `of_listing_token` (no metadata) and `ResolveListed::default`"
+        );
     }
 
     #[test]

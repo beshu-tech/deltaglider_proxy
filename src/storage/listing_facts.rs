@@ -116,10 +116,6 @@ fn decode(s: &str) -> Option<String> {
     Some(out)
 }
 
-fn bare(etag: &str) -> &str {
-    etag.trim_matches('"')
-}
-
 /// An ETag we can put in a key field: non-empty, and without the field
 /// separator or characters that would change the key's meaning.
 fn etag_fits(etag: &str) -> bool {
@@ -144,7 +140,10 @@ pub fn facts_key(
     stored_size: u64,
     facts: &LogicalFacts,
 ) -> Option<String> {
-    if stored_size == facts.size && bare(stored_etag) == bare(&facts.etag) {
+    if stored_size == facts.size
+        && super::list_size_cache::bare_etag(stored_etag)
+            == super::list_size_cache::bare_etag(&facts.etag)
+    {
         return None;
     }
     asked_facts_key(stored_key, stored_etag, stored_size, facts)
@@ -161,8 +160,8 @@ pub fn asked_facts_key(
     stored_size: u64,
     facts: &LogicalFacts,
 ) -> Option<String> {
-    let stored_etag = bare(stored_etag);
-    let etag = bare(&facts.etag);
+    let stored_etag = super::list_size_cache::bare_etag(stored_etag);
+    let etag = super::list_size_cache::bare_etag(&facts.etag);
     if !etag_fits(stored_etag) || !logical_etag_fits(etag) {
         return None;
     }
@@ -231,7 +230,7 @@ pub fn token_key(
     stored_size: u64,
     token: &str,
 ) -> Option<String> {
-    let stored_etag = bare(stored_etag);
+    let stored_etag = super::list_size_cache::bare_etag(stored_etag);
     if !etag_fits(stored_etag) || !token_fits(token) {
         return None;
     }
@@ -317,7 +316,7 @@ pub fn token_for<'a>(
     stored_etag: &str,
     stored_size: u64,
 ) -> Option<String> {
-    let stored_etag = bare(stored_etag);
+    let stored_etag = super::list_size_cache::bare_etag(stored_etag);
     let mut found: Option<&str> = None;
     for e in entries {
         if e.stored_etag != stored_etag || e.stored_size != stored_size {
@@ -370,8 +369,9 @@ pub fn gc_doomed(
         .filter_map(|c| Some((c, c.entry.as_ref()?.stored())))
         .filter(|(_, (key, _, _))| *key <= through)
         .filter(|(_, (key, stored_etag, stored_size))| {
-            live.get(*key)
-                .is_none_or(|(etag, size)| bare(etag) != *stored_etag || size != stored_size)
+            live.get(*key).is_none_or(|(etag, size)| {
+                super::list_size_cache::bare_etag(etag) != *stored_etag || size != stored_size
+            })
         })
         .map(|(c, _)| c.key.clone())
         .collect()
@@ -443,7 +443,7 @@ pub fn facts_for<'a>(
     stored_etag: &str,
     stored_size: u64,
 ) -> Option<LogicalFacts> {
-    let stored_etag = bare(stored_etag);
+    let stored_etag = super::list_size_cache::bare_etag(stored_etag);
     let mut found: Option<&LogicalFacts> = None;
     for e in entries {
         if e.stored_etag != stored_etag || e.stored_size != stored_size {

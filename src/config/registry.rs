@@ -140,6 +140,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Storage",
     },
     EnvVarEntry {
+        name: "DGP_BOOT_PLAINTEXT_CHECK",
+        description: "At boot, in the background, list the first 100 objects of each bucket that encrypts with plaintext_reads: refuse, send a HEAD for each, and log a warning that names the first object that is not encrypted (every read of it fails). false turns the check off (default: true)",
+        example: "false",
+        category: "Storage",
+    },
+    EnvVarEntry {
         name: "DGP_BOOT_CREATE_DECLARED_BUCKETS",
         description: "At boot, create every bucket declared under storage.buckets that its backend does not have: a directory on a filesystem backend, a CreateBucket on an S3 backend (after a HeadBucket). false turns this off for every backend (default: true)",
         example: "false",

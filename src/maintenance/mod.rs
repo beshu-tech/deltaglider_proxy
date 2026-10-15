@@ -52,7 +52,7 @@ use std::collections::HashMap;
 
 use crate::config::{BackendEncryptionConfig, Config};
 use crate::storage::encrypting::{
-    ENCRYPTION_KEY_ID_KEY, ENCRYPTION_MARKER_KEY, ENCRYPTION_MARKER_VALUE,
+    ENCRYPTION_KEY_ID_KEY, ENCRYPTION_MARKER_KEY, PRESENTED_MARKER_VALUE,
 };
 
 /// The at-rest state every object in a bucket SHOULD be in, derived from
@@ -125,27 +125,24 @@ pub fn resolve_desired(config: &Config, bucket: &str) -> Result<DesiredEncryptio
 /// | present| Plain         | yes (decrypt) |
 /// | present| Proxy(k)      | iff stamped key-id ≠ k (or absent) |
 pub fn needs_rewrite(user_metadata: &HashMap<String, String>, desired: &DesiredEncryption) -> bool {
-    let marker = user_metadata.get(ENCRYPTION_MARKER_KEY).map(String::as_str);
-    let encrypted = matches!(marker, Some(ENCRYPTION_MARKER_VALUE));
     match desired {
-        DesiredEncryption::Plain => encrypted,
-        DesiredEncryption::Proxy { key_id } => {
-            if !encrypted {
-                return true;
-            }
-            user_metadata.get(ENCRYPTION_KEY_ID_KEY).map(String::as_str) != Some(key_id.as_str())
-        }
+        DesiredEncryption::Plain => matches!(
+            user_metadata.get(ENCRYPTION_MARKER_KEY).map(String::as_str),
+            Some(PRESENTED_MARKER_VALUE)
+        ),
+        DesiredEncryption::Proxy { key_id } => !stamped_with_key_id(user_metadata, key_id),
     }
 }
 
-/// Is this object encrypted AND stamped with exactly `key_id`? The
-/// question "does anything still need the legacy key": an unstamped or
-/// plaintext object never decrypts with the legacy key (the wrapper picks
-/// the primary for an unstamped body).
+/// Is this object encrypted under the key `key_id`? Its presented
+/// `dg-encryption-key-id` is the id of the key that the seal's fingerprint
+/// names, so the object counts when that id equals `key_id`. A plaintext
+/// object never counts. This answers "does anything still need the legacy
+/// key".
 pub fn stamped_with_key_id(user_metadata: &HashMap<String, String>, key_id: &str) -> bool {
     let encrypted = matches!(
         user_metadata.get(ENCRYPTION_MARKER_KEY).map(String::as_str),
-        Some(ENCRYPTION_MARKER_VALUE)
+        Some(PRESENTED_MARKER_VALUE)
     );
     encrypted && user_metadata.get(ENCRYPTION_KEY_ID_KEY).map(String::as_str) == Some(key_id)
 }

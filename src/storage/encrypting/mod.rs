@@ -18,7 +18,8 @@
 //!
 //! `v2.rs`: the format (pure). `seal.rs`: sealed metadata, the keyring by
 //! fingerprint and the read rule (pure). `format.rs`: the key type and the
-//! marker names. This file: the wrapper.
+//! marker names. `witness.rs`: the node-local gate of the encryption
+//! witness. This file: the wrapper.
 
 #[cfg(test)]
 mod bucket_tests;
@@ -27,10 +28,12 @@ pub(crate) mod seal;
 #[cfg(test)]
 mod tests;
 pub(crate) mod v2;
+mod witness;
 
-pub use seal::{ENCRYPTION_MARKER_KEYS, ENCRYPTION_MARKER_VALUE};
+pub use seal::{ENCRYPTION_MARKER_KEYS, PRESENTED_MARKER_VALUE};
 
 pub use format::*;
+pub use witness::{WitnessGate, WitnessGateState, WITNESS_BACKEND_DEFAULT};
 
 /// The id of a key that the config does not name: `fp-` and the hex of
 /// its v2 fingerprint (issue #120). It depends on the key alone, so the
@@ -42,8 +45,8 @@ pub fn fingerprint_label(key: &EncryptionKey) -> String {
 use super::io_to_storage_error;
 use super::list_size_cache::{ListedSize, ResolveListed};
 use super::traits::{
-    BulkListing, ByteStream, DelegatedListResult, LiteScanResult, MultipartUpload, RangeRead,
-    ReferenceSource, StorageBackend, StorageError, StoredObject, UploadedPart,
+    BulkListing, ByteStream, DelegatedListResult, LiteScanResult, MultipartUpload, ObjectRead,
+    RangeRead, ReferenceSource, StorageBackend, StorageError, StoredObject, UploadedPart,
 };
 use crate::deltaglider::spool::SpoolBudget;
 use crate::types::FileMetadata;
@@ -59,9 +62,7 @@ use std::sync::Arc;
 pub(crate) fn strip_encryption_markers(
     user_metadata: &mut std::collections::HashMap<String, String>,
 ) {
-    for k in ENCRYPTION_MARKER_KEYS {
-        user_metadata.remove(k);
-    }
+    user_metadata.retain(|k, _| !seal::is_marker_key(k));
 }
 
 /// The wrapper OWNS its markers: a write stores only its own decision. Any
@@ -112,36 +113,32 @@ pub(crate) const NO_KEY_WRITE_REFUSAL: &str = "this backend is in aes256-gcm-pro
      key is configured, so the proxy refuses the write instead of storing plaintext. Set \
      encryption.key (or the DGP_*_ENCRYPTION_KEY env var) for the backend, or change its mode";
 
-/// Hot-reloadable encryption configuration.
+/// Hot-reloadable encryption configuration of one raw backend.
 ///
-/// `key` is the AES-256 master key used to encrypt/decrypt object
-/// bodies on this backend. `key_id` is a stable, non-secret
-/// identifier stamped on each written object as the
-/// `dg-encryption-key-id` metadata field so read paths can detect
-/// cross-backend key mismatch (see [`ENCRYPTION_KEY_ID_KEY`]).
+/// `key` is the site key that writes of this backend use. Every key here
+/// (`key`, `legacy_key`, `keyring`, the bucket overrides' keys) goes into
+/// one ring indexed by its fingerprint: a read opens an object with the key
+/// that the object's seal names by fingerprint, never by id and never by
+/// trying keys in turn. Key ids are labels in the ring only: they are not
+/// stored with an object, and callers see the id of the key that opened it
+/// as `dg-encryption-key-id`.
 ///
-/// `legacy_key` + `legacy_key_id` hold the PREVIOUS key after a mode
-/// transition. When a read's `dg-encryption-key-id` matches the
-/// legacy id, the wrapper decrypts with `legacy_key` instead of
-/// `key`. This is the decrypt-only-shim affordance during
-/// proxy-AES → native-SSE migrations: operators keep reading old
-/// objects without having to rewrite them all up front.
+/// `legacy_key` holds the PREVIOUS key after a mode transition (for
+/// example proxy AES to native SSE), so the history stays readable
+/// without a rewrite up front.
 #[derive(Default)]
 pub struct EncryptionConfig {
     pub key: Option<EncryptionKey>,
-    /// Stable id paired with `key`. Required when `key` is Some so
-    /// reads can detect mismatch; the engine resolver derives it
-    /// automatically from `SHA-256(backend_name || key)` when the
-    /// YAML doesn't pin one explicitly.
+    /// The label of `key`. Without an explicit id in the YAML, the engine
+    /// uses [`fingerprint_label`] of the key.
     pub key_id: Option<String>,
     /// Write-path policy. `Encrypt` (default) follows the key:
     /// encrypt when Some, passthrough when None. `PassThrough`
     /// forces passthrough regardless of key presence — used by the
     /// decrypt-only shim.
     pub write_mode: WriteMode,
-    /// Decrypt-only-shim: the PREVIOUS key after a mode transition.
-    /// Consulted on reads when the object's stamped id doesn't match
-    /// `key_id` but DOES match `legacy_key_id`.
+    /// The PREVIOUS key after a mode transition: in the ring for reads,
+    /// never used to write.
     pub legacy_key: Option<EncryptionKey>,
     /// Id paired with `legacy_key`. Same shape rules as `key_id`.
     pub legacy_key_id: Option<String>,
@@ -151,9 +148,9 @@ pub struct EncryptionConfig {
     /// with the backend's own `key` / `write_mode` above.
     pub buckets: std::collections::HashMap<String, BucketKeys>,
     /// Every other key on this raw backend (the bucket overrides' keys and
-    /// legacy keys), indexed by key id. A read picks the key by the id
-    /// stamped on the object, so a bucket reads its history under the
-    /// backend's key, a rotated key, or a removed override.
+    /// legacy keys), indexed by key id. They are in the ring, so a bucket
+    /// reads its history under the backend's key, a rotated key, or a
+    /// removed override.
     pub keyring: std::collections::HashMap<String, EncryptionKey>,
     /// `plaintext_reads: serve` of the backend's own encryption: a read of
     /// a bucket without an override may serve an unencrypted object.
@@ -291,110 +288,6 @@ async fn collect_stream(stream: ByteStream) -> Result<Vec<u8>, StorageError> {
     Ok(buf)
 }
 
-/// The stored buckets whose writes this node refuses (the multi-instance
-/// encryption witness, issue #116 P3). Indexed by `(raw backend, real
-/// bucket)`; the bucket `*` stands for every bucket on the backend that has
-/// no entry of its own. Inactive (refuses nothing) on a single instance.
-#[derive(Default)]
-pub struct WitnessGate {
-    state: ArcSwap<WitnessGateState>,
-    /// Unix ms of the last successful sync; 0 = never.
-    last_ok_ms: std::sync::atomic::AtomicI64,
-    /// How long a sync verdict holds; 0 = gate inactive.
-    ttl_ms: std::sync::atomic::AtomicI64,
-}
-
-/// What the witness decided at its last judgement.
-#[derive(Default, Clone, Debug)]
-pub struct WitnessGateState {
-    /// Storages this node refuses, with the refusal message.
-    pub refused: std::collections::HashMap<(String, String), String>,
-    /// Storages the witness covers: when the last successful sync is older
-    /// than the TTL, writes to them are refused (a stale verdict must not
-    /// let this node write a form that the others may have changed).
-    pub witnessed: std::collections::HashSet<(String, String)>,
-}
-
-/// The bucket name that stands for a backend's buckets with no entry.
-pub const WITNESS_BACKEND_DEFAULT: &str = "*";
-
-fn unix_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-impl WitnessGate {
-    /// Turn the gate on with a verdict lifetime of `ttl`. Until the first
-    /// successful sync, every witnessed storage is refused (fail closed).
-    pub fn activate(&self, ttl: std::time::Duration) {
-        use std::sync::atomic::Ordering;
-        self.ttl_ms
-            .store((ttl.as_millis() as i64).max(1), Ordering::Relaxed);
-    }
-
-    /// Replace the judgement.
-    pub fn set(&self, state: WitnessGateState) {
-        self.state.store(Arc::new(state));
-    }
-
-    /// Record a successful sync (the verdict is fresh from now).
-    pub fn synced(&self) {
-        self.synced_at(unix_ms());
-    }
-
-    /// Record a successful sync that STARTED at `started_ms` (unix ms): the
-    /// verdict's age counts from there, so a slow sync does not stretch it.
-    pub fn synced_at(&self, started_ms: i64) {
-        self.last_ok_ms
-            .store(started_ms, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Pure lookup of `(backend, bucket)` in `map`, with the backend's `*`
-    /// entry standing for a bucket that has none of its own.
-    fn lookup<'a, V>(
-        map: impl Fn(&(String, String)) -> Option<&'a V>,
-        has_own: impl Fn(&(String, String)) -> bool,
-        backend: &str,
-        bucket: &str,
-    ) -> Option<&'a V> {
-        let own = (backend.to_string(), bucket.to_string());
-        if has_own(&own) {
-            return map(&own);
-        }
-        map(&(backend.to_string(), WITNESS_BACKEND_DEFAULT.to_string()))
-    }
-
-    /// The refusal of a write to `bucket` on `backend`, if any.
-    pub fn refusal(&self, backend: &str, bucket: &str) -> Option<String> {
-        use std::sync::atomic::Ordering;
-        let ttl = self.ttl_ms.load(Ordering::Relaxed);
-        if ttl == 0 {
-            return None;
-        }
-        let st = self.state.load();
-        let key = |b: &str| (backend.to_string(), b.to_string());
-        let own = key(bucket);
-        let witnessed_own = st.witnessed.contains(&own);
-        let has_own = |k: &(String, String)| st.refused.contains_key(k) || st.witnessed.contains(k);
-        if let Some(msg) = Self::lookup(|k| st.refused.get(k), has_own, backend, bucket) {
-            return Some(msg.clone());
-        }
-        let witnessed = witnessed_own || st.witnessed.contains(&key(WITNESS_BACKEND_DEFAULT));
-        let age = unix_ms() - self.last_ok_ms.load(Ordering::Relaxed);
-        (witnessed && age > ttl).then(|| {
-            format!(
-                "bucket '{bucket}' on backend '{backend}': this instance cannot confirm that \
-                 its encryption of the bucket agrees with the other instances (no successful \
-                 check of the coordination bucket for {}s), so it refuses writes to the bucket \
-                 until a check succeeds. Reads keep working",
-                age / 1000
-            )
-        })
-    }
-}
-
 /// Transparent encryption wrapper around any `StorageBackend`.
 pub struct EncryptingBackend<B: StorageBackend> {
     inner: B,
@@ -458,14 +351,18 @@ fn named(meta: &FileMetadata, object: StoredObject<'_>) -> FileMetadata {
 /// The stored object of a listed key: its folder, and the object in it.
 fn listed_object<'a>(key: &'a str, meta: &FileMetadata) -> (&'a str, StoredObject<'a>) {
     let (prefix, name) = key.rsplit_once('/').unwrap_or(("", key));
-    let object = if meta.is_reference() {
+    (prefix, stored_object_of(meta, name))
+}
+
+/// The stored object that `meta` describes, named `name` in its folder.
+fn stored_object_of<'a>(meta: &FileMetadata, name: &'a str) -> StoredObject<'a> {
+    if meta.is_reference() {
         StoredObject::Reference
     } else if meta.is_delta() {
         StoredObject::Delta(name)
     } else {
         StoredObject::Passthrough(name)
-    };
-    (prefix, object)
+    }
 }
 
 /// A folder marker: never sealed, always readable.
@@ -487,12 +384,6 @@ fn listing_facts_of(facts: &v2::SealedFacts) -> Option<v2::ListingFacts> {
     })
 }
 
-/// An ETag without its quotes. A PUT response quotes the ETag, a listing
-/// does not: a token binds the bare form, so both sides agree.
-fn bare_etag(etag: &str) -> &str {
-    etag.trim_matches('"')
-}
-
 /// The listing-token maker of a sealed object (see `ListingTokenMaker`).
 fn token_maker(
     site: Arc<v2::SiteKey>,
@@ -508,7 +399,7 @@ fn token_maker(
             &v2::ListedAt {
                 bucket: &bucket,
                 stored_key: key,
-                stored_etag: bare_etag(etag),
+                stored_etag: super::list_size_cache::bare_etag(etag),
                 stored_size: size,
             },
             &lf,
@@ -534,6 +425,23 @@ impl SealedBody {
     fn opener(&self) -> v2::ContentOpener {
         self.site.opener(self.salt)
     }
+}
+
+/// The caller's pin `source` against the presented metadata of the source
+/// now: another version is the same `PreconditionFailed` the inner backends
+/// return, never a copy of a version the caller did not read.
+fn check_copy_pin(
+    source: &FileMetadata,
+    now: &FileMetadata,
+    src: &super::traits::ObjectAt<'_>,
+) -> Result<(), StorageError> {
+    if super::traits::same_stored_generation(source, now) {
+        return Ok(());
+    }
+    Err(StorageError::PreconditionFailed(format!(
+        "{}/{}/{} changed before the copy",
+        src.bucket, src.prefix, src.filename
+    )))
 }
 
 /// Refuse a plaintext stream that begins with a `DGE<digit>` magic: a
@@ -681,15 +589,11 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             .map_or(cfg.serve_plaintext, |b| b.serve_plaintext)
     }
 
-    /// True when this wrapper encrypts `bucket`'s writes (or refuses them).
-    fn actively_encrypts(&self, bucket: &str) -> bool {
-        !self.writes_plaintext(bucket)
-    }
-
-    /// True when `bucket` may hold sealed objects: a key exists anywhere on
-    /// this backend (a key of another bucket can open an object that was
-    /// moved here; its seal then fails at the location).
-    fn has_any_key(&self, _bucket: &str) -> bool {
+    /// True when a bucket of this backend may hold sealed objects: a key
+    /// exists anywhere on it (a key of another bucket can open an object
+    /// that was moved here; its seal then fails at the location). Per
+    /// backend, not per bucket.
+    fn has_any_key(&self) -> bool {
         !self.config.load().ring().is_empty()
     }
 
@@ -732,34 +636,44 @@ impl<B: StorageBackend> EncryptingBackend<B> {
     }
 
     /// The presented metadata of a listed or scanned entry. An entry
-    /// without a seal is listed as it is (a GET applies the read rule).
+    /// without a seal is listed as it is (a GET applies the read rule). An
+    /// entry whose seal does not open is listed as stored, without its seal
+    /// ([`FileMetadata::is_unopened_seal`]), and logged: one such object
+    /// must not fail the listing of its whole folder, nor the re-encrypt
+    /// and migrate jobs that page through it. A GET or HEAD of it fails.
     fn present_entry(
         &self,
         bucket: &str,
         prefix: &str,
         object: StoredObject<'_>,
-        raw: FileMetadata,
-    ) -> Result<FileMetadata, StorageError> {
+        mut raw: FileMetadata,
+    ) -> FileMetadata {
         if !raw.user_metadata.contains_key(seal::SEALED_KEY) {
-            return Ok(raw);
+            return raw;
         }
-        self.present_raw(bucket, prefix, object, &raw)
-            .map(|o| o.meta)
+        match self.present_raw(bucket, prefix, object, &raw) {
+            Ok(opened) => opened.meta,
+            Err(e) => {
+                tracing::warn!("listing {bucket}/{prefix}: an entry does not open: {e}");
+                raw.user_metadata.remove(seal::SEALED_KEY);
+                raw
+            }
+        }
     }
 
     fn present_listed(
         &self,
         bucket: &str,
         objects: Vec<(String, FileMetadata)>,
-    ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
+    ) -> Vec<(String, FileMetadata)> {
         objects
             .into_iter()
             .map(|(key, raw)| {
                 let meta = {
                     let (prefix, object) = listed_object(&key, &raw);
-                    self.present_entry(bucket, prefix, object, raw)?
+                    self.present_entry(bucket, prefix, object, raw)
                 };
-                Ok((key, meta))
+                (key, meta)
             })
             .collect()
     }
@@ -769,18 +683,12 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         bucket: &str,
         prefix: &str,
         metas: Vec<FileMetadata>,
-    ) -> Result<Vec<FileMetadata>, StorageError> {
+    ) -> Vec<FileMetadata> {
         metas
             .into_iter()
             .map(|raw| {
                 let name = raw.original_name.clone();
-                let object = if raw.is_reference() {
-                    StoredObject::Reference
-                } else if raw.is_delta() {
-                    StoredObject::Delta(&name)
-                } else {
-                    StoredObject::Passthrough(&name)
-                };
+                let object = stored_object_of(&raw, &name);
                 self.present_entry(bucket, prefix, object, raw)
             })
             .collect()
@@ -976,24 +884,38 @@ impl<B: StorageBackend> EncryptingBackend<B> {
     }
 
     /// A range of a plaintext object that the rule lets this bucket serve,
-    /// from a second read at plaintext offsets pinned to `raw`.
+    /// from a second read at plaintext offsets pinned to `raw`. A range that
+    /// starts after byte 0 does not hold the magic, so the first bytes of
+    /// the object are read too (in parallel): a body whose metadata was
+    /// stripped is refused at any offset, not only at offset 0.
     async fn plaintext_range(
         &self,
         (bucket, prefix, filename): (&str, &str, &str),
         (start, end): (u64, u64),
         raw: &FileMetadata,
     ) -> Result<RangeRead, StorageError> {
-        let read = self
-            .pinned_range(bucket, prefix, filename, start, end, raw)
-            .await?;
+        if start == 0 {
+            let read = self
+                .pinned_range(bucket, prefix, filename, start, end, raw)
+                .await?;
+            return Ok(RangeRead {
+                stream: sniff_dge_magic(read.stream),
+                metadata: raw.clone(),
+                ..read
+            });
+        }
+        let magic_end = (v2::MAGIC.len() - 1) as u64;
+        let (head, read) = tokio::join!(
+            self.pinned_range(bucket, prefix, filename, 0, magic_end, raw),
+            self.pinned_range(bucket, prefix, filename, start, end, raw),
+        );
+        let head = collect_stream(head?.stream).await?;
+        if v2::has_dge_magic(&head) {
+            return Err(stripped_marker_error());
+        }
         Ok(RangeRead {
-            stream: if start == 0 {
-                sniff_dge_magic(read.stream)
-            } else {
-                read.stream
-            },
             metadata: raw.clone(),
-            ..read
+            ..read?
         })
     }
 
@@ -1126,13 +1048,16 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
                 if raw.user_metadata.contains_key(ENCRYPTION_MARKER_KEY) {
                     return Ok(CopyOutcome::Unsupported);
                 }
+                // The read rule and the caller's pin hold here too: a copy
+                // must not move an object the source bucket refuses, nor a
+                // version the caller never read.
+                let opened = self.present_raw(src.bucket, src.prefix, src_object, &raw)?;
+                check_copy_pin(source, &opened.meta, &src)?;
                 without_markers(metadata)
             }
             (Some(sealed), Some(site)) if sealed.fp == site.fingerprint() => {
                 let opened = self.present_raw(src.bucket, src.prefix, src_object, &raw)?;
-                if !super::traits::same_stored_generation(source, &opened.meta) {
-                    return Ok(CopyOutcome::Unsupported);
-                }
+                check_copy_pin(source, &opened.meta, &src)?;
                 let at = seal::location(dst.bucket, dst.prefix, dst_object);
                 let keys = site.object(sealed.salt);
                 let mut stored = seal::seal(&named(metadata, dst_object), &at, &keys)?;
@@ -1316,15 +1241,16 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     // ── Reads: open ──
 
     async fn get_reference(&self, bucket: &str, prefix: &str) -> Result<Vec<u8>, StorageError> {
-        let (stream, _) = self
+        let read = self
             .open_object(bucket, prefix, StoredObject::Reference)
             .await?;
-        collect_stream(stream).await
+        collect_stream(read.stream).await
     }
 
     /// A plaintext reference passes through (the filesystem keeps its
-    /// hardlink). A sealed one is decrypted whole, checked against its
-    /// stored size, and its size is the sealed plaintext size.
+    /// hardlink). A sealed one is checked against its stored size, then
+    /// decrypted frame by frame as the caller writes it; its size is the
+    /// sealed plaintext size.
     async fn open_reference_source(
         &self,
         bucket: &str,
@@ -1336,9 +1262,15 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
             source.metadata = opened.meta;
             return Ok(source);
         };
-        let wire = source.read_all().await?;
-        let plain = body.opener().open_all(&wire, body.len)?;
-        let stream: ByteStream = Box::pin(futures::stream::once(async { Ok(Bytes::from(plain)) }));
+        // The inner source's size is the stored size: checked before the
+        // body is read, so a reference with bytes appended on the backend
+        // is refused without reading it into memory.
+        v2::check_stored_len(source.size, body.len)?;
+        // Decrypted frame by frame into the caller's file: a reference of
+        // any size costs one frame of memory. Each frame is authenticated
+        // before it is written, and a cut or extended body fails at its
+        // end (final-frame flag), so the caller's write fails.
+        let stream = open_body_stream(source.into_stream(), &body).await?;
         Ok(ReferenceSource::stream(stream, body.len, opened.meta))
     }
 
@@ -1348,7 +1280,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         prefix: &str,
         filename: &str,
     ) -> Result<Vec<u8>, StorageError> {
-        let (stream, _) = self
+        let ObjectRead { stream, .. } = self
             .open_object(bucket, prefix, StoredObject::Delta(filename))
             .await?;
         collect_stream(stream).await
@@ -1360,7 +1292,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         prefix: &str,
         filename: &str,
     ) -> Result<Vec<u8>, StorageError> {
-        let (stream, _) = self
+        let ObjectRead { stream, .. } = self
             .open_object(bucket, prefix, StoredObject::Passthrough(filename))
             .await?;
         collect_stream(stream).await
@@ -1372,34 +1304,44 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         prefix: &str,
         filename: &str,
     ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
-        let (stream, _) = self
+        let ObjectRead { stream, .. } = self
             .open_object(bucket, prefix, StoredObject::Passthrough(filename))
             .await?;
         Ok(stream)
     }
 
-    /// The inner read carries the stored metadata, so the read rule needs no
-    /// HEAD of its own. References and deltas (bounded by the object size
-    /// limit) are decrypted whole, with an exact size check; a passthrough
+    /// The inner read carries the stored metadata and the stored size, so
+    /// the read rule needs no HEAD of its own, and a sealed object of the
+    /// wrong stored size fails before the first byte. References and deltas
+    /// (bounded by the object size limit) are decrypted whole; a passthrough
     /// streams frame by frame. Returns the PRESENTED metadata.
     async fn open_object(
         &self,
         bucket: &str,
         prefix: &str,
         object: StoredObject<'_>,
-    ) -> Result<(ByteStream, FileMetadata), StorageError> {
-        let (stream, raw) = self.inner.open_object(bucket, prefix, object).await?;
-        let opened = self.present_raw(bucket, prefix, object, &raw)?;
-        let plain: ByteStream = match (&opened.sealed, object) {
+    ) -> Result<ObjectRead, StorageError> {
+        let read = self.inner.open_object(bucket, prefix, object).await?;
+        let opened = self.present_raw(bucket, prefix, object, &read.metadata)?;
+        if let Some(body) = &opened.sealed {
+            v2::check_stored_len(read.stored_total, body.len)?;
+        }
+        let stream: ByteStream = match (&opened.sealed, object) {
             (Some(body), StoredObject::Reference | StoredObject::Delta(_)) => {
-                let wire = collect_stream(stream).await?;
+                let wire = collect_stream(read.stream).await?;
                 let plain = body.opener().open_all(&wire, body.len)?;
                 Box::pin(futures::stream::once(async { Ok(Bytes::from(plain)) }))
             }
-            (Some(body), StoredObject::Passthrough(_)) => open_body_stream(stream, body).await?,
-            (None, _) => sniff_dge_magic(stream),
+            (Some(body), StoredObject::Passthrough(_)) => {
+                open_body_stream(read.stream, body).await?
+            }
+            (None, _) => sniff_dge_magic(read.stream),
         };
-        Ok((plain, opened.meta))
+        Ok(ObjectRead {
+            stream,
+            metadata: opened.meta,
+            stored_total: read.stored_total,
+        })
     }
 
     // === Multipart upload ===
@@ -1419,7 +1361,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         self.check_witness(bucket)?;
         // A refused write names its cause, not "multipart unsupported".
         self.write_key(bucket)?;
-        if self.actively_encrypts(bucket) {
+        if !self.writes_plaintext(bucket) {
             return Err(StorageError::Other(
                 "multipart upload unsupported on a proxy-AES-encrypting bucket".to_string(),
             ));
@@ -1495,7 +1437,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     }
 
     fn multipart_storage_label(&self, bucket: &str) -> &'static str {
-        if self.actively_encrypts(bucket) {
+        if !self.writes_plaintext(bucket) {
             return "aes256-gcm-proxy";
         }
         self.inner.multipart_storage_label(bucket)
@@ -1504,7 +1446,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     fn supports_native_multipart(&self, bucket: &str) -> bool {
         // Encryption rewrites the bytes, so the streaming multipart path
         // cannot be used, whatever the inner backend.
-        if self.actively_encrypts(bucket) {
+        if !self.writes_plaintext(bucket) {
             return false;
         }
         self.inner.supports_native_multipart(bucket)
@@ -1542,7 +1484,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         start: u64,
         end: u64,
     ) -> Result<RangeRead, StorageError> {
-        if self.has_any_key(bucket) {
+        if self.has_any_key() {
             return self.keyed_range(bucket, prefix, filename, start, end).await;
         }
         let read = self
@@ -1564,18 +1506,6 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
             metadata: opened.meta,
             ..read
         })
-    }
-
-    async fn put_listing_token(
-        &self,
-        b: &str,
-        k: &str,
-        e: &str,
-        n: u64,
-        t: &str,
-    ) -> Result<(), StorageError> {
-        self.check_witness(b)?;
-        self.inner.put_listing_token(b, k, e, n, t).await
     }
 
     async fn listing_tokens(
@@ -1750,11 +1680,11 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
 
     async fn scan_deltaspace(&self, b: &str, p: &str) -> Result<Vec<FileMetadata>, StorageError> {
         let raw = self.inner.scan_deltaspace(b, p).await?;
-        self.present_scanned(b, p, raw)
+        Ok(self.present_scanned(b, p, raw))
     }
     async fn scan_deltaspace_lite(&self, b: &str, p: &str) -> Result<LiteScanResult, StorageError> {
         let mut lite = self.inner.scan_deltaspace_lite(b, p).await?;
-        lite.metadata = self.present_scanned(b, p, std::mem::take(&mut lite.metadata))?;
+        lite.metadata = self.present_scanned(b, p, std::mem::take(&mut lite.metadata));
         Ok(lite)
     }
     async fn holds_only_reference(&self, b: &str, p: &str) -> Result<bool, StorageError> {
@@ -1766,7 +1696,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         p: &str,
     ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
         let raw = self.inner.bulk_list_objects(b, p).await?;
-        self.present_listed(b, raw)
+        Ok(self.present_listed(b, raw))
     }
     async fn enrich_list_metadata(
         &self,
@@ -1774,7 +1704,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         o: Vec<(String, FileMetadata)>,
     ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
         let raw = self.inner.enrich_list_metadata(b, o).await?;
-        self.present_listed(b, raw)
+        Ok(self.present_listed(b, raw))
     }
     async fn bulk_list_objects_with_baselines(
         &self,
@@ -1787,7 +1717,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
             .inner
             .bulk_list_objects_with_baselines(b, p, start_after, max_listed)
             .await?;
-        listing.objects = self.present_listed(b, std::mem::take(&mut listing.objects))?;
+        listing.objects = self.present_listed(b, std::mem::take(&mut listing.objects));
         Ok(listing)
     }
     async fn list_objects_delegated(
@@ -1801,7 +1731,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         let Some(mut page) = self.inner.list_objects_delegated(b, p, d, m, t).await? else {
             return Ok(None);
         };
-        page.objects = self.present_listed(b, std::mem::take(&mut page.objects))?;
+        page.objects = self.present_listed(b, std::mem::take(&mut page.objects));
         Ok(Some(page))
     }
     /// With a key, the inner listing may hold ciphertext: its own facts are
@@ -1814,7 +1744,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         objects: &mut [(String, FileMetadata)],
         how: ResolveListed,
     ) -> Vec<ListedSize> {
-        if !self.has_any_key(b) {
+        if !self.has_any_key() {
             return self.inner.resolve_listed_sizes(b, objects, how).await;
         }
         let mut sizes = self
@@ -1823,7 +1753,6 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
                 b,
                 objects,
                 ResolveListed {
-                    passthrough_may_differ: true,
                     trust_v1_facts: false,
                     ..how
                 },
@@ -1951,7 +1880,7 @@ fn open_token(
         &v2::ListedAt {
             bucket,
             stored_key: &t.stored_key,
-            stored_etag: bare_etag(&t.stored_etag),
+            stored_etag: super::list_size_cache::bare_etag(&t.stored_etag),
             stored_size: t.stored_size,
         },
         &t.token,
@@ -1974,13 +1903,15 @@ fn apply_listing_facts(
     } else if body != Some(lf.size) {
         return false;
     }
-    meta.file_size = lf.size;
-    if lf.parts == 0 {
-        meta.md5 = hex::encode(lf.etag_digest);
-        meta.multipart_etag = None;
-    } else {
-        meta.multipart_etag = Some(format!("\"{}-{}\"", hex::encode(lf.etag_digest), lf.parts));
-    }
+    let digest = hex::encode(lf.etag_digest);
+    let etag = match lf.parts {
+        0 => digest,
+        parts => format!("{digest}-{parts}"),
+    };
+    super::list_size_cache::apply(
+        meta,
+        &super::list_size_cache::LogicalFacts::of_listing_token(lf.size, etag),
+    );
     true
 }
 

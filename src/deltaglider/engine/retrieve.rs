@@ -194,7 +194,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     .open_object(bucket, &deltaspace_id, stored_object(form, filename))
                     .await
                 {
-                    Ok((stream, meta)) => {
+                    Ok(read) => {
+                        let (stream, meta) = (read.stream, read.metadata);
                         return self
                             .serve_opened(bucket, key, &deltaspace_id, &obj_key, form, stream, meta)
                             .await;
@@ -236,14 +237,22 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let opened_wins = match (&opened, &other) {
             (None, _) => false,
             (Some(_), None) => true,
-            (Some((_, o)), Some(x)) => match guess {
-                ObjectVariant::Delta => super::metadata::delta_is_newest(o, x),
-                ObjectVariant::Passthrough => !super::metadata::delta_is_newest(x, o),
+            (Some(read), Some(x)) => match guess {
+                ObjectVariant::Delta => super::metadata::delta_is_newest(&read.metadata, x),
+                ObjectVariant::Passthrough => !super::metadata::delta_is_newest(x, &read.metadata),
             },
         };
-        if let (true, Some((stream, meta))) = (opened_wins, opened) {
+        if let (true, Some(read)) = (opened_wins, opened) {
             return self
-                .serve_opened(bucket, key, &deltaspace_id, &obj_key, guess, stream, meta)
+                .serve_opened(
+                    bucket,
+                    key,
+                    &deltaspace_id,
+                    &obj_key,
+                    guess,
+                    read.stream,
+                    read.metadata,
+                )
                 .await;
         }
         // The other form wins (or the guess is absent): the opened stream,
@@ -259,7 +268,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .open_object(bucket, &deltaspace_id, stored_object(other_form, filename))
             .await
         {
-            Ok((stream, meta)) => {
+            Ok(read) => {
+                let (stream, meta) = (read.stream, read.metadata);
                 self.serve_opened(
                     bucket,
                     key,
@@ -418,7 +428,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 // carries the bytes, not the earlier read's: a write between
                 // the two would pair one version's ETag with another's body.
                 let stored_name = passthrough_stored_name(&obj_key.filename, &metadata);
-                let (stream, served) = self
+                let crate::storage::ObjectRead {
+                    stream,
+                    metadata: served,
+                    ..
+                } = self
                     .storage
                     .open_object(
                         bucket,
@@ -1326,7 +1340,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             )
             .await
         {
-            Ok(opened) => opened,
+            Ok(read) => (read.stream, read.metadata),
             Err(StorageError::NotFound(_)) => {
                 return Err(EngineError::NotFound(obj_key.full_key()))
             }

@@ -65,15 +65,31 @@ export function buildEncryptionSectionBody(
   storage: StorageSectionBackends,
 ): Record<string, unknown> {
   const encBody = encryptionBody(patch);
+  return withBackendEncryption(backendName, storage, encBody, (b) => keepReadPolicy(b, encBody));
+}
+
+/**
+ * The storage-section body that changes one backend's encryption block.
+ * Singleton: `{ backend_encryption: singleton }`, a merge-patch. Named:
+ * the section's own `backends` list, every entry as-is, with the target's
+ * `encryption` replaced by `named(entry)`. Throws when a named target is
+ * not in the section (a stale page).
+ */
+function withBackendEncryption(
+  backendName: string,
+  storage: StorageSectionBackends,
+  singleton: Record<string, unknown>,
+  named: (entry: Record<string, unknown>) => Record<string, unknown>,
+): Record<string, unknown> {
   const list = storage.backends ?? [];
   if (list.length === 0 && backendName === 'default') {
-    return { backend_encryption: encBody };
+    return { backend_encryption: singleton };
   }
   if (!list.some((b) => b.name === backendName)) {
     throw new Error(`Backend "${backendName}" is not in the storage configuration. Reload the page.`);
   }
   return {
-    backends: list.map((b) => (b.name === backendName ? { ...b, encryption: keepReadPolicy(b, encBody) } : b)),
+    backends: list.map((b) => (b.name === backendName ? { ...b, encryption: named(b) } : b)),
   };
 }
 
@@ -146,21 +162,10 @@ function buildEncryptionFieldsSectionBody(
   fields: Record<string, unknown>,
   storage: StorageSectionBackends,
 ): Record<string, unknown> {
-  const clear = fields;
-  const list = storage.backends ?? [];
-  if (list.length === 0 && backendName === 'default') {
-    return { backend_encryption: clear };
-  }
-  if (!list.some((b) => b.name === backendName)) {
-    throw new Error(`Backend "${backendName}" is not in the storage configuration. Reload the page.`);
-  }
-  return {
-    backends: list.map((b) =>
-      b.name === backendName
-        ? { ...b, encryption: { ...((b.encryption as Record<string, unknown> | undefined) ?? {}), ...clear } }
-        : b,
-    ),
-  };
+  return withBackendEncryption(backendName, storage, fields, (b) => ({
+    ...((b.encryption as Record<string, unknown> | undefined) ?? {}),
+    ...fields,
+  }));
 }
 
 /**

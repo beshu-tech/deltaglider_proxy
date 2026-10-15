@@ -777,14 +777,13 @@ impl Sealed {
 #[derive(Clone, Copy, Debug)]
 pub struct Location<'a> {
     pub bucket: &'a str,
-    /// The deltaspace prefix, without a trailing `/`.
+    /// The deltaspace prefix: the key up to its last `/`, exclusive.
     pub prefix: &'a str,
     pub object: StoredObject<'a>,
 }
 
 impl Location<'_> {
     fn encode_into(&self, out: &mut Vec<u8>) {
-        debug_assert!(!self.prefix.ends_with('/'), "one canonical split");
         let (tag, name) = match self.object {
             StoredObject::Reference => (b'r', ""),
             StoredObject::Delta(f) => (b'd', f),
@@ -924,8 +923,9 @@ impl<'a> Reader<'a> {
 }
 
 /// The digest of the client-visible headers that a backend writer could
-/// change: content type, original name, client user metadata. Keys are
-/// lowercased and sorted; every field is length-prefixed.
+/// change: the pairs the caller gives (the content type and the client
+/// user metadata, `seal::client_headers`). Keys are lowercased and sorted;
+/// every field is length-prefixed.
 pub fn client_headers_digest<'a>(pairs: impl IntoIterator<Item = (&'a str, &'a str)>) -> [u8; 16] {
     use sha2::Digest as _;
     let mut sorted: Vec<(String, &str)> = pairs

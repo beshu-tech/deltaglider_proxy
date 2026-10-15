@@ -109,19 +109,56 @@ impl EncryptionChangeKind {
     }
 }
 
+/// The subject of an encryption change: what a confirmation header names.
+/// Its [`Display`](std::fmt::Display) form is the wire string (the
+/// confirmation header values, the error and audit texts).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Subject {
+    /// Every bucket on this backend that the config does not name:
+    /// `backend:<name>` (S3 bucket names never hold `:`, so it never
+    /// collides with a bucket).
+    Backend(String),
+    /// The buckets that no config names and that follow the default route:
+    /// [`DEFAULT_ROUTE_SUBJECT`].
+    DefaultRoute,
+    /// A configured bucket: its name.
+    Bucket(String),
+}
+
+impl Subject {
+    /// The bucket, for a bucket subject.
+    pub fn bucket(&self) -> Option<&str> {
+        match self {
+            Self::Bucket(b) => Some(b),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Subject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backend(name) => write!(f, "backend:{name}"),
+            Self::DefaultRoute => f.write_str(DEFAULT_ROUTE_SUBJECT),
+            Self::Bucket(name) => f.write_str(name),
+        }
+    }
+}
+
 /// One subject whose write encryption a config change changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncryptionChange {
-    /// A configured bucket name, or `backend:<name>` for every bucket on
-    /// that backend that the config does not name (S3 bucket names never
-    /// hold `:`, so the two never collide). The confirmation token of a
-    /// downgrade.
-    pub subject: String,
-    /// The bucket, for a bucket subject.
-    pub bucket: Option<String>,
+    /// The confirmation token of a gated change.
+    pub subject: Subject,
     pub before: WriteEncryption,
     pub after: WriteEncryption,
     pub kind: EncryptionChangeKind,
+    /// The new config serves the plaintext history
+    /// (`plaintext_reads: serve`).
+    pub serves_plaintext: bool,
+    /// A bucket subject that inherits the encryption of one backend in
+    /// both configs: that backend. The backend's own subject covers it.
+    pub follows_backend: Option<String>,
 }
 
 impl EncryptionChange {
@@ -133,6 +170,26 @@ impl EncryptionChange {
             self.before.describe(),
             self.after.describe()
         )
+    }
+
+    /// True when `confirmed` names this change's subject.
+    fn confirmed_by(&self, confirmed: &[String]) -> bool {
+        confirmed.contains(&self.subject.to_string())
+    }
+
+    /// True when a backend change in `changes` that `covers` accepts covers
+    /// this bucket change (see [`Self::follows_backend`]).
+    fn covered_by(
+        &self,
+        changes: &[EncryptionChange],
+        covers: impl Fn(&EncryptionChange) -> bool,
+    ) -> bool {
+        let Some(backend) = &self.follows_backend else {
+            return false;
+        };
+        changes
+            .iter()
+            .any(|c| matches!(&c.subject, Subject::Backend(n) if n == backend) && covers(c))
     }
 }
 
@@ -164,6 +221,17 @@ pub(crate) fn confirmed_subjects(
         .collect()
 }
 
+/// Pure: the downgrade subjects that `headers` confirm.
+pub(crate) fn confirmed_downgrades(headers: Option<&axum::http::HeaderMap>) -> Vec<String> {
+    confirmed_subjects(headers, CONFIRM_ENCRYPTION_DOWNGRADE_HEADER)
+}
+
+/// The encryption of one backend's own site.
+struct BackendSite {
+    write: WriteEncryption,
+    serves_plaintext: bool,
+}
+
 /// Pure: the kind of a change from `before` to `after`, `None` when equal.
 fn change_kind(before: &WriteEncryption, after: &WriteEncryption) -> Option<EncryptionChangeKind> {
     if before == after {
@@ -178,6 +246,22 @@ fn change_kind(before: &WriteEncryption, after: &WriteEncryption) -> Option<Encr
 }
 
 impl Config {
+    /// The buckets of `listed` whose reads refuse an unencrypted object:
+    /// they encrypt with `aes256-gcm-proxy` and do not set
+    /// `plaintext_reads: serve`. The boot check samples them.
+    pub fn buckets_refusing_plaintext<'a>(&self, listed: &'a [String]) -> Vec<&'a str> {
+        listed
+            .iter()
+            .filter(|b| {
+                self.encryption_for_bucket(b).is_some_and(|e| {
+                    matches!(e.config, BackendEncryptionConfig::Aes256GcmProxy { .. })
+                        && !e.config.serves_plaintext()
+                })
+            })
+            .map(String::as_str)
+            .collect()
+    }
+
     /// The write encryption of a configured bucket name, or `None` when it
     /// routes to an undefined backend.
     pub fn write_encryption_for_bucket(&self, bucket: &str) -> Option<WriteEncryption> {
@@ -185,9 +269,9 @@ impl Config {
             .map(|e| e.write_encryption())
     }
 
-    /// The write encryption of each backend's own site (what a bucket that
-    /// the config does not name writes with), by backend name.
-    fn backend_write_encryptions(&self) -> std::collections::BTreeMap<String, WriteEncryption> {
+    /// The encryption of each backend's own site (what a bucket that the
+    /// config does not name writes with), by backend name.
+    fn backend_sites(&self) -> std::collections::BTreeMap<String, BackendSite> {
         self.encryption_sites()
             .into_iter()
             .filter_map(|(site, enc)| {
@@ -198,7 +282,11 @@ impl Config {
                     _ => return None,
                 };
                 let keys = resolve_site_keys(KeyScope::Backend(&name), enc);
-                Some((name, WriteEncryption::of(enc, &keys)))
+                let site = BackendSite {
+                    write: WriteEncryption::of(enc, &keys),
+                    serves_plaintext: enc.serves_plaintext(),
+                };
+                Some((name, site))
             })
             .collect()
     }
@@ -208,22 +296,20 @@ impl Config {
     /// does not name), then each bucket that either config names (its
     /// override, its route and its backend all count). Migrate's transient
     /// routes are internal and skipped. THE list that the transition
-    /// audits and the downgrade gate judges.
+    /// audits and the gates judge.
     pub fn encryption_changes(&self, old: &Config) -> Vec<EncryptionChange> {
         let mut out = Vec::new();
-        let (before, after) = (
-            old.backend_write_encryptions(),
-            self.backend_write_encryptions(),
-        );
+        let (before, after) = (old.backend_sites(), self.backend_sites());
         for (name, b) in &before {
             let Some(a) = after.get(name) else { continue };
-            if let Some(kind) = change_kind(b, a) {
+            if let Some(kind) = change_kind(&b.write, &a.write) {
                 out.push(EncryptionChange {
-                    subject: format!("backend:{name}"),
-                    bucket: None,
-                    before: b.clone(),
-                    after: a.clone(),
+                    subject: Subject::Backend(name.clone()),
+                    before: b.write.clone(),
+                    after: a.write.clone(),
                     kind,
+                    serves_plaintext: a.serves_plaintext,
+                    follows_backend: None,
                 });
             }
         }
@@ -233,13 +319,14 @@ impl Config {
         let (od, nd) = (old.default_backend_name(), self.default_backend_name());
         if od != nd {
             if let (Some(b), Some(a)) = (before.get(&od), after.get(&nd)) {
-                if let Some(kind) = change_kind(b, a) {
+                if let Some(kind) = change_kind(&b.write, &a.write) {
                     out.push(EncryptionChange {
-                        subject: DEFAULT_ROUTE_SUBJECT.to_string(),
-                        bucket: None,
-                        before: b.clone(),
-                        after: a.clone(),
+                        subject: Subject::DefaultRoute,
+                        before: b.write.clone(),
+                        after: a.write.clone(),
                         kind,
+                        serves_plaintext: a.serves_plaintext,
+                        follows_backend: None,
                     });
                 }
             }
@@ -251,18 +338,22 @@ impl Config {
                 continue;
             }
             let (Some(b), Some(a)) = (
-                old.write_encryption_for_bucket(name),
-                self.write_encryption_for_bucket(name),
+                old.encryption_for_bucket(name),
+                self.encryption_for_bucket(name),
             ) else {
                 continue;
             };
-            if let Some(kind) = change_kind(&b, &a) {
+            let (wb, wa) = (b.write_encryption(), a.write_encryption());
+            if let Some(kind) = change_kind(&wb, &wa) {
+                let follows_backend = (!b.from_bucket && !a.from_bucket && a.backend == b.backend)
+                    .then(|| a.backend.clone());
                 out.push(EncryptionChange {
-                    subject: name.clone(),
-                    bucket: Some(name.clone()),
-                    before: b,
-                    after: a,
+                    subject: Subject::Bucket(name.clone()),
+                    before: wb,
+                    after: wa,
                     kind,
+                    serves_plaintext: a.config.serves_plaintext(),
+                    follows_backend,
                 });
             }
         }
@@ -275,8 +366,10 @@ impl Config {
     /// them. The change needs `plaintext_reads: serve` (and a re-encrypt job
     /// to convert the history), or the subject in `confirmed` (the bucket
     /// holds no plaintext that anyone needs). A bucket in `absent` (no
-    /// backend lists it yet) has no history. A bucket that follows its
-    /// backend is covered by the backend's subject. `None` = not gated.
+    /// backend lists it yet) has no history. A bucket that follows one
+    /// backend in both configs is covered by the backend's subject; a
+    /// bucket that starts to inherit an encrypting backend is its own
+    /// subject. `None` = not gated.
     pub fn unconfirmed_plaintext_refusals(
         &self,
         old: &Config,
@@ -286,62 +379,30 @@ impl Config {
         let Some(confirmed) = confirmed else {
             return Vec::new();
         };
-        let serves = |enc: &BackendEncryptionConfig| {
-            matches!(
-                enc,
-                BackendEncryptionConfig::Aes256GcmProxy {
-                    plaintext_reads: PlaintextReads::Serve,
-                    ..
-                }
-            )
+        let starts_to_refuse = |c: &EncryptionChange| {
+            !c.before.encrypts()
+                && c.after.mode == "aes256-gcm-proxy"
+                && !c.after.refuses_writes()
+                && !c.serves_plaintext
         };
-        let backend_enc = |name: &str| -> Option<&BackendEncryptionConfig> {
-            self.encryption_sites()
-                .into_iter()
-                .find_map(|(site, enc)| match site {
-                    EncryptionSite::Backend(n) if n == name => Some(enc),
-                    EncryptionSite::Singleton if self.backends.is_empty() && name == "default" => {
-                        Some(enc)
-                    }
-                    _ => None,
-                })
-        };
+        let changes = self.encryption_changes(old);
         let mut errors = Vec::new();
-        for c in self.encryption_changes(old) {
-            if c.before.encrypts() || c.after.mode != "aes256-gcm-proxy" || c.after.refuses_writes()
-            {
+        for c in changes.iter().filter(|c| starts_to_refuse(c)) {
+            if c.confirmed_by(confirmed) || c.covered_by(&changes, starts_to_refuse) {
                 continue;
             }
-            if confirmed.iter().any(|s| s == &c.subject) {
-                continue;
-            }
-            let (enc, what) = match &c.bucket {
-                Some(b) => {
+            let what = match &c.subject {
+                Subject::Bucket(b) => {
                     if absent.iter().any(|a| a.eq_ignore_ascii_case(b)) {
                         continue;
                     }
-                    match self.encryption_for_bucket(b) {
-                        Some(e) if e.from_bucket => (Some(e.config), format!("bucket '{b}'")),
-                        _ => continue,
-                    }
+                    format!("bucket '{b}'")
                 }
-                None if c.subject == DEFAULT_ROUTE_SUBJECT => (
-                    backend_enc(&self.default_backend_name()),
-                    "every bucket that the config does not name".to_string(),
-                ),
-                None => {
-                    let name = c.subject.trim_start_matches("backend:");
-                    (
-                        backend_enc(name),
-                        format!(
-                            "every bucket on backend '{name}' without its own encryption block"
-                        ),
-                    )
+                Subject::DefaultRoute => "every bucket that the config does not name".to_string(),
+                Subject::Backend(name) => {
+                    format!("every bucket on backend '{name}' without its own encryption block")
                 }
             };
-            if enc.is_some_and(serves) {
-                continue;
-            }
             errors.push(format!(
                 "this change makes {what} encrypt, but the objects stored there before are \
                  plaintext, and with `plaintext_reads: refuse` (the default) the proxy refuses \
@@ -370,46 +431,23 @@ impl Config {
         let Some(confirmed) = confirmed else {
             return Vec::new();
         };
+        let cleared = |c: &EncryptionChange| c.kind == EncryptionChangeKind::Cleared;
         let changes = self.encryption_changes(old);
-        let downgraded_backends: std::collections::BTreeSet<String> = changes
-            .iter()
-            .filter(|c| c.bucket.is_none() && c.kind == EncryptionChangeKind::Cleared)
-            .map(|c| c.subject.clone())
-            .collect();
-        let inherits_from = |cfg: &Config, bucket: &str| {
-            cfg.encryption_for_bucket(bucket)
-                .filter(|e| !e.from_bucket)
-                .map(|e| e.backend)
-        };
         let mut errors = Vec::new();
-        for c in changes
-            .iter()
-            .filter(|c| c.kind == EncryptionChangeKind::Cleared)
-        {
-            if confirmed.iter().any(|s| s == &c.subject) {
+        for c in changes.iter().filter(|c| cleared(c)) {
+            if c.confirmed_by(confirmed) || c.covered_by(&changes, cleared) {
                 continue;
             }
-            if let Some(bucket) = &c.bucket {
-                // Covered by the backend's own downgrade.
-                let (b, a) = (inherits_from(old, bucket), inherits_from(self, bucket));
-                if let (Some(b), Some(a)) = (b, a) {
-                    let subject = format!("backend:{a}");
-                    if a == b && downgraded_backends.contains(&subject) {
-                        continue;
-                    }
-                }
-            }
-            let what = match &c.bucket {
-                Some(b) => format!("bucket '{b}'"),
-                None if c.subject == DEFAULT_ROUTE_SUBJECT => {
+            let what = match &c.subject {
+                Subject::Bucket(b) => format!("bucket '{b}'"),
+                Subject::DefaultRoute => {
                     "every bucket that the config does not name (they follow the default \
                      backend)"
                         .to_string()
                 }
-                None => format!(
-                    "every bucket on backend '{}' without its own encryption block",
-                    c.subject.trim_start_matches("backend:")
-                ),
+                Subject::Backend(name) => {
+                    format!("every bucket on backend '{name}' without its own encryption block")
+                }
             };
             errors.push(format!(
                 "this change makes {what} store new objects in plaintext (it encrypted with \
@@ -424,18 +462,6 @@ impl Config {
         }
         errors
     }
-}
-
-/// Pure: the downgrade subjects that `headers` confirm.
-pub(crate) fn confirmed_downgrades(headers: Option<&axum::http::HeaderMap>) -> Vec<String> {
-    headers
-        .into_iter()
-        .flat_map(|h| h.get_all(CONFIRM_ENCRYPTION_DOWNGRADE_HEADER))
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
 }
 
 #[cfg(test)]
@@ -470,6 +496,26 @@ mod tests {
         format!("      encryption: {}\n", aes(key, id))
     }
 
+    /// The boot check samples exactly the buckets that refuse plaintext:
+    /// proxy AES without `serve`, inherited or their own.
+    #[test]
+    fn buckets_refusing_plaintext_are_the_proxy_aes_ones_without_serve() {
+        let c = cfg(
+            &local_aes(KA, "ka"),
+            &format!(
+                "    releases: {{ backend: local-disk }}\n    db-archive: {{ backend: local-disk, encryption: {{ mode: aes256-gcm-proxy, key: \"{KB}\", key_id: kb, plaintext_reads: serve }} }}\n    downloads: {{ backend: hetzner-fsn1 }}\n"
+            ),
+        );
+        let listed: Vec<String> = ["releases", "db-archive", "downloads", "unnamed"]
+            .map(String::from)
+            .to_vec();
+        // `unnamed` is on the default backend, local-disk, which encrypts.
+        assert_eq!(
+            c.buckets_refusing_plaintext(&listed),
+            ["releases", "unnamed"]
+        );
+    }
+
     #[test]
     fn changes_are_set_cleared_or_rotated() {
         let none = cfg("", "    releases: { backend: local-disk }\n");
@@ -490,7 +536,7 @@ mod tests {
         let kinds = |new: &Config, old: &Config| {
             new.encryption_changes(old)
                 .into_iter()
-                .map(|c| (c.subject, c.kind))
+                .map(|c| (c.subject.to_string(), c.kind))
                 .collect::<Vec<_>>()
         };
         assert_eq!(
@@ -580,7 +626,7 @@ mod tests {
         assert!(
             changes
                 .iter()
-                .any(|c| c.subject == DEFAULT_ROUTE_SUBJECT
+                .any(|c| c.subject == Subject::DefaultRoute
                     && c.kind == EncryptionChangeKind::Cleared),
             "{changes:?}"
         );

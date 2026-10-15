@@ -629,6 +629,19 @@ pub(crate) enum Reader {
 }
 
 impl Reader {
+    /// THE disclosure rule for delta facts (storage type, stored size,
+    /// reference SHA-256, the `dg-*` delta keys): only a reader of the
+    /// whole folder gets them. Every output path asks this.
+    pub(crate) fn sees_delta_facts(self) -> bool {
+        self == Self::Authenticated
+    }
+
+    /// THE disclosure rule for deployment provenance (`dg-tool`): every
+    /// reader but an anonymous one.
+    fn sees_provenance(self) -> bool {
+        self != Self::Anonymous
+    }
+
     fn of(ext: &axum::http::Extensions) -> Self {
         let anonymous_principal =
             crate::iam::request_principal(ext).is_some_and(|u| u.is_anonymous());
@@ -649,7 +662,7 @@ fn strip_fingerprint_metadata(
     metadata: &mut std::collections::HashMap<String, String>,
     reader: Reader,
 ) {
-    if reader != Reader::Anonymous {
+    if reader.sees_provenance() {
         return;
     }
     metadata.remove(crate::types::meta_keys::TOOL);
@@ -672,7 +685,7 @@ fn response_metadata_map(
         }
     }
     strip_fingerprint_metadata(&mut map, reader);
-    if reader == Reader::OutsideFolder {
+    if !reader.sees_delta_facts() {
         for key in DELTA_FACT_KEYS {
             map.remove(key);
         }
@@ -735,7 +748,7 @@ pub(crate) fn folder_of(key: &str) -> &str {
 }
 
 /// The metadata keys that describe how an object is stored relative to its
-/// folder: hidden from [`Reader::OutsideFolder`].
+/// folder: hidden from every reader that [`Reader::sees_delta_facts`] refuses.
 const DELTA_FACT_KEYS: [&str; 7] = [
     crate::types::meta_keys::NOTE,
     crate::types::meta_keys::REF_PATH,
@@ -770,7 +783,7 @@ pub(crate) fn write_fact_headers(
     result: &crate::types::StoreResult,
     writer: Reader,
 ) -> Vec<(&'static str, axum::http::HeaderValue)> {
-    if writer != Reader::Authenticated {
+    if !writer.sees_delta_facts() {
         return Vec::new();
     }
     let [storage_type, stored_size, ref_sha256, baseline] = WRITE_FACT_HEADERS;
@@ -821,7 +834,7 @@ fn add_storage_debug_headers(
     meta: &FileMetadata,
     reader: Reader,
 ) {
-    if !debug_headers_enabled(svc) || reader != Reader::Authenticated {
+    if !debug_headers_enabled(svc) || !reader.sees_delta_facts() {
         return;
     }
     if let Ok(value) = axum::http::HeaderValue::from_str(meta.storage_info.label()) {

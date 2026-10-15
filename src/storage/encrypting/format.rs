@@ -4,8 +4,9 @@
 //! The format itself is in `v2.rs`, the sealed metadata in `seal.rs`.
 
 /// The user-metadata key of the encryption marker. Callers above the
-/// wrapper see `v2` on an encrypted object (`seal::ENCRYPTION_MARKER_VALUE`).
-pub const ENCRYPTION_MARKER_KEY: &str = "dg-encrypted";
+/// wrapper see `v2` on an encrypted object (`seal::PRESENTED_MARKER_VALUE`);
+/// the backend stores `seal::DISK_MARKER`.
+pub const ENCRYPTION_MARKER_KEY: &str = crate::types::meta_keys::ENCRYPTED;
 
 /// The user-metadata key that names, above the wrapper, the id of the key
 /// that encrypted an object. Never stored: the wrapper derives it from the

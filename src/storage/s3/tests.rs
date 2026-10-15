@@ -2674,7 +2674,7 @@ mod sealed_shape_tests {
             refused(
                 s3.open_object("b", "p", StoredObject::Passthrough(name))
                     .await
-                    .map(|(_, m)| m),
+                    .map(|read| read.metadata),
             );
             refused(
                 s3.open_passthrough_range("b", "p", name, 0, 3)
@@ -2747,20 +2747,12 @@ mod sealed_shape_tests {
         fake.insert_object("b/p/b.bin", b"bbbbbb", &[]);
         fake.insert_object("b/p/c.bin", b"cc", &[]);
         let (a, b) = (md5_hex(b"aaaa"), md5_hex(b"bbbbbb"));
-        s3.put_listing_token("b", "p/app.zip.delta", &md5_hex(&delta_body), 333, "dTok")
-            .await
-            .unwrap();
-        s3.put_listing_token("b", "p/a.bin", &format!("\"{a}\""), 4, "aTok")
-            .await
-            .unwrap();
+        s3.write_listing_token("b", "p/app.zip.delta", &md5_hex(&delta_body), 333, "dTok");
+        s3.write_listing_token("b", "p/a.bin", &format!("\"{a}\""), 4, "aTok");
         // Another stored object at the key (the object was overwritten).
-        s3.put_listing_token("b", "p/b.bin", &b, 7, "stale")
-            .await
-            .unwrap();
+        s3.write_listing_token("b", "p/b.bin", &b, 7, "stale");
         // Too long for S3's key limit: skipped, not an error.
-        s3.put_listing_token("b", &"k".repeat(1100), &a, 4, "t")
-            .await
-            .unwrap();
+        s3.write_listing_token("b", &"k".repeat(1100), &a, 4, "t");
         s3.facts_cleanup.settle("b").await;
         let token_puts: Vec<String> = fake
             .requests()
@@ -2832,7 +2824,6 @@ mod sealed_shape_tests {
                     ResolveListed {
                         trust_v1_facts: trust,
                         caller_heads_misses: true,
-                        ..Default::default()
                     },
                 )
                 .await;

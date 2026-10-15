@@ -362,7 +362,7 @@ async fn store_marked(engine: &crate::deltaglider::DynEngine, n: usize) {
     for i in 0..n {
         let meta = std::collections::HashMap::from([(
             ENCRYPTION_MARKER_KEY.to_string(),
-            crate::storage::encrypting::ENCRYPTION_MARKER_VALUE.to_string(),
+            crate::storage::encrypting::PRESENTED_MARKER_VALUE.to_string(),
         )]);
         engine
             .store("b", &format!("k-{i:03}.txt"), b"x", None, meta)

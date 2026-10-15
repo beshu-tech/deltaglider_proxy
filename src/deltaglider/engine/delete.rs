@@ -506,11 +506,17 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // tokio::sync::Mutex is not reentrant, so resolve_metadata_with_migration
         // here would deadlock. Legacy objects that haven't been migrated yet will appear
         // as NotFound; a prior GET/HEAD on the key will have triggered migration.
-        let Some((metadata, forms)) = self
-            .resolve_stored_forms(bucket, &deltaspace_id, &obj_key.filename)
+        let Some((metadata, forms, refusal)) = self
+            .resolve_forms_to_delete(bucket, &deltaspace_id, &obj_key.filename)
             .await?
         else {
             return Ok(ConditionalDelete::Gone);
+        };
+        // A conditional delete must check the object's facts, which a
+        // refused form does not show.
+        let refused = match (refusal, still_ours) {
+            (Some(refusal), Some(_)) => return Err(EngineError::Storage(refusal)),
+            (refusal, _) => refusal.is_some(),
         };
         let (variant, sibling) = match metadata.storage_info {
             StorageInfo::Delta { .. } => (ObjectVariant::Delta, ObjectVariant::Passthrough),
@@ -620,7 +626,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         // The object is gone: the counter forgets it now, before any other
         // await, so a caller dropped later (in its reclaim) leaves no drift.
-        self.record_delete(bucket, &metadata, 0);
+        if refused {
+            self.record_unknown_change(bucket);
+        } else {
+            self.record_delete(bucket, &metadata, 0);
+        }
         self.metadata_cache.invalidate(bucket, key);
 
         // Release the per-prefix lock before cleanup so strong_count drops to 1.

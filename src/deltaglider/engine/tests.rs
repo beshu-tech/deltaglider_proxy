@@ -190,10 +190,7 @@ impl crate::storage::StorageBackend for NullInner {
         b: &str,
         p: &str,
         o: crate::storage::StoredObject<'_>,
-    ) -> Result<
-        (crate::storage::ByteStream, crate::types::FileMetadata),
-        crate::storage::StorageError,
-    > {
+    ) -> Result<crate::storage::ObjectRead, crate::storage::StorageError> {
         crate::storage::open_object_by_parts(self, b, p, o).await
     }
 
@@ -214,16 +211,6 @@ impl crate::storage::StorageBackend for NullInner {
         end: u64,
     ) -> Result<crate::storage::RangeRead, crate::storage::StorageError> {
         crate::storage::open_passthrough_range_by_parts(self, b, p, f, start, end).await
-    }
-    async fn put_listing_token(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-        _: u64,
-        _: &str,
-    ) -> Result<(), crate::storage::StorageError> {
-        Ok(())
     }
     async fn listing_tokens(
         &self,
@@ -801,8 +788,6 @@ fn list_entry_needs_head_only_for_a_facts_miss() {
     assert!(needs(ListedSize::StoredOnly));
     assert!(!needs(ListedSize::Listed));
     assert!(!needs(ListedSize::Cached));
-    // Its listed size is the ciphertext's; dg-delta-size is the plaintext.
-    assert!(needs(ListedSize::CachedEncryptedDelta));
 }
 
 /// X-ray H3: a throttle-aborted HEAD sweep returns delta STUBS (empty

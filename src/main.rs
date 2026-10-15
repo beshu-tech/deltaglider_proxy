@@ -884,6 +884,9 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .and_then(|s| s.engine.load().write_refusal(bucket))
         }));
     }
+    if deltaglider_proxy::config::env_bool("DGP_BOOT_PLAINTEXT_CHECK", true) {
+        startup::spawn_plaintext_refusal_check(&state, &config);
+    }
     if let Some(witness) = &encryption_witness {
         witness.clone().spawn_poller(
             shared_config.clone(),

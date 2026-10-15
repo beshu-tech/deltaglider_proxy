@@ -75,7 +75,7 @@ pub struct ReferenceSource {
 }
 
 enum ReferenceBody {
-    /// Bytes to write (an S3 GET body, a decrypted buffer).
+    /// Bytes to write (an S3 GET body, a stream of decrypted frames).
     Stream(ByteStream),
     /// The local file that the read opened (the filesystem backend), and
     /// its path: hardlinked while the path still names that file, else
@@ -104,7 +104,27 @@ impl ReferenceSource {
         }
     }
 
-    /// The whole body in memory (the encrypting wrapper decrypts it).
+    /// The body as a stream of at most `size + 1` bytes (a local file is
+    /// read from the file that the read opened): the encrypting wrapper
+    /// decrypts it frame by frame, so a reference of any size costs one
+    /// frame of memory, not its whole size.
+    pub fn into_stream(self) -> ByteStream {
+        use futures::StreamExt;
+        match self.content {
+            ReferenceBody::Stream(stream) => stream,
+            ReferenceBody::Local { file, .. } => {
+                let reader = tokio::io::AsyncReadExt::take(
+                    tokio::fs::File::from_std(file),
+                    self.size.saturating_add(1),
+                );
+                Box::pin(
+                    tokio_util::io::ReaderStream::new(reader).map(|r| r.map_err(StorageError::Io)),
+                )
+            }
+        }
+    }
+
+    /// The whole body in memory. For tests and small bodies only.
     pub async fn read_all(self) -> Result<Vec<u8>, StorageError> {
         use futures::TryStreamExt;
         use tokio::io::AsyncReadExt;
@@ -177,6 +197,14 @@ impl ReferenceSource {
                     file.write_all(&chunk).await?;
                 }
                 file.flush().await?;
+                // A body shorter than its declared size is an error too:
+                // the spool would otherwise hold a cut reference.
+                if written != self.size {
+                    return Err(StorageError::Other(format!(
+                        "reference body holds {written} bytes, not its declared {}",
+                        self.size
+                    )));
+                }
                 Ok(written)
             }
         }
@@ -213,6 +241,17 @@ pub struct RangeRead {
     /// The TOTAL size of the STORED object (S3: from Content-Range;
     /// filesystem: the file length), so a reader can check the stored
     /// length before the first byte without another request.
+    pub stored_total: u64,
+}
+
+/// One whole read of a stored object.
+pub struct ObjectRead {
+    /// The bytes of the object.
+    pub stream: ByteStream,
+    /// The metadata stored with the object (raw, markers included).
+    pub metadata: FileMetadata,
+    /// The size of the STORED object (S3: the Content-Length; filesystem:
+    /// the file length), so a reader can check it before the first byte.
     pub stored_total: u64,
 }
 
@@ -282,17 +321,12 @@ pub enum CopyOutcome {
 /// plaintext. The encrypting wrapper restates the source's markers when it
 /// forwards a copy, so a copy that no wrapper checked fails here.
 pub fn copy_keeps_encryption(source: &FileMetadata, metadata: &FileMetadata) -> bool {
-    use crate::storage::encrypting::{
-        seal::SEALED_KEY, ENCRYPTION_KEY_ID_KEY, ENCRYPTION_MARKER_KEY,
-    };
+    use crate::storage::encrypting::seal::SEALED_KEY;
     // The wrapper re-seals a copy for its destination (the seal binds the
     // location), so the seal VALUES differ by design: a copy must keep the
     // marker and the key id, and be sealed exactly when its source is.
-    let has = |m: &FileMetadata, k: &str| m.user_metadata.contains_key(k);
-    [ENCRYPTION_MARKER_KEY, ENCRYPTION_KEY_ID_KEY]
-        .iter()
-        .all(|k| source.user_metadata.get(*k) == metadata.user_metadata.get(*k))
-        && has(source, SEALED_KEY) == has(metadata, SEALED_KEY)
+    let has = |m: &FileMetadata| m.user_metadata.contains_key(SEALED_KEY);
+    same_at_rest_encryption(source, metadata) && has(source) == has(metadata)
 }
 
 /// Pure: do `a` and `b` name the same at-rest encryption (the same marker
@@ -614,33 +648,38 @@ pub async fn unfenced_reference_write<B: StorageBackend + ?Sized>(
 }
 
 /// `open_object` from two reads: the metadata read, then the data read. For
-/// a backend (or a test double) whose data read does not carry the
-/// metadata.
+/// a test double whose data read does not carry the metadata. The data is
+/// collected to measure its stored size.
 pub async fn open_object_by_parts<B: StorageBackend + ?Sized>(
     backend: &B,
     bucket: &str,
     prefix: &str,
     object: StoredObject<'_>,
-) -> Result<(ByteStream, FileMetadata), StorageError> {
-    let once = |data: Vec<u8>| -> ByteStream {
-        Box::pin(futures::stream::once(async move { Ok(Bytes::from(data)) }))
-    };
-    Ok(match object {
+) -> Result<ObjectRead, StorageError> {
+    use futures::TryStreamExt;
+    let (data, metadata) = match object {
         StoredObject::Reference => {
             let meta = backend.get_reference_metadata(bucket, prefix).await?;
-            (once(backend.get_reference(bucket, prefix).await?), meta)
+            (backend.get_reference(bucket, prefix).await?, meta)
         }
         StoredObject::Delta(f) => {
             let meta = backend.get_delta_metadata(bucket, prefix, f).await?;
-            (once(backend.get_delta(bucket, prefix, f).await?), meta)
+            (backend.get_delta(bucket, prefix, f).await?, meta)
         }
         StoredObject::Passthrough(f) => {
             let meta = backend.get_passthrough_metadata(bucket, prefix, f).await?;
-            (
-                backend.get_passthrough_stream(bucket, prefix, f).await?,
-                meta,
-            )
+            let chunks: Vec<Bytes> = backend
+                .get_passthrough_stream(bucket, prefix, f)
+                .await?
+                .try_collect()
+                .await?;
+            (chunks.concat(), meta)
         }
+    };
+    Ok(ObjectRead {
+        stored_total: data.len() as u64,
+        stream: Box::pin(futures::stream::once(async move { Ok(Bytes::from(data)) })),
+        metadata,
     })
 }
 
@@ -1167,7 +1206,7 @@ pub trait StorageBackend: Send + Sync {
         bucket: &str,
         prefix: &str,
         object: StoredObject<'_>,
-    ) -> impl Future<Output = Result<(ByteStream, FileMetadata), StorageError>> + Send;
+    ) -> impl Future<Output = Result<ObjectRead, StorageError>> + Send;
 
     /// A byte range of a passthrough object and the metadata stored with
     /// it, from ONE read where the backend can (S3: the ranged GET, whose
@@ -1569,31 +1608,15 @@ pub trait StorageBackend: Send + Sync {
         }
     }
 
-    /// Keep the opaque listing `token` of the stored object `stored_key`
-    /// (with that stored ETag and size), so a LIST on any node can read it
-    /// back ([`Self::listing_tokens`]). Only the encrypting wrapper computes
-    /// tokens; a backend stores them unread. S3: a `!!2` marker in the
-    /// listing-facts namespace, written in the background like the facts,
-    /// replacing the older tokens of the key; skipped when the marker key
-    /// would pass S3's key limit. Filesystem: a no-op (its listing reads the
-    /// metadata). No default: a wrapper must forward it.
-    fn put_listing_token(
-        &self,
-        bucket: &str,
-        stored_key: &str,
-        stored_etag: &str,
-        stored_size: u64,
-        token: &str,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send;
-
     /// Per listed entry (lite metadata as a listing returns it: `file_size`
     /// and `md5` are the STORED size and ETag), the listing token kept for
     /// exactly that stored object (same stored ETag and size), with the
     /// stored key, ETag and size it was kept for (the AD of the token), or
     /// `None`.
     /// Two tokens that disagree are `None`. S3: the same one scan of the
-    /// facts namespace that resolves `!!1` facts. Filesystem: all `None`.
-    /// No default: a wrapper must forward it.
+    /// facts namespace that resolves `!!1` facts; the tokens themselves are
+    /// written with the object (`FileMetadata::listing_token`). Filesystem:
+    /// all `None`. No default: a wrapper must forward it.
     fn listing_tokens(
         &self,
         bucket: &str,
