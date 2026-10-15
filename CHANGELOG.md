@@ -2,9 +2,12 @@
 
 ## Unreleased
 
-### Fixed — DeleteBucket on a non-empty backend bucket answers 409
+### Fixed — DeleteBucket on a versioned backend bucket
 
-When the backend refused DeleteBucket with `BucketNotEmpty`, the proxy answered `500 InternalError`. It now answers `409 BucketNotEmpty`. A Backblaze B2 bucket keeps every old version of a deleted object, so it can refuse DeleteBucket when a listing through the proxy shows no objects.
+A versioned backend bucket keeps the old versions and the delete markers of every deleted object. A Backblaze B2 bucket is always versioned. Clients of the proxy cannot see or delete these versions, so the backend refused DeleteBucket with `BucketNotEmpty`, and the proxy answered `500 InternalError`.
+
+- When the bucket has no current object, DeleteBucket now deletes its old versions and then its delete markers, and deletes the bucket. It deletes at most 100 listing pages of each.
+- A `BucketNotEmpty` from the backend is now `409 BucketNotEmpty`, not a 500.
 
 ## v2.0.14 — 2026-10-15
 

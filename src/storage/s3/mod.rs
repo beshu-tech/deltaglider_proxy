@@ -32,6 +32,7 @@ mod objects;
 #[cfg(test)]
 mod tests;
 mod timing;
+mod versions;
 #[cfg(test)]
 pub(crate) use tests::test_support;
 
@@ -448,12 +449,22 @@ impl StorageBackend for S3Backend {
         // purge, so wait for it first.
         self.facts_cleanup.settle(bucket).await;
         self.purge_listing_facts_if_only_ones(bucket).await?;
-        self.client
-            .delete_bucket()
-            .bucket(bucket)
-            .send()
-            .await
-            .map_err(|e| self.classify(bucket, &e, S3Op::Other("delete_bucket")))?;
+        let delete = || async {
+            self.client
+                .delete_bucket()
+                .bucket(bucket)
+                .send()
+                .await
+                .map(drop)
+                .map_err(|e| self.classify(bucket, &e, S3Op::Other("delete_bucket")))
+        };
+        match delete().await {
+            // A versioned bucket that lists empty still holds old versions.
+            Err(StorageError::BucketNotEmpty(_)) if self.purge_old_versions(bucket).await? => {
+                delete().await?
+            }
+            other => other?,
+        }
         debug!("Deleted S3 bucket: {}", bucket);
         Ok(())
     }

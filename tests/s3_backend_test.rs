@@ -1132,3 +1132,83 @@ async fn delete_bucket_reclaims_an_orphan_reference() {
         "the bucket is still on MinIO"
     );
 }
+
+/// A versioned backend bucket (Backblaze B2 always is) keeps the old
+/// versions and the delete markers of every deleted object. A client of the
+/// proxy cannot see or delete them, so DeleteBucket of a bucket that lists
+/// empty must remove them. A bucket with a current object stays refused.
+#[tokio::test]
+async fn delete_bucket_removes_old_versions_of_a_versioned_bucket() {
+    skip_unless_minio!();
+    let bucket = review3_bucket("versioned").await;
+    let raw = minio_client().await;
+    raw.put_bucket_versioning()
+        .bucket(&bucket)
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .expect("enable versioning");
+    let server = TestServer::builder()
+        .s3_endpoint(&common::minio_endpoint_url())
+        .bucket(&bucket)
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    for key in ["a.jpg", "b.jpg"] {
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from(generate_binary(10_000, 3)))
+            .send()
+            .await
+            .unwrap();
+    }
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key("a.jpg")
+        .send()
+        .await
+        .unwrap();
+
+    let refused = client.delete_bucket().bucket(&bucket).send().await;
+    let err = refused.expect_err("b.jpg is a current object");
+    assert_eq!(
+        err.raw_response().map(|r| r.status().as_u16()),
+        Some(409),
+        "{err:?}"
+    );
+    let versions = raw
+        .list_object_versions()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        versions.versions().iter().any(|v| v.key() == Some("a.jpg")),
+        "a refused DeleteBucket removes nothing"
+    );
+
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key("b.jpg")
+        .send()
+        .await
+        .unwrap();
+    client
+        .delete_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("DeleteBucket of a versioned bucket that lists empty");
+    assert!(
+        raw.head_bucket().bucket(&bucket).send().await.is_err(),
+        "the bucket is still on MinIO"
+    );
+}
