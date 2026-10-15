@@ -108,9 +108,11 @@ test('backend: one job line per bucket; confirm calls the handler, cancel does n
   await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
   expect(onRefuse).not.toHaveBeenCalled();
 
-  await user.click(screen.getByRole('button', { name: BUTTON }));
+  // The closing dialog keeps the page aria-hidden for a moment: wait for
+  // the button to be reachable again instead of reading it at once.
+  await user.click(await screen.findByRole('button', { name: BUTTON }));
   dialog = await screen.findByRole('dialog');
-  await user.click(within(dialog).getByRole('button', { name: BUTTON }));
+  await user.click(await within(dialog).findByRole('button', { name: BUTTON }));
   await waitFor(() => expect(onRefuse).toHaveBeenCalledTimes(1));
 });
 
