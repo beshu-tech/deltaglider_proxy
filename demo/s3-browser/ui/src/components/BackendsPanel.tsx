@@ -4,7 +4,7 @@ import { CAPABILITY_DOC_URL } from '../linkifyDocUrl';
 import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
 import { Button, Input, Radio, Switch, Typography, Space, Alert, Spin, message } from 'antd';
-import { PlusOutlined, DeleteOutlined, DatabaseOutlined, CloudOutlined, CheckCircleOutlined, ApiOutlined } from '@ant-design/icons';
+import { PlusOutlined, DeleteOutlined, DatabaseOutlined, CheckCircleOutlined, ApiOutlined } from '@ant-design/icons';
 import type { BackendEncryptionMode, BackendHealthEntry, BackendInfo, ConfirmHeaders, CreateBackendRequest } from '../adminApi';
 import { confirmDialog } from '../confirmDialog';
 import { createBackend, deleteBackend, probeBackend, testS3Connection, updateAdminConfig, getSectionVersioned } from '../adminApi';
@@ -12,7 +12,8 @@ import { applySection, persistFailureText, sectionApplyErrorText } from '../appl
 import { useAdminConfig } from '../queries/config';
 import { useBackends, useBucketOrigins } from '../queries/backends';
 import CreateBucketModal from './CreateBucketModal';
-import { backendSummary } from '../backendSummary';
+import { backendFacts, backendKind } from '../backendSummary';
+import BackendCard, { type BackendPill } from './BackendCard';
 import ReencryptProposalModal from './ReencryptProposalModal';
 import {
   backendBucketCountText,
@@ -51,34 +52,30 @@ function healthLabel(h: BackendHealthEntry): string {
   }
 }
 
-/** Colored status dot + short label for the backend row header. */
-function HealthBadge({ h, colors }: { h: BackendHealthEntry; colors: ReturnType<typeof useColors> }) {
-  const ok = h.status === 'healthy';
-  const color = ok ? colors.ACCENT_GREEN : h.status === 'auth-rejected' ? colors.ACCENT_RED : colors.ACCENT_AMBER;
-  const short = ok
-    ? 'Connected'
-    : h.status === 'auth-rejected'
-      ? 'CREDENTIALS REJECTED'
-      : h.status === 'unreachable'
-        ? 'UNREACHABLE'
-        : 'ERRORING';
-  return (
-    <span
-      title={`${healthLabel(h)} · probed ${new Date(h.probed_at * 1000).toLocaleString()}`}
-      style={{
-        display: 'inline-flex',
-        alignItems: 'center',
-        gap: 5,
-        marginLeft: 8,
-        fontSize: 10,
-        fontWeight: 600,
-        color,
-      }}
-    >
-      <span style={{ width: 7, height: 7, borderRadius: '50%', background: color, flexShrink: 0 }} />
-      {short}
-    </span>
-  );
+/** The status pills after a backend's name: default, legacy singleton, health. */
+function backendPills(b: BackendInfo, isDefault: boolean, colors: ReturnType<typeof useColors>): BackendPill[] {
+  const pills: BackendPill[] = [];
+  if (isDefault) {
+    pills.push({ label: 'Default', color: colors.ACCENT_BLUE, title: 'Buckets without a backend of their own are created here.' });
+  }
+  if (b.is_synthesized) {
+    pills.push({
+      label: 'Legacy singleton',
+      color: colors.ACCENT_AMBER,
+      title: 'This entry stands for the single backend defined under storage.backend in YAML. It is not a named backend, so you cannot delete it. Add a named backend to migrate.',
+    });
+  }
+  const h = b.health;
+  if (h) {
+    const ok = h.status === 'healthy';
+    pills.push({
+      label: ok ? 'Connected' : h.status === 'auth-rejected' ? 'Credentials rejected' : h.status === 'unreachable' ? 'Unreachable' : 'Erroring',
+      color: ok ? colors.ACCENT_GREEN : h.status === 'auth-rejected' ? colors.ACCENT_RED : colors.ACCENT_AMBER,
+      dot: true,
+      title: `${healthLabel(h)} · probed ${new Date(h.probed_at * 1000).toLocaleString()}`,
+    });
+  }
+  return pills;
 }
 
 interface Props {
@@ -461,76 +458,49 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
           />
 
           {backends.map((b) => (
-            <div key={b.name} data-backend-card={b.name} style={{
-              marginTop: 12, padding: '12px 14px',
-              border: `1px solid ${b.name === defaultBackend ? colors.ACCENT_BLUE + '66' : colors.BORDER}`,
-              borderRadius: 8,
-              background: b.name === defaultBackend ? colors.ACCENT_BLUE + '08' : colors.BG_ELEVATED,
-            }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', rowGap: 8 }}>
-                {b.backend_type === 'filesystem'
-                  ? <DatabaseOutlined style={{ fontSize: 16, color: colors.ACCENT_BLUE }} />
-                  : <CloudOutlined style={{ fontSize: 16, color: colors.ACCENT_BLUE }} />}
-                <div style={{ flex: '1 1 180px', minWidth: 0 }}>
-                  <Text strong style={{ fontFamily: 'var(--font-ui)', fontSize: 14 }}>{b.name}</Text>
-                  {b.name === defaultBackend && (
-                    <span style={{ fontSize: 10, color: colors.ACCENT_BLUE, marginLeft: 8, fontWeight: 600 }}>DEFAULT</span>
-                  )}
-                  {b.is_synthesized && (
-                    <span
-                      style={{ fontSize: 10, color: colors.ACCENT_AMBER, marginLeft: 8, fontWeight: 600 }}
-                      title="This entry stands for the single backend defined under storage.backend in YAML. It is not a named backend, so you cannot delete it. Add a named backend to migrate."
-                    >
-                      LEGACY SINGLETON
-                    </span>
-                  )}
-                  {b.health && <HealthBadge h={b.health} colors={colors} />}
-                  <div style={{ fontSize: 12, color: colors.TEXT_MUTED, fontFamily: 'var(--font-mono)', overflowWrap: 'anywhere' }}>
-                    {backendSummary(b)}
-                  </div>
-                  {b.is_synthesized && singletonEnv && (
-                    <div data-testid="backend-env-note" style={{ fontSize: 12, color: colors.TEXT_MUTED, marginTop: 2 }}>
-                      {envOverrideHelp(singletonEnv).replace('this value', 'this backend')}
-                    </div>
-                  )}
-                  <div style={{ fontSize: 11, color: colors.TEXT_MUTED, marginTop: 2 }}>
-                    {(() => {
-                      const n = countByBackend[b.name] ?? 0;
-                      return n === 0
-                        ? "No buckets routed here yet — use 'Create bucket here' to add one."
-                        : `${n} bucket${n === 1 ? '' : 's'} routed here`;
-                    })()}
-                  </div>
-                  {backendBucketCountText(encryptionCounts[b.name]) && (
-                    <div
-                      data-testid="backend-encryption-counts"
-                      style={{ fontSize: 11, color: colors.TEXT_MUTED, marginTop: 2 }}
-                      title="Encryption: buckets without their own encryption block use this backend's setting; a bucket with its own block overrides it."
-                    >
-                      Encryption: {backendBucketCountText(encryptionCounts[b.name])}
-                    </div>
-                  )}
-                </div>
-                <Button
-                  size="small"
-                  icon={<PlusOutlined />}
-                  onClick={() => setCreateBucketBackend(b.name)}
-                  title="Create a bucket on this backend"
-                >
-                  Create bucket here
-                </Button>
-                <Button
-                  size="small"
-                  icon={<ApiOutlined />}
-                  loading={testingBackend === b.name}
-                  onClick={() => handleTestConnection(b)}
-                  title="Live server-side probe of this backend's connectivity + credentials"
-                >
-                  Test connection
-                </Button>
-                {/* Remove sits in a "⋯" menu, not as a red icon on every card:
-                    a destructive action should take a deliberate second step. */}
-                {!b.is_synthesized && (
+            <BackendCard
+              key={b.name}
+              name={b.name}
+              filesystem={b.backend_type === 'filesystem'}
+              kind={backendKind(b)}
+              highlighted={b.name === defaultBackend}
+              pills={backendPills(b, b.name === defaultBackend, colors)}
+              facts={[
+                ...backendFacts(b),
+                {
+                  label: 'Buckets',
+                  value: (() => {
+                    const n = countByBackend[b.name] ?? 0;
+                    return n === 0 ? "None yet. Use 'Create bucket here' to add one." : `${n} routed here`;
+                  })(),
+                  mono: false,
+                },
+              ]}
+              actions={
+                <>
+                  <Button
+                    size="small"
+                    icon={<ApiOutlined />}
+                    loading={testingBackend === b.name}
+                    onClick={() => handleTestConnection(b)}
+                    title="Live server-side probe of this backend's connectivity + credentials"
+                  >
+                    Test connection
+                  </Button>
+                  <Button
+                    size="small"
+                    icon={<PlusOutlined />}
+                    onClick={() => setCreateBucketBackend(b.name)}
+                    title="Create a bucket on this backend"
+                  >
+                    Create bucket here
+                  </Button>
+                </>
+              }
+              // Remove sits in a "⋯" menu, not as a red icon on every card:
+              // a destructive action should take a deliberate second step.
+              menu={
+                !b.is_synthesized && (
                   <RowActionsMenu
                     label={`More actions for backend ${b.name}`}
                     actions={[
@@ -544,8 +514,14 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                       },
                     ]}
                   />
-                )}
-              </div>
+                )
+              }
+            >
+              {b.is_synthesized && singletonEnv && (
+                <div data-testid="backend-env-note" style={{ fontSize: 12, color: colors.TEXT_MUTED, marginTop: 8 }}>
+                  {envOverrideHelp(singletonEnv).replace('this value', 'this backend')}
+                </div>
+              )}
               {testResult?.name === b.name && (
                 <Alert type={testResult.ok ? 'success' : 'error'} title={testResult.message} showIcon style={{ marginTop: 8, borderRadius: 6 }} />
               )}
@@ -622,8 +598,9 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 onApply={(patch) => handleEncryptionApply(b.name, b.encryption.mode, patch)}
                 onClearLegacy={() => handleClearLegacy(b.name)}
                 readOnly={!!encryptionEnv(b)}
+                usage={backendBucketCountText(encryptionCounts[b.name])}
               />
-            </div>
+            </BackendCard>
           ))}
 
           {!showForm && (

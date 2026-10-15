@@ -374,12 +374,12 @@ export function backendBucketCounts(
   return out;
 }
 
-/** "Default for 3 buckets · 1 bucket overrides". */
+/** "Applies to 3 buckets · 1 bucket has its own setting". */
 export function backendBucketCountText(c: { inherit: number; override: number } | undefined): string | null {
   if (!c || (c.inherit === 0 && c.override === 0)) return null;
   const n = (k: number, one: string, many: string) => `${k} ${k === 1 ? one : many}`;
-  const parts = [`Default for ${n(c.inherit, 'bucket', 'buckets')}`];
-  if (c.override > 0) parts.push(`${n(c.override, 'bucket overrides', 'buckets override')}`);
+  const parts = [`Applies to ${n(c.inherit, 'bucket', 'buckets')}`];
+  if (c.override > 0) parts.push(`${n(c.override, 'bucket has', 'buckets have')} its own setting`);
   return parts.join(' · ');
 }
 

@@ -66,7 +66,7 @@ afterEach(() => vi.unstubAllGlobals());
 test('the card counts the buckets that inherit and the buckets that override', async () => {
   renderWithQuery(<BackendsPanel />);
   expect(await screen.findByTestId('backend-encryption-counts')).toHaveTextContent(
-    'Encryption: Default for 2 buckets · 1 bucket overrides',
+    'Applies to 2 buckets · 1 bucket has its own setting',
   );
 });
 

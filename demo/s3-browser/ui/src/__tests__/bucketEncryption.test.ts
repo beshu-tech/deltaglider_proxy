@@ -211,7 +211,7 @@ test('backend card counts', () => {
     { effective_encryption: null },
   ]);
   expect(c).toEqual({ 'hetzner-fsn1': { inherit: 2, override: 1 }, 'local-disk': { inherit: 1, override: 0 } });
-  expect(backendBucketCountText(c['hetzner-fsn1'])).toBe('Default for 2 buckets · 1 bucket overrides');
-  expect(backendBucketCountText(c['local-disk'])).toBe('Default for 1 bucket');
+  expect(backendBucketCountText(c['hetzner-fsn1'])).toBe('Applies to 2 buckets · 1 bucket has its own setting');
+  expect(backendBucketCountText(c['local-disk'])).toBe('Applies to 1 bucket');
   expect(backendBucketCountText(undefined)).toBeNull();
 });

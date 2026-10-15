@@ -4,7 +4,7 @@ This guide shows you how to turn on at-rest encryption on a storage backend. The
 
 ## 1. Choose where the encryption goes
 
-- **On the backend** (this guide): every bucket on the backend that has no block of its own is encrypted. The Backends page shows, on each backend card, how many buckets take its setting and how many set their own, for example "Encryption: Default for 2 buckets · 1 bucket overrides".
+- **On the backend** (this guide): every bucket on the backend that has no block of its own is encrypted. The Backends page shows, on each backend card, how many buckets take its setting and how many set their own, for example "Applies to 2 buckets · 1 bucket has its own setting".
 - **On one bucket** ([How to encrypt one bucket on a shared backend](encrypt-one-bucket-on-a-shared-backend.md)): only that bucket is encrypted, with a key that only it uses. Choose this when one storage account holds both data that must be encrypted and data that must stay plaintext, for example a replication target that an external reader expects in plaintext.
 
 The bucket list on **Storage → Buckets** shows where each bucket's encryption comes from: **Encrypted · from hetzner-fsn1** for a bucket that takes the backend's encryption, and **Encrypted · bucket key db-archive-2026-10** for a bucket with its own key.

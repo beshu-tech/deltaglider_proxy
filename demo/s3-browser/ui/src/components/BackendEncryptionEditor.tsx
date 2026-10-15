@@ -76,9 +76,12 @@ interface Props {
    * still needs the key. Resolves on success.
    */
   onClearLegacy?: () => Promise<void>;
+  /** Which buckets take this setting (`backendBucketCountText`); shown
+   *  under the status line. */
+  usage?: string | null;
 }
 
-export default function BackendEncryptionEditor({ backendName, current, onApply, readOnly, onClearLegacy }: Props) {
+export default function BackendEncryptionEditor({ backendName, current, onApply, readOnly, onClearLegacy, usage }: Props) {
   const uid = useId();
   const colors = useColors();
   const { cardStyle, inputRadius } = useCardStyles();
@@ -215,6 +218,7 @@ export default function BackendEncryptionEditor({ backendName, current, onApply,
       style={{
         ...cardStyle,
         marginTop: 8,
+        marginBottom: 0,
         padding: '10px 12px',
         background: colors.BG_ELEVATED,
       }}
@@ -222,9 +226,21 @@ export default function BackendEncryptionEditor({ backendName, current, onApply,
       {/* Wraps on narrow screens: the Select drops below the label instead
           of squeezing the label to one letter per line. */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-          <LockOutlined style={{ fontSize: 14, color: tone }} />
-          {statusLine}
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, minWidth: 0 }}>
+          <LockOutlined style={{ fontSize: 14, color: tone, marginTop: 4 }} />
+          <div style={{ minWidth: 0 }}>
+            {statusLine}
+            {usage && (
+              <Text
+                type="secondary"
+                data-testid="backend-encryption-counts"
+                style={{ display: 'block', fontSize: 12 }}
+                title="A bucket without an encryption setting of its own takes this backend's setting."
+              >
+                {usage}
+              </Text>
+            )}
+          </div>
         </div>
         {!pending && !readOnly && (
           <Space wrap>

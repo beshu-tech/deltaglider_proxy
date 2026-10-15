@@ -1003,3 +1003,87 @@ body {
 [data-theme="dark"] .ant-tag.ant-tag-purple {
   color: #c4b5fd !important;
 }
+
+/* ───── Backend card (BackendCard.tsx): follows its OWN width ─────
+ *
+ * Wide: icon | name + pills + kind | buttons | "⋯" on one row, facts as a
+ * label/value list. Narrow: the buttons take their own row and share it
+ * evenly; the "⋯" menu stays in the top-right corner at every width.
+ */
+.dg-backend-card {
+  container-type: inline-size;
+}
+.dg-backend-card__head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  grid-template-areas: "icon title actions menu";
+  align-items: start;
+  column-gap: 12px;
+  row-gap: 12px;
+}
+.dg-backend-card__icon { grid-area: icon; }
+.dg-backend-card__title { grid-area: title; }
+.dg-backend-card__actions {
+  grid-area: actions;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.dg-backend-card__menu { grid-area: menu; }
+.dg-backend-card__menu:empty { display: none; }
+.dg-backend-card__rule {
+  margin-top: 12px;
+}
+/* Below the header everything starts at the title's left edge (icon 32 px
+   + gap 12 px), so the name, the facts and the encryption row share one
+   column. */
+.dg-backend-card__body {
+  margin-left: 44px;
+  padding-top: 12px;
+}
+.dg-backend-card__facts {
+  display: grid;
+  /* One label width for every card: the values of all cards line up. */
+  grid-template-columns: 6.5rem minmax(0, 1fr);
+  column-gap: 12px;
+  row-gap: 4px;
+  margin: 0;
+}
+.dg-backend-card__fact {
+  display: contents;
+}
+.dg-backend-card__facts dt {
+  font-size: 12px;
+  line-height: 20px;
+}
+.dg-backend-card__facts dd {
+  margin: 0;
+  line-height: 20px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+@container (max-width: 720px) {
+  .dg-backend-card__head {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas:
+      "icon title menu"
+      "actions actions actions";
+  }
+  .dg-backend-card__actions {
+    justify-content: stretch;
+  }
+  .dg-backend-card__actions > .ant-btn {
+    flex: 1 1 160px;
+  }
+  .dg-backend-card__body {
+    margin-left: 0;
+  }
+}
+@container (max-width: 360px) {
+  .dg-backend-card__facts {
+    grid-template-columns: 5.5rem minmax(0, 1fr);
+    column-gap: 8px;
+  }
+}
