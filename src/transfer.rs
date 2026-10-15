@@ -2976,7 +2976,7 @@ mod multipart_abort_tests {
             &self,
             _: &str,
             objects: &[(String, crate::types::FileMetadata)],
-        ) -> Vec<Option<String>> {
+        ) -> Vec<Option<crate::storage::ListedToken>> {
             vec![None; objects.len()]
         }
         async fn get_passthrough_stream(
@@ -3277,7 +3277,7 @@ mod multipart_abort_tests {
             &self,
             b: &str,
             objects: &[(String, crate::types::FileMetadata)],
-        ) -> Vec<Option<String>> {
+        ) -> Vec<Option<crate::storage::ListedToken>> {
             self.0.listing_tokens(b, objects).await
         }
         async fn get_passthrough_stream(

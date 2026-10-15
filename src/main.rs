@@ -174,6 +174,11 @@ enum ConfigCommand {
         /// does not name. Repeat for several subjects.
         #[arg(long = "confirm-encryption-downgrade", value_name = "SUBJECT")]
         confirm_encryption_downgrade: Vec<String>,
+        /// Confirm that a subject which starts to encrypt may refuse the
+        /// plaintext objects it holds (`plaintext_reads: refuse`): a bucket
+        /// name, or `backend:<name>`. Repeat for several subjects.
+        #[arg(long = "confirm-plaintext-refusal", value_name = "SUBJECT")]
+        confirm_plaintext_refusal: Vec<String>,
     },
     /// Validate a config file without applying or hitting a server.
     ///
@@ -274,6 +279,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     timeout,
                     confirm_key_removal,
                     confirm_encryption_downgrade,
+                    confirm_plaintext_refusal,
                 } => {
                     let mut opts = AdminClientOpts::default();
                     if let Some(s) = server.as_deref() {
@@ -285,6 +291,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let confirm = deltaglider_proxy::cli::config::ApplyConfirmations {
                         key_removal: confirm_key_removal.clone(),
                         encryption_downgrade: confirm_encryption_downgrade.clone(),
+                        plaintext_refusal: confirm_plaintext_refusal.clone(),
                     };
                     apply(file, opts, &confirm)
                 }

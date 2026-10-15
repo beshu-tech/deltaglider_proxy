@@ -50,9 +50,27 @@ impl S3Backend {
         if key.rsplit('/').next() == Some("reference.bin") {
             return;
         }
-        // A sealed object has no facts in clear: the wrapper writes its
-        // listing token (`put_listing_token`) instead.
+        // A sealed object has no facts in clear: its listing token, made by
+        // the encrypting wrapper's maker now that the stored ETag and size
+        // are known, takes their place.
         let Some(facts) = LogicalFacts::of(meta) else {
+            if let Some(token) = meta.listing_token.token(key, stored_etag, stored_size) {
+                crate::storage::list_size_cache::record_token(
+                    &StoredObjectId {
+                        scope: &self.list_cache_scope,
+                        bucket,
+                        key,
+                        etag: stored_etag,
+                        size: stored_size,
+                    },
+                    &token,
+                );
+                if let Some(marker) =
+                    listing_facts::token_key(key, stored_etag, stored_size, &token)
+                {
+                    self.facts_cleanup.write(bucket, key, marker);
+                }
+            }
             return;
         };
         let Some(facts_key) = listing_facts::facts_key(key, stored_etag, stored_size, &facts)
@@ -210,18 +228,45 @@ impl S3Backend {
         &self,
         bucket: &str,
         objects: &[(String, FileMetadata)],
-    ) -> Vec<Option<String>> {
+    ) -> Vec<Option<crate::storage::ListedToken>> {
         let stored: Vec<Option<String>> = objects
             .iter()
             .map(|(key, meta)| listed_stored_key(key, meta))
             .collect();
-        let markers = self
-            .read_markers(bucket, stored.iter().flatten().map(String::as_str))
-            .await;
-        stored
+        // The tokens this process made (a LIST right after a PUT) need no
+        // marker read.
+        let local: Vec<Option<String>> = stored
             .iter()
             .zip(objects)
             .map(|(stored_key, (_, meta))| {
+                crate::storage::list_size_cache::lookup_token(&StoredObjectId {
+                    scope: &self.list_cache_scope,
+                    bucket,
+                    key: stored_key.as_deref()?,
+                    etag: &meta.md5,
+                    size: meta.stored_size(),
+                })
+            })
+            .collect();
+        let unresolved = stored
+            .iter()
+            .zip(&local)
+            .filter(|(_, l)| l.is_none())
+            .filter_map(|(s, _)| s.as_deref());
+        let markers = self.read_markers(bucket, unresolved).await;
+        stored
+            .iter()
+            .zip(objects)
+            .zip(local)
+            .map(|((stored_key, (_, meta)), local)| {
+                if let Some(token) = local {
+                    return Some(crate::storage::ListedToken {
+                        token,
+                        stored_key: stored_key.clone()?,
+                        stored_etag: meta.md5.clone(),
+                        stored_size: meta.stored_size(),
+                    });
+                }
                 let tokens = markers
                     .get(stored_key.as_ref()?)?
                     .iter()
@@ -229,7 +274,13 @@ impl S3Backend {
                         listing_facts::Marker::Token(t) => Some(t),
                         listing_facts::Marker::Facts(_) => None,
                     });
-                listing_facts::token_for(tokens, &meta.md5, meta.stored_size())
+                let token = listing_facts::token_for(tokens, &meta.md5, meta.stored_size())?;
+                Some(crate::storage::ListedToken {
+                    token,
+                    stored_key: stored_key.clone()?,
+                    stored_etag: meta.md5.clone(),
+                    stored_size: meta.stored_size(),
+                })
             })
             .collect()
     }

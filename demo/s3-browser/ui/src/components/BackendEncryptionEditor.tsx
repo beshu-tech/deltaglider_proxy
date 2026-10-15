@@ -51,6 +51,7 @@ export interface BackendEncryptionPatch {
   bucket_key_enabled?: boolean;
   legacy_key?: string | null;
   legacy_key_id?: string | null;
+  plaintext_reads?: 'serve' | 'refuse';
 }
 
 interface Props {
@@ -76,12 +77,22 @@ interface Props {
    * still needs the key. Resolves on success.
    */
   onClearLegacy?: () => Promise<void>;
+  /** Stop serving unencrypted objects (`plaintext_reads: refuse`). */
+  onRefusePlaintext?: () => Promise<void>;
   /** Which buckets take this setting (`backendBucketCountText`); shown
    *  under the status line. */
   usage?: string | null;
 }
 
-export default function BackendEncryptionEditor({ backendName, current, onApply, readOnly, onClearLegacy, usage }: Props) {
+export default function BackendEncryptionEditor({
+  backendName,
+  current,
+  onApply,
+  readOnly,
+  onClearLegacy,
+  onRefusePlaintext,
+  usage,
+}: Props) {
   const uid = useId();
   const colors = useColors();
   const { cardStyle, inputRadius } = useCardStyles();
@@ -278,6 +289,23 @@ export default function BackendEncryptionEditor({ backendName, current, onApply,
         <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 6 }}>
           {keyChangeBlockedReason}
         </Text>
+      )}
+      {current.serves_plaintext && !pending && (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginTop: 8, borderRadius: 6, fontSize: 12 }}
+          title="Unencrypted objects are served"
+          description="The backend encrypts new writes, and it also serves objects that are not encrypted, so that the history of its buckets stays readable until a re-encrypt job converts it. When the job has finished, refuse unencrypted objects: then nobody can put one directly on the storage and have the proxy serve it."
+          action={
+            onRefusePlaintext &&
+            !readOnly && (
+              <Button size="small" onClick={() => void onRefusePlaintext()}>
+                Refuse unencrypted objects
+              </Button>
+            )
+          }
+        />
       )}
       {current.shim_active && !pending && (
         <LegacyKeyBanner backendName={backendName} readOnly={readOnly} onClearLegacy={onClearLegacy} />

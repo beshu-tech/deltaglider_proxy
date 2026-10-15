@@ -45,6 +45,10 @@ export interface EffectiveEncryption {
   key_env?: string;
   /** New writes are stored encrypted. */
   encrypts: boolean;
+  /** Proxy mode with `plaintext_reads: serve`: reads also serve objects
+   *  that are not encrypted (the history of a bucket that started to
+   *  encrypt). Absent on an older server. */
+  serves_plaintext?: boolean;
   /** A re-encrypt job can change objects of this bucket. */
   reencrypt: boolean;
   /** The config fixes the bucket's backend; an edit that adds the bucket's

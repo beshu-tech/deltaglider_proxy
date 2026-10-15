@@ -321,7 +321,8 @@ async fn encrypted_at_rest(ps: &ProdShape) {
         );
     }
     // Issue #116: `reenc-demo` has its own key; its neighbours use the
-    // backend's (derived) key id.
+    // backend's key. At rest the seal names a key by its fingerprint only
+    // (format v2, issue #120); the keys are the fixture's.
     let stamp = |bucket: &str| {
         let path = ps
             .local_disk
@@ -331,15 +332,15 @@ async fn encrypted_at_rest(ps: &ProdShape) {
             .unwrap()
             .unwrap_or_else(|| panic!("{}: no metadata", path.display()));
         let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-        v["user_metadata"]["dg-encryption-key-id"]
-            .as_str()
-            .map(str::to_string)
+        common::sealed_fp_label(v["user_metadata"]["dg-sealed"].as_str())
     };
-    assert_eq!(stamp("reenc-demo").as_deref(), Some("reenc-demo-2026"));
-    let neighbour = stamp("db-archive");
-    assert!(
-        neighbour.is_some() && neighbour.as_deref() != Some("reenc-demo-2026"),
-        "db-archive uses the backend key: {neighbour:?}"
+    const BUCKET_KEY: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const BACKEND_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    assert_eq!(stamp("reenc-demo"), Some(common::key_fp_label(BUCKET_KEY)));
+    assert_eq!(
+        stamp("db-archive"),
+        Some(common::key_fp_label(BACKEND_KEY)),
+        "db-archive uses the backend key"
     );
     assert_eq!(
         get_bytes(

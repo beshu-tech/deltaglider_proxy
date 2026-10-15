@@ -252,7 +252,17 @@ pub(super) async fn run(
                 &p.new_cfg,
                 &super::transition::confirmed_key_removals(write.headers),
                 Some(&crate::config::confirmed_downgrades(write.headers)),
-                &super::transition::absent_buckets(&state.s3_state, &old).await,
+                &{
+                    let mut absent = super::transition::absent_buckets(&state.s3_state, &old).await;
+                    absent.extend(
+                        super::transition::absent_buckets(&state.s3_state, &p.new_cfg).await,
+                    );
+                    absent
+                },
+                Some(&crate::config::confirmed_subjects(
+                    write.headers,
+                    crate::config::CONFIRM_PLAINTEXT_REFUSAL_HEADER,
+                )),
             ) {
                 // What the apply would refuse, a validate refuses too.
                 Err(error) => Outcome::Rejected(Rejection {

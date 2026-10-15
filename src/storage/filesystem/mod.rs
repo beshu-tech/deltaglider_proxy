@@ -1817,7 +1817,7 @@ impl StorageBackend for FilesystemBackend {
         &self,
         _bucket: &str,
         objects: &[(String, FileMetadata)],
-    ) -> Vec<Option<String>> {
+    ) -> Vec<Option<crate::storage::ListedToken>> {
         vec![None; objects.len()]
     }
 

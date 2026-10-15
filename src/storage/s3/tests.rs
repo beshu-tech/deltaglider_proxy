@@ -2778,7 +2778,7 @@ mod sealed_shape_tests {
         let by_key: HashMap<&str, Option<&str>> = objects
             .iter()
             .zip(&tokens)
-            .map(|((k, _), t)| (k.as_str(), t.as_deref()))
+            .map(|((k, _), t)| (k.as_str(), t.as_ref().map(|t| t.token.as_str())))
             .collect();
         assert_eq!(
             by_key,

@@ -795,11 +795,9 @@ async fn run_range(
 /// P3.7: a ranged GET of a passthrough object (no If-Range, no
 /// conditionals) sends the ranged GET and the `.delta` HEAD in parallel:
 /// the metadata comes from the ranged response. Was HEAD x2 + ranged GET.
-/// Behind a wrapper with a key the photo is v1 (single-shot) encrypted:
-/// the wrapper's first ranged GET gives the metadata and the start of the
-/// body, with no HEAD (P3.5), and one more GET reads the rest of the body
-/// unless the first one held it all: 4 -> 3 requests, or 2.
-/// (`encrypted_ranges_send_no_metadata_head` covers the chunked format.)
+/// Behind a wrapper with a key the photo is v2 encrypted: the frame
+/// offsets of a range do not depend on the object, so one ranged GET reads
+/// exactly the frames that hold it and carries the metadata (#120).
 #[tokio::test]
 async fn a_passthrough_range_is_one_round_trip() {
     for kind in KINDS {
@@ -834,24 +832,11 @@ async fn a_passthrough_range_is_one_round_trip() {
             assert_eq!(got_etag, etag, "{kind:?}");
             let mut reqs = key_requests(&fx.fake);
             reqs.sort();
-            if kind == Kind::Encrypted {
-                // The guessed read; the rest of the body unless the guess,
-                // which runs through the frame of the range's end, held it.
-                let gets = if last.is_some_and(|l| l >= size) {
-                    1
-                } else {
-                    2
-                };
-                let mut want = vec!["GET /b/pics/a.jpg"; gets];
-                want.push("HEAD /b/pics/a.jpg.delta");
-                assert_eq!(reqs, want, "{kind:?} {first}");
-            } else {
-                assert_eq!(
-                    reqs,
-                    ["GET /b/pics/a.jpg", "HEAD /b/pics/a.jpg.delta"],
-                    "{kind:?}"
-                );
-            }
+            assert_eq!(
+                reqs,
+                ["GET /b/pics/a.jpg", "HEAD /b/pics/a.jpg.delta"],
+                "{kind:?} {first}"
+            );
         }
     }
 }
@@ -1042,14 +1027,20 @@ async fn a_wrong_guess_serves_the_etag_of_its_bytes() {
 /// GET paths race: the HEAD (the first read of the key) sees version A,
 /// every later read sees B.
 async fn photo_overwritten_after_its_head(fx: &Fixture) -> Vec<u8> {
+    // Version B is a real write of `pics/a.jpg` (an encrypted object is
+    // sealed for its own key, #120), stashed aside; A goes back in place,
+    // and the fake swaps B in after A's first read.
     let writer = engine_on(&fx.backend, None);
     let b = rnd(fx.photo.len(), 4321);
+    fx.fake.copy_stored("b/pics/a.jpg", "b/stash/a");
     writer
-        .store("b", "pics/b.jpg", &b, None, Default::default())
+        .store("b", "pics/a.jpg", &b, None, Default::default())
         .await
         .unwrap();
+    fx.fake.copy_stored("b/pics/a.jpg", "b/stash/b");
+    fx.fake.copy_stored("b/stash/a", "b/pics/a.jpg");
     fx.fake
-        .overwrite_after_reads("b/pics/a.jpg", "b/pics/b.jpg", 1);
+        .overwrite_after_reads("b/pics/a.jpg", "b/stash/b", 1);
     b
 }
 

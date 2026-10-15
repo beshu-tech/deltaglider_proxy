@@ -126,14 +126,16 @@ pub struct BackendEncryptionSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kms_key_id: Option<String>,
     pub shim_active: bool,
+    /// `plaintext_reads: serve` (issue #120): reads also serve objects that
+    /// are not encrypted.
+    pub serves_plaintext: bool,
 }
 
 impl BackendEncryptionSummary {
     /// Build a summary from a config variant + backend name.
     /// Non-secret-only extraction — `key`/`legacy_key` are NOT
-    /// surfaced here. The backend name is needed to derive the
-    /// `key_id` when the operator left it implicit (same derivation
-    /// the engine wrapper uses: `SHA-256(name || 0x00 || key)`).
+    /// surfaced here. A `key_id` the operator left implicit is the key's
+    /// fingerprint id (`fp-<hex>`), the one the engine presents.
     pub fn from_config(backend_name: &str, enc: &crate::config::BackendEncryptionConfig) -> Self {
         use crate::config::BackendEncryptionConfig as E;
         match enc {
@@ -143,11 +145,13 @@ impl BackendEncryptionSummary {
                 key_id: None,
                 kms_key_id: None,
                 shim_active: legacy_key.is_some(),
+                serves_plaintext: false,
             },
             E::Aes256GcmProxy {
                 key,
                 key_id,
                 legacy_key,
+                plaintext_reads,
                 ..
             } => {
                 // Surface the same id the engine stamps on written
@@ -166,6 +170,7 @@ impl BackendEncryptionSummary {
                     key_id: resolved_kid,
                     kms_key_id: None,
                     shim_active: legacy_key.is_some(),
+                    serves_plaintext: *plaintext_reads == crate::config::PlaintextReads::Serve,
                 }
             }
             E::SseKms {
@@ -178,6 +183,7 @@ impl BackendEncryptionSummary {
                 key_id: None,
                 kms_key_id: Some(kms_key_id.clone()),
                 shim_active: legacy_key.is_some(),
+                serves_plaintext: false,
             },
             E::SseS3 { legacy_key, .. } => Self {
                 mode: "sse-s3".into(),
@@ -185,6 +191,7 @@ impl BackendEncryptionSummary {
                 key_id: None,
                 kms_key_id: None,
                 shim_active: legacy_key.is_some(),
+                serves_plaintext: false,
             },
         }
     }

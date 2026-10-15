@@ -6,10 +6,10 @@ pub mod advisories;
 mod bucket_encryption;
 pub use bucket_encryption::{BucketOverride, EncryptionSite};
 mod encryption_state;
-pub(crate) use encryption_state::confirmed_downgrades;
+pub(crate) use encryption_state::{confirmed_downgrades, confirmed_subjects};
 pub use encryption_state::{
     key_check_value, EncryptionChange, EncryptionChangeKind, WriteEncryption,
-    CONFIRM_ENCRYPTION_DOWNGRADE_HEADER, DEFAULT_ROUTE_SUBJECT,
+    CONFIRM_ENCRYPTION_DOWNGRADE_HEADER, CONFIRM_PLAINTEXT_REFUSAL_HEADER, DEFAULT_ROUTE_SUBJECT,
 };
 mod keys;
 pub(crate) use keys::*;

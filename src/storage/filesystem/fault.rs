@@ -694,7 +694,7 @@ impl StorageBackend for FaultyFs {
         &self,
         b: &str,
         objects: &[(String, crate::types::FileMetadata)],
-    ) -> Vec<Option<String>> {
+    ) -> Vec<Option<crate::storage::ListedToken>> {
         self.inner.listing_tokens(b, objects).await
     }
 

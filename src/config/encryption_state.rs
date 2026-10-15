@@ -144,6 +144,26 @@ pub const DEFAULT_ROUTE_SUBJECT: &str = "route:default";
 /// `config apply --confirm-encryption-downgrade <subject>` sends it.
 pub const CONFIRM_ENCRYPTION_DOWNGRADE_HEADER: &str = "x-dgp-confirm-encryption-downgrade";
 
+/// The request header that confirms that a subject which starts to encrypt
+/// may refuse its plaintext history (`plaintext_reads: refuse`): subjects,
+/// comma-separated. `config apply --confirm-plaintext-refusal <subject>`.
+pub const CONFIRM_PLAINTEXT_REFUSAL_HEADER: &str = "x-dgp-confirm-plaintext-refusal";
+
+/// Pure: the subjects that `headers` confirm in `header`.
+pub(crate) fn confirmed_subjects(
+    headers: Option<&axum::http::HeaderMap>,
+    header: &str,
+) -> Vec<String> {
+    headers
+        .into_iter()
+        .flat_map(|h| h.get_all(header))
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 /// Pure: the kind of a change from `before` to `after`, `None` when equal.
 fn change_kind(before: &WriteEncryption, after: &WriteEncryption) -> Option<EncryptionChangeKind> {
     if before == after {
@@ -247,6 +267,93 @@ impl Config {
             }
         }
         out
+    }
+
+    /// The plaintext-refusal gate (issue #120): one error per subject that
+    /// starts to encrypt with proxy AES and `plaintext_reads: refuse`. Its
+    /// objects written before are plaintext, and the read rule then refuses
+    /// them. The change needs `plaintext_reads: serve` (and a re-encrypt job
+    /// to convert the history), or the subject in `confirmed` (the bucket
+    /// holds no plaintext that anyone needs). A bucket in `absent` (no
+    /// backend lists it yet) has no history. A bucket that follows its
+    /// backend is covered by the backend's subject. `None` = not gated.
+    pub fn unconfirmed_plaintext_refusals(
+        &self,
+        old: &Config,
+        confirmed: Option<&[String]>,
+        absent: &[String],
+    ) -> Vec<String> {
+        let Some(confirmed) = confirmed else {
+            return Vec::new();
+        };
+        let serves = |enc: &BackendEncryptionConfig| {
+            matches!(
+                enc,
+                BackendEncryptionConfig::Aes256GcmProxy {
+                    plaintext_reads: PlaintextReads::Serve,
+                    ..
+                }
+            )
+        };
+        let backend_enc = |name: &str| -> Option<&BackendEncryptionConfig> {
+            self.encryption_sites()
+                .into_iter()
+                .find_map(|(site, enc)| match site {
+                    EncryptionSite::Backend(n) if n == name => Some(enc),
+                    EncryptionSite::Singleton if self.backends.is_empty() && name == "default" => {
+                        Some(enc)
+                    }
+                    _ => None,
+                })
+        };
+        let mut errors = Vec::new();
+        for c in self.encryption_changes(old) {
+            if c.before.encrypts() || c.after.mode != "aes256-gcm-proxy" || c.after.refuses_writes()
+            {
+                continue;
+            }
+            if confirmed.iter().any(|s| s == &c.subject) {
+                continue;
+            }
+            let (enc, what) = match &c.bucket {
+                Some(b) => {
+                    if absent.iter().any(|a| a.eq_ignore_ascii_case(b)) {
+                        continue;
+                    }
+                    match self.encryption_for_bucket(b) {
+                        Some(e) if e.from_bucket => (Some(e.config), format!("bucket '{b}'")),
+                        _ => continue,
+                    }
+                }
+                None if c.subject == DEFAULT_ROUTE_SUBJECT => (
+                    backend_enc(&self.default_backend_name()),
+                    "every bucket that the config does not name".to_string(),
+                ),
+                None => {
+                    let name = c.subject.trim_start_matches("backend:");
+                    (
+                        backend_enc(name),
+                        format!(
+                            "every bucket on backend '{name}' without its own encryption block"
+                        ),
+                    )
+                }
+            };
+            if enc.is_some_and(serves) {
+                continue;
+            }
+            errors.push(format!(
+                "this change makes {what} encrypt, but the objects stored there before are \
+                 plaintext, and with `plaintext_reads: refuse` (the default) the proxy refuses \
+                 to read them. Set encryption.plaintext_reads: serve and run a re-encrypt job \
+                 (POST /_/api/admin/jobs/reencrypt) to convert them, then set it back. If the \
+                 subject holds no plaintext that anyone needs, confirm with the header \
+                 `X-DGP-Confirm-Plaintext-Refusal: {}` (`config apply \
+                 --confirm-plaintext-refusal {}`)",
+                c.subject, c.subject
+            ));
+        }
+        errors
     }
 
     /// The downgrade gate: one error per change from `old` that makes a

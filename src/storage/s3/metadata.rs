@@ -358,6 +358,7 @@ impl S3Backend {
             content_type: get_value(&["content-type"]),
             user_metadata,
             storage_info,
+            listing_token: Default::default(),
         })
     }
 

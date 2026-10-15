@@ -86,18 +86,26 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
       status.rs              /_/health, /_/stats
   → deltaglider/engine/      Orchestration split into submodules:
       mod.rs                 Core types: DeltaGliderEngine, EngineError, RetrieveResponse, ListObjectsPage, StoreContext; re-exports
-      construction.rs        DynEngine::new, backend build + per-backend encryption wrapping (derive_key_id), builders
+      construction.rs        DynEngine::new, backend build + per-backend encryption wrapping (`one_id_per_key`; a key without `key_id` gets `fp-<hex>` of its fingerprint), builders
       metadata.rs            validated_key, metadata resolution, HEAD, verified reference cache (get_reference_cached)
       locking.rs             prefix_locks, ReferenceLockGuard + the `reference_writes` module (RefWriteProof), with_dest_prefix_lock
       list.rs / delete.rs    ListObjects + pagination helpers / delete paths + reference reclamation
       raw.rs / resources.rs  raw deltaspace blob accessors / spool + codec permits + accessors (also usage.rs, buckets.rs)
       store.rs               PUT pipeline: delta encoding, migration, reference management; `store_spooled_delta` (streaming PUT for objects > spool threshold)
       retrieve.rs            GET pipeline: delta reconstruction, streaming, range requests; `reconstruct_delta_to_spool` (streaming GET)
-  → deltaglider/spool.rs    Quota'd temp space for streaming codec ops (SpoolDir byte-budget semaphore; `acquire_pair` for the deadlock-safe ref+out reservation; age-based startup orphan sweep; `SpoolBudget` hands a storage write — the encrypting wrapper's ciphertext/joined-parts temps — the caller's held spool + a reservation taken BEFORE the deltaspace lock, and a storage write never waits for budget; multipart relay parts and the buffered codec's source file are spool files too — `no_scratch_files_outside_the_spool` source-guards it). DGP_SPOOL_DIR/`_MAX_BYTES`/`_THRESHOLD_BYTES`/`_ACQUIRE_TIMEOUT_SECS`.
+  → deltaglider/spool.rs    Quota'd temp space for streaming codec ops (SpoolDir byte-budget semaphore; `acquire_pair` for the deadlock-safe ref+out reservation; age-based startup orphan sweep; `SpoolBudget` hands a storage write — the encrypting wrapper's ciphertext temp — the caller's held spool + a reservation taken BEFORE the deltaspace lock, and a storage write never waits for budget; multipart relay parts and the buffered codec's source file are spool files too — `encrypted_file_put_temp_is_inside_the_spool_budget` tests the wrapper's). DGP_SPOOL_DIR/`_MAX_BYTES`/`_THRESHOLD_BYTES`/`_ACQUIRE_TIMEOUT_SECS`.
   → storage/traits.rs       StorageBackend trait: native `async fn` with `Send` futures (RPITIT); `dyn` dispatch via the `dynosaur`-generated `DynStorageBackend` (same for CoordinationLease, ReferenceLock, EventDeliveryClient; `async_trait` remains only for the s3s traits). `get_reference_to_file`/`put_reference_from_file` materialise the reference to/from a local file WITHOUT heap-loading it (filesystem hardlinks, S3 streams) — the bounded-memory backbone of the streaming-delta paths; the large-delta GET uses `open_reference_source` (no default), which gives the plaintext size from the same read, so the spool is reserved with no size HEAD.
   → storage/filesystem/     Local filesystem impl (xattr metadata via xattr_meta.rs, list_objects_delegated); write.rs = atomic writes (one blocking task each) + durable_rename + deferred fsync + the process-wide known-folder cache (a stale entry only costs the ENOENT retry)
   → storage/s3/             AWS S3/MinIO impl: mod.rs (backend + trait impl), client.rs (SSRF guard), errors.rs (S3Op, `classify_s3_error` + `classify_get_error` pure fns), metadata.rs, objects.rs (fenced writes), facts.rs, listing.rs, tests.rs
-  → storage/encrypting/     At-rest encryption wrapper backend (per-backend AES key, dg-encryption-key-id metadata); format.rs = the v1 + chunked formats
+  → storage/encrypting/     At-rest encryption wrapper, one per raw backend (issue #120): v2.rs = THE format (per-object HKDF keys, DGE2
+                             header + 64 KiB GCM frames, exact stored_len, AES-GCM-SIV listing tokens; pure), seal.rs = sealed metadata
+                             (`dg-sealed`: facts bound to bucket/folder/variant/name, no hashes in clear, identity tokens, stored marker
+                             `aes-256-gcm-chunked-v1` on purpose so older releases fail closed), the keyring by fingerprint and THE read rule
+                             (unsealed objects only where the bucket writes plaintext or `plaintext_reads: serve`); mod.rs = the wrapper:
+                             every metadata-returning method presents, raw metadata never leaves it (source guards
+                             `the_seal_key_is_named_only_where_a_sealed_shape_is_handled`, `no_v1_encryption_format_remains`). S3 lists
+                             logical facts of sealed objects from `!!2` tokens (`FileMetadata::listing_token` → `put` path; in-process
+                             `list_size_cache::record_token`); `!!1` facts are ignored on a backend with a key
   → storage/routing.rs      Multi-backend routing (virtual bucket → real backend)
   → security.rs             Pure security primitives (validate_bucket_name, bucket_name_is_ip_like, outbound-URL SSRF policy) — unit + proptest, shared by CLI URL parser
   → demo.rs                 Embedded UI + admin API router, mounted under /_/

@@ -651,6 +651,69 @@ mod source_guards {
         out_of_line_test_modules, prod_mask, rel as rel_path, root, rust_files, test_module_lines,
     };
 
+    /// #120: production code names the `dg-sealed` key only where a sealed
+    /// object is handled: the encrypting wrapper (which seals and opens),
+    /// the key's definition, and the inner-backend code that must recognise
+    /// a sealed shape so that it never derives clear facts from it. A new
+    /// file here is a place where the seal could leave the wrapper.
+    #[test]
+    fn the_seal_key_is_named_only_where_a_sealed_shape_is_handled() {
+        const ALLOWED: &[&str] = &[
+            "src/types.rs",
+            "src/storage/encrypting/seal.rs",
+            "src/storage/encrypting/mod.rs",
+            "src/storage/encrypting/v2.rs",
+            "src/storage/list_size_cache.rs",
+            "src/storage/traits.rs",
+            "src/storage/s3/metadata.rs",
+            "src/storage/s3/heal.rs",
+        ];
+        let mut bad = Vec::new();
+        for (file, text) in crate::source_scan::prod_sources("src") {
+            if ALLOWED.contains(&file.as_str()) {
+                continue;
+            }
+            for (n, line) in crate::source_scan::prod_lines(&text) {
+                let code = line.split("//").next().unwrap_or("");
+                if ["dg-sealed", "SEALED_KEY", "meta_keys::SEALED"]
+                    .iter()
+                    .any(|k| code.contains(k))
+                {
+                    bad.push(format!("{file}:{n}"));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "the seal key outside its places: {bad:?}");
+    }
+
+    /// #120: the v1 at-rest formats have no reader and no writer. Their
+    /// names may appear only as the stored marker that keeps older releases
+    /// failing closed (`seal::DISK_MARKER`).
+    #[test]
+    fn no_v1_encryption_format_remains() {
+        let mut bad = Vec::new();
+        for (file, text) in crate::source_scan::prod_sources("src") {
+            for (n, line) in crate::source_scan::prod_lines(&text) {
+                let code = line.split("//").next().unwrap_or("");
+                let v1 = [
+                    "aes-256-gcm-v1",
+                    "DGE1",
+                    "encrypt_chunk",
+                    "ChunkFramer",
+                    "CHUNK_MARKER_VALUE",
+                ]
+                .iter()
+                .any(|k| code.contains(k));
+                let marker = code.contains("aes-256-gcm-chunked-v1")
+                    && !(file == "src/storage/encrypting/seal.rs" && code.contains("DISK_MARKER"));
+                if v1 || marker {
+                    bad.push(format!("{file}:{n}: {}", line.trim()));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "v1 encryption code: {bad:?}");
+    }
+
     /// Review B1: what S3 does with no IAM user has ONE derivation
     /// (`Config::empty_iam_outcome` → `IamState::from_outcome`). Production
     /// code outside `iam/mod.rs` may match on `IamState::Disabled` /

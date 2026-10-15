@@ -52,7 +52,7 @@ use std::collections::HashMap;
 
 use crate::config::{BackendEncryptionConfig, Config};
 use crate::storage::encrypting::{
-    CHUNK_MARKER_VALUE, ENCRYPTION_KEY_ID_KEY, ENCRYPTION_MARKER_KEY, ENCRYPTION_MARKER_VALUE,
+    ENCRYPTION_KEY_ID_KEY, ENCRYPTION_MARKER_KEY, ENCRYPTION_MARKER_VALUE,
 };
 
 /// The at-rest state every object in a bucket SHOULD be in, derived from
@@ -115,7 +115,8 @@ pub fn resolve_desired(config: &Config, bucket: &str) -> Result<DesiredEncryptio
 
 /// Does this object's at-rest state differ from the desired one?
 ///
-/// Truth table (marker = `dg-encrypted` ∈ {aes-256-gcm-v1, aes-256-gcm-chunked-v1}):
+/// Truth table (marker = `dg-encrypted: v2`, as the wrapper presents an
+/// encrypted object; one key has one id on a backend, so the id names the key):
 ///
 /// | marker | desired       | rewrite? |
 /// |--------|---------------|----------|
@@ -125,10 +126,7 @@ pub fn resolve_desired(config: &Config, bucket: &str) -> Result<DesiredEncryptio
 /// | present| Proxy(k)      | iff stamped key-id ≠ k (or absent) |
 pub fn needs_rewrite(user_metadata: &HashMap<String, String>, desired: &DesiredEncryption) -> bool {
     let marker = user_metadata.get(ENCRYPTION_MARKER_KEY).map(String::as_str);
-    let encrypted = matches!(
-        marker,
-        Some(ENCRYPTION_MARKER_VALUE) | Some(CHUNK_MARKER_VALUE)
-    );
+    let encrypted = matches!(marker, Some(ENCRYPTION_MARKER_VALUE));
     match desired {
         DesiredEncryption::Plain => encrypted,
         DesiredEncryption::Proxy { key_id } => {
@@ -147,7 +145,7 @@ pub fn needs_rewrite(user_metadata: &HashMap<String, String>, desired: &DesiredE
 pub fn stamped_with_key_id(user_metadata: &HashMap<String, String>, key_id: &str) -> bool {
     let encrypted = matches!(
         user_metadata.get(ENCRYPTION_MARKER_KEY).map(String::as_str),
-        Some(ENCRYPTION_MARKER_VALUE) | Some(CHUNK_MARKER_VALUE)
+        Some(ENCRYPTION_MARKER_VALUE)
     );
     encrypted && user_metadata.get(ENCRYPTION_KEY_ID_KEY).map(String::as_str) == Some(key_id)
 }
@@ -279,38 +277,22 @@ mod tests {
             "plaintext + Proxy = encrypt"
         );
 
-        // single-shot marker
-        let enc = meta(&[
-            ("dg-encrypted", "aes-256-gcm-v1"),
-            ("dg-encryption-key-id", "kid-1"),
-        ]);
+        // an encrypted object, as the wrapper presents it
+        let enc = meta(&[("dg-encrypted", "v2"), ("dg-encryption-key-id", "kid-1")]);
         assert!(needs_rewrite(&enc, &plain), "encrypted + Plain = decrypt");
         assert!(!needs_rewrite(&enc, &proxy), "matching key id = no-op");
 
-        // chunked marker counts as encrypted too
-        let chunked = meta(&[
-            ("dg-encrypted", "aes-256-gcm-chunked-v1"),
-            ("dg-encryption-key-id", "kid-1"),
-        ]);
-        assert!(!needs_rewrite(&chunked, &proxy));
-        assert!(needs_rewrite(&chunked, &plain));
-
-        // key rotation: stamped id differs
-        let old_key = meta(&[
-            ("dg-encrypted", "aes-256-gcm-v1"),
-            ("dg-encryption-key-id", "kid-0"),
-        ]);
+        // key rotation: another key
+        let old_key = meta(&[("dg-encrypted", "v2"), ("dg-encryption-key-id", "kid-0")]);
         assert!(
             needs_rewrite(&old_key, &proxy),
             "key-id mismatch = re-encrypt"
         );
 
-        // legacy object: marker without key id → conservative rewrite
-        let no_kid = meta(&[("dg-encrypted", "aes-256-gcm-v1")]);
-        assert!(
-            needs_rewrite(&no_kid, &proxy),
-            "missing key id = re-encrypt"
-        );
+        // the stored marker of the previous format is never presented: if
+        // it shows, it is not the presented v2 marker
+        let stored = meta(&[("dg-encrypted", "aes-256-gcm-chunked-v1")]);
+        assert!(needs_rewrite(&stored, &proxy));
 
         // unknown marker value is NOT treated as encrypted
         let bogus = meta(&[("dg-encrypted", "something-else")]);
@@ -320,24 +302,16 @@ mod tests {
 
     #[test]
     fn stamped_with_key_id_truth_table() {
-        let old = meta(&[
-            ("dg-encrypted", "aes-256-gcm-v1"),
-            ("dg-encryption-key-id", "kid-old"),
-        ]);
+        let old = meta(&[("dg-encrypted", "v2"), ("dg-encryption-key-id", "kid-old")]);
         assert!(stamped_with_key_id(&old, "kid-old"));
         assert!(!stamped_with_key_id(&old, "kid-new"));
-        let chunked = meta(&[
-            ("dg-encrypted", "aes-256-gcm-chunked-v1"),
-            ("dg-encryption-key-id", "kid-old"),
-        ]);
-        assert!(stamped_with_key_id(&chunked, "kid-old"));
         // A key id without the marker is not an encrypted body.
         assert!(!stamped_with_key_id(
             &meta(&[("dg-encryption-key-id", "kid-old")]),
             "kid-old"
         ));
         assert!(!stamped_with_key_id(
-            &meta(&[("dg-encrypted", "aes-256-gcm-v1")]),
+            &meta(&[("dg-encrypted", "aes-256-gcm-chunked-v1")]),
             "kid-old"
         ));
         assert!(!stamped_with_key_id(&meta(&[]), "kid-old"));
@@ -346,13 +320,15 @@ mod tests {
     #[test]
     fn strip_removes_both_markers_only() {
         let mut m = meta(&[
-            ("dg-encrypted", "aes-256-gcm-v1"),
+            ("dg-encrypted", "v2"),
             ("dg-encryption-key-id", "kid"),
+            ("dg-sealed", "2.x"),
             ("custom", "keep-me"),
         ]);
         strip_encryption_markers(&mut m);
         assert!(!m.contains_key("dg-encrypted"));
         assert!(!m.contains_key("dg-encryption-key-id"));
+        assert!(!m.contains_key("dg-sealed"));
         assert_eq!(m.get("custom").map(String::as_str), Some("keep-me"));
     }
 

@@ -251,6 +251,8 @@ impl SiteKey {
     }
 
     fn list_ad(bucket: &str, stored_key: &str, stored_etag: &str, stored_size: u64) -> Vec<u8> {
+        // An ETag reads quoted from one API and bare from another.
+        let stored_etag = stored_etag.trim_matches('"');
         let mut ad = Vec::with_capacity(64 + stored_key.len());
         ad.extend_from_slice(b"DGE2 list");
         for f in [bucket, stored_key, stored_etag] {
@@ -659,6 +661,7 @@ pub struct ObjectMeta {
 pub const SEALED_PREFIX: &str = "2.";
 
 impl ObjectMeta {
+    #[cfg(test)]
     pub fn salt(&self) -> [u8; SALT_LEN] {
         self.salt
     }

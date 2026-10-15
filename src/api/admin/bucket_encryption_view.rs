@@ -39,6 +39,9 @@ pub struct EffectiveEncryption {
     /// New writes are stored encrypted. Proxy mode without a key is
     /// false: the proxy refuses those writes.
     pub encrypts: bool,
+    /// Proxy mode with `plaintext_reads: serve` (issue #120): reads also
+    /// serve objects that are not encrypted (the bucket's history).
+    pub serves_plaintext: bool,
     /// A re-encrypt job can change objects of this bucket: it encrypts
     /// with a proxy key, or it is plaintext and can still read an older key.
     pub reencrypt: bool,
@@ -150,6 +153,13 @@ pub fn effective_encryption(
         kms_key_id,
         key_env,
         encrypts,
+        serves_plaintext: matches!(
+            e.config,
+            BackendEncryptionConfig::Aes256GcmProxy {
+                plaintext_reads: crate::config::PlaintextReads::Serve,
+                ..
+            }
+        ),
         reencrypt,
         pinned: cfg.bucket_storage(&name).is_some(),
         bucket_modes: cfg.bucket_encryption_modes(&e.backend),

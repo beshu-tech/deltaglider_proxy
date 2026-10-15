@@ -13,15 +13,10 @@ fn key(byte: u8) -> EncryptionKey {
     EncryptionKey::from_hex(&format!("{byte:02x}").repeat(32)).unwrap()
 }
 
+/// Passthrough metadata as the engine writes it (a seal needs the hashes;
+/// the wrapper does not check them against the body).
 fn meta(name: &str, size: u64) -> FileMetadata {
-    FileMetadata::fallback(
-        name.into(),
-        size,
-        "md5".into(),
-        chrono::Utc::now(),
-        None,
-        crate::types::StorageInfo::Passthrough,
-    )
+    FileMetadata::new_passthrough(name.into(), "ab".repeat(32), "cd".repeat(16), size, None)
 }
 
 /// The backend key `a` (id `local-a`), and `db-archive` with its own key
@@ -86,14 +81,20 @@ impl Rig {
             .unwrap()
     }
 
-    /// The key id stamped on the stored object (`None`: plaintext).
+    /// The id of the key that encrypted the object, as the wrapper
+    /// presents it (`None`: plaintext).
     async fn stamp(&self, bucket: &str, name: &str) -> Option<String> {
-        let raw = self
+        let shown = self
             .wrapper
             .get_passthrough_metadata(bucket, "", name)
             .await
             .unwrap();
-        is_encrypted(&raw).then(|| stamped_key_id(&raw).unwrap().to_string())
+        (shown
+            .user_metadata
+            .get(ENCRYPTION_MARKER_KEY)
+            .map(String::as_str)
+            == Some(ENCRYPTION_MARKER_VALUE))
+        .then(|| shown.user_metadata[ENCRYPTION_KEY_ID_KEY].clone())
     }
 }
 
@@ -162,6 +163,47 @@ async fn a_retired_bucket_key_still_reads_from_the_keyring() {
     use futures::StreamExt;
     let body: Vec<u8> = stream.map(|c| c.unwrap().to_vec()).concat().await;
     assert_eq!((len, body.as_slice()), (3, &b"und"[..]));
+}
+
+/// A bucket with its own override decides with its own
+/// `plaintext_reads`, not the backend's: an unsealed object is served only
+/// where the bucket's rule says `serve`.
+#[tokio::test]
+async fn a_bucket_override_decides_whether_plaintext_is_served() {
+    for (backend_serves, bucket_serves) in [(false, false), (true, false), (false, true)] {
+        let mut cfg = two_keys();
+        cfg.serve_plaintext = backend_serves;
+        cfg.buckets.get_mut("db-archive").unwrap().serve_plaintext = bucket_serves;
+        let r = rig(cfg).await;
+        for b in ["releases", "db-archive"] {
+            r.wrapper
+                .inner
+                .put_passthrough(
+                    b,
+                    "",
+                    "plain",
+                    bytes::Bytes::from_static(b"p"),
+                    &meta("plain", 1),
+                )
+                .await
+                .unwrap();
+        }
+        let label = format!("backend {backend_serves} bucket {bucket_serves}");
+        let w = &r.wrapper;
+        let read = |b| async move {
+            (
+                w.get_passthrough(b, "", "plain").await.is_ok(),
+                w.get_passthrough_metadata(b, "", "plain").await.is_ok(),
+                w.get_passthrough_stream_range(b, "", "plain", 0, 0)
+                    .await
+                    .is_ok(),
+            )
+        };
+        let s = backend_serves;
+        assert_eq!(read("releases").await, (s, s, s), "{label}");
+        let s = bucket_serves;
+        assert_eq!(read("db-archive").await, (s, s, s), "{label}");
+    }
 }
 
 #[tokio::test]
@@ -324,13 +366,7 @@ fn every_write_method_checks_the_witness() {
     let wrapper = std::fs::read_to_string("src/storage/encrypting/mod.rs").unwrap();
     // Trait defaults that only delegate to a checked method, and
     // `write_refusal`, the witness query itself (it writes nothing).
-    // `put_listing_token` (issue #120 C3c) is a plain forward until the
-    // wrapper computes tokens itself (C3d decides its witness check).
-    let delegating = [
-        "put_reference_from_file",
-        "write_refusal",
-        "put_listing_token",
-    ];
+    let delegating = ["put_reference_from_file", "write_refusal"];
     let prefixes = [
         "put_",
         "write_",

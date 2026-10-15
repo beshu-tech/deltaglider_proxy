@@ -105,8 +105,10 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    /// Passthrough metadata whose content hash is `sha` repeated (hex, as
+    /// a seal needs).
     fn meta(sha: &str) -> FileMetadata {
-        FileMetadata::new_passthrough("a.jpg".into(), sha.into(), "m".into(), 4, None)
+        FileMetadata::new_passthrough("a.jpg".into(), sha.repeat(32), "cd".repeat(16), 4, None)
     }
 
     #[test]
@@ -120,7 +122,7 @@ mod tests {
         let encrypted = |id: &str| {
             let mut e = a.clone();
             e.user_metadata
-                .insert(ENCRYPTION_MARKER_KEY.into(), "aes-256-gcm-v1".into());
+                .insert(ENCRYPTION_MARKER_KEY.into(), "v2".into());
             e.user_metadata
                 .insert(ENCRYPTION_KEY_ID_KEY.into(), id.into());
             e
@@ -188,9 +190,12 @@ mod tests {
             .unwrap()
     }
 
+    /// A config that encrypts with a key of its own per id (in v2 the id is
+    /// a label: a rotation is another key).
     fn keyed(id: &str) -> Arc<arc_swap::ArcSwap<EncryptionConfig>> {
+        let hex = if id == "rotated" { "cd" } else { "ab" };
         Arc::new(arc_swap::ArcSwap::new(Arc::new(EncryptionConfig {
-            key: Some(EncryptionKey::from_hex(&"ab".repeat(32)).unwrap()),
+            key: Some(EncryptionKey::from_hex(&hex.repeat(32)).unwrap()),
             key_id: Some(id.into()),
             ..Default::default()
         })))
@@ -331,10 +336,13 @@ mod tests {
             )
             .await;
 
+        // Not copied: the plaintext wrapper sees a sealed source (v2) and
+        // declines, or the inner pin sees another version.
         assert!(
             matches!(
                 copied,
-                Err(crate::storage::StorageError::PreconditionFailed(_))
+                Ok(CopyOutcome::Unsupported)
+                    | Err(crate::storage::StorageError::PreconditionFailed(_))
             ),
             "{copied:?}"
         );

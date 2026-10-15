@@ -302,6 +302,9 @@ export interface BackendEncryptionSummary {
   key_id?: string;
   kms_key_id?: string;
   shim_active: boolean;
+  /** `plaintext_reads: serve` (#120): reads also serve unencrypted objects.
+   *  Absent on an older server. */
+  serves_plaintext?: boolean;
 }
 
 export interface BackendInfo {

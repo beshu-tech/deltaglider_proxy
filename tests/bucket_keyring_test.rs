@@ -200,7 +200,8 @@ impl Env {
 
     /// The at-rest form of the stored blob `stored` (a key, `<key>.delta`,
     /// or `<prefix>/reference.bin`) in `bucket` on `local-disk`:
-    /// `None` = plaintext, `Some(id)` = encrypted under key id `id`.
+    /// `None` = plaintext, `Some(hex)` = encrypted under the test key `hex`
+    /// (the blob names it only by fingerprint, issue #120).
     async fn at_rest(&self, bucket: &str, stored: &str) -> Option<String> {
         match &self.store {
             Store::Fs(root) => fs_at_rest(&fs_blob(root, bucket, stored)),
@@ -216,11 +217,9 @@ impl Env {
                 let meta = head.metadata().cloned().unwrap_or_default();
                 // The S3 backend stores user metadata as `user-<key>`.
                 meta.get("user-dg-encrypted")?;
-                Some(
-                    meta.get("user-dg-encryption-key-id")
-                        .cloned()
-                        .expect("an encrypted blob carries its key id"),
-                )
+                let fp = common::sealed_fp_label(meta.get("user-dg-sealed").map(String::as_str))
+                    .expect("an encrypted blob carries its seal");
+                Some(id_of_fp(&fp))
             }
         }
     }
@@ -252,12 +251,22 @@ fn fs_at_rest(path: &std::path::Path) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
     let um = &v["user_metadata"];
     um.get("dg-encrypted")?;
-    Some(
-        um["dg-encryption-key-id"]
-            .as_str()
-            .expect("an encrypted blob carries its key id")
-            .to_string(),
-    )
+    let fp = common::sealed_fp_label(um["dg-sealed"].as_str())
+        .expect("an encrypted blob carries its seal");
+    Some(id_of_fp(&fp))
+}
+
+/// Every test key, by hex.
+const TEST_KEYS: [&str; 4] = [KA, KB, KC, KD];
+
+/// The at-rest form names a key only by its fingerprint (format v2, issue
+/// #120): map it back to the key's hex, so a scenario can compare it with
+/// the key it configured. An unknown fingerprint stays `fp-<hex>`.
+fn id_of_fp(fp: &str) -> String {
+    TEST_KEYS
+        .iter()
+        .find(|k| common::key_fp_label(k) == fp)
+        .map_or_else(|| fp.to_string(), |k| k.to_string())
 }
 
 async fn wait_job_done(admin: &reqwest::Client, endpoint: &str, bucket: &str) {
@@ -296,17 +305,14 @@ async fn override_added_on_history(env: Env, bucket: &str, backend_patch: serde_
     env.put(bucket, "photo.jpg", b"old passthrough body").await;
     env.put(bucket, "app.zip", &v1).await;
     env.put(bucket, "app2.zip", &v2).await;
-    assert_eq!(
-        env.at_rest(bucket, "photo.jpg").await.as_deref(),
-        Some("local-a")
-    );
+    assert_eq!(env.at_rest(bucket, "photo.jpg").await.as_deref(), Some(KA));
     assert_eq!(
         env.at_rest(bucket, "reference.bin").await.as_deref(),
-        Some("local-a")
+        Some(KA)
     );
     assert_eq!(
         env.at_rest(bucket, "app2.zip.delta").await.as_deref(),
-        Some("local-a")
+        Some(KA)
     );
 
     let mut patch = backend_patch;
@@ -326,12 +332,12 @@ async fn override_added_on_history(env: Env, bucket: &str, backend_patch: serde_
     assert_eq!(env.get(bucket, "app3.zip").await, v3);
     assert_eq!(
         env.at_rest(bucket, "app3.zip.delta").await.as_deref(),
-        Some("releases-b"),
+        Some(KB),
         "the new delta is written under the bucket key"
     );
     assert_eq!(
         env.at_rest(bucket, "reference.bin").await.as_deref(),
-        Some("local-a"),
+        Some(KA),
         "the reference keeps its form until the re-encrypt job"
     );
 
@@ -339,7 +345,7 @@ async fn override_added_on_history(env: Env, bucket: &str, backend_patch: serde_
     for stored in ["photo.jpg", "app2.zip.delta", "reference.bin"] {
         assert_eq!(
             env.at_rest(bucket, stored).await.as_deref(),
-            Some("releases-b"),
+            Some(KB),
             "{stored} after the re-encrypt job"
         );
     }
@@ -417,7 +423,7 @@ async fn a_bucket_key_rotation_keeps_old_objects_readable() {
     env.put("releases", "old.txt", b"under key A").await;
     assert_eq!(
         env.at_rest("releases", "old.txt").await.as_deref(),
-        Some("releases-a")
+        Some(KA)
     );
 
     env.storage_patch_ok(
@@ -428,7 +434,7 @@ async fn a_bucket_key_rotation_keeps_old_objects_readable() {
     env.put("releases", "new.txt", b"under key B").await;
     assert_eq!(
         env.at_rest("releases", "new.txt").await.as_deref(),
-        Some("releases-b")
+        Some(KB)
     );
     assert_eq!(env.get("releases", "new.txt").await, b"under key B");
 
@@ -591,8 +597,8 @@ async fn mixed_modes_on_one_backend(shape: Shape, names: [&str; 4]) {
     env.put(a1, "x.txt", b"a1 source").await;
     env.put(b, "old/y.txt", b"b source").await;
     assert_eq!(env.at_rest(p, "x.txt").await, None);
-    assert_eq!(env.at_rest(a1, "x.txt").await.as_deref(), Some("shared-a"));
-    assert_eq!(env.at_rest(b, "old/y.txt").await.as_deref(), Some("only-b"));
+    assert_eq!(env.at_rest(a1, "x.txt").await.as_deref(), Some(KA));
+    assert_eq!(env.at_rest(b, "old/y.txt").await.as_deref(), Some(KB));
 
     // (none → A), (A → B), (A → A), (B → none).
     env.copy((p, "x.txt"), (a1, "from-p.txt")).await;
@@ -600,9 +606,9 @@ async fn mixed_modes_on_one_backend(shape: Shape, names: [&str; 4]) {
     env.copy((a1, "x.txt"), (a2, "from-a1.txt")).await;
     env.copy((b, "old/y.txt"), (p, "from-b.txt")).await;
     for (bucket, key, form, body) in [
-        (a1, "from-p.txt", Some("shared-a"), &b"plain source"[..]),
-        (b, "from-a1.txt", Some("only-b"), b"a1 source"),
-        (a2, "from-a1.txt", Some("shared-a"), b"a1 source"),
+        (a1, "from-p.txt", Some(KA), &b"plain source"[..]),
+        (b, "from-a1.txt", Some(KB), b"a1 source"),
+        (a2, "from-a1.txt", Some(KA), b"a1 source"),
         (p, "from-b.txt", None, b"b source"),
     ] {
         assert_eq!(
@@ -656,10 +662,7 @@ async fn mixed_modes_on_one_backend(shape: Shape, names: [&str; 4]) {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     };
     assert_eq!(run["status"], "succeeded", "{run}");
-    assert_eq!(
-        env.at_rest(a1, "cold/y.txt").await.as_deref(),
-        Some("shared-a")
-    );
+    assert_eq!(env.at_rest(a1, "cold/y.txt").await.as_deref(), Some(KA));
     assert_eq!(env.get(a1, "cold/y.txt").await, b"b source");
 }
 
@@ -714,7 +717,7 @@ async fn migrate_keeps_a_buckets_own_encryption() {
     let dr = env.dr.as_ref().unwrap();
     assert_eq!(
         fs_at_rest(&fs_blob(dr, "releases", "x.txt")).as_deref(),
-        Some("releases-b"),
+        Some(KB),
         "the copy on the target is under the bucket key, not aws-dr's mode"
     );
     assert_eq!(env.get("releases", "x.txt").await, b"moves with its key");
@@ -733,7 +736,7 @@ async fn migrate_keeps_a_buckets_own_encryption() {
     env.put("releases", "after.txt", b"after the flip").await;
     assert_eq!(
         fs_at_rest(&fs_blob(dr, "releases", "after.txt")).as_deref(),
-        Some("releases-b")
+        Some(KB)
     );
 }
 
@@ -776,10 +779,7 @@ async fn a_bucket_key_never_leaves_and_survives_a_round_trip() {
     env.storage_patch_ok(section).await;
     assert_eq!(env.get("releases", "x.txt").await, b"secret body");
     env.put("releases", "y.txt", b"still encrypted").await;
-    assert_eq!(
-        env.at_rest("releases", "y.txt").await.as_deref(),
-        Some("releases-b")
-    );
+    assert_eq!(env.at_rest("releases", "y.txt").await.as_deref(), Some(KB));
     let file = std::fs::read_to_string(env.server.config_path()).unwrap();
     assert!(file.contains(KB), "the persisted file keeps the key");
 }
@@ -1036,7 +1036,7 @@ async fn a_downgrade_needs_confirmation_and_every_change_is_audited() {
     env.put("releases", "still.txt", b"still encrypted").await;
     assert_eq!(
         env.at_rest("releases", "still.txt").await.as_deref(),
-        Some("releases-b"),
+        Some(KB),
         "the refused change changed nothing"
     );
     let (code, v) = env
@@ -1056,11 +1056,25 @@ async fn a_downgrade_needs_confirmation_and_every_change_is_audited() {
         "{cleared:?}"
     );
 
-    // Back to encrypting needs no confirmation: `set`.
-    env.storage_patch_ok(
-        json!({ "buckets": { "releases": { "encryption": override_json(KA, "releases-a") } } }),
-    )
-    .await;
+    // Back to encrypting: `plain.txt` is plaintext history, so `refuse`
+    // (the default) needs a confirmation (issue #120); `serve` keeps it
+    // readable and needs none. The change is a `set`.
+    let (code, v) = env
+        .storage_patch(
+            json!({ "buckets": { "releases": { "encryption": override_json(KA, "releases-a") } } }),
+        )
+        .await;
+    assert!(
+        code == 422
+            && v.to_string()
+                .contains("X-DGP-Confirm-Plaintext-Refusal: releases"),
+        "{code} {v}"
+    );
+    let mut serve = override_json(KA, "releases-a");
+    serve["plaintext_reads"] = json!("serve");
+    env.storage_patch_ok(json!({ "buckets": { "releases": { "encryption": serve } } }))
+        .await;
+    assert_eq!(env.get("releases", "plain.txt").await, b"now plaintext");
     let set = audit_targets(&env, "bucket_encryption_set").await;
     assert!(
         set.iter()
@@ -1370,7 +1384,7 @@ async fn the_witness_makes_a_disagreeing_instance_refuse_writes_minio() {
     assert_eq!(a.wait_witness("agree").await["status"], "agree");
     let (code, body) = a.raw_put(&data, "a.txt", b"written by A").await;
     assert_eq!(code, 200, "{body}");
-    assert_eq!(a.at_rest(&data, "a.txt").await.as_deref(), Some("ha-b"));
+    assert_eq!(a.at_rest(&data, "a.txt").await.as_deref(), Some(KB));
 
     // B stores the bucket in plaintext: it disagrees.
     let stale =
@@ -1401,15 +1415,19 @@ async fn the_witness_makes_a_disagreeing_instance_refuse_writes_minio() {
     // A is not affected.
     assert_eq!(a.raw_put(&data, "a2.txt", b"A again").await.0, 200);
 
-    // Converge: B applies A's encryption.
-    b.storage_patch_ok(
-        json!({ "buckets": { data.as_str(): { "encryption": override_json(KB, "ha-b") } } }),
-    )
-    .await;
+    // Converge: B applies A's encryption. B refused every write, so the
+    // bucket holds no plaintext: B confirms that (issue #120's gate).
+    let (code, v) = b
+        .storage_patch_with(
+            json!({ "buckets": { data.as_str(): { "encryption": override_json(KB, "ha-b") } } }),
+            &[("X-DGP-Confirm-Plaintext-Refusal", data.as_str())],
+        )
+        .await;
+    assert_eq!(code, 200, "{v}");
     b.wait_witness("agree").await;
     let (code, body) = b.raw_put(&data, "b.txt", b"written by B").await;
     assert_eq!(code, 200, "{body}");
-    assert_eq!(b.at_rest(&data, "b.txt").await.as_deref(), Some("ha-b"));
+    assert_eq!(b.at_rest(&data, "b.txt").await.as_deref(), Some(KB));
 
     // A rotation applied on A publishes; B refuses until it applies it too.
     a.storage_patch_ok(
@@ -1427,7 +1445,7 @@ async fn the_witness_makes_a_disagreeing_instance_refuse_writes_minio() {
     .await;
     b.wait_witness("agree").await;
     assert_eq!(b.raw_put(&data, "b2.txt", b"converged").await.0, 200);
-    assert_eq!(b.at_rest(&data, "b2.txt").await.as_deref(), Some("ha-c"));
+    assert_eq!(b.at_rest(&data, "b2.txt").await.as_deref(), Some(KC));
     assert_eq!(b.get(&data, "a3.txt").await, b"A rotated");
 
     // The manifest holds key ids only.
@@ -1496,7 +1514,7 @@ async fn a_restart_rollout_converges_by_witness_publish_minio() {
     b.wait_witness("agree").await;
     let (code, body) = b.raw_put(&data, "x.txt", b"after the rollout").await;
     assert_eq!(code, 200, "{body}");
-    assert_eq!(b.at_rest(&data, "x.txt").await.as_deref(), Some("ha-c"));
+    assert_eq!(b.at_rest(&data, "x.txt").await.as_deref(), Some(KC));
     let published = audit_targets(&b, "bucket_encryption_witness_publish").await;
     assert!(
         published.iter().any(|t| t.contains("ha-c")),
@@ -1553,7 +1571,7 @@ async fn the_witness_never_lets_a_downgrade_win_by_boot_minio() {
     assert_eq!(b.raw_put(&data, "b.txt", b"plaintext?").await.0, 503);
     assert_eq!(a.witness().await["status"], "agree");
     assert_eq!(a.raw_put(&data, "a.txt", b"encrypted").await.0, 200);
-    assert_eq!(a.at_rest(&data, "a.txt").await.as_deref(), Some("ha-b"));
+    assert_eq!(a.at_rest(&data, "a.txt").await.as_deref(), Some(KB));
 
     // The supported downgrade: an apply on B with the confirmation, and no
     // config change, publishes plaintext; A then refuses until it agrees.
@@ -1745,11 +1763,11 @@ async fn the_bucket_list_reports_each_buckets_encryption() {
         .await;
     assert_eq!(
         env.at_rest("downloads", "new.txt").await.as_deref(),
-        Some("downloads-2026-10")
+        Some(KB)
     );
     assert_eq!(
         env.at_rest("downloads", "old.txt").await.as_deref(),
-        Some("local-a")
+        Some(KA)
     );
 
     // "Off for this bucket": plaintext writes, the key becomes legacy. The
@@ -1795,7 +1813,7 @@ async fn the_bucket_list_reports_each_buckets_encryption() {
     env.put("db-archive", "dump.sql", b"first object").await;
     assert_eq!(
         env.at_rest("db-archive", "dump.sql").await.as_deref(),
-        Some("db-archive-2026-10"),
+        Some(KD),
         "the first object of a new bucket is written with its own key"
     );
     let db = effective(&env, "db-archive").await;
@@ -1870,7 +1888,7 @@ async fn a_bucket_created_with_a_key_writes_its_first_object_under_it() {
     env.put("db-archive", "dump.sql", b"first object").await;
     assert_eq!(
         env.at_rest("db-archive", "dump.sql").await.as_deref(),
-        Some("db-archive-2026-10")
+        Some(KD)
     );
     assert_eq!(policy(&env, "db-archive").await["backend"], "local-disk");
 }
@@ -1922,12 +1940,18 @@ async fn settings_of_a_bucket_that_does_not_exist_can_be_removed() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200, "{:?}", resp.text().await);
     assert!(policy(&env, "ghost").await.is_null());
-    // An existing bucket keeps the gate.
-    env.storage_patch_ok(json!({ "buckets": { "releases": {
-        "backend": "local-disk",
-        "encryption": override_json(KA, "releases-2026-10"),
-    } } }))
-    .await;
+    // An existing bucket keeps the gate. It is empty: its plaintext
+    // history is confirmed away (issue #120's gate).
+    let (code, v) = env
+        .storage_patch_with(
+            json!({ "buckets": { "releases": {
+                "backend": "local-disk",
+                "encryption": override_json(KA, "releases-2026-10"),
+            } } }),
+            &[("X-DGP-Confirm-Plaintext-Refusal", "releases")],
+        )
+        .await;
+    assert_eq!(code, 200, "{v}");
     let (code, v) = env
         .storage_patch(json!({ "buckets": { "releases": null } }))
         .await;

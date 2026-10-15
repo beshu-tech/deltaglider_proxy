@@ -461,6 +461,9 @@ pub struct ApplyConfirmations {
     /// Subjects (bucket names, `backend:<name>`) that the apply may make
     /// store plaintext (`--confirm-encryption-downgrade`).
     pub encryption_downgrade: Vec<String>,
+    /// Subjects that start to encrypt and may refuse their plaintext
+    /// history (`--confirm-plaintext-refusal`, issue #120).
+    pub plaintext_refusal: Vec<String>,
 }
 
 pub fn apply(input: &str, opts: AdminClientOpts, confirm: &ApplyConfirmations) -> i32 {
@@ -520,6 +523,12 @@ async fn apply_async(
         req = req.header(
             crate::config::CONFIRM_ENCRYPTION_DOWNGRADE_HEADER,
             confirm.encryption_downgrade.join(","),
+        );
+    }
+    if !confirm.plaintext_refusal.is_empty() {
+        req = req.header(
+            crate::config::CONFIRM_PLAINTEXT_REFUSAL_HEADER,
+            confirm.plaintext_refusal.join(","),
         );
     }
     let resp = req

@@ -27,7 +27,12 @@ import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
 import SectionHeader from './SectionHeader';
 import FormField from './FormField';
 import BackendEncryptionEditor, { type BackendEncryptionPatch } from './BackendEncryptionEditor';
-import { buildClearLegacySectionBody, buildEncryptionSectionBody, type StorageSectionBackends } from '../backendEncryptionPayload';
+import {
+  buildClearLegacySectionBody,
+  buildEncryptionSectionBody,
+  buildRefusePlaintextSectionBody,
+  type StorageSectionBackends,
+} from '../backendEncryptionPayload';
 import MaskedSecretInput from './MaskedSecretInput';
 import { normalizeUiError } from '../errorHandling';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
@@ -395,6 +400,25 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
     }
   };
 
+  /** Stop serving unencrypted objects on a backend (#120). */
+  const handleRefusePlaintext = async (backendName: string): Promise<void> => {
+    try {
+      const { body: storage, version } = await getSectionVersioned<StorageSectionBackends>('storage');
+      const result = await applySection(qc, 'storage', buildRefusePlaintextSectionBody(backendName, storage), version);
+      if (!result.ok) {
+        setSaveResult({ ok: false, message: result.error || 'Failed to change the backend' });
+        return;
+      }
+      setSaveResult({
+        ok: true,
+        message: [`Backend '${backendName}' now refuses unencrypted objects`, persistFailureText(result)].filter(Boolean).join('. '),
+      });
+      await refresh();
+    } catch (e) {
+      setSaveResult({ ok: false, message: sectionApplyErrorText(e, 'Failed to change the backend') });
+    }
+  };
+
   const globalCompressionOn = (config?.max_delta_ratio ?? 0.75) > 0;
   // DGP_MAX_DELTA_RATIO controls the switch's field: show it read-only.
   const ratioEnv = findEnvOverride(config?.env_overrides, 'advanced.max_delta_ratio');
@@ -597,6 +621,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 current={b.encryption}
                 onApply={(patch) => handleEncryptionApply(b.name, b.encryption.mode, patch)}
                 onClearLegacy={() => handleClearLegacy(b.name)}
+                onRefusePlaintext={() => handleRefusePlaintext(b.name)}
                 readOnly={!!encryptionEnv(b)}
                 usage={backendBucketCountText(encryptionCounts[b.name])}
               />

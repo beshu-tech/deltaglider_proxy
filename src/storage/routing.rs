@@ -1544,7 +1544,7 @@ impl StorageBackend for RoutingBackend {
         &self,
         bucket: &str,
         objects: &[(String, FileMetadata)],
-    ) -> Vec<Option<String>> {
+    ) -> Vec<Option<crate::storage::ListedToken>> {
         route_existing!(self, bucket, listing_tokens, objects)
     }
 
@@ -2096,7 +2096,7 @@ mod tests {
             &self,
             _: &str,
             objects: &[(String, crate::types::FileMetadata)],
-        ) -> Vec<Option<String>> {
+        ) -> Vec<Option<crate::storage::ListedToken>> {
             vec![None; objects.len()]
         }
         async fn get_passthrough_stream(
@@ -3498,7 +3498,9 @@ mod tests {
             "aes256-gcm-proxy"
         );
         assert!(!routing.supports_native_multipart("db-archive"));
-        assert!(!routing.lite_list_carries_logical_facts("db-archive"));
+        // The wrapper presents listed entries (sealed ones opened), so the
+        // inner backend's answer holds (#120).
+        assert!(routing.lite_list_carries_logical_facts("db-archive"));
         // Another bucket on the same raw backend has no override.
         assert_eq!(routing.multipart_storage_label("releases"), "none");
     }

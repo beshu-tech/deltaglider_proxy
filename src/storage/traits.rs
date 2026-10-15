@@ -193,6 +193,16 @@ fn reference_size_mismatch(size: u64, got: u64) -> StorageError {
 
 /// One range read of a passthrough object
 /// ([`StorageBackend::open_passthrough_range`]).
+/// A listing token, and the stored object it was kept for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedToken {
+    pub token: String,
+    pub stored_key: String,
+    pub stored_etag: String,
+    pub stored_size: u64,
+}
+
+/// One ranged read of a stored object.
 pub struct RangeRead {
     /// The bytes of the range.
     pub stream: ByteStream,
@@ -272,7 +282,17 @@ pub enum CopyOutcome {
 /// plaintext. The encrypting wrapper restates the source's markers when it
 /// forwards a copy, so a copy that no wrapper checked fails here.
 pub fn copy_keeps_encryption(source: &FileMetadata, metadata: &FileMetadata) -> bool {
-    same_at_rest_encryption(source, metadata)
+    use crate::storage::encrypting::{
+        seal::SEALED_KEY, ENCRYPTION_KEY_ID_KEY, ENCRYPTION_MARKER_KEY,
+    };
+    // The wrapper re-seals a copy for its destination (the seal binds the
+    // location), so the seal VALUES differ by design: a copy must keep the
+    // marker and the key id, and be sealed exactly when its source is.
+    let has = |m: &FileMetadata, k: &str| m.user_metadata.contains_key(k);
+    [ENCRYPTION_MARKER_KEY, ENCRYPTION_KEY_ID_KEY]
+        .iter()
+        .all(|k| source.user_metadata.get(*k) == metadata.user_metadata.get(*k))
+        && has(source, SEALED_KEY) == has(metadata, SEALED_KEY)
 }
 
 /// Pure: do `a` and `b` name the same at-rest encryption (the same marker
@@ -282,6 +302,14 @@ fn same_at_rest_encryption(a: &FileMetadata, b: &FileMetadata) -> bool {
     [ENCRYPTION_MARKER_KEY, ENCRYPTION_KEY_ID_KEY]
         .iter()
         .all(|k| a.user_metadata.get(*k) == b.user_metadata.get(*k))
+}
+
+/// Pure: do `a` and `b` carry the same seal (issue #120)? A seal is unique
+/// per write, so two stored versions of a sealed object never share one;
+/// on presented metadata neither side has one.
+fn same_seal(a: &FileMetadata, b: &FileMetadata) -> bool {
+    let k = crate::storage::encrypting::seal::SEALED_KEY;
+    a.user_metadata.get(k) == b.user_metadata.get(k)
 }
 
 /// Pure: does `current` (the source as the backend holds it now) still
@@ -299,6 +327,7 @@ pub fn same_stored_generation(pin: &FileMetadata, current: &FileMetadata) -> boo
     if !crate::deltaglider::DynEngine::same_generation(pin, current)
         || pin.created_at != current.created_at
         || !same_at_rest_encryption(pin, current)
+        || !same_seal(pin, current)
     {
         return false;
     }
@@ -1559,7 +1588,9 @@ pub trait StorageBackend: Send + Sync {
 
     /// Per listed entry (lite metadata as a listing returns it: `file_size`
     /// and `md5` are the STORED size and ETag), the listing token kept for
-    /// exactly that stored object (same stored ETag and size), or `None`.
+    /// exactly that stored object (same stored ETag and size), with the
+    /// stored key, ETag and size it was kept for (the AD of the token), or
+    /// `None`.
     /// Two tokens that disagree are `None`. S3: the same one scan of the
     /// facts namespace that resolves `!!1` facts. Filesystem: all `None`.
     /// No default: a wrapper must forward it.
@@ -1567,7 +1598,7 @@ pub trait StorageBackend: Send + Sync {
         &self,
         bucket: &str,
         objects: &[(String, FileMetadata)],
-    ) -> impl Future<Output = Vec<Option<String>>> + Send;
+    ) -> impl Future<Output = Vec<Option<ListedToken>>> + Send;
 
     /// Enrich listed objects with full metadata from HEAD calls.
     /// Used by the `metadata=true` MinIO ListObjectsV2 extension.

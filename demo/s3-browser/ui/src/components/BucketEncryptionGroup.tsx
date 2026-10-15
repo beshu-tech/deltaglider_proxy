@@ -209,6 +209,13 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
           re-encrypt job rewrites them; after you apply, the proxy offers that job.
         </Text>
       )}
+      {enabling && dialog.change.kind === 'bucket-key' && (
+        <Text style={{ fontSize: 12 }}>
+          The objects already in the bucket are not encrypted. The proxy keeps serving them until the
+          re-encrypt job converts them. After the job, choose <b>Refuse unencrypted objects</b>, so that the
+          proxy refuses an unencrypted object that someone puts directly on the storage.
+        </Text>
+      )}
       {(enabling || dialog.change.kind === 'bucket-key') && (
         <Text type="warning" style={{ fontSize: 12 }}>
           While the re-encrypt job runs on the bucket, reads keep working, but uploads and deletes
@@ -293,6 +300,27 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
         >
           Rotate key
         </Button>
+      )}
+
+      {eff.source === 'bucket' && eff.serves_plaintext && !editing && (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginTop: 8, borderRadius: 6, fontSize: 12 }}
+          title="Unencrypted objects are served"
+          description="The bucket encrypts new writes, and it also serves objects that are not encrypted, so that its history stays readable until the re-encrypt job converts it. When the job has finished, refuse unencrypted objects: then nobody can put one directly on the storage and have the proxy serve it."
+          action={
+            <Button
+              size="small"
+              disabled={readOnly || !!blockedReason || busy}
+              onClick={async () => {
+                await apply({ kind: 'refuse-plaintext' });
+              }}
+            >
+              Refuse unencrypted objects
+            </Button>
+          }
+        />
       )}
 
       {eff.source === 'bucket' && eff.legacy_key_id && !editing && (

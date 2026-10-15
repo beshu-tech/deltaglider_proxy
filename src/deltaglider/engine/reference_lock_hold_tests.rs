@@ -757,7 +757,7 @@ impl crate::storage::StorageBackend for FencingFs {
         &self,
         _: &str,
         objects: &[(String, crate::types::FileMetadata)],
-    ) -> Vec<Option<String>> {
+    ) -> Vec<Option<crate::storage::ListedToken>> {
         vec![None; objects.len()]
     }
     async fn get_passthrough_stream(

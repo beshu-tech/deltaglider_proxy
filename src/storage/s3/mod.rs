@@ -1712,7 +1712,7 @@ impl StorageBackend for S3Backend {
         &self,
         bucket: &str,
         objects: &[(String, FileMetadata)],
-    ) -> Vec<Option<String>> {
+    ) -> Vec<Option<crate::storage::ListedToken>> {
         self.read_listing_tokens(bucket, objects).await
     }
 

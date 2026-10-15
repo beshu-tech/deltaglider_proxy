@@ -29,6 +29,7 @@ interface EncryptionPatch {
   bucket_key_enabled?: boolean;
   legacy_key?: string | null;
   legacy_key_id?: string | null;
+  plaintext_reads?: 'serve' | 'refuse';
 }
 
 /** The part of the storage section GET body this builder reads. Each
@@ -49,6 +50,7 @@ function encryptionBody(patch: EncryptionPatch): Record<string, unknown> {
   if (patch.bucket_key_enabled !== undefined) encBody.bucket_key_enabled = patch.bucket_key_enabled;
   if (patch.legacy_key !== undefined) encBody.legacy_key = patch.legacy_key;
   if (patch.legacy_key_id !== undefined) encBody.legacy_key_id = patch.legacy_key_id;
+  if (patch.plaintext_reads !== undefined) encBody.plaintext_reads = patch.plaintext_reads;
   return encBody;
 }
 
@@ -71,8 +73,27 @@ export function buildEncryptionSectionBody(
     throw new Error(`Backend "${backendName}" is not in the storage configuration. Reload the page.`);
   }
   return {
-    backends: list.map((b) => (b.name === backendName ? { ...b, encryption: encBody } : b)),
+    backends: list.map((b) => (b.name === backendName ? { ...b, encryption: keepReadPolicy(b, encBody) } : b)),
   };
+}
+
+/** The new block of a named backend, with the backend's `plaintext_reads`
+ *  kept while the mode stays proxy-AES (the block is replaced whole, and
+ *  the editor does not show that field). */
+function keepReadPolicy(
+  entry: Record<string, unknown>,
+  encBody: Record<string, unknown>,
+): Record<string, unknown> {
+  const current = entry.encryption as Record<string, unknown> | undefined;
+  if (
+    encBody.mode === 'aes256-gcm-proxy' &&
+    encBody.plaintext_reads === undefined &&
+    current?.mode === 'aes256-gcm-proxy' &&
+    current.plaintext_reads !== undefined
+  ) {
+    return { ...encBody, plaintext_reads: current.plaintext_reads };
+  }
+  return encBody;
 }
 
 /**
@@ -90,7 +111,9 @@ export function aesKeyPatch(
   if (current.mode === 'aes256-gcm-proxy' && current.key_id) {
     return { mode: 'aes256-gcm-proxy', key, key_id: null, legacy_key_id: current.key_id };
   }
-  return { mode: 'aes256-gcm-proxy', key };
+  // A backend that starts to encrypt holds unencrypted objects: keep
+  // serving them until the re-encrypt job converts them (#120).
+  return { mode: 'aes256-gcm-proxy', key, plaintext_reads: 'serve' };
 }
 
 /**
@@ -104,7 +127,26 @@ export function buildClearLegacySectionBody(
   backendName: string,
   storage: StorageSectionBackends,
 ): Record<string, unknown> {
-  const clear = { legacy_key: null, legacy_key_id: null };
+  return buildEncryptionFieldsSectionBody(backendName, { legacy_key: null, legacy_key_id: null }, storage);
+}
+
+/** The payload that stops a backend from serving unencrypted objects
+ *  (`plaintext_reads: refuse`, #120); the rest of the block stays. */
+export function buildRefusePlaintextSectionBody(
+  backendName: string,
+  storage: StorageSectionBackends,
+): Record<string, unknown> {
+  return buildEncryptionFieldsSectionBody(backendName, { plaintext_reads: 'refuse' }, storage);
+}
+
+/** Change only `fields` of a backend's encryption block: a merge-patch on
+ *  the singleton; the entry's own block with `fields` on a named backend. */
+function buildEncryptionFieldsSectionBody(
+  backendName: string,
+  fields: Record<string, unknown>,
+  storage: StorageSectionBackends,
+): Record<string, unknown> {
+  const clear = fields;
   const list = storage.backends ?? [];
   if (list.length === 0 && backendName === 'default') {
     return { backend_encryption: clear };

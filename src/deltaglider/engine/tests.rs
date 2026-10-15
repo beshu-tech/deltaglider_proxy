@@ -229,7 +229,7 @@ impl crate::storage::StorageBackend for NullInner {
         &self,
         _: &str,
         objects: &[(String, crate::types::FileMetadata)],
-    ) -> Vec<Option<String>> {
+    ) -> Vec<Option<crate::storage::ListedToken>> {
         vec![None; objects.len()]
     }
     async fn get_passthrough_stream(
@@ -920,8 +920,28 @@ async fn a_proxy_backend_without_a_key_refuses_writes_and_keeps_reads() {
         !tmp.path().join("b").join("new.bin").exists(),
         "no plaintext object may reach the disk"
     );
-    // The read path is untouched.
-    let got = wrapped.get_passthrough("b", "", "old.bin").await.unwrap();
+    // The bucket encrypts, so its plaintext history is refused (#120)...
+    assert!(wrapped.get_passthrough("b", "", "old.bin").await.is_err());
+    // ...unless the config serves it while a re-encrypt job converts it.
+    let serving = wrap_backend_with_encryption(
+        "keyless",
+        DynStorageBackend::new_box(
+            crate::storage::FilesystemBackend::new(tmp.path().to_path_buf())
+                .await
+                .unwrap(),
+        ),
+        &crate::config::BackendEncryptionConfig::Aes256GcmProxy {
+            key: None,
+            key_id: None,
+            legacy_key: None,
+            legacy_key_id: None,
+            plaintext_reads: crate::config::PlaintextReads::Serve,
+        },
+        &[],
+        &mut KeyIdCollisionCheck::new(),
+    )
+    .unwrap();
+    let got = serving.get_passthrough("b", "", "old.bin").await.unwrap();
     assert_eq!(got, b"old");
 }
 

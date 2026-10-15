@@ -1,12 +1,155 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Unit tests of the encrypting wrapper and its formats.
+//! Unit tests of the encrypting wrapper (format v2, issue #120). The format
+//! itself is tested in `v2.rs`, the sealed metadata in `seal.rs`.
 
 use super::*;
+use bytes::Bytes;
+use futures::TryStreamExt;
+
+const F: usize = v2::FRAME_PLAINTEXT;
+
+fn key(byte: u8) -> EncryptionKey {
+    EncryptionKey::from_hex(&format!("{byte:02x}").repeat(32)).unwrap()
+}
+
+fn shared(cfg: EncryptionConfig) -> Arc<ArcSwap<EncryptionConfig>> {
+    Arc::new(ArcSwap::new(Arc::new(cfg)))
+}
+
+/// A backend config that encrypts with `k` under the id `id`.
+fn keyed(k: EncryptionKey, id: &str) -> EncryptionConfig {
+    EncryptionConfig {
+        key: Some(k),
+        key_id: Some(id.to_string()),
+        ..Default::default()
+    }
+}
+
+fn sha_hex(data: &[u8]) -> String {
+    hex::encode(<sha2::Sha256 as sha2::Digest>::digest(data))
+}
+
+fn md5_hex(data: &[u8]) -> String {
+    hex::encode(<md5::Md5 as md5::Digest>::digest(data))
+}
+
+/// Passthrough metadata as the engine writes it.
+fn pmeta(name: &str, data: &[u8]) -> FileMetadata {
+    FileMetadata::new_passthrough(
+        name.into(),
+        sha_hex(data),
+        md5_hex(data),
+        data.len() as u64,
+        None,
+    )
+}
+
+/// Delta metadata whose stored body is `delta`.
+fn dmeta(name: &str, delta: &[u8]) -> FileMetadata {
+    FileMetadata::new_delta(
+        name.into(),
+        "ab".repeat(32),
+        "cd".repeat(16),
+        delta.len() as u64 + 1000,
+        "reference.bin".into(),
+        "ef".repeat(32),
+        delta.len() as u64,
+        None,
+    )
+}
+
+/// Reference metadata whose body is `data`.
+fn rmeta(data: &[u8]) -> FileMetadata {
+    FileMetadata::new_reference(
+        "reference.bin".into(),
+        "app.zip".into(),
+        sha_hex(data),
+        md5_hex(data),
+        data.len() as u64,
+        None,
+    )
+}
+
+fn body_of(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+async fn collect(stream: ByteStream) -> Result<Vec<u8>, StorageError> {
+    let parts: Vec<Bytes> = stream.try_collect().await?;
+    Ok(parts.concat())
+}
+
+/// The bytes of a range read, or its error (the open or the stream).
+async fn read_range<B: StorageBackend>(
+    w: &EncryptingBackend<B>,
+    bucket: &str,
+    prefix: &str,
+    name: &str,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u8>, StorageError> {
+    let read = w
+        .open_passthrough_range(bucket, prefix, name, start, end)
+        .await?;
+    collect(read.stream).await
+}
+
+fn has_seal(m: &FileMetadata) -> bool {
+    m.user_metadata.contains_key(seal::SEALED_KEY)
+}
+
+fn has_any_marker(m: &FileMetadata) -> bool {
+    ENCRYPTION_MARKER_KEYS
+        .iter()
+        .any(|k| m.user_metadata.contains_key(*k))
+}
+
+struct Fs {
+    dir: tempfile::TempDir,
+    w: EncryptingBackend<crate::storage::FilesystemBackend>,
+    cfg: Arc<ArcSwap<EncryptionConfig>>,
+}
+
+async fn fs(cfg: EncryptionConfig) -> Fs {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = crate::storage::FilesystemBackend::new(dir.path().join("data"))
+        .await
+        .unwrap();
+    let cfg = shared(cfg);
+    let w = EncryptingBackend::new(inner, cfg.clone());
+    for b in ["b", "b2"] {
+        w.create_bucket(b).await.unwrap();
+    }
+    Fs { dir, w, cfg }
+}
+
+impl Fs {
+    fn spool(&self) -> crate::deltaglider::spool::SpoolDir {
+        crate::deltaglider::spool::SpoolDir::new(self.dir.path().join("spool"), 256 * 1024 * 1024)
+            .unwrap()
+    }
+
+    async fn put(&self, prefix: &str, name: &str, data: &[u8]) {
+        self.w
+            .put_passthrough(
+                "b",
+                prefix,
+                name,
+                Bytes::copy_from_slice(data),
+                &pmeta(name, data),
+            )
+            .await
+            .unwrap();
+    }
+}
 
 #[cfg(test)]
 mod wrapper_tests {
     use super::*;
+    use crate::deltaglider::RefWriteProof;
+    use crate::storage::RewriteBasis;
+    use std::sync::Mutex;
 
     #[test]
     fn ciphertext_listings_without_a_cache_hit_are_stored_only() {
@@ -35,709 +178,187 @@ mod wrapper_tests {
         );
     }
 
-    fn test_key() -> EncryptionKey {
-        EncryptionKey::from_hex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
-            .unwrap()
-    }
-
-    /// strip_encryption_markers must remove BOTH proxy-encryption markers and
-    /// leave user metadata otherwise intact. Copy/move paths (transfer.rs, s3s
-    /// CopyObject, admin bulk copy/move) rely on this to avoid stamping stale
-    /// "this is encrypted" markers onto a decrypted body — which would make the
-    /// destination unreadable (and, for move, unrecoverable after source delete).
+    /// The copy paths strip every marker, the seal included, so a copy
+    /// never carries a stale "this is encrypted" claim onto another body.
     #[test]
-    fn strip_encryption_markers_removes_both_and_preserves_rest() {
+    fn strip_encryption_markers_removes_every_marker_and_preserves_rest() {
         let mut md = std::collections::HashMap::new();
-        md.insert(ENCRYPTION_MARKER_KEY.to_string(), "aes256-gcm-proxy".into());
+        md.insert(ENCRYPTION_MARKER_KEY.to_string(), "v2".into());
         md.insert(ENCRYPTION_KEY_ID_KEY.to_string(), "k1".into());
+        md.insert(seal::SEALED_KEY.to_string(), "2.abc".into());
         md.insert("user-tag".to_string(), "keep-me".into());
         strip_encryption_markers(&mut md);
-        assert!(
-            !md.contains_key(ENCRYPTION_MARKER_KEY),
-            "dg-encrypted removed"
-        );
-        assert!(
-            !md.contains_key(ENCRYPTION_KEY_ID_KEY),
-            "dg-encryption-key-id removed"
-        );
+        assert_eq!(md.len(), 1, "{md:?}");
         assert_eq!(md.get("user-tag").map(String::as_str), Some("keep-me"));
     }
 
-    /// The streaming `put_passthrough_file` must produce a chunked object that
-    /// decrypts byte-identically via the normal read path — across the framing
-    /// boundaries (empty, sub-window, exact window, exact 2 windows, multi+tail).
-    /// storage-2: the adapter clamps a range against a size from the
-    /// metadata cache, which can be stale. The v1 (single-shot) branch then
-    /// sliced `plain[s..e]` with `s` past the end and panicked the request.
-    /// Out-of-range is an `InvalidRange` error; an end past the object is
-    /// clamped.
-    #[tokio::test]
-    async fn v1_range_reads_out_of_bounds_are_an_error_not_a_panic() {
-        use crate::storage::filesystem::FilesystemBackend;
-        use futures::StreamExt;
-        let dir = tempfile::tempdir().unwrap();
-        let fs = FilesystemBackend::new(dir.path().to_path_buf())
-            .await
-            .unwrap();
-        let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
-            key: Some(test_key()),
-            key_id: Some("kid-1".to_string()),
-            ..Default::default()
-        })));
-        let wrapper = EncryptingBackend::new(fs, cfg);
-        wrapper.create_bucket("b").await.unwrap();
-        let meta = FileMetadata::fallback(
-            "o.bin".into(),
-            10,
-            "md5".into(),
-            Utc::now(),
-            None,
-            crate::types::StorageInfo::Passthrough,
-        );
-        wrapper
-            .put_passthrough(
-                "b",
-                "p",
-                "o.bin",
-                bytes::Bytes::from_static(b"0123456789"),
-                &meta,
+    #[test]
+    fn a_fingerprint_label_is_the_hex_of_the_v2_fingerprint() {
+        let label = fingerprint_label(&key(0x11));
+        assert_eq!(
+            label,
+            format!(
+                "fp-{}",
+                hex::encode(v2::SiteKey::new(&key(0x11)).fingerprint())
             )
-            .await
-            .unwrap();
-        for (start, end) in [(20, 25), (10, 10), (8, 2)] {
-            let res = wrapper
-                .get_passthrough_stream_range("b", "p", "o.bin", start, end)
-                .await;
+        );
+        assert_eq!(label.len(), 3 + 2 * v2::FP_LEN);
+        assert_ne!(label, fingerprint_label(&key(0x12)));
+    }
+
+    /// storage-2: the adapter clamps a range against a size from the
+    /// metadata cache, which can be stale. Out-of-range is an `InvalidRange`
+    /// error, never a panic; an end past the object is clamped.
+    #[tokio::test]
+    async fn range_reads_out_of_bounds_are_an_error_not_a_panic() {
+        let r = fs(keyed(key(1), "kid-1")).await;
+        r.put("p", "o.bin", b"0123456789").await;
+        for (start, end) in [(20, 25), (10, 10), (8, 2), (70_000, 70_010)] {
+            let res =
+                r.w.get_passthrough_stream_range("b", "p", "o.bin", start, end)
+                    .await;
             assert!(
                 matches!(res, Err(StorageError::InvalidRange(_))),
                 "({start},{end}) must be InvalidRange"
             );
         }
-        let (stream, len) = wrapper
-            .get_passthrough_stream_range("b", "p", "o.bin", 5, 100)
-            .await
-            .unwrap();
-        let body: Vec<u8> = stream.map(|c| c.unwrap().to_vec()).concat().await;
-        assert_eq!((len, body.as_slice()), (5, &b"56789"[..]));
+        let (stream, len) =
+            r.w.get_passthrough_stream_range("b", "p", "o.bin", 5, 100)
+                .await
+                .unwrap();
+        assert_eq!(
+            (len, collect(stream).await.unwrap()),
+            (5, b"56789".to_vec())
+        );
     }
 
+    /// Every write path stores a v2 body of exactly `stored_len` bytes and
+    /// sealed metadata, and reads back byte-identical, across the frame
+    /// boundaries (empty, sub-frame, exact frames, multi-frame + tail).
     #[tokio::test]
-    async fn streaming_put_passthrough_file_roundtrips_all_boundaries() {
-        use crate::storage::filesystem::FilesystemBackend;
-        let cw = CHUNK_PLAINTEXT_SIZE;
+    async fn every_write_path_round_trips_at_frame_boundaries() {
+        let r = fs(keyed(key(1), "kid-1")).await;
+        let sd = r.spool();
         for size in [
             0usize,
             1,
             100,
-            cw - 1,
-            cw,
-            cw + 1,
-            2 * cw,
-            2 * cw + 7,
-            5 * cw + 123,
+            F - 1,
+            F,
+            F + 1,
+            2 * F,
+            2 * F + 7,
+            5 * F + 123,
         ] {
-            let dir = tempfile::tempdir().unwrap();
-            let fs = FilesystemBackend::new(dir.path().to_path_buf())
-                .await
-                .unwrap();
-            let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
-                key: Some(test_key()),
-                key_id: Some("kid-1".to_string()),
-                ..Default::default()
-            })));
-            let wrapper = EncryptingBackend::new(fs, cfg);
-            wrapper.create_bucket("b").await.unwrap();
-            let sd = test_spool(&dir);
-
-            let plaintext: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
-            let mut src = tempfile::NamedTempFile::new().unwrap();
-            std::io::Write::write_all(&mut src, &plaintext).unwrap();
-            let meta = FileMetadata::fallback(
-                "o.bin".into(),
-                size as u64,
-                "md5".into(),
-                Utc::now(),
-                None,
-                crate::types::StorageInfo::Passthrough,
-            );
-            wrapper
-                .put_passthrough_file("b", "p", "o.bin", src.path(), &meta, unheld(&sd))
-                .await
-                .unwrap_or_else(|e| panic!("size {size}: put failed: {e:?}"));
-            let wire = wrapper
-                .inner
-                .get_passthrough("b", "p", "o.bin")
-                .await
-                .unwrap();
-            assert!(
-                wire.len() as u64 <= chunked_wire_len_bound(size as u64),
-                "size {size}: wire {} over the reservation bound",
-                wire.len()
-            );
-
-            let got = wrapper.get_passthrough("b", "p", "o.bin").await.unwrap();
-            assert_eq!(got, plaintext, "size {size}: roundtrip mismatch");
-            // On-disk body must be chunked-encrypted (not plaintext, not single-shot).
-            let stored_meta = wrapper
-                .inner
-                .get_passthrough_metadata("b", "p", "o.bin")
-                .await
-                .unwrap();
-            assert!(
-                is_chunked_encrypted(&stored_meta),
-                "size {size}: not chunked on disk"
-            );
-
-            // Same via the RELAYED-PARTS sink (the multipart-upload path): split
-            // into 3 part files, store, read back byte-identical.
+            let data = body_of(size);
+            let prefix = format!("s{size}");
+            let p = prefix.as_str();
+            let meta = pmeta("x", &data);
+            let src = r.dir.path().join(format!("src{size}"));
+            std::fs::write(&src, &data).unwrap();
             let third = size / 3;
-            let mut part_files = Vec::new();
-            let mut off = 0usize;
-            for len in [third, third, size - 2 * third] {
-                let mut pf = tempfile::NamedTempFile::new().unwrap();
-                std::io::Write::write_all(&mut pf, &plaintext[off..off + len]).unwrap();
-                off += len;
-                part_files.push(pf);
-            }
-            let part_paths: Vec<std::path::PathBuf> =
-                part_files.iter().map(|f| f.path().to_path_buf()).collect();
-            wrapper
-                .put_passthrough_parts("b", "p", "parts.bin", &part_paths, &meta, unheld(&sd))
-                .await
-                .unwrap_or_else(|e| panic!("size {size}: parts put failed: {e:?}"));
-            let got_parts = wrapper
-                .get_passthrough("b", "p", "parts.bin")
+            let parts: Vec<std::path::PathBuf> = [0..third, third..2 * third, 2 * third..size]
+                .into_iter()
+                .enumerate()
+                .map(|(i, range)| {
+                    let path = r.dir.path().join(format!("part{size}-{i}"));
+                    std::fs::write(&path, &data[range]).unwrap();
+                    path
+                })
+                .collect();
+            let chunks: Vec<Bytes> = data.chunks(7777).map(Bytes::copy_from_slice).collect();
+            let w = &r.w;
+            w.put_passthrough("b", p, "buffered", Bytes::from(data.clone()), &meta)
                 .await
                 .unwrap();
-            assert_eq!(
-                got_parts, plaintext,
-                "size {size}: parts roundtrip mismatch"
-            );
-        }
-    }
+            w.put_passthrough_file(
+                "b",
+                p,
+                "file",
+                &src,
+                &meta,
+                SpoolBudget::new(&sd, None, None),
+            )
+            .await
+            .unwrap();
+            w.put_passthrough_parts(
+                "b",
+                p,
+                "parts",
+                &parts,
+                &meta,
+                SpoolBudget::new(&sd, None, None),
+            )
+            .await
+            .unwrap();
+            w.put_passthrough_chunked("b", p, "chunked", &chunks, &meta)
+                .await
+                .unwrap();
+            w.put_delta(
+                "b",
+                p,
+                "app.zip",
+                Bytes::from(data.clone()),
+                &dmeta("app.zip", &data),
+                RefWriteProof::for_tests(),
+            )
+            .await
+            .unwrap();
+            w.put_reference(
+                "b",
+                p,
+                Bytes::from(data.clone()),
+                &rmeta(&data),
+                RefWriteProof::for_tests(),
+            )
+            .await
+            .unwrap();
 
-    fn other_key() -> EncryptionKey {
-        EncryptionKey::from_hex("fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210")
-            .unwrap()
-    }
+            let want_wire = v2::stored_len(size as u64).unwrap();
+            for name in ["buffered", "file", "parts", "chunked"] {
+                let at = format!("size {size} {name}");
+                let wire = w.inner.get_passthrough("b", p, name).await.unwrap();
+                assert_eq!(wire.len() as u64, want_wire, "{at}");
+                assert_eq!(wire[..4], v2::MAGIC, "{at}");
+                let raw = w
+                    .inner
+                    .get_passthrough_metadata("b", p, name)
+                    .await
+                    .unwrap();
+                assert!(has_seal(&raw), "{at}: no seal");
+                assert_eq!(raw.user_metadata[ENCRYPTION_MARKER_KEY], seal::DISK_MARKER);
+                assert!(raw.md5.is_empty(), "{at}: md5 in clear");
+                assert!(raw.file_sha256.starts_with("sealed:"), "{at}");
+                assert!(!raw.user_metadata.contains_key(ENCRYPTION_KEY_ID_KEY));
 
-    #[test]
-    fn test_encrypt_decrypt_roundtrip() {
-        let key = test_key();
-        let pt = b"hello, encryption at rest!";
-        let blob = encrypt(&key, pt).unwrap();
-        assert_eq!(decrypt(&key, &blob).unwrap(), pt);
-    }
-
-    #[test]
-    fn test_unique_ivs() {
-        let key = test_key();
-        let pt = b"same data";
-        let b1 = encrypt(&key, pt).unwrap();
-        let b2 = encrypt(&key, pt).unwrap();
-        assert_ne!(b1, b2);
-        assert_eq!(decrypt(&key, &b1).unwrap(), pt);
-        assert_eq!(decrypt(&key, &b2).unwrap(), pt);
-    }
-
-    #[test]
-    fn test_wrong_key_error() {
-        let blob = encrypt(&test_key(), b"secret").unwrap();
-        let r = decrypt(&other_key(), &blob);
-        assert!(r.is_err());
-        assert!(r.unwrap_err().to_string().contains("decryption failed"));
-    }
-
-    #[test]
-    fn test_tampered_ciphertext() {
-        let key = test_key();
-        let mut blob = encrypt(&key, b"important").unwrap();
-        blob[IV_LEN + 5] ^= 0xFF;
-        assert!(decrypt(&key, &blob).is_err());
-    }
-
-    #[test]
-    fn test_empty_data() {
-        let key = test_key();
-        let blob = encrypt(&key, b"").unwrap();
-        assert_eq!(blob.len(), IV_LEN + 16);
-        assert!(decrypt(&key, &blob).unwrap().is_empty());
-    }
-
-    #[test]
-    fn test_large_data() {
-        let key = test_key();
-        let pt: Vec<u8> = (0..10_000_000u32).map(|i| (i % 256) as u8).collect();
-        let blob = encrypt(&key, &pt).unwrap();
-        assert_eq!(decrypt(&key, &blob).unwrap(), pt);
-    }
-
-    #[test]
-    fn test_metadata_detection() {
-        let mut m = FileMetadata::fallback(
-            "test".into(),
-            100,
-            "md5".into(),
-            chrono::Utc::now(),
-            None,
-            crate::types::StorageInfo::Passthrough,
-        );
-        assert!(!is_encrypted(&m));
-        mark_encrypted(&mut m, None);
-        assert!(is_encrypted(&m));
-    }
-
-    #[test]
-    fn test_key_validation() {
-        assert!(EncryptionKey::from_hex("0123").is_err());
-        assert!(EncryptionKey::from_hex("zzzz").is_err());
-        assert!(EncryptionKey::from_hex(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn test_blob_too_short() {
-        let r = decrypt(&test_key(), &[0u8; 10]);
-        assert!(r.is_err());
-        assert!(r.unwrap_err().to_string().contains("too short"));
-    }
-
-    // ─────────────────────────────────────────────────────────────────
-    // Chunked-format codec tests
-    //
-    // These cover the AEAD primitives in isolation; integration tests in
-    // `tests/encryption_test.rs` exercise the streaming trait impl
-    // (chunking on upload, decoding on range GET, etc.).
-    // ─────────────────────────────────────────────────────────────────
-
-    fn test_base_iv() -> [u8; IV_LEN] {
-        // Fixed value for deterministic tests — real callers generate with OsRng.
-        [0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-    }
-
-    #[test]
-    fn test_chunk_nonce_is_derived_deterministically() {
-        let iv = test_base_iv();
-        let n0 = chunk_nonce(&iv, 0);
-        // chunk_index=0 XORs zeros into the low 4 bytes — nonce equals base_iv.
-        assert_eq!(n0, iv, "chunk 0 nonce must equal base_iv");
-
-        let n1 = chunk_nonce(&iv, 1);
-        assert_ne!(n1, iv, "chunk 1 nonce differs from base_iv");
-        assert_eq!(n1[8], iv[8]);
-        assert_eq!(n1[9], iv[9]);
-        assert_eq!(n1[10], iv[10]);
-        assert_eq!(n1[11], iv[11] ^ 0x01);
-    }
-
-    #[test]
-    fn test_chunk_nonces_unique_across_sequential_indices() {
-        // A real stream might have millions of chunks; we sanity-check a
-        // small range and confirm each maps to a distinct nonce.
-        let iv = test_base_iv();
-        let mut seen = std::collections::HashSet::new();
-        for i in 0u32..10_000 {
-            let n = chunk_nonce(&iv, i);
-            assert!(seen.insert(n), "duplicate nonce at index {i}");
-        }
-    }
-
-    #[test]
-    fn test_chunk_aad_distinguishes_final_flag() {
-        // A truncation attack would try to reuse an AAD from a non-final
-        // chunk but claim it as final (or vice versa). The decrypt-time
-        // AAD rebuild must differ to catch this.
-        let a = chunk_aad(42, false);
-        let b = chunk_aad(42, true);
-        assert_ne!(a, b, "AAD must differ when final flag differs");
-        assert_eq!(a[8], 0);
-        assert_eq!(b[8], 1);
-    }
-
-    /// ChunkFramer owns the is_final/index invariant for BOTH the file and the
-    /// in-memory chunked paths. Feed it N full windows + an optional tail and
-    /// assert: exactly one final frame (the last), monotonic 0..k indices, and a
-    /// zero-window input still emits one empty final frame. Decrypting each frame
-    /// with the index/is_final it was framed under must succeed (any drift in
-    /// index or final-flag placement fails the AEAD auth).
-    #[test]
-    fn chunk_framer_stamps_final_and_index_correctly() {
-        let key = test_key();
-        let base_iv = test_base_iv();
-
-        // Drive the framer with `n_full` full windows + a `tail_len`-byte tail
-        // (tail_len == 0 means no tail). Returns the emitted frames in order.
-        let run = |n_full: usize, tail_len: usize| -> Vec<Vec<u8>> {
-            let mut framer = ChunkFramer::new(base_iv);
-            let mut frames = Vec::new();
-            for i in 0..n_full {
-                let w = vec![(i as u8).wrapping_add(1); CHUNK_PLAINTEXT_SIZE];
-                if let Some(f) = framer.push_window(&key, w).unwrap() {
-                    frames.push(f);
+                assert_eq!(w.get_passthrough("b", p, name).await.unwrap(), data, "{at}");
+                let shown = w.get_passthrough_metadata("b", p, name).await.unwrap();
+                assert_eq!(shown.md5, md5_hex(&data), "{at}");
+                assert_eq!(shown.file_sha256, sha_hex(&data), "{at}");
+                assert_eq!(shown.file_size, size as u64, "{at}");
+                assert!(!has_seal(&shown), "{at}: the seal leaked");
+                if size > 10 {
+                    let (s, e) = (size as u64 / 2 - 5, size as u64 / 2 + 5);
+                    let got = read_range(w, "b", p, name, s, e).await.unwrap();
+                    assert_eq!(got, data[s as usize..=e as usize], "{at} range");
                 }
             }
-            if tail_len > 0 {
-                if let Some(f) = framer.push_window(&key, vec![0xAB; tail_len]).unwrap() {
-                    frames.push(f);
-                }
-            }
-            frames.push(framer.finish(&key).unwrap());
-            frames
-        };
-
-        // Decode a frame body (strip the 4-byte LE length prefix) and verify it
-        // decrypts under (index, is_final) — proving the framer stamped both.
-        let verify = |frames: &[Vec<u8>]| {
-            let last = frames.len() - 1;
-            for (idx, frame) in frames.iter().enumerate() {
-                let ct = &frame[CHUNK_FRAME_LEN_FIELD..];
-                let is_final = idx == last;
-                decrypt_chunk(&key, &base_iv, idx as u32, is_final, ct)
-                    .unwrap_or_else(|e| panic!("frame {idx} (final={is_final}) failed: {e:?}"));
-                // A non-final frame must NOT verify as final and vice-versa.
-                assert!(
-                    decrypt_chunk(&key, &base_iv, idx as u32, !is_final, ct).is_err(),
-                    "frame {idx} verified under the WRONG final-flag — is_final drift"
-                );
-            }
-        };
-
-        // Zero-byte object → exactly one empty final frame.
-        let z = run(0, 0);
-        assert_eq!(z.len(), 1, "zero-byte → one final frame");
-        verify(&z);
-        // Sub-window, exact one window, one window + tail, several + tail.
-        for (n_full, tail) in [(0, 100), (1, 0), (1, 7), (3, 0), (3, 4096)] {
-            let frames = run(n_full, tail);
-            let expected = n_full + if tail > 0 { 1 } else { 0 };
-            let expected = expected.max(1); // always ≥1 (the final frame)
-            assert_eq!(
-                frames.len(),
-                expected,
-                "n_full={n_full} tail={tail} frame count"
-            );
-            verify(&frames);
+            assert_eq!(w.get_delta("b", p, "app.zip").await.unwrap(), data);
+            let raw = w.inner.get_delta_metadata("b", p, "app.zip").await.unwrap();
+            assert!(has_seal(&raw) && raw.file_size == 0, "size {size}: delta");
+            let shown = w.get_delta_metadata("b", p, "app.zip").await.unwrap();
+            assert_eq!(shown.file_size, size as u64 + 1000);
+            assert_eq!(w.get_reference("b", p).await.unwrap(), data);
+            let source = w.open_reference_source("b", p).await.unwrap();
+            assert_eq!(source.size, size as u64);
+            assert_eq!(source.read_all().await.unwrap(), data, "size {size}: ref");
         }
     }
 
-    #[test]
-    fn test_encrypt_decrypt_chunk_roundtrip() {
-        let key = test_key();
-        let iv = test_base_iv();
-        let pt = b"chunk zero plaintext";
-        let frame = encrypt_chunk(&key, &iv, 0, false, pt).unwrap();
+    // ── A spy backend: one passthrough object in memory ──
 
-        // Frame layout: [4 B length prefix] [ciphertext + tag]
-        let declared_len = u32::from_le_bytes(frame[..4].try_into().unwrap()) as usize;
-        let ct = &frame[4..];
-        assert_eq!(ct.len(), declared_len);
-        assert_eq!(ct.len(), pt.len() + GCM_TAG_LEN);
-
-        let decrypted = decrypt_chunk(&key, &iv, 0, false, ct).unwrap();
-        assert_eq!(decrypted, pt);
-    }
-
-    #[test]
-    fn test_encrypt_decrypt_chunk_final_flag_preserved() {
-        // Writer encrypts the final chunk with is_final=true; reader must
-        // pass the same flag to decrypt or GCM auth fails (the whole
-        // point of binding final into AAD).
-        let key = test_key();
-        let iv = test_base_iv();
-        let pt = b"tail chunk";
-        let frame = encrypt_chunk(&key, &iv, 5, true, pt).unwrap();
-        let ct = &frame[4..];
-
-        // Honest reader — matches flag.
-        assert_eq!(decrypt_chunk(&key, &iv, 5, true, ct).unwrap(), pt);
-
-        // Malicious reader claiming final=false — must fail (truncation guard).
-        let bad = decrypt_chunk(&key, &iv, 5, false, ct);
-        assert!(bad.is_err(), "AAD mismatch on final flag must reject");
-    }
-
-    #[test]
-    fn test_chunk_reordering_is_detected() {
-        // Simulate an attacker swapping two chunks on disk: their
-        // ciphertexts are valid AEAD outputs, but the AAD they were
-        // signed with had different chunk_index values. Decrypt with the
-        // SWAPPED index (what an out-of-order reader would compute) must
-        // fail.
-        let key = test_key();
-        let iv = test_base_iv();
-
-        let frame0 = encrypt_chunk(&key, &iv, 0, false, b"chunk-zero").unwrap();
-        let frame1 = encrypt_chunk(&key, &iv, 1, false, b"chunk-one_").unwrap();
-        let ct0 = &frame0[4..];
-        let ct1 = &frame1[4..];
-
-        // Honest sequential decrypt works.
-        assert_eq!(
-            decrypt_chunk(&key, &iv, 0, false, ct0).unwrap(),
-            b"chunk-zero"
-        );
-        assert_eq!(
-            decrypt_chunk(&key, &iv, 1, false, ct1).unwrap(),
-            b"chunk-one_"
-        );
-
-        // Swapped: try to decrypt chunk 0's ciphertext AS IF it were chunk 1.
-        assert!(decrypt_chunk(&key, &iv, 1, false, ct0).is_err());
-        assert!(decrypt_chunk(&key, &iv, 0, false, ct1).is_err());
-    }
-
-    #[test]
-    fn test_chunk_oversized_plaintext_rejected() {
-        // encrypt_chunk guards against accidental oversized plaintext
-        // (would exceed the frame-size ceiling on disk). Writers must
-        // re-slice before calling.
-        let key = test_key();
-        let iv = test_base_iv();
-        let too_big = vec![0u8; CHUNK_PLAINTEXT_SIZE + 1];
-        let r = encrypt_chunk(&key, &iv, 0, false, &too_big);
-        assert!(r.is_err());
-        assert!(r
-            .unwrap_err()
-            .to_string()
-            .contains("chunk plaintext too large"));
-    }
-
-    #[test]
-    fn test_chunk_tampered_ciphertext_rejected() {
-        // Standard AEAD property: any single-bit flip in the ciphertext
-        // invalidates the tag. We verify it holds for the chunked path.
-        let key = test_key();
-        let iv = test_base_iv();
-        let frame = encrypt_chunk(&key, &iv, 0, false, b"sensitive").unwrap();
-        let mut ct = frame[4..].to_vec();
-        ct[0] ^= 0xFF;
-        assert!(decrypt_chunk(&key, &iv, 0, false, &ct).is_err());
-    }
-
-    #[test]
-    fn test_chunk_wrong_key_rejected() {
-        let iv = test_base_iv();
-        let frame = encrypt_chunk(&test_key(), &iv, 0, false, b"secret").unwrap();
-        let ct = &frame[4..];
-        assert!(decrypt_chunk(&other_key(), &iv, 0, false, ct).is_err());
-    }
-
-    #[test]
-    fn test_chunk_empty_plaintext_is_legal() {
-        // A zero-byte object still gets ONE frame (a zero-length plaintext)
-        // with is_final=true. The frame carries just the GCM tag.
-        let key = test_key();
-        let iv = test_base_iv();
-        let frame = encrypt_chunk(&key, &iv, 0, true, b"").unwrap();
-        let declared_len = u32::from_le_bytes(frame[..4].try_into().unwrap()) as usize;
-        assert_eq!(declared_len, GCM_TAG_LEN);
-        let ct = &frame[4..];
-        assert_eq!(decrypt_chunk(&key, &iv, 0, true, ct).unwrap(), b"");
-    }
-
-    #[test]
-    fn test_chunk_index_for_plaintext_offset() {
-        // Boundary and mid-chunk math. If this is wrong, range reads will
-        // return garbage. Cover: offset 0, mid-chunk-0, exactly-chunk-1,
-        // mid-chunk-1, a huge offset.
-        assert_eq!(chunk_index_for_plaintext_offset(0), (0, 0));
-        assert_eq!(chunk_index_for_plaintext_offset(1), (0, 1));
-        assert_eq!(
-            chunk_index_for_plaintext_offset(CHUNK_PLAINTEXT_SIZE as u64 - 1),
-            (0, CHUNK_PLAINTEXT_SIZE as u32 - 1)
-        );
-        assert_eq!(
-            chunk_index_for_plaintext_offset(CHUNK_PLAINTEXT_SIZE as u64),
-            (1, 0)
-        );
-        assert_eq!(
-            chunk_index_for_plaintext_offset(CHUNK_PLAINTEXT_SIZE as u64 + 42),
-            (1, 42)
-        );
-        // 10 GiB at 64 KiB chunks = 163840 chunks; pick a midway offset.
-        let offset_10gib = 10u64 * 1024 * 1024 * 1024 + 777;
-        let (idx, off) = chunk_index_for_plaintext_offset(offset_10gib);
-        assert_eq!(
-            idx as u64 * CHUNK_PLAINTEXT_SIZE as u64 + off as u64,
-            offset_10gib
-        );
-    }
-
-    #[test]
-    fn test_wire_offset_of_chunk() {
-        // Header is 16 bytes (4 magic + 12 iv). Every chunk is 65556 bytes
-        // on the wire (except possibly the final one — the helper is only
-        // correct for non-final chunks, but that's all the range path needs:
-        // it uses this to SEEK to the start of a chunk, then decrypts from
-        // there).
-        assert_eq!(wire_offset_of_chunk(0), CHUNK_HEADER_LEN as u64);
-        assert_eq!(
-            wire_offset_of_chunk(1),
-            CHUNK_HEADER_LEN as u64 + CHUNK_FRAME_WIRE_LEN as u64
-        );
-        assert_eq!(
-            wire_offset_of_chunk(100),
-            CHUNK_HEADER_LEN as u64 + 100 * CHUNK_FRAME_WIRE_LEN as u64
-        );
-    }
-
-    #[test]
-    fn test_chunk_marker_detection() {
-        // is_encrypted is true for BOTH formats; is_chunked_encrypted is
-        // true only for the chunked format.
-        let mut m = FileMetadata::fallback(
-            "test".into(),
-            100,
-            "md5".into(),
-            chrono::Utc::now(),
-            None,
-            crate::types::StorageInfo::Passthrough,
-        );
-        assert!(!is_encrypted(&m));
-        assert!(!is_chunked_encrypted(&m));
-
-        mark_encrypted(&mut m, None);
-        assert!(is_encrypted(&m));
-        assert!(!is_chunked_encrypted(&m));
-
-        let mut m2 = FileMetadata::fallback(
-            "test".into(),
-            100,
-            "md5".into(),
-            chrono::Utc::now(),
-            None,
-            crate::types::StorageInfo::Passthrough,
-        );
-        mark_chunked_encrypted(&mut m2, None);
-        assert!(is_encrypted(&m2));
-        assert!(is_chunked_encrypted(&m2));
-    }
-
-    // ─────────────────────────────────────────────────────────────────
-    // Step 3: key_id stamping + mismatch detection
-    // ─────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_mark_encrypted_stamps_key_id_when_present() {
-        let mut m = FileMetadata::fallback(
-            "x".into(),
-            10,
-            "md5".into(),
-            chrono::Utc::now(),
-            None,
-            crate::types::StorageInfo::Passthrough,
-        );
-        mark_encrypted(&mut m, Some("my-kid"));
-        assert_eq!(stamped_key_id(&m), Some("my-kid"));
-        // Marker and key_id are distinct fields.
-        assert!(is_encrypted(&m));
-    }
-
-    #[test]
-    fn test_mark_encrypted_no_key_id_leaves_field_absent() {
-        let mut m = FileMetadata::fallback(
-            "x".into(),
-            10,
-            "md5".into(),
-            chrono::Utc::now(),
-            None,
-            crate::types::StorageInfo::Passthrough,
-        );
-        mark_encrypted(&mut m, None);
-        assert_eq!(stamped_key_id(&m), None);
-    }
-
-    #[test]
-    fn test_mark_chunked_encrypted_stamps_key_id() {
-        let mut m = FileMetadata::fallback(
-            "x".into(),
-            10,
-            "md5".into(),
-            chrono::Utc::now(),
-            None,
-            crate::types::StorageInfo::Passthrough,
-        );
-        mark_chunked_encrypted(&mut m, Some("chunked-kid"));
-        assert_eq!(stamped_key_id(&m), Some("chunked-kid"));
-        assert!(is_chunked_encrypted(&m));
-    }
-
-    #[test]
-    fn test_check_key_id_match_happy_path() {
-        assert!(check_key_id_match(Some("same"), Some("same")).is_ok());
-    }
-
-    #[test]
-    fn test_check_key_id_match_object_has_no_id_is_legacy_ok() {
-        // Legacy objects written before Step 3 have no stamp. The
-        // wrapper can still decrypt them — the check must NOT fire
-        // when only one side has an id.
-        assert!(check_key_id_match(None, Some("configured")).is_ok());
-    }
-
-    #[test]
-    fn test_check_key_id_match_configured_has_no_id_is_ok() {
-        // Symmetric. A mode:none-but-somehow-reading-an-encrypted-
-        // object path — the OUTER "no key configured" error is the
-        // right surface here, not a key_id mismatch.
-        assert!(check_key_id_match(Some("obj"), None).is_ok());
-    }
-
-    #[test]
-    fn test_check_key_id_match_both_absent_is_ok() {
-        assert!(check_key_id_match(None, None).is_ok());
-    }
-
-    #[test]
-    fn test_check_key_id_match_mismatch_errors_with_specifics() {
-        let err = check_key_id_match(Some("obj-id"), Some("cfg-id")).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("obj-id") && msg.contains("cfg-id"),
-            "error must cite BOTH ids so the operator can reason about \
-             the rotation/routing/split-storage cause, got: {msg}"
-        );
-        // And the hint is present.
-        assert!(
-            msg.contains("rotated")
-                || msg.contains("wrong backend")
-                || msg.contains("different keys"),
-            "error should explain the typical causes, got: {msg}"
-        );
-    }
-
-    // ─────────────────────────────────────────────────────────────────
-    // B3 regression: range reads on chunked-encrypted objects must
-    // fetch only the header + the target chunks, NOT the whole file.
-    //
-    // Before the fix, `wire_start = 0` pulled the header + every chunk
-    // from 0 up to the target, then the decoder threw the leading
-    // chunks away. For a request like "last 100 bytes of a 10 GiB
-    // object" that meant pulling and decrypting all 10 GiB to emit
-    // 100 plaintext bytes.
-    //
-    // We can't easily prove this with an integration test (mocking
-    // network I/O is heavy-weight). Instead we use a tiny counting
-    // backend that records the `(start, end)` ranges that the
-    // encrypting wrapper asks for from its inner layer. The math
-    // guarantees hold: the body fetch must start at or after
-    // `wire_offset_of_chunk(first_chunk)`, and the separate header
-    // fetch must cover `[0, CHUNK_HEADER_LEN)`.
-    // ─────────────────────────────────────────────────────────────────
-
-    use bytes::Bytes;
-    use chrono::Utc;
-    use futures::stream::BoxStream;
-    use std::sync::Mutex;
-
-    /// A spy backend that records every `get_passthrough_stream_range`
-    /// call so tests can assert on WHERE the wrapper reads from. Holds
-    /// one passthrough object in memory; everything else no-ops or
-    /// errors.
     struct CountingBackend {
-        bytes: Vec<u8>,
+        bytes: Mutex<Vec<u8>>,
         metadata: Mutex<Option<FileMetadata>>,
         ranges_requested: Mutex<Vec<(u64, u64)>>,
         /// Make metadata READS fail (a transient backend error).
@@ -746,23 +367,30 @@ mod wrapper_tests {
         probe_spool: Option<crate::deltaglider::spool::SpoolDir>,
         /// (source path, free spool MiB) per `put_passthrough_file` call.
         file_puts: Mutex<Vec<(std::path::PathBuf, usize)>>,
+        /// What `listing_tokens` answers.
+        tokens: Mutex<Vec<Option<crate::storage::ListedToken>>>,
     }
 
     impl CountingBackend {
         fn new() -> Self {
             Self {
-                bytes: Vec::new(),
+                bytes: Mutex::new(Vec::new()),
                 metadata: Mutex::new(None),
                 ranges_requested: Mutex::new(Vec::new()),
                 fail_meta_reads: Default::default(),
                 probe_spool: None,
                 file_puts: Mutex::new(Vec::new()),
+                tokens: Mutex::new(Vec::new()),
             }
         }
 
-        fn set_contents(&mut self, bytes: Vec<u8>, meta: FileMetadata) {
-            self.bytes = bytes;
-            *self.metadata.lock().unwrap() = Some(meta);
+        fn slice(&self, start: u64, end: u64) -> Result<Vec<u8>, StorageError> {
+            let bytes = self.bytes.lock().unwrap();
+            if start >= bytes.len() as u64 {
+                return Err(StorageError::InvalidRange(format!("{start}-{end}")));
+            }
+            let end = end.min(bytes.len() as u64 - 1);
+            Ok(bytes[start as usize..=end as usize].to_vec())
         }
     }
 
@@ -770,34 +398,33 @@ mod wrapper_tests {
         StorageError::Other("CountingBackend: not implemented for this test".into())
     }
 
+    fn once(data: Vec<u8>) -> ByteStream {
+        Box::pin(futures::stream::once(async move { Ok(Bytes::from(data)) }))
+    }
+
     impl StorageBackend for CountingBackend {
         async fn copy_within(
             &self,
-            v: crate::storage::ObjectVariant,
-            s: crate::storage::ObjectAt<'_>,
-            d: crate::storage::ObjectAt<'_>,
-            src: &crate::types::FileMetadata,
-            m: &crate::types::FileMetadata,
-        ) -> Result<crate::storage::CopyOutcome, crate::storage::StorageError> {
-            let _ = (v, s, d, src, m);
+            _: crate::storage::ObjectVariant,
+            _: crate::storage::ObjectAt<'_>,
+            _: crate::storage::ObjectAt<'_>,
+            _: &FileMetadata,
+            _: &FileMetadata,
+        ) -> Result<crate::storage::CopyOutcome, StorageError> {
             Ok(crate::storage::CopyOutcome::Unsupported)
         }
-
         async fn reference_fence(
             &self,
             b: &str,
             p: &str,
-        ) -> Result<crate::storage::RefFence, crate::storage::StorageError> {
+        ) -> Result<crate::storage::RefFence, StorageError> {
             crate::storage::unfenced_reference_fence(self, b, p).await
         }
         async fn reference_fence_with_metadata(
             &self,
             b: &str,
             p: &str,
-        ) -> Result<
-            (crate::storage::RefFence, Option<crate::types::FileMetadata>),
-            crate::storage::StorageError,
-        > {
+        ) -> Result<(crate::storage::RefFence, Option<FileMetadata>), StorageError> {
             crate::storage::unfenced_reference_fence_with_metadata(self, b, p).await
         }
         async fn write_reference_fenced(
@@ -806,8 +433,8 @@ mod wrapper_tests {
             p: &str,
             op: crate::storage::RefWrite<'_>,
             _: &crate::storage::RefFence,
-            proof: &crate::deltaglider::RefWriteProof,
-        ) -> Result<crate::storage::RefFence, crate::storage::StorageError> {
+            proof: &RefWriteProof,
+        ) -> Result<crate::storage::RefFence, StorageError> {
             crate::storage::unfenced_reference_write(self, b, p, op, proof).await
         }
         async fn get_passthrough_stream_range(
@@ -817,40 +444,28 @@ mod wrapper_tests {
             _: &str,
             start: u64,
             end: u64,
-        ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError> {
+        ) -> Result<(ByteStream, u64), StorageError> {
             self.ranges_requested.lock().unwrap().push((start, end));
-            let end_clamped = std::cmp::min(end, self.bytes.len() as u64 - 1);
-            let slice = self.bytes[start as usize..=end_clamped as usize].to_vec();
+            let slice = self.slice(start, end)?;
             let len = slice.len() as u64;
-            Ok((
-                Box::pin(futures::stream::once(async move { Ok(Bytes::from(slice)) })),
-                len,
-            ))
+            Ok((once(slice), len))
         }
-
-        /// Full-stream read. Serves the whole byte vec as a single
-        /// Bytes so the chunked decoder's phase-1 header parse hits
-        /// the same code path it would over a real network stream.
         async fn open_object(
             &self,
             b: &str,
             p: &str,
-            o: crate::storage::StoredObject<'_>,
-        ) -> Result<
-            (crate::storage::ByteStream, crate::types::FileMetadata),
-            crate::storage::StorageError,
-        > {
+            o: StoredObject<'_>,
+        ) -> Result<(ByteStream, FileMetadata), StorageError> {
             crate::storage::open_object_by_parts(self, b, p, o).await
         }
-
         async fn open_reference_source(
             &self,
             b: &str,
             p: &str,
-        ) -> Result<crate::storage::ReferenceSource, crate::storage::StorageError> {
+        ) -> Result<ReferenceSource, StorageError> {
             crate::storage::open_reference_source_by_parts(self, b, p).await
         }
-
+        /// One read: the range, the metadata and the stored total.
         async fn open_passthrough_range(
             &self,
             b: &str,
@@ -858,8 +473,16 @@ mod wrapper_tests {
             f: &str,
             start: u64,
             end: u64,
-        ) -> Result<crate::storage::RangeRead, crate::storage::StorageError> {
-            crate::storage::open_passthrough_range_by_parts(self, b, p, f, start, end).await
+        ) -> Result<RangeRead, StorageError> {
+            self.ranges_requested.lock().unwrap().push((start, end));
+            let metadata = self.get_passthrough_metadata(b, p, f).await?;
+            let slice = self.slice(start, end)?;
+            Ok(RangeRead {
+                len: slice.len() as u64,
+                stream: once(slice),
+                metadata,
+                stored_total: self.bytes.lock().unwrap().len() as u64,
+            })
         }
         async fn put_listing_token(
             &self,
@@ -868,26 +491,29 @@ mod wrapper_tests {
             _: &str,
             _: u64,
             _: &str,
-        ) -> Result<(), crate::storage::StorageError> {
+        ) -> Result<(), StorageError> {
             Ok(())
         }
         async fn listing_tokens(
             &self,
             _: &str,
-            objects: &[(String, crate::types::FileMetadata)],
-        ) -> Vec<Option<String>> {
-            vec![None; objects.len()]
+            objects: &[(String, FileMetadata)],
+        ) -> Vec<Option<crate::storage::ListedToken>> {
+            let mut t = self.tokens.lock().unwrap().clone();
+            t.resize(objects.len(), None);
+            t
+        }
+        fn lite_list_carries_logical_facts(&self, _: &str) -> bool {
+            false
         }
         async fn get_passthrough_stream(
             &self,
             _: &str,
             _: &str,
             _: &str,
-        ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
-            let b = Bytes::from(self.bytes.clone());
-            Ok(Box::pin(futures::stream::once(async move { Ok(b) })))
+        ) -> Result<ByteStream, StorageError> {
+            Ok(once(self.bytes.lock().unwrap().clone()))
         }
-
         async fn get_passthrough_metadata(
             &self,
             _: &str,
@@ -902,29 +528,26 @@ mod wrapper_tests {
             }
             self.metadata.lock().unwrap().clone().ok_or_else(cb_err)
         }
-
         async fn get_passthrough_metadata_for_rewrite(
             &self,
             b: &str,
             p: &str,
             f: &str,
-        ) -> Result<(FileMetadata, crate::storage::RewriteBasis), StorageError> {
+        ) -> Result<(FileMetadata, RewriteBasis), StorageError> {
             let meta = self.get_passthrough_metadata(b, p, f).await?;
-            Ok((meta.clone(), crate::storage::RewriteBasis::stored(meta)))
+            Ok((meta.clone(), RewriteBasis::stored(meta)))
         }
-
         async fn put_passthrough_metadata(
             &self,
             _: &str,
             _: &str,
             _: &str,
             m: &FileMetadata,
-            _: &crate::storage::RewriteBasis,
+            _: &RewriteBasis,
         ) -> Result<(), StorageError> {
             *self.metadata.lock().unwrap() = Some(m.clone());
             Ok(())
         }
-
         async fn put_passthrough_file(
             &self,
             _: &str,
@@ -940,6 +563,26 @@ mod wrapper_tests {
                 .unwrap()
                 .push((source_path.to_path_buf(), free));
             Ok(())
+        }
+        async fn put_passthrough(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            data: Bytes,
+            m: &FileMetadata,
+        ) -> Result<(), StorageError> {
+            *self.bytes.lock().unwrap() = data.to_vec();
+            *self.metadata.lock().unwrap() = Some(m.clone());
+            Ok(())
+        }
+        async fn get_passthrough(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<u8>, StorageError> {
+            Ok(self.bytes.lock().unwrap().clone())
         }
 
         // All other trait methods: not needed for these tests.
@@ -967,9 +610,9 @@ mod wrapper_tests {
             &self,
             _: &str,
             _: &str,
-            _: bytes::Bytes,
+            _: Bytes,
             _: &FileMetadata,
-            _proof: &crate::deltaglider::RefWriteProof,
+            _: &RefWriteProof,
         ) -> Result<(), StorageError> {
             Err(cb_err())
         }
@@ -988,7 +631,7 @@ mod wrapper_tests {
             _: &str,
             _: &str,
             _: &FileMetadata,
-            _proof: &crate::deltaglider::RefWriteProof,
+            _: &RefWriteProof,
         ) -> Result<(), StorageError> {
             Err(cb_err())
         }
@@ -996,7 +639,7 @@ mod wrapper_tests {
             &self,
             _: &str,
             _: &str,
-            _proof: &crate::deltaglider::RefWriteProof,
+            _: &RefWriteProof,
         ) -> Result<(), StorageError> {
             Err(cb_err())
         }
@@ -1008,9 +651,9 @@ mod wrapper_tests {
             _: &str,
             _: &str,
             _: &str,
-            _: bytes::Bytes,
+            _: Bytes,
             _: &FileMetadata,
-            _proof: &crate::deltaglider::RefWriteProof,
+            _: &RefWriteProof,
         ) -> Result<(), StorageError> {
             Err(cb_err())
         }
@@ -1026,24 +669,6 @@ mod wrapper_tests {
             Err(cb_err())
         }
         async fn delete_delta(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
-            Err(cb_err())
-        }
-        async fn put_passthrough(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: bytes::Bytes,
-            _: &FileMetadata,
-        ) -> Result<(), StorageError> {
-            Err(cb_err())
-        }
-        async fn get_passthrough(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-        ) -> Result<Vec<u8>, StorageError> {
             Err(cb_err())
         }
         async fn delete_passthrough(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
@@ -1088,959 +713,1131 @@ mod wrapper_tests {
         }
     }
 
-    /// Shared helper: encrypt a plaintext blob into a chunked-format
-    /// wire stream, return the bytes + the final_chunk_index.
-    fn encode_chunked(key: &EncryptionKey, plaintext: &[u8]) -> (Vec<u8>, [u8; IV_LEN], u32) {
-        let base_iv: [u8; IV_LEN] = [7u8; IV_LEN]; // fixed for determinism
-        let mut out = Vec::new();
-        out.extend_from_slice(&CHUNK_MAGIC);
-        out.extend_from_slice(&base_iv);
-        if plaintext.is_empty() {
-            let frame = encrypt_chunk(key, &base_iv, 0, true, &[]).unwrap();
-            out.extend_from_slice(&frame);
-            return (out, base_iv, 0);
-        }
-        let final_idx = final_chunk_index_for_plaintext_size(plaintext.len() as u64);
-        for (idx, pt_chunk) in plaintext.chunks(CHUNK_PLAINTEXT_SIZE).enumerate() {
-            let is_final = idx as u32 == final_idx;
-            let frame = encrypt_chunk(key, &base_iv, idx as u32, is_final, pt_chunk).unwrap();
-            out.extend_from_slice(&frame);
-        }
-        (out, base_iv, final_idx)
-    }
-
-    /// Construct a CountingBackend pre-loaded with a chunked-encrypted
-    /// object, wrap it in an EncryptingBackend, and return the wrapper
-    /// plus the plaintext for assertion. Degenerate case of
-    /// [`setup_shim_wrapper`] — no key_id on either side, no shim.
-    async fn setup_wrapper_with_chunked_object(
-        key: EncryptionKey,
-        plaintext_size: usize,
+    /// A spy wrapper with `cfg` that holds `test.bin` of `size` bytes,
+    /// sealed under `writer` (the key `kid-w`), and its plaintext.
+    async fn counting(
+        cfg: EncryptionConfig,
+        writer: EncryptionKey,
+        size: usize,
     ) -> (EncryptingBackend<CountingBackend>, Vec<u8>) {
-        setup_shim_wrapper(ShimSetup {
-            primary_key: Some(key.clone()),
-            primary_kid: None,
-            write_mode: WriteMode::default(),
-            legacy_key: None,
-            legacy_kid: None,
-            stamped_key: key,
-            stamped_kid: None,
-            plaintext_size,
-        })
+        let data = body_of(size);
+        let w = EncryptingBackend::new(CountingBackend::new(), shared(keyed(writer, "kid-w")));
+        w.put_passthrough_chunked(
+            "b",
+            "p",
+            "test.bin",
+            &[Bytes::from(data.clone())],
+            &pmeta("test.bin", &data),
+        )
         .await
+        .unwrap();
+        let inner = w.inner;
+        (EncryptingBackend::new(inner, shared(cfg)), data)
     }
 
+    /// B3: a range in frames 7-8 of a 10-frame object is ONE ranged read of
+    /// exactly those two frames (the response carries the metadata, so no
+    /// HEAD and no header fetch), never a read from the file start.
     #[tokio::test]
-    async fn test_range_read_fetches_only_target_chunks() {
-        // 10 × 64 KiB plaintext = 640 KiB, chunks 0..=9. Request bytes
-        // covering ONLY chunks 7-8. The wrapper must:
-        //   1. Fetch the 16-byte header via a short range [0, 15].
-        //   2. Fetch the body covering chunks 7-8 via a widened range
-        //      starting at `wire_offset_of_chunk(7)`, NOT at 0.
-        // Regression: before the fix, wire_start was hardcoded to 0
-        // and the whole file up to last_chunk was pulled.
-        let key = test_key();
-        let plaintext_size = 10 * CHUNK_PLAINTEXT_SIZE;
-        let (wrapper, plaintext) = setup_wrapper_with_chunked_object(key, plaintext_size).await;
-
-        // Bytes covering chunks 7 (pt offset 458752..524287) and 8.
-        let start = 7 * CHUNK_PLAINTEXT_SIZE as u64 + 100;
-        let end = 8 * CHUNK_PLAINTEXT_SIZE as u64 + 500;
-        let (stream, content_length) = wrapper
+    async fn a_range_read_is_one_read_of_the_covering_frames() {
+        let (w, data) = counting(keyed(key(1), "kid-1"), key(1), 10 * F).await;
+        let (start, end) = (7 * F as u64 + 100, 8 * F as u64 + 500);
+        let (stream, len) = w
             .get_passthrough_stream_range("b", "p", "test.bin", start, end)
             .await
             .unwrap();
-        assert_eq!(content_length, end - start + 1);
-
-        use futures::TryStreamExt;
-        let got: Vec<Bytes> = stream.try_collect().await.unwrap();
-        let got: Vec<u8> = got.into_iter().flatten().collect();
-        assert_eq!(got, &plaintext[start as usize..=end as usize]);
-
-        // Now the assertion that justifies this test: the wrapper must
-        // have made exactly TWO range requests to the inner backend —
-        // one tiny one for the header, and one covering chunks 7-8.
-        // It must NOT have fetched from wire offset 0 for the body
-        // (that would mean pulling chunks 0-6 and throwing them away,
-        // the pre-fix behaviour).
-        let ranges = wrapper.inner.ranges_requested.lock().unwrap().clone();
+        assert_eq!(len, end - start + 1);
         assert_eq!(
-            ranges.len(),
-            2,
-            "expected exactly 2 inner range requests (header + body), got {}: {:?}",
-            ranges.len(),
-            ranges
+            collect(stream).await.unwrap(),
+            &data[start as usize..=end as usize]
         );
+        let ranges = w.inner.ranges_requested.lock().unwrap().clone();
         assert_eq!(
-            ranges[0],
-            (0, CHUNK_HEADER_LEN as u64 - 1),
-            "first request must be the 16-byte header fetch"
+            ranges,
+            [(
+                v2::wire_offset_of_frame(7),
+                v2::wire_offset_of_frame(8) + v2::FRAME_WIRE_LEN as u64 - 1
+            )]
         );
-        let body_wire_start = ranges[1].0;
-        let expected_body_start = wire_offset_of_chunk(7);
-        assert_eq!(
-            body_wire_start, expected_body_start,
-            "body fetch must start at wire_offset_of_chunk(first_chunk) = {}, \
-             got {} — if this is 0, the wrapper is back to pulling from the \
-             file start and the B3 perf fix is broken",
-            expected_body_start, body_wire_start
-        );
-        // Body range must not extend past last_chunk's frame end (chunk
-        // 8 is non-final since final is 9).
-        let expected_body_end = wire_offset_of_chunk(8) + CHUNK_FRAME_WIRE_LEN as u64 - 1;
-        assert_eq!(ranges[1].1, expected_body_end);
     }
 
-    /// B4 regression: `get_passthrough` must return plaintext for BOTH
-    /// wire formats. Before the fix, chunked-encrypted objects fell
-    /// through to the single-shot `decrypt()` which parsed the 12-byte
-    /// segment after the `DGE1` magic as an IV and AEAD-rejected —
-    /// breaking any caller who called `get_passthrough` on a chunked
-    /// object (latent footgun; no current production caller exercised
-    /// the path).
+    /// "The last 100 bytes of a large object" reads the last frame only.
     #[tokio::test]
-    async fn test_get_passthrough_handles_chunked_objects() {
-        let key = test_key();
-        // Cross chunk boundaries — otherwise single-shot might
-        // coincidentally look valid.
-        let plaintext_size = 3 * CHUNK_PLAINTEXT_SIZE + 123;
-        let (wrapper, plaintext) = setup_wrapper_with_chunked_object(key, plaintext_size).await;
-
-        let got = wrapper.get_passthrough("b", "p", "test.bin").await.unwrap();
-        assert_eq!(got, plaintext);
-    }
-
-    /// B9 regression: if xattrs are stripped during backup/restore,
-    /// an on-disk chunked-encrypted body loses its `dg-encrypted`
-    /// metadata marker. Without defense-in-depth, the wrapper would
-    /// serve raw ciphertext as plaintext. The magic-sniff on the
-    /// stream's first emission catches it and errors instead.
-    #[tokio::test]
-    async fn test_stripped_xattr_with_dge1_body_refuses_to_serve() {
-        let key = test_key();
-        let plaintext: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
-        let (ciphertext, _iv, _final) = encode_chunked(&key, &plaintext);
-
-        // Metadata says plaintext (no encryption marker) — simulates
-        // the post-xattr-strip state.
-        let meta = FileMetadata::fallback(
-            "test.bin".into(),
-            plaintext.len() as u64,
-            "md5".into(),
-            Utc::now(),
-            None,
-            crate::types::StorageInfo::Passthrough,
-        );
-
-        let mut backend = CountingBackend::new();
-        backend.set_contents(ciphertext, meta);
-
-        let enc_config = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
-            key: None,
-            key_id: None,
-            ..Default::default()
-        })));
-        let wrapper = EncryptingBackend::new(backend, enc_config);
-
-        let stream = wrapper
-            .get_passthrough_stream("b", "p", "test.bin")
+    async fn the_last_bytes_of_a_large_object_are_a_bounded_read() {
+        let size = 64 * F;
+        let (w, data) = counting(keyed(key(1), "kid-1"), key(1), size).await;
+        let (start, end) = (size as u64 - 100, size as u64 - 1);
+        let (stream, len) = w
+            .get_passthrough_stream_range("b", "p", "test.bin", start, end)
             .await
-            .expect("stream open should succeed — the error surfaces on first pull");
+            .unwrap();
+        assert_eq!(len, 100);
+        assert_eq!(collect(stream).await.unwrap(), &data[start as usize..]);
+        let ranges = w.inner.ranges_requested.lock().unwrap().clone();
+        assert_eq!(ranges.len(), 1, "{ranges:?}");
+        assert_eq!(ranges[0].0, v2::wire_offset_of_frame(63));
+    }
 
-        use futures::TryStreamExt;
-        let res: Result<Vec<Bytes>, _> = stream.try_collect().await;
-        let err = res.expect_err(
-            "stream must error when body begins with DGE1 but metadata has no marker — \
-             otherwise we'd serve ciphertext as plaintext after an xattr strip",
+    /// The configs whose reads may serve plaintext: a bucket without a key,
+    /// and an encrypting one with `plaintext_reads: serve`.
+    fn plaintext_serving() -> [(&'static str, EncryptionConfig); 2] {
+        [
+            ("no key", EncryptionConfig::default()),
+            (
+                "serve",
+                EncryptionConfig {
+                    serve_plaintext: true,
+                    ..keyed(key(1), "kid-1")
+                },
+            ),
+        ]
+    }
+
+    /// Strip the markers (and the seal) of the stored object, as a backup
+    /// that drops xattrs or a copy without metadata does, and set its 4th
+    /// byte (the format digit) to `digit`.
+    fn strip(w: &EncryptingBackend<CountingBackend>, digit: u8) {
+        let mut m = w.inner.metadata.lock().unwrap().clone().unwrap();
+        strip_encryption_markers(&mut m.user_metadata);
+        *w.inner.metadata.lock().unwrap() = Some(m);
+        w.inner.bytes.lock().unwrap()[3] = digit;
+    }
+
+    /// B9: a `DGE<digit>` body whose metadata lost its markers is refused,
+    /// never served as plaintext, whatever the format digit.
+    #[tokio::test]
+    async fn a_dge_body_without_markers_is_refused() {
+        for digit in *b"219" {
+            for (label, cfg) in plaintext_serving() {
+                let (w, _) = counting(cfg, key(1), 4096).await;
+                strip(&w, digit);
+                let err = w
+                    .get_passthrough("b", "p", "test.bin")
+                    .await
+                    .expect_err("ciphertext served as plaintext");
+                assert!(
+                    err.to_string().contains("stripped"),
+                    "{label} DGE{}: {err}",
+                    digit as char
+                );
+            }
+        }
+        // DGE and a non-digit is ordinary plaintext.
+        let (w, _) = counting(EncryptionConfig::default(), key(1), 4096).await;
+        strip(&w, b'x');
+        let stored = w.inner.bytes.lock().unwrap().clone();
+        assert_eq!(
+            w.get_passthrough("b", "p", "test.bin").await.unwrap(),
+            stored
         );
-        let msg = err.to_string();
-        assert!(
-            msg.contains("xattrs") || msg.contains("dg-encrypted"),
-            "error must explain the xattr-strip scenario, got: {msg}"
-        );
+    }
+
+    /// The range path refuses a stripped body too: from the start of the
+    /// object (the magic is in the range), and in an encrypting bucket
+    /// without `serve` anywhere (an unmarked object is refused there).
+    #[tokio::test]
+    async fn a_dge_body_without_markers_is_refused_on_range_reads() {
+        let mut cases: Vec<(&str, EncryptionConfig, u64)> = plaintext_serving()
+            .into_iter()
+            .map(|(l, c)| (l, c, 0))
+            .collect();
+        for start in [0, 100, 70_000] {
+            cases.push(("refuse", keyed(key(1), "kid-1"), start));
+        }
+        for (label, cfg, start) in cases {
+            let (w, _) = counting(cfg, key(1), 2 * F).await;
+            strip(&w, b'2');
+            let res = read_range(&w, "b", "p", "test.bin", start, start + 50).await;
+            assert!(res.is_err(), "{label} at {start}: ciphertext served");
+        }
+        // A plaintext object is served by range where plaintext may be.
+        for (label, cfg) in plaintext_serving() {
+            let w = EncryptingBackend::new(CountingBackend::new(), shared(cfg));
+            let data = body_of(4096);
+            w.inner
+                .put_passthrough("b", "p", "t", Bytes::from(data.clone()), &pmeta("t", &data))
+                .await
+                .unwrap();
+            let got = read_range(&w, "b", "p", "t", 100, 150).await.unwrap();
+            assert_eq!(got, data[100..=150], "{label}");
+        }
     }
 
     /// Production bodies are `unfold` streams (s3_body_to_stream), which
     /// panic when polled after they end. An object shorter than the magic
     /// ends inside the sniff; the sniff must not poll it again.
     #[tokio::test]
-    async fn dge1_sniff_never_polls_an_ended_stream() {
-        use futures::TryStreamExt;
-        let body = |data: &'static [u8]| {
+    async fn dge_sniff_never_polls_an_ended_stream() {
+        let body = |data: &'static [u8]| -> ByteStream {
             Box::pin(futures::stream::unfold(Some(data), |d| async move {
                 d.map(|d| (Ok::<_, StorageError>(Bytes::from_static(d)), None))
             }))
         };
         for data in [&b"v0"[..], b"abc", b"abcd", b"abcdefg"] {
-            let out: Vec<Bytes> = sniff_dge1_magic(body(data)).try_collect().await.unwrap();
-            assert_eq!(out.concat(), data.to_vec());
+            let out = collect(sniff_dge_magic(body(data))).await.unwrap();
+            assert_eq!(out, data.to_vec());
         }
     }
 
-    /// The sniff must see the magic even when the backend emits it split
-    /// over chunks shorter than 4 bytes; the bytes pass through unchanged.
+    /// The sniff sees the magic even when the backend emits it split over
+    /// chunks shorter than 4 bytes; other bytes pass through unchanged.
     #[tokio::test]
-    async fn dge1_sniff_joins_short_leading_chunks() {
-        use futures::TryStreamExt;
-        let split = |parts: &[&'static [u8]]| {
+    async fn dge_sniff_joins_short_leading_chunks() {
+        let split = |parts: &[&'static [u8]]| -> ByteStream {
             let items: Vec<Result<Bytes, StorageError>> =
                 parts.iter().map(|p| Ok(Bytes::from_static(p))).collect();
-            futures::stream::iter(items)
+            Box::pin(futures::stream::iter(items))
         };
-        let res: Result<Vec<Bytes>, _> = sniff_dge1_magic(split(&[b"DG", b"E", b"1rest"]))
-            .try_collect()
-            .await;
-        assert!(res.is_err(), "split magic must be caught");
-        let ok: Vec<Bytes> = sniff_dge1_magic(split(&[b"ab", b"c", b"defg"]))
-            .try_collect()
-            .await
-            .unwrap();
-        assert_eq!(ok.concat(), b"abcdefg".to_vec());
-        let short: Vec<Bytes> = sniff_dge1_magic(split(&[b"DG"]))
-            .try_collect()
-            .await
-            .unwrap();
-        assert_eq!(
-            short.concat(),
-            b"DG".to_vec(),
-            "a 2-byte object is not ciphertext"
-        );
-        let empty: Vec<Bytes> = sniff_dge1_magic(split(&[])).try_collect().await.unwrap();
-        assert!(empty.is_empty());
-    }
-
-    /// Tier 4: the range path must refuse a stripped-marker DGE1 body too.
-    /// It delegated straight to the inner backend, so a range GET served
-    /// ciphertext where a full GET refused.
-    #[tokio::test]
-    async fn test_stripped_xattr_with_dge1_body_refuses_range_reads() {
-        use futures::TryStreamExt;
-        let key = test_key();
-        let plaintext: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
-        let (ciphertext, _iv, _final) = encode_chunked(&key, &plaintext);
-        let meta = FileMetadata::fallback(
-            "test.bin".into(),
-            ciphertext.len() as u64,
-            "md5".into(),
-            Utc::now(),
-            None,
-            crate::types::StorageInfo::Passthrough,
-        );
-        for (configured, start) in [
-            (None, 0u64),
-            (Some(key.clone()), 0),
-            (Some(key.clone()), 100),
-        ] {
-            let mut backend = CountingBackend::new();
-            backend.set_contents(ciphertext.clone(), meta.clone());
-            let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
-                key: configured.clone(),
-                key_id: None,
-                ..Default::default()
-            })));
-            let wrapper = EncryptingBackend::new(backend, cfg);
-            let res = match wrapper
-                .get_passthrough_stream_range("b", "p", "test.bin", start, start + 50)
-                .await
-            {
-                Ok((stream, _)) => stream.try_collect::<Vec<Bytes>>().await.map(|_| ()),
-                Err(e) => Err(e),
-            };
+        for magic in [&[&b"DG"[..], b"E", b"2rest"][..], &[b"D", b"GE7", b"x"]] {
             assert!(
-                res.is_err(),
-                "key={} start={start}: range read served ciphertext",
-                configured.is_some()
+                collect(sniff_dge_magic(split(magic))).await.is_err(),
+                "split magic must be caught"
             );
         }
-        // A plaintext object is still served by range.
-        let mut backend = CountingBackend::new();
-        backend.set_contents(plaintext.clone(), meta.clone());
-        let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
-            key: Some(key),
-            key_id: None,
-            ..Default::default()
-        })));
-        let wrapper = EncryptingBackend::new(backend, cfg);
-        let (stream, _) = wrapper
-            .get_passthrough_stream_range("b", "p", "test.bin", 100, 150)
+        let ok = collect(sniff_dge_magic(split(&[b"ab", b"c", b"defg"])))
             .await
             .unwrap();
-        let got: Vec<Bytes> = stream.try_collect().await.unwrap();
-        assert_eq!(got.concat(), plaintext[100..=150].to_vec());
+        assert_eq!(ok, b"abcdefg".to_vec());
+        let not_digit = collect(sniff_dge_magic(split(&[b"DGE", b"x"])))
+            .await
+            .unwrap();
+        assert_eq!(not_digit, b"DGEx".to_vec());
+        let short = collect(sniff_dge_magic(split(&[b"DG"]))).await.unwrap();
+        assert_eq!(short, b"DG".to_vec(), "a 2-byte object is not ciphertext");
+        assert!(collect(sniff_dge_magic(split(&[])))
+            .await
+            .unwrap()
+            .is_empty());
     }
 
-    /// Tier 4: a metadata-only rewrite must fail CLOSED when it cannot read
-    /// the stored markers. It wrote the caller's metadata without them, so
-    /// one transient HEAD error made an encrypted object unreadable.
+    /// Tier 4: a metadata-only rewrite fails CLOSED when it cannot read the
+    /// stored seal; it never writes the caller's metadata without it.
     #[tokio::test]
-    async fn put_passthrough_metadata_fails_closed_without_the_stored_markers() {
-        let key = test_key();
-        let (ciphertext, _iv, _f) = encode_chunked(&key, b"secret body");
-        let mut stored = FileMetadata::fallback(
-            "o".into(),
-            11,
-            "md5".into(),
-            Utc::now(),
-            None,
-            crate::types::StorageInfo::Passthrough,
-        );
-        mark_chunked_encrypted(&mut stored, None);
-        let mut backend = CountingBackend::new();
-        backend.set_contents(ciphertext, stored.clone());
-        backend
+    async fn put_passthrough_metadata_fails_closed_without_the_stored_seal() {
+        let (w, _) = counting(keyed(key(1), "kid-1"), key(1), 11).await;
+        let stored = w.inner.metadata.lock().unwrap().clone().unwrap();
+        w.inner
             .fail_meta_reads
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
-            key: Some(key),
-            key_id: None,
-            ..Default::default()
-        })));
-        let wrapper = EncryptingBackend::new(backend, cfg);
-        let mut rewrite = stored.clone();
-        strip_encryption_markers(&mut rewrite.user_metadata);
-        assert!(wrapper
-            .put_passthrough_metadata(
-                "b",
-                "p",
-                "o",
-                &rewrite,
-                &crate::storage::RewriteBasis::none()
-            )
+        let rewrite = pmeta("test.bin", &body_of(11));
+        assert!(w
+            .put_passthrough_metadata("b", "p", "test.bin", &rewrite, &RewriteBasis::none())
             .await
             .is_err());
-        let now = wrapper.inner.metadata.lock().unwrap().clone().unwrap();
-        assert!(is_chunked_encrypted(&now), "the stored marker must survive");
+        let now = w.inner.metadata.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            now.user_metadata.get(seal::SEALED_KEY),
+            stored.user_metadata.get(seal::SEALED_KEY),
+            "the stored seal must survive"
+        );
     }
 
+    /// A metadata rewrite re-seals under the stored object's own keys: the
+    /// body stays readable, the new client metadata is covered by the new
+    /// seal. With or without an earlier read as its basis.
     #[tokio::test]
-    async fn test_range_read_last_bytes_of_large_object_bounded_fetch() {
-        // The scenario that motivates B3: "last 100 bytes of a large
-        // object" must NOT pull the whole file. Here large=64×64KiB=4
-        // MiB; the principle is identical for 10 GiB.
-        let key = test_key();
-        let plaintext_size = 64 * CHUNK_PLAINTEXT_SIZE;
-        let (wrapper, plaintext) = setup_wrapper_with_chunked_object(key, plaintext_size).await;
+    async fn a_metadata_rewrite_reseals_the_stored_object() {
+        let r = fs(keyed(key(1), "kid-1")).await;
+        let data = body_of(3 * F + 5);
+        r.put("p", "a.bin", &data).await;
+        let first =
+            r.w.inner
+                .get_passthrough_metadata("b", "p", "a.bin")
+                .await
+                .unwrap();
+        for (round, via_basis) in [(1, false), (2, true)] {
+            let (shown, basis) = if via_basis {
+                r.w.get_passthrough_metadata_for_rewrite("b", "p", "a.bin")
+                    .await
+                    .unwrap()
+            } else {
+                let shown =
+                    r.w.get_passthrough_metadata("b", "p", "a.bin")
+                        .await
+                        .unwrap();
+                (shown, RewriteBasis::none())
+            };
+            let mut next = shown.clone();
+            next.user_metadata.insert("round".into(), round.to_string());
+            next.content_type = Some("application/zip".into());
+            r.w.put_passthrough_metadata("b", "p", "a.bin", &next, &basis)
+                .await
+                .unwrap();
+            let raw =
+                r.w.inner
+                    .get_passthrough_metadata("b", "p", "a.bin")
+                    .await
+                    .unwrap();
+            assert_ne!(
+                raw.user_metadata[seal::SEALED_KEY],
+                first.user_metadata[seal::SEALED_KEY]
+            );
+            let now =
+                r.w.get_passthrough_metadata("b", "p", "a.bin")
+                    .await
+                    .unwrap();
+            assert_eq!(now.user_metadata["round"], round.to_string());
+            assert_eq!(now.md5, md5_hex(&data));
+            assert_eq!(r.w.get_passthrough("b", "p", "a.bin").await.unwrap(), data);
+        }
+        // A rewrite that names another body size is refused.
+        let mut wrong =
+            r.w.get_passthrough_metadata("b", "p", "a.bin")
+                .await
+                .unwrap();
+        wrong.file_size += 1;
+        assert!(r
+            .w
+            .put_passthrough_metadata("b", "p", "a.bin", &wrong, &RewriteBasis::none())
+            .await
+            .is_err());
+    }
 
-        let start = (plaintext_size - 100) as u64;
-        let end = (plaintext_size - 1) as u64;
-        let (stream, content_length) = wrapper
-            .get_passthrough_stream_range("b", "p", "test.bin", start, end)
+    /// A stored object that carries a marker but no seal is not re-sealed
+    /// (its bytes were never authenticated): the rewrite is refused.
+    #[tokio::test]
+    async fn a_metadata_rewrite_refuses_a_marked_but_unsealed_object() {
+        let r = fs(keyed(key(1), "kid-1")).await;
+        r.put("p", "a.bin", b"secret").await;
+        let mut raw =
+            r.w.inner
+                .get_passthrough_metadata("b", "p", "a.bin")
+                .await
+                .unwrap();
+        raw.user_metadata.remove(seal::SEALED_KEY);
+        r.w.inner
+            .put_passthrough_metadata("b", "p", "a.bin", &raw, &RewriteBasis::none())
             .await
             .unwrap();
-        assert_eq!(content_length, 100);
-
-        use futures::TryStreamExt;
-        let got: Vec<Bytes> = stream.try_collect().await.unwrap();
-        let got: Vec<u8> = got.into_iter().flatten().collect();
-        assert_eq!(got, &plaintext[start as usize..=end as usize]);
-
-        let ranges = wrapper.inner.ranges_requested.lock().unwrap().clone();
-        assert_eq!(ranges.len(), 2, "expected header + body = 2 requests");
-        let body_start = ranges[1].0;
-        let last_chunk = final_chunk_index_for_plaintext_size(plaintext_size as u64);
-        let expected = wire_offset_of_chunk(last_chunk);
-        assert_eq!(
-            body_start, expected,
-            "must seek to the last chunk's boundary, not file start. \
-             expected {}, got {}",
-            expected, body_start
-        );
-    }
-
-    // ─────────────────────────────────────────────────────────────────
-    // Step 3: key_id end-to-end — round-trip, mismatch, legacy object
-    // ─────────────────────────────────────────────────────────────────
-
-    /// Reconstruct a chunked-encrypted object in memory, wrap with a
-    /// given (key, key_id) pair, and return the wrapper + expected
-    /// plaintext. Differs from `setup_wrapper_with_chunked_object`:
-    /// this variant writes the `dg-encryption-key-id` metadata stamp
-    /// directly so we can exercise the READ path's mismatch check
-    /// without needing a write cycle. Degenerate case of
-    /// [`setup_shim_wrapper`] — no legacy shim, primary-only.
-    async fn setup_wrapper_with_stamped_object(
-        key: EncryptionKey,
-        stamped_kid: Option<&'static str>,
-        plaintext_size: usize,
-        wrapper_key_id: Option<String>,
-    ) -> (EncryptingBackend<CountingBackend>, Vec<u8>) {
-        setup_shim_wrapper(ShimSetup {
-            primary_key: Some(key.clone()),
-            primary_kid: wrapper_key_id,
-            write_mode: WriteMode::default(),
-            legacy_key: None,
-            legacy_kid: None,
-            stamped_key: key,
-            stamped_kid,
-            plaintext_size,
-        })
-        .await
-    }
-
-    #[tokio::test]
-    async fn test_read_succeeds_when_key_ids_match() {
-        let key = test_key();
-        let (wrapper, plaintext) = setup_wrapper_with_stamped_object(
-            key,
-            Some("matching-id"),
-            4096,
-            Some("matching-id".to_string()),
-        )
-        .await;
-        let got = wrapper.get_passthrough("b", "p", "test.bin").await.unwrap();
-        assert_eq!(got, plaintext);
-    }
-
-    #[tokio::test]
-    async fn test_read_fails_with_specific_error_when_key_ids_mismatch() {
-        // Object says "written with key_id A"; wrapper says "I have
-        // key_id B". The AEAD would fail with an opaque message —
-        // the specific error must fire FIRST.
-        let key = test_key();
-        let (wrapper, _plaintext) = setup_wrapper_with_stamped_object(
-            key,
-            Some("object-a"),
-            4096,
-            Some("wrapper-b".to_string()),
-        )
-        .await;
-
-        let res = wrapper.get_passthrough("b", "p", "test.bin").await;
-        let err = match res {
-            Ok(_) => panic!("must error on key_id mismatch"),
-            Err(e) => e,
-        };
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("object-a") && msg.contains("wrapper-b"),
-            "must cite both key ids, got: {msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_read_fails_via_streaming_range_when_key_ids_mismatch() {
-        // Same mismatch, this time through get_passthrough_stream_range.
-        // The check fires at stream-open time — BEFORE any AEAD
-        // attempt — so the error surfaces as a failed open, not a
-        // mid-stream fail.
-        let key = test_key();
-        let (wrapper, _plaintext) = setup_wrapper_with_stamped_object(
-            key,
-            Some("object-c"),
-            4096,
-            Some("wrapper-d".to_string()),
-        )
-        .await;
-
-        let res = wrapper
-            .get_passthrough_stream_range("b", "p", "test.bin", 0, 99)
-            .await;
-        let err = match res {
-            Ok(_) => panic!("range-read must error on key_id mismatch"),
-            Err(e) => e,
-        };
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("object-c") && msg.contains("wrapper-d"),
-            "range-read mismatch must also cite both ids, got: {msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_legacy_object_without_key_id_still_decrypts() {
-        // Object written before Step 3 has no `dg-encryption-key-id`
-        // stamp. The wrapper has a key_id today. The check is
-        // conditional — one-sided absence is legal — so decrypt
-        // succeeds as long as the key material matches.
-        let key = test_key();
-        let (wrapper, plaintext) = setup_wrapper_with_stamped_object(
-            key,
-            None, // pre-Step-3 object
-            4096,
-            Some("current-wrapper-id".to_string()),
-        )
-        .await;
-        let got = wrapper.get_passthrough("b", "p", "test.bin").await.unwrap();
-        assert_eq!(
-            got, plaintext,
-            "legacy objects must decrypt when the key itself still matches"
-        );
-    }
-
-    // ─────────────────────────────────────────────────────────────────
-    // Step 5: decrypt-only shim + WriteMode::PassThrough
-    // ─────────────────────────────────────────────────────────────────
-
-    /// Inputs for the shim-wrapper fixture. Struct keeps the param
-    /// count under clippy's `too_many_arguments` threshold while
-    /// still being readable at call sites (field names document
-    /// intent better than positional args).
-    struct ShimSetup {
-        primary_key: Option<EncryptionKey>,
-        primary_kid: Option<String>,
-        write_mode: WriteMode,
-        legacy_key: Option<EncryptionKey>,
-        legacy_kid: Option<String>,
-        stamped_key: EncryptionKey,
-        stamped_kid: Option<&'static str>,
-        plaintext_size: usize,
-    }
-
-    /// Build a wrapper with a two-key config (primary + legacy shim)
-    /// around a CountingBackend pre-loaded with a chunked-encrypted
-    /// object encrypted under `stamped_key` + `stamped_kid`.
-    async fn setup_shim_wrapper(s: ShimSetup) -> (EncryptingBackend<CountingBackend>, Vec<u8>) {
-        let plaintext: Vec<u8> = (0..s.plaintext_size).map(|i| (i & 0xff) as u8).collect();
-        let (ciphertext, _iv, _final_idx) = encode_chunked(&s.stamped_key, &plaintext);
-        let mut meta = FileMetadata::fallback(
-            "test.bin".into(),
-            s.plaintext_size as u64,
-            "md5".into(),
-            Utc::now(),
-            None,
-            crate::types::StorageInfo::Passthrough,
-        );
-        mark_chunked_encrypted(&mut meta, s.stamped_kid);
-        let mut backend = CountingBackend::new();
-        backend.set_contents(ciphertext, meta);
-        let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
-            key: s.primary_key,
-            key_id: s.primary_kid,
-            write_mode: s.write_mode,
-            legacy_key: s.legacy_key,
-            legacy_key_id: s.legacy_kid,
-            ..Default::default()
-        })));
-        (EncryptingBackend::new(backend, cfg), plaintext)
-    }
-
-    #[tokio::test]
-    async fn test_shim_decrypts_legacy_stamped_objects() {
-        // Scenario: operator migrated from aes256-gcm-proxy (key=K1,
-        // id=id-K1) to sse-kms (on S3 side), keeping K1/id-K1 as the
-        // legacy shim. A historical object is stamped with id-K1;
-        // the wrapper has NO primary key (native mode), write_mode
-        // PassThrough. Read must succeed by matching against the
-        // legacy shim.
-        let k1 = test_key();
-        let k1_for_stamp = test_key(); // same bytes, independent allocation
-        let (wrapper, plaintext) = setup_shim_wrapper(ShimSetup {
-            primary_key: None, // native mode primary
-            primary_kid: None,
-            write_mode: WriteMode::PassThrough,
-            legacy_key: Some(k1),
-            legacy_kid: Some("id-K1".to_string()),
-            stamped_key: k1_for_stamp,
-            stamped_kid: Some("id-K1"),
-            plaintext_size: 4096,
-        })
-        .await;
-        let got = wrapper.get_passthrough("b", "p", "test.bin").await.unwrap();
-        assert_eq!(got, plaintext);
-    }
-
-    #[tokio::test]
-    async fn test_shim_primary_key_takes_precedence() {
-        // Wrapper has BOTH primary and legacy keys configured. An
-        // object stamped with the primary's id decrypts under the
-        // primary; the legacy is never consulted. Guards against
-        // ambiguous routing where both happen to have the same id
-        // (the collision-detect path elsewhere prevents this, but
-        // this test pins the tie-break in the wrapper itself).
-        let k_primary = test_key();
-        let k_primary_stamp = test_key();
-        let k_legacy = other_key();
-        let (wrapper, plaintext) = setup_shim_wrapper(ShimSetup {
-            primary_key: Some(k_primary),
-            primary_kid: Some("id-primary".to_string()),
-            write_mode: WriteMode::Encrypt,
-            legacy_key: Some(k_legacy),
-            legacy_kid: Some("id-legacy".to_string()),
-            stamped_key: k_primary_stamp,
-            stamped_kid: Some("id-primary"),
-            plaintext_size: 4096,
-        })
-        .await;
-        let got = wrapper.get_passthrough("b", "p", "test.bin").await.unwrap();
-        assert_eq!(got, plaintext);
-    }
-
-    #[tokio::test]
-    async fn test_shim_legacy_id_only_fires_when_object_matches() {
-        // Object stamped with an id that matches NEITHER primary nor
-        // legacy. Must error with the specific "rotated without
-        // legacy_key" message so the operator knows what's missing.
-        let k_primary = test_key();
-        let k_orphan_stamp = other_key(); // stamped with DIFFERENT key material
-        let (wrapper, _plaintext) = setup_shim_wrapper(ShimSetup {
-            primary_key: Some(k_primary),
-            primary_kid: Some("id-primary".to_string()),
-            write_mode: WriteMode::Encrypt,
-            legacy_key: None, // NO legacy — expected to fail hard
-            legacy_kid: None,
-            stamped_key: k_orphan_stamp,
-            stamped_kid: Some("id-orphan"),
-            plaintext_size: 4096,
-        })
-        .await;
-        let err = match wrapper.get_passthrough("b", "p", "test.bin").await {
-            Ok(_) => panic!("must error when object id matches nothing"),
-            Err(e) => e,
-        };
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("id-orphan") && msg.contains("id-primary"),
-            "error must cite BOTH ids so the operator can diagnose, got: {msg}"
-        );
-        assert!(
-            msg.contains("legacy_key"),
-            "error must mention legacy_key as the recovery path, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_write_mode_passthrough_skips_encryption() {
-        // Direct unit test on `encrypt_if_enabled` via a wrapper.
-        // WriteMode::PassThrough must return the plaintext verbatim
-        // and NOT stamp the `dg-encrypted` marker — even when a
-        // primary key is configured. This is the native-SSE
-        // transition invariant: writes go through the proxy wrapper
-        // unchanged while old objects still decrypt via the shim.
-        let key = test_key();
-        let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
-            key: Some(key),
-            key_id: Some("current".into()),
-            write_mode: WriteMode::PassThrough,
-            ..Default::default()
-        })));
-        let wrapper: EncryptingBackend<CountingBackend> =
-            EncryptingBackend::new(CountingBackend::new(), cfg);
-
-        let mut meta = FileMetadata::fallback(
-            "x".into(),
-            10,
-            "md5".into(),
-            Utc::now(),
-            None,
-            crate::types::StorageInfo::Passthrough,
-        );
-        let plaintext = b"no encrypt for me";
-        let out = wrapper
-            .encrypt_if_enabled("b", &bytes::Bytes::from_static(plaintext), &mut meta)
-            .unwrap();
-        assert_eq!(
-            &out[..],
-            plaintext,
-            "PassThrough must return plaintext verbatim"
-        );
-        assert!(
-            !is_encrypted(&meta),
-            "PassThrough must NOT stamp dg-encrypted marker"
-        );
-        assert!(
-            stamped_key_id(&meta).is_none(),
-            "PassThrough must NOT stamp dg-encryption-key-id"
-        );
-    }
-
-    #[test]
-    fn test_write_mode_encrypt_still_works_normally() {
-        // The Encrypt default continues to encrypt + stamp markers.
-        // Regression guard that the Default impl on WriteMode is
-        // Encrypt (not PassThrough), which the struct-update
-        // `..Default::default()` calls in this module rely on.
-        let key = test_key();
-        let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
-            key: Some(key),
-            key_id: Some("id".into()),
-            ..Default::default()
-        })));
-        assert_eq!(cfg.load().write_mode, WriteMode::Encrypt);
-        let wrapper: EncryptingBackend<CountingBackend> =
-            EncryptingBackend::new(CountingBackend::new(), cfg);
-
-        let mut meta = FileMetadata::fallback(
-            "x".into(),
-            10,
-            "md5".into(),
-            Utc::now(),
-            None,
-            crate::types::StorageInfo::Passthrough,
-        );
-        let out = wrapper
-            .encrypt_if_enabled("b", &bytes::Bytes::from_static(b"secret"), &mut meta)
-            .unwrap();
-        assert_ne!(&out[..], &b"secret"[..], "Encrypt must actually encrypt");
-        assert!(is_encrypted(&meta), "Encrypt must stamp dg-encrypted");
-        assert_eq!(
-            stamped_key_id(&meta),
-            Some("id"),
-            "Encrypt must stamp the key_id"
-        );
-    }
-
-    #[test]
-    fn test_pick_decrypt_key_legacy_object_uses_primary() {
-        // Pre-Step-3 objects have no stamp. `pick_decrypt_key`
-        // returns the primary key (legacy shim is ignored when the
-        // object has no id to match).
-        let k_primary = test_key();
-        let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
-            key: Some(k_primary),
-            key_id: Some("primary-id".into()),
-            legacy_key: Some(other_key()),
-            legacy_key_id: Some("legacy-id".into()),
-            ..Default::default()
-        })));
-        let wrapper: EncryptingBackend<CountingBackend> =
-            EncryptingBackend::new(CountingBackend::new(), cfg);
-        // `None` = the object had no `dg-encryption-key-id` stamp.
-        let picked = wrapper.pick_decrypt_key(None).unwrap();
-        // Assert it's the PRIMARY key by re-encrypting with it and
-        // decrypting a round-trip.
-        let ct = encrypt(&picked, b"hello").unwrap();
-        assert_eq!(decrypt(&test_key(), &ct).unwrap(), b"hello");
-    }
-
-    #[test]
-    fn test_pick_decrypt_key_no_primary_no_legacy_errors() {
-        // Wrapper has no key at all. `pick_decrypt_key` called for
-        // an encrypted object must error with the specific "no
-        // encryption key configured" message (H6 fix). The earlier
-        // text said "no legacy-shim match either", which misled
-        // operators whose actual problem was a completely missing
-        // key, not a mis-rotation.
-        let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig::default())));
-        let wrapper: EncryptingBackend<CountingBackend> =
-            EncryptingBackend::new(CountingBackend::new(), cfg);
-        let err = match wrapper.pick_decrypt_key(Some("some-id")) {
-            Ok(_) => panic!("must error when wrapper has no keys"),
-            Err(e) => e,
-        };
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("some-id") && msg.contains("NO encryption key"),
-            "error must cite the object id and the specific 'no key at all' hint, got: {msg}"
-        );
-        // Must NOT cite the rotation-shaped hint — this isn't that case.
-        assert!(
-            !msg.contains("rotated"),
-            "no-key-at-all case must not quote the rotation hint (H6): {msg}"
-        );
-    }
-
-    #[test]
-    fn test_pick_decrypt_key_primary_set_but_wrong_id_errors_with_rotation_hint() {
-        // Wrapper HAS a primary key, but it doesn't match the object's
-        // stamped id. Error must cite the rotation-shaped hint (not
-        // the "no key at all" H6 variant).
-        let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
-            key: Some(test_key()),
-            key_id: Some("configured-id".into()),
-            ..Default::default()
-        })));
-        let wrapper: EncryptingBackend<CountingBackend> =
-            EncryptingBackend::new(CountingBackend::new(), cfg);
-        let err = match wrapper.pick_decrypt_key(Some("object-id-X")) {
-            Ok(_) => panic!("must error on id mismatch"),
-            Err(e) => e,
-        };
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("object-id-X") && msg.contains("configured-id"),
-            "mismatch error must cite both ids, got: {msg}"
-        );
-        assert!(
-            msg.contains("rotated") || msg.contains("legacy-shim"),
-            "mismatch error must point to the rotation/routing remedies, got: {msg}"
-        );
-    }
-
-    /// Every write path must honour `WriteMode::PassThrough` even when a key
-    /// is configured (the proxy-AES → native-SSE transition). The chunked
-    /// path used to check only for the key.
-    #[tokio::test]
-    async fn chunked_write_honours_passthrough_mode_with_a_key() {
-        let tmp = tempfile::tempdir().unwrap();
-        let inner = crate::storage::FilesystemBackend::new(tmp.path().to_path_buf())
+        let err =
+            r.w.put_passthrough_metadata(
+                "b",
+                "p",
+                "a.bin",
+                &pmeta("a.bin", b"secret"),
+                &RewriteBasis::none(),
+            )
             .await
-            .unwrap();
-        inner.create_bucket("enc-bkt").await.unwrap();
-        let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
-            key: Some(test_key()),
-            key_id: Some("current".into()),
-            write_mode: WriteMode::PassThrough,
-            ..Default::default()
-        })));
-        let wrapper = EncryptingBackend::new(inner, cfg);
-        let plaintext = b"chunked plaintext".to_vec();
-        let meta = FileMetadata::new_passthrough(
-            "obj.bin".into(),
-            "0".repeat(64),
-            "0".repeat(32),
-            plaintext.len() as u64,
-            None,
-        );
-        wrapper
-            .put_passthrough_chunked(
-                "enc-bkt",
-                "",
-                "obj.bin",
-                &[Bytes::from(plaintext.clone())],
-                &meta,
+            .unwrap_err();
+        assert!(err.to_string().contains("encryption marker"), "{err}");
+    }
+
+    /// A plaintext object stays plaintext on a metadata rewrite, also in an
+    /// encrypting bucket, and a caller's markers are dropped.
+    #[tokio::test]
+    async fn a_plaintext_object_stays_plaintext_on_a_metadata_rewrite() {
+        let r = fs(EncryptionConfig {
+            serve_plaintext: true,
+            ..keyed(key(1), "kid-1")
+        })
+        .await;
+        r.w.inner
+            .put_passthrough(
+                "b",
+                "p",
+                "plain",
+                Bytes::from_static(b"plain"),
+                &pmeta("plain", b"plain"),
             )
             .await
             .unwrap();
-
-        let raw = wrapper
-            .inner
-            .get_passthrough("enc-bkt", "", "obj.bin")
+        let mut m = pmeta("plain", b"plain");
+        m.user_metadata
+            .insert(ENCRYPTION_MARKER_KEY.into(), "v2".into());
+        m.user_metadata
+            .insert(seal::SEALED_KEY.into(), "2.forged".into());
+        m.user_metadata.insert("team".into(), "ci".into());
+        r.w.put_passthrough_metadata("b", "p", "plain", &m, &RewriteBasis::none())
             .await
             .unwrap();
-        assert_eq!(raw, plaintext, "PassThrough must store the plaintext");
-        let stored = wrapper
-            .inner
-            .get_passthrough_metadata("enc-bkt", "", "obj.bin")
-            .await
-            .unwrap();
-        assert!(
-            !is_encrypted(&stored),
-            "PassThrough must not stamp a marker"
+        let raw =
+            r.w.inner
+                .get_passthrough_metadata("b", "p", "plain")
+                .await
+                .unwrap();
+        assert!(!has_any_marker(&raw), "{:?}", raw.user_metadata);
+        assert_eq!(raw.user_metadata["team"], "ci");
+        assert_eq!(
+            r.w.get_passthrough("b", "p", "plain").await.unwrap(),
+            b"plain"
         );
     }
 
-    /// S15: client metadata that names the wrapper's markers must not decide
-    /// how the body is read. A client `x-amz-meta-dg-encrypted` (e.g. a sync
-    /// tool that copies metadata from a GET into the next PUT) was stored
-    /// verbatim, and the object became unreadable.
+    // ── Keys ──
+
+    /// A read finds the key by the fingerprint in the seal, under any id:
+    /// the presented `dg-encryption-key-id` is the id that THIS config
+    /// gives the key, never a stored claim.
+    #[tokio::test]
+    async fn reads_pick_the_key_by_the_fingerprint_in_the_seal() {
+        let r = fs(keyed(key(0xa1), "kid-a")).await;
+        r.put("p", "x", b"under a").await;
+        let shown = r.w.get_passthrough_metadata("b", "p", "x").await.unwrap();
+        assert_eq!(
+            shown.user_metadata[ENCRYPTION_MARKER_KEY],
+            ENCRYPTION_MARKER_VALUE
+        );
+        assert_eq!(shown.user_metadata[ENCRYPTION_KEY_ID_KEY], "kid-a");
+        let raw =
+            r.w.inner
+                .get_passthrough_metadata("b", "p", "x")
+                .await
+                .unwrap();
+        assert!(!raw.user_metadata.contains_key(ENCRYPTION_KEY_ID_KEY));
+
+        let rotated = EncryptionConfig {
+            legacy_key: Some(key(0xa1)),
+            legacy_key_id: Some("kid-old".into()),
+            ..keyed(key(0xb2), "kid-b")
+        };
+        let renamed = keyed(key(0xa1), "renamed");
+        let mut ring = keyed(key(0xb2), "kid-b");
+        ring.keyring.insert("from-ring".into(), key(0xa1));
+        for (cfg, id) in [
+            (rotated, "kid-old"),
+            (renamed, "renamed"),
+            (ring, "from-ring"),
+        ] {
+            r.cfg.store(Arc::new(cfg));
+            assert_eq!(
+                r.w.get_passthrough("b", "p", "x").await.unwrap(),
+                b"under a"
+            );
+            let shown = r.w.get_passthrough_metadata("b", "p", "x").await.unwrap();
+            assert_eq!(shown.user_metadata[ENCRYPTION_KEY_ID_KEY], id);
+            let got = read_range(&r.w, "b", "p", "x", 2, 4).await.unwrap();
+            assert_eq!(got, b"der");
+        }
+    }
+
+    /// An object under a key the backend does not have fails with a
+    /// message that names the fingerprint and the fix, on every read path.
+    #[tokio::test]
+    async fn a_read_under_an_unknown_key_names_the_fingerprint() {
+        let r = fs(keyed(key(0xa1), "kid-a")).await;
+        r.put("p", "x", b"under a").await;
+        r.cfg.store(Arc::new(keyed(key(0xb2), "kid-b")));
+        let fp = hex::encode(v2::SiteKey::new(&key(0xa1)).fingerprint());
+        let errors = [
+            r.w.get_passthrough("b", "p", "x").await.unwrap_err(),
+            r.w.get_passthrough_metadata("b", "p", "x")
+                .await
+                .unwrap_err(),
+            read_range(&r.w, "b", "p", "x", 0, 3).await.unwrap_err(),
+        ];
+        for err in errors {
+            let msg = err.to_string();
+            assert!(msg.contains(&fp) && msg.contains("legacy_key"), "{msg}");
+        }
+        // A backend without any key cannot read it either.
+        r.cfg.store(Arc::new(EncryptionConfig::default()));
+        assert!(r.w.get_passthrough("b", "p", "x").await.is_err());
+    }
+
+    /// The decrypt-only shim (proxy AES → native SSE): no primary key,
+    /// writes pass through as plaintext, the legacy key reads the history.
+    #[tokio::test]
+    async fn the_shim_reads_legacy_objects_and_writes_plaintext() {
+        let r = fs(keyed(key(0xa1), "id-K1")).await;
+        r.put("p", "old", b"history").await;
+        r.cfg.store(Arc::new(EncryptionConfig {
+            write_mode: WriteMode::PassThrough,
+            legacy_key: Some(key(0xa1)),
+            legacy_key_id: Some("id-K1".into()),
+            ..Default::default()
+        }));
+        assert_eq!(
+            r.w.get_passthrough("b", "p", "old").await.unwrap(),
+            b"history"
+        );
+        r.put("p", "new", b"plain now").await;
+        assert_eq!(
+            r.w.inner.get_passthrough("b", "p", "new").await.unwrap(),
+            b"plain now"
+        );
+        let raw =
+            r.w.inner
+                .get_passthrough_metadata("b", "p", "new")
+                .await
+                .unwrap();
+        assert!(!has_any_marker(&raw));
+    }
+
+    // ── Write modes ──
+
+    /// Every write path honours `WriteMode::PassThrough` even with a key
+    /// (the proxy-AES → native-SSE transition): it stores plaintext.
+    #[tokio::test]
+    async fn passthrough_mode_writes_plaintext_on_every_path() {
+        let r = fs(EncryptionConfig {
+            write_mode: WriteMode::PassThrough,
+            ..keyed(key(1), "current")
+        })
+        .await;
+        let sd = r.spool();
+        let data = b"chunked plaintext".to_vec();
+        let meta = pmeta("x", &data);
+        let src = r.dir.path().join("src");
+        std::fs::write(&src, &data).unwrap();
+        let w = &r.w;
+        w.put_passthrough("b", "p", "a", Bytes::from(data.clone()), &meta)
+            .await
+            .unwrap();
+        w.put_passthrough_chunked("b", "p", "c", &[Bytes::from(data.clone())], &meta)
+            .await
+            .unwrap();
+        w.put_passthrough_file(
+            "b",
+            "p",
+            "f",
+            &src,
+            &meta,
+            SpoolBudget::new(&sd, None, None),
+        )
+        .await
+        .unwrap();
+        w.put_passthrough_parts(
+            "b",
+            "p",
+            "m",
+            std::slice::from_ref(&src),
+            &meta,
+            SpoolBudget::new(&sd, None, None),
+        )
+        .await
+        .unwrap();
+        for name in ["a", "c", "f", "m"] {
+            assert_eq!(
+                w.inner.get_passthrough("b", "p", name).await.unwrap(),
+                data,
+                "{name}"
+            );
+            let raw = w
+                .inner
+                .get_passthrough_metadata("b", "p", name)
+                .await
+                .unwrap();
+            assert!(!has_any_marker(&raw), "{name}");
+            assert_eq!(w.get_passthrough("b", "p", name).await.unwrap(), data);
+        }
+        assert_eq!(w.file_put_spool_bytes("b", 1 << 20, true).await, 0);
+    }
+
+    #[test]
+    fn encrypt_is_the_default_write_mode() {
+        assert_eq!(WriteMode::default(), WriteMode::Encrypt);
+        assert_eq!(keyed(key(1), "id").write_mode, WriteMode::Encrypt);
+    }
+
+    /// `WriteMode::Refuse` (a backend set to encrypt, without a key): every
+    /// write fails, none stores plaintext.
+    #[tokio::test]
+    async fn refuse_mode_refuses_every_write() {
+        let r = fs(EncryptionConfig {
+            write_mode: WriteMode::Refuse,
+            ..Default::default()
+        })
+        .await;
+        let sd = r.spool();
+        let src = r.dir.path().join("src");
+        std::fs::write(&src, b"x").unwrap();
+        let (w, m, x) = (&r.w, pmeta("x", b"x"), Bytes::from_static(b"x"));
+        let results = [
+            w.put_passthrough("b", "p", "x", x.clone(), &m).await,
+            w.put_passthrough_chunked("b", "p", "x", std::slice::from_ref(&x), &m)
+                .await,
+            w.put_passthrough_file("b", "p", "x", &src, &m, SpoolBudget::new(&sd, None, None))
+                .await,
+            w.put_delta(
+                "b",
+                "p",
+                "x",
+                x.clone(),
+                &dmeta("x", b"x"),
+                RefWriteProof::for_tests(),
+            )
+            .await,
+            w.put_reference("b", "p", x, &rmeta(b"x"), RefWriteProof::for_tests())
+                .await,
+            w.create_multipart_upload("b", "p", "x", &m)
+                .await
+                .map(|_| ()),
+        ];
+        for (i, res) in results.into_iter().enumerate() {
+            let err = res.expect_err("a write stored plaintext");
+            assert!(err.to_string().contains("refuses the write"), "{i}: {err}");
+        }
+        assert!(w.inner.get_passthrough("b", "p", "x").await.is_err());
+    }
+
+    /// S15: client metadata that names the wrapper's markers never decides
+    /// how the body is stored or read: a client `dg-encrypted`,
+    /// `dg-encryption-key-id` or `dg-sealed` (a sync tool that copies GET
+    /// metadata into the next PUT) is dropped on every write path.
     #[tokio::test]
     async fn client_supplied_markers_never_reach_storage() {
-        for (mode_name, key) in [("no-key", None), ("encrypt", Some(test_key()))] {
-            let tmp = tempfile::tempdir().unwrap();
-            let inner = crate::storage::FilesystemBackend::new(tmp.path().to_path_buf())
-                .await
-                .unwrap();
-            inner.create_bucket("b").await.unwrap();
-            let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
-                key,
-                key_id: None,
-                ..Default::default()
-            })));
-            let wrapper = EncryptingBackend::new(inner, cfg);
-            let body = b"client body".to_vec();
-            let mut meta = FileMetadata::new_passthrough(
-                "x".into(),
-                "0".repeat(64),
-                "0".repeat(32),
-                body.len() as u64,
-                None,
-            );
-            meta.user_metadata
-                .insert(ENCRYPTION_MARKER_KEY.into(), CHUNK_MARKER_VALUE.into());
-            meta.user_metadata
+        let forge = |mut m: FileMetadata| {
+            m.user_metadata
+                .insert(ENCRYPTION_MARKER_KEY.into(), seal::DISK_MARKER.into());
+            m.user_metadata
                 .insert(ENCRYPTION_KEY_ID_KEY.into(), "forged-kid".into());
-            meta.user_metadata.insert("team".into(), "ci".into());
-
-            let src = tmp.path().join("src.bin");
-            tokio::fs::write(&src, &body).await.unwrap();
-            wrapper
-                .put_passthrough("b", "p", "a", bytes::Bytes::copy_from_slice(&body), &meta)
+            m.user_metadata
+                .insert(seal::SEALED_KEY.into(), "2.forged".into());
+            m.user_metadata.insert("team".into(), "ci".into());
+            m
+        };
+        for (mode, cfg) in [
+            ("no-key", EncryptionConfig::default()),
+            ("encrypt", keyed(key(1), "kid-1")),
+        ] {
+            let r = fs(cfg).await;
+            let sd = r.spool();
+            let body = b"client body".to_vec();
+            let meta = forge(pmeta("x", &body));
+            let src = r.dir.path().join("src.bin");
+            std::fs::write(&src, &body).unwrap();
+            let w = &r.w;
+            let b = || Bytes::from(body.clone());
+            w.put_passthrough("b", "p", "a", b(), &meta).await.unwrap();
+            w.put_passthrough_file(
+                "b",
+                "p",
+                "c",
+                &src,
+                &meta,
+                SpoolBudget::new(&sd, None, None),
+            )
+            .await
+            .unwrap();
+            w.put_passthrough_chunked("b", "p", "d", &[b()], &meta)
                 .await
                 .unwrap();
-            wrapper
-                .put_passthrough_file("b", "p", "c", &src, &meta, unheld(&test_spool(&tmp)))
-                .await
-                .unwrap();
-            wrapper
-                .put_passthrough_chunked("b", "p", "d", &[Bytes::from(body.clone())], &meta)
-                .await
-                .unwrap();
-            wrapper
-                .put_passthrough_parts(
-                    "b",
-                    "p",
-                    "e",
-                    std::slice::from_ref(&src),
-                    &meta,
-                    unheld(&test_spool(&tmp)),
-                )
-                .await
-                .unwrap();
-            wrapper
-                .put_delta(
-                    "b",
-                    "p",
-                    "f",
-                    bytes::Bytes::copy_from_slice(&body),
-                    &meta,
-                    crate::deltaglider::RefWriteProof::for_tests(),
-                )
-                .await
-                .unwrap();
-            wrapper
-                .put_reference(
-                    "b",
-                    "p",
-                    bytes::Bytes::copy_from_slice(&body),
-                    &meta,
-                    crate::deltaglider::RefWriteProof::for_tests(),
-                )
-                .await
-                .unwrap();
+            w.put_passthrough_parts(
+                "b",
+                "p",
+                "e",
+                std::slice::from_ref(&src),
+                &meta,
+                SpoolBudget::new(&sd, None, None),
+            )
+            .await
+            .unwrap();
+            w.put_delta(
+                "b",
+                "p",
+                "f",
+                b(),
+                &forge(dmeta("f", &body)),
+                RefWriteProof::for_tests(),
+            )
+            .await
+            .unwrap();
+            w.put_reference(
+                "b",
+                "p",
+                b(),
+                &forge(rmeta(&body)),
+                RefWriteProof::for_tests(),
+            )
+            .await
+            .unwrap();
+            let mut raws = Vec::new();
             for f in ["a", "c", "d", "e"] {
                 assert_eq!(
-                    wrapper.get_passthrough("b", "p", f).await.unwrap(),
+                    w.get_passthrough("b", "p", f).await.unwrap(),
                     body,
-                    "{mode_name}: passthrough {f} must read back"
+                    "{mode}: {f}"
                 );
-                let stored = wrapper.get_passthrough_metadata("b", "p", f).await.unwrap();
+                let shown = w.get_passthrough_metadata("b", "p", f).await.unwrap();
                 assert_ne!(
-                    stamped_key_id(&stored),
+                    shown
+                        .user_metadata
+                        .get(ENCRYPTION_KEY_ID_KEY)
+                        .map(String::as_str),
                     Some("forged-kid"),
-                    "{mode_name}: {f}"
+                    "{mode}: {f}"
                 );
-                assert_eq!(
-                    stored.user_metadata.get("team").map(String::as_str),
-                    Some("ci")
-                );
+                assert_eq!(shown.user_metadata["team"], "ci");
+                raws.push(w.inner.get_passthrough_metadata("b", "p", f).await.unwrap());
             }
-            assert_eq!(
-                wrapper.get_delta("b", "p", "f").await.unwrap(),
-                body,
-                "{mode_name}"
-            );
-            assert_eq!(
-                wrapper.get_reference("b", "p").await.unwrap(),
-                body,
-                "{mode_name}"
-            );
+            raws.push(w.inner.get_delta_metadata("b", "p", "f").await.unwrap());
+            raws.push(w.inner.get_reference_metadata("b", "p").await.unwrap());
+            for raw in &raws {
+                assert!(
+                    !raw.user_metadata.contains_key(ENCRYPTION_KEY_ID_KEY),
+                    "{mode}"
+                );
+                assert_ne!(
+                    raw.user_metadata.get(seal::SEALED_KEY).map(String::as_str),
+                    Some("2.forged"),
+                    "{mode}"
+                );
+                assert_eq!(has_seal(raw), mode == "encrypt", "{mode}");
+            }
+            assert_eq!(w.get_delta("b", "p", "f").await.unwrap(), body, "{mode}");
+            assert_eq!(w.get_reference("b", "p").await.unwrap(), body, "{mode}");
 
             // A metadata-only rewrite must not plant a marker either.
-            wrapper
-                .put_passthrough_metadata(
-                    "b",
-                    "p",
-                    "a",
-                    &meta,
-                    &crate::storage::RewriteBasis::none(),
-                )
+            let mut rewrite = w.get_passthrough_metadata("b", "p", "a").await.unwrap();
+            rewrite
+                .user_metadata
+                .insert(seal::SEALED_KEY.into(), "2.forged".into());
+            w.put_passthrough_metadata("b", "p", "a", &rewrite, &RewriteBasis::none())
                 .await
                 .unwrap();
             assert_eq!(
-                wrapper.get_passthrough("b", "p", "a").await.unwrap(),
+                w.get_passthrough("b", "p", "a").await.unwrap(),
                 body,
-                "{mode_name}: metadata rewrite"
+                "{mode}"
             );
         }
     }
 
-    fn keyed_cfg() -> Arc<ArcSwap<EncryptionConfig>> {
-        Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
-            key: Some(test_key()),
-            key_id: Some("kid-1".to_string()),
+    // ── Fail closed ──
+
+    /// Issue #120: an object without a seal in a bucket that encrypts is
+    /// refused on every read (a writer with backend access could have
+    /// planted it), unless the config says `plaintext_reads: serve`.
+    #[tokio::test]
+    async fn an_unmarked_object_in_an_encrypting_bucket_is_refused_unless_serve() {
+        let r = fs(keyed(key(1), "kid-1")).await;
+        let data = body_of(F + 10);
+        let w = &r.w;
+        w.inner
+            .put_passthrough(
+                "b",
+                "p",
+                "plain",
+                Bytes::from(data.clone()),
+                &pmeta("plain", &data),
+            )
+            .await
+            .unwrap();
+        w.inner
+            .put_delta(
+                "b",
+                "p",
+                "d",
+                Bytes::from(data.clone()),
+                &dmeta("d", &data),
+                RefWriteProof::for_tests(),
+            )
+            .await
+            .unwrap();
+        w.inner
+            .put_reference(
+                "b",
+                "p",
+                Bytes::from(data.clone()),
+                &rmeta(&data),
+                RefWriteProof::for_tests(),
+            )
+            .await
+            .unwrap();
+        async fn reads(
+            w: &EncryptingBackend<crate::storage::FilesystemBackend>,
+        ) -> Vec<Result<(), StorageError>> {
+            vec![
+                w.get_passthrough("b", "p", "plain").await.map(|_| ()),
+                w.get_passthrough_metadata("b", "p", "plain")
+                    .await
+                    .map(|_| ()),
+                read_range(w, "b", "p", "plain", 0, 9).await.map(|_| ()),
+                read_range(w, "b", "p", "plain", F as u64, F as u64 + 5)
+                    .await
+                    .map(|_| ()),
+                w.get_delta("b", "p", "d").await.map(|_| ()),
+                w.get_delta_metadata("b", "p", "d").await.map(|_| ()),
+                w.get_reference("b", "p").await.map(|_| ()),
+                w.get_reference_metadata("b", "p").await.map(|_| ()),
+                w.open_reference_source("b", "p").await.map(|_| ()),
+            ]
+        }
+        for (i, res) in reads(w).await.into_iter().enumerate() {
+            let err = res.expect_err("plaintext served in an encrypting bucket");
+            assert!(err.to_string().contains("plaintext_reads"), "{i}: {err}");
+        }
+        r.cfg.store(Arc::new(EncryptionConfig {
+            serve_plaintext: true,
+            ..keyed(key(1), "kid-1")
+        }));
+        for (i, res) in reads(w).await.into_iter().enumerate() {
+            res.unwrap_or_else(|e| panic!("{i}: {e}"));
+        }
+        assert_eq!(w.get_passthrough("b", "p", "plain").await.unwrap(), data);
+        // A bucket that refuses writes (no key) refuses plaintext reads too.
+        r.cfg.store(Arc::new(EncryptionConfig {
+            write_mode: WriteMode::Refuse,
             ..Default::default()
-        })))
+        }));
+        assert!(w.get_passthrough("b", "p", "plain").await.is_err());
     }
+
+    /// A folder marker (a zero-byte key ending in `/`) is never sealed and
+    /// always reads; any other unsealed object follows the bucket's rule.
+    #[test]
+    fn a_folder_marker_always_reads() {
+        let w = EncryptingBackend::new(CountingBackend::new(), shared(keyed(key(1), "kid-1")));
+        let raw = |size| {
+            FileMetadata::fallback(
+                "dir/".into(),
+                size,
+                String::new(),
+                chrono::Utc::now(),
+                None,
+                crate::types::StorageInfo::Passthrough,
+            )
+        };
+        let read = |name, size| {
+            w.present_raw("b", "p", StoredObject::Passthrough(name), &raw(size))
+                .is_ok()
+        };
+        assert!(read("dir/", 0));
+        assert!(read("", 0));
+        assert!(!read("dir/", 1), "a folder marker has no bytes");
+        assert!(!read("x", 0), "an empty object is not a folder marker");
+        let mut marked = raw(0);
+        marked
+            .user_metadata
+            .insert(ENCRYPTION_MARKER_KEY.into(), seal::DISK_MARKER.into());
+        assert!(
+            w.present_raw("b", "p", StoredObject::Passthrough("dir/"), &marked)
+                .is_err(),
+            "a marker without a seal is refused, also on a folder"
+        );
+    }
+
+    /// The seal binds the location: a sealed object copied at the storage
+    /// level (body and metadata) to another key, prefix, bucket or variant
+    /// fails closed.
+    #[tokio::test]
+    async fn a_sealed_object_moved_on_the_backend_fails() {
+        let r = fs(keyed(key(1), "kid-1")).await;
+        let w = &r.w;
+        r.put("p", "a.bin", b"sealed body").await;
+        let body = Bytes::from(w.inner.get_passthrough("b", "p", "a.bin").await.unwrap());
+        let raw = w
+            .inner
+            .get_passthrough_metadata("b", "p", "a.bin")
+            .await
+            .unwrap();
+        for (bucket, prefix, name) in [
+            ("b", "p", "c.bin"),
+            ("b2", "p", "a.bin"),
+            ("b", "q", "a.bin"),
+        ] {
+            w.inner
+                .put_passthrough(bucket, prefix, name, body.clone(), &raw)
+                .await
+                .unwrap();
+            let at = format!("{bucket}/{prefix}/{name}");
+            assert!(
+                w.get_passthrough(bucket, prefix, name).await.is_err(),
+                "{at}"
+            );
+            assert!(
+                w.get_passthrough_metadata(bucket, prefix, name)
+                    .await
+                    .is_err(),
+                "{at}"
+            );
+            assert!(
+                read_range(w, bucket, prefix, name, 0, 3).await.is_err(),
+                "{at}"
+            );
+        }
+        assert_eq!(
+            w.get_passthrough("b", "p", "a.bin").await.unwrap(),
+            b"sealed body"
+        );
+
+        // A delta's stored form moved to another delta key.
+        let delta = b"delta body".to_vec();
+        w.put_delta(
+            "b",
+            "p",
+            "x",
+            Bytes::from(delta.clone()),
+            &dmeta("x", &delta),
+            RefWriteProof::for_tests(),
+        )
+        .await
+        .unwrap();
+        let body = w.inner.get_delta("b", "p", "x").await.unwrap();
+        let raw = w.inner.get_delta_metadata("b", "p", "x").await.unwrap();
+        w.inner
+            .put_delta(
+                "b",
+                "p",
+                "y",
+                Bytes::from(body),
+                &raw,
+                RefWriteProof::for_tests(),
+            )
+            .await
+            .unwrap();
+        assert!(w.get_delta("b", "p", "y").await.is_err());
+        assert_eq!(w.get_delta("b", "p", "x").await.unwrap(), delta);
+    }
+
+    /// The seal covers the clear headers: a backend writer that edits the
+    /// content type or the client's user metadata makes the object fail.
+    #[tokio::test]
+    async fn an_edited_clear_header_fails() {
+        let r = fs(keyed(key(1), "kid-1")).await;
+        let w = &r.w;
+        let mut meta = pmeta("a.bin", b"body");
+        meta.content_type = Some("application/zip".into());
+        meta.user_metadata.insert("build".into(), "42".into());
+        w.put_passthrough("b", "p", "a.bin", Bytes::from_static(b"body"), &meta)
+            .await
+            .unwrap();
+        let raw = w
+            .inner
+            .get_passthrough_metadata("b", "p", "a.bin")
+            .await
+            .unwrap();
+        let edits: [fn(&mut FileMetadata); 4] = [
+            |m| m.content_type = Some("text/html".into()),
+            |m| {
+                m.user_metadata.insert("build".into(), "43".into());
+            },
+            |m| {
+                m.user_metadata.remove("build");
+            },
+            |m| {
+                m.user_metadata.insert("extra".into(), "1".into());
+            },
+        ];
+        for (i, edit) in edits.into_iter().enumerate() {
+            let mut edited = raw.clone();
+            edit(&mut edited);
+            w.inner
+                .put_passthrough_metadata("b", "p", "a.bin", &edited, &RewriteBasis::none())
+                .await
+                .unwrap();
+            let err = w.get_passthrough("b", "p", "a.bin").await.unwrap_err();
+            assert!(err.to_string().contains("clear metadata"), "{i}: {err}");
+            assert!(w.get_passthrough_metadata("b", "p", "a.bin").await.is_err());
+        }
+        w.inner
+            .put_passthrough_metadata("b", "p", "a.bin", &raw, &RewriteBasis::none())
+            .await
+            .unwrap();
+        assert_eq!(w.get_passthrough("b", "p", "a.bin").await.unwrap(), b"body");
+    }
+
+    // ── copy_within ──
+
+    /// A storage-level copy under the same key re-seals for the destination
+    /// (the seal binds the location) and keeps the body. A stale pin, a
+    /// plaintext source into an encrypting bucket, and a sealed source into
+    /// a plaintext bucket are `Unsupported` (the caller copies through).
+    #[tokio::test]
+    async fn copy_within_reseals_for_the_destination() {
+        use crate::storage::{CopyOutcome, ObjectAt, ObjectVariant};
+        let mut cfg = keyed(key(1), "kid-1");
+        cfg.buckets.insert("b2".into(), BucketKeys::default());
+        let r = fs(cfg).await;
+        let w = &r.w;
+        let data = body_of(2 * F + 3);
+        r.put("p", "a.bin", &data).await;
+        let source = w.get_passthrough_metadata("b", "p", "a.bin").await.unwrap();
+        let src = ObjectAt {
+            bucket: "b",
+            prefix: "p",
+            filename: "a.bin",
+        };
+        let to = |bucket, filename| ObjectAt {
+            bucket,
+            prefix: "q",
+            filename,
+        };
+        let mut dst_meta = source.clone();
+        dst_meta.original_name = "c.bin".into();
+        let copied = w
+            .copy_within(
+                ObjectVariant::Passthrough,
+                src,
+                to("b", "c.bin"),
+                &source,
+                &dst_meta,
+            )
+            .await
+            .unwrap();
+        assert_eq!(copied, CopyOutcome::Copied);
+        assert_eq!(w.get_passthrough("b", "q", "c.bin").await.unwrap(), data);
+        let raw_src = w
+            .inner
+            .get_passthrough_metadata("b", "p", "a.bin")
+            .await
+            .unwrap();
+        let raw_dst = w
+            .inner
+            .get_passthrough_metadata("b", "q", "c.bin")
+            .await
+            .unwrap();
+        assert_ne!(
+            raw_src.user_metadata[seal::SEALED_KEY],
+            raw_dst.user_metadata[seal::SEALED_KEY]
+        );
+        assert_eq!(
+            w.get_passthrough_metadata("b", "q", "c.bin")
+                .await
+                .unwrap()
+                .md5,
+            md5_hex(&data)
+        );
+
+        let mut stale = source.clone();
+        stale.created_at += chrono::Duration::microseconds(1);
+        let unsupported = [
+            w.copy_within(
+                ObjectVariant::Passthrough,
+                src,
+                to("b", "s.bin"),
+                &stale,
+                &dst_meta,
+            )
+            .await
+            .unwrap(),
+            w.copy_within(
+                ObjectVariant::Passthrough,
+                src,
+                to("b2", "c.bin"),
+                &source,
+                &dst_meta,
+            )
+            .await
+            .unwrap(),
+        ];
+        assert_eq!(unsupported, [CopyOutcome::Unsupported; 2]);
+        w.inner
+            .put_passthrough(
+                "b",
+                "p",
+                "plain",
+                Bytes::from_static(b"plain"),
+                &pmeta("plain", b"plain"),
+            )
+            .await
+            .unwrap();
+        let plain = pmeta("plain", b"plain");
+        let res = w
+            .copy_within(
+                ObjectVariant::Passthrough,
+                ObjectAt {
+                    filename: "plain",
+                    ..src
+                },
+                to("b", "plain"),
+                &plain,
+                &plain,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res, CopyOutcome::Unsupported);
+    }
+
+    // ── Listings ──
+
+    /// With a key, a listed entry's logical size and ETag come only from a
+    /// listing token that opens under a key of this backend for exactly
+    /// that stored object; a forged, foreign or mismatched token is ignored.
+    #[tokio::test]
+    async fn resolve_listed_sizes_applies_only_a_valid_listing_token() {
+        let site = v2::SiteKey::new(&key(0xa1));
+        let foreign = v2::SiteKey::new(&key(0xb2));
+        let entry = |key: &str, stored: u64| {
+            (
+                key.to_string(),
+                FileMetadata::fallback(
+                    key.into(),
+                    stored,
+                    "e1".into(),
+                    chrono::Utc::now(),
+                    None,
+                    crate::types::StorageInfo::Passthrough,
+                ),
+            )
+        };
+        let stored = v2::stored_len(1000).unwrap();
+        let token = |site: &v2::SiteKey, key: &str, stored_size: u64, size: u64, parts: u16| {
+            let lf = v2::ListingFacts {
+                size,
+                etag_digest: [3; 16],
+                parts,
+            };
+            let at = v2::ListedAt {
+                bucket: "b",
+                stored_key: key,
+                stored_etag: "e1",
+                stored_size,
+            };
+            Some(crate::storage::ListedToken {
+                token: site.listing_token(&at, &lf).unwrap(),
+                stored_key: key.into(),
+                stored_etag: "e1".into(),
+                stored_size,
+            })
+        };
+        let mut moved = token(&site, "p/good.bin", stored, 1000, 0);
+        moved.as_mut().unwrap().stored_key = "p/moved.bin".into();
+        let tokens = vec![
+            token(&site, "p/good.bin", stored, 1000, 0),
+            token(&foreign, "p/forged.bin", stored, 1000, 0),
+            moved,
+            token(&site, "p/size.bin", stored, 999, 0),
+            token(&site, "p/multi.bin", stored, 1000, 3),
+            None,
+            None,
+        ];
+        let listing = || {
+            vec![
+                entry("p/good.bin", stored),
+                entry("p/forged.bin", stored),
+                entry("p/moved.bin", stored),
+                entry("p/size.bin", stored),
+                entry("p/multi.bin", stored),
+                entry("p/none.bin", stored),
+                entry("p/dir/", 0),
+            ]
+        };
+        let w = EncryptingBackend::new(CountingBackend::new(), shared(keyed(key(0xa1), "kid-a")));
+        *w.inner.tokens.lock().unwrap() = tokens.clone();
+        let mut objects = listing();
+        let sizes = w
+            .resolve_listed_sizes("b", &mut objects, ResolveListed::default())
+            .await;
+        use ListedSize::{Cached, Listed, StoredOnly};
+        assert_eq!(
+            sizes,
+            [Cached, StoredOnly, StoredOnly, StoredOnly, Cached, StoredOnly, Listed]
+        );
+        assert_eq!(objects[0].1.file_size, 1000);
+        assert_eq!(
+            objects[0].1.etag(),
+            format!("\"{}\"", hex::encode([3u8; 16]))
+        );
+        assert_eq!(objects[1].1.file_size, stored, "a forged token applied");
+        assert_eq!(
+            objects[4].1.etag(),
+            format!("\"{}-3\"", hex::encode([3u8; 16]))
+        );
+
+        // Without any key, the inner listing stands.
+        let plain =
+            EncryptingBackend::new(CountingBackend::new(), shared(EncryptionConfig::default()));
+        *plain.inner.tokens.lock().unwrap() = tokens;
+        let mut objects = listing();
+        let sizes = plain
+            .resolve_listed_sizes("b", &mut objects, ResolveListed::default())
+            .await;
+        assert!(sizes.iter().all(|s| *s == Listed), "{sizes:?}");
+        assert_eq!(objects[0].1.file_size, stored);
+    }
+
+    // ── Spool budget ──
 
     fn test_spool(dir: &tempfile::TempDir) -> crate::deltaglider::spool::SpoolDir {
         crate::deltaglider::spool::SpoolDir::new(dir.path().join("spool"), 64 * 1024 * 1024)
@@ -2056,7 +1853,7 @@ mod wrapper_tests {
     ) -> EncryptingBackend<CountingBackend> {
         let mut inner = CountingBackend::new();
         inner.probe_spool = Some(sd.clone());
-        EncryptingBackend::new(inner, keyed_cfg())
+        EncryptingBackend::new(inner, shared(keyed(key(1), "kid-1")))
     }
 
     fn meta_of(len: usize) -> FileMetadata {
@@ -2065,10 +1862,10 @@ mod wrapper_tests {
 
     const MIB: usize = 1024 * 1024;
 
-    /// The ciphertext temp file of an encrypted file PUT must live in the
-    /// spool dir and hold spool budget while the inner backend reads it.
-    /// It was a `NamedTempFile::new()` in the system temp dir, outside the
-    /// budget, so N large encrypted PUTs could fill the disk.
+    /// The ciphertext temp file of an encrypted file PUT lives in the spool
+    /// dir and holds spool budget while the inner backend reads it. It was
+    /// a `NamedTempFile::new()` in the system temp dir, outside the budget,
+    /// so N large encrypted PUTs could fill the disk.
     #[tokio::test]
     async fn encrypted_file_put_temp_is_inside_the_spool_budget() {
         let dir = tempfile::tempdir().unwrap();
@@ -2097,9 +1894,11 @@ mod wrapper_tests {
         assert_eq!(sd.free_mib(), 64, "budget released after the write");
     }
 
-    /// Same for relayed parts: the joined plaintext AND the ciphertext.
+    /// Relayed parts are encrypted straight into ONE ciphertext file (no
+    /// joined plaintext copy), which uses the engine's reservation when
+    /// there is one, else free budget.
     #[tokio::test]
-    async fn encrypted_parts_put_temps_are_inside_the_spool_budget() {
+    async fn encrypted_parts_put_temp_is_inside_the_spool_budget() {
         let dir = tempfile::tempdir().unwrap();
         let sd = test_spool(&dir);
         let wrapper = probe_wrapper(&sd);
@@ -2111,11 +1910,14 @@ mod wrapper_tests {
             })
             .collect();
 
-        // With the engine's up-front reservation: both files share it.
         let need = wrapper
             .file_put_spool_bytes("b", 3 * MIB as u64, true)
             .await;
-        assert!(need > 6 * MIB as u64, "joined + ciphertext, got {need}");
+        assert_eq!(
+            need,
+            v2::stored_len(3 * MIB as u64).unwrap(),
+            "the ciphertext file only"
+        );
         let reserved = sd.reserve_beside(0, need).await.unwrap();
         let free_after_reserve = sd.free_mib();
         wrapper
@@ -2133,7 +1935,7 @@ mod wrapper_tests {
         assert_eq!(puts[0].0.parent(), Some(sd.dir()));
         assert_eq!(
             puts[0].1, free_after_reserve,
-            "the files use the reservation, not more budget"
+            "the file uses the reservation, not more budget"
         );
         drop(reserved);
         assert_eq!(sd.free_mib(), 64);
@@ -2144,11 +1946,7 @@ mod wrapper_tests {
             .await
             .unwrap();
         let puts = wrapper.inner.file_puts.lock().unwrap().clone();
-        assert!(
-            puts[1].1 <= 64 - 7,
-            "joined 3 + ciphertext 4 MiB, free {}",
-            puts[1].1
-        );
+        assert_eq!(puts[1].1, 64 - 4, "the ciphertext (3 MiB + overhead) only");
         assert_eq!(sd.free_mib(), 64);
     }
 
@@ -2212,134 +2010,119 @@ mod wrapper_tests {
 
     #[tokio::test]
     async fn file_put_spool_bytes_is_zero_without_a_write_key() {
-        let plain = EncryptingBackend::new(
-            CountingBackend::new(),
-            Arc::new(ArcSwap::new(Arc::new(EncryptionConfig::default()))),
-        );
+        let plain =
+            EncryptingBackend::new(CountingBackend::new(), shared(EncryptionConfig::default()));
         assert_eq!(plain.file_put_spool_bytes("b", 1 << 30, true).await, 0);
-        let keyed = EncryptingBackend::new(CountingBackend::new(), keyed_cfg());
+        let keyed = EncryptingBackend::new(CountingBackend::new(), shared(keyed(key(1), "kid-1")));
         assert_eq!(
             keyed.file_put_spool_bytes("b", 0, false).await,
-            chunked_wire_len_bound(0)
+            v2::stored_len(0).unwrap()
         );
     }
 }
 
-/// storage-7: a read decides encrypted-or-plaintext from the markers of its
+/// storage-7: a read decides sealed-or-plaintext from the metadata of its
 /// own backend response, so it sends no separate metadata HEAD.
 #[cfg(test)]
 mod read_request_tests {
     use super::*;
     use crate::storage::fake_s3;
-    use futures::TryStreamExt;
 
-    fn cfg(key: Option<EncryptionKey>) -> Arc<ArcSwap<EncryptionConfig>> {
-        let key_id = key.as_ref().map(|_| "kid-1".to_string());
-        Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
+    fn cfg(key: Option<EncryptionKey>, serve: bool) -> Arc<ArcSwap<EncryptionConfig>> {
+        shared(EncryptionConfig {
+            key_id: key.as_ref().map(|_| "kid-1".to_string()),
             key,
-            key_id,
+            serve_plaintext: serve,
             ..Default::default()
-        })))
+        })
     }
 
-    fn key() -> EncryptionKey {
-        EncryptionKey::from_hex(&"42".repeat(32)).unwrap()
-    }
-
-    fn meta(data: &[u8]) -> FileMetadata {
-        FileMetadata::new_passthrough(
-            "a.bin".into(),
-            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(data)),
-            hex::encode(<md5::Md5 as md5::Digest>::digest(data)),
-            data.len() as u64,
-            None,
-        )
+    fn k() -> EncryptionKey {
+        key(0x42)
     }
 
     async fn wrapped(
         key: Option<EncryptionKey>,
+        serve: bool,
     ) -> (
         EncryptingBackend<crate::storage::S3Backend>,
         Arc<fake_s3::FakeS3>,
+        String,
     ) {
         let (ep, fake) = fake_s3::start().await;
         let s3 = crate::storage::s3::test_support::for_test_endpoint(&ep);
-        (EncryptingBackend::new(s3, cfg(key)), fake)
+        (EncryptingBackend::new(s3, cfg(key, serve)), fake, ep)
     }
 
-    fn one_get(requests: &[String]) -> bool {
-        requests.len() == 1 && requests[0].starts_with("GET ")
+    /// The object reads, not the background listing-token writes.
+    fn reads(fake: &fake_s3::FakeS3) -> Vec<String> {
+        fake.requests()
+            .into_iter()
+            .filter(|r| !r.contains(".dg/facts") && !r.contains(".dg%2Ffacts"))
+            .collect()
+    }
+
+    fn one_get(fake: &fake_s3::FakeS3) -> bool {
+        let r = reads(fake);
+        r.len() == 1 && r[0].starts_with("GET ")
     }
 
     #[tokio::test]
     async fn a_passthrough_stream_read_is_one_get() {
-        for k in [None, Some(key())] {
-            let (w, fake) = wrapped(k.clone()).await;
+        for key in [None, Some(k())] {
+            let (w, fake, _) = wrapped(key.clone(), false).await;
             let body = b"hello passthrough".to_vec();
             w.put_passthrough(
                 "b",
                 "p",
                 "a.bin",
-                bytes::Bytes::copy_from_slice(&body),
-                &meta(&body),
+                Bytes::from(body.clone()),
+                &pmeta("a.bin", &body),
             )
             .await
             .unwrap();
             fake.clear();
-            let got: Vec<Bytes> = w
-                .get_passthrough_stream("b", "p", "a.bin")
-                .await
-                .unwrap()
-                .try_collect()
+            let got = collect(w.get_passthrough_stream("b", "p", "a.bin").await.unwrap())
                 .await
                 .unwrap();
-            assert_eq!(got.concat(), body, "key: {}", k.is_some());
-            assert!(one_get(&fake.requests()), "{:?}", fake.requests());
+            assert_eq!(got, body, "key: {}", key.is_some());
+            assert!(one_get(&fake), "{:?}", fake.requests());
             fake.clear();
             assert_eq!(w.get_passthrough("b", "p", "a.bin").await.unwrap(), body);
-            assert!(one_get(&fake.requests()), "{:?}", fake.requests());
+            assert!(one_get(&fake), "{:?}", fake.requests());
         }
     }
 
-    /// P3.5: a range read of a keyed backend takes the object's metadata
-    /// from its own ranged GET, not from a HEAD. A range in chunk 0
-    /// (`bytes=0-`, video players) is one GET of the header and the frames;
-    /// a range further in is a header GET and a body GET. Before: a
-    /// metadata HEAD, a header GET and a body GET, 3 for each.
+    /// P3.5 / v2: a range read of a sealed object is ONE ranged GET of the
+    /// frames that hold it; the response carries the metadata (no HEAD) and
+    /// the frame offsets need no header (no header GET), at any offset.
     #[tokio::test]
-    async fn encrypted_ranges_send_no_metadata_head() {
-        let (w, fake) = wrapped(Some(key())).await;
-        let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    async fn a_sealed_range_is_one_get() {
+        let (w, fake, _) = wrapped(Some(k()), false).await;
+        let body = body_of(200_000);
         w.put_passthrough_chunked(
             "b",
             "p",
             "a.bin",
             &[Bytes::from(body.clone())],
-            &meta(&body),
+            &pmeta("a.bin", &body),
         )
         .await
         .unwrap();
         let last = body.len() as u64 - 1;
-        // The object reads, not the background listing-facts write.
-        let reads = || -> Vec<String> {
-            fake.requests()
-                .into_iter()
-                .filter(|r| !r.contains(".dg/facts"))
-                .collect()
-        };
-        for (start, end, want) in [
-            (0, u64::MAX - 1, 1),
-            (0, 9, 1),
-            (10, 70_000, 1),
-            (0, last, 1),
-            (70_000, 70_100, 2),
-            (150_000, u64::MAX - 1, 2),
-            (last, last, 2),
+        for (start, end) in [
+            (0, u64::MAX - 1),
+            (0, 9),
+            (10, 70_000),
+            (0, last),
+            (70_000, 70_100),
+            (150_000, u64::MAX - 1),
+            (last, last),
         ] {
             let e = end.min(last);
             let expected = &body[start as usize..=e as usize];
             fake.clear();
-            let crate::storage::RangeRead {
+            let RangeRead {
                 stream,
                 len,
                 metadata: m,
@@ -2348,140 +2131,138 @@ mod read_request_tests {
                 .open_passthrough_range("b", "p", "a.bin", start, end)
                 .await
                 .unwrap();
-            let got: Vec<Bytes> = stream.try_collect().await.unwrap();
-            assert_eq!(got.concat(), expected, "open {start}-{end}");
+            assert_eq!(
+                collect(stream).await.unwrap(),
+                expected,
+                "open {start}-{end}"
+            );
             assert_eq!(len, expected.len() as u64);
             assert_eq!(m.file_size, body.len() as u64);
-            let reqs = reads();
-            assert!(reqs.iter().all(|r| r.starts_with("GET ")), "{reqs:?}");
-            assert_eq!(reqs.len(), want, "open {start}-{end}: {reqs:?}");
+            assert!(one_get(&fake), "open {start}-{end}: {:?}", reads(&fake));
             fake.clear();
             let (stream, len) = w
                 .get_passthrough_stream_range("b", "p", "a.bin", start, end)
                 .await
                 .unwrap();
-            let got: Vec<Bytes> = stream.try_collect().await.unwrap();
-            assert_eq!(got.concat(), expected, "range {start}-{end}");
+            assert_eq!(
+                collect(stream).await.unwrap(),
+                expected,
+                "range {start}-{end}"
+            );
             assert_eq!(len, expected.len() as u64);
-            assert_eq!(reads().len(), want, "{:?}", reads());
+            assert!(one_get(&fake), "{:?}", reads(&fake));
         }
-        // A range past the end is refused, as before.
-        assert!(matches!(
-            w.open_passthrough_range("b", "p", "a.bin", body.len() as u64, u64::MAX - 1)
-                .await,
-            Err(StorageError::InvalidRange(_))
-        ));
-    }
-
-    /// P3.5: the read that guessed the chunked format serves the other
-    /// stored forms right, from the metadata it read: a v1 (single-shot)
-    /// object and a plaintext object on a keyed backend, and a ciphertext
-    /// whose markers were stripped is refused, never served.
-    #[tokio::test]
-    async fn encrypted_range_reads_serve_every_stored_form() {
-        let (w, _fake) = wrapped(Some(key())).await;
-        let body: Vec<u8> = (0..1000u32).map(|i| (i % 7) as u8).collect();
-        // v1: the small buffered write.
-        w.put_passthrough("b", "p", "v1.bin", Bytes::from(body.clone()), &meta(&body))
-            .await
-            .unwrap();
-        // Plaintext: written by the inner backend directly.
-        w.inner
-            .put_passthrough(
-                "b",
-                "p",
-                "plain.bin",
-                Bytes::from(body.clone()),
-                &meta(&body),
-            )
-            .await
-            .unwrap();
-        for name in ["v1.bin", "plain.bin"] {
-            for (start, end) in [(0, u64::MAX - 1), (0, 9), (500, 600)] {
-                let crate::storage::RangeRead { stream, len, .. } = w
-                    .open_passthrough_range("b", "p", name, start, end)
-                    .await
-                    .unwrap();
-                let got: Vec<Bytes> = stream.try_collect().await.unwrap();
-                let e = end.min(body.len() as u64 - 1) as usize;
-                assert_eq!(
-                    got.concat(),
-                    &body[start as usize..=e],
-                    "{name} {start}-{end}"
-                );
-                assert_eq!(len, (e + 1 - start as usize) as u64);
-            }
-        }
-        // Ciphertext with its markers stripped (a foreign metadata rewrite).
-        let big: Vec<u8> = (0..100_000u32).map(|i| (i % 13) as u8).collect();
-        w.put_passthrough_chunked("b", "p", "c.bin", &[Bytes::from(big.clone())], &meta(&big))
-            .await
-            .unwrap();
-        let wire = w.inner.get_passthrough("b", "p", "c.bin").await.unwrap();
-        w.inner
-            .put_passthrough("b", "p", "c.bin", Bytes::from(wire), &meta(&big))
-            .await
-            .unwrap();
-        for (start, end) in [(0, 99), (70_000, 70_100)] {
-            let read = async {
-                let crate::storage::RangeRead { stream, .. } = w
-                    .open_passthrough_range("b", "p", "c.bin", start, end)
-                    .await?;
-                stream.try_collect::<Vec<Bytes>>().await
-            };
+        // A range past the end is refused.
+        for start in [body.len() as u64, 4 * F as u64, 10 * F as u64] {
             assert!(
-                read.await.is_err(),
-                "stripped ciphertext served {start}-{end}"
+                matches!(
+                    w.open_passthrough_range("b", "p", "a.bin", start, u64::MAX - 1)
+                        .await,
+                    Err(StorageError::InvalidRange(_))
+                ),
+                "{start}"
             );
         }
     }
 
-    /// A ranged read whose second GET starts at or past the object's end
-    /// gets a 416 from the backend; that is `InvalidRange`, never a 500.
-    /// (a) A v1 object whose wire size is exactly the first read's guess:
-    /// the "rest" read starts at the end, and a valid range must serve.
-    /// (b) A plaintext object on a keyed backend and a range that starts
-    /// past its end, in a later chunk: 416, not 500 (next test).
+    /// The forms a keyed bucket can hold: sealed (buffered or chunked
+    /// write), and plaintext, which is served only under `serve`. A sealed
+    /// body whose markers were stripped is refused, never served.
     #[tokio::test]
-    async fn a_v1_object_that_fills_the_guess_serves_a_valid_range() {
-        let (w, _fake) = wrapped(Some(key())).await;
-        // The chunk-0 guess reads wire bytes 0..=header+one frame-1.
-        let guess = (CHUNK_HEADER_LEN + CHUNK_FRAME_WIRE_LEN) as u64;
-        let plain_len = guess as usize
-            - crate::storage::encrypting::format::IV_LEN
-            - crate::storage::encrypting::format::GCM_TAG_LEN;
-        let body: Vec<u8> = (0..plain_len as u32).map(|i| (i % 249) as u8).collect();
-        w.put_passthrough("b", "p", "v1.bin", Bytes::from(body.clone()), &meta(&body))
+    async fn keyed_range_reads_serve_every_stored_form() {
+        for serve in [false, true] {
+            let (w, _fake, _) = wrapped(Some(k()), serve).await;
+            let body = body_of(1000);
+            w.put_passthrough(
+                "b",
+                "p",
+                "buffered",
+                Bytes::from(body.clone()),
+                &pmeta("x", &body),
+            )
             .await
             .unwrap();
-        let wire = w.inner.get_passthrough("b", "p", "v1.bin").await.unwrap();
-        assert_eq!(wire.len() as u64, guess, "the v1 wire must fill the guess");
-        let crate::storage::RangeRead { stream, len, .. } = w
-            .open_passthrough_range("b", "p", "v1.bin", 0, 100)
+            w.put_passthrough_chunked(
+                "b",
+                "p",
+                "chunked",
+                &[Bytes::from(body.clone())],
+                &pmeta("x", &body),
+            )
             .await
             .unwrap();
-        let got: Vec<Bytes> = stream.try_collect().await.unwrap();
-        assert_eq!(got.concat(), &body[..=100]);
-        assert_eq!(len, 101);
+            w.inner
+                .put_passthrough(
+                    "b",
+                    "p",
+                    "plain",
+                    Bytes::from(body.clone()),
+                    &pmeta("x", &body),
+                )
+                .await
+                .unwrap();
+            for name in ["buffered", "chunked", "plain"] {
+                for (start, end) in [(0, u64::MAX - 1), (0, 9), (500, 600)] {
+                    let got = read_range(&w, "b", "p", name, start, end).await;
+                    if name == "plain" && !serve {
+                        assert!(got.is_err(), "plaintext served without serve");
+                        continue;
+                    }
+                    let e = end.min(body.len() as u64 - 1) as usize;
+                    assert_eq!(
+                        got.unwrap(),
+                        &body[start as usize..=e],
+                        "{name} {start}-{end}"
+                    );
+                }
+            }
+            // Ciphertext with its markers stripped (a foreign rewrite).
+            let big = body_of(100_000);
+            w.put_passthrough_chunked(
+                "b",
+                "p",
+                "c.bin",
+                &[Bytes::from(big.clone())],
+                &pmeta("c.bin", &big),
+            )
+            .await
+            .unwrap();
+            let wire = w.inner.get_passthrough("b", "p", "c.bin").await.unwrap();
+            w.inner
+                .put_passthrough("b", "p", "c.bin", Bytes::from(wire), &pmeta("c.bin", &big))
+                .await
+                .unwrap();
+            let ranges: &[(u64, u64)] = if serve {
+                &[(0, 99)]
+            } else {
+                &[(0, 99), (70_000, 70_100)]
+            };
+            for &(start, end) in ranges {
+                assert!(
+                    read_range(&w, "b", "p", "c.bin", start, end).await.is_err(),
+                    "serve {serve}: stripped ciphertext served {start}-{end}"
+                );
+            }
+        }
     }
 
-    /// (b) of the test above: a plaintext object on a keyed backend.
+    /// A ranged read whose follow-up starts past a plaintext object's end
+    /// gets a 416 from the backend: `InvalidRange`, never a 500.
     #[tokio::test]
     async fn a_plaintext_range_past_the_end_on_a_keyed_backend_is_invalid_range() {
-        let (w, _fake) = wrapped(Some(key())).await;
-        // Plaintext written by the inner backend directly.
-        let small: Vec<u8> = (0..1000u32).map(|i| (i % 7) as u8).collect();
+        let (w, _fake, _) = wrapped(Some(k()), true).await;
+        let small = body_of(1000);
         w.inner
             .put_passthrough(
                 "b",
                 "p",
                 "plain.bin",
                 Bytes::from(small.clone()),
-                &meta(&small),
+                &pmeta("x", &small),
             )
             .await
             .unwrap();
-        for start in [70_000u64, CHUNK_PLAINTEXT_SIZE as u64] {
+        for start in [1000, 70_000u64, F as u64] {
             let res = w
                 .open_passthrough_range("b", "p", "plain.bin", start, u64::MAX - 1)
                 .await;
@@ -2495,15 +2276,15 @@ mod read_request_tests {
 
     #[tokio::test]
     async fn delta_and_reference_reads_are_one_get() {
-        for k in [None, Some(key())] {
-            let (w, fake) = wrapped(k.clone()).await;
+        for key in [None, Some(k())] {
+            let (w, fake, _) = wrapped(key.clone(), false).await;
             let body = b"delta bytes".to_vec();
             w.put_delta(
                 "b",
                 "p",
                 "a.bin",
-                bytes::Bytes::copy_from_slice(&body),
-                &meta(&body),
+                Bytes::from(body.clone()),
+                &dmeta("a.bin", &body),
                 crate::deltaglider::RefWriteProof::for_tests(),
             )
             .await
@@ -2511,19 +2292,70 @@ mod read_request_tests {
             w.put_reference(
                 "b",
                 "p",
-                bytes::Bytes::copy_from_slice(&body),
-                &meta(&body),
+                Bytes::from(body.clone()),
+                &rmeta(&body),
                 crate::deltaglider::RefWriteProof::for_tests(),
             )
             .await
             .unwrap();
             fake.clear();
             assert_eq!(w.get_delta("b", "p", "a.bin").await.unwrap(), body);
-            assert!(one_get(&fake.requests()), "{:?}", fake.requests());
+            assert!(one_get(&fake), "{:?}", fake.requests());
             fake.clear();
             assert_eq!(w.get_reference("b", "p").await.unwrap(), body);
-            assert!(one_get(&fake.requests()), "{:?}", fake.requests());
+            assert!(one_get(&fake), "{:?}", fake.requests());
         }
+    }
+
+    /// The S3 write path keeps a `!!2` listing token, made by the wrapper's
+    /// maker (`FileMetadata::listing_token`) from the stored ETag and size;
+    /// a LIST on another node (no shared process cache) opens it and lists
+    /// the logical size and ETag without a HEAD.
+    #[tokio::test]
+    async fn an_s3_put_keeps_a_listing_token_that_a_list_applies() {
+        let (w, fake, ep) = wrapped(Some(k()), false).await;
+        let body = body_of(3000);
+        w.put_passthrough(
+            "b",
+            "p",
+            "a.bin",
+            Bytes::from(body.clone()),
+            &pmeta("a.bin", &body),
+        )
+        .await
+        .unwrap();
+        assert!(
+            fake.wait_for(|r| r.starts_with("PUT /b/.dg/facts/")).await,
+            "no token write: {:?}",
+            fake.requests()
+        );
+        let token_put = fake
+            .requests()
+            .into_iter()
+            .find(|r| r.starts_with("PUT /b/.dg/facts/"))
+            .unwrap();
+        assert!(
+            token_put.contains("!!2.") || token_put.contains("%21%212."),
+            "{token_put}"
+        );
+        let other = EncryptingBackend::new(
+            crate::storage::s3::test_support::for_test_endpoint_as_node(&ep, "n2"),
+            cfg(Some(k()), false),
+        );
+        let mut objects = other.bulk_list_objects("b", "p/").await.unwrap();
+        assert_eq!(objects.len(), 1, "{objects:?}");
+        fake.clear();
+        let sizes = other
+            .resolve_listed_sizes("b", &mut objects, ResolveListed::default())
+            .await;
+        assert_eq!(sizes, [ListedSize::Cached]);
+        assert_eq!(objects[0].1.file_size, body.len() as u64);
+        assert_eq!(objects[0].1.etag(), format!("\"{}\"", md5_hex(&body)));
+        assert!(
+            !fake.requests().iter().any(|r| r.starts_with("HEAD ")),
+            "{:?}",
+            fake.requests()
+        );
     }
 }
 
@@ -2531,57 +2363,17 @@ mod read_request_tests {
 mod pinned_follow_up_tests {
     use super::*;
     use crate::storage::fake_s3;
-    use futures::TryStreamExt;
-
-    fn cfg(key: Option<EncryptionKey>) -> Arc<ArcSwap<EncryptionConfig>> {
-        Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
-            key_id: key.as_ref().map(|_| "kid-a".to_string()),
-            key,
-            ..Default::default()
-        })))
-    }
-
-    fn meta(data: &[u8]) -> FileMetadata {
-        FileMetadata::new_passthrough(
-            "x.bin".into(),
-            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(data)),
-            hex::encode(<md5::Md5 as md5::Digest>::digest(data)),
-            data.len() as u64,
-            None,
-        )
-    }
 
     #[derive(Clone, Copy, Debug)]
     enum Form {
         Plain,
-        Chunked,
-        V1,
-    }
-
-    async fn put<B: StorageBackend>(
-        plain: &EncryptingBackend<B>,
-        keyed: &EncryptingBackend<B>,
-        form: Form,
-        name: &str,
-        data: &[u8],
-    ) {
-        let b = Bytes::from(data.to_vec());
-        match form {
-            Form::Plain => plain.put_passthrough("b", "p", name, b, &meta(data)).await,
-            Form::Chunked => {
-                keyed
-                    .put_passthrough_chunked("b", "p", name, &[b], &meta(data))
-                    .await
-            }
-            Form::V1 => keyed.put_passthrough("b", "p", name, b, &meta(data)).await,
-        }
-        .unwrap();
+        Sealed,
     }
 
     #[test]
     fn same_stored_version_truth_table() {
         use crate::storage::traits::same_stored_version;
-        let a = meta(b"hello");
+        let a = pmeta("x.bin", b"hello");
         assert!(same_stored_version(&a, &a.clone()));
         let mut later = a.clone();
         later.created_at += chrono::Duration::microseconds(1);
@@ -2592,58 +2384,84 @@ mod pinned_follow_up_tests {
         let mut sized = a.clone();
         sized.file_size += 1;
         assert!(!same_stored_version(&a, &sized), "other size");
-        let mut marked = a.clone();
-        mark_chunked_encrypted(&mut marked, Some("kid-a"));
-        assert!(!same_stored_version(&a, &marked), "other format");
+        let mut sealed = a.clone();
+        sealed
+            .user_metadata
+            .insert(seal::SEALED_KEY.into(), "2.one".into());
+        assert!(!same_stored_version(&a, &sealed), "other format");
+        let mut resealed = sealed.clone();
+        resealed
+            .user_metadata
+            .insert(seal::SEALED_KEY.into(), "2.two".into());
+        assert!(!same_stored_version(&sealed, &resealed), "another seal");
     }
 
-    /// A keyed range read takes the object's metadata (and its format)
-    /// from its first GET, and may need a second GET for the bytes. When
-    /// another version replaces the object between the two, the read fails
-    /// with a retryable 503 SlowDown. Before, the second GET was not tied
-    /// to the first: a plaintext object replaced by a chunked one served
-    /// the new ciphertext as plaintext under the old ETag, and the other
-    /// pairs failed with an opaque decryption error.
+    /// A keyed range read takes the object's metadata from its first GET.
+    /// A sealed object needs no second request. A plaintext one (under
+    /// `serve`) does: when another version replaced the object between the
+    /// two, the read fails with a retryable 503 SlowDown, so the bytes of
+    /// one version never go out with the metadata of another.
     #[tokio::test]
     async fn a_follow_up_read_of_another_version_is_slow_down() {
-        let key = EncryptionKey::from_hex(&"aa".repeat(32)).unwrap();
-        let a: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let k = key(0xaa);
+        let a = body_of(200_000);
         let b: Vec<u8> = (0..200_000u32).map(|i| (i % 13) as u8).collect();
         for (from, to, start) in [
-            (Form::Plain, Form::Chunked, 70_000),
-            (Form::Chunked, Form::Plain, 70_000),
-            (Form::Chunked, Form::Chunked, 140_000),
-            (Form::V1, Form::V1, 0),
+            (Form::Plain, Form::Sealed, 70_000),
+            (Form::Plain, Form::Plain, 70_000),
+            (Form::Plain, Form::Plain, 0),
+            (Form::Sealed, Form::Plain, 70_000),
+            (Form::Sealed, Form::Sealed, 140_000),
         ] {
             let (ep, fake) = fake_s3::start().await;
             let mk = || crate::storage::s3::test_support::for_test_endpoint(&ep);
-            let plain = EncryptingBackend::new(mk(), cfg(None));
-            let keyed = EncryptingBackend::new(mk(), cfg(Some(key.clone())));
-            put(&plain, &keyed, from, "x.bin", &a).await;
-            put(&plain, &keyed, to, "y.bin", &b).await;
+            let plain = EncryptingBackend::new(mk(), shared(EncryptionConfig::default()));
+            let keyed = EncryptingBackend::new(
+                mk(),
+                shared(EncryptionConfig {
+                    serve_plaintext: true,
+                    ..keyed(k.clone(), "kid-a")
+                }),
+            );
+            for (form, name, data) in [(from, "x.bin", &a), (to, "y.bin", &b)] {
+                let w = match form {
+                    Form::Plain => &plain,
+                    Form::Sealed => &keyed,
+                };
+                w.put_passthrough(
+                    "b",
+                    "p",
+                    name,
+                    Bytes::from(data.clone()),
+                    &pmeta(name, data),
+                )
+                .await
+                .unwrap();
+            }
             fake.overwrite_after_reads("b/p/x.bin", "b/p/y.bin", 1);
             let label = format!("{from:?} -> {to:?} at {start}");
             let read = async {
-                let crate::storage::RangeRead {
-                    stream: s,
-                    metadata: m,
-                    ..
+                let RangeRead {
+                    stream, metadata, ..
                 } = keyed
                     .open_passthrough_range("b", "p", "x.bin", start, start + 99)
                     .await?;
-                let body: Vec<Bytes> = s.try_collect().await?;
-                Ok::<_, StorageError>((body.concat(), m))
+                Ok::<_, StorageError>((collect(stream).await?, metadata))
             };
-            match read.await {
-                Err(StorageError::Throttled(_)) => {}
-                Ok((body, m)) => panic!(
-                    "{label}: served {} bytes, A's: {}, B's: {}, etag {}",
+            let want_a = &a[start as usize..start as usize + 100];
+            match (from, read.await) {
+                (Form::Plain, Err(StorageError::Throttled(_))) => {}
+                (Form::Sealed, Ok((body, m))) => {
+                    assert_eq!(body, want_a, "{label}");
+                    assert_eq!(m.md5, md5_hex(&a), "{label}");
+                }
+                (_, Ok((body, m))) => panic!(
+                    "{label}: served {} bytes, A's: {}, etag {}",
                     body.len(),
-                    body == a[start as usize..start as usize + 100],
-                    body == b[start as usize..start as usize + 100],
+                    body == want_a,
                     m.etag()
                 ),
-                Err(e) => panic!("{label}: {e}"),
+                (_, Err(e)) => panic!("{label}: {e}"),
             }
         }
     }
@@ -2651,9 +2469,8 @@ mod pinned_follow_up_tests {
 
 /// THE rule: a range read of this wrapper that needs a second request
 /// reads it with `pinned_range` (the response's own metadata checked
-/// against the first read's), never with a bare
-/// `get_passthrough_stream_range` / `get_passthrough` of the inner
-/// backend, which carries no metadata and so cannot tell another version.
+/// against the first read's), never with a bare read of the inner backend
+/// that carries no metadata and so cannot tell another version.
 #[test]
 fn follow_up_reads_are_pinned_to_the_first_read() {
     let text = std::fs::read_to_string("src/storage/encrypting/mod.rs").unwrap();
@@ -2668,38 +2485,39 @@ fn follow_up_reads_are_pinned_to_the_first_read() {
             "encrypting/mod.rs calls {bare}: use pinned_range"
         );
     }
+    // The plaintext follow-up goes through the pinned helper, which is
+    // the one place that checks the version.
+    let helper = squashed
+        .split("asyncfnplaintext_range(")
+        .nth(1)
+        .expect("plaintext_range is gone: update this guard");
+    let helper = &helper[..helper.find("asyncfn").unwrap_or(helper.len())];
+    assert!(
+        helper.contains(".pinned_range("),
+        "plaintext_range must pin"
+    );
+    assert!(squashed.contains("same_stored_version(pin,&read.metadata)"));
 }
 
 #[cfg(test)]
 mod range_matrix_tests {
     use super::*;
     use crate::storage::fake_s3;
-    use futures::TryStreamExt;
 
-    fn k(b: &str) -> EncryptionKey {
-        EncryptionKey::from_hex(&b.repeat(32)).unwrap()
-    }
     fn cfg(
         key: Option<EncryptionKey>,
         kid: Option<&str>,
         legacy: Option<(EncryptionKey, &str)>,
+        serve: bool,
     ) -> Arc<ArcSwap<EncryptionConfig>> {
-        Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
+        shared(EncryptionConfig {
             key,
             key_id: kid.map(str::to_string),
             legacy_key: legacy.as_ref().map(|l| l.0.clone()),
             legacy_key_id: legacy.map(|l| l.1.to_string()),
+            serve_plaintext: serve,
             ..Default::default()
-        })))
-    }
-    fn meta(data: &[u8]) -> FileMetadata {
-        FileMetadata::new_passthrough(
-            "a.bin".into(),
-            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(data)),
-            hex::encode(<md5::Md5 as md5::Digest>::digest(data)),
-            data.len() as u64,
-            None,
-        )
+        })
     }
 
     async fn outcome<B: StorageBackend>(
@@ -2724,9 +2542,8 @@ mod range_matrix_tests {
             }
         };
         match r {
-            Ok((s, len, m)) => match s.try_collect::<Vec<Bytes>>().await {
-                Ok(parts) => {
-                    let body = parts.concat();
+            Ok((s, len, m)) => match collect(s).await {
+                Ok(body) => {
                     let md = m
                         .map(|m| format!("size={} etag={}", m.file_size, m.etag()))
                         .unwrap_or_default();
@@ -2734,70 +2551,66 @@ mod range_matrix_tests {
                         "OK len={} bodylen={} body_md5={} {}",
                         len,
                         body.len(),
-                        hex::encode(<md5::Md5 as md5::Digest>::digest(&body)),
+                        md5_hex(&body),
                         md
                     )
                 }
                 Err(e) => format!("STREAM-ERR {e}"),
             },
-            Err(e) => format!(
-                "ERR {}",
-                match e {
-                    StorageError::InvalidRange(_) => "InvalidRange".to_string(),
-                    other => format!("{other}"),
-                }
-            ),
+            Err(StorageError::InvalidRange(_)) => "ERR InvalidRange".to_string(),
+            Err(e) => format!("ERR {e}"),
         }
     }
 
     async fn run<B: StorageBackend, F: Fn() -> B>(mk: F) -> Vec<String> {
-        let (a, p) = (k("aa"), k("bb"));
-        let writer_a = EncryptingBackend::new(mk(), cfg(Some(a.clone()), Some("kid-a"), None));
-        let writer_nokid = EncryptingBackend::new(mk(), cfg(Some(a.clone()), None, None));
-        let writer_prev = EncryptingBackend::new(mk(), cfg(Some(p.clone()), Some("kid-p"), None));
-        let plain_w = EncryptingBackend::new(mk(), cfg(None, None, None));
+        let (a, p) = (key(0xaa), key(0xbb));
+        let writer_a =
+            EncryptingBackend::new(mk(), cfg(Some(a.clone()), Some("kid-a"), None, false));
+        let writer_nokid = EncryptingBackend::new(mk(), cfg(Some(a.clone()), None, None, false));
+        let writer_prev =
+            EncryptingBackend::new(mk(), cfg(Some(p.clone()), Some("kid-p"), None, false));
+        let plain_w = EncryptingBackend::new(mk(), cfg(None, None, None, false));
         let reader = EncryptingBackend::new(
             mk(),
-            cfg(Some(a.clone()), Some("kid-a"), Some((p.clone(), "kid-p"))),
+            cfg(
+                Some(a.clone()),
+                Some("kid-a"),
+                Some((p.clone(), "kid-p")),
+                true,
+            ),
         );
-        let unkeyed = EncryptingBackend::new(mk(), cfg(None, None, None));
+        let unkeyed = EncryptingBackend::new(mk(), cfg(None, None, None, false));
         let _ = plain_w.create_bucket("b").await;
         let mut mismatches = Vec::new();
-        // The chunk edges: empty, one byte, the header length, one frame
-        // and one byte more, two frames and one byte more.
-        let sizes: [u64; 6] = [0, 1, 16, 65536, 65537, 131073];
+        // The frame edges: empty, one byte, one frame and one byte more,
+        // two frames and one byte more.
+        let sizes: [u64; 6] = [0, 1, 76, 65536, 65537, 131073];
         for size in sizes {
-            let body: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
-            let m = meta(&body);
+            let body = body_of(size as usize);
+            let m = pmeta("a.bin", &body);
             let b = Bytes::from(body.clone());
             plain_w
                 .put_passthrough("b", "p", "plain", b.clone(), &m)
                 .await
                 .unwrap();
-            writer_a
-                .put_passthrough_chunked("b", "p", "chunked", std::slice::from_ref(&b), &m)
+            for (w, prefix) in [
+                (&writer_a, ""),
+                (&writer_nokid, "nokid-"),
+                (&writer_prev, "prev-"),
+            ] {
+                w.put_passthrough_chunked(
+                    "b",
+                    "p",
+                    &format!("{prefix}chunked"),
+                    std::slice::from_ref(&b),
+                    &m,
+                )
                 .await
                 .unwrap();
-            writer_a
-                .put_passthrough("b", "p", "v1", b.clone(), &m)
-                .await
-                .unwrap();
-            writer_nokid
-                .put_passthrough_chunked("b", "p", "nokid-chunked", std::slice::from_ref(&b), &m)
-                .await
-                .unwrap();
-            writer_nokid
-                .put_passthrough("b", "p", "nokid-v1", b.clone(), &m)
-                .await
-                .unwrap();
-            writer_prev
-                .put_passthrough_chunked("b", "p", "prev-chunked", std::slice::from_ref(&b), &m)
-                .await
-                .unwrap();
-            writer_prev
-                .put_passthrough("b", "p", "prev-v1", b.clone(), &m)
-                .await
-                .unwrap();
+                w.put_passthrough("b", "p", &format!("{prefix}buffered"), b.clone(), &m)
+                    .await
+                    .unwrap();
+            }
             let last = size.saturating_sub(1);
             let max = u64::MAX - 1;
             let mut ranges: Vec<(u64, u64)> = vec![
@@ -2815,8 +2628,8 @@ mod range_matrix_tests {
                 (size, max),
                 (size + 10, size + 20),
                 (1, 1),
-                (15, 16),
-                (16, 16),
+                (75, 76),
+                (76, 76),
             ];
             // suffix bytes=-N as the adapter resolves it (HEAD-first)
             for n in [1u64, 10, 65536, 70000] {
@@ -2832,11 +2645,11 @@ mod range_matrix_tests {
                 for name in [
                     "plain",
                     "chunked",
-                    "v1",
+                    "buffered",
                     "nokid-chunked",
-                    "nokid-v1",
+                    "nokid-buffered",
                     "prev-chunked",
-                    "prev-v1",
+                    "prev-buffered",
                 ] {
                     let got = outcome(&reader, name, s, e, open).await;
                     if got != twin {
@@ -2850,13 +2663,14 @@ mod range_matrix_tests {
         mismatches
     }
 
-    /// Every wire format behind a keyed wrapper (plaintext, chunked, v1,
-    /// each with and without a key id, and under the previous key) answers
-    /// every range shape exactly as an unkeyed read of the plaintext twin:
-    /// the same length, bytes and metadata, or the same error. On S3 also
-    /// with a store that sends GET bodies chunked (no Content-Length).
+    /// Every stored form behind a keyed reader (plaintext under `serve`,
+    /// sealed chunked and buffered writes, with and without a key id, and
+    /// under the previous key) answers every range shape exactly as an
+    /// unkeyed read of the plaintext twin: the same length, bytes and
+    /// metadata, or the same error. On S3 also with a store that sends GET
+    /// bodies chunked (no Content-Length).
     #[tokio::test]
-    async fn every_format_answers_ranges_as_its_plaintext_twin_on_s3() {
+    async fn every_form_answers_ranges_as_its_plaintext_twin_on_s3() {
         for chunked in [false, true] {
             let (ep, fake) = fake_s3::start().await;
             fake.set_chunked_gets(chunked);
@@ -2866,7 +2680,7 @@ mod range_matrix_tests {
     }
 
     #[tokio::test]
-    async fn every_format_answers_ranges_as_its_plaintext_twin_on_the_filesystem() {
+    async fn every_form_answers_ranges_as_its_plaintext_twin_on_the_filesystem() {
         use crate::storage::filesystem::FilesystemBackend;
         let dir = tempfile::tempdir().unwrap();
         let mut backends = Vec::new();

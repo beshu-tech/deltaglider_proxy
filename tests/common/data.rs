@@ -79,3 +79,29 @@ pub fn read_xattr_metadata(
     }
     out
 }
+
+// === At-rest encryption (format v2, issue #120) ===
+
+/// The id that the proxy gives a key without an explicit `key_id`
+/// (`fp-<hex of its v2 fingerprint>`). Objects at rest carry only this
+/// fingerprint, never an id.
+pub fn key_fp_label(key_hex: &str) -> String {
+    let key = deltaglider_proxy::storage::EncryptionKey::from_hex(key_hex).expect("test key hex");
+    deltaglider_proxy::storage::encrypting::fingerprint_label(&key)
+}
+
+/// The key fingerprint of a stored object, as `fp-<hex>`, decoded from
+/// its stored `dg-sealed` value (`2.<b64url(fp(8) | ...)>`). `None` = the
+/// object carries no seal (plaintext).
+pub fn sealed_fp_label(sealed: Option<&str>) -> Option<String> {
+    use base64::Engine;
+    let sealed = sealed?;
+    let body = sealed
+        .strip_prefix("2.")
+        .unwrap_or_else(|| panic!("dg-sealed of an unknown version: {sealed}"));
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(body.trim_end_matches('='))
+        .unwrap_or_else(|e| panic!("dg-sealed is not base64url: {e}"));
+    assert!(raw.len() > 8, "dg-sealed too short");
+    Some(format!("fp-{}", hex::encode(&raw[..8])))
+}

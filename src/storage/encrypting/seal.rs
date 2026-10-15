@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// The user-metadata key of the sealed facts.
-pub const SEALED_KEY: &str = "dg-sealed";
+pub const SEALED_KEY: &str = crate::types::meta_keys::SEALED;
 
 /// The `dg-encrypted` value that callers above the wrapper see on an
 /// encrypted object.
@@ -105,17 +105,14 @@ pub fn location<'a>(bucket: &'a str, prefix: &'a str, object: StoredObject<'a>) 
     }
 }
 
-/// The clear headers that a seal covers: content type, original name, and
-/// every user-metadata pair except the wrapper's own markers. A backend
+/// The clear headers that a seal covers: the content type and every
+/// user-metadata pair except the wrapper's own markers. A backend
 /// writer that changes one of them makes the object fail closed.
 pub fn client_headers(meta: &FileMetadata) -> [u8; 16] {
+    // Not the original name: a listing names an entry by its key.
     let ct = meta.content_type.as_deref().unwrap_or("");
-    let pairs = [
-        (":content-type", ct),
-        (":original-name", meta.original_name.as_str()),
-    ];
     v2::client_headers_digest(
-        pairs.into_iter().chain(
+        [(":content-type", ct)].into_iter().chain(
             meta.user_metadata
                 .iter()
                 .filter(|(k, _)| {
@@ -304,7 +301,7 @@ pub fn open<'r>(
     if facts.headers != client_headers(raw) {
         return Err(enc_err(format!(
             "the clear metadata of an object in bucket '{}' was changed on the backend \
-             (content type, name or user metadata): the proxy refuses it",
+             (content type or user metadata): the proxy refuses it",
             at.bucket
         )));
     }
@@ -458,7 +455,6 @@ mod tests {
         for edit in [
             (|m: &mut FileMetadata| m.content_type = Some("text/html".into()))
                 as fn(&mut FileMetadata),
-            |m| m.original_name = "evil.html".into(),
             |m| {
                 m.user_metadata.insert("build".into(), "43".into());
             },

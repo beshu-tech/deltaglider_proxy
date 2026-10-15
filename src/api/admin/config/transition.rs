@@ -363,6 +363,7 @@ pub(super) fn static_transition_gates(
     confirmed_key_removals: &[String],
     confirmed_downgrades: Option<&[String]>,
     absent_buckets: &[String],
+    confirmed_refusals: Option<&[String]>,
 ) -> Result<(), String> {
     // FATAL config-graph errors (bucket → undefined backend, duplicate
     // backend names): un-runnable states that boot refuses too.
@@ -376,6 +377,13 @@ pub(super) fn static_transition_gates(
     // A bucket that would store plaintext where it encrypted needs an
     // explicit confirmation (issue #116 P3).
     fatal.extend(new_cfg.unconfirmed_encryption_downgrades(old_cfg, confirmed_downgrades));
+    // A subject that starts to encrypt refuses its plaintext history
+    // unless it serves it (issue #120): explicit confirmation, or `serve`.
+    fatal.extend(new_cfg.unconfirmed_plaintext_refusals(
+        old_cfg,
+        confirmed_refusals,
+        absent_buckets,
+    ));
     // A webhook URL that every delivery would refuse: refuse the apply that
     // adds it, instead of failing (and retrying) every event later.
     fatal.extend(
@@ -446,8 +454,27 @@ async fn transition_gates(
         } => Some(crate::config::confirmed_downgrades(Some(headers))),
         _ => None,
     };
-    let absent = absent_buckets(app, old_cfg).await;
-    static_transition_gates(old_cfg, new_cfg, &confirmed, downgrades.as_deref(), &absent)?;
+    let refusals = match ctx {
+        TransitionCtx::Admin {
+            headers,
+            restoring: false,
+            ..
+        } => Some(crate::config::confirmed_subjects(
+            Some(headers),
+            crate::config::CONFIRM_PLAINTEXT_REFUSAL_HEADER,
+        )),
+        _ => None,
+    };
+    let mut absent = absent_buckets(app, old_cfg).await;
+    absent.extend(absent_buckets(app, new_cfg).await);
+    static_transition_gates(
+        old_cfg,
+        new_cfg,
+        &confirmed,
+        downgrades.as_deref(),
+        &absent,
+        refusals.as_deref(),
+    )?;
 
     // Backend write-capability gate (guard B, hot-apply half): refuse routing
     // a client-writable bucket onto a non-CAS backend under multi-instance.
@@ -986,7 +1013,7 @@ mod keyless_proxy_gate_tests {
         let old = Config::default();
         let mut keyless = old.clone();
         keyless.backend_encryption = proxy(None);
-        let err = static_transition_gates(&old, &keyless, &[], Some(&[]), &[])
+        let err = static_transition_gates(&old, &keyless, &[], Some(&[]), &[], None)
             .expect_err("a keyless proxy backend must be refused");
         assert!(
             err.contains("backend 'default'") && err.contains("DGP_ENCRYPTION_KEY"),
@@ -995,13 +1022,59 @@ mod keyless_proxy_gate_tests {
 
         let mut keyed = old.clone();
         keyed.backend_encryption = proxy(Some(&"ab".repeat(32)));
-        static_transition_gates(&old, &keyed, &[], Some(&[]), &[])
+        static_transition_gates(&old, &keyed, &[], Some(&[]), &[], None)
             .expect("a keyed proxy backend applies");
 
         let mut unrelated = keyless.clone();
         unrelated.log_level = "warn".into();
-        static_transition_gates(&keyless, &unrelated, &[], Some(&[]), &[])
+        static_transition_gates(&keyless, &unrelated, &[], Some(&[]), &[], None)
             .expect("a backend that was keyless before does not block another edit");
+    }
+
+    /// #120: a subject that starts to encrypt with `plaintext_reads: refuse`
+    /// needs a confirmation, unless it serves its plaintext history or the
+    /// bucket does not exist yet.
+    #[test]
+    fn a_bucket_that_starts_to_encrypt_must_serve_or_confirm_its_history() {
+        let yaml =
+            |enc: &str| format!("storage:\n  filesystem: /tmp/x\n  buckets:\n    releases:\n{enc}");
+        let old = Config::from_yaml_str(&yaml("      compression: true\n")).unwrap();
+        let block = |extra: &str| {
+            format!(
+                "      encryption:\n        mode: aes256-gcm-proxy\n        key: \"{}\"\n        \
+                 key_id: releases-2026\n{extra}",
+                "ab".repeat(32)
+            )
+        };
+        let refuse = Config::from_yaml_str(&yaml(&block(""))).unwrap();
+        let err = static_transition_gates(&old, &refuse, &[], Some(&[]), &[], Some(&[]))
+            .expect_err("the history would be refused");
+        assert!(
+            err.contains("bucket 'releases'") && err.contains("X-DGP-Confirm-Plaintext-Refusal"),
+            "{err}"
+        );
+        static_transition_gates(
+            &old,
+            &refuse,
+            &[],
+            Some(&[]),
+            &[],
+            Some(&["releases".to_string()]),
+        )
+        .expect("confirmed");
+        static_transition_gates(
+            &old,
+            &refuse,
+            &[],
+            Some(&[]),
+            &["releases".into()],
+            Some(&[]),
+        )
+        .expect("a bucket that does not exist has no history");
+        let serve =
+            Config::from_yaml_str(&yaml(&block("        plaintext_reads: serve\n"))).unwrap();
+        static_transition_gates(&old, &serve, &[], Some(&[]), &[], Some(&[]))
+            .expect("the history is served");
     }
 
     /// The documented shape keeps working: the YAML names the mode, the

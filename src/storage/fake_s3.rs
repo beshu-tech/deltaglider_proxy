@@ -210,6 +210,14 @@ impl FakeS3 {
     /// concurrent writer would make it: a test reads one version, then
     /// another, with no timing. The copy happens when the last of those
     /// reads has read the object, before its response leaves.
+    /// Copy the stored object at `from` (body and metadata) to `to`.
+    pub(crate) fn copy_stored(&self, from: &str, to: &str) {
+        let mut objects = self.objects.lock();
+        if let Some(o) = objects.get(from).cloned() {
+            objects.insert(to.to_string(), o);
+        }
+    }
+
     pub(crate) fn overwrite_after_reads(&self, path: &str, source: &str, reads: u32) {
         self.overwrites
             .lock()

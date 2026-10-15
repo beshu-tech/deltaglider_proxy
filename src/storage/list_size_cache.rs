@@ -205,6 +205,26 @@ pub fn mark_sealed(id: &StoredObjectId<'_>) {
     SEALED.insert(key, ());
 }
 
+/// The listing tokens that this process made for stored objects (issue
+/// #120): a LIST right after a PUT finds the token here, before the
+/// background writer has stored its `!!2` marker. Exact per stored object;
+/// bounded. A token is opaque here: the encrypting wrapper opens it.
+static TOKENS: LazyLock<Cache<String, String>> =
+    LazyLock::new(|| Cache::builder().max_capacity(100_000).build());
+
+/// Remember the listing token of the stored object `id`.
+pub fn record_token(id: &StoredObjectId<'_>, token: &str) {
+    if bare_etag(id.etag).is_empty() {
+        return;
+    }
+    TOKENS.insert(cache_key(id), token.to_string());
+}
+
+/// The listing token this process made for the stored object `id`.
+pub fn lookup_token(id: &StoredObjectId<'_>) -> Option<String> {
+    TOKENS.get(&cache_key(id))
+}
+
 /// Did a HEAD show that the stored object `id` is sealed?
 pub fn known_sealed(id: &StoredObjectId<'_>) -> bool {
     SEALED.contains_key(&cache_key(id))

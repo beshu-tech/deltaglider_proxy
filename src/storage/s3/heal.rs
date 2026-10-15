@@ -594,21 +594,21 @@ mod tests {
         )
     }
 
-    /// Q2: with an encryption key, a plain object stored before the key
-    /// lists its stored facts, and they are its logical facts. The LIST
-    /// cannot know that, so it reads the facts namespace for it; the healer
-    /// HEAD learned the facts, found them equal and wrote nothing. Every
-    /// LIST, on every node and after each restart, missed the object again
-    /// (a facts LIST per page a minute, a HEAD per object an hour). The
-    /// HEAD now records the facts, equal or not, once a LIST asked.
+    /// Q2, under #120: with an encryption key, a LIST does not trust
+    /// `!!1` facts (a backend writer can forge them), so it neither reads
+    /// nor heals them. A plain object stored before the key lists its
+    /// stored size and ETag (its logical ones), and no LIST, on any node,
+    /// sends a background HEAD or writes facts for it.
     #[tokio::test]
-    async fn plain_objects_under_an_encryption_key_heal_for_good() {
+    async fn plain_objects_under_an_encryption_key_send_no_background_requests() {
         const N: usize = 5;
         let (endpoint, fake) = crate::storage::fake_s3::start().await;
         let writer = engine_on(test_support::for_test_endpoint(&endpoint));
         writer.create_bucket("b").await.unwrap();
+        let mut sizes = Vec::new();
         for i in 0..N {
             let body = format!("plain object {i}");
+            sizes.push(body.len() as u64);
             writer
                 .store(
                     "b",
@@ -620,31 +620,22 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let first = encrypted_reader(&endpoint, "enc-node-1");
-        fake.clear();
-        let page = list(&first, "old/").await;
-        assert_eq!(page.objects.len(), N);
-        assert!(wait_count(&fake, N, |r| r.starts_with("HEAD /b/old/p")).await);
-        assert!(
-            wait_count(&fake, N, |r| r.starts_with("PUT /b/.dg/facts/old/p")).await,
-            "the healer wrote no facts: {:?}",
-            fake.requests()
-        );
-        // Another node (or this one after a restart) reads the facts.
-        let second = encrypted_reader(&endpoint, "enc-node-2");
-        fake.clear();
-        let page = list(&second, "old/").await;
-        assert!(page.facts_missing_keys.is_empty(), "{page:?}");
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert_eq!(
-            fake.requests()
-                .iter()
-                .filter(|r| r.starts_with("HEAD "))
-                .count(),
-            0,
-            "{:?}",
-            fake.requests()
-        );
+        for node in ["enc-node-1", "enc-node-2"] {
+            let reader = encrypted_reader(&endpoint, node);
+            fake.clear();
+            let page = list(&reader, "old/").await;
+            assert_eq!(page.objects.len(), N);
+            let listed: Vec<u64> = page.objects.iter().map(|(_, m)| m.file_size).collect();
+            assert_eq!(listed, sizes, "{node}");
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            assert!(
+                fake.requests()
+                    .iter()
+                    .all(|r| !r.starts_with("HEAD ") && !r.starts_with("PUT /b/.dg/facts/")),
+                "{node}: {:?}",
+                fake.requests()
+            );
+        }
     }
 
     /// A miss that a LIST marked.

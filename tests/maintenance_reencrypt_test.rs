@@ -26,6 +26,11 @@ async fn put_storage_encryption(admin: &reqwest::Client, endpoint: &str, body: s
         // A disable is a downgrade: confirmed (issue #116 P3). The header
         // changes nothing for a change that is not one.
         .header("X-DGP-Confirm-Encryption-Downgrade", "backend:default")
+        // An enable on a bucket that exists refuses its plaintext history
+        // unless confirmed (issue #120). The tests that keep plaintext
+        // history set `plaintext_reads: serve` ([`enable_encryption`]); the
+        // others enable on an empty bucket, so the confirmation is true.
+        .header("X-DGP-Confirm-Plaintext-Refusal", "backend:default")
         .json(&serde_json::json!({ "backend_encryption": body }))
         .send()
         .await
@@ -38,11 +43,17 @@ async fn put_storage_encryption(admin: &reqwest::Client, endpoint: &str, body: s
     );
 }
 
+/// Enable encryption the documented way for a bucket with plaintext
+/// history (issue #120): `plaintext_reads: serve`, so the old objects stay
+/// readable and the re-encrypt job can read them.
 async fn enable_encryption(admin: &reqwest::Client, endpoint: &str) {
     put_storage_encryption(
         admin,
         endpoint,
-        serde_json::json!({ "mode": "aes256-gcm-proxy", "key": KEY, "key_id": KEY_ID }),
+        serde_json::json!({
+            "mode": "aes256-gcm-proxy", "key": KEY, "key_id": KEY_ID,
+            "plaintext_reads": "serve",
+        }),
     )
     .await;
 }
@@ -614,16 +625,12 @@ async fn test_reencrypt_key_rotation_a_to_b() {
     let v1_expected = seed_bucket(&http, &endpoint, bucket, 8).await;
     let data_dir = server.data_dir().unwrap();
 
-    // Every encrypted object on disk is stamped with A's key-id.
+    // Every encrypted object on disk is sealed under A. At rest, format v2
+    // names the key by its fingerprint only (issue #120).
     let stamped_kids = |dir: &std::path::Path| -> Vec<String> {
         common::read_xattr_metadata(dir)
             .into_iter()
-            .filter_map(|(_, v)| {
-                v.get("user_metadata")
-                    .and_then(|um| um.get("dg-encryption-key-id"))
-                    .and_then(|k| k.as_str())
-                    .map(String::from)
-            })
+            .filter_map(|(_, v)| common::sealed_fp_label(v["user_metadata"]["dg-sealed"].as_str()))
             .collect()
     };
     let before = stamped_kids(data_dir);
@@ -632,8 +639,8 @@ async fn test_reencrypt_key_rotation_a_to_b() {
         "objects must be encrypted before rotation"
     );
     assert!(
-        before.iter().all(|k| k == KEY_ID),
-        "all objects stamped with A before rotation: {before:?}"
+        before.iter().all(|k| *k == common::key_fp_label(KEY)),
+        "all objects sealed under A before rotation: {before:?}"
     );
 
     // ── Rotate: B primary, A retained as legacy decrypt shim. ──
@@ -666,8 +673,8 @@ async fn test_reencrypt_key_rotation_a_to_b() {
     );
     let after = stamped_kids(data_dir);
     assert!(
-        after.iter().all(|k| k == KEY_B_ID),
-        "all objects re-stamped to B after rotation: {after:?}"
+        !after.is_empty() && after.iter().all(|k| *k == common::key_fp_label(KEY_B)),
+        "all objects re-sealed under B after rotation: {after:?}"
     );
 
     // (c) idempotent: a 2nd rotation re-encrypt skips everything.

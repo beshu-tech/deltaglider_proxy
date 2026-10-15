@@ -533,17 +533,16 @@ async fn test_chunked_path_actually_exercised() {
     let _ = found_v1_marker;
 }
 
-/// Step 3 regression: every encrypted write stamps
-/// `dg-encryption-key-id` on the object's xattr metadata. Without
-/// this stamp the key-id mismatch check on reads can't fire, and the
-/// ops value of "tell the operator WHICH key the object was written
-/// with" disappears into an opaque AEAD failure.
+/// Every encrypted write seals its facts under the key (format v2, issue
+/// #120): the stored metadata carries `dg-sealed`, whose fingerprint
+/// names the key, and never the key id or the content hashes in clear.
+/// Without the seal, a read could not find the key, and the operator
+/// could not learn WHICH key wrote the object.
 ///
-/// Test covers BOTH single-shot writes (put_passthrough) and the
-/// chunked write path (put_passthrough_chunked via multipart) to catch
-/// regressions in either mark_encrypted / mark_chunked_encrypted.
+/// Covers a single PUT (put_passthrough) and a multipart upload
+/// (put_passthrough_chunked), so that a regression in either path fails.
 #[tokio::test]
-async fn test_write_stamps_key_id_metadata() {
+async fn test_write_seals_under_the_key_fingerprint() {
     let server = encrypted_builder().build().await;
 
     // Single-shot: a small object goes through put_passthrough.
@@ -554,43 +553,34 @@ async fn test_write_stamps_key_id_metadata() {
     multipart_put(&server, "chunked.bin", &parts).await;
 
     let data_dir = server.data_dir().expect("filesystem backend");
-    let mut small_kid: Option<String> = None;
-    let mut chunked_kid: Option<String> = None;
+    let want = common::key_fp_label(TEST_KEY);
+    let mut seen = Vec::new();
     for (path, parsed) in common::read_xattr_metadata(data_dir) {
-        let kid = parsed
-            .get("user_metadata")
-            .and_then(|um| um.get("dg-encryption-key-id"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        if let Some(kid) = kid {
-            let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            // Both files get the SAME kid (singleton "default"
-            // backend → same wrapper → same id).
-            if fname == "small.txt" {
-                small_kid = Some(kid);
-            } else if fname == "chunked.bin" {
-                chunked_kid = Some(kid);
-            }
+        let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if fname != "small.txt" && fname != "chunked.bin" {
+            continue;
         }
+        let um = &parsed["user_metadata"];
+        assert_eq!(
+            common::sealed_fp_label(um["dg-sealed"].as_str()).as_deref(),
+            Some(want.as_str()),
+            "{fname}: sealed under the configured key: {parsed}"
+        );
+        for clear in ["dg-encryption-key-id", "dg-md5", "dg-file-sha256"] {
+            assert!(
+                um.get(clear).is_none(),
+                "{fname}: {clear} in clear: {parsed}"
+            );
+        }
+        let sha = parsed["file_sha256"].as_str().unwrap_or_default();
+        assert!(
+            sha.starts_with("sealed:"),
+            "{fname}: file_sha256 is an identity token, not a content hash: {parsed}"
+        );
+        seen.push(fname.to_string());
     }
-
-    assert!(
-        small_kid.is_some(),
-        "single-shot write must stamp dg-encryption-key-id metadata"
-    );
-    assert!(
-        chunked_kid.is_some(),
-        "chunked write must stamp dg-encryption-key-id metadata"
-    );
-    // The observable cross-path invariant: single-shot and chunked
-    // writes go through the same EncryptingBackend wrapper, so they
-    // must stamp the SAME key_id. Format invariants (16 hex chars,
-    // lowercase, etc.) are covered by unit tests on `derive_key_id`
-    // — the integration test deliberately doesn't re-cover them.
-    assert_eq!(
-        small_kid, chunked_kid,
-        "two writes through the same backend wrapper must produce the SAME key_id"
-    );
+    seen.sort();
+    assert_eq!(seen, ["chunked.bin", "small.txt"], "both writes found");
 }
 
 /// Range reads on a chunked-encrypted object. Exercises the O(1)
@@ -1128,15 +1118,22 @@ async fn a_key_id_mismatch_on_get_logs_its_cause() {
         .await
         .unwrap();
     let text = logs.to_string();
+    // Format v2 (#120): the object names its key by fingerprint only.
+    let cause = "was encrypted with a key that this backend does not have";
     assert!(
-        text.contains("was encrypted with key id"),
-        "no ERROR line names the key-id mismatch: {text}"
+        text.contains(cause),
+        "no ERROR line names the key mismatch: {text}"
+    );
+    let fp = common::key_fp_label(TEST_KEY);
+    assert!(
+        text.contains(fp.trim_start_matches("fp-")),
+        "the ERROR line names the fingerprint of the object's key: {text}"
     );
     // One request, one ERROR line: the cause. A second line that repeats
     // only the sanitised client text is noise.
     let errors = logs["entries"].as_array().expect("a log list");
     assert_eq!(errors.len(), 1, "one ERROR line per 500: {text}");
-    assert!(errors[0].to_string().contains("was encrypted with key id"));
+    assert!(errors[0].to_string().contains(cause));
     assert!(
         !text.contains(TEST_KEY) && !text.contains(OTHER_KEY),
         "a key reached the log"

@@ -308,6 +308,42 @@ pub struct FileMetadata {
     /// Storage type specific fields
     #[serde(flatten)]
     pub storage_info: StorageInfo,
+
+    /// The listing-token maker of a sealed object (issue #120): the
+    /// encrypting wrapper sets it on the metadata it hands to the inner
+    /// backend, which calls it once it knows the stored ETag and size.
+    /// Never stored.
+    #[serde(skip)]
+    pub listing_token: ListingTokenMaker,
+}
+
+/// Makes the listing token of a sealed object from its stored key, stored
+/// ETag and stored size (see [`FileMetadata::listing_token`]).
+#[derive(Clone, Default)]
+pub struct ListingTokenMaker(Option<std::sync::Arc<MakeToken>>);
+
+/// (stored key, stored ETag, stored size) → the listing token.
+type MakeToken = dyn Fn(&str, &str, u64) -> Option<String> + Send + Sync;
+
+impl ListingTokenMaker {
+    pub fn new(f: impl Fn(&str, &str, u64) -> Option<String> + Send + Sync + 'static) -> Self {
+        Self(Some(std::sync::Arc::new(f)))
+    }
+
+    /// The token of the stored object, if this metadata has a maker.
+    pub fn token(&self, stored_key: &str, stored_etag: &str, stored_size: u64) -> Option<String> {
+        self.0.as_ref()?(stored_key, stored_etag, stored_size)
+    }
+}
+
+impl fmt::Debug for ListingTokenMaker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "ListingTokenMaker(set)"
+        } else {
+            "ListingTokenMaker(none)"
+        })
+    }
 }
 
 /// Storage-type specific metadata fields
@@ -391,6 +427,7 @@ impl FileMetadata {
             content_type,
             user_metadata: HashMap::new(),
             storage_info: StorageInfo::Reference { source_name },
+            listing_token: Default::default(),
         }
     }
 
@@ -426,6 +463,7 @@ impl FileMetadata {
                 delta_size,
                 delta_cmd,
             },
+            listing_token: Default::default(),
         }
     }
 
@@ -448,6 +486,7 @@ impl FileMetadata {
             content_type,
             user_metadata: HashMap::new(),
             storage_info: StorageInfo::Passthrough,
+            listing_token: Default::default(),
         }
     }
 
@@ -473,6 +512,7 @@ impl FileMetadata {
             content_type,
             user_metadata: HashMap::new(),
             storage_info,
+            listing_token: Default::default(),
         }
     }
 
@@ -489,6 +529,7 @@ impl FileMetadata {
             content_type: Some("application/x-directory".to_string()),
             user_metadata: HashMap::new(),
             storage_info: StorageInfo::Passthrough,
+            listing_token: Default::default(),
         }
     }
 

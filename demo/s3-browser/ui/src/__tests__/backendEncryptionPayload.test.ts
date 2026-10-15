@@ -1,7 +1,13 @@
 /** src/backendEncryptionPayload.ts */
 import assert from 'node:assert/strict';
 import { test } from 'vitest';
-import { aesKeyPatch, buildClearLegacySectionBody, buildEncryptionSectionBody, encryptionKeyEnvVar } from '../backendEncryptionPayload';
+import {
+  aesKeyPatch,
+  buildClearLegacySectionBody,
+  buildEncryptionSectionBody,
+  buildRefusePlaintextSectionBody,
+  encryptionKeyEnvVar,
+} from '../backendEncryptionPayload';
 
 // One entry per backend variant, as the storage section GET returns it
 // (secrets redacted, so absent). Every field must survive an encryption
@@ -101,8 +107,13 @@ test('a proxy-AES key patch on a proxy-AES backend names the retired key id', ()
     key_id: null,
     legacy_key_id: 'old-id',
   });
-  // Enabling from another mode: nothing to retire.
-  assert.deepEqual(aesKeyPatch('NEW', { mode: 'none' }), { mode: 'aes256-gcm-proxy', key: 'NEW' });
+  // Enabling from another mode: nothing to retire, and the objects already
+  // there are plaintext: keep serving them until the re-encrypt job (#120).
+  assert.deepEqual(aesKeyPatch('NEW', { mode: 'none' }), {
+    mode: 'aes256-gcm-proxy',
+    key: 'NEW',
+    plaintext_reads: 'serve',
+  });
 });
 
 test('clearing the legacy key on the singleton nulls only the legacy fields', () => {
@@ -136,4 +147,35 @@ test('encryptionKeyEnvVar matches the server env-var names', () => {
   assert.equal(encryptionKeyEnvVar('default'), 'DGP_ENCRYPTION_KEY');
   assert.equal(encryptionKeyEnvVar('hetzner-fsn1'), 'DGP_BACKEND_HETZNER_FSN1_ENCRYPTION_KEY');
   assert.equal(encryptionKeyEnvVar('aws.dr'), 'DGP_BACKEND_AWS_DR_ENCRYPTION_KEY');
+});
+
+test('a key change keeps the backend plaintext_reads (#120)', () => {
+  const storage = {
+    backends: [
+      {
+        name: 'local-disk',
+        encryption: { mode: 'aes256-gcm-proxy', key_id: 'old', plaintext_reads: 'serve' },
+      },
+    ],
+  };
+  const body = buildEncryptionSectionBody('local-disk', aesKeyPatch('a'.repeat(64), { mode: 'aes256-gcm-proxy', key_id: 'old' }), storage) as {
+    backends: Array<{ encryption: Record<string, unknown> }>;
+  };
+  assert.equal(body.backends[0].encryption.plaintext_reads, 'serve');
+  const off = buildEncryptionSectionBody('local-disk', { mode: 'none' }, storage) as {
+    backends: Array<{ encryption: Record<string, unknown> }>;
+  };
+  assert.equal(off.backends[0].encryption.plaintext_reads, undefined, 'mode none has no such field');
+});
+
+test('refusing plaintext changes only plaintext_reads of a backend (#120)', () => {
+  assert.deepEqual(buildRefusePlaintextSectionBody('default', {}), {
+    backend_encryption: { plaintext_reads: 'refuse' },
+  });
+  const storage = {
+    backends: [{ name: 'local-disk', encryption: { mode: 'aes256-gcm-proxy', key_id: 'k', plaintext_reads: 'serve' } }],
+  };
+  assert.deepEqual(buildRefusePlaintextSectionBody('local-disk', storage), {
+    backends: [{ name: 'local-disk', encryption: { mode: 'aes256-gcm-proxy', key_id: 'k', plaintext_reads: 'refuse' } }],
+  });
 });

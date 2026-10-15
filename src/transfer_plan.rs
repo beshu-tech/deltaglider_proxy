@@ -37,9 +37,9 @@ pub const TRANSFERS: usize = 4;
 
 /// The storage label a backend reports for whole-object proxy-AES
 /// encryption (matches `BackendEncryptionConfig::mode_tag`). Multipart
-/// is gated OFF for this label: the `aes-256-gcm-chunked-v1` whole-object
-/// GCM framing does not map onto independent S3 parts, so those copies
-/// fall back to the existing buffered/chunked path.
+/// is gated OFF for this label: the format-v2 body (one header, frames of
+/// one object key) does not map onto independent S3 parts, so those
+/// copies fall back to the buffered/chunked path.
 pub const PROXY_AES_LABEL: &str = "aes256-gcm-proxy";
 
 /// One contiguous part of a multipart upload (1-indexed part number,

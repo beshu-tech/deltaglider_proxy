@@ -1,72 +1,34 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Transparent encryption-at-rest wrapper for any StorageBackend.
+//! Transparent encryption at rest for any StorageBackend (issue #120).
 //!
-//! `EncryptingBackend<B>` wraps a storage backend and encrypts all object data
-//! with AES-256-GCM before writing, decrypting on read. Metadata is NOT encrypted.
-//!
-//! # Two wire formats
-//!
-//! **`aes-256-gcm-v1`** (single-shot, original) — used for `put_reference`,
-//! `put_delta`, `put_passthrough`. These bodies are bounded by
-//! `max_object_size` (default 100 MiB) so whole-blob encryption is fine.
-//!
-//! ```text
-//! [12-byte IV] [ciphertext + 16-byte GCM tag]
-//! ```
-//! Overhead: 28 bytes per object.
-//!
-//! **`aes-256-gcm-chunked-v1`** (chunked, streaming reads) — used ONLY for
-//! `put_passthrough_chunked`. The format exists so the read path can
-//! decrypt chunk-by-chunk with bounded peak memory and do O(1) range reads
-//! on large objects. The WRITE path is not fully streaming in this
-//! release — the wrapper buffers all encrypted frames before handing them
-//! to the inner backend's chunked PUT. Peak write memory ≈ ciphertext size.
-//! The engine's `max_object_size` ceiling (default 100 MiB) keeps this
-//! bounded; if operators raise it, they should budget RAM accordingly.
-//!
-//! ```text
-//! [4-byte magic "DGE1"] [12-byte base_iv]
-//! | [4-byte u32 LE frame_len] [ciphertext + 16-byte GCM tag]    # chunk 0
-//! | [4-byte u32 LE frame_len] [ciphertext + 16-byte GCM tag]    # chunk 1
-//! | ...
-//! | [4-byte u32 LE frame_len] [ciphertext + 16-byte GCM tag]    # chunk N (final)
-//! ```
-//!
-//! Each chunk's nonce = `base_iv XOR (chunk_index as big-endian u96)` — unique
-//! for 2^32 chunks (256 TiB at 64 KiB each). The AAD for chunk `i` is 16 bytes:
-//! `"DGE1" || chunk_index_le_u32 || final_flag_u8 || 0x00 0x00 0x00`, binding
-//! the index (foils reordering) and the final flag (foils truncation — the
-//! former last-chunk's `final_flag=0` AAD wouldn't match after a truncation).
-//!
-//! Every non-final chunk is exactly `4 + 64 * 1024 + 16 = 65556` wire bytes,
-//! which lets range reads compute chunk offsets in O(1) without scanning
-//! the frame-length prefixes.
-//!
-//! # Detection
-//!
-//! Objects with `dg-encrypted: aes-256-gcm-v1` → single-shot decrypt.
-//! Objects with `dg-encrypted: aes-256-gcm-chunked-v1` → chunked decrypt.
-//! Objects without the marker → returned as-is (backward compatible).
-
+//! `EncryptingBackend<B>` wraps one raw backend. A write to a bucket that
+//! encrypts stores a format-v2 body (`v2.rs`: per-object keys, 64 KiB
+//! authenticated frames, key commitment) and sealed metadata (`seal.rs`:
+//! the facts bound to the object's location, no hashes in clear). Every
+//! read of a body or of metadata goes through THE read rule
+//! (`present_raw`): a sealed object opens with the key its fingerprint
+//! names; an object without a seal is served only where the bucket may
+//! serve plaintext (it writes plaintext, or `plaintext_reads: serve`).
+//! Callers above the wrapper see the logical object, with the markers
+//! `dg-encrypted: v2` and `dg-encryption-key-id: <id>`; the raw stored
+//! metadata never leaves the wrapper.
 //!
 //! # Layout
 //!
-//! `format.rs` holds the formats (key, markers, v1 blob, chunked framing and
-//! decoder); this file holds the wrapper backend; `tests.rs` the tests.
+//! `v2.rs`: the format (pure). `seal.rs`: sealed metadata, the keyring by
+//! fingerprint and the read rule (pure). `format.rs`: the key type and the
+//! marker names. This file: the wrapper.
 
 #[cfg(test)]
 mod bucket_tests;
 mod format;
+pub(crate) mod seal;
 #[cfg(test)]
 mod tests;
-// Format v2 (issue #120). Wired into the read and write paths in a later
-// commit; until then only its tests and the fuzz entry use it.
-// Wired in the switch-over commit; some items are unused until then.
-#[allow(dead_code)]
-pub(crate) mod seal;
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod v2;
+
+pub use seal::{ENCRYPTION_MARKER_KEYS, ENCRYPTION_MARKER_VALUE};
 
 pub use format::*;
 
@@ -85,47 +47,30 @@ use super::traits::{
 };
 use crate::deltaglider::spool::SpoolBudget;
 use crate::types::FileMetadata;
-use aes_gcm::aead::{Aead, Payload};
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use futures::stream::BoxStream;
-use rand::RngCore;
 use std::sync::Arc;
 
-/// Drop the at-rest encryption markers from an object's user-metadata so a
-/// SUBSEQUENT write decides them fresh: re-stamped iff that write actually
-/// encrypts, absent iff it writes plaintext (PassThrough shim / no key). This
-/// is the single home for the marker-key set — a stale marker on a plaintext
-/// (or re-encrypted) body makes reads pick the wrong key and hard-fail. Used by
-/// the re-encrypt job (maintenance) AND the delta-passthrough ship (transfer);
-/// both live ABOVE this module, so it belongs here where the consts do.
+/// Drop the at-rest encryption markers (and the seal) from an object's
+/// user metadata, so a SUBSEQUENT write decides them fresh. The single home
+/// of the marker set ([`ENCRYPTION_MARKER_KEYS`]): used by the re-encrypt
+/// job, the delta-passthrough ship and the copy paths above this module.
 pub(crate) fn strip_encryption_markers(
     user_metadata: &mut std::collections::HashMap<String, String>,
 ) {
-    user_metadata.remove(ENCRYPTION_MARKER_KEY);
-    user_metadata.remove(ENCRYPTION_KEY_ID_KEY);
+    for k in ENCRYPTION_MARKER_KEYS {
+        user_metadata.remove(k);
+    }
 }
 
 /// The wrapper OWNS its markers: a write stores only its own decision. Any
-/// copy the caller carries (a client's `x-amz-meta-dg-encrypted`, a sync
-/// tool replaying GET metadata into a PUT, a marker read from another
-/// object) is dropped first — stored verbatim, it made the body unreadable.
+/// copy the caller carries (a client's `x-amz-meta-dg-sealed`, a sync tool
+/// replaying GET metadata into a PUT) is dropped first.
 fn without_markers(metadata: &FileMetadata) -> FileMetadata {
     let mut meta = metadata.clone();
     strip_encryption_markers(&mut meta.user_metadata);
-    meta
-}
-
-/// For a metadata-only rewrite (body unchanged): `metadata` with the markers
-/// of the stored object `raw`, never the caller's own.
-fn with_markers_of(metadata: &FileMetadata, raw: &FileMetadata) -> FileMetadata {
-    let mut meta = without_markers(metadata);
-    for key in [ENCRYPTION_MARKER_KEY, ENCRYPTION_KEY_ID_KEY] {
-        if let Some(v) = raw.user_metadata.get(key) {
-            meta.user_metadata.insert(key.to_string(), v.clone());
-        }
-    }
+    meta.listing_token = Default::default();
     meta
 }
 
@@ -210,6 +155,11 @@ pub struct EncryptionConfig {
     /// stamped on the object, so a bucket reads its history under the
     /// backend's key, a rotated key, or a removed override.
     pub keyring: std::collections::HashMap<String, EncryptionKey>,
+    /// `plaintext_reads: serve` of the backend's own encryption: a read of
+    /// a bucket without an override may serve an unencrypted object.
+    pub serve_plaintext: bool,
+    /// Every key above, by fingerprint (built on first use).
+    pub(crate) ring: std::sync::OnceLock<seal::Keyring>,
 }
 
 /// One raw backend's policy slot and the config an engine publishes into it.
@@ -281,6 +231,8 @@ pub struct BucketKeys {
     pub write_mode: WriteMode,
     /// The bucket's decrypt-only key id, if any (its key is in the keyring).
     pub legacy_key_id: Option<String>,
+    /// `plaintext_reads: serve` of the bucket's override.
+    pub serve_plaintext: bool,
     /// The native SSE headers of the bucket's writes (an S3 backend reads
     /// them per request through [`EncryptionConfig::native_for`]).
     /// `None` for a proxy-AES or plaintext override.
@@ -288,20 +240,45 @@ pub struct BucketKeys {
 }
 
 impl EncryptionConfig {
+    /// Every key of this raw backend by fingerprint, with its id: the
+    /// primary, the legacy key, and the keyring (bucket keys, retired keys).
+    pub(crate) fn ring(&self) -> &seal::Keyring {
+        self.ring.get_or_init(|| {
+            let mut ring = seal::Keyring::default();
+            if let (Some(k), Some(id)) = (&self.key, &self.key_id) {
+                ring.insert(id, k);
+            }
+            if let (Some(k), Some(id)) = (&self.legacy_key, &self.legacy_key_id) {
+                ring.insert(id, k);
+            }
+            for (id, k) in &self.keyring {
+                ring.insert(id, k);
+            }
+            for b in self.buckets.values() {
+                if let (Some(k), Some(id)) = (&b.key, &b.key_id) {
+                    ring.insert(id, k);
+                }
+            }
+            ring
+        })
+    }
+
+    /// The prepared key of `key` (from the ring; a key that is not there,
+    /// which the engine never builds, is prepared on the spot).
+    fn site_of(&self, key: &EncryptionKey) -> Arc<v2::SiteKey> {
+        let site = v2::SiteKey::new(key);
+        match self.ring().get(&site.fingerprint()) {
+            Some(entry) => entry.site.clone(),
+            None => Arc::new(site),
+        }
+    }
+
     /// The native SSE mode of a bucket with its own override, or `None`
     /// when the bucket follows the backend.
     pub fn native_for(&self, bucket: &str) -> Option<crate::storage::NativeEncryptionConfig> {
         self.buckets.get(bucket).map(|b| b.native.clone())
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────
-// Chunked-format primitives
-// ─────────────────────────────────────────────────────────────────────
-
-// ─────────────────────────────────────────────────────────────────────
-// Streaming decoder
-// ─────────────────────────────────────────────────────────────────────
 
 /// A whole stream in one buffer.
 async fn collect_stream(stream: ByteStream) -> Result<Vec<u8>, StorageError> {
@@ -312,63 +289,6 @@ async fn collect_stream(stream: ByteStream) -> Result<Vec<u8>, StorageError> {
         buf.extend_from_slice(&p);
     }
     Ok(buf)
-}
-
-/// `take` bytes of `stream` after its first `skip` bytes.
-fn slice_stream(stream: ByteStream, skip: u64, take: u64) -> ByteStream {
-    use futures::StreamExt;
-    let (mut skip, mut left) = (skip, take);
-    Box::pin(
-        stream
-            .map(move |chunk| {
-                chunk.map(|mut b| {
-                    let s = skip.min(b.len() as u64) as usize;
-                    skip -= s as u64;
-                    let b = b.split_off(s);
-                    let t = left.min(b.len() as u64) as usize;
-                    left -= t as u64;
-                    b.slice(..t)
-                })
-            })
-            .filter(|r| futures::future::ready(r.as_ref().map_or(true, |b| !b.is_empty()))),
-    )
-}
-
-/// Split the `[magic][base_iv]` header off the front of a chunked object's
-/// wire stream: the parsed `base_iv`, and the stream of the frames that
-/// follow it.
-async fn split_chunked_header(
-    mut stream: ByteStream,
-) -> Result<([u8; IV_LEN], ByteStream), StorageError> {
-    use futures::StreamExt;
-    let mut head: Vec<u8> = Vec::with_capacity(CHUNK_HEADER_LEN);
-    while head.len() < CHUNK_HEADER_LEN {
-        match stream.next().await {
-            Some(chunk) => head.extend_from_slice(&chunk?),
-            None => {
-                return Err(StorageError::Encryption(format!(
-                    "stream ended before encryption header (got {} of {} bytes)",
-                    head.len(),
-                    CHUNK_HEADER_LEN
-                )))
-            }
-        }
-    }
-    if head[..4] != CHUNK_MAGIC {
-        return Err(StorageError::Encryption(format!(
-            "bad chunked-encryption magic: {:02x?}",
-            &head[..4]
-        )));
-    }
-    let mut base_iv = [0u8; IV_LEN];
-    base_iv.copy_from_slice(&head[4..CHUNK_HEADER_LEN]);
-    let rest = Bytes::from(head.split_off(CHUNK_HEADER_LEN));
-    let frames = futures::stream::once(async move { Ok(rest) })
-        .filter(|b: &Result<Bytes, StorageError>| {
-            futures::future::ready(b.as_ref().map_or(true, |b| !b.is_empty()))
-        })
-        .chain(stream);
-    Ok((base_iv, Box::pin(frames)))
 }
 
 /// The stored buckets whose writes this node refuses (the multi-instance
@@ -514,98 +434,209 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         self.witness = Some((name.to_string(), gate));
         self
     }
+}
 
-    /// THE write-side decision: the (key, key_id) to encrypt a write with,
-    /// or `None` to write plaintext. `None` under `WriteMode::PassThrough`
-    /// even when a key is present (the decrypt-only shim for proxy-AES →
-    /// native-SSE transitions: the inner backend encrypts natively). One
-    /// `ArcSwap` load, so a concurrent hot-reload cannot pair one config's
-    /// key with another config's key_id. Every write path goes through here.
-    /// Encrypt `source_path` into the spool file `ct` (chunked wire format,
-    /// 64 KiB windows, on a blocking thread), then store `ct` through the
-    /// inner backend.
-    #[allow(clippy::too_many_arguments)]
-    async fn encrypt_file_and_put(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        source_path: &std::path::Path,
-        ct: &crate::deltaglider::spool::Spool,
-        (key, key_id): (EncryptionKey, Option<String>),
-        metadata: &FileMetadata,
-        spool: SpoolBudget<'_>,
-    ) -> Result<(), StorageError> {
-        let src = source_path.to_path_buf();
-        let dest = ct.path().to_path_buf();
-        tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
-            use std::io::{Read, Write};
-            let mut input = std::fs::File::open(&src).map_err(io_to_storage_error)?;
-            let mut out = std::fs::File::create(&dest).map_err(io_to_storage_error)?;
-            let (mut framer, header) = ChunkFramer::with_random_iv();
-            out.write_all(&header).map_err(io_to_storage_error)?;
-
-            // Read the source in 64 KiB windows; ChunkFramer owns the
-            // is_final/index framing so this path just feeds windows and
-            // writes the frames it hands back.
-            let mut buf = vec![0u8; CHUNK_PLAINTEXT_SIZE];
-            loop {
-                // Fill a full window (short read only at EOF).
-                let mut filled = 0usize;
-                while filled < CHUNK_PLAINTEXT_SIZE {
-                    let n = input
-                        .read(&mut buf[filled..])
-                        .map_err(io_to_storage_error)?;
-                    if n == 0 {
-                        break;
-                    }
-                    filled += n;
-                }
-                if filled == 0 {
-                    break; // EOF, no more windows
-                }
-                if let Some(frame) = framer.push_window(&key, buf[..filled].to_vec())? {
-                    out.write_all(&frame).map_err(io_to_storage_error)?;
-                }
-                if filled < CHUNK_PLAINTEXT_SIZE {
-                    break; // short read = EOF
-                }
-            }
-            // The final frame (or an empty final frame for a zero-byte object).
-            out.write_all(&framer.finish(&key)?)
-                .map_err(io_to_storage_error)?;
-            out.flush().map_err(io_to_storage_error)
-        })
-        .await
-        .map_err(|e| StorageError::Other(format!("encrypt-to-file task join: {e}")))??;
-
-        let mut meta = without_markers(metadata);
-        mark_chunked_encrypted(&mut meta, key_id.as_deref());
-        self.inner
-            .put_passthrough_file(
-                bucket,
-                prefix,
-                filename,
-                ct.path(),
-                &meta,
-                spool.holding(ct),
-            )
-            .await
+/// Where a stored object lives, for its seal.
+fn object_of<'a>(variant: super::traits::ObjectVariant, filename: &'a str) -> StoredObject<'a> {
+    match variant {
+        super::traits::ObjectVariant::Delta => StoredObject::Delta(filename),
+        super::traits::ObjectVariant::Passthrough => StoredObject::Passthrough(filename),
     }
+}
 
+/// `meta` named for the stored object: a delta or passthrough stores its
+/// own filename as its original name, so a scan (which returns metadata
+/// without keys) finds the location of its seal.
+fn named(meta: &FileMetadata, object: StoredObject<'_>) -> FileMetadata {
+    let mut m = meta.clone();
+    if let StoredObject::Delta(f) | StoredObject::Passthrough(f) = object {
+        m.original_name = f.to_string();
+    }
+    m
+}
+
+/// The stored object of a listed key: its folder, and the object in it.
+fn listed_object<'a>(key: &'a str, meta: &FileMetadata) -> (&'a str, StoredObject<'a>) {
+    let (prefix, name) = key.rsplit_once('/').unwrap_or(("", key));
+    let object = if meta.is_reference() {
+        StoredObject::Reference
+    } else if meta.is_delta() {
+        StoredObject::Delta(name)
+    } else {
+        StoredObject::Passthrough(name)
+    };
+    (prefix, object)
+}
+
+/// A folder marker: never sealed, always readable.
+fn is_folder(object: StoredObject<'_>) -> bool {
+    matches!(object, StoredObject::Passthrough(f) if f.is_empty() || f.ends_with('/'))
+}
+
+/// The listing facts of sealed `facts`, or `None` without an ETag.
+fn listing_facts_of(facts: &v2::SealedFacts) -> Option<v2::ListingFacts> {
+    let (etag_digest, parts) = match (facts.multipart, facts.md5) {
+        (Some((d, n)), _) => (d, n),
+        (None, Some(md5)) => (md5, 0),
+        (None, None) => return None,
+    };
+    Some(v2::ListingFacts {
+        size: facts.file_size,
+        etag_digest,
+        parts,
+    })
+}
+
+/// An ETag without its quotes. A PUT response quotes the ETag, a listing
+/// does not: a token binds the bare form, so both sides agree.
+fn bare_etag(etag: &str) -> &str {
+    etag.trim_matches('"')
+}
+
+/// The listing-token maker of a sealed object (see `ListingTokenMaker`).
+fn token_maker(
+    site: Arc<v2::SiteKey>,
+    bucket: &str,
+    facts: &v2::SealedFacts,
+) -> crate::types::ListingTokenMaker {
+    let Some(lf) = listing_facts_of(facts) else {
+        return Default::default();
+    };
+    let bucket = bucket.to_string();
+    crate::types::ListingTokenMaker::new(move |key, etag, size| {
+        site.listing_token(
+            &v2::ListedAt {
+                bucket: &bucket,
+                stored_key: key,
+                stored_etag: bare_etag(etag),
+                stored_size: size,
+            },
+            &lf,
+        )
+        .ok()
+    })
+}
+
+/// A stored object, read: its presented metadata, and the keys of its
+/// body when it is sealed.
+struct Opened {
+    meta: FileMetadata,
+    sealed: Option<SealedBody>,
+}
+
+struct SealedBody {
+    site: Arc<v2::SiteKey>,
+    salt: [u8; v2::SALT_LEN],
+    len: u64,
+}
+
+impl SealedBody {
+    fn opener(&self) -> v2::ContentOpener {
+        self.site.opener(self.salt)
+    }
+}
+
+/// Refuse a plaintext stream that begins with a `DGE<digit>` magic: a
+/// proxy-encrypted body whose metadata was stripped. Joins short leading
+/// chunks; never polls an ended stream.
+fn sniff_dge_magic(inner: ByteStream) -> ByteStream {
+    enum State {
+        Initial(ByteStream),
+        Passthrough(ByteStream),
+        Done,
+    }
+    Box::pin(futures::stream::unfold(
+        State::Initial(inner),
+        |st| async move {
+            use futures::StreamExt;
+            match st {
+                State::Initial(mut inner) => {
+                    let mut head = bytes::BytesMut::new();
+                    let mut ended = false;
+                    while head.len() < v2::MAGIC.len() {
+                        match inner.next().await {
+                            Some(Ok(chunk)) => head.extend_from_slice(&chunk),
+                            Some(Err(e)) => return Some((Err(e), State::Done)),
+                            None => {
+                                ended = true;
+                                break;
+                            }
+                        }
+                    }
+                    if head.is_empty() {
+                        return None;
+                    }
+                    if v2::has_dge_magic(&head) {
+                        return Some((Err(stripped_marker_error()), State::Done));
+                    }
+                    let next = if ended {
+                        State::Done
+                    } else {
+                        State::Passthrough(inner)
+                    };
+                    Some((Ok(head.freeze()), next))
+                }
+                State::Passthrough(mut inner) => inner
+                    .next()
+                    .await
+                    .map(|item| (item, State::Passthrough(inner))),
+                State::Done => None,
+            }
+        },
+    ))
+}
+
+pub(super) fn stripped_marker_error() -> StorageError {
+    StorageError::Encryption(
+        "the object body is proxy-encrypted but its metadata names no encryption: the \
+         metadata was stripped (for example by a backup or a copy without metadata). The \
+         proxy refuses to serve ciphertext as plaintext"
+            .into(),
+    )
+}
+
+/// The plaintext of a whole sealed body as a stream: the header is read and
+/// checked first, then the frames are decrypted one by one.
+async fn open_body_stream(
+    mut stream: ByteStream,
+    body: &SealedBody,
+) -> Result<ByteStream, StorageError> {
+    use futures::StreamExt;
+    let mut head: Vec<u8> = Vec::with_capacity(v2::HEADER_LEN);
+    while head.len() < v2::HEADER_LEN {
+        match stream.next().await {
+            Some(chunk) => head.extend_from_slice(&chunk?),
+            None => {
+                return Err(StorageError::Encryption(
+                    "the object body ends inside its header: it was truncated".into(),
+                ))
+            }
+        }
+    }
+    let opener = body.opener();
+    opener.check_header(&head[..v2::HEADER_LEN])?;
+    let rest = Bytes::from(head.split_off(v2::HEADER_LEN));
+    let frames: ByteStream = Box::pin(
+        futures::stream::once(async move { Ok(rest) })
+            .filter(|b: &Result<Bytes, StorageError>| {
+                futures::future::ready(b.as_ref().map_or(true, |b| !b.is_empty()))
+            })
+            .chain(stream),
+    );
+    Ok(v2::decrypt_frames(frames, opener, 0, body.len, 0, None))
+}
+
+impl<B: StorageBackend> EncryptingBackend<B> {
     /// THE write-side decision for one REAL bucket: the bucket's own
     /// override when it has one (issue #116), else the backend's. `Err`
     /// under [`WriteMode::Refuse`]: the write must fail, never fall back
-    /// to plaintext.
-    fn write_key(
-        &self,
-        bucket: &str,
-    ) -> Result<Option<(EncryptionKey, Option<String>)>, StorageError> {
+    /// to plaintext. `None`: the write stores plaintext.
+    fn write_key(&self, bucket: &str) -> Result<Option<Arc<v2::SiteKey>>, StorageError> {
         self.check_witness(bucket)?;
         let cfg = self.config.load();
-        let (mode, key, key_id) = match cfg.buckets.get(bucket) {
-            Some(b) => (b.write_mode, &b.key, &b.key_id),
-            None => (cfg.write_mode, &cfg.key, &cfg.key_id),
+        let (mode, key) = match cfg.buckets.get(bucket) {
+            Some(b) => (b.write_mode, &b.key),
+            None => (cfg.write_mode, &cfg.key),
         };
         match mode {
             WriteMode::PassThrough => Ok(None),
@@ -617,172 +648,311 @@ impl<B: StorageBackend> EncryptingBackend<B> {
                 )))
             }
             WriteMode::Refuse => Err(StorageError::Encryption(NO_KEY_WRITE_REFUSAL.to_string())),
-            WriteMode::Encrypt => Ok(key.clone().map(|key| (key, key_id.clone()))),
+            WriteMode::Encrypt => Ok(key.as_ref().map(|k| cfg.site_of(k))),
         }
     }
 
-    /// True when a write to `bucket` stores its bytes as they are (no
-    /// key, or native SSE). False when it encrypts or is refused.
+    /// True when a write to `bucket` stores plaintext under the config
+    /// (no key, or native SSE). Not the witness: a node that the witness
+    /// stops still reads the bucket by its config.
     fn writes_plaintext(&self, bucket: &str) -> bool {
-        matches!(self.write_key(bucket), Ok(None))
+        let cfg = self.config.load();
+        let (mode, key) = match cfg.buckets.get(bucket) {
+            Some(b) => (b.write_mode, &b.key),
+            None => (cfg.write_mode, &cfg.key),
+        };
+        match mode {
+            WriteMode::PassThrough => true,
+            WriteMode::Refuse => false,
+            WriteMode::Encrypt => key.is_none(),
+        }
     }
 
-    /// True when this wrapper holds any key (primary or decrypt-only
-    /// legacy), so the backend may hold proxy-encrypted bodies.
-    /// A range of a passthrough object on a backend with a key, and the
-    /// object's raw stored metadata, without a metadata HEAD (P3.5).
-    ///
-    /// The first read guesses the chunked format (what every large or
-    /// streamed write stores) and is a ranged GET from wire byte 0: its
-    /// response carries the metadata with the encryption markers. A range
-    /// that starts in chunk 0 (`bytes=0-`, a video player's first read)
-    /// reads the header and the frames it needs in that one GET: the
-    /// header and chunk 0 are contiguous. A range further in reads only
-    /// the 16-byte header first, then the frames. When the metadata names
-    /// another form, the guessed bytes still serve: a v1 (single-shot)
-    /// object reads only its rest (none when the guess held it all); a
-    /// plaintext object serves a chunk-0 range from them, and a later
-    /// range reads its bytes, with the magic check done on the guessed
-    /// header (no 4-byte probe).
-    async fn keyed_range(
+    /// May a read of `bucket` serve an object that is not encrypted? Yes
+    /// when the bucket writes plaintext, or encrypts with
+    /// `plaintext_reads: serve`.
+    fn plaintext_ok(&self, bucket: &str) -> bool {
+        if self.writes_plaintext(bucket) {
+            return true;
+        }
+        let cfg = self.config.load();
+        cfg.buckets
+            .get(bucket)
+            .map_or(cfg.serve_plaintext, |b| b.serve_plaintext)
+    }
+
+    /// True when this wrapper encrypts `bucket`'s writes (or refuses them).
+    fn actively_encrypts(&self, bucket: &str) -> bool {
+        !self.writes_plaintext(bucket)
+    }
+
+    /// True when `bucket` may hold sealed objects: a key exists anywhere on
+    /// this backend (a key of another bucket can open an object that was
+    /// moved here; its seal then fails at the location).
+    fn has_any_key(&self, _bucket: &str) -> bool {
+        !self.config.load().ring().is_empty()
+    }
+
+    /// THE read rule: the presented metadata of the stored object `raw` at
+    /// (`bucket`, `prefix`, `object`). A sealed object opens with the key
+    /// its fingerprint names, at its location; an object without a seal is
+    /// served only where the bucket may serve plaintext.
+    fn present_raw(
         &self,
         bucket: &str,
         prefix: &str,
-        filename: &str,
-        start: u64,
-        end: u64,
-    ) -> Result<RangeRead, StorageError> {
-        let (first_chunk, _) = chunk_index_for_plaintext_offset(start);
-        let guess_end = if first_chunk == 0 {
-            // Through the frame that holds `end` (or past the object's
-            // end: the backend clamps). The size is not known yet.
-            let last_chunk = (end / CHUNK_PLAINTEXT_SIZE as u64).min(u64::from(u32::MAX));
-            (CHUNK_HEADER_LEN as u64)
-                .saturating_add((last_chunk + 1).saturating_mul(CHUNK_FRAME_WIRE_LEN as u64))
-                .saturating_sub(1)
-                .min(u64::MAX - 1)
-        } else {
-            CHUNK_HEADER_LEN as u64 - 1
+        object: StoredObject<'_>,
+        raw: &FileMetadata,
+    ) -> Result<Opened, StorageError> {
+        let at = seal::location(bucket, prefix, object);
+        match seal::sealed_of(raw)? {
+            Some(sealed) => {
+                let cfg = self.config.load();
+                let (facts, entry) = seal::open(raw, &sealed, &at, cfg.ring())?;
+                Ok(Opened {
+                    meta: seal::present(raw, &facts, &entry.id),
+                    sealed: Some(SealedBody {
+                        site: entry.site.clone(),
+                        salt: sealed.salt,
+                        len: seal::body_len(&facts),
+                    }),
+                })
+            }
+            None => match seal::read_verdict(raw, is_folder(object), self.plaintext_ok(bucket)) {
+                seal::Unsealed::Serve => Ok(Opened {
+                    meta: raw.clone(),
+                    sealed: None,
+                }),
+                seal::Unsealed::Refuse => {
+                    tracing::warn!("encryption: refused {bucket}/{prefix} {object:?}");
+                    Err(seal::refusal(&at, raw))
+                }
+            },
+        }
+    }
+
+    /// The presented metadata of a listed or scanned entry. An entry
+    /// without a seal is listed as it is (a GET applies the read rule).
+    fn present_entry(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        object: StoredObject<'_>,
+        raw: FileMetadata,
+    ) -> Result<FileMetadata, StorageError> {
+        if !raw.user_metadata.contains_key(seal::SEALED_KEY) {
+            return Ok(raw);
+        }
+        self.present_raw(bucket, prefix, object, &raw)
+            .map(|o| o.meta)
+    }
+
+    fn present_listed(
+        &self,
+        bucket: &str,
+        objects: Vec<(String, FileMetadata)>,
+    ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
+        objects
+            .into_iter()
+            .map(|(key, raw)| {
+                let meta = {
+                    let (prefix, object) = listed_object(&key, &raw);
+                    self.present_entry(bucket, prefix, object, raw)?
+                };
+                Ok((key, meta))
+            })
+            .collect()
+    }
+
+    fn present_scanned(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        metas: Vec<FileMetadata>,
+    ) -> Result<Vec<FileMetadata>, StorageError> {
+        metas
+            .into_iter()
+            .map(|raw| {
+                let name = raw.original_name.clone();
+                let object = if raw.is_reference() {
+                    StoredObject::Reference
+                } else if raw.is_delta() {
+                    StoredObject::Delta(&name)
+                } else {
+                    StoredObject::Passthrough(&name)
+                };
+                self.present_entry(bucket, prefix, object, raw)
+            })
+            .collect()
+    }
+
+    /// The stored metadata of a write of `meta` (body of `body_len` bytes)
+    /// sealed with fresh object keys of `site`, and the content sealer.
+    fn seal_new(
+        &self,
+        site: &Arc<v2::SiteKey>,
+        bucket: &str,
+        prefix: &str,
+        object: StoredObject<'_>,
+        meta: &FileMetadata,
+        body_len: u64,
+    ) -> Result<(v2::ContentSealer, FileMetadata), StorageError> {
+        let (sealer, keys) = site.fresh_object();
+        let mut stored = seal::seal(
+            &named(meta, object),
+            &seal::location(bucket, prefix, object),
+            &keys,
+        )?;
+        let facts = seal::facts_of(&named(meta, object))?;
+        if seal::body_len(&facts) != body_len {
+            return Err(StorageError::Encryption(format!(
+                "cannot seal {bucket}/{prefix} {object:?}: its metadata names a body of {} \
+                 bytes, the write has {body_len}",
+                seal::body_len(&facts)
+            )));
+        }
+        stored.listing_token = token_maker(site.clone(), bucket, &facts);
+        Ok((sealer, stored))
+    }
+
+    /// The stored body and metadata of a buffered write.
+    fn seal_bytes(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        object: StoredObject<'_>,
+        data: &Bytes,
+        meta: &FileMetadata,
+    ) -> Result<(Bytes, FileMetadata), StorageError> {
+        match self.write_key(bucket)? {
+            Some(site) => {
+                let (sealer, stored) =
+                    self.seal_new(&site, bucket, prefix, object, meta, data.len() as u64)?;
+                Ok((Bytes::from(sealer.seal_all(data)?), stored))
+            }
+            None => Ok((data.clone(), without_markers(meta))),
+        }
+    }
+
+    /// The stored metadata of a metadata-only rewrite (the body stays):
+    /// re-sealed under the stored object's own keys, at its location. A
+    /// stored object without a seal keeps no markers.
+    fn reseal(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        object: StoredObject<'_>,
+        meta: &FileMetadata,
+        raw: &FileMetadata,
+    ) -> Result<FileMetadata, StorageError> {
+        let Some(sealed) = seal::sealed_of(raw)? else {
+            if raw.user_metadata.contains_key(ENCRYPTION_MARKER_KEY) {
+                return Err(seal::refusal(&seal::location(bucket, prefix, object), raw));
+            }
+            return Ok(without_markers(meta));
         };
-        let RangeRead {
-            stream,
-            len: got,
-            metadata: meta,
-            stored_total,
-        } = self
-            .inner
-            .open_passthrough_range(bucket, prefix, filename, 0, guess_end)
-            .await?;
-        // The backend clamped the guess: the response holds the whole object.
-        let whole = got < guess_end + 1;
-        if is_encrypted(&meta) && !is_chunked_encrypted(&meta) {
-            // v1 single-shot (bounded by max_object_size): decrypt the
-            // whole body. The guessed bytes are its start; the rest, if
-            // any, is one more ranged GET.
-            let mut wire = collect_stream(stream).await?;
-            if !whole {
-                match self
-                    .pinned_range(bucket, prefix, filename, guess_end + 1, u64::MAX - 1, &meta)
-                    .await
-                {
-                    Ok((rest, _)) => wire.extend_from_slice(&collect_stream(rest).await?),
-                    Err(StorageError::InvalidRange(_)) => {}
-                    Err(e) => return Err(e),
+        let cfg = self.config.load();
+        let at = seal::location(bucket, prefix, object);
+        let (old, entry) = seal::open(raw, &sealed, &at, cfg.ring())?;
+        let keys = entry.site.object(sealed.salt);
+        let mut stored = seal::seal(&named(meta, object), &at, &keys)?;
+        let facts = seal::facts_of(&named(meta, object))?;
+        if seal::body_len(&facts) != seal::body_len(&old) {
+            return Err(StorageError::Encryption(format!(
+                "a metadata rewrite of {bucket}/{prefix} {object:?} names another body size \
+                 than the stored body"
+            )));
+        }
+        stored.listing_token = token_maker(entry.site.clone(), bucket, &facts);
+        Ok(stored)
+    }
+
+    /// Encrypt the files `parts` (in order) into the spool file `ct` on a
+    /// blocking thread: header and frames, 256 KiB reads.
+    async fn encrypt_files(
+        parts: Vec<std::path::PathBuf>,
+        ct: std::path::PathBuf,
+        sealer: v2::ContentSealer,
+    ) -> Result<u64, StorageError> {
+        tokio::task::spawn_blocking(move || -> Result<u64, StorageError> {
+            use std::io::{Read, Write};
+            let mut sealer = sealer;
+            let mut out = std::fs::File::create(&ct).map_err(io_to_storage_error)?;
+            out.write_all(&sealer.header())
+                .map_err(io_to_storage_error)?;
+            let mut buf = vec![0u8; 256 * 1024];
+            let mut frames = Vec::with_capacity(buf.len() + v2::FRAME_WIRE_LEN);
+            for p in &parts {
+                let mut input = std::fs::File::open(p).map_err(io_to_storage_error)?;
+                loop {
+                    let n = input.read(&mut buf).map_err(io_to_storage_error)?;
+                    if n == 0 {
+                        break;
+                    }
+                    sealer.push(&buf[..n], &mut frames)?;
+                    out.write_all(&frames).map_err(io_to_storage_error)?;
+                    frames.clear();
                 }
             }
-            let plain = self.decrypt_if_needed(wire, &meta)?;
-            let (s, e) = super::clamp_range(start, end, plain.len() as u64)?;
-            let slice = Bytes::from(plain[s as usize..=e as usize].to_vec());
-            let len = slice.len() as u64;
-            return Ok(RangeRead {
-                stream: Box::pin(futures::stream::once(async { Ok(slice) })),
-                len,
-                metadata: meta,
-                stored_total,
-            });
-        }
-        if !is_chunked_encrypted(&meta) {
-            // Plaintext per its metadata. The guessed bytes start at 0, so
-            // they show the chunked magic of a ciphertext whose markers were
-            // stripped: refuse it, never serve ciphertext as plaintext.
-            if first_chunk == 0 {
-                // The guess holds the range: through `end`, or to the
-                // object's end when the backend clamped it.
-                let object_end = if whole { got.checked_sub(1) } else { Some(end) };
-                let Some(effective_end) = object_end.map(|o| o.min(end)).filter(|e| *e >= start)
-                else {
-                    return Err(StorageError::InvalidRange(format!(
-                        "range start {start} is past the end of {prefix}/{filename}"
-                    )));
-                };
-                let len = effective_end - start + 1;
-                return Ok(RangeRead {
-                    stream: slice_stream(sniff_dge1_magic(stream), start, len),
-                    len,
-                    metadata: meta,
-                    stored_total,
-                });
-            }
-            let head = collect_stream(stream).await?;
-            if head.starts_with(&CHUNK_MAGIC) {
-                return Err(stripped_marker_error());
-            }
-            let (stream, len) = self
-                .pinned_range(bucket, prefix, filename, start, end, &meta)
-                .await?;
-            return Ok(RangeRead {
-                stream,
-                len,
-                metadata: meta,
-                stored_total,
-            });
-        }
-        let key = self.pick_decrypt_key(stamped_key_id(&meta))?;
-        let final_idx = final_chunk_index_for_plaintext_size(meta.file_size);
-        let (start, effective_end) = super::clamp_range(start, end, meta.file_size)?;
-        let plaintext_len = effective_end - start + 1;
-        let (base_iv, frames) = split_chunked_header(stream).await?;
-        if first_chunk == 0 {
-            let plain = chunked_decrypt_stream_from_chunk(
-                frames,
-                key,
-                base_iv,
-                0,
-                final_idx,
-                start,
-                Some(plaintext_len),
-            );
-            return Ok(RangeRead {
-                stream: plain,
-                len: plaintext_len,
-                metadata: meta,
-                stored_total,
-            });
-        }
-        drop(frames);
-        let (plain, len) = self
-            .chunked_frames_range(
-                (bucket, prefix, filename),
-                (start, effective_end),
-                (key, base_iv, final_idx),
-                &meta,
-            )
-            .await?;
-        Ok(RangeRead {
-            stream: plain,
-            len,
-            metadata: meta,
-            stored_total,
+            let len = sealer.finish(&mut frames)?;
+            out.write_all(&frames).map_err(io_to_storage_error)?;
+            out.flush().map_err(io_to_storage_error)?;
+            Ok(len)
         })
+        .await
+        .map_err(|e| StorageError::Other(format!("encrypt-to-file task join: {e}")))?
+    }
+
+    /// Encrypt the files `parts` into a spool file and store it as the
+    /// passthrough object `filename`.
+    #[allow(clippy::too_many_arguments)]
+    async fn put_encrypted_files(
+        &self,
+        site: Arc<v2::SiteKey>,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        parts: &[std::path::PathBuf],
+        metadata: &FileMetadata,
+        spool: SpoolBudget<'_>,
+    ) -> Result<(), StorageError> {
+        let mut plain_len = 0u64;
+        for p in parts {
+            plain_len += tokio::fs::metadata(p)
+                .await
+                .map_err(io_to_storage_error)?
+                .len();
+        }
+        let wire_len = v2::stored_len(plain_len).ok_or_else(|| {
+            StorageError::Encryption("object too large for the encryption format".into())
+        })?;
+        let object = StoredObject::Passthrough(filename);
+        let (sealer, stored) = self.seal_new(&site, bucket, prefix, object, metadata, plain_len)?;
+        let ct = spool.file(wire_len).await.map_err(spool_error)?;
+        let written = Self::encrypt_files(parts.to_vec(), ct.path().to_path_buf(), sealer).await?;
+        if written != plain_len {
+            return Err(StorageError::Other(format!(
+                "a source file changed while it was encrypted ({plain_len} → {written} bytes)"
+            )));
+        }
+        self.inner
+            .put_passthrough_file(
+                bucket,
+                prefix,
+                filename,
+                ct.path(),
+                &stored,
+                spool.holding(&ct),
+            )
+            .await
     }
 
     /// A follow-up read of `start..=end` of the stored (raw) object whose
-    /// first read gave the metadata `pin`. Its response carries the stored
-    /// metadata too: when it shows another version (a write replaced the
-    /// object between the two requests), the read fails with a retryable
-    /// 503 SlowDown, so the bytes of one version never go out with the
-    /// metadata (the ETag, the format) of another. Every follow-up read of
-    /// this wrapper goes through here.
+    /// first read gave the metadata `pin`. When the response shows another
+    /// version (a write replaced the object between the two requests), the
+    /// read fails with a retryable 503 SlowDown, so the bytes of one
+    /// version never go out with the metadata of another. Every follow-up
+    /// read of this wrapper goes through here.
     async fn pinned_range(
         &self,
         bucket: &str,
@@ -791,251 +961,117 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         start: u64,
         end: u64,
         pin: &FileMetadata,
-    ) -> Result<(ByteStream, u64), StorageError> {
-        let RangeRead {
-            stream,
-            len,
-            metadata: again,
-            ..
-        } = self
+    ) -> Result<RangeRead, StorageError> {
+        let read = self
             .inner
             .open_passthrough_range(bucket, prefix, filename, start, end)
             .await?;
-        if !super::traits::same_stored_version(pin, &again) {
+        if !super::traits::same_stored_version(pin, &read.metadata) {
             return Err(super::traits::object_changed_while_read(
                 bucket,
                 &format!("{prefix}/{filename}"),
             ));
         }
-        Ok((stream, len))
+        Ok(read)
     }
 
-    /// The plaintext `start..=end` (clamped already) of a chunked object
-    /// whose header is known: one ranged GET of the frames that hold it,
-    /// pinned to the version whose metadata is `pin`.
-    async fn chunked_frames_range(
+    /// A range of a plaintext object that the rule lets this bucket serve,
+    /// from a second read at plaintext offsets pinned to `raw`.
+    async fn plaintext_range(
         &self,
         (bucket, prefix, filename): (&str, &str, &str),
-        (start, effective_end): (u64, u64),
-        (key, base_iv, final_idx): (EncryptionKey, [u8; IV_LEN], u32),
-        pin: &FileMetadata,
-    ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError> {
-        let (first_chunk, _) = chunk_index_for_plaintext_offset(start);
-        let (last_chunk, _) = chunk_index_for_plaintext_offset(effective_end);
-        let wire_start = wire_offset_of_chunk(first_chunk);
-        let wire_end = if last_chunk < final_idx {
-            wire_offset_of_chunk(last_chunk) + CHUNK_FRAME_WIRE_LEN as u64 - 1
-        } else {
-            // Last chunk IS the object's final chunk; it may be
-            // shorter than a full frame, so ask for EOF. The
-            // `u64::MAX - 1` sentinel works across both backends:
-            // S3 interprets it per RFC 7233 (clamp to resource
-            // length), filesystem `File::take` limits on actual
-            // EOF.
-            u64::MAX - 1
-        };
-        let (ct_stream, _) = self
-            .pinned_range(bucket, prefix, filename, wire_start, wire_end, pin)
+        (start, end): (u64, u64),
+        raw: &FileMetadata,
+    ) -> Result<RangeRead, StorageError> {
+        let read = self
+            .pinned_range(bucket, prefix, filename, start, end, raw)
             .await?;
-        // Skip any plaintext bytes before `start` within the
-        // first fetched chunk. E.g. for start=70000 and chunk
-        // size 65536, first_chunk=1 (starts at plaintext 65536)
-        // and we skip 70000 - 65536 = 4464 bytes of its
-        // plaintext. The preceding full chunks (index 0) are
-        // never fetched or decrypted.
-        let skip_bytes = start - (first_chunk as u64) * (CHUNK_PLAINTEXT_SIZE as u64);
-        let plaintext_len = effective_end - start + 1;
-        let plain = chunked_decrypt_stream_from_chunk(
-            ct_stream,
-            key,
-            base_iv,
-            first_chunk,
-            final_idx,
-            skip_bytes,
-            Some(plaintext_len),
-        );
-        Ok((plain, plaintext_len))
+        Ok(RangeRead {
+            stream: if start == 0 {
+                sniff_dge_magic(read.stream)
+            } else {
+                read.stream
+            },
+            metadata: raw.clone(),
+            ..read
+        })
     }
 
-    /// True when `bucket` may hold proxy-encrypted bodies: the backend's
-    /// own key or legacy key, or the bucket's override key or legacy key.
-    /// (A key of ANOTHER bucket on this backend can still decrypt an
-    /// object that was moved here at the storage level: the read path
-    /// sees its marker and takes the keyed route; only its listed size
-    /// may then be the ciphertext size.)
-    fn has_any_key(&self, bucket: &str) -> bool {
-        let cfg = self.config.load();
-        cfg.key.is_some()
-            || cfg.legacy_key.is_some()
-            || cfg
-                .buckets
-                .get(bucket)
-                .is_some_and(|b| b.key.is_some() || b.legacy_key_id.is_some())
-    }
-
-    /// True when this wrapper encrypts `bucket`'s object bodies in-process.
-    /// Gates the streaming multipart path OFF — whole-object GCM framing
-    /// doesn't map onto independent S3 parts — so those copies fall back to
-    /// the buffered/chunked path.
-    fn actively_encrypts(&self, bucket: &str) -> bool {
-        !self.writes_plaintext(bucket)
-    }
-
-    /// The stored body: the ciphertext, or `data` itself (shared, not
-    /// copied) when `bucket` does not encrypt.
-    fn encrypt_if_enabled(
+    /// A range of a passthrough object on a backend with a key: one ranged
+    /// GET of exactly the frames that hold it (frame offsets do not depend
+    /// on the object), whose response also carries the metadata. A
+    /// plaintext object needs a second read at plaintext offsets.
+    async fn keyed_range(
         &self,
         bucket: &str,
-        data: &bytes::Bytes,
-        metadata: &mut FileMetadata,
-    ) -> Result<bytes::Bytes, StorageError> {
-        match self.write_key(bucket)? {
-            Some((key, key_id)) => {
-                let encrypted = encrypt(&key, data)?;
-                mark_encrypted(metadata, key_id.as_deref());
-                Ok(bytes::Bytes::from(encrypted))
-            }
-            None => Ok(data.clone()),
-        }
-    }
-
-    /// Pick the (key, key_id) pair that should decrypt this object.
-    /// Returns `(key, Some(key_id))` for the matching current or
-    /// legacy key, or the current key with no-id-match for legacy
-    /// (pre-Step-3) objects. Returns an error on mismatch AND no
-    /// legacy fallback — same semantics as `check_key_id_match`
-    /// plus the shim overlay.
-    fn pick_decrypt_key(&self, object_kid: Option<&str>) -> Result<EncryptionKey, StorageError> {
-        // Snapshot under a single ArcSwap load so a concurrent
-        // hot-reload can't split the decision.
-        let cfg = self.config.load();
-        let primary_key = cfg.key.clone();
-        let primary_kid = cfg.key_id.clone();
-        let legacy = match (cfg.legacy_key.clone(), cfg.legacy_key_id.clone()) {
-            (Some(k), Some(kid)) => Some((k, kid)),
-            _ => None,
-        };
-        // Every other key on this raw backend (issue #116).
-        let ring = object_kid.and_then(|id| cfg.keyring.get(id).cloned());
-        let has_ring = !cfg.keyring.is_empty();
-        drop(cfg); // release the guard early
-
-        match object_kid {
-            Some(obj_id) => {
-                // Prefer primary when ids match.
-                if let Some(pid) = primary_kid.as_deref() {
-                    if pid == obj_id {
-                        return primary_key.ok_or_else(|| {
-                            StorageError::Encryption(
-                                "object is encrypted but no key is configured".into(),
-                            )
-                        });
-                    }
-                }
-                // Fall back to legacy if present and matching.
-                if let Some((lk, lid)) = legacy {
-                    if lid == obj_id {
-                        return Ok(lk);
-                    }
-                }
-                // A bucket override's key or legacy key on this backend.
-                if let Some(key) = ring {
-                    return Ok(key);
-                }
-                // Neither primary nor legacy matches. Split the
-                // error text by root cause — an "actually no key
-                // at all" state looks like "<unset>" vs X on the
-                // current backend and is a completely different
-                // operational fix (restore the key; or configure the
-                // backend's encryption mode correctly) from a
-                // "rotated-without-shim" mismatch.
-                //
-                // H6: the old error text cited "rotated without
-                // `legacy_key`" in all three sub-cases, which misled
-                // operators whose actual problem was "the backend
-                // was wrongly flipped to mode: none + no shim".
-                let cfg_has_primary = primary_kid.is_some() || primary_key.is_some();
-                if !cfg_has_primary && !has_ring {
-                    return Err(StorageError::Encryption(format!(
-                        "object was encrypted with key id '{obj_id}', but this backend has \
-                         NO encryption key configured. The object can't be decrypted until \
-                         the key is restored. Set `encryption.key` in YAML or the \
-                         DGP_*_ENCRYPTION_KEY env var on this backend. If the object shouldn't \
-                         be here (e.g. bucket routed to the wrong backend), fix routing \
-                         instead."
+        prefix: &str,
+        filename: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<RangeRead, StorageError> {
+        let (first, skip) = v2::frame_for_offset(start);
+        let (last, _) = v2::frame_for_offset(end);
+        let wire_start = v2::wire_offset_of_frame(first);
+        let wire_end = last
+            .checked_mul(v2::FRAME_WIRE_LEN as u64)
+            .and_then(|o| o.checked_add((v2::HEADER_LEN + v2::FRAME_WIRE_LEN - 1) as u64))
+            .unwrap_or(u64::MAX - 1)
+            .min(u64::MAX - 1);
+        let object = StoredObject::Passthrough(filename);
+        let read = match self
+            .inner
+            .open_passthrough_range(bucket, prefix, filename, wire_start, wire_end)
+            .await
+        {
+            Ok(read) => read,
+            // The frame offset is past the stored end: a range past the end
+            // of a sealed object, or a range near the end of a plaintext one.
+            Err(StorageError::InvalidRange(_)) => {
+                let raw = self
+                    .inner
+                    .get_passthrough_metadata(bucket, prefix, filename)
+                    .await?;
+                let opened = self.present_raw(bucket, prefix, object, &raw)?;
+                if let Some(body) = opened.sealed {
+                    return Err(StorageError::InvalidRange(format!(
+                        "bytes {start}-{end} of an object of {} bytes",
+                        body.len
                     )));
                 }
-                let cfg_id = primary_kid.as_deref().unwrap_or("<unset>");
-                Err(StorageError::Encryption(format!(
-                    "object was encrypted with key id '{obj_id}', but this backend is \
-                     configured with key id '{cfg_id}' (no legacy-shim match either). This \
-                     usually means: (a) the key was rotated without `legacy_key` set — \
-                     restore the old key alongside the new one to read historical objects; \
-                     (b) this bucket is routed to the wrong backend; (c) two backends \
-                     share physical storage with different keys. Refusing to run AEAD — \
-                     the underlying auth failure would be opaque."
-                )))
+                return self
+                    .plaintext_range((bucket, prefix, filename), (start, end), &raw)
+                    .await;
             }
-            None => {
-                // Legacy object (no stamp). Primary key wins. If
-                // primary has no key, we return the same error as
-                // pre-shim behaviour — the caller surfaces "no key
-                // configured" when needed.
-                primary_key.ok_or_else(|| {
-                    StorageError::Encryption("object is encrypted but no key is configured".into())
-                })
-            }
-        }
-    }
-
-    fn decrypt_if_needed(
-        &self,
-        data: Vec<u8>,
-        metadata: &FileMetadata,
-    ) -> Result<Vec<u8>, StorageError> {
-        if is_encrypted(metadata) {
-            let key = self.pick_decrypt_key(stamped_key_id(metadata))?;
-            decrypt(&key, &data)
-        } else {
-            Ok(data)
-        }
+            Err(e) => return Err(e),
+        };
+        let opened = self.present_raw(bucket, prefix, object, &read.metadata)?;
+        let Some(body) = opened.sealed else {
+            drop(read.stream);
+            return self
+                .plaintext_range((bucket, prefix, filename), (start, end), &read.metadata)
+                .await;
+        };
+        v2::check_stored_len(read.stored_total, body.len)?;
+        let (start, end) = super::clamp_range(start, end, body.len)?;
+        let take = end - start + 1;
+        Ok(RangeRead {
+            stream: v2::decrypt_frames(
+                read.stream,
+                body.opener(),
+                first,
+                body.len,
+                skip,
+                Some(take),
+            ),
+            len: take,
+            metadata: opened.meta,
+            stored_total: read.stored_total,
+        })
     }
 }
 
-/// Short-circuit check: if the object carries a stamped `dg-encryption-
-/// key-id` AND the wrapper is configured with a `key_id`, they must
-/// match. Returns a SPECIFIC error on mismatch — the AEAD auth failure
-/// that would otherwise surface gives an opaque "decryption failed"
-/// message that doesn't tell operators whether they rotated the key,
-/// routed a bucket to the wrong backend, or accidentally pointed two
-/// backends at the same physical bucket with different keys.
-///
-/// Returns `Ok(())` in three legal cases:
-///   * both ids present and equal (happy path).
-///   * object has no id (legacy / pre-Step-3 object).
-///   * wrapper has no id (mode:none wrapper reading an encrypted
-///     object; the outer `no key configured` error still fires).
-pub fn check_key_id_match(
-    object_kid: Option<&str>,
-    configured_kid: Option<&str>,
-) -> Result<(), StorageError> {
-    match (object_kid, configured_kid) {
-        (Some(obj), Some(cfg)) if obj != cfg => Err(StorageError::Encryption(format!(
-            "object was encrypted with key id '{obj}', but this backend is configured \
-             with key id '{cfg}'. This usually means: (a) the key was rotated (unsupported \
-             in this release — restore the old key alongside the new one to read historical \
-             objects); (b) this bucket is routed to the wrong backend; (c) two backends \
-             share physical storage with different keys. Refusing to run AEAD — the \
-             underlying auth failure would be opaque."
-        ))),
-        _ => Ok(()),
-    }
-}
-
-// Generate the full StorageBackend impl. Encrypt/decrypt methods are hand-written;
-// all other methods delegate to self.inner unchanged.
 impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
-    // ── Encrypt on write ──
+    // ── Writes: seal ──
 
     async fn put_reference(
         &self,
@@ -1046,19 +1082,20 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
         self.check_witness(bucket)?;
-        let mut meta = without_markers(metadata);
-        let enc = self.encrypt_if_enabled(bucket, &data, &mut meta)?;
+        let (body, stored) =
+            self.seal_bytes(bucket, prefix, StoredObject::Reference, &data, metadata)?;
         self.inner
-            .put_reference(bucket, prefix, enc, &meta, proof)
+            .put_reference(bucket, prefix, body, &stored, proof)
             .await
     }
 
-    /// The stored bytes move as they are, so the copy is valid only when
-    /// this wrapper would store them the same way: plaintext with no write
-    /// key, or encrypted under the write key's own id. Otherwise
-    /// `Unsupported` (the caller re-encrypts through the proxy). The
-    /// destination gets the markers of the copied bytes, never the
-    /// caller's.
+    /// A storage-level copy moves the stored bytes as they are, so it is
+    /// valid only when the destination would store them the same way:
+    /// plaintext to plaintext, or sealed under the destination's write key.
+    /// A sealed copy is re-sealed for its destination (the seal binds the
+    /// location) under the source's own object keys, after the source is
+    /// checked against the caller's pin. Otherwise `Unsupported`: the
+    /// caller copies through the proxy.
     async fn copy_within(
         &self,
         variant: super::traits::ObjectVariant,
@@ -1068,19 +1105,48 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         metadata: &FileMetadata,
     ) -> Result<super::traits::CopyOutcome, StorageError> {
         self.check_witness(dst.bucket)?;
-        // The destination bucket's own write policy (issue #116).
-        let write_key_id = self.write_key(dst.bucket)?.map(|(_, id)| id);
-        let same_form = match (&write_key_id, is_encrypted(source)) {
-            (None, false) => true,
-            (Some(Some(id)), true) => stamped_key_id(source) == Some(id.as_str()),
-            _ => false,
+        use super::traits::{CopyOutcome, ObjectVariant};
+        let dst_site = self.write_key(dst.bucket)?;
+        let raw = match variant {
+            ObjectVariant::Delta => {
+                self.inner
+                    .get_delta_metadata(src.bucket, src.prefix, src.filename)
+                    .await?
+            }
+            ObjectVariant::Passthrough => {
+                self.inner
+                    .get_passthrough_metadata(src.bucket, src.prefix, src.filename)
+                    .await?
+            }
         };
-        if !same_form {
-            return Ok(super::traits::CopyOutcome::Unsupported);
-        }
-        let meta = with_markers_of(metadata, source);
+        let src_object = object_of(variant, src.filename);
+        let dst_object = object_of(variant, dst.filename);
+        let stored = match (seal::sealed_of(&raw)?, dst_site) {
+            (None, None) => {
+                if raw.user_metadata.contains_key(ENCRYPTION_MARKER_KEY) {
+                    return Ok(CopyOutcome::Unsupported);
+                }
+                without_markers(metadata)
+            }
+            (Some(sealed), Some(site)) if sealed.fp == site.fingerprint() => {
+                let opened = self.present_raw(src.bucket, src.prefix, src_object, &raw)?;
+                if !super::traits::same_stored_generation(source, &opened.meta) {
+                    return Ok(CopyOutcome::Unsupported);
+                }
+                let at = seal::location(dst.bucket, dst.prefix, dst_object);
+                let keys = site.object(sealed.salt);
+                let mut stored = seal::seal(&named(metadata, dst_object), &at, &keys)?;
+                let facts = seal::facts_of(&named(metadata, dst_object))?;
+                if seal::body_len(&facts) != opened.sealed.as_ref().map_or(0, |b| b.len) {
+                    return Ok(CopyOutcome::Unsupported);
+                }
+                stored.listing_token = token_maker(site, dst.bucket, &facts);
+                stored
+            }
+            _ => return Ok(CopyOutcome::Unsupported),
+        };
         self.inner
-            .copy_within(variant, src, dst, source, &meta)
+            .copy_within(variant, src, dst, &raw, &stored)
             .await
     }
 
@@ -1094,10 +1160,15 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
         self.check_witness(bucket)?;
-        let mut meta = without_markers(metadata);
-        let enc = self.encrypt_if_enabled(bucket, &data, &mut meta)?;
+        let (body, stored) = self.seal_bytes(
+            bucket,
+            prefix,
+            StoredObject::Delta(filename),
+            &data,
+            metadata,
+        )?;
         self.inner
-            .put_delta(bucket, prefix, filename, enc, &meta, proof)
+            .put_delta(bucket, prefix, filename, body, &stored, proof)
             .await
     }
 
@@ -1110,21 +1181,21 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         self.check_witness(bucket)?;
-        let mut meta = without_markers(metadata);
-        let enc = self.encrypt_if_enabled(bucket, &data, &mut meta)?;
+        let (body, stored) = self.seal_bytes(
+            bucket,
+            prefix,
+            StoredObject::Passthrough(filename),
+            &data,
+            metadata,
+        )?;
         self.inner
-            .put_passthrough(bucket, prefix, filename, enc, &meta)
+            .put_passthrough(bucket, prefix, filename, body, &stored)
             .await
     }
 
-    /// BOUNDED-MEMORY file store: encrypt the source file in 64 KiB windows
-    /// into the chunked wire format, streamed to a spool file (peak ≈ one
-    /// window + one frame, ~130 KiB — never the whole object), then hand THAT
-    /// file to the inner backend (which streams it to disk/S3). This is the
-    /// re-encrypt / large-passthrough path; the trait default
-    /// `tokio::fs::read`s the whole file and single-shot-encrypts (100
-    /// MiB-capped, O(object) RAM). The ciphertext file is in the spool dir
-    /// and holds spool budget. PassThrough / no-key → delegate to inner.
+    /// BOUNDED-MEMORY file store: encrypt the source file into a spool file
+    /// (256 KiB reads, never the whole object), then hand that file to the
+    /// inner backend. The ciphertext file holds spool budget.
     async fn put_passthrough_file(
         &self,
         bucket: &str,
@@ -1135,7 +1206,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         spool: SpoolBudget<'_>,
     ) -> Result<(), StorageError> {
         self.check_witness(bucket)?;
-        let Some((key, key_id)) = self.write_key(bucket)? else {
+        let Some(site) = self.write_key(bucket)? else {
             return self
                 .inner
                 .put_passthrough_file(
@@ -1148,33 +1219,20 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
                 )
                 .await;
         };
-        let plain_len = tokio::fs::metadata(source_path)
-            .await
-            .map_err(io_to_storage_error)?
-            .len();
-        let ct = spool
-            .file(chunked_wire_len_bound(plain_len))
-            .await
-            .map_err(spool_error)?;
-        self.encrypt_file_and_put(
+        self.put_encrypted_files(
+            site,
             bucket,
             prefix,
             filename,
-            source_path,
-            &ct,
-            (key, key_id),
+            &[source_path.to_path_buf()],
             metadata,
             spool,
         )
         .await
     }
 
-    /// BOUNDED-MEMORY relayed-parts store: concatenate the ordered part files
-    /// into ONE spool file (streamed, `std::io::copy` — never a whole `Vec`),
-    /// then encrypt it windowed like `put_passthrough_file`. The trait default
-    /// assembles every part into one in-RAM `Vec` (O(object)); with the raised
-    /// passthrough ceiling that OOMs a multi-GiB encrypted multipart upload.
-    /// PassThrough / no-key → delegate.
+    /// BOUNDED-MEMORY relayed-parts store: the ordered part files are
+    /// encrypted straight into one spool file (no joined plaintext copy).
     async fn put_passthrough_parts(
         &self,
         bucket: &str,
@@ -1185,7 +1243,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         spool: SpoolBudget<'_>,
     ) -> Result<(), StorageError> {
         self.check_witness(bucket)?;
-        let Some(write_key) = self.write_key(bucket)? else {
+        let Some(site) = self.write_key(bucket)? else {
             return self
                 .inner
                 .put_passthrough_parts(
@@ -1198,62 +1256,21 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
                 )
                 .await;
         };
-        let mut plain_len = 0u64;
-        for p in part_paths {
-            plain_len += tokio::fs::metadata(p)
-                .await
-                .map_err(io_to_storage_error)?
-                .len();
-        }
-        let joined = spool.file(plain_len).await.map_err(spool_error)?;
-        let ct = spool
-            .file(chunked_wire_len_bound(plain_len))
+        self.put_encrypted_files(site, bucket, prefix, filename, part_paths, metadata, spool)
             .await
-            .map_err(spool_error)?;
-        let parts = part_paths.to_vec();
-        let joined_path = joined.path().to_path_buf();
-        tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
-            let mut out = std::fs::File::create(&joined_path).map_err(io_to_storage_error)?;
-            for p in &parts {
-                let mut f = std::fs::File::open(p).map_err(io_to_storage_error)?;
-                std::io::copy(&mut f, &mut out).map_err(io_to_storage_error)?;
-            }
-            std::io::Write::flush(&mut out).map_err(io_to_storage_error)
-        })
-        .await
-        .map_err(|e| StorageError::Other(format!("relay-join task: {e}")))??;
-        self.encrypt_file_and_put(
-            bucket,
-            prefix,
-            filename,
-            joined.path(),
-            &ct,
-            write_key,
-            metadata,
-            spool,
-        )
-        .await
     }
 
     async fn file_put_spool_bytes(&self, bucket: &str, bytes: u64, parts: bool) -> u64 {
         if self.writes_plaintext(bucket) {
             return self.inner.file_put_spool_bytes(bucket, bytes, parts).await;
         }
-        // The ciphertext file, plus the joined plaintext for parts.
-        let wire = chunked_wire_len_bound(bytes);
-        let joined = if parts { bytes } else { 0 };
-        wire + joined + self.inner.file_put_spool_bytes(bucket, wire, false).await
+        // The ciphertext file.
+        let wire = v2::stored_len(bytes).unwrap_or(u64::MAX);
+        wire.saturating_add(self.inner.file_put_spool_bytes(bucket, wire, false).await)
     }
 
-    // put_passthrough_chunked: re-slices incoming chunks into 64 KiB
-    // plaintext windows, encrypts each into a framed ciphertext chunk,
-    // and forwards a new `Vec<Bytes>` (header + all frames) to the
-    // inner backend's chunked PUT. No whole-object buffer in memory —
-    // the peak allocation is one 64 KiB plaintext window + one frame
-    // (~130 KiB) at a time.
-    //
-    // When encryption is off, delegates to inner's chunked impl
-    // directly — no copying.
+    /// The chunks are encrypted as they come (one 64 KiB window and one
+    /// frame of working memory) and handed to the inner chunked PUT.
     async fn put_passthrough_chunked(
         &self,
         bucket: &str,
@@ -1263,7 +1280,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         self.check_witness(bucket)?;
-        let Some((key, key_id)) = self.write_key(bucket)? else {
+        let Some(site) = self.write_key(bucket)? else {
             return self
                 .inner
                 .put_passthrough_chunked(
@@ -1275,52 +1292,28 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
                 )
                 .await;
         };
-
-        // Random per-object base IV (each chunk's nonce derives from it +
-        // the chunk index); the wire-format header goes out first.
-        let (mut framer, header) = ChunkFramer::with_random_iv();
-        let mut out_frames: Vec<Bytes> = Vec::with_capacity(chunks.len() + 4);
-        out_frames.push(Bytes::from(header));
-
-        // Re-slice incoming chunks into exactly CHUNK_PLAINTEXT_SIZE windows
-        // (multipart parts arrive ~5 MiB, so one Bytes splits into ~80 windows)
-        // and drive them through ChunkFramer — which owns the is_final/index
-        // invariant and the zero-byte / sub-window / boundary tail cases that
-        // used to be a 5-branch hand-rolled block here.
-        let mut pt_window: Vec<u8> = Vec::with_capacity(CHUNK_PLAINTEXT_SIZE);
-        for incoming in chunks {
-            let mut remaining: &[u8] = incoming.as_ref();
-            while !remaining.is_empty() {
-                let space = CHUNK_PLAINTEXT_SIZE - pt_window.len();
-                let take = std::cmp::min(space, remaining.len());
-                pt_window.extend_from_slice(&remaining[..take]);
-                remaining = &remaining[take..];
-                if pt_window.len() == CHUNK_PLAINTEXT_SIZE {
-                    if let Some(frame) = framer.push_window(&key, std::mem::take(&mut pt_window))? {
-                        out_frames.push(Bytes::from(frame));
-                    }
-                    pt_window = Vec::with_capacity(CHUNK_PLAINTEXT_SIZE);
-                }
+        let plain_len: u64 = chunks.iter().map(|c| c.len() as u64).sum();
+        let object = StoredObject::Passthrough(filename);
+        let (mut sealer, stored) =
+            self.seal_new(&site, bucket, prefix, object, metadata, plain_len)?;
+        let mut out: Vec<Bytes> = Vec::with_capacity(chunks.len() + 2);
+        out.push(Bytes::copy_from_slice(&sealer.header()));
+        for chunk in chunks {
+            let mut frames = Vec::with_capacity(chunk.len() + v2::FRAME_WIRE_LEN);
+            sealer.push(chunk, &mut frames)?;
+            if !frames.is_empty() {
+                out.push(Bytes::from(frames));
             }
         }
-        // Feed a non-empty tail (sub-window remainder) as the last window, then
-        // let the framer emit the final frame. An all-empty input → finish()
-        // emits the single empty final frame (zero-byte object).
-        if !pt_window.is_empty() {
-            if let Some(frame) = framer.push_window(&key, pt_window)? {
-                out_frames.push(Bytes::from(frame));
-            }
-        }
-        out_frames.push(Bytes::from(framer.finish(&key)?));
-
-        let mut meta = without_markers(metadata);
-        mark_chunked_encrypted(&mut meta, key_id.as_deref());
+        let mut last = Vec::with_capacity(v2::FRAME_WIRE_LEN);
+        sealer.finish(&mut last)?;
+        out.push(Bytes::from(last));
         self.inner
-            .put_passthrough_chunked(bucket, prefix, filename, &out_frames, &meta)
+            .put_passthrough_chunked(bucket, prefix, filename, &out, &stored)
             .await
     }
 
-    // ── Decrypt on read ──
+    // ── Reads: open ──
 
     async fn get_reference(&self, bucket: &str, prefix: &str) -> Result<Vec<u8>, StorageError> {
         let (stream, _) = self
@@ -1329,31 +1322,24 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         collect_stream(stream).await
     }
 
-    // NOTE: get_reference_to_file deliberately uses the trait DEFAULT (get_reference
-    // + write) here. AES-GCM decryption is a whole-buffer operation in the current
-    // design, so a streaming hardlink/stream-to-file would hand xdelta3 ciphertext.
-    // The default decrypts to RAM then writes plaintext to the spool — correct, but
-    // bounded by reference size for encrypted backends. Streaming decryption is a
-    // separate future optimisation (chunked GCM / per-block nonce).
-
     /// A plaintext reference passes through (the filesystem keeps its
-    /// hardlink). An encrypted one is decrypted whole, as `get_reference`
-    /// does, and its size is the decrypted length.
+    /// hardlink). A sealed one is decrypted whole, checked against its
+    /// stored size, and its size is the sealed plaintext size.
     async fn open_reference_source(
         &self,
         bucket: &str,
         prefix: &str,
     ) -> Result<ReferenceSource, StorageError> {
-        let source = self.inner.open_reference_source(bucket, prefix).await?;
-        if !is_encrypted(&source.metadata) {
+        let mut source = self.inner.open_reference_source(bucket, prefix).await?;
+        let opened = self.present_raw(bucket, prefix, StoredObject::Reference, &source.metadata)?;
+        let Some(body) = opened.sealed else {
+            source.metadata = opened.meta;
             return Ok(source);
-        }
-        let meta = source.metadata.clone();
-        let data = source.read_all().await?;
-        let plain = self.decrypt_if_needed(data, &meta)?;
-        let size = plain.len() as u64;
+        };
+        let wire = source.read_all().await?;
+        let plain = body.opener().open_all(&wire, body.len)?;
         let stream: ByteStream = Box::pin(futures::stream::once(async { Ok(Bytes::from(plain)) }));
-        Ok(ReferenceSource::stream(stream, size, meta))
+        Ok(ReferenceSource::stream(stream, body.len, opened.meta))
     }
 
     async fn get_delta(
@@ -1368,9 +1354,6 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         collect_stream(stream).await
     }
 
-    /// One blob, plaintext, for both wire formats: a chunked object runs
-    /// through the chunked decoder (a single-shot decrypt would read its
-    /// `DGE1` header as an IV and fail).
     async fn get_passthrough(
         &self,
         bucket: &str,
@@ -1395,56 +1378,36 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         Ok(stream)
     }
 
-    /// The inner read carries the raw stored metadata, markers included, so
-    /// the format decision needs no HEAD of its own (storage-7). Returns
-    /// that raw metadata, as `get_*_metadata` does.
+    /// The inner read carries the stored metadata, so the read rule needs no
+    /// HEAD of its own. References and deltas (bounded by the object size
+    /// limit) are decrypted whole, with an exact size check; a passthrough
+    /// streams frame by frame. Returns the PRESENTED metadata.
     async fn open_object(
         &self,
         bucket: &str,
         prefix: &str,
         object: StoredObject<'_>,
     ) -> Result<(ByteStream, FileMetadata), StorageError> {
-        let (stream, meta) = self.inner.open_object(bucket, prefix, object).await?;
-        let plain: ByteStream = match object {
-            // References and deltas are single-shot or plaintext.
-            StoredObject::Reference | StoredObject::Delta(_) => {
-                if is_encrypted(&meta) {
-                    let data = collect_stream(stream).await?;
-                    let plain = self.decrypt_if_needed(data, &meta)?;
-                    Box::pin(futures::stream::once(async { Ok(Bytes::from(plain)) }))
-                } else {
-                    stream
-                }
-            }
-            // Chunked: decrypt frame by frame, no whole-object buffer (a
-            // 5 GiB download stays at ~130 KiB peak in the decoder). The
-            // shim-aware key choice names the fix on a key-id mismatch.
-            StoredObject::Passthrough(_) if is_chunked_encrypted(&meta) => {
-                let key = self.pick_decrypt_key(stamped_key_id(&meta))?;
-                let final_idx = final_chunk_index_for_plaintext_size(meta.file_size);
-                chunked_decrypt_stream(stream, key, final_idx, 0, None)
-            }
-            // Single-shot (bounded by max_object_size): decrypt whole.
-            StoredObject::Passthrough(_) if is_encrypted(&meta) => {
-                let data = collect_stream(stream).await?;
-                let plain = self.decrypt_if_needed(data, &meta)?;
+        let (stream, raw) = self.inner.open_object(bucket, prefix, object).await?;
+        let opened = self.present_raw(bucket, prefix, object, &raw)?;
+        let plain: ByteStream = match (&opened.sealed, object) {
+            (Some(body), StoredObject::Reference | StoredObject::Delta(_)) => {
+                let wire = collect_stream(stream).await?;
+                let plain = body.opener().open_all(&wire, body.len)?;
                 Box::pin(futures::stream::once(async { Ok(Bytes::from(plain)) }))
             }
-            // Plaintext per metadata: refuse a body that starts with the
-            // chunked `DGE1` magic (the xattr got stripped in a
-            // backup/restore and the body is still ciphertext). Plaintext
-            // that starts with those 4 bytes is a 1-in-2^32 case.
-            StoredObject::Passthrough(_) => Box::pin(sniff_dge1_magic(stream)),
+            (Some(body), StoredObject::Passthrough(_)) => open_body_stream(stream, body).await?,
+            (None, _) => sniff_dge_magic(stream),
         };
-        Ok((plain, meta))
+        Ok((plain, opened.meta))
     }
 
-    // === Multipart upload (Phase B) ===
+    // === Multipart upload ===
     //
-    // Forward to the inner backend ONLY when this wrapper isn't actively
-    // encrypting. When it IS (proxy-AES), the transfer layer never calls
-    // these (gated off by `multipart_storage_label`); the explicit error
-    // is defence-in-depth in case a future caller skips the gate.
+    // Forwarded to the inner backend ONLY when this wrapper does not
+    // encrypt the bucket. When it does, the transfer layer never calls
+    // these (gated off by `multipart_storage_label`); the explicit error is
+    // defence-in-depth.
 
     async fn create_multipart_upload(
         &self,
@@ -1490,13 +1453,10 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         metadata: &FileMetadata,
     ) -> Result<String, StorageError> {
         self.check_witness(&upload.bucket)?;
-        // The bucket's write policy NOW. A config apply can change it
-        // between create and complete: the new engine publishes its policy
-        // into the slot that this (older) wrapper shares
-        // (`EncryptionPolicies`), and a multipart upload completes on the
-        // engine it started on. A bucket that encrypts never
-        // stores the parts as plaintext: buffered parts are encrypted like
-        // any chunked write; native parts already sit on the backend in
+        // The bucket's write policy NOW (a config apply can change it
+        // between create and complete). A bucket that encrypts never stores
+        // the parts as plaintext: buffered parts are encrypted like any
+        // chunked write; native parts already sit on the backend in
         // plaintext, so the upload is refused.
         if self.write_key(&upload.bucket)?.is_some() {
             if upload.native {
@@ -1509,7 +1469,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
             }
             self.put_passthrough_chunked(&upload.bucket, prefix, filename, assembled, metadata)
                 .await?;
-            return Ok(format!("\"{}\"", metadata.md5));
+            return Ok(metadata.etag());
         }
         self.inner
             .complete_multipart_upload(
@@ -1542,20 +1502,18 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     }
 
     fn supports_native_multipart(&self, bucket: &str) -> bool {
-        // Proxy-AES rewrites each part's bytes, so the passthrough streaming
-        // multipart path can't be used regardless of the inner backend.
+        // Encryption rewrites the bytes, so the streaming multipart path
+        // cannot be used, whatever the inner backend.
         if self.actively_encrypts(bucket) {
             return false;
         }
         self.inner.supports_native_multipart(bucket)
     }
 
+    /// The wrapper presents listed entries already (sealed ones opened), so
+    /// the inner backend's answer holds: the filesystem lists the logical
+    /// facts, an S3 lite list does not.
     fn lite_list_carries_logical_facts(&self, bucket: &str) -> bool {
-        // When actively encrypting, the lite list reports CIPHERTEXT size/etag —
-        // parity must HEAD for plaintext logical facts.
-        if self.actively_encrypts(bucket) {
-            return false;
-        }
         self.inner.lite_list_carries_logical_facts(bucket)
     }
 
@@ -1573,10 +1531,9 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         Ok((read.stream, read.len))
     }
 
-    /// Without a key, objects here are plaintext: the inner backend's one
-    /// read gives the range and the metadata, with the same stripped-marker
-    /// checks as a range read. With a key, `keyed_range` takes the
-    /// metadata from its first ranged GET, never from a HEAD.
+    /// Without any key, objects here are plaintext: the inner backend's one
+    /// read gives the range and the metadata, and the read rule applies.
+    /// With a key, `keyed_range` reads the covering frames.
     async fn open_passthrough_range(
         &self,
         bucket: &str,
@@ -1588,33 +1545,24 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         if self.has_any_key(bucket) {
             return self.keyed_range(bucket, prefix, filename, start, end).await;
         }
-        let RangeRead {
-            stream,
-            len,
-            metadata: meta,
-            stored_total,
-        } = self
+        let read = self
             .inner
             .open_passthrough_range(bucket, prefix, filename, start, end)
             .await?;
-        if is_chunked_encrypted(&meta) || is_encrypted(&meta) {
-            // Encrypted, and no key to read it: the key choice names why,
-            // with no more requests. A key that a reload added since the
-            // check above reads the object the keyed way.
-            drop(stream);
-            self.pick_decrypt_key(stamped_key_id(&meta))?;
-            return self.keyed_range(bucket, prefix, filename, start, end).await;
-        }
-        let stream = if start == 0 {
-            sniff_dge1_magic(stream)
-        } else {
-            stream
-        };
+        let opened = self.present_raw(
+            bucket,
+            prefix,
+            StoredObject::Passthrough(filename),
+            &read.metadata,
+        )?;
         Ok(RangeRead {
-            stream,
-            len,
-            metadata: meta,
-            stored_total,
+            stream: if start == 0 {
+                sniff_dge_magic(read.stream)
+            } else {
+                read.stream
+            },
+            metadata: opened.meta,
+            ..read
         })
     }
 
@@ -1626,17 +1574,282 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         n: u64,
         t: &str,
     ) -> Result<(), StorageError> {
+        self.check_witness(b)?;
         self.inner.put_listing_token(b, k, e, n, t).await
     }
+
     async fn listing_tokens(
         &self,
         b: &str,
         objects: &[(String, FileMetadata)],
-    ) -> Vec<Option<String>> {
+    ) -> Vec<Option<crate::storage::ListedToken>> {
         self.inner.listing_tokens(b, objects).await
     }
 
-    // ── Pass-through (no encryption) ──
+    // ── Metadata: present / re-seal ──
+
+    async fn get_reference_metadata(&self, b: &str, p: &str) -> Result<FileMetadata, StorageError> {
+        let raw = self.inner.get_reference_metadata(b, p).await?;
+        Ok(self.present_raw(b, p, StoredObject::Reference, &raw)?.meta)
+    }
+    async fn get_delta_metadata(
+        &self,
+        b: &str,
+        p: &str,
+        f: &str,
+    ) -> Result<FileMetadata, StorageError> {
+        let raw = self.inner.get_delta_metadata(b, p, f).await?;
+        Ok(self.present_raw(b, p, StoredObject::Delta(f), &raw)?.meta)
+    }
+    async fn get_passthrough_metadata(
+        &self,
+        b: &str,
+        p: &str,
+        f: &str,
+    ) -> Result<FileMetadata, StorageError> {
+        let raw = self.inner.get_passthrough_metadata(b, p, f).await?;
+        Ok(self
+            .present_raw(b, p, StoredObject::Passthrough(f), &raw)?
+            .meta)
+    }
+    /// The presented metadata; the basis keeps the stored (raw) metadata,
+    /// which the re-seal of the rewrite needs (its salt).
+    async fn get_passthrough_metadata_for_rewrite(
+        &self,
+        b: &str,
+        p: &str,
+        f: &str,
+    ) -> Result<(FileMetadata, super::RewriteBasis), StorageError> {
+        let (raw, mut basis) = self
+            .inner
+            .get_passthrough_metadata_for_rewrite(b, p, f)
+            .await?;
+        let meta = self
+            .present_raw(b, p, StoredObject::Passthrough(f), &raw)?
+            .meta;
+        if basis.stored.is_none() {
+            basis.stored = Some(raw);
+        }
+        Ok((meta, basis))
+    }
+    async fn put_passthrough_metadata(
+        &self,
+        b: &str,
+        p: &str,
+        f: &str,
+        m: &FileMetadata,
+        basis: &super::RewriteBasis,
+    ) -> Result<(), StorageError> {
+        self.check_witness(b)?;
+        // The body is not rewritten: the stored object's seal decides. A
+        // caller's earlier read gives the stored metadata without a HEAD.
+        let raw = match &basis.stored {
+            Some(raw) => raw.clone(),
+            None => self.inner.get_passthrough_metadata(b, p, f).await?,
+        };
+        let stored = self.reseal(b, p, StoredObject::Passthrough(f), m, &raw)?;
+        self.inner
+            .put_passthrough_metadata(b, p, f, &stored, basis)
+            .await
+    }
+    async fn put_reference_metadata(
+        &self,
+        b: &str,
+        p: &str,
+        m: &FileMetadata,
+        proof: &crate::deltaglider::RefWriteProof,
+    ) -> Result<(), StorageError> {
+        self.check_witness(b)?;
+        let raw = self.inner.get_reference_metadata(b, p).await?;
+        let stored = self.reseal(b, p, StoredObject::Reference, m, &raw)?;
+        self.inner
+            .put_reference_metadata(b, p, &stored, proof)
+            .await
+    }
+    async fn reference_fence_with_metadata(
+        &self,
+        b: &str,
+        p: &str,
+    ) -> Result<(super::traits::RefFence, Option<FileMetadata>), StorageError> {
+        let (fence, raw) = self.inner.reference_fence_with_metadata(b, p).await?;
+        let meta = match raw {
+            Some(raw) => Some(self.present_raw(b, p, StoredObject::Reference, &raw)?.meta),
+            None => None,
+        };
+        Ok((fence, meta))
+    }
+    /// The same transformation as the unfenced writes (seal a body, re-seal
+    /// a metadata-only write), then the inner fenced write: the fence is on
+    /// the stored object, which is what the inner backend observes.
+    async fn write_reference_fenced(
+        &self,
+        b: &str,
+        p: &str,
+        op: super::traits::RefWrite<'_>,
+        fence: &super::traits::RefFence,
+        proof: &crate::deltaglider::RefWriteProof,
+    ) -> Result<super::traits::RefFence, StorageError> {
+        self.check_witness(b)?;
+        use super::traits::RefWrite;
+        match op {
+            RefWrite::Put { data, metadata } => {
+                let (body, stored) =
+                    self.seal_bytes(b, p, StoredObject::Reference, data, metadata)?;
+                self.inner
+                    .write_reference_fenced(
+                        b,
+                        p,
+                        RefWrite::Put {
+                            data: &body,
+                            metadata: &stored,
+                        },
+                        fence,
+                        proof,
+                    )
+                    .await
+            }
+            RefWrite::PutFile { path, metadata } => {
+                let data = bytes::Bytes::from(tokio::fs::read(path).await?);
+                let (body, stored) =
+                    self.seal_bytes(b, p, StoredObject::Reference, &data, metadata)?;
+                self.inner
+                    .write_reference_fenced(
+                        b,
+                        p,
+                        RefWrite::Put {
+                            data: &body,
+                            metadata: &stored,
+                        },
+                        fence,
+                        proof,
+                    )
+                    .await
+            }
+            RefWrite::Metadata { metadata } => {
+                let raw = self.inner.get_reference_metadata(b, p).await?;
+                let stored = self.reseal(b, p, StoredObject::Reference, metadata, &raw)?;
+                self.inner
+                    .write_reference_fenced(
+                        b,
+                        p,
+                        RefWrite::Metadata { metadata: &stored },
+                        fence,
+                        proof,
+                    )
+                    .await
+            }
+            RefWrite::Delete => {
+                self.inner
+                    .write_reference_fenced(b, p, RefWrite::Delete, fence, proof)
+                    .await
+            }
+        }
+    }
+
+    // ── Listings: present ──
+
+    async fn scan_deltaspace(&self, b: &str, p: &str) -> Result<Vec<FileMetadata>, StorageError> {
+        let raw = self.inner.scan_deltaspace(b, p).await?;
+        self.present_scanned(b, p, raw)
+    }
+    async fn scan_deltaspace_lite(&self, b: &str, p: &str) -> Result<LiteScanResult, StorageError> {
+        let mut lite = self.inner.scan_deltaspace_lite(b, p).await?;
+        lite.metadata = self.present_scanned(b, p, std::mem::take(&mut lite.metadata))?;
+        Ok(lite)
+    }
+    async fn holds_only_reference(&self, b: &str, p: &str) -> Result<bool, StorageError> {
+        self.inner.holds_only_reference(b, p).await
+    }
+    async fn bulk_list_objects(
+        &self,
+        b: &str,
+        p: &str,
+    ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
+        let raw = self.inner.bulk_list_objects(b, p).await?;
+        self.present_listed(b, raw)
+    }
+    async fn enrich_list_metadata(
+        &self,
+        b: &str,
+        o: Vec<(String, FileMetadata)>,
+    ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
+        let raw = self.inner.enrich_list_metadata(b, o).await?;
+        self.present_listed(b, raw)
+    }
+    async fn bulk_list_objects_with_baselines(
+        &self,
+        b: &str,
+        p: &str,
+        start_after: Option<&str>,
+        max_listed: Option<usize>,
+    ) -> Result<BulkListing, StorageError> {
+        let mut listing = self
+            .inner
+            .bulk_list_objects_with_baselines(b, p, start_after, max_listed)
+            .await?;
+        listing.objects = self.present_listed(b, std::mem::take(&mut listing.objects))?;
+        Ok(listing)
+    }
+    async fn list_objects_delegated(
+        &self,
+        b: &str,
+        p: &str,
+        d: Option<&str>,
+        m: u32,
+        t: Option<&str>,
+    ) -> Result<Option<DelegatedListResult>, StorageError> {
+        let Some(mut page) = self.inner.list_objects_delegated(b, p, d, m, t).await? else {
+            return Ok(None);
+        };
+        page.objects = self.present_listed(b, std::mem::take(&mut page.objects))?;
+        Ok(Some(page))
+    }
+    /// With a key, the inner listing may hold ciphertext: its own facts are
+    /// not trusted (a backend writer can forge `!!1` markers), a listed
+    /// size is the stored size, and the logical facts come from listing
+    /// tokens that open under a key of this backend.
+    async fn resolve_listed_sizes(
+        &self,
+        b: &str,
+        objects: &mut [(String, FileMetadata)],
+        how: ResolveListed,
+    ) -> Vec<ListedSize> {
+        if !self.has_any_key(b) {
+            return self.inner.resolve_listed_sizes(b, objects, how).await;
+        }
+        let mut sizes = self
+            .inner
+            .resolve_listed_sizes(
+                b,
+                objects,
+                ResolveListed {
+                    passthrough_may_differ: true,
+                    trust_v1_facts: false,
+                    ..how
+                },
+            )
+            .await;
+        if self.inner.lite_list_carries_logical_facts(b) {
+            return sizes;
+        }
+        downgrade_ciphertext_listings(objects, &mut sizes);
+        let tokens = self.inner.listing_tokens(b, objects).await;
+        let cfg = self.config.load();
+        for (((_, meta), size), token) in objects.iter_mut().zip(sizes.iter_mut()).zip(tokens) {
+            let Some(t) = token else { continue };
+            if *size != ListedSize::StoredOnly {
+                continue;
+            }
+            if let Some(lf) = open_token(cfg.ring(), b, &t) {
+                if apply_listing_facts(meta, &t, &lf) {
+                    *size = ListedSize::Cached;
+                }
+            }
+        }
+        sizes
+    }
+
+    // ── Pass-through ──
 
     async fn create_bucket(&self, b: &str) -> Result<(), StorageError> {
         self.inner.create_bucket(b).await
@@ -1661,79 +1874,6 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     async fn has_reference(&self, b: &str, p: &str) -> Result<bool, StorageError> {
         self.inner.has_reference(b, p).await
     }
-    async fn get_reference_metadata(&self, b: &str, p: &str) -> Result<FileMetadata, StorageError> {
-        self.inner.get_reference_metadata(b, p).await
-    }
-    async fn get_delta_metadata(
-        &self,
-        b: &str,
-        p: &str,
-        f: &str,
-    ) -> Result<FileMetadata, StorageError> {
-        self.inner.get_delta_metadata(b, p, f).await
-    }
-    async fn get_passthrough_metadata(
-        &self,
-        b: &str,
-        p: &str,
-        f: &str,
-    ) -> Result<FileMetadata, StorageError> {
-        self.inner.get_passthrough_metadata(b, p, f).await
-    }
-    async fn get_passthrough_metadata_for_rewrite(
-        &self,
-        b: &str,
-        p: &str,
-        f: &str,
-    ) -> Result<(FileMetadata, super::RewriteBasis), StorageError> {
-        // As `get_passthrough_metadata`: the stored metadata as it is.
-        self.inner
-            .get_passthrough_metadata_for_rewrite(b, p, f)
-            .await
-    }
-    async fn put_passthrough_metadata(
-        &self,
-        b: &str,
-        p: &str,
-        f: &str,
-        m: &FileMetadata,
-        basis: &super::RewriteBasis,
-    ) -> Result<(), StorageError> {
-        self.check_witness(b)?;
-        // Metadata itself is not encrypted, but the RAW object carries the
-        // encryption markers, and a caller-supplied FileMetadata built from a
-        // decrypted read may lack them. Re-assert the markers from the raw
-        // object so a metadata-only rewrite can NEVER strip what makes the
-        // object decryptable on read.
-        // The markers come from the raw object ONLY: the caller's copy is
-        // dropped, so a rewrite can neither strip nor plant one.
-        // Fail CLOSED: without the stored markers the rewrite would drop
-        // them and make an encrypted body unreadable.
-        // A caller's earlier read of the stored object gives them without
-        // a HEAD (the rewrite is fenced on that read where the backend can).
-        let raw = match &basis.stored {
-            Some(raw) => raw.clone(),
-            None => self.inner.get_passthrough_metadata(b, p, f).await?,
-        };
-        let meta = with_markers_of(m, &raw);
-        self.inner
-            .put_passthrough_metadata(b, p, f, &meta, basis)
-            .await
-    }
-    async fn put_reference_metadata(
-        &self,
-        b: &str,
-        p: &str,
-        m: &FileMetadata,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), StorageError> {
-        self.check_witness(b)?;
-        // Same rule as put_passthrough_metadata: the body is not rewritten,
-        // so its markers stay those of the stored reference.
-        let raw = self.inner.get_reference_metadata(b, p).await?;
-        let meta = with_markers_of(m, &raw);
-        self.inner.put_reference_metadata(b, p, &meta, proof).await
-    }
     async fn delete_reference(
         &self,
         b: &str,
@@ -1752,92 +1892,13 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     ) -> Result<super::traits::RefFence, StorageError> {
         self.inner.reference_fence(b, p).await
     }
-    /// Metadata is stored as-is (see `get_reference_metadata`).
-    async fn reference_fence_with_metadata(
-        &self,
-        b: &str,
-        p: &str,
-    ) -> Result<(super::traits::RefFence, Option<FileMetadata>), StorageError> {
-        self.inner.reference_fence_with_metadata(b, p).await
-    }
-    /// The same transformation as the unfenced writes (encrypt the body, keep
-    /// the stored markers on a metadata-only write), then the inner fenced
-    /// write: the fence is on the stored object, which is what the inner
-    /// backend observes.
-    async fn write_reference_fenced(
-        &self,
-        b: &str,
-        p: &str,
-        op: super::traits::RefWrite<'_>,
-        fence: &super::traits::RefFence,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<super::traits::RefFence, StorageError> {
-        self.check_witness(b)?;
-        use super::traits::RefWrite;
-        match op {
-            RefWrite::Put { data, metadata } => {
-                let mut meta = without_markers(metadata);
-                let enc = self.encrypt_if_enabled(b, data, &mut meta)?;
-                self.inner
-                    .write_reference_fenced(
-                        b,
-                        p,
-                        RefWrite::Put {
-                            data: &enc,
-                            metadata: &meta,
-                        },
-                        fence,
-                        proof,
-                    )
-                    .await
-            }
-            // Like the unfenced default of `put_reference_from_file`: read the
-            // file, then encrypt it as a Put.
-            RefWrite::PutFile { path, metadata } => {
-                let data = bytes::Bytes::from(tokio::fs::read(path).await?);
-                let mut meta = without_markers(metadata);
-                let enc = self.encrypt_if_enabled(b, &data, &mut meta)?;
-                self.inner
-                    .write_reference_fenced(
-                        b,
-                        p,
-                        RefWrite::Put {
-                            data: &enc,
-                            metadata: &meta,
-                        },
-                        fence,
-                        proof,
-                    )
-                    .await
-            }
-            RefWrite::Metadata { metadata } => {
-                let raw = self.inner.get_reference_metadata(b, p).await?;
-                let meta = with_markers_of(metadata, &raw);
-                self.inner
-                    .write_reference_fenced(
-                        b,
-                        p,
-                        RefWrite::Metadata { metadata: &meta },
-                        fence,
-                        proof,
-                    )
-                    .await
-            }
-            RefWrite::Delete => {
-                self.inner
-                    .write_reference_fenced(b, p, RefWrite::Delete, fence, proof)
-                    .await
-            }
-        }
-    }
     async fn delete_delta(&self, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
         self.inner.delete_delta(b, p, f).await
     }
     async fn delete_passthrough(&self, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
-        // The inner backend drops the listing facts of the ciphertext.
         self.inner.delete_passthrough(b, p, f).await
     }
-    // The version is the stored ciphertext's: an overwrite changes it too.
+    // The version is the stored object's: an overwrite changes it too.
     async fn variant_version(
         &self,
         b: &str,
@@ -1856,15 +1917,6 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         version: &str,
     ) -> Result<bool, StorageError> {
         self.inner.delete_variant_if(b, p, f, v, version).await
-    }
-    async fn scan_deltaspace(&self, b: &str, p: &str) -> Result<Vec<FileMetadata>, StorageError> {
-        self.inner.scan_deltaspace(b, p).await
-    }
-    async fn scan_deltaspace_lite(&self, b: &str, p: &str) -> Result<LiteScanResult, StorageError> {
-        self.inner.scan_deltaspace_lite(b, p).await
-    }
-    async fn holds_only_reference(&self, b: &str, p: &str) -> Result<bool, StorageError> {
-        self.inner.holds_only_reference(b, p).await
     }
     async fn list_deltaspaces(&self, b: &str) -> Result<Vec<String>, StorageError> {
         self.inner.list_deltaspaces(b).await
@@ -1885,87 +1937,56 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         self.check_witness(b)?;
         self.inner.put_directory_marker(b, k).await
     }
-    async fn bulk_list_objects(
-        &self,
-        b: &str,
-        p: &str,
-    ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
-        self.inner.bulk_list_objects(b, p).await
-    }
-    async fn enrich_list_metadata(
-        &self,
-        b: &str,
-        o: Vec<(String, FileMetadata)>,
-    ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
-        self.inner.enrich_list_metadata(b, o).await
-    }
-    async fn bulk_list_objects_with_baselines(
-        &self,
-        b: &str,
-        p: &str,
-        start_after: Option<&str>,
-        max_listed: Option<usize>,
-    ) -> Result<BulkListing, StorageError> {
-        self.inner
-            .bulk_list_objects_with_baselines(b, p, start_after, max_listed)
-            .await
-    }
-    async fn resolve_listed_sizes(
-        &self,
-        b: &str,
-        objects: &mut [(String, FileMetadata)],
-        how: ResolveListed,
-    ) -> Vec<ListedSize> {
-        // With a key (current or legacy), a passthrough entry may be
-        // ciphertext: its facts are looked up like a delta's.
-        let mut sizes = self
-            .inner
-            .resolve_listed_sizes(
-                b,
-                objects,
-                ResolveListed {
-                    passthrough_may_differ: how.passthrough_may_differ || self.has_any_key(b),
-                    ..how
-                },
-            )
-            .await;
-        // An inner listing of ciphertext (S3) reports the ciphertext size of a
-        // passthrough object: without a cache hit, only that is known. A
-        // decrypt-only key (write mode passthrough, or a legacy key) still
-        // reads ciphertext written before.
-        if self.has_any_key(b) && !self.inner.lite_list_carries_logical_facts(b) {
-            downgrade_ciphertext_listings(objects, &mut sizes);
-        }
-        // A listed delta may be ciphertext whenever a key exists: its
-        // listed `.delta` size is not the delta size a HEAD shows.
-        if self.has_any_key(b) && !self.inner.lite_list_carries_logical_facts(b) {
-            mark_encrypted_deltas(objects, &mut sizes);
-        }
-        sizes
-    }
-    async fn list_objects_delegated(
-        &self,
-        b: &str,
-        p: &str,
-        d: Option<&str>,
-        m: u32,
-        t: Option<&str>,
-    ) -> Result<Option<DelegatedListResult>, StorageError> {
-        self.inner.list_objects_delegated(b, p, d, m, t).await
-    }
 }
 
-/// On a backend whose listing reports ciphertext, a passthrough entry the
-/// listing-size cache did not resolve carries the ciphertext size: mark it
+/// The logical facts of a listing token, when it opens under a key of
+/// `ring` for exactly the stored object it was kept for. Pure.
+fn open_token(
+    ring: &seal::Keyring,
+    bucket: &str,
+    t: &crate::storage::ListedToken,
+) -> Option<v2::ListingFacts> {
+    let entry = ring.get(&v2::token_fingerprint(&t.token)?)?;
+    entry.site.open_listing_token(
+        &v2::ListedAt {
+            bucket,
+            stored_key: &t.stored_key,
+            stored_etag: bare_etag(&t.stored_etag),
+            stored_size: t.stored_size,
+        },
+        &t.token,
+    )
+}
+
+/// Apply the facts of an opened listing token to a listed entry. A
+/// passthrough's stored size must be exactly the stored size of its
+/// logical size; a delta's plaintext size follows from its stored size.
+fn apply_listing_facts(
+    meta: &mut FileMetadata,
+    t: &crate::storage::ListedToken,
+    lf: &v2::ListingFacts,
+) -> bool {
+    let body = v2::plaintext_len_of(t.stored_size);
+    if let crate::types::StorageInfo::Delta { delta_size, .. } = &mut meta.storage_info {
+        if let Some(b) = body {
+            *delta_size = b;
+        }
+    } else if body != Some(lf.size) {
+        return false;
+    }
+    meta.file_size = lf.size;
+    if lf.parts == 0 {
+        meta.md5 = hex::encode(lf.etag_digest);
+        meta.multipart_etag = None;
+    } else {
+        meta.multipart_etag = Some(format!("\"{}-{}\"", hex::encode(lf.etag_digest), lf.parts));
+    }
+    true
+}
+
+/// On a backend whose listing reports stored bytes, a passthrough entry
+/// not resolved yet carries its stored (ciphertext) size: mark it
 /// `StoredOnly`. Directory markers stay `Listed`. Pure; unit-tested.
-fn mark_encrypted_deltas(objects: &[(String, FileMetadata)], sizes: &mut [ListedSize]) {
-    for ((_, meta), size) in objects.iter().zip(sizes.iter_mut()) {
-        if *size == ListedSize::Cached && meta.is_delta() {
-            *size = ListedSize::CachedEncryptedDelta;
-        }
-    }
-}
-
 fn downgrade_ciphertext_listings(objects: &[(String, FileMetadata)], sizes: &mut [ListedSize]) {
     for ((key, _), size) in objects.iter().zip(sizes.iter_mut()) {
         if *size == ListedSize::Listed && !key.ends_with('/') {

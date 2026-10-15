@@ -83,7 +83,7 @@ const ENCRYPTION_READS: Record<string, [number, string]> = {
   'components/bucketPolicyPayload.ts': [4, 'the bucket policy\'s own block, not a backend'],
   'components/BucketCard.tsx': [3, 'a draft policy\'s own block, not a backend'],
   'adminApi/backends.ts': [2, 'the create request body'],
-  'backendEncryptionPayload.ts': [1, 'the storage section body of a backend change'],
+  'backendEncryptionPayload.ts': [2, 'the storage section body of a backend change, and its plaintext_reads (copied as stored)'],
   'envOverrides.ts': [1, 'a YAML path string'],
   'bucketEncryption.ts': [1, 'the YAML path in the key file text'],
 };

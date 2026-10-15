@@ -34,12 +34,12 @@ impl DynEngine {
         // Per-backend encryption wrapping.
         //
         // Every backend ends up wrapped by `EncryptingBackend`, whether
-        // or not it has a key configured. The wrapper's read path checks
-        // the `dg-encrypted` metadata marker + sniffs for the DGE1 magic
-        // on "not-encrypted" responses, so even a mode:none backend gets
-        // the xattr-strip defense (if the xattr is lost during a
-        // backup/restore round-trip, the wrapper refuses to serve
-        // DGE1-prefixed ciphertext as plaintext).
+        // or not it has a key configured. The wrapper's read path applies
+        // the read rule (a seal, or plaintext the bucket may serve) and
+        // sniffs for a `DGE<digit>` magic on unsealed bodies, so even a
+        // mode:none backend gets the xattr-strip defense (a body whose
+        // metadata was lost in a backup/restore is never served as
+        // plaintext).
         //
         // Two orthogonal encryption layers live here:
         //   - Proxy-side AES-256-GCM via `EncryptingBackend` when the
@@ -467,7 +467,20 @@ pub(super) fn resolve_encryption_config(
         legacy_key_id: legacy_kid_opt,
         buckets: bucket_keys,
         keyring,
+        serve_plaintext: serves_plaintext(enc),
+        ..Default::default()
     })
+}
+
+/// `plaintext_reads: serve` of a proxy-AES config (issue #120).
+fn serves_plaintext(enc: &crate::config::BackendEncryptionConfig) -> bool {
+    matches!(
+        enc,
+        crate::config::BackendEncryptionConfig::Aes256GcmProxy {
+            plaintext_reads: crate::config::PlaintextReads::Serve,
+            ..
+        }
+    )
 }
 
 /// One key has one id within a raw backend (issue #120): a v2 object
@@ -565,6 +578,7 @@ pub(super) fn resolve_bucket_keys(
         // override that is not native gets no SSE headers on a backend
         // whose own mode is native.
         keys.native = native_encryption_for(o.config);
+        keys.serve_plaintext = serves_plaintext(o.config);
         if let Some(slot) = site.legacy {
             let crate::config::SiteKey { key, key_id: kid } =
                 slot.map_err(StorageError::Encryption)?;
