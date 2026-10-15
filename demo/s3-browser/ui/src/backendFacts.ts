@@ -23,7 +23,7 @@ export function encryptsAtRest(enc: BackendEncryptionSummary | undefined): boole
 }
 
 /** Short encryption word for a picker row. */
-export function encryptionWord(enc: BackendEncryptionSummary | undefined): string {
+export function encryptionWord(enc: Pick<BackendEncryptionSummary, 'mode' | 'has_key'> | undefined): string {
   if (!enc) return 'encryption unknown';
   switch (enc.mode) {
     case 'aes256-gcm-proxy':

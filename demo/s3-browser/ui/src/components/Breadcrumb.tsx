@@ -4,6 +4,7 @@ import { useColors } from '../ThemeContext';
 import { buildBrowserUrl } from '../urlState';
 import { useBucketOrigins } from '../queries/backends';
 import BucketBackendBadge from './BucketBackendBadge';
+import BucketEncryptionIcon from './BucketEncryptionIcon';
 import { showBackendChips } from '../bucketBackend';
 import type { BucketBackendOrigin } from '../types';
 
@@ -111,7 +112,8 @@ export default function Breadcrumb({ bucket, prefix, onNavigate, canAdmin = fals
         </li>
 
         {!compact && canAdmin && bucket && activeOrigin && (
-          <li style={{ display: 'inline-flex', alignItems: 'center', marginLeft: 6 }}>
+          <li style={{ display: 'inline-flex', alignItems: 'center', gap: 6, marginLeft: 6 }}>
+            <BucketEncryptionIcon origin={activeOrigin} />
             <BucketBackendBadge origin={activeOrigin} />
           </li>
         )}

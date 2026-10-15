@@ -20,7 +20,7 @@ import type {
   ConfirmHeaders,
   EffectiveEncryption,
 } from './adminApi';
-import { encryptsAtRest } from './backendFacts';
+import { encryptionWord, encryptsAtRest } from './backendFacts';
 
 /** The radio of the bucket card. "off" is not "inherit": off writes
  *  plaintext even on an encrypting backend, and keeps the bucket key as a
@@ -397,4 +397,13 @@ export type NewBucketEncryption =
 export function newBucketEncryptionBlock(enc: NewBucketEncryption): Record<string, unknown> | undefined {
   if (enc.kind === 'same') return undefined;
   return enc.kind === 'off' ? { mode: 'none' } : { mode: 'aes256-gcm-proxy', key: enc.key, key_id: enc.keyId };
+}
+
+/** Hover text of the browser's padlock: how new writes of the bucket are
+ *  encrypted, or null when they are stored in plaintext (no padlock). */
+export function encryptedAtRestText(eff: EffectiveEncryption | null | undefined): string | null {
+  if (!eff?.encrypts) return null;
+  const key = eff.mode === 'aes256-gcm-proxy' ? eff.key_id : eff.mode === 'sse-kms' ? eff.kms_key_id : undefined;
+  const owner = eff.source === 'bucket' ? 'this bucket' : `backend ${eff.backend}`;
+  return `Encrypted at rest: ${encryptionWord(eff)}${key ? `, key ${key}` : ''} (set on ${owner})`;
 }

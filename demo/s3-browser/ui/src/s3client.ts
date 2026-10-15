@@ -15,6 +15,7 @@ import {
   type ListMultipartUploadsCommandOutput,
   AbortMultipartUploadCommand,
 } from '@aws-sdk/client-s3';
+import { encryptedAtRestText } from './bucketEncryption';
 import { Upload } from '@aws-sdk/lib-storage';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { S3Object, ListResult, BucketInfo } from './types';
@@ -763,6 +764,7 @@ async function listBucketsUncached(opts?: ListBucketsOptions): Promise<BucketInf
     backendRegion: o.backend_region || undefined,
     backendPath: o.backend_path || undefined,
     realBucket: o.real_bucket || undefined,
+    encryptedAtRest: encryptedAtRestText(o.effective_encryption) ?? undefined,
   });
   if (!respSettled.ok) {
     const flagged = (origins?.buckets || []).filter((b) => b.unavailable);

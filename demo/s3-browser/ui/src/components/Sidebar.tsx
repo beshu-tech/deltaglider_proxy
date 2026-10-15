@@ -23,6 +23,7 @@ import {
 import type { BucketInfo } from '../types';
 import { useColors } from '../ThemeContext';
 import BucketBackendBadge from './BucketBackendBadge';
+import BucketEncryptionIcon from './BucketEncryptionIcon';
 import { showBackendChips } from '../bucketBackend';
 import { BUCKET_PROBE_CAP, BUCKET_PROBE_TIMEOUT_MS, deleteConfirmText, deleteMenuEntry, type BucketObjectCount } from '../bucketDelete';
 import CreateBucketModal from './CreateBucketModal';
@@ -464,6 +465,7 @@ export default function Sidebar({
                   }}>
                     {b.name}
                   </span>
+                  <BucketEncryptionIcon origin={b.backend} />
                   {backendChips && (
                     // Line breaking sees the 40 px stub, so the chip shrinks
                     // (with an ellipsis) before it wraps out of view.

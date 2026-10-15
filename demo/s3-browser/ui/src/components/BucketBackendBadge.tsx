@@ -37,7 +37,9 @@ export default function BucketBackendBadge({ origin, style }: Props) {
         // readable stub; a parent that runs out of room wraps it out of view
         // (see the sidebar row) instead of squeezing it to a sliver.
         flex: '0 1 auto',
-        minWidth: 40,
+        // ...but never wider than its own label: a short name ("b2") gets a
+        // tight frame (monospace: one `ch` per character, + padding and border).
+        minWidth: `min(40px, ${label.length}ch + 14px)`,
         ...style,
       }}
     >

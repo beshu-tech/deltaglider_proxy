@@ -35,4 +35,6 @@ export interface BucketBackendOrigin {
   backendRegion?: string;
   backendPath?: string;
   realBucket?: string;
+  /** Hover text of the padlock; undefined = plaintext or unknown. */
+  encryptedAtRest?: string;
 }
