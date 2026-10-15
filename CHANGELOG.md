@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.15 — 2026-10-15
+
 ### Changed — Encryption at rest, format v2 (issue #120)
 
 Proxy-side encryption (`aes256-gcm-proxy`) writes one new format for every object: a delta reference, a delta, and an object stored as it is. The earlier formats `aes-256-gcm-v1` and `aes-256-gcm-chunked-v1` (body magic `DGE1`) are gone, with no reader and no migration, because no deployment used them. An object that an earlier release encrypted fails to read.
