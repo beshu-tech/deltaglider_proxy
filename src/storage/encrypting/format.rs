@@ -66,7 +66,10 @@ pub struct EncryptionKey(pub(crate) [u8; 32]);
 
 impl EncryptionKey {
     pub fn from_hex(hex_str: &str) -> Result<Self, String> {
-        let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex key: {}", e))?;
+        // The decoded copy is wiped on drop too, not only the key.
+        let bytes = zeroize::Zeroizing::new(
+            hex::decode(hex_str).map_err(|e| format!("invalid hex key: {}", e))?,
+        );
         if bytes.len() != 32 {
             return Err(format!(
                 "key must be 32 bytes (64 hex chars), got {}",

@@ -101,8 +101,12 @@ subtle = "2"
 zeroize = "1"
 base64 = "0.22"
 
-# Encryption at rest (AES-256-GCM)
-aes-gcm = "0.10"
+# Encryption at rest (AES-256-GCM). `zeroize` wipes the GHASH key and (through
+# the direct `aes` entry, which unifies the feature) the AES key schedule on
+# drop. `hkdf` derives the per-object keys of format v2 (issue #120).
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+aes = { version = "0.8", features = ["zeroize"] }
+hkdf = "0.12"
 
 # ZIP archive (Full Backup). Pure-Rust deflate via flate2 (no system
 # zlib). Used by the backup export/import handlers to bundle
