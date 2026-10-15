@@ -26,7 +26,17 @@ export const MAX_REPORTED_FAILURES = 20;
 /** What the action bar shows while a bulk action runs. */
 export type BulkProgress =
   | ({ action: BulkAction; phase: 'listing'; stopping: boolean } & ListingProgress)
-  | { action: BulkAction; phase: 'sending'; stopping: boolean; done: number; total: number };
+  /** Counted; the confirmation dialog is open and nothing has started. */
+  | { action: BulkAction; phase: 'confirming'; stopping: boolean; total: number }
+  | {
+      action: BulkAction;
+      phase: 'sending';
+      stopping: boolean;
+      done: number;
+      total: number;
+      /** `Date.now()` when the first batch went: the time left is estimated from it. */
+      startedAt?: number;
+    };
 
 /**
  * Send `items` to `sendBatch` in batches of `batchSize`, one batch at a
@@ -66,20 +76,49 @@ const DONE: Record<BulkAction, string> = { delete: 'deleted', copy: 'copied', mo
 /** What the reports count: a delete says objects, copy and move say items (as their picker does). */
 export const UNIT: Record<BulkAction, string> = { delete: 'object', copy: 'item', move: 'item' };
 
-/** The status line of the action bar while a bulk action runs. */
-export function bulkProgressText(p: BulkProgress): string {
+/** No time left is shown before the run has gone this long: the first batches say little about the rate. */
+const ESTIMATE_AFTER_MS = 5_000;
+
+/** "about 4 min left", from the time per item so far; '' while too early to tell. */
+export function timeLeftText(done: number, total: number, elapsedMs: number): string {
+  if (done <= 0 || done >= total || elapsedMs < ESTIMATE_AFTER_MS) return '';
+  const leftMs = (elapsedMs / done) * (total - done);
+  if (leftMs < 60_000) return 'less than a minute left';
+  const minutes = Math.round(leftMs / 60_000);
+  if (minutes < 90) return `about ${minutes} min left`;
+  return `about ${Math.round(minutes / 60)} h left`;
+}
+
+/**
+ * The status line of the action bar while a bulk action runs. A delete
+ * counts its objects first and says that nothing is deleted yet.
+ */
+export function bulkProgressText(p: BulkProgress, now: number = Date.now()): string {
+  if (p.phase === 'confirming') {
+    return `${count(p.total)} ${noun(p.total, UNIT[p.action])} to ${p.action}. Waiting for your confirmation.`;
+  }
   if (p.phase === 'listing') {
     if (p.stopping) return 'Stopping…';
+    if (p.action === 'delete') {
+      const where = p.folders > 1 ? ` in folder ${Math.min(p.listed + 1, p.folders)} of ${p.folders}` : '';
+      return `Counting objects to delete${where}… ${count(p.keysFound)} found. Nothing is deleted yet.`;
+    }
     if (p.folders === 0) return 'Preparing…';
     const found = p.keysFound > 0 ? ` ${count(p.keysFound)} ${noun(p.keysFound, 'object')} found` : '';
     return `Listing folders ${p.listed} of ${p.folders}…${found}`;
   }
   if (p.stopping) return `Stopping after this batch… ${count(p.done)} of ${count(p.total)} done`;
-  return `${RUNNING[p.action]} ${count(p.done)} of ${count(p.total)}…`;
+  const percent = p.total > 0 ? ` · ${bulkProgressPercent(p)}%` : '';
+  const left = p.startedAt === undefined ? '' : timeLeftText(p.done, p.total, now - p.startedAt);
+  return `${RUNNING[p.action]} ${count(p.done)} of ${count(p.total)}${percent}${left ? ` · ${left}` : '…'}`;
 }
 
-/** The progress bar's percent for the current phase. */
-export function bulkProgressPercent(p: BulkProgress): number {
+/**
+ * The progress bar's percent for the current phase; `null` while a delete
+ * counts (the size of a folder is unknown until it is listed).
+ */
+export function bulkProgressPercent(p: BulkProgress): number | null {
+  if (p.phase === 'confirming' || (p.phase === 'listing' && p.action === 'delete')) return null;
   const [part, whole] = p.phase === 'listing' ? [p.listed, p.folders] : [p.done, p.total];
   return whole === 0 ? 100 : Math.floor((part / whole) * 100);
 }

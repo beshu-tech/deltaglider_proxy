@@ -11,6 +11,47 @@ import type { BulkDeleteProgress } from './adminApi/bulkObjects';
 import { count, keepFailures, sendInBatches } from './bulkBatches';
 import { noun } from './utils';
 
+/** What a delete is about to remove, counted before the confirmation. */
+export interface DeletePlanSummary {
+  /** Objects to delete: the selected objects plus everything inside the selected folders. */
+  objects: number;
+  /** Selected folders. */
+  folders: number;
+  /** Selected objects outside the folders. */
+  files: number;
+}
+
+/** From this many objects the confirmation explains how a long delete runs. */
+const LARGE_DELETE_OBJECTS = 10_000;
+
+/**
+ * The words of the delete confirmation, shown after the selection is
+ * counted: the exact number of objects, what the selection holds, and for a
+ * large delete how it runs and how it stops.
+ */
+export function bulkDeleteConfirm(s: DeletePlanSummary): { title: string; body: string[]; okText: string } {
+  const objects = `${count(s.objects)} ${noun(s.objects, 'object')}`;
+  const parts = [
+    s.folders > 0 ? `${count(s.folders)} ${noun(s.folders, 'folder')}` : '',
+    s.files > 0 ? `${count(s.files)} ${noun(s.files, 'object')}` : '',
+  ].filter(Boolean);
+  const body =
+    s.folders > 0
+      ? [`You selected ${parts.join(' and ')}. With everything inside the ${noun(s.folders, 'folder')}, that is ${objects}. This cannot be undone.`]
+      : [`This cannot be undone.`];
+  if (s.objects >= LARGE_DELETE_OBJECTS) {
+    body.push(
+      `A delete this large runs from this browser tab and can take several minutes. The bar shows how far it got and the time left. Keep the tab open until it ends.`,
+      `Cancel stops it after the batch in flight. Objects deleted before that stay deleted.`,
+    );
+  }
+  return {
+    title: `Delete ${objects} permanently?`,
+    body,
+    okText: s.objects >= LARGE_DELETE_OBJECTS ? `Delete ${objects}` : 'Delete',
+  };
+}
+
 /** The answer of `POST /api/admin/objects/delete`. */
 export interface DeleteBatchResult {
   deleted: number;

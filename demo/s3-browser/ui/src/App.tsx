@@ -583,7 +583,6 @@ export default function App() {
         {(s3.selectedKeys.size > 0 || s3.bulkRunning) && (
           <BulkActionBar
             selectedCount={s3.selectedKeys.size}
-            selectedFolderCount={[...s3.selectedKeys].filter((k) => k.startsWith('folder:')).length}
             onDelete={canDeleteSelected && sessionCaps.canUseBulkActions ? s3.bulkDelete : undefined}
             onCopy={canCopyFromActiveBucket && sessionCaps.canUseBulkActions ? s3.bulkCopy : undefined}
             onMove={canMoveFromActiveBucket && sessionCaps.canUseBulkActions ? s3.bulkMove : undefined}

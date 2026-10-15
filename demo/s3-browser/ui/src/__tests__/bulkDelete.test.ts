@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'vitest';
 import { BULK_BATCH_SIZE, MAX_REPORTED_FAILURES } from '../bulkBatches';
-import { bulkDeleteOutcomeMessage, deleteInBatches, type DeleteBatchResult } from '../bulkDelete';
+import { bulkDeleteConfirm, bulkDeleteOutcomeMessage, deleteInBatches, type DeleteBatchResult } from '../bulkDelete';
 
 // A page of ~50 folders went to the server as ONE delete request: no
 // progress, no cancel, and more than 10,000 keys failed at the very end.
@@ -152,4 +152,23 @@ test('the report after a run', () => {
     bulkDeleteOutcomeMessage({ ...base, deleted: 9700, failed: 100, failures: [{ key: 'a/b.zip', error: 'AccessDenied' }] }),
     { type: 'warning', text: '9,700 of 9,800 objects deleted. 100 failed, for example a/b.zip: AccessDenied' },
   );
+});
+
+test('the delete confirmation gives the exact count, and explains a large delete', () => {
+  assert.deepEqual(bulkDeleteConfirm({ objects: 2, folders: 0, files: 2 }), {
+    title: 'Delete 2 objects permanently?',
+    body: ['This cannot be undone.'],
+    okText: 'Delete',
+  });
+  assert.deepEqual(bulkDeleteConfirm({ objects: 1_201, folders: 1, files: 1 }), {
+    title: 'Delete 1,201 objects permanently?',
+    body: ['You selected 1 folder and 1 object. With everything inside the folder, that is 1,201 objects. This cannot be undone.'],
+    okText: 'Delete',
+  });
+  const large = bulkDeleteConfirm({ objects: 230_412, folders: 2, files: 0 });
+  assert.equal(large.title, 'Delete 230,412 objects permanently?');
+  assert.equal(large.body[0], 'You selected 2 folders. With everything inside the folders, that is 230,412 objects. This cannot be undone.');
+  assert.match(large.body[1], /runs from this browser tab .* Keep the tab open until it ends\.$/);
+  assert.equal(large.body[2], 'Cancel stops it after the batch in flight. Objects deleted before that stay deleted.');
+  assert.equal(large.okText, 'Delete 230,412 objects', 'a large delete names the count on its button');
 });

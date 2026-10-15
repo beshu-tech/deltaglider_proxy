@@ -1,22 +1,22 @@
 import { useState, useCallback } from 'react';
-import { Button, Progress, message } from 'antd';
+import { Button, Progress, Spin, message } from 'antd';
 import { DeleteOutlined, CopyOutlined, ScissorOutlined, DownloadOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import DestinationPickerModal from './DestinationPickerModal';
 import { isSessionExpired, normalizeUiError } from '../errorHandling';
 import { useBackClosesModal } from '../hooks/useOverlayClose';
-import { bulkDeleteConfirmText } from '../bulkSelection';
 import { type BulkProgress, bulkProgressPercent, bulkProgressText } from '../bulkBatches';
-import { type BulkDeleteOutcome, bulkDeleteOutcomeMessage } from '../bulkDelete';
+import { type BulkDeleteOutcome, type DeletePlanSummary, bulkDeleteConfirm, bulkDeleteOutcomeMessage } from '../bulkDelete';
 import { type BulkTransferOutcome, bulkTransferOutcomeMessage } from '../bulkTransfer';
-import { confirmDelete } from './confirmDelete';
+import { confirmDeletePlan } from './confirmDelete';
 
 interface Props {
   selectedCount: number;
-  /** How many of the selected entries are folders (named in the delete confirm). */
-  selectedFolderCount?: number;
-  /** Runs the whole delete; resolves with its outcome, rejects on a failure. */
-  onDelete?: () => Promise<BulkDeleteOutcome>;
+  /**
+   * Runs the whole delete: counts the objects, asks `confirm` with the exact
+   * numbers, then deletes. Resolves with its outcome, rejects on a failure.
+   */
+  onDelete?: (confirm: (plan: DeletePlanSummary) => Promise<boolean>) => Promise<BulkDeleteOutcome>;
   /** Run the whole copy / move; resolve with its outcome, reject on a failure. */
   onCopy?: (destBucket: string, destPrefix: string) => Promise<BulkTransferOutcome>;
   onMove?: (destBucket: string, destPrefix: string) => Promise<BulkTransferOutcome>;
@@ -35,7 +35,7 @@ interface Props {
   onSessionExpired?: () => void;
 }
 
-export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, onDelete, onCopy, onMove, onDownloadZip, progress, onCancel, hint, currentPrefix, selectionKeys, onSessionExpired }: Props) {
+export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove, onDownloadZip, progress, onCancel, hint, currentPrefix, selectionKeys, onSessionExpired }: Props) {
   const colors = useColors();
   const [modal, setModal] = useState<'copy' | 'move' | null>(null);
   const [operating, setOperating] = useState(false);
@@ -81,7 +81,7 @@ export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, 
   const handleDelete = async () => {
     if (!onDelete) return;
     try {
-      const { type, text } = bulkDeleteOutcomeMessage(await onDelete());
+      const { type, text } = bulkDeleteOutcomeMessage(await onDelete((plan) => confirmDeletePlan(bulkDeleteConfirm(plan))));
       message[type](text);
     } catch (e) {
       if (isSessionExpired(e) && onSessionExpired) onSessionExpired();
@@ -90,6 +90,7 @@ export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, 
   };
 
   const busy = operating || downloading;
+  const percent = progress ? bulkProgressPercent(progress) : null;
   const statusStyle = { fontSize: 13, fontFamily: 'var(--font-ui)', color: colors.TEXT_SECONDARY, whiteSpace: 'nowrap' } as const;
 
   return (
@@ -116,22 +117,30 @@ export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, 
             <span role="status" style={statusStyle}>
               {bulkProgressText(progress)}
             </span>
-            <Progress
-              aria-label={`Bulk ${progress.action} progress`}
-              percent={bulkProgressPercent(progress)}
-              status="active"
-              showInfo={false}
-              size="small"
-              style={{ width: 140, margin: 0 }}
-            />
-            <Button
-              size="small"
-              onClick={onCancel}
-              disabled={!onCancel || progress.stopping}
-              aria-label={`Cancel ${progress.action}`}
-            >
-              Cancel
-            </Button>
+            {progress.phase === 'confirming' ? null : percent === null ? (
+              // Counting: the size of a folder is unknown until it is listed.
+              <Spin size="small" aria-label={`Bulk ${progress.action} counting`} />
+            ) : (
+              <Progress
+                aria-label={`Bulk ${progress.action} progress`}
+                percent={percent}
+                status="active"
+                showInfo={false}
+                size="small"
+                style={{ width: 140, margin: 0 }}
+              />
+            )}
+            {/* The confirmation dialog has its own Cancel. */}
+            {progress.phase !== 'confirming' && (
+              <Button
+                size="small"
+                onClick={onCancel}
+                disabled={!onCancel || progress.stopping}
+                aria-label={`Cancel ${progress.action}`}
+              >
+                Cancel
+              </Button>
+            )}
           </>
         ) : (
           <>
@@ -183,9 +192,8 @@ export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, 
                 danger
                 size="small"
                 icon={<DeleteOutlined />}
-                onClick={() =>
-                  confirmDelete(bulkDeleteConfirmText(selectedCount, selectedFolderCount), () => void handleDelete())
-                }
+                // Counts first (nothing is deleted), then asks with the exact number.
+                onClick={() => void handleDelete()}
                 disabled={busy}
                 aria-label={`Delete ${selectedCount} selected items`}
               >

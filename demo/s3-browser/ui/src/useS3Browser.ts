@@ -20,7 +20,7 @@ import useSelection from './useSelection';
 import { virtualWritableChildren } from './permissions';
 import { type ExpandedItem, MAX_BULK_OBJECTS, expandSelection } from './bulkSelection';
 import { type BulkAction, type BulkProgress, BulkActionFailed } from './bulkBatches';
-import { type BulkDeleteOutcome, deleteInBatches } from './bulkDelete';
+import { type BulkDeleteOutcome, type DeletePlanSummary, deleteInBatches } from './bulkDelete';
 import { type BulkTransferOutcome, transferInBatches, transferPlanError } from './bulkTransfer';
 import { downloadZip as saveZip, zipPreflightError } from './zipDownload';
 // Bulk actions → admin objects API; App gates them on `sessionCaps.canUseBulkActions`
@@ -472,8 +472,10 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
           sent: (done: number, went: number) => void,
           progress: (done: number, went: number) => void,
         ) => Promise<O>;
-        /** The outcome of a run cancelled while it listed. */
+        /** The outcome of a run cancelled while it listed (or declined at the confirmation). */
         cancelledWhileListing: () => O;
+        /** Asked after the listing, before the first request: `false` ends the run with nothing done. */
+        confirm?: (items: ExpandedItem[]) => Promise<boolean>;
         /** Reload the listing after each batch: the sources leave the page as the run goes on. */
         reloadPerBatch: boolean;
       },
@@ -489,11 +491,16 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
           signal: ctl.signal,
           onProgress: (p) => setBulkProgress({ action, phase: 'listing', ...p, stopping: stopping() }),
         });
+        if (run.confirm) {
+          setBulkProgress({ action, phase: 'confirming', total: items.length, stopping: false });
+          if (!(await run.confirm(items))) return run.cancelledWhileListing();
+        }
         total = items.length;
-        setBulkProgress({ action, phase: 'sending', done: 0, total, stopping: stopping() });
+        const startedAt = Date.now();
+        setBulkProgress({ action, phase: 'sending', done: 0, total, stopping: stopping(), startedAt });
         const show = (done: number, n: number) => {
           went = n;
-          setBulkProgress({ action, phase: 'sending', done, total, stopping: stopping() });
+          setBulkProgress({ action, phase: 'sending', done, total, stopping: stopping(), startedAt });
         };
         const outcome = await run.send(
           items,
@@ -523,12 +530,21 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     [clearSelection, refresh, mutate],
   );
 
-  /** Delete the selection (see runBulk). The run has no total limit. */
-  const bulkDelete = useCallback((): Promise<BulkDeleteOutcome> => {
+  /**
+   * Delete the selection (see runBulk). The run has no total limit. It
+   * counts the objects first; `confirm` then gets the exact numbers, and
+   * nothing is deleted unless it resolves `true`.
+   */
+  const bulkDelete = useCallback(
+    (confirm?: (plan: DeletePlanSummary) => Promise<boolean>): Promise<BulkDeleteOutcome> => {
     // Snapshot the bucket: a bucket switch mid-run must not move the deletes.
     const bucket = getBucket();
+    const selection = [...selectedKeys];
+    const folders = new Set(selection.filter((k) => k.startsWith('folder:') && k !== 'folder:')).size;
+    const files = selection.filter((k) => !k.startsWith('folder:')).length;
     return runBulk('delete', {
       expand: (opts) => expandSelected(bucket, opts),
+      confirm: confirm && ((items) => (items.length === 0 ? Promise.resolve(true) : confirm({ objects: items.length, folders, files }))),
       send: (items, signal, sent, progress) =>
         deleteInBatches(
           items.map((i) => i.source),
@@ -538,7 +554,9 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
       cancelledWhileListing: () => ({ total: 0, deleted: 0, failed: 0, failures: [], cancelled: true }),
       reloadPerBatch: true,
     });
-  }, [runBulk, expandSelected]);
+    },
+    [runBulk, expandSelected, selectedKeys],
+  );
 
   /**
    * Copy or move the selection to `destBucket`/`destPrefix` (see runBulk).

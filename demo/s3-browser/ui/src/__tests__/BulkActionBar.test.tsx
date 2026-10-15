@@ -1,12 +1,13 @@
 /**
- * The bulk action bar and its destination picker: delete asks first, copy /
+ * The bulk action bar and its destination picker: delete counts, then asks
+ * with the exact number, copy /
  * move send the chosen destination, and a destination path with a `.` or
  * `..` folder (or the selection's own folder) cannot be confirmed.
  */
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, test, vi } from 'vitest';
-import type { BulkDeleteOutcome } from '../bulkDelete';
+import type { BulkDeleteOutcome, DeletePlanSummary } from '../bulkDelete';
 import type { BulkTransferOutcome } from '../bulkTransfer';
 import { ApiError } from '../errorHandling';
 import { renderWithQuery } from '../test/render';
@@ -23,12 +24,17 @@ const transferred = (action: 'copy' | 'move', over: Partial<BulkTransferOutcome>
   action, total: 2, succeeded: 2, failed: 0, deleted: action === 'move' ? 2 : 0, failures: [], cancelled: false, ...over,
 });
 const done = async (): Promise<BulkDeleteOutcome> => ({ total: 3, deleted: 3, failed: 0, failures: [], cancelled: false });
+type Confirm = (plan: DeletePlanSummary) => Promise<boolean>;
+/** A delete as the hook runs it: count, ask, then run `then` or end with nothing done. */
+const askingDelete =
+  (plan: DeletePlanSummary, then: () => Promise<BulkDeleteOutcome>) =>
+  async (confirm: Confirm): Promise<BulkDeleteOutcome> =>
+    (await confirm(plan)) ? then() : { total: 0, deleted: 0, failed: 0, failures: [], cancelled: true };
 
 function bar(props: Partial<Parameters<typeof BulkActionBar>[0]> = {}) {
   return renderWithQuery(
     <BulkActionBar
       selectedCount={2}
-      selectedFolderCount={1}
       currentPrefix="builds/"
       selectionKeys={['builds/app.zip', 'folder:builds/nightly/']}
       {...props}
@@ -37,28 +43,38 @@ function bar(props: Partial<Parameters<typeof BulkActionBar>[0]> = {}) {
 }
 
 describe('delete', () => {
-  test('asks for confirmation naming the folder, and deletes only on OK', async () => {
+  test('counts first, then asks with the exact number; deletes only on OK', async () => {
     const user = userEvent.setup();
-    const onDelete = vi.fn(done);
-    bar({ onDelete });
+    const deleted = vi.fn(done);
+    bar({ onDelete: askingDelete({ objects: 1_201, folders: 1, files: 1 }, deleted) });
     await user.click(screen.getByRole('button', { name: 'Delete 2 selected items' }));
     const dialog = await screen.findByRole('dialog');
-    expect(within(dialog).getAllByText('Delete permanently?').length).toBeGreaterThan(0);
+    expect(within(dialog).getAllByText('Delete 1,201 objects permanently?').length).toBeGreaterThan(0);
     expect(
       within(dialog).getByText(
-        'Delete 2 selected items? 1 of them is a folder: everything inside is deleted too. This cannot be undone.',
+        'You selected 1 folder and 1 object. With everything inside the folder, that is 1,201 objects. This cannot be undone.',
       ),
     ).toBeInTheDocument();
-    expect(onDelete).not.toHaveBeenCalled();
     await user.click(within(dialog).getByRole('button', { name: 'Cancel' }));
-    expect(onDelete).not.toHaveBeenCalled();
-
+    expect(await screen.findByText('Delete cancelled. Nothing was deleted.')).toBeInTheDocument();
+    expect(deleted).not.toHaveBeenCalled();
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
 
     await user.click(screen.getByRole('button', { name: 'Delete 2 selected items' }));
-    const again = await screen.findByRole('dialog');
-    await user.click(within(again).getByRole('button', { name: 'Delete' }));
-    await waitFor(() => expect(onDelete).toHaveBeenCalledTimes(1));
+    await user.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Delete' }));
+    await waitFor(() => expect(deleted).toHaveBeenCalledTimes(1));
+  });
+
+  test('a large delete explains how it runs and names the count on its button', async () => {
+    const user = userEvent.setup();
+    bar({ onDelete: askingDelete({ objects: 230_412, folders: 2, files: 0 }, done) });
+    await user.click(screen.getByRole('button', { name: 'Delete 2 selected items' }));
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText(/Keep the tab open until it ends\./)).toBeInTheDocument();
+    expect(
+      within(dialog).getByText('Cancel stops it after the batch in flight. Objects deleted before that stay deleted.'),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByRole('button', { name: 'Delete 230,412 objects' })).toBeInTheDocument();
   });
 
   test('actions without a handler are not offered; the hint explains why', () => {
@@ -77,15 +93,17 @@ describe('delete', () => {
       progress: { action: 'delete', phase: 'listing', listed: 12, folders: 50, keysFound: 4310, stopping: false },
     });
     const toolbar = screen.getByRole('toolbar', { name: 'Selection actions' });
-    expect(within(toolbar).getByRole('status')).toHaveTextContent('Listing folders 12 of 50… 4,310 objects found');
-    const progress = within(toolbar).getByRole('progressbar', { name: 'Bulk delete progress' });
-    expect(progress).toHaveAttribute('aria-valuenow', '24');
+    expect(within(toolbar).getByRole('status')).toHaveTextContent(
+      'Counting objects to delete in folder 13 of 50… 4,310 found. Nothing is deleted yet.',
+    );
+    // A folder's size is unknown until it is listed: no percent while counting.
+    expect(within(toolbar).queryByRole('progressbar')).toBeNull();
     expect(within(toolbar).queryByRole('button', { name: /^(Copy|Move|Download|Delete) 2/ })).toBeNull();
     await user.click(within(toolbar).getByRole('button', { name: 'Cancel delete' }));
     expect(onCancel).toHaveBeenCalledTimes(1);
 
     view.rerender(<BulkActionBar selectedCount={2} {...props} progress={{ action: 'delete', phase: 'sending', done: 3400, total: 9800, stopping: false }} />);
-    expect(within(toolbar).getByRole('status')).toHaveTextContent('Deleting 3,400 of 9,800…');
+    expect(within(toolbar).getByRole('status')).toHaveTextContent('Deleting 3,400 of 9,800 · 34%…');
     expect(within(toolbar).getByRole('progressbar', { name: 'Bulk delete progress' })).toHaveAttribute('aria-valuenow', '34');
 
     view.rerender(<BulkActionBar selectedCount={2} {...props} progress={{ action: 'delete', phase: 'sending', done: 3400, total: 9800, stopping: true }} />);
@@ -94,15 +112,15 @@ describe('delete', () => {
 
     // A copy or move shows the same, with its own verb.
     view.rerender(<BulkActionBar selectedCount={2} {...props} progress={{ action: 'move', phase: 'sending', done: 500, total: 1201, stopping: false }} />);
-    expect(within(toolbar).getByRole('status')).toHaveTextContent('Moving 500 of 1,201…');
+    expect(within(toolbar).getByRole('status')).toHaveTextContent('Moving 500 of 1,201 · 41%…');
     expect(within(toolbar).getByRole('progressbar', { name: 'Bulk move progress' })).toHaveAttribute('aria-valuenow', '41');
     await user.click(within(toolbar).getByRole('button', { name: 'Cancel move' }));
     expect(onCancel).toHaveBeenCalledTimes(2);
   });
 
-  async function confirmDeleteWith(onDelete: () => Promise<BulkDeleteOutcome>, extra: Parameters<typeof bar>[0] = {}) {
+  async function confirmDeleteWith(run: () => Promise<BulkDeleteOutcome>, extra: Parameters<typeof bar>[0] = {}) {
     const user = userEvent.setup();
-    bar({ onDelete, ...extra });
+    bar({ onDelete: askingDelete({ objects: 9_800, folders: 1, files: 1 }, run), ...extra });
     await user.click(screen.getByRole('button', { name: 'Delete 2 selected items' }));
     await user.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Delete' }));
   }

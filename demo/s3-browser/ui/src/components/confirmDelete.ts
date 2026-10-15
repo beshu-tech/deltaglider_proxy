@@ -1,3 +1,4 @@
+import { createElement } from 'react';
 import { Modal } from 'antd';
 
 /**
@@ -12,5 +13,22 @@ export function confirmDelete(content: string, onOk: () => unknown): void {
     okText: 'Delete',
     okButtonProps: { danger: true },
     onOk,
+  });
+}
+
+/**
+ * The bulk-delete confirmation, after the selection is counted: resolves
+ * `true` on the OK button, `false` on Cancel or close.
+ */
+export function confirmDeletePlan(c: { title: string; body: string[]; okText: string }): Promise<boolean> {
+  return new Promise((resolve) => {
+    Modal.confirm({
+      title: c.title,
+      content: c.body.map((text, i) => createElement('p', { key: i, style: { margin: i ? '8px 0 0' : 0 } }, text)),
+      okText: c.okText,
+      okButtonProps: { danger: true },
+      onOk: () => resolve(true),
+      onCancel: () => resolve(false),
+    });
   });
 }

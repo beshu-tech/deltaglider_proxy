@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import { test } from 'vitest';
 import {
   expandSelection,
-  bulkDeleteConfirmText,
   objectDeleteConfirmText,
   FOLDER_LIST_CONCURRENCY,
   type PrefixLister,
@@ -66,11 +65,7 @@ test('a truncated folder aborts the whole expansion with a clear message', async
   );
 });
 
-test('the delete confirmation names folders (their contents go too)', () => {
-  assert.equal(bulkDeleteConfirmText(2, 0), 'Delete 2 selected items? This cannot be undone.');
-  assert.equal(bulkDeleteConfirmText(1, 1), 'Delete 1 selected item? It is a folder: everything inside is deleted too. This cannot be undone.');
-  assert.equal(bulkDeleteConfirmText(3, 1), 'Delete 3 selected items? 1 of them is a folder: everything inside is deleted too. This cannot be undone.');
-
+test('the inspector delete confirmation names the object', () => {
   // The inspector's single-object delete confirms too (it used to delete on the
   // first click), naming the object.
   assert.equal(objectDeleteConfirmText('builds/v1/app.zip'), 'Delete "builds/v1/app.zip"? This cannot be undone.');

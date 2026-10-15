@@ -171,6 +171,35 @@ describe('bulkDelete', () => {
     expect(result.current.bulkRunning).toBe(false);
   });
 
+  test('the confirmation gets the counted objects; declining deletes nothing', async () => {
+    http.on('POST', DELETE, json({ deleted: 3, failed: 0, failures: [] }));
+    const { result } = await mountBrowser();
+    selectFileAndFolder(result);
+    const confirm = vi.fn(async () => false);
+    const outcome = await act(() => result.current.bulkDelete(confirm));
+    expect(confirm).toHaveBeenCalledWith({ objects: 3, folders: 1, files: 1 });
+    expect(outcome).toMatchObject({ deleted: 0, cancelled: true });
+    expect(http.callsTo('POST', DELETE)).toHaveLength(0);
+    expect(result.current.selectedKeys.size).toBe(2);
+  });
+
+  test('a folder of more than one listing is counted page by page, then deleted', async () => {
+    const keys = Array.from({ length: 10_001 }, (_, i) => `builds/nightly/${String(i).padStart(5, '0')}`);
+    http.on('GET', LIST, (req) => {
+      const after = new URL(req.path, 'http://x').searchParams.get('start_after');
+      const page = after === null ? keys.slice(0, 10_000) : keys.slice(keys.indexOf(after) + 1);
+      const truncated = after === null;
+      return json({ keys: page, truncated, ...(truncated ? { next_start_after: page[page.length - 1] } : {}) });
+    });
+    http.on('POST', DELETE, (req) => json({ deleted: (req.body as { keys: string[] }).keys.length, failed: 0, failures: [] }));
+    const { result } = await mountBrowser();
+    act(() => result.current.toggleKey('folder:builds/nightly/'));
+    const confirm = vi.fn(async () => true);
+    const outcome = await act(() => result.current.bulkDelete(confirm));
+    expect(confirm).toHaveBeenCalledWith({ objects: 10_001, folders: 1, files: 0 });
+    expect(outcome).toMatchObject({ total: 10_001, deleted: 10_001, cancelled: false });
+  }, 30_000);
+
   test('a failed delete keeps the selection and rejects with the error and the count', async () => {
     http.on('POST', DELETE, json({ error: 'denied' }, 500));
     const { result } = await mountBrowser();
@@ -209,7 +238,6 @@ describe('bulkDelete', () => {
           {(s3.selectedKeys.size > 0 || s3.bulkRunning) && (
             <BulkActionBar
               selectedCount={s3.selectedKeys.size}
-              selectedFolderCount={1}
               onDelete={s3.bulkDelete}
               progress={s3.bulkProgress}
               onCancel={s3.cancelBulk}
@@ -226,11 +254,11 @@ describe('bulkDelete', () => {
 
     const toolbar = screen.getByRole('toolbar', { name: 'Selection actions' });
     await waitFor(() => expect(http.callsTo('POST', DELETE)).toHaveLength(1));
-    await waitFor(() => expect(within(toolbar).getByRole('status')).toHaveTextContent('Deleting 0 of 2…'));
+    await waitFor(() => expect(within(toolbar).getByRole('status')).toHaveTextContent('Deleting 0 of 2 · 0%…'));
     const [loads, requests] = [listing.loads, http.calls.length];
 
     act(() => push('{"done":1,"deleted":1,"failed":0}\n'));
-    await waitFor(() => expect(within(toolbar).getByRole('status')).toHaveTextContent('Deleting 1 of 2…'));
+    await waitFor(() => expect(within(toolbar).getByRole('status')).toHaveTextContent('Deleting 1 of 2 · 50%'));
     expect(within(toolbar).getByRole('progressbar', { name: 'Bulk delete progress' })).toHaveAttribute('aria-valuenow', '50');
     // A key's line costs no request: no reload, no poll.
     expect([listing.loads, http.calls.length]).toEqual([loads, requests]);
@@ -296,7 +324,7 @@ describe('bulkDelete in batches', () => {
     const run = startDelete(result);
     await waitFor(() => expect(held).toHaveLength(1));
     expect(held[0].keys).toEqual(BIG.slice(0, 500));
-    expect(result.current.bulkProgress).toEqual({ action: 'delete', phase: 'sending', done: 0, total: 1201, stopping: false });
+    expect(result.current.bulkProgress).toMatchObject({ action: 'delete', phase: 'sending', done: 0, total: 1201, stopping: false });
     const loads = listing.loads;
 
     held[0].answer();
@@ -394,7 +422,6 @@ describe('bulkDelete in batches', () => {
           {(s3.selectedKeys.size > 0 || s3.bulkRunning) && (
             <BulkActionBar
               selectedCount={s3.selectedKeys.size}
-              selectedFolderCount={1}
               onDelete={s3.bulkDelete}
               progress={s3.bulkProgress}
               onCancel={s3.cancelBulk}
@@ -411,11 +438,11 @@ describe('bulkDelete in batches', () => {
 
     const toolbar = screen.getByRole('toolbar', { name: 'Selection actions' });
     await waitFor(() => expect(held).toHaveLength(1));
-    await waitFor(() => expect(within(toolbar).getByRole('status')).toHaveTextContent('Deleting 0 of 1,201…'));
+    await waitFor(() => expect(within(toolbar).getByRole('status')).toHaveTextContent('Deleting 0 of 1,201 · 0%…'));
     expect(within(toolbar).getByRole('progressbar', { name: 'Bulk delete progress' })).toBeInTheDocument();
 
     held[0].answer();
-    await waitFor(() => expect(within(toolbar).getByRole('status')).toHaveTextContent('Deleting 500 of 1,201…'));
+    await waitFor(() => expect(within(toolbar).getByRole('status')).toHaveTextContent('Deleting 500 of 1,201 · 41%'));
     await waitFor(() => expect(held).toHaveLength(2));
 
     await user.click(within(toolbar).getByRole('button', { name: 'Cancel delete' }));

@@ -101,7 +101,7 @@ describe.each(['copy', 'move'] as const)('bulk %s', (op) => {
     await waitFor(() => expect(held).toHaveLength(1));
     expect(held[0].items).toHaveLength(BULK_BATCH_SIZE);
     expect(held[0].items[0]).toEqual({ source_key: BIG[0], relative: `nightly/${BIG[0].split('/').pop()}` });
-    expect(result.current.bulkProgress).toEqual({ action: op, phase: 'sending', done: 0, total: 1201, stopping: false });
+    expect(result.current.bulkProgress).toMatchObject({ action: op, phase: 'sending', done: 0, total: 1201, stopping: false });
 
     held[0].answer();
     await waitFor(() => expect(held).toHaveLength(2));
@@ -262,7 +262,6 @@ test('wired to the action bar: the copy closes the picker, shows its progress, a
         {(s3.selectedKeys.size > 0 || s3.bulkRunning) && (
           <BulkActionBar
             selectedCount={s3.selectedKeys.size}
-            selectedFolderCount={1}
             onCopy={s3.bulkCopy}
             progress={s3.bulkProgress}
             onCancel={s3.cancelBulk}
@@ -286,11 +285,11 @@ test('wired to the action bar: the copy closes the picker, shows its progress, a
   const toolbar = screen.getByRole('toolbar', { name: 'Selection actions' });
   await waitFor(() => expect(held).toHaveLength(1));
   await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
-  await waitFor(() => expect(within(toolbar).getByRole('status')).toHaveTextContent('Copying 0 of 1,201…'));
+  await waitFor(() => expect(within(toolbar).getByRole('status')).toHaveTextContent('Copying 0 of 1,201 · 0%…'));
   expect(within(toolbar).getByRole('progressbar', { name: 'Bulk copy progress' })).toBeInTheDocument();
 
   held[0].answer();
-  await waitFor(() => expect(within(toolbar).getByRole('status')).toHaveTextContent('Copying 500 of 1,201…'));
+  await waitFor(() => expect(within(toolbar).getByRole('status')).toHaveTextContent('Copying 500 of 1,201 · 41%'));
   await waitFor(() => expect(held).toHaveLength(2));
   await user.click(within(toolbar).getByRole('button', { name: 'Cancel copy' }));
   expect(within(toolbar).getByRole('status')).toHaveTextContent('Stopping after this batch…');
