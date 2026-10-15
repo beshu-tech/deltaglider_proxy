@@ -4169,18 +4169,24 @@ async fn test_form_post_waits_for_a_completion_of_the_same_key() {
                 .send()
                 .await
                 .expect("complete");
-            std::time::Instant::now()
         })
     };
     // Inside the stalled completion, which holds the key's write lock.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let post_start = std::time::Instant::now();
     let post = form_post(&server, key, b"form", &[]).await;
-    let post_done = std::time::Instant::now();
+    let waited = post_start.elapsed();
     assert_eq!(post.status().as_u16(), 204);
-    let complete_done = complete.await.unwrap();
+    complete.await.unwrap();
+    // The POST waited for the lock through the rest of the stall (about
+    // 1 s). Not the order in which the two RESPONSES arrive: the server
+    // releases the lock when the completion's store ends, so the POST's
+    // response can reach the client a moment before the completion's.
+    // (A POST that stored first would make the `If-None-Match: *`
+    // completion fail above.)
     assert!(
-        post_done >= complete_done,
-        "the form POST stored inside the completion's write window"
+        waited >= std::time::Duration::from_millis(700),
+        "the form POST stored inside the completion's write window (waited {waited:?})"
     );
     let got = s3
         .get_object()
