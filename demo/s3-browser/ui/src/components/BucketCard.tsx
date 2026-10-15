@@ -334,6 +334,7 @@ export default function BucketCard({
 
   return (
     <div
+      data-bucket-card={name}
       style={{
         border: `1px solid ${cardBorder}`,
         borderRadius: 10,

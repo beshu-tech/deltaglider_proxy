@@ -179,6 +179,14 @@ export function buildViewUrl(view: View, subPath = '', query?: Record<string, st
  * Complements `parseBrowserLocation` which handles the browser-specific `?q=`
  * and `?object=` params.
  */
+/** Query parameter of the Buckets page that opens one bucket's settings. */
+export const BUCKET_SETTINGS_PARAM = 'bucket';
+
+/** The Buckets page with `bucket`'s settings card open. */
+export function bucketSettingsUrl(bucket: string): string {
+  return buildViewUrl('admin', 'storage/buckets', { [BUCKET_SETTINGS_PARAM]: bucket });
+}
+
 export function parseAdminQuery(search: string): Record<string, string> {
   const params = new URLSearchParams(search.startsWith('?') ? search.slice(1) : search);
   const result: Record<string, string> = {};

@@ -101,8 +101,8 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
   // menu's section-YAML target (which IS section-scoped).
   const activeApplyKeys = useMemo(() => applyKeysForPath(adminPath), [adminPath]);
   const navigateAdmin = useCallback(
-    (path: string) => {
-      navigate(buildViewUrl('admin', path));
+    (path: string, query?: Record<string, string>) => {
+      navigate(buildViewUrl('admin', path, query));
       // Close the mobile drawer (if open) on navigation. Harmless
       // no-op on wide viewports where the drawer is never shown.
       setMobileNavOpen(false);

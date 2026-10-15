@@ -42,7 +42,14 @@ test('Create bucket comes before every bucket card, also with the last card expa
   await userEvent.setup().click(last);
   expect(last).toHaveAttribute('aria-expanded', 'true');
   const create = screen.getByTestId('buckets-create');
-  for (const card of screen.getAllByRole('button', { name: / — click to edit/ })) {
+  for (const card of screen.getAllByRole('button', { name: / — click to (edit|collapse)/ })) {
     expect(create.compareDocumentPosition(card) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   }
+});
+
+test('?bucket= opens that bucket card', async () => {
+  renderWithQuery(<BucketsPanel search="?bucket=releases" />);
+  const card = await screen.findByRole('button', { name: /^releases — click to collapse/ });
+  expect(card).toHaveAttribute('aria-expanded', 'true');
+  expect(screen.getByRole('button', { name: /^downloads — click to edit/ })).toHaveAttribute('aria-expanded', 'false');
 });

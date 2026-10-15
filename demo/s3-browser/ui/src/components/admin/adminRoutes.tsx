@@ -26,12 +26,13 @@ import SystemPanel from '../SystemPanel';
 import WebhookDeliveryPanel from '../WebhookDeliveryPanel';
 import TabHeader from '../TabHeader';
 import { headerForPath } from '../adminNavigation';
+import { BUCKET_SETTINGS_PARAM } from '../../urlState';
 
 /** Everything a routed admin page may need from AdminPage. */
 export interface AdminRouteContext {
   onSessionExpired?: () => void;
   onBack: () => void;
-  navigateAdmin: (path: string) => void;
+  navigateAdmin: (path: string, query?: Record<string, string>) => void;
   navigateToGroup: (groupId: number) => void;
   /** Group to preselect when arriving from a user's group chip. */
   pendingGroupId: number | null;
@@ -88,8 +89,7 @@ const ADMIN_ROUTES: Record<string, AdminRoute> = {
     render: (c) => (
       <AdmissionPanel
         onSessionExpired={c.onSessionExpired}
-        // No per-bucket deep link yet: land on the Buckets page.
-        onNavigateToBucket={(_bucket) => c.navigateAdmin('storage/buckets')}
+        onNavigateToBucket={(bucket) => c.navigateAdmin('storage/buckets', { [BUCKET_SETTINGS_PARAM]: bucket })}
       />
     ),
   },
@@ -124,7 +124,7 @@ const ADMIN_ROUTES: Record<string, AdminRoute> = {
     render: (c) => <BackendsPanel onSessionExpired={c.onSessionExpired} />,
   },
   'storage/buckets': {
-    render: (c) => <BucketsPanel onSessionExpired={c.onSessionExpired} />,
+    render: (c) => <BucketsPanel onSessionExpired={c.onSessionExpired} search={c.search} />,
   },
   'jobs': {
     render: (c) => <JobsPanel onSessionExpired={c.onSessionExpired} search={c.search} />,

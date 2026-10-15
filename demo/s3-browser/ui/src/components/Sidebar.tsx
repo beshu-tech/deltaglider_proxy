@@ -5,6 +5,7 @@ import type { MenuProps } from 'antd';
 import {
   PlusOutlined,
   DeleteOutlined,
+  EditOutlined,
   EllipsisOutlined,
   UploadOutlined,
   ExclamationCircleOutlined,
@@ -25,6 +26,8 @@ import BucketBackendBadge from './BucketBackendBadge';
 import { showBackendChips } from '../bucketBackend';
 import { BUCKET_PROBE_CAP, BUCKET_PROBE_TIMEOUT_MS, deleteConfirmText, deleteMenuEntry, type BucketObjectCount } from '../bucketDelete';
 import CreateBucketModal from './CreateBucketModal';
+import { useNavigation } from '../NavigationContext';
+import { bucketSettingsUrl } from '../urlState';
 
 const { Sider } = Layout;
 const { Text } = Typography;
@@ -101,6 +104,7 @@ export default function Sidebar({
   const [objectCounts, setObjectCounts] = useState<Record<string, BucketObjectCount>>({});
   const { token } = theme.useToken();
   const [messageApi, contextHolder] = message.useMessage();
+  const { navigate } = useNavigation();
 
   useEffect(() => {
     let cancelled = false;
@@ -302,23 +306,35 @@ export default function Sidebar({
       .finally(() => clearTimeout(timer));
   };
 
-  const bucketMenu = (name: string): MenuProps => {
+  // Settings need the admin GUI; delete needs admin on the bucket, and an
+  // unavailable bucket offers only its settings (where its backend is fixed).
+  const canEditSettings = canAdmin;
+  const canDeleteRow = (b: BucketInfo) => !b.unavailable && canDeleteBucket(b.name);
+
+  const bucketMenu = (b: BucketInfo): MenuProps => {
+    const name = b.name;
     const entry = deleteMenuEntry(objectCounts[name]);
+    const items: NonNullable<MenuProps['items']> = [];
+    if (canEditSettings) {
+      items.push({ key: 'settings', icon: <EditOutlined />, label: 'Edit settings' });
+    }
+    if (canDeleteRow(b)) {
+      items.push({
+        key: 'delete',
+        danger: !entry.disabled,
+        disabled: entry.disabled,
+        icon: <DeleteOutlined />,
+        label: entry.label,
+        title: entry.disabled && objectCounts[name]?.state === 'known'
+          ? 'Only an empty bucket can be deleted. Delete or move its objects first.'
+          : undefined,
+      });
+    }
     return {
-      items: [
-        {
-          key: 'delete',
-          danger: !entry.disabled,
-          disabled: entry.disabled,
-          icon: <DeleteOutlined />,
-          label: entry.label,
-          title: entry.disabled && objectCounts[name]?.state === 'known'
-            ? 'Only an empty bucket can be deleted. Delete or move its objects first.'
-            : undefined,
-        },
-      ],
+      items,
       onClick: ({ key, domEvent }) => {
         domEvent.stopPropagation();
+        if (key === 'settings') navigate(bucketSettingsUrl(name));
         if (key === 'delete') confirmDeleteBucket(name);
       },
     };
@@ -469,12 +485,12 @@ export default function Sidebar({
                   )}
                 </span>
               </button>
-              {!isUnavailable && canDeleteBucket(b.name) && (
+              {(canEditSettings || canDeleteRow(b)) && (
                 <Dropdown
-                  menu={bucketMenu(b.name)}
+                  menu={bucketMenu(b)}
                   trigger={['click']}
                   placement="bottomRight"
-                  onOpenChange={(isOpen) => { if (isOpen) probeBucketContents(b.name); }}
+                  onOpenChange={(isOpen) => { if (isOpen && canDeleteRow(b)) probeBucketContents(b.name); }}
                 >
                   <Button
                     type="text"

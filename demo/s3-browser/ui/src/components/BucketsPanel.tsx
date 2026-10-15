@@ -23,7 +23,7 @@
  * Uses the section-level storage Apply flow so dirty-state indicators,
  * beforeunload, and Cmd/Ctrl+S behave like the rest of Configuration.
  */
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Button, Space, Typography, message } from 'antd';
 import Dropdown from './KeyboardDropdown';
 import { DownOutlined, PlusOutlined } from '@ant-design/icons';
@@ -62,9 +62,12 @@ import { applySection, sectionApplyErrorText } from '../applySection';
 import { bucketsWhoseEncryptionChanged, dominantTransition, type ReencryptTransition } from '../bucketEncryption';
 import type { EffectiveEncryption } from '../adminApi';
 import { numericCompare } from '../utils';
+import { BUCKET_SETTINGS_PARAM, parseAdminQuery } from '../urlState';
 
 interface Props {
   onSessionExpired?: () => void;
+  /** `?bucket=<name>` opens that bucket's card (`bucketSettingsUrl`). */
+  search?: string;
 }
 
 type PolicyGet = NonNullable<AdminConfig['bucket_policies']>[string];
@@ -73,7 +76,7 @@ type BucketWire = { buckets: Record<string, PolicyGet | BucketPolicyPatch | null
 
 const { Text } = Typography;
 
-export default function BucketsPanel({ onSessionExpired }: Props) {
+export default function BucketsPanel({ onSessionExpired, search }: Props) {
   const { cardStyle, inputRadius } = useCardStyles();
 
   // Bucket names that had a policy on the server at fetch time — the
@@ -152,6 +155,17 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
   const [createOpen, setCreateOpen] = useState(false);
   /** Expanded row: `real:<name>` for buckets, the row `_id` for drafts. */
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
+  // A deep link (`?bucket=`) opens its bucket's card once the bucket list
+  // names it, and scrolls the card into view.
+  const linkedBucket = parseAdminQuery(search ?? '')[BUCKET_SETTINGS_PARAM] ?? null;
+  const linkedBucketKnown = linkedBucket !== null && realBuckets.includes(linkedBucket);
+  useEffect(() => {
+    if (!linkedBucket || !linkedBucketKnown) return;
+    setExpandedKey(`real:${linkedBucket}`);
+    document
+      .querySelector(`[data-bucket-card="${CSS.escape(linkedBucket)}"]`)
+      ?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, [linkedBucket, linkedBucketKnown]);
   /** Re-encrypt proposal: the manual "Re-encrypt existing objects" action
    *  of a card, or the offer after an encryption change of a bucket. */
   const [reencrypt, setReencrypt] = useState<{ buckets: string[]; transition: ReencryptTransition } | null>(null);
