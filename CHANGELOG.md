@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed — DeleteBucket on a non-empty backend bucket answers 409
+
+When the backend refused DeleteBucket with `BucketNotEmpty`, the proxy answered `500 InternalError`. It now answers `409 BucketNotEmpty`. A Backblaze B2 bucket keeps every old version of a deleted object, so it can refuse DeleteBucket when a listing through the proxy shows no objects.
+
 ## v2.0.14 — 2026-10-15
 
 ### Fixed — DeleteBucket right after an upload

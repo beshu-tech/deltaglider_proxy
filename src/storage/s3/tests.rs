@@ -1026,6 +1026,24 @@ mod classify_tests {
         );
     }
 
+    /// A backend's 409 BucketNotEmpty is the client's 409 BucketNotEmpty.
+    /// Before, it fell into the S3(...) catch-all: DeleteBucket on a B2
+    /// bucket that still held old versions answered 500 InternalError.
+    #[test]
+    fn classify_s3_error_maps_bucket_not_empty() {
+        let inner = GetObjectError::generic(
+            aws_smithy_types::error::ErrorMetadata::builder()
+                .code("BucketNotEmpty")
+                .build(),
+        );
+        let err: SdkError<_> = SdkError::service_error(inner, http_response(409, Some("req-409")));
+        let classified = S3Backend::classify_s3_error("b", &err, S3Op::Other("delete_bucket"));
+        assert!(
+            matches!(classified, StorageError::BucketNotEmpty(ref b) if b == "b"),
+            "got {classified:?}"
+        );
+    }
+
     /// A 416 is the backend saying "range not satisfiable": every ranged
     /// read gets `InvalidRange` (416 to the client), whatever the error
     /// code and the operation. Before, only `open_passthrough_range`

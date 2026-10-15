@@ -150,6 +150,11 @@ impl S3Backend {
         if code == "NoSuchBucket" {
             return StorageError::BucketNotFound(bucket.to_string());
         }
+        // DeleteBucket on a bucket that still holds objects or old versions
+        // (B2 keeps every version): a 409 to the client, not a 500.
+        if code == "BucketNotEmpty" {
+            return StorageError::BucketNotEmpty(bucket.to_string());
+        }
         // The backend refuses the key's length: a client error, not a 500.
         if code == "KeyTooLongError" {
             return StorageError::KeyTooLong(format!(
