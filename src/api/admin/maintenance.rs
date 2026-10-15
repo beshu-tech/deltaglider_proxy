@@ -205,7 +205,7 @@ pub async fn start_reencrypt(
     drop(cfg);
 
     if !started.is_empty() {
-        state.s3_state.maintenance_notify.notify_one();
+        crate::maintenance::wake_workers(&state.s3_state.maintenance_notify);
         let names: Vec<&str> = started.iter().map(|s| s.bucket.as_str()).collect();
         info!("maintenance: re-encrypt requested for {:?}", names);
         super::audit_log(
@@ -290,7 +290,7 @@ pub async fn start_backfill(
     }
 
     if !started.is_empty() {
-        state.s3_state.maintenance_notify.notify_one();
+        crate::maintenance::wake_workers(&state.s3_state.maintenance_notify);
         let names: Vec<&str> = started.iter().map(|s| s.bucket.as_str()).collect();
         info!("maintenance: metadata backfill requested for {:?}", names);
         super::audit_log(
@@ -485,7 +485,7 @@ pub async fn start_migrate(
         )));
     };
 
-    state.s3_state.maintenance_notify.notify_one();
+    crate::maintenance::wake_workers(&state.s3_state.maintenance_notify);
     info!(
         "maintenance: migrate requested for '{}' → '{}' (job #{job_id})",
         bucket, params.target_backend
@@ -584,10 +584,14 @@ pub async fn bucket_status(
             "the session may not list this bucket",
         ));
     }
-    let job = super::with_jobs_db(&state, "read bucket maintenance status", |db| {
-        db.maintenance_active_job_for_bucket(&bucket.to_ascii_lowercase())
+    let jobs = super::with_jobs_db(&state, "read bucket maintenance status", |db| {
+        db.maintenance_active_jobs_for_bucket(&bucket.to_ascii_lowercase())
     })
     .await?;
+    let (deletes, mut holding): (Vec<_>, Vec<_>) = jobs
+        .into_iter()
+        .partition(|j| j.kind == crate::maintenance::delete::KIND);
+    let job = (!holding.is_empty()).then(|| holding.remove(0));
     // `active` is the job row (until it settles); `writes_blocked` is the
     // write gate.
     // They differ: a cancelled migrate releases the source while it still
@@ -600,5 +604,8 @@ pub async fn bucket_status(
             ..MaintenanceJobView::from(j)
         }),
         "writes_blocked": busy,
+        // The bucket's running deletes: they do not hold it, so several
+        // run next to each other and next to `active`.
+        "deletes": deletes.into_iter().map(MaintenanceJobView::from).collect::<Vec<_>>(),
     })))
 }

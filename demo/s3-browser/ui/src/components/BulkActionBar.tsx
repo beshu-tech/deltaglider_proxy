@@ -6,17 +6,18 @@ import DestinationPickerModal from './DestinationPickerModal';
 import { isSessionExpired, normalizeUiError } from '../errorHandling';
 import { useBackClosesModal } from '../hooks/useOverlayClose';
 import { type BulkProgress, bulkProgressPercent, bulkProgressText } from '../bulkBatches';
-import { type BulkDeleteOutcome, type DeletePlanSummary, bulkDeleteConfirm, bulkDeleteOutcomeMessage } from '../bulkDelete';
+import { type DeleteJobOutcome, type DeletePlanSummary, bulkDeleteConfirm, deleteJobMessage } from '../bulkDelete';
 import { type BulkTransferOutcome, bulkTransferOutcomeMessage } from '../bulkTransfer';
 import { confirmDeletePlan } from './confirmDelete';
 
 interface Props {
   selectedCount: number;
   /**
-   * Runs the whole delete: counts the objects, asks `confirm` with the exact
-   * numbers, then deletes. Resolves with its outcome, rejects on a failure.
+   * Starts the delete: counts the objects, asks `confirm` with the exact
+   * numbers, then starts the server job that deletes. Resolves with the
+   * outcome, rejects on a failure.
    */
-  onDelete?: (confirm: (plan: DeletePlanSummary) => Promise<boolean>) => Promise<BulkDeleteOutcome>;
+  onDelete?: (confirm: (plan: DeletePlanSummary) => Promise<boolean>) => Promise<DeleteJobOutcome>;
   /** Run the whole copy / move; resolve with its outcome, reject on a failure. */
   onCopy?: (destBucket: string, destPrefix: string) => Promise<BulkTransferOutcome>;
   onMove?: (destBucket: string, destPrefix: string) => Promise<BulkTransferOutcome>;
@@ -81,7 +82,7 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
   const handleDelete = async () => {
     if (!onDelete) return;
     try {
-      const { type, text } = bulkDeleteOutcomeMessage(await onDelete((plan) => confirmDeletePlan(bulkDeleteConfirm(plan))));
+      const { type, text } = deleteJobMessage(await onDelete((plan) => confirmDeletePlan(bulkDeleteConfirm(plan))));
       message[type](text);
     } catch (e) {
       if (isSessionExpired(e) && onSessionExpired) onSessionExpired();

@@ -340,6 +340,8 @@ export function kindLabel(kind: JobKind): string {
       return 'Migrate';
     case 'backfill-metadata':
       return 'Backfill metadata';
+    case 'delete':
+      return 'Delete';
     default:
       return kind;
   }
@@ -1002,6 +1004,8 @@ function kindWords(kind: JobKind, verb?: LifecycleVerb): KindWords {
       return { done: 're-encrypted', skipped: 'already current', nothing: 'all already current' };
     case 'migrate':
       return { done: 'copied', skipped: 'already on the target', nothing: 'nothing to copy' };
+    case 'delete':
+      return { done: 'deleted', skipped: 'skipped', nothing: 'nothing to delete' };
     default:
       return { done: 'processed', skipped: 'skipped', nothing: 'nothing to do' };
   }

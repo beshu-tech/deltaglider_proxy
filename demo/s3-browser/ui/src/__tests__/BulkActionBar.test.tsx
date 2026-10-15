@@ -7,7 +7,7 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, test, vi } from 'vitest';
-import type { BulkDeleteOutcome, DeletePlanSummary } from '../bulkDelete';
+import type { DeleteJobOutcome, DeletePlanSummary } from '../bulkDelete';
 import type { BulkTransferOutcome } from '../bulkTransfer';
 import { ApiError } from '../errorHandling';
 import { renderWithQuery } from '../test/render';
@@ -23,13 +23,13 @@ type Op = (b: string, p: string) => Promise<BulkTransferOutcome>;
 const transferred = (action: 'copy' | 'move', over: Partial<BulkTransferOutcome> = {}): BulkTransferOutcome => ({
   action, total: 2, succeeded: 2, failed: 0, deleted: action === 'move' ? 2 : 0, failures: [], cancelled: false, ...over,
 });
-const done = async (): Promise<BulkDeleteOutcome> => ({ total: 3, deleted: 3, failed: 0, failures: [], cancelled: false });
+const done = async (): Promise<DeleteJobOutcome> => ({ total: 3, cancelled: false, failed: 0, jobId: 1 });
 type Confirm = (plan: DeletePlanSummary) => Promise<boolean>;
 /** A delete as the hook runs it: count, ask, then run `then` or end with nothing done. */
 const askingDelete =
-  (plan: DeletePlanSummary, then: () => Promise<BulkDeleteOutcome>) =>
-  async (confirm: Confirm): Promise<BulkDeleteOutcome> =>
-    (await confirm(plan)) ? then() : { total: 0, deleted: 0, failed: 0, failures: [], cancelled: true };
+  (plan: DeletePlanSummary, then: () => Promise<DeleteJobOutcome>) =>
+  async (confirm: Confirm): Promise<DeleteJobOutcome> =>
+    (await confirm(plan)) ? then() : { total: 0, cancelled: true, failed: 0 };
 
 function bar(props: Partial<Parameters<typeof BulkActionBar>[0]> = {}) {
   return renderWithQuery(
@@ -70,9 +70,9 @@ describe('delete', () => {
     bar({ onDelete: askingDelete({ objects: 230_412, folders: 2, files: 0 }, done) });
     await user.click(screen.getByRole('button', { name: 'Delete 2 selected items' }));
     const dialog = await screen.findByRole('dialog');
-    expect(within(dialog).getByText(/Keep the tab open until it ends\./)).toBeInTheDocument();
+    expect(within(dialog).getByText(/It runs on the server, so you can close this tab\./)).toBeInTheDocument();
     expect(
-      within(dialog).getByText('Cancel stops it after the batch in flight. Objects deleted before that stay deleted.'),
+      within(dialog).getByText('Cancel stops it after the page in flight. Objects deleted before that stay deleted.'),
     ).toBeInTheDocument();
     expect(within(dialog).getByRole('button', { name: 'Delete 230,412 objects' })).toBeInTheDocument();
   });
@@ -102,13 +102,14 @@ describe('delete', () => {
     await user.click(within(toolbar).getByRole('button', { name: 'Cancel delete' }));
     expect(onCancel).toHaveBeenCalledTimes(1);
 
-    view.rerender(<BulkActionBar selectedCount={2} {...props} progress={{ action: 'delete', phase: 'sending', done: 3400, total: 9800, stopping: false }} />);
-    expect(within(toolbar).getByRole('status')).toHaveTextContent('Deleting 3,400 of 9,800 · 34%…');
-    expect(within(toolbar).getByRole('progressbar', { name: 'Bulk delete progress' })).toHaveAttribute('aria-valuenow', '34');
+    // A delete only starts its server job in the bar: the bucket shows it then.
+    view.rerender(<BulkActionBar selectedCount={2} {...props} progress={{ action: 'delete', phase: 'sending', done: 0, total: 9800, stopping: false }} />);
+    expect(within(toolbar).getByRole('status')).toHaveTextContent('Starting the delete of 9,800 objects…');
+    expect(within(toolbar).queryByRole('progressbar')).toBeNull();
 
-    view.rerender(<BulkActionBar selectedCount={2} {...props} progress={{ action: 'delete', phase: 'sending', done: 3400, total: 9800, stopping: true }} />);
+    view.rerender(<BulkActionBar selectedCount={2} {...props} progress={{ action: 'copy', phase: 'sending', done: 3400, total: 9800, stopping: true }} />);
     expect(within(toolbar).getByRole('status')).toHaveTextContent('Stopping after this batch… 3,400 of 9,800 done');
-    expect(within(toolbar).getByRole('button', { name: 'Cancel delete' })).toBeDisabled();
+    expect(within(toolbar).getByRole('button', { name: 'Cancel copy' })).toBeDisabled();
 
     // A copy or move shows the same, with its own verb.
     view.rerender(<BulkActionBar selectedCount={2} {...props} progress={{ action: 'move', phase: 'sending', done: 500, total: 1201, stopping: false }} />);
@@ -118,21 +119,18 @@ describe('delete', () => {
     expect(onCancel).toHaveBeenCalledTimes(2);
   });
 
-  async function confirmDeleteWith(run: () => Promise<BulkDeleteOutcome>, extra: Parameters<typeof bar>[0] = {}) {
+  async function confirmDeleteWith(run: () => Promise<DeleteJobOutcome>, extra: Parameters<typeof bar>[0] = {}) {
     const user = userEvent.setup();
     bar({ onDelete: askingDelete({ objects: 9_800, folders: 1, files: 1 }, run), ...extra });
     await user.click(screen.getByRole('button', { name: 'Delete 2 selected items' }));
     await user.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Delete' }));
   }
 
-  test('a finished delete reports what it did', async () => {
-    await confirmDeleteWith(async () => ({ total: 9800, deleted: 9800, failed: 0, failures: [], cancelled: false }));
-    expect(await screen.findByText('9,800 objects deleted')).toBeInTheDocument();
-  });
-
-  test('a cancelled delete reports how far it got', async () => {
-    await confirmDeleteWith(async () => ({ total: 9800, deleted: 3400, failed: 0, failures: [], cancelled: true }));
-    expect(await screen.findByText('Delete stopped. 3,400 of 9,800 objects deleted.')).toBeInTheDocument();
+  test('a started delete says it runs on the server', async () => {
+    await confirmDeleteWith(async () => ({ total: 9800, cancelled: false, failed: 0, jobId: 4 }));
+    expect(
+      await screen.findByText('Deleting 9,800 objects on the server. You can close this tab: the bucket shows the progress.'),
+    ).toBeInTheDocument();
   });
 
   test('a delete that stops on an error shows the error with its count', async () => {

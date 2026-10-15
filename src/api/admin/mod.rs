@@ -22,6 +22,7 @@ mod logs;
 pub(crate) mod maintenance;
 pub(crate) mod objects;
 mod path_guard;
+pub(crate) use path_guard::AdminObjectPath;
 pub(crate) mod replication;
 pub(crate) mod savings;
 mod scanner;
@@ -99,8 +100,8 @@ pub use maintenance::{
     start_migrate as maintenance_start_migrate, start_reencrypt as maintenance_start_reencrypt,
 };
 pub use objects::{
-    bulk_delete as bulk_delete_objects, copy_objects, download_zip, list_all as list_all_objects,
-    move_objects,
+    bulk_delete as bulk_delete_objects, cancel_delete_job, copy_objects, download_zip,
+    list_all as list_all_objects, move_objects, start_delete_job,
 };
 pub use savings::{get_savings, SavingsCache};
 pub use scanner::{

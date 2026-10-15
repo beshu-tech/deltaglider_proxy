@@ -49,12 +49,14 @@ test('progress text and percent, per phase and action', () => {
   assert.equal(bulkProgressText({ ...copyListing, folders: 0, listed: 0, keysFound: 0 }), 'Preparing…');
   assert.equal(bulkProgressText({ ...listing, stopping: true }), 'Stopping…');
 
-  const sending: BulkProgress = { action: 'delete', phase: 'sending', done: 3400, total: 9800, stopping: false };
-  assert.equal(bulkProgressText(sending), 'Deleting 3,400 of 9,800 · 34%…');
-  assert.equal(bulkProgressText({ ...sending, action: 'copy' }), 'Copying 3,400 of 9,800 · 34%…');
+  const sending: BulkProgress = { action: 'copy', phase: 'sending', done: 3400, total: 9800, stopping: false };
+  assert.equal(bulkProgressText(sending), 'Copying 3,400 of 9,800 · 34%…');
   assert.equal(bulkProgressText({ ...sending, action: 'move' }), 'Moving 3,400 of 9,800 · 34%…');
+  // A delete only starts its server job in this phase.
+  assert.equal(bulkProgressText({ ...sending, action: 'delete' }), 'Starting the delete of 9,800 objects…');
+  assert.equal(bulkProgressPercent({ ...sending, action: 'delete' }), null);
   // The time left, from the rate so far: 3,400 in 68 s → 6,400 more in 128 s.
-  assert.equal(bulkProgressText({ ...sending, startedAt: 0 }, 68_000), 'Deleting 3,400 of 9,800 · 34% · about 2 min left');
+  assert.equal(bulkProgressText({ ...sending, startedAt: 0 }, 68_000), 'Copying 3,400 of 9,800 · 34% · about 2 min left');
   assert.equal(bulkProgressPercent(sending), 34, 'rounds down: 100 only when done');
   assert.equal(bulkProgressText({ ...sending, stopping: true }), 'Stopping after this batch… 3,400 of 9,800 done');
   assert.equal(bulkProgressPercent({ ...sending, done: 0, total: 0 }), 100);

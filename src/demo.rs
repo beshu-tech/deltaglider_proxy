@@ -449,6 +449,14 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             "/_/api/admin/objects/delete",
             post(admin::bulk_delete_objects),
         )
+        .route(
+            "/_/api/admin/objects/delete-jobs",
+            post(admin::start_delete_job),
+        )
+        .route(
+            "/_/api/admin/objects/delete-jobs/:id/cancel",
+            post(admin::cancel_delete_job),
+        )
         .route("/_/api/admin/objects/zip", get(admin::download_zip))
         .route("/_/api/admin/objects/list", get(admin::list_all_objects))
         .layer(middleware::from_fn_with_state(

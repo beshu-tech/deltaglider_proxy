@@ -211,6 +211,11 @@ async fn admin_jobs_and_scans_refuse_the_coordination_bucket() {
             "/_/api/admin/jobs/backfill-metadata",
             serde_json::json!({"buckets": [SYNC]}),
         ),
+        (
+            "delete job",
+            "/_/api/admin/objects/delete-jobs",
+            serde_json::json!({"bucket": SYNC, "prefixes": ["_dgp/"]}),
+        ),
     ] {
         let r = admin
             .post(format!("{ep}{path}"))

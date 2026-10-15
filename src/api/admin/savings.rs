@@ -943,14 +943,28 @@ mod tests {
         ] {
             assert!(body(head).contains(call), "{head} must call {call}");
         }
-        // The only mutating admin object handlers are the three above.
+        // A delete job deletes in the worker, which drops the totals.
+        assert!(
+            include_str!("../../maintenance/delete.rs").contains(".invalidate_keys("),
+            "the delete job must invalidate the savings cache"
+        );
+        // The only mutating admin object handlers are the three above, and
+        // the delete job's start (its worker invalidates, checked above).
         let handlers: Vec<&str> = src
             .lines()
             .filter(|l| l.starts_with("pub async fn "))
             .collect();
         for h in &handlers {
             assert!(
-                ["copy_objects", "move_objects", "bulk_delete", "download_zip", "list_all"]
+                [
+                    "copy_objects",
+                    "move_objects",
+                    "bulk_delete",
+                    "download_zip",
+                    "list_all",
+                    "start_delete_job",
+                    "cancel_delete_job",
+                ]
                     .iter()
                     .any(|name| h.contains(&format!("fn {name}("))),
                 "new admin object handler {h}: does it change objects? then invalidate the savings cache"

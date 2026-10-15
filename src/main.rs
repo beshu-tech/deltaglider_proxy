@@ -975,12 +975,19 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
+    // Shared by the admin API and the delete jobs (both drop the totals a
+    // delete changes).
+    let savings_cache = Arc::new(deltaglider_proxy::api::admin::SavingsCache::new());
     let mut maintenance_worker = None;
     if !config_db_mismatch {
         if let Some(db) = jobs_db.as_ref() {
             maintenance_worker = Some(deltaglider_proxy::maintenance::worker::spawn_worker(
                 config_mutator.clone(),
                 db.clone(),
+                deltaglider_proxy::maintenance::delete::DeleteDeps {
+                    iam: iam_state.clone(),
+                    savings: savings_cache.clone(),
+                },
             ));
         }
         // Job-plane leader lease: S3-CAS (cross-node failover) when a validated
@@ -1150,7 +1157,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         bucket_scanner: deltaglider_proxy::api::admin::BucketScanner::load(
             std::path::PathBuf::from(".deltaglider_scans"),
         ),
-        savings_cache: Arc::new(deltaglider_proxy::api::admin::SavingsCache::new()),
+        savings_cache,
         rate_limiter,
         config_sync,
         config_db_mismatch,

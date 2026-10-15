@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Changed — A bulk delete runs on the server
+
+A delete from the file browser was a loop in the browser tab, so closing or reloading the tab stopped it, and the tab could run only one delete at a time. The browser now counts the selection and asks for confirmation as before, and then it starts a delete job on the proxy (`POST /_/api/admin/objects/delete-jobs`).
+
+- **The delete goes on without the tab.** Closing the tab does not stop it, and a restart of the proxy resumes it from its cursor.
+- **Several deletes run at once.** Delete jobs run in their own worker lane, four at a time, so deletes in buckets of different backends run in parallel. Several deletes can run on one bucket, and a long re-encryption does not hold them up.
+- **The bucket stays writable.** A delete job does not gate the bucket: uploads keep working while it runs.
+- **The bucket shows its deletes.** Each running delete has a line above the listing with its progress, who started it, and a Cancel button for an admin or for the user who started it. The listing reloads as the delete goes on. The Jobs page lists each delete as a job of the kind "Delete".
+
+The job acts with the permissions of the user who started it, and the proxy checks them again for every page.
+
 ## v2.0.15 — 2026-10-15
 
 ### Changed — Encryption at rest, format v2 (issue #120)

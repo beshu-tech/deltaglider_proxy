@@ -737,7 +737,16 @@ async fn the_worker_drains_at_start_and_wakes_when_a_row_comes_due() {
             )
             .unwrap()
             .unwrap();
-    let worker = spawn_worker(e.mutator.clone(), e.db.clone());
+    let worker = spawn_worker(
+        e.mutator.clone(),
+        e.db.clone(),
+        crate::maintenance::delete::DeleteDeps {
+            iam: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::iam::IamState::deny_all(),
+            )),
+            savings: Default::default(),
+        },
+    );
     let row = settled(&e.db, queued, 2).await;
     assert_eq!(row.status, "completed", "not drained at start: {row:?}");
     let row = settled(&e.db, id, 4).await;

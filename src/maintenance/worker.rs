@@ -50,7 +50,7 @@ use super::paged::{
     list_job_keys, paged_phase, BackgroundCount, JobCtx, KeyPage, ListError, PageStep, PhaseSpec,
     CANCEL_CHECK_EVERY, PAGE_CONCURRENCY,
 };
-use super::store::{current_unix_seconds, MaintenanceJob};
+use super::store::{current_unix_seconds, Lane, MaintenanceJob};
 use super::{needs_rewrite, resolve_desired, strip_encryption_markers, DesiredEncryption};
 
 /// How long a job whose backend is gated waits before a worker claims it
@@ -76,6 +76,8 @@ pub(crate) struct Holder<'a> {
     pub lease: LeaseTiming,
     /// The job's backend-health check (`None`: never gated).
     pub backend: Option<&'a super::gate::BackendCheck>,
+    /// What a delete job needs (`None` in tests that run no delete).
+    pub deletes: Option<&'a super::delete::DeleteDeps>,
 }
 
 impl Holder<'_> {
@@ -96,26 +98,84 @@ impl<'a> Holder<'a> {
             id,
             lease: LeaseTiming::MAINTENANCE,
             backend: None,
+            deletes: None,
         }
     }
 }
 
-/// Spawn the maintenance worker loop. It drains every claimable job, then
-/// waits for `state.maintenance_notify` (every job creation sends it), for
-/// the time at which a deferred, backed-off or abandoned row comes due, or
-/// at most half a lease TTL (`idle_wait_secs`). It drains at once on
-/// start: a job that the previous process left queued resumes at boot.
-pub fn spawn_worker(mutator: ConfigMutator, db: Arc<Mutex<JobsDb>>) -> tokio::task::JoinHandle<()> {
+/// Spawn the maintenance worker: two lanes over one queue. The serial lane
+/// runs every kind but `delete`, one job at a time (a re-encryption or a
+/// migration rewrites a whole bucket). The delete lane runs delete jobs,
+/// [`super::delete::DELETE_PARALLEL`] at a time: deletes on buckets of
+/// different backends go in parallel, and a long re-encryption never
+/// holds them up.
+///
+/// Each lane drains every job it may claim, then waits for
+/// `state.maintenance_notify` (every job creation sends it), for the time
+/// at which a deferred, backed-off or abandoned row comes due, or at most
+/// half a lease TTL (`idle_wait_secs`). It drains at once on start: a job
+/// that the previous process left queued resumes at boot.
+pub fn spawn_worker(
+    mutator: ConfigMutator,
+    db: Arc<Mutex<JobsDb>>,
+    deletes: super::delete::DeleteDeps,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // One task: aborting the worker stops both lanes.
+        tokio::join!(
+            run_lane(
+                mutator.clone(),
+                db.clone(),
+                deletes.clone(),
+                Lane::Serial,
+                1
+            ),
+            run_lane(
+                mutator,
+                db,
+                deletes,
+                Lane::Delete,
+                super::delete::DELETE_PARALLEL,
+            ),
+        );
+    })
+}
+
+async fn run_lane(
+    mutator: ConfigMutator,
+    db: Arc<Mutex<JobsDb>>,
+    deletes: super::delete::DeleteDeps,
+    lane: Lane,
+    parallel: usize,
+) {
     let config: SharedConfig = mutator.config.clone();
     let state: Arc<AppState> = mutator.app.clone();
-    let instance_id = format!("maintenance:{}", uuid::Uuid::new_v4());
-    tokio::spawn(async move {
-        info!("Maintenance worker started: instance_id={}", instance_id);
+    let instance_id: Arc<str> = format!("maintenance:{}", uuid::Uuid::new_v4()).into();
+    let slots = Arc::new(tokio::sync::Semaphore::new(parallel.max(1)));
+    {
+        info!(
+            "Maintenance worker lane {:?} started: instance_id={}, parallel={}",
+            lane, instance_id, parallel
+        );
         loop {
             // Drain every claimable job before waiting again.
             let (lease, next_due) = loop {
+                // A free slot first: a lane with every slot busy claims
+                // nothing, so the row stays for a peer or for later.
+                let Ok(slot) = slots.clone().acquire_owned().await else {
+                    return;
+                };
                 if crate::shutdown::is_shutting_down() {
-                    info!("Maintenance worker stopped: the process shuts down");
+                    // The jobs of this lane run in their own tasks: wait until
+                    // each one has handed its row back (`ReleaseForResume`),
+                    // so the next boot resumes it at once instead of waiting
+                    // for its lease to lapse. main bounds the wait.
+                    drop(slot);
+                    let _ = slots.acquire_many(parallel.max(1) as u32).await;
+                    info!(
+                        "Maintenance worker lane {:?} stopped: the process shuts down",
+                        lane
+                    );
                     return;
                 }
                 let lease = config
@@ -131,7 +191,8 @@ pub fn spawn_worker(mutator: ConfigMutator, db: Arc<Mutex<JobsDb>>) -> tokio::ta
                     if let Err(e) = db.maintenance_requeue_abandoned() {
                         warn!("maintenance: requeue scan failed: {}", e);
                     }
-                    let claimed = db.maintenance_claim_next_job(
+                    let claimed = db.maintenance_claim_next_job_in(
+                        lane,
                         &instance_id,
                         current_unix_seconds(),
                         lease.ttl_secs,
@@ -153,12 +214,24 @@ pub fn spawn_worker(mutator: ConfigMutator, db: Arc<Mutex<JobsDb>>) -> tokio::ta
                 };
                 match claimed {
                     Ok(Some(job)) => {
-                        let holder = Holder {
-                            id: &instance_id,
-                            lease,
-                            backend: None,
-                        };
-                        run_job(&mutator, &config, &db, &state, holder, job).await;
+                        let (mutator, config, db, state, deletes, id) = (
+                            mutator.clone(),
+                            config.clone(),
+                            db.clone(),
+                            state.clone(),
+                            deletes.clone(),
+                            instance_id.clone(),
+                        );
+                        tokio::spawn(async move {
+                            let holder = Holder {
+                                id: &id,
+                                lease,
+                                backend: None,
+                                deletes: Some(&deletes),
+                            };
+                            run_job(&mutator, &config, &db, &state, holder, job).await;
+                            drop(slot);
+                        });
                     }
                     Ok(None) => break (lease, next_due),
                     Err(e) => {
@@ -174,7 +247,7 @@ pub fn spawn_worker(mutator: ConfigMutator, db: Arc<Mutex<JobsDb>>) -> tokio::ta
                 _ = crate::shutdown::started() => {}
             }
         }
-    })
+    }
 }
 
 /// Pure: how long the idle worker waits before it looks at the queue
@@ -253,6 +326,9 @@ async fn run_job(
         "migrate" => super::migrate::execute_migrate_phases(mutator, db, state, holder, &job).await,
         super::backfill::KIND => {
             super::backfill::execute_backfill_phases(db, state, holder, &job).await
+        }
+        super::delete::KIND => {
+            super::delete::execute_delete_phases(config, db, state, holder, &job).await
         }
         other => Err(format!("unknown maintenance job kind '{other}'").into()),
     };
@@ -1066,10 +1142,10 @@ pub(crate) fn after_run(
     }
 }
 
-/// Save the job's progress. Private: the migrate phases save through
-/// [`persist_flushed`], which takes the proof that their deferred copies
-/// are durable.
-async fn persist(
+/// Save the job's progress. The migrate phases save through
+/// [`persist_flushed`] instead, which takes the proof that their deferred
+/// copies are durable; a delete is durable per key.
+pub(crate) async fn persist(
     db: &Arc<Mutex<JobsDb>>,
     job: &MaintenanceJob,
     phase: &str,

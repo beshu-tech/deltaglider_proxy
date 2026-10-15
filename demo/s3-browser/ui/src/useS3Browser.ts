@@ -6,7 +6,7 @@ import { listObjects, getBucket, setBucket, hasCredentials } from './s3client';
 import { buildBrowserUrl } from './urlState';
 import {
   bulkCopyObjects,
-  bulkDeleteObjects,
+  startDeleteJob,
   bulkMoveObjects,
   bulkZipDownloadUrl,
   getPrefixSavings,
@@ -20,7 +20,7 @@ import useSelection from './useSelection';
 import { virtualWritableChildren } from './permissions';
 import { type ExpandedItem, MAX_BULK_OBJECTS, expandSelection } from './bulkSelection';
 import { type BulkAction, type BulkProgress, BulkActionFailed } from './bulkBatches';
-import { type BulkDeleteOutcome, type DeletePlanSummary, deleteInBatches } from './bulkDelete';
+import type { DeleteJobOutcome, DeletePlanSummary } from './bulkDelete';
 import { type BulkTransferOutcome, transferInBatches, transferPlanError } from './bulkTransfer';
 import { downloadZip as saveZip, zipPreflightError } from './zipDownload';
 // Bulk actions → admin objects API; App gates them on `sessionCaps.canUseBulkActions`
@@ -531,31 +531,40 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
   );
 
   /**
-   * Delete the selection (see runBulk). The run has no total limit. It
-   * counts the objects first; `confirm` then gets the exact numbers, and
-   * nothing is deleted unless it resolves `true`.
+   * Delete the selection (see runBulk): count the objects, ask `confirm`
+   * with the exact numbers, then start a server job that deletes the
+   * selected folders and objects. The run ends when the job starts: the
+   * delete goes on without this tab, and the bucket status shows it.
    */
   const bulkDelete = useCallback(
-    (confirm?: (plan: DeletePlanSummary) => Promise<boolean>): Promise<BulkDeleteOutcome> => {
-    // Snapshot the bucket: a bucket switch mid-run must not move the deletes.
-    const bucket = getBucket();
-    const selection = [...selectedKeys];
-    const folders = new Set(selection.filter((k) => k.startsWith('folder:') && k !== 'folder:')).size;
-    const files = selection.filter((k) => !k.startsWith('folder:')).length;
-    return runBulk('delete', {
-      expand: (opts) => expandSelected(bucket, opts),
-      confirm: confirm && ((items) => (items.length === 0 ? Promise.resolve(true) : confirm({ objects: items.length, folders, files }))),
-      send: (items, signal, sent, progress) =>
-        deleteInBatches(
-          items.map((i) => i.source),
-          (batch, onKey) => bulkDeleteObjects({ bucket, keys: batch }, onKey),
-          { signal, onBatch: (p) => sent(p.done, p.deleted), onProgress: (p) => progress(p.done, p.deleted) },
-        ),
-      cancelledWhileListing: () => ({ total: 0, deleted: 0, failed: 0, failures: [], cancelled: true }),
-      reloadPerBatch: true,
-    });
+    (confirm?: (plan: DeletePlanSummary) => Promise<boolean>): Promise<DeleteJobOutcome> => {
+      // Snapshot the bucket: a bucket switch mid-run must not move the delete.
+      const bucket = getBucket();
+      const selection = [...selectedKeys];
+      const prefixes = [
+        ...new Set(selection.filter((k) => k.startsWith('folder:') && k !== 'folder:').map((k) => k.slice('folder:'.length))),
+      ];
+      const keys = selection.filter((k) => !k.startsWith('folder:'));
+      return runBulk<DeleteJobOutcome>('delete', {
+        expand: (opts) => expandSelected(bucket, opts),
+        confirm:
+          confirm &&
+          ((items) =>
+            items.length === 0
+              ? Promise.resolve(true)
+              : confirm({ objects: items.length, folders: prefixes.length, files: keys.length })),
+        send: async (items) => {
+          if (items.length === 0) return { total: 0, cancelled: false, failed: 0 };
+          const { job_id } = await startDeleteJob({ bucket, prefixes, keys, expected: items.length });
+          // The banner shows the job at once, not at the next idle poll.
+          void queryClient.invalidateQueries({ queryKey: qk.maintenance.bucket(bucket) });
+          return { total: items.length, cancelled: false, failed: 0, jobId: job_id };
+        },
+        cancelledWhileListing: () => ({ total: 0, cancelled: true, failed: 0 }),
+        reloadPerBatch: false,
+      });
     },
-    [runBulk, expandSelected, selectedKeys],
+    [runBulk, expandSelected, selectedKeys, queryClient],
   );
 
   /**

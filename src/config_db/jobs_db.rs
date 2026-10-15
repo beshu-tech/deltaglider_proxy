@@ -408,6 +408,13 @@ CREATE TABLE IF NOT EXISTS lifecycle_run_counts (
     objects_excluded INTEGER NOT NULL DEFAULT 0,
     objects_not_due  INTEGER NOT NULL DEFAULT 0
 );
+-- A delete job does not hold its bucket: several deletes, and a delete next
+-- to a job that does, run on one bucket. The index of schema v1 counted
+-- every kind.
+DROP INDEX IF EXISTS idx_maint_active_bucket;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_maint_active_bucket_v2
+    ON maintenance_jobs(bucket)
+    WHERE status IN ('queued','running','cancelling') AND kind != 'delete';
 ";
 
 const SCHEMA_V1: &str = "

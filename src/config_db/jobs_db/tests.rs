@@ -203,6 +203,12 @@ fn jobs_tables_match_the_config_db() {
         );
         let have = indexes(&jobs.conn, t);
         for i in indexes(&config.conn, t) {
+            // The jobs DB replaced it: a delete job does not hold its bucket.
+            let i = if i == "idx_maint_active_bucket" {
+                "idx_maint_active_bucket_v2".to_string()
+            } else {
+                i
+            };
             assert!(have.contains(&i), "{t}: index {i} missing from the jobs DB");
         }
     }

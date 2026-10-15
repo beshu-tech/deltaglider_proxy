@@ -56,6 +56,15 @@ pub struct MaintenanceJob {
     pub updated_at: i64,
 }
 
+/// A worker lane: which kinds it claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lane {
+    /// Every kind but `delete`, one job at a time.
+    Serial,
+    /// `delete` jobs, several at a time.
+    Delete,
+}
+
 /// A per-object failure row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MaintenanceFailure {
@@ -182,7 +191,23 @@ impl JobsDb {
             .query_row("SELECT COUNT(*) FROM maintenance_jobs", [], |r| r.get(0))?)
     }
 
-    /// The bucket's active job (queued/running/cancelling), if any.
+    /// The bucket's active jobs (queued/running/cancelling), oldest first:
+    /// at most one job that holds the bucket, and any number of deletes.
+    pub fn maintenance_active_jobs_for_bucket(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<MaintenanceJob>, ConfigDbError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {JOB_COLUMNS} FROM maintenance_jobs
+              WHERE bucket = ? AND status IN {ACTIVE_STATUSES} ORDER BY id ASC"
+        ))?;
+        let jobs = stmt
+            .query_map(params![bucket], row_to_job)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(jobs)
+    }
+
+    /// The bucket's active job that holds it (any kind but `delete`), if any.
     pub fn maintenance_active_job_for_bucket(
         &self,
         bucket: &str,
@@ -192,7 +217,8 @@ impl JobsDb {
             .query_row(
                 &format!(
                     "SELECT {JOB_COLUMNS} FROM maintenance_jobs
-                     WHERE bucket = ? AND status IN {ACTIVE_STATUSES}"
+                     WHERE bucket = ? AND status IN {ACTIVE_STATUSES}
+                       AND kind != 'delete'"
                 ),
                 params![bucket],
                 row_to_job,
@@ -233,6 +259,10 @@ impl JobsDb {
             .collect::<Result<Vec<_>, _>>()?;
         let mut arms = Vec::new();
         for (job_id, bucket, kind, phase, params) in rows {
+            // A delete never gates its bucket: clients keep writing to it.
+            if kind == super::delete::KIND {
+                continue;
+            }
             let migrate = kind == "migrate";
             if migrate {
                 // Only `cleanup` is post-flip (bucket live on the new backend);
@@ -316,6 +346,30 @@ impl JobsDb {
         now: i64,
         lease_ttl_secs: i64,
     ) -> Result<Option<MaintenanceJob>, ConfigDbError> {
+        self.claim_next(None, instance_id, now, lease_ttl_secs)
+    }
+
+    /// [`Self::maintenance_claim_next_job`] for one worker lane: the delete
+    /// lane claims only `delete` jobs, the serial lane every other kind.
+    pub fn maintenance_claim_next_job_in(
+        &self,
+        lane: Lane,
+        instance_id: &str,
+        now: i64,
+        lease_ttl_secs: i64,
+    ) -> Result<Option<MaintenanceJob>, ConfigDbError> {
+        self.claim_next(Some(lane), instance_id, now, lease_ttl_secs)
+    }
+
+    fn claim_next(
+        &self,
+        lane: Option<Lane>,
+        instance_id: &str,
+        now: i64,
+        lease_ttl_secs: i64,
+    ) -> Result<Option<MaintenanceJob>, ConfigDbError> {
+        // NULL: any kind; 1: only deletes; 0: no deletes.
+        let deletes: Option<bool> = lane.map(|l| l == Lane::Delete);
         // Candidate finder, intentionally OUTSIDE the claim transaction below: it
         // only narrows which row to attempt. Correctness does not rely on it —
         // the tx re-validates everything via its WHERE-clause guards, so a stale
@@ -329,8 +383,9 @@ impl JobsDb {
                    AND (leader_instance_id IS NULL
                         OR leader_expires_at IS NULL
                         OR leader_expires_at < ?)
+                   AND (?2 IS NULL OR (kind = 'delete') = ?2)
                  ORDER BY id ASC LIMIT 1",
-                params![now],
+                params![now, deletes],
                 |r| r.get(0),
             )
             .optional()?;
@@ -741,6 +796,57 @@ mod tests {
         assert_eq!(job.kind, "reencrypt");
         assert_eq!(job.objects_total, None);
         assert_eq!(db.maintenance_gate_arm_keys().unwrap(), vec!["pippo"]);
+    }
+
+    /// A delete job holds no bucket: it runs next to a job that does and
+    /// next to other deletes, arms no write gate, and only the delete lane
+    /// claims it.
+    #[test]
+    fn delete_jobs_hold_no_bucket_and_run_in_their_own_lane() {
+        use super::super::delete::{KIND, PHASE};
+        let db = db();
+        let now = current_unix_seconds();
+        let r = db
+            .maintenance_create_job("reencrypt", "b", "counting", None, "admin", 1)
+            .unwrap()
+            .unwrap();
+        let d1 = db
+            .maintenance_create_job(KIND, "b", PHASE, Some("{}"), "dana", 1)
+            .unwrap()
+            .expect("a delete next to a re-encryption");
+        let d2 = db
+            .maintenance_create_job(KIND, "b", PHASE, Some("{}"), "dana", 1)
+            .unwrap()
+            .expect("two deletes on one bucket");
+        assert!(
+            db.maintenance_create_job("backfill-metadata", "b", "counting", None, "admin", 1)
+                .unwrap()
+                .is_none(),
+            "a second job that holds the bucket is still refused"
+        );
+        assert_eq!(db.maintenance_gate_arm_keys().unwrap(), vec!["b"]);
+        assert!(db
+            .maintenance_gate_arms()
+            .unwrap()
+            .iter()
+            .all(|a| a.job_id == r));
+        assert_eq!(
+            db.maintenance_active_job_for_bucket("b")
+                .unwrap()
+                .map(|j| j.id),
+            Some(r)
+        );
+        assert_eq!(db.maintenance_active_jobs_for_bucket("b").unwrap().len(), 3);
+        let claim = |lane| {
+            db.maintenance_claim_next_job_in(lane, "w", now, 60)
+                .unwrap()
+                .map(|j| j.id)
+        };
+        assert_eq!(claim(Lane::Delete), Some(d1));
+        assert_eq!(claim(Lane::Delete), Some(d2));
+        assert_eq!(claim(Lane::Delete), None);
+        assert_eq!(claim(Lane::Serial), Some(r));
+        assert_eq!(claim(Lane::Serial), None);
     }
 
     #[test]

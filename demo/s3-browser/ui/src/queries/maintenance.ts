@@ -30,6 +30,11 @@ export function useBucketMaintenance(bucket: string | null) {
     // Idle floor (10 s): catches a job that starts while the user browses
     // before an upload hits the 503.
     refetchInterval: (query) =>
-      bucketStatusPollMs(!!query.state.data?.active, !!query.state.error, ACTIVE_POLL_MS, IDLE_POLL_MS),
+      bucketStatusPollMs(
+        !!query.state.data?.active || (query.state.data?.deletes?.length ?? 0) > 0,
+        !!query.state.error,
+        ACTIVE_POLL_MS,
+        IDLE_POLL_MS,
+      ),
   });
 }

@@ -134,3 +134,19 @@ export function bucketStatusPollMs(
   if (failed) return idleMs * 3;
   return hasActive ? activeMs : idleMs;
 }
+
+/**
+ * The banner line of one running delete job: what it did of how much, and
+ * who started it when that is not the reader.
+ */
+export function deleteJobText(job: MaintenanceJobView, me: string | null): string {
+  if (job.status === 'cancelling') return 'Stopping the delete…';
+  if (job.status === 'queued' && job.started_at == null) return 'Delete waiting to start…';
+  if (job.objects_total == null) return 'Starting the delete…';
+  const done = job.objects_done + job.objects_failed;
+  const total = job.objects_total;
+  const pct = total > 0 ? ` · ${Math.min(99, Math.floor((done / total) * 100))}%` : '';
+  const who = job.triggered_by && job.triggered_by !== me ? ` · started by ${job.triggered_by}` : '';
+  const failed = job.objects_failed > 0 ? ` · ${job.objects_failed.toLocaleString('en-US')} failed` : '';
+  return `Deleting ${done.toLocaleString('en-US')} of ${total.toLocaleString('en-US')} objects${pct}${failed}${who}`;
+}

@@ -1349,3 +1349,137 @@ async fn folder_listing_of_a_scoped_user_stops_at_the_list_budget() {
     assert_eq!(status, 400, "the walk was not bounded: {body}");
     assert!(body.contains("filtered_list_max_engine_pages"), "{body}");
 }
+
+/// Wait until the bucket has no running delete job; the bucket status.
+async fn wait_for_deletes(admin: &reqwest::Client, endpoint: &str, bucket: &str) -> Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let status: Value = admin
+            .get(format!("{endpoint}/_/api/admin/jobs/bucket/{bucket}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if status["deletes"].as_array().is_some_and(|d| d.is_empty()) {
+            return status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the delete job did not end: {status}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// A delete job deletes on the server: a folder of more keys than one page
+/// (1,000) and an object selected directly, in two buckets at once. Nothing
+/// outside the selection goes, and the job settles `completed` with the
+/// count of deleted objects.
+#[tokio::test]
+async fn test_delete_jobs_delete_folders_on_the_server() {
+    let server = TestServer::builder().build().await;
+    let http = server.http();
+    let admin = admin_http_client(&server.endpoint()).await;
+    let ep = server.endpoint();
+    let first = server.bucket().to_string();
+    let second = format!("{first}-second");
+    http.put(format!("{ep}/{second}")).send().await.unwrap();
+    let mut keys: Vec<String> = (0..1_205).map(|i| format!("big/f{i:05}.txt")).collect();
+    keys.extend(["single.txt".to_string(), "keep/x.txt".to_string()]);
+    for bucket in [first.as_str(), second.as_str()] {
+        let puts = keys.iter().map(|key| {
+            http.put(format!("{ep}/{bucket}/{key}"))
+                .body(b"x".to_vec())
+                .send()
+        });
+        for r in futures::future::join_all(puts).await {
+            assert!(r.unwrap().status().is_success());
+        }
+    }
+    let mut jobs = Vec::new();
+    for bucket in [first.as_str(), second.as_str()] {
+        let resp = admin
+            .post(format!("{ep}/_/api/admin/objects/delete-jobs"))
+            .json(&json!({
+                "bucket": bucket,
+                "prefixes": ["big/"],
+                "keys": ["single.txt"],
+                "expected": 1_206
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 202);
+        let started: Value = resp.json().await.unwrap();
+        jobs.push(started["job_id"].as_i64().unwrap());
+    }
+    for bucket in [first.as_str(), second.as_str()] {
+        let status = wait_for_deletes(&admin, &ep, bucket).await;
+        assert_eq!(
+            status["writes_blocked"], false,
+            "a delete never gates writes"
+        );
+        let left: Value = admin
+            .get(format!(
+                "{ep}/_/api/admin/objects/list?bucket={bucket}&prefix=big/"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(left["keys"], json!([]), "{bucket}: big/ is gone");
+        for (key, kept) in [("single.txt", false), ("keep/x.txt", true)] {
+            let head = http
+                .head(format!("{ep}/{bucket}/{key}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(head.status().is_success(), kept, "{bucket}/{key}");
+        }
+    }
+    let all: Value = admin
+        .get(format!("{ep}/_/api/admin/jobs"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for id in jobs {
+        let row = all["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|j| j["id"] == format!("maintenance:{id}"))
+            .unwrap_or_else(|| panic!("job {id} not listed: {all}"));
+        assert_eq!(row["kind"], "delete", "{row}");
+        assert_eq!(row["status"], "succeeded", "{row}");
+        assert_eq!(row["progress"]["processed"], 1_206, "{row}");
+    }
+}
+
+/// A delete job refuses a key that is not a folder as a prefix, and an
+/// empty selection.
+#[tokio::test]
+async fn test_delete_job_refuses_a_bad_selection() {
+    let server = TestServer::builder().build().await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let ep = server.endpoint();
+    let bucket = server.bucket();
+    for body in [
+        json!({ "bucket": bucket, "prefixes": ["not-a-folder"] }),
+        json!({ "bucket": bucket }),
+    ] {
+        let resp = admin
+            .post(format!("{ep}/_/api/admin/objects/delete-jobs"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400, "{body}");
+    }
+}

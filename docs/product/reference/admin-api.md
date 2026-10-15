@@ -236,9 +236,31 @@ Server-side helpers behind the embedded S3 browser's bulk actions.
 | `POST` | `/_/api/admin/objects/copy` | Server-side copy of selected objects |
 | `POST` | `/_/api/admin/objects/move` | Server-side move (copy + delete) |
 | `POST` | `/_/api/admin/objects/delete` | Bulk delete selected objects |
+| `POST` | `/_/api/admin/objects/delete-jobs` | Start a delete job: folders of any size and selected objects, deleted on the server |
+| `POST` | `/_/api/admin/objects/delete-jobs/:id/cancel` | Stop a delete job |
 | `GET` | `/_/api/admin/objects/zip` | Stream selected objects as a ZIP |
 
 These endpoints accept an admin GUI session and also the browser session of a user without admin rights (the session that an access-key sign-in in the file browser creates). For an admin session, the session is the authorization boundary. For a user without admin rights, the proxy checks every key against that user's own IAM permissions before it touches the key, with the same rules as the S3 API, including `aws:SourceIp` conditions. A copy needs `read` on the source key and `write` on the destination key; a move needs `delete` on the source key too; a delete needs `delete`; a ZIP needs `read`. A key that the user may not use is not touched: the response lists it under `failures` with an `AccessDenied` error, and the other keys are processed. A ZIP leaves such a key out and names it in the skip report inside the archive; when no selected key may be read, the ZIP answers `403`. A folder listing (`objects/list`) returns only the keys that the user can see, like an S3 `LIST`. It reads the backend in the same way as an S3 `LIST`: the proxy reads only the prefixes that the user's policy can reach, and when it must skip hidden keys, it reads pages of 1000 keys and the whole folder listing sends at most `advanced.filtered_list_max_engine_pages` backend requests (about 50,000 keys with the default). A folder that holds more hidden keys than that limit can read makes the request fail with `400`, because a partial folder must not become the selection of a copy, move or delete; select a narrower folder instead. Because a move deletes its sources only when every copy of the request succeeded, one denied key keeps all the sources of that request in place. The file browser sends a copy or a move in requests of at most 500 objects, so a denied key keeps only the sources of its own batch in place. The file browser also stops listing the selected folders as soon as the selection passes 10,000 objects, the limit of one request. In open mode (`authentication: none`) an open browser session may use the endpoints without checks, like the S3 API in open mode.
+
+### `POST /_/api/admin/objects/delete-jobs`
+
+The request body names one bucket, the folders to delete with everything under them, and the objects to delete directly:
+
+```json
+{ "bucket": "releases", "prefixes": ["builds/v1/"], "keys": ["notes.txt"], "expected": 12346 }
+```
+
+Each folder must end with `/`. A request may name at most 1,000 folders and 10,000 objects, and a folder may hold any number of objects. `expected` is optional: it is the number of objects that the browser counted, and the job shows it as its total until it has deleted more than that.
+
+The proxy checks the request before it starts the job. The request fails with `400` when it names nothing, when a folder does not end with `/`, or when it names too many entries. It fails with `403` when the bucket is the coordination bucket or accepts only replication writes, and when the session may not list one of the folders. When the checks pass, the proxy answers `202` with the job id:
+
+```json
+{ "job_id": 42 }
+```
+
+The job then runs on the proxy, as described in [Delete jobs](jobs.md#delete-jobs). Its row is `maintenance:<id>` in `GET /_/api/admin/jobs`, and the `deletes` list of `GET /_/api/admin/jobs/bucket/:bucket` shows it while it runs.
+
+`POST /_/api/admin/objects/delete-jobs/:id/cancel` stops the job after its current page. An admin session can stop any delete job; the session of a user without admin rights can stop only the jobs that the user started, and gets `403` for the others. The answer is `{"status": "cancelling"}`, or `{"status": "cancelled"}` for a job that had not started yet. A job that already ended gets `409`.
 
 ### `POST /_/api/admin/objects/delete`
 

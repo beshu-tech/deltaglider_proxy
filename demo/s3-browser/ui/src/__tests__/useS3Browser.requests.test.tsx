@@ -33,7 +33,7 @@ import useS3Browser from '../useS3Browser';
 
 const SAVINGS = '/_/api/admin/deltaspace/savings';
 const LIST = '/_/api/admin/objects/list';
-const DELETE = '/_/api/admin/objects/delete';
+const DELETE_JOB = '/_/api/admin/objects/delete-jobs';
 
 const savings = json({
   bucket: 'releases',
@@ -134,41 +134,17 @@ describe('savings chip', () => {
     expect(savingsCalls()[1].signal?.aborted).toBe(false);
   });
 
-  test('a bulk delete loads it once when the run ends, not after each batch', async () => {
+  test('a bulk delete loads it once, when its job has started', async () => {
     http.on('GET', LIST, json({ keys: keys(1201, 'builds/nightly/'), truncated: false }));
-    // Each batch answers when the test says so, after the reload of the batch before it rendered.
-    const held: (() => void)[] = [];
-    http.on('POST', DELETE, (req) => () =>
-      new Promise<Response>((resolve) => {
-        const n = (req.body as { keys: string[] }).keys.length;
-        held.push(() => resolve(json({ deleted: n, failed: 0, failures: [] })));
-      }),
-    );
+    http.on('POST', DELETE_JOB, json({ job_id: 1 }, 202));
     const { result } = mount();
     await waitFor(() => expect(result.current.deltaSummary?.savingsPct).toBe(90));
     const before = savingsCalls().length;
-
     act(() => result.current.toggleKey('folder:builds/nightly/'));
-    let run!: Promise<unknown>;
-    act(() => {
-      run = result.current.bulkDelete();
-    });
-    for (let batch = 1; batch <= 3; batch++) {
-      await waitFor(() => expect(held).toHaveLength(batch));
-      const lists = s3.lists;
-      await act(async () => held[batch - 1]());
-      // The listing reloads after each batch, as before.
-      await waitFor(() => expect(s3.lists).toBeGreaterThan(lists));
-    }
     await act(async () => {
-      await run;
+      await result.current.bulkDelete();
     });
     await waitFor(() => expect(savingsCalls()).toHaveLength(before + 1));
-    // Settle any late effect, then check that no other walk started.
-    await act(async () => {
-      await new Promise((r) => setTimeout(r, 50));
-    });
-    expect(savingsCalls()).toHaveLength(before + 1);
   });
 });
 

@@ -1,8 +1,9 @@
 // Cockroach scan 2026-10-10: bulk copy and move sent the whole selection as
 // ONE request (no progress, no cancel, a loop of hours inside one HTTP
-// request). Every bulk object request now goes through useS3Browser's bulk
-// runner, which sends batches (useS3Browser.bulk*.test.tsx prove it). This
-// guard keeps a new caller from sending a whole selection again.
+// request). Every bulk copy and move request now goes through
+// useS3Browser's bulk runner, which sends batches
+// (useS3Browser.bulk*.test.tsx prove it); a delete starts a server job.
+// This guard keeps a new caller from sending a whole selection again.
 import { readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { expect, test } from 'vitest';
@@ -18,9 +19,9 @@ async function sources(dir: string): Promise<string[]> {
   return out;
 }
 
-test('only the bulk runner in useS3Browser.ts sends bulk copy, move and delete requests', async () => {
+test('only the bulk runner in useS3Browser.ts sends bulk copy and move requests, and starts delete jobs', async () => {
   const root = new URL('../', import.meta.url).pathname;
-  const BULK_REQUEST = /\bbulk(Copy|Move|Delete)Objects\b/;
+  const BULK_REQUEST = /\b(bulk(Copy|Move)Objects|startDeleteJob)\b/;
   const ALLOWED = ['src/adminApi/bulkObjects.ts', 'src/useS3Browser.ts'];
   const hits: string[] = [];
   for (const f of await sources(root)) {
@@ -35,6 +36,6 @@ test('only the bulk runner in useS3Browser.ts sends bulk copy, move and delete r
   expect(hits).toEqual([]);
   // In the hook, the requests are made only inside the batch senders.
   const hook = await readFile(join(root, 'useS3Browser.ts'), 'utf8');
-  expect(hook).toMatch(/deleteInBatches\(\s*[\s\S]{0,200}bulkDeleteObjects\(/);
+  expect(hook).toMatch(/runBulk<DeleteJobOutcome>\('delete'[\s\S]{0,1500}startDeleteJob\(/);
   expect(hook).toMatch(/const request = action === 'copy' \? bulkCopyObjects : bulkMoveObjects;[\s\S]{0,1500}transferInBatches\(/);
 });

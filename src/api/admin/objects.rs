@@ -264,7 +264,7 @@ fn validate_plan(
 // ---------------------------------------------------------------------------
 
 /// Who a bulk request acts as.
-enum BulkActor {
+pub(crate) enum BulkActor {
     /// Admin GUI or open mode: no per-key check.
     Unrestricted,
     /// A browser session's IAM user and the request's policy context.
@@ -288,12 +288,41 @@ impl BulkActor {
                 client_ip,
             } => (access_key_id, *client_ip),
         };
-        let iam = state.iam_state.load();
-        let user = match iam.as_ref() {
+        Self::for_user(&state.iam_state.load(), access_key_id, client_ip)
+            .map_err(AdminError::forbidden)
+    }
+
+    /// The actor of a stored principal (a delete job), against the IAM
+    /// state of now: a user that is gone or disabled, or an open-access
+    /// principal while IAM users exist, is refused.
+    pub(crate) fn for_principal(
+        iam: &crate::iam::IamState,
+        principal: &crate::maintenance::delete::Principal,
+    ) -> Result<Self, String> {
+        use crate::maintenance::delete::Principal;
+        match principal {
+            Principal::Admin => Ok(Self::Unrestricted),
+            Principal::Open => match iam {
+                crate::iam::IamState::Disabled => Ok(Self::Unrestricted),
+                _ => Err("AccessDenied: open access is off".to_string()),
+            },
+            Principal::User {
+                access_key_id,
+                client_ip,
+            } => Self::for_user(iam, access_key_id, *client_ip),
+        }
+    }
+
+    fn for_user(
+        iam: &crate::iam::IamState,
+        access_key_id: &str,
+        client_ip: Option<std::net::IpAddr>,
+    ) -> Result<Self, String> {
+        let user = match iam {
             crate::iam::IamState::Iam(index) => index.principal(access_key_id).cloned(),
             _ => None,
         }
-        .ok_or(AdminError::forbidden("AccessDenied: user disabled or gone"))?;
+        .ok_or("AccessDenied: user disabled or gone")?;
         let mut context = iam_rs::Context::new();
         crate::iam::permissions::insert_source_ip(&mut context, client_ip);
         Ok(Self::User {
@@ -339,7 +368,7 @@ impl BulkActor {
     }
 
     /// The S3 LIST's scope for this actor: filtered per key for a user.
-    fn list_scope(&self) -> Option<crate::iam::ListScope> {
+    pub(crate) fn list_scope(&self) -> Option<crate::iam::ListScope> {
         match self {
             Self::Unrestricted => None,
             Self::User { user, context } => Some(crate::iam::ListScope::Filtered {
@@ -350,7 +379,7 @@ impl BulkActor {
     }
 
     /// The audit actor.
-    fn label(&self) -> &str {
+    pub(crate) fn label(&self) -> &str {
         match self {
             Self::Unrestricted => "admin",
             Self::User { user, .. } => &user.name,
@@ -956,6 +985,163 @@ pub async fn bulk_delete(
     Ok(answer_bulk_delete(state.s3_state.clone(), req, actor, headers).await)
 }
 
+// ---------------------------------------------------------------------------
+// POST /_/api/admin/objects/delete-jobs, POST …/delete-jobs/:id/cancel
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteJobRequest {
+    pub bucket: AdminBucket,
+    /// Folders: everything under each is deleted.
+    #[serde(default)]
+    pub prefixes: Vec<AdminObjectPath>,
+    /// Objects selected directly.
+    #[serde(default)]
+    pub keys: Vec<AdminObjectPath>,
+    /// The browser's count of the objects to delete (shown as the total).
+    #[serde(default)]
+    pub expected: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeleteJobStarted {
+    pub job_id: i64,
+}
+
+/// The principal a delete job acts as, from the session that starts it.
+fn job_principal(session: &BulkSession) -> crate::maintenance::delete::Principal {
+    use crate::maintenance::delete::Principal;
+    match session {
+        BulkSession::AdminGui => Principal::Admin,
+        BulkSession::Open => Principal::Open,
+        BulkSession::IamUser {
+            access_key_id,
+            client_ip,
+        } => Principal::User {
+            access_key_id: access_key_id.clone(),
+            client_ip: *client_ip,
+        },
+    }
+}
+
+/// Start a delete of folders and objects of one bucket as a server job.
+/// The job runs on the server with the session's permissions (checked
+/// again on every page); closing the browser does not stop it.
+pub async fn start_delete_job(
+    Extension(session): Extension<BulkSession>,
+    State(state): State<Arc<crate::api::admin::AdminState>>,
+    headers: axum::http::HeaderMap,
+    AdminJson(req): AdminJson<DeleteJobRequest>,
+) -> Result<(StatusCode, Json<DeleteJobStarted>), AdminError> {
+    use crate::maintenance::delete::{self as job, DeleteParams};
+    let bucket = req.bucket.admit(&state)?;
+    reject_if_replication_target_only(&state, &bucket)?;
+    if req.prefixes.is_empty() && req.keys.is_empty() {
+        return Err(AdminError::invalid("nothing to delete"));
+    }
+    if req.keys.len() > job::MAX_KEYS || req.prefixes.len() > job::MAX_PREFIXES {
+        return Err(AdminError::invalid(format!(
+            "too many entries (at most {} objects and {} folders; a folder may hold any number)",
+            job::MAX_KEYS,
+            job::MAX_PREFIXES
+        )));
+    }
+    let actor = BulkActor::for_session(&state, &session)?;
+    for prefix in &req.prefixes {
+        // Never the whole bucket, and only a folder.
+        if prefix.is_empty() || !prefix.ends_with('/') {
+            return Err(AdminError::invalid(format!(
+                "'{}' is not a folder (it must end with /)",
+                &**prefix
+            )));
+        }
+        if !actor.may_list(&bucket, prefix) {
+            return Err(AdminError::forbidden(format!(
+                "AccessDenied: {} may not list {}/{}",
+                actor.label(),
+                &*bucket,
+                &**prefix
+            )));
+        }
+    }
+    let params = DeleteParams {
+        prefixes: req.prefixes.iter().map(|p| p.to_string()).collect(),
+        keys: req.keys.iter().map(|k| k.to_string()).collect(),
+        principal: job_principal(&session),
+        expected: req.expected,
+    };
+    let params = serde_json::to_string(&params).expect("params serialize");
+    let db = state.jobs_db.as_ref().ok_or_else(AdminError::no_jobs_db)?;
+    let created = db.lock().await.maintenance_create_job(
+        job::KIND,
+        &bucket.to_ascii_lowercase(),
+        job::PHASE,
+        Some(&params),
+        actor.label(),
+        crate::maintenance::store::current_unix_seconds(),
+    )?;
+    // A delete holds no bucket, so the unique index never refuses it.
+    let job_id = created.ok_or_else(|| AdminError::conflict("the delete job was refused"))?;
+    crate::maintenance::wake_workers(&state.s3_state.maintenance_notify);
+    info!(
+        "bulk delete job #{job_id} on '{}': {} folders, {} objects, by {}",
+        &*bucket,
+        req.prefixes.len(),
+        req.keys.len(),
+        actor.label()
+    );
+    super::audit_log(
+        "bulk_delete_job_started",
+        actor.label(),
+        &format!("job:{job_id}"),
+        &headers,
+    );
+    Ok((StatusCode::ACCEPTED, Json(DeleteJobStarted { job_id })))
+}
+
+/// Cancel a delete job: an admin or open session cancels any; a user
+/// cancels the jobs it started.
+pub async fn cancel_delete_job(
+    Extension(session): Extension<BulkSession>,
+    State(state): State<Arc<crate::api::admin::AdminState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Result<Json<serde_json::Value>, AdminError> {
+    use crate::maintenance::store::CancelOutcome;
+    let actor = BulkActor::for_session(&state, &session)?;
+    let db = state.jobs_db.as_ref().ok_or_else(AdminError::no_jobs_db)?;
+    let outcome = {
+        let db = db.lock().await;
+        let job = db
+            .maintenance_job_by_id(id)?
+            .filter(|j| j.kind == crate::maintenance::delete::KIND)
+            .ok_or_else(|| AdminError::not_found(format!("no delete job {id}")))?;
+        let own = job.triggered_by.as_deref() == Some(actor.label());
+        if !matches!(actor, BulkActor::Unrestricted) && !own {
+            return Err(AdminError::forbidden(format!(
+                "AccessDenied: {} did not start delete job {id}",
+                actor.label()
+            )));
+        }
+        db.maintenance_request_cancel(id)?
+    };
+    crate::maintenance::wake_workers(&state.s3_state.maintenance_notify);
+    let status = match outcome {
+        CancelOutcome::CancelledImmediately => "cancelled",
+        CancelOutcome::CancelRequested => "cancelling",
+        CancelOutcome::NotActive => {
+            return Err(AdminError::conflict("the delete job is not active"))
+        }
+    };
+    super::audit_log(
+        "bulk_delete_job_cancel",
+        actor.label(),
+        &format!("job:{id}"),
+        &headers,
+    );
+    Ok(Json(serde_json::json!({ "status": status })))
+}
+
 /// The media type of the streamed answer of a bulk delete.
 const NDJSON: &str = "application/x-ndjson";
 
@@ -1138,7 +1324,7 @@ fn counts_as_deleted(outcome: &crate::deltaglider::DeleteOutcome) -> bool {
 /// totals are the counts of the response.
 ///
 /// [`DynEngine::delete_batch`]: crate::deltaglider::DynEngine::delete_batch
-async fn run_bulk_delete(
+pub(crate) async fn run_bulk_delete(
     s3: &Arc<AppState>,
     bucket: &str,
     keys: &[AdminObjectPath],

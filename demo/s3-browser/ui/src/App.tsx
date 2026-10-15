@@ -41,6 +41,7 @@ import { writeStorage } from './safeStorage';
 import { pageTitle } from './pageTitle';
 import { headerForPath } from './components/adminNavigation';
 import { identitySummary } from './identitySummary';
+import DeleteJobsBanner from './components/DeleteJobsBanner';
 
 const { useBreakpoint } = Grid;
 
@@ -108,7 +109,9 @@ export default function App() {
   // Maintenance (re-encryption) status for the active bucket. Polls fast
   // while a job runs; the banner self-dismisses on completion. Reads keep
   // working — only write affordances are disabled below.
-  const bucketStatus = useBucketMaintenance(view === 'browser' ? activeBucket || null : null).data;
+  const bucketStatusQuery = useBucketMaintenance(view === 'browser' ? activeBucket || null : null);
+  const bucketStatus = bucketStatusQuery.data;
+  const runningDeletes = bucketStatus?.deletes ?? [];
   const bucketMaintenance = bucketStatus?.active ?? null;
   // The server's write gate decides: a migration that is being cancelled
   // (or cleans up after the switch) no longer blocks writes, so Upload and
@@ -381,6 +384,16 @@ export default function App() {
   // A session can also belong to a non-admin external SSO user. Only
   // show Settings after whoami resolves admin/open/bootstrap authority.
   const canAdmin = identity?.mode === 'bootstrap' || identity?.mode === 'open' || identity?.user?.is_admin === true;
+  // A running delete removes objects page by page: reload the listing each
+  // time it reports progress, and once more when it ends.
+  const deleteProgress = runningDeletes.map((j) => `${j.id}:${j.objects_done}`).join(',');
+  const { mutate: reloadListing } = s3;
+  const seenDeleteProgress = useRef(deleteProgress);
+  useEffect(() => {
+    if (seenDeleteProgress.current === deleteProgress) return;
+    seenDeleteProgress.current = deleteProgress;
+    reloadListing();
+  }, [deleteProgress, reloadListing]);
   const canCreateBucket = canUse(identity, 'admin');
   const canWriteActivePrefix = Boolean(activeBucket) && !bucketBusy && canUse(identity, 'write', activeBucket, s3.prefix);
   // The upload page opens at the folder the user is in, even a read-only one:
@@ -577,6 +590,13 @@ export default function App() {
             </span>
           </div>
         )}
+        <DeleteJobsBanner
+          jobs={runningDeletes}
+          // A job started without an IAM user (admin password, open access) says "admin".
+          me={identity?.user?.name ?? (canAdmin ? 'admin' : null)}
+          canCancel={(job) => canAdmin || (!!identity?.user && job.triggered_by === identity.user.name)}
+          onChanged={() => void bucketStatusQuery.refetch()}
+        />
         {/* A running bulk action keeps the bar (and its progress) on screen
             even when the selection empties: a delete's or move's batch reloads
             the listing, and a folder change clears the selection. */}

@@ -107,6 +107,8 @@ export function bulkProgressText(p: BulkProgress, now: number = Date.now()): str
     const found = p.keysFound > 0 ? ` ${count(p.keysFound)} ${noun(p.keysFound, 'object')} found` : '';
     return `Listing folders ${p.listed} of ${p.folders}…${found}`;
   }
+  // A delete only starts its server job here.
+  if (p.action === 'delete') return `Starting the delete of ${count(p.total)} ${noun(p.total, 'object')}…`;
   if (p.stopping) return `Stopping after this batch… ${count(p.done)} of ${count(p.total)} done`;
   const percent = p.total > 0 ? ` · ${bulkProgressPercent(p)}%` : '';
   const left = p.startedAt === undefined ? '' : timeLeftText(p.done, p.total, now - p.startedAt);
@@ -118,7 +120,8 @@ export function bulkProgressText(p: BulkProgress, now: number = Date.now()): str
  * counts (the size of a folder is unknown until it is listed).
  */
 export function bulkProgressPercent(p: BulkProgress): number | null {
-  if (p.phase === 'confirming' || (p.phase === 'listing' && p.action === 'delete')) return null;
+  // A delete only counts and starts its job here: no percent to show.
+  if (p.phase === 'confirming' || p.action === 'delete') return null;
   const [part, whole] = p.phase === 'listing' ? [p.listed, p.folders] : [p.done, p.total];
   return whole === 0 ? 100 : Math.floor((part / whole) * 100);
 }

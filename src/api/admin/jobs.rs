@@ -334,6 +334,17 @@ fn maintenance_job_view(j: &MaintenanceJob) -> JobView {
             ),
             Err(_) => (None, serde_json::json!({})),
         },
+        (crate::maintenance::delete::KIND, Some(p)) => {
+            match crate::maintenance::delete::parse_params(p) {
+                // The folders by name; the objects selected directly by count
+                // (up to 10,000 of them).
+                Ok(dp) => (
+                    None,
+                    serde_json::json!({ "prefixes": dp.prefixes, "objects": dp.keys.len() }),
+                ),
+                Err(_) => (None, serde_json::json!({})),
+            }
+        }
         _ => (None, serde_json::json!({})),
     };
     JobView {

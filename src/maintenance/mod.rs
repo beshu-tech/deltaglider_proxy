@@ -41,12 +41,22 @@
 //! instance's DB, nothing more.
 
 pub mod backfill;
+pub mod delete;
 pub mod gate;
 pub mod live;
 pub mod migrate;
 mod paged;
 pub mod store;
 pub mod worker;
+
+/// Wake the maintenance worker after a job row changes. Every lane waits
+/// on the same `Notify`: `notify_waiters` wakes each lane that waits now,
+/// and `notify_one` keeps a permit for a lane that is between its drain and
+/// its wait. A bare `notify_one` woke one lane only, often the wrong one.
+pub fn wake_workers(notify: &tokio::sync::Notify) {
+    notify.notify_waiters();
+    notify.notify_one();
+}
 
 use std::collections::HashMap;
 
@@ -255,6 +265,33 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    /// Every lane of the worker waits on one `Notify`; a bare `notify_one`
+    /// wakes one lane only. Every wake goes through `wake_workers`.
+    #[test]
+    fn every_worker_wake_goes_through_wake_workers() {
+        let mut offenders = Vec::new();
+        let mut dirs = vec![std::path::PathBuf::from("src")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    && path != std::path::Path::new("src/maintenance/mod.rs")
+                {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    if text.contains("maintenance_notify.notify_") {
+                        offenders.push(path.display().to_string());
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "wake the workers with wake_workers: {offenders:?}"
+        );
     }
 
     #[test]

@@ -151,7 +151,7 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
                             one early release is `release_for_unwind` (pre-flip migrate cancel/failure opens the source); the middleware only counts in-flight
                             writes; `check_verified_request` 503-SlowDowns writes to busy buckets (and runs the backend-health
                             gate) AFTER signature verification — s3s access hook + form-POST handler; reads pass; in-flight write drain; admin bulk copy/move/delete loops participate via
-                            write_started/finished + per-item is_busy), worker.rs (sequential runner, kind dispatch; phases return `PhaseStop`
+                            write_started/finished + per-item is_busy), worker.rs (two lanes over one queue: a serial lane for every kind but `delete`, and a delete lane running `delete::DELETE_PARALLEL` delete jobs at once — every wake goes through `maintenance::wake_workers`; kind dispatch; phases return `PhaseStop`
                             {Cancelled, LeaseLost, ShuttingDown, Failed}; the ONE `background::LeaseKeeper` (verdict = `job_store::keeper_step`:
                             refusal = lost, store error retried within the TTL) renews maintenance, lifecycle and replication leases;
                             LeaseLost → phase stops, row NOT settled; graceful shutdown
@@ -165,7 +165,7 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
                             IN PLACE — bytes read once to hash, written never: S3 self-copy REPLACE / xattr rewrite via
                             StorageBackend::put_passthrough_metadata; dg-created-at pinned to the pre-job time unless refresh_last_modified,
                             multipart ETag preserved via dg-multipart-etag; POST /jobs/backfill-metadata),
-                            mod.rs (pure: resolve_desired/needs_rewrite/progress_percent/display_percent)
+                            delete.rs (kind=delete: the file browser's bulk delete as a server job — POST /objects/delete-jobs; holds NO bucket (exempt from the one-active-job index `idx_maint_active_bucket_v2`), arms no write gate, waits (Deferred) while another job gates the bucket; acts as the stored principal, re-checked per page; per-page cursor), mod.rs (pure: resolve_desired/needs_rewrite/progress_percent/display_percent)
   → config_apply.rs         ConfigMutator: background config mutations (migrate flips) through the same apply_config_transition
                             (TransitionCtx::Background names the skipped steps). Every admin config writer — PATCH, section, document,
                             bootstrap removal, backup secrets, backends, bucket-on-backend, rule delete — goes through ONE pipeline in
