@@ -50,3 +50,10 @@ path = "fuzz_targets/admission_spec.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "encryption_v2"
+path = "fuzz_targets/encryption_v2.rs"
+test = false
+doc = false
+bench = false

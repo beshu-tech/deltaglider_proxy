@@ -107,6 +107,11 @@ base64 = "0.22"
 aes-gcm = { version = "0.10", features = ["zeroize"] }
 aes = { version = "0.8", features = ["zeroize"] }
 hkdf = "0.12"
+# Deterministic AEAD for the v2 listing tokens (a marker is an object name,
+# so the same facts must give the same token). `polyval` only to turn on its
+# zeroize feature (GHASH/POLYVAL key and state).
+aes-gcm-siv = "0.11"
+polyval = { version = "0.6", features = ["zeroize"] }
 
 # ZIP archive (Full Backup). Pure-Rust deflate via flate2 (no system
 # zlib). Used by the backup export/import handlers to bundle

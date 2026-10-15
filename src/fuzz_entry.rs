@@ -124,6 +124,13 @@ pub fn admission_spec(data: &[u8]) {
     }
 }
 
+/// The at-rest encryption v2 parsers: the `dg-sealed` value, the sealed
+/// facts, listing tokens and a stored body. A backend writer controls all
+/// of them, so none may panic.
+pub fn encryption_v2(data: &[u8]) {
+    crate::storage::encrypting::v2::fuzz_sealed_and_frames(data);
+}
+
 #[cfg(test)]
 mod tests {
     //! Run each entry on its checked-in seeds (`fuzz/seeds/<target>`)
@@ -159,6 +166,13 @@ mod tests {
     fn config_yaml_seeds() {
         for s in seeds("config_yaml") {
             super::config_yaml(&s);
+        }
+    }
+
+    #[test]
+    fn encryption_v2_seeds() {
+        for s in seeds("encryption_v2") {
+            super::encryption_v2(&s);
         }
     }
 

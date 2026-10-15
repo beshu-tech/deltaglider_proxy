@@ -60,6 +60,10 @@ mod bucket_tests;
 mod format;
 #[cfg(test)]
 mod tests;
+// Format v2 (issue #120). Wired into the read and write paths in a later
+// commit; until then only its tests and the fuzz entry use it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod v2;
 
 pub use format::*;
 
