@@ -1,6 +1,6 @@
 # Lifecycle rules
 
-Lifecycle rules act on engine-visible objects. A rule deletes old objects by age, keeps the newest *N* by count (`retain-newest`), or transitions (archives) objects to another bucket or prefix. Lifecycle rules appear on the unified Jobs surface (`GET /_/api/admin/jobs`, job id `lifecycle:<rule-name>`); see [Jobs](jobs.md).
+Lifecycle rules act on engine-visible objects. A rule deletes old objects by age, keeps the newest *N* by count (`retain-newest`), or transitions (archives) objects to another bucket or prefix. Lifecycle rules appear on the unified Jobs surface (`GET /_/api/admin/jobs`, job id `lifecycle:<rule-name>`); see [Jobs](jobs.md). In the admin UI, the rules are on **Storage → Lifecycle** (`/_/admin/storage/lifecycle`), and their runs are also on **Storage → Jobs** (`/_/admin/jobs`).
 
 ## Scope
 
@@ -29,6 +29,8 @@ storage:
         include_globs: ["nightly/**/*.dump"]
         exclude_globs: [".deltaglider/**", "nightly/golden/**"]
 ```
+
+In the admin UI, the rules are on **Storage → Lifecycle** (`/_/admin/storage/lifecycle`). On that page, `enabled` is the switch **Run lifecycle rules on schedule**, and `tick_interval` is the field **Run each lifecycle rule every**.
 
 Rule names use `[A-Za-z0-9_.-]{1,64}` and must be unique.
 
@@ -99,11 +101,11 @@ The preview also splits its counters. `objects_deleted`, `objects_moved` and `ob
 
 The preview also returns `computed_at`, which is the time at which the walk ended, and `next_due_at`. The `next_due_at` field is the earliest time at which a scanned object that the rule does not match now will match. The planner compares the creation time of each object with `expire_after`, so an object becomes due at its creation time plus `expire_after`. The proxy reads these times from the metadata that the walk already has, so the field costs no extra request. Objects that the globs exclude never count. The field is absent when no scanned object will ever match, and for a retain-newest rule, because that rule has no age condition of its own.
 
-Run-now does not wait for the run. The proxy opens the run-history row, starts the run in the background, and answers `202` with the new `run_id` and `status: "running"`; the counters in that response are zero. To get the result, poll `GET /_/api/admin/jobs/lifecycle:<name>/runs` until the row with that `id` has a terminal `status`. The row carries the counters (`objects_processed` is the affected count) and `errors`, and the failures of the run are in `GET …/failures`. The Jobs screen polls in the same way.
+Run-now does not wait for the run. The proxy opens the run-history row, starts the run in the background, and answers `202` with the new `run_id` and `status: "running"`; the counters in that response are zero. To get the result, poll `GET /_/api/admin/jobs/lifecycle:<name>/runs` until the row with that `id` has a terminal `status`. The row carries the counters (`objects_processed` is the affected count) and `errors`, and the failures of the run are in `GET …/failures`. The Lifecycle page polls in the same way.
 
 History rows include `id`, `triggered_by` (`scheduler` or `run-now`), `started_at`, `finished_at`, the counters, `errors`, and `status`. `objects_processed` is the number of objects that the run deleted, moved or copied, and `bytes` is their logical size. A transition inside one backend is a server-side copy that sends no byte through the proxy, but it still counts the size of the object. A row also has `objects_deleted`, `objects_moved`, `objects_copied`, `objects_not_due` and `objects_excluded`, with the same meaning as in the preview. A row of a run that ended before the proxy stored these fields does not have them. The status of a finished run is `succeeded`, `failed`, `paused` (a pause stopped it and it kept its cursor), `deferred` (a maintenance job started on one of its buckets; it kept its cursor, and the rule is due again a minute later) or `cancelled` (a kill stopped it). While a run runs on this instance, its row shows the live counters. Failure rows include `run_id`, `bucket`, `object_key`, `occurred_at`, and `error_message`. A failed transition copy names the destination bucket and key in its message.
 
-The Jobs row of a lifecycle rule (`GET /_/api/admin/jobs`) shows the live counters of a run in progress in `progress` (`processed`, `skipped`, `failed`, `bytes` and `deleted`) and in `detail.live`. The row also has `last_error` (the last failure of the latest run), `failed_total` (the number of failures of that run), `next_due_at` (when the rule runs next on schedule), `detail.tick_interval`, and `detail.deferred` while the scheduler does not run a due rule because a maintenance job gates one of its buckets or the health check closed one of its backends.
+The row of a lifecycle rule in `GET /_/api/admin/jobs` shows the live counters of a run in progress in `progress` (`processed`, `skipped`, `failed`, `bytes` and `deleted`) and in `detail.live`. The row also has `last_error` (the last failure of the latest run), `failed_total` (the number of failures of that run), `next_due_at` (when the rule runs next on schedule), `detail.tick_interval`, and `detail.deferred` while the scheduler does not run a due rule because a maintenance job gates one of its buckets or the health check closed one of its backends.
 
 A run whose first 20 writes (copies and deletes) all fail stops with an error that says so. The destination or the backend then cannot accept writes, and the run does not try the same write on every object of the scope.
 
@@ -140,7 +142,7 @@ A run reads the creation time and the logical size of each delta object with a `
 
 `tick_interval` sets how often each rule runs: a rule is due again one `tick_interval` after its last run ended (a run-now also counts). The scheduler checks every 30 seconds which rules are due, so a rule runs at most 30 seconds after its due time. The first check after a boot comes 30 seconds after the start.
 
-A new enabled rule does not run at the next check. The proxy schedules its first run one `tick_interval` after it first sees the rule: the apply that adds or enables the rule, or the boot. The Jobs row shows when (`next_due_at`), and the review step of the Jobs screen says so before you apply. Use that time to open the Preview tab of the rule and see what it will do. A rule that ran before keeps its schedule when you disable it and enable it again, so it can run at the next check.
+A new enabled rule does not run at the next check. The proxy schedules its first run one `tick_interval` after it first sees the rule: the apply that adds or enables the rule, or the boot. The row of the rule shows when (`next_due_at`), and the review step of the Lifecycle page says so before you apply. Use that time to open the Preview tab of the rule and see what it will do. A rule that ran before keeps its schedule when you disable it and enable it again, so it can run at the next check.
 
 While the backend health check marks the backend of a bucket that the rule writes to as unavailable, or a maintenance job gates one of those buckets, the scheduler does not start the rule. The rule stays due and runs at a check after the backend recovers or the job ends. The row says why in `detail.deferred`. Pause/resume state lives in the same row and survives restarts, as in replication.
 

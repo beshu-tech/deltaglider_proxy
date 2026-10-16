@@ -47,7 +47,7 @@ Migration does not rewrite objects as clients read them, and no background daemo
 
 ## A related but different thing: backend-to-backend moves
 
-*Migrating onto the proxy* (the subject of this page) is different from *moving a bucket between backends when the bucket is already on the proxy*. For the second case, the proxy has a resumable [migrate job](../reference/jobs.md) with the phases stage, copy, verify, flip and cleanup. You start it from the Jobs screen, and a write gate keeps the bucket consistent during the move. The [move-a-bucket guide](../how-to/move-a-bucket-between-backends.md) covers it. This page is about the one-time move from storage that the proxy has never seen.
+*Migrating onto the proxy* (the subject of this page) is different from *moving a bucket between backends when the bucket is already on the proxy*. For the second case, the proxy has a resumable [migrate job](../reference/jobs.md) with the phases stage, copy, verify, flip and cleanup. You start it from the Buckets page or the Jobs page, and a write gate keeps the bucket consistent during the move. The [move-a-bucket guide](../how-to/move-a-bucket-between-backends.md) covers it. This page is about the one-time move from storage that the proxy has never seen.
 
 ## Related
 

@@ -8,10 +8,10 @@ The example deletes the nightly database dumps in `db-archive` that are older th
 
 In the admin UI:
 
-1. In the sidebar, open **Storage → Jobs** (`/_/admin/jobs`), and click **New job**.
-2. Click **Lifecycle rule — scheduled expiry / archive**. A drawer opens with the definition of a new rule.
+1. In the sidebar, open **Storage → Lifecycle** (`/_/admin/storage/lifecycle`).
+2. Click **New lifecycle rule**. A drawer opens with the definition of a new rule.
 
-   ![The Jobs page with the New job menu open; callout 1 marks New job and callout 2 marks Lifecycle rule — scheduled expiry / archive.](/_/screenshots/lifecycle-new-job.webp)
+   ![The Lifecycle page; callout 1 marks Lifecycle in the sidebar, and callout 2 marks New lifecycle rule.](/_/screenshots/lifecycle-new-rule.webp)
 
 3. In **Rule name**, type `expire-nightly-dumps`.
 4. Leave **Enabled** off. A new lifecycle rule starts disabled, so that you can preview it first (section 3).
@@ -21,9 +21,9 @@ In the admin UI:
 
    ![A new lifecycle rule named expire-nightly-dumps; callout 3 marks Rule name, callout 4 marks the Enabled switch, which stays off, callout 5 marks Scope, set to db-archive and nightly/, callout 6 marks Expire after, set to 90d, and callout 7 marks Action, set to Delete.](/_/screenshots/lifecycle-rule-fields.webp)
 
-8. Click **Filters and batch size**. In **Include globs**, type `nightly/**/*.dump`. In **Exclude globs**, keep `.deltaglider/**`, and add `nightly/golden/**` on a new line.
+8. In **Which objects**, type `nightly/**/*.dump` in **Include**. In **Exclude**, keep `.deltaglider/**`, and add `nightly/golden/**` on a new line. Under each list, every glob shows how many objects under the scope it matches.
 
-   ![The Filters and batch size part of the expire-nightly-dumps rule is open; the box marks Include globs and Exclude globs, which hold nightly/**/*.dump and nightly/golden/**.](/_/screenshots/lifecycle-rule-filters.webp)
+   ![The Which objects section of the expire-nightly-dumps rule; the box marks Include and Exclude, which hold nightly/**/*.dump and nightly/golden/**.](/_/screenshots/lifecycle-rule-filters.webp)
 
 9. Click **Review & apply** in the bar at the bottom of the page. Check the new rule in the dialog, and then click **Apply and Persist**.
 
@@ -95,7 +95,7 @@ After you edit the file, restart the proxy, or apply the file to the running pro
 
 Always preview a rule before you enable it. The preview lists the objects that a run would delete or move now. It works while the rule is disabled, it is strictly read-only, and it writes no history rows. In the admin UI:
 
-1. On **Storage → Jobs**, click **Preview** in the row of `expire-nightly-dumps`. The drawer of the rule opens on the **Preview** tab, which lists the candidate keys with their total count and size.
+1. On **Storage → Lifecycle**, click **Preview** in the row of `expire-nightly-dumps`. The drawer of the rule opens on the **Preview** tab, which lists the candidate keys with their total count and size.
 2. Check the list. If it contains anything that must survive, change the **Scope**, the globs or **Expire after** of the rule, apply the change, and click **Refresh preview**. Repeat until the list is right.
 
    ![The Preview tab of the expire-nightly-dumps rule lists three dumps that the rule would delete, with their total size; the arrow points at Refresh preview.](/_/screenshots/lifecycle-preview.webp)
@@ -116,11 +116,11 @@ In the response, `objects_affected` and `bytes_affected` give the size of the ch
 In the admin UI:
 
 1. Click the row of `expire-nightly-dumps`, and turn on **Enabled** on the **Definition** tab.
-2. On the Jobs page, turn on **Run lifecycle rules on schedule**. It is off by default, and while it is off, no lifecycle rule runs.
+2. On the Lifecycle page, turn on **Run lifecycle rules on schedule**. It is off by default, and while it is off, no lifecycle rule runs.
 
-   ![The Jobs page with the switch Run lifecycle rules on schedule, which is on; the arrow points at the switch.](/_/screenshots/lifecycle-scheduler-switch.webp)
+   ![The Lifecycle page with the switch Run lifecycle rules on schedule, which is on; the arrow points at the switch.](/_/screenshots/lifecycle-scheduler-switch.webp)
 
-3. Click **Review & apply**, and then click **Apply and Persist**. The scheduler now runs the rule when it is due. It checks for due rules every hour (`storage.lifecycle.tick_interval`).
+3. Click **Review & apply**, and then click **Apply and Persist**. The scheduler now runs the rule when it is due. It runs each rule every hour by default; the field **Run each lifecycle rule every** under the switch sets this interval (`storage.lifecycle.tick_interval`).
 4. To run the rule at once, click **Run now** in its row. The run does not start yet: a dialog shows the objects that the run would delete or move, with their count and total size. The dialog uses the preview of the last 5 minutes when there is one; otherwise the proxy computes a new preview first.
 5. Click the button that names the count, for example **Run: delete 3 objects**. The run acts on the objects that match the rule when it starts, so the result can differ slightly from the preview.
 
@@ -141,7 +141,9 @@ To stop the rule for a while (an incident, an audit freeze), click **Pause** in 
 
 ## 5. Read the history
 
-The proxy keeps a record of every execution. On the Jobs page, the drawer of the rule has two tabs for it. **Runs** lists each run: when it started, whether the scheduler or run-now started it, the objects and bytes it affected, and its final status. **Failures** lists the errors per object, with the run that saw them. With the admin API:
+The proxy keeps a record of every execution. On the Lifecycle page, the drawer of the rule has two tabs for it. **Runs** lists each run: when it started, whether the scheduler or run-now started it, the objects and bytes it affected, and its final status. **Failures** lists the errors per object, with the run that saw them.
+
+**All runs →** in the **Last run** cell of the rule opens **Storage → Jobs** (`/_/admin/jobs`) with a filter for the rule, and it lists the runs of the rule, newest first. Close the filter chip to see the runs of every rule and of the one-off jobs on one list. The Jobs page hides the runs that deleted and moved nothing, unless you turn on **Show runs that changed nothing**. With the admin API:
 
 ```bash
 curl -b cookies https://s3.acme.example/_/api/admin/jobs/lifecycle:expire-nightly-dumps/runs?limit=10
@@ -166,7 +168,7 @@ The design also protects you in these ways:
 
 ## Verify
 
-1. After the first run, check that the **Runs** tab shows `succeeded`, and that the number of affected objects matches the preview.
+1. After the first run, check that the **Runs** tab of the rule shows `succeeded`, and that the number of affected objects matches the preview.
 2. Check that an expired key is gone, or that it is in the cold prefix after an archive:
 
    ```bash
@@ -180,7 +182,7 @@ The design also protects you in these ways:
 ## Related
 
 - [Lifecycle reference](../reference/lifecycle.md): the full grammar, the run and failure schemas, and the guardrail list.
-- [Jobs reference](../reference/jobs.md): the unified jobs surface and its capability matrix.
+- [Jobs reference](../reference/jobs.md): the unified jobs surface, its capability matrix, and the Lifecycle and Jobs pages.
 - [How to replicate a bucket to another backend](replicate-a-bucket.md): continuous mirroring instead of age-based moves.
 - [Jobs and durability](../explanation/jobs-and-durability.md): leases, crash-resume, and why a preview is safe.
 - [Two ways to configure DeltaGlider](../explanation/two-ways-to-configure.md): how the admin UI and the YAML file relate.

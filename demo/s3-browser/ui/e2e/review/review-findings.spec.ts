@@ -178,9 +178,9 @@ test('analytics hero never says more than 100% smaller', async ({ page }) => {
 
 test('lifecycle "Run now" asks for confirmation before deleting', async ({ page }) => {
   await signIn(page);
-  await page.goto('/_/admin/jobs');
-  await expect(page.getByText('Everything that runs in the background', { exact: false })).toBeVisible();
-  const row = page.locator('tr, [role=row]').filter({ hasText: 'Lifecycle' }).filter({ has: page.locator('button:has-text("Run now"):not([disabled])') }).last();
+  await page.goto('/_/admin/storage/lifecycle');
+  await expect(page.getByText('Rules that expire or archive objects by age', { exact: false })).toBeVisible();
+  const row = page.locator('tr, [role=row]').filter({ has: page.locator('button:has-text("Run now"):not([disabled])') }).last();
   const hasRule = await row.waitFor({ timeout: 10_000 }).then(() => true, () => false);
   test.skip(!hasRule, 'needs a lifecycle rule');
   let sent = false;

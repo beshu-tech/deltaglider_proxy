@@ -109,7 +109,7 @@ The proxy log has one line for each such error: `transient storage fault answere
 
 ## Writes to one bucket return 503 SlowDown
 
-A maintenance job (re-encryption, migration, or metadata backfill) is running on that bucket. The proxy intentionally refuses writes while the job rewrites objects. SDKs retry automatically and succeed when the job finishes. Reads are unaffected. Check **Storage → Jobs** (`/_/admin/jobs`, or `GET /_/api/admin/jobs`) for the job's progress; cancel it if it shouldn't be running. A job survives restarts by design, so if a job is stuck, cancel it through `POST /_/api/admin/jobs/maintenance:<id>/cancel` rather than restarting the proxy. See [Jobs reference](../reference/jobs.md).
+A maintenance job (re-encryption, migration, or metadata backfill) is running on that bucket. The proxy intentionally refuses writes while the job rewrites objects. SDKs retry automatically and succeed when the job finishes. Reads are unaffected. Check **Storage → Jobs** (`/_/admin/jobs`, or `GET /_/api/admin/jobs/runs?status=active`) for the job's progress. If the job should not run, cancel it with **Cancel…** in the "⋯" menu of its row. A job survives restarts by design, so if a job is stuck, cancel it through `POST /_/api/admin/jobs/maintenance:<id>/cancel` rather than restarting the proxy. See [Jobs reference](../reference/jobs.md).
 
 ## Cache miss storm on GET
 

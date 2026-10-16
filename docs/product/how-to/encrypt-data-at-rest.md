@@ -165,7 +165,7 @@ In the admin UI:
 
    If you click **Later**, start the jobs when you are ready from **Storage → Jobs** with **New job** → **Re-encrypt buckets… — one-off rewrite**. While the job of a bucket runs, writes to that bucket get `503 SlowDown`, and reads pass. The job survives restarts.
 
-3. Open **Storage → Jobs** (`/_/admin/jobs`), and wait until every re-encrypt job shows `succeeded`, with no rows on its **Failures** tab.
+3. Open **Storage → Jobs** (`/_/admin/jobs`), and wait until every re-encrypt job shows `succeeded`, with no rows on its **Failures** tab. To see only these jobs, select **Re-encrypt** in **Every kind**.
 4. Back on **Storage → Backends**, the encryption editor of `hetzner-fsn1` shows the box **Unencrypted objects are served**. Click **Refuse unencrypted objects**. From now on, the proxy refuses every object in these buckets that it did not encrypt.
 
 The re-encrypt job does not handle the SSE modes: on an SSE-KMS or SSE-S3 backend, use the migrate job ([recipe C](rotate-encryption-keys.md#recipe-c-migrate-from-proxy-aes-to-sse-kms)). [How to rotate or change encryption keys](rotate-encryption-keys.md) explains the mechanics of the job.

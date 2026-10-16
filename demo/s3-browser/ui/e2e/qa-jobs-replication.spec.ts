@@ -1,10 +1,12 @@
 /**
  * QA nightly flow for a replication rule, the way an operator meets it:
  *
- * New job → Replication rule → fill the buckets → Review & apply → the row
+ * Storage → Replication → New replication rule → fill the buckets → Review & apply → the row
  * shows the run as running, with its live progress → it settles with the
  * number of objects that it copied → the Verify tab audits the mirror and
- * says "Verified in sync".
+ * says "Verified in sync" → Clone opens a draft that warns while it copies
+ * the same objects → "All runs →" opens the Jobs page filtered to the rule,
+ * and its run drawer leads back to the rule.
  *
  * Only a real browser + real server + real timers show this: the rule row
  * reported zero progress until the run ended, and the Verify tab hid the
@@ -71,12 +73,11 @@ test('replication: create a rule, watch it run, verify the mirror', async ({ pag
   await page.getByPlaceholder('Admin password').fill(PASSWORD);
   await page.getByRole('button', { name: 'Sign in' }).click();
   await expect(page.getByRole('navigation', { name: 'Bucket list' })).toBeVisible({ timeout: 30_000 });
-  await page.goto('/_/admin/jobs');
-  await expect(page.getByRole('heading', { level: 2, name: /^Jobs/ })).toBeVisible({ timeout: 30_000 });
+  await page.goto('/_/admin/storage/replication');
+  await expect(page.getByRole('heading', { level: 2, name: /^Replication/ })).toBeVisible({ timeout: 30_000 });
 
-  // New job → Replication rule: a draft opens in the drawer.
-  await page.getByRole('button', { name: 'New job' }).click();
-  await page.getByText('Replication rule — continuous copy').click();
+  // New replication rule: a draft opens in the drawer.
+  await page.getByRole('button', { name: 'New replication rule' }).click();
   const drawer = page.getByRole('dialog');
   await drawer.getByPlaceholder('prod-artifacts').fill(SRC);
   await drawer.getByPlaceholder('backup-artifacts').fill(DST);
@@ -108,6 +109,37 @@ test('replication: create a rule, watch it run, verify the mirror', async ({ pag
   await expect(
     drawer.getByText(`All ${OBJECTS.toLocaleString('en-US')} objects are present and verified identical.`),
   ).toBeVisible();
+
+  // Clone: a draft "<name>-copy" opens, and it warns while it copies the
+  // same objects as the rule it came from. Discard drops it.
+  const ruleName = (await row.locator('[data-col="rule"] [title]').first().getAttribute('title')) ?? '';
+  expect(ruleName).not.toBe('');
+  await page.keyboard.press('Escape');
+  await expect(drawer).toBeHidden();
+  await row.getByRole('button', { name: `More actions for ${ruleName}` }).click();
+  await page.getByRole('menuitem', { name: 'Clone' }).click();
+  const clone = page.getByRole('dialog');
+  await expect(clone).toContainText(`${ruleName}-copy`);
+  await expect(clone.getByText(`Rule "${ruleName}" has the same source, destination and filters`)).toBeVisible();
+  await clone.getByPlaceholder('mirror/releases/').fill('elsewhere/');
+  await expect(clone.getByText(/has the same source, destination and filters/)).toBeHidden();
+  // The close button, not Escape: Escape first closes the prefix suggestions.
+  await clone.getByRole('button', { name: 'Close', exact: true }).click();
+  await expect(clone).toBeHidden();
+  await page.getByRole('button', { name: 'Discard' }).click();
+  await expect(page.getByRole('row').filter({ hasText: `${ruleName}-copy` })).toHaveCount(0);
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+
+  // All runs →: the Jobs page, filtered to the rule, lists its run.
+  await row.getByRole('button', { name: `All runs of ${ruleName}` }).click();
+  await expect(page).toHaveURL(/\/_\/admin\/jobs\?rule=replication/);
+  const run = page.getByRole('row').filter({ hasText: ruleName });
+  await expect(run.first()).toContainText(new RegExp(`${OBJECTS.toLocaleString('en-US')} copied`), { timeout: 15_000 });
+  await run.first().click();
+  const runDrawer = page.getByRole('dialog');
+  await expect(runDrawer.getByText('Failures of this run')).toBeVisible();
+  await runDrawer.getByRole('button', { name: 'Open rule' }).click();
+  await expect(page).toHaveURL(/\/_\/admin\/storage\/replication\?job=replication/);
 
   expect(errors).toEqual([]);
 });

@@ -10,24 +10,23 @@ The destination bucket must exist, and it must route to the backend that holds t
 
 In the admin UI:
 
-1. In the sidebar, open **Storage → Jobs** (`/_/admin/jobs`).
-2. Click **New job**.
-3. Click **Replication rule — continuous copy**. A drawer opens with the definition of a new rule.
+1. In the sidebar, open **Storage → Replication** (`/_/admin/storage/replication`).
+2. Click **New replication rule**. A drawer opens with the definition of a new rule.
 
-   ![The Jobs page with the New job menu open; callout 1 marks Jobs in the sidebar, callout 2 marks New job, and callout 3 marks Replication rule — continuous copy.](/_/screenshots/replicate-new-job.webp)
+   ![The Replication page; callout 1 marks Replication in the sidebar, and callout 2 marks New replication rule.](/_/screenshots/replicate-new-rule.webp)
 
-4. In **Rule name**, type `releases-to-dr`.
-5. Leave **Enabled** on.
-6. In **Source**, type `releases` as the bucket, and leave the prefix empty. An empty prefix copies the entire bucket.
-7. In **Destination**, type `releases-dr` as the bucket, and leave the prefix empty. The copies then keep the key paths of the source.
+3. In **Rule name**, type `releases-to-dr`.
+4. Leave **Enabled** on.
+5. In **Source**, type `releases` as the bucket, and leave the prefix empty. An empty prefix copies the entire bucket.
+6. In **Destination**, type `releases-dr` as the bucket, and leave the prefix empty. The copies then keep the key paths of the source.
 
-   ![The Definition tab of the releases-to-dr replication rule; callout 4 marks Rule name, callout 5 marks Enabled, callout 6 marks Source, set to releases, and callout 7 marks Destination, set to releases-dr.](/_/screenshots/replicate-rule-fields.webp)
+   ![The Definition tab of the releases-to-dr replication rule; callout 3 marks Rule name, callout 4 marks Enabled, callout 5 marks Source, set to releases, and callout 6 marks Destination, set to releases-dr.](/_/screenshots/replicate-rule-fields.webp)
 
-8. In **Which objects**, leave **Exclude** at `.deltaglider/**`. Then click **Advanced rule behavior**. In **Interval**, type `1h`. Leave **Conflict policy** at **Newer wins — safest default**, and leave **Delete replication** off. Sections 3 to 5 explain these choices.
+7. In **Which objects**, leave **Exclude** at `.deltaglider/**`. Then click **Advanced rule behavior**. In **Interval**, type `1h`. Leave **Conflict policy** at **Newer wins — safest default**, and leave **Delete replication** off. Sections 3 to 5 explain these choices.
 
    ![The Advanced rule behavior part of the releases-to-dr rule is open; the box marks the Conflict policy choices, and the arrow points at the Delete replication switch.](/_/screenshots/replicate-rule-advanced.webp)
 
-9. Click **Review & apply** in the bar at the bottom of the page. The dialog lists each changed field and a **Replication plan** with every rule. Check it, and then click **Apply and Persist**.
+8. Click **Review & apply** in the bar at the bottom of the page. The dialog lists each changed field and a **Replication plan** with every rule. Check it, and then click **Apply and Persist**.
 
    ![The review dialog lists the changed fields of the releases-to-dr rule and the Replication plan; the arrow points at Apply and Persist.](/_/screenshots/replicate-apply.webp)
 
@@ -93,7 +92,7 @@ storage:
         exclude_globs: [".deltaglider/**"]
 ```
 
-`storage.replication.enabled` is the global switch of replication, and it is `true` by default. The admin UI has no control for it. When it is `false`, no rule runs, and **Run now** is refused.
+`storage.replication.enabled` is the global switch of replication, and it is `true` by default. On the Replication page, it is the switch **Run replication rules**. When it is off, no rule copies on schedule or on events, and **Run now** is refused. The field **Check for due rules every** on the same page is `storage.replication.tick_interval`: how often the scheduler looks for a rule whose interval has passed.
 
 After you edit the file, restart the proxy, or apply the file to the running proxy with `POST /_/api/admin/config/apply` or with `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example`.
 
@@ -101,9 +100,9 @@ After you edit the file, restart the proxy, or apply the file to the running pro
 
 The first sync does not have to wait for events or for the interval. In the admin UI:
 
-1. On **Storage → Jobs**, click **Run now** in the row of `releases-to-dr`. The wide table shows the actions as icons, and each icon shows its name when you point at it.
+1. On **Storage → Replication**, click **Run now** in the row of `releases-to-dr`. The wide table shows the actions as icons, and each icon shows its name when you point at it.
 
-   ![The Jobs page lists the releases-to-dr replication rule; the arrow points at its Run now button.](/_/screenshots/replicate-run-now.webp)
+   ![The Replication page lists the releases-to-dr rule; the arrow points at its Run now button.](/_/screenshots/replicate-run-now.webp)
 
 A rule that is disabled or paused shows **Run once** instead. It runs the rule one time, and it does not enable or resume the rule.
 
@@ -132,11 +131,17 @@ The run opens its row in the run history after this response, so `run_id` is `0`
 
 If you get `409 Conflict`, the rule is already running, replication is disabled globally (`storage.replication.enabled: false`), or a maintenance job is active on `releases-dr`. The error message says which one.
 
-## 7. Watch it in Jobs
+## 7. Watch the runs
 
-On **Storage → Jobs**, the rule is the row `releases-to-dr`, with its status and its last run. Click the row to open its drawer. The **Runs** tab lists every execution, and the **Failures** tab lists the errors per object. A few failed objects do not fail the run, because the next pass copies them.
+On **Storage → Replication**, the row of `releases-to-dr` shows the status of the rule and its last run. In the admin UI:
 
-![The Runs tab of the replication job shows one finished run that copied five objects; the arrow points at the number of copied objects.](/_/screenshots/job-runs.webp)
+1. In the **Last run** cell of `releases-to-dr`, click **All runs →**. The page **Storage → Jobs** (`/_/admin/jobs`) opens with a filter for the rule, and it lists each run of the rule, newest first.
+
+   ![The Jobs page shows only the runs of the releases-to-dr rule; the box marks the filter chip of the rule, and the arrow points at the five objects that its run copied.](/_/screenshots/job-runs.webp)
+
+2. Click a run to open its drawer. The drawer shows the counts and the duration of the run, how it started, and the failures of that run. **Open rule** takes you back to the rule.
+
+The Jobs page hides the runs that changed nothing, because a rule that runs every hour makes such a run most hours. Turn on **Show runs that changed nothing** to see them. The drawer of the rule on the Replication page also has a **Runs** tab and a **Failures** tab. A few failed objects do not fail the run, because the next pass copies them.
 
 The same data with the admin API:
 
@@ -146,6 +151,69 @@ curl -b cookies https://s3.acme.example/_/api/admin/jobs/replication:releases-to
 ```
 
 To stop the rule for a while, click **Pause** in its row (or send `POST …/pause`), and click **Resume** to start it again (`POST …/resume`). A paused rule copies and deletes nothing, also for new events, and the pause survives restarts. A run that is in progress when you click **Pause** stops at the end of the object that it copies, also when **Run now** started it. That run gets the status `paused` and keeps its position in the walk. After a resume, the next scheduler tick starts a run that continues from that position, so it copies the rest first. The proxy does not keep the events of the pause, so that run cannot see the objects that changed during the pause in the part of the walk that is already done. For this reason, when the continued run finishes, the rule is due again at once, and the full reconcile that follows brings `releases-dr` in sync. With delete replication on, that reconcile also applies the deletes of the pause.
+
+## 8. Copy the rule to another bucket
+
+A second bucket often needs the same replication settings. **Clone** copies a rule into a new draft, and you change only what differs. The example mirrors `downloads` into the folder `downloads/` of `releases-dr`, with the settings of `releases-to-dr`. In the admin UI:
+
+1. On **Storage → Replication**, click "⋯" in the row of `releases-to-dr`.
+2. Click **Clone**. The drawer opens with a draft named `releases-to-dr-copy`, with the settings of `releases-to-dr`.
+
+   ![The Replication page with the "⋯" menu of the releases-to-dr rule open; callout 1 marks the "⋯" button, and callout 2 marks Clone.](/_/screenshots/replicate-clone-menu.webp)
+
+   The draft has the same source, the same destination and the same filters as `releases-to-dr`, so both rules would copy the same objects. The drawer says so with the warning **Rule "releases-to-dr" has the same source, destination and filters**.
+
+   ![The drawer of the new draft releases-to-dr-copy; the box marks the warning that the rule releases-to-dr has the same source, destination and filters, callout 3 marks Rule name, callout 4 marks Source, and callout 5 marks Destination.](/_/screenshots/replicate-clone-draft.webp)
+
+3. In **Rule name**, type `downloads-to-dr`.
+4. In **Source**, type `downloads` as the bucket. The warning goes away, because the source of the two rules differs now.
+5. In **Destination**, type `downloads/` as the prefix. The copies then stay apart from the copies of `releases`.
+6. Click **Review & apply**, check the new rule in the dialog, and then click **Apply and Persist**.
+
+Keep **Delete replication** off on both rules. With delete replication on, `releases-to-dr` would delete the copies of `downloads` in `releases-dr`, because its source `releases` does not hold them (section 5).
+
+### The same change in YAML
+
+The clone adds a second rule to the `storage` section of `deltaglider_proxy.yaml` ([why the UI and the file hold the same configuration](../explanation/two-ways-to-configure.md)). In YAML, copy the rule entry and change its name, its source and its destination:
+
+```yaml
+# validate
+storage:
+  default_backend: hetzner-fsn1
+  backends:
+    - name: hetzner-fsn1
+      type: s3
+      endpoint: https://fsn1.your-objectstorage.com
+      region: fsn1
+      force_path_style: true
+    - name: aws-dr
+      type: s3
+      region: eu-west-1
+  buckets:
+    releases-dr:
+      backend: aws-dr
+  replication:
+    enabled: true
+    rules:
+      - name: releases-to-dr
+        enabled: true
+        source: { bucket: releases, prefix: "" }
+        destination: { bucket: releases-dr, prefix: "" }
+        interval: "1h"
+        conflict: newer-wins
+        replicate_deletes: false
+        exclude_globs: [".deltaglider/**"]
+      - name: downloads-to-dr
+        enabled: true
+        source: { bucket: downloads, prefix: "" }
+        destination: { bucket: releases-dr, prefix: "downloads/" }
+        interval: "1h"
+        conflict: newer-wins
+        replicate_deletes: false
+        exclude_globs: [".deltaglider/**"]
+```
+
+After you edit the file, restart the proxy, or apply the file to the running proxy with `POST /_/api/admin/config/apply` or with `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example`.
 
 ## Verify
 
@@ -176,13 +244,13 @@ To stop the rule for a while, click **Pause** in its row (or send `POST …/paus
    aws --endpoint-url https://s3.acme.example s3 ls s3://releases-dr/firmware/widget-3000/
    ```
 
-5. Check that the run history shows `succeeded` with `errors: 0`.
+5. Check that the run of the rule on **Storage → Jobs** shows `succeeded`, with no failed objects.
 
 ## Related
 
 - [How to use a backend without conditional writes](backend-capability-validation.md): mark the destination `replication_target_only` to host a mirror on a cheap backend like Backblaze B2.
 - [Replication reference](../reference/replication.md): rule grammar, conflict policies, failure modes, and what does not replicate.
-- [Jobs reference](../reference/jobs.md): the unified jobs API that shows the rule.
+- [Jobs reference](../reference/jobs.md): the unified jobs API, and the Replication and Jobs pages.
 - [Event log reference](../reference/event-outbox.md): the event stream that drives the near-real-time copies.
 - [Jobs and durability](../explanation/jobs-and-durability.md): why replication is a durable job.
 - [How to expire and archive objects](expire-and-archive-objects.md): age-based moves instead of mirroring.

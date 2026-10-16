@@ -60,7 +60,7 @@ Each copy keeps the original creation time of the object, which S3 clients see a
 
 ## 2. Watch it run
 
-In the sidebar, open **Storage → Jobs** (`/_/admin/jobs`). The migration is a row of the kind **Migrate**, with its status and live progress. Click the row to open its drawer, which shows the phase, the progress in objects and bytes, and any failures per object.
+In the sidebar, open **Storage → Jobs** (`/_/admin/jobs`). The page lists every run, newest first, and the migration is a row of the kind **Migrate**, with its status and live progress. To see only this bucket, select `db-archive` in **Every bucket**. Click the row to open its drawer, which shows the phase, the progress in objects and bytes, and any failures per object.
 
 ![The Jobs page lists the running migrate job of db-archive to hetzner-fsn1; the box marks the job row.](/_/screenshots/migrate-jobs-row.webp)
 
@@ -71,7 +71,7 @@ curl -b cookies https://s3.acme.example/_/api/admin/jobs
 curl -b cookies https://s3.acme.example/_/api/admin/jobs/maintenance:7/failures
 ```
 
-If something looks wrong, click **Cancel** in the row of the job (or send `POST /_/api/admin/jobs/maintenance:7/cancel`). The job checks for a cancel every 20 objects. A cancel before the switch unwinds cleanly: writes to the source bucket resume at once, the job deletes the copies that it wrote to the destination, and the job never deletes the source on a failed or cancelled run. When the job fails because a backend did not answer, it keeps the copies that it wrote. Start the migration again with **Mirror** as the destination mode (`"target": "mirror"`), and the new job copies only the objects that differ.
+If something looks wrong, click "⋯" in the row of the job, and then click **Cancel…** (or send `POST /_/api/admin/jobs/maintenance:7/cancel`). The job checks for a cancel every 20 objects. A cancel before the switch unwinds cleanly: writes to the source bucket resume at once, the job deletes the copies that it wrote to the destination, and the job never deletes the source on a failed or cancelled run. When the job fails because a backend did not answer, it keeps the copies that it wrote. Start the migration again with **Mirror** as the destination mode (`"target": "mirror"`), and the new job copies only the objects that differ.
 
 A restart of the proxy in the middle of the job does not leave the bucket behind: the proxy puts the job back in the queue at startup, and the job resumes from its cursor ([details](../explanation/jobs-and-durability.md)).
 

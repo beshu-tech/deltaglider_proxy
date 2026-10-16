@@ -1,5 +1,5 @@
 /**
- * QA nightly flow for the Jobs screen as a whole (not one job kind): what
+ * QA nightly flow for the Jobs page (every run) as a whole (not one job kind): what
  * only a real browser + real server + real timers show.
  *
  * - ⌘K / Ctrl+K → "Jobs" opens the screen.
@@ -77,7 +77,7 @@ test('jobs overview: palette, second tab sees a new job, 390 px layout', async (
   const errorsB = collectErrors(tabB);
   await tabB.setViewportSize({ width: 390, height: 844 });
   await tabB.goto('/_/admin/jobs');
-  await expect(tabB.getByText(/jobs? — select one|No jobs yet/).first()).toBeVisible({ timeout: 30_000 });
+  await expect(tabB.getByText(/No runs yet/).first()).toBeVisible({ timeout: 30_000 });
   await expect(jobRow(tabB)).toHaveCount(0);
 
   // Start a job from tab A (the admin API of the signed-in session).
@@ -96,11 +96,11 @@ test('jobs overview: palette, second tab sees a new job, 390 px layout', async (
   // 390 px: nothing scrolls sideways, and the meter label is not cut.
   const overflow = await tabB.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
   expect(overflow).toBeLessThanOrEqual(0);
-  // Dense cards: a phone shows more than one job per screen (the cards
-  // were about 310 px tall each).
+  // Dense cards: a phone (844 px) shows three runs per screen (the cards
+  // were about 310 px tall each; a run card is about 250 px).
   const cardHeight = (await jobRow(tabB).boundingBox())?.height ?? 0;
   expect(cardHeight).toBeGreaterThan(0);
-  expect(cardHeight).toBeLessThan(240);
+  expect(cardHeight).toBeLessThan(280);
   const label = jobRow(tabB).locator('.dg-meter-label');
   const cut = await label.evaluate((el) => el.scrollWidth > el.clientWidth + 1);
   expect(cut).toBe(false);

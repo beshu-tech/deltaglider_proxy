@@ -311,7 +311,7 @@ export async function seed(): Promise<void> {
     'admission section',
   );
 
-  // One finished replication run, so the Jobs screen has history.
+  // One finished replication run, so the Jobs page has history.
   await ok(ctx.post('/_/api/admin/jobs/replication:releases-to-dr/run-now'), 'replication run-now');
   await waitFor('replication run', async () => {
     const runs = (await ok(ctx.get('/_/api/admin/jobs/replication:releases-to-dr/runs'), 'runs')) as {

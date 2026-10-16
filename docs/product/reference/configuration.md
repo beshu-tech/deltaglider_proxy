@@ -793,7 +793,7 @@ storage:
         exclude_globs: [".deltaglider/**", "nightly/golden/**"]
 ```
 
-Use `POST /_/api/admin/jobs/lifecycle:<name>/preview` (or the Preview button on the Jobs screen) before enabling a rule. See [Lifecycle rules](lifecycle.md) for API details, skip rules, and limitations.
+Use `POST /_/api/admin/jobs/lifecycle:<name>/preview` (or the **Preview** button on the Lifecycle page, **Storage → Lifecycle**) before enabling a rule. See [Lifecycle rules](lifecycle.md) for API details, skip rules, and limitations.
 
 ## Job leases
 

@@ -27,11 +27,10 @@
  *   PLAYWRIGHT_BASE_URL=http://127.0.0.1:18600 \
  *   npx playwright test e2e/qa-jobs-maintenance.spec.ts
  *
- * Run order: the job this spec starts stays in the Jobs list, so a later
- * "Jobs → No jobs yet" assertion in the same proxy (qa-regression step 7)
- * must run first or tolerate it.
+ * Run order: scripts/qa-e2e.sh gives each spec its own proxy, so the job
+ * this spec starts never shows up in another spec's Jobs list.
  */
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Locator, type Page } from '@playwright/test';
 import { S3Client, CreateBucketCommand, PutObjectCommand, ListObjectsV2Command } from '@aws-sdk/client-s3';
 
 const PASSWORD = 'testpass';
@@ -102,8 +101,8 @@ async function migrateRow(page: Page): Promise<JobRowLite | undefined> {
 }
 
 /** Pick an AntD Select option by the start of its label. */
-async function pickOption(page: Page, combobox: string, labelStart: string) {
-  await page.getByRole('combobox', { name: combobox }).click();
+async function pickOption(page: Page, root: Locator, combobox: string, labelStart: string) {
+  await root.getByRole('combobox', { name: combobox }).click();
   await page
     .locator('.ant-select-dropdown:visible .ant-select-item-option')
     .filter({ hasText: new RegExp(`^${labelStart.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`) })
@@ -135,7 +134,7 @@ test('migrate a bucket from the UI: busy banner, live row, succeeded, listing wo
   await seed();
   expect(await countKeys()).toBe(OBJECTS);
 
-  // Jobs → New job → Migrate bucket.
+  // Jobs → New job → Migrate bucket (the Jobs page lists every run).
   await page.goto('/_/admin/jobs');
   await expect(page.getByRole('heading', { level: 2, name: /^Jobs\b/ })).toBeVisible({ timeout: 30_000 });
   await page.getByRole('button', { name: 'New job' }).click();
@@ -143,8 +142,8 @@ test('migrate a bucket from the UI: busy banner, live row, succeeded, listing wo
   // The title names the bucket once it is picked: find the dialog by its button.
   const dialog = page.getByRole('dialog').filter({ has: page.getByRole('button', { name: 'Start migration' }) });
   await expect(dialog).toBeVisible();
-  await pickOption(page, 'Bucket', `${BUCKET} (on `);
-  await pickOption(page, 'Target backend', `${TARGET} (`);
+  await pickOption(page, dialog, 'Bucket', `${BUCKET} (on `);
+  await pickOption(page, dialog, 'Target backend', `${TARGET} (`);
   // Both backends are plaintext filesystems: no acknowledgement to give.
   await dialog.getByRole('button', { name: 'Start migration' }).click();
   await expect(dialog).toBeHidden();

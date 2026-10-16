@@ -63,17 +63,16 @@ test('lifecycle: create a rule, preview count = confirmed count = deleted count'
   }
   expect(await keysUnder('logs/')).toBe(OLD + NEW);
 
-  // Sign in, open Jobs.
+  // Sign in, open Storage → Lifecycle.
   await page.goto('/_/browse');
   await page.getByPlaceholder('Admin password').fill(PASSWORD);
   await page.getByRole('button', { name: 'Sign in' }).click();
   await expect(page.getByRole('navigation', { name: 'Bucket list' })).toBeVisible({ timeout: 30_000 });
-  await page.goto('/_/admin/jobs');
-  await expect(page.getByRole('heading', { level: 2, name: /^Jobs/ })).toBeVisible({ timeout: 30_000 });
+  await page.goto('/_/admin/storage/lifecycle');
+  await expect(page.getByRole('heading', { level: 2, name: /^Lifecycle/ })).toBeVisible({ timeout: 30_000 });
 
-  // New job → Lifecycle rule: name, enabled, scope; 30d is the default age.
-  await page.getByRole('button', { name: 'New job' }).click();
-  await page.getByRole('menuitem', { name: /Lifecycle rule/ }).click();
+  // New lifecycle rule: name, enabled, scope; 30d is the default age.
+  await page.getByRole('button', { name: 'New lifecycle rule' }).click();
   const drawer = page.getByRole('dialog').last();
   const name = drawer.getByRole('textbox').first();
   await name.fill(RULE);
@@ -83,7 +82,7 @@ test('lifecycle: create a rule, preview count = confirmed count = deleted count'
   await page.keyboard.press('Escape');
 
   // The master switch, then apply. The review step names the first run.
-  const master = page.getByRole('switch').first();
+  const master = page.getByRole('switch', { name: 'Run lifecycle rules on schedule' });
   if ((await master.getAttribute('aria-checked')) !== 'true') await master.click();
   await page.getByRole('button', { name: /Review & apply/ }).click();
   const review = page.getByRole('dialog').filter({ hasText: 'Lifecycle plan' });

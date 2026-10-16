@@ -260,7 +260,7 @@ test('1. bootstrap login, create bucket, upload, inspect, preview, download, del
   await expect(page.getByRole('heading', { name: 'five.txt' })).toBeVisible();
   await page.getByRole('button', { name: /Delete object/ }).click();
   // It asks first; Cancel keeps the object.
-  const confirm = page.getByRole('dialog').filter({ hasText: 'Delete permanently?' });
+  const confirm = page.getByRole('dialog').filter({ hasText: /Delete.*permanently\?/ });
   await expect(confirm).toContainText('"five.txt"');
   await confirm.getByRole('button', { name: 'Cancel' }).click();
   await expect(confirm).toBeHidden();
@@ -418,7 +418,7 @@ test('3. bulk copy, move, ZIP, delete; refusals for move-into-source and path es
 
   // Bulk delete (confirm dialog).
   await toolbar().getByRole('button', { name: /^Delete \d+ selected/ }).click();
-  await page.getByRole('dialog').filter({ hasText: 'Delete permanently?' }).getByRole('button', { name: 'Delete' }).click();
+  await page.getByRole('dialog').filter({ hasText: /Delete.*permanently\?/ }).getByRole('button', { name: 'Delete' }).click();
   await expect(row('a.txt')).toBeHidden({ timeout: 30_000 });
   await expect(row('b.txt')).toBeHidden();
   const left = await listKeys(BUCKET, 'mv/');
@@ -666,7 +666,7 @@ test('6. config: export YAML, edit + Review & apply, persisted; env refs in YAML
 
 // ── 7. Backup, audit log, jobs ──────────────────────────────────────────
 
-test('7. backup export downloads a zip; audit log shows actors; jobs empty state', async () => {
+test('7. backup export downloads a zip; audit log shows actors; Jobs lists the bulk delete', async () => {
   await ensureSignedIn();
   await openAdmin('system', 'System');
   const [dl] = await Promise.all([
@@ -686,8 +686,12 @@ test('7. backup export downloads a zip; audit log shows actors; jobs empty state
   await expect(table).toContainText('bootstrap');
   await expect(table).toContainText('export_backup');
 
+  // The Jobs page lists every run: the bulk delete of step 3 ran as a
+  // server job that the file browser started.
   await openAdmin('jobs', 'Jobs');
-  await expect(page.getByText(/No jobs yet/)).toBeVisible({ timeout: 30_000 });
+  const deleteRun = page.getByRole('row').filter({ hasText: 'Delete' }).filter({ hasText: /File browser/ });
+  await expect(deleteRun.first()).toBeVisible({ timeout: 30_000 });
+  await expect(deleteRun.first()).toContainText(/succeeded/);
 });
 
 // ── 8. Security behaviours the UI must survive ──────────────────────────
@@ -712,7 +716,7 @@ test('8. cross-origin admin POST refused; HTML served sandboxed; anonymous conte
   await openBucket(BUCKET);
   await select('notes.txt');
   await toolbar().getByRole('button', { name: /^Delete \d+ selected/ }).click();
-  await page.getByRole('dialog').filter({ hasText: 'Delete permanently?' }).getByRole('button', { name: 'Delete' }).click();
+  await page.getByRole('dialog').filter({ hasText: /Delete.*permanently\?/ }).getByRole('button', { name: 'Delete' }).click();
   await expect(row('notes.txt')).toBeHidden({ timeout: 30_000 });
   expect(await listKeys(BUCKET)).not.toContain('notes.txt');
 
