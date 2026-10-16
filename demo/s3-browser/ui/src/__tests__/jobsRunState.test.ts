@@ -194,7 +194,8 @@ test('availableActions: cancel only while it can still act; no Run now while a r
   const oneoff = row({ kind: 'migrate', trigger: 'oneoff' });
   assert.deepEqual(availableActions({ ...oneoff, status: 'running' }), ['cancel']);
   assert.deepEqual(availableActions({ ...oneoff, status: 'cancelling' }), []);
-  assert.deepEqual(availableActions({ ...oneoff, status: 'succeeded' }), []);
+  // A finished one-off can be removed from the list.
+  assert.deepEqual(availableActions({ ...oneoff, status: 'succeeded' }), ['delete']);
   // Regression: while Kill was cancelling the run, Run now was already offered.
   assert.equal(availableActions(row({ status: 'cancelling' })).includes('run-now'), false);
   assert.equal(availableActions(row({ status: 'queued' })).includes('run-now'), false);
