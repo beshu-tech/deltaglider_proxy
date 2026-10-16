@@ -8,7 +8,32 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-10-15_
+_Last updated: 2026-10-16_
+
+## v2.0.16 — 2026-10-16
+
+### Added — A preview of a rule's include and exclude globs
+
+Replication and lifecycle rules have a **Which objects** section in their editor, with the include and exclude globs. The globs were under "Advanced" before. Under each list, every glob shows how many objects of a sample it matches. A glob that matches nothing because the rule's prefix is missing in front of it (globs match the whole key from the bucket root) offers a button that adds the prefix. **Preview objects** opens a wide window with the sampled keys sorted by verdict, the glob that decided each one, and a box that tests one key. The preview reads the globs as you type. The server answers with the rules' own matcher (`POST /_/api/admin/jobs/filter-preview`), on the first 1,000 objects under the prefix.
+
+### Fixed — The filters of a replication rule bound its deletes and Verify
+
+With `replicate_deletes`, a rule deleted a destination object whose source was absent, even when the rule's exclude globs left that key out. An exclude meant to keep a destination's own folder therefore deleted it on the next run. The scheduled walk, the event-driven deletes and **Verify** now apply the filters to the source key of each destination object: the rule copies, deletes and reports only the keys inside its filters.
+
+### Changed — A replication glob that does not compile is refused
+
+A bad include or exclude glob was a warning, so the rule saved and then failed on every run. The proxy now refuses the config and names the rule and the glob, as it does for lifecycle rules. Replication, lifecycle and Slack notifications share one glob matcher.
+
+### Changed — A bulk delete runs on the server
+
+A delete from the file browser was a loop in the browser tab, so closing or reloading the tab stopped it, and the tab could run only one delete at a time. The browser now counts the selection and asks for confirmation as before, and then it starts a delete job on the proxy (`POST /_/api/admin/objects/delete-jobs`).
+
+- **The delete goes on without the tab.** Closing the tab does not stop it, and a restart of the proxy resumes it from its cursor.
+- **Several deletes run at once.** Delete jobs run in their own worker lane, four at a time, so deletes in buckets of different backends run in parallel. Several deletes can run on one bucket, and a long re-encryption does not hold them up.
+- **The bucket stays writable.** A delete job does not gate the bucket: uploads keep working while it runs.
+- **The bucket shows its deletes.** Each running delete has a line above the listing with its progress, who started it, and a Cancel button for an admin or for the user who started it. The listing reloads as the delete goes on. The Jobs page lists each delete as a job of the kind "Delete".
+
+The job acts with the permissions of the user who started it, and the proxy checks them again for every page.
 
 ## v2.0.15 — 2026-10-15
 
