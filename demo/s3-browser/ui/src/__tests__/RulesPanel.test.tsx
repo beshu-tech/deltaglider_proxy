@@ -1,5 +1,5 @@
 /**
- * JobsPanel run-now: the button POSTs /jobs/:id/run-now, the server answers
+ * Rule-page run-now: the button POSTs /jobs/:id/run-now, the server answers
  * 202 (the run goes on in the background), the panel refetches the list at
  * once, and then polls fast (2s) while the row is live until it settles.
  * With nothing live the list polls every 10s.

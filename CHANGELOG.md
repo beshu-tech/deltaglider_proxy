@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Changed — Rules and runs have their own pages
+
+The Jobs screen mixed two different things in one table. A replication or lifecycle rule is a definition that runs many times, and its row showed only its latest run. A bulk delete, re-encrypt, migrate or backfill job is one run. The two now live apart:
+
+- **Storage → Replication** and **Storage → Lifecycle** list the rules. Each page has one editor and one unsaved-changes bar, and it shows the settings of its kind: the switch that runs the rules, and how often the scheduler checks them. A rule's **All runs →** link opens Jobs filtered to that rule.
+- **Storage → Jobs** lists every run, newest first: the runs of the rules and the one-off jobs. The **Started by** column says how each run started: by the schedule, by **Run now**, from the file browser (with the user), or by an admin. Filters select active or failed runs, one kind, one bucket, or one rule. Runs that changed nothing are hidden unless you ask for them. A rule run opens a drawer with its counts and its failed objects.
+
+An old link to a rule on the Jobs page opens the rule's page.
+
+### Added — Clone a replication or lifecycle rule
+
+The "⋯" menu of a rule, and of its drawer, has **Clone**. It copies the rule, with its unsaved edits, into a new draft named `<name>-copy` and opens it, so you can point the copy at other source or destination buckets before you apply it. While the copy acts on the same objects as another rule (replication: the same source, destination and filters; lifecycle: the same bucket, prefix, action and filters), the drawer says so.
+
+### Added — One list of runs, and a limit on run history
+
+`GET /_/api/admin/jobs/runs` lists the runs of every rule and every one-off job, newest first, with filters (`status`, `kind`, `rule`, `bucket`, `noop`) and a cursor. `GET /jobs/:id/failures?run_id=` reads the failures of one run of a rule. Run history no longer grows without limit: for each rule, runs that changed nothing are deleted after 30 days, and at most the newest 1,000 runs are kept; a one-off job is deleted 90 days after it ended.
+
 ### Fixed — The filter preview counts every object under the prefix
 
 The preview of include and exclude globs classified the first 1,000 objects under the prefix. Keys sort by name, so a glob for names that sort late matched nothing in that sample: under `ror/builds/`, the first `-pre` build sorted at position 73,828 of 93,723, and `*-pre*` showed no match. The preview now counts every object under the prefix, up to 200,000, and lists at most 500 keys of each verdict. A listing is kept for two minutes, so editing a glob does not list the prefix again.

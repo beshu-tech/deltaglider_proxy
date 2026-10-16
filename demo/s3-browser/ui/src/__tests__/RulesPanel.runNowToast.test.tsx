@@ -1,8 +1,8 @@
 /**
  * Review 2d, UI finding 3: one lifecycle Run now gave two "finished" toasts.
  * The confirmation dialog watched the run on its own and compared the
- * browser clock with the server's started_at, and JobsPanel watched the row
- * too. Now JobsPanel is the one watcher (server clock only), and its toast
+ * browser clock with the server's started_at, and the rules page watched the row
+ * too. Now the rules page is the one watcher (server clock only), and its toast
  * names what the run did, from the run record.
  */
 import { screen, waitFor, within } from '@testing-library/react';

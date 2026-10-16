@@ -107,6 +107,8 @@ top-level group; Event outbox moves next to the thing it observes.
 
 ### 3.2 The Jobs screen — the centerpiece
 
+> Superseded (2026-10-16) by `jobs-runs-and-rules.md`: rules moved to Storage → Replication and Storage → Lifecycle; Jobs lists runs.
+
 One table, one vocabulary, every row a **job**:
 
 | Name | Kind | Scope | Trigger | Status | Progress | Last run | Actions |
