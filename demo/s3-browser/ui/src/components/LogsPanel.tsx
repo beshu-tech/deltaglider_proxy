@@ -16,6 +16,7 @@
  * bounded — a triage convenience, not a log store.
  */
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
+import { useDebounced } from '../hooks/useDebounced';
 import { Typography, Input, Button, Tag, Select, Space, Switch } from 'antd';
 import { ReloadOutlined, SearchOutlined, FileTextOutlined } from '@ant-design/icons';
 import { useVirtualizer } from '@tanstack/react-virtual';
@@ -29,16 +30,6 @@ import { useDocumentVisible } from '../useVisiblePolling';
 const { Text } = Typography;
 const RING_CAP = 2000; // client-side trim ceiling for the live tail
 const FILTER_DEBOUNCE_MS = 300;
-
-/** `value`, updated only after it stops changing for `ms`. */
-function useDebounced<T>(value: T, ms: number): T {
-  const [debounced, setDebounced] = useState(value);
-  useEffect(() => {
-    const id = window.setTimeout(() => setDebounced(value), ms);
-    return () => window.clearTimeout(id);
-  }, [value, ms]);
-  return debounced;
-}
 
 interface Props {
   onSessionExpired?: () => void;

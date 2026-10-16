@@ -110,6 +110,7 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
                              (`FileMetadata::is_unopened_seal`, never cached), a DELETE removes it (`resolve_forms_to_delete`),
                              and boot warns about plaintext in a `refuse` bucket (`startup::spawn_plaintext_refusal_check`)
   → storage/routing.rs      Multi-backend routing (virtual bucket → real backend)
+  → glob_filter.rs          THE include/exclude glob matcher of replication, lifecycle and Slack (`compile`, `verdict`, `in_scope`; a glob matches the whole key from the bucket root, `*` crosses `/`, exclude wins). A replication rule's filters bound its copies, its mirror deletes (walk + event consumer, via `planner::dest_key_in_scope`) AND Verify; `POST /jobs/filter-preview` (api/admin/filter_preview.rs) runs it on a sample for the editor's Which-objects preview
   → security.rs             Pure security primitives (validate_bucket_name, bucket_name_is_ip_like, outbound-URL SSRF policy) — unit + proptest, shared by CLI URL parser
   → demo.rs                 Embedded UI + admin API router, mounted under /_/
   → session.rs              In-memory session store (OsRng tokens, 4h default TTL)

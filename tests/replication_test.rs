@@ -3267,3 +3267,83 @@ replication:
         "the removed rule's runs survived the apply: {history}"
     );
 }
+
+/// The filter preview answers with the rules' own matcher on real keys:
+/// each key's verdict and deciding glob, each glob's match count, and for a
+/// glob written without the prefix, the prefixed glob that would match.
+#[tokio::test]
+async fn test_filter_preview_classifies_real_keys() {
+    let server = TestServer::builder().build().await;
+    let http = server.http();
+    let admin = common::admin_http_client(&server.endpoint()).await;
+    let ep = server.endpoint();
+    let bucket = server.bucket();
+    for key in [
+        "ror/builds/a.zip",
+        "ror/builds/a.tmp",
+        "ror/notes.txt",
+        "other/x.zip",
+    ] {
+        http.put(format!("{ep}/{bucket}/{key}"))
+            .body(b"x".to_vec())
+            .send()
+            .await
+            .unwrap();
+    }
+    let preview: serde_json::Value = admin
+        .post(format!("{ep}/_/api/admin/jobs/filter-preview"))
+        .json(&serde_json::json!({
+            "bucket": bucket,
+            "prefix": "ror/",
+            "include_globs": ["*.zip", "*.tmp"],
+            "exclude_globs": ["*.tmp", "builds/**"]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        preview["sampled"], 3,
+        "only keys under the prefix: {preview}"
+    );
+    assert_eq!(
+        (
+            &preview["included"],
+            &preview["excluded"],
+            &preview["not_included"]
+        ),
+        (
+            &serde_json::json!(1),
+            &serde_json::json!(1),
+            &serde_json::json!(1)
+        ),
+        "{preview}"
+    );
+    let builds = preview["globs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["glob"] == "builds/**")
+        .unwrap();
+    assert_eq!(builds["matches"], 0);
+    assert_eq!(builds["suggestion"], "ror/builds/**");
+    // "Test a key": named keys are classified without a listing.
+    let one: serde_json::Value = admin
+        .post(format!("{ep}/_/api/admin/jobs/filter-preview"))
+        .json(&serde_json::json!({
+            "bucket": bucket,
+            "prefix": "ror/",
+            "exclude_globs": ["*.tmp"],
+            "keys": ["ror/new/b.tmp"]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(one["keys"][0]["verdict"], "excluded", "{one}");
+    assert_eq!(one["keys"][0]["glob"], "*.tmp", "{one}");
+}

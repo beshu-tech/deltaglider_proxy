@@ -1930,6 +1930,13 @@ pub fn replication_gate(
         .map(|n| format!("replication rule name '{n}' is duplicated — rename one copy"))
         .collect();
     errors.extend(replication_nesting_errors(&new.rules));
+    // A glob that does not compile fails every run of the rule: refuse it
+    // now, as lifecycle does.
+    for rule in &new.rules {
+        if let Err(e) = crate::replication::planner::compile_rule_globs(rule) {
+            errors.push(format!("replication rule '{}': {e}", rule.name));
+        }
+    }
     if errors.is_empty() {
         Ok(())
     } else {
@@ -2193,15 +2200,7 @@ pub fn validate_replication(cfg: &ReplicationConfig) -> Vec<String> {
             ));
         }
 
-        // Globs compile.
-        for glob in rule.include_globs.iter().chain(rule.exclude_globs.iter()) {
-            if globset::Glob::new(glob).is_err() {
-                warnings.push(format!(
-                    "replication rule '{}' glob pattern {:?} is invalid",
-                    rule.name, glob
-                ));
-            }
-        }
+        // A glob that does not compile is fatal: `replication_gate`.
     }
 
     // Cycle detection across rules. A 2-hop cycle (A→B, B→A with
@@ -3112,6 +3111,26 @@ mod tests {
     }
 
     #[test]
+    fn replication_gate_rejects_a_glob_that_does_not_compile() {
+        // A bad glob used to be a warning: the rule saved, then every run
+        // failed. Lifecycle already refused it at config time.
+        let mut bad = rule("r1", ("a", ""), ("b", ""), "1h");
+        bad.exclude_globs.push("tmp/[".into());
+        let err = replication_gate(
+            &ReplicationConfig::default(),
+            &ReplicationConfig {
+                rules: vec![bad],
+                ..Default::default()
+            },
+        )
+        .expect_err("a bad glob is fatal");
+        assert!(
+            err.iter().any(|e| e.contains("tmp/[") && e.contains("r1")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn replication_gate_is_fatal_on_changed_dup_but_lets_unchanged_through() {
         let clean = ReplicationConfig {
             rules: vec![rule("r1", ("a", ""), ("b", ""), "1h")],
@@ -3269,8 +3288,8 @@ mod tests {
             ..Default::default()
         };
         cfg.rules[0].include_globs = vec!["[badbracket".to_string()];
-        let warnings = validate_replication(&cfg);
-        assert!(warnings.iter().any(|w| w.contains("glob")));
+        // The gate refuses it (an error, not a warning).
+        assert!(replication_gate(&ReplicationConfig::default(), &cfg).is_err());
     }
 
     #[test]

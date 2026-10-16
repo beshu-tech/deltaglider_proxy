@@ -12,7 +12,7 @@
 //! config, and `should_notify` decides whether an event posts at all. Both are
 //! unit-tested without any HTTP.
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::GlobSet;
 use serde_json::{json, Value};
 
 use crate::config_sections::EventDeliveryConfig;
@@ -22,12 +22,7 @@ use crate::replication::event_consumer::is_user_object_key;
 /// Build a globset from patterns; an empty pattern list yields an empty set
 /// (matches nothing — callers treat "empty include" as "match all").
 fn build_globset(patterns: &[String]) -> Result<GlobSet, String> {
-    let mut b = GlobSetBuilder::new();
-    for p in patterns {
-        b.add(Glob::new(p).map_err(|e| format!("invalid slack glob {p:?}: {e}"))?);
-    }
-    b.build()
-        .map_err(|e| format!("slack globset build failed: {e}"))
+    crate::glob_filter::compile(patterns).map_err(|e| format!("slack: {e}"))
 }
 
 /// Whether `event` should post to Slack under `cfg`'s filters: the kind must be

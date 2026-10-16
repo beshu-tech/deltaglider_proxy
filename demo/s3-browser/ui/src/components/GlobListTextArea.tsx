@@ -21,6 +21,8 @@ import { lineList, lines } from './ruleEditorHelpers';
 interface Props {
   value: string[];
   onChange: (value: string[]) => void;
+  /** Every edit, parsed, before the blur commits it (a live preview reads it). */
+  onDraft?: (value: string[]) => void;
   rows?: number;
   placeholder?: string;
   style?: React.CSSProperties;
@@ -34,6 +36,7 @@ interface Props {
 export default function GlobListTextArea({
   value,
   onChange,
+  onDraft,
   rows = 3,
   placeholder,
   style,
@@ -70,7 +73,10 @@ export default function GlobListTextArea({
       id={id}
       aria-labelledby={labelledBy}
       value={text}
-      onChange={(e) => setText(e.target.value)}
+      onChange={(e) => {
+        setText(e.target.value);
+        onDraft?.(lineList(e.target.value));
+      }}
       onBlur={commit}
       rows={rows}
       placeholder={placeholder}

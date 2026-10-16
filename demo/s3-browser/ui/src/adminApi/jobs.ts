@@ -389,3 +389,49 @@ export async function createMigrateJob(
     context: `Migrate ${bucket}`,
   });
 }
+
+// === Filter preview: what a rule's include/exclude globs select ===
+
+export type FilterVerdict = 'included' | 'excluded' | 'not_included' | 'internal';
+
+export interface FilterPreviewGlob {
+  glob: string;
+  list: 'include' | 'exclude';
+  /** Sampled keys that the glob matches (whether or not it decided). */
+  matches: number;
+  /** The glob does not compile. */
+  error?: string;
+  /** For a glob that matches nothing: the same glob with the prefix in front, which matches. */
+  suggestion?: string;
+}
+
+export interface FilterPreview {
+  sampled: number;
+  /** More objects exist under the prefix than the sample holds. */
+  truncated: boolean;
+  included: number;
+  excluded: number;
+  not_included: number;
+  internal: number;
+  globs: FilterPreviewGlob[];
+  keys: { key: string; verdict: FilterVerdict; glob?: string }[];
+}
+
+export interface FilterPreviewRequest {
+  bucket: string;
+  prefix: string;
+  include_globs: string[];
+  exclude_globs: string[];
+  /** Classify these keys instead of a sample of the bucket. */
+  keys?: string[];
+  limit?: number;
+}
+
+/**
+ * What `include_globs`/`exclude_globs` do to real keys: the server runs the
+ * rules' own matcher on the first objects under the prefix (or on `keys`).
+ * Admin session.
+ */
+export async function previewFilters(req: FilterPreviewRequest): Promise<FilterPreview> {
+  return adminJson('/api/admin/jobs/filter-preview', { method: 'POST', body: req, context: 'Filter preview' });
+}

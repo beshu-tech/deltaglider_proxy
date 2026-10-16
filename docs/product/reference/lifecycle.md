@@ -116,6 +116,8 @@ Lifecycle skips:
 - Storage artifacts if they ever leak through a backend listing (`reference.bin`, `*.delta`).
 - Keys excluded by `exclude_globs`.
 - Keys outside `include_globs` when includes are configured.
+
+Lifecycle globs use the same matcher as replication globs: a glob matches the whole key from the bucket root, so the rule's prefix is part of it, and `*` also matches `/` ([details](replication.md#include-and-exclude-globs)). The **Which objects** section of a rule previews the globs on a sample of the bucket before you apply the rule.
 - Keys newer than `expire_after`.
 
 Deletion is idempotent at the object level. A copy failure never deletes the source; a configured source delete runs only after the destination write verifies. The proxy reports per-object failures in the response and persists them in the jobs DB with the id of the run that observed them.

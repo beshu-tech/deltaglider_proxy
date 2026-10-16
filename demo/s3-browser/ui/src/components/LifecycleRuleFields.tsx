@@ -3,7 +3,8 @@ import type { LifecycleAction, LifecycleRuleConfig } from '../adminApi';
 import BucketPrefixInput from './BucketPrefixInput';
 import FormField from './FormField';
 import { AdvancedDisclosure } from './ruleEditorFields';
-import GlobListTextArea from './GlobListTextArea';
+import RuleFilterFields from './RuleFilterFields';
+import { ruleFolderPrefix } from '../ruleFilterPreview';
 import { actionKind } from './lifecyclePayload';
 import { ruleGlobError } from './jobs/lifecycleText';
 
@@ -254,46 +255,22 @@ export default function RuleEditor({
         </div>
       )}
 
-      <AdvancedDisclosure title="Filters and batch size">
+      <RuleFilterFields
+        bucket={rule.bucket}
+        prefix={ruleFolderPrefix(rule.prefix)}
+        include={rule.include_globs}
+        exclude={rule.exclude_globs}
+        onChange={onChange}
+        yamlBase="storage.lifecycle.rules[]"
+        verb="are candidates"
+        excludeHelp="One glob per line. The rule never acts on a matching object. The proxy never acts on its own .deltaglider/ and .dg/ keys, also when you replace the default pattern."
+        includeError={includeError}
+        excludeError={excludeError}
+        inputRadius={inputRadius}
+      />
+
+      <AdvancedDisclosure title="Batch size">
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 14 }}>
-          <FormField
-            label="Include globs"
-            yamlPath="storage.lifecycle.rules[].include_globs"
-            helpText="One glob per line. If non-empty, only matching keys are candidates. Empty means every key under the prefix."
-          >
-            <GlobListTextArea
-              value={rule.include_globs}
-              onChange={(v) => onChange({ include_globs: v })}
-              rows={3}
-              placeholder={'*.zip\nreleases/**'}
-              style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
-              status={includeError ? 'error' : undefined}
-            />
-            {includeError && (
-              <div role="alert" style={{ color: 'var(--ant-color-error, #ff4d4f)', fontSize: 12, marginTop: 4 }}>
-                {includeError}
-              </div>
-            )}
-          </FormField>
-          <FormField
-            label="Exclude globs"
-            yamlPath="storage.lifecycle.rules[].exclude_globs"
-            helpText="One glob per line. Keys matching any pattern are skipped. The proxy never acts on its own .deltaglider/ and .dg/ keys, also when you replace the default pattern."
-          >
-            <GlobListTextArea
-              value={rule.exclude_globs}
-              onChange={(v) => onChange({ exclude_globs: v })}
-              rows={3}
-              placeholder=".deltaglider/**"
-              style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
-              status={excludeError ? 'error' : undefined}
-            />
-            {excludeError && (
-              <div role="alert" style={{ color: 'var(--ant-color-error, #ff4d4f)', fontSize: 12, marginTop: 4 }}>
-                {excludeError}
-              </div>
-            )}
-          </FormField>
           <FormField
             label="Batch size"
             yamlPath="storage.lifecycle.rules[].batch_size"

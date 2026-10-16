@@ -1290,8 +1290,19 @@ impl WalkMachine {
                 if e.path.ends_with('/') || is_dg_internal(&abs_dest) {
                     return; // markers and DG internals are never candidates
                 }
-                // Faithful mirror: a dest key absent at source is deleted,
-                // regardless of who wrote it. No provenance gate — the
+                // The rule's filters decide what it owns on the destination
+                // too: a key whose source key it excludes (or does not
+                // include) is never deleted (as rclone keeps excluded files).
+                let abs_src = format!("{}{}", self.cfg.src_prefix, e.path);
+                if !crate::glob_filter::in_scope(
+                    &abs_src,
+                    &self.cfg.include_globs,
+                    &self.cfg.exclude_globs,
+                ) {
+                    return;
+                }
+                // Faithful mirror: a dest key absent at source (and inside
+                // the rule's filters) is deleted, regardless of who wrote it. No provenance gate — the
                 // destination is dedicated to this rule. The source-absence
                 // HEAD in the driver is still the safety (delete ONLY on a
                 // confirmed NoSuchKey; any other error preserves).
@@ -1632,7 +1643,7 @@ fn skip_dir(rel_dir: &str) -> bool {
 /// Mirror of should_replicate's DG-internal gate, applied to DEST keys
 /// (delete candidates) — replication never writes these, never delete them.
 fn is_dg_internal(key: &str) -> bool {
-    key.starts_with(".deltaglider/") || key.contains("/.deltaglider/")
+    super::planner::is_internal_key(key)
 }
 
 // ---------------------------------------------------------------------------
@@ -2567,6 +2578,55 @@ mod machine_tests {
                 .into_iter()
                 .map(String::from)
                 .collect::<BTreeSet<_>>()
+        );
+    }
+
+    /// The filters bound the deletes too: a destination key whose source key
+    /// the rule excludes (or does not include) is not the rule's, so a
+    /// mirror never deletes it. An exclude used to keep a destination's own
+    /// `archive/` deleted it on the next run.
+    #[test]
+    fn deletes_stay_inside_the_rule_filters() {
+        let mut w = simple_world(AUTH);
+        for k in ["archive/a", "archive/b/c", "orphan.zip", "notes.txt"] {
+            w.dest
+                .insert(k.into(), world_obj(mk_meta(1, "s", "e", 100, true), true));
+        }
+        let globs = |g: &[&str]| {
+            crate::glob_filter::compile(&g.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                .unwrap()
+        };
+        let mut machine = mk_machine(
+            &w,
+            ConflictPolicy::NewerWins,
+            false,
+            true,
+            3,
+            10_000,
+            2,
+            2,
+            usize::MAX,
+            None,
+        );
+        machine.cfg.include_globs = globs(&["*.zip", "archive/**"]);
+        machine.cfg.exclude_globs = globs(&["archive/**"]);
+        let mut sim = Sim {
+            world: w.clone(),
+            page_size: 3,
+            trace: Trace::default(),
+            queue: Vec::new(),
+            last_cursor: None,
+            head_keys: 0,
+        };
+        drive(&mut machine, &mut sim, &[0], None);
+        assert!(machine.is_done());
+        assert_eq!(
+            sim.trace.deletes,
+            ["orphan.zip"]
+                .into_iter()
+                .map(String::from)
+                .collect::<BTreeSet<_>>(),
+            "archive/ is excluded and notes.txt is not included: neither is deleted"
         );
     }
 

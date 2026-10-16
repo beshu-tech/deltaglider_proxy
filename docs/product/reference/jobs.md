@@ -33,6 +33,7 @@ Rules are recurring and YAML-authored; maintenance jobs are one-offs born in the
 | `POST` | `/_/api/admin/jobs/reencrypt` | Create re-encrypt jobs: `{"buckets": [...]}` (max 100), one job per bucket |
 | `POST` | `/_/api/admin/jobs/backfill-metadata` | Create metadata-backfill jobs: `{"buckets": [...], "refresh_last_modified": false}` (max 100), one job per bucket |
 | `POST` | `/_/api/admin/buckets/:bucket/migrate` | Create a migrate job: `{"target_backend", "delete_source", "target"}` → `202` + `maintenance:<n>`. `target` is `empty` (default: the job fails in `stage` when the destination holds objects) or `mirror` (destination objects absent at the source are deleted before the flip, audited). `409` while `config_sync_bucket` is set: the routing flip is per-instance |
+| `POST` | `/_/api/admin/jobs/filter-preview` | What include/exclude globs select, on real keys ([below](#filter-preview)) |
 | `GET` | `/_/api/admin/jobs/bucket/:bucket` | Busy state for one bucket: `active` is the active job row that holds the bucket (until it settles), `writes_blocked` says whether the write gate refuses writes now, and `deletes` lists the bucket's running delete jobs. Readable by non-admin browser sessions that may list the bucket (`403` otherwise) |
 
 All routes except the last are session-gated admin routes.
@@ -63,6 +64,23 @@ By default the job keeps the Last-Modified time that the proxy serves for each o
 While a re-encrypt, migrate or backfill job is active, S3 writes (PUT, DELETE, POST, multipart) to that bucket return `503 SlowDown`. AWS SDKs back off and retry automatically. Reads pass untouched. The gate starts when the proxy creates the job, so there is no window between creation and claim. The proxy drains in-flight writes before the copy starts, and it lifts the gate when the job finishes. For a migration, writes resume at the moment the bucket flips to the new backend, before any optional source cleanup. The embedded object browser shows a busy banner on gated buckets via `GET /_/api/admin/jobs/bucket/:bucket`. The `503` names the kind of the job that holds the bucket (a re-encryption, a migration to another backend, or a metadata backfill). The job row and the gate can differ for a short time: a cancelled migrate releases the source bucket at once, while it still removes its staged copies, and a migrate in its `cleanup` phase no longer gates the bucket. The `writes_blocked` field of the bucket status (at the top level and inside `active`) follows the gate.
 
 ## Durability
+
+## Filter preview
+
+`POST /_/api/admin/jobs/filter-preview` shows what a rule's include and exclude globs do, before you save the rule. It runs the same matcher as replication and lifecycle rules. The request names a bucket, a prefix and the two lists:
+
+```json
+{ "bucket": "releases", "prefix": "firmware/", "include_globs": [], "exclude_globs": ["*.tmp", "widget-3000/**"] }
+```
+
+The proxy lists the first 1,000 objects under the prefix (`limit` sets another number, at most 5,000) and classifies each one. A request with `keys` classifies those keys (at most 100) instead of a listing. The answer holds:
+
+- `sampled`, and `truncated` when the prefix holds more objects than the sample.
+- The counts `included`, `excluded`, `not_included` and `internal`. An `internal` key is a `.deltaglider/` key, on which no rule acts.
+- `globs`: for each glob, its `list` (`include` or `exclude`), the number of sampled keys that it `matches`, its `error` when it does not compile, and a `suggestion` when it matches nothing but the glob with the prefix in front of it matches.
+- `keys`: each key with its `verdict` and the `glob` that decided it.
+
+The proxy keeps a sample for 30 seconds, so a preview that runs on every edit lists the bucket once. The route needs an admin session.
 
 ## Delete jobs
 

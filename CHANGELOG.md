@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added — A preview of a rule's include and exclude globs
+
+Replication and lifecycle rules have a **Which objects** section in their editor, with the include and exclude globs. The globs were under "Advanced" before. Under each list, every glob shows how many objects of a sample it matches. A glob that matches nothing because the rule's prefix is missing in front of it (globs match the whole key from the bucket root) offers a button that adds the prefix. **Preview objects** opens a wide window with the sampled keys sorted by verdict, the glob that decided each one, and a box that tests one key. The preview reads the globs as you type. The server answers with the rules' own matcher (`POST /_/api/admin/jobs/filter-preview`), on the first 1,000 objects under the prefix.
+
+### Fixed — The filters of a replication rule bound its deletes and Verify
+
+With `replicate_deletes`, a rule deleted a destination object whose source was absent, even when the rule's exclude globs left that key out. An exclude meant to keep a destination's own folder therefore deleted it on the next run. The scheduled walk, the event-driven deletes and **Verify** now apply the filters to the source key of each destination object: the rule copies, deletes and reports only the keys inside its filters.
+
+### Changed — A replication glob that does not compile is refused
+
+A bad include or exclude glob was a warning, so the rule saved and then failed on every run. The proxy now refuses the config and names the rule and the glob, as it does for lifecycle rules. Replication, lifecycle and Slack notifications share one glob matcher.
+
 ### Changed — A bulk delete runs on the server
 
 A delete from the file browser was a loop in the browser tab, so closing or reloading the tab stopped it, and the tab could run only one delete at a time. The browser now counts the selection and asks for confirmation as before, and then it starts a delete job on the proxy (`POST /_/api/admin/objects/delete-jobs`).

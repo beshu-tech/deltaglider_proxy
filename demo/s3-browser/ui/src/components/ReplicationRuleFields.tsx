@@ -3,7 +3,8 @@ import type { ReplicationRuleConfig } from '../adminApi';
 import BucketPrefixInput from './BucketPrefixInput';
 import FormField from './FormField';
 import { AdvancedDisclosure } from './ruleEditorFields';
-import GlobListTextArea from './GlobListTextArea';
+import RuleFilterFields from './RuleFilterFields';
+import { ruleFolderPrefix } from '../ruleFilterPreview';
 
 const { Text } = Typography;
 
@@ -74,6 +75,18 @@ export default function ReplicationRuleFields({
         </FormField>
       </div>
 
+      <RuleFilterFields
+        bucket={rule.source.bucket}
+        prefix={ruleFolderPrefix(rule.source.prefix)}
+        include={rule.include_globs}
+        exclude={rule.exclude_globs}
+        onChange={onChange}
+        yamlBase="storage.replication.rules[]"
+        verb="replicate"
+        excludeHelp="One glob per line. A matching object is not copied, and a run never deletes its copy on the destination."
+        inputRadius={inputRadius}
+      />
+
       <AdvancedDisclosure title="Advanced rule behavior">
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 14 }}>
           <FormField
@@ -118,7 +131,7 @@ export default function ReplicationRuleFields({
           <FormField
             label="Delete replication"
             yamlPath="storage.replication.rules[].replicate_deletes"
-            helpText="Make the destination a faithful mirror: any object not present at source is deleted."
+            helpText="Make the destination a faithful mirror: an object that is not on the source is deleted, unless the rule's filters exclude it."
           >
             <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
               <Switch
@@ -133,7 +146,7 @@ export default function ReplicationRuleFields({
                   }
                   Modal.confirm({
                     title: 'Delete objects on the destination?',
-                    content: `When this rule runs, it deletes every object under ${rule.destination.bucket || 'the destination'}${rule.destination.prefix ? '/' + rule.destination.prefix : ''} that is not on the source, also objects that other tools wrote there.`,
+                    content: `When this rule runs, it deletes every object under ${rule.destination.bucket || 'the destination'}${rule.destination.prefix ? '/' + rule.destination.prefix : ''} that is not on the source, also objects that other tools wrote there. Objects that the rule's filters exclude stay.`,
                     okText: 'Turn on delete replication',
                     okButtonProps: { danger: true },
                     onOk: () => onChange({ replicate_deletes: true }),
@@ -146,34 +159,8 @@ export default function ReplicationRuleFields({
               type="warning"
               showIcon
               title="Deletes are destructive"
-              description="When enabled, the destination is a faithful mirror of the source: ANY destination object absent at source is deleted — including objects written by other tools. The destination bucket must be dedicated to this rule."
+              description="When enabled, the destination is a faithful mirror of the source: a destination object absent at source is deleted, also one that another tool wrote. Only objects that the rule's filters exclude stay. Dedicate the destination to this rule, or exclude what it must keep."
               style={{ marginTop: 8 }}
-            />
-          </FormField>
-          <FormField
-            label="Include globs"
-            yamlPath="storage.replication.rules[].include_globs"
-            helpText="One glob per line. If non-empty, only matching source keys are replicated. Empty means everything under the source prefix."
-          >
-            <GlobListTextArea
-              value={rule.include_globs}
-              onChange={(v) => onChange({ include_globs: v })}
-              rows={3}
-              placeholder={'*.zip\nreleases/**'}
-              style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
-            />
-          </FormField>
-          <FormField
-            label="Exclude globs"
-            yamlPath="storage.replication.rules[].exclude_globs"
-            helpText="One glob per line. Source keys matching any pattern are skipped."
-          >
-            <GlobListTextArea
-              value={rule.exclude_globs}
-              onChange={(v) => onChange({ exclude_globs: v })}
-              rows={3}
-              placeholder=".deltaglider/**"
-              style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
             />
           </FormField>
         </div>

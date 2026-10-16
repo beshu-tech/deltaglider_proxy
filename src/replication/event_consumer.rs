@@ -1189,7 +1189,10 @@ async fn drain_rule_rows(
             KeyClaim::Abort => return std::ops::ControlFlow::Break(()),
         }
         let outcome = match w.action {
-            KeyAction::Delete if w.rule.replicate_deletes => {
+            // Only a key inside the rule's filters is the rule's to delete on
+            // the destination (the walk and Verify use the same scope). A
+            // rule whose globs do not compile deletes nothing.
+            KeyAction::Delete if w.rule.replicate_deletes && key_in_rule_scope(w.rule, w.key) => {
                 deletes.push(w);
                 continue;
             }
@@ -1444,6 +1447,12 @@ fn failure_counts_toward_give_up(class: CopyClass) -> bool {
 /// Pure: has a key used up its attempts?
 fn key_attempts_exhausted(consecutive_failures: u32) -> bool {
     consecutive_failures >= MAX_EVENT_KEY_ATTEMPTS
+}
+
+/// Whether `key` (a source key) is inside `rule`'s include/exclude filters.
+fn key_in_rule_scope(rule: &ReplicationRule, key: &str) -> bool {
+    compile_rule_globs(rule)
+        .is_ok_and(|(include, exclude)| crate::glob_filter::in_scope(key, &include, &exclude))
 }
 
 /// Apply a Copy action for one (rule, key): the planner + a destination
@@ -2827,6 +2836,39 @@ storage:
         for k in &keys[1..] {
             assert!(f.engine.head("dst", k).await.is_err(), "{k} not deleted");
         }
+    }
+
+    /// A source delete of a key outside the rule's filters is not mirrored:
+    /// the rule does not own that key on the destination (the walk keeps
+    /// it too).
+    #[tokio::test]
+    async fn a_delete_outside_the_filters_is_not_mirrored() {
+        let mut f = fixture(true).await;
+        for k in ["keep/a.bin", "f/b.bin"] {
+            f.put(k).await;
+        }
+        f.drain(None).await;
+        assert!(f.engine.head("dst", "keep/a.bin").await.is_ok(), "copied");
+        f.config.write().await.replication.rules[0].exclude_globs = vec!["keep/**".into()];
+        for k in ["keep/a.bin", "f/b.bin"] {
+            f.engine
+                .delete_batch(
+                    "src",
+                    vec![crate::deltaglider::DeleteItem::new(k.to_string())],
+                    Default::default(),
+                )
+                .await;
+            f.event(EventKind::ObjectDeleted, k).await;
+        }
+        f.drain(None).await;
+        assert!(
+            f.engine.head("dst", "keep/a.bin").await.is_ok(),
+            "an excluded key was deleted on the destination"
+        );
+        assert!(
+            f.engine.head("dst", "f/b.bin").await.is_err(),
+            "f/b.bin not deleted"
+        );
     }
 
     /// Jobs finding 2: a destination that refused every PUT got the whole

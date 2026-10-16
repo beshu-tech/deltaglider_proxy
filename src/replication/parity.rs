@@ -28,7 +28,8 @@ use tracing::warn;
 
 use super::event_consumer;
 use super::planner::{
-    compile_rule_globs, normalize_prefix, rewrite_key, should_replicate, Decision,
+    compile_rule_globs, dest_key_in_scope, normalize_prefix, rewrite_key, should_replicate,
+    Decision,
 };
 use super::remediation::{analyze_finding, FindingFacts, Remediation};
 use super::state_store::{ObjectFailure, ParityCacheEntry, ParitySide};
@@ -1381,9 +1382,9 @@ pub(crate) async fn cache_put(
 ///
 /// SOURCE is filtered through `should_replicate` so the audit covers
 /// EXACTLY what replication acts on; each source key is rewritten into the
-/// dest namespace. DEST is listed with the same marker/internal skip (but
-/// not the source globs — an excluded-but-present dest object is a genuine
-/// orphan). Caps total scanned at `MAX_PARITY_OBJECTS`; `truncated=true`
+/// dest namespace. DEST is listed with the same marker/internal skip and
+/// the same filters, applied to the source key that each dest key mirrors
+/// (`dest_key_in_scope`): an object outside them is not the rule's. Caps total scanned at `MAX_PARITY_OBJECTS`; `truncated=true`
 /// rather than hang for huge buckets.
 /// Paginate one bucket+prefix, feeding each object to `keep` (which inserts,
 /// or skips it). Caps at `max` VISITED objects: a cap on the kept ones let a
@@ -1676,6 +1677,11 @@ pub async fn parity_audit(
         0,
         |key, meta| {
             if is_skippable_key(key) {
+                return Ok(false);
+            }
+            // A destination key outside the rule's filters is not the rule's:
+            // no run copies or deletes it, so it is no orphan.
+            if !dest_key_in_scope(rule, &inc, &exc, key) {
                 return Ok(false);
             }
             let mut st = ObjState::from_metadata(meta);
@@ -3340,6 +3346,25 @@ mod request_count_tests {
         )
         .await
         .unwrap();
+    }
+
+    /// The filters bound the destination side too: a destination object
+    /// whose source key the rule excludes is not the rule's, so Verify does
+    /// not call it an orphan (no run would ever delete it).
+    #[tokio::test]
+    async fn verify_ignores_destination_objects_outside_the_filters() {
+        let (engine, _fake) = s3_engine().await;
+        for key in ["archive/old.bin", "orphan.bin"] {
+            engine
+                .store("dst", key, b"x", None, Default::default())
+                .await
+                .unwrap();
+        }
+        let mut r = rule(&[]);
+        r.exclude_globs = vec!["archive/**".into()];
+        let outcome = parity_audit(&engine, &r, 1_000, None, None).await.unwrap();
+        assert_eq!(outcome.orphan_on_dest, 1, "{outcome:?}");
+        assert_eq!(outcome.dest_objects, 1, "{outcome:?}");
     }
 
     /// Jobs finding 18: the cap counted objects KEPT by the rule's globs,

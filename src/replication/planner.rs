@@ -11,7 +11,7 @@
 
 use crate::config_sections::{ConflictPolicy, ReplicationRule};
 use crate::types::FileMetadata;
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::GlobSet;
 
 /// Decision for a single listed object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +50,29 @@ pub struct BatchPlan {
     pub to_copy: Vec<(String, String, u64)>,
     /// Per-object skip reasons — surfaced in totals/telemetry.
     pub skipped: Vec<(String, SkipReason)>,
+}
+
+/// The source key that a destination key mirrors: the inverse of
+/// [`rewrite_key`]. `None` when `dest_key` is outside the destination prefix
+/// (the rule never writes it).
+pub fn source_key_of(source_prefix: &str, dest_prefix: &str, dest_key: &str) -> Option<String> {
+    let source_prefix = normalize_prefix(source_prefix);
+    let dest_prefix = normalize_prefix(dest_prefix);
+    let rest = dest_key.strip_prefix(dest_prefix.as_str())?;
+    Some(format!("{source_prefix}{rest}"))
+}
+
+/// Whether a destination key is inside the rule's filters: its source key
+/// is one the rule includes and does not exclude. A mirror deletes, and
+/// Verify reports, only such keys.
+pub fn dest_key_in_scope(
+    rule: &ReplicationRule,
+    include: &GlobSet,
+    exclude: &GlobSet,
+    dest_key: &str,
+) -> bool {
+    source_key_of(&rule.source.prefix, &rule.destination.prefix, dest_key)
+        .is_some_and(|k| crate::glob_filter::in_scope(&k, include, exclude))
 }
 
 /// Rewrite a source key into the destination's namespace.
@@ -153,23 +176,9 @@ pub fn compile_rule_globs(rule: &ReplicationRule) -> Result<(GlobSet, GlobSet), 
 }
 
 fn build_globset(patterns: &[String]) -> Result<GlobSet, PlanError> {
-    let mut builder = GlobSetBuilder::new();
-    for p in patterns {
-        match Glob::new(p) {
-            Ok(g) => {
-                builder.add(g);
-            }
-            Err(e) => {
-                return Err(PlanError::InvalidGlob {
-                    pattern: p.clone(),
-                    reason: e.to_string(),
-                });
-            }
-        }
-    }
-    builder.build().map_err(|e| PlanError::InvalidGlob {
-        pattern: "<set>".to_string(),
-        reason: e.to_string(),
+    crate::glob_filter::compile(patterns).map_err(|e| PlanError::InvalidGlob {
+        pattern: e.pattern,
+        reason: e.reason,
     })
 }
 
@@ -207,6 +216,11 @@ fn have_comparable_hash(
     both_sha || both_etag
 }
 
+/// A DeltaGlider config-sync internal (`.deltaglider/`): no rule acts on it.
+pub fn is_internal_key(key: &str) -> bool {
+    key.starts_with(".deltaglider/") || key.contains("/.deltaglider/")
+}
+
 /// Pure predicate: should we copy `source_key` from `src_meta` to
 /// destination, given optional `dest_meta`?
 ///
@@ -232,18 +246,13 @@ pub fn should_replicate(
     // DeltaGlider config-sync internals: never leak across replication.
     // Storage-layer delta artifacts (`reference.bin`, `*.delta`) are
     // filtered before planner input by the engine listing.
-    if source_key.starts_with(".deltaglider/") || source_key.contains("/.deltaglider/") {
+    if is_internal_key(source_key) {
         return Decision::Skip {
             reason: SkipReason::DgInternal,
         };
     }
 
-    if exclude_globs.is_match(source_key) {
-        return Decision::Skip {
-            reason: SkipReason::Excluded,
-        };
-    }
-    if !include_globs.is_empty() && !include_globs.is_match(source_key) {
+    if !crate::glob_filter::in_scope(source_key, include_globs, exclude_globs) {
         return Decision::Skip {
             reason: SkipReason::Excluded,
         };
@@ -455,6 +464,24 @@ mod tests {
                 reason: SkipReason::DestIdentical
             }
         ));
+    }
+
+    #[test]
+    fn source_key_of_inverts_rewrite_key() {
+        for (sp, dp, key) in [
+            ("", "", "a/b.zip"),
+            ("src/", "", "src/a.zip"),
+            ("", "mirror/", "a.zip"),
+            ("src/", "mirror/x/", "src/a/b.zip"),
+        ] {
+            let dest = rewrite_key(sp, dp, key).unwrap();
+            assert_eq!(
+                source_key_of(sp, dp, &dest).as_deref(),
+                Some(key),
+                "{sp} {dp} {key}"
+            );
+        }
+        assert_eq!(source_key_of("src/", "mirror/", "other/a.zip"), None);
     }
 
     #[test]

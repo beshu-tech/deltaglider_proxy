@@ -15,6 +15,8 @@ mod error;
 mod event_outbox;
 pub mod external_auth;
 mod extract;
+mod filter_preview;
+pub use filter_preview::filter_preview as jobs_filter_preview;
 mod groups;
 pub(crate) mod jobs;
 mod lifecycle;

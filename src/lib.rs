@@ -28,6 +28,7 @@ pub mod event_delivery;
 pub mod event_outbox;
 #[doc(hidden)]
 pub mod fuzz_entry;
+pub mod glob_filter;
 pub mod iam;
 pub mod init;
 pub mod job_loop;

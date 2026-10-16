@@ -6,7 +6,7 @@ use crate::config_sections::{LifecycleAction, LifecycleConfig, LifecycleRule};
 use crate::replication::{normalize_prefix, rewrite_key};
 use crate::types::FileMetadata;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::GlobSet;
 
 /// FATAL per-rule config errors: conditions under which the rule can NEVER run
 /// successfully, so it must be REJECTED at config time (apply / lint / validate)
@@ -263,23 +263,9 @@ pub fn compile_rule_globs(rule: &LifecycleRule) -> Result<(GlobSet, GlobSet), Pl
 }
 
 fn build_globset(patterns: &[String]) -> Result<GlobSet, PlanError> {
-    let mut builder = GlobSetBuilder::new();
-    for pattern in patterns {
-        match Glob::new(pattern) {
-            Ok(glob) => {
-                builder.add(glob);
-            }
-            Err(err) => {
-                return Err(PlanError::InvalidGlob {
-                    pattern: pattern.clone(),
-                    reason: err.to_string(),
-                });
-            }
-        }
-    }
-    builder.build().map_err(|err| PlanError::InvalidGlob {
-        pattern: "<set>".to_string(),
-        reason: err.to_string(),
+    crate::glob_filter::compile(patterns).map_err(|e| PlanError::InvalidGlob {
+        pattern: e.pattern,
+        reason: e.reason,
     })
 }
 
@@ -346,12 +332,7 @@ pub fn plan_object(
         });
     }
 
-    if exclude_globs.is_match(key) {
-        return Ok(Decision::Skip {
-            reason: SkipReason::Excluded,
-        });
-    }
-    if !include_globs.is_empty() && !include_globs.is_match(key) {
+    if !crate::glob_filter::in_scope(key, include_globs, exclude_globs) {
         return Ok(Decision::Skip {
             reason: SkipReason::Excluded,
         });

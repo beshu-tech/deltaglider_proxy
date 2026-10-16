@@ -70,11 +70,25 @@ Rule-name grammar: `[A-Za-z0-9_.-]{1,64}`. The name `__event_consumer__` is rese
 
 A replica keeps the creation time of its source object, so its `LastModified` is the source's `LastModified` and not the time of the copy. This matters for `newer-wins`, because the policy compares these times. If a replica carried the copy time, it would look newer than its source, and a rule in the opposite direction would copy it back. It also matters for a lifecycle rule on the destination bucket, because that rule counts an object's age from its creation time. To read the creation time, the copy sends one extra metadata request to the source for each object that it copies.
 
+## Include and exclude globs
+
+`include_globs` and `exclude_globs` decide which source objects a rule owns. Both lists use the same matcher, which lifecycle rules use too:
+
+- A glob matches the whole key from the bucket root. The source prefix is therefore part of the key. With the prefix `firmware/`, the glob `widget-3000/**` matches nothing, and `firmware/widget-3000/**` matches the files of that folder.
+- `*` matches any run of characters, `/` included. So `*.tmp` matches `firmware/scratch/a.tmp`, and `firmware/*` matches every key under `firmware/`.
+- `**` matches any depth, `?` matches one character, `[ab]` matches one character of a class, and `{zip,tar}` matches either form.
+- When `include_globs` is empty, every object under the source prefix is in. When it is not empty, an object is in only when one of its globs matches.
+- An exclude wins over an include.
+
+The filters bound everything that the rule does. A rule does not copy an object that its filters leave out. A rule with `replicate_deletes` also does not delete the destination copy of such an object, and **Verify** does not report it as an extra object. An exclude therefore also protects objects that only the destination holds, as `--exclude` does in rclone.
+
+The proxy refuses a rule with a glob that does not compile, because every run of the rule would fail. In the admin UI, the **Which objects** section of a rule shows, under each list, how many objects of a sample each glob matches. A glob that matches nothing, but would match with the source prefix in front of it, gets a button that adds the prefix. **Preview objects** opens a window with the sampled keys, sorted by verdict, and a box that tests one key. The sample is the first 1,000 objects under the source prefix, and the verdicts come from the same matcher that the rule runs ([`POST /_/api/admin/jobs/filter-preview`](jobs.md#filter-preview)).
+
 ## Delete replication
 
-When `replicate_deletes: true`, the destination is a **faithful mirror** of the source: the rule deletes any destination object that is not present at the source, no matter who wrote it. This applies to both the scheduled reconcile and the event-driven path.
+When `replicate_deletes: true`, the destination is a **faithful mirror** of the source: the rule deletes any destination object that is not present at the source, no matter who wrote it, unless the rule's filters leave the object out. To find the source key of a destination object, the proxy replaces the destination prefix with the source prefix, and it applies the filters to that key. This applies to both the scheduled reconcile and the event-driven path.
 
-The only guardrail is source absence: the rule deletes a destination object only after the proxy checks again that the source key is gone. For a batch of deletes, the proxy reads one listing of each source folder instead of sending one HEAD request per key. A key that the listing shows (it was created again after its delete) keeps its destination copy. When the check fails with an error, the proxy keeps the object. The proxy then sends the deletes of the batch together, so it checks each destination folder only once for a delta reference that it can remove. Delete replication removes *anything* absent at the source, including objects that other tools or a different rule wrote, so the destination bucket must be **dedicated to this rule**. A bucket shared with another writer is not a supported setup for delete replication.
+The only guardrail is source absence: the rule deletes a destination object only after the proxy checks again that the source key is gone. For a batch of deletes, the proxy reads one listing of each source folder instead of sending one HEAD request per key. A key that the listing shows (it was created again after its delete) keeps its destination copy. When the check fails with an error, the proxy keeps the object. The proxy then sends the deletes of the batch together, so it checks each destination folder only once for a delta reference that it can remove. Delete replication removes *anything* absent at the source inside the rule's filters, including objects that other tools or a different rule wrote, so the destination bucket must be **dedicated to this rule**, or the rule must exclude what the other writers keep there.
 
 ## What doesn't replicate
 
@@ -106,7 +120,10 @@ Warnings (surfaced at startup; do not block config load):
 - `dir_concurrency` outside `[1, 16]`.
 - Self-loop (source == destination).
 - Multi-hop cycles (A→B + B→A with overlapping prefixes). The warning shows the full cycle path.
-- Invalid include/exclude glob patterns.
+
+Errors (the config is refused):
+
+- An include or exclude glob that does not compile. The error names the rule and the glob.
 
 ## Transparency guarantees
 
