@@ -528,6 +528,27 @@ impl JobsDb {
         Ok(CancelOutcome::NotActive)
     }
 
+    /// Remove a FINISHED job and its failure rows from the list. An active
+    /// job is never removed (cancel it first): `false` when the job is
+    /// active or does not exist.
+    pub fn maintenance_delete_finished_job(&self, job_id: i64) -> Result<bool, ConfigDbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let n = tx.execute(
+            &format!(
+                "DELETE FROM maintenance_jobs WHERE id = ? AND status NOT IN {ACTIVE_STATUSES}"
+            ),
+            params![job_id],
+        )?;
+        if n > 0 {
+            tx.execute(
+                "DELETE FROM maintenance_failures WHERE job_id = ?",
+                params![job_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(n > 0)
+    }
+
     /// True when a cancel has been requested for this job.
     pub fn maintenance_cancel_requested(&self, job_id: i64) -> Result<bool, ConfigDbError> {
         let status: Option<String> = self
@@ -1409,6 +1430,22 @@ mod tests {
         let jobs = db.maintenance_list_jobs(10).unwrap();
         assert_eq!(jobs.len(), 2);
         assert_eq!(jobs[0].id, b);
+    }
+
+    #[test]
+    fn only_a_finished_job_is_deleted_with_its_failures() {
+        let db = db();
+        let id = db
+            .maintenance_create_job("delete", "a", "counting", None, "admin", 1)
+            .unwrap()
+            .unwrap();
+        assert!(!db.maintenance_delete_finished_job(id).unwrap(), "queued");
+        db.maintenance_record_failure(id, "k", "boom", 10).unwrap();
+        db.maintenance_finish(id, "completed", None).unwrap();
+        assert!(db.maintenance_delete_finished_job(id).unwrap());
+        assert!(db.maintenance_job_by_id(id).unwrap().is_none());
+        assert!(db.maintenance_list_failures(id, 10).unwrap().is_empty());
+        assert!(!db.maintenance_delete_finished_job(id).unwrap(), "gone");
     }
 
     /// B094: the worker runs the OLDEST queued job first, so with more jobs

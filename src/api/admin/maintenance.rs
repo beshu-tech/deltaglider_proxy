@@ -514,6 +514,33 @@ pub async fn start_migrate(
     ))
 }
 
+/// Remove a finished one-off job (and its failures) from the Jobs list.
+/// 409 while the job is active: cancel it first.
+pub async fn delete_finished_job(
+    state: &Arc<AdminState>,
+    id: i64,
+    headers: &HeaderMap,
+) -> Result<(), AdminError> {
+    let db = state.jobs_db.as_ref().ok_or_else(AdminError::no_jobs_db)?;
+    let db = db.lock().await;
+    if db.maintenance_job_by_id(id)?.is_none() {
+        return Err(AdminError::not_found(format!("job {id} not found")));
+    }
+    if !db.maintenance_delete_finished_job(id)? {
+        return Err(AdminError::conflict(
+            "the job is still active: cancel it first",
+        ));
+    }
+    drop(db);
+    super::audit_log(
+        "maintenance_job_delete",
+        "admin",
+        &format!("job:{id}"),
+        headers,
+    );
+    Ok(())
+}
+
 /// POST /_/api/admin/jobs/maintenance:<id>/cancel (routed via jobs.rs)
 pub async fn cancel_job(
     State(state): State<Arc<AdminState>>,

@@ -342,7 +342,7 @@ maintenance one-offs are DB-born. See [replication.md](replication.md) and
 | `GET` | `/_/api/admin/jobs/:id/verify` | Replication only: the state of the parity audit: `{status, progress_scanned, progress_total, scanned_at, outcome, error}`. |
 | `POST` | `/_/api/admin/jobs/:id/verify/cancel` | Replication only: stop a running parity audit. |
 | `POST` | `/_/api/admin/jobs/:id/kill` | Replication only: stop the running run of the rule on the instance that runs it (`202`). `409` when no run is in progress. |
-| `POST` | `/_/api/admin/jobs/:id/delete` | Replication and lifecycle rules: remove the rule from the config and delete its run state (`204`). `409` while the rule has a run or an audit in progress. |
+| `POST` | `/_/api/admin/jobs/:id/delete` | Replication and lifecycle rules: remove the rule from the config and delete its run state (`204`). `409` while the rule has a run or an audit in progress. A finished maintenance one-off: remove the job and its failures from the list (`204`); this changes no object. `409` while the job is active. |
 | `POST` | `/_/api/admin/jobs/:id/cancel` | Maintenance only: cancel a queued or running one-off. A migrate cancel before the flip unwinds cleanly. |
 | `POST` | `/_/api/admin/jobs/reencrypt` | `{"buckets": [...]}` (max 100) → one durable re-encrypt job per bucket: `{started: [{bucket, job_id}], errors: [...]}`. |
 | `POST` | `/_/api/admin/jobs/backfill-metadata` | `{"buckets": [...], "refresh_last_modified": false}` (max 100) → one durable metadata-backfill job per bucket, with the same response as re-encrypt. See [Jobs](jobs.md#metadata-backfill). |

@@ -157,7 +157,7 @@ pub fn supported_actions(sub: JobSubsystem) -> &'static [JobAction] {
             JobAction::Delete,
             JobAction::Kill,
         ],
-        JobSubsystem::Maintenance => &[JobAction::Cancel],
+        JobSubsystem::Maintenance => &[JobAction::Cancel, JobAction::Delete],
     }
 }
 
@@ -1125,6 +1125,11 @@ pub async fn job_action(
                 super::maintenance::cancel_job(State(state), Path(job_id), headers).await?;
             Ok((StatusCode::OK, Json(resp)))
         }
+        (JobSubsystem::Maintenance, JobAction::Delete) => {
+            let job_id: i64 = name.parse().map_err(|_| not_found())?;
+            super::maintenance::delete_finished_job(&state, job_id, &headers).await?;
+            Ok((StatusCode::NO_CONTENT, Json(serde_json::json!({}))))
+        }
         (JobSubsystem::Replication | JobSubsystem::Lifecycle, JobAction::Delete) => {
             delete_rule(&state, sub, &name, &headers).await?;
             Ok((StatusCode::NO_CONTENT, Json(serde_json::json!({}))))
@@ -1473,7 +1478,10 @@ mod tests {
             supported_actions(JobSubsystem::Lifecycle),
             &[Pause, Resume, RunNow, Preview, Delete, Kill]
         );
-        assert_eq!(supported_actions(JobSubsystem::Maintenance), &[Cancel]);
+        assert_eq!(
+            supported_actions(JobSubsystem::Maintenance),
+            &[Cancel, Delete]
+        );
         assert_eq!(JobAction::parse("run-now"), Some(RunNow));
         assert_eq!(JobAction::parse("verify"), Some(Verify));
         assert_eq!(JobAction::parse("delete"), Some(Delete));

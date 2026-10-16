@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added — Remove a finished one-off job from the Jobs list
+
+A finished delete, re-encrypt, migrate or backfill job had no action on the Jobs screen, so every bulk delete stayed in the list. The row's "⋯" menu now has **Delete** for a finished one-off (`POST /_/api/admin/jobs/maintenance:<n>/delete`). It removes the job and its failures from the list, and it changes no object. An active job answers `409`: cancel it first.
+
 ## v2.0.16 — 2026-10-16
 
 ### Added — A preview of a rule's include and exclude globs

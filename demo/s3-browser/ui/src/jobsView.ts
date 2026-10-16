@@ -376,7 +376,7 @@ export function triggerLabel(trigger: string): string {
  * The uniform action matrix, contextualised by row state:
  * - rule kinds: pause XOR resume (by current flag) + run-now (only when
  *   enabled, not paused, not mid-run); lifecycle adds preview.
- * - one-off kinds: cancel while active.
+ * - one-off kinds: cancel while active; delete (from the list) once finished.
  */
 export function availableActions(row: JobRow): JobAction[] {
   const out: JobAction[] = [];
@@ -397,7 +397,8 @@ export function availableActions(row: JobRow): JobAction[] {
     out.push('delete');
     return out;
   }
-  if (isActiveJobStatus(row.status) && row.status !== 'cancelling') out.push('cancel');
+  if (!isActiveJobStatus(row.status)) out.push('delete');
+  else if (row.status !== 'cancelling') out.push('cancel');
   return out;
 }
 

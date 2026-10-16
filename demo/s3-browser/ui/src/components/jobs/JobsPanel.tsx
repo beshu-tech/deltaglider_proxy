@@ -141,20 +141,28 @@ const ACTION_META: Record<
     label: 'Delete',
     icon: <DeleteOutlined />,
     danger: true,
-    done: 'Rule deleted',
   },
 };
+
+const isRuleKind = (kind: JobRow['kind']) => kind === 'replication' || kind === 'lifecycle';
 
 /** Destructive row actions: shown in the row's "⋯" menu, not as buttons. */
 type MenuAction = 'kill' | 'delete' | 'cancel';
 const MENU_ACTIONS: readonly JobAction[] = ['kill', 'delete', 'cancel'] satisfies MenuAction[];
 /** The confirmation each menu action asks before it runs. */
 const MENU_CONFIRM: Record<MenuAction, (row: JobRow) => RowActionConfirm> = {
-  delete: (row) => ({
-    title: `Delete rule "${row.name}"?`,
-    content: 'This removes the rule from the configuration and clears its run history.',
-    okText: 'Delete rule',
-  }),
+  delete: (row) =>
+    isRuleKind(row.kind)
+      ? {
+          title: `Delete rule "${row.name}"?`,
+          content: 'This removes the rule from the configuration and clears its run history.',
+          okText: 'Delete rule',
+        }
+      : {
+          title: `Remove this ${kindLabel(row.kind).toLowerCase()} job from the list?`,
+          content: 'This removes the job record and its failures. It changes no object.',
+          okText: 'Remove',
+        },
   // Kill aborts in-flight work mid-object.
   kill: (row) => ({
     title: `Kill the running "${row.name}" run?`,
@@ -613,7 +621,11 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
       if (action === 'run-now') {
         messageApi.success(runNowMessage(row.kind, result));
       } else {
-        messageApi.success(ACTION_META[action].done ?? `${ACTION_META[action].label} OK`);
+        messageApi.success(
+          action === 'delete'
+            ? isRuleKind(row.kind) ? 'Rule deleted' : 'Job removed from the list'
+            : ACTION_META[action].done ?? `${ACTION_META[action].label} OK`,
+        );
       }
       // Resume and Run now make the server start a run a moment later.
       if (action === 'run-now' || action === 'resume' || action === 'cancel') watchJobs([row.id], action === 'run-now');

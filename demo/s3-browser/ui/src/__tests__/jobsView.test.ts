@@ -165,7 +165,12 @@ test('availableActions matrix', () => {
   );
   assert.deepEqual(
     availableActions(row({ kind: 'migrate', trigger: 'oneoff', status: 'succeeded' })),
-    [],
+    ['delete'],
+    'a finished one-off can be removed from the list',
+  );
+  assert.deepEqual(
+    availableActions(row({ kind: 'delete', trigger: 'oneoff', status: 'failed' })),
+    ['delete'],
   );
 });
 
