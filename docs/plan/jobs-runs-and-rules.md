@@ -1,6 +1,6 @@
 # Jobs: runs on one page, rules on their own pages
 
-Status: in progress (2026-10-16). Phase 1 done. Owner: Simone + Claude.
+Status: done (2026-10-16): phases 1–5 on main. Owner: Simone + Claude.
 
 ## Problem
 
