@@ -12,7 +12,7 @@ import userEvent from '@testing-library/user-event';
 import { QueryClient } from '@tanstack/react-query';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import type { JobRow } from '../jobsView';
-import JobsPanel from '../components/jobs/JobsPanel';
+import { LifecycleRulesPanel } from '../components/jobs/RulesPanel';
 import { applySection } from '../applySection';
 import { qk } from '../queries/keys';
 import { json, mockFetch } from '../test/fetchMock';
@@ -81,7 +81,7 @@ async function closeDrawer(user: ReturnType<typeof userEvent.setup>) {
 
 test('reopening the Preview tab shows the same preview; Refresh preview recomputes it', async () => {
   const user = userEvent.setup();
-  renderWithQuery(<JobsPanel />);
+  renderWithQuery(<LifecycleRulesPanel />);
   await screen.findByText('expire-nightlies');
   await openPreviewTab(user);
   expect(previews()).toBe(1);
@@ -108,7 +108,7 @@ test('Refresh preview is disabled while a walk runs, and the time shown is when 
     });
   });
   const user = userEvent.setup();
-  renderWithQuery(<JobsPanel />);
+  renderWithQuery(<LifecycleRulesPanel />);
   await screen.findByText('expire-nightlies');
   await user.click(within(jobRow()).getByRole('button', { name: 'Preview: expire-nightlies' }));
   await screen.findByRole('tab', { name: 'Preview', selected: true });
@@ -122,7 +122,7 @@ test('Refresh preview is disabled while a walk runs, and the time shown is when 
 
 test("Run now's confirmation reuses the cached preview", async () => {
   const user = userEvent.setup();
-  renderWithQuery(<JobsPanel />);
+  renderWithQuery(<LifecycleRulesPanel />);
   await screen.findByText('expire-nightlies');
   await openPreviewTab(user);
   await closeDrawer(user);
@@ -136,7 +136,7 @@ test("Run now's confirmation reuses the cached preview", async () => {
 
 test('after a run the next confirmation computes a new preview', async () => {
   const user = userEvent.setup();
-  renderWithQuery(<JobsPanel />);
+  renderWithQuery(<LifecycleRulesPanel />);
   await screen.findByText('expire-nightlies');
   await user.click(within(jobRow()).getByRole('button', { name: 'Run now: expire-nightlies' }));
   const dialog = await screen.findByRole('dialog');
@@ -185,7 +185,7 @@ test("Run now's confirmation walks again when its preview is old, and says how o
     });
   });
   const user = userEvent.setup();
-  renderWithQuery(<JobsPanel />);
+  renderWithQuery(<LifecycleRulesPanel />);
   await screen.findByText('expire-nightlies');
   await user.click(within(jobRow()).getByRole('button', { name: 'Run now: expire-nightlies' }));
   const dialog = await screen.findByRole('dialog');
@@ -217,7 +217,7 @@ test('a run-now ends with a toast that counts what it did', async () => {
     }],
   }));
   const user = userEvent.setup();
-  renderWithQuery(<JobsPanel />);
+  renderWithQuery(<LifecycleRulesPanel />);
   await screen.findByText('expire-nightlies');
   await user.click(within(jobRow()).getByRole('button', { name: 'Run now: expire-nightlies' }));
   const dialog = await screen.findByRole('dialog');

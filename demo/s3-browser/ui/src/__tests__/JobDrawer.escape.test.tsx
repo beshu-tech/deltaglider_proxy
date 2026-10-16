@@ -6,7 +6,7 @@
 import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
-import JobsPanel from '../components/jobs/JobsPanel';
+import { LifecycleRulesPanel } from '../components/jobs/RulesPanel';
 import { json, mockFetch } from '../test/fetchMock';
 import { renderWithQuery } from '../test/render';
 
@@ -51,7 +51,7 @@ afterEach(() => vi.unstubAllGlobals());
 
 test('Escape in an open autocomplete does not close the drawer', async () => {
   const user = userEvent.setup();
-  renderWithQuery(<JobsPanel />);
+  renderWithQuery(<LifecycleRulesPanel />);
   await user.click(await screen.findByText('expire-old'));
   await screen.findByRole('dialog');
   const [bucket] = await screen.findAllByRole('combobox');

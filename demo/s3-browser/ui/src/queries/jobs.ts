@@ -4,7 +4,7 @@
  * after an action (see `JobWatch`), and every 10 s otherwise, so a
  * scheduled run or a job started in another tab still shows up.
  */
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   cancelVerifyParity,
   getJob,
@@ -12,12 +12,13 @@ import {
   getJobRuns,
   getJobs,
   getLifecyclePreviewStatus,
+  getRunList,
   getVerifyStatus,
   previewLifecycleJob,
   runJobAction,
   startVerifyParity,
 } from '../adminApi';
-import type { ParityStatus, VerifyScope } from '../adminApi';
+import type { ParityStatus, RunFilters, VerifyScope } from '../adminApi';
 import { isActiveJobStatus, jobsPollInterval, runsPollInterval, ACTIVE_POLL_MS } from '../jobsView';
 import type { JobWatch } from '../jobsView';
 import { qk } from './keys';
@@ -64,11 +65,27 @@ export function useJobRuns(id: string | null) {
   });
 }
 
-export function useJobFailures(id: string | null) {
+export function useJobFailures(id: string | null, runId?: number) {
   return useQuery({
-    queryKey: qk.jobs.failures(id ?? ''),
-    queryFn: () => getJobFailures(id as string),
+    queryKey: runId === undefined ? qk.jobs.failures(id ?? '') : [...qk.jobs.failures(id ?? ''), runId],
+    queryFn: () => getJobFailures(id as string, runId),
     enabled: !!id,
+  });
+}
+
+/**
+ * The runs list of the Jobs page, page by page. It polls fast while a run
+ * in it is live, and every 10 s otherwise, so a scheduled run or a job
+ * started in another tab shows up.
+ */
+export function useRunList(filters: RunFilters) {
+  return useInfiniteQuery({
+    queryKey: qk.jobs.runList(JSON.stringify(filters)),
+    queryFn: ({ pageParam }) => getRunList(filters, pageParam),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.next_cursor,
+    refetchInterval: (query) =>
+      jobsPollInterval((query.state.data?.pages ?? []).flatMap((p) => p.runs)),
   });
 }
 

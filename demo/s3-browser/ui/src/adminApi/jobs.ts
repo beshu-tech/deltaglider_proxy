@@ -41,7 +41,7 @@ interface JobRunEntry {
 }
 export type { JobRunEntry };
 
-interface JobFailureEntry {
+export interface JobFailureEntry {
   id: number;
   run_id?: number | null;
   occurred_at: number;
@@ -262,11 +262,54 @@ export async function getJobRuns(id: string): Promise<{ runs: JobRunEntry[] }> {
   return adminJson(`/api/admin/jobs/${encodeURIComponent(id)}/runs`, { context: 'Job runs' });
 }
 
-/** `total`: all failures recorded (the list holds the most recent ones). */
-export async function getJobFailures(id: string): Promise<{ failures: JobFailureEntry[]; total?: number | null }> {
-  return adminJson(`/api/admin/jobs/${encodeURIComponent(id)}/failures`, {
+/** `total`: all failures recorded (the list holds the most recent ones).
+ *  `runId` reads the failures of one run of a rule. */
+export async function getJobFailures(
+  id: string,
+  runId?: number,
+): Promise<{ failures: JobFailureEntry[]; total?: number | null }> {
+  const q = runId === undefined ? '' : `?run_id=${runId}`;
+  return adminJson(`/api/admin/jobs/${encodeURIComponent(id)}/failures${q}`, {
     context: 'Job failures',
   });
+}
+
+/** One run of the Jobs page: a rule run or a one-off (`GET /jobs/runs`). */
+export interface RunEntry extends JobRow {
+  /** The job that ran: `replication:<rule>`, `lifecycle:<rule>`, `maintenance:<n>`. */
+  job_id: string;
+  /** The run number of a rule run. */
+  run_id?: number;
+  /** `schedule`, `run-now`, `file-browser`, `admin`. */
+  origin: string;
+  /** Who started a one-off. */
+  started_by?: string;
+}
+
+export interface RunsPage {
+  runs: RunEntry[];
+  next_cursor?: string;
+}
+
+/** Filters of `GET /jobs/runs`; empty fields are not sent. */
+export interface RunFilters {
+  status?: 'active' | 'failed';
+  kind?: string;
+  rule?: string;
+  bucket?: string;
+  noop?: boolean;
+}
+
+export async function getRunList(filters: RunFilters, cursor?: string): Promise<RunsPage> {
+  const params = new URLSearchParams();
+  if (filters.status) params.set('status', filters.status);
+  if (filters.kind) params.set('kind', filters.kind);
+  if (filters.rule) params.set('rule', filters.rule);
+  if (filters.bucket) params.set('bucket', filters.bucket);
+  if (filters.noop) params.set('noop', 'true');
+  if (cursor) params.set('cursor', cursor);
+  const qs = params.toString();
+  return adminJson(`/api/admin/jobs/runs${qs ? `?${qs}` : ''}`, { context: 'Runs' });
 }
 
 /** Uniform action dispatch; returns the action's JSON payload (if any). */

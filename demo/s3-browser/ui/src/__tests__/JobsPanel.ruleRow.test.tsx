@@ -7,7 +7,7 @@
 import { screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import type { JobRow } from '../jobsView';
-import JobsPanel from '../components/jobs/JobsPanel';
+import { ReplicationRulesPanel } from '../components/jobs/RulesPanel';
 import { json, mockFetch } from '../test/fetchMock';
 import { renderWithQuery } from '../test/render';
 
@@ -68,7 +68,7 @@ function ruleRow(): HTMLElement {
 }
 
 test('a settled rule row keeps its counts and shows its live copies', async () => {
-  renderWithQuery(<JobsPanel />);
+  renderWithQuery(<ReplicationRulesPanel />);
   await screen.findByText('nightly-dr');
   const r = ruleRow();
   expect(within(r).getByText('14 copied · 1 deleted · 3 already in sync · 2 failed')).toBeInTheDocument();
@@ -78,7 +78,7 @@ test('a settled rule row keeps its counts and shows its live copies', async () =
 });
 
 test('Failures: total, live-copy tag; Runs: finish time', async () => {
-  renderWithQuery(<JobsPanel search="?job=replication:nightly-dr&tab=failures" />);
+  renderWithQuery(<ReplicationRulesPanel search="?job=replication:nightly-dr&tab=failures" />);
   const drawer = await screen.findByRole('dialog');
   expect(await within(drawer).findByText('The 2 most recent of 250 failures.')).toBeInTheDocument();
   expect(within(drawer).getByText('live copy')).toBeInTheDocument();
@@ -86,7 +86,7 @@ test('Failures: total, live-copy tag; Runs: finish time', async () => {
 });
 
 test('Runs rows say when the run finished', async () => {
-  renderWithQuery(<JobsPanel search="?job=replication:nightly-dr&tab=runs" />);
+  renderWithQuery(<ReplicationRulesPanel search="?job=replication:nightly-dr&tab=runs" />);
   const drawer = await screen.findByRole('dialog');
   expect(await within(drawer).findByText('Finished')).toBeInTheDocument();
   expect(within(drawer).getByText('1m')).toBeInTheDocument();

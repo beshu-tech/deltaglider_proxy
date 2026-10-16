@@ -1,804 +1,245 @@
 /**
- * Jobs — ONE screen for every background operation: replication rules,
- * lifecycle rules, and one-off re-encrypt / migrate jobs.
+ * Jobs — every run, live and past, on one list: the runs of replication and
+ * lifecycle rules, and the one-off jobs (bulk delete, re-encrypt, migrate,
+ * metadata backfill; a one-off is a run without a rule). The rules
+ * themselves are on the Replication and Lifecycle pages (RulesPanel).
  *
- * Reads come from the unified GET /api/admin/jobs (adaptive 2s polling
- * while anything runs). Rule DEFINITIONS are still YAML config: this
- * panel hosts TWO section editors (replication + lifecycle, both on the
- * `storage` section with disjoint `{replication}` / `{lifecycle}`
- * merge-patches — verified safe to be dirty simultaneously) and ONE
- * dirty bar driving a SEQUENTIAL apply queue: replication's ApplyDialog
- * first, then lifecycle's. Cancelling either step keeps the remaining
- * edits dirty — nothing is ever auto-discarded.
- *
- * One-off jobs are DB-born (created via the modals), not config: they
- * have no dirty state, just live progress + cancel.
+ * Reads `GET /jobs/runs` page by page; it polls fast while a run in it is
+ * live. The filters and the open drawer live in the URL (?status, ?kind,
+ * ?bucket, ?rule, ?noop, ?job).
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Alert, Button, Input, Space, Spin, Switch, Tag, Typography, message } from 'antd';
-import Dropdown from '../KeyboardDropdown';
-import {
-  CaretRightOutlined,
-  DeleteOutlined,
-  EyeOutlined,
-  PauseOutlined,
-  PlayCircleOutlined,
-  PlusOutlined,
-  StopOutlined,
-  ThunderboltOutlined,
-} from '@ant-design/icons';
+import { useEffect, useMemo, useState } from 'react';
+import { Alert, Button, Segmented, Select, Space, Spin, Switch, Tag, Typography, message } from 'antd';
+import { CloseOutlined, DeleteOutlined, PlusOutlined, StopOutlined, ThunderboltOutlined } from '@ant-design/icons';
 import { useQueryClient } from '@tanstack/react-query';
-import type { LifecycleConfig, ReplicationConfig, StorageSectionBody } from '../../adminApi';
-import { getJobRuns, runJobAction } from '../../adminApi';
-import type { JobAction, JobDisplayRow, JobRow, JobWatch } from '../../jobsView';
+import Dropdown from '../KeyboardDropdown';
+import type { RunEntry, RunFilters } from '../../adminApi';
+import { runJobAction } from '../../adminApi';
 import {
-  availableActions,
   cancelConfirmText,
-  editedRuleIds,
-  editorAfterDiscard,
-  editorRuleJobId,
-  findEditorRule,
-  ruleIdsChangedByApply,
-  savedRulesChangedByApply,
-  DRAFT_KEY_MARK,
   isActiveJobStatus,
   jobStatusLabel,
   jobStatusTone,
   kindLabel,
   kindTone,
-  lastRunCell,
-  lifecycleVerb,
-  mergeDraftRules,
-  draftBlocksAction,
-  lifecycleRunNowBlock,
-  nextRunText,
-  deferredText,
-  planRuleDeleteSync,
-  liveCopySummary,
-  rowMeterInput,
-  runEndedMessage,
-  statusCellView,
-  runNowMessage,
-  scopeText,
-  startJobWatch,
-  stepJobWatch,
-  triggerLabel,
-  watchSettled,
   parseJobId,
+  rowMeterInput,
+  runDuration,
+  scopeText,
 } from '../../jobsView';
-import { carryRuleUids, ruleUid } from '../../ruleUid';
-import { tickPeriodMs, useNow } from '../../hooks/useNow';
+import {
+  isRuleRun,
+  runActions,
+  runFiltersFromQuery,
+  runFiltersToQuery,
+  runName,
+  runOriginLabel,
+  runSubject,
+  RUN_KIND_OPTIONS,
+  type RunAction,
+} from '../../runsView';
+import { useRunList } from '../../queries/jobs';
+import { useBucketNames } from '../../queries/backends';
 import { qk } from '../../queries/keys';
-import { useJobs } from '../../queries/jobs';
 import { useNavigation } from '../../NavigationContext';
 import { buildViewUrl, parseAdminQuery } from '../../urlState';
 import { useOverlayClose } from '../../hooks/useOverlayClose';
-import TimeAgo from '../TimeAgo';
-import RecordList, { type RecordColumn } from './RecordList';
-import RowActionsMenu, { type RowActionConfirm } from '../RowActionsMenu';
-import { draftRemoveAction } from './draftRemoveAction';
-import OutcomeMeter from './OutcomeMeter';
-import { useSectionEditor } from '../../useSectionEditor';
-import { useApplyHandler } from '../../useDirtySection';
+import { useNow } from '../../hooks/useNow';
+import { normalizeUiError } from '../../errorHandling';
 import { useCardStyles, contentColumn, CONTENT_WIDE } from '../shared-styles';
-import ApplyDialog from '../ApplyDialog';
-import StickyDirtyBar from '../StickyDirtyBar';
+import TimeAgo from '../TimeAgo';
+import RowActionsMenu from '../RowActionsMenu';
 import ReencryptProposalModal from '../ReencryptProposalModal';
 import BackfillMetadataModal from '../BackfillMetadataModal';
 import MigrateBucketModal from '../MigrateBucketModal';
+import RecordList, { type RecordColumn } from './RecordList';
+import OutcomeMeter from './OutcomeMeter';
 import JobDrawer from './JobDrawer';
-import LifecycleRunConfirm from './LifecycleRunConfirm';
-import { lifecycleRunResultText, newestSettledRun } from './lifecycleText';
-import {
-  buildReplicationPayload,
-  DEFAULT_REPLICATION,
-  emptyRule as emptyReplicationRule,
-  normalizeReplication,
-} from '../replicationPayload';
-import {
-  buildLifecyclePayload,
-  DEFAULT_LIFECYCLE,
-  emptyRule as emptyLifecycleRule,
-  normalizeLifecycle,
-} from '../lifecyclePayload';
-import ReplicationApplySummary from '../ReplicationApplySummary';
-import { LifecycleApplySummary } from '../LifecycleSummary';
-import { normalizeUiError } from '../../errorHandling';
-import FormField from '../FormField';
+import RunDrawer from './RunDrawer';
 
 const { Text } = Typography;
 
 interface Props {
   onSessionExpired?: () => void;
-  /** Raw query string (with leading `?`) for deep-linking (?job=…&tab=…). */
+  /** Raw query string (with leading `?`): the filters and the open drawer. */
   search?: string;
 }
 
-const ACTION_META: Record<
-  JobAction,
-  { label: string; icon: React.ReactNode; danger?: boolean; done?: string }
-> = {
-  pause: { label: 'Pause', icon: <PauseOutlined />, done: 'Paused' },
-  // Resume (un-pause the schedule) keeps the bare play caret; Run now/once
-  // (fire a single execution) uses a DISTINCT circled-play so the two icons
-  // don't collide on a paused rule that offers both.
-  resume: { label: 'Resume', icon: <CaretRightOutlined />, done: 'Resumed' },
-  'run-now': { label: 'Run now', icon: <PlayCircleOutlined /> },
-  preview: { label: 'Preview', icon: <EyeOutlined /> },
+/** The confirmation of each run action. */
+function actionConfirm(run: RunEntry, action: RunAction): { title: string; content: string; okText: string } {
+  switch (action) {
+    case 'cancel':
+      return { ...cancelConfirmText(run), okText: 'Cancel job' };
+    case 'kill':
+      return {
+        title: `Kill the running "${runName(run)}" run?`,
+        content: 'Transfers in progress stop immediately.',
+        okText: 'Kill run',
+      };
+    case 'remove':
+      return {
+        title: `Remove this ${kindLabel(run.kind).toLowerCase()} job from the list?`,
+        content: 'This removes the job record and its failures. It changes no object.',
+        okText: 'Remove',
+      };
+  }
+}
+
+const ACTION_UI: Record<RunAction, { label: string; icon: React.ReactNode; wire: 'cancel' | 'kill' | 'delete'; done: string }> = {
   cancel: {
     label: 'Cancel',
     icon: <StopOutlined />,
-    danger: true,
+    wire: 'cancel',
     done: 'Cancellation requested — the job stops at the next safe point',
   },
-  kill: {
-    label: 'Kill run',
-    icon: <ThunderboltOutlined />,
-    danger: true,
-    done: 'Kill requested — the running sweep aborts in-flight',
-  },
-  delete: {
-    label: 'Delete',
-    icon: <DeleteOutlined />,
-    danger: true,
-  },
+  kill: { label: 'Kill run', icon: <ThunderboltOutlined />, wire: 'kill', done: 'Kill requested' },
+  remove: { label: 'Remove', icon: <DeleteOutlined />, wire: 'delete', done: 'Job removed from the list' },
 };
 
-const isRuleKind = (kind: JobRow['kind']) => kind === 'replication' || kind === 'lifecycle';
-
-/** Destructive row actions: shown in the row's "⋯" menu, not as buttons. */
-type MenuAction = 'kill' | 'delete' | 'cancel';
-const MENU_ACTIONS: readonly JobAction[] = ['kill', 'delete', 'cancel'] satisfies MenuAction[];
-/** The confirmation each menu action asks before it runs. */
-const MENU_CONFIRM: Record<MenuAction, (row: JobRow) => RowActionConfirm> = {
-  delete: (row) =>
-    isRuleKind(row.kind)
-      ? {
-          title: `Delete rule "${row.name}"?`,
-          content: 'This removes the rule from the configuration and clears its run history.',
-          okText: 'Delete rule',
-        }
-      : {
-          title: `Remove this ${kindLabel(row.kind).toLowerCase()} job from the list?`,
-          content: 'This removes the job record and its failures. It changes no object.',
-          okText: 'Remove',
-        },
-  // Kill aborts in-flight work mid-object.
-  kill: (row) => ({
-    title: `Kill the running "${row.name}" run?`,
-    content: 'Transfers in progress stop immediately.',
-    okText: 'Kill run',
-  }),
-  // A migration cancelled before the switch deletes the copies made so far.
-  cancel: (row) => ({ ...cancelConfirmText(row), okText: 'Cancel job' }),
-};
-
-/**
- * The Last run cell: how long a run in progress has run, else when the last
- * run finished; under it, when a scheduled rule runs next. Its own component
- * so that only this cell re-renders each second.
- */
-function LastRunCell({ row, schedulerOn }: { row: JobRow; schedulerOn: boolean }) {
-  const live = isActiveJobStatus(row.status);
-  const now = useNow(live ? 1000 : tickPeriodMs(3600));
-  const cell = lastRunCell(row, now / 1000);
-  const next = nextRunText(row, now, row.kind === 'lifecycle' ? schedulerOn : true);
-  const deferred = deferredText(row);
+/** When a run started, and how long it ran (or runs). */
+function WhenCell({ run }: { run: RunEntry }) {
+  const live = isActiveJobStatus(run.status);
+  const nowSec = useNow(live ? 1000 : 60_000) / 1000;
+  const took = runDuration(run.started_at ?? run.created_at, run.finished_at, nowSec);
   return (
     <div style={{ fontSize: 12, whiteSpace: 'nowrap', lineHeight: 1.4 }}>
-      {cell.running && <Text style={{ fontSize: 12, display: 'block' }}>{cell.running}</Text>}
-      {(cell.finishedAt || !cell.running) && (
-        <Text type="secondary" style={{ fontSize: 12, display: 'block' }}>
-          {cell.running && cell.finishedAt ? 'last: ' : ''}
-          <TimeAgo ts={cell.finishedAt} />
-        </Text>
-      )}
-      {next && (
+      <Text style={{ fontSize: 12, display: 'block' }}>
+        <TimeAgo ts={run.started_at ?? run.created_at} />
+      </Text>
+      {took && (
         <Text type="secondary" style={{ fontSize: 11, display: 'block' }}>
-          {next}
-        </Text>
-      )}
-      {deferred && (
-        <Text type="warning" style={{ fontSize: 11, display: 'block', whiteSpace: 'normal' }}>
-          {deferred}
+          {live ? `running ${took}` : `took ${took}`}
         </Text>
       )}
     </div>
   );
 }
 
-export default function JobsPanel({ onSessionExpired, search }: Props) {
+export default function JobsPanel({ search }: Props) {
   const { cardStyle, inputRadius } = useCardStyles();
   const qc = useQueryClient();
   const [messageApi, msgCtx] = message.useMessage();
   const { navigate } = useNavigation();
   const { markPushed, closeOverlay } = useOverlayClose();
+  const bucketNames = useBucketNames();
 
-  // Jobs watched after an action that makes the server start a run a moment
-  // later: the list polls fast until that run is seen and settles.
-  const [watches, setWatches] = useState<JobWatch[]>([]);
-  const jobsQuery = useJobs({ watches });
-  const serverRows: JobRow[] = useMemo(
-    () => jobsQuery.data?.jobs ?? [],
-    [jobsQuery.data]
-  );
-  const schedulerOn = jobsQuery.data?.workers?.lifecycle?.enabled ?? true;
-  const olderOneoffs = jobsQuery.data?.older_oneoffs ?? 0;
+  // The filters and the open drawer: local state, mirrored to the URL (a
+  // shared link, Back/Forward and a reload land on the same view).
+  const query = useMemo(() => parseAdminQuery(search ?? ''), [search]);
+  const [filters, setFiltersState] = useState<RunFilters>(() => runFiltersFromQuery(query));
+  const [openJob, setOpenJob] = useState<string | null>(query.job ?? null);
+  const [tab, setTab] = useState<string>(query.tab ?? 'definition');
   useEffect(() => {
-    if (watches.length === 0) return;
-    const now = Date.now();
-    const next = watches
-      .map((w) => {
-        const row = serverRows.find((r) => r.id === w.id);
-        // A run the operator started: say how it ended. The row of a rule
-        // carries the counts of the run in progress only, so the words come
-        // from its status.
-        if (w.announce && row && watchSettled(w, row)) void announceRunEnd(row);
-        return stepJobWatch(w, row, now);
-      })
-      .filter((w): w is JobWatch => w !== null);
-    if (next.length !== watches.length || next.some((w, i) => w !== watches[i])) setWatches(next);
-    // Each new list sample steps the watches; `watches` itself is not a trigger.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jobsQuery.dataUpdatedAt]);
-  // The ONE toast for a run that the operator started. A lifecycle run reads
-  // its run record, which names what it did ("deleted 80"); the row may no
-  // longer carry the counts once the run ended.
-  const announceRunEnd = async (row: JobRow) => {
-    if (row.kind === 'lifecycle') {
-      try {
-        const data = await qc.fetchQuery({
-          queryKey: qk.jobs.runs(row.id),
-          queryFn: () => getJobRuns(row.id),
-          staleTime: 0,
-        });
-        const run = newestSettledRun(data.runs);
-        if (run) {
-          const m = lifecycleRunResultText(row.name, run);
-          void messageApi.open({ type: m.type, content: m.text, duration: 8 });
-          return;
-        }
-      } catch {
-        // Fall back to the row's words below.
-      }
-    }
-    const m = runEndedMessage(row, ruleVerb(row));
-    messageApi[m.type](m.text);
-  };
-  const watchJobs = useCallback(
-    (ids: Iterable<string>, announce = false) => {
-      const now = Date.now();
-      const add = [...ids].map((id) => startJobWatch(id, serverRows.find((r) => r.id === id), now, announce));
-      if (add.length === 0) return;
-      setWatches((cur) => [...cur.filter((w) => !add.some((a) => a.id === w.id)), ...add]);
-    },
-    [serverRows],
-  );
+    setFiltersState(runFiltersFromQuery(query));
+    setOpenJob(query.job ?? null);
+    setTab(query.tab ?? 'definition');
+  }, [query]);
 
-  // ── The two rule-definition editors (disjoint storage merge-patches). ──
-  // Each re-read keeps the rule uids (by name) of the rules the editor holds,
-  // then of its last snapshot: after an apply, the rules the editor holds must
-  // still match their saved twins. The value comes first because the re-read
-  // after the PUT can resolve before React renders the new snapshot.
-  const replKnown = useRef<ReplicationConfig['rules']>([]);
-  const lcKnown = useRef<LifecycleConfig['rules']>([]);
-  const repl = useSectionEditor<StorageSectionBody, ReplicationConfig>({
-    section: 'storage',
-    dirtyKey: 'jobs/replication',
-    initial: DEFAULT_REPLICATION,
-    onSessionExpired,
-    noun: 'replication',
-    pick: (body) => {
-      const next = normalizeReplication(body.replication);
-      return { ...next, rules: carryRuleUids(next.rules, replKnown.current) };
-    },
-    toPayload: (v) => {
-      const res = buildReplicationPayload(v);
-      return res.ok ? res.body : {};
-    },
-  });
-  const lc = useSectionEditor<StorageSectionBody, LifecycleConfig>({
-    section: 'storage',
-    dirtyKey: 'jobs/lifecycle',
-    initial: DEFAULT_LIFECYCLE,
-    onSessionExpired,
-    noun: 'lifecycle',
-    pick: (body) => {
-      const next = normalizeLifecycle(body.lifecycle);
-      return { ...next, rules: carryRuleUids(next.rules, lcKnown.current) };
-    },
-    toPayload: (v) => {
-      const res = buildLifecyclePayload(v);
-      return res.ok ? res.body : {};
-    },
-  });
-
-  replKnown.current = [...repl.value.rules, ...repl.baseline.rules];
-  lcKnown.current = [...lc.value.rules, ...lc.baseline.rules];
-
-  // What a lifecycle rule does to an object, from its saved definition.
-  const ruleVerb = (row: JobRow) => {
-    if (row.kind !== 'lifecycle') return undefined;
-    const rule = lc.baseline.rules.find((r) => r.name === row.name);
-    return lifecycleVerb(rule?.action ?? row.detail?.action);
-  };
-
-  // True after a rule was deleted on the server while that editor was dirty:
-  // the rule was filtered out of the value, but the baseline still holds it,
-  // so Discard must re-fetch instead of reverting to the baseline.
-  const replBaselineStale = useRef(false);
-  const lcBaselineStale = useRef(false);
-
-  const syncEditorAfterDelete = (row: JobRow) => {
-    // The Verify tab's cached parity result belongs to the deleted rule: a
-    // new rule with the same name must not show it.
-    if (row.kind === 'replication') qc.removeQueries({ queryKey: qk.jobs.verify(row.name) });
-    if (row.kind === 'replication') {
-      const plan = planRuleDeleteSync(repl.isDirty, repl.value.rules, repl.baseline.rules, row.name);
-      if (plan.action === 'refresh') {
-        void repl.refresh();
-      } else {
-        const keep = new Set(plan.rules.map(ruleUid));
-        repl.setValue((cur) => ({ ...cur, rules: cur.rules.filter((r) => keep.has(ruleUid(r))) }));
-        replBaselineStale.current = true;
-      }
-    } else if (row.kind === 'lifecycle') {
-      const plan = planRuleDeleteSync(lc.isDirty, lc.value.rules, lc.baseline.rules, row.name);
-      if (plan.action === 'refresh') {
-        void lc.refresh();
-      } else {
-        const keep = new Set(plan.rules.map(ruleUid));
-        lc.setValue((cur) => ({ ...cur, rules: cur.rules.filter((r) => keep.has(ruleUid(r))) }));
-        lcBaselineStale.current = true;
-      }
-    }
-  };
-
-  // A draft (staged, never applied) leaves the editor alone: the other
-  // unsaved edits stay, and the dirty bar goes away if it was the only one.
-  // The draft is found by its id (a uid), never by its name: another rule
-  // can have the same name, and a draft's name can be empty.
-  const removeDraft = (row: Pick<JobRow, 'id' | 'kind'>) => {
-    const key = parseJobId(row.id)?.key ?? '';
-    const ed = row.kind === 'replication' ? repl : row.kind === 'lifecycle' ? lc : null;
-    if (!ed) return;
-    const idx = findEditorRule(key, ed.value.rules, ed.baseline.rules);
-    if (idx >= 0) {
-      const uid = ruleUid(ed.value.rules[idx]);
-      const drop = <T extends { rules: object[] }>(cur: T): T => ({
-        ...cur,
-        rules: cur.rules.filter((r) => ruleUid(r) !== uid),
+  // A link to a RULE (an older `jobs?job=replication:x` link) opens the rule
+  // page: the rule's definition lives there now.
+  useEffect(() => {
+    if (!openJob || openJob.includes('#')) return;
+    const kind = parseJobId(openJob)?.subsystem;
+    if (kind === 'replication' || kind === 'lifecycle') {
+      const tab = query.tab;
+      navigate(buildViewUrl('admin', `storage/${kind}`, tab ? { job: openJob, tab } : { job: openJob }), {
+        replace: true,
       });
-      if (row.kind === 'replication') repl.setValue(drop);
-      else lc.setValue(drop);
     }
-    if (drawerJobId === row.id) handleDrawerClose();
+  }, [openJob, query.tab, navigate]);
+
+  const setUrl = (f: RunFilters, job: string | null, push = false, nextTab?: string) => {
+    setFiltersState(f);
+    setOpenJob(job);
+    setTab(nextTab ?? 'definition');
+    const q = runFiltersToQuery(f, job);
+    if (job && nextTab && nextTab !== 'definition') q.tab = nextTab;
+    navigate(buildViewUrl('admin', 'jobs', Object.keys(q).length > 0 ? q : undefined), { replace: !push });
+    if (push) markPushed();
   };
+  const setFilters = (patch: Partial<RunFilters>) => setUrl({ ...filters, ...patch }, null);
 
-  const discardEditors = () => {
-    for (const [ed, stale] of [
-      [repl, replBaselineStale],
-      [lc, lcBaselineStale],
-    ] as const) {
-      if (editorAfterDiscard(stale.current) === 'refresh') {
-        stale.current = false;
-        void ed.refresh();
-      } else {
-        ed.discard();
-      }
-    }
-  };
+  const list = useRunList(filters);
+  const runs: RunEntry[] = useMemo(() => (list.data?.pages ?? []).flatMap((p) => p.runs), [list.data]);
+  const openRun = openJob ? (runs.find((r) => r.id === openJob) ?? null) : null;
 
-  // Rules with unapplied edits (and drafts): only THESE block Run now /
-  // Preview and show the "edited" marker.
-  const edited = useMemo(
-    () =>
-      new Set([
-        ...editedRuleIds('replication', repl.value.rules, repl.baseline.rules),
-        ...editedRuleIds('lifecycle', lc.value.rules, lc.baseline.rules),
-      ]),
-    [repl.value.rules, repl.baseline.rules, lc.value.rules, lc.baseline.rules],
-  );
-
-  // ── Sequential apply queue: replication dialog → lifecycle dialog. ──
-  // 'lifecycle-pending' means: after replication confirms, open lifecycle.
-  const [queueLifecycleNext, setQueueLifecycleNext] = useState(false);
-  // How many dialogs this apply opens (1 or 2): each dialog says its step.
-  const [applySteps, setApplySteps] = useState(1);
-  const startApplyQueue = useCallback(async () => {
-    // Client-side validation for BOTH before any dialog opens.
-    if (repl.isDirty) {
-      const r = buildReplicationPayload(repl.value);
-      if (!r.ok) {
-        messageApi.error(r.error);
-        return;
-      }
-    }
-    if (lc.isDirty) {
-      const l = buildLifecyclePayload(lc.value);
-      if (!l.ok) {
-        messageApi.error(l.error);
-        return;
-      }
-    }
-    setApplySteps(repl.isDirty && lc.isDirty ? 2 : 1);
-    if (repl.isDirty) {
-      setQueueLifecycleNext(lc.isDirty);
-      await repl.runApply();
-    } else if (lc.isDirty) {
-      await lc.runApply();
-    }
-  }, [repl, lc, messageApi]);
-
-  // After an apply the scheduler starts the changed rules within a second:
-  // watch them so their runs show up without waiting for the idle poll.
-  const watchApplied = useCallback(
-    (kind: 'replication' | 'lifecycle') => {
-      const ed = kind === 'replication' ? repl : lc;
-      watchJobs(ruleIdsChangedByApply(kind, ed.value.rules, ed.baseline.rules));
-    },
-    [repl, lc, watchJobs],
-  );
-
-  const anyDirty = repl.isDirty || lc.isDirty;
-  useApplyHandler('jobs', startApplyQueue, anyDirty);
-
-  const confirmReplApply = useCallback(async () => {
-    // Before the apply moves the snapshot: the saved rules it deletes or changes.
-    const staleVerify = savedRulesChangedByApply(repl.value.rules, repl.baseline.rules);
-    const ok = await repl.confirmApply();
-    if (ok) {
-      watchApplied('replication');
-      // A deleted, renamed or changed rule's parity result is not the new rule's.
-      for (const name of staleVerify) qc.removeQueries({ queryKey: qk.jobs.verify(name) });
-    }
-    qc.invalidateQueries({ queryKey: qk.jobs.list() });
-    if (!ok) {
-      // Replication PUT failed: abort the queue. The lifecycle edits stay
-      // dirty (nothing is discarded) and its dialog must NOT open stacked
-      // on top of the failure the operator is looking at.
-      setQueueLifecycleNext(false);
-      setApplySteps(1);
-      return;
-    }
-    // A successful apply re-fetches the section: the baseline is fresh.
-    replBaselineStale.current = false;
-    if (queueLifecycleNext) {
-      setQueueLifecycleNext(false);
-      // Open the lifecycle dialog as the next step of the queue.
-      await lc.runApply();
-    }
-  }, [repl, lc, qc, queueLifecycleNext, watchApplied]);
-
-  const cancelReplApply = useCallback(() => {
-    // Aborting step 1 aborts the queue; BOTH edit sets stay dirty.
-    setQueueLifecycleNext(false);
-    setApplySteps(1);
-    repl.cancelApply();
-  }, [repl]);
-
-  const confirmLcApply = useCallback(async () => {
-    if (await lc.confirmApply()) {
-      lcBaselineStale.current = false;
-      watchApplied('lifecycle');
-    }
-    setApplySteps(1);
-    qc.invalidateQueries({ queryKey: qk.jobs.list() });
-  }, [lc, qc, watchApplied]);
-
-  // ── Display rows: server rows + drafts/pending-deletes overlay. ──
-  const displayRows: JobDisplayRow[] = useMemo(
-    () =>
-      mergeDraftRules(
-        serverRows,
-        { rules: repl.value.rules, baseline: repl.baseline.rules },
-        { rules: lc.value.rules, baseline: lc.baseline.rules },
-        edited,
-      ),
-    [serverRows, repl.value.rules, repl.baseline.rules, lc.value.rules, lc.baseline.rules, edited]
-  );
-
-  // ── Drawer + creation modals ──
-  // The drawer's open job and active tab are URL-deep-linked via ?job=…&tab=…
-  // so shared links, browser Back/Forward, and reloads all land on the right
-  // view. On first mount we read from the query string; thereafter the URL is
-  // the single source of truth.
-  const queryParams = useMemo(() => parseAdminQuery(search ?? ''), [search]);
-  const [drawerJobId, setDrawerJobId] = useState<string | null>(queryParams.job ?? null);
-  const [drawerTab, setDrawerTab] = useState<string>(queryParams.tab ?? 'definition');
-  const [newJobMenuOpen, setNewJobMenuOpen] = useState(false);
   const [reencryptOpen, setReencryptOpen] = useState(false);
   const [backfillOpen, setBackfillOpen] = useState(false);
   const [migrateOpen, setMigrateOpen] = useState(false);
-  const [actionBusy, setActionBusy] = useState<string | null>(null);
-  const [confirmRun, setConfirmRun] = useState<JobRow | null>(null);
+  const [newMenuOpen, setNewMenuOpen] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
 
-  // Sync URL → state: when the query string changes (Back/Forward / shared link),
-  // update the local drawer state.
-  useEffect(() => {
-    setDrawerJobId(queryParams.job ?? null);
-    setDrawerTab(queryParams.tab ?? 'definition');
-  }, [queryParams.job, queryParams.tab]);
+  const refresh = (run: RunEntry) => {
+    qc.invalidateQueries({ queryKey: qk.jobs.runList() });
+    qc.invalidateQueries({ queryKey: qk.jobs.list() });
+    qc.invalidateQueries({ queryKey: qk.jobs.one(run.job_id) });
+  };
 
-  // Sync state → URL: when the drawer opens/closes or tab changes, update the
-  // URL so it's shareable and Back-button navigable. We replace (not push) for
-  // tab changes to avoid history spam; push for open/close transitions.
-  const updateDrawerUrl = useCallback(
-    (job: string | null, tab: string) => {
-      const query: Record<string, string> = {};
-      if (job) query.job = job;
-      if (job && tab && tab !== 'definition') query.tab = tab;
-      const url = buildViewUrl('admin', 'jobs', Object.keys(query).length > 0 ? query : undefined);
-      navigate(url, { replace: true });
-    },
-    [navigate],
-  );
-
-  const openDrawer = useCallback(
-    (jobId: string, tab = 'definition') => {
-      setDrawerJobId(jobId);
-      setDrawerTab(tab);
-      const url = buildViewUrl('admin', 'jobs', tab === 'definition' ? { job: jobId } : { job: jobId, tab });
-      navigate(url);
-      markPushed();
-    },
-    [navigate, markPushed],
-  );
-
-  // Retarget: same as openDrawer but REPLACE (not push). The drawer is
-  // already open on the same rule; only its job id changes.
-  const retargetDrawer = useCallback(
-    (jobId: string) => {
-      setDrawerJobId(jobId);
-      const url = buildViewUrl('admin', 'jobs', { job: jobId, ...(drawerTab !== 'definition' ? { tab: drawerTab } : {}) });
-      navigate(url, { replace: true });
-    },
-    [navigate, drawerTab],
-  );
-
-  // The drawer holds ONE rule while its id changes under it. A draft id
-  // stays the same while the operator types the name (also through the
-  // name of another rule). After an apply, the drawer moves to the rule's
-  // server id: a draft becomes a server rule, and a renamed rule is now
-  // known by its new name.
-  const drawerRule = useRef<{ jobId: string; uid: string } | null>(null);
-  useEffect(() => {
-    const parsed = drawerJobId ? parseJobId(drawerJobId) : null;
-    const kind = parsed?.subsystem;
-    if (!drawerJobId || !parsed || (kind !== 'replication' && kind !== 'lifecycle')) {
-      drawerRule.current = null;
-      return;
-    }
-    const ed = kind === 'replication' ? repl : lc;
-    const idx = findEditorRule(parsed.key, ed.value.rules, ed.baseline.rules);
-    let rule = idx >= 0 ? ed.value.rules[idx] : undefined;
-    if (!rule && drawerRule.current?.jobId === drawerJobId) {
-      const uid = drawerRule.current.uid;
-      rule = ed.value.rules.find((r) => ruleUid(r) === uid);
-    }
-    if (!rule) {
-      drawerRule.current = null;
-      return;
-    }
-    const canonical = editorRuleJobId(kind, rule, ed.baseline.rules);
-    // A server id stays while it resolves (a rename in progress keeps its
-    // Runs tab); a draft id moves once the rule is applied.
-    const move = canonical !== drawerJobId && (idx < 0 || parsed.key.startsWith(DRAFT_KEY_MARK));
-    drawerRule.current = { jobId: move ? canonical : drawerJobId, uid: ruleUid(rule) };
-    if (move) retargetDrawer(canonical);
-  }, [drawerJobId, repl, lc, retargetDrawer]);
-
-  const handleDrawerClose = useCallback(() => {
-    setDrawerJobId(null);
-    setDrawerTab('definition');
-    closeOverlay(buildViewUrl('admin', 'jobs'), navigate);
-  }, [closeOverlay, navigate]);
-
-  const handleTabChange = useCallback(
-    (tab: string) => {
-      setDrawerTab(tab);
-      if (drawerJobId) updateDrawerUrl(drawerJobId, tab);
-    },
-    [drawerJobId, updateDrawerUrl],
-  );
-
-  const runAction = async (row: JobRow, action: JobAction, confirmed = false) => {
-    // A lifecycle run deletes or moves objects: confirm with the preview list.
-    if (action === 'run-now' && row.kind === 'lifecycle' && !confirmed) {
-      setConfirmRun(row);
-      return;
-    }
-    // Preview is a view, not a toast: the drawer's Preview tab lists the keys.
-    // It shows the cached preview while it is fresh (each one walks the rule's
-    // scope); the tab's "Refresh preview" computes a new one.
-    if (action === 'preview') {
-      openDrawer(row.id, 'preview');
-      return;
-    }
-    setActionBusy(`${row.id}:${action}`);
+  const runAction = async (run: RunEntry, action: RunAction) => {
+    setBusy(`${run.id}:${action}`);
     try {
-      const result = await runJobAction(row.id, action);
-      if (action === 'run-now') {
-        messageApi.success(runNowMessage(row.kind, result));
-      } else {
-        messageApi.success(
-          action === 'delete'
-            ? isRuleKind(row.kind) ? 'Rule deleted' : 'Job removed from the list'
-            : ACTION_META[action].done ?? `${ACTION_META[action].label} OK`,
-        );
-      }
-      // Resume and Run now make the server start a run a moment later.
-      if (action === 'run-now' || action === 'resume' || action === 'cancel') watchJobs([row.id], action === 'run-now');
-      // A deleted rule no longer exists — close its drawer.
-      if (action === 'delete' && drawerJobId === row.id) handleDrawerClose();
-      // …and drop it from its editor, or it comes back as a draft that the
-      // next Apply re-creates.
-      if (action === 'delete') syncEditorAfterDelete(row);
-      // Refresh the list AND this job's runs/failures tables — a resume/run-now
-      // starts a new run that the open drawer's Runs/Failures tabs must show.
-      qc.invalidateQueries({ queryKey: qk.jobs.list() });
-      qc.invalidateQueries({ queryKey: qk.jobs.runs(row.id) });
-      qc.invalidateQueries({ queryKey: qk.jobs.failures(row.id) });
-      // A run changes the objects that the cached preview lists.
-      if (action === 'run-now') qc.invalidateQueries({ queryKey: qk.jobs.preview(row.id) });
+      await runJobAction(run.job_id, ACTION_UI[action].wire);
+      messageApi.success(ACTION_UI[action].done);
+      if (action === 'remove' && openJob === run.id) closeDrawer();
+      refresh(run);
     } catch (e) {
-      messageApi.error(normalizeUiError(e, `${action} failed`));
+      messageApi.error(normalizeUiError(e, `${ACTION_UI[action].label} failed`));
     } finally {
-      setActionBusy(null);
+      setBusy(null);
     }
   };
 
-  const newJobMenu = {
+  const openDrawer = (run: RunEntry, tab?: string) => setUrl(filters, run.id, true, tab);
+  const closeDrawer = () => {
+    setOpenJob(null);
+    setTab('definition');
+    closeOverlay(buildViewUrl('admin', 'jobs', runFiltersToQuery(filters)), navigate);
+  };
+
+  const newMenu = {
     items: [
-      { key: 'replication', label: 'Replication rule — continuous copy' },
-      { key: 'lifecycle', label: 'Lifecycle rule — scheduled expiry / archive' },
-      { type: 'divider' as const },
       { key: 'reencrypt', label: 'Re-encrypt buckets… — one-off rewrite' },
       { key: 'migrate', label: 'Migrate bucket… — one-off move' },
       { key: 'backfill', label: 'Backfill metadata… — for objects written without the proxy' },
+      { type: 'divider' as const },
+      { key: 'replication', label: 'Replication rule… — on the Replication page' },
+      { key: 'lifecycle', label: 'Lifecycle rule… — on the Lifecycle page' },
     ],
     onClick: ({ key }: { key: string }) => {
-      // Close the menu explicitly: opening a drawer / modal synchronously in
-      // these handlers otherwise leaves the dropdown lingering over the drawer
-      // until the next click.
-      setNewJobMenuOpen(false);
-      if (key === 'replication') {
-        const rule = emptyReplicationRule(repl.value.rules);
-        repl.setValue((cur) => ({ ...cur, rules: [...cur.rules, rule] }));
-        openDrawer(editorRuleJobId('replication', rule, repl.baseline.rules));
-      } else if (key === 'lifecycle') {
-        const rule = emptyLifecycleRule(lc.value.rules);
-        lc.setValue((cur) => ({ ...cur, rules: [...cur.rules, rule] }));
-        openDrawer(editorRuleJobId('lifecycle', rule, lc.baseline.rules));
-      } else if (key === 'reencrypt') {
-        setReencryptOpen(true);
-      } else if (key === 'backfill') {
-        setBackfillOpen(true);
-      } else {
-        setMigrateOpen(true);
-      }
+      setNewMenuOpen(false);
+      if (key === 'reencrypt') setReencryptOpen(true);
+      else if (key === 'migrate') setMigrateOpen(true);
+      else if (key === 'backfill') setBackfillOpen(true);
+      else navigate(buildViewUrl('admin', `storage/${key}`));
     },
   };
 
-  const columns: RecordColumn<JobDisplayRow>[] = [
+  const columns: RecordColumn<RunEntry>[] = [
     {
       key: 'job',
       label: 'Job',
-      // The name is what operators scan for; Status is usually one short tag.
-      // Self-describing: no caption on a phone card.
       hideLabelOnNarrow: true,
       track: 'minmax(200px,2fr)',
-      render: (d) => (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-          <Tag color={kindTone(d.row.kind)} style={{ margin: 0, flexShrink: 0 }}>
-            {kindLabel(d.row.kind)}
-          </Tag>
-          <Text
-            strong
-            // AntD tooltips are hidden globally (theme.css): native title.
-            ellipsis
-            title={d.row.name}
-            style={{ fontFamily: 'var(--font-mono)', fontSize: 13, minWidth: 0 }}
-          >
-            {d.row.name}
-          </Text>
-          {d.draft && <Tag color="warning" style={{ margin: 0, flexShrink: 0 }}>draft</Tag>}
-          {d.edited && (
-            <Tag
-              color="warning"
-              style={{ margin: 0, flexShrink: 0 }}
-              title="This rule has unsaved edits. Run now and Preview use the saved rule, so they wait until you apply or discard."
-            >
-              edited
-            </Tag>
-          )}
-          {d.pendingDelete && <Tag color="error" style={{ margin: 0, flexShrink: 0 }}>removing</Tag>}
-        </div>
-      ),
-    },
-    {
-      key: 'scope',
-      label: 'Scope',
-      track: 'minmax(140px,1.2fr)',
-      render: (d) => {
-        const scope = scopeText(d.row.scope);
+      render: (r) => {
+        const subject = runSubject(r);
         return (
-          <Text
-            type="secondary"
-            className="dg-cell-truncate"
-            title={scope}
-            style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}
-          >
-            {scope || '—'}
-          </Text>
-        );
-      },
-    },
-    {
-      key: 'trigger',
-      label: 'Trigger',
-      narrowHalf: true,
-      track: 'max-content',
-      render: (d) => (
-        <Text type="secondary" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
-          {triggerLabel(d.row.trigger)}
-        </Text>
-      ),
-    },
-    {
-      key: 'status',
-      label: 'Status',
-      // Self-describing: no caption on a phone card.
-      hideLabelOnNarrow: true,
-      track: 'minmax(0,1fr)',
-      render: (d) => {
-        const live = isActiveJobStatus(d.row.status);
-        // A one-off's row IS its run, and a settled rule keeps the counts
-        // of its last run ("14 copied"), not only a status word.
-        const view = statusCellView(d.row, d.draft);
-        const failed = d.row.failed_total ?? d.row.progress.failed;
-        const liveCopies = liveCopySummary(d.row);
-        return (
-          // OutcomeMeter.css grows this wrapper to the column width.
-          <div>
-            {view.tag && (
-              <Tag color={jobStatusTone(d.row)} style={{ margin: view.meter ? '0 0 4px' : 0 }}>
-                {jobStatusLabel(d.row)}
+          <div style={{ minWidth: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+              <Tag color={kindTone(r.kind)} style={{ margin: 0, flexShrink: 0 }}>
+                {kindLabel(r.kind)}
               </Tag>
-            )}
-            {view.meter && <OutcomeMeter {...rowMeterInput(d.row, ruleVerb(d.row))} />}
-            {liveCopies && (
-              // Event-driven copies write no run row: this is where they show.
-              <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 2 }}>
-                last live copy {liveCopies.at ? <TimeAgo ts={liveCopies.at} /> : '—'}
-                {liveCopies.counts ? ` · ${liveCopies.counts}` : ''}
-              </Text>
-            )}
-            {live && d.row.paused && d.row.status === 'running' && (
-              <Text type="warning" style={{ display: 'block', fontSize: 11, marginTop: 2 }}>
-                Paused: this run goes on; the next one waits for Resume.
-              </Text>
-            )}
-            {failed > 0 && (
-              <Button
-                type="link"
-                size="small"
-                danger
-                style={{ padding: '0 4px', height: 'auto', fontSize: 12 }}
-                aria-label={`${failed} failed — show failures: ${d.row.name}`}
-                title="Show the failed objects"
-                onClick={(e) => {
-                  // The row click opens the Definition tab; this opens Failures.
-                  e.stopPropagation();
-                  openDrawer(d.row.id, 'failures');
-                }}
+              <Text
+                strong
+                ellipsis
+                title={runName(r)}
+                style={{ fontFamily: 'var(--font-mono)', fontSize: 13, minWidth: 0 }}
               >
-                {failed.toLocaleString()} failed
-              </Button>
-            )}
-            {d.row.last_error && (
-              <Text type="danger" style={{ display: 'block', fontSize: 11, marginTop: 2 }} ellipsis title={d.row.last_error}>
-                {d.row.last_error}
+                {runName(r)}
+              </Text>
+            </div>
+            {subject && (
+              <Text type="secondary" className="dg-cell-truncate" title={subject} style={{ display: 'block', fontSize: 12 }}>
+                {subject}
               </Text>
             )}
           </div>
@@ -806,11 +247,71 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
       },
     },
     {
-      key: 'last',
-      label: 'Last run',
+      key: 'origin',
+      label: 'Started by',
       narrowHalf: true,
       track: 'max-content',
-      render: (d) => (d.draft ? <Text type="secondary">—</Text> : <LastRunCell row={d.row} schedulerOn={schedulerOn} />),
+      render: (r) => (
+        <Text type="secondary" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+          {runOriginLabel(r)}
+        </Text>
+      ),
+    },
+    {
+      key: 'scope',
+      label: 'Scope',
+      track: 'minmax(140px,1.2fr)',
+      render: (r) => {
+        const scope = scopeText(r.scope);
+        return (
+          <Text type="secondary" className="dg-cell-truncate" title={scope} style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+            {scope || '—'}
+          </Text>
+        );
+      },
+    },
+    {
+      key: 'status',
+      label: 'Status',
+      hideLabelOnNarrow: true,
+      track: 'minmax(0,1fr)',
+      render: (r) => (
+        <div>
+          <Tag color={jobStatusTone(r)} style={{ margin: '0 0 4px' }}>
+            {jobStatusLabel(r)}
+          </Tag>
+          <OutcomeMeter {...rowMeterInput(r)} />
+          {r.progress.failed > 0 && (
+            <Button
+              type="link"
+              size="small"
+              danger
+              style={{ padding: '0 4px', height: 'auto', fontSize: 12 }}
+              aria-label={`${r.progress.failed} failed — show failures: ${runName(r)}`}
+              title="Show the failed objects"
+              onClick={(e) => {
+                // The row click opens the drawer's first tab; this opens Failures.
+                e.stopPropagation();
+                openDrawer(r, 'failures');
+              }}
+            >
+              {r.progress.failed.toLocaleString()} failed
+            </Button>
+          )}
+          {r.last_error && (
+            <Text type="danger" style={{ display: 'block', fontSize: 11, marginTop: 2 }} ellipsis title={r.last_error}>
+              {r.last_error}
+            </Text>
+          )}
+        </div>
+      ),
+    },
+    {
+      key: 'when',
+      label: 'Started',
+      narrowHalf: true,
+      track: 'max-content',
+      render: (r) => <WhenCell run={r} />,
     },
     {
       key: 'actions',
@@ -818,82 +319,31 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
       track: 'max-content',
       align: 'end',
       hideLabelOnNarrow: true,
-      render: (d) =>
-        d.draft ? (
+      render: (r) => {
+        const actions = runActions(r);
+        if (actions.length === 0) return null;
+        return (
           <Space size={2} onClick={(e) => e.stopPropagation()}>
             <RowActionsMenu
-              label={`More actions for ${d.row.name}`}
-              actions={[draftRemoveAction(d.row, removeDraft)]}
+              label={`More actions for ${runName(r)}`}
+              loading={actions.some((a) => busy === `${r.id}:${a}`)}
+              actions={actions.map((a) => ({
+                key: a,
+                danger: true as const,
+                icon: ACTION_UI[a].icon,
+                label: `${ACTION_UI[a].label}…`,
+                confirm: actionConfirm(r, a),
+                onSelect: () => runAction(r, a),
+              }))}
             />
           </Space>
-        ) : (
-          <Space size={2} onClick={(e) => e.stopPropagation()}>
-            {availableActions(d.row)
-              .filter((a) => !MENU_ACTIONS.includes(a))
-              .map((a) => {
-                // A replication one-off on a disabled/paused rule reads as "Run
-                // once" (it runs the rule a single time without re-enabling it).
-                const oneOff =
-                  a === 'run-now' &&
-                  d.row.kind === 'replication' &&
-                  (d.row.enabled === false || d.row.paused === true);
-                const label = oneOff ? 'Run once' : ACTION_META[a].label;
-                const blocked =
-                  draftBlocksAction(a, d.row, edited) ??
-                  // The SAVED master switch decides (unknown while it loads:
-                  // do not block on the default).
-                  (a === 'run-now' ? lifecycleRunNowBlock(d.row, lc.loading || lc.baseline.enabled) : null);
-                const title = oneOff
-                  ? 'Run this rule once now — does not enable or resume it'
-                  : label;
-                return (
-                  <Button
-                    key={a}
-                    size="small"
-                    type="text"
-                    danger={ACTION_META[a].danger}
-                    icon={ACTION_META[a].icon}
-                    loading={actionBusy === `${d.row.id}:${a}`}
-                    disabled={blocked !== null}
-                    title={blocked ?? title}
-                    // Unique per row: every row has a "Run now".
-                    aria-label={`${title}: ${d.row.name}`}
-                    onClick={() => void runAction(d.row, a)}
-                  >
-                    {/* Icon-only on the wide table (label in the tooltip); the
-                        caption returns on the narrow stacked card. */}
-                    <span className="dg-action-label">{label}</span>
-                  </Button>
-                );
-              })}
-            {/* Destructive actions (delete, kill) live behind "⋯", not as a
-                red icon on every row; the menu confirms each one. */}
-            <RowActionsMenu
-              label={`More actions for ${d.row.name}`}
-              loading={MENU_ACTIONS.some((a) => actionBusy === `${d.row.id}:${a}`)}
-              actions={availableActions(d.row)
-                .filter((a) => MENU_ACTIONS.includes(a))
-                .map((a) => ({
-                  key: a,
-                  danger: true as const,
-                  icon: ACTION_META[a].icon,
-                  label: `${ACTION_META[a].label}…`,
-                  confirm: MENU_CONFIRM[a as MenuAction](d.row),
-                  onSelect: () => runAction(d.row, a),
-                }))}
-            />
-          </Space>
-        ),
+        );
+      },
     },
   ];
 
-  if (jobsQuery.isLoading) {
-    return (
-      <div style={{ display: 'flex', justifyContent: 'center', padding: 64 }}>
-        <Spin />
-      </div>
-    );
-  }
+  const ruleLabel = filters.rule ? parseJobId(filters.rule) : null;
+  const filtered = !!(filters.status || filters.kind || filters.bucket || filters.rule);
 
   return (
     <div style={contentColumn(CONTENT_WIDE)}>
@@ -907,149 +357,124 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
         onClose={() => setReencryptOpen(false)}
       />
       <BackfillMetadataModal open={backfillOpen} onClose={() => setBackfillOpen(false)} />
-      <MigrateBucketModal
-        open={migrateOpen}
-        bucket={null}
-        onClose={() => setMigrateOpen(false)}
-      />
-      <LifecycleRunConfirm
-        row={confirmRun}
-        onCancel={() => setConfirmRun(null)}
-        onRun={(r) => {
-          setConfirmRun(null);
-          void runAction(r, 'run-now', true);
-        }}
-      />
-      <JobDrawer
-        jobId={drawerJobId}
-        rows={serverRows}
-        replication={repl.value}
-        lifecycle={lc.value}
-        replicationSaved={repl.baseline}
-        lifecycleSaved={lc.baseline}
-        onReplicationChange={repl.setValue}
-        onLifecycleChange={lc.setValue}
-        onRemoveDraft={removeDraft}
-        onCancelJob={(row) => runAction(row, 'cancel')}
-        lifecycleVerbOf={ruleVerb}
-        bottomInset={anyDirty}
-        activeTab={drawerTab}
-        onTabChange={handleTabChange}
-        inputRadius={inputRadius}
-        onClose={handleDrawerClose}
-      />
+      <MigrateBucketModal open={migrateOpen} bucket={null} onClose={() => setMigrateOpen(false)} />
+      {openRun && isRuleRun(openRun) ? (
+        <RunDrawer run={openRun} onClose={closeDrawer} />
+      ) : (
+        <JobDrawer
+          jobId={openJob && openJob.startsWith('maintenance:') ? openJob : null}
+          rows={runs.filter((r) => !isRuleRun(r))}
+          activeTab={tab}
+          onTabChange={(t) => setUrl(filters, openJob, false, t)}
+          onCancelJob={(row) => {
+            const run = runs.find((r) => r.id === row.id);
+            if (!run) return;
+            return runJobAction(run.job_id, 'cancel')
+              .then(() => refresh(run))
+              .catch((e) => messageApi.error(normalizeUiError(e, 'Cancel failed')));
+          }}
+          inputRadius={inputRadius}
+          onClose={closeDrawer}
+        />
+      )}
 
       <div style={cardStyle}>
-        {/* Lean toolbar — the page TabHeader already carries the "Jobs" title +
-            description, so this row is just the count + the action (no duplicate
-            heading). Keeps one header per screen and saves vertical space. */}
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
-          <div style={{ minWidth: 0 }}>
-            <Text type="secondary" style={{ fontSize: 13 }}>
-              {/* With no jobs, the list's empty state says so (once). */}
-              {displayRows.length === 0
-                ? ''
-                : `${displayRows.length} job${displayRows.length === 1 ? '' : 's'} — select one for its definition, runs, and failures.`}
-            </Text>
-            {olderOneoffs > 0 ? (
-              <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>
-                {olderOneoffs.toLocaleString()} older one-off job{olderOneoffs === 1 ? '' : 's'} not listed.
-              </Text>
-            ) : null}
-          </div>
-          <Dropdown
-            menu={newJobMenu}
-            trigger={['click']}
-            open={newJobMenuOpen}
-            onOpenChange={setNewJobMenuOpen}
-          >
-            <Button type="primary" icon={<PlusOutlined />}>
+        {/* The filters wrap on their own; "New job" stays top right. */}
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 }}>
+          <Space wrap size={8} style={{ flex: 1, minWidth: 0 }}>
+            <Segmented
+              aria-label="Status"
+              value={filters.status ?? 'all'}
+              options={[
+                { value: 'all', label: 'All' },
+                { value: 'active', label: 'Active' },
+                { value: 'failed', label: 'Failed' },
+              ]}
+              onChange={(v) => setFilters({ status: v === 'all' ? undefined : (v as RunFilters['status']) })}
+            />
+            <Select
+              id="runs-filter-kind"
+              aria-label="Kind"
+              allowClear
+              placeholder="Every kind"
+              style={{ minWidth: 160 }}
+              value={filters.kind}
+              options={RUN_KIND_OPTIONS}
+              onChange={(v) => setFilters({ kind: v || undefined })}
+            />
+            <Select
+              id="runs-filter-bucket"
+              aria-label="Bucket"
+              allowClear
+              showSearch
+              placeholder="Every bucket"
+              style={{ minWidth: 160 }}
+              value={filters.bucket}
+              options={bucketNames.map((b) => ({ value: b, label: b }))}
+              onChange={(v) => setFilters({ bucket: v || undefined })}
+            />
+            {ruleLabel && (
+              <Tag
+                closable
+                closeIcon={<CloseOutlined aria-label="Show every rule" />}
+                onClose={() => setFilters({ rule: undefined })}
+                style={{ margin: 0, padding: '2px 8px' }}
+              >
+                {kindLabel(ruleLabel.subsystem)} rule <span style={{ fontFamily: 'var(--font-mono)' }}>{ruleLabel.key}</span>
+              </Tag>
+            )}
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+              <Switch
+                size="small"
+                checked={!!filters.noop}
+                onChange={(on) => setFilters({ noop: on || undefined })}
+                aria-label="Show runs that changed nothing"
+              />
+              Show runs that changed nothing
+            </label>
+          </Space>
+          <Dropdown menu={newMenu} trigger={['click']} open={newMenuOpen} onOpenChange={setNewMenuOpen}>
+            <Button type="primary" icon={<PlusOutlined />} style={{ flexShrink: 0 }}>
               New job
             </Button>
           </Dropdown>
         </div>
 
-        {/* The lifecycle master switch (default off): without it no lifecycle
-            rule runs, on schedule or with Run now. */}
-        <FormField
-          label="Run lifecycle rules on schedule"
-          yamlPath="storage.lifecycle.enabled"
-          helpText="Off by default. While it is off, no lifecycle rule runs, and Run now is refused. Each rule also has its own Enabled switch."
-          style={{ marginTop: 16, marginBottom: 0 }}
-        >
-          <Switch
-            checked={lc.value.enabled}
-            disabled={lc.loading}
-            onChange={(enabled) => lc.setValue((cur) => ({ ...cur, enabled }))}
-          />
-        </FormField>
-        {/* How often each lifecycle rule runs: the "next run in …" of a row
-            is the end of its last run plus this. */}
-        <FormField
-          label="Run each lifecycle rule every"
-          yamlPath="storage.lifecycle.tick_interval"
-          helpText="A rule runs this long after its last run ended. A new rule first runs this long after you apply it, so you can preview it first. Humantime, at least 1m, e.g. 1h, 30m, 1d."
-          style={{ marginTop: 12, marginBottom: 0, maxWidth: 360 }}
-        >
-          <Input
-            value={lc.value.tick_interval}
-            disabled={lc.loading}
-            placeholder="1h"
-            onChange={(e) => lc.setValue((cur) => ({ ...cur, tick_interval: e.target.value }))}
-            style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
-          />
-        </FormField>
-
-        {jobsQuery.error ? (
+        {list.error ? (
           <Alert
             type="error"
             showIcon
             style={{ marginTop: 16, borderRadius: 8 }}
-            title={normalizeUiError(jobsQuery.error, 'Failed to load jobs')}
+            title={normalizeUiError(list.error, 'Failed to load the runs')}
           />
+        ) : list.isLoading ? (
+          <div style={{ display: 'flex', justifyContent: 'center', padding: 48 }}>
+            <Spin />
+          </div>
         ) : (
           <div style={{ marginTop: 16 }}>
             <RecordList
-              rows={displayRows}
+              rows={runs}
               columns={columns}
-              rowKey={(d) => d.row.id}
-              onRowClick={(d) => openDrawer(d.row.id)}
-              empty='No jobs yet. Use "New job" to add a replication or lifecycle rule, or start a one-off re-encrypt, migrate or metadata-backfill job.'
+              rowKey={(r) => r.id}
+              onRowClick={openDrawer}
+              empty={
+                filtered
+                  ? 'No run matches these filters.'
+                  : 'No runs yet. Rules run on their schedule; a bulk delete in the file browser, or "New job", starts a one-off.'
+              }
             />
+            {list.hasNextPage && (
+              <div style={{ display: 'flex', justifyContent: 'center', marginTop: 12 }}>
+                <Button loading={list.isFetchingNextPage} onClick={() => void list.fetchNextPage()}>
+                  Show older runs
+                </Button>
+              </div>
+            )}
           </div>
         )}
       </div>
-
-      <StickyDirtyBar
-        visible={anyDirty}
-        applying={repl.applying || lc.applying}
-        onDiscard={discardEditors}
-        onApply={() => void startApplyQueue()}
-        floating
-      />
-      <ApplyDialog
-        open={repl.applyOpen}
-        section="storage"
-        response={repl.applyResponse}
-        onApply={() => void confirmReplApply()}
-        onCancel={cancelReplApply}
-        loading={repl.applying}
-        step={{ index: 1, total: applySteps, what: 'replication rules' }}
-        summary={<ReplicationApplySummary replication={repl.pendingBody?.replication ?? repl.value} />}
-      />
-      <ApplyDialog
-        open={lc.applyOpen}
-        section="storage"
-        response={lc.applyResponse}
-        onApply={() => void confirmLcApply()}
-        onCancel={() => {
-          setApplySteps(1);
-          lc.cancelApply();
-        }}
-        loading={lc.applying}
-        step={{ index: applySteps, total: applySteps, what: 'lifecycle rules' }}
-        summary={<LifecycleApplySummary lifecycle={lc.pendingBody?.lifecycle ?? lc.value} />}
-      />
     </div>
   );
 }
+

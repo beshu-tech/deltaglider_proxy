@@ -6,7 +6,7 @@
 import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
-import JobsPanel from '../components/jobs/JobsPanel';
+import { LifecycleRulesPanel } from '../components/jobs/RulesPanel';
 import { json, mockFetch } from '../test/fetchMock';
 import { renderWithQuery } from '../test/render';
 
@@ -27,7 +27,7 @@ afterEach(() => vi.unstubAllGlobals());
 
 test('the lifecycle scheduler switch shows the saved value and applies storage.lifecycle.enabled', async () => {
   const user = userEvent.setup();
-  renderWithQuery(<JobsPanel />);
+  renderWithQuery(<LifecycleRulesPanel />);
   const sw = await screen.findByRole('switch', { name: LABEL });
   await waitFor(() => expect(http.callsTo('GET', SECTION).length).toBeGreaterThan(0));
   expect(sw).not.toBeChecked();
@@ -43,7 +43,7 @@ test('the lifecycle scheduler switch shows the saved value and applies storage.l
 
 test('the switch reads on when the saved config has the scheduler on', async () => {
   http.on('GET', SECTION, json({ lifecycle: { enabled: true, tick_interval: '1h', max_failures_retained: 100, rules: [] } }));
-  renderWithQuery(<JobsPanel />);
+  renderWithQuery(<LifecycleRulesPanel />);
   const sw = await screen.findByRole('switch', { name: LABEL });
   await waitFor(() => expect(sw).toBeChecked());
 });

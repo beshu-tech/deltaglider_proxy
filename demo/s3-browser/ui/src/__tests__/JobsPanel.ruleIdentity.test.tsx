@@ -11,7 +11,7 @@ import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import type { JobRow } from '../jobsView';
-import JobsPanel from '../components/jobs/JobsPanel';
+import { ReplicationRulesPanel } from '../components/jobs/RulesPanel';
 import { json, mockFetch } from '../test/fetchMock';
 import { renderWithQuery } from '../test/render';
 import { qk } from '../queries/keys';
@@ -50,13 +50,12 @@ function tableRows(): string[] {
 
 async function newReplicationDraft(user: ReturnType<typeof userEvent.setup>) {
   await screen.findAllByText('nightly');
-  await user.click(await screen.findByRole('button', { name: /New job/ }));
-  await user.click(await screen.findByText('Replication rule — continuous copy'));
+  await user.click(await screen.findByRole('button', { name: /New replication rule/ }));
 }
 
 test('typing a new rule name through an applied name keeps the drawer on the new rule', async () => {
   const user = userEvent.setup();
-  renderWithQuery(<JobsPanel />);
+  renderWithQuery(<ReplicationRulesPanel />);
   await newReplicationDraft(user);
   // Select the default name and type over it, one key at a time (the name
   // never goes empty): after "nightly", the drawer must still hold the draft.
@@ -68,28 +67,28 @@ test('typing a new rule name through an applied name keeps the drawer on the new
   const rows = tableRows();
   expect(rows).toHaveLength(2);
   // The applied rule is untouched: not edited, not removed, same scope.
-  expect(rows[0]).toMatch(/^Replicationnightlyreleases → downloads/);
+  expect(rows[0]).toMatch(/^nightlyreleases → downloads/);
   expect(rows[0]).not.toMatch(/edited|removing|draft/);
-  expect(rows[1]).toMatch(/^Replicationnightly-eudraft/);
+  expect(rows[1]).toMatch(/^nightly-eudraft/);
   // The drawer did not move onto the applied rule.
   expect(within(await screen.findByRole('dialog')).getByText('draft')).toBeInTheDocument();
 });
 
 test('a draft with an empty name keeps its drawer and shows as "(unnamed)"', async () => {
   const user = userEvent.setup();
-  renderWithQuery(<JobsPanel />);
+  renderWithQuery(<ReplicationRulesPanel />);
   await newReplicationDraft(user);
   await user.clear(await nameInput());
   expect((await nameInput()).value).toBe('');
-  await waitFor(() => expect(tableRows().some((t) => t.startsWith('Replication(unnamed)draft'))).toBe(true));
+  await waitFor(() => expect(tableRows().some((t) => t.startsWith('(unnamed)draft'))).toBe(true));
   // Typing a name again edits the same draft.
   await user.type(await nameInput(), 'fresh');
-  await waitFor(() => expect(tableRows().some((t) => t.startsWith('Replicationfreshdraft'))).toBe(true));
+  await waitFor(() => expect(tableRows().some((t) => t.startsWith('freshdraft'))).toBe(true));
 });
 
 test('Remove draft removes the draft, not the applied rule with the same name', async () => {
   const user = userEvent.setup();
-  renderWithQuery(<JobsPanel />);
+  renderWithQuery(<ReplicationRulesPanel />);
   await newReplicationDraft(user);
   await user.click(await nameInput());
   await user.keyboard('{Control>}a{/Control}n');
@@ -122,7 +121,7 @@ test('a rename applies as the new name, with no client id in the body; the drawe
       source: { bucket: 'releases', prefix: '' }, destination: { bucket: 'downloads', prefix: '' } }] },
   }));
   const user = userEvent.setup();
-  const { client } = renderWithQuery(<JobsPanel />);
+  const { client } = renderWithQuery(<ReplicationRulesPanel />);
   // A parity result cached for the old name must not outlive the rename.
   client.setQueryData(qk.jobs.verify('nightly'), { status: 'completed' });
 
@@ -132,8 +131,8 @@ test('a rename applies as the new name, with no client id in the body; the drawe
   await user.type(await nameInput(), 'ightly-eu');
   // A rename is a delete and a create on the server: the table says so.
   await waitFor(() => expect(tableRows()).toHaveLength(2));
-  expect(tableRows()[0]).toMatch(/^Replicationnightlyremoving/);
-  expect(tableRows()[1]).toMatch(/^Replicationnightly-eudraft/);
+  expect(tableRows()[0]).toMatch(/^nightlyremoving/);
+  expect(tableRows()[1]).toMatch(/^nightly-eudraft/);
   // The drawer still holds the same rule.
   expect((await nameInput()).value).toBe('nightly-eu');
 

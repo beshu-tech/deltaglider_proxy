@@ -1,5 +1,5 @@
 /**
- * A draft rule (added with "New job", never applied) can be removed on its
+ * A draft rule (added with "New replication rule", never applied) can be removed on its
  * own, from the row's "⋯" menu or the drawer's. Before, a draft row had no
  * actions: the only way out was Discard, which also dropped every other
  * unsaved edit.
@@ -7,7 +7,7 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
-import JobsPanel from '../components/jobs/JobsPanel';
+import { ReplicationRulesPanel } from '../components/jobs/RulesPanel';
 import { json, mockFetch } from '../test/fetchMock';
 import { renderWithQuery } from '../test/render';
 
@@ -21,8 +21,7 @@ afterEach(() => vi.unstubAllGlobals());
 
 /** Add a replication draft; returns its name as the table shows it. */
 async function addDraft(user: ReturnType<typeof userEvent.setup>): Promise<string> {
-  await user.click(await screen.findByRole('button', { name: /New job/ }));
-  await user.click(await screen.findByText('Replication rule — continuous copy'));
+  await user.click(await screen.findByRole('button', { name: /New replication rule/ }));
   const tag = await screen.findAllByText('draft');
   const row = tag.map((t) => t.closest('[role="row"]')).find(Boolean) as HTMLElement;
   return within(row).getAllByText(/\S/)[1].textContent ?? '';
@@ -50,7 +49,7 @@ async function confirmRemove(user: ReturnType<typeof userEvent.setup>) {
 
 test('the row menu removes one draft and keeps the other unsaved edits', async () => {
   const user = userEvent.setup();
-  renderWithQuery(<JobsPanel />);
+  renderWithQuery(<ReplicationRulesPanel />);
   await addDraft(user);
   await user.keyboard('{Escape}'); // close the drawer the new rule opened
   await addDraft(user);
@@ -68,7 +67,7 @@ test('the row menu removes one draft and keeps the other unsaved edits', async (
 
 test('removing the only draft clears the unsaved-changes bar; the drawer offers it too', async () => {
   const user = userEvent.setup();
-  renderWithQuery(<JobsPanel />);
+  renderWithQuery(<ReplicationRulesPanel />);
   await addDraft(user);
   // The drawer of the new draft is open: its "⋯" removes it and closes.
   const drawer = await screen.findByRole('dialog');

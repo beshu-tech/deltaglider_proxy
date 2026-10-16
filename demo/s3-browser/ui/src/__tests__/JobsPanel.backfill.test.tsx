@@ -13,7 +13,7 @@ import { renderWithQuery } from '../test/render';
 let http: ReturnType<typeof mockFetch>;
 beforeEach(() => {
   http = mockFetch();
-  http.on('GET', '/_/api/admin/jobs', json({ jobs: [] }));
+  http.on('GET', '/_/api/admin/jobs/runs', json({ runs: [] }));
   http.on('GET', '/_/api/admin/config/section/storage', json({}));
   http.on('GET', '/_/api/admin/buckets', json({ buckets: [{ name: 'releases' }, { name: 'downloads' }] }));
   http.on(

@@ -22,6 +22,7 @@ import SessionsPanel from '../SessionsPanel';
 import BackendsPanel from '../BackendsPanel';
 import BucketsPanel from '../BucketsPanel';
 import JobsPanel from '../jobs/JobsPanel';
+import { LifecycleRulesPanel, ReplicationRulesPanel } from '../jobs/RulesPanel';
 import SystemPanel from '../SystemPanel';
 import WebhookDeliveryPanel from '../WebhookDeliveryPanel';
 import TabHeader from '../TabHeader';
@@ -125,6 +126,12 @@ const ADMIN_ROUTES: Record<string, AdminRoute> = {
   },
   'storage/buckets': {
     render: (c) => <BucketsPanel onSessionExpired={c.onSessionExpired} search={c.search} />,
+  },
+  'storage/replication': {
+    render: (c) => <ReplicationRulesPanel onSessionExpired={c.onSessionExpired} search={c.search} />,
+  },
+  'storage/lifecycle': {
+    render: (c) => <LifecycleRulesPanel onSessionExpired={c.onSessionExpired} search={c.search} />,
   },
   'jobs': {
     render: (c) => <JobsPanel onSessionExpired={c.onSessionExpired} search={c.search} />,

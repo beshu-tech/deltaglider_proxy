@@ -11,7 +11,7 @@ import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import type { JobRow } from '../jobsView';
-import JobsPanel from '../components/jobs/JobsPanel';
+import { ReplicationRulesPanel } from '../components/jobs/RulesPanel';
 import { json, mockFetch } from '../test/fetchMock';
 import { renderWithQuery } from '../test/render';
 
@@ -57,7 +57,7 @@ afterEach(() => {
 
 async function mount() {
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
-  renderWithQuery(<JobsPanel />);
+  renderWithQuery(<ReplicationRulesPanel />);
   await screen.findByText('nightly-dr');
   return user;
 }
@@ -154,8 +154,7 @@ describe('run-now', () => {
     const runNow = () => within(jobRow()).getByRole('button', { name: 'Run now: nightly-dr' });
     // "New job → Replication rule" adds a draft rule: the editor is dirty,
     // but nightly-dr itself is unchanged, so its Run now stays.
-    await user.click(screen.getByRole('button', { name: /New job/ }));
-    await user.click(await screen.findByText('Replication rule — continuous copy'));
+    await user.click(await screen.findByRole('button', { name: /New replication rule/ }));
     expect(await screen.findAllByText('draft')).not.toHaveLength(0);
     expect(runNow()).toBeEnabled();
     expect(within(jobRow()).queryByText('edited')).not.toBeInTheDocument();

@@ -1,18 +1,20 @@
 /**
- * The Jobs screen shows runs that the SERVER starts a moment after an
- * action, reads the Runs tab again when a run finished between two polls,
- * opens a deep link to a one-off that the list no longer carries, and asks
- * before it cancels a one-off.
+ * A rule page shows runs that the SERVER starts a moment after an action
+ * and reads the Runs tab again when a run finished between two polls. The
+ * Jobs page opens a deep link to a one-off that its list does not carry,
+ * and asks before it cancels a one-off.
  */
 import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import type { JobRow } from '../jobsView';
 import JobsPanel from '../components/jobs/JobsPanel';
+import { LifecycleRulesPanel, ReplicationRulesPanel } from '../components/jobs/RulesPanel';
 import { json, mockFetch } from '../test/fetchMock';
 import { renderWithQuery } from '../test/render';
 
 const JOBS = '/_/api/admin/jobs';
+const RUNS = '/_/api/admin/jobs/runs';
 
 function rule(over: Partial<JobRow> = {}): JobRow {
   return {
@@ -73,7 +75,7 @@ test('after Resume the list polls fast until the run the scheduler starts is see
   });
   http.on('POST', '/_/api/admin/jobs/replication%3Anightly-dr/resume', json({}, 200));
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
-  renderWithQuery(<JobsPanel />);
+  renderWithQuery(<ReplicationRulesPanel />);
   await screen.findByText('nightly-dr');
   await user.click(within(rowOf('nightly-dr')).getByRole('button', { name: 'Resume: nightly-dr' }));
   await waitFor(() => expect(reads).toBe(2));
@@ -91,7 +93,7 @@ test('the Runs tab reads again when last_run_at moves', async () => {
   http.on('GET', '/_/api/admin/jobs/replication%3Anightly-dr/runs', () => json({ runs }));
   http.on('GET', '/_/api/admin/jobs/replication%3Anightly-dr/failures', json({ failures: [] }));
   http.on('GET', '/_/api/admin/jobs/replication%3Anightly-dr/verify', json({ status: 'idle' }));
-  renderWithQuery(<JobsPanel search="?job=replication:nightly-dr&tab=runs" />);
+  renderWithQuery(<ReplicationRulesPanel search="?job=replication:nightly-dr&tab=runs" />);
   expect(await screen.findByText('No runs yet')).toBeInTheDocument();
 
   runs = [
@@ -121,7 +123,7 @@ test('the Runs tab reads again when last_run_at moves', async () => {
 // Regression: ?job=maintenance:3 for a job the list did not carry read
 // "Lifecycle · 3 [draft] — no longer exists".
 test('a deep link to a one-off the list does not carry loads it by id', async () => {
-  http.on('GET', JOBS, json({ jobs: [rule()] }));
+  http.on('GET', RUNS, json({ runs: [] }));
   http.on(
     'GET',
     '/_/api/admin/jobs/maintenance%3A3',
@@ -165,7 +167,7 @@ test('Cancel of a running migration asks first and says what it deletes', async 
     progress: { processed: 20_001, bytes: 0, failed: 0, skipped: 0 },
     detail: { target_backend: 'aws-dr', from_backend: 'hetzner-fsn1', delete_source: false, target: 'empty' },
   };
-  http.on('GET', JOBS, json({ jobs: [migrate] }));
+  http.on('GET', RUNS, json({ runs: [{ ...migrate, job_id: 'maintenance:9', origin: 'admin' }] }));
   http.on('POST', '/_/api/admin/jobs/maintenance%3A9/cancel', json({}, 200));
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
   renderWithQuery(<JobsPanel />);
@@ -188,17 +190,16 @@ test('Cancel of a running migration asks first and says what it deletes', async 
 test('while edits are unsaved, the drawer leaves room under its last field', async () => {
   http.on('GET', JOBS, json({ jobs: [] }));
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
-  renderWithQuery(<JobsPanel />);
-  await user.click(await screen.findByRole('button', { name: /New job/ }));
-  await user.click(await screen.findByText('Lifecycle rule — scheduled expiry / archive'));
+  renderWithQuery(<LifecycleRulesPanel />);
+  await user.click(await screen.findByRole('button', { name: /New lifecycle rule/ }));
   const body = (await screen.findByRole('dialog')).querySelector('.ant-drawer-body') as HTMLElement;
   expect(body.style.paddingBottom).toBe('96px');
 });
 
 // Regression (QA nightly step 7): the header and the empty list both said
 // "No jobs yet".
-test('an empty Jobs screen says "No jobs yet" once', async () => {
-  http.on('GET', JOBS, json({ jobs: [] }));
+test('an empty Jobs screen says "No runs yet" once', async () => {
+  http.on('GET', RUNS, json({ runs: [] }));
   renderWithQuery(<JobsPanel />);
-  expect(await screen.findAllByText(/No jobs yet/)).toHaveLength(1);
+  expect(await screen.findAllByText(/No runs yet/)).toHaveLength(1);
 });

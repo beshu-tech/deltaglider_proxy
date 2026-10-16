@@ -8,6 +8,7 @@ import { Alert, Button, Drawer, Empty, Modal, Tabs, Tag, Typography } from 'antd
 import { StopOutlined } from '@ant-design/icons';
 import RowActionsMenu from '../RowActionsMenu';
 import { draftRemoveAction } from './draftRemoveAction';
+import { cloneRuleAction } from './cloneRuleAction';
 import { useColors } from '../../ThemeContext';
 import './OutcomeMeter.css';
 import type { LifecycleConfig, ReplicationConfig } from '../../adminApi';
@@ -16,10 +17,8 @@ import {
   availableActions,
   cancelConfirmText,
   DRAFT_KEY_MARK,
-  failuresCountText,
   findEditorRule,
   UNNAMED_RULE,
-  groupFailureErrors,
   isActiveJobStatus,
   jobInFlight,
   jobWalkProgress,
@@ -42,28 +41,36 @@ import { qk } from '../../queries/keys';
 import { useJob, useJobFailures, useJobRuns } from '../../queries/jobs';
 import TimeAgo from '../TimeAgo';
 import RecordList from './RecordList';
+import FailuresList from './FailuresList';
 import OutcomeMeter from './OutcomeMeter';
 import ReplicationRuleFields from '../ReplicationRuleFields';
 import LifecycleRuleFields from '../LifecycleRuleFields';
+import { sameScopeRule } from '../ruleClone';
 import VerifyTab from './VerifyTab';
 import LifecyclePreviewTab from './LifecyclePreviewTab';
 import { useBucketNames } from '../../queries/backends';
 
 const { Text } = Typography;
 
+/** A rule editor as the drawer sees it. `saved` is the editor's last server
+ *  snapshot: a server job id names the saved rule, and the editor rule is
+ *  the one with that rule's uid. */
+export interface RuleEditor<C> {
+  value: C;
+  saved: C;
+  onChange: (fn: (cur: C) => C) => void;
+}
+
 interface Props {
   jobId: string | null;
   rows: JobRow[];
-  replication: ReplicationConfig;
-  lifecycle: LifecycleConfig;
-  /** The editors' last server snapshots: a server job id names the saved
-   *  rule, and the editor rule is the one with that rule's uid. */
-  replicationSaved: ReplicationConfig;
-  lifecycleSaved: LifecycleConfig;
-  onReplicationChange: (fn: (cur: ReplicationConfig) => ReplicationConfig) => void;
-  onLifecycleChange: (fn: (cur: LifecycleConfig) => LifecycleConfig) => void;
+  /** The rule editor of the page (a rule page has one; the Jobs page none). */
+  replication?: RuleEditor<ReplicationConfig>;
+  lifecycle?: RuleEditor<LifecycleConfig>;
   /** Drop a draft (a rule that exists only in the unsaved edits). */
-  onRemoveDraft: (draft: Pick<JobRow, 'id' | 'kind' | 'name'>) => void;
+  onRemoveDraft?: (draft: Pick<JobRow, 'id' | 'kind' | 'name'>) => void;
+  /** Copy the shown rule into a new draft. */
+  onCloneRule?: (rule: Pick<JobRow, 'id' | 'kind' | 'name'>) => void;
   /** Cancel a running one-off (asked for confirmation here first). */
   onCancelJob?: (row: JobRow) => Promise<unknown> | void;
   /** What a lifecycle rule does to an object (meter words). */
@@ -92,13 +99,10 @@ function stopEscapeFromOpenDropdown(e: React.KeyboardEvent) {
 export default function JobDrawer({
   jobId,
   rows,
-  replication,
-  lifecycle,
-  replicationSaved,
-  lifecycleSaved,
-  onReplicationChange,
-  onLifecycleChange,
+  replication: replEditor,
+  lifecycle: lcEditor,
   onRemoveDraft,
+  onCloneRule,
   onCancelJob,
   lifecycleVerbOf,
   bottomInset,
@@ -155,63 +159,77 @@ export default function JobDrawer({
 
   // The editor rule this drawer shows: by uid, never by name (a name
   // changes while the operator types it, and can match another rule).
+  const replication = replEditor?.value;
+  const lifecycle = lcEditor?.value;
   const replIndex =
-    parsed?.subsystem === 'replication'
-      ? findEditorRule(parsed.key, replication.rules, replicationSaved.rules)
+    parsed?.subsystem === 'replication' && replEditor
+      ? findEditorRule(parsed.key, replEditor.value.rules, replEditor.saved.rules)
       : -1;
   const lcIndex =
-    parsed?.subsystem === 'lifecycle'
-      ? findEditorRule(parsed.key, lifecycle.rules, lifecycleSaved.rules)
+    parsed?.subsystem === 'lifecycle' && lcEditor
+      ? findEditorRule(parsed.key, lcEditor.value.rules, lcEditor.saved.rules)
       : -1;
   const editorRuleName =
-    replIndex >= 0 ? replication.rules[replIndex].name : lcIndex >= 0 ? lifecycle.rules[lcIndex].name : null;
+    replication && replIndex >= 0
+      ? replication.rules[replIndex].name
+      : lifecycle && lcIndex >= 0
+        ? lifecycle.rules[lcIndex].name
+        : null;
   // What the title calls a rule that the server does not know yet.
   const draftName = editorRuleName ?? (parsed && !parsed.key.startsWith(DRAFT_KEY_MARK) ? parsed.key : '');
   const draftLabel = draftName || UNNAMED_RULE;
 
   const definition = (() => {
-    if (replIndex >= 0) {
+    if (replEditor && replication && replIndex >= 0) {
       const rule = replication.rules[replIndex];
+      const twin = sameScopeRule('replication', replication.rules, replIndex);
       return (
-        <ReplicationRuleFields
-          rule={rule}
-          buckets={bucketNames}
-          inputRadius={inputRadius}
-          onChange={(patch) =>
-            onReplicationChange((cur) => ({
-              ...cur,
-              rules: cur.rules.map((r, i) => (i === replIndex ? { ...r, ...patch } : r)),
-            }))
-          }
-          onRename={(next) =>
-            onReplicationChange((cur) => ({
-              ...cur,
-              rules: cur.rules.map((r, i) => (i === replIndex ? { ...r, name: next } : r)),
-            }))
-          }
-        />
+        <>
+          {twin && <SameScopeAlert twin={twin} what="source, destination and filters" />}
+          <ReplicationRuleFields
+            rule={rule}
+            buckets={bucketNames}
+            inputRadius={inputRadius}
+            onChange={(patch) =>
+              replEditor.onChange((cur) => ({
+                ...cur,
+                rules: cur.rules.map((r, i) => (i === replIndex ? { ...r, ...patch } : r)),
+              }))
+            }
+            onRename={(next) =>
+              replEditor.onChange((cur) => ({
+                ...cur,
+                rules: cur.rules.map((r, i) => (i === replIndex ? { ...r, name: next } : r)),
+              }))
+            }
+          />
+        </>
       );
     }
-    if (lcIndex >= 0) {
+    if (lcEditor && lifecycle && lcIndex >= 0) {
       const rule = lifecycle.rules[lcIndex];
+      const twin = sameScopeRule('lifecycle', lifecycle.rules, lcIndex);
       return (
-        <LifecycleRuleFields
-          rule={rule}
-          buckets={bucketNames}
-          inputRadius={inputRadius}
-          onChange={(patch) =>
-            onLifecycleChange((cur) => ({
-              ...cur,
-              rules: cur.rules.map((r, i) => (i === lcIndex ? { ...r, ...patch } : r)),
-            }))
-          }
-          onRename={(next) =>
-            onLifecycleChange((cur) => ({
-              ...cur,
-              rules: cur.rules.map((r, i) => (i === lcIndex ? { ...r, name: next } : r)),
-            }))
-          }
-        />
+        <>
+          {twin && <SameScopeAlert twin={twin} what="bucket, prefix, action and filters" />}
+          <LifecycleRuleFields
+            rule={rule}
+            buckets={bucketNames}
+            inputRadius={inputRadius}
+            onChange={(patch) =>
+              lcEditor.onChange((cur) => ({
+                ...cur,
+                rules: cur.rules.map((r, i) => (i === lcIndex ? { ...r, ...patch } : r)),
+              }))
+            }
+            onRename={(next) =>
+              lcEditor.onChange((cur) => ({
+                ...cur,
+                rules: cur.rules.map((r, i) => (i === lcIndex ? { ...r, name: next } : r)),
+              }))
+            }
+          />
+        </>
       );
     }
     if (serverRow) {
@@ -363,83 +381,7 @@ export default function JobDrawer({
     />
   );
 
-  const failures = failuresQuery.data?.failures ?? [];
-  const failuresCount = failuresCountText(failures.length, failuresQuery.data?.total);
-  const errorGroups = groupFailureErrors(failures);
-  const failuresTable = (
-    <div>
-      {failuresCount && (
-        <Text type="secondary" style={{ display: 'block', fontSize: 12, marginBottom: 8 }}>
-          {failuresCount}
-        </Text>
-      )}
-      {errorGroups.length > 0 && (
-        <div style={{ marginBottom: 12, fontSize: 12 }} aria-label="Repeated errors">
-          {errorGroups.slice(0, 3).map((g) => (
-            <div key={g.error} style={{ display: 'flex', gap: 8, padding: '2px 0' }}>
-              <Text strong style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
-                {g.count}×
-              </Text>
-              <span className="dg-fail-text" style={{ color: c.ACCENT_RED }}>
-                {g.error}
-              </span>
-            </div>
-          ))}
-        </div>
-      )}
-      <RecordList
-        rows={failures}
-        rowKey={(f) => String(f.id)}
-        empty="No recorded failures"
-        columns={[
-          {
-            key: 'when',
-            label: 'When',
-            track: 'max-content',
-            render: (f) => (
-              <span style={{ whiteSpace: 'nowrap' }}>
-                <TimeAgo ts={f.occurred_at} />
-                {f.trigger && (
-                  <Tag
-                    style={{ marginLeft: 6, fontSize: 11 }}
-                    title={f.trigger === 'event' ? 'A live copy, made when the object changed' : 'A run of the rule'}
-                  >
-                    {f.trigger === 'event' ? 'live copy' : 'run'}
-                  </Tag>
-                )}
-              </span>
-            ),
-          },
-          {
-            key: 'object',
-            label: 'Object',
-            track: 'minmax(0,1.2fr)',
-            render: (f) => {
-              const obj = `${f.bucket ? `${f.bucket}/` : ''}${f.object_key || '(job-level)'}`;
-              return (
-                <span className="dg-fail-text" title={obj} style={{ fontFamily: 'var(--font-mono)' }}>
-                  {obj}
-                  {f.dest_key && f.dest_key !== f.object_key && (
-                    <span style={{ color: c.TEXT_MUTED }}> → {f.dest_key}</span>
-                  )}
-                </span>
-              );
-            },
-          },
-          {
-            key: 'error',
-            label: 'Error',
-            track: 'minmax(0,1.5fr)',
-            render: (f) => (
-              <span className="dg-fail-text" title={f.error} style={{ color: c.ACCENT_RED }}>
-                {f.error}
-              </span>
-            ),
-          },
-        ]}
-      />
-    </div>
-  );
+  const failuresTable = <FailuresList data={failuresQuery.data} />;
 
   // Clamp the URL-deep-linked tab to one that actually exists for this job —
   // e.g. ?tab=verify on a lifecycle job would otherwise render a blank body.
@@ -465,18 +407,14 @@ export default function JobDrawer({
       // Room under the last field for the page's floating unsaved-changes bar.
       styles={bottomInset ? { body: { paddingBottom: 96 } } : undefined}
       extra={
-        !serverRow && parsed && ruleKind ? (
+        parsed && ruleKind && onCloneRule && onRemoveDraft ? (
           <RowActionsMenu
             label={`More actions for ${draftLabel}`}
             actions={[
-              draftRemoveAction(
-                {
-                  id: jobId ?? '',
-                  kind: ruleKind,
-                  name: draftLabel,
-                },
-                onRemoveDraft,
-              ),
+              cloneRuleAction({ id: jobId ?? '', kind: ruleKind, name: draftLabel }, onCloneRule),
+              ...(serverRow
+                ? []
+                : [draftRemoveAction({ id: jobId ?? '', kind: ruleKind, name: draftLabel }, onRemoveDraft)]),
             ]}
           />
         ) : undefined
@@ -601,5 +539,18 @@ export default function JobDrawer({
       />
       </div>
     </Drawer>
+  );
+}
+
+/** Two rules that act on the same objects: usually a clone not yet pointed elsewhere. */
+function SameScopeAlert({ twin, what }: { twin: string; what: string }) {
+  return (
+    <Alert
+      type="warning"
+      showIcon
+      style={{ marginBottom: 16 }}
+      title={`Rule "${twin}" has the same ${what}`}
+      description="Both rules would act on the same objects. Change a bucket, a prefix or a filter before you apply."
+    />
   );
 }

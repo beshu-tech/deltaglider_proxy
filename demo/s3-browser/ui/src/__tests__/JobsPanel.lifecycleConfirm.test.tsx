@@ -11,7 +11,7 @@ import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import type { JobRow } from '../jobsView';
-import JobsPanel from '../components/jobs/JobsPanel';
+import { LifecycleRulesPanel } from '../components/jobs/RulesPanel';
 import { json, mockFetch } from '../test/fetchMock';
 import { renderWithQuery } from '../test/render';
 
@@ -63,7 +63,7 @@ function jobRow(): HTMLElement {
 
 test('run-now on a lifecycle rule confirms with the candidate list before it runs', async () => {
   const user = userEvent.setup();
-  renderWithQuery(<JobsPanel />);
+  renderWithQuery(<LifecycleRulesPanel />);
   await screen.findByText('expire-nightlies');
   await user.click(within(jobRow()).getByRole('button', { name: 'Run now: expire-nightlies' }));
 
@@ -79,7 +79,7 @@ test('run-now on a lifecycle rule confirms with the candidate list before it run
 
 test('cancelling the confirmation never sends run-now', async () => {
   const user = userEvent.setup();
-  renderWithQuery(<JobsPanel />);
+  renderWithQuery(<LifecycleRulesPanel />);
   await screen.findByText('expire-nightlies');
   await user.click(within(jobRow()).getByRole('button', { name: 'Run now: expire-nightlies' }));
   const dialog = await screen.findByRole('dialog');
@@ -91,7 +91,7 @@ test('cancelling the confirmation never sends run-now', async () => {
 
 test('preview shows the candidate list in the drawer, not a toast', async () => {
   const user = userEvent.setup();
-  renderWithQuery(<JobsPanel />);
+  renderWithQuery(<LifecycleRulesPanel />);
   await screen.findByText('expire-nightlies');
   await user.click(within(jobRow()).getByRole('button', { name: 'Preview: expire-nightlies' }));
   const tab = await screen.findByRole('tab', { name: 'Preview', selected: true });

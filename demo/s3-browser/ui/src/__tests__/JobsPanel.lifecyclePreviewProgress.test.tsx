@@ -8,7 +8,7 @@ import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import type { JobRow } from '../jobsView';
-import JobsPanel from '../components/jobs/JobsPanel';
+import { LifecycleRulesPanel } from '../components/jobs/RulesPanel';
 import { json, mockFetch } from '../test/fetchMock';
 import { renderWithQuery } from '../test/render';
 
@@ -49,7 +49,7 @@ afterEach(() => {
 });
 
 async function openPreviewTab(user: ReturnType<typeof userEvent.setup>) {
-  renderWithQuery(<JobsPanel />);
+  renderWithQuery(<LifecycleRulesPanel />);
   await screen.findByText('expire-old-qa-reports');
   const jobRow = screen.getByText('expire-old-qa-reports').closest('[role="row"]') as HTMLElement;
   await user.click(within(jobRow).getByRole('button', { name: 'Preview: expire-old-qa-reports' }));

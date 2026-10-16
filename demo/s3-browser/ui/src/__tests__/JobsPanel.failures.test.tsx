@@ -1,17 +1,19 @@
 /**
  * A finished one-off job with per-object failures shows the failure count in
- * its row, and the count opens the drawer on the Failures tab.
+ * its row on the Jobs page, and the count opens the drawer on the Failures tab.
  */
 import { screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
-import type { JobRow } from '../jobsView';
+import type { RunEntry } from '../adminApi';
 import JobsPanel from '../components/jobs/JobsPanel';
 import { json, mockFetch } from '../test/fetchMock';
 import { renderWithQuery } from '../test/render';
 
-const row: JobRow = {
+const row: RunEntry = {
   id: 'maintenance:7',
+  job_id: 'maintenance:7',
+  origin: 'admin',
   kind: 'reencrypt',
   name: 'db-archive',
   scope: { bucket: 'db-archive' },
@@ -25,7 +27,7 @@ const row: JobRow = {
 
 beforeEach(() => {
   const http = mockFetch();
-  http.on('GET', '/_/api/admin/jobs', json({ jobs: [row] }));
+  http.on('GET', '/_/api/admin/jobs/runs', json({ runs: [row] }));
   http.on('GET', '/_/api/admin/jobs/maintenance%3A7/runs', json({ runs: [] }));
   http.on(
     'GET',

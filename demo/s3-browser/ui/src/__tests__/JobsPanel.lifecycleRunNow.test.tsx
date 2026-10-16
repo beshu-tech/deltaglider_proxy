@@ -7,7 +7,7 @@
 import { screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import type { JobRow } from '../jobsView';
-import JobsPanel from '../components/jobs/JobsPanel';
+import { LifecycleRulesPanel } from '../components/jobs/RulesPanel';
 import { json, mockFetch } from '../test/fetchMock';
 import { renderWithQuery } from '../test/render';
 
@@ -45,7 +45,7 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals());
 
 async function runNowButton() {
-  renderWithQuery(<JobsPanel />);
+  renderWithQuery(<LifecycleRulesPanel />);
   const row = (await screen.findByText('expire-nightly-dumps')).closest('[role="row"]') as HTMLElement;
   return within(row).findByRole('button', { name: 'Run now: expire-nightly-dumps' });
 }

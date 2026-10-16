@@ -64,6 +64,8 @@ export const qk = {
     list: () => ['jobs', 'list'] as const,
     one: (id: string) => ['jobs', 'one', id] as const,
     runs: (id: string) => ['jobs', 'runs', id] as const,
+    /** The runs list of the Jobs page (`GET /jobs/runs`), by its filters. */
+    runList: (filters?: string) => (filters ? (['jobs', 'run-list', filters] as const) : (['jobs', 'run-list'] as const)),
     failures: (id: string) => ['jobs', 'failures', id] as const,
     preview: (id: string) => ['jobs', 'preview', id] as const,
     // Root of every rule's preview (a storage-section apply may change any rule).

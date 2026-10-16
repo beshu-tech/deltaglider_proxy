@@ -9,7 +9,7 @@ import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import type { JobRow } from '../jobsView';
-import JobsPanel from '../components/jobs/JobsPanel';
+import { LifecycleRulesPanel } from '../components/jobs/RulesPanel';
 import { json, mockFetch } from '../test/fetchMock';
 import { renderWithQuery } from '../test/render';
 
@@ -70,7 +70,7 @@ const finishedToasts = () => seen;
 
 async function runNow() {
   const user = userEvent.setup();
-  renderWithQuery(<JobsPanel />);
+  renderWithQuery(<LifecycleRulesPanel />);
   const r = (await screen.findByText('expire-nightly-dumps')).closest('[role="row"]') as HTMLElement;
   await user.click(await within(r).findByRole('button', { name: 'Run now: expire-nightly-dumps' }));
   const dlg = await screen.findByRole('dialog');
