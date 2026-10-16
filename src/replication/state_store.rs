@@ -55,6 +55,34 @@ pub struct RunRecord {
     pub reconstructed: i64,
 }
 
+const RUN_COLUMNS: &str = "id, rule_name, triggered_by, started_at, finished_at,
+    objects_scanned, objects_copied, objects_skipped, objects_deleted,
+    bytes_copied, errors, status,
+    delta_passthrough, bytes_egress_saved, reconstructed";
+
+/// A replication run that copied, deleted and failed nothing.
+const REPLICATION_NOOP: &str = "objects_copied = 0 AND objects_deleted = 0 AND errors = 0";
+
+fn row_to_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
+    Ok(RunRecord {
+        id: r.get(0)?,
+        rule_name: r.get(1)?,
+        triggered_by: r.get(2)?,
+        started_at: r.get(3)?,
+        finished_at: r.get(4)?,
+        objects_scanned: r.get(5)?,
+        objects_copied: r.get(6)?,
+        objects_skipped: r.get(7)?,
+        objects_deleted: r.get(8)?,
+        bytes_copied: r.get(9)?,
+        errors: r.get(10)?,
+        status: r.get(11)?,
+        delta_passthrough: r.get(12)?,
+        bytes_egress_saved: r.get(13)?,
+        reconstructed: r.get(14)?,
+    })
+}
+
 /// A per-object failure row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FailureRecord {
@@ -530,6 +558,17 @@ impl JobsDb {
                 rule_name
             ],
         )?;
+        // Retention: a finished run is the moment the rule's history grows.
+        if let Err(e) = job_store::prune_run_history(
+            &self.conn,
+            "replication_run_history",
+            "replication_failures",
+            rule_name,
+            finished_at,
+            REPLICATION_NOOP,
+        ) {
+            tracing::warn!("replication: run-history retention for '{rule_name}' failed: {e}");
+        }
         Ok(true)
     }
 
@@ -792,15 +831,25 @@ impl JobsDb {
         rule_name: &str,
         limit: u32,
     ) -> Result<Vec<FailureRecord>, ConfigDbError> {
+        self.replication_failures_of(rule_name, None, limit)
+    }
+
+    /// The newest failures of a rule, or of one of its runs.
+    pub fn replication_failures_of(
+        &self,
+        rule_name: &str,
+        run_id: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<FailureRecord>, ConfigDbError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, rule_name, run_id, occurred_at, source_key, dest_key, error_message
              FROM replication_failures
-             WHERE rule_name = ?
+             WHERE rule_name = ?1 AND (?2 IS NULL OR run_id = ?2)
              ORDER BY occurred_at DESC, id DESC
-             LIMIT ?",
+             LIMIT ?3",
         )?;
         let rows = stmt
-            .query_map(params![rule_name, limit], |r| {
+            .query_map(params![rule_name, run_id, limit], |r| {
                 Ok(FailureRecord {
                     id: r.get(0)?,
                     rule_name: r.get(1)?,
@@ -818,9 +867,18 @@ impl JobsDb {
     /// Every failure the ring keeps for a rule. The failures endpoint reports
     /// it next to its page ("20 most recent of 500").
     pub fn replication_failure_count(&self, rule_name: &str) -> Result<i64, ConfigDbError> {
+        self.replication_failure_count_of(rule_name, None)
+    }
+
+    /// How many failures the ring keeps for a rule, or for one of its runs.
+    pub fn replication_failure_count_of(
+        &self,
+        rule_name: &str,
+        run_id: Option<i64>,
+    ) -> Result<i64, ConfigDbError> {
         Ok(self.conn.query_row(
-            "SELECT COUNT(*) FROM replication_failures WHERE rule_name = ?",
-            params![rule_name],
+            "SELECT COUNT(*) FROM replication_failures WHERE rule_name = ?1 AND (?2 IS NULL OR run_id = ?2)",
+            params![rule_name, run_id],
             |r| r.get(0),
         )?)
     }
@@ -898,36 +956,42 @@ impl JobsDb {
         rule_name: &str,
         limit: u32,
     ) -> Result<Vec<RunRecord>, ConfigDbError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, rule_name, triggered_by, started_at, finished_at,
-                    objects_scanned, objects_copied, objects_skipped, objects_deleted,
-                    bytes_copied, errors, status,
-                    delta_passthrough, bytes_egress_saved, reconstructed
-             FROM replication_run_history
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {RUN_COLUMNS} FROM replication_run_history
              WHERE rule_name = ?
              ORDER BY started_at DESC, id DESC
-             LIMIT ?",
-        )?;
+             LIMIT ?"
+        ))?;
         let rows = stmt
-            .query_map(params![rule_name, limit], |r| {
-                Ok(RunRecord {
-                    id: r.get(0)?,
-                    rule_name: r.get(1)?,
-                    triggered_by: r.get(2)?,
-                    started_at: r.get(3)?,
-                    finished_at: r.get(4)?,
-                    objects_scanned: r.get(5)?,
-                    objects_copied: r.get(6)?,
-                    objects_skipped: r.get(7)?,
-                    objects_deleted: r.get(8)?,
-                    bytes_copied: r.get(9)?,
-                    errors: r.get(10)?,
-                    status: r.get(11)?,
-                    delta_passthrough: r.get(12)?,
-                    bytes_egress_saved: r.get(13)?,
-                    reconstructed: r.get(14)?,
-                })
-            })?
+            .query_map(params![rule_name, limit], row_to_run)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// One page of the runs list across every replication rule
+    /// (`GET /jobs/runs`), newest first.
+    pub fn replication_runs_page(
+        &self,
+        f: &job_store::RunPageFilter,
+    ) -> Result<Vec<RunRecord>, ConfigDbError> {
+        let (filter, mut args) = job_store::run_page_where(
+            f,
+            "started_at",
+            "id",
+            "status",
+            "rule_name",
+            None,
+            REPLICATION_NOOP,
+        );
+        args.push(rusqlite::types::Value::Integer(f.limit as i64));
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {RUN_COLUMNS} FROM replication_run_history
+             WHERE {filter}
+             ORDER BY started_at DESC, id DESC
+             LIMIT ?"
+        ))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args), row_to_run)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -1674,6 +1738,126 @@ mod tests {
         // v24 strategy mix round-trips (verbatim + rebuilt; straight = 7−4−2 = 1).
         assert_eq!(runs[0].delta_passthrough, 4);
         assert_eq!(runs[0].reconstructed, 2);
+    }
+
+    /// A finished run: `copied` objects copied at `t`.
+    fn finished_run(db: &JobsDb, rule: &str, t: i64, copied: i64, status: &str) -> i64 {
+        let id = db.replication_begin_run(rule, t, "scheduler").unwrap();
+        let totals = RunTotals {
+            objects_copied: copied,
+            ..Default::default()
+        };
+        db.replication_finish_run(id, rule, status, t + 1, totals, t + 100)
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn runs_page_filters_hides_noops_and_pages_by_keyset() {
+        use crate::config_db::job_store::{RunPageFilter, RunStatusFilter};
+        let db = db();
+        db.replication_ensure_state("a", 0).unwrap();
+        db.replication_ensure_state("b", 0).unwrap();
+        let a1 = finished_run(&db, "a", 100, 5, "succeeded");
+        let _noop = finished_run(&db, "a", 200, 0, "succeeded");
+        let b1 = finished_run(&db, "b", 300, 0, "failed");
+        let running = db.replication_begin_run("a", 400, "run-now").unwrap();
+        let ids = |f: &RunPageFilter| {
+            db.replication_runs_page(f)
+                .unwrap()
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>()
+        };
+        let all = RunPageFilter {
+            hide_noop: true,
+            limit: 10,
+            ..Default::default()
+        };
+        // The succeeded no-op hides; a failed no-op and a running run stay.
+        assert_eq!(ids(&all), vec![running, b1, a1]);
+        let only_a = RunPageFilter {
+            keys: Some(vec!["a".into()]),
+            ..all.clone()
+        };
+        assert_eq!(ids(&only_a), vec![running, a1]);
+        let active = RunPageFilter {
+            status: RunStatusFilter::Active,
+            ..all.clone()
+        };
+        assert_eq!(ids(&active), vec![running]);
+        let next = RunPageFilter {
+            before: Some((300, b1)),
+            ..all
+        };
+        assert_eq!(ids(&next), vec![a1]);
+    }
+
+    #[test]
+    fn retention_drops_old_noop_runs_with_their_failures() {
+        use crate::config_db::job_store::RUN_NOOP_RETENTION_SECS;
+        let db = db();
+        db.replication_ensure_state("r", 0).unwrap();
+        let old_noop = finished_run(&db, "r", 1_000, 0, "succeeded");
+        let old_work = finished_run(&db, "r", 1_100, 3, "succeeded");
+        let old_failed = db.replication_begin_run("r", 1_200, "scheduler").unwrap();
+        db.replication_record_failure(
+            "r",
+            FailureInsert {
+                run_id: Some(old_failed),
+                occurred_at: 1_200,
+                source_key: "k",
+                dest_key: "k",
+                error_message: "boom",
+            },
+            100,
+        )
+        .unwrap();
+        let totals = RunTotals {
+            errors: 1,
+            ..Default::default()
+        };
+        db.replication_finish_run(old_failed, "r", "failed", 1_201, totals, 0)
+            .unwrap();
+        // A run that ends past the window prunes the old no-op only.
+        let late = 1_000 + RUN_NOOP_RETENTION_SECS + 10;
+        let new = finished_run(&db, "r", late, 0, "succeeded");
+        let kept: Vec<i64> = db
+            .replication_recent_runs("r", 10)
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(kept, vec![new, old_failed, old_work]);
+        assert!(!kept.contains(&old_noop));
+        assert_eq!(
+            db.replication_failure_count_of("r", Some(old_failed))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn retention_keeps_at_most_the_newest_runs_of_a_rule() {
+        use crate::config_db::job_store::RUN_HISTORY_MAX_PER_RULE;
+        let db = db();
+        db.replication_ensure_state("r", 0).unwrap();
+        let first = finished_run(&db, "r", 10, 1, "succeeded");
+        for t in 0..RUN_HISTORY_MAX_PER_RULE {
+            finished_run(&db, "r", 20 + t, 1, "succeeded");
+        }
+        let n: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM replication_run_history", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, RUN_HISTORY_MAX_PER_RULE);
+        assert!(db
+            .replication_recent_runs("r", 2_000)
+            .unwrap()
+            .iter()
+            .all(|r| r.id != first));
     }
 
     #[test]

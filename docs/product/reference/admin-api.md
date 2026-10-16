@@ -332,8 +332,9 @@ maintenance one-offs are DB-born. See [replication.md](replication.md) and
 |---|---|---|
 | `GET` | `/_/api/admin/jobs` | Every job as one normalized row: kind, scope, status (`idle` / `queued` / `running` / `cancelling` / `paused` / `deferred` / `succeeded` / `completed_with_errors` / `failed` / `cancelled`), pause flag, progress, last run. |
 | `GET` | `/_/api/admin/jobs/:id` | One job row with the same shape as a row of `GET /jobs`. It also answers for a one-off job that the list no longer carries. `404` for an unknown id. |
+| `GET` | `/_/api/admin/jobs/runs` | Every run, newest first: the runs of replication and lifecycle rules and the one-off jobs, with filters (`status`, `kind`, `rule`, `bucket`, `noop`) and a cursor. See [Jobs](jobs.md#the-runs-list). |
 | `GET` | `/_/api/admin/jobs/:id/runs?limit=N` | Recent runs, newest first. A maintenance one-off synthesizes a single run, because the job is its own run. |
-| `GET` | `/_/api/admin/jobs/:id/failures?limit=N` | Recent per-object failures, newest first. |
+| `GET` | `/_/api/admin/jobs/:id/failures?limit=N&run_id=R` | Recent per-object failures, newest first. With `run_id`, only the failures of that run of a rule. |
 | `POST` | `/_/api/admin/jobs/:id/pause` / `/resume` | Replication and lifecycle rules. Persists across restarts. |
 | `POST` | `/_/api/admin/jobs/:id/run-now` | Replication and lifecycle rules. Starts the run in the background and answers `202` with `status: "running"`; poll `GET /jobs/:id/runs` for the result. Lifecycle returns the `run_id` of the new run. Replication opens its run row in the background, so its response has `run_id: 0`. Replication runs a disabled or paused rule once. Both answer `409` when the subsystem is disabled globally, when the rule is already running, or when a maintenance job is active on a bucket that the rule writes to. Lifecycle also answers `409` when the rule is disabled or paused. |
 | `POST` | `/_/api/admin/jobs/:id/preview` | Lifecycle only: list the candidate keys as a dry run. Read-only: no deletes, no history rows. The answer includes `next_due_at`, the time at which the first scanned object that does not match now will match. |

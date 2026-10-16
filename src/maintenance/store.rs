@@ -90,6 +90,9 @@ pub enum CancelOutcome {
 
 const ACTIVE_STATUSES: &str = "('queued','running','cancelling')";
 
+/// Retention keeps a finished one-off job this long after it ended.
+pub const ONEOFF_RETENTION_SECS: i64 = 90 * 86_400;
+
 fn row_to_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<MaintenanceJob> {
     Ok(MaintenanceJob {
         id: r.get(0)?,
@@ -182,6 +185,57 @@ impl JobsDb {
             .query_map(params![limit as i64], row_to_job)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// One page of the runs list (`GET /jobs/runs`): one-off jobs, newest
+    /// first by start time (a queued job by its creation time).
+    pub fn maintenance_runs_page(
+        &self,
+        f: &job_store::RunPageFilter,
+    ) -> Result<Vec<MaintenanceJob>, ConfigDbError> {
+        // A one-off always shows: it ran because someone started it.
+        let (filter, mut args) = job_store::run_page_where(
+            f,
+            "COALESCE(started_at, created_at)",
+            "id",
+            "status",
+            "bucket",
+            Some("kind"),
+            "0",
+        );
+        args.push(rusqlite::types::Value::Integer(f.limit as i64));
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {JOB_COLUMNS} FROM maintenance_jobs
+             WHERE {filter}
+             ORDER BY COALESCE(started_at, created_at) DESC, id DESC
+             LIMIT ?"
+        ))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args), row_to_job)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Retention: drop finished jobs that ended more than
+    /// [`ONEOFF_RETENTION_SECS`] before `now`, with their failures.
+    pub fn maintenance_prune_finished(&self, now: i64) -> Result<usize, ConfigDbError> {
+        let cutoff = now - ONEOFF_RETENTION_SECS;
+        let doomed = format!(
+            "SELECT id FROM maintenance_jobs
+              WHERE status NOT IN {ACTIVE_STATUSES} AND finished_at IS NOT NULL
+                AND finished_at < ?1"
+        );
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            &format!("DELETE FROM maintenance_failures WHERE job_id IN ({doomed})"),
+            params![cutoff],
+        )?;
+        let n = tx.execute(
+            &format!("DELETE FROM maintenance_jobs WHERE id IN ({doomed})"),
+            params![cutoff],
+        )?;
+        tx.commit()?;
+        Ok(n)
     }
 
     /// How many job rows the table holds.
@@ -1430,6 +1484,90 @@ mod tests {
         let jobs = db.maintenance_list_jobs(10).unwrap();
         assert_eq!(jobs.len(), 2);
         assert_eq!(jobs[0].id, b);
+    }
+
+    #[test]
+    fn runs_page_filters_by_kind_and_bucket() {
+        use crate::config_db::job_store::RunPageFilter;
+        let db = db();
+        let del = db
+            .maintenance_create_job("delete", "a", "counting", None, "dana", 10)
+            .unwrap()
+            .unwrap();
+        let re = db
+            .maintenance_create_job("reencrypt", "b", "counting", None, "admin", 20)
+            .unwrap()
+            .unwrap();
+        let ids = |f: RunPageFilter| {
+            db.maintenance_runs_page(&f)
+                .unwrap()
+                .iter()
+                .map(|j| j.id)
+                .collect::<Vec<_>>()
+        };
+        let base = RunPageFilter {
+            hide_noop: true,
+            limit: 10,
+            ..Default::default()
+        };
+        assert_eq!(
+            ids(base.clone()),
+            vec![re, del],
+            "a one-off is never a no-op"
+        );
+        assert_eq!(
+            ids(RunPageFilter {
+                kinds: Some(vec!["delete".into()]),
+                ..base.clone()
+            }),
+            vec![del]
+        );
+        assert_eq!(
+            ids(RunPageFilter {
+                keys: Some(vec!["b".into()]),
+                ..base.clone()
+            }),
+            vec![re]
+        );
+        assert_eq!(
+            ids(RunPageFilter {
+                before: Some((20, re)),
+                ..base
+            }),
+            vec![del]
+        );
+    }
+
+    #[test]
+    fn retention_drops_one_offs_long_finished() {
+        let db = db();
+        let old = db
+            .maintenance_create_job("delete", "a", "counting", None, "admin", 1)
+            .unwrap()
+            .unwrap();
+        db.maintenance_finish(old, "completed", None).unwrap();
+        let active = db
+            .maintenance_create_job("delete", "a", "counting", None, "admin", 2)
+            .unwrap()
+            .unwrap();
+        let finished_at = db
+            .maintenance_job_by_id(old)
+            .unwrap()
+            .unwrap()
+            .finished_at
+            .unwrap();
+        assert_eq!(
+            db.maintenance_prune_finished(finished_at).unwrap(),
+            0,
+            "too young"
+        );
+        let later = finished_at + ONEOFF_RETENTION_SECS + 1;
+        assert_eq!(db.maintenance_prune_finished(later).unwrap(), 1);
+        assert!(db.maintenance_job_by_id(old).unwrap().is_none());
+        assert!(
+            db.maintenance_job_by_id(active).unwrap().is_some(),
+            "active jobs stay"
+        );
     }
 
     #[test]

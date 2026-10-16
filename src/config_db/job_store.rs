@@ -235,6 +235,125 @@ pub(crate) fn prune_failure_ring(
     Ok(())
 }
 
+/// Which statuses a page of the runs list keeps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RunStatusFilter {
+    #[default]
+    All,
+    /// Queued, running or cancelling.
+    Active,
+    /// Failed, or ended with failed objects.
+    Failed,
+}
+
+impl RunStatusFilter {
+    /// The raw statuses it keeps; `None` keeps every status.
+    pub fn raw_statuses(self) -> Option<&'static [&'static str]> {
+        match self {
+            Self::All => None,
+            Self::Active => Some(&["queued", "running", "cancelling"]),
+            Self::Failed => Some(&["failed", "completed_with_errors"]),
+        }
+    }
+}
+
+/// One page of one run table, newest first (`started_at DESC, id DESC`).
+#[derive(Debug, Clone, Default)]
+pub struct RunPageFilter {
+    /// Only rows whose key column (rule name, or bucket) is one of these.
+    pub keys: Option<Vec<String>>,
+    /// Only rows of these kinds (maintenance only).
+    pub kinds: Option<Vec<String>>,
+    pub status: RunStatusFilter,
+    /// Hide runs that ended without changing anything.
+    pub hide_noop: bool,
+    /// Keyset: only rows before `(time, id)` in the page order.
+    pub before: Option<(i64, i64)>,
+    pub limit: usize,
+}
+
+/// Statuses of a run that ended normally: such a run that changed nothing
+/// is noise in the runs list, and the first one retention drops.
+const SETTLED_OK: &str = "('succeeded','completed','deferred','stopped')";
+
+/// The WHERE clause and its parameters for one page of a run table. The
+/// column arguments are SQL literals of the caller (`noop` is a boolean
+/// expression: "this run changed nothing and failed nothing").
+pub(crate) fn run_page_where(
+    f: &RunPageFilter,
+    time: &'static str,
+    id: &'static str,
+    status: &'static str,
+    key: &'static str,
+    kind: Option<&'static str>,
+    noop: &'static str,
+) -> (String, Vec<rusqlite::types::Value>) {
+    use rusqlite::types::Value;
+    let mut clauses: Vec<String> = vec!["1 = 1".into()];
+    let mut args: Vec<Value> = Vec::new();
+    let list = |n: usize| vec!["?"; n].join(",");
+    if let Some(keys) = &f.keys {
+        clauses.push(format!("{key} IN ({})", list(keys.len())));
+        args.extend(keys.iter().cloned().map(Value::Text));
+    }
+    if let (Some(kinds), Some(kind)) = (&f.kinds, kind) {
+        clauses.push(format!("{kind} IN ({})", list(kinds.len())));
+        args.extend(kinds.iter().cloned().map(Value::Text));
+    }
+    if let Some(raw) = f.status.raw_statuses() {
+        clauses.push(format!("{status} IN ({})", list(raw.len())));
+        args.extend(raw.iter().map(|s| Value::Text((*s).to_string())));
+    }
+    if f.hide_noop {
+        clauses.push(format!("NOT ({status} IN {SETTLED_OK} AND ({noop}))"));
+    }
+    if let Some((t, i)) = f.before {
+        clauses.push(format!("({time} < ? OR ({time} = ? AND {id} < ?))"));
+        args.extend([Value::Integer(t), Value::Integer(t), Value::Integer(i)]);
+    }
+    (clauses.join(" AND "), args)
+}
+
+/// Retention keeps a finished run that changed nothing this long.
+pub(crate) const RUN_NOOP_RETENTION_SECS: i64 = 30 * 86_400;
+/// Retention keeps at most this many runs of one rule.
+pub(crate) const RUN_HISTORY_MAX_PER_RULE: i64 = 1_000;
+
+/// Apply run retention to one rule: delete its finished runs that changed
+/// nothing and are older than [`RUN_NOOP_RETENTION_SECS`], and its finished
+/// runs beyond the newest [`RUN_HISTORY_MAX_PER_RULE`], with their
+/// failures. Returns how many runs went.
+pub(crate) fn prune_run_history(
+    conn: &Connection,
+    run_table: &str,
+    failure_table: &str,
+    rule: &str,
+    now: i64,
+    noop: &'static str,
+) -> Result<usize, ConfigDbError> {
+    check_idents(&[run_table, failure_table])?;
+    let doomed = format!(
+        "SELECT id FROM {run_table}
+          WHERE rule_name = ?1 AND finished_at IS NOT NULL
+            AND ((started_at < ?2 AND status IN {SETTLED_OK} AND ({noop}))
+                 OR id NOT IN (SELECT id FROM {run_table} WHERE rule_name = ?1
+                               ORDER BY started_at DESC, id DESC LIMIT ?3))"
+    );
+    let cutoff = now - RUN_NOOP_RETENTION_SECS;
+    conn.execute(
+        &format!("DELETE FROM {failure_table} WHERE run_id IN ({doomed})"),
+        params![rule, cutoff, RUN_HISTORY_MAX_PER_RULE],
+    )?;
+    let n = conn.execute(
+        &format!("DELETE FROM {run_table} WHERE id IN ({doomed})"),
+        params![rule, cutoff, RUN_HISTORY_MAX_PER_RULE],
+    )?;
+    if n > 0 {
+        super::reclaim_free_pages(conn);
+    }
+    Ok(n)
+}
+
 /// Boot-time zombie scan: run-history rows left `running` by a dead
 /// process. Returns `(id, name, started_at)` triples; the caller applies
 /// its subsystem's policy (mark failed / re-queue / stamp state).

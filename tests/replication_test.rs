@@ -3347,3 +3347,126 @@ async fn test_filter_preview_classifies_real_keys() {
     assert_eq!(one["keys"][0]["verdict"], "excluded", "{one}");
     assert_eq!(one["keys"][0]["glob"], "*.tmp", "{one}");
 }
+
+/// `GET /jobs/runs`: rule runs and one-offs on one list, newest first,
+/// with filters and a cursor. A run that changed nothing shows only on
+/// request.
+#[tokio::test]
+async fn test_runs_list_merges_rule_runs_and_one_offs() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(RULE_YAML)
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    for b in ["repl-src", "repl-dst"] {
+        client.create_bucket().bucket(b).send().await.ok();
+    }
+    for key in ["a.txt", "b.txt"] {
+        client
+            .put_object()
+            .bucket("repl-src")
+            .key(key)
+            .body(ByteStream::from(b"x".to_vec()))
+            .send()
+            .await
+            .expect("seed");
+    }
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let first = fire_run_now(&admin, &ep, "repl-a-to-b").await;
+    let second = fire_run_now(&admin, &ep, "repl-a-to-b").await;
+    assert_eq!(
+        second["objects_processed"], 0,
+        "nothing left to copy: {second}"
+    );
+    let resp = admin
+        .post(format!("{ep}/_/api/admin/objects/delete-jobs"))
+        .json(&serde_json::json!({ "bucket": "repl-src", "keys": ["a.txt"], "expected": 1 }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "delete job: {}", resp.status());
+
+    let get = |query: &str| {
+        let url = format!("{ep}/_/api/admin/jobs/runs{query}");
+        let admin = admin.clone();
+        async move {
+            let r = admin.get(url).send().await.unwrap();
+            assert_eq!(r.status().as_u16(), 200);
+            r.json::<Value>().await.unwrap()
+        }
+    };
+    let ids = |page: &Value| -> Vec<String> {
+        page["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let first_id = format!("replication:repl-a-to-b#{}", first["id"]);
+    let second_id = format!("replication:repl-a-to-b#{}", second["id"]);
+
+    let all = get("?noop=true").await;
+    let all_ids = ids(&all);
+    assert_eq!(all_ids.len(), 3, "{all}");
+    // Everything here started in one second: the order is then by source.
+    let delete = all["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["kind"] == "delete")
+        .unwrap();
+    assert_eq!(delete["origin"], "file-browser");
+    assert_eq!(delete["started_by"], "admin");
+    let run = all["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == first_id.as_str())
+        .unwrap();
+    assert_eq!(run["origin"], "run-now");
+    assert_eq!(run["job_id"], "replication:repl-a-to-b");
+    assert_eq!(run["scope"]["target"], "repl-dst");
+
+    // By default the run that changed nothing is not listed.
+    let default = ids(&get("").await);
+    assert!(!default.contains(&second_id), "{default:?}");
+    assert!(default.contains(&first_id) || first["objects_processed"] == 0);
+
+    // Filters.
+    let rule = ids(&get("?noop=true&rule=replication:repl-a-to-b").await);
+    assert_eq!(rule.len(), 2, "{rule:?}");
+    let one_offs = ids(&get("?kind=delete").await);
+    assert_eq!(one_offs.len(), 1);
+    assert_eq!(
+        ids(&get("?noop=true&bucket=repl-dst").await).len(),
+        2,
+        "the rule writes repl-dst"
+    );
+    assert!(ids(&get("?bucket=other-bucket").await).is_empty());
+
+    // A page of one, then the next page from its cursor.
+    let p1 = get("?noop=true&limit=1").await;
+    let cursor = p1["next_cursor"].as_str().expect("more pages").to_string();
+    let p2 = get(&format!("?noop=true&limit=2&cursor={cursor}")).await;
+    let mut paged = ids(&p1);
+    paged.extend(ids(&p2));
+    assert_eq!(paged, all_ids);
+    assert!(p2.get("next_cursor").is_none(), "{p2}");
+
+    // A rule's failures can be read per run (none here).
+    let f: Value = admin
+        .get(format!(
+            "{ep}/_/api/admin/jobs/replication:repl-a-to-b/failures?run_id={}",
+            first["id"]
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(f["total"], 0, "{f}");
+}

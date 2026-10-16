@@ -23,9 +23,10 @@ Rules are recurring and YAML-authored; maintenance jobs are one-offs born in the
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/_/api/admin/jobs` | All jobs, normalized rows. One-off jobs: every active one and the 200 newest; `older_oneoffs` counts the older ones that the answer leaves out |
+| `GET` | `/_/api/admin/jobs/runs` | Every run on one list, newest first ([below](#the-runs-list)) |
 | `GET` | `/_/api/admin/jobs/:id` | One job row, also a one-off that the list no longer carries; `404` for an unknown id |
 | `GET` | `/_/api/admin/jobs/:id/runs?limit=N` | Recent runs for one job |
-| `GET` | `/_/api/admin/jobs/:id/failures?limit=N` | Recent per-object failures. The response also has `total`: for a replication rule, every failure that the ring keeps; for a one-off job, every failed object. For a replication rule, each failure has `trigger`: `run` or `event`. The event-driven path keeps one failure per object: a new failed attempt replaces the older one. |
+| `GET` | `/_/api/admin/jobs/:id/failures?limit=N&run_id=R` | Recent per-object failures. With `run_id`, only the failures of that run of a rule. The response also has `total`: for a replication rule, every failure that the ring keeps; for a one-off job, every failed object. For a replication rule, each failure has `trigger`: `run` or `event`. The event-driven path keeps one failure per object: a new failed attempt replaces the older one. |
 | `POST` | `/_/api/admin/jobs/:id/pause` / `resume` / `run-now` / `preview` / `cancel` / `verify` / `kill` / `delete` | Per-kind actions; `400` outside the matrix |
 | `GET` | `/_/api/admin/jobs/:id/preview` | Progress of the running preview walk of a lifecycle rule |
 | `GET` | `/_/api/admin/jobs/:id/verify` | State of the parity audit of a replication rule |
@@ -64,6 +65,28 @@ By default the job keeps the Last-Modified time that the proxy serves for each o
 While a re-encrypt, migrate or backfill job is active, S3 writes (PUT, DELETE, POST, multipart) to that bucket return `503 SlowDown`. AWS SDKs back off and retry automatically. Reads pass untouched. The gate starts when the proxy creates the job, so there is no window between creation and claim. The proxy drains in-flight writes before the copy starts, and it lifts the gate when the job finishes. For a migration, writes resume at the moment the bucket flips to the new backend, before any optional source cleanup. The embedded object browser shows a busy banner on gated buckets via `GET /_/api/admin/jobs/bucket/:bucket`. The `503` names the kind of the job that holds the bucket (a re-encryption, a migration to another backend, or a metadata backfill). The job row and the gate can differ for a short time: a cancelled migrate releases the source bucket at once, while it still removes its staged copies, and a migrate in its `cleanup` phase no longer gates the bucket. The `writes_blocked` field of the bucket status (at the top level and inside `active`) follows the gate.
 
 ## Durability
+
+## The runs list
+
+`GET /_/api/admin/jobs/runs` lists the runs of every replication and lifecycle rule and every one-off job, newest first by start time. A one-off job is one run: it has no rule. Each entry has the row shape of `GET /jobs`, and also these fields:
+
+- `id`: the run. For a rule run it is `<job id>#<run id>`, for example `replication:nightly#42`; for a one-off it is the job id, `maintenance:<n>`.
+- `job_id` and `run_id`: the job that ran, and the number of the run (rule runs only).
+- `origin`: how the run started. `schedule` and `run-now` for rule runs, `file-browser` for a bulk delete, and `admin` for another one-off.
+- `started_by`: who started a one-off (`admin`, or the IAM user name).
+
+| Query | Effect |
+|---|---|
+| `status` | `all` (default), `active` (queued, running or cancelling), or `failed` (failed, or ended with failed objects) |
+| `kind` | `replication`, `lifecycle`, or a one-off kind: `delete`, `reencrypt`, `migrate`, `backfill-metadata` |
+| `rule` | `replication:<name>` or `lifecycle:<name>`: the runs of one rule |
+| `bucket` | Runs that read or write the bucket: a rule whose source, destination or bucket it is, and the one-offs on it |
+| `noop` | `true` also lists the rule runs that ended without copying, deleting, moving or failing anything. By default they are hidden, because a rule that runs every hour makes such a run most hours |
+| `limit`, `cursor` | Page size (default 50, at most 200), and the `next_cursor` of the previous page |
+
+Runs that start in the same second come in a fixed order: replication, then lifecycle, then one-offs.
+
+The proxy keeps run history for a limited time. When a rule's run ends, the proxy deletes the rule's runs that changed nothing and started more than 30 days earlier, and it keeps at most the newest 1,000 runs of the rule. The failures of a deleted run go with it. A one-off job that ended more than 90 days earlier is deleted with its failures.
 
 ## Filter preview
 

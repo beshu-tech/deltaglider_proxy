@@ -400,6 +400,8 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             "/_/api/admin/jobs/filter-preview",
             post(admin::jobs_filter_preview),
         )
+        // Every run, newest first (a literal segment: it wins over `:id`).
+        .route("/_/api/admin/jobs/runs", get(admin::jobs_run_list))
         .route("/_/api/admin/jobs/:id", get(admin::jobs_get))
         .route("/_/api/admin/jobs/:id/runs", get(admin::jobs_runs))
         .route("/_/api/admin/jobs/:id/failures", get(admin::jobs_failures))

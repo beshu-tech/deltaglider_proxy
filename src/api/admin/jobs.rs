@@ -293,10 +293,34 @@ pub struct JobFailureEntry {
     pub trigger: Option<&'static str>,
 }
 
+/// The scope of a replication rule: its source, and its destination bucket.
+pub(super) fn replication_scope(rule: &crate::config_sections::ReplicationRule) -> JobScope {
+    JobScope {
+        bucket: rule.source.bucket.clone(),
+        prefix: (!rule.source.prefix.is_empty()).then(|| rule.source.prefix.clone()),
+        target: Some(rule.destination.bucket.clone()),
+    }
+}
+
+/// The scope of a lifecycle rule: its bucket and prefix, and where a
+/// transition moves objects.
+pub(super) fn lifecycle_scope(rule: &crate::config_sections::LifecycleRule) -> JobScope {
+    JobScope {
+        bucket: rule.bucket.clone(),
+        prefix: (!rule.prefix.is_empty()).then(|| rule.prefix.clone()),
+        target: match &rule.action {
+            crate::config_sections::LifecycleAction::Transition(t) => {
+                Some(t.destination.bucket.clone())
+            }
+            _ => None,
+        },
+    }
+}
+
 /// PURE: the live progress of a replication rule's row, from its newest run
 /// (its counters are written at each checkpoint while it runs). No run yet:
 /// zeros. `bytes` is the logical size of the objects copied.
-fn replication_row_progress(
+pub(super) fn replication_row_progress(
     run: Option<&crate::replication::state_store::RunRecord>,
 ) -> JobProgress {
     match run {
@@ -312,7 +336,7 @@ fn replication_row_progress(
     }
 }
 
-fn maintenance_job_view(j: &MaintenanceJob) -> JobView {
+pub(super) fn maintenance_job_view(j: &MaintenanceJob) -> JobView {
     let percent = crate::maintenance::display_percent(j);
     let (target, detail) = match (j.kind.as_str(), j.params.as_deref()) {
         ("migrate", Some(p)) => match migrate::parse_params(p) {
@@ -441,16 +465,7 @@ fn lifecycle_job_view(
         id: format!("lifecycle:{}", rule.name),
         kind: "lifecycle".into(),
         name: rule.name.clone(),
-        scope: JobScope {
-            bucket: rule.bucket.clone(),
-            prefix: (!rule.prefix.is_empty()).then(|| rule.prefix.clone()),
-            target: match &rule.action {
-                crate::config_sections::LifecycleAction::Transition(t) => {
-                    Some(t.destination.bucket.clone())
-                }
-                _ => None,
-            },
-        },
+        scope: lifecycle_scope(rule),
         trigger: "scheduled",
         enabled: Some(rule.enabled),
         paused: Some(st.as_ref().map(|s| s.paused).unwrap_or(false)),
@@ -558,7 +573,7 @@ fn lifecycle_run_entry(
     v
 }
 
-fn lifecycle_progress(
+pub(super) fn lifecycle_progress(
     processed: i64,
     skipped: i64,
     failed: i64,
@@ -673,11 +688,7 @@ pub async fn list_jobs(
                 id: format!("replication:{}", rule.name),
                 kind: "replication".into(),
                 name: rule.name.clone(),
-                scope: JobScope {
-                    bucket: rule.source.bucket.clone(),
-                    prefix: (!rule.source.prefix.is_empty()).then(|| rule.source.prefix.clone()),
-                    target: Some(rule.destination.bucket.clone()),
-                },
+                scope: replication_scope(rule),
                 trigger: "continuous",
                 enabled: Some(rule.enabled),
                 paused: Some(st.as_ref().map(|s| s.paused).unwrap_or(false)),
@@ -971,10 +982,18 @@ pub async fn job_runs(
     Ok(Json(serde_json::json!({ "runs": runs })))
 }
 
+/// Query of `GET /jobs/:id/failures`: how many, and optionally only the
+/// failures of one run of a rule.
+#[derive(Debug, Deserialize)]
+pub struct FailuresQuery {
+    pub limit: Option<u32>,
+    pub run_id: Option<i64>,
+}
+
 /// GET /_/api/admin/jobs/:id/failures
 pub async fn job_failures(
     Path(id): Path<String>,
-    AdminQuery(q): AdminQuery<LimitQuery>,
+    AdminQuery(q): AdminQuery<FailuresQuery>,
     State(state): State<Arc<AdminState>>,
 ) -> Result<Json<serde_json::Value>, AdminError> {
     let (sub, key) = parse_job_id(&id).ok_or(not_found())?;
@@ -987,7 +1006,7 @@ pub async fn job_failures(
         .await;
     let failures: Vec<JobFailureEntry> = match sub {
         JobSubsystem::Replication => db
-            .replication_recent_failures(key, limit)?
+            .replication_failures_of(key, q.run_id, limit)?
             .into_iter()
             .map(|f| JobFailureEntry {
                 id: f.id,
@@ -1002,7 +1021,7 @@ pub async fn job_failures(
             })
             .collect(),
         JobSubsystem::Lifecycle => db
-            .lifecycle_recent_failures(key, limit)?
+            .lifecycle_failures_of(key, q.run_id, limit)?
             .into_iter()
             .map(|f| JobFailureEntry {
                 id: f.id,
@@ -1037,8 +1056,8 @@ pub async fn job_failures(
     // How many failures there are in all, so the UI can say "20 most
     // recent of 500".
     let total = match sub {
-        JobSubsystem::Replication => Some(db.replication_failure_count(key)?),
-        JobSubsystem::Lifecycle => Some(db.lifecycle_failure_count(key)?),
+        JobSubsystem::Replication => Some(db.replication_failure_count_of(key, q.run_id)?),
+        JobSubsystem::Lifecycle => Some(db.lifecycle_failure_count_of(key, q.run_id)?),
         // A one-off row counts every failed object; the ring keeps the newest.
         JobSubsystem::Maintenance => key
             .parse::<i64>()

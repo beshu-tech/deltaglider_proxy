@@ -191,6 +191,9 @@ async fn run_lane(
                     if let Err(e) = db.maintenance_requeue_abandoned() {
                         warn!("maintenance: requeue scan failed: {}", e);
                     }
+                    if let Err(e) = db.maintenance_prune_finished(current_unix_seconds()) {
+                        warn!("maintenance: job retention failed: {}", e);
+                    }
                     let claimed = db.maintenance_claim_next_job_in(
                         lane,
                         &instance_id,

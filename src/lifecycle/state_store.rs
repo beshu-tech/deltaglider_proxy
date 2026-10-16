@@ -58,6 +58,38 @@ pub struct LifecycleRunSplit {
     pub objects_not_due: i64,
 }
 
+const RUN_COLUMNS: &str = "h.id, h.rule_name, h.triggered_by, h.started_at, h.finished_at,
+    h.objects_scanned, h.objects_affected, h.objects_skipped,
+    h.bytes_affected, h.errors, h.status,
+    c.objects_deleted, c.objects_moved, c.objects_copied,
+    c.objects_excluded, c.objects_not_due";
+
+fn row_to_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<LifecycleRunRecord> {
+    Ok(LifecycleRunRecord {
+        id: r.get(0)?,
+        rule_name: r.get(1)?,
+        triggered_by: r.get(2)?,
+        started_at: r.get(3)?,
+        finished_at: r.get(4)?,
+        objects_scanned: r.get(5)?,
+        objects_affected: r.get(6)?,
+        objects_skipped: r.get(7)?,
+        bytes_affected: r.get(8)?,
+        errors: r.get(9)?,
+        status: r.get(10)?,
+        split: match r.get::<_, Option<i64>>(11)? {
+            None => None,
+            Some(objects_deleted) => Some(LifecycleRunSplit {
+                objects_deleted,
+                objects_moved: r.get(12)?,
+                objects_copied: r.get(13)?,
+                objects_excluded: r.get(14)?,
+                objects_not_due: r.get(15)?,
+            }),
+        },
+    })
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LifecycleFailureRecord {
     pub id: i64,
@@ -451,6 +483,17 @@ impl JobsDb {
                 rule_name
             ],
         )?;
+        // Retention: a finished run is the moment the rule's history grows.
+        if let Err(e) = job_store::prune_run_history(
+            &self.conn,
+            "lifecycle_run_history",
+            "lifecycle_failures",
+            rule_name,
+            finished_at,
+            "objects_affected = 0 AND errors = 0",
+        ) {
+            tracing::warn!("lifecycle: run-history retention for '{rule_name}' failed: {e}");
+        }
         Ok(())
     }
 
@@ -488,15 +531,25 @@ impl JobsDb {
         rule_name: &str,
         limit: u32,
     ) -> Result<Vec<LifecycleFailureRecord>, ConfigDbError> {
+        self.lifecycle_failures_of(rule_name, None, limit)
+    }
+
+    /// The newest failures of a rule, or of one of its runs.
+    pub fn lifecycle_failures_of(
+        &self,
+        rule_name: &str,
+        run_id: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<LifecycleFailureRecord>, ConfigDbError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, rule_name, run_id, occurred_at, bucket, object_key, error_message
              FROM lifecycle_failures
-             WHERE rule_name = ?
+             WHERE rule_name = ?1 AND (?2 IS NULL OR run_id = ?2)
              ORDER BY occurred_at DESC, id DESC
-             LIMIT ?",
+             LIMIT ?3",
         )?;
         let rows = stmt
-            .query_map(params![rule_name, limit], |r| {
+            .query_map(params![rule_name, run_id, limit], |r| {
                 Ok(LifecycleFailureRecord {
                     id: r.get(0)?,
                     rule_name: r.get(1)?,
@@ -514,9 +567,18 @@ impl JobsDb {
     /// How many failures the ring keeps for `rule_name` (the failures
     /// endpoint lists the most recent of them).
     pub fn lifecycle_failure_count(&self, rule_name: &str) -> Result<i64, ConfigDbError> {
+        self.lifecycle_failure_count_of(rule_name, None)
+    }
+
+    /// How many failures the ring keeps for a rule, or for one of its runs.
+    pub fn lifecycle_failure_count_of(
+        &self,
+        rule_name: &str,
+        run_id: Option<i64>,
+    ) -> Result<i64, ConfigDbError> {
         Ok(self.conn.query_row(
-            "SELECT COUNT(*) FROM lifecycle_failures WHERE rule_name = ?",
-            params![rule_name],
+            "SELECT COUNT(*) FROM lifecycle_failures WHERE rule_name = ?1 AND (?2 IS NULL OR run_id = ?2)",
+            params![rule_name, run_id],
             |r| r.get(0),
         )?)
     }
@@ -556,44 +618,46 @@ impl JobsDb {
         rule_name: &str,
         limit: u32,
     ) -> Result<Vec<LifecycleRunRecord>, ConfigDbError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT h.id, h.rule_name, h.triggered_by, h.started_at, h.finished_at,
-                    h.objects_scanned, h.objects_affected, h.objects_skipped,
-                    h.bytes_affected, h.errors, h.status,
-                    c.objects_deleted, c.objects_moved, c.objects_copied,
-                    c.objects_excluded, c.objects_not_due
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {RUN_COLUMNS}
              FROM lifecycle_run_history h
              LEFT JOIN lifecycle_run_counts c ON c.run_id = h.id
              WHERE h.rule_name = ?
              ORDER BY h.started_at DESC, h.id DESC
-             LIMIT ?",
-        )?;
+             LIMIT ?"
+        ))?;
         let rows = stmt
-            .query_map(params![rule_name, limit], |r| {
-                Ok(LifecycleRunRecord {
-                    id: r.get(0)?,
-                    rule_name: r.get(1)?,
-                    triggered_by: r.get(2)?,
-                    started_at: r.get(3)?,
-                    finished_at: r.get(4)?,
-                    objects_scanned: r.get(5)?,
-                    objects_affected: r.get(6)?,
-                    objects_skipped: r.get(7)?,
-                    bytes_affected: r.get(8)?,
-                    errors: r.get(9)?,
-                    status: r.get(10)?,
-                    split: match r.get::<_, Option<i64>>(11)? {
-                        None => None,
-                        Some(objects_deleted) => Some(LifecycleRunSplit {
-                            objects_deleted,
-                            objects_moved: r.get(12)?,
-                            objects_copied: r.get(13)?,
-                            objects_excluded: r.get(14)?,
-                            objects_not_due: r.get(15)?,
-                        }),
-                    },
-                })
-            })?
+            .query_map(params![rule_name, limit], row_to_run)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// One page of the runs list across every lifecycle rule
+    /// (`GET /jobs/runs`), newest first.
+    pub fn lifecycle_runs_page(
+        &self,
+        f: &job_store::RunPageFilter,
+    ) -> Result<Vec<LifecycleRunRecord>, ConfigDbError> {
+        let (filter, mut args) = job_store::run_page_where(
+            f,
+            "h.started_at",
+            "h.id",
+            "h.status",
+            "h.rule_name",
+            None,
+            "h.objects_affected = 0 AND h.errors = 0",
+        );
+        args.push(rusqlite::types::Value::Integer(f.limit as i64));
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {RUN_COLUMNS}
+             FROM lifecycle_run_history h
+             LEFT JOIN lifecycle_run_counts c ON c.run_id = h.id
+             WHERE {filter}
+             ORDER BY h.started_at DESC, h.id DESC
+             LIMIT ?"
+        ))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args), row_to_run)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
