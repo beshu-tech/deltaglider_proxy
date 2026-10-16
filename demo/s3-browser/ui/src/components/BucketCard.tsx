@@ -49,11 +49,15 @@ import { activateOnKey } from '../keyboard';
 import RowActionsMenu from './RowActionsMenu';
 import { useNavigation } from '../NavigationContext';
 import { buildViewUrl } from '../urlState';
+import type { BucketRule } from '../runsView';
+import { runsUrl } from './jobs/runsLink';
 import { WITNESS_CARD_ID } from './EncryptionWitnessCard';
 
 const { Text } = Typography;
 
 interface CardProps {
+  /** The replication and lifecycle rules that read or write this bucket. */
+  rules?: BucketRule[];
   /** Bucket name (the display identity of the row). */
   name: string;
   /** The policy row, or null when this real bucket has no overrides. */
@@ -125,6 +129,14 @@ function Chip({ tone, children, title }: { tone: string; children: React.ReactNo
   );
 }
 
+/** What a rule does with the bucket (the button's title). */
+const BUCKET_RULE_ROLE: Record<BucketRule['role'], string> = {
+  source: 'The rule copies objects from this bucket.',
+  destination: 'The rule copies objects into this bucket.',
+  bucket: 'The rule expires or moves objects of this bucket.',
+  archive: 'The rule moves objects into this bucket.',
+};
+
 export default function BucketCard({
   name,
   row,
@@ -148,6 +160,7 @@ export default function BucketCard({
   maintenanceJob = null,
   onReencrypt,
   witnessRefused = false,
+  rules = [],
 }: CardProps) {
   const uid = useId();
   const colors = useColors();
@@ -665,6 +678,42 @@ export default function BucketCard({
           )}
 
           {/* Advanced — rare knobs behind a disclosure; auto-open when in use. */}
+          {/* The rules that read or write the bucket, and its runs. */}
+          {real && (
+            <div style={{ paddingTop: 12 }}>
+              <Text style={{ ...groupLabel, color: colors.TEXT_MUTED }}>Rules and runs</Text>
+              <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, marginTop: 6, fontSize: 12 }}>
+                {rules.length === 0 && <Text type="secondary" style={{ fontSize: 12 }}>No replication or lifecycle rule uses this bucket.</Text>}
+                {rules.map((r) => (
+                  <Button
+                    key={r.id}
+                    size="small"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      navigate(buildViewUrl('admin', `storage/${r.kind}`, { job: r.id }));
+                    }}
+                    title={BUCKET_RULE_ROLE[r.role]}
+                  >
+                    {r.kind === 'replication' ? 'Replication' : 'Lifecycle'}{' '}
+                    <span style={{ fontFamily: 'var(--font-mono)' }}>{r.name}</span>
+                    <Text type="secondary" style={{ fontSize: 11 }}>
+                      ({r.role})
+                    </Text>
+                  </Button>
+                ))}
+                <Button
+                  size="small"
+                  type="link"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    navigate(runsUrl({ bucket: name }));
+                  }}
+                >
+                  Runs on this bucket →
+                </Button>
+              </div>
+            </div>
+          )}
           <Collapse
             ghost
             size="small"

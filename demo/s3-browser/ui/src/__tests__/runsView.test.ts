@@ -8,6 +8,7 @@ import {
   runName,
   runOriginLabel,
   runSubject,
+  rulesTouchingBucket,
 } from '../runsView';
 
 const run = (over: Partial<RunEntry>): RunEntry => ({
@@ -62,4 +63,20 @@ test('actions: cancel or kill while live, remove a finished one-off', () => {
   assert.deepEqual(runActions({ kind: 'delete', status: 'failed' }), ['remove']);
   assert.deepEqual(runActions({ kind: 'replication', status: 'running' }), ['kill']);
   assert.deepEqual(runActions({ kind: 'lifecycle', status: 'succeeded' }), []);
+});
+
+test('rulesTouchingBucket names each rule with its role on the bucket', () => {
+  const row = (id: string, kind: string, scope: { bucket: string; target?: string }) =>
+    run({ id, job_id: id, kind, name: id.split(':')[1], scope });
+  const rows = [
+    row('replication:dr', 'replication', { bucket: 'releases', target: 'db-archive' }),
+    row('lifecycle:expire', 'lifecycle', { bucket: 'db-archive' }),
+    row('lifecycle:archive', 'lifecycle', { bucket: 'downloads', target: 'db-archive' }),
+    row('maintenance:3', 'delete', { bucket: 'db-archive' }),
+  ];
+  assert.deepEqual(
+    rulesTouchingBucket(rows, 'db-archive').map((r) => `${r.name}:${r.role}`),
+    ['archive:archive', 'expire:bucket', 'dr:destination'],
+  );
+  assert.deepEqual(rulesTouchingBucket(rows, 'releases').map((r) => r.role), ['source']);
 });

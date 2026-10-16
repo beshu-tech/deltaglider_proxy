@@ -2,6 +2,7 @@
  * Pure view logic of the Jobs page: the runs list (`GET /jobs/runs`).
  */
 import type { RunEntry, RunFilters } from './adminApi';
+import type { JobRow } from './jobsView';
 import { isActiveJobStatus, kindLabel, parseJobId } from './jobsView';
 
 /** The page filters from the URL query (unknown values are dropped). */
@@ -87,3 +88,29 @@ export const RUN_KIND_OPTIONS: { value: string; label: string }[] = [
   'migrate',
   'backfill-metadata',
 ].map((k) => ({ value: k, label: kindLabel(k) }));
+
+/** A rule that reads or writes a bucket, and how. */
+export interface BucketRule {
+  id: string;
+  kind: 'replication' | 'lifecycle';
+  name: string;
+  /** `source`: the rule copies from the bucket; `destination`: into it;
+   *  `bucket`: a lifecycle rule acts on it; `archive`: a lifecycle rule
+   *  moves objects into it. */
+  role: 'source' | 'destination' | 'bucket' | 'archive';
+}
+
+/** The replication and lifecycle rules that read or write `bucket`, by name. */
+export function rulesTouchingBucket(rows: readonly JobRow[], bucket: string): BucketRule[] {
+  const out: BucketRule[] = [];
+  for (const r of rows) {
+    if (r.kind !== 'replication' && r.kind !== 'lifecycle') continue;
+    const here = r.scope.bucket === bucket;
+    const there = r.scope.target === bucket;
+    if (!here && !there) continue;
+    const role: BucketRule['role'] =
+      r.kind === 'replication' ? (here ? 'source' : 'destination') : here ? 'bucket' : 'archive';
+    out.push({ id: r.id, kind: r.kind, name: r.name, role });
+  }
+  return out.sort((a, b) => a.kind.localeCompare(b.kind) || a.name.localeCompare(b.name));
+}

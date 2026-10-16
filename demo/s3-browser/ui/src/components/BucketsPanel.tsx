@@ -45,6 +45,7 @@ import ReencryptProposalModal from './ReencryptProposalModal';
 import { useApplyHandler } from '../useDirtySection';
 import { useSectionEditor } from '../useSectionEditor';
 import { useJobs } from '../queries/jobs';
+import { rulesTouchingBucket } from '../runsView';
 import { busyJobForBucket } from '../jobsView';
 import type { BucketPolicyRow, BucketPolicyPatch, PrefixEntry } from './bucketPolicyPayload';
 import {
@@ -400,6 +401,7 @@ export default function BucketsPanel({ onSessionExpired, search }: Props) {
                 onPrefixesChange={prefixChangeFor(name)}
                 inputRadius={inputRadius}
                 maintenanceJob={busyJobForBucket(maintenanceJobs, name)}
+                rules={rulesTouchingBucket(maintenanceJobs, name)}
                 onReencrypt={
                   effectiveByName.get(name)?.reencrypt ? () => openReencrypt(name) : undefined
                 }
