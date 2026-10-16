@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.16 — 2026-10-16
+
 ### Added — A preview of a rule's include and exclude globs
 
 Replication and lifecycle rules have a **Which objects** section in their editor, with the include and exclude globs. The globs were under "Advanced" before. Under each list, every glob shows how many objects of a sample it matches. A glob that matches nothing because the rule's prefix is missing in front of it (globs match the whole key from the bucket root) offers a button that adds the prefix. **Preview objects** opens a wide window with the sampled keys sorted by verdict, the glob that decided each one, and a box that tests one key. The preview reads the globs as you type. The server answers with the rules' own matcher (`POST /_/api/admin/jobs/filter-preview`), on the first 1,000 objects under the prefix.
