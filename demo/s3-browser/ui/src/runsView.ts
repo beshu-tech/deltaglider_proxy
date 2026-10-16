@@ -33,22 +33,41 @@ export function isRuleRun(run: Pick<RunEntry, 'kind'>): boolean {
   return run.kind === 'replication' || run.kind === 'lifecycle';
 }
 
-/** The second line of the Job cell: what the run did, in words. */
-export function runSubject(run: RunEntry): string {
-  if (isRuleRun(run)) return run.run_id !== undefined ? `run #${run.run_id}` : '';
-  if (run.kind === 'delete') {
-    const prefixes = Array.isArray(run.detail?.prefixes) ? (run.detail.prefixes as string[]) : [];
-    const objects = typeof run.detail?.objects === 'number' ? run.detail.objects : 0;
-    const parts: string[] = [];
-    if (prefixes.length === 1) parts.push(prefixes[0]);
-    else if (prefixes.length > 1) parts.push(`${prefixes[0]} and ${prefixes.length - 1} more folder${prefixes.length > 2 ? 's' : ''}`);
-    if (objects > 0) parts.push(`${objects.toLocaleString()} selected object${objects === 1 ? '' : 's'}`);
-    return parts.join(' · ');
-  }
-  return '';
+/** The folders and objects a delete job removes. */
+function deleteTargets(run: RunEntry): { prefixes: string[]; objects: number } {
+  const prefixes = Array.isArray(run.detail?.prefixes) ? (run.detail.prefixes as string[]) : [];
+  const objects = typeof run.detail?.objects === 'number' ? run.detail.objects : 0;
+  return { prefixes, objects };
 }
 
-/** The name of the Job cell: the rule, or the bucket of a one-off. */
+/**
+ * The title of the Job cell, which tells one run from the next: the rule and
+ * its run number, the first folder that a delete removes, or the bucket of
+ * another one-off.
+ */
+export function runTitle(run: RunEntry): string {
+  if (isRuleRun(run)) return run.run_id !== undefined ? `${runName(run)} #${run.run_id}` : runName(run);
+  if (run.kind === 'delete') {
+    const { prefixes, objects } = deleteTargets(run);
+    const more = prefixes.length - 1 + (objects > 0 ? 1 : 0);
+    if (prefixes.length > 0) return more > 0 ? `${prefixes[0]} +${more}` : prefixes[0];
+    if (objects > 0) return `${objects.toLocaleString()} selected object${objects === 1 ? '' : 's'}`;
+  }
+  return runName(run);
+}
+
+/** The second line of the Job cell: the rest of what a delete removes. */
+export function runSubject(run: RunEntry): string {
+  if (run.kind !== 'delete') return '';
+  const { prefixes, objects } = deleteTargets(run);
+  if (prefixes.length === 0) return '';
+  const parts: string[] = [];
+  if (prefixes.length > 1) parts.push(`also ${prefixes.slice(1).join(', ')}`);
+  if (objects > 0) parts.push(`${objects.toLocaleString()} selected object${objects === 1 ? '' : 's'}`);
+  return parts.join(' · ');
+}
+
+/** The name of a run's rule, or the bucket of a one-off. */
 export function runName(run: RunEntry): string {
   return isRuleRun(run) ? (parseJobId(run.job_id)?.key ?? run.name) : run.scope.bucket;
 }

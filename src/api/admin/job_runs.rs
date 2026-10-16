@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use super::extract::AdminQuery;
 use super::jobs::{
-    lifecycle_progress, lifecycle_scope, maintenance_job_view, normalize_status,
-    replication_row_progress, replication_scope, JobView,
+    lifecycle_live_progress, lifecycle_record_progress, lifecycle_scope, maintenance_job_view,
+    normalize_status, replication_row_progress, replication_scope, JobView,
 };
 use super::path_guard::AdminBucket;
 use super::{AdminError, AdminState};
@@ -286,21 +286,9 @@ pub async fn list_runs(
             let live = crate::lifecycle::live::running(&r.rule_name)
                 .filter(|l| l.run_id == Some(r.id) && r.finished_at.is_none())
                 .map(|l| l.counters());
-            let progress = match live {
-                Some(c) => lifecycle_progress(
-                    c.objects_affected,
-                    c.objects_skipped,
-                    c.errors,
-                    c.bytes_affected,
-                    c.objects_deleted,
-                ),
-                None => lifecycle_progress(
-                    r.objects_affected,
-                    r.objects_skipped,
-                    r.errors,
-                    r.bytes_affected,
-                    r.split.map_or(0, |s| s.objects_deleted),
-                ),
+            let progress = match &live {
+                Some(c) => lifecycle_live_progress(c),
+                None => lifecycle_record_progress(&r),
             };
             let job_id = format!("lifecycle:{}", r.rule_name);
             let key = Cursor {

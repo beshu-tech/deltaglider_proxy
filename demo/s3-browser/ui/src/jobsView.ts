@@ -38,6 +38,10 @@ export interface JobRow {
     skipped: number;
     /** Objects the run deleted (mirror delete, lifecycle expiry). */
     deleted?: number | null;
+    /** Lifecycle: of `skipped`, the objects a glob keeps out of the rule. */
+    excluded?: number | null;
+    /** Lifecycle: of `skipped`, the objects not old enough yet. */
+    not_due?: number | null;
   };
   /** Total objects when known (also inside `progress.total` on older servers). */
   total?: number | null;
@@ -996,7 +1000,7 @@ function kindWords(kind: JobKind, verb?: LifecycleVerb): KindWords {
     case 'lifecycle':
       return {
         done: verb === 'delete' ? 'deleted' : verb === 'move' ? 'moved' : verb === 'copy' ? 'copied' : 'acted on',
-        skipped: 'not due',
+        skipped: 'skipped',
         nothing: 'nothing due',
       };
     case 'backfill-metadata':
@@ -1063,6 +1067,10 @@ export interface OutcomeMeterInput {
   phase?: string | null;
   /** Lifecycle: what the rule does to an object. */
   verb?: LifecycleVerb;
+  /** Lifecycle: of `skipped`, the objects a glob keeps out (null: unknown). */
+  excluded?: number | null;
+  /** Lifecycle: of `skipped`, the objects not old enough yet (null: unknown). */
+  notDue?: number | null;
 }
 
 export interface MeterView {
@@ -1086,12 +1094,21 @@ export function deriveMeter(p: OutcomeMeterInput): MeterView {
   // Lifecycle `processed` already counts the deletes of a delete rule.
   const deleted = kind === 'lifecycle' ? 0 : Math.max(0, p.deleted ?? 0);
   const acted = copied + deleted + errors;
+  // A lifecycle run says why it skipped: not old enough, or not matched by
+  // the rule's globs. An older run without the split says "skipped".
+  const split = kind === 'lifecycle' && (p.notDue != null || p.excluded != null);
+  const skipWords: [number, string][] = split
+    ? [
+        [Math.max(0, p.notDue ?? 0), 'not due'],
+        [Math.max(0, p.excluded ?? 0), 'not matched'],
+      ]
+    : [[skipped, w.skipped]];
 
   const parts = (withZeroDone: boolean) => {
     const out: string[] = [];
     if (copied > 0 || withZeroDone) out.push(`${n(copied)} ${w.done}`);
     if (deleted > 0) out.push(`${n(deleted)} deleted`);
-    if (skipped > 0) out.push(`${n(skipped)} ${w.skipped}`);
+    for (const [count, word] of skipWords) if (count > 0) out.push(`${n(count)} ${word}`);
     if (errors > 0) out.push(`${n(errors)} failed`);
     return out;
   };
@@ -1099,7 +1116,7 @@ export function deriveMeter(p: OutcomeMeterInput): MeterView {
   const aria =
     `${n(scanned)} scanned, ${n(copied)} ${w.done}, ` +
     (deleted > 0 ? `${n(deleted)} deleted, ` : '') +
-    `${n(skipped)} ${w.skipped}, ` +
+    skipWords.map(([count, word]) => `${n(count)} ${word}, `).join('') +
     `${n(errors)} error${errors === 1 ? '' : 's'}` +
     (percent != null && isActiveJobStatus(status) ? `, ${percent}% done` : '') +
     `; status ${jobStatusLabel({ status })}`;
@@ -1153,7 +1170,12 @@ export function deriveMeter(p: OutcomeMeterInput): MeterView {
       greenPct: 0,
       redPct: 0,
       dot: 'muted',
-      label: scanned === 0 ? 'no objects' : `${w.nothing} · ${n(scanned)} checked`,
+      label:
+        scanned === 0
+          ? 'no objects'
+          : split
+            ? [`nothing ${w.done}`, ...parts(false)].join(' · ')
+            : `${w.nothing} · ${n(scanned)} checked`,
       aria,
     };
   }
@@ -1187,6 +1209,8 @@ export function rowMeterInput(row: JobRow, verb?: LifecycleVerb): OutcomeMeterIn
     kind: row.kind,
     phase: row.phase ?? null,
     verb: verb ?? lifecycleVerb(row.detail?.action),
+    excluded: pr.excluded ?? null,
+    notDue: pr.not_due ?? null,
   };
 }
 
@@ -1198,6 +1222,8 @@ export function rowMeterInput(row: JobRow, verb?: LifecycleVerb): OutcomeMeterIn
 export function runMeterInput(
   run: Pick<JobRunEntry, 'objects_scanned' | 'objects_processed' | 'objects_skipped' | 'errors' | 'status'> & {
     objects_deleted?: number | null;
+    objects_excluded?: number | null;
+    objects_not_due?: number | null;
     __percent?: number | null;
   },
   kind: JobKind,
@@ -1215,6 +1241,8 @@ export function runMeterInput(
     kind,
     phase: phase ?? null,
     verb,
+    excluded: run.objects_excluded ?? null,
+    notDue: run.objects_not_due ?? null,
   };
 }
 

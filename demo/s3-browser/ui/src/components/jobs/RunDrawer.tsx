@@ -42,6 +42,9 @@ export default function RunDrawer({ run, onClose }: Props) {
     [run.kind === 'replication' ? 'Copied' : 'Acted on', p.processed.toLocaleString()],
     ['Deleted', (p.deleted ?? 0).toLocaleString()],
     [run.kind === 'replication' ? 'Already in sync' : 'Skipped', p.skipped.toLocaleString()],
+    // Lifecycle: why it skipped them (absent on a run older than the split).
+    ...(p.not_due != null ? [['Not old enough yet', p.not_due.toLocaleString()] as [string, string]] : []),
+    ...(p.excluded != null ? [['Not matched by the globs', p.excluded.toLocaleString()] as [string, string]] : []),
     ['Failed', p.failed.toLocaleString()],
     ['Data', formatBytes(p.bytes)],
   ];

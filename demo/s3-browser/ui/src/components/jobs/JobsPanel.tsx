@@ -35,6 +35,7 @@ import {
   runName,
   runOriginLabel,
   runSubject,
+  runTitle,
   RUN_KIND_OPTIONS,
   type RunAction,
 } from '../../runsView';
@@ -231,10 +232,10 @@ export default function JobsPanel({ search }: Props) {
               <Text
                 strong
                 ellipsis
-                title={runName(r)}
+                title={runTitle(r)}
                 style={{ fontFamily: 'var(--font-mono)', fontSize: 13, minWidth: 0 }}
               >
-                {runName(r)}
+                {runTitle(r)}
               </Text>
             </div>
             {subject && (

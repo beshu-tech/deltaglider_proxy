@@ -128,6 +128,21 @@ test('words per kind', () => {
   assert.equal(m({ kind: 'lifecycle', verb: 'copy', scanned: 3, copied: 3 }).label, '3 copied');
   assert.equal(m({ kind: 'lifecycle', verb: 'move', scanned: 3, copied: 3 }).label, '3 moved');
   assert.equal(m({ kind: 'lifecycle', scanned: 40, skipped: 40 }).label, 'nothing due · 40 checked');
+  // With the split, a lifecycle run says why it skipped each object.
+  assert.equal(
+    m({ kind: 'lifecycle', verb: 'delete', scanned: 40, copied: 4, skipped: 36, notDue: 6, excluded: 30 }).label,
+    '4 deleted · 6 not due · 30 not matched',
+  );
+  assert.equal(
+    m({ kind: 'lifecycle', verb: 'delete', scanned: 30, skipped: 30, notDue: 0, excluded: 30 }).label,
+    'nothing deleted · 30 not matched',
+  );
+  assert.equal(
+    m({ kind: 'lifecycle', verb: 'delete', status: 'running', scanned: 30, skipped: 30, notDue: 0, excluded: 30 }).label,
+    'running · 0 deleted · 30 not matched…',
+  );
+  // An older run without the split.
+  assert.equal(m({ kind: 'lifecycle', verb: 'delete', scanned: 9, copied: 4, skipped: 5 }).label, '4 deleted · 5 skipped');
   // Lifecycle `processed` already holds the deletes of a delete rule.
   assert.equal(m({ kind: 'lifecycle', verb: 'delete', scanned: 5, copied: 5, deleted: 5 }).label, '5 deleted');
   for (const kind of ['backfill-metadata', 'reencrypt', 'migrate', 'lifecycle']) {

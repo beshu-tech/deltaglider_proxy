@@ -183,6 +183,13 @@ pub struct JobProgress {
     /// Objects the job deleted (replication mirror deletes).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted: Option<i64>,
+    /// Lifecycle: of `skipped`, the objects an include/exclude glob keeps
+    /// out of the rule. `None` when the run did not store the split.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excluded: Option<i64>,
+    /// Lifecycle: of `skipped`, the objects not old enough yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_due: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -332,6 +339,8 @@ pub(super) fn replication_row_progress(
             failed: r.errors,
             skipped: r.objects_skipped,
             deleted: Some(r.objects_deleted),
+            excluded: None,
+            not_due: None,
         },
     }
 }
@@ -394,6 +403,8 @@ pub(super) fn maintenance_job_view(j: &MaintenanceJob) -> JobView {
             failed: j.objects_failed,
             skipped: j.objects_skipped,
             deleted: None,
+            excluded: None,
+            not_due: None,
         },
         lifetime: None,
         last_run_at: None,
@@ -427,24 +438,12 @@ fn lifecycle_job_view(
         .ok()
         .and_then(|mut runs| runs.pop());
     let progress = match (&live, &latest) {
-        (Some(run), _) => {
-            let c = run.counters();
-            lifecycle_progress(
-                c.objects_affected,
-                c.objects_skipped,
-                c.errors,
-                c.bytes_affected,
-                c.objects_deleted,
-            )
-        }
-        (None, Some(r)) => lifecycle_progress(
-            r.objects_affected,
-            r.objects_skipped,
-            r.errors,
-            r.bytes_affected,
-            r.split.map_or(0, |s| s.objects_deleted),
-        ),
-        (None, None) => lifecycle_progress(0, 0, 0, 0, 0),
+        (Some(run), _) => lifecycle_live_progress(&run.counters()),
+        (None, Some(r)) => lifecycle_record_progress(r),
+        (None, None) => JobProgress {
+            deleted: Some(0),
+            ..JobProgress::default()
+        },
     };
     // The latest run's last failure, so a failed row says why.
     let (last_error, failed_total) = match &latest {
@@ -573,20 +572,32 @@ fn lifecycle_run_entry(
     v
 }
 
-pub(super) fn lifecycle_progress(
-    processed: i64,
-    skipped: i64,
-    failed: i64,
-    bytes: i64,
-    deleted: i64,
-) -> JobProgress {
+/// The progress of a lifecycle run in progress in this process.
+pub(super) fn lifecycle_live_progress(c: &crate::lifecycle::live::LiveCounters) -> JobProgress {
     JobProgress {
-        processed,
+        processed: c.objects_affected,
         total: None,
-        bytes,
-        failed,
-        skipped,
-        deleted: Some(deleted),
+        bytes: c.bytes_affected,
+        failed: c.errors,
+        skipped: c.objects_skipped,
+        deleted: Some(c.objects_deleted),
+        excluded: Some(c.objects_excluded),
+        not_due: Some(c.objects_not_due),
+    }
+}
+
+/// The progress of a lifecycle run from its history row. A run that ended
+/// before the split was stored has no `excluded` / `not_due`.
+pub(super) fn lifecycle_record_progress(r: &crate::lifecycle::LifecycleRunRecord) -> JobProgress {
+    JobProgress {
+        processed: r.objects_affected,
+        total: None,
+        bytes: r.bytes_affected,
+        failed: r.errors,
+        skipped: r.objects_skipped,
+        deleted: Some(r.split.map_or(0, |s| s.objects_deleted)),
+        excluded: r.split.map(|s| s.objects_excluded),
+        not_due: r.split.map(|s| s.objects_not_due),
     }
 }
 
@@ -1454,6 +1465,38 @@ mod tests {
     /// A replication rule's row carries the live counters of its newest run
     /// (copied, in sync, failed, logical bytes, deleted) — not zeros.
     #[test]
+    fn lifecycle_progress_splits_the_skipped_objects() {
+        let mut run = crate::lifecycle::LifecycleRunRecord {
+            id: 7,
+            rule_name: "purge".into(),
+            triggered_by: "run-now".into(),
+            started_at: 1,
+            finished_at: Some(2),
+            objects_scanned: 15,
+            objects_affected: 4,
+            objects_skipped: 11,
+            bytes_affected: 100,
+            errors: 0,
+            status: "completed".into(),
+            split: Some(crate::lifecycle::state_store::LifecycleRunSplit {
+                objects_deleted: 4,
+                objects_excluded: 9,
+                objects_not_due: 2,
+                ..Default::default()
+            }),
+        };
+        let p = lifecycle_record_progress(&run);
+        assert_eq!(
+            (p.skipped, p.excluded, p.not_due, p.deleted),
+            (11, Some(9), Some(2), Some(4))
+        );
+        // An older run without the split: unknown, not zero.
+        run.split = None;
+        let p = lifecycle_record_progress(&run);
+        assert_eq!((p.excluded, p.not_due, p.deleted), (None, None, Some(0)));
+    }
+
+    #[test]
     fn replication_row_progress_reads_the_newest_run() {
         assert_eq!(replication_row_progress(None), JobProgress::default());
         let run = crate::replication::state_store::RunRecord {
@@ -1482,6 +1525,8 @@ mod tests {
                 failed: 1,
                 skipped: 3,
                 deleted: Some(2),
+                excluded: None,
+                not_due: None,
             }
         );
     }
