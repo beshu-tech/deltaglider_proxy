@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.17 — 2026-10-16
+
 ### Changed — Rules and runs have their own pages
 
 The Jobs screen mixed two different things in one table. A replication or lifecycle rule is a definition that runs many times, and its row showed only its latest run. A bulk delete, re-encrypt, migrate or backfill job is one run. The two now live apart:
