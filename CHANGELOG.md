@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed — The filter preview counts every object under the prefix
+
+The preview of include and exclude globs classified the first 1,000 objects under the prefix. Keys sort by name, so a glob for names that sort late matched nothing in that sample: under `ror/builds/`, the first `-pre` build sorted at position 73,828 of 93,723, and `*-pre*` showed no match. The preview now counts every object under the prefix, up to 200,000, and lists at most 500 keys of each verdict. A listing is kept for two minutes, so editing a glob does not list the prefix again.
+
 ### Added — Remove a finished one-off job from the Jobs list
 
 A finished delete, re-encrypt, migrate or backfill job had no action on the Jobs screen, so every bulk delete stayed in the list. The row's "⋯" menu now has **Delete** for a finished one-off (`POST /_/api/admin/jobs/maintenance:<n>/delete`). It removes the job and its failures from the list, and it changes no object. An active job answers `409`: cancel it first.

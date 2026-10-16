@@ -96,14 +96,14 @@ The proxy keeps run history for a limited time. When a rule's run ends, the prox
 { "bucket": "releases", "prefix": "firmware/", "include_globs": [], "exclude_globs": ["*.tmp", "widget-3000/**"] }
 ```
 
-The proxy lists the first 1,000 objects under the prefix (`limit` sets another number, at most 5,000) and classifies each one. A request with `keys` classifies those keys (at most 100) instead of a listing. The answer holds:
+The proxy lists every object under the prefix, up to 200,000 objects (`limit` sets a lower number), and classifies each one. Keys sort by name, so a sample of the first objects would miss globs for names that sort late, such as pre-release builds. A request with `keys` classifies those keys (at most 100) instead of a listing. The answer holds:
 
 - `sampled`, and `truncated` when the prefix holds more objects than the sample.
 - The counts `included`, `excluded`, `not_included` and `internal`. An `internal` key is a `.deltaglider/` key, on which no rule acts.
 - `globs`: for each glob, its `list` (`include` or `exclude`), the number of sampled keys that it `matches`, its `error` when it does not compile, and a `suggestion` when it matches nothing but the glob with the prefix in front of it matches.
-- `keys`: each key with its `verdict` and the `glob` that decided it.
+- `keys`: each key with its `verdict` and the `glob` that decided it, at most 500 keys of each verdict. The counts cover every key.
 
-The proxy keeps a sample for 30 seconds, so a preview that runs on every edit lists the bucket once. The route needs an admin session.
+The proxy keeps the listing for two minutes, and two previews of the same prefix share one listing, so a preview that runs on every edit lists the prefix once. A listing reads 1,000 keys per request, so a prefix of 100,000 objects costs 100 requests. The route needs an admin session.
 
 ## Delete jobs
 

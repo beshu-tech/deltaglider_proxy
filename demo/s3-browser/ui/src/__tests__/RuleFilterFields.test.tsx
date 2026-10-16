@@ -66,8 +66,8 @@ test('each glob shows its matches; a glob without the prefix offers the prefixed
   const onChange = section();
   const user = userEvent.setup();
   const list = await screen.findByRole('list', { name: 'exclude glob matches' });
-  expect(within(list).getByText('matches 1 of the sample')).toBeInTheDocument();
-  expect(within(list).getByText('matches nothing in the sample')).toBeInTheDocument();
+  expect(within(list).getByText('matches 1')).toBeInTheDocument();
+  expect(within(list).getByText('matches nothing')).toBeInTheDocument();
   expect(screen.getByRole('status', { name: 'Filter preview summary' })).toHaveTextContent(
     'Of the 3 objects under releases/ror/, 1 replicate and 1 is excluded.',
   );
@@ -79,6 +79,16 @@ test('each glob shows its matches; a glob without the prefix offers the prefixed
     include_globs: [],
     exclude_globs: ['*.tmp', 'builds/**'],
   });
+});
+
+test('a group with more objects than the listed keys says how many it lists', async () => {
+  http.on('POST', PREVIEW, json({ ...sample, sampled: 93_723, included: 12_815, keys: [{ key: 'ror/a-pre1.zip', verdict: 'included' }] }));
+  section();
+  const user = userEvent.setup();
+  await screen.findByRole('list', { name: 'exclude glob matches' });
+  await user.click(screen.getByRole('button', { name: /Preview objects/ }));
+  const dialog = await screen.findByRole('dialog');
+  expect(await within(dialog).findByText('Showing the first 1 of 12,815 objects in this group.')).toBeInTheDocument();
 });
 
 test('the preview window lists the keys by verdict and tests a typed key', async () => {

@@ -15,7 +15,7 @@ export function scopeLabel(bucket: string, prefix: string): string {
 }
 
 /**
- * One sentence on what the filters do to the sample. `verb` is what an
+ * One sentence on what the filters do to the objects under the prefix. `verb` is what an
  * included object does: "replicate", "are candidates".
  */
 export function filterSummary(p: FilterPreview, scope: string, verb: string): string {
@@ -64,7 +64,7 @@ export function splitAtPrefix(key: string, prefix: string): [string, string] {
 
 /**
  * A rule's prefix as the proxy reads it (`normalize_prefix`): no empty
- * segments, a trailing `/`. The preview samples this folder.
+ * segments, a trailing `/`. The preview counts this folder.
  */
 export function ruleFolderPrefix(prefix: string): string {
   const parts = prefix.split('/').filter(Boolean);

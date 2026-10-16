@@ -24,14 +24,17 @@ use super::path_guard::{AdminBucket, AdminObjectPath};
 use super::{AdminError, AdminState};
 use crate::glob_filter::{self, Verdict};
 
-/// Keys sampled when the request names no limit.
-const DEFAULT_SAMPLE: usize = 1_000;
-/// The most keys one preview samples.
-const MAX_SAMPLE: usize = 5_000;
+/// The most keys one preview reads under the prefix. A first-N sample
+/// lied: keys sort by name, so a glob for later names (`*-pre*` builds)
+/// matched nothing in it. Counting every key up to this cap costs one
+/// LIST request per 1,000 keys, once per cache period.
+const SCAN_CAP: usize = 200_000;
+/// Keys of each verdict returned for display; the counts cover them all.
+pub const KEYS_PER_VERDICT: usize = 500;
 /// The most keys one request may name.
 const MAX_NAMED_KEYS: usize = 100;
-/// How long a sample is reused: an editor previews on every keystroke.
-const SAMPLE_TTL: Duration = Duration::from_secs(30);
+/// How long a scan is reused: an editor previews on every keystroke.
+const SAMPLE_TTL: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Deserialize)]
 pub struct FilterPreviewRequest {
@@ -85,15 +88,16 @@ pub struct GlobReport {
 
 #[derive(Debug, Serialize)]
 pub struct FilterPreviewResponse {
-    /// Keys classified.
+    /// Keys classified: every key under the prefix, up to the scan cap.
     pub sampled: usize,
-    /// More keys exist under the prefix than the sample holds.
+    /// More keys exist under the prefix than the scan cap.
     pub truncated: bool,
     pub included: usize,
     pub excluded: usize,
     pub not_included: usize,
     pub internal: usize,
     pub globs: Vec<GlobReport>,
+    /// At most [`KEYS_PER_VERDICT`] keys of each verdict, in key order.
     pub keys: Vec<PreviewKey>,
 }
 
@@ -151,7 +155,7 @@ pub fn preview(
         not_included: 0,
         internal: 0,
         globs: Vec::new(),
-        keys: Vec::with_capacity(keys.len()),
+        keys: Vec::new(),
     };
     for key in keys {
         count_hits(&inc, key, &mut inc_hits);
@@ -165,11 +169,15 @@ pub fn preview(
                 Verdict::NotIncluded => (KeyVerdict::NotIncluded, None),
             }
         };
-        match verdict {
-            KeyVerdict::Included => out.included += 1,
-            KeyVerdict::Excluded => out.excluded += 1,
-            KeyVerdict::NotIncluded => out.not_included += 1,
-            KeyVerdict::Internal => out.internal += 1,
+        let n = match verdict {
+            KeyVerdict::Included => &mut out.included,
+            KeyVerdict::Excluded => &mut out.excluded,
+            KeyVerdict::NotIncluded => &mut out.not_included,
+            KeyVerdict::Internal => &mut out.internal,
+        };
+        *n += 1;
+        if *n > KEYS_PER_VERDICT {
+            continue;
         }
         out.keys.push(PreviewKey {
             key: key.clone(),
@@ -224,15 +232,17 @@ fn with_prefix_suggestion(prefix: &str, glob: &str, keys: &[String]) -> Option<S
 }
 
 type SampleKey = (String, String, usize);
-/// A sample: its keys, and whether more exist.
+/// A scan: its keys, and whether more exist.
 type Sample = Arc<(Vec<String>, bool)>;
-type SampleCache = moka::sync::Cache<SampleKey, Sample>;
+type SampleCache = moka::future::Cache<SampleKey, Sample>;
 
+/// A few scans (one per prefix being edited), single-flight: two previews
+/// of one cold prefix list it once.
 fn sample_cache() -> &'static SampleCache {
     static CACHE: OnceLock<SampleCache> = OnceLock::new();
     CACHE.get_or_init(|| {
-        moka::sync::Cache::builder()
-            .max_capacity(32)
+        moka::future::Cache::builder()
+            .max_capacity(4)
             .time_to_live(SAMPLE_TTL)
             .build()
     })
@@ -255,14 +265,13 @@ pub async fn filter_preview(
             (Arc::new((keys, false)), false)
         }
         None => {
-            let limit = req.limit.unwrap_or(DEFAULT_SAMPLE).clamp(1, MAX_SAMPLE);
+            let limit = req.limit.unwrap_or(SCAN_CAP).clamp(1, SCAN_CAP);
             let cache_key = (bucket.to_string(), req.prefix.to_string(), limit);
-            let sample = match sample_cache().get(&cache_key) {
-                Some(sample) => sample,
-                None => {
+            let budget = state.config.read().await.filtered_list_max_engine_pages;
+            let sample = sample_cache()
+                .try_get_with(cache_key, async {
                     let engine = state.s3_state.engine.load();
-                    let budget = state.config.read().await.filtered_list_max_engine_pages;
-                    let (keys, truncated) = crate::iam::listing::list_keys_for_caller(
+                    crate::iam::listing::list_keys_for_caller(
                         &**engine,
                         &bucket,
                         &req.prefix,
@@ -272,17 +281,15 @@ pub async fn filter_preview(
                         budget,
                     )
                     .await
-                    .map_err(|e| match e {
-                        crate::iam::listing::ListingError::Engine(e) => {
-                            AdminError::internal(e.to_string())
-                        }
-                        other => AdminError::invalid(format!("{other:?}")),
-                    })?;
-                    let sample = Arc::new((keys, truncated));
-                    sample_cache().insert(cache_key, sample.clone());
-                    sample
-                }
-            };
+                    .map(Arc::new)
+                })
+                .await
+                .map_err(|e| match &*e {
+                    crate::iam::listing::ListingError::Engine(e) => {
+                        AdminError::internal(e.to_string())
+                    }
+                    other => AdminError::invalid(format!("{other:?}")),
+                })?;
             let truncated = sample.1;
             (sample, truncated)
         }

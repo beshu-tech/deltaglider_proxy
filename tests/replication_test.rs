@@ -3470,3 +3470,49 @@ async fn test_runs_list_merges_rule_runs_and_one_offs() {
         .unwrap();
     assert_eq!(f["total"], 0, "{f}");
 }
+
+/// The preview counts every object under the prefix, not the first 1,000:
+/// in prod, the first `-pre` build sorted at position 73,828 of 93,723, so a
+/// 1,000-key sample showed `*-pre*` matching nothing.
+#[tokio::test]
+async fn test_filter_preview_counts_past_the_first_thousand_keys() {
+    let server = TestServer::builder().build().await;
+    let http = server.http();
+    let admin = common::admin_http_client(&server.endpoint()).await;
+    let ep = server.endpoint();
+    let bucket = server.bucket().to_string();
+    let mut keys: Vec<String> = (0..1_050).map(|i| format!("b/1.{i:04}/a.zip")).collect();
+    keys.push("b/9.0-pre1/a.zip".into());
+    use futures::StreamExt;
+    let statuses: Vec<u16> = futures::stream::iter(keys.iter())
+        .map(|k| {
+            let req = http.put(format!("{ep}/{bucket}/{k}")).body(b"x".to_vec());
+            async move { req.send().await.unwrap().status().as_u16() }
+        })
+        .buffer_unordered(16)
+        .collect()
+        .await;
+    assert!(statuses.iter().all(|s| *s == 200), "{statuses:?}");
+    let preview: serde_json::Value = admin
+        .post(format!("{ep}/_/api/admin/jobs/filter-preview"))
+        .json(&serde_json::json!({
+            "bucket": bucket,
+            "prefix": "b/",
+            "include_globs": ["*-pre*"]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(preview["sampled"], 1_051, "{}", preview["sampled"]);
+    assert_eq!(preview["truncated"], false);
+    assert_eq!(preview["included"], 1);
+    assert_eq!(preview["globs"][0]["matches"], 1);
+    assert_eq!(
+        preview["keys"].as_array().unwrap().len(),
+        1 + 500,
+        "500 keys per verdict at most"
+    );
+}

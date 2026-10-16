@@ -9,7 +9,7 @@ import FormField from './FormField';
 import GlobListTextArea from './GlobListTextArea';
 
 interface Props {
-  /** The bucket and prefix the rule reads: the preview samples them. */
+  /** The bucket and prefix the rule reads: the preview counts every object under them. */
   bucket: string;
   prefix: string;
   include: string[];
@@ -35,9 +35,9 @@ const SECTION_TITLE: React.CSSProperties = {
 
 /**
  * The include/exclude globs of a rule, and what they select. Under each
- * list, every glob shows how many objects of a sample it matches; a glob
+ * list, every glob shows how many objects under the prefix it matches; a glob
  * that matches nothing because it lacks the prefix offers the prefixed glob.
- * A line under the lists sums the sample up, and Preview opens a wide
+ * A line under the lists sums the counts up, and Preview opens a wide
  * window with the keys and their verdicts. The preview reads the globs as
  * they are typed; they go into the rule when a field loses focus.
  */
@@ -85,7 +85,7 @@ export default function RuleFilterFields(props: Props) {
               ? `The preview failed: ${(preview.error as Error).message}`
               : preview.data
                 ? filterSummary(preview.data, scope, verb)
-                : 'Reading a sample of the bucket…'}
+                : `Counting the objects under ${scope}…`}
         </div>
         {preview.isFetching && <Spin size="small" aria-label="Updating the preview" />}
         <Button icon={<EyeOutlined />} onClick={() => setOpen(true)} disabled={!bucket}>
@@ -210,8 +210,8 @@ function GlobReports({
               // `.deltaglider/**` is meant to match nothing.
               <span style={{ color: r.suggestion ? colors.ACCENT_AMBER : colors.TEXT_SECONDARY }}>
                 {r.matches > 0
-                  ? `matches ${r.matches.toLocaleString('en-US')} of the sample`
-                  : 'matches nothing in the sample'}
+                  ? `matches ${r.matches.toLocaleString('en-US')}`
+                  : 'matches nothing'}
               </span>
             )}
             {r.suggestion && (
@@ -270,6 +270,23 @@ function FilterPreviewModal({
   }, [preview, tab, search]);
   const n = (v: number | undefined) => (v ?? 0).toLocaleString('en-US');
   const verbTitle = props.verb === 'replicate' ? 'Replicate' : 'In the rule';
+  // The server returns at most 500 keys per verdict; the counts cover all.
+  const groupCount = !preview
+    ? 0
+    : tab === 'included'
+      ? preview.included
+      : tab === 'excluded'
+        ? preview.excluded
+        : tab === 'not_included'
+          ? preview.not_included + preview.internal
+          : preview.sampled;
+  const listed = (preview?.keys ?? []).filter(
+    (k) => tab === 'all' || k.verdict === tab || (tab === 'not_included' && k.verdict === 'internal'),
+  ).length;
+  const shownNote =
+    groupCount > listed
+      ? `Showing the first ${n(listed)} of ${n(groupCount)} objects in this group${search.trim() ? '; Find searches only these' : ''}.`
+      : null;
 
   return (
     <Modal
@@ -289,7 +306,7 @@ function FilterPreviewModal({
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           <span style={{ flex: 1, textAlign: 'left', fontSize: 12, color: colors.TEXT_MUTED }}>
             {preview?.truncated
-              ? `A sample: the first ${n(preview.sampled)} objects. The rule acts on every object under the prefix.`
+              ? `The counts cover the first ${n(preview.sampled)} objects. The rule acts on every object under the prefix.`
               : 'The globs go into the rule as you leave a field; Review & apply saves the rule.'}
           </span>
           <Button type="primary" onClick={onClose}>
@@ -359,11 +376,11 @@ function FilterPreviewModal({
             {rows.length === 0 ? (
               <Empty
                 image={Empty.PRESENTED_IMAGE_SIMPLE}
-                description={preview ? 'No object in this group.' : 'Reading a sample of the bucket…'}
+                description={preview ? 'No object in this group.' : 'Counting the objects under the prefix…'}
                 style={{ marginTop: 48 }}
               />
             ) : (
-              rows.slice(0, 2000).map((k) => {
+              rows.map((k) => {
                 const [pre, rest] = splitAtPrefix(k.key, props.prefix);
                 return (
                   <div
@@ -394,6 +411,9 @@ function FilterPreviewModal({
               })
             )}
           </div>
+          {shownNote && (
+            <div style={{ marginTop: 6, fontSize: 12, color: colors.TEXT_MUTED }}>{shownNote}</div>
+          )}
         </div>
       </div>
     </Modal>
