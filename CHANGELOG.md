@@ -6,6 +6,7 @@
 
 - On **Storage → Jobs**, the title of a rule run now includes its number ("expire-old-qa-reports #93"). Before this release, the runs of one rule all had the same title. A bulk delete is now titled with the first folder that it removes ("ror/e2e_reports/2026-09-25/ +2"), not with its bucket, so three deletes in one bucket no longer look like one job.
 - A lifecycle run counted every object that it did not act on as "not due". This count also included the objects that the rule's include and exclude globs keep out, so a rule with `expire_after: 0s` reported thousands of objects as "not due". The meter and the run drawer now show two counts: "not due" for the objects that are not old enough yet, and "not matched" for the objects outside the globs. `GET /jobs` and `GET /jobs/runs` report them as `progress.not_due` and `progress.excluded`.
+- The **Pause**, **Resume** and **Delete** actions of a rule or a job sent a `204 No Content` response that had a body. Behind a proxy that speaks HTTP/2 to the browser, such a response is a protocol error, so the browser reported a failure although the action took effect. These responses now have no body.
 
 ## v2.0.17 — 2026-10-16
 

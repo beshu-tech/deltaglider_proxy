@@ -1949,6 +1949,41 @@ mod source_guards {
     /// refuses `std::env::var` outside `crate::config`; this guard also
     /// catches the `env_parse` helpers, which clippy cannot tell apart from
     /// a boot-time read.
+    /// A 204 carries no body. Behind an HTTP/2 proxy, a 204 with a JSON
+    /// body (and its `content-length`) is a protocol error, so the browser
+    /// fails the request although the server did the work.
+    #[test]
+    fn no_content_responses_carry_no_body() {
+        let src = rust_files("src");
+        let test_files = out_of_line_test_modules(&src);
+        let needle = ["NO_CONTENT", ", Json("].concat();
+        let mut offenders = Vec::new();
+        for file in src {
+            if test_files.contains(&file) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).unwrap();
+            let tests: std::collections::BTreeSet<usize> = test_module_lines(&text)
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect();
+            let code: String = text
+                .lines()
+                .enumerate()
+                .filter(|(i, l)| !tests.contains(&(i + 1)) && !l.trim_start().starts_with("//"))
+                .map(|(_, l)| l.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if code.contains(needle.as_str()) {
+                offenders.push(rel_path(&file));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a 204 response with a JSON body: {offenders:?} (return StatusCode::NO_CONTENT alone)"
+        );
+    }
+
     #[test]
     fn request_path_reads_no_env() {
         const REQUEST_PATH: &[&str] = &[

@@ -26,6 +26,7 @@ use crate::api::admin::extract::AdminQuery;
 use crate::coordination::CoordinationLease;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -909,7 +910,7 @@ pub async fn job_preview(
     state: State<Arc<AdminState>>,
     query: AdminQuery<ActionQuery>,
     headers: HeaderMap,
-) -> Result<(StatusCode, Json<serde_json::Value>), AdminError> {
+) -> Result<Response, AdminError> {
     job_action(Path((id, "preview".to_string())), state, query, headers).await
 }
 
@@ -1083,13 +1084,14 @@ pub async fn job_failures(
     Ok(Json(body))
 }
 
-/// POST /_/api/admin/jobs/:id/:action — uniform action dispatch.
+/// POST /_/api/admin/jobs/:id/:action — uniform action dispatch. A 204
+/// has no body (source guard `no_content_responses_carry_no_body`).
 pub async fn job_action(
     Path((id, action)): Path<(String, String)>,
     State(state): State<Arc<AdminState>>,
     AdminQuery(q): AdminQuery<ActionQuery>,
     headers: HeaderMap,
-) -> Result<(StatusCode, Json<serde_json::Value>), AdminError> {
+) -> Result<Response, AdminError> {
     let (sub, key) = parse_job_id(&id).ok_or(not_found())?;
     let action = JobAction::parse(&action)
         .ok_or(AdminError::not_found(format!("unknown action '{action}'")))?;
@@ -1107,16 +1109,16 @@ pub async fn job_action(
     match (sub, action) {
         (JobSubsystem::Replication, JobAction::Pause) => {
             super::replication::pause(state, name, &headers).await?;
-            Ok((StatusCode::NO_CONTENT, Json(serde_json::json!({}))))
+            Ok(StatusCode::NO_CONTENT.into_response())
         }
         (JobSubsystem::Replication, JobAction::Resume) => {
             super::replication::resume(state, name, &headers).await?;
-            Ok((StatusCode::NO_CONTENT, Json(serde_json::json!({}))))
+            Ok(StatusCode::NO_CONTENT.into_response())
         }
         (JobSubsystem::Replication, JobAction::RunNow) => {
             // Background run — returns 202 + the (running) status immediately.
             let (code, resp) = super::replication::run_now(state, name, &headers).await?;
-            Ok((code, Json(serde_json::to_value(resp).map_err(internal)?)))
+            Ok((code, Json(serde_json::to_value(resp).map_err(internal)?)).into_response())
         }
         (JobSubsystem::Replication, JobAction::Verify) => {
             // Kicks off a BACKGROUND audit; returns 202 + the (running) status.
@@ -1127,49 +1129,51 @@ pub async fn job_action(
                 super::replication::VerifyScope::All,
             )
             .await?;
-            Ok((code, Json(serde_json::to_value(resp).map_err(internal)?)))
+            Ok((code, Json(serde_json::to_value(resp).map_err(internal)?)).into_response())
         }
         (JobSubsystem::Lifecycle, JobAction::Pause) => {
             super::lifecycle::pause(state, name, &headers).await?;
-            Ok((StatusCode::NO_CONTENT, Json(serde_json::json!({}))))
+            Ok(StatusCode::NO_CONTENT.into_response())
         }
         (JobSubsystem::Lifecycle, JobAction::Resume) => {
             super::lifecycle::resume(state, name, &headers).await?;
-            Ok((StatusCode::NO_CONTENT, Json(serde_json::json!({}))))
+            Ok(StatusCode::NO_CONTENT.into_response())
         }
         (JobSubsystem::Lifecycle, JobAction::RunNow) => {
             // Background run — returns 202 + the run id immediately.
             let (code, resp) = super::lifecycle::run_now(state, name, &headers).await?;
-            Ok((code, Json(serde_json::to_value(resp).map_err(internal)?)))
+            Ok((code, Json(serde_json::to_value(resp).map_err(internal)?)).into_response())
         }
         (JobSubsystem::Lifecycle, JobAction::Preview) => {
             let resp = super::lifecycle::preview(state, name, q.fresh).await?;
             Ok((
                 StatusCode::OK,
                 Json(serde_json::to_value(resp).map_err(internal)?),
-            ))
+            )
+                .into_response())
         }
         (JobSubsystem::Maintenance, JobAction::Cancel) => {
             let job_id: i64 = name.parse().map_err(|_| not_found())?;
             let Json(resp) =
                 super::maintenance::cancel_job(State(state), Path(job_id), headers).await?;
-            Ok((StatusCode::OK, Json(resp)))
+            Ok((StatusCode::OK, Json(resp)).into_response())
         }
         (JobSubsystem::Maintenance, JobAction::Delete) => {
             let job_id: i64 = name.parse().map_err(|_| not_found())?;
             super::maintenance::delete_finished_job(&state, job_id, &headers).await?;
-            Ok((StatusCode::NO_CONTENT, Json(serde_json::json!({}))))
+            Ok(StatusCode::NO_CONTENT.into_response())
         }
         (JobSubsystem::Replication | JobSubsystem::Lifecycle, JobAction::Delete) => {
             delete_rule(&state, sub, &name, &headers).await?;
-            Ok((StatusCode::NO_CONTENT, Json(serde_json::json!({}))))
+            Ok(StatusCode::NO_CONTENT.into_response())
         }
         (JobSubsystem::Lifecycle, JobAction::Kill) => {
             let code = super::lifecycle::kill(state, name, &headers).await?;
             Ok((
                 code,
                 Json(serde_json::json!({"killing": true, "instance_local": true})),
-            ))
+            )
+                .into_response())
         }
         (JobSubsystem::Replication, JobAction::Kill) => {
             let db = state.jobs_db.as_ref().ok_or_else(AdminError::no_jobs_db)?;
@@ -1188,7 +1192,8 @@ pub async fn job_action(
             Ok((
                 StatusCode::ACCEPTED,
                 Json(serde_json::json!({"killing": true, "instance_local": true})),
-            ))
+            )
+                .into_response())
         }
         _ => unreachable!("supported_actions gate covers the matrix"),
     }
@@ -1462,8 +1467,6 @@ mod tests {
         }
     }
 
-    /// A replication rule's row carries the live counters of its newest run
-    /// (copied, in sync, failed, logical bytes, deleted) — not zeros.
     #[test]
     fn lifecycle_progress_splits_the_skipped_objects() {
         let mut run = crate::lifecycle::LifecycleRunRecord {
@@ -1496,6 +1499,8 @@ mod tests {
         assert_eq!((p.excluded, p.not_due, p.deleted), (None, None, Some(0)));
     }
 
+    /// A replication rule's row carries the live counters of its newest run
+    /// (copied, in sync, failed, logical bytes, deleted) — not zeros.
     #[test]
     fn replication_row_progress_reads_the_newest_run() {
         assert_eq!(replication_row_progress(None), JobProgress::default());
