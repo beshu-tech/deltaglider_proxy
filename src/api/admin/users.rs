@@ -18,7 +18,7 @@ use crate::iam::{
 };
 
 use super::{
-    audit_log, next_copy_name, trigger_config_sync, AdminError, AdminState, Bare, ErrorBody,
+    audit_log, next_copy_name, trigger_config_sync, AdminError, AdminState, ErrorBody, Scrubbed,
 };
 
 #[derive(Deserialize)]
@@ -208,7 +208,7 @@ pub async fn usage_scan_version() -> impl IntoResponse {
 /// Returns empty list if IAM DB is not initialized (legacy/open mode).
 pub async fn list_users(
     State(state): State<Arc<AdminState>>,
-) -> Result<Json<Vec<IamUser>>, AdminError<Bare>> {
+) -> Result<Json<Vec<IamUser>>, AdminError<Scrubbed>> {
     let db = match state.config_db.as_ref() {
         Some(db) => db,
         None => return Ok(Json(vec![])), // No IAM DB -> empty list (not an error)
@@ -225,7 +225,7 @@ pub async fn create_user(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     AdminJson(body): AdminJson<CreateUserRequest>,
-) -> Result<(StatusCode, Json<IamUser>), AdminError<Bare>> {
+) -> Result<(StatusCode, Json<IamUser>), AdminError<Scrubbed>> {
     let db = state
         .config_db
         .as_ref()
@@ -293,7 +293,7 @@ pub async fn clone_user(
     axum::extract::Path(user_id): axum::extract::Path<i64>,
     headers: HeaderMap,
     body: Option<Json<CloneUserRequest>>,
-) -> Result<(StatusCode, Json<IamUser>), AdminError<Bare>> {
+) -> Result<(StatusCode, Json<IamUser>), AdminError<Scrubbed>> {
     let db = state
         .config_db
         .as_ref()
@@ -363,7 +363,7 @@ pub async fn update_user(
     axum::extract::Path(user_id): axum::extract::Path<i64>,
     headers: HeaderMap,
     AdminJson(body): AdminJson<UpdateUserRequest>,
-) -> Result<Json<IamUser>, AdminError<Bare>> {
+) -> Result<Json<IamUser>, AdminError<Scrubbed>> {
     let db = state
         .config_db
         .as_ref()
@@ -439,10 +439,10 @@ pub async fn delete_user(
 enum DeleteRefusal {
     /// The delete would leave no credential: a `{"error"}` body names why.
     Lockout(iam::Lockout),
-    Other(AdminError<Bare>),
+    Other(AdminError<Scrubbed>),
 }
 
-impl<E: Into<AdminError<Bare>>> From<E> for DeleteRefusal {
+impl<E: Into<AdminError<Scrubbed>>> From<E> for DeleteRefusal {
     fn from(e: E) -> Self {
         DeleteRefusal::Other(e.into())
     }
@@ -456,7 +456,7 @@ async fn delete_user_inner(
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(AdminError::<Bare>::no_config_db)?;
+        .ok_or_else(AdminError::<Scrubbed>::no_config_db)?;
     let db = db.lock().await;
 
     // A14: under the DB lock, so a concurrent delete or config change sees
@@ -546,7 +546,7 @@ pub async fn rotate_user_keys(
     axum::extract::Path(user_id): axum::extract::Path<i64>,
     headers: HeaderMap,
     body: Option<Json<RotateKeysRequest>>,
-) -> Result<Json<IamUser>, AdminError<Bare>> {
+) -> Result<Json<IamUser>, AdminError<Scrubbed>> {
     let db = state
         .config_db
         .as_ref()
@@ -627,13 +627,13 @@ mod tests {
         let state = legacy_state();
         db.create_user("alice", "AKALICE", "alice-secret", true, &[])
             .unwrap();
-        rebuild_iam_index::<Bare>(&db, &state).unwrap();
+        rebuild_iam_index::<Scrubbed>(&db, &state).unwrap();
         assert!(matches!(&**state.load(), IamState::Iam(_)));
 
         for u in db.load_users().unwrap() {
             db.delete_user(u.id).unwrap();
         }
-        rebuild_iam_index::<Bare>(&db, &state).unwrap();
+        rebuild_iam_index::<Scrubbed>(&db, &state).unwrap();
         match &**state.load() {
             IamState::Legacy(auth) => assert_eq!(auth.access_key_id, "AKBOOT"),
             IamState::Disabled => panic!("empty IAM DB opened access"),
@@ -650,7 +650,7 @@ mod tests {
         let state = legacy_state();
         db.create_user("alice", "AKALICE", "alice-secret", true, &[])
             .unwrap();
-        rebuild_iam_index::<Bare>(&db, &state).unwrap();
+        rebuild_iam_index::<Scrubbed>(&db, &state).unwrap();
         assert!(
             matches!(&**state.load(), IamState::Iam(_)),
             "expected IAM mode"
@@ -664,7 +664,7 @@ mod tests {
         for u in db.load_users().unwrap() {
             db.delete_user(u.id).unwrap();
         }
-        rebuild_iam_index::<Bare>(&db, &state).unwrap();
+        rebuild_iam_index::<Scrubbed>(&db, &state).unwrap();
         assert!(
             !matches!(&**state.load(), IamState::Disabled),
             "deleting the last user opened access"
@@ -679,11 +679,11 @@ mod tests {
         let state: SharedIamState = Arc::new(ArcSwap::from_pointee(IamState::Disabled));
         db.create_user("alice", "AKALICE", "alice-secret", true, &[])
             .unwrap();
-        rebuild_iam_index::<Bare>(&db, &state).unwrap();
+        rebuild_iam_index::<Scrubbed>(&db, &state).unwrap();
         for u in db.load_users().unwrap() {
             db.delete_user(u.id).unwrap();
         }
-        rebuild_iam_index::<Bare>(&db, &state).unwrap();
+        rebuild_iam_index::<Scrubbed>(&db, &state).unwrap();
         assert!(matches!(&**state.load(), IamState::Disabled));
     }
 }

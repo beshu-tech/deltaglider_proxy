@@ -11,7 +11,7 @@ use axum::http::HeaderMap;
 use tokio::sync::RwLockWriteGuard;
 use tracing_subscriber::EnvFilter;
 
-use super::super::{AdminState, Bare};
+use super::super::{AdminState, Scrubbed};
 use crate::api::handlers::AppState;
 use crate::config::Config;
 
@@ -593,7 +593,7 @@ async fn commit_iam(
         // warning, never an `Err` (the caller would keep the old config over
         // the new DB). The `_declarative` variant skips the legacy-admin
         // auto-migration: YAML is authoritative.
-        if let Err(e) = super::super::users::rebuild_iam_index_declarative::<Bare>(
+        if let Err(e) = super::super::users::rebuild_iam_index_declarative::<Scrubbed>(
             db,
             &state.iam_state,
             outcome.clone(),

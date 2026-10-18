@@ -484,7 +484,27 @@ interface ConfigValidateResponse {
  * showing a confirm-apply dialog.
  */
 export async function validateConfigYaml(yaml: string): Promise<ConfigValidateResponse> {
-  return adminJson('/api/admin/config/validate', { method: 'POST', body: { yaml } });
+  const path = '/api/admin/config/validate';
+  const res = await adminFetch(path, 'POST', { yaml });
+  const refused = await refusalBody<ConfigValidateResponse>(res, (b) => b.ok === false);
+  if (refused) return refused;
+  if (!res.ok) await throwApiError(res, defaultContext(path));
+  return safeJson<ConfigValidateResponse>(res);
+}
+
+/**
+ * THE rule for a refused config write: the server answers a refusal with a
+ * non-2xx status (400, 422, ...) AND the write's own result body
+ * (`ok: false` or `applied: false`, with the error, the warnings and the
+ * diff). That body is the answer the caller shows, not an exception. Null
+ * when `res` is a success or another failure (a session error has no
+ * result body, so it still throws).
+ */
+export async function refusalBody<T>(res: Response, isRefusal: (body: T) => boolean): Promise<T | null> {
+  if (res.ok) return null;
+  if (!(res.headers.get('content-type') || '').includes('application/json')) return null;
+  const data = (await res.clone().json().catch(() => null)) as T | null;
+  return data !== null && typeof data === 'object' && isRefusal(data) ? data : null;
 }
 
 export interface ConfigApplyResponse {
@@ -513,6 +533,8 @@ export async function applyConfigYaml(yaml: string): Promise<ConfigApplyResponse
     const data = (await res.clone().json().catch(() => null)) as ConfigApplyResponse | null;
     if (data?.applied && data.persist_error) return data;
   }
+  const refused = await refusalBody<ConfigApplyResponse>(res, (b) => b.applied === false);
+  if (refused) return refused;
   if (!res.ok) await throwApiError(res, defaultContext(path));
   return safeJson<ConfigApplyResponse>(res);
 }
@@ -554,6 +576,9 @@ export interface IamImportSummary {
   providers_updated: number;
   providers_deleted: number;
   mapping_rules_replaced: number;
+  /** OAuth login bindings that the import adds or changes (an unchanged
+   *  binding does not count). */
+  external_identities_applied: number;
   no_changes: boolean;
 }
 
@@ -700,6 +725,8 @@ export async function putSection<T = unknown>(
     const data = (await res.clone().json().catch(() => null)) as SectionApplyResponse | null;
     if (data?.ok && data.persist_error) return { ...data, version: res.headers.get('etag') };
   }
+  const refused = await refusalBody<SectionApplyResponse>(res, (b) => b.ok === false);
+  if (refused) return refused;
   if (!res.ok) await throwApiError(res, defaultContext(path));
   const resp = await safeJson<SectionApplyResponse>(res);
   return { ...resp, version: res.headers.get('etag') };
@@ -715,12 +742,15 @@ export async function validateSection<T = unknown>(
   body: T,
   confirm?: ConfirmHeaders
 ): Promise<SectionApplyResponse> {
+  const path = `/api/admin/config/section/${section}/validate`;
   const headers = confirmHeaderMap(confirm);
-  return adminJson(`/api/admin/config/section/${section}/validate`, {
-    method: 'POST',
-    body,
-    ...(Object.keys(headers).length > 0 ? { headers } : {}),
-  });
+  const res = await adminFetch(path, 'POST', body, undefined, Object.keys(headers).length > 0 ? headers : undefined);
+  // A refusal (400/422 with `ok: false`) goes to the ApplyDialog, which
+  // shows its error, warnings and diff.
+  const refused = await refusalBody<SectionApplyResponse>(res, (b) => b.ok === false);
+  if (refused) return refused;
+  if (!res.ok) await throwApiError(res, defaultContext(path));
+  return safeJson<SectionApplyResponse>(res);
 }
 
 /**
@@ -793,8 +823,12 @@ export async function changeAdminPassword(
   currentPassword: string,
   newPassword: string
 ): Promise<PasswordChangeResponse> {
-  return adminJson('/api/admin/password', {
-    method: 'PUT',
-    body: { current_password: currentPassword, new_password: newPassword },
-  });
+  // The server refuses with 400/403/409/500 and `{ok: false, error}`: the
+  // caller shows that error, so it is a result, not an exception.
+  const path = '/api/admin/password';
+  const res = await adminFetch(path, 'PUT', { current_password: currentPassword, new_password: newPassword });
+  const refused = await refusalBody<PasswordChangeResponse>(res, (b) => b.ok === false);
+  if (refused) return refused;
+  if (!res.ok) await throwApiError(res, defaultContext(path));
+  return safeJson<PasswordChangeResponse>(res);
 }

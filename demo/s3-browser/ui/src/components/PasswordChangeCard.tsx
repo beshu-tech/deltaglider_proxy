@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Button, Input, Space, Alert, Typography } from 'antd';
 import { LockOutlined, WarningOutlined } from '@ant-design/icons';
 import { changeAdminPassword } from '../adminApi';
+import { normalizeUiError } from '../errorHandling';
 import { useCardStyles } from './shared-styles';
 import SectionHeader from './SectionHeader';
 import { CodeTokenText } from './CodeTokenText';
@@ -21,13 +22,18 @@ export default function PasswordChangeCard() {
   const handleSubmit = async () => {
     setChanging(true);
     setResult(null);
-    const res = await changeAdminPassword(currentPassword, newPassword);
-    setResult(res);
-    if (res.ok) {
-      setCurrentPassword('');
-      setNewPassword('');
+    try {
+      const res = await changeAdminPassword(currentPassword, newPassword);
+      setResult(res);
+      if (res.ok) {
+        setCurrentPassword('');
+        setNewPassword('');
+      }
+    } catch (e) {
+      setResult({ ok: false, error: normalizeUiError(e, 'The password change failed') });
+    } finally {
+      setChanging(false);
     }
-    setChanging(false);
   };
 
   return (

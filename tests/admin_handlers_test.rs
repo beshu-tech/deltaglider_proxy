@@ -847,8 +847,16 @@ async fn groups_crud_members_clone_and_errors() {
     )
     .await;
     assert_eq!(code, StatusCode::BAD_REQUEST, "invalid action: {v}");
+    // The refusal carries its reason, so the UI can show it.
+    assert!(
+        v["error"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("invalid permissions:")),
+        "the 400 names the bad permission: {v}"
+    );
     let (code, v) = json_of(create(json!({ "name": "" })).await.unwrap()).await;
     assert_eq!(code, StatusCode::BAD_REQUEST, "an empty group name: {v}");
+    assert_eq!(v["error"], "group name cannot be blank", "{v}");
 
     // Update.
     let put = |id: i64, body: Value| {
@@ -1106,15 +1114,21 @@ async fn users_rotate_clone_delete_and_empty_name() {
     assert_eq!(code, StatusCode::NOT_FOUND, "update of a missing user");
 
     // Reserved and empty names.
-    for name in ["$anonymous", ""] {
-        let code = admin
-            .post(format!("{ep}/_/api/admin/users"))
-            .json(&json!({ "name": name, "permissions": [] }))
-            .send()
-            .await
-            .unwrap()
-            .status();
+    for (name, reason) in [
+        ("$anonymous", "user name cannot start with '$'"),
+        ("", "user name cannot be blank"),
+    ] {
+        let (code, v) = json_of(
+            admin
+                .post(format!("{ep}/_/api/admin/users"))
+                .json(&json!({ "name": name, "permissions": [] }))
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
         assert_eq!(code, StatusCode::BAD_REQUEST, "user name {name:?}");
+        assert_eq!(v["error"], reason, "the 400 carries its reason: {v}");
     }
     let policies: Value = admin
         .get(format!("{ep}/_/api/admin/policies"))
@@ -1965,6 +1979,7 @@ async fn admin_error_bodies_keep_their_shape() {
     let admin = admin_http_client(&ep).await;
     let api = |p: &str| format!("{ep}/_/api/admin{p}");
     let text = |s: &str| ErrorBody::Text(s.to_string());
+    let err = |s: &str| ErrorBody::Json(json!({ "error": s }));
 
     // Set-up for the conflict cases.
     for _ in 0..2 {
@@ -1977,20 +1992,21 @@ async fn admin_error_bodies_keep_their_shape() {
     }
 
     let cases: Vec<(&str, reqwest::RequestBuilder, StatusCode, ErrorBody)> = vec![
-        // groups / users: bare status.
+        // groups / users / external auth: a client error carries its
+        // reason as JSON (an empty body left the UI with a generic hint).
         (
             "group duplicate",
             admin
                 .post(api("/groups"))
                 .json(&json!({ "name": "shape-dup" })),
             StatusCode::CONFLICT,
-            ErrorBody::Empty,
+            err("the name is already in use (UNIQUE constraint failed: groups.name)"),
         ),
         (
             "group blank name",
             admin.post(api("/groups")).json(&json!({ "name": "" })),
             StatusCode::BAD_REQUEST,
-            ErrorBody::Empty,
+            err("group name cannot be blank"),
         ),
         (
             "user missing",
@@ -1998,7 +2014,7 @@ async fn admin_error_bodies_keep_their_shape() {
                 .put(api("/users/999999"))
                 .json(&json!({ "name": "x" })),
             StatusCode::NOT_FOUND,
-            ErrorBody::Empty,
+            err("not found"),
         ),
         (
             "user reserved name",
@@ -2006,20 +2022,19 @@ async fn admin_error_bodies_keep_their_shape() {
                 .post(api("/users"))
                 .json(&json!({ "name": "$x", "permissions": [] })),
             StatusCode::BAD_REQUEST,
-            ErrorBody::Empty,
+            err("user name cannot start with '$'"),
         ),
-        // external auth: bare status, 422 JSON for a bad provider.
         (
             "mapping missing",
             admin.delete(api("/ext-auth/mappings/999999")),
             StatusCode::NOT_FOUND,
-            ErrorBody::Empty,
+            err("Not found: Mapping rule ID 999999"),
         ),
         (
             "provider test missing",
             admin.post(api("/ext-auth/providers/999999/test")),
             StatusCode::NOT_FOUND,
-            ErrorBody::Empty,
+            err("Not found: Auth provider ID 999999"),
         ),
         // event outbox: text.
         (
@@ -2179,7 +2194,13 @@ async fn session_gate_error_bodies_keep_their_shape() {
             .unwrap(),
     )
     .await;
-    assert_eq!(got, (StatusCode::NOT_FOUND, ErrorBody::Empty));
+    assert_eq!(
+        got,
+        (
+            StatusCode::NOT_FOUND,
+            ErrorBody::Json(json!({ "error": "no S3 credentials in this session" }))
+        )
+    );
 }
 
 /// B042: "create bucket here" on a bucket that already exists on another

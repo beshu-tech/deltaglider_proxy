@@ -23,7 +23,7 @@ export async function exportBackup(): Promise<{ blob: Blob; filename: string }> 
   return { blob, filename };
 }
 
-interface ImportBackupResult {
+export interface ImportBackupResult {
   users_created: number;
   users_skipped: number;
   users_deleted?: number;
@@ -33,6 +33,11 @@ interface ImportBackupResult {
   memberships_created: number;
   external_identities_created?: number;
   external_identities_skipped?: number;
+  /** Users imported under a new name because another user had theirs: `"old -> new"`. */
+  users_renamed?: string[];
+  /** Policy rules kept with a condition the proxy cannot evaluate (contained: an
+   *  Allow grants nothing, a Deny applies without its condition). Absent when none. */
+  contained_rules?: string[];
 }
 
 export type ImportBackupMode = 'full' | 'preserve-bootstrap' | 'iam-only' | 'config-only';

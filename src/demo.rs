@@ -109,10 +109,6 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             "/_/api/admin/ext-auth/mappings/:id",
             put(admin::external_auth::update_mapping).delete(admin::external_auth::delete_mapping),
         )
-        .route(
-            "/_/api/admin/ext-auth/mappings/preview",
-            post(admin::external_auth::preview_mapping),
-        )
         // External identities — read-only listing (no mutation), but
         // included here to keep all ext-auth routes colocated. The
         // gate is a no-op for GETs.
@@ -426,6 +422,13 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             get(admin::jobs_preview_status).post(admin::jobs_preview),
         )
         .route("/_/api/admin/jobs/:id/:action", post(admin::jobs_action))
+        // The mapping preview is a POST but reads only (which groups would an
+        // email get?), so it stays outside `iam_gated`: in declarative mode it
+        // answers too.
+        .route(
+            "/_/api/admin/ext-auth/mappings/preview",
+            post(admin::external_auth::preview_mapping),
+        )
         // Merge the IAM-gated subrouter in; it already carries its own
         // `require_not_declarative` layer.
         .merge(iam_gated)

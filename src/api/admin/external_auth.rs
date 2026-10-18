@@ -25,7 +25,7 @@ use crate::rate_limiter;
 use crate::session::AuthMethod;
 
 use super::{
-    audit_log, trigger_config_sync, users::rebuild_iam_index, AdminError, AdminState, Bare,
+    audit_log, trigger_config_sync, users::rebuild_iam_index, AdminError, AdminState, Scrubbed,
 };
 
 /// Monotonic external-auth (OAuth/OIDC provider) version counter.
@@ -584,7 +584,7 @@ pub async fn oauth_callback(
     // This handler returns a redirect Response (not a Result), so
     // we can't `?`-propagate here — but a swallowed rebuild error would leave
     // the just-provisioned user invisible to auth, so log it loudly.
-    if let Err(e) = rebuild_iam_index::<Bare>(&db, &state.iam_state) {
+    if let Err(e) = rebuild_iam_index::<Scrubbed>(&db, &state.iam_state) {
         tracing::error!(
             "OAuth callback: IAM index rebuild failed after provisioning '{}' (status {})",
             user.name,
@@ -740,7 +740,7 @@ fn check_provider(
 /// GET /api/admin/ext-auth/providers — list all providers (secrets masked).
 pub async fn list_providers(
     State(state): State<Arc<AdminState>>,
-) -> Result<impl IntoResponse, AdminError<Bare>> {
+) -> Result<impl IntoResponse, AdminError<Scrubbed>> {
     let mut providers =
         super::with_config_db(&state, "load auth providers", |db| db.load_auth_providers()).await?;
     providers.iter_mut().for_each(mask_client_secret);
@@ -761,7 +761,7 @@ pub async fn create_provider(
         return invalid_provider(e);
     }
     let mut provider =
-        match super::with_config_db::<_, Bare, _>(&state, "create auth provider", |db| {
+        match super::with_config_db::<_, Scrubbed, _>(&state, "create auth provider", |db| {
             db.create_auth_provider(&body)
         })
         .await
@@ -788,14 +788,15 @@ pub async fn update_provider(
     AdminJson(body): AdminJson<UpdateAuthProviderRequest>,
 ) -> Response {
     // Validate the provider as it will be after the update.
-    let current = match super::with_config_db::<_, Bare, _>(&state, "load auth provider", |db| {
-        db.get_auth_provider(id)
-    })
-    .await
-    {
-        Ok(p) => p,
-        Err(status) => return status.into_response(),
-    };
+    let current =
+        match super::with_config_db::<_, Scrubbed, _>(&state, "load auth provider", |db| {
+            db.get_auth_provider(id)
+        })
+        .await
+        {
+            Ok(p) => p,
+            Err(status) => return status.into_response(),
+        };
     if let Err(e) = check_provider(
         body.provider_type
             .as_deref()
@@ -806,7 +807,7 @@ pub async fn update_provider(
         return invalid_provider(e);
     }
     let mut updated =
-        match super::with_config_db::<_, Bare, _>(&state, "update auth provider", |db| {
+        match super::with_config_db::<_, Scrubbed, _>(&state, "update auth provider", |db| {
             db.update_auth_provider(id, &body)
         })
         .await
@@ -830,7 +831,7 @@ pub async fn delete_provider(
     State(state): State<Arc<AdminState>>,
     Path(id): Path<i64>,
     req_headers: HeaderMap,
-) -> Result<impl IntoResponse, AdminError<Bare>> {
+) -> Result<impl IntoResponse, AdminError<Scrubbed>> {
     let target = super::with_config_db(&state, "delete auth provider", |db| {
         let name = db.get_auth_provider(id).ok().map(|p| p.name);
         db.delete_auth_provider(id)
@@ -926,7 +927,7 @@ pub(crate) fn resolve_provider_test(
 }
 
 /// The optional JSON body of a test route. Empty = test the saved provider.
-fn test_form(body: &[u8]) -> Result<TestProviderRequest, AdminError<Bare>> {
+fn test_form(body: &[u8]) -> Result<TestProviderRequest, AdminError<Scrubbed>> {
     if body.iter().all(u8::is_ascii_whitespace) {
         return Ok(TestProviderRequest::default());
     }
@@ -971,7 +972,7 @@ pub async fn test_provider(
     State(state): State<Arc<AdminState>>,
     Path(id): Path<i64>,
     body: axum::body::Bytes,
-) -> Result<impl IntoResponse, AdminError<Bare>> {
+) -> Result<impl IntoResponse, AdminError<Scrubbed>> {
     let form = test_form(&body)?;
     let db = state
         .config_db
@@ -989,7 +990,7 @@ pub async fn test_provider(
 /// saved yet (the create form). The body is the form.
 pub async fn test_unsaved_provider(
     body: axum::body::Bytes,
-) -> Result<impl IntoResponse, AdminError<Bare>> {
+) -> Result<impl IntoResponse, AdminError<Scrubbed>> {
     let form = test_form(&body)?;
     Ok(Json(run_provider_test(None, form).await))
 }
@@ -999,7 +1000,7 @@ pub async fn test_unsaved_provider(
 /// GET /api/admin/ext-auth/mappings — list all mapping rules.
 pub async fn list_mappings(
     State(state): State<Arc<AdminState>>,
-) -> Result<impl IntoResponse, AdminError<Bare>> {
+) -> Result<impl IntoResponse, AdminError<Scrubbed>> {
     let rules = super::with_config_db(&state, "load mapping rules", |db| {
         db.load_group_mapping_rules()
     })
@@ -1012,7 +1013,7 @@ pub async fn create_mapping(
     State(state): State<Arc<AdminState>>,
     req_headers: HeaderMap,
     AdminJson(body): AdminJson<CreateMappingRuleRequest>,
-) -> Result<impl IntoResponse, AdminError<Bare>> {
+) -> Result<impl IntoResponse, AdminError<Scrubbed>> {
     let db = state
         .config_db
         .as_ref()
@@ -1044,7 +1045,7 @@ pub async fn update_mapping(
     Path(id): Path<i64>,
     req_headers: HeaderMap,
     AdminJson(body): AdminJson<UpdateMappingRuleRequest>,
-) -> Result<impl IntoResponse, AdminError<Bare>> {
+) -> Result<impl IntoResponse, AdminError<Scrubbed>> {
     // Validate match_type / match_value when either is being changed.
     // On a partial update we may have a type without a value (or vice
     // versa); only run the full validator when both are present, but
@@ -1083,7 +1084,7 @@ pub async fn delete_mapping(
     State(state): State<Arc<AdminState>>,
     Path(id): Path<i64>,
     req_headers: HeaderMap,
-) -> Result<impl IntoResponse, AdminError<Bare>> {
+) -> Result<impl IntoResponse, AdminError<Scrubbed>> {
     let db = state
         .config_db
         .as_ref()
@@ -1123,7 +1124,7 @@ pub struct PreviewResponse {
 pub async fn preview_mapping(
     State(state): State<Arc<AdminState>>,
     AdminJson(body): AdminJson<PreviewRequest>,
-) -> Result<impl IntoResponse, AdminError<Bare>> {
+) -> Result<impl IntoResponse, AdminError<Scrubbed>> {
     let db = state
         .config_db
         .as_ref()
@@ -1154,7 +1155,7 @@ pub async fn preview_mapping(
 /// GET /api/admin/ext-auth/identities — list all external identities.
 pub async fn list_identities(
     State(state): State<Arc<AdminState>>,
-) -> Result<impl IntoResponse, AdminError<Bare>> {
+) -> Result<impl IntoResponse, AdminError<Scrubbed>> {
     let identities = super::with_config_db(&state, "load external identities", |db| {
         db.list_external_identities()
     })
@@ -1171,7 +1172,7 @@ pub struct SyncResult {
 
 pub async fn sync_memberships(
     State(state): State<Arc<AdminState>>,
-) -> Result<impl IntoResponse, AdminError<Bare>> {
+) -> Result<impl IntoResponse, AdminError<Scrubbed>> {
     let db = state
         .config_db
         .as_ref()
@@ -1315,7 +1316,9 @@ fn build_callback_uri_with(headers: &HeaderMap, trust_proxy: bool) -> String {
 /// `GET /_/api/admin/ext-auth/version` pollers). Callers propagate the error so
 /// a provider mutation whose rebuild failed surfaces a 500 instead of a lying
 /// 2xx — mirroring how `rebuild_iam_index` errors propagate.
-pub(super) async fn rebuild_external_auth(state: &Arc<AdminState>) -> Result<(), AdminError<Bare>> {
+pub(super) async fn rebuild_external_auth(
+    state: &Arc<AdminState>,
+) -> Result<(), AdminError<Scrubbed>> {
     let Some(config_db) = &state.config_db else {
         return Ok(());
     };
@@ -1336,7 +1339,7 @@ pub(super) async fn rebuild_external_auth(state: &Arc<AdminState>) -> Result<(),
 pub(super) fn publish_provider_set(
     state: &AdminState,
     db: &crate::config_db::ConfigDb,
-) -> Result<Option<ProviderDiscovery>, AdminError<Bare>> {
+) -> Result<Option<ProviderDiscovery>, AdminError<Scrubbed>> {
     let Some(ext_auth) = &state.external_auth else {
         return Ok(None);
     };

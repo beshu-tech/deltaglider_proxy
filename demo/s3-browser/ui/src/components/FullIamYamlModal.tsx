@@ -66,7 +66,8 @@ function totalChanges(s: IamImportSummary): number {
     s.groups_deleted +
     s.providers_created +
     s.providers_updated +
-    s.providers_deleted
+    s.providers_deleted +
+    s.external_identities_applied
   );
 }
 
@@ -91,6 +92,14 @@ function SummaryTags({ s }: { s: IamImportSummary }) {
         <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
           <Text strong style={{ minWidth: 78, display: 'inline-block' }}>Rules</Text>
           <Tag color="purple">{s.mapping_rules_replaced} mapping rule{s.mapping_rules_replaced === 1 ? '' : 's'} replaced</Tag>
+        </div>
+      )}
+      {s.external_identities_applied > 0 && (
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          <Text strong style={{ minWidth: 78, display: 'inline-block' }}>Logins</Text>
+          <Tag color="cyan">
+            {s.external_identities_applied} OAuth login binding{s.external_identities_applied === 1 ? '' : 's'} added or changed
+          </Tag>
         </div>
       )}
     </Space>

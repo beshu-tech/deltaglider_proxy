@@ -8,8 +8,14 @@
 //!
 //! - [`Text`] (default): `text/plain` body with the message — the shape of
 //!   the former `(StatusCode, String)` handlers.
-//! - [`Bare`]: status only, empty body — the former `StatusCode` handlers.
-//!   The message goes to the log, not to the client.
+//! - [`Scrubbed`]: a client error (4xx) is `{"error": <message>}`, so the
+//!   UI shows why the request was refused; a server error (5xx) is the
+//!   status only, and the message goes to the log, not to the client.
+//!   (It replaces the former `Bare`, which sent an empty body also for a
+//!   4xx: the validation text never reached the UI.)
+//!
+//! No shape sends an empty body for a 4xx
+//! (`no_shape_sends_an_empty_client_error`).
 //! - [`JsonError`]: `{"error": <message>}` — the former
 //!   `(StatusCode, Json(json!({"error": ..})))` handlers.
 //! - [`CodedJson`]: `{"error": <code>, "message": <message>}` — a machine
@@ -36,8 +42,8 @@ pub trait ErrorBody {
 
 /// `text/plain` body with the message.
 pub struct Text;
-/// Status only, empty body.
-pub struct Bare;
+/// 4xx: `{"error": <message>}`; 5xx: status only, message logged.
+pub struct Scrubbed;
 /// `{"error": <message>}`.
 pub struct JsonError;
 /// `{"error": <code>, "message": <message>}`.
@@ -49,9 +55,13 @@ impl ErrorBody for Text {
     }
 }
 
-impl ErrorBody for Bare {
-    fn render(status: StatusCode, _code: &'static str, _message: String) -> Response {
-        status.into_response()
+impl ErrorBody for Scrubbed {
+    fn render(status: StatusCode, code: &'static str, message: String) -> Response {
+        if status.is_server_error() {
+            tracing::warn!("admin API {status}: {message}");
+            return status.into_response();
+        }
+        JsonError::render(status, code, message)
     }
 }
 
@@ -182,7 +192,27 @@ impl<B: ErrorBody> IntoResponse for AdminError<B> {
 
 impl<B: ErrorBody> From<ConfigDbError> for AdminError<B> {
     fn from(e: ConfigDbError) -> Self {
-        Self::status(db_error_status(&e), e.to_string())
+        let status = db_error_status(&e);
+        Self::status(status, db_error_message(status, &e))
+    }
+}
+
+/// Pure: the message of a config-DB error. A SQLite failure that is the
+/// caller's (404, 409) is said in words, because the client shows it; the
+/// rest keeps the error's own text.
+fn db_error_message(status: StatusCode, e: &ConfigDbError) -> String {
+    match (status, e) {
+        (StatusCode::CONFLICT, ConfigDbError::Sqlite(rusqlite::Error::SqliteFailure(_, msg))) => {
+            match msg {
+                Some(m) => format!("the name is already in use ({m})"),
+                None => "the name is already in use".to_string(),
+            }
+        }
+        (StatusCode::NOT_FOUND, ConfigDbError::Sqlite(rusqlite::Error::SqliteFailure(..))) => {
+            "a user or group that the request names does not exist".to_string()
+        }
+        (StatusCode::NOT_FOUND, ConfigDbError::Sqlite(_)) => "not found".to_string(),
+        _ => e.to_string(),
     }
 }
 
@@ -248,10 +278,15 @@ mod tests {
                 parts(AdminError::<Text>::status(status, msg.clone()).into_response()).await,
                 parts((status, msg.clone()).into_response()).await,
             );
-            assert_eq!(
-                parts(AdminError::<Bare>::status(status, msg.clone()).into_response()).await,
-                parts(status.into_response()).await,
-            );
+            if status.is_client_error() {
+                assert_eq!(
+                    parts(AdminError::<Scrubbed>::status(status, msg.clone()).into_response())
+                        .await,
+                    parts(AdminError::<JsonError>::status(status, msg.clone()).into_response())
+                        .await,
+                    "a Scrubbed client error carries its message as JSON"
+                );
+            }
             assert_eq!(
                 parts(AdminError::<JsonError>::status(status, msg.clone()).into_response()).await,
                 parts(
@@ -264,6 +299,60 @@ mod tests {
                 .await,
             );
         }
+    }
+
+    /// A Scrubbed server error keeps its detail off the wire.
+    #[tokio::test]
+    async fn scrubbed_server_errors_send_no_detail() {
+        for status in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let r = AdminError::<Scrubbed>::status(status, "sqlite: disk I/O at /var/x")
+                .into_response();
+            assert_eq!(parts(r).await, parts(status.into_response()).await);
+        }
+    }
+
+    /// Guard: every body shape carries the message of a client error
+    /// (4xx), so the UI can show why the request was refused. A shape that
+    /// sends an empty 4xx body fails here.
+    #[tokio::test]
+    async fn no_shape_sends_an_empty_client_error() {
+        async fn body_of<B: ErrorBody>(status: StatusCode) -> String {
+            let r = AdminError::<B>::status(status, "invalid permissions: x").into_response();
+            String::from_utf8(parts(r).await.2).unwrap()
+        }
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::CONFLICT,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
+            for body in [
+                body_of::<Text>(status).await,
+                body_of::<Scrubbed>(status).await,
+                body_of::<JsonError>(status).await,
+                body_of::<CodedJson>(status).await,
+            ] {
+                assert!(
+                    body.contains("invalid permissions: x"),
+                    "{status}: body without the message: {body:?}"
+                );
+            }
+        }
+        // A new shape must join the list above.
+        let shapes = crate::source_scan::prod_sources("src")
+            .into_iter()
+            .map(|(_, text)| {
+                text.lines()
+                    .filter(|l| l.starts_with("impl ErrorBody for "))
+                    .count()
+            })
+            .sum::<usize>();
+        assert_eq!(shapes, 4, "add the new ErrorBody shape to this guard");
     }
 
     /// `CodedJson` answers what the hand-built `{error, message}` bodies
@@ -340,6 +429,26 @@ mod tests {
         let e: AdminError = ConfigDbError::NotFound("provider 9".into()).into();
         assert_eq!(e.status_code(), StatusCode::NOT_FOUND);
         assert_eq!(e.message(), "Not found: provider 9");
+        let e: AdminError = ConfigDbError::Sqlite(rusqlite::Error::QueryReturnedNoRows).into();
+        assert_eq!(
+            (e.status_code(), e.message()),
+            (StatusCode::NOT_FOUND, "not found")
+        );
+        let unique = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::ConstraintViolation,
+                extended_code: rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE,
+            },
+            Some("UNIQUE constraint failed: groups.name".into()),
+        );
+        let e: AdminError = ConfigDbError::Sqlite(unique).into();
+        assert_eq!(
+            (e.status_code(), e.message()),
+            (
+                StatusCode::CONFLICT,
+                "the name is already in use (UNIQUE constraint failed: groups.name)"
+            )
+        );
     }
 
     #[test]

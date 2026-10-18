@@ -425,3 +425,31 @@ async fn provider_test_connection_works_in_declarative_mode() {
     let result: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(result["success"], false, "{result}");
 }
+
+/// The mapping preview is a POST that reads only, so it answers in
+/// declarative mode; the membership sync writes the DB, so it stays 403.
+#[tokio::test]
+async fn mapping_preview_works_in_declarative_mode_and_sync_does_not() {
+    let server = TestServer::builder()
+        .auth("IAMMK10", "IAMMS10")
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    set_iam_mode(&admin, &ep, "declarative").await;
+    let resp = admin
+        .post(format!("{ep}/_/api/admin/ext-auth/mappings/preview"))
+        .json(&json!({ "email": "dana@example.com" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let result: serde_json::Value = resp.json().await.unwrap();
+    assert!(result["group_names"].is_array(), "{result}");
+    let resp = admin
+        .post(format!("{ep}/_/api/admin/ext-auth/sync-memberships"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}

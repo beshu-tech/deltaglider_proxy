@@ -25,6 +25,6 @@ interface SyncResult {
 export async function syncMemberships(): Promise<SyncResult> {
   return adminJson('/api/admin/ext-auth/sync-memberships', {
     method: 'POST',
-    context: 'Config sync now',
+    context: 'Sync group memberships',
   });
 }

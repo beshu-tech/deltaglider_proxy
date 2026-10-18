@@ -32,6 +32,23 @@
 - A browser form upload (`POST` with `multipart/form-data`) stored its `x-amz-meta-*` field names and its `Content-Type` field without a check. A name with a space, or a `Content-Type` with a line break, was accepted with 204, and then every GET and HEAD of the object failed with 500, because the proxy could not send these values back as response headers. Such a form upload is now refused with `400 InvalidArgument` before anything is stored, as a PutObject with the same values is.
 - A `416 Range Not Satisfiable` that the proxy decides from the object's metadata now has `Content-Range: bytes */<length>`, so a client can retry with a range that fits. This covers a HEAD, a conditional GET and a GET with `If-Range`. A plain ranged GET lets the storage backend refuse the range, and that answer does not give the length, so its 416 still has no `Content-Range`.
 
+### Fixed — The admin UI shows why the server refused a change
+
+- The user, group, mapping-rule and job-banner endpoints answered a refused request (400, 404, 409) with an empty body, and the reason went only to the server log. The UI therefore showed a generic "Bad request" message. These refusals now carry their reason as `{"error": "<reason>"}` (for example "invalid permissions: …", "user name cannot start with '$'" or the regex error of a mapping rule), and the UI shows it. A name that another user or group already has now reads "the name is already in use (…)", not the raw SQLite text. A server error (5xx) still sends no detail, and the detail stays in the log. A unit test makes sure that no error shape sends an empty body for a 4xx.
+- The server refuses a section or YAML validate or apply with a 400 or 422 status and a result body that holds the error, the warnings and the diff. The UI treated every non-2xx status as an exception, so it showed a short error message and dropped the warnings and the diff. The UI now reads that body and shows the refusal in the apply dialog, the YAML import dialog and the bucket encryption dialog.
+- The server refuses a password change with a status such as 403 or 409 and a reason. The UI did not catch this response, so the spinner turned forever and the reason did not show. The UI now stops the spinner and shows the reason.
+- When the database recovery key is wrong, the connect page now shows the server's sentence without the "failed (401)" prefix.
+- A legacy JSON backup restore that the server refused showed only the status text, for example "Conflict". It now shows the reason of the refusal.
+- After a backup restore, the dialog now names the users that the restore imported under a new name (because another user had their name) and the policy rules with a condition that the proxy cannot evaluate.
+
+### Fixed — The full-IAM import preview of an unchanged export
+
+The import preview counted every OAuth login binding in the YAML as a change, also the bindings that the database already held, so the preview of the instance's own export always said "will change" with no details. The preview now counts only the bindings that the import adds or changes, and it shows that count.
+
+### Fixed — The mapping preview works in declarative IAM mode
+
+The mapping-rule preview only reads the rules, but the server refused it with 403 in declarative mode, because it is a POST request. The preview now answers in declarative mode. **Sync Groups** writes group memberships to the database, so it stays refused in declarative mode, and the UI no longer shows the button in that mode.
+
 ## v2.0.17 — 2026-10-16
 
 ### Changed — Rules and runs have their own pages

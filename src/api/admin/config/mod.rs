@@ -115,7 +115,7 @@ use std::sync::Arc;
 
 use crate::iam::IamState;
 
-use super::{AdminError, AdminState, Bare, JsonError, Text};
+use super::{AdminError, AdminState, JsonError, Scrubbed, Text};
 
 #[derive(Deserialize)]
 pub struct TestS3Request {
@@ -961,7 +961,7 @@ pub struct SyncNowResponse {
 /// why), 502 when the bucket cannot be read.
 pub async fn sync_now(
     State(state): State<Arc<AdminState>>,
-) -> Result<(axum::http::StatusCode, Json<SyncNowResponse>), AdminError<Bare>> {
+) -> Result<(axum::http::StatusCode, Json<SyncNowResponse>), AdminError<Scrubbed>> {
     let sync = state.config_sync.as_ref().ok_or_else(no_sync_bucket)?;
 
     // Same helper as the periodic poll: download, three-way merge, rebuild.
@@ -1026,7 +1026,7 @@ fn sync_now_reply(
 }
 
 /// The bare 404 of the sync endpoints on an instance without a sync bucket.
-fn no_sync_bucket() -> AdminError<Bare> {
+fn no_sync_bucket() -> AdminError<Scrubbed> {
     AdminError::not_found("no config sync bucket configured")
 }
 
@@ -1043,7 +1043,7 @@ pub struct SyncStatusResponse {
 /// base. 404 when no sync bucket is configured.
 pub async fn sync_status(
     State(state): State<Arc<AdminState>>,
-) -> Result<Json<SyncStatusResponse>, AdminError<Bare>> {
+) -> Result<Json<SyncStatusResponse>, AdminError<Scrubbed>> {
     let sync = state.config_sync.as_ref().ok_or_else(no_sync_bucket)?;
     let sync_generation = match &state.config_db {
         Some(db) => db.lock().await.sync_generation().ok(),

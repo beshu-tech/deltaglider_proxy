@@ -442,9 +442,13 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
       {/* Login Activity */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
         <SectionHeader icon={<SafetyOutlined />} title={`Login Activity (${identities.length})`} />
-        <Button size="small" icon={<SyncOutlined spin={syncing} />} onClick={handleSync} loading={syncing}>
-          Sync Groups
-        </Button>
+        {/* Sync writes group memberships to the DB, which declarative mode
+            refuses (403); the YAML owns IAM there. */}
+        {!readOnly && (
+          <Button size="small" icon={<SyncOutlined spin={syncing} />} onClick={handleSync} loading={syncing}>
+            Sync Groups
+          </Button>
+        )}
       </div>
 
       {identities.length === 0 ? (

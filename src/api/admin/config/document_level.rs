@@ -25,7 +25,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use super::super::{audit_log, AdminError, AdminState, Bare};
+use super::super::{audit_log, AdminError, AdminState, Scrubbed};
 use super::write::{
     self, Built, ConfigWrite, Mode, Outcome, Rejection, ScrubEnv, ScrubMap, Stage, Surface,
     Warnings, WriteResult,
@@ -751,7 +751,7 @@ pub async fn apply_declarative_iam(
     // the entire IAM set, so we must not silently auto-author a `legacy-admin`
     // row the imported document didn't declare — same contract as the
     // declarative config-apply path (config/mod.rs).
-    if let Err(e) = super::super::users::rebuild_iam_index_declarative::<Bare>(
+    if let Err(e) = super::super::users::rebuild_iam_index_declarative::<Scrubbed>(
         &db,
         &state.iam_state,
         state.iam_state.load().when_empty(),

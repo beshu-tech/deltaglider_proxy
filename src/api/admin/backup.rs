@@ -51,7 +51,7 @@ use std::sync::Arc;
 use crate::config::{BackendConfig, Config};
 
 use super::users::rebuild_iam_index;
-use super::{audit_log, trigger_config_sync, AdminError, AdminState, Bare};
+use super::{audit_log, trigger_config_sync, AdminError, AdminState, Scrubbed};
 
 #[derive(Serialize)]
 struct ImportErrorBody {
@@ -250,6 +250,23 @@ fn import_fail(
     BackupImportError::new(status, stage, Some(context), Some(detail))
 }
 
+/// A failed IAM restore as the import's error. A refusal (4xx: a lockout,
+/// a bootstrap-key collision) carries its reason, so the operator reads
+/// why; a server error carries only the status text (its detail is
+/// logged, as [`Scrubbed`] does).
+fn restore_iam_failure(e: AdminError<Scrubbed>, context: &str) -> BackupImportError {
+    let status = e.status_code();
+    let detail = if status.is_client_error() {
+        e.message().to_string()
+    } else {
+        status
+            .canonical_reason()
+            .unwrap_or("IAM backup import failed")
+            .to_string()
+    };
+    import_fail(status, "restore_iam", context, detail)
+}
+
 /// Hex-encoded SHA-256 of a byte slice. Used in three places in this
 /// module (manifest write on export, manifest verify on import) so
 /// it lives at module scope instead of as a closure repeated at each
@@ -442,7 +459,7 @@ struct SecretsStorage {
 
 /// Build the IamBackup struct from current DB state. Used by both
 /// the JSON and zip export paths.
-async fn build_iam_backup(state: &Arc<AdminState>) -> Result<IamBackup, AdminError<Bare>> {
+async fn build_iam_backup(state: &Arc<AdminState>) -> Result<IamBackup, AdminError<Scrubbed>> {
     let db = state
         .config_db
         .as_ref()
@@ -502,7 +519,7 @@ pub async fn export_backup(
     State(state): State<Arc<AdminState>>,
     AdminQuery(q): AdminQuery<ExportQuery>,
     headers: axum::http::HeaderMap,
-) -> Result<Response, AdminError<Bare>> {
+) -> Result<Response, AdminError<Scrubbed>> {
     let iam = build_iam_backup(&state).await?;
 
     let format = q.format.as_deref().unwrap_or("zip");
@@ -536,7 +553,7 @@ pub async fn export_backup(
 async fn export_zip(
     state: &Arc<AdminState>,
     iam: &IamBackup,
-) -> Result<(Bytes, String), AdminError<Bare>> {
+) -> Result<(Bytes, String), AdminError<Scrubbed>> {
     // We hold the read lock for the entire inspection of config so
     // a concurrent apply can't tear the YAML + secrets harvest apart.
     let cfg = state.config.read().await;
@@ -704,18 +721,7 @@ pub async fn import_backup(
     })?;
     import_backup_iam(state, headers, backup, query.iam, false)
         .await
-        .map_err(|e| {
-            let status = e.status_code();
-            import_fail(
-                status,
-                "restore_iam",
-                "legacy JSON backup",
-                status
-                    .canonical_reason()
-                    .unwrap_or("IAM backup import failed")
-                    .to_string(),
-            )
-        })
+        .map_err(|e| restore_iam_failure(e, "legacy JSON backup"))
 }
 
 /// Per-entry cap for zip unpack. 8 MiB is generous for the three
@@ -1801,18 +1807,7 @@ async fn apply_backup_iam(
             let Json(result) =
                 import_backup_iam(state.clone(), headers.clone(), backup, iam_mode, false)
                     .await
-                    .map_err(|e| {
-                        let status = e.status_code();
-                        import_fail(
-                            status,
-                            "restore_iam",
-                            "iam.json",
-                            status
-                                .canonical_reason()
-                                .unwrap_or("IAM backup import failed")
-                                .to_string(),
-                        )
-                    })?;
+                    .map_err(|e| restore_iam_failure(e, "iam.json"))?;
             tracing::info!(
                 users_created = result.users_created,
                 users_skipped = result.users_skipped,
@@ -1991,7 +1986,7 @@ async fn import_backup_iam(
     backup: IamBackup,
     mode: IamRestoreMode,
     restoring: bool,
-) -> Result<Json<ImportResult>, AdminError<Bare>> {
+) -> Result<Json<ImportResult>, AdminError<Scrubbed>> {
     let db = state
         .config_db
         .as_ref()
@@ -2061,6 +2056,21 @@ mod tests {
         AuthProviderConfig, ExternalIdentity, GroupMappingRule,
     };
     use crate::config_db::restore::resolve_backup_user_id;
+
+    /// A refused restore tells the operator why; a server error keeps its
+    /// detail in the log.
+    #[test]
+    fn a_refused_restore_names_its_reason_and_a_500_does_not() {
+        use super::{restore_iam_failure, AdminError, Scrubbed};
+        let refused = AdminError::<Scrubbed>::conflict("the restore leaves no credential");
+        let e = restore_iam_failure(refused, "legacy JSON backup");
+        assert_eq!(
+            e.detail.as_deref(),
+            Some("the restore leaves no credential")
+        );
+        let e = restore_iam_failure(AdminError::internal("sqlite: /var/db"), "iam.json");
+        assert_eq!(e.detail.as_deref(), Some("Internal Server Error"));
+    }
 
     /// D13: a full backup must carry the YAML-configured AES keys (singleton
     /// and named), and a restore must put them back into the applied config.

@@ -249,6 +249,9 @@ pub struct CurrentIam {
     /// therefore safe to delete. Missing entry (non-external user, or an
     /// external user with no identity) is treated as an empty baseline.
     pub external_baseline_groups: HashMap<i64, Vec<i64>>,
+    /// The stored OAuth login bindings by name, so [`diff_iam`] carries
+    /// only the YAML bindings that change something.
+    pub external_identities: Vec<DeclarativeExternalIdentity>,
 }
 
 // ───── Diff output ─────────────────────────────────────────────────────
@@ -294,10 +297,9 @@ pub struct IamDiff {
     /// silently dropped the table).
     pub mapping_rules: MappingRulesAction,
 
-    /// OAuth login bindings carried through VERBATIM from the YAML
-    /// snapshot (not diffed — they are upsert-by-(provider,subject)
-    /// in the transaction, so "absent from YAML" means "leave the DB
-    /// alone", never delete). Empty when the YAML didn't carry them
+    /// The YAML's OAuth login bindings that the DB does not already hold
+    /// as-is (upsert-by-(provider,subject) in the transaction, so
+    /// "absent from YAML" means "leave the DB alone", never delete). Empty when the YAML didn't carry them
     /// (hand-authored YAML, redacted export) — the preserve-externals
     /// philosophy. Only the full-IAM import path populates this (#71).
     pub external_identities: Vec<DeclarativeExternalIdentity>,
@@ -551,26 +553,7 @@ pub fn export_as_declarative_inner(
     // `raw_claims` can embed IdP PII, and the lossless mode is the one that
     // needs them anyway.
     let external_identities = if include_secrets {
-        db.list_external_identities()
-            .map_err(|e| format!("load external identities: {e}"))?
-            .into_iter()
-            .filter_map(|ident| {
-                let user_name = db_users
-                    .iter()
-                    .find(|u| u.id == ident.user_id)
-                    .map(|u| u.name.clone())?;
-                let provider_name = provider_id_to_name.get(&ident.provider_id).cloned()?;
-                Some(DeclarativeExternalIdentity {
-                    user: user_name,
-                    provider: provider_name,
-                    subject: ident.external_sub.clone(),
-                    email: ident.email.clone(),
-                    display_name: ident.display_name.clone(),
-                    email_verified: Some(ident.email_verified),
-                    raw_claims: ident.raw_claims.clone(),
-                })
-            })
-            .collect()
+        named_external_identities(db, &db_users, &db_providers)?
     } else {
         Vec::new()
     };
@@ -582,6 +565,52 @@ pub fn export_as_declarative_inner(
         mapping_rules,
         external_identities,
     })
+}
+
+/// The DB's OAuth login bindings by NAME (user, provider), the shape the
+/// full-IAM export writes. A binding whose user or provider row is gone
+/// is skipped.
+fn named_external_identities(
+    db: &ConfigDb,
+    users: &[IamUser],
+    providers: &[AuthProviderConfig],
+) -> Result<Vec<DeclarativeExternalIdentity>, String> {
+    let provider_name: HashMap<i64, &str> =
+        providers.iter().map(|p| (p.id, p.name.as_str())).collect();
+    Ok(db
+        .list_external_identities()
+        .map_err(|e| format!("load external identities: {e}"))?
+        .into_iter()
+        .filter_map(|ident| {
+            let user = users.iter().find(|u| u.id == ident.user_id)?.name.clone();
+            let provider = (*provider_name.get(&ident.provider_id)?).to_string();
+            Some(DeclarativeExternalIdentity {
+                user,
+                provider,
+                subject: ident.external_sub,
+                email: ident.email,
+                display_name: ident.display_name,
+                email_verified: Some(ident.email_verified),
+                raw_claims: ident.raw_claims,
+            })
+        })
+        .collect())
+}
+
+/// Pure: the YAML binding `y` is already stored as `stored` (same
+/// provider and subject, same user and facts). An absent
+/// `email_verified` reads as `false`, as the reconcile writes it.
+fn binding_is_stored(
+    y: &DeclarativeExternalIdentity,
+    stored: &DeclarativeExternalIdentity,
+) -> bool {
+    y.provider == stored.provider
+        && y.subject == stored.subject
+        && y.user == stored.user
+        && y.email == stored.email
+        && y.display_name == stored.display_name
+        && y.email_verified.unwrap_or(false) == stored.email_verified.unwrap_or(false)
+        && y.raw_claims == stored.raw_claims
 }
 
 /// Pure preview: would-be reconcile diff against the current DB
@@ -658,14 +687,18 @@ fn load_current_iam(db: &ConfigDb) -> Result<CurrentIam, String> {
         .load_group_mapping_rules()
         .map_err(|e| format!("load mapping_rules: {e}"))?;
     let external_baseline_groups = compute_external_baseline_groups(db, &mapping_rules)?;
+    let users = db.load_users().map_err(|e| format!("load users: {e}"))?;
+    let auth_providers = db
+        .load_auth_providers()
+        .map_err(|e| format!("load auth_providers: {e}"))?;
+    let external_identities = named_external_identities(db, &users, &auth_providers)?;
     Ok(CurrentIam {
-        users: db.load_users().map_err(|e| format!("load users: {e}"))?,
+        users,
         groups: db.load_groups().map_err(|e| format!("load groups: {e}"))?,
-        auth_providers: db
-            .load_auth_providers()
-            .map_err(|e| format!("load auth_providers: {e}"))?,
+        auth_providers,
         mapping_rules,
         external_baseline_groups,
+        external_identities,
     })
 }
 
@@ -1075,10 +1108,20 @@ fn diff_iam_unchecked(yaml: &DeclarativeIam, db: &CurrentIam) -> Result<IamDiff,
         MappingRulesAction::ReplaceWith(yaml.mapping_rules.clone())
     };
 
-    // #71: OAuth bindings ride through verbatim — the transaction
-    // upserts by (provider, subject), so there is nothing to diff.
+    // #71: OAuth bindings are upserts by (provider, subject), never
+    // deletes. Only a binding that the DB does not already hold as-is
+    // is carried, so the preview of an unchanged export counts none.
     // Empty (hand-authored YAML / redacted export) = "leave DB alone".
-    diff.external_identities = yaml.external_identities.clone();
+    diff.external_identities = yaml
+        .external_identities
+        .iter()
+        .filter(|y| {
+            !db.external_identities
+                .iter()
+                .any(|stored| binding_is_stored(y, stored))
+        })
+        .cloned()
+        .collect();
 
     // Ref validation (fail BEFORE any DB write, same contract as the
     // group/provider refs above): every binding must name a user and a
@@ -2947,6 +2990,50 @@ mod tests {
             err.contains("unknown user 'ghost'"),
             "validation must fail before any DB write: {err}"
         );
+    }
+
+    /// The preview of the instance's own export counts no binding: an
+    /// unchanged binding is not a change, a changed one is.
+    #[test]
+    fn only_changed_bindings_enter_the_diff() {
+        let stored = DeclarativeExternalIdentity {
+            user: "dana".into(),
+            provider: "corp".into(),
+            subject: "sub-dana".into(),
+            email: Some("dana@example.com".into()),
+            display_name: None,
+            email_verified: Some(false),
+            raw_claims: Some(serde_json::json!({ "hd": "example.com" })),
+        };
+        let current = CurrentIam {
+            users: vec![db_user(1, "dana", "AKDANA")],
+            external_identities: vec![stored.clone()],
+            ..empty_db()
+        };
+        let yaml = |ident: DeclarativeExternalIdentity| {
+            DeclarativeIam {
+            users: vec![yu("dana", "AKDANA")],
+            auth_providers: vec![serde_yaml::from_str(
+                "{ name: corp, provider_type: oidc, issuer_url: 'https://idp.example.com', client_secret: cs }",
+            )
+            .unwrap()],
+            external_identities: vec![ident],
+            ..Default::default()
+        }
+        };
+        // An absent email_verified is the stored `false`.
+        let same = DeclarativeExternalIdentity {
+            email_verified: None,
+            ..stored.clone()
+        };
+        let diff = diff_iam(&yaml(same), &current).unwrap();
+        assert!(diff.external_identities.is_empty(), "{diff:?}");
+        let changed = DeclarativeExternalIdentity {
+            email: Some("dana@corp.example.com".into()),
+            ..stored
+        };
+        let diff = diff_iam(&yaml(changed.clone()), &current).unwrap();
+        assert_eq!(diff.external_identities, vec![changed]);
     }
 
     #[test]

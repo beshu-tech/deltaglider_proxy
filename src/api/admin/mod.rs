@@ -47,7 +47,7 @@ use crate::rate_limiter::RateLimiter;
 use crate::session::SessionStore;
 use crate::usage_scanner::UsageScanner;
 
-pub use error::{AdminError, Bare, CodedJson, ErrorBody, JsonError, Text};
+pub use error::{AdminError, CodedJson, ErrorBody, JsonError, Scrubbed, Text};
 
 // Re-export everything so external code doesn't need import changes.
 pub use audit::{get_audit, get_encryption_witness, publish_encryption_witness};
@@ -333,7 +333,7 @@ pub(crate) fn trigger_config_sync(state: &Arc<AdminState>) {
 /// ```ignore
 /// pub async fn list_providers(
 ///     State(state): State<Arc<AdminState>>,
-/// ) -> Result<impl IntoResponse, AdminError<Bare>> {
+/// ) -> Result<impl IntoResponse, AdminError<Scrubbed>> {
 ///     let providers = with_config_db(&state, "load auth providers", |db| {
 ///         db.load_auth_providers()
 ///     })

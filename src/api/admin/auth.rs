@@ -17,7 +17,7 @@ use crate::iam::{Group, IamIndex, IamState, IamUser};
 use crate::rate_limiter;
 use crate::session::{AuthMethod, S3SessionCredentials, SessionKind, SessionStore};
 
-use super::{audit_log, AdminError, AdminState, Bare, JsonError};
+use super::{audit_log, AdminError, AdminState, JsonError, Scrubbed};
 
 /// Marker type inserted by [`require_admin_gui_session`] into request extensions.
 /// Handlers that must never run under a browser-lift session take
@@ -1474,7 +1474,8 @@ fn session_actor_label(method: &AuthMethod, iam: &IamState) -> String {
 ///   - `/api/admin/users/*`
 ///   - `/api/admin/groups/*`
 ///   - `/api/admin/ext-auth/providers/*`
-///   - `/api/admin/ext-auth/mappings/*`
+///   - `/api/admin/ext-auth/mappings/*` (not `mappings/preview`: a POST
+///     that only reads, routed outside the gate)
 ///   - `/api/admin/ext-auth/sync-memberships`
 ///   - `/api/admin/migrate`
 ///
@@ -1531,7 +1532,7 @@ pub async fn get_s3_session_creds(
     State(state): State<Arc<AdminState>>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
-) -> Result<Response, AdminError<Bare>> {
+) -> Result<Response, AdminError<Scrubbed>> {
     let token = extract_session_token(&headers)
         .ok_or_else(|| AdminError::status(StatusCode::UNAUTHORIZED, "no session"))?;
     let client_ip = request_client_ip(&headers, connect_info.as_ref());
@@ -1559,7 +1560,7 @@ pub async fn set_s3_session_creds(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     AdminJson(creds): AdminJson<S3SessionCredentials>,
-) -> Result<StatusCode, AdminError<Bare>> {
+) -> Result<StatusCode, AdminError<Scrubbed>> {
     let token = extract_session_token(&headers)
         .ok_or_else(|| AdminError::status(StatusCode::UNAUTHORIZED, "no session"))?;
     state.sessions.set_s3_creds(&token, creds);
@@ -1570,7 +1571,7 @@ pub async fn set_s3_session_creds(
 pub async fn clear_s3_session_creds(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
-) -> Result<StatusCode, AdminError<Bare>> {
+) -> Result<StatusCode, AdminError<Scrubbed>> {
     let token = extract_session_token(&headers)
         .ok_or_else(|| AdminError::status(StatusCode::UNAUTHORIZED, "no session"))?;
     state.sessions.clear_s3_creds(&token);
