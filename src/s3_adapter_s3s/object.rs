@@ -630,8 +630,18 @@ pub(super) fn served_range(
     }
     match range.check(meta.file_size) {
         Ok(checked) if !checked.is_empty() => Ok(Some(checked)),
-        _ => Err(s3s::s3_error!(InvalidRange)),
+        _ => Err(invalid_range(meta.file_size)),
     }
+}
+
+/// A 416 that names the object length in `Content-Range: bytes */<len>`
+/// (RFC 9110 §15.5.17), so a client can retry with a range that fits.
+pub(super) fn invalid_range(file_size: u64) -> s3s::S3Error {
+    let mut headers = axum::http::HeaderMap::new();
+    if let Ok(value) = axum::http::HeaderValue::from_str(&format!("bytes */{file_size}")) {
+        headers.insert(axum::http::header::CONTENT_RANGE, value);
+    }
+    super::error_with_headers(s3s::s3_error!(InvalidRange), headers)
 }
 
 /// Whether an `If-Range` validator names this object version. A value that
@@ -656,9 +666,9 @@ pub(super) fn if_range_matches(
 }
 
 /// A 304 with the validators S3 sends (`ETag`, `Last-Modified`; RFC 9110
-/// §15.4.5). s3s writes an error's own headers IN PLACE of its XML ones, so
-/// the 304 also loses the `Content-Type`/`Content-Length` of a body that is
-/// never sent (s3surface-7).
+/// §15.4.5). s3s still serializes an XML error body for it; the S3
+/// response layer (`api::s3_router::strip_forbidden_body`) removes that
+/// body and its `Content-Length`, because a 304 must not have content.
 pub(super) fn not_modified(
     etag: &s3s::dto::ETag,
     last_modified: &s3s::dto::Timestamp,
@@ -676,9 +686,7 @@ pub(super) fn not_modified(
             headers.insert(axum::http::header::LAST_MODIFIED, value);
         }
     }
-    let mut err = s3s::s3_error!(NotModified);
-    err.set_headers(headers);
-    err
+    super::error_with_headers(s3s::s3_error!(NotModified), headers)
 }
 
 /// `Last-Modified` at the precision the wire carries: whole seconds. An HTTP

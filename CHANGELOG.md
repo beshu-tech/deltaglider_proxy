@@ -26,6 +26,12 @@
 - The folder picker read only the first 100 entries of a folder, so it did not show the folders after them. It now reads every page of the listing.
 - A move whose destination is its own source (two bucket names on one storage) reported the object as "kept in the source folder". The move response now has an `in_place` count, and the browser says that the object already was at the destination.
 
+### Fixed — S3 responses without content, and form uploads with bad header fields
+
+- A conditional GET or HEAD that answered `304 Not Modified` carried an XML error body, because the S3 framework writes one for every error. The response therefore had `Content-Length: 77`, and over HTTP/2 it had a DATA frame, which curl and nghttp2 reject as a protocol error. The S3 response layer now removes the content of every 1xx, 204 and 304 response and drops its `Content-Length`. The `ETag` and `Last-Modified` of the 304 stay.
+- A browser form upload (`POST` with `multipart/form-data`) stored its `x-amz-meta-*` field names and its `Content-Type` field without a check. A name with a space, or a `Content-Type` with a line break, was accepted with 204, and then every GET and HEAD of the object failed with 500, because the proxy could not send these values back as response headers. Such a form upload is now refused with `400 InvalidArgument` before anything is stored, as a PutObject with the same values is.
+- A `416 Range Not Satisfiable` that the proxy decides from the object's metadata now has `Content-Range: bytes */<length>`, so a client can retry with a range that fits. This covers a HEAD, a conditional GET and a GET with `If-Range`. A plain ranged GET lets the storage backend refuse the range, and that answer does not give the length, so its 416 still has no `Content-Range`.
+
 ## v2.0.17 — 2026-10-16
 
 ### Changed — Rules and runs have their own pages

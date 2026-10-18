@@ -1003,11 +1003,14 @@ mod source_guards {
 
     /// s3s replaces every header of an error response with the error's own
     /// header map, so a header map on an error with an XML body drops its
-    /// `Content-Type` and, with it, the `<RequestId>`. Only `304 Not
-    /// Modified`, which has no body, may set one. A 503's `Retry-After`
-    /// comes from `api::errors::ensure_retry_after` on the response.
+    /// `Content-Type` and, with it, the `<RequestId>`. s3s also writes an
+    /// XML body for a 304; the S3 response layer removes it
+    /// (`strip_forbidden_body`). Only `s3_adapter_s3s::error_with_headers`,
+    /// which puts the `Content-Type` back for a status with a body, sets a
+    /// header map. A 503's `Retry-After` comes from
+    /// `api::errors::ensure_retry_after` on the response.
     #[test]
-    fn only_a_bodyless_s3s_error_carries_headers() {
+    fn s3s_error_headers_go_through_error_with_headers() {
         let mut offenders = Vec::new();
         for file in rust_files("src") {
             let rel = rel_path(&file);
@@ -1020,16 +1023,21 @@ mod source_guards {
                 if line.trim_start().starts_with("//") || !line.contains(".set_headers(") {
                     continue;
                 }
-                let not_modified = n > 0 && lines[n - 1].contains("s3_error!(NotModified)");
-                if !not_modified {
+                let in_helper = rel == "src/s3_adapter_s3s/mod.rs"
+                    && lines[..n]
+                        .iter()
+                        .rev()
+                        .find(|l| l.contains("fn "))
+                        .is_some_and(|l| l.contains("fn error_with_headers("));
+                if !in_helper {
                     offenders.push(format!("{rel}:{}", n + 1));
                 }
             }
         }
         assert!(
             offenders.is_empty(),
-            "an s3s error header map replaces Content-Type; set response headers in \
-             the S3 response layer instead:\n{}",
+            "an s3s error header map replaces Content-Type; use \
+             s3_adapter_s3s::error_with_headers or the S3 response layer:\n{}",
             offenders.join("\n")
         );
     }

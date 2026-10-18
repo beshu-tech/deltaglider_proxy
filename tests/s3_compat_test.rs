@@ -954,6 +954,54 @@ async fn test_get_range_invalid_returns_416() {
         416,
         "Range beyond file size should return 416"
     );
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("<Code>InvalidRange</Code>"), "{body}");
+    assert!(body.contains("<RequestId>"), "{body}");
+
+    // A 416 that the proxy judges from the metadata names the length
+    // (RFC 9110 §15.5.17), and its XML error keeps its Content-Type and
+    // RequestId. A HEAD and a conditional GET judge from the metadata; a
+    // plain ranged GET lets the backend answer, which gives no length.
+    let url = format!(
+        "{}/{}/range-invalid.bin",
+        server.endpoint(),
+        server.bucket()
+    );
+    let head = http
+        .head(&url)
+        .header("range", "bytes=200-300")
+        .send()
+        .await
+        .unwrap();
+    let get = http
+        .get(&url)
+        .header("range", "bytes=200-300")
+        .header("if-match", "*")
+        .send()
+        .await
+        .unwrap();
+    for (name, resp) in [("HEAD", head), ("conditional GET", get)] {
+        assert_eq!(resp.status().as_u16(), 416, "{name}");
+        let header = |h: &str| {
+            resp.headers()
+                .get(h)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        assert_eq!(
+            header("content-range").as_deref(),
+            Some("bytes */100"),
+            "{name}"
+        );
+        assert_eq!(
+            header("content-type").as_deref(),
+            Some("application/xml"),
+            "{name}"
+        );
+        if name != "HEAD" {
+            let body = resp.text().await.unwrap();
+            assert!(body.contains("<RequestId>"), "{name}: {body}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -2347,6 +2395,75 @@ async fn test_form_post_upload_succeeds_with_presigned_policy() {
         .expect("GET uploaded object");
     let body = got.body.collect().await.expect("collect body").into_bytes();
     assert_eq!(body.as_ref(), b"hello-form-post");
+}
+
+/// A form POST whose `x-amz-meta-*` field name is not an HTTP header name, or
+/// whose `Content-Type` field is not a header value, answers 400 and stores
+/// nothing. Before the check the upload answered 204, and every later GET and
+/// HEAD of the object answered 500, because s3s could not build the header.
+#[tokio::test]
+async fn test_form_post_rejects_fields_that_are_not_header_safe() {
+    let server = TestServer::builder()
+        .auth("POSTACCESSKEY", "POSTSECRETKEY123")
+        .build()
+        .await;
+    let client = reqwest::Client::new();
+    let (bucket, endpoint) = (server.bucket(), server.endpoint());
+    let amz_date = "20260507T120000Z";
+    let credential = "POSTACCESSKEY/20260507/us-east-1/s3/aws4_request";
+    let cases: [(&str, &str, &str); 2] = [
+        ("post/meta.txt", "x-amz-meta-a b", "v"),
+        ("post/ct.txt", "Content-Type", "text/plain\r\nX-Evil: 1"),
+    ];
+    for (key, field, value) in cases {
+        let policy = serde_json::json!({
+            "expiration": "2099-01-01T00:00:00.000Z",
+            "conditions": [
+                { "bucket": bucket },
+                ["starts-with", "$key", "post/"],
+                ["starts-with", format!("${field}"), ""],
+                { "x-amz-algorithm": "AWS4-HMAC-SHA256" },
+                { "x-amz-credential": credential },
+                { "x-amz-date": amz_date }
+            ]
+        });
+        let policy_b64 = base64::engine::general_purpose::STANDARD.encode(policy.to_string());
+        let signing_key = derive_post_signing_key("POSTSECRETKEY123", "20260507", "us-east-1");
+        let signature = hex::encode(hmac_sha256(&signing_key, policy_b64.as_bytes()));
+        // Built by hand: reqwest percent-encodes a field name with a space.
+        let mut body = String::new();
+        for (name, val) in [
+            ("key", key),
+            ("policy", policy_b64.as_str()),
+            ("x-amz-algorithm", "AWS4-HMAC-SHA256"),
+            ("x-amz-credential", credential),
+            ("x-amz-date", amz_date),
+            ("x-amz-signature", signature.as_str()),
+            (field, value),
+        ] {
+            body.push_str(&format!(
+                "--B\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{val}\r\n"
+            ));
+        }
+        body.push_str(
+            "--B\r\nContent-Disposition: form-data; name=\"file\"; filename=\"x.txt\"\r\n\
+             Content-Type: text/plain\r\n\r\nx\r\n--B--\r\n",
+        );
+        let resp = client
+            .post(format!("{}/{}", endpoint, bucket))
+            .header("content-type", "multipart/form-data; boundary=B")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400, "{field}");
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("InvalidArgument"), "{field}: {body}");
+
+        let s3 = server.s3_client().await;
+        let head = s3.head_object().bucket(bucket).key(key).send().await;
+        assert!(head.is_err(), "{field}: the object must not be stored");
+    }
 }
 
 /// C2 regression: a form field NOT covered by any policy condition is rejected

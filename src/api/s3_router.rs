@@ -40,6 +40,55 @@ fn head_range_is_partial(
         && headers.contains_key(axum::http::header::CONTENT_RANGE)
 }
 
+/// Whether a response with this status must have no content (RFC 9110
+/// §6.4.1: 1xx, 204 and 304).
+pub(crate) fn status_forbids_body(status: axum::http::StatusCode) -> bool {
+    status.is_informational()
+        || status == axum::http::StatusCode::NO_CONTENT
+        || status == axum::http::StatusCode::NOT_MODIFIED
+}
+
+/// Removes the content of a response whose status forbids it. s3s
+/// serializes an XML error body for `NotModified`, so a 304 had
+/// `Content-Length: 77` and, over HTTP/2, a DATA frame that nghttp2 and
+/// curl reject as PROTOCOL_ERROR. The other headers (the 304's `ETag` and
+/// `Last-Modified`) stay.
+fn strip_forbidden_body(response: axum::response::Response) -> axum::response::Response {
+    if !status_forbids_body(response.status()) {
+        return response;
+    }
+    let (mut parts, _body) = response.into_parts();
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    parts.headers.remove(axum::http::header::TRANSFER_ENCODING);
+    axum::http::Response::from_parts(parts, axum::body::Body::new(NoContent))
+}
+
+/// A body that is at its end and claims no size. `Body::empty()` claims an
+/// exact size of 0, so axum's top-level router adds `Content-Length: 0`,
+/// and hyper sends it on a HEAD. A 304 must not have a `Content-Length`
+/// that differs from the one a 200 has (RFC 9110 §8.6).
+struct NoContent;
+
+impl http_body::Body for NoContent {
+    type Data = bytes::Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::task::Poll::Ready(None)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        true
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::default()
+    }
+}
+
 /// The per-backend share of the request slots (`DGP_BACKEND_SHARE_PERCENT`
 /// of `DGP_MAX_CONCURRENT_REQUESTS`). One global cap served every bucket,
 /// so the requests to a slow backend (slow, so it passes its health probe)
@@ -212,7 +261,7 @@ where
     ) -> axum::response::Response {
         let is_acl_request = is_acl_request(request.uri());
         let method = request.method().clone();
-        let mut response = next.run(request).await;
+        let mut response = strip_forbidden_body(next.run(request).await);
         if head_range_is_partial(&method, response.status(), response.headers()) {
             *response.status_mut() = axum::http::StatusCode::PARTIAL_CONTENT;
         }
@@ -642,7 +691,59 @@ mod backend_share_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{head_range_is_partial, is_acl_request};
+    use super::{head_range_is_partial, is_acl_request, status_forbids_body, strip_forbidden_body};
+
+    #[test]
+    fn bodyless_statuses() {
+        use axum::http::StatusCode;
+        for code in [100, 101, 103, 204, 304] {
+            assert!(
+                status_forbids_body(StatusCode::from_u16(code).unwrap()),
+                "{code}"
+            );
+        }
+        for code in [200, 205, 206, 301, 400, 412, 416, 500] {
+            assert!(
+                !status_forbids_body(StatusCode::from_u16(code).unwrap()),
+                "{code}"
+            );
+        }
+    }
+
+    /// The s3s `NotModified` error, as s3s serializes it: an XML body and,
+    /// in place of its own headers, the validators from `not_modified`.
+    #[tokio::test]
+    async fn a_304_loses_its_body_and_length_but_keeps_validators() {
+        use axum::http::{header, StatusCode};
+        let xml = "<Error><Code>NotModified</Code></Error>";
+        let resp = axum::http::Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, "\"abc\"")
+            .header(header::LAST_MODIFIED, "Wed, 01 Jan 2026 00:00:00 GMT")
+            .header(header::CONTENT_LENGTH, xml.len())
+            .body(axum::body::Body::from(xml))
+            .unwrap();
+        let out = strip_forbidden_body(resp);
+        assert_eq!(out.status(), StatusCode::NOT_MODIFIED);
+        assert!(out.headers().get(header::CONTENT_LENGTH).is_none());
+        assert_eq!(out.headers()[header::ETAG], "\"abc\"");
+        assert!(out.headers().contains_key(header::LAST_MODIFIED));
+        // At its end (hyper sends no DATA frame) and with no exact size
+        // (axum adds no `Content-Length: 0`).
+        assert!(http_body::Body::is_end_stream(out.body()));
+        assert_eq!(http_body::Body::size_hint(out.body()).exact(), None);
+        let bytes = axum::body::to_bytes(out.into_body(), 1024).await.unwrap();
+        assert!(bytes.is_empty());
+
+        // Any other status keeps its body.
+        let ok = axum::http::Response::builder()
+            .status(StatusCode::OK)
+            .body(axum::body::Body::from("data"))
+            .unwrap();
+        let ok = strip_forbidden_body(ok);
+        let bytes = axum::body::to_bytes(ok.into_body(), 1024).await.unwrap();
+        assert_eq!(&bytes[..], b"data");
+    }
 
     #[test]
     fn only_a_head_with_content_range_becomes_206() {

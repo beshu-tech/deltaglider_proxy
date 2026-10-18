@@ -589,6 +589,8 @@ async fn parse_form_post_upload(
     let content_type = lookup_form_field(&fields_ci, "content-type")
         .map(str::to_string)
         .or(file_content_type);
+    super::object_helpers::stored_header_fields_check(&user_metadata, content_type.as_deref())
+        .map_err(S3Error::InvalidArgument)?;
     let file_data = file_data.ok_or_else(|| {
         S3Error::InvalidArgument("POST form upload requires a multipart file part".into())
     })?;

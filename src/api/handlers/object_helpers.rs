@@ -481,6 +481,85 @@ pub(crate) fn user_metadata_size_check(
     }
 }
 
+/// Pure verdict: can every GET and HEAD of the object send these values
+/// back as response headers? A PutObject reads them from request headers,
+/// so they are valid there by construction. A form POST reads them from
+/// form fields, which can hold any text: a metadata name with a space or a
+/// `Content-Type` with CR/LF was stored, and then every GET and HEAD of the
+/// object failed with 500 because s3s could not build the header. A
+/// metadata VALUE needs no check, because s3s RFC 2047-encodes any value
+/// that is not a safe header value. `Err` names the bad field.
+pub(crate) fn stored_header_fields_check(
+    metadata: &std::collections::HashMap<String, String>,
+    content_type: Option<&str>,
+) -> Result<(), String> {
+    for name in metadata.keys() {
+        let header = format!("x-amz-meta-{name}");
+        if axum::http::HeaderName::from_bytes(header.as_bytes()).is_err() {
+            return Err(format!("'{header}' is not a valid HTTP header name"));
+        }
+    }
+    // ASCII only, like PutObject: s3s reads a request header with
+    // `to_str`, which refuses other bytes.
+    if let Some(value) = content_type {
+        if !value.is_ascii() || axum::http::HeaderValue::from_str(value).is_err() {
+            return Err("Content-Type is not a valid HTTP header value".to_string());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod stored_header_fields_tests {
+    use super::stored_header_fields_check;
+    use std::collections::HashMap;
+
+    fn meta(name: &str) -> HashMap<String, String> {
+        HashMap::from([(name.to_string(), "v".to_string())])
+    }
+
+    #[test]
+    fn names_must_be_header_tokens() {
+        for good in ["a", "build-id", "x_y.z", "a1"] {
+            assert_eq!(
+                stored_header_fields_check(&meta(good), None),
+                Ok(()),
+                "{good}"
+            );
+        }
+        for bad in ["a b", "a\r\nb", "a:b", "a\"b", "é", "a(b)"] {
+            assert!(
+                stored_header_fields_check(&meta(bad), None).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn values_need_no_check() {
+        let m = HashMap::from([("k".to_string(), "line\r\nbreak é".to_string())]);
+        assert_eq!(stored_header_fields_check(&m, None), Ok(()));
+    }
+
+    #[test]
+    fn content_type_must_be_a_header_value() {
+        let none = HashMap::new();
+        for good in ["text/plain", "text/plain; charset=utf-8", "a\tb"] {
+            assert_eq!(
+                stored_header_fields_check(&none, Some(good)),
+                Ok(()),
+                "{good}"
+            );
+        }
+        for bad in ["text/plain\r\nX-Evil: 1", "a\nb", "a\0b", "tëxt/plain"] {
+            assert!(
+                stored_header_fields_check(&none, Some(bad)).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod metadata_size_tests {
     use super::{user_metadata_size_check, USER_METADATA_MAX_BYTES};

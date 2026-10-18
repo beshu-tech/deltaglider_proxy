@@ -97,9 +97,23 @@ async fn not_modified_carries_validators() {
     let etag = header(&head, "etag").unwrap();
     let lm = header(&head, "last-modified").unwrap();
 
-    for (name, value) in [("if-none-match", &etag), ("if-modified-since", &lm)] {
-        let resp = http.get(&url).header(name, value).send().await.unwrap();
+    let cases = [
+        ("GET", "if-none-match", &etag),
+        ("GET", "if-modified-since", &lm),
+        ("HEAD", "if-none-match", &etag),
+    ];
+    for (method, name, value) in cases {
+        let req = if method == "HEAD" {
+            http.head(&url)
+        } else {
+            http.get(&url)
+        };
+        let resp = req.header(name, value).send().await.unwrap();
+        let name = format!("{method} {name}");
         assert_eq!(resp.status().as_u16(), 304, "{name}");
+        // A 304 has no content: s3s's XML error body made it
+        // `Content-Length: 77` (an HTTP/2 PROTOCOL_ERROR in curl).
+        assert_eq!(header(&resp, "content-length"), None, "{name}");
         assert_eq!(
             header(&resp, "etag").as_deref(),
             Some(etag.as_str()),

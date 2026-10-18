@@ -134,6 +134,9 @@ crc32fast = "1"
 tokio-util = { version = "0.7", features = ["io", "rt"] }
 # compression-*: gzip/br for the embedded UI assets only (see demo.rs).
 tower-http = { version = "0.6", features = ["trace", "cors", "timeout", "compression-gzip", "compression-br"] }
+# The no-content body of a 304/204 (api/s3_router.rs). Already in the
+# lockfile through axum and hyper.
+http-body = "1"
 arc-swap = "1"
 urlencoding = "2"
 tempfile = "3"

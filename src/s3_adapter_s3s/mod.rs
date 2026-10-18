@@ -44,6 +44,28 @@ pub(crate) use copy::copy_source_bucket_key;
 pub use list::{ListMetadataXmlExtensions, LEGACY_V2_TOKENS};
 pub use list_token::install_list_token_keys;
 
+/// THE one way to give an s3s error extra response headers. s3s writes the
+/// error's header map IN PLACE of its own headers, so this helper puts back
+/// the `Content-Type: application/xml` of the XML body (the S3 response
+/// layer reads it to add `<RequestId>`). A status that has no body (304)
+/// gets no `Content-Type`; the response layer also drops that body.
+pub(crate) fn error_with_headers(
+    mut err: s3s::S3Error,
+    mut headers: axum::http::HeaderMap,
+) -> s3s::S3Error {
+    let status = err
+        .status_code()
+        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    if !crate::api::s3_router::status_forbids_body(status) {
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/xml"),
+        );
+    }
+    err.set_headers(headers);
+    err
+}
+
 /// The `s3s::S3` service. Each verb is a one-line delegation to its verb
 /// group (`bucket`, `object`, `list`, `multipart`, `copy`); a verb that is
 /// not implemented keeps the s3s default `NotImplemented` answer.

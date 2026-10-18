@@ -3,6 +3,23 @@
 use super::*;
 use crate::storage::DynStorageBackend;
 
+/// An error with a body keeps `Content-Type: application/xml` (the response
+/// layer reads it to add `<RequestId>`); a 304 gets none.
+#[test]
+fn error_headers_keep_the_xml_content_type_only_with_a_body() {
+    use axum::http::header::{CONTENT_RANGE, CONTENT_TYPE, ETAG};
+    let range = invalid_range(100);
+    let headers = range.headers().unwrap();
+    assert_eq!(headers[CONTENT_RANGE], "bytes */100");
+    assert_eq!(headers[CONTENT_TYPE], "application/xml");
+
+    let etag = parse_s3s_etag("\"abc\"").unwrap();
+    let nm = not_modified(&etag, &s3s::dto::Timestamp::from(SystemTime::UNIX_EPOCH));
+    let headers = nm.headers().unwrap();
+    assert!(headers.contains_key(ETAG));
+    assert!(!headers.contains_key(CONTENT_TYPE));
+}
+
 /// B029: the coordination bucket is refused as a copy source, for every
 /// identity (open mode included), before the IAM check.
 #[test]
