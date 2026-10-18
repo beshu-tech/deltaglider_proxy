@@ -17,6 +17,9 @@ export interface TransferBatchResult {
   failed: number;
   /** Move: the sources removed. A batch with a failed copy removes none of its sources. */
   deleted?: number;
+  /** Move: items whose destination is their own source. They already are
+   *  where the move sends them, so the server deletes no source for them. */
+  in_place?: number;
   failures: { source_key: string; dest_key: string; error: string }[];
 }
 
@@ -29,6 +32,8 @@ export interface BulkTransferOutcome {
   failed: number;
   /** Move: sources removed (an object moved). Copy: 0. */
   deleted: number;
+  /** Move: items that already were at their destination (absent = 0). */
+  inPlace?: number;
   failures: TransferBatchResult['failures'];
   /** The user stopped the run; the items after the last finished batch were not sent. */
   cancelled: boolean;
@@ -68,6 +73,7 @@ export async function transferInBatches(
       outcome.succeeded += answer.succeeded;
       outcome.failed += answer.failed;
       if (action === 'move') outcome.deleted += answer.deleted ?? 0;
+      if (action === 'move' && answer.in_place) outcome.inPlace = (outcome.inPlace ?? 0) + answer.in_place;
       keepFailures(outcome.failures, answer.failures);
       onBatch?.({ done, went: transferred(outcome) });
     },
@@ -75,9 +81,10 @@ export async function transferInBatches(
   return { ...outcome, cancelled };
 }
 
-/** Objects that got where they were sent: copies, or for a move the removed sources. */
-function transferred(o: Pick<BulkTransferOutcome, 'action' | 'succeeded' | 'deleted'>): number {
-  return o.action === 'copy' ? o.succeeded : o.deleted;
+/** Objects that got where they were sent: copies, or for a move the removed
+ *  sources and the items that already were at their destination. */
+function transferred(o: Pick<BulkTransferOutcome, 'action' | 'succeeded' | 'deleted' | 'inPlace'>): number {
+  return o.action === 'copy' ? o.succeeded : o.deleted + (o.inPlace ?? 0);
 }
 
 /**
@@ -126,9 +133,17 @@ export function bulkTransferOutcomeMessage(o: BulkTransferOutcome): { type: 'suc
   const items = `${count(o.total)} ${noun(o.total, unit)}`;
   // A move whose copy succeeded but whose source stayed: a batch with a
   // failed copy keeps all its sources.
-  const kept = o.action === 'move' ? o.succeeded - o.deleted : 0;
+  // An item already at its destination is not "kept in the source": the
+  // move had nothing to do for it.
+  const inPlace = o.action === 'move' ? (o.inPlace ?? 0) : 0;
+  const kept = o.action === 'move' ? Math.max(0, o.succeeded - o.deleted - inPlace) : 0;
+  const inPlaceText =
+    inPlace > 0
+      ? ` ${count(inPlace)} ${noun(inPlace, unit)} already ${inPlace === 1 ? 'was' : 'were'} at the destination.`
+      : '';
   const keptText =
-    kept > 0 ? ` ${count(kept)} copied ${noun(kept, unit)} also ${kept === 1 ? 'stays' : 'stay'} in the source folder.` : '';
+    (kept > 0 ? ` ${count(kept)} copied ${noun(kept, unit)} also ${kept === 1 ? 'stays' : 'stay'} in the source folder.` : '') +
+    inPlaceText;
   if (o.cancelled) {
     if (o.succeeded === 0 && o.failed === 0) return { type: 'info', text: `${Verb} cancelled. Nothing was ${past}.` };
     return { type: 'info', text: `${Verb} stopped. ${count(went)} of ${items} ${past}.${keptText}` };
@@ -144,5 +159,6 @@ export function bulkTransferOutcomeMessage(o: BulkTransferOutcome): { type: 'suc
   }
   if (o.total === 0) return { type: 'info', text: `Nothing to ${o.action}.` };
   if (kept > 0) return { type: 'warning', text: `${count(went)} of ${items} ${past}.${keptText}` };
+  if (inPlace > 0) return { type: 'info', text: `${count(went)} ${noun(went, unit)} ${past}.${inPlaceText}` };
   return { type: 'success', text: `${count(went)} ${noun(went, unit)} ${past}` };
 }

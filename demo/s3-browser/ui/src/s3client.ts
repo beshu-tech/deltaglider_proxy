@@ -11,9 +11,6 @@ import {
   type ListBucketsCommandOutput,
   CreateBucketCommand,
   DeleteBucketCommand,
-  ListMultipartUploadsCommand,
-  type ListMultipartUploadsCommandOutput,
-  AbortMultipartUploadCommand,
 } from '@aws-sdk/client-s3';
 import { encryptedAtRestText } from './bucketEncryption';
 import { Upload } from '@aws-sdk/lib-storage';
@@ -349,24 +346,36 @@ export async function listObjects(prefix = '', maxPages = MAX_LIST_PAGES): Promi
   return { objects: allObjects, folders: Array.from(folderSet), isTruncated, continuesAfter, pages: listed };
 }
 
+/** Pages of 1000 entries that `listCommonPrefixes` reads at most. */
+const MAX_PREFIX_PAGES = 100;
+
 export async function listCommonPrefixes(bucket: string, prefix = ''): Promise<string[]> {
   const cleanBucket = bucket.trim();
   if (!cleanBucket) return [];
 
-  const resp = await sendCommand<ListObjectsV2CommandOutput>(
-    new ListObjectsV2Command({
-      Bucket: cleanBucket,
-      Prefix: prefix || undefined,
-      Delimiter: '/',
-      MaxKeys: 100,
-    }),
-    `List prefixes in bucket ${cleanBucket}`
-  );
-
-  return (resp.CommonPrefixes || [])
-    .map((cp) => cp.Prefix)
-    .filter((p): p is string => isValidCommonPrefix(p, prefix));
+  // Every page: a folder past the first page (once 100 keys, with no
+  // continuation) was missing from the folder picker.
+  const folders: string[] = [];
+  let continuationToken: string | undefined;
+  for (let page = 0; page < MAX_PREFIX_PAGES; page++) {
+    const resp = await sendCommand<ListObjectsV2CommandOutput>(
+      new ListObjectsV2Command({
+        Bucket: cleanBucket,
+        Prefix: prefix || undefined,
+        Delimiter: '/',
+        ContinuationToken: continuationToken,
+      }),
+      `List prefixes in bucket ${cleanBucket}`
+    );
+    for (const cp of resp.CommonPrefixes || []) {
+      if (isValidCommonPrefix(cp.Prefix, prefix)) folders.push(cp.Prefix);
+    }
+    continuationToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
+    if (!continuationToken) break;
+  }
+  return folders;
 }
+
 
 interface HeadObjectShape {
   headers: Record<string, string>;
@@ -847,97 +856,5 @@ export async function deleteBucket(name: string): Promise<void> {
     `Delete bucket ${name}`,
   );
   invalidateListBucketsCache();
-}
-
-type MultipartUploadRef = {
-  key: string;
-  uploadId: string;
-};
-
-async function listMultipartUploadsPage(
-  bucket: string,
-  keyMarker?: string,
-  uploadIdMarker?: string,
-): Promise<{ uploads: MultipartUploadRef[]; isTruncated: boolean; nextKeyMarker?: string; nextUploadIdMarker?: string }> {
-  const resp = await sendCommand<ListMultipartUploadsCommandOutput>(
-    new ListMultipartUploadsCommand({
-      Bucket: bucket,
-      KeyMarker: keyMarker,
-      UploadIdMarker: uploadIdMarker,
-      MaxUploads: 1000,
-    }),
-    `List multipart uploads in bucket ${bucket}`,
-  );
-  const uploads = (resp.Uploads || [])
-    .map((upload) => ({
-      key: upload.Key || '',
-      uploadId: upload.UploadId || '',
-    }))
-    .filter((upload) => Boolean(upload.key) && Boolean(upload.uploadId));
-  return {
-    uploads,
-    isTruncated: Boolean(resp.IsTruncated),
-    nextKeyMarker: resp.NextKeyMarker,
-    nextUploadIdMarker: resp.NextUploadIdMarker,
-  };
-}
-
-export async function countMultipartUploads(bucket: string): Promise<number> {
-  let count = 0;
-  let keyMarker: string | undefined;
-  let uploadIdMarker: string | undefined;
-  for (;;) {
-    const page = await listMultipartUploadsPage(bucket, keyMarker, uploadIdMarker);
-    count += page.uploads.length;
-    if (!page.isTruncated) break;
-    keyMarker = page.nextKeyMarker;
-    uploadIdMarker = page.nextUploadIdMarker;
-    if (!keyMarker && !uploadIdMarker) break;
-  }
-  return count;
-}
-
-export async function abortAllMultipartUploads(bucket: string): Promise<{ aborted: number; remaining: number }> {
-  let totalAborted = 0;
-  // Retry in rounds so pagination remains stable while we mutate upload state.
-  // If a round makes no progress, remaining uploads are likely in transient
-  // states (or concurrently recreated), so we stop deterministically.
-  for (let round = 0; round < 8; round++) {
-    const pending: MultipartUploadRef[] = [];
-    let keyMarker: string | undefined;
-    let uploadIdMarker: string | undefined;
-    for (;;) {
-      const page = await listMultipartUploadsPage(bucket, keyMarker, uploadIdMarker);
-      pending.push(...page.uploads);
-      if (!page.isTruncated) break;
-      keyMarker = page.nextKeyMarker;
-      uploadIdMarker = page.nextUploadIdMarker;
-      if (!keyMarker && !uploadIdMarker) break;
-    }
-    if (pending.length === 0) {
-      return { aborted: totalAborted, remaining: 0 };
-    }
-    let abortedThisRound = 0;
-    for (const upload of pending) {
-      try {
-        await sendCommand(
-          new AbortMultipartUploadCommand({
-            Bucket: bucket,
-            Key: upload.key,
-            UploadId: upload.uploadId,
-          }),
-          `Abort multipart upload ${upload.uploadId}`,
-        );
-        abortedThisRound += 1;
-      } catch {
-        // Best effort: the upload may have already completed/aborted concurrently.
-      }
-    }
-    totalAborted += abortedThisRound;
-    if (abortedThisRound === 0) {
-      return { aborted: totalAborted, remaining: pending.length };
-    }
-  }
-  return { aborted: totalAborted, remaining: await countMultipartUploads(bucket) };
 }
 

@@ -423,8 +423,10 @@ export default function InspectorPanel({
       if (latestKeyRef.current !== reqKey) { onDeleted(reqKey); return; }
       onClose();
       onDeleted(reqKey);
-    } catch {
-      messageApi.error('Failed to delete object');
+    } catch (e) {
+      // The proxy's message says why (quota, maintenance, a replication
+      // mirror, access denied); a bare "failed" hid it.
+      messageApi.error(normalizeUiError(e, 'Failed to delete object'));
     }
   };
 

@@ -134,10 +134,19 @@ pub async fn admission_middleware(mut request: Request<Body>, next: Next) -> Res
                 matched,
                 status
             );
-            // Custom status + body. Unlike Deny, the operator controls
-            // the HTTP shape — typically used for maintenance-mode pages
-            // or rate-exceeded responses.
-            return (code, message.unwrap_or_default()).into_response();
+            // Custom status + message. Unlike Deny, the operator controls
+            // the status and the text — typically used for maintenance
+            // windows or rate-exceeded responses. The body is an S3 XML
+            // error: an S3 SDK cannot parse a plain-text body, so it lost
+            // the operator's message.
+            let message = message.unwrap_or_else(|| format!("Rejected by access rule '{matched}'"));
+            let mut response = crate::api::errors::xml_error_response(
+                code,
+                crate::api::errors::reject_error_code(code),
+                &message,
+            );
+            crate::api::errors::ensure_retry_after(code, response.headers_mut());
+            return response;
         }
     }
 

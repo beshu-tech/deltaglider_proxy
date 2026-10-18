@@ -153,4 +153,23 @@ test('the report after a run', () => {
     type: 'warning',
     text: '1,200 of 1,201 items moved. 1 copied item also stays in the source folder.',
   });
+  // A move onto itself (two names of one storage) deletes no source: the
+  // item already is at the destination, not "kept in the source folder".
+  const self = { ...move, total: 1, succeeded: 1, deleted: 0, inPlace: 1 };
+  assert.deepEqual(bulkTransferOutcomeMessage(self), {
+    type: 'info',
+    text: '1 item moved. 1 item already was at the destination.',
+  });
+  assert.deepEqual(bulkTransferOutcomeMessage({ ...move, deleted: 1199, inPlace: 1 }), {
+    type: 'warning',
+    text: '1,200 of 1,201 items moved. 1 copied item also stays in the source folder. 1 item already was at the destination.',
+  });
+});
+
+test('a move adds up the items already at their destination', async () => {
+  const outcome = await transferInBatches('move', items(2), async () => ({
+    succeeded: 2, failed: 0, deleted: 1, in_place: 1, failures: [],
+  }));
+  assert.equal(outcome.inPlace, 1);
+  assert.equal(bulkTransferOutcomeMessage(outcome).type, 'info');
 });

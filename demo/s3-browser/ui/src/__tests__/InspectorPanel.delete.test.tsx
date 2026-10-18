@@ -72,13 +72,15 @@ test('confirming deletes that key, closes the drawer and refreshes the list', as
   expect(onClose).toHaveBeenCalledTimes(1);
 });
 
-test('a failed delete keeps the drawer open and reports it', async () => {
-  s3.deleteObject.mockRejectedValue(new Error('AccessDenied'));
+test('a failed delete keeps the drawer open and reports why', async () => {
+  // The error once was dropped for a bare "Failed to delete object".
+  const why = 'Delete object builds/app-1.0.zip failed (403) [AccessDenied]: Access Denied';
+  s3.deleteObject.mockRejectedValue(new Error(why));
   const user = userEvent.setup();
   const { onClose, onDeleted } = inspector();
   const confirm = await openConfirm(user);
   await user.click(within(confirm).getByRole('button', { name: 'Delete' }));
-  expect(await screen.findByText('Failed to delete object')).toBeInTheDocument();
+  expect(await screen.findByText(why)).toBeInTheDocument();
   expect(onClose).not.toHaveBeenCalled();
   expect(onDeleted).not.toHaveBeenCalled();
 });

@@ -84,10 +84,24 @@ interface DeltaEfficiencyScanning {
 }
 
 /**
- * Discriminated union: either a fresh/cached result, or a 202 saying
- * "we're working on it, poll again". Callers switch on `'scanning' in r`.
+ * 202 Accepted shape when the last scan failed a short time ago. The
+ * server starts no new scan for this answer (every poll after a failure
+ * once started a new full bucket scan); `POST .../scan` starts one.
  */
-type DeltaEfficiencyFetchResult = DeltaEfficiencyResponse | DeltaEfficiencyScanning;
+interface DeltaEfficiencyScanFailed {
+  scanning: false;
+  bucket: string;
+  min_deltas: number;
+  status: 'scan_failed';
+  error: string;
+}
+
+/**
+ * Discriminated union: a fresh/cached result, a 202 saying "we're working
+ * on it, poll again", or a 202 with the failure of the last scan. Callers
+ * switch on `'scanning' in r`, then on `r.scanning`.
+ */
+type DeltaEfficiencyFetchResult = DeltaEfficiencyResponse | DeltaEfficiencyScanning | DeltaEfficiencyScanFailed;
 
 /**
  * Scan one bucket's deltaspaces and surface those whose reference

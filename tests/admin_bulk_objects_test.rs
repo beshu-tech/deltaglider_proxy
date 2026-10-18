@@ -1253,7 +1253,7 @@ async fn move_between_two_aliases_of_one_bucket_keeps_the_object() {
         200,
         "fixture: the two names share storage"
     );
-    let _ = admin
+    let r: Value = admin
         .post(format!("{ep}/_/api/admin/objects/move"))
         .json(&json!({
             "source_bucket": "releases",
@@ -1263,7 +1263,17 @@ async fn move_between_two_aliases_of_one_bucket_keeps_the_object() {
         }))
         .send()
         .await
+        .unwrap()
+        .json()
+        .await
         .unwrap();
+    // The answer says the object already was in place, so the browser
+    // does not report it as "kept in the source".
+    assert_eq!(
+        (r["deleted"].as_u64(), r["in_place"].as_u64()),
+        (Some(0), Some(1)),
+        "{r}"
+    );
     let got = http
         .get(format!("{ep}/downloads/v1.zip"))
         .send()

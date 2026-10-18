@@ -557,8 +557,15 @@ admission:
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    // An S3 XML error, so an S3 SDK reads the operator's message (a
+    // plain-text body failed its XML parse and lost the message).
+    assert!(resp.headers().contains_key("x-amz-request-id"));
     let body = resp.text().await.unwrap();
-    assert_eq!(body, "maintenance window");
+    assert!(body.contains("<Code>SlowDown</Code>"), "{body}");
+    assert!(
+        body.contains("<Message>maintenance window</Message>"),
+        "{body}"
+    );
 }
 
 #[tokio::test]

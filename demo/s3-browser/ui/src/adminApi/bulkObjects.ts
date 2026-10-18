@@ -45,6 +45,8 @@ interface BulkCopyResponse {
 
 interface BulkMoveResponse extends BulkCopyResponse {
   deleted: number;
+  /** Items whose destination is their own source: no source deleted. */
+  in_place: number;
 }
 
 /** Requires administrator sign-in in Settings (`403 admin_session_required` otherwise). */

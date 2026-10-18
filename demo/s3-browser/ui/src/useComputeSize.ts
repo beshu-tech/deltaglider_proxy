@@ -92,13 +92,14 @@ export default function useComputeSize() {
           schedule(attempt + 1);
         } else if (step.kind === 'fail') {
           settle({ progress: null, loading: false, error: step.error });
-        } else if ('result' in outcome && outcome.result) {
+        } else if ('result' in outcome && outcome.result.state === 'ready') {
+          const entry = outcome.result.entry;
           settle({
             progress: {
-              totalSize: outcome.result.total_size,
-              totalFiles: outcome.result.total_objects,
+              totalSize: entry.total_size,
+              totalFiles: entry.total_objects,
               done: true,
-              bound: folderSizeBound(outcome.result),
+              bound: folderSizeBound(entry),
             },
             loading: false,
             error: null,
@@ -128,10 +129,11 @@ export default function useComputeSize() {
   const autoPopulate = useCallback(async (currentPrefix: string, folderPrefixes: string[]) => {
     const bucket = getBucket();
     try {
-      const result = await getPrefixUsage(bucket, currentPrefix);
+      const lookup = await getPrefixUsage(bucket, currentPrefix);
       // Drop a result for a bucket the user already left (sizes are keyed by
       // folder prefix only, so it would land under the new bucket's folders).
-      if (!result || getBucket() !== bucket) return;
+      if (lookup.state !== 'ready' || getBucket() !== bucket) return;
+      const result = lookup.entry;
       // Populate sizes for folders that have cached data in the children map
       const updates: Record<string, FolderSizeState> = {};
       for (const fp of folderPrefixes) {

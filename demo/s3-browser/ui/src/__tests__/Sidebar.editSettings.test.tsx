@@ -19,7 +19,6 @@ vi.mock('../s3client', async (importOriginal) => {
       { name: 'db-archive', creationDate: '', unavailable: 'backend down' },
     ],
     countBucketObjects: async () => ({ count: 0, truncated: false }),
-    countMultipartUploads: async () => 0,
   };
 });
 

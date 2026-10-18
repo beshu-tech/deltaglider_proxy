@@ -61,6 +61,58 @@ const MAX_SCAN_OBJECTS: usize = 100_000;
 /// instead of starting one more recursive walk next to the others.
 const MAX_CONCURRENT_SCANS: usize = 2;
 
+/// How long a failed scan is remembered. A poll in this window gets the
+/// failure instead of "no result yet", and the quota fallback does not start
+/// the same failing scan again. It is longer than any client poll interval.
+const FAILURE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The recent failures of background scans, by scan key. A failed scan
+/// caches no result, so without this a poll could not tell a failure from
+/// a scan that did not start yet: the client polled until its timeout, and
+/// a poll that starts a scan when there is no result started a new full
+/// scan on every poll. Shared by [`UsageScanner`] and the delta-efficiency
+/// scanner.
+pub(crate) struct ScanFailures {
+    inner: RwLock<HashMap<String, (String, std::time::Instant)>>,
+    ttl: std::time::Duration,
+}
+
+impl Default for ScanFailures {
+    fn default() -> Self {
+        Self::with_ttl(FAILURE_TTL)
+    }
+}
+
+impl ScanFailures {
+    pub(crate) fn with_ttl(ttl: std::time::Duration) -> Self {
+        Self {
+            inner: RwLock::new(HashMap::new()),
+            ttl,
+        }
+    }
+
+    /// Remember that the scan of `key` failed with `error`. Expired
+    /// failures go at the same time, so the map stays small.
+    pub(crate) fn record(&self, key: &str, error: String) {
+        let now = std::time::Instant::now();
+        let mut inner = self.inner.write();
+        inner.retain(|_, (_, at)| now.duration_since(*at) < self.ttl);
+        inner.insert(key.to_string(), (error, now));
+    }
+
+    /// Forget the failure of `key` (a new scan of it starts, or one ended well).
+    pub(crate) fn clear(&self, key: &str) {
+        self.inner.write().remove(key);
+    }
+
+    /// The error of the last scan of `key`, while it is recent.
+    pub(crate) fn get(&self, key: &str) -> Option<String> {
+        let inner = self.inner.read();
+        let (error, at) = inner.get(key)?;
+        (at.elapsed() < self.ttl).then(|| error.clone())
+    }
+}
+
 /// Result of a prefix usage scan — sizes grouped by immediate child prefix.
 ///
 /// Sizes follow the rule the rest of the UI uses for files: `total_size` and
@@ -213,6 +265,8 @@ fn stale_seconds_for(age: i64, ttl: i64) -> i64 {
 pub struct UsageScanner {
     cache: Arc<RwLock<HashMap<String, UsageEntry>>>,
     scanning: Arc<RwLock<HashSet<String>>>,
+    /// Scans that failed a short time ago (see [`ScanFailures`]).
+    failures: ScanFailures,
     /// `DGP_USAGE_CACHE_TTL_SECS`.
     ttl_secs: i64,
     /// [`MAX_CONCURRENT_SCANS`] permits; a scan lists only while it holds one.
@@ -246,6 +300,7 @@ impl UsageScanner {
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
             scanning: Arc::new(RwLock::new(HashSet::new())),
+            failures: ScanFailures::default(),
             ttl_secs: cache_ttl_secs(),
             scan_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SCANS)),
         }
@@ -279,6 +334,15 @@ impl UsageScanner {
     pub fn is_scanning(&self, bucket: &str, prefix: &str) -> bool {
         let key = Self::cache_key(bucket, prefix);
         self.scanning.read().contains(&key)
+    }
+
+    /// The error of the last scan of this bucket/prefix, when it failed a
+    /// short time ago and no new scan runs.
+    pub fn failure(&self, bucket: &str, prefix: &str) -> Option<String> {
+        if self.is_scanning(bucket, prefix) {
+            return None;
+        }
+        self.failures.get(&Self::cache_key(bucket, prefix))
     }
 
     /// Insert an entry into the cache, evicting the oldest entry if the cache
@@ -315,7 +379,10 @@ impl UsageScanner {
         prefix: &str,
     ) -> Option<UsageEntry> {
         let cached = self.get(bucket, prefix);
-        if cached.is_none() || cached.as_ref().is_some_and(|e| e.stale_seconds > 0) {
+        let needs_scan = cached.is_none() || cached.as_ref().is_some_and(|e| e.stale_seconds > 0);
+        // A scan that failed a short time ago is not started again on every
+        // write: the next one starts after the failure expires.
+        if needs_scan && self.failure(bucket, prefix).is_none() {
             // Trigger background scan when no cache or cache is stale
             self.enqueue_scan(bucket.to_string(), prefix.to_string(), s3_state.clone());
         }
@@ -344,6 +411,7 @@ impl UsageScanner {
                 return false;
             }
         }
+        self.failures.clear(&key);
 
         let scanner = Arc::clone(self);
         tokio::spawn(async move {
@@ -395,6 +463,10 @@ impl UsageScanner {
                         error = %e,
                         "Usage scan failed"
                     );
+                    // Recorded BEFORE the guard clears the dedup key, so a
+                    // poll never sees "not scanning" without the failure.
+                    scanner.failures.record(&key, e);
+                    crate::usage_scanner::bump_usage_scan_version();
                 }
             }
             // _scan_guard drops here, removing the dedup key. Same
@@ -994,6 +1066,51 @@ mod tests {
             fake.peak_in_flight("LIST")
         );
         assert!((0..6).all(|d| scanner.get("b", &format!("d{d}/")).is_some()));
+    }
+
+    /// A failed scan cached nothing and cleared its dedup key, so a poll
+    /// read "no result, not scanning" and the client polled until its
+    /// 5-minute timeout. The failure is now kept and answered.
+    #[tokio::test]
+    async fn a_failed_scan_is_remembered_until_the_next_scan() {
+        let (engine, fake, endpoint) = fake_s3_engine().await;
+        put_raw(&endpoint, "p/a.bin", b"x").await;
+        let state = AppState::for_tests(engine);
+        let scanner = Arc::new(UsageScanner::new());
+        fake.fail("LIST", "", 503, "SlowDown", u32::MAX);
+        assert!(scanner.enqueue_scan("b".into(), "p/".into(), state.clone()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while scanner.is_scanning("b", "p/") {
+            assert!(std::time::Instant::now() < deadline, "the scan never ended");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(scanner.get("b", "p/").is_none());
+        let error = scanner.failure("b", "p/").expect("the failure is kept");
+        assert!(!error.is_empty());
+        assert!(scanner.failure("b", "other/").is_none());
+        // The quota fallback does not start the failing scan again.
+        let lists = scope_lists(&fake).len();
+        assert!(scanner.get_or_scan(&state, "b", "p/").is_none());
+        assert!(!scanner.is_scanning("b", "p/"));
+        assert_eq!(scope_lists(&fake).len(), lists);
+        // An explicit scan starts again and forgets the failure.
+        assert!(scanner.enqueue_scan("b".into(), "p/".into(), state.clone()));
+        assert!(scanner
+            .failures
+            .get(&UsageScanner::cache_key("b", "p/"))
+            .is_none());
+    }
+
+    #[test]
+    fn scan_failures_expire() {
+        let failures = ScanFailures::with_ttl(std::time::Duration::from_millis(0));
+        failures.record("k", "boom".into());
+        assert_eq!(failures.get("k"), None);
+        let failures = ScanFailures::default();
+        failures.record("k", "boom".into());
+        assert_eq!(failures.get("k").as_deref(), Some("boom"));
+        failures.clear("k");
+        assert_eq!(failures.get("k"), None);
     }
 }
 

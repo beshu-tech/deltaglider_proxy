@@ -78,12 +78,21 @@ export default function BucketUsageChip({
     );
   }
 
+  // The last Refresh of this chip could not read the size of some objects:
+  // the server kept the counter and answered the scan's own numbers apart.
+  const estimate = refresh.data?.estimated ? refresh.data.estimate : undefined;
   const scope = `Whole bucket "${bucket}" (all folders). `;
   const scannedTitle =
     scope +
     (data.last_scan_at != null
       ? `Last full scan ${relativeTime(data.last_scan_at * 1000)}`
-      : 'Not reconciled — the running total of writes and deletes may be off (never scanned, the last scan ran while writes changed the bucket, or a write could not read the object it replaced); ⟳ to reconcile when no writes are running');
+      : 'Not reconciled — the running total of writes and deletes may be off (never scanned, the last scan ran while writes changed the bucket, or a write could not read the object it replaced); ⟳ to reconcile when no writes are running') +
+    (refresh.data?.estimated
+      ? '. The last Refresh could not read the size of some objects, so it kept the running total' +
+        (estimate
+          ? `; the scan estimated about ${formatBytes(estimate.logical_bytes)} in ${estimate.object_count.toLocaleString()} ${noun(estimate.object_count, 'object')}`
+          : '')
+      : '');
 
   return (
     <span
@@ -103,6 +112,11 @@ export default function BucketUsageChip({
       }}
     >
       {inFolder && <span style={{ color: c.TEXT_MUTED }}>Bucket total</span>}
+      {refresh.data?.estimated && (
+        <span style={{ color: c.ACCENT_AMBER }} aria-label="estimated">
+          ≈
+        </span>
+      )}
       <strong style={{ color: c.TEXT_PRIMARY, fontVariantNumeric: 'tabular-nums' }}>
         {formatBytes(data.logical_bytes)}
       </strong>

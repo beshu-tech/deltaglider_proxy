@@ -31,6 +31,8 @@ export interface DeltaSummary {
   savingsPct: number | null;
   /** Server walked too many objects and bailed — totals are a lower bound. */
   truncated: boolean;
+  /** Some original sizes are not known: the original bytes and the savings are approximate. */
+  estimated: boolean;
   /** Network/fetch in progress so the chip can show a muted state. */
   loading: boolean;
 }
@@ -47,6 +49,7 @@ export function summaryFromResponse(resp: PrefixSavingsResponse): DeltaSummary {
     referenceBytes: t.reference_bytes,
     savingsPct: resp.savings_percentage,
     truncated: resp.truncated,
+    estimated: Boolean(resp.estimated),
     loading: false,
   };
 }

@@ -171,6 +171,25 @@ export function normalizeS3Error(err: unknown, context: string): ApiError {
   );
 }
 
+/** Error names that the AWS SDK gives a failure whose body it could not read
+ *  as an S3 XML error (empty, HTML from a gateway, plain text). */
+const UNPARSED_ERROR_NAMES = new Set(['Unknown', 'UnknownError', 'Error', 'TypeError']);
+
+/**
+ * The `<Message>` of an S3 XML error body, or null when the body was not
+ * one. The SDK names a parsed error by its `<Code>` and sets the message to
+ * `<Message>`; a body it could not parse gets the name `Unknown` and the
+ * message `UnknownError` (empty body), or a parse error (HTML, text).
+ */
+function s3XmlErrorMessage(e: S3LikeError | undefined): string | null {
+  const code = e?.Code || e?.code || e?.name;
+  const message = e?.message?.trim();
+  if (!code || !message || UNPARSED_ERROR_NAMES.has(code) || /^\d+$/.test(code)) return null;
+  if (message === 'UnknownError' || message === code) return null;
+  if (/DOMParser|XML parsing error|char 0|deserialization/i.test(message)) return null;
+  return message;
+}
+
 function describeS3Error(err: unknown, context: string): Error {
   const e = err as S3LikeError;
   const raw = stringifyUnknown(err);
@@ -188,20 +207,16 @@ function describeS3Error(err: unknown, context: string): Error {
     return new Error(`${context} failed${status ? ` (${status})` : ''}: ${hint}${reqPart}`);
   }
 
-  // The proxy's own 503s (backend-health gate, maintenance gate) carry a
-  // crafted, actionable <Message> naming the backend and cause — surface it
-  // VERBATIM instead of the generic gateway hint, which would misdirect the
-  // operator toward reverse-proxy limits.
-  const serverMessage = (err as { message?: string })?.message;
-  if (
-    status === 503 &&
-    typeof serverMessage === 'string' &&
-    // The encryption witness refuses writes of a bucket whose encryption
-    // this instance disagrees on, or that it cannot check now (issue #116).
-    /backend|read-only|unavailable|encryption|witness/i.test(serverMessage)
-  ) {
+  // The proxy's own 5xx answers (backend health, maintenance, rate limit,
+  // concurrency cap, spool budget, codec slots, multipart caps, an object
+  // that changed while it was read, the encryption witness, an admission
+  // `reject`) are S3 XML errors with a crafted <Message>. Surface it
+  // VERBATIM: the gateway hint would send the operator to reverse-proxy
+  // limits. The hint stays for bodies that are not ours (see below).
+  const serverMessage = s3XmlErrorMessage(e);
+  if (status !== undefined && status >= 500 && serverMessage) {
     const reqPart = requestIdSuffix(requestId);
-    return new Error(`${context} failed (503): ${serverMessage}${reqPart}`);
+    return new Error(`${context} failed (${status}) [${code}]: ${serverMessage}${reqPart}`);
   }
 
   // Gateway/plaintext failures during large PUTs may arrive as non-S3 bodies.

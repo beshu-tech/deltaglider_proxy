@@ -11,9 +11,7 @@ import {
   ExclamationCircleOutlined,
 } from '@ant-design/icons';
 import {
-  abortAllMultipartUploads,
   countBucketObjects,
-  countMultipartUploads,
   deleteBucket,
   getBucket,
   invalidateListBucketsCache,
@@ -25,7 +23,16 @@ import { useColors } from '../ThemeContext';
 import BucketBackendBadge from './BucketBackendBadge';
 import BucketEncryptionIcon from './BucketEncryptionIcon';
 import { showBackendChips } from '../bucketBackend';
-import { BUCKET_PROBE_CAP, BUCKET_PROBE_TIMEOUT_MS, deleteConfirmText, deleteMenuEntry, type BucketObjectCount } from '../bucketDelete';
+import {
+  BUCKET_PROBE_CAP,
+  BUCKET_PROBE_TIMEOUT_MS,
+  bucketDeleteRefusalText,
+  classifyBucketDeleteRefusal,
+  deleteConfirmText,
+  deleteMenuEntry,
+  type BucketObjectCount,
+} from '../bucketDelete';
+import { ApiError } from '../errorHandling';
 import CreateBucketModal from './CreateBucketModal';
 import { useNavigation } from '../NavigationContext';
 import { bucketSettingsUrl } from '../urlState';
@@ -185,15 +192,6 @@ export default function Sidebar({
     return typeof e === 'string' ? e : 'Unknown error';
   };
 
-  const isBucketNotEmptyError = (messageText: string): boolean => /BucketNotEmpty/i.test(messageText);
-
-  const parseMultipartCountFromError = (messageText: string): number | null => {
-    const match = messageText.match(/multipart_uploads=(\d+)/i);
-    if (!match) return null;
-    const count = Number.parseInt(match[1], 10);
-    return Number.isFinite(count) ? count : null;
-  };
-
   const refreshBucketsAfterDelete = async (name: string) => {
     const updated = await listBuckets({ includeOrigins: includeBucketOrigins });
     setBuckets(updated);
@@ -207,28 +205,6 @@ export default function Sidebar({
     }
   };
 
-  const abortMultipartUploadsAndRetryDelete = async (name: string, knownCount: number) => {
-    setDeletingBucketName(name);
-    try {
-      const cleanup = await abortAllMultipartUploads(name);
-      await deleteBucket(name);
-      await refreshBucketsAfterDelete(name);
-      messageApi.success(
-        `Bucket "${name}" deleted after aborting ${cleanup.aborted || knownCount} multipart upload(s)`,
-      );
-      if (cleanup.remaining > 0) {
-        messageApi.info(
-          `${cleanup.remaining} upload(s) were still in-flight during cleanup and may need another attempt.`,
-        );
-      }
-    } catch (e: unknown) {
-      const msg = formatError(e);
-      messageApi.error(`Cleanup + delete failed: ${msg}`);
-    } finally {
-      setDeletingBucketName(null);
-    }
-  };
-
   const handleDeleteBucket = async (name: string) => {
     setDeletingBucketName(name);
     try {
@@ -237,29 +213,16 @@ export default function Sidebar({
       await refreshBucketsAfterDelete(name);
     } catch (e: unknown) {
       const msg = formatError(e);
-      if (isBucketNotEmptyError(msg)) {
-        // Prefer blocker count from server error; if absent, derive via ListMultipartUploads.
-        let mpuCount = parseMultipartCountFromError(msg) ?? 0;
-        if (mpuCount <= 0) {
-          try {
-            mpuCount = await countMultipartUploads(name);
-          } catch {
-            mpuCount = 0;
-          }
-        }
-        if (mpuCount > 0) {
-          Modal.confirm({
-            title: `Delete blocked by ${mpuCount} multipart upload(s)`,
-            icon: <ExclamationCircleOutlined />,
-            content:
-              'This bucket looks empty but still has pending multipart uploads. Abort them and retry delete?',
-            okText: 'Abort uploads and delete',
-            okButtonProps: { danger: true },
-            cancelText: 'Cancel',
-            onOk: () => abortMultipartUploadsAndRetryDelete(name, mpuCount),
-          });
-          return;
-        }
+      // The proxy removes the multipart uploads of a bucket with no object
+      // itself, so the browser never aborts uploads: they can be other
+      // users' uploads in progress (bucketDelete.ts).
+      const refusal = classifyBucketDeleteRefusal(
+        e instanceof ApiError ? e.code : undefined,
+        e instanceof ApiError && e.detail ? e.detail : msg,
+      );
+      if (refusal) {
+        messageApi.error(bucketDeleteRefusalText(name, refusal));
+        return;
       }
       messageApi.error(`Failed to delete bucket: ${msg}`);
     }

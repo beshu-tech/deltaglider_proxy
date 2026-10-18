@@ -51,7 +51,8 @@ export default function DeltaSavingsChip({ summary }: Props) {
     ? `Scanning prefix…`
     : `${summary.deltaCount} delta${summary.deltaCount === 1 ? '' : 's'} of ${summary.totalCount} object${summary.totalCount === 1 ? '' : 's'} · ` +
       `${formatBytes(summary.originalBytes)} → ${formatBytes(summary.storedBytes)}${refDetail}` +
-      (summary.truncated ? ' · scope truncated (>100k objects)' : '');
+      (summary.truncated ? ' · scope truncated (>100k objects)' : '') +
+      (summary.estimated ? ' · estimated: the original size of some objects is not known' : '');
 
   return (
     <div
@@ -95,7 +96,7 @@ export default function DeltaSavingsChip({ summary }: Props) {
         />
       </svg>
       <span>
-        {pct}% smaller{summary.truncated ? '+' : ''}
+        {summary.estimated ? '≈' : ''}{pct}% smaller{summary.truncated ? '+' : ''}
       </span>
       <span style={{ color: TEXT_MUTED, fontWeight: 400 }}>·</span>
       <span>{savedLabel} saved</span>

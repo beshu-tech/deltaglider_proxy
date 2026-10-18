@@ -76,6 +76,7 @@ function aggregate(results: Record<string, BucketScanResult>): {
   savings: number;
   oldestCompletedAt: string | null;
   newestCompletedAt: string | null;
+  estimated: boolean;
 } {
   let objects = 0;
   let originalBytes = 0;
@@ -83,8 +84,10 @@ function aggregate(results: Record<string, BucketScanResult>): {
   let oldest: string | null = null;
   let newest: string | null = null;
   let count = 0;
+  let estimated = false;
   for (const r of Object.values(results)) {
     count += 1;
+    estimated ||= Boolean(r.estimated);
     objects += r.total_objects;
     originalBytes += r.total_original_bytes;
     storedBytes += r.total_stored_bytes;
@@ -105,6 +108,7 @@ function aggregate(results: Record<string, BucketScanResult>): {
     savings,
     oldestCompletedAt: oldest,
     newestCompletedAt: newest,
+    estimated,
   };
 }
 
@@ -304,6 +308,7 @@ export default function BucketScanCard({ onRenderActions, scopeBucket }: Props) 
           savings: scopeResult.savings_percentage,
           oldestCompletedAt: scopeResult.completed_at,
           newestCompletedAt: scopeResult.completed_at,
+          estimated: Boolean(scopeResult.estimated),
         }
       : aggregate(scans);
 
@@ -334,7 +339,7 @@ export default function BucketScanCard({ onRenderActions, scopeBucket }: Props) 
             marginTop: 4,
           }}
         >
-          {formatBytes(totals.originalBytes)} original ·{' '}
+          {totals.estimated ? '≈' : ''}{formatBytes(totals.originalBytes)} original ·{' '}
           <span style={{ color: totals.savings > 10 ? colors.ACCENT_GREEN : colors.TEXT_SECONDARY, fontWeight: 600 }}>
             {totals.savings.toFixed(1)}% saved
           </span>{' '}
@@ -363,6 +368,12 @@ export default function BucketScanCard({ onRenderActions, scopeBucket }: Props) 
             </span>
           )}
         </div>
+
+        {totals.estimated && (
+          <div style={{ marginTop: 4, fontSize: 11, color: colors.ACCENT_AMBER }}>
+            Estimated: the original size of some objects is not known, so they count their stored size.
+          </div>
+        )}
 
         {unscanned > 0 && (
           <div

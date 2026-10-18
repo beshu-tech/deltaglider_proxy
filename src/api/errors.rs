@@ -18,6 +18,45 @@ fn escape_xml(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// The S3 error code of an admission `reject` answer with `status`: the
+/// code S3 uses for that status where there is one, else `Rejected`.
+pub(crate) fn reject_error_code(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        400 => "InvalidRequest",
+        403 => "AccessDenied",
+        404 => "NoSuchKey",
+        405 => "MethodNotAllowed",
+        429 | 503 => "SlowDown",
+        501 => "NotImplemented",
+        _ => "Rejected",
+    }
+}
+
+/// An S3 XML error answer with any status, code and message: the shape
+/// the S3 SDKs parse (an SDK cannot read a plain-text error body, so its
+/// message would be lost). Same XML and `x-amz-request-id` header as
+/// [`S3Error`]'s answers.
+pub(crate) fn xml_error_response(status: StatusCode, code: &str, message: &str) -> Response {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let body = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+    <Code>{}</Code>
+    <Message>{}</Message>
+    <Resource></Resource>
+    <RequestId>{}</RequestId>
+</Error>"#,
+        escape_xml(code),
+        escape_xml(message),
+        request_id
+    );
+    let mut response = (status, [("Content-Type", "application/xml")], body).into_response();
+    if let Ok(value) = axum::http::HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert("x-amz-request-id", value);
+    }
+    response
+}
+
 /// The `Retry-After` of a 503, in seconds. A caller that knows the real wait
 /// (the auth lockout) replaces it.
 pub(crate) const RETRY_AFTER_SECS: u64 = 5;
@@ -434,6 +473,27 @@ impl S3Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An admission `reject` answers an S3 XML error that an SDK parses:
+    /// the operator's text is the `<Message>`, escaped.
+    #[tokio::test]
+    async fn a_reject_answer_is_an_s3_xml_error() {
+        let status = StatusCode::SERVICE_UNAVAILABLE;
+        let response = xml_error_response(status, reject_error_code(status), "back <soon> & ok");
+        assert_eq!(response.status(), status);
+        assert!(response.headers().contains_key("x-amz-request-id"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("<Code>SlowDown</Code>"), "{body}");
+        assert!(
+            body.contains("<Message>back &lt;soon&gt; &amp; ok</Message>"),
+            "{body}"
+        );
+        assert_eq!(reject_error_code(StatusCode::FORBIDDEN), "AccessDenied");
+        assert_eq!(reject_error_code(StatusCode::IM_A_TEAPOT), "Rejected");
+    }
 
     /// Source guard: a `tracing` target outside `deltaglider_proxy` is
     /// dropped by the default filter (`deltaglider_proxy=debug,…`, plus the

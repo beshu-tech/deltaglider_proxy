@@ -99,6 +99,10 @@ pub struct MoveResponse {
     pub succeeded: usize,
     pub failed: usize,
     pub deleted: usize,
+    /// Items whose destination is their own source: they already are where
+    /// the move sends them, so their source is not deleted (it is the only
+    /// copy). Not a "kept in the source" leftover.
+    pub in_place: usize,
     pub failures: Vec<CopyFailure>,
 }
 
@@ -784,7 +788,7 @@ pub async fn move_objects(
     // Pre-migration the client implemented this same rule client-side;
     // doing it here keeps the contract identical and lets us extend
     // to actual transactions later.
-    let deleted = if copy_result.failed == 0 {
+    let (deleted, in_place) = if copy_result.failed == 0 {
         let same_location = |it: &CopyItem| {
             is_same_location_move(
                 &source_storage,
@@ -796,7 +800,7 @@ pub async fn move_objects(
         };
         delete_moved_sources(&s3, &req.source_bucket, &req.items, &copied, same_location).await
     } else {
-        0
+        (0, 0)
     };
     invalidate_savings(&state, &req, true).await;
 
@@ -827,12 +831,13 @@ pub async fn move_objects(
         succeeded: copy_result.succeeded,
         failed: copy_result.failed,
         deleted,
+        in_place,
         failures: copy_result.failures,
     }))
 }
 
 /// Delete the sources of a move whose copies all succeeded; returns how
-/// many went. `same_location(item)`: the item's destination is its own
+/// many went, and how many items were already in place. `same_location(item)`: the item's destination is its own
 /// source, which is never deleted. One [`DynEngine::delete_batch`]: each
 /// source folder is checked once for a reference.bin to reclaim.
 ///
@@ -843,7 +848,7 @@ async fn delete_moved_sources(
     items: &[CopyItem],
     copied: &[Option<crate::types::FileMetadata>],
     same_location: impl Fn(&CopyItem) -> bool,
-) -> usize {
+) -> (usize, usize) {
     use crate::deltaglider::{DeleteHooks, DeleteItem, DeleteOutcome};
     let mut skipped_self = 0usize;
     let engine = s3.engine.load_full();
@@ -922,7 +927,7 @@ async fn delete_moved_sources(
             skipped_self
         );
     }
-    deleted
+    (deleted, skipped_self)
 }
 
 /// The `on_outcome` hook of an admin delete batch: an `ObjectDeleted`
@@ -2522,7 +2527,7 @@ mod tests {
             let state = AppState::for_tests(engine);
             fake.clear();
 
-            let deleted = delete_moved_sources(&state, "b", &items, &copied, |_| false).await;
+            let (deleted, _) = delete_moved_sources(&state, "b", &items, &copied, |_| false).await;
 
             assert_eq!(deleted, keys.len());
             let lists = folder_lists(&fake);

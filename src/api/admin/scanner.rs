@@ -103,12 +103,16 @@ pub async fn get_usage(
             // `cached: false` so the client can treat it as "no data yet"
             // without a console trace. (Mirrors the reasoning behind
             // delta_efficiency's 202 — 404/"not found" is the wrong semantic.)
+            //
+            // A scan that failed a short time ago answers its error, so the
+            // client stops polling and shows why (a failed scan caches no
+            // result: without this it read as "not yet" until a timeout).
             let scanning = state.usage_scanner.is_scanning(&bucket, &prefix);
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({"cached": false, "scanning": scanning})),
-            )
-                .into_response()
+            let mut body = serde_json::json!({"cached": false, "scanning": scanning});
+            if let Some(error) = state.usage_scanner.failure(&bucket, &prefix) {
+                body["error"] = serde_json::Value::String(error);
+            }
+            (StatusCode::OK, Json(body)).into_response()
         }
     }
 }

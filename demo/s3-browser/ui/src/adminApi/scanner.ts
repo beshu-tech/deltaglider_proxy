@@ -40,16 +40,41 @@ export async function scanPrefixUsage(bucket: string, prefix: string): Promise<v
   });
 }
 
-/** Get cached usage entry for a bucket/prefix, or null if not cached yet. */
-export async function getPrefixUsage(bucket: string, prefix: string): Promise<UsageEntry | null> {
+/**
+ * What the server knows about the usage of a bucket/prefix:
+ * - `ready`: a cached scan result;
+ * - `scanning`: no result yet, a scan runs;
+ * - `failed`: the last scan failed a short time ago (the server keeps the
+ *   failure for about a minute), with its error;
+ * - `none`: no result, no scan, no recent failure.
+ */
+export type PrefixUsageLookup =
+  | { state: 'ready'; entry: UsageEntry }
+  | { state: 'scanning' }
+  | { state: 'failed'; error: string }
+  | { state: 'none' };
+
+/** Not cached: 200 `{ cached: false, scanning, error? }` (a benign state,
+ *  not a 404, so the console stays clean). */
+interface UsageNotCached {
+  cached: false;
+  scanning?: boolean;
+  error?: string;
+}
+
+/** The cached usage of a bucket/prefix, or why there is none. */
+export async function getPrefixUsage(bucket: string, prefix: string): Promise<PrefixUsageLookup> {
   const params = new URLSearchParams({ bucket, prefix });
-  // The server returns 200 `{ cached: false }` for the not-yet-scanned case
-  // (a benign state, not a 404 — keeps the console clean).
-  const body = await adminJson<UsageEntry | { cached: false } | null>(`/api/admin/usage?${params}`, {
+  const body = await adminJson<UsageEntry | UsageNotCached | null>(`/api/admin/usage?${params}`, {
     context: 'Usage query',
   });
-  if (!body || (body as { cached?: boolean }).cached === false) return null;
-  return body as UsageEntry;
+  if (!body) return { state: 'none' };
+  if ('cached' in body && body.cached === false) {
+    if (body.scanning) return { state: 'scanning' };
+    if (body.error) return { state: 'failed', error: body.error };
+    return { state: 'none' };
+  }
+  return { state: 'ready', entry: body as UsageEntry };
 }
 
 /**
@@ -93,6 +118,9 @@ export interface PrefixSavingsResponse {
   /** 0..=99.99, or null when there's nothing measurable under the prefix. */
   savings_percentage: number | null;
   truncated: boolean;
+  /** The original size of some objects is not known to the proxy: they count
+   *  their stored size, so the original bytes and the savings are approximate. */
+  estimated: boolean;
   computed_at: string;
 }
 
@@ -124,6 +152,13 @@ export interface BucketUsage {
   savings_percentage: number | null;
   last_scan_at: number | null;
   never_scanned: boolean;
+  /**
+   * Refresh answers only: the scan could not read the size of some objects,
+   * so it kept the counter (the numbers above), and `estimate` holds what
+   * the scan counted.
+   */
+  estimated?: boolean;
+  estimate?: { object_count: number; logical_bytes: number; stored_bytes: number };
 }
 
 export async function getBucketUsage(bucket: string): Promise<BucketUsage | null> {

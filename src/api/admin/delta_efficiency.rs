@@ -251,6 +251,10 @@ impl EfficiencyResponse {
 pub struct DeltaEfficiencyScanner {
     cache: Arc<RwLock<HashMap<String, EfficiencyResponse>>>,
     scanning: Arc<RwLock<HashSet<String>>>,
+    /// Scans that failed a short time ago. A GET in this window answers
+    /// the failure and starts no new scan (before, every poll after a
+    /// failure started another full bucket scan).
+    failures: crate::usage_scanner::ScanFailures,
 }
 
 impl Default for DeltaEfficiencyScanner {
@@ -279,6 +283,7 @@ impl DeltaEfficiencyScanner {
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
             scanning: Arc::new(RwLock::new(HashSet::new())),
+            failures: Default::default(),
         }
     }
 
@@ -305,6 +310,15 @@ impl DeltaEfficiencyScanner {
         self.scanning.read().contains(bucket)
     }
 
+    /// The error of the last scan of `bucket`, when it failed a short time
+    /// ago and no new scan runs.
+    pub fn failure(&self, bucket: &str) -> Option<String> {
+        if self.is_scanning(bucket) {
+            return None;
+        }
+        self.failures.get(bucket)
+    }
+
     /// Spawn a background scan of `bucket` if none is running. Returns
     /// true if a new scan was started, false if one was already in flight.
     pub fn enqueue_scan(self: &Arc<Self>, bucket: String, s3_state: Arc<AppState>) -> bool {
@@ -313,6 +327,7 @@ impl DeltaEfficiencyScanner {
             debug!(bucket = %bucket, "Delta-efficiency scan already in progress, skipping");
             return false;
         }
+        self.failures.clear(&bucket);
 
         let scanner = Arc::clone(self);
         tokio::spawn(async move {
@@ -335,6 +350,8 @@ impl DeltaEfficiencyScanner {
                 }
                 Err(e) => {
                     warn!(bucket = %bucket, error = %e, "Delta-efficiency scan failed");
+                    // Recorded before the guard clears the dedup key.
+                    scanner.failures.record(&bucket, e);
                 }
             }
             // _scan_guard drops here, removing the dedup key.
@@ -555,6 +572,9 @@ pub struct EfficiencyQuery {
 /// * `202 Accepted` with `{ scanning: true }` when no fresh cache
 ///   exists and a background scan is now running. The frontend
 ///   should poll the same endpoint until it gets a 200.
+/// * `202 Accepted` with `{ scanning: false, status: "scan_failed",
+///   error }` when the last scan failed a short time ago. No new scan
+///   starts until the failure expires or `POST .../scan` asks for one.
 pub async fn get_delta_efficiency(
     State(state): State<Arc<AdminState>>,
     AdminQuery(q): AdminQuery<EfficiencyQuery>,
@@ -568,6 +588,9 @@ pub async fn get_delta_efficiency(
     // Cache hit → return immediately.
     if let Some(cached) = state.delta_efficiency_scanner.get(&bucket, min_deltas) {
         return (StatusCode::OK, Json(cached)).into_response();
+    }
+    if let Some(body) = failed_scan_body(&state.delta_efficiency_scanner, &bucket, min_deltas) {
+        return (StatusCode::ACCEPTED, Json(body)).into_response();
     }
 
     // No fresh cache → enqueue a background scan and tell the caller
@@ -590,6 +613,23 @@ pub async fn get_delta_efficiency(
         })),
     )
         .into_response()
+}
+
+/// The body of a GET while the last scan of `bucket` failed a short time
+/// ago, or `None` to scan.
+fn failed_scan_body(
+    scanner: &DeltaEfficiencyScanner,
+    bucket: &str,
+    min_deltas: usize,
+) -> Option<serde_json::Value> {
+    let error = scanner.failure(bucket)?;
+    Some(serde_json::json!({
+        "bucket": bucket,
+        "min_deltas": min_deltas,
+        "scanning": false,
+        "status": "scan_failed",
+        "error": error,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -620,6 +660,8 @@ pub async fn post_delta_efficiency_scan(
         Json(serde_json::json!({
             "bucket": bucket,
             "min_deltas": min_deltas,
+            // Started now or already running: a scan runs either way.
+            "scanning": true,
             "status": if started { "scan_started" } else { "scan_already_running" },
         })),
     )
@@ -1457,5 +1499,34 @@ mod tests {
             .get("b", 1)
             .expect("another min_deltas reads the same cached scan");
         assert_eq!((one.reported_deltaspaces, one.min_deltas), (2, 1));
+    }
+
+    /// A failed scan was only logged: every poll after it found no cache
+    /// and started a new full bucket scan (one every 3 s from the panel).
+    /// The failure is now answered, and no scan starts while it is recent.
+    #[tokio::test]
+    async fn a_failed_scan_is_answered_without_a_new_scan() {
+        let (engine, fake, endpoint) = fake_s3_engine().await;
+        put_raw_many(&endpoint, delta_folders(1, 3)).await;
+        let state = AppState::for_tests(engine);
+        let scanner = Arc::new(DeltaEfficiencyScanner::new());
+        fake.fail("LIST", "", 503, "SlowDown", u32::MAX);
+        assert!(scanner.enqueue_scan("b".into(), state.clone()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while scanner.is_scanning("b") {
+            assert!(std::time::Instant::now() < deadline, "the scan never ended");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let body = failed_scan_body(&scanner, "b", 3).expect("the failure is answered");
+        assert_eq!(body["status"], "scan_failed", "{body}");
+        assert_eq!(body["scanning"], false, "{body}");
+        assert!(
+            body["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "{body}"
+        );
+        assert!(failed_scan_body(&scanner, "other", 3).is_none());
+        // An explicit scan forgets the failure.
+        assert!(scanner.enqueue_scan("b".into(), state.clone()));
+        assert!(scanner.failures.get("b").is_none());
     }
 }

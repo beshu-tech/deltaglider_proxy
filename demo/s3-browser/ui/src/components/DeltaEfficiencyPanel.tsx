@@ -138,6 +138,11 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
       // A newer scan superseded us — stop polling and discard the
       // result so it can't clobber the newer scan's state.
       if (scanIdRef.current !== scanId) return null;
+      if ('scanning' in r && !r.scanning) {
+        // The last scan failed: the server starts no new scan for a GET,
+        // so polling again would only wait for the timeout.
+        throw new Error(r.error);
+      }
       if ('scanning' in r) {
         // Server is working on it. Wait briefly, then re-fetch.
         setScanning(true);
@@ -240,11 +245,13 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
         </HoverHint>
         {/* One button. The first scan may answer from the server's 5-minute
             cache; once a result is on screen, the button forces a fresh scan
-            (a cached re-read would only show the same result again). */}
+            (a cached re-read would only show the same result again). After
+            an error it forces one too: a GET answers a recent failure
+            without a new scan. */}
         <Button
           type="primary"
           icon={response ? <ReloadOutlined /> : <ThunderboltOutlined />}
-          onClick={() => runScan(response !== null)}
+          onClick={() => runScan(response !== null || error !== null)}
           loading={loading && !scanning}
           disabled={!bucket}
           title={response ? 'Scan this bucket again now, ignoring the 5-minute cache' : undefined}

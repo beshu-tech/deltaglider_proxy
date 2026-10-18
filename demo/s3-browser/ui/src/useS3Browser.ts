@@ -583,7 +583,7 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
       // against the same bucket even if the user switches buckets mid-run.
       const sourceBucket = getBucket();
       const request = action === 'copy' ? bulkCopyObjects : bulkMoveObjects;
-      return runBulk(action, {
+      return runBulk<BulkTransferOutcome>(action, {
         expand: async (opts) => {
           // The folder's own marker key (empty suffix) is not copied.
           const items = (await expandSelected(sourceBucket, { ...opts, maxKeys: MAX_BULK_OBJECTS })).filter(

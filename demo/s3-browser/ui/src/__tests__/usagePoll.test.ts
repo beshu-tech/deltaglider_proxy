@@ -6,11 +6,29 @@ import assert from 'node:assert/strict';
 import { test } from 'vitest';
 import { usagePollStep, type UsagePollStep } from '../usagePoll';
 import { ApiError } from '../errorHandling';
+import type { PrefixUsageLookup } from '../adminApi';
+
+const SCANNING: PrefixUsageLookup = { state: 'scanning' };
+const READY = { state: 'ready', entry: { total_size: 1 } } as unknown as PrefixUsageLookup;
+
+// A failed scan caches no result. The server once answered it as "not
+// cached, not scanning", which the poll read as "not yet" for 5 minutes and
+// then said "Timed out". The server now keeps the failure, and the poll stops.
+test('a failed scan stops the poll with its error; a scan that left no answer stops too', () => {
+  assert.deepEqual(usagePollStep(1, { result: { state: 'failed', error: 'listing b failed: SlowDown' } }), {
+    kind: 'fail',
+    error: 'The size scan failed: listing b failed: SlowDown',
+  });
+  assert.deepEqual(usagePollStep(1, { result: { state: 'none' } }), {
+    kind: 'fail',
+    error: 'The size scan ended without a result. Try again.',
+  });
+});
 
 // The budget is module-private; find it by probing, and pin its range.
 function findMaxAttempts(): number {
   let attempts = 1;
-  while (usagePollStep(attempts, { result: null }).kind === 'retry') {
+  while (usagePollStep(attempts, { result: SCANNING }).kind === 'retry') {
     attempts += 1;
     assert.ok(attempts < 10_000, 'the poll must be bounded');
   }
@@ -26,8 +44,8 @@ test('the probed attempt budget covers at least ~1 minute at 2s', () => {
 const kind = (s: UsagePollStep): UsagePollStep['kind'] => s.kind;
 
 test('result → done; not-yet-cached → retry', () => {
-  assert.equal(kind(usagePollStep(1, { result: { total_size: 1 } })), 'done');
-  assert.equal(kind(usagePollStep(1, { result: null })), 'retry');
+  assert.equal(kind(usagePollStep(1, { result: READY })), 'done');
+  assert.equal(kind(usagePollStep(1, { result: SCANNING })), 'retry');
 });
 
 test('transient errors retry', () => {
@@ -48,9 +66,9 @@ test('non-retryable errors stop at once', () => {
 });
 
 test('the attempt budget bounds both "no result yet" and transient errors', () => {
-  assert.equal(kind(usagePollStep(USAGE_POLL_MAX_ATTEMPTS - 1, { result: null })), 'retry');
-  assert.equal(kind(usagePollStep(USAGE_POLL_MAX_ATTEMPTS, { result: null })), 'fail');
+  assert.equal(kind(usagePollStep(USAGE_POLL_MAX_ATTEMPTS - 1, { result: SCANNING })), 'retry');
+  assert.equal(kind(usagePollStep(USAGE_POLL_MAX_ATTEMPTS, { result: SCANNING })), 'fail');
   assert.equal(kind(usagePollStep(USAGE_POLL_MAX_ATTEMPTS, { error: new ApiError('boom', 503) })), 'fail');
   // ...but a result on the last attempt still wins
-  assert.equal(kind(usagePollStep(USAGE_POLL_MAX_ATTEMPTS, { result: { total_size: 1 } })), 'done');
+  assert.equal(kind(usagePollStep(USAGE_POLL_MAX_ATTEMPTS, { result: READY })), 'done');
 });

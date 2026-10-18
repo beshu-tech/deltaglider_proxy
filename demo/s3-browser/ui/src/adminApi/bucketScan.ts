@@ -25,6 +25,9 @@ export interface BucketScanResult {
   completed_at: string; // ISO-8601
   duration_ms: number;
   version: number;
+  /** Some objects counted their stored size: their original size was not
+   *  known and a HEAD did not answer, so the totals are an estimate. */
+  estimated?: boolean;
 }
 
 /**
@@ -41,6 +44,8 @@ export interface BucketScanProgress {
   finished: boolean;
   error: string | null;
   started_at: string;
+  /** Terminal frame only: the result is an estimate (see BucketScanResult). */
+  estimated?: boolean;
 }
 
 /**

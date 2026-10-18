@@ -232,6 +232,8 @@ Expose debug/fingerprinting headers: `x-amz-storage-type` and `x-deltaglider-sto
 
 Enable permissive CORS for cross-origin admin access. Use it only in development, because it opens the door to CSRF against the session-cookie endpoints.
 
+A browser lets a page read only the response headers that the server names in `Access-Control-Expose-Headers`. With this setting, the proxy names `*` (every header, for requests without credentials), and it also names the headers that the S3 SDK and the browser UI read: `ETag` (a multipart upload needs it for every part), `Content-Range`, `x-amz-request-id`, `x-amz-version-id`, the write-fact headers and the `x-amz-meta-dg-*` metadata headers.
+
 | | |
 |---|---|
 | **Env var** | `DGP_CORS_PERMISSIVE` |
@@ -538,6 +540,8 @@ admission:
 | `action` | string \| object (required) | Simple: `allow-anonymous`, `deny`, `continue`. Tagged: `{ type: reject, status: <4xx\|5xx>, message?: <string> }`. |
 
 The operator chain holds at most 1000 blocks. The proxy checks the blocks for every request, so it refuses a longer chain with an error that names the count. To gate many addresses, list them in the `source_ip_list` of one block.
+
+`reject` answers the request with its `status` and an S3 XML error body, so that S3 clients can read the message. The `<Message>` of the body is the rule's `message`, or `Rejected by access rule '<name>'` when the rule has no message. The `<Code>` follows the status: `SlowDown` for `429` and `503`, `AccessDenied` for `403`, `InvalidRequest` for `400`, and `Rejected` for a status that has no S3 code. A `503` also carries a `Retry-After` header.
 
 `continue` is an explicit terminal action that passes the request on to authentication. It is useful as the final block, because the trace output then shows where the chain ended.
 
