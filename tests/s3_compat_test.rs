@@ -958,15 +958,20 @@ async fn test_get_range_invalid_returns_416() {
     assert!(body.contains("<Code>InvalidRange</Code>"), "{body}");
     assert!(body.contains("<RequestId>"), "{body}");
 
-    // A 416 that the proxy judges from the metadata names the length
-    // (RFC 9110 §15.5.17), and its XML error keeps its Content-Type and
-    // RequestId. A HEAD and a conditional GET judge from the metadata; a
-    // plain ranged GET lets the backend answer, which gives no length.
+    // Every 416 names the length (RFC 9110 §15.5.17), and its XML error
+    // keeps its Content-Type and RequestId: a HEAD, a conditional GET, and a
+    // plain ranged GET (whose backend refusal carries no length).
     let url = format!(
         "{}/{}/range-invalid.bin",
         server.endpoint(),
         server.bucket()
     );
+    let plain = http
+        .get(&url)
+        .header("range", "bytes=200-300")
+        .send()
+        .await
+        .unwrap();
     let head = http
         .head(&url)
         .header("range", "bytes=200-300")
@@ -980,7 +985,7 @@ async fn test_get_range_invalid_returns_416() {
         .send()
         .await
         .unwrap();
-    for (name, resp) in [("HEAD", head), ("conditional GET", get)] {
+    for (name, resp) in [("HEAD", head), ("conditional GET", get), ("GET", plain)] {
         assert_eq!(resp.status().as_u16(), 416, "{name}");
         let header = |h: &str| {
             resp.headers()

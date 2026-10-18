@@ -290,12 +290,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// A ranged GET (no If-Range, no conditional headers) of a passthrough
     /// object in one round trip: the ranged read of the plain object, whose
     /// response carries its metadata, in parallel with the HEAD of the
-    /// `.delta` form. The backend answers a range past the end itself
-    /// (`InvalidRange`). `Ok(None)`: the HEAD-first path answers instead,
+    /// `.delta` form. `Ok(None)`: the HEAD-first path answers instead,
     /// because the plain object is absent, a `.delta` form is newer (a
-    /// crash leftover), its metadata names another layout, or a 416 came
-    /// back while a `.delta` form exists. The ranged body is then dropped
-    /// unread.
+    /// crash leftover), its metadata names another layout, or the backend
+    /// refused the range. The backend's refusal does not carry the object
+    /// length, and the HEAD-first path answers the 416 with
+    /// `Content-Range: bytes */<len>` (one HEAD, on the error path only).
+    /// The ranged body is then dropped unread.
     #[instrument(skip(self))]
     #[allow(clippy::type_complexity)]
     pub async fn retrieve_range_fresh(
@@ -342,7 +343,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 Ok(Some((stream, len, meta)))
             }
             Err(StorageError::NotFound(_)) => Ok(None),
-            Err(StorageError::InvalidRange(_)) if delta.is_some() => Ok(None),
+            Err(StorageError::InvalidRange(_)) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
