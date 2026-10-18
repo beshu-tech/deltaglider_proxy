@@ -309,7 +309,7 @@ fn zip_edit(zip: &[u8], edit: impl FnOnce(&mut Vec<(String, Vec<u8>)>)) -> Vec<u
         let mut f = src.by_index(i).unwrap();
         let mut buf = Vec::new();
         f.read_to_end(&mut buf).unwrap();
-        files.push((f.name().to_string(), buf));
+        files.push((f.name().unwrap().into_owned(), buf));
     }
     edit(&mut files);
     let hex = |b: &[u8]| {

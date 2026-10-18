@@ -337,7 +337,7 @@ fn unzip(body: &[u8]) -> Vec<(String, Vec<u8>)> {
             let mut data = Vec::new();
             // read_to_end checks each entry's CRC-32.
             f.read_to_end(&mut data).unwrap();
-            (f.name().to_string(), data)
+            (f.name().unwrap().into_owned(), data)
         })
         .collect()
 }

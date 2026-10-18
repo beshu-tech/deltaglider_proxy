@@ -502,7 +502,7 @@ mod tests {
                 let mut data = Vec::new();
                 // read_to_end checks the CRC-32 at the end of the entry.
                 f.read_to_end(&mut data).unwrap();
-                (f.name().to_string(), data)
+                (f.name().unwrap().into_owned(), data)
             })
             .collect()
     }

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Security — Dependency updates
+
+- The `zip` crate is now version 9 (was 2.4.2). Version 2.4.2 has three advisories about extraction to disk: [RUSTSEC-2026-0367](https://rustsec.org/advisories/RUSTSEC-2026-0367), [RUSTSEC-2026-0368](https://rustsec.org/advisories/RUSTSEC-2026-0368) and [RUSTSEC-2026-0369](https://rustsec.org/advisories/RUSTSEC-2026-0369). The proxy does not call `extract()`: the backup import reads each entry into memory. A backup entry whose name is not valid now gets a `400` response with `parse_zip`.
+- The Kubernetes operator now uses `rustls` 0.23.46 (was 0.23.45), which fixes [RUSTSEC-2026-0346](https://rustsec.org/advisories/RUSTSEC-2026-0346) and [RUSTSEC-2026-0347](https://rustsec.org/advisories/RUSTSEC-2026-0347).
+
 ### Fixed — The runs list tells runs apart, and says why lifecycle skipped objects
 
 - On **Storage → Jobs**, the title of a rule run now includes its number ("expire-old-qa-reports #93"). Before this release, the runs of one rule all had the same title. A bulk delete is now titled with the first folder that it removes ("ror/e2e_reports/2026-09-25/ +2"), not with its bucket, so three deletes in one bucket no longer look like one job.

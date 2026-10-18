@@ -117,7 +117,7 @@ polyval = { version = "0.6", features = ["zeroize"] }
 # zlib). Used by the backup export/import handlers to bundle
 # config.yaml + iam.json + secrets.json + manifest.json into a single
 # atomic artifact.
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 # Utilities
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }

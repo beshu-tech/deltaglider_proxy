@@ -621,8 +621,8 @@ async fn export_zip(
     ));
     {
         let mut zw = zip::ZipWriter::new(&mut buf);
-        let opts: zip::write::FileOptions<'_, ()> =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
         for (name, bytes) in [
             ("manifest.json", manifest_bytes.as_slice()),
             ("config.yaml", yaml_bytes.as_slice()),
@@ -780,7 +780,17 @@ fn unzip_bounded(
                 format!("zip entry unreadable: {e}"),
             )
         })?;
-        let name = f.name().to_string();
+        let name = f
+            .name()
+            .map_err(|e| {
+                import_fail(
+                    StatusCode::BAD_REQUEST,
+                    "parse_zip",
+                    format!("entry index {i}"),
+                    format!("zip entry name unreadable: {e}"),
+                )
+            })?
+            .into_owned();
 
         // Zip-slip: reject any entry whose name traverses out of the
         // archive root. We don't write to disk — but a future caller
@@ -2616,7 +2626,7 @@ storage:
         let mut buf = Vec::new();
         {
             let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+            let opts = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             for (n, c) in entries {
                 w.start_file(*n, opts).unwrap();
