@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.18 — 2026-10-18
+
 ### Security — Dependency updates
 
 - The `zip` crate is now version 9 (was 2.4.2). Version 2.4.2 has three advisories about extraction to disk: [RUSTSEC-2026-0367](https://rustsec.org/advisories/RUSTSEC-2026-0367), [RUSTSEC-2026-0368](https://rustsec.org/advisories/RUSTSEC-2026-0368) and [RUSTSEC-2026-0369](https://rustsec.org/advisories/RUSTSEC-2026-0369). The proxy does not call `extract()`: the backup import reads each entry into memory. A backup entry whose name is not valid now gets a `400` response with `parse_zip`.

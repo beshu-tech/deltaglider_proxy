@@ -8,7 +8,66 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-10-16_
+_Last updated: 2026-10-18_
+
+## v2.0.18 — 2026-10-18
+
+### Security — Dependency updates
+
+- The `zip` crate is now version 9 (was 2.4.2). Version 2.4.2 has three advisories about extraction to disk: [RUSTSEC-2026-0367](https://rustsec.org/advisories/RUSTSEC-2026-0367), [RUSTSEC-2026-0368](https://rustsec.org/advisories/RUSTSEC-2026-0368) and [RUSTSEC-2026-0369](https://rustsec.org/advisories/RUSTSEC-2026-0369). The proxy does not call `extract()`: the backup import reads each entry into memory. A backup entry whose name is not valid now gets a `400` response with `parse_zip`.
+- The Kubernetes operator now uses `rustls` 0.23.46 (was 0.23.45), which fixes [RUSTSEC-2026-0346](https://rustsec.org/advisories/RUSTSEC-2026-0346) and [RUSTSEC-2026-0347](https://rustsec.org/advisories/RUSTSEC-2026-0347).
+
+### Fixed — The admin password survives a restart when only the config file sets it
+
+- The proxy removes the bootstrap password hash from the config file every time it saves the config, so that the file is not a store for the hash. A hash that only the config file set was therefore gone after the first save, and the next start generated a random password, so the admin sign-in failed. The proxy now also writes such a hash to its state file `.deltaglider_bootstrap_hash` at start. A hash that `DGP_BOOTSTRAP_PASSWORD_HASH` sets is not copied, because the variable sets it again at every start.
+
+### Fixed — Adding the first named backend no longer hides the existing buckets
+
+- On a proxy that ran on the single backend under `storage.backend`, adding the first named backend (for example `local-disk`, through **Storage → Backends** or `POST /_/api/admin/backends`) made the new backend the default. The proxy uses the single backend only while no named backends exist, so the buckets on it disappeared from ListBuckets and GET, although their files stayed on disk. Now the first named backend that you add turns the single backend into the named backend `default`, with its encryption, and `default` stays the default backend. The buckets stay visible in the running proxy, in the saved YAML and after a restart. A new backend becomes the default only when the request asks for it with `set_default: true`; in that case the old buckets also stay visible on `default`.
+- `GET /_/api/admin/backends` now reports `default_backend: "default"` for a proxy on the single backend, so the panel marks that backend as the default.
+- `POST /_/api/admin/users/:id/rotate-keys` accepted an access key ID that is empty, that contains whitespace, or that is not ASCII. A SigV4 request cannot carry such a key, so the user was locked out. The rotation now refuses such a key with `400`, as user creation already did.
+
+### Fixed — The runs list tells runs apart, and says why lifecycle skipped objects
+
+- On **Storage → Jobs**, the title of a rule run now includes its number ("expire-old-qa-reports #93"). Before this release, the runs of one rule all had the same title. A bulk delete is now titled with the first folder that it removes ("ror/e2e_reports/2026-09-25/ +2"), not with its bucket, so three deletes in one bucket no longer look like one job.
+- A lifecycle run counted every object that it did not act on as "not due". This count also included the objects that the rule's include and exclude globs keep out, so a rule with `expire_after: 0s` reported thousands of objects as "not due". The meter and the run drawer now show two counts: "not due" for the objects that are not old enough yet, and "not matched" for the objects outside the globs. `GET /jobs` and `GET /jobs/runs` report them as `progress.not_due` and `progress.excluded`.
+- The **Pause**, **Resume** and **Delete** actions of a rule or a job sent a `204 No Content` response that had a body. Behind a proxy that speaks HTTP/2 to the browser, such a response is a protocol error, so the browser reported a failure although the action took effect. These responses now have no body.
+
+### Fixed — The browser and the proxy agree on errors, estimates and scan failures
+
+- When a bucket that still held objects refused a delete, the sidebar read the count of multipart uploads in the refusal as "the bucket looks empty but has pending uploads" and offered to abort every upload. Those uploads could belong to other users. The sidebar now says that the bucket still holds objects and names one of them. When uploads are being completed at that moment, it asks you to try again in a few seconds. It never aborts uploads, because the proxy removes the uploads of a bucket with no objects when it deletes the bucket.
+- A folder size scan that failed stored no result, so the browser waited 5 minutes and then reported "Timed out waiting for the size scan". The proxy now keeps the failure for about a minute, `GET /_/api/admin/usage` returns it in an `error` field, and the browser shows it at once. The quota check does not start the same failing scan again on every write while the failure is kept.
+- A compression-health scan that failed was only logged. Every poll of the page then started a new full scan of the bucket, which was one scan every 3 seconds against a broken backend. The proxy now keeps the failure for about a minute and answers it with `status: "scan_failed"` and the error, without a new scan. The page shows the error, and its button starts a new scan. The `POST .../delta-efficiency/scan` response now includes `scanning: true`.
+- The savings chip, the dashboard scan card and the bucket size pill ignored the `estimated` flag that the proxy sends when it does not know the original size of some objects. They now show "≈" and say that the numbers are estimated. After a **Refresh** that could not read some sizes, the size pill says that it kept the running total and shows what the scan counted.
+- The browser showed the message of a `503` error only when it contained one of a few words, and otherwise it showed a hint about gateway limits. The proxy's own messages about its rate limit, concurrency cap, spool budget, codec slots, multipart limits and objects that changed during a read were hidden. The browser now shows the message of every S3 XML error that the proxy sends, and it keeps the gateway hint for responses that are not S3 errors, such as an HTML page from a reverse proxy.
+- An admission `reject` rule answered with a plain-text body, which an S3 SDK cannot parse, so the client lost the operator's message. The response is now an S3 XML error with the same status and the message (or "Rejected by access rule '<name>'" when the rule has no message), and a `503` carries `Retry-After`.
+- The object inspector reported every failed delete as "Failed to delete object". It now shows why the delete failed.
+- With `DGP_CORS_PERMISSIVE=true`, a page on another origin could read only the write-fact headers. The browser hid `ETag`, so a multipart upload larger than 16 MiB failed with "Part 1 is missing ETag", and it also hid `Content-Range`, `x-amz-request-id`, `x-amz-version-id` and the `x-amz-meta-dg-*` headers. These headers are now exposed.
+- The folder picker read only the first 100 entries of a folder, so it did not show the folders after them. It now reads every page of the listing.
+- A move whose destination is its own source (two bucket names on one storage) reported the object as "kept in the source folder". The move response now has an `in_place` count, and the browser says that the object already was at the destination.
+
+### Fixed — S3 responses without content, and form uploads with bad header fields
+
+- A conditional GET or HEAD that answered `304 Not Modified` carried an XML error body, because the S3 framework writes one for every error. The response therefore had `Content-Length: 77`, and over HTTP/2 it had a DATA frame, which curl and nghttp2 reject as a protocol error. The S3 response layer now removes the content of every 1xx, 204 and 304 response and drops its `Content-Length`. The `ETag` and `Last-Modified` of the 304 stay.
+- A browser form upload (`POST` with `multipart/form-data`) stored its `x-amz-meta-*` field names and its `Content-Type` field without a check. A name with a space, or a `Content-Type` with a line break, was accepted with 204, and then every GET and HEAD of the object failed with 500, because the proxy could not send these values back as response headers. Such a form upload is now refused with `400 InvalidArgument` before anything is stored, as a PutObject with the same values is.
+- A `416 Range Not Satisfiable` now has `Content-Range: bytes */<length>`, so a client can retry with a range that fits. A plain ranged GET reads the range from the storage backend in one request, and the backend's refusal does not give the length. When the backend refuses the range, the proxy now reads the object's metadata once and answers the 416 from it.
+
+### Fixed — The admin UI shows why the server refused a change
+
+- The user, group, mapping-rule and job-banner endpoints answered a refused request (400, 404, 409) with an empty body, and the reason went only to the server log. The UI therefore showed a generic "Bad request" message. These refusals now carry their reason as `{"error": "<reason>"}` (for example "invalid permissions: …", "user name cannot start with '$'" or the regex error of a mapping rule), and the UI shows it. A name that another user or group already has now reads "the name is already in use (…)", not the raw SQLite text. A server error (5xx) still sends no detail, and the detail stays in the log. A unit test makes sure that no error shape sends an empty body for a 4xx.
+- The server refuses a section or YAML validate or apply with a 400 or 422 status and a result body that holds the error, the warnings and the diff. The UI treated every non-2xx status as an exception, so it showed a short error message and dropped the warnings and the diff. The UI now reads that body and shows the refusal in the apply dialog, the YAML import dialog and the bucket encryption dialog.
+- The server refuses a password change with a status such as 403 or 409 and a reason. The UI did not catch this response, so the spinner turned forever and the reason did not show. The UI now stops the spinner and shows the reason.
+- When the database recovery key is wrong, the connect page now shows the server's sentence without the "failed (401)" prefix.
+- A legacy JSON backup restore that the server refused showed only the status text, for example "Conflict". It now shows the reason of the refusal.
+- After a backup restore, the dialog now names the users that the restore imported under a new name (because another user had their name) and the policy rules with a condition that the proxy cannot evaluate.
+
+### Fixed — The full-IAM import preview of an unchanged export
+
+The import preview counted every OAuth login binding in the YAML as a change, also the bindings that the database already held, so the preview of the instance's own export always said "will change" with no details. The preview now counts only the bindings that the import adds or changes, and it shows that count.
+
+### Fixed — The mapping preview works in declarative IAM mode
+
+The mapping-rule preview only reads the rules, but the server refused it with 403 in declarative mode, because it is a POST request. The preview now answers in declarative mode. **Sync Groups** writes group memberships to the database, so it stays refused in declarative mode, and the UI no longer shows the button in that mode.
 
 ## v2.0.17 — 2026-10-16
 
