@@ -7,6 +7,12 @@
 - The `zip` crate is now version 9 (was 2.4.2). Version 2.4.2 has three advisories about extraction to disk: [RUSTSEC-2026-0367](https://rustsec.org/advisories/RUSTSEC-2026-0367), [RUSTSEC-2026-0368](https://rustsec.org/advisories/RUSTSEC-2026-0368) and [RUSTSEC-2026-0369](https://rustsec.org/advisories/RUSTSEC-2026-0369). The proxy does not call `extract()`: the backup import reads each entry into memory. A backup entry whose name is not valid now gets a `400` response with `parse_zip`.
 - The Kubernetes operator now uses `rustls` 0.23.46 (was 0.23.45), which fixes [RUSTSEC-2026-0346](https://rustsec.org/advisories/RUSTSEC-2026-0346) and [RUSTSEC-2026-0347](https://rustsec.org/advisories/RUSTSEC-2026-0347).
 
+### Fixed — Adding the first named backend no longer hides the existing buckets
+
+- On a proxy that ran on the single backend under `storage.backend`, adding the first named backend (for example `local-disk`, through **Storage → Backends** or `POST /_/api/admin/backends`) made the new backend the default. The proxy uses the single backend only while no named backends exist, so the buckets on it disappeared from ListBuckets and GET, although their files stayed on disk. Now the first named backend that you add turns the single backend into the named backend `default`, with its encryption, and `default` stays the default backend. The buckets stay visible in the running proxy, in the saved YAML and after a restart. A new backend becomes the default only when the request asks for it with `set_default: true`; in that case the old buckets also stay visible on `default`.
+- `GET /_/api/admin/backends` now reports `default_backend: "default"` for a proxy on the single backend, so the panel marks that backend as the default.
+- `POST /_/api/admin/users/:id/rotate-keys` accepted an access key ID that is empty, that contains whitespace, or that is not ASCII. A SigV4 request cannot carry such a key, so the user was locked out. The rotation now refuses such a key with `400`, as user creation already did.
+
 ### Fixed — The runs list tells runs apart, and says why lifecycle skipped objects
 
 - On **Storage → Jobs**, the title of a rule run now includes its number ("expire-old-qa-reports #93"). Before this release, the runs of one rule all had the same title. A bulk delete is now titled with the first folder that it removes ("ror/e2e_reports/2026-09-25/ +2"), not with its bucket, so three deletes in one bucket no longer look like one job.

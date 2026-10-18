@@ -30,9 +30,38 @@ pub fn generate_secret_access_key() -> String {
         .collect()
 }
 
+/// Whether `access_key_id` has a usable format: non-empty, ASCII, no
+/// whitespace (a SigV4 `Credential=` field cannot carry anything else).
+/// THE check of every admin path that sets a user's access key id: create,
+/// clone and rotate (update cannot change the key).
+pub fn access_key_id_is_valid(access_key_id: &str) -> bool {
+    !access_key_id.is_empty()
+        && access_key_id.is_ascii()
+        && !access_key_id.contains(char::is_whitespace)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn access_key_id_format_check() {
+        for ok in ["AKIAEXAMPLE", "ci-uploader", "a", "AK_1.2/x"] {
+            assert!(access_key_id_is_valid(ok), "{ok:?}");
+        }
+        for bad in ["", " ", "AK EXAMPLE", "AK\tX", "AKX\n", "AKé", " AK"] {
+            assert!(!access_key_id_is_valid(bad), "{bad:?}");
+        }
+        assert!(access_key_id_is_valid(&generate_access_key_id()));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn access_key_id_check_matches_its_definition(s in "\\PC*|[ \t\na-zé]{0,4}") {
+            let want = !s.is_empty() && s.chars().all(|c| c.is_ascii() && !c.is_whitespace());
+            proptest::prop_assert_eq!(access_key_id_is_valid(&s), want);
+        }
+    }
 
     #[test]
     fn test_access_key_id_format() {

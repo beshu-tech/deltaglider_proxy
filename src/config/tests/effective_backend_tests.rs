@@ -204,3 +204,122 @@ fn encryption_for_bucket_follows_the_effective_backend() {
     cfg.buckets.get_mut("releases").unwrap().backend = Some("gone".into());
     assert!(cfg.encryption_for_bucket("releases").is_none());
 }
+
+fn fs_named(name: &str, path: &str) -> NamedBackendConfig {
+    NamedBackendConfig {
+        name: name.into(),
+        backend: BackendConfig::Filesystem { path: path.into() },
+        encryption: BackendEncryptionConfig::default(),
+    }
+}
+
+const SINGLETON: &str = r#"
+storage:
+  backend:
+    type: filesystem
+    path: /tmp/dgp-singleton
+  backend_encryption:
+    mode: aes256-gcm-proxy
+    key: "0000000000000000000000000000000000000000000000000000000000000000"
+  buckets:
+    releases: {}
+    db-archive: { backend: default }
+"#;
+
+/// The first named backend turns the singleton into the named backend
+/// `default` (definition and encryption), which stays the default: every
+/// bucket resolves where it did before.
+#[test]
+fn first_named_backend_keeps_the_singleton_as_default() {
+    let mut cfg = Config::from_yaml_str(SINGLETON).unwrap();
+    let resolve = |cfg: &Config, b: &str| {
+        let (name, def) = cfg.effective_backend_for_bucket(b).unwrap();
+        let enc = cfg.encryption_for_bucket(b).unwrap().config.clone();
+        (name, def.clone(), enc)
+    };
+    let buckets = ["releases", "db-archive", "downloads"];
+    let before: Vec<_> = buckets.iter().map(|b| resolve(&cfg, b)).collect();
+    cfg.add_named_backend(fs_named("local-disk", "/tmp/dgp-local"), false)
+        .unwrap();
+    let names: Vec<_> = cfg.backends.iter().map(|b| b.name.as_str()).collect();
+    assert_eq!(names, ["default", "local-disk"]);
+    assert_eq!(cfg.default_backend.as_deref(), Some("default"));
+    assert!(cfg.check_fatal().is_empty(), "{:?}", cfg.check_fatal());
+    for (b, want) in buckets.iter().zip(&before) {
+        assert_eq!(&resolve(&cfg, b), want, "{b}");
+    }
+}
+
+/// `set_default` gives the new backend the default; a bucket routed to the
+/// singleton keeps its backend, now the named `default`.
+#[test]
+fn first_named_backend_as_default_still_names_the_singleton() {
+    let mut cfg = Config::from_yaml_str(SINGLETON).unwrap();
+    cfg.add_named_backend(fs_named("local-disk", "/tmp/dgp-local"), true)
+        .unwrap();
+    assert_eq!(cfg.default_backend_name(), "local-disk");
+    assert_eq!(
+        cfg.effective_backend_for_bucket("db-archive").unwrap().0,
+        "default"
+    );
+}
+
+/// With named backends and no `default_backend` key, the implicit default
+/// (the first backend) is pinned, so the new backend never takes it.
+#[test]
+fn a_later_named_backend_never_takes_the_implicit_default() {
+    let mut cfg = Config::from_yaml_str(NAMED).unwrap();
+    assert_eq!(cfg.default_backend, None);
+    cfg.add_named_backend(fs_named("aws-dr", "/tmp/dgp-dr"), false)
+        .unwrap();
+    assert_eq!(cfg.default_backend_name(), "hetzner-fsn1");
+}
+
+#[test]
+fn a_duplicate_backend_name_is_refused() {
+    let mut cfg = Config::from_yaml_str(SINGLETON).unwrap();
+    let err = cfg
+        .add_named_backend(fs_named("default", "/tmp/x"), false)
+        .unwrap_err();
+    assert!(err.contains("already exists"), "{err}");
+    assert!(cfg.backends.is_empty(), "a refused add changes nothing");
+    let mut cfg = Config::from_yaml_str(NAMED).unwrap();
+    let err = cfg
+        .add_named_backend(fs_named("local-disk", "/tmp/x"), false)
+        .unwrap_err();
+    assert!(err.contains("already exists"), "{err}");
+    assert_eq!(cfg.backends.len(), 2);
+}
+
+/// Production code adds a named backend only through
+/// `Config::add_named_backend`: a bare push onto an empty list hides the
+/// legacy singleton and every bucket on it.
+#[test]
+fn named_backends_are_added_in_one_place() {
+    let needle = concat!(".backends", ".push(");
+    let files = crate::source_scan::rust_files("src");
+    let test_files = crate::source_scan::out_of_line_test_modules(&files);
+    let mut offenders = Vec::new();
+    for path in &files {
+        if test_files.contains(path) {
+            continue;
+        }
+        let rel = crate::source_scan::rel(path);
+        let text = std::fs::read_to_string(path).unwrap();
+        let prod = crate::source_scan::prod_mask(&text);
+        let hits = text
+            .lines()
+            .enumerate()
+            .filter(|(i, l)| prod[*i] && l.contains(needle))
+            .count();
+        // The two pushes of `Config::add_named_backend`.
+        let limit = if rel == "src/config/mod.rs" { 2 } else { 0 };
+        if hits > limit {
+            offenders.push(format!("{rel}: {hits}"));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "add a named backend with Config::add_named_backend: {offenders:?}"
+    );
+}

@@ -92,7 +92,7 @@ deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.e
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/_/api/admin/backends` | List named backends |
-| `POST` | `/_/api/admin/backends` | Create; validates S3 creds upfront |
+| `POST` | `/_/api/admin/backends` | Create; validates S3 creds upfront. The default backend changes only when the request sets `set_default: true`. When the proxy runs on the singleton backend (`storage.backend`), the first named backend that you add turns the singleton into the named backend `default`, with its encryption, so that its buckets stay where they are |
 | `DELETE` | `/_/api/admin/backends/:name` | Remove a backend. The proxy refuses to delete the default backend or a backend in use |
 | `POST` | `/_/api/admin/backends/:name/probe` | Test connection: probe one backend now, update its health state, and return the result (`:name` is a named backend or `default`) |
 | `GET` | `/_/api/admin/backends/:name/legacy-key-usage?limit=N&fresh=true&bucket=B` | Count the objects and delta references that still carry the backend's legacy key id, or the legacy key id of bucket `B`'s own encryption (see below) |

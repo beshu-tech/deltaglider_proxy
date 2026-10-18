@@ -252,6 +252,132 @@ fn two_backends(a: &std::path::Path, b: &std::path::Path) -> String {
     )
 }
 
+/// The bucket names that ListBuckets returns.
+async fn listed_buckets(server: &TestServer) -> Vec<String> {
+    let out = server
+        .s3_client()
+        .await
+        .list_buckets()
+        .send()
+        .await
+        .unwrap();
+    let mut names: Vec<String> = out
+        .buckets()
+        .iter()
+        .filter_map(|b| b.name().map(str::to_string))
+        .collect();
+    names.sort();
+    names
+}
+
+/// The checks of [`first_named_backend_case`].
+async fn singleton_buckets_still_served(
+    server: &TestServer,
+    before: &[String],
+    default: &str,
+    when: &str,
+) {
+    assert_eq!(listed_buckets(server).await, before, "{when}: ListBuckets");
+    let got = server
+        .s3_client()
+        .await
+        .get_object()
+        .bucket("releases")
+        .key("v1/app.zip")
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("{when}: GET releases/v1/app.zip: {e:?}"));
+    let body = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(&body[..], b"payload", "{when}");
+    let ep = server.endpoint();
+    let list: Value = admin_http_client(&ep)
+        .await
+        .get(format!("{ep}/_/api/admin/backends"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let names: Vec<&str> = list["backends"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["default", "local-disk"], "{when}: {list}");
+    assert_eq!(list["default_backend"], default, "{when}: {list}");
+}
+
+/// The first named backend added to a proxy that runs on the legacy
+/// singleton (`storage.backend`) must not hide the singleton's buckets: the
+/// singleton becomes the named backend `default` and stays the default, in
+/// the running config, in the persisted YAML and after a restart. With
+/// `set_default` the new backend takes the default, and the old buckets are
+/// still served.
+async fn first_named_backend_case(set_default: bool) {
+    let extra = tempfile::tempdir().unwrap();
+    let mut server = TestServer::builder().build().await;
+    let ep = server.endpoint();
+    let s3 = server.s3_client().await;
+    for bucket in ["releases", "db-archive"] {
+        s3.create_bucket().bucket(bucket).send().await.unwrap();
+        s3.put_object()
+            .bucket(bucket)
+            .key("v1/app.zip")
+            .body(b"payload".to_vec().into())
+            .send()
+            .await
+            .unwrap();
+    }
+    let before = listed_buckets(&server).await;
+    assert!(before.contains(&"releases".to_string()), "{before:?}");
+
+    let admin = admin_http_client(&ep).await;
+    let (code, v) = json_of(
+        admin
+            .post(format!("{ep}/_/api/admin/backends"))
+            .json(&json!({
+                "name": "local-disk",
+                "type": "filesystem",
+                "path": extra.path().display().to_string(),
+                "set_default": set_default,
+            }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{v}");
+    let default = if set_default { "local-disk" } else { "default" };
+
+    singleton_buckets_still_served(&server, &before, default, "after the create").await;
+    let persisted = std::fs::read_to_string(server.config_path()).unwrap();
+    assert!(
+        persisted.contains("local-disk") && persisted.contains("name: default"),
+        "both backends are persisted:\n{persisted}"
+    );
+    // Persist strips `bootstrap_password_hash` from the YAML, so the restart
+    // gets it from the environment.
+    server
+        .respawn_with_env(&[(
+            "DGP_BOOTSTRAP_PASSWORD_HASH",
+            common::TEST_BOOTSTRAP_PASSWORD_HASH,
+        )])
+        .await;
+    singleton_buckets_still_served(&server, &before, default, "after a restart").await;
+}
+
+#[tokio::test]
+async fn first_named_backend_keeps_the_singleton_buckets() {
+    first_named_backend_case(false).await;
+}
+
+#[tokio::test]
+async fn first_named_backend_as_default_keeps_the_singleton_buckets() {
+    first_named_backend_case(true).await;
+}
+
 #[tokio::test]
 async fn backends_create_probe_route_and_delete() {
     let (a, b, extra) = (
@@ -1042,6 +1168,33 @@ async fn users_rotate_clone_delete_and_empty_name() {
         .unwrap()
         .status();
     assert_eq!(code, StatusCode::NOT_FOUND);
+    // A key id that a SigV4 request cannot carry is refused, as on create,
+    // and the current key stays.
+    let current = v["access_key_id"].as_str().unwrap().to_string();
+    for bad in ["", "HAS SPACE", "AKé"] {
+        let (code, v) = json_of(
+            admin
+                .post(format!("{ep}/_/api/admin/users/{id}/rotate-keys"))
+                .json(&json!({ "access_key_id": bad, "secret_access_key": "s3cr3t-value" }))
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{bad:?}: {v}");
+    }
+    let users: Value = admin
+        .get(format!("{ep}/_/api/admin/users"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        users.to_string().contains(&current),
+        "a refused rotation keeps the key: {users}"
+    );
 
     // Clone: fresh credentials, same permissions.
     let (code, c) = json_of(

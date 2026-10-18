@@ -1982,6 +1982,48 @@ impl Config {
         }
     }
 
+    /// Add the named backend `named`; with `set_default`, it becomes the
+    /// default. Adding a backend never moves an existing bucket:
+    ///
+    /// * The first named backend hides the legacy singleton
+    ///   (`storage.backend`) from the engine, and with it every bucket on
+    ///   it. So the singleton first becomes the named backend `"default"`
+    ///   (its synthesized name: routes to `default`, per-bucket encryption
+    ///   overrides and the `DGP_ENCRYPTION_KEY` env name stay valid), with
+    ///   its encryption. `storage.backend` itself stays: an S3 singleton
+    ///   keeps the coordination role ([`Self::coordination_backend`]) and
+    ///   the `DGP_S3_*` / `DGP_DATA_DIR` overrides still write it.
+    /// * Without `set_default`, the effective default before the add is
+    ///   pinned in `default_backend`, so the new backend never takes it.
+    ///
+    /// Refuses a duplicate name (the converted singleton counts).
+    pub fn add_named_backend(
+        &mut self,
+        named: NamedBackendConfig,
+        set_default: bool,
+    ) -> Result<(), String> {
+        if self.backends.is_empty() {
+            if named.name == "default" {
+                return Err("Backend 'default' already exists (it is the name of the \
+                     single backend under storage.backend)"
+                    .to_string());
+            }
+            self.backends.push(NamedBackendConfig {
+                name: "default".to_string(),
+                backend: self.backend.clone(),
+                encryption: self.backend_encryption.clone(),
+            });
+        }
+        if self.backends.iter().any(|b| b.name == named.name) {
+            return Err(format!("Backend '{}' already exists", named.name));
+        }
+        let previous_default = self.default_backend_name();
+        let name = named.name.clone();
+        self.backends.push(named);
+        self.default_backend = Some(if set_default { name } else { previous_default });
+        Ok(())
+    }
+
     /// Definition of a backend by NAME. `"default"` means the singleton only
     /// while no named backends exist (the rule `check_fatal` enforces).
     pub fn backend_by_name(&self, name: &str) -> Option<&BackendConfig> {

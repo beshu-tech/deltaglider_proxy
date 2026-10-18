@@ -67,7 +67,7 @@ function backendPills(b: BackendInfo, isDefault: boolean, colors: ReturnType<typ
     pills.push({
       label: 'Legacy singleton',
       color: colors.ACCENT_AMBER,
-      title: 'This entry stands for the single backend defined under storage.backend in YAML. It is not a named backend, so you cannot delete it. Add a named backend to migrate.',
+      title: 'This entry stands for the single backend defined under storage.backend in YAML. It is not a named backend, so you cannot delete it. When you add a named backend, this backend becomes the named backend "default", and its buckets stay on it.',
     });
   }
   const h = b.health;
@@ -486,7 +486,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
               backends.length === 0
                 ? 'No backend configured.'
                 : backends.every((b) => b.is_synthesized)
-                  ? 'Running on a single unnamed backend (below). Add a named backend to move to the multi-backend setup.'
+                  ? 'Running on a single unnamed backend (below). When you add a named backend, this one becomes the named backend "default" and keeps its buckets.'
                   : `${backends.length} backend${backends.length !== 1 ? 's' : ''} configured.`
             }
           />

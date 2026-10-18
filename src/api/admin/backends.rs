@@ -176,8 +176,10 @@ pub async fn list_backends(State(state): State<Arc<AdminState>>) -> impl IntoRes
     Json(BackendListResponse {
         backends,
         // The effective default (the first named backend when the key is
-        // unset), so the panel marks the backend that unrouted buckets use.
-        default_backend: (!cfg.backends.is_empty()).then(|| cfg.default_backend_name()),
+        // unset, the synthesized `default` for the singleton), so the panel
+        // marks the backend that unrouted buckets use and confirms an add
+        // that takes the default from an encrypting backend.
+        default_backend: Some(cfg.default_backend_name()),
     })
 }
 
@@ -595,24 +597,18 @@ pub async fn create_backend(
         &name,
         StatusCode::CREATED,
         |cfg| {
-            if cfg.backends.iter().any(|b| b.name == name) {
-                return Err((
-                    StatusCode::CONFLICT,
-                    format!("Backend '{}' already exists", name),
-                ));
-            }
-            cfg.backends.push(NamedBackendConfig {
-                name: name.clone(),
-                backend: backend_config,
-                // New backends default to plaintext (mode: none) —
-                // operators configure encryption after creation via the
-                // Backends panel or a section-level PATCH.
-                encryption: crate::config::BackendEncryptionConfig::default(),
-            });
-            if set_default || cfg.default_backend.is_none() {
-                cfg.default_backend = Some(name.clone());
-            }
-            Ok(())
+            cfg.add_named_backend(
+                NamedBackendConfig {
+                    name: name.clone(),
+                    backend: backend_config,
+                    // New backends default to plaintext (mode: none) —
+                    // operators configure encryption after creation via the
+                    // Backends panel or a section-level PATCH.
+                    encryption: crate::config::BackendEncryptionConfig::default(),
+                },
+                set_default,
+            )
+            .map_err(|e| (StatusCode::CONFLICT, e))
         },
     )
     .await

@@ -49,6 +49,17 @@ fn default_copy_group_memberships() -> bool {
     true
 }
 
+/// 400 unless `access_key_id` has a usable format
+/// ([`iam::keygen::access_key_id_is_valid`]). Create, clone and rotate run
+/// it before they write the key.
+fn check_access_key_id(access_key_id: &str) -> Result<(), AdminError<Scrubbed>> {
+    if iam::keygen::access_key_id_is_valid(access_key_id) {
+        return Ok(());
+    }
+    tracing::warn!("Invalid access key format: {:?}", access_key_id);
+    Err(AdminError::invalid("invalid access key format"))
+}
+
 #[derive(Deserialize)]
 pub struct CloneUserRequest {
     pub name: Option<String>,
@@ -239,14 +250,7 @@ pub async fn create_user(
         .secret_access_key
         .unwrap_or_else(iam::generate_secret_access_key);
 
-    // Validate access key format: must be non-empty, ASCII, no whitespace
-    if access_key_id.is_empty()
-        || !access_key_id.is_ascii()
-        || access_key_id.contains(char::is_whitespace)
-    {
-        tracing::warn!("Invalid access key format: {:?}", access_key_id);
-        return Err(AdminError::invalid("invalid access key format"));
-    }
+    check_access_key_id(&access_key_id)?;
 
     // Block reserved and blank names
     if crate::iam::types::is_blank_principal_name(&body.name) {
@@ -324,6 +328,7 @@ pub async fn clone_user(
     }
 
     let access_key_id = iam::generate_access_key_id();
+    check_access_key_id(&access_key_id)?;
     let secret_access_key = iam::generate_secret_access_key();
     let copy_groups = body.map(|b| b.copy_group_memberships).unwrap_or(true);
 
@@ -565,6 +570,7 @@ pub async fn rotate_user_keys(
             iam::generate_secret_access_key(),
         ),
     };
+    check_access_key_id(&new_access_key)?;
 
     // Capture the OLD key before rotation: sessions minted with it must die.
     let old_access_key = db.get_user_by_id(user_id).ok().map(|u| u.access_key_id);
