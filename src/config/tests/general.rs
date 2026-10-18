@@ -2411,3 +2411,19 @@ storage:
         "legacy_key_id without legacy_key must warn, got {warnings:?}"
     );
 }
+
+/// A hash that only the config file carries goes to the state file, because
+/// a persist removes it from the config file; an env-pinned hash does not.
+#[test]
+fn the_state_file_keeps_a_hash_that_only_the_config_file_carries() {
+    let h = "$2b$12$abcdefghijklmnopqrstuuJ0123456789abcdefghijklmnopqrstu";
+    assert!(file_hash_needs_write(None, None, h));
+    assert!(file_hash_needs_write(None, Some("$2b$12$other"), h));
+    assert!(!file_hash_needs_write(None, Some(h), h));
+    assert!(!file_hash_needs_write(None, Some(&format!("{h}\n")), h));
+    assert!(!file_hash_needs_write(
+        Some("DGP_BOOTSTRAP_PASSWORD_HASH"),
+        None,
+        h
+    ));
+}

@@ -2337,13 +2337,30 @@ impl Config {
     ///
     /// Returns the bcrypt hash (always raw, never base64).
     pub fn ensure_bootstrap_password_hash(&mut self) -> String {
-        if let Some(ref hash) = self.bootstrap_password_hash {
-            return Self::decode_hash(hash);
-        }
-
         // Check new file first, fall back to legacy file name
         let new_file = std::path::Path::new(".deltaglider_bootstrap_hash");
         let legacy_file = std::path::Path::new(".deltaglider_admin_hash");
+        if let Some(ref hash) = self.bootstrap_password_hash {
+            let hash = Self::decode_hash(hash);
+            // Every persist drops the hash from the config file
+            // (`redact_for_persist`), so a hash that only the file carries
+            // would be gone at the next boot, and the admin password with
+            // it. Keep it in the state file too.
+            let on_disk = std::fs::read_to_string(new_file)
+                .or_else(|_| std::fs::read_to_string(legacy_file))
+                .ok();
+            if file_hash_needs_write(self.tuning.bootstrap_hash_env, on_disk.as_deref(), &hash) {
+                if let Err(e) = write_bootstrap_hash_file(new_file, &hash) {
+                    eprintln!(
+                        "Warning: could not persist bootstrap hash to {}: {}",
+                        new_file.display(),
+                        e
+                    );
+                }
+            }
+            return hash;
+        }
+
         let state_file = if new_file.exists() {
             new_file
         } else {
@@ -3206,6 +3223,18 @@ fn first_run_banner(password: &str, hash: &str, is_tty: bool) -> Vec<String> {
 /// config DB), so it must not be world-readable — not even transiently.
 /// Create it 0600 in one syscall (not fs::write-then-chmod, which leaves an
 /// umask-wide window on a path where the hash is known-valid).
+/// PURE: whether the state file must store the bootstrap hash that the
+/// config carries. A hash pinned by an env var comes back at every boot,
+/// so it needs no copy; any other hash must be in the file, because a
+/// persist removes it from the config file.
+fn file_hash_needs_write(env_pin: Option<&str>, on_disk: Option<&str>, hash: &str) -> bool {
+    env_pin.is_none()
+        && on_disk
+            .map(|raw| Config::decode_hash(raw.trim()))
+            .as_deref()
+            != Some(hash)
+}
+
 pub fn write_bootstrap_hash_file(path: &std::path::Path, hash: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
