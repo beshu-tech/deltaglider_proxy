@@ -148,17 +148,6 @@ jobs:
             echo '```'
             echo "</details>"
           } >> $GITHUB_STEP_SUMMARY
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: lcov-coverage
-          path: |
-            /tmp/coverage/lcov.info
-            /tmp/coverage/lcov-lib.info
-            /tmp/coverage/summary-lib.txt
-            /tmp/coverage/summary-combined.txt
-            /tmp/coverage/compare.md
-          if-no-files-found: ignore
       - name: Stop MinIO
         if: always()
         run: docker rm -f minio-coverage 2>/dev/null || true
@@ -253,7 +242,7 @@ jobs:
             demo/s3-browser/ui/test-results
             qa-proxy*.log
           if-no-files-found: ignore
-          retention-days: 14
+          retention-days: 1
 
   # ── Fuzzing (fuzz/, libFuzzer): 5 minutes per target on the pinned STABLE
   #    toolchain via scripts/fuzz.sh (cargo-fuzz's coverage flags with no
@@ -281,7 +270,9 @@ jobs:
           name: fuzz-crash-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}
           if-no-files-found: ignore
-          retention-days: 30
+          # The org caps retention at 1 day. libFuzzer also prints a crash
+          # input of 256 bytes or less as Base64 in the job log.
+          retention-days: 1
 
   # ── Failure visibility: one open `nightly-failure` issue while the nightly
   #    is red (a comment per further red run, never a second issue), closed

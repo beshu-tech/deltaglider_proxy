@@ -62,6 +62,8 @@ jobs:
         uses: docker/setup-buildx-action@v3
       - if: steps.exists.outputs.exists == 'false'
         uses: docker/build-push-action@v6
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
         with:
           context: operator
           platforms: linux/amd64,linux/arm64
