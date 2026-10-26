@@ -22,7 +22,7 @@ permissions: {}
 
 defaults:
   run:
-    # Self-hosted k3s runner's container image defaults to /bin/sh, not
+    # The self-hosted runner's job container defaults to /bin/sh, not
     # bash. Every `run:` step here uses bash-isms (`set -o pipefail`,
     # `[[ ... =~ ... ]]`). Pin bash workflow-wide.
     shell: bash
@@ -30,7 +30,7 @@ defaults:
 jobs:
   prepare:
     name: Prepare release PR
-    runs-on: k3s
+    runs-on: incus
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       credentials:
@@ -125,7 +125,7 @@ jobs:
           git push origin "$BRANCH"
 
           # Create the PR via the GitHub REST API — the builder image
-          # on the k3s self-hosted runner doesn't ship with the `gh`
+          # on the self-hosted runner doesn't ship with the `gh`
           # CLI, so we can't shell out to `gh pr create` here. The
           # REST API is always available and only needs `curl` + the
           # GITHUB_TOKEN we already have via `pull-requests: write`.
