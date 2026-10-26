@@ -19,7 +19,7 @@ env:
   RUSTC_WRAPPER: sccache
   CARGO_INCREMENTAL: "0"
   SCCACHE_BUCKET: sccache-rust
-  SCCACHE_ENDPOINT: http://sccache-minio.sccache.svc.cluster.local:9000
+  SCCACHE_ENDPOINT: http://sccache-minio:9000
   SCCACHE_REGION: auto
   SCCACHE_S3_USE_SSL: "false"
   AWS_ACCESS_KEY_ID: sccache
@@ -117,7 +117,7 @@ jobs:
   validate:
     name: Validate Release
     needs: verify-ci
-    runs-on: k3s
+    runs-on: incus
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       credentials:
@@ -189,7 +189,7 @@ jobs:
   build-linux-x86_64:
     name: Build x86_64-unknown-linux-gnu
     needs: verify-ci
-    runs-on: k3s
+    runs-on: incus
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       credentials:
@@ -248,7 +248,7 @@ jobs:
     permissions:
       contents: read
     env:
-      # Disable sccache for non-k3s runners (no access to local MinIO)
+      # Disable sccache on GitHub-hosted runners (no access to the local MinIO)
       RUSTC_WRAPPER: ""
       CARGO_INCREMENTAL: "1"
     strategy:
@@ -552,7 +552,7 @@ jobs:
   release:
     name: Create Release
     needs: [validate, build-linux-x86_64, build-other, docker-merge]
-    runs-on: k3s
+    runs-on: incus
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       credentials:

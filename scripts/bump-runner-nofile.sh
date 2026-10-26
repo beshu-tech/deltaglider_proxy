@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Bump the open-file limit (nofile) on the self-hosted CI runners.
 #
-# WHY: the runners are Ryzen LXC containers (the `k3s` label is a historical
-# alias — no Kubernetes). LXC inherits a low default nofile (~1024). The CI
+# WHY: the runners are Incus (LXC) containers on the Ryzen host. LXC inherits
+# a low default nofile (~1024). The CI
 # integration job runs ~35 test binaries in parallel, each with its own proxy +
 # MinIO sockets, so the aggregate fd count crosses 1024 and fails as
 # `ConnectError("tcp open error", Os code 24 "Too many open files")`.

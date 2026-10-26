@@ -22,7 +22,7 @@ See [product/README.md](product/README.md) — that file is also the landing pag
 
 - [contributing.md](dev/contributing.md) — build, test, project structure
 - [releasing.md](dev/releasing.md) — release process, git tagging, Docker pipeline
-- [ci-infra.md](dev/ci-infra.md) — k3s runner setup, actions-runner-controller
+- [ci-infra.md](dev/ci-infra.md) — self-hosted Incus runners, sccache MinIO
 - [historical/](dev/historical/) — design docs that shaped the current implementation; kept for archaeology, not maintained
 
 ## CI enforcement
