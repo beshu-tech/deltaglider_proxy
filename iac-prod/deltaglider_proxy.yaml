@@ -33,29 +33,15 @@ storage:
       force_path_style: true
       access_key_id: ${env:DGP_BACKEND_HETZNER_ACCESS_KEY_ID}
       secret_access_key: ${env:DGP_BACKEND_HETZNER_SECRET_ACCESS_KEY}
-
-    # Local filesystem backend with at-rest encryption (proxy-side
-    # AES-256-GCM). The data lives on the container volume; the key is an
-    # env placeholder — REQUIRED to read every object already written under
-    # this key. Losing it makes those objects unrecoverable.
-    - name: LOCAL1BE
-      type: filesystem
-      path: ./data
-      encryption:
-        mode: aes256-gcm-proxy
-        key: ${env:DGP_BACKEND_LOCAL1BE_AES_KEY}
   default_backend: HetznerHelsinki1
 
   buckets:
     beshu:
       public_prefixes:
         - ror/libs/
-    # PRUNED 2026-06-12: the staging-experiment buckets didi / pippo /
-    # reenc-demo (and the disabled mirror-debug-to-local replication rule
-    # that targeted pippo) were removed from this template. Applying this
-    # config deletes their ROUTING POLICY only — any historical data stays
-    # on the LOCAL1BE backend volume (which is kept below, with its key,
-    # so that data remains readable if ever re-routed).
+    # REMOVED 2026-10-27: the LOCAL1BE filesystem backend, which held only the
+    # pruned staging buckets didi / pippo / reenc-demo. Its data used the v1
+    # encryption format, which v2.0.15+ cannot read, so it was dropped.
 
   # Lifecycle is fully OFF (subsystem disabled AND the rule disabled).
   lifecycle:
