@@ -82,11 +82,16 @@ export const ACTIVE_POLL_MS = 2000;
 export const IDLE_POLL_MS = 10_000;
 /**
  * How long the list polls fast after an action that makes the SERVER start a
- * run a moment later (Apply of a rule, Resume, Run now). The scheduler picks
- * the rule up within a second; the window only bounds the case where no run
- * starts at all (a lifecycle rule with nothing due).
+ * run a moment later (Apply of a rule, Resume, Run now). The schedulers check
+ * which rules are due every 30 s by default (replication:
+ * `replication.tick_interval`; lifecycle: `min(tick, 30 s)`), so a rule that is due at once
+ * can wait a whole check interval before its run starts: the window must be
+ * longer than that, or the fast polling ends just as the run begins and the
+ * row is never sampled while it runs (a short run then shows only its
+ * outcome). It still bounds the case where no run starts at all (a rule with
+ * nothing due).
  */
-export const WATCH_WINDOW_MS = 30_000;
+export const WATCH_WINDOW_MS = 60_000;
 
 /**
  * A job the list watches after an action: it polls fast until the run is

@@ -73,6 +73,19 @@ test('a watch also ends on a run that finished between two polls, or at the dead
   assert.equal(stepJobWatch(w, undefined, t0 + 1000), w);
 });
 
+// Regression: the window was exactly ONE scheduler check (30 s), so a rule
+// whose run started at that check was no longer watched: the list dropped to
+// its idle poll and a short run was never seen while it ran.
+test('a watch outlives one scheduler check, so the first run is still watched', () => {
+  const t0 = 0;
+  const w = startJobWatch('replication:r1', row({ last_run_at: 100 }), t0);
+  assert.ok(WATCH_WINDOW_MS > 30_000, 'longer than the scheduler check interval');
+  const still = stepJobWatch(w, row({ last_run_at: 100 }), t0 + 30_000);
+  assert.equal(still && still.id, w.id, 'the check that starts the run is inside the window');
+  assert.equal(jobsPollInterval([row()], still ? [still] : []), ACTIVE_POLL_MS, 'still polling fast');
+  assert.equal(stepJobWatch(still!, row({ status: 'running', last_run_at: 100 }), t0 + 30_500)?.sawActive, true);
+});
+
 // Regression: the Runs tab refetched only on active→terminal, so a run the
 // scheduler started and finished between polls stayed "No runs yet".
 test('runsRefreshKey changes when a run starts, settles, or the rule pauses', () => {
