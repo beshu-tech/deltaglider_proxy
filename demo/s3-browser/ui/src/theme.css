@@ -326,6 +326,68 @@ body {
   border-radius: 6px;
 }
 
+/* ───── Browser sidebar: resize handle + backend groups ───── */
+/* 8 px hit area on the sidebar's right edge; the visible line is 2 px. */
+.dg-sidebar-resize-handle {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 8px;
+  z-index: 2;
+  cursor: col-resize;
+  touch-action: none;
+}
+.dg-sidebar-resize-handle::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 2px;
+  background: transparent;
+  transition: background 0.15s ease 0.1s;
+}
+.dg-sidebar-resize-handle:hover::after,
+.dg-sidebar-resize-handle:focus-visible::after,
+.dg-col-resizing .dg-sidebar-resize-handle::after {
+  background: var(--focus-ring);
+}
+.dg-sidebar-resize-handle:focus-visible {
+  outline: none;
+}
+/* During a drag: one cursor everywhere, no text selection, and no width
+   transition on the sider (it would lag behind the pointer). */
+.dg-col-resizing,
+.dg-col-resizing * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+.dg-col-resizing .ant-layout-sider {
+  transition: none !important;
+}
+
+.dg-bucket-group-header {
+  width: 100%;
+  gap: 8px;
+  height: 28px;
+  padding: 0 10px 0 12px;
+  border-radius: 6px;
+  color: var(--dg-group-color);
+  transition: color 0.15s, background 0.15s;
+}
+.dg-bucket-group-header:hover {
+  color: var(--dg-group-hover-color);
+  background: var(--surface-hover);
+}
+.dg-bucket-group-chevron {
+  font-size: 9px;
+  transition: transform 0.15s ease;
+}
+.dg-bucket-group-header[aria-expanded='true'] .dg-bucket-group-chevron {
+  transform: rotate(90deg);
+}
+
 /* ───── Animations ───── */
 @keyframes fadeIn {
   from { opacity: 0; transform: translateY(6px); }

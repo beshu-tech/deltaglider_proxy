@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useId, useMemo, useRef } from 'react';
 import { Layout, Button, Typography, Drawer, theme, message, Modal } from 'antd';
 import Dropdown from './KeyboardDropdown';
 import type { MenuProps } from 'antd';
@@ -9,6 +9,7 @@ import {
   EllipsisOutlined,
   UploadOutlined,
   ExclamationCircleOutlined,
+  RightOutlined,
 } from '@ant-design/icons';
 import {
   countBucketObjects,
@@ -20,9 +21,20 @@ import {
 } from '../s3client';
 import type { BucketInfo } from '../types';
 import { useColors } from '../ThemeContext';
-import BucketBackendBadge from './BucketBackendBadge';
 import BucketEncryptionIcon from './BucketEncryptionIcon';
-import { showBackendChips } from '../bucketBackend';
+import SidebarResizeHandle from './SidebarResizeHandle';
+import { describeBackend } from '../bucketBackend';
+import {
+  COLLAPSED_GROUPS_STORAGE_KEY,
+  SIDEBAR_DEFAULT_WIDTH,
+  groupBucketsByBackend,
+  groupKey,
+  parseCollapsedGroups,
+  serializeCollapsedGroups,
+  type BucketGroup,
+} from '../sidebarLayout';
+import { readStorage, writeStorage } from '../safeStorage';
+import { useSidebarWidth } from '../useSidebarWidth';
 import {
   BUCKET_PROBE_CAP,
   BUCKET_PROBE_TIMEOUT_MS,
@@ -54,6 +66,7 @@ function formatBuildTime(iso: string): string {
 
 /* Shared inline style constants for sidebar menu items */
 const MENU_ICON_STYLE: React.CSSProperties = { fontSize: 14, width: 22, textAlign: 'center', display: 'inline-flex', justifyContent: 'center' };
+const LIST_STYLE: React.CSSProperties = { listStyle: 'none', margin: 0, padding: 0 };
 
 interface Props {
   onUploadClick: () => void;
@@ -110,6 +123,11 @@ export default function Sidebar({
   // Object count per bucket, probed when its row menu opens: Delete is only
   // offered for an empty bucket, because S3 refuses to delete any other.
   const [objectCounts, setObjectCounts] = useState<Record<string, BucketObjectCount>>({});
+  const [collapsedGroups, setCollapsedGroups] = useState(
+    () => parseCollapsedGroups(readStorage(COLLAPSED_GROUPS_STORAGE_KEY)),
+  );
+  const sidebarWidth = useSidebarWidth();
+  const groupIdPrefix = useId();
   const { token } = theme.useToken();
   const [messageApi, contextHolder] = message.useMessage();
   const { navigate } = useNavigation();
@@ -309,8 +327,16 @@ export default function Sidebar({
     onBucketChange(name);
   };
 
+  const toggleGroup = (key: string) => {
+    const next = new Set(collapsedGroups);
+    if (!next.delete(key)) next.add(key);
+    setCollapsedGroups(next);
+    writeStorage(COLLAPSED_GROUPS_STORAGE_KEY, serializeCollapsedGroups(next));
+  };
+
   const activeBucket = getBucket();
-  const backendChips = canAdmin && showBackendChips(buckets.map((b) => b.backend));
+  // Backend names come with the admin bucket-origins data only.
+  const groups = useMemo(() => (canAdmin ? groupBucketsByBackend(buckets) : null), [buckets, canAdmin]);
   const menuItemStyle: React.CSSProperties = {
     gap: 10,
     padding: '8px 6px',
@@ -319,6 +345,139 @@ export default function Sidebar({
     width: '100%',
     transition: 'color 0.15s',
     fontFamily: "var(--font-ui)",
+  };
+
+  const renderBucketRow = (b: BucketInfo) => {
+    const isUnavailable = Boolean(b.unavailable);
+    const isActive = b.name === activeBucket;
+    // The full name first: a long one is cut with an ellipsis in the row.
+    const hoverText = [
+      b.name,
+      isUnavailable ? `Temporarily unavailable — ${b.unavailable}` : describeBackend(b.backend),
+    ].filter(Boolean).join('\n');
+    return (
+      <li key={b.name} style={{ display: 'flex', alignItems: 'center', minWidth: 0 }}>
+        <button
+          className="btn-reset"
+          onClick={() => { if (!isUnavailable) handleSelectBucket(b.name); }}
+          disabled={isUnavailable}
+          aria-current={isActive ? 'true' : undefined}
+          aria-disabled={isUnavailable || undefined}
+          title={hoverText}
+          style={{
+            flex: 1,
+            minWidth: 0,
+            gap: 8,
+            padding: '7px 10px',
+            borderRadius: 6,
+            marginBottom: 2,
+            cursor: isUnavailable ? 'not-allowed' : 'pointer',
+            opacity: isUnavailable ? 0.5 : 1,
+            background: isActive ? `rgba(45, 212, 191, 0.1)` : 'transparent',
+            color: isActive ? ACCENT_BLUE_LIGHT : TEXT_SECONDARY,
+            transition: 'all 0.15s ease',
+            borderLeft: isActive ? `2px solid ${ACCENT_BLUE}` : '2px solid transparent',
+          }}
+          onMouseEnter={(e) => {
+            if (!isUnavailable && !isActive) e.currentTarget.style.background = 'var(--surface-hover)';
+          }}
+          onMouseLeave={(e) => {
+            if (!isActive) e.currentTarget.style.background = 'transparent';
+          }}
+        >
+          <span style={{
+            lineHeight: '20px',
+            fontFamily: "var(--font-mono)",
+            fontSize: 13,
+            fontWeight: isActive ? 600 : 400,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+            minWidth: 0,
+          }}>
+            {b.name}
+          </span>
+          <BucketEncryptionIcon origin={b.backend} />
+          {isUnavailable && (
+            <span
+              title={b.unavailable}
+              style={{
+                flexShrink: 0, marginLeft: 'auto', fontSize: 9, fontWeight: 700, letterSpacing: 0.5,
+                textTransform: 'uppercase', padding: '1px 5px', borderRadius: 4,
+                color: token.colorWarning,
+                border: `1px solid ${token.colorWarning}`,
+              }}
+            >
+              Unavailable
+            </span>
+          )}
+        </button>
+        {(canEditSettings || canDeleteRow(b)) && (
+          <Dropdown
+            menu={bucketMenu(b)}
+            trigger={['click']}
+            placement="bottomRight"
+            onOpenChange={(isOpen) => { if (isOpen && canDeleteRow(b)) probeBucketContents(b.name); }}
+          >
+            <Button
+              type="text"
+              size="small"
+              icon={<EllipsisOutlined />}
+              aria-label={`Actions for bucket ${b.name}`}
+              title="Bucket actions"
+              loading={deletingBucketName === b.name}
+              disabled={deletingBucketName !== null}
+              onClick={(e) => e.stopPropagation()}
+              style={{ color: TEXT_MUTED, flexShrink: 0 }}
+            />
+          </Dropdown>
+        )}
+      </li>
+    );
+  };
+
+  const renderGroup = (group: BucketGroup, index: number) => {
+    const key = groupKey(group);
+    const expanded = !collapsedGroups.has(key);
+    const label = group.backend ?? 'Unknown backend';
+    // Not the backend name: an id must not hold spaces (aria-controls is a list).
+    const listId = `${groupIdPrefix}-group-${index}`;
+    // A collapsed group hides the open bucket: its header takes the accent
+    // colour so the operator can see where the open bucket is.
+    const hidesActive = !expanded && group.buckets.some((b) => b.name === activeBucket);
+    // Backend-level facts only; the real bucket differs per row.
+    const origin = group.buckets[0].backend;
+    const backendFacts = describeBackend(origin && { ...origin, realBucket: undefined });
+    return (
+      <li key={`group:${key}`} style={{ marginTop: index === 0 ? 0 : 8 }}>
+        <button
+          className="btn-reset dg-bucket-group-header"
+          aria-expanded={expanded}
+          aria-controls={listId}
+          aria-label={`${label} (${group.buckets.length} buckets)`}
+          title={[backendFacts, hidesActive ? 'Contains the open bucket' : null].filter(Boolean).join('\n')}
+          onClick={() => toggleGroup(key)}
+          style={{
+            '--dg-group-color': hidesActive ? ACCENT_BLUE_LIGHT : TEXT_MUTED,
+            '--dg-group-hover-color': hidesActive ? ACCENT_BLUE_LIGHT : TEXT_PRIMARY,
+          } as React.CSSProperties}
+        >
+          <RightOutlined aria-hidden="true" className="dg-bucket-group-chevron" />
+          <span style={{
+            flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+            fontFamily: 'var(--font-mono)', fontSize: 12, fontWeight: 600,
+          }}>
+            {label}
+          </span>
+          <span style={{ flexShrink: 0, fontSize: 11, color: TEXT_FAINT, fontVariantNumeric: 'tabular-nums' }}>
+            {group.buckets.length}
+          </span>
+        </button>
+        <ul id={listId} hidden={!expanded} style={{ ...LIST_STYLE, marginTop: 2 }}>
+          {group.buckets.map(renderBucketRow)}
+        </ul>
+      </li>
+    );
   };
 
   const sidebarContent = (
@@ -372,108 +531,13 @@ export default function Sidebar({
           </div>
         )}
 
-        <ul style={{ listStyle: 'none', margin: 0, padding: 0 }}>
-          {buckets.map((b) => {
-            const isUnavailable = Boolean(b.unavailable);
-            return (
-            <li key={b.name} style={{ display: 'flex', alignItems: 'center', minWidth: 0 }}>
-              <button
-                className="btn-reset"
-                onClick={() => { if (!isUnavailable) handleSelectBucket(b.name); }}
-                disabled={isUnavailable}
-                aria-current={b.name === activeBucket ? 'true' : undefined}
-                aria-disabled={isUnavailable || undefined}
-                // Full origin backend error, verbatim, on hover — so an operator
-                // sees exactly WHY the bucket is dark (e.g. the raw 503/SlowDown).
-                title={isUnavailable ? `Temporarily unavailable — ${b.unavailable}` : undefined}
-                style={{
-                  flex: 1,
-                  minWidth: 0,
-                  padding: '7px 10px',
-                  borderRadius: 6,
-                  marginBottom: 2,
-                  cursor: isUnavailable ? 'not-allowed' : 'pointer',
-                  opacity: isUnavailable ? 0.5 : 1,
-                  background: b.name === activeBucket ? `rgba(45, 212, 191, 0.1)` : 'transparent',
-                  color: b.name === activeBucket ? ACCENT_BLUE_LIGHT : TEXT_SECONDARY,
-                  transition: 'all 0.15s ease',
-                  borderLeft: b.name === activeBucket ? `2px solid ${ACCENT_BLUE}` : '2px solid transparent',
-                }}
-                onMouseEnter={(e) => {
-                  if (!isUnavailable && b.name !== activeBucket) e.currentTarget.style.background = 'var(--surface-hover)';
-                }}
-                onMouseLeave={(e) => {
-                  if (b.name !== activeBucket) e.currentTarget.style.background = 'transparent';
-                }}
-              >
-                {/* Status badges sit outside the wrapping part and never hide;
-                    the name then shrinks with an ellipsis. */}
-                <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-                {/* One line tall and wrapping: a chip with no room left wraps
-                    to a second line, which the fixed height hides. */}
-                <span style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', columnGap: 8, height: 20, minWidth: 0, flex: '1 1 auto', overflow: 'hidden' }}>
-                  <span style={{
-                    lineHeight: '20px',
-                    fontFamily: "var(--font-mono)",
-                    fontSize: 13,
-                    fontWeight: b.name === activeBucket ? 600 : 400,
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                    whiteSpace: 'nowrap',
-                    display: 'block',
-                    // The name keeps its full width; the backend chip beside it
-                    // gives way (and is hidden) first.
-                    flex: 'none',
-                    maxWidth: '100%',
-                  }}>
-                    {b.name}
-                  </span>
-                  <BucketEncryptionIcon origin={b.backend} />
-                  {backendChips && (
-                    // Line breaking sees the 40 px stub, so the chip shrinks
-                    // (with an ellipsis) before it wraps out of view.
-                    <BucketBackendBadge origin={b.backend} style={{ flex: '1 1 40px', maxWidth: 'max-content' }} />
-                  )}
-                </span>
-                  {isUnavailable && (
-                    <span
-                      title={b.unavailable}
-                      style={{
-                        flexShrink: 0, fontSize: 9, fontWeight: 700, letterSpacing: 0.5,
-                        textTransform: 'uppercase', padding: '1px 5px', borderRadius: 4,
-                        color: token.colorWarning,
-                        border: `1px solid ${token.colorWarning}`,
-                      }}
-                    >
-                      Unavailable
-                    </span>
-                  )}
-                </span>
-              </button>
-              {(canEditSettings || canDeleteRow(b)) && (
-                <Dropdown
-                  menu={bucketMenu(b)}
-                  trigger={['click']}
-                  placement="bottomRight"
-                  onOpenChange={(isOpen) => { if (isOpen && canDeleteRow(b)) probeBucketContents(b.name); }}
-                >
-                  <Button
-                    type="text"
-                    size="small"
-                    icon={<EllipsisOutlined />}
-                    aria-label={`Actions for bucket ${b.name}`}
-                    title="Bucket actions"
-                    loading={deletingBucketName === b.name}
-                    disabled={deletingBucketName !== null}
-                    onClick={(e) => e.stopPropagation()}
-                    style={{ color: TEXT_MUTED, flexShrink: 0 }}
-                  />
-                </Dropdown>
-              )}
-            </li>
-            );
-          })}
-        </ul>
+        {groups ? (
+          <ul style={LIST_STYLE}>
+            {groups.map(renderGroup)}
+          </ul>
+        ) : (
+          <ul style={LIST_STYLE}>{buckets.map(renderBucketRow)}</ul>
+        )}
 
         {canUpload && (
           <div style={{ padding: '4px 0', borderTop: `1px solid ${token.colorBorderSecondary}`, marginTop: 4 }}>
@@ -556,7 +620,7 @@ export default function Sidebar({
       <>
         <Drawer
           placement="left"
-          size={260}
+          size={SIDEBAR_DEFAULT_WIDTH}
           open={open}
           onClose={onClose}
           styles={{ body: { padding: 0, background: BG_SIDEBAR } }}
@@ -570,7 +634,7 @@ export default function Sidebar({
 
   return (
     <Sider
-      width={250}
+      width={sidebarWidth.width}
       style={{
         background: BG_SIDEBAR,
         borderRight: `1px solid ${BORDER}`,
@@ -585,6 +649,7 @@ export default function Sidebar({
         {sidebarContent}
         {createBucketModal}
       </aside>
+      <SidebarResizeHandle {...sidebarWidth} />
     </Sider>
   );
 }

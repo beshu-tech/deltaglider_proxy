@@ -1,10 +1,12 @@
 /**
  * Sidebar rows: an encrypted bucket carries a padlock (hover text says how),
- * a plaintext one none; and a short backend name gets a frame no wider than
- * the name (a 40 px minimum made "b2" sit in a wide empty box).
+ * a plaintext one none. And the backend chip (breadcrumb) gives a short
+ * backend name a frame no wider than the name (a 40 px minimum made "b2" sit
+ * in a wide empty box).
  */
 import { screen } from '@testing-library/react';
 import { expect, test, vi } from 'vitest';
+import BucketBackendBadge from '../components/BucketBackendBadge';
 import Sidebar from '../components/Sidebar';
 import { renderWithQuery } from '../test/render';
 
@@ -22,7 +24,7 @@ vi.mock('../s3client', async (importOriginal) => {
   };
 });
 
-test('the padlock marks only the encrypted bucket; a short chip is tight', async () => {
+test('the padlock marks only the encrypted bucket', async () => {
   renderWithQuery(
     <Sidebar
       onUploadClick={() => {}} onBucketChange={() => {}} canCreateBucket canDeleteBucket={() => false}
@@ -33,5 +35,9 @@ test('the padlock marks only the encrypted bucket; a short chip is tight', async
   expect(lock).toHaveAttribute('title', 'Encrypted at rest: proxy AES-256-GCM, key k1 (set on this bucket)');
   expect(lock.closest('li')).toHaveTextContent('db-archive');
   expect(screen.getAllByRole('img', { name: 'Encrypted' })).toHaveLength(1);
+});
+
+test('a short backend chip is tight', () => {
+  renderWithQuery(<BucketBackendBadge origin={{ backendName: 'b2' }} />);
   expect(screen.getByLabelText('Backend b2').style.minWidth).toBe('min(40px, 2ch + 14px)');
 });
