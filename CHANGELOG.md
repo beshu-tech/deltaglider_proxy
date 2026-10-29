@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.19 — 2026-10-29
+
 ### Security — Dependency updates
 
 - The TLS stack that the S3 client uses now has fixed versions of three dependencies: `rustls-webpki` 0.103.16 ([RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382): certificate verification could accept distrusted intermediate certificates), `webpki-roots` 1.0.11 ([RUSTSEC-2026-0381](https://rustsec.org/advisories/RUSTSEC-2026-0381): distrusted emSign root certificates) and `ctutils` 0.4.6 ([RUSTSEC-2026-0385](https://rustsec.org/advisories/RUSTSEC-2026-0385): mask generation that was not constant-time). The Kubernetes operator gets the same updates.
