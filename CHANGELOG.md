@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Security — Dependency updates
+
+- The TLS stack that the S3 client uses now has fixed versions of three dependencies: `rustls-webpki` 0.103.16 ([RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382): certificate verification could accept distrusted intermediate certificates), `webpki-roots` 1.0.11 ([RUSTSEC-2026-0381](https://rustsec.org/advisories/RUSTSEC-2026-0381): distrusted emSign root certificates) and `ctutils` 0.4.6 ([RUSTSEC-2026-0385](https://rustsec.org/advisories/RUSTSEC-2026-0385): mask generation that was not constant-time). The Kubernetes operator gets the same updates.
+- `tokio` is now version 1.54.1 (was 1.53.1), which fixes the unsound `AsyncFd::new` of [RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386).
+
+### Changed — The browser sidebar shows buckets in groups by backend, and you can make it wider
+
+- When the buckets are on more than one backend, the sidebar of an admin session shows one group for each backend, in name order. Before this release, each bucket had a chip with its backend name, and the chip took space from the bucket name. Click the header of a group to collapse or expand it. The browser keeps the collapsed groups for the next visit. When a collapsed group holds the open bucket, its header shows in the accent colour. Sessions that are not admin sessions do not get backend data, so they show one list as before.
+- The sidebar is 312 px wide by default (was 250 px), so that more bucket names show in full. To change the width, drag the right edge of the sidebar, or focus the edge and use the arrow keys (Shift makes the steps larger, Home and End go to the narrowest and the widest width). A double-click on the edge restores the default width. The width can be from 240 px to 640 px, and at most half of the window. The browser keeps the width for the next visit.
+
+### Fixed — The jobs list shows a new rule while it runs
+
+- After you apply a rule, resume it or click **Run now**, the jobs list asks for updates every 2 seconds for a period. That period was 30 seconds, but the scheduler checks for due rules only every 30 seconds by default, so the fast updates could stop just as the run started, and a short run then showed only its result. The period is now 60 seconds.
+
 ## v2.0.18 — 2026-10-18
 
 ### Security — Dependency updates
