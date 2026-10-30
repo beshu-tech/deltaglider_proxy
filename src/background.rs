@@ -2,13 +2,13 @@
 
 //! Shared infrastructure for background job runners.
 //!
-//! - [`parse_duration_or`] — env-var duration parsing with sensible
+//! - `parse_duration_or` — env-var duration parsing with sensible
 //!   defaults (used by replication, lifecycle, event_delivery).
-//! - [`RunLease`] — per-run leader-lease knobs, shared by the replication +
+//! - `RunLease` — per-run leader-lease knobs, shared by the replication +
 //!   lifecycle workers.
-//! - [`LeaseKeeper`] — THE timer-driven lease renewal of every job kind
+//! - `LeaseKeeper` — THE timer-driven lease renewal of every job kind
 //!   (maintenance, lifecycle, replication, parity), with one error policy
-//!   ([`crate::config_db::job_store::keeper_step`]).
+//!   (`config_db::job_store::keeper_step`).
 //! - [`spawn_supervised`] — THE spawn of a long-lived background loop: a
 //!   panic is logged, counted, and the loop restarts after a backoff.
 
