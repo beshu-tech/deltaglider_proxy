@@ -35,8 +35,13 @@ export function extractSummary(markdown: string, max = 155): string {
     // inside (...) is dropped — not left fused to the link text. ![alt](src)
     // and [text](href) → alt / text.
     .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1')
-    // Then strip residual inline-markdown punctuation.
-    .replace(/[*_`#>]/g, '')
+    // Then strip residual inline-markdown punctuation, outside code spans only:
+    // `/_/api/admin/*` and `config_sync_bucket` keep their `_` and `*`.
+    .split(/(`[^`]*`)/)
+    .map((part) => (part.startsWith('`') && part.endsWith('`') && part.length > 1
+      ? part.slice(1, -1)
+      : part.replace(/[*_`#>]/g, '')))
+    .join('')
     .replace(/\s+/g, ' ')
     .trim();
   if (text.length <= max) return text;

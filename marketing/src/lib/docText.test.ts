@@ -20,4 +20,11 @@ describe('extractSummary', () => {
     const s = extractSummary('# T\n\nAlpha beta gamma, delta epsilon zeta eta theta.\n', 20);
     expect(s).toBe('Alpha beta gamma…');
   });
+
+  it('keeps the characters inside a code span', () => {
+    expect(extractSummary('# T\n\n*Every endpoint under `/_/api/admin/*`, grouped by purpose.*\n'))
+      .toBe('Every endpoint under /_/api/admin/*, grouped by purpose.');
+    expect(extractSummary('# T\n\nSet `config_sync_bucket` to __share__ the DB.\n'))
+      .toBe('Set config_sync_bucket to share the DB.');
+  });
 });

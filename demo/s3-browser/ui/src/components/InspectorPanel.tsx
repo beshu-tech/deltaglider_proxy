@@ -563,8 +563,6 @@ export default function InspectorPanel({
                   onClick={handleDownload}
                   style={{
                     flex: 1,
-                    background: ACCENT_GREEN,
-                    borderColor: ACCENT_GREEN,
                     fontWeight: 600,
                     borderRadius: 10,
                     fontFamily: "var(--font-ui)",

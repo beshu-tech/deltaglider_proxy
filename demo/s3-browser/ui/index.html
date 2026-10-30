@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" class="dark">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -8,10 +8,13 @@
   </head>
   <body>
     <script>
-      // Prevent theme flash: apply saved theme before first paint
+      // Prevent theme flash: set data-theme before first paint, with the rule
+      // ThemeProvider uses (a saved choice wins, else the system setting).
       (function() {
-        var t = localStorage.getItem('dg-theme');
-        if (t === 'light') document.documentElement.classList.remove('dark');
+        var t = null;
+        try { t = localStorage.getItem('dg-theme'); } catch (e) {}
+        var dark = t ? t === 'dark' : !window.matchMedia || window.matchMedia('(prefers-color-scheme: dark)').matches;
+        document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
       })();
     </script>
     <div id="root"></div>

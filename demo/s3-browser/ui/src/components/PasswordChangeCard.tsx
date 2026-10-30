@@ -12,7 +12,7 @@ const { Text } = Typography;
 
 export default function PasswordChangeCard() {
   const { cardStyle, inputRadius } = useCardStyles();
-  const { TEXT_MUTED, TEXT_PRIMARY, ACCENT_AMBER } = useColors();
+  const { TEXT_MUTED } = useColors();
 
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
@@ -95,10 +95,11 @@ export default function PasswordChangeCard() {
 
         <Button
           htmlType="submit"
+          type="primary"
           loading={changing}
           disabled={!currentPassword || !newPassword}
           block
-          style={{ ...inputRadius, fontFamily: "var(--font-ui)", fontWeight: 600, background: ACCENT_AMBER, borderColor: ACCENT_AMBER, color: TEXT_PRIMARY }}
+          style={{ ...inputRadius, fontFamily: "var(--font-ui)", fontWeight: 600 }}
         >
           Change Admin Password
         </Button>

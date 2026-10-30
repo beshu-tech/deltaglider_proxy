@@ -99,6 +99,13 @@ const UI_RULES = {
       selector: "JSXOpeningElement[name.name='Progress']:not(:has(JSXAttribute[name.name='aria-label']))",
       message: 'Give <Progress> an aria-label that says what is progressing.',
     },
+    {
+      // A hand-picked fill on a Button skips the contrast that the theme tokens
+      // are tested for (the amber password button was 2.89:1). Use type/danger.
+      selector:
+        "JSXOpeningElement[name.name='Button'] JSXAttribute[name.name='style'] Property[key.name=/^(background|backgroundColor)$/]:matches([value.name=/^ACCENT_/], [value.property.name=/^ACCENT_/])",
+      message: 'No ACCENT_* fill on <Button>: use type="primary" / danger, whose colours contrast.test.ts checks.',
+    },
     // AntD 6 deprecated props: each one floods the dev console with a warning.
     ...ANTD_DEPRECATED.map(([selector, message]) => ({ selector, message: `AntD 6 deprecation: ${message}` })),
   ],
