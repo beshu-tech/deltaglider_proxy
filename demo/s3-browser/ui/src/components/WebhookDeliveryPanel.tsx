@@ -20,7 +20,6 @@
  * dirty-dot + ⌘S + discard all work via useSectionEditor.
  */
 import { useMemo, useRef } from 'react';
-import { useEffect, useState } from 'react';
 import {
   Alert,
   Button,
@@ -34,7 +33,8 @@ import {
 } from 'antd';
 import { ApiOutlined, DeleteOutlined } from '@ant-design/icons';
 import type { SectionApplyResponse } from '../adminApi';
-import { DELIVERY_STATE, deliveryStateOf, fetchEventOutbox, type DeliveryState } from '../adminApi';
+import { DELIVERY_STATE, deliveryStateOf } from '../adminApi';
+import { useEventOutboxSummary } from '../queries/eventOutbox';
 import { useCardStyles, contentColumn, CONTENT_WIDE } from './shared-styles';
 import { LoadingState } from './StatePlaceholders';
 import { useColors } from '../ThemeContext';
@@ -191,30 +191,16 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
     },
   });
 
-  // Live delivery status strip (best-effort, read-only).
-  const [outbox, setOutbox] = useState<{
-    pending: number;
-    failed: number;
-    state: DeliveryState;
-    lastError: string | null;
-  } | null>(null);
-  useEffect(() => {
-    let alive = true;
-    fetchEventOutbox(1)
-      .then((r) => {
-        if (!alive) return;
-        setOutbox({
-          pending: r.counts.pending,
-          failed: r.counts.failed,
-          state: deliveryStateOf(r),
-          lastError: r.last_delivery_error ?? null,
-        });
-      })
-      .catch(() => {});
-    return () => {
-      alive = false;
-    };
-  }, []);
+  // Live delivery status strip (best-effort, read-only: a failure hides it).
+  const outboxQuery = useEventOutboxSummary();
+  const outbox = outboxQuery.data
+    ? {
+        pending: outboxQuery.data.counts.pending,
+        failed: outboxQuery.data.counts.failed,
+        state: deliveryStateOf(outboxQuery.data),
+        lastError: outboxQuery.data.last_delivery_error ?? null,
+      }
+    : null;
 
   // ── Row + field mutators (edit the editor value directly) ──
   // Functional updater: a burst of edits within one tick always builds on the

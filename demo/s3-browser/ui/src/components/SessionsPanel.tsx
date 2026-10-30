@@ -6,45 +6,43 @@
  * (DELETE /sessions/:id) or all sessions of an IAM key (revoke-user). Sessions
  * are in-memory, so a proxy restart still clears everything.
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { confirmDialog } from '../confirmDialog';
 import { Typography, Button, Tag, Table, Space, message, Input } from 'antd';
 import { ReloadOutlined, LogoutOutlined } from '@ant-design/icons';
-import { listSessions, revokeSession, revokeUserSessions, type SessionSummary } from '../adminApi';
+import type { SessionSummary } from '../adminApi';
+import { useRevokeSession, useRevokeUserSessions, useSessions } from '../queries/sessions';
 import { contentColumn, CONTENT_WIDE } from './shared-styles';
 import { normalizeUiError } from '../errorHandling';
 import { isSessionExpired } from '../errorHandling';
+import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
 import { formatDuration } from '../utils';
 import RowActionsMenu from './RowActionsMenu';
 
 const { Text } = Typography;
 
 export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?: () => void }) {
-  const [rows, setRows] = useState<SessionSummary[]>([]);
-  const [loading, setLoading] = useState(true);
+  const sessions = useSessions();
+  const revokeSessionMutation = useRevokeSession();
+  const revokeUserMutation = useRevokeUserSessions();
+  const rows = sessions.data ?? [];
+  const loading = sessions.isFetching;
   const [busy, setBusy] = useState<string | null>(null);
   const [revokeKey, setRevokeKey] = useState('');
 
-  const refresh = useCallback(async () => {
-    setLoading(true);
-    try {
-      setRows(await listSessions());
-    } catch (e) {
-      if (isSessionExpired(e)) { onSessionExpired?.(); return; }
-      message.error(normalizeUiError(e, 'Failed to load sessions'));
-    } finally {
-      setLoading(false);
+  useSessionExpiredOn(sessions.error, onSessionExpired);
+  // A load failure is a toast, as before; an expiry goes to sign-in instead.
+  useEffect(() => {
+    if (sessions.error && !isSessionExpired(sessions.error)) {
+      message.error(normalizeUiError(sessions.error, 'Failed to load sessions'));
     }
-  }, [onSessionExpired]);
-
-  useEffect(() => { void refresh(); }, [refresh]);
+  }, [sessions.error]);
 
   const revokeOne = async (id: string) => {
     try {
       setBusy(id);
-      await revokeSession(id);
+      await revokeSessionMutation.mutateAsync(id);
       message.success('Session revoked');
-      await refresh();
     } catch (e) {
       message.error(normalizeUiError(e, 'Failed to revoke session'));
     } finally {
@@ -63,7 +61,7 @@ export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?:
     }))) return;
     try {
       setBusy('user');
-      const res = await revokeUserSessions(key);
+      const res = await revokeUserMutation.mutateAsync(key);
       const local = `Revoked ${res.revoked_local} session${res.revoked_local === 1 ? '' : 's'} locally`;
       if (!res.persisted) {
         message.warning(`${local} — but the revocation could NOT be persisted; sessions on OTHER instances stay valid. Retry, or restart the peers.`);
@@ -71,7 +69,6 @@ export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?:
         message.success(`${local}; peers converge within ~${Math.ceil((res.propagation_bound_secs ?? 300) / 60)} min`);
       }
       setRevokeKey('');
-      await refresh();
     } catch (e) {
       message.error(normalizeUiError(e, 'Failed to revoke user sessions'));
     } finally {
@@ -131,7 +128,7 @@ export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?:
   return (
     <div style={{ ...contentColumn(CONTENT_WIDE), padding: 'clamp(12px, 2vw, 18px)', display: 'flex', flexDirection: 'column', gap: 14 }}>
       <Space>
-        <Button icon={<ReloadOutlined />} onClick={() => void refresh()} loading={loading}>Refresh</Button>
+        <Button icon={<ReloadOutlined />} onClick={() => void sessions.refetch()} loading={loading}>Refresh</Button>
         <Text type="secondary">{rows.length} live session{rows.length === 1 ? '' : 's'}</Text>
       </Space>
       <Table rowKey="id" size="small" columns={columns} dataSource={rows} loading={loading} pagination={false} />

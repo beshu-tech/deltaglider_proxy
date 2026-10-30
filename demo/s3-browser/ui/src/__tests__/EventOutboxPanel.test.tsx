@@ -215,3 +215,26 @@ test('a 500 shows the fetch error', async () => {
   renderWithQuery(<EventOutboxPanel />);
   expect(await screen.findByText('Fetch failed')).toBeInTheDocument();
 });
+
+test('an empty log explains when events are recorded', async () => {
+  http.on('GET', LIST, page([], { pending: 0, in_progress: 0, delivered: 0, failed: 0 }));
+  renderWithQuery(<EventOutboxPanel />);
+  expect(await screen.findByText(/No object events have been recorded yet/)).toBeInTheDocument();
+});
+
+test('Purge asks first, then deletes the failed events and refetches the counts', async () => {
+  let failed = 2;
+  http.on('GET', LIST, () => page([record(1)], { pending: 0, in_progress: 0, delivered: 1, failed }));
+  http.on('POST', '/_/api/admin/event-outbox/purge-failed', () => {
+    failed = 0;
+    return json({ purged: 2 });
+  });
+  const user = userEvent.setup();
+  renderWithQuery(<EventOutboxPanel />);
+  await user.click(await screen.findByRole('button', { name: /Purge failed \(2\)/ }));
+  const dialogs = await screen.findAllByRole('dialog');
+  await user.click(within(dialogs[dialogs.length - 1]).getByRole('button', { name: 'Delete' }));
+  await waitFor(() => expect(http.callsTo('POST', '/_/api/admin/event-outbox/purge-failed')).toHaveLength(1));
+  expect(await screen.findByText('Purged 2 failed events')).toBeInTheDocument();
+  await waitFor(() => expect(screen.getByRole('button', { name: /Purge failed \(0\)/ })).toBeDisabled());
+});

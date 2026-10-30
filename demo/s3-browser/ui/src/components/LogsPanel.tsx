@@ -15,16 +15,17 @@
  * Captured at INFO+ by default (DGP_LOG_RING_LEVEL). Read-only, per-instance,
  * bounded — a triage convenience, not a log store.
  */
-import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useDebounced } from '../hooks/useDebounced';
 import { Typography, Input, Button, Tag, Select, Space, Switch } from 'antd';
 import { ReloadOutlined, SearchOutlined, FileTextOutlined } from '@ant-design/icons';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useColors } from '../ThemeContext';
 import { relativeTime } from '../utils';
-import { fetchLogs, streamLogs, type LogEntry, type LogFilters } from '../adminApi';
+import { streamLogs, type LogEntry, type LogFilters } from '../adminApi';
+import { useLogBacklog } from '../queries/logs';
+import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
 import { normalizeUiError } from '../errorHandling';
-import { isSessionExpired } from '../errorHandling';
 import { useDocumentVisible } from '../useVisiblePolling';
 
 const { Text } = Typography;
@@ -54,12 +55,10 @@ function levelColour(level: string): string {
 
 export default function LogsPanel({ onSessionExpired }: Props) {
   const c = useColors();
-  const [entries, setEntries] = useState<LogEntry[]>([]);
   const [level, setLevel] = useState<string | undefined>(undefined);
   const [target, setTarget] = useState('');
   const [q, setQ] = useState('');
   const [follow, setFollow] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [streamError, setStreamError] = useState<string | null>(null);
   const [now, setNow] = useState(new Date());
   const unsubRef = useRef<(() => void) | null>(null);
@@ -73,28 +72,27 @@ export default function LogsPanel({ onSessionExpired }: Props) {
     [level, debouncedTarget, debouncedQ],
   );
 
-  // Generation guard: a slow response for an older filter set must not
-  // overwrite the entries of a newer one.
-  const fetchGen = useRef(0);
-  const loadBacklog = useCallback(async () => {
-    const gen = ++fetchGen.current;
-    try {
-      const resp = await fetchLogs(filters, RING_CAP);
-      if (gen !== fetchGen.current) return; // superseded by a newer load
-      setEntries(resp.entries);
-      setError(null);
-    } catch (e) {
-      if (gen !== fetchGen.current) return;
-      const msg = normalizeUiError(e, 'fetch failed');
-      if (isSessionExpired(e)) onSessionExpired?.();
-      setError(msg);
-    }
-  }, [filters, onSessionExpired]);
+  // Backlog: refetched on a filter change; the previous filter's lines stay
+  // until the new ones land.
+  const backlog = useLogBacklog(filters, RING_CAP);
+  const { refetch: refetchBacklog } = backlog;
+  const loadBacklog = () => void refetchBacklog();
+  useSessionExpiredOn(backlog.error, onSessionExpired);
+  const error = backlog.error ? normalizeUiError(backlog.error, 'fetch failed') : null;
 
-  // Initial + filter-change backlog load (always; the tail layers on top).
-  useEffect(() => {
-    loadBacklog();
-  }, [loadBacklog]);
+  // Live-tail lines, prepended to the backlog they arrived on top of. A new
+  // backlog already holds them, so a tail stamped with an older backlog
+  // counts as empty.
+  const backlogAt = backlog.dataUpdatedAt;
+  const backlogAtRef = useRef(backlogAt);
+  backlogAtRef.current = backlogAt;
+  const [tail, setTail] = useState<{ base: number; lines: LogEntry[] }>({ base: 0, lines: [] });
+  const entries = useMemo(() => {
+    const lines = backlog.data?.entries ?? [];
+    if (tail.base !== backlogAt || tail.lines.length === 0) return lines;
+    const next = [...tail.lines, ...lines];
+    return next.length > RING_CAP ? next.slice(0, RING_CAP) : next;
+  }, [backlog.data, backlogAt, tail]);
 
   // A hidden tab holds no live stream (it reconnects and delivered every
   // line for nobody). On return, the backlog fills the gap, then the tail
@@ -106,9 +104,9 @@ export default function LogsPanel({ onSessionExpired }: Props) {
       wasHidden.current = true;
     } else if (wasHidden.current) {
       wasHidden.current = false;
-      if (follow) loadBacklog();
+      if (follow) void refetchBacklog();
     }
-  }, [visible, follow, loadBacklog]);
+  }, [visible, follow, refetchBacklog]);
 
   // Live tail: (re)subscribe whenever Follow, the filters or the tab's
   // visibility change.
@@ -122,9 +120,10 @@ export default function LogsPanel({ onSessionExpired }: Props) {
       (entry) => {
         // An entry arrived: the stream is healthy again.
         setStreamError(null);
-        setEntries((prev) => {
-          const next = [entry, ...prev];
-          return next.length > RING_CAP ? next.slice(0, RING_CAP) : next;
+        setTail((prev) => {
+          const base = backlogAtRef.current;
+          const lines = prev.base === base ? [entry, ...prev.lines] : [entry];
+          return { base, lines: lines.length > RING_CAP ? lines.slice(0, RING_CAP) : lines };
         });
       },
       undefined,

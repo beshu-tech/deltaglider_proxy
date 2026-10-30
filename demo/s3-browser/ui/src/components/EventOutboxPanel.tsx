@@ -1,7 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { withKeyboardSort } from '../tableSort';
 import { confirmDialog } from '../confirmDialog';
-import { useVisiblePolling } from '../useVisiblePolling';
 import { Alert, Button, Input, message, Select, Space, Switch, Table, Tag, Typography } from 'antd';
 import {
   DatabaseOutlined,
@@ -16,11 +15,6 @@ import { useColors } from '../ThemeContext';
 import {
   DELIVERY_STATE,
   deliveryStateOf,
-  fetchEventOutbox,
-  requeueEventOutbox,
-  requeueEventOutboxMany,
-  purgeFailedEventOutbox,
-  type DeliveryState,
   type EndpointDelivery,
   type EventOutboxRecord,
   type EventOutboxStatus,
@@ -28,12 +22,20 @@ import {
 import { contentColumn, CONTENT_WIDE } from './shared-styles';
 import { normalizeUiError } from '../errorHandling';
 import { isSessionExpired } from '../errorHandling';
+import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
+import {
+  useEventOutboxPage,
+  usePurgeFailedEvents,
+  useRequeueEvent,
+  useRequeueEvents,
+} from '../queries/eventOutbox';
 import { relativeTime } from '../utils';
 import { countTone, endpointDeliverySummary, eventStatusTone } from '../statusTone';
 
 const { Text } = Typography;
 const DEFAULT_PAGE_SIZE = 50;
 const PAGE_SIZE_OPTIONS = [25, 50, 100, 250];
+const EMPTY_COUNTS = { pending: 0, in_progress: 0, delivered: 0, failed: 0 };
 
 interface Props {
   onSessionExpired?: () => void;
@@ -74,10 +76,6 @@ function nextStep(row: EventOutboxRecord): string {
 
 export default function EventOutboxPanel({ onSessionExpired }: Props) {
   const colors = useColors();
-  const [rows, setRows] = useState<EventOutboxRecord[]>([]);
-  const [counts, setCounts] = useState({ pending: 0, in_progress: 0, delivered: 0, failed: 0 });
-  const [total, setTotal] = useState(0);
-  const [deliveryState, setDeliveryState] = useState<DeliveryState>('disabled');
   const [filter, setFilter] = useState('');
   const [status, setStatus] = useState<StatusFilter>('all');
   const [page, setPage] = useState(1);
@@ -85,43 +83,27 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
   const [sort, setSort] = useState('occurred_at');
   const [order, setOrder] = useState<SortOrder>('desc');
   const [autoRefresh, setAutoRefresh] = useState(false);
-  const [loading, setLoading] = useState(true);
   const [requeueing, setRequeueing] = useState<number | 'bulk' | 'purge' | null>(null);
-  const [error, setError] = useState<string | null>(null);
 
-  // Generation guard: the interval tick and dep-change refetches can overlap,
-  // so stamp each fetch and only publish the newest response (an older,
-  // slower response must not clobber a newer one).
-  const fetchGen = useRef(0);
-  const refresh = useCallback(async () => {
-    const gen = ++fetchGen.current;
-    try {
-      setLoading(true);
-      const res = await fetchEventOutbox(pageSize, status, (page - 1) * pageSize, sort, order);
-      if (gen !== fetchGen.current) return; // superseded by a newer refresh
-      setRows(res.rows);
-      setCounts(res.counts);
-      setTotal(res.total);
-      setDeliveryState(deliveryStateOf(res));
-      setError(null);
-    } catch (e) {
-      if (gen !== fetchGen.current) return;
-      if (isSessionExpired(e)) {
-        onSessionExpired?.();
-        return;
-      }
-      setError(normalizeUiError(e, "Failed to load the event log"));
-    } finally {
-      if (gen === fetchGen.current) setLoading(false);
-    }
-  }, [onSessionExpired, order, page, pageSize, sort, status]);
-
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
-
-  // Visibility-gated: a backgrounded tab stops polling and catches up on return.
-  useVisiblePolling(() => void refresh(), 3000, autoRefresh);
+  // Polled every 3 s while auto-refresh is on; paused in a background tab.
+  const outbox = useEventOutboxPage(
+    { limit: pageSize, offset: (page - 1) * pageSize, status, sort, order },
+    autoRefresh ? 3000 : false,
+  );
+  const requeueOneMutation = useRequeueEvent();
+  const requeueManyMutation = useRequeueEvents();
+  const purgeMutation = usePurgeFailedEvents();
+  const rows = useMemo(() => outbox.data?.rows ?? [], [outbox.data]);
+  const counts = outbox.data?.counts ?? EMPTY_COUNTS;
+  const total = outbox.data?.total ?? 0;
+  const deliveryState = outbox.data ? deliveryStateOf(outbox.data) : 'disabled';
+  const loading = outbox.isFetching;
+  const refresh = () => outbox.refetch();
+  useSessionExpiredOn(outbox.error, onSessionExpired);
+  const error =
+    outbox.error && !isSessionExpired(outbox.error)
+      ? normalizeUiError(outbox.error, 'Failed to load the event log')
+      : null;
 
   const filtered = useMemo(() => {
     const q = filter.trim().toLowerCase();
@@ -290,9 +272,8 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
   const requeueOne = async (id: number) => {
     try {
       setRequeueing(id);
-      const res = await requeueEventOutbox(id);
+      const res = await requeueOneMutation.mutateAsync(id);
       message.success(`Requeued ${res.requeued} event`);
-      await refresh();
     } catch (e) {
       if (isSessionExpired(e)) {
         onSessionExpired?.();
@@ -308,9 +289,8 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
     if (visibleFailedIds.length === 0) return;
     try {
       setRequeueing('bulk');
-      const res = await requeueEventOutboxMany(visibleFailedIds);
+      const res = await requeueManyMutation.mutateAsync(visibleFailedIds);
       message.success(`Requeued ${res.requeued} failed event${res.requeued === 1 ? '' : 's'}`);
-      await refresh();
     } catch (e) {
       if (isSessionExpired(e)) {
         onSessionExpired?.();
@@ -333,9 +313,8 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
     }
     try {
       setRequeueing('purge');
-      const res = await purgeFailedEventOutbox();
+      const res = await purgeMutation.mutateAsync();
       message.success(`Purged ${res.purged} failed event${res.purged === 1 ? '' : 's'}`);
-      await refresh();
     } catch (e) {
       if (isSessionExpired(e)) {
         onSessionExpired?.();

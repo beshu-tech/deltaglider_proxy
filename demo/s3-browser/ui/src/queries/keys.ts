@@ -55,7 +55,21 @@ export const qk = {
   // The multi-instance encryption witness verdict (null on one instance).
   encryptionWitness: () => ['encryption-witness'] as const,
 
+  // ── Integrations ────────────────────────────────────────────────
+  eventOutbox: {
+    all: () => ['event-outbox'] as const,
+    /** One server page of the event log, by its query string. */
+    page: (query: string) => ['event-outbox', 'page', query] as const,
+    /** The counts strip of the delivery settings page. */
+    summary: () => ['event-outbox', 'summary'] as const,
+  },
+
   // ── Diagnostics ─────────────────────────────────────────────────
+  sessions: {
+    list: () => ['sessions', 'list'] as const,
+  },
+  audit: (limit: number) => ['audit', limit] as const,
+  logs: (level: string, target: string, q: string, limit: number) => ['logs', level, target, q, limit] as const,
   bucketUsage: (bucket: string) => ['bucket-usage', bucket] as const,
 
   // ── Jobs (replication / lifecycle / reencrypt / migrate) ────────

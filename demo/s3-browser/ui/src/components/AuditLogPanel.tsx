@@ -22,21 +22,21 @@
  * For long-term audit, stdout remains authoritative: this panel
  * is a triage convenience, not a compliance substitute.
  */
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Typography, Input, Button, Tag, Alert, Space, Switch } from 'antd';
-import { useVisiblePolling } from '../useVisiblePolling';
 import {
   ReloadOutlined,
   SearchOutlined,
   FileTextOutlined,
 } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
-import { fetchAudit, type AuditEntry } from '../adminApi';
+import { useAuditLog } from '../queries/audit';
 import { LoadingState } from './StatePlaceholders';
 import { relativeTime } from '../utils';
 import { contentColumn, CONTENT_WIDE } from './shared-styles';
 import { normalizeUiError } from '../errorHandling';
 import { isSessionExpired } from '../errorHandling';
+import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
 
 const { Text } = Typography;
 
@@ -115,62 +115,22 @@ function actionColour(action: string): string {
 
 export default function AuditLogPanel({ onSessionExpired }: Props) {
   const colors = useColors();
-  const [entries, setEntries] = useState<AuditEntry[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState('');
   const [autoRefresh, setAutoRefresh] = useState(false);
-  // `now` is refreshed on the same cadence as the fetch so the
-  // relative-time column stays honest without re-rendering the
-  // world every second.
-  const [now, setNow] = useState(() => new Date());
-
-  // The 3s poll does not wait for the previous request: on a slow server the
-  // ticks (and a manual Refresh) overlap. `inFlight` skips a tick while one is
-  // pending; the generation guard drops any response a newer one superseded.
-  const fetchGen = useRef(0);
-  const inFlight = useRef(false);
-  const refresh = async () => {
-    const gen = ++fetchGen.current;
-    inFlight.current = true;
-    try {
-      setLoading(true);
-      const res = await fetchAudit(500);
-      if (gen !== fetchGen.current) return; // superseded by a newer refresh
-      setEntries(res.entries);
-      setNow(new Date());
-      setError(null);
-    } catch (e) {
-      if (gen !== fetchGen.current) return;
-      if (isSessionExpired(e)) {
-        onSessionExpired?.();
-        return;
-      }
-      setError(
-        `Failed to load audit entries: ${normalizeUiError(e, 'unknown')}`);
-    } finally {
-      if (gen === fetchGen.current) {
-        inFlight.current = false;
-        setLoading(false);
-      }
-    }
-  };
-
-  useEffect(() => {
-    void refresh();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   // Auto-refresh. 3s — quick enough for incident-debugging ("does my click show
-  // up?") without being abusive. Visibility-gated: a backgrounded tab stops
-  // polling and catches up on return, instead of hammering the audit endpoint.
-  useVisiblePolling(
-    () => {
-      if (!inFlight.current) void refresh();
-    },
-    3000,
-    autoRefresh,
-  );
+  // up?") without being abusive. react-query skips a tick while a fetch is in
+  // flight and pauses in a background tab.
+  const audit = useAuditLog(autoRefresh ? 3000 : false);
+  const entries = useMemo(() => audit.data?.entries ?? [], [audit.data]);
+  const loading = audit.isFetching;
+  // `now` follows the last fetch so the relative-time column stays honest
+  // without re-rendering the world every second.
+  const now = useMemo(() => new Date(audit.dataUpdatedAt || Date.now()), [audit.dataUpdatedAt]);
+  useSessionExpiredOn(audit.error, onSessionExpired);
+  const error =
+    audit.error && !isSessionExpired(audit.error)
+      ? `Failed to load audit entries: ${normalizeUiError(audit.error, 'unknown')}`
+      : null;
 
   // Client-side filter — free-text substring match across action,
   // user, target, ip, bucket, and path. Deliberately lenient:
@@ -244,7 +204,7 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
         <Button
           size="middle"
           icon={<ReloadOutlined />}
-          onClick={() => void refresh()}
+          onClick={() => void audit.refetch()}
           loading={loading && !autoRefresh}
         >
           Refresh
