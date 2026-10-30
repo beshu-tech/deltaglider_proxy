@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Added — More file types are stored as deltas, and a bucket can change the list
+
+- The proxy now tries a delta for disk and firmware images (`.bin`, `.img`, `.raw`, `.vmdk`, `.qcow2` and more), executables and libraries (`.exe`, `.dll`, `.so`, `.dylib`, `.wasm`), model weights (`.safetensors`, `.gguf`, `.onnx`, `.ckpt`, `.pt`, `.pth`, `.h5`, `.npy`, `.npz`), ZIP-based packages (`.apk`, `.aab`, `.ipa`, `.whl`, `.nupkg`, `.vsix`, `.xpi`) and database files (`.sqlite`, `.db`). Before, only `zip`, `tar`, `jar`, `war`, `ear`, `dmg`, `iso`, `sql`, `dump`, `bak` and `backup` were tried, so firmware and model files were always stored whole. A delta that is not small enough (`max_delta_ratio`) is still stored whole, so a new type costs encode time, never space. See [Delta-eligible file types](docs/product/reference/configuration.md#delta-eligible-file-types).
+- A bucket adds or removes types with `delta_extensions: {add: [...], remove: [...]}`, also in the **File types** field of the bucket's **Advanced** settings. `GET /_/api/admin/config` returns the built-in list as `delta_extensions_default`.
+- The object inspector says why an object is stored whole: compression is off for the bucket, the bucket does not try deltas for its type, or the delta was not small enough. For an admin, it links to the bucket's settings.
+
+### Changed — An eligible object larger than `max_object_size` is stored whole
+
+- A CopyObject, a replication or lifecycle copy, a `deltaglider_proxy s3` upload and a large PutObject to a delta-eligible key refused an object larger than `max_object_size` (`400 EntityTooLarge` or `TooLarge`), while a multipart upload of the same object stored it whole. Every path now stores such an object whole, up to `max_passthrough_object_size` (and 5 GiB for CopyObject). A single PutObject body is still limited to `max_object_size`, because the proxy holds it in memory to check its signature.
+
+### Fixed — Interface and website
+
+- The **Change Admin Password** button had a contrast of 2.89:1 in the light theme, and the **Download** button of the inspector was white on mint in the dark theme. Both use the theme's primary button now, and a lint rule refuses a hand-picked accent fill on a button.
+- The page no longer starts with `class="dark"` on `<html>` while the theme is light: the first paint sets `data-theme` with the same rule as the app.
+- The docs index showed `//api/admin/` for `/_/api/admin/*`, and page descriptions dropped the `_` of names such as `config_sync_bucket`. A summary now keeps the text of code spans.
+- The upload page no longer says that every file is compressed.
+
 ### Changed — One error body for the admin API
 
 - An admin API error now always has the JSON body `{"error": <code>, "message": <text>}`. Before, an error had one of four bodies: plain text, `{"error": <text>}`, `{"error": <code>, "message": <text>}`, or an empty body for a server error. The `error` field now holds a stable machine code (for example `not_found`, `conflict` or `invalid_request`), and the text is in `message`. The codes that clients already matched on, such as `iam_declarative`, `admin_session_required` and `invalid_path`, stay in `error`. A script that showed `error` as the reason must now show `message`. See [Errors](docs/product/reference/admin-api.md#errors).

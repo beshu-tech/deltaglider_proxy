@@ -6,9 +6,9 @@
 //! A body above [`BUFFERED_MAX`] never sits whole in RAM: an upload is
 //! copied into an engine spool file and stored with
 //! `store_spooled_delta`; a download writes the `retrieve_stream` chunks
-//! to disk; an S3-to-S3 copy spools the source stream. The engine's own
-//! size ceilings still apply (`max_object_size` for a delta-eligible
-//! object, `max_passthrough_object_size` for the rest).
+//! to disk; an S3-to-S3 copy spools the source stream. The engine stores
+//! an object above `max_object_size` whole, so the one size ceiling is
+//! `max_passthrough_object_size`.
 
 use crate::deltaglider::{DynEngine, EngineError, RetrieveResponse};
 use crate::types::{FileMetadata, StoreResult};

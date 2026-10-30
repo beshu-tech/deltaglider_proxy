@@ -18,6 +18,9 @@ import { useOnClickOutside } from '../useDocumentEvent';
 import { useBackClosesModal } from '../hooks/useOverlayClose';
 import { useCopyToClipboard } from '../useCopyToClipboard';
 import { activateOnKey } from '../keyboard';
+import { passthroughReason, passthroughSentence } from '../passthroughReason';
+import { useNavigation } from '../NavigationContext';
+import { bucketSettingsUrl } from '../urlState';
 
 const SHARE_DURATIONS = [
   { label: '1 hour', seconds: 3600 },
@@ -291,6 +294,7 @@ export default function InspectorPanel({
   // into `currentBucket`. The previous effect tracked bucket changes manually
   // and cancelled stale fetches; with a cached query the active bucket's policy
   // is just a lookup against `config.bucket_policies`, recomputed each render.
+  const { navigate } = useNavigation();
   const { data: adminConfig, isLoading: adminConfigLoading } = useAdminConfig({
     enabled: hasAdminSession,
   });
@@ -403,6 +407,13 @@ export default function InspectorPanel({
   // size view instead. Until the HEAD resolves (storageType still undefined),
   // keep the bucket-policy default so we don't flicker.
   const isPassthroughObject = storageType === 'passthrough';
+  const storedWhole = isPassthroughObject
+    ? passthroughReason(
+        object.key,
+        adminConfig?.delta_extensions_default,
+        adminConfig && currentBucket ? bucketPolicyFor(adminConfig, currentBucket) : null,
+      )
+    : null;
   const compressionEnabled = (bucketPolicy?.compressionEnabled ?? true) && !isPassthroughObject;
   /** When policy is still loading or unavailable, never show a false "public" badge. */
   const isPublic =
@@ -701,9 +712,22 @@ export default function InspectorPanel({
                     {formatBytes(object.size)}
                   </div>
                   <div style={{ fontSize: 11, color: TEXT_FAINT, fontFamily: 'var(--font-ui)', marginTop: 8 }}>
-                    {isPassthroughObject && (bucketPolicy?.compressionEnabled ?? true)
-                      ? 'Stored as-is: delta compression does not apply to this file type'
-                      : 'Compression disabled for this bucket'}
+                    {storedWhole ? passthroughSentence(storedWhole) : 'Compression is off for this bucket.'}
+                    {hasAdminSession && currentBucket && storedWhole && storedWhole.kind !== 'unknown' && (
+                      <>
+                        {' '}
+                        <a
+                          href={bucketSettingsUrl(currentBucket)}
+                          onClick={(e) => {
+                            if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+                            e.preventDefault();
+                            navigate(bucketSettingsUrl(currentBucket));
+                          }}
+                        >
+                          Bucket settings
+                        </a>
+                      </>
+                    )}
                   </div>
                 </div>
               </InspectorSection>

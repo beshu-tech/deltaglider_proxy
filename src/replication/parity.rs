@@ -961,8 +961,13 @@ fn is_skippable_key(key: &str) -> bool {
 /// delta-stored, so the lite size could be the delta size). A non-eligible
 /// passthrough object (a `.sha1` sidecar, an image) is stored verbatim — the
 /// lite size/etag ARE the truth, so no resolution is needed (the common case).
-fn needs_logical_resolution(engine: &DynEngine, key: &str, meta: &FileMetadata) -> bool {
-    meta.is_delta() || engine.is_delta_eligible(key)
+fn needs_logical_resolution(
+    engine: &DynEngine,
+    bucket: &str,
+    key: &str,
+    meta: &FileMetadata,
+) -> bool {
+    meta.is_delta() || engine.is_delta_eligible(bucket, key)
 }
 
 /// True for a small VERBATIM sidecar (`.sha1`/`.sha256`/`.sha512`) that is
@@ -972,9 +977,9 @@ fn needs_logical_resolution(engine: &DynEngine, key: &str, meta: &FileMetadata) 
 /// their HEADs roughly halves a HEAD-bound S3 parity sweep. Correctness: a
 /// sidecar can still be a mismatch (size/etag differ) or an orphan — but those
 /// are decided from the lite entry, which is exact for a verbatim object.
-fn is_verbatim_sidecar(engine: &DynEngine, key: &str, meta: &FileMetadata) -> bool {
+fn is_verbatim_sidecar(engine: &DynEngine, bucket: &str, key: &str, meta: &FileMetadata) -> bool {
     !meta.is_delta()
-        && !engine.is_delta_eligible(key)
+        && !engine.is_delta_eligible(bucket, key)
         && (key.ends_with(".sha1") || key.ends_with(".sha256") || key.ends_with(".sha512"))
 }
 
@@ -1648,8 +1653,9 @@ pub async fn parity_audit(
             // list on ANY backend — skip its HEAD even when the list isn't
             // otherwise authoritative (the S3 sweep's biggest avoidable cost).
             if !pure_mirror
-                && !is_verbatim_sidecar(engine, key, meta)
-                && (!src_lite_authoritative || needs_logical_resolution(engine, key, meta))
+                && !is_verbatim_sidecar(engine, &rule.source.bucket, key, meta)
+                && (!src_lite_authoritative
+                    || needs_logical_resolution(engine, &rule.source.bucket, key, meta))
             {
                 src_needs_logical.push(key.to_string());
             }
@@ -1698,8 +1704,9 @@ pub async fn parity_audit(
             // mirror deletes any source-absent key regardless of provenance), so
             // the ownership overlay a HEAD would provide changes no verdict.
             if !pure_mirror
-                && !is_verbatim_sidecar(engine, key, meta)
-                && (!dest_lite_authoritative || needs_logical_resolution(engine, key, meta))
+                && !is_verbatim_sidecar(engine, &rule.destination.bucket, key, meta)
+                && (!dest_lite_authoritative
+                    || needs_logical_resolution(engine, &rule.destination.bucket, key, meta))
             {
                 dst_needs_logical.push(key.to_string());
             }

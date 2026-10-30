@@ -72,6 +72,10 @@ pub struct ConfigResponse {
     // Per-bucket policies (BTreeMap for deterministic JSON ordering, matching
     // the canonical YAML export).
     bucket_policies: std::collections::BTreeMap<String, crate::bucket_policy::BucketPolicyConfig>,
+    // The built-in delta-eligible file types that a bucket's
+    // `delta_extensions` changes. The GUI shows them on the bucket card and
+    // explains a passthrough object with them.
+    delta_extensions_default: &'static [&'static str],
     // Log level
     log_level: String,
     // Backend credentials indicator
@@ -579,6 +583,7 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
             config_sync_bucket: cfg.config_sync_bucket.clone(),
             // Bucket overrides carry keys (issue #116): redacted.
             bucket_policies: cfg.redacted_bucket_policies(),
+            delta_extensions_default: crate::deltaglider::DEFAULT_DELTA_EXTENSIONS,
             // Logging
             log_level,
             backend_has_credentials,

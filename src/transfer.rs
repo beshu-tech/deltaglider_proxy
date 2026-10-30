@@ -325,6 +325,7 @@ async fn copy_object_once(
         request.destination_bucket,
         request.destination_key,
         &fields.user_metadata,
+        source_head.file_size,
     ) {
         if let Some(shipped) =
             delta_passthrough_copy(engine, lock, request, source_head, prior, fields).await?
@@ -1403,6 +1404,7 @@ async fn server_side_copy(
         request.destination_bucket,
         request.destination_key,
         &fields.user_metadata,
+        source_head.file_size,
     ) {
         return Ok(None);
     }
@@ -3403,15 +3405,15 @@ mod request_count_tests {
     #[tokio::test]
     async fn a_copy_heads_the_source_only_when_the_caller_has_no_metadata() {
         let (engine, fake) = s3_engine(None).await;
-        for key in ["k.bin", "j.bin"] {
+        for key in ["k.dat", "j.dat"] {
             engine
                 .store("src", key, b"payload", None, Default::default())
                 .await
                 .unwrap();
         }
-        let meta = engine.head("src", "k.bin").await.unwrap();
+        let meta = engine.head("src", "k.dat").await.unwrap();
         fake.clear();
-        copy_object_from(&engine, request("k.bin"), Some(&meta))
+        copy_object_from(&engine, request("k.dat"), Some(&meta))
             .await
             .unwrap();
         let heads = count(&fake, "HEAD ");
@@ -3430,7 +3432,7 @@ mod request_count_tests {
             fake.requests()
         );
         fake.clear();
-        copy_object_from(&engine, request("j.bin"), None)
+        copy_object_from(&engine, request("j.dat"), None)
             .await
             .unwrap();
         assert!(

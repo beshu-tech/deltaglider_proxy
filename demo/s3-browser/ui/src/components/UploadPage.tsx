@@ -232,7 +232,7 @@ export default function UploadPage({
         Upload to {bucket}
       </Title>
       <Text style={{ color: TEXT_SECONDARY, fontSize: 13, display: 'block', marginBottom: 24, fontFamily: "var(--font-ui)" }}>
-        Drag and drop files, or select files and folders to upload. Files are automatically compressed with delta encoding.
+        Drag and drop files, or select files and folders to upload. Archives, disk images, binaries and model files are stored as deltas when a new version is close to an older one; other files are stored whole.
       </Text>
 
       {/* Upload destination — the clear, editable target path. */}

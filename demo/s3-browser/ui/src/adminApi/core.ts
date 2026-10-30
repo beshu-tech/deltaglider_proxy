@@ -187,6 +187,8 @@ export interface AdminConfig {
   debug_headers: boolean;
   // Sync
   config_sync_bucket: string | null;
+  /** The built-in delta-eligible file types (extensions without the dot). */
+  delta_extensions_default?: string[];
   // Per-bucket policies
   bucket_policies: Record<
     string,
@@ -194,6 +196,9 @@ export interface AdminConfig {
       /** Omit / inherit; explicit override; JSON `null` on merge clears override (RFC 7396). */
       compression?: boolean | null;
       max_delta_ratio?: number;
+      /** File types tried as deltas on top of the built-in list, and
+       *  built-in types stored whole (`delta_extensions_default`). */
+      delta_extensions?: { add?: string[]; remove?: string[] };
       backend?: string;
       alias?: string;
       /**

@@ -75,7 +75,7 @@ pub(super) async fn copy_object(
     } else {
         source_meta.user_metadata.clone()
     };
-    if source_meta.file_size > copy_size_limit(&engine, &input.bucket, &input.key, &dest_metadata) {
+    if source_meta.file_size > copy_size_limit(&engine) {
         return Err(s3s::s3_error!(EntityTooLarge));
     }
     // The stored object moves as it is when the destination stores it in
@@ -84,7 +84,12 @@ pub(super) async fn copy_object(
     // key that does not (the backend copies it server-side). Otherwise, or
     // when that is not possible, the copy goes through the store.
     let precondition = crate::deltaglider::Precondition::none();
-    let tries_delta = engine.write_tries_delta(&input.bucket, &input.key, &dest_metadata);
+    let tries_delta = engine.write_tries_delta(
+        &input.bucket,
+        &input.key,
+        &dest_metadata,
+        source_meta.file_size,
+    );
     let as_stored = source_meta.is_delta() == tries_delta
         && (source_meta.is_delta()
             || matches!(
@@ -232,25 +237,14 @@ fn copy_destination_fields(
 /// S3's limit on the source of one CopyObject request.
 pub(super) const COPY_OBJECT_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
-/// The largest source that CopyObject copies into `bucket/key` with
-/// `user_metadata`. A destination that stores the object as it is
-/// (passthrough) takes S3's 5 GiB copy limit (capped at
-/// `max_passthrough_object_size`): the source streams through a spool file,
-/// so its size costs disk, not memory. A destination that tries a delta keeps
-/// `max_object_size`, the store's limit for a delta. Every copy had the
-/// delta limit (100 MiB by default), so rclone and mc copies of larger
-/// objects failed with EntityTooLarge.
-pub(super) fn copy_size_limit(
-    engine: &crate::deltaglider::DynEngine,
-    bucket: &str,
-    key: &str,
-    user_metadata: &std::collections::HashMap<String, String>,
-) -> u64 {
-    if engine.write_tries_delta(bucket, key, user_metadata) {
-        engine.max_object_size()
-    } else {
-        COPY_OBJECT_MAX_BYTES.min(engine.max_passthrough_object_size())
-    }
+/// The largest CopyObject source: S3's 5 GiB copy limit, capped at
+/// `max_passthrough_object_size`. The source streams through a spool file,
+/// so its size costs disk, not memory. A source above `max_object_size` is
+/// stored whole (`StorePlan::tries_delta`), so the delta limit never refuses
+/// a copy; with it, rclone and mc copies of larger objects failed with
+/// EntityTooLarge.
+pub(super) fn copy_size_limit(engine: &crate::deltaglider::DynEngine) -> u64 {
+    COPY_OBJECT_MAX_BYTES.min(engine.max_passthrough_object_size())
 }
 
 /// The body of a CopyObject source, read with bounded memory.
@@ -642,7 +636,8 @@ mod large_copy_tests {
     /// streams through the spool, as a passthrough store takes objects up to
     /// `max_passthrough_object_size` (S3 copies up to 5 GiB). It answered
     /// EntityTooLarge, so rclone and mc copies of large objects failed. A
-    /// destination that tries a delta keeps the delta limit.
+    /// delta-eligible destination stores a source above the delta limit
+    /// whole.
     #[tokio::test]
     async fn a_large_passthrough_source_is_copied() {
         let dir = tempfile::tempdir().unwrap();
@@ -684,10 +679,9 @@ mod large_copy_tests {
             .unwrap();
         assert_eq!(copied, body);
         assert!(!meta.is_delta());
-        // Into a key that tries a delta, the delta limit holds.
-        let err = copy_object(&svc, request(copy("b/app.zip")))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), &s3s::S3ErrorCode::EntityTooLarge);
+        // Into a delta-eligible key: above the delta limit, stored whole.
+        copy_object(&svc, request(copy("b/app.zip"))).await.unwrap();
+        let meta = state.engine.load().head("dst", "b/app.zip").await.unwrap();
+        assert!(!meta.is_delta());
     }
 }

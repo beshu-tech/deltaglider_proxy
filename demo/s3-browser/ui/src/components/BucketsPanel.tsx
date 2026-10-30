@@ -182,6 +182,7 @@ export default function BucketsPanel({ onSessionExpired, search }: Props) {
   const defaultBackend = cfg?.default_backend ?? null;
   const globalRatio = cfg?.max_delta_ratio ?? 0.75;
   const globalCompressionOn = globalRatio > 0;
+  const defaultDeltaExtensions = cfg?.delta_extensions_default ?? [];
 
   // Guarded apply: client-side validation first, then the editor's
   // validate → ApplyDialog → PUT flow (which re-derives the same body via
@@ -397,6 +398,7 @@ export default function BucketsPanel({ onSessionExpired, search }: Props) {
                 onEncryptionApplied={(before) => void onEncryptionApplied(name, before)}
                 globalCompressionOn={globalCompressionOn}
                 globalRatio={globalRatio}
+                defaultDeltaExtensions={defaultDeltaExtensions}
                 onPatch={(patch) => patchBucket(name, patch)}
                 onPrefixesChange={prefixChangeFor(name)}
                 inputRadius={inputRadius}
@@ -430,6 +432,7 @@ export default function BucketsPanel({ onSessionExpired, search }: Props) {
               defaultBackend={defaultBackend}
               globalCompressionOn={globalCompressionOn}
               globalRatio={globalRatio}
+                defaultDeltaExtensions={defaultDeltaExtensions}
               onPatch={(patch) => patchDraft(row._id, patch)}
               onPrefixesChange={prefixChangeForDraft(row._id)}
               // A policy with its own key keeps its name: a rename would

@@ -765,14 +765,14 @@ async fn test_write_seals_under_the_key_fingerprint() {
 
     // Chunked: a multipart upload goes through put_passthrough_chunked.
     let parts = vec![vec![0u8; 256 * 1024]; 2];
-    multipart_put(&server, "chunked.bin", &parts).await;
+    multipart_put(&server, "chunked.dat", &parts).await;
 
     let data_dir = server.data_dir().expect("filesystem backend");
     let want = common::key_fp_label(TEST_KEY);
     let mut seen = Vec::new();
     for (path, parsed) in common::read_xattr_metadata(data_dir) {
         let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if fname != "small.txt" && fname != "chunked.bin" {
+        if fname != "small.txt" && fname != "chunked.dat" {
             continue;
         }
         let um = &parsed["user_metadata"];
@@ -795,7 +795,7 @@ async fn test_write_seals_under_the_key_fingerprint() {
         seen.push(fname.to_string());
     }
     seen.sort();
-    assert_eq!(seen, ["chunked.bin", "small.txt"], "both writes found");
+    assert_eq!(seen, ["chunked.dat", "small.txt"], "both writes found");
 }
 
 /// Range reads on a chunked-encrypted object. Exercises the O(1)
@@ -910,7 +910,7 @@ async fn test_chunked_encryption_range_over_final_chunk() {
 async fn test_chunked_truncation_detected() {
     let server = encrypted_builder().build().await;
     let parts = vec![vec![0xABu8; 200 * 1024]; 2]; // 2 × 200 KiB, crosses chunk boundaries
-    multipart_put(&server, "truncate-me.bin", &parts).await;
+    multipart_put(&server, "truncate-me.dat", &parts).await;
 
     // Find the passthrough file on disk and truncate it by 1 byte.
     let data_dir = server.data_dir().expect("filesystem backend");
@@ -922,7 +922,7 @@ async fn test_chunked_truncation_detected() {
         if !entry.file_type().is_file() {
             continue;
         }
-        if entry.path().file_name().and_then(|s| s.to_str()) == Some("truncate-me.bin") {
+        if entry.path().file_name().and_then(|s| s.to_str()) == Some("truncate-me.dat") {
             target_path = Some(entry.path().to_path_buf());
             break;
         }
@@ -938,7 +938,7 @@ async fn test_chunked_truncation_detected() {
     let result = client
         .get_object()
         .bucket(BUCKET)
-        .key("truncate-me.bin")
+        .key("truncate-me.dat")
         .send()
         .await;
     match result {

@@ -62,7 +62,19 @@ Read the ratio against this rule of thumb:
 | `0.50–0.80` | Marginal |
 | `> 0.80` | Usually stored as-is |
 
-## 4. Set a soft quota
+## 4. Choose the file types
+
+The proxy tries a delta only for the file types in its built-in list, such as `zip`, `bin`, `img`, `exe` and `safetensors` (the full list is in [Delta-eligible file types](../reference/configuration.md#delta-eligible-file-types)). A bucket can add types to that list or remove types from it.
+
+1. Go to **Storage → Buckets** and open the row of the bucket, for example `releases`.
+2. Open **Advanced**. The **File types** field shows how many types the built-in list has.
+3. To try deltas for another type, type its extension in **Also compress**, for example `pkl`, and press Enter.
+4. To store a built-in type whole, select it in **Store whole**, for example `sql`.
+5. Select **Review & apply**.
+
+The row shows a **file types +1 −1** chip while the bucket changes the list. When an object is stored whole, its inspector in the file browser says why: compression is off, the bucket does not try deltas for its type, or the delta was not small enough.
+
+## 5. Set a soft quota
 
 In the admin UI:
 
@@ -86,7 +98,7 @@ A scan makes the counter trusted only when no write changed the bucket while the
 
 The same page has one more limit, in the card **Object size limit**. **Maximum object size (MiB)** is the largest object that any bucket accepts (`advanced.max_object_size`, which the YAML file holds in bytes). The card has its own **Review & apply** bar. When you sign in to the admin UI, the upload page reads the quota of the bucket, its usage counter and the object size limit. It refuses a file that is bigger than the size limit, or that does not fit in the space that the quota leaves, before any byte goes out, and it says why. A files-only session cannot read these limits, so for such a session the check of the proxy is the only one.
 
-## 5. Freeze a bucket
+## 6. Freeze a bucket
 
 To make a bucket read-only, for example during a manual migration, set its quota to `0`. The proxy then rejects every upload to the bucket with `403 AccessDenied` and the message `Bucket is frozen (quota = 0)`. Reads and lists keep working. In the admin UI, type `0` in **Quota**. An empty **Quota** field removes the quota, so it does not freeze the bucket.
 
@@ -106,6 +118,9 @@ storage:
       compression: false              # every object stored as-is
     releases:
       max_delta_ratio: 0.5            # keep only deltas that save 50% or more
+      delta_extensions:
+        add: [pkl]                    # also try .pkl files as deltas
+        remove: [sql]                 # store .sql files whole
     db-archive:
       quota_bytes: 536870912000       # 500 GiB; 0 freezes the bucket
 ```

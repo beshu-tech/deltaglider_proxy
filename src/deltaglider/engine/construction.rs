@@ -650,7 +650,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             codec: Arc::new(
                 DeltaCodec::new(config.max_object_size as usize).with_timeouts(config.tuning.codec),
             ),
-            file_router: FileRouter::new(),
             cache: ReferenceCache::new(config.cache_size_mb),
             max_object_size: config.max_object_size,
             max_passthrough_object_size: config.max_passthrough_object_size,

@@ -55,8 +55,8 @@ test('a single click on the mask closes the drawer', async () => {
 // Browser-review item 16: README.txt on a compressing bucket said
 // "Compression disabled for this bucket". It is a passthrough object: the
 // bucket compresses, this file type is simply stored as-is.
-test('a passthrough object on a compressing bucket says it is stored as-is', async () => {
+test('a passthrough object on a compressing bucket says it is stored whole', async () => {
   setup();
-  expect(await screen.findByText(/Stored as-is/)).toBeInTheDocument();
-  expect(screen.queryByText('Compression disabled for this bucket')).not.toBeInTheDocument();
+  expect(await screen.findByText(/Stored whole/)).toBeInTheDocument();
+  expect(screen.queryByText(/compression is off/i)).not.toBeInTheDocument();
 });

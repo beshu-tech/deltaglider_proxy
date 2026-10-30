@@ -399,15 +399,17 @@ async fn a_single_put_stores_no_multipart_etag() {
 use super::store::{EncodeOutcome, StorePlan};
 
 #[test]
-fn tries_delta_only_when_compressing_an_eligible_key_without_the_hint() {
+fn tries_delta_only_when_compressing_an_eligible_key_that_fits_without_the_hint() {
     for compression in [false, true] {
         for eligible in [false, true] {
             for no_delta in [false, true] {
-                assert_eq!(
-                    StorePlan::tries_delta(compression, eligible, no_delta),
-                    compression && eligible && !no_delta,
-                    "compression={compression} eligible={eligible} no_delta={no_delta}"
-                );
+                for fits in [false, true] {
+                    assert_eq!(
+                        StorePlan::tries_delta(compression, eligible, no_delta, fits),
+                        compression && eligible && !no_delta && fits,
+                        "compression={compression} eligible={eligible} no_delta={no_delta} fits={fits}"
+                    );
+                }
             }
         }
     }

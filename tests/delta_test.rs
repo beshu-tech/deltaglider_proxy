@@ -48,6 +48,39 @@ async fn test_similar_files_stored_as_delta() {
     assert_eq!(st2, "delta", "Similar file should be stored as delta");
 }
 
+/// Firmware images (`.bin`) are delta-eligible by default, and a bucket's
+/// `delta_extensions.remove` stores them whole again.
+#[tokio::test]
+async fn firmware_bin_is_a_delta_unless_the_bucket_removes_it() {
+    let base = generate_binary(100_000, 7);
+    let variant = mutate_binary(&base, 0.01);
+    for (remove, want) in [(false, "delta"), (true, "passthrough")] {
+        let mut builder = TestServer::builder();
+        if remove {
+            builder = builder.bucket_policy("test-bucket", "delta_extensions: {remove: [bin]}");
+        }
+        let server = builder.bucket("test-bucket").build().await;
+        let http = server.http();
+        for (key, body) in [
+            ("fw/fw-1.0.bin", base.clone()),
+            ("fw/fw-1.1.bin", variant.clone()),
+        ] {
+            let st = put_and_get_storage_type(
+                &http,
+                &server.endpoint(),
+                server.bucket(),
+                key,
+                body,
+                "application/octet-stream",
+            )
+            .await;
+            if key.ends_with("1.1.bin") {
+                assert_eq!(st, want, "remove={remove}");
+            }
+        }
+    }
+}
+
 /// `x-amz-meta-dg-no-delta: true` on a PUT stores a delta-eligible object
 /// that would be a delta as passthrough.
 #[tokio::test]

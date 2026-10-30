@@ -34,7 +34,7 @@ import { useColors } from '../ThemeContext';
 import SimpleAutoComplete from './SimpleAutoComplete';
 import { formRow } from './ruleEditorHelpers';
 import type { BucketPolicyRow, PrefixEntry } from './bucketPolicyPayload';
-import { DEFAULT_ROW_FIELDS, freshId, hasOwnEncryption, isAllDefaultRow, resetRowFields } from './bucketPolicyPayload';
+import { DEFAULT_ROW_FIELDS, freshId, hasOwnEncryption, isAllDefaultRow, normalizeExtension, resetRowFields } from './bucketPolicyPayload';
 import PrefixListEditor from './PrefixListEditor';
 import MigrateBucketModal from './MigrateBucketModal';
 import type { JobRow } from '../jobsView';
@@ -83,6 +83,8 @@ interface CardProps {
   /** Global compression default — for resolved labels. */
   globalCompressionOn: boolean;
   globalRatio: number;
+  /** The built-in delta-eligible file types (`delta_extensions_default`). */
+  defaultDeltaExtensions?: readonly string[];
   /** Stage a change. Parent materialises a policy row on first edit. */
   onPatch: (patch: Partial<BucketPolicyRow>) => void;
   /** Functional prefix-list transform routed through the parent's setRows. */
@@ -151,6 +153,7 @@ export default function BucketCard({
   onEncryptionApplied,
   globalCompressionOn,
   globalRatio,
+  defaultDeltaExtensions = [],
   onPatch,
   onPrefixesChange,
   onDraftNameChange,
@@ -225,8 +228,9 @@ export default function BucketCard({
   // The server's answer, never a client-side resolution (a bucket's own
   // block overrides its backend).
   const encryptionInfo = describeBucketEncryption(effectiveEncryption);
+  const fileTypesChanged = eff.delta_add.length > 0 || eff.delta_remove.length > 0;
   const advancedActive =
-    eff.compression !== null || eff.max_delta_ratio !== null || eff.alias !== '' || eff.quota_bytes !== null;
+    eff.compression !== null || eff.max_delta_ratio !== null || fileTypesChanged || eff.alias !== '' || eff.quota_bytes !== null;
 
   const chips: React.ReactNode[] = [];
   if (maintenanceJob) {
@@ -331,6 +335,21 @@ export default function BucketCard({
           : eff.max_delta_ratio !== null
             ? `delta ≤ ${eff.max_delta_ratio}`
             : 'compression on'}
+      </Chip>
+    );
+  }
+
+  if (fileTypesChanged && eff.compression !== false) {
+    chips.push(
+      <Chip
+        key="types"
+        tone={colors.ACCENT_PURPLE}
+        title={[
+          eff.delta_add.length ? `Also compressed: ${eff.delta_add.join(', ')}` : '',
+          eff.delta_remove.length ? `Stored whole: ${eff.delta_remove.join(', ')}` : '',
+        ].filter(Boolean).join('\n')}
+      >
+        file types{eff.delta_add.length ? ` +${eff.delta_add.length}` : ''}{eff.delta_remove.length ? ` −${eff.delta_remove.length}` : ''}
       </Chip>
     );
   }
@@ -768,6 +787,45 @@ export default function BucketCard({
                           style={{ width: 170, ...inputRadius }}
                           size="small"
                         />
+                      </div>
+                    )}
+                    {eff.compression !== false && (
+                      <div style={formRow(8, { flexWrap: 'wrap', alignItems: 'flex-start' })}>
+                        <Text id={`${uid}-types`} style={{ fontSize: 12, color: colors.TEXT_MUTED, width: 150, paddingTop: 4 }}>
+                          File types
+                        </Text>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minWidth: 260 }}>
+                          <Select
+                            mode="tags"
+                            size="small"
+                            aria-label="Also compress these file types"
+                            placeholder="Also compress, e.g. pkl"
+                            value={eff.delta_add}
+                            onChange={(v: string[]) =>
+                              onPatch({ delta_add: [...new Set(v.map(normalizeExtension).filter(Boolean))] })
+                            }
+                            open={false}
+                            suffixIcon={null}
+                            style={{ width: '100%', ...inputRadius }}
+                          />
+                          <Select
+                            mode="multiple"
+                            size="small"
+                            aria-label="Store these built-in file types whole"
+                            placeholder="Store whole, e.g. sql"
+                            value={eff.delta_remove}
+                            onChange={(v: string[]) => onPatch({ delta_remove: v })}
+                            options={defaultDeltaExtensions.map((e) => ({ value: e, label: e }))}
+                            style={{ width: '100%', ...inputRadius }}
+                          />
+                          <Text
+                            style={{ fontSize: 12, color: colors.TEXT_MUTED }}
+                            title={defaultDeltaExtensions.join(', ')}
+                          >
+                            Built-in: {defaultDeltaExtensions.length} types, such as{' '}
+                            {defaultDeltaExtensions.slice(0, 6).join(', ')}. A delta that is not small enough is still stored whole.
+                          </Text>
+                        </div>
                       </div>
                     )}
                     <div style={formRow(8, { flexWrap: 'wrap' })}>

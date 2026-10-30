@@ -403,11 +403,11 @@ async fn test_copy_unmanaged_object_succeeds() {
 }
 
 /// Regression test for M5: copy_object with an unmanaged source that exceeds
-/// max_object_size is checked against its ACTUAL size. A destination that
-/// can become a delta keeps the max_object_size limit (the codec buffers
-/// it); a passthrough destination streams the copy, up to 5 GiB.
+/// max_object_size is checked against its ACTUAL size. Above
+/// max_object_size the destination stores the copy whole, even for a key
+/// that would otherwise try a delta: the delta limit never refuses a copy.
 #[tokio::test]
-async fn test_copy_unmanaged_object_too_large_rejected() {
+async fn test_copy_unmanaged_object_above_delta_limit_is_stored_whole() {
     let server = TestServer::builder().max_object_size(100).build().await;
     let data_dir = server.data_dir().expect("filesystem backend has data_dir");
 
@@ -428,19 +428,20 @@ async fn test_copy_unmanaged_object_too_large_rejected() {
         client.put(&url).header("x-amz-copy-source", &source).send()
     };
 
-    // A delta-eligible destination: refused after the actual size check.
+    // A delta-eligible destination: stored whole, not refused.
     let resp = copy_to("dest.zip").await.unwrap();
-    let status = resp.status().as_u16();
-    let body = resp.text().await.unwrap_or_default();
-    assert!(
-        status == 400 || status == 413,
-        "Copy of an oversized unmanaged object to a delta destination should be rejected (400 or 413), got {}: {}",
-        status,
-        body
+    assert_eq!(
+        resp.headers()
+            .get("x-amz-storage-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("passthrough"),
+        "{:?}",
+        resp.headers()
     );
+    assert_eq!(resp.status().as_u16(), 200);
 
     // A passthrough destination: streamed, byte for byte.
-    let resp = copy_to("dest.bin").await.unwrap();
+    let resp = copy_to("dest.dat").await.unwrap();
     assert_eq!(
         resp.status().as_u16(),
         200,
@@ -448,7 +449,7 @@ async fn test_copy_unmanaged_object_too_large_rejected() {
         resp.text().await.unwrap_or_default()
     );
     let url = format!(
-        "{}/{}/copy-big/dest.bin",
+        "{}/{}/copy-big/dest.dat",
         server.endpoint(),
         server.bucket()
     );

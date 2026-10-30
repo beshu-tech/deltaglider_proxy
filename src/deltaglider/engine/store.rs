@@ -86,13 +86,17 @@ pub(crate) enum StorePlan {
 
 impl StorePlan {
     /// Whether a PUT tries a delta at all. No: store passthrough, with no
-    /// baseline.
+    /// baseline. `fits_delta_limit`: the object is at most `max_object_size`,
+    /// the limit of a delta. A larger object of an eligible type is stored
+    /// whole on every path, as a large multipart upload already was, never
+    /// refused for being too large for a delta.
     pub(crate) fn tries_delta(
         compression_enabled: bool,
         delta_eligible: bool,
         no_delta_requested: bool,
+        fits_delta_limit: bool,
     ) -> bool {
-        compression_enabled && delta_eligible && !no_delta_requested
+        compression_enabled && delta_eligible && !no_delta_requested && fits_delta_limit
     }
 
     /// After the encode. S-P1-1: the ratio is checked on EVERY PUT, not only
@@ -532,7 +536,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             multipart_etag,
             prior: &prior,
         };
-        if !self.tries_delta(bucket, &obj_key, &put.user_metadata) {
+        if !self.tries_delta(bucket, &obj_key, &put.user_metadata, put.size) {
             // The key's write lock only (P7.4): see `write_passthrough_locked`.
             let result = self
                 .write_passthrough_locked(put.passthrough_write(), None)
@@ -544,19 +548,21 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.store_delta_eligible(put).await
     }
 
-    /// Whether a write of `key` into `bucket` with `user_metadata` tries a
-    /// delta (the `StorePlan::tries_delta` rule). Multipart completion asks before it
-    /// assembles the parts; counts nothing.
+    /// Whether a write of `size` bytes to `key` in `bucket` with
+    /// `user_metadata` tries a delta (the `StorePlan::tries_delta` rule).
+    /// Multipart completion asks before it assembles the parts; counts nothing.
     pub fn write_tries_delta(
         &self,
         bucket: &str,
         key: &str,
         user_metadata: &HashMap<String, String>,
+        size: u64,
     ) -> bool {
         StorePlan::tries_delta(
             self.bucket_policies.compression_enabled(bucket),
-            self.is_delta_eligible(key),
+            self.is_delta_eligible(bucket, key),
             crate::types::no_delta_requested(user_metadata),
+            size <= self.max_object_size,
         )
     }
 
@@ -567,15 +573,21 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         bucket: &str,
         obj_key: &ObjectKey,
         user_metadata: &HashMap<String, String>,
+        size: u64,
     ) -> bool {
         let compression = self.bucket_policies.compression_enabled(bucket);
-        let eligible = self.file_router.is_delta_eligible(&obj_key.filename);
+        let eligible = self
+            .bucket_policies
+            .is_delta_eligible(bucket, &obj_key.filename);
         let no_delta = crate::types::no_delta_requested(user_metadata);
-        if StorePlan::tries_delta(compression, eligible, no_delta) {
+        let fits = size <= self.max_object_size;
+        if StorePlan::tries_delta(compression, eligible, no_delta, fits) {
             return true;
         }
         if no_delta {
             debug!("The PUT asks for no delta, storing as passthrough");
+        } else if compression && eligible {
+            debug!("Larger than max_object_size ({size} bytes), storing as passthrough");
         } else if compression {
             debug!("File type not delta-eligible, storing as passthrough");
         } else {
@@ -661,24 +673,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ) -> Result<StoreResult, EngineError> {
         self.metadata_cache.invalidate(bucket, key);
         let (obj_key, deltaspace_id) = self.validated_key_ingest(lock, bucket, key)?;
-        // Size ceiling depends on the STRATEGY: a delta-eligible object is
-        // bounded by max_object_size (it will be xdelta3-encoded in RAM); a
-        // passthrough object streams from the spool and is bounded by the far
-        // larger max_passthrough_object_size. Applying the delta limit to
-        // passthrough objects made every spooled passthrough copy fail
-        // TooLarge under default config (finding #3).
-        let is_passthrough = !StorePlan::tries_delta(
-            self.bucket_policies.compression_enabled(bucket),
-            self.file_router.is_delta_eligible(&obj_key.filename),
-            crate::types::no_delta_requested(&user_metadata),
-        );
-        let ceiling = if is_passthrough {
-            self.max_passthrough_object_size
-        } else {
-            self.max_object_size
-        };
-        if size > ceiling {
-            return Err(EngineError::TooLarge { size, max: ceiling });
+        // An object above max_object_size never tries a delta (`tries_delta`):
+        // it is stored whole, so the one ceiling here is the passthrough one.
+        if size > self.max_passthrough_object_size {
+            return Err(EngineError::TooLarge {
+                size,
+                max: self.max_passthrough_object_size,
+            });
         }
         let prior = self.prior_or_read(bucket, key, known_prior).await;
 
@@ -708,7 +709,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
 
         // (2) Not delta-eligible → passthrough from the body spool.
-        if !self.tries_delta(bucket, &obj_key, &user_metadata) {
+        if !self.tries_delta(bucket, &obj_key, &user_metadata, size) {
             let result = self
                 .store_passthrough_file_inner(
                     lock,
@@ -1450,9 +1451,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         .map_err(|e| EngineError::Storage(StorageError::from(e)))
     }
 
-    /// Check if a key's filename is eligible for delta compression.
-    pub fn is_delta_eligible(&self, key: &str) -> bool {
-        self.file_router.is_delta_eligible(key)
+    /// Whether `key`'s file type is one that `bucket` tries to store as a delta.
+    pub fn is_delta_eligible(&self, bucket: &str, key: &str) -> bool {
+        self.bucket_policies.is_delta_eligible(bucket, key)
     }
 
     /// Store a non-delta-eligible object from pre-split chunks without assembling

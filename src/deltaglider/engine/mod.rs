@@ -6,7 +6,6 @@ use crate::storage::DynStorageBackend;
 
 use super::cache::ReferenceCache;
 use super::codec::{CodecError, DeltaCodec};
-use super::file_router::FileRouter;
 use crate::config::{BackendConfig, Config};
 use crate::metadata_cache::MetadataCache;
 use crate::metrics::Metrics;
@@ -221,7 +220,6 @@ impl From<EngineError> for crate::api::S3Error {
 pub struct DeltaGliderEngine<S: StorageBackend> {
     storage: Arc<S>,
     codec: Arc<DeltaCodec>,
-    file_router: FileRouter,
     /// Per engine on purpose (unlike `prefix_locks`): every hit is checked
     /// against the stored reference sha, so an overlap with the old engine
     /// cannot serve stale bytes, and a rebuild may re-route a bucket to

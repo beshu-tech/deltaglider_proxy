@@ -389,11 +389,11 @@ async fn a_copy_that_must_not_be_a_delta_goes_through_the_store() {
     }
 }
 
-/// A destination that tries a delta keeps the delta size limit on the
-/// LOGICAL size, though the fast path moves only the small delta: the
-/// answer for a too-large source does not change.
+/// The delta size limit applies to the LOGICAL size, though the fast path
+/// moves only the small delta: a source above it is copied whole, not
+/// refused and not shipped as a delta.
 #[tokio::test]
-async fn the_delta_size_limit_holds_for_a_fast_copy() {
+async fn a_fast_copy_above_the_delta_limit_is_stored_whole() {
     let (endpoint, _fake) = crate::storage::fake_s3::start().await;
     let on_fake = || async {
         let config = crate::config::BackendConfig::S3 {
@@ -423,14 +423,15 @@ async fn the_delta_size_limit_holds_for_a_fast_copy() {
     };
     let small = engine_on(on_fake().await, &config, &metrics);
     let state = AppState::for_tests(small);
-    let svc = service(state);
-    let err = copy::copy_object(
+    let svc = service(state.clone());
+    copy::copy_object(
         &svc,
         request(copy_input(("b", &keys[1]), ("b", "run/copy.zip"), None)),
     )
     .await
-    .unwrap_err();
-    assert_eq!(err.code(), &s3s::S3ErrorCode::EntityTooLarge);
+    .unwrap();
+    let head = state.engine.load().head("b", "run/copy.zip").await.unwrap();
+    assert!(!head.is_delta(), "{:?}", head.storage_info);
 }
 
 /// A source overwritten after the HEAD that the conditionals judged: the

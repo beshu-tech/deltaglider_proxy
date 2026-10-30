@@ -130,7 +130,7 @@ A download (`cp -r` or `sync` from S3 to a local directory) writes only below th
 
 `--no-delta` on `cp`, `sync`, and `migrate` stores each object as a plain object, without a delta against the `reference.bin` baseline. The verb sends the user metadata `dg-no-delta: true`, and the engine does not store this hint with the object. An S3 client that stores through the proxy can send the same hint as the header `x-amz-meta-dg-no-delta: true`.
 
-`--max-object-size-mb` sets the size limit for delta-eligible objects only (default 100 MiB), because the xdelta3 memory use grows with the object size. Other files are limited to 64 GiB, the default of `max_passthrough_object_size`. The verbs do not read the proxy config file, so no setting changes this limit.
+`--max-object-size-mb` sets the size limit of a delta (default 100 MiB), because the xdelta3 work grows with the object size. A delta-eligible file that is larger is stored whole, like any other file, up to 64 GiB, the default of `max_passthrough_object_size`. The verbs do not read the proxy config file, so no setting changes this limit.
 
 ### `s3 verify` results
 

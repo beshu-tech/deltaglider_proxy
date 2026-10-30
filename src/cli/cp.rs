@@ -813,6 +813,30 @@ mod tests {
         assert!(std::fs::read(&dst).unwrap() == body, "bytes differ");
     }
 
+    /// An eligible file above the delta ceiling is stored whole, not
+    /// refused: a 12 MiB `.zip` under a 1 MiB `max_object_size` uploads as
+    /// passthrough and reads back byte for byte.
+    #[tokio::test]
+    async fn cp_stores_an_eligible_file_above_the_delta_ceiling_whole() {
+        let store = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let engine = fs_engine(store.path()).await;
+        let body: Vec<u8> = (0..12 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let src = local.path().join("app.zip");
+        std::fs::write(&src, &body).unwrap();
+        let a = args(src.to_str().unwrap(), "s3://b/in/app.zip");
+        let meta = HashMap::new();
+
+        let code = upload_one(&engine, &a, &meta, "b", &src, "in/app.zip").await;
+        assert_eq!(code, cli_exit::EXIT_OK, "upload");
+        let head = engine.head("b", "in/app.zip").await.unwrap();
+        assert!(!head.is_delta(), "stored whole: {:?}", head.storage_info);
+        let dst = local.path().join("back.zip");
+        let code = download_one(&engine, &a, "b", "in/app.zip", &dst).await;
+        assert_eq!(code, cli_exit::EXIT_OK, "download");
+        assert!(std::fs::read(&dst).unwrap() == body, "bytes differ");
+    }
+
     /// Guard for the class: every download path must build local paths
     /// through `keys::local_path_for_key`, never `Path::join` on a key.
     #[test]

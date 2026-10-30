@@ -21,17 +21,17 @@ async fn pinned_range_read_errors_when_source_changes_generation() {
     let engine = DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None);
     engine.create_bucket("b").await.ok();
 
-    // `.bin` is not delta-eligible → stored passthrough → range-able.
+    // `.dat` is not delta-eligible → stored passthrough → range-able.
     let gen_a = vec![0xAAu8; 4096];
     engine
-        .store("b", "obj.bin", &gen_a, None, Default::default())
+        .store("b", "obj.dat", &gen_a, None, Default::default())
         .await
         .expect("store gen A");
-    let head_a = engine.head("b", "obj.bin").await.expect("head A");
+    let head_a = engine.head("b", "obj.dat").await.expect("head A");
 
     // A pinned read against the CURRENT generation succeeds.
     let ok = engine
-        .retrieve_stream_range("b", "obj.bin", 0, 1023, Some(&head_a))
+        .retrieve_stream_range("b", "obj.dat", 0, 1023, Some(&head_a))
         .await
         .expect("pinned read of current gen");
     assert!(ok.is_some(), "range read available for passthrough");
@@ -39,13 +39,13 @@ async fn pinned_range_read_errors_when_source_changes_generation() {
     // Overwrite with a DIFFERENT same-size generation.
     let gen_b = vec![0xBBu8; 4096];
     engine
-        .store("b", "obj.bin", &gen_b, None, Default::default())
+        .store("b", "obj.dat", &gen_b, None, Default::default())
         .await
         .expect("store gen B");
 
     // The stale pin now mismatches → the read MUST error (never mix bytes).
     match engine
-        .retrieve_stream_range("b", "obj.bin", 0, 1023, Some(&head_a))
+        .retrieve_stream_range("b", "obj.dat", 0, 1023, Some(&head_a))
         .await
     {
         Err(e) => {
@@ -60,7 +60,7 @@ async fn pinned_range_read_errors_when_source_changes_generation() {
 
     // Unpinned reads are unaffected (the pin is opt-in, copy-path only).
     let unpinned = engine
-        .retrieve_stream_range("b", "obj.bin", 0, 1023, None)
+        .retrieve_stream_range("b", "obj.dat", 0, 1023, None)
         .await
         .expect("unpinned read still works");
     assert!(unpinned.is_some());

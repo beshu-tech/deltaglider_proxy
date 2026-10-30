@@ -1772,7 +1772,7 @@ async fn object_created_payload_is_the_same_for_put_and_multipart() {
     let put = s3
         .put_object()
         .bucket(bucket)
-        .key("ev/put.bin")
+        .key("ev/put.dat")
         .body(body.clone().into())
         .send()
         .await
@@ -1780,7 +1780,7 @@ async fn object_created_payload_is_the_same_for_put_and_multipart() {
     let up = s3
         .create_multipart_upload()
         .bucket(bucket)
-        .key("ev/mpu.bin")
+        .key("ev/mpu.dat")
         .send()
         .await
         .unwrap();
@@ -1788,7 +1788,7 @@ async fn object_created_payload_is_the_same_for_put_and_multipart() {
     let part = s3
         .upload_part()
         .bucket(bucket)
-        .key("ev/mpu.bin")
+        .key("ev/mpu.dat")
         .upload_id(id)
         .part_number(1)
         .body(body.clone().into())
@@ -1798,7 +1798,7 @@ async fn object_created_payload_is_the_same_for_put_and_multipart() {
     let done = s3
         .complete_multipart_upload()
         .bucket(bucket)
-        .key("ev/mpu.bin")
+        .key("ev/mpu.dat")
         .upload_id(id)
         .multipart_upload(
             CompletedMultipartUpload::builder()
@@ -1814,7 +1814,7 @@ async fn object_created_payload_is_the_same_for_put_and_multipart() {
         .await
         .unwrap();
     let v = common::wait_for_outbox(&admin, &ep, |rows| {
-        ["ev/put.bin", "ev/mpu.bin"].iter().all(|k| {
+        ["ev/put.dat", "ev/mpu.dat"].iter().all(|k| {
             rows.iter()
                 .any(|r| r["kind"] == "ObjectCreated" && r["key"] == *k)
         })
@@ -1822,8 +1822,8 @@ async fn object_created_payload_is_the_same_for_put_and_multipart() {
     .await;
     let rows = v["rows"].as_array().expect("outbox rows");
     for (key, etag) in [
-        ("ev/put.bin", put.e_tag().unwrap()),
-        ("ev/mpu.bin", done.e_tag().unwrap()),
+        ("ev/put.dat", put.e_tag().unwrap()),
+        ("ev/mpu.dat", done.e_tag().unwrap()),
     ] {
         let row = rows
             .iter()

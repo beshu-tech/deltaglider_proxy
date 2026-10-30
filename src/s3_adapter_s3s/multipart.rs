@@ -21,7 +21,9 @@ pub(super) async fn create_multipart_upload(
     // A write that tries no delta is never assembled in memory: its parts go
     // to relay files from the first one. Completion decides again (the config
     // can change mid-upload) and reads relay files either way.
-    let relay_now = !engine.write_tries_delta(&input.bucket, &input.key, &user_metadata);
+    // The size is unknown here: 0 asks only about the type, the bucket and
+    // the hint.
+    let relay_now = !engine.write_tries_delta(&input.bucket, &input.key, &user_metadata, 0);
     let upload_id = svc.state.multipart.create_with_relay_policy(
         &input.bucket,
         &input.key,
@@ -270,7 +272,7 @@ pub(super) fn completion_stores_from_parts(
     user_metadata: &std::collections::HashMap<String, String>,
     total_parts_size: u64,
 ) -> bool {
-    !engine.write_tries_delta(bucket, key, user_metadata)
+    !engine.write_tries_delta(bucket, key, user_metadata, total_parts_size)
         || total_parts_size > engine.tuning().mpu_delta_reconstruct_max_bytes
 }
 

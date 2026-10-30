@@ -30,6 +30,12 @@ pub struct BucketPolicyConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression: Option<bool>,
 
+    /// Change which file types this bucket tries to store as deltas: the
+    /// built-in list (`DEFAULT_DELTA_EXTENSIONS`) plus `add`, minus `remove`.
+    /// Entries are extensions without the dot (`bin`, `tar.zst`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_extensions: Option<DeltaExtensions>,
+
     /// Override the global `max_delta_ratio` for this bucket.
     /// Delta is kept only if `delta_size / original_size < ratio`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -94,6 +100,47 @@ pub struct BucketPolicyConfig {
     /// `None` = the bucket inherits the backend's encryption.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption: Option<crate::config::BackendEncryptionConfig>,
+}
+
+/// A bucket's change to the delta-eligible file types. See
+/// [`BucketPolicyConfig::delta_extensions`].
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeltaExtensions {
+    /// Extensions to try as deltas on top of the built-in list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub add: Vec<String>,
+    /// Built-in extensions this bucket stores as they are.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove: Vec<String>,
+}
+
+impl DeltaExtensions {
+    /// Normalize both lists ([`crate::deltaglider::normalize_extension`]),
+    /// sorted and without duplicates. An entry in both lists is an error.
+    fn normalize(&mut self) -> Result<(), String> {
+        let norm = |list: &[String]| -> Result<Vec<String>, String> {
+            let mut out = list
+                .iter()
+                .map(|e| crate::deltaglider::normalize_extension(e))
+                .collect::<Result<Vec<_>, _>>()?;
+            out.sort();
+            out.dedup();
+            Ok(out)
+        };
+        self.add = norm(&self.add).map_err(|e| format!("delta_extensions.add: {e}"))?;
+        self.remove = norm(&self.remove).map_err(|e| format!("delta_extensions.remove: {e}"))?;
+        if let Some(both) = self.add.iter().find(|e| self.remove.contains(e)) {
+            return Err(format!(
+                "delta_extensions: `{both}` is in both `add` and `remove`; keep it in one list"
+            ));
+        }
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.add.is_empty() && self.remove.is_empty()
+    }
 }
 
 /// Why a `public_prefix` was rejected during validation. Carries enough
@@ -172,6 +219,12 @@ impl BucketPolicyConfig {
         // `public: true` is set, that's the post-first-expansion state
         // — re-accept it as-is rather than treating the sentinel as a
         // conflict.
+        if let Some(exts) = self.delta_extensions.as_mut() {
+            exts.normalize()?;
+            if exts.is_empty() {
+                self.delta_extensions = None;
+            }
+        }
         let already_expanded = self.public == Some(true)
             && self.public_prefixes.len() == 1
             && self.public_prefixes[0].is_empty();
@@ -231,6 +284,10 @@ impl BucketPolicyConfig {
 /// Constructed from `Config` at engine startup.
 pub struct BucketPolicyRegistry {
     policies: HashMap<String, BucketPolicyConfig>,
+    /// The built-in delta-eligible file types, and one router per bucket
+    /// that changes them (`delta_extensions`).
+    default_router: crate::deltaglider::FileRouter,
+    bucket_routers: HashMap<String, crate::deltaglider::FileRouter>,
     default_compression: bool,
     default_max_delta_ratio: f32,
     /// Lowercased REAL storage names of every `replication_target_only` bucket
@@ -450,13 +507,43 @@ impl BucketPolicyRegistry {
                     .to_ascii_lowercase()
             })
             .collect();
+        let bucket_routers = policies
+            .iter()
+            .filter_map(|(name, p)| {
+                let exts = p.delta_extensions.as_ref()?;
+                // `normalize` ran at load; a registry built from an
+                // unnormalized policy (tests) normalizes here, and an
+                // invalid entry falls back to the built-in list.
+                let mut exts = exts.clone();
+                if let Err(e) = exts.normalize() {
+                    tracing::warn!("Bucket '{name}': {e}; using the built-in file types");
+                    return None;
+                }
+                Some((
+                    name.clone(),
+                    crate::deltaglider::FileRouter::with_overrides(&exts.add, &exts.remove),
+                ))
+            })
+            .collect();
         Self {
             reserved_buckets: Default::default(),
+            default_router: crate::deltaglider::FileRouter::new(),
+            bucket_routers,
             policies,
             default_compression: true,
             default_max_delta_ratio,
             replication_target_real_names,
         }
+    }
+
+    /// Whether `key`'s file type is one that `bucket` tries to store as a
+    /// delta (the built-in list, changed by the bucket's `delta_extensions`).
+    /// Says nothing about `compression: false`; see [`Self::compression_enabled`].
+    pub fn is_delta_eligible(&self, bucket: &str, key: &str) -> bool {
+        self.bucket_routers
+            .get(bucket)
+            .unwrap_or(&self.default_router)
+            .is_delta_eligible(key)
     }
 
     /// Whether delta compression is enabled for this bucket.
@@ -722,6 +809,52 @@ mod tests {
         let registry = BucketPolicyRegistry::new(HashMap::new(), 0.75);
         assert!(registry.compression_enabled("any-bucket"));
         assert!((registry.max_delta_ratio("any-bucket") - 0.75).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn delta_extensions_change_one_buckets_file_types() {
+        let mut models: BucketPolicyConfig =
+            serde_yaml::from_str("delta_extensions:\n  add: [.PKL, tar.zst]\n  remove: [bin]\n")
+                .unwrap();
+        models.normalize().unwrap();
+        let exts = models.delta_extensions.as_ref().unwrap();
+        assert_eq!(exts.add, ["pkl", "tar.zst"]);
+        assert_eq!(exts.remove, ["bin"]);
+        let registry = BucketPolicyRegistry::new([("models".to_string(), models)], 0.75);
+        assert!(registry.is_delta_eligible("models", "a/model.pkl"));
+        assert!(registry.is_delta_eligible("models", "a/x.tar.zst"));
+        assert!(!registry.is_delta_eligible("models", "fw.bin"));
+        // Other buckets keep the built-in list.
+        assert!(registry.is_delta_eligible("releases", "fw.bin"));
+        assert!(!registry.is_delta_eligible("releases", "a/model.pkl"));
+    }
+
+    #[test]
+    fn delta_extensions_refuse_bad_entries_at_load() {
+        for (yaml, needle) in [
+            ("delta_extensions:\n  add: [a/b]\n", "delta_extensions.add"),
+            (
+                "delta_extensions:\n  remove: [sha256]\n",
+                "checksum sidecars",
+            ),
+            (
+                "delta_extensions:\n  add: [bin]\n  remove: [.BIN]\n",
+                "both",
+            ),
+        ] {
+            let mut p: BucketPolicyConfig = serde_yaml::from_str(yaml).unwrap();
+            let err = p.normalize().unwrap_err();
+            assert!(err.contains(needle), "{yaml}: {err}");
+        }
+        assert!(
+            serde_yaml::from_str::<BucketPolicyConfig>("delta_extensions:\n  added: [x]\n")
+                .is_err()
+        );
+        // Empty lists say nothing: the override disappears from the export.
+        let mut p: BucketPolicyConfig =
+            serde_yaml::from_str("delta_extensions: {add: [], remove: []}\n").unwrap();
+        p.normalize().unwrap();
+        assert_eq!(p.delta_extensions, None);
     }
 
     #[test]

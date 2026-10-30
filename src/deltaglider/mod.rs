@@ -26,5 +26,7 @@ pub use engine::{
     EngineError, ListObjectsPage, ListedPageForms, RefWriteProof, ReferenceScan, RetrieveResponse,
     StoredForms, BULK_DELETE_CONCURRENCY, REFERENCE_SCAN_LIMIT,
 };
-pub use file_router::{CompressionStrategy, FileRouter};
+pub use file_router::{
+    normalize_extension, CompressionStrategy, FileRouter, DEFAULT_DELTA_EXTENSIONS,
+};
 pub use savings::SavingsTotals;

@@ -143,7 +143,7 @@ test('a passthrough file on a compressing bucket does not claim compression is o
   await page.goto(`/_/browse/${BUCKET}/docs/`);
   await page.getByText('README.txt', { exact: true }).click();
   await expect(page.locator('.ant-drawer-open')).toBeVisible();
-  await expect(page.locator('.ant-drawer-open').getByText('Compression disabled for this bucket')).toHaveCount(0);
+  await expect(page.locator('.ant-drawer-open').getByText(/compression is off/i)).toHaveCount(0);
 });
 
 test('dashboard "avg per entry" divides the used cache bytes, not the cache size', async ({ page }) => {

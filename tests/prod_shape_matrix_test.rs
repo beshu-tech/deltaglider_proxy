@@ -298,7 +298,7 @@ async fn encrypted_at_rest(ps: &ProdShape) {
             &ps.admin_http,
             &ps.server.endpoint(),
             bucket,
-            "enc/secret.bin",
+            "enc/secret.dat",
             body.clone(),
             "application/octet-stream",
         )
@@ -327,7 +327,7 @@ async fn encrypted_at_rest(ps: &ProdShape) {
         let path = ps
             .local_disk
             .join(bucket)
-            .join("deltaspaces/enc/secret.bin");
+            .join("deltaspaces/enc/secret.dat");
         let raw = xattr::get(&path, "user.dg.metadata")
             .unwrap()
             .unwrap_or_else(|| panic!("{}: no metadata", path.display()));
@@ -347,7 +347,7 @@ async fn encrypted_at_rest(ps: &ProdShape) {
             &ps.admin_http,
             &ps.server.endpoint(),
             "reenc-demo",
-            "enc/secret.bin"
+            "enc/secret.dat"
         )
         .await,
         body
@@ -654,7 +654,7 @@ async fn public_prefix_matrix(ps: &ProdShape) {
             url(ps, "releases", "firmware/public/pub.bin"),
             403,
         ),
-        (Method::GET, url(ps, "db-archive", "enc/secret.bin"), 403),
+        (Method::GET, url(ps, "db-archive", "enc/secret.dat"), 403),
     ] {
         let b = (method == Method::PUT).then_some(body.as_slice());
         let got = status(&anon, method.clone(), &u, b).await;

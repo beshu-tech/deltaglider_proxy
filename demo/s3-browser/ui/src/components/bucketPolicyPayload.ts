@@ -48,6 +48,10 @@ export interface BucketPolicyRow {
   /** `null` = omit key / YAML null — inherit engine default (delta enabled). */
   compression: boolean | null;
   max_delta_ratio: number | null;
+  /** `delta_extensions`: file types tried as deltas on top of the built-in
+   *  list, and built-in types stored whole. Normalized (lowercase, no dot). */
+  delta_add: string[];
+  delta_remove: string[];
   backend: string;
   alias: string;
   /** Tri-state source of truth for the anonymous-read radio group. */
@@ -84,6 +88,7 @@ export interface BucketPolicyRow {
 const MODELED_KEYS: ReadonlySet<string> = new Set([
   'compression',
   'max_delta_ratio',
+  'delta_extensions',
   'backend',
   'alias',
   'public',
@@ -137,6 +142,7 @@ export function resetRowFields(row: BucketPolicyRow | null): Partial<BucketPolic
 export interface BucketPolicyPatch {
   compression: boolean | null;
   max_delta_ratio: number | null;
+  delta_extensions: { add: string[]; remove: string[] } | null;
   backend: string | null;
   alias: string | null;
   /** Always emitted as null — the [""]-sentinel in `public_prefixes` is the
@@ -157,6 +163,8 @@ type BucketsPatchBody = { buckets: Record<string, BucketPolicyPatch | null> };
 export const DEFAULT_ROW_FIELDS: Omit<BucketPolicyRow, '_id' | 'name' | 'unmodeled'> = Object.freeze({
   compression: null,
   max_delta_ratio: null,
+  delta_add: [],
+  delta_remove: [],
   backend: '',
   alias: '',
   publicMode: 'none' as const,
@@ -197,6 +205,8 @@ export function policyToRow(
     compression:
       p.compression === undefined || p.compression === null ? null : p.compression,
     max_delta_ratio: p.max_delta_ratio ?? null,
+    delta_add: p.delta_extensions?.add?.slice() ?? [],
+    delta_remove: p.delta_extensions?.remove?.slice() ?? [],
     backend: p.backend ?? '',
     alias: p.alias ?? '',
     publicMode,
@@ -206,6 +216,12 @@ export function policyToRow(
     encryption: (p as { encryption?: Record<string, unknown> | null }).encryption ?? null,
     unmodeled: unmodeledFields(p),
   };
+}
+
+/** A typed file extension in the server's form: trimmed, lowercase, no
+ *  leading dot. `''` when nothing is left. The server validates the rest. */
+export function normalizeExtension(raw: string): string {
+  return raw.trim().replace(/^\.+/, '').toLowerCase();
 }
 
 /** The row's non-blank public prefixes (what would actually serialise). */
@@ -225,6 +241,8 @@ export function isAllDefaultRow(row: BucketPolicyRow): boolean {
     !hasOwnEncryption(row) &&
     row.compression === null &&
     row.max_delta_ratio === null &&
+    row.delta_add.length === 0 &&
+    row.delta_remove.length === 0 &&
     row.backend === '' &&
     row.alias === '' &&
     row.quota_bytes === null &&
@@ -254,6 +272,10 @@ function rowToPolicy(row: BucketPolicyRow): BucketPolicyPatch {
   return {
     compression: row.compression === null ? null : row.compression,
     max_delta_ratio: row.max_delta_ratio ?? null,
+    delta_extensions:
+      row.delta_add.length || row.delta_remove.length
+        ? { add: row.delta_add, remove: row.delta_remove }
+        : null,
     backend: row.backend || null,
     alias: row.alias || null,
     public: null,

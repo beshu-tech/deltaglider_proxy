@@ -206,7 +206,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             }
         }
         let guess = if self.bucket_policies.compression_enabled(bucket)
-            && self.file_router.is_delta_eligible(filename)
+            && self.bucket_policies.is_delta_eligible(bucket, filename)
         {
             ObjectVariant::Delta
         } else {

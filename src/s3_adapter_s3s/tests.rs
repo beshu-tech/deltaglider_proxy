@@ -1123,7 +1123,7 @@ async fn copy_source_above_the_spool_threshold_streams_to_a_spool() {
     );
     engine.create_bucket("src").await.unwrap();
     let body: Vec<u8> = (0..200 * 1024u32).map(|i| (i * 31 % 251) as u8).collect();
-    for key in ["a/blob.bin", "a/app.zip"] {
+    for key in ["a/blob.dat", "a/app.zip"] {
         engine
             .store("src", key, &body, None, Default::default())
             .await
@@ -1154,7 +1154,7 @@ async fn copy_source_above_the_spool_threshold_streams_to_a_spool() {
         }
     }
     // A source that grew after the HEAD does not overrun its reservation.
-    let grown = read_copy_source(&engine, "src", "a/blob.bin", 100 * 1024, 64 * 1024).await;
+    let grown = read_copy_source(&engine, "src", "a/blob.dat", 100 * 1024, 64 * 1024).await;
     assert_eq!(
         grown.err().map(|e| e.code().as_str().to_string()),
         Some("SlowDown".to_string())

@@ -393,7 +393,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         known_prior: Option<super::usage::CounterPrior>,
     ) -> Result<StoreResult, EngineError> {
         let size = data.len() as u64;
-        if size > self.spool_threshold() && self.write_tries_delta(bucket, key, &user_metadata) {
+        if size > self.spool_threshold()
+            && self.write_tries_delta(bucket, key, &user_metadata, size)
+        {
             let spool = self.spool_acquire(size).await?;
             // Hash from RAM while the spool is written: the spooled store
             // then does not read the body back to hash it.

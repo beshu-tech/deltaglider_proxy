@@ -357,7 +357,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     Completion::HeadMetadata => {
                         !size.is_known()
                             || meta.is_delta()
-                            || self.file_router.is_delta_eligible(&key)
+                            || self.bucket_policies.is_delta_eligible(bucket, &key)
                     }
                     _ => Self::list_entry_needs_head(size),
                 };

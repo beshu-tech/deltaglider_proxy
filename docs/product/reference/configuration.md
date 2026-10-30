@@ -761,6 +761,7 @@ storage:
 |-------|------|---------|-------------|
 | `compression` | bool | global | Enable/disable delta compression for this bucket |
 | `max_delta_ratio` | float (0-1) | global | Override the delta-keep threshold |
+| `delta_extensions` | `{add: [string], remove: [string]}` | — | Change the file types that the bucket tries as deltas: the built-in list plus `add`, minus `remove`. Entries are extensions without the dot (`pkl`, `tar.zst`). See [Delta-eligible file types](#delta-eligible-file-types) |
 | `backend` | string | default | Route to a named backend from `storage.backends` |
 | `alias` | string | same as bucket name | Virtual → real bucket name mapping on the backend |
 | `public_prefixes` | `[string]` | `[]` | Anonymous read (GET/HEAD/LIST) scoped to these key prefixes |
@@ -768,6 +769,32 @@ storage:
 | `quota_bytes` | u64 | — | Soft storage quota (it may overshoot by up to 5 minutes of writes); `0` freezes the bucket |
 | `replication_target_only` | bool | `false` | Client writes return 403; replication is the only writer. This makes a non-CAS backend (e.g. Backblaze B2) a safe mirror (see [backend capability validation](../how-to/backend-capability-validation.md)) |
 | `encryption` | encryption block | the backend's | The bucket's own encryption at rest, with the same fields as a backend's `encryption` block. Only `aes256-gcm-proxy` and `none`; `key_id` is required. See [Encryption at rest](#encryption-at-rest) |
+
+### Delta-eligible file types
+
+The proxy tries a delta only for a key that ends in one of these extensions. The match ignores case.
+
+| Group | Extensions |
+|---|---|
+| Archives and ZIP-based packages | `zip` `tar` `jar` `war` `ear` `apk` `aab` `ipa` `whl` `nupkg` `vsix` `xpi` |
+| Disk and firmware images | `dmg` `iso` `img` `bin` `raw` `fw` `rom` `vhd` `vhdx` `vmdk` `vdi` `qcow2` |
+| Executables and libraries | `exe` `dll` `so` `dylib` `wasm` |
+| Model weights and checkpoints | `safetensors` `gguf` `onnx` `ckpt` `pt` `pth` `h5` `npy` `npz` |
+| Database dumps and files, backups | `sql` `dump` `sqlite` `db` `bak` `backup` |
+
+A bucket changes the list with `delta_extensions`:
+
+```yaml
+# fragment
+storage:
+  buckets:
+    releases:
+      delta_extensions:
+        add: [pkl, tar.zst]   # also try these as deltas
+        remove: [sql]         # store these whole
+```
+
+An entry is an extension without the dot: letters, digits, `-`, `_` and inner dots, at most 32 characters. The proxy refuses a config with an entry in both lists, and with `sha1`, `sha256` or `sha512`, because checksum sidecars are always stored as they are. An eligible file still needs a delta that is small enough (`max_delta_ratio`), and an eligible file that is larger than `max_object_size` is stored whole. `GET /_/api/admin/config` returns the built-in list as `delta_extensions_default`.
 
 A bucket policy refuses an unknown field, in the sectioned shape and in the flat shape. The proxy does not start, `config lint` exits with code `4`, and an apply is refused, and each error names the field. Before this release, the proxy ignored an unknown bucket field and kept running without it. The refusal is deliberate: when a later release adds a bucket field, an older binary refuses a config that uses it, instead of running without the setting after a downgrade. A release without per-bucket encryption therefore refuses a config with a bucket `encryption` block.
 

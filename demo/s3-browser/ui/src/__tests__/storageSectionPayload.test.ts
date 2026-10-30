@@ -5,6 +5,7 @@ import {
   freshId,
   policyToRow,
   isAllDefaultRow,
+  normalizeExtension,
   DEFAULT_ROW_FIELDS,
   type BucketPolicyRow,
 } from '../components/bucketPolicyPayload';
@@ -54,6 +55,8 @@ test('empty-name rows are dropped; a populated row serialises every clearable fi
       name: 'prod',
       compression: false,
       max_delta_ratio: 0.5,
+      delta_add: [],
+      delta_remove: [],
       backend: 'b1',
       alias: 'realprod',
       publicMode: 'none',
@@ -71,6 +74,7 @@ test('empty-name rows are dropped; a populated row serialises every clearable fi
   assert.deepEqual(p, {
     compression: false,
     max_delta_ratio: 0.5,
+    delta_extensions: null,
     backend: 'b1',
     alias: 'realprod',
     public: null,
@@ -78,6 +82,26 @@ test('empty-name rows are dropped; a populated row serialises every clearable fi
     quota_bytes: 1073741824,
     replication_target_only: null,
   });
+});
+
+test('delta_extensions round-trip: a file-type-only policy survives and clears with null', () => {
+  const row = policyToRow('models', { delta_extensions: { add: ['pkl'], remove: ['bin'] } });
+  assert.deepEqual([row.delta_add, row.delta_remove], [['pkl'], ['bin']]);
+  assert.equal(isAllDefaultRow(row), false, 'a file-type override is a policy');
+  const res = buildBucketPayload([row], ['models']);
+  assert.ok(res.ok);
+  if (!res.ok) return;
+  assert.deepEqual(res.body.buckets.models?.delta_extensions, { add: ['pkl'], remove: ['bin'] });
+  const cleared = buildBucketPayload([{ ...row, delta_add: [], delta_remove: [], compression: false }], ['models']);
+  assert.ok(cleared.ok);
+  if (!cleared.ok) return;
+  assert.equal(cleared.body.buckets.models?.delta_extensions, null, 'null deletes the override');
+});
+
+test('normalizeExtension matches the server form', () => {
+  assert.equal(normalizeExtension(' .BIN '), 'bin');
+  assert.equal(normalizeExtension('tar.zst'), 'tar.zst');
+  assert.equal(normalizeExtension('...'), '');
 });
 
 test('replication_target_only passthrough: a MARKER-ONLY policy must not round-trip as "all default"', () => {

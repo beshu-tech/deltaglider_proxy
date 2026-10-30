@@ -43,6 +43,11 @@ storage:
   #     quota_bytes: 10737418240   # 10 GiB
   #     compression: true
   #     max_delta_ratio: 0.5
+  #     # File types tried as deltas: the built-in list (zip, tar, bin, img,
+  #     # exe, safetensors, ...) plus `add`, minus `remove`.
+  #     delta_extensions:
+  #       add: [pkl]
+  #       remove: [sql]
   #
   #   # A cheap mirror on a backend WITHOUT conditional-write support
   #   # (e.g. Backblaze B2): mark it replication_target_only so client
