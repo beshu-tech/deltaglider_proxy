@@ -163,7 +163,7 @@ Keep one trait and dynosaur. Remove methods in two ways:
 | Deletes of delta/passthrough | 2 | 1 (`delete_object(ObjectVariant)`; reference delete stays in `write_reference`) |
 | Puts of delta/passthrough (bytes, file, parts, chunks) | 5 | 1 (`put_object(StoredWrite, PutBody)`) |
 
-About 67 → 55 methods, and fewer per-form copies in each wrapper. Later,
+About 67 → 55 methods (actual: 53), and fewer per-form copies in each wrapper. Later,
 with evidence: a declarative forwarding macro for the pure forwards (the
 encrypting wrapper has about 20, `SpyRef` forwards all).
 
@@ -231,4 +231,20 @@ format, a request count, or who can make a proof.
   still calls `check_witness`), but never on an UNFENCED one (the old
   `delete_reference` forwarded as is). So a single-instance delete-reclaim
   of `reference.bin` passes a witness refusal that a multi-instance one
-  does not. Decide which one is right before step 5.
+  does not. Still open after step 6: steps 3 to 6 kept every check as it
+  was.
+- Step 7: measured; no forwarding macro. `StorageBackend` has 53 methods
+  (67 at the start). One-line forwards left: encrypting 19 of its 48
+  methods (about 110 lines), routing 27 of 53 (already one
+  `route_existing!` line each; the rest is the signature), `FaultyFs` 20
+  of 37, `FencingFs` 15 of 27, `SpyRef` 29. Steps 1 to 6 removed about
+  930 lines net. A `macro_rules!` forwarder cannot read the trait, so
+  each use still spells every signature: it saves only the body line,
+  hides the forwards from rustfmt and go-to-definition, and adds nothing
+  to the rule that matters (no default, so the compiler makes every
+  wrapper forward). Revisit only if the trait grows again, and then with
+  a macro that reads the trait (as dynosaur does), not `macro_rules!`.
+- Left, outside this plan: the reference family (`get_reference_to_file`,
+  `open_reference_source`, `has_reference`, the three fence methods),
+  `open_passthrough_range`, the metadata-rewrite pair, the four multipart
+  methods, and the listing/scan methods.
