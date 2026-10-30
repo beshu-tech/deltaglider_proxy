@@ -3,8 +3,8 @@
 //! Filesystem-based storage backend with xattr-based metadata
 
 use super::traits::{
-    BulkListing, CopyOutcome, DelegatedListResult, ObjectAt, ObjectVariant, RefFence, RefWrite,
-    StorageBackend, StorageBackendExt, StorageError, StoredObject,
+    BulkListing, CopyOutcome, DelegatedListResult, ObjectAt, ObjectVariant, PutBody, RefFence,
+    RefWrite, StorageBackend, StorageBackendExt, StorageError, StoredObject, StoredWrite,
 };
 use super::xattr_meta;
 use crate::types::FileMetadata;
@@ -325,6 +325,111 @@ impl FilesystemBackend {
         } else {
             self.bucket_dir(bucket).join("deltaspaces").join(prefix)
         })
+    }
+
+    /// `put_object` of a passthrough from a local file.
+    #[instrument(skip(self, metadata))]
+    async fn put_passthrough_from_file(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        source_path: &Path,
+        metadata: &FileMetadata,
+    ) -> Result<(), StorageError> {
+        self.require_bucket_exists(bucket).await?;
+        let data_path = self.passthrough_path(bucket, prefix, filename)?;
+        let dir = self.ensure_dir(bucket, &data_path)?;
+        atomic_copy_with_metadata(
+            dir,
+            source_path,
+            &data_path,
+            metadata,
+            Durability::for_object(),
+        )
+        .await?;
+        debug!(
+            "Copied passthrough file {:?} -> {:?} for {}/{}",
+            source_path, data_path, prefix, filename
+        );
+        Ok(())
+    }
+
+    /// `put_object` of a passthrough from ordered part files.
+    #[instrument(skip(self, part_paths, metadata))]
+    async fn put_passthrough_from_parts(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        part_paths: &[PathBuf],
+        metadata: &FileMetadata,
+    ) -> Result<(), StorageError> {
+        self.require_bucket_exists(bucket).await?;
+        let data_path = self.passthrough_path(bucket, prefix, filename)?;
+        let dir = self.ensure_dir(bucket, &data_path)?;
+        let target = data_path.clone();
+        let parts: Vec<PathBuf> = part_paths.to_vec();
+        let meta_json = serde_json::to_vec(metadata)?;
+        let durability = Durability::for_object();
+
+        let (_gate, ticket) = write::commit_gate();
+        tokio::task::spawn_blocking(move || {
+            let mut tmp = dir.temp()?;
+            for path in &parts {
+                // fsio-exempt: a write source, not a probe of the store.
+                let mut src = std::fs::File::open(path).map_err(io_to_storage_error)?;
+                std::io::copy(&mut src, &mut tmp).map_err(io_to_storage_error)?;
+            }
+            xattr_meta::set_metadata_xattr(tmp.path(), &meta_json)?;
+            durable_rename(tmp, &target, durability, ticket)
+        })
+        .await
+        .map_err(super::join_error)?
+    }
+
+    /// `put_object` of a passthrough from chunks, without a contiguous
+    /// buffer.
+    #[instrument(skip(self, chunks, metadata))]
+    async fn put_passthrough_from_chunks(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        chunks: &[Bytes],
+        metadata: &FileMetadata,
+    ) -> Result<(), StorageError> {
+        self.require_bucket_exists(bucket).await?;
+        let data_path = self.passthrough_path(bucket, prefix, filename)?;
+
+        let dir = self.ensure_dir(bucket, &data_path)?;
+
+        // Write chunks sequentially to a temp file, then fsync + rename.
+        // This avoids allocating a contiguous buffer for the entire object.
+        let target = data_path.clone();
+        let chunks: Vec<Bytes> = chunks.to_vec();
+        let num_chunks = chunks.len();
+        let meta_json = serde_json::to_vec(metadata)?;
+        let durability = Durability::for_object();
+
+        let (_gate, ticket) = write::commit_gate();
+        tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
+            let mut tmp = dir.temp()?;
+            for chunk in &chunks {
+                tmp.write_all(chunk).map_err(io_to_storage_error)?;
+            }
+            // Write xattr before rename — atomic metadata+data visibility.
+            xattr_meta::set_metadata_xattr(tmp.path(), &meta_json)?;
+            durable_rename(tmp, &target, durability, ticket)
+        })
+        .await
+        .map_err(super::join_error)??;
+
+        debug!(
+            "Wrote passthrough chunked ({} chunks) for {}/{}",
+            num_chunks, prefix, filename
+        );
+        Ok(())
     }
 
     /// The file of one stored object, its label, and its name (as the
@@ -1503,161 +1608,59 @@ impl StorageBackend for FilesystemBackend {
 
     // === Delta operations ===
 
-    #[instrument(skip(self, data, metadata))]
-    async fn put_delta(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        data: bytes::Bytes,
-        metadata: &FileMetadata,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), StorageError> {
-        self.require_bucket_exists(bucket).await?;
-        self.put_object_file(
-            bucket,
-            &self.delta_path(bucket, prefix, filename)?,
-            data,
-            metadata,
-            "delta",
-            prefix,
-            filename,
-            Durability::for_object(),
-        )
-        .await
-    }
-
     // === Passthrough operations (stored with original filename) ===
-
-    #[instrument(skip(self, data, metadata))]
-    async fn put_passthrough(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        data: bytes::Bytes,
-        metadata: &FileMetadata,
-    ) -> Result<(), StorageError> {
-        self.require_bucket_exists(bucket).await?;
-        self.put_object_file(
-            bucket,
-            &self.passthrough_path(bucket, prefix, filename)?,
-            data,
-            metadata,
-            "passthrough",
-            prefix,
-            filename,
-            Durability::for_object(),
-        )
-        .await
-    }
-
-    #[instrument(skip(self, metadata, _spool))]
-    async fn put_passthrough_file(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        source_path: &Path,
-        metadata: &FileMetadata,
-        _spool: crate::deltaglider::spool::SpoolBudget<'_>,
-    ) -> Result<(), StorageError> {
-        self.require_bucket_exists(bucket).await?;
-        let data_path = self.passthrough_path(bucket, prefix, filename)?;
-        let dir = self.ensure_dir(bucket, &data_path)?;
-        atomic_copy_with_metadata(
-            dir,
-            source_path,
-            &data_path,
-            metadata,
-            Durability::for_object(),
-        )
-        .await?;
-        debug!(
-            "Copied passthrough file {:?} -> {:?} for {}/{}",
-            source_path, data_path, prefix, filename
-        );
-        Ok(())
-    }
-
-    #[instrument(skip(self, part_paths, metadata, _spool))]
-    async fn put_passthrough_parts(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        part_paths: &[PathBuf],
-        metadata: &FileMetadata,
-        _spool: crate::deltaglider::spool::SpoolBudget<'_>,
-    ) -> Result<(), StorageError> {
-        self.require_bucket_exists(bucket).await?;
-        let data_path = self.passthrough_path(bucket, prefix, filename)?;
-        let dir = self.ensure_dir(bucket, &data_path)?;
-        let target = data_path.clone();
-        let parts: Vec<PathBuf> = part_paths.to_vec();
-        let meta_json = serde_json::to_vec(metadata)?;
-        let durability = Durability::for_object();
-
-        let (_gate, ticket) = write::commit_gate();
-        tokio::task::spawn_blocking(move || {
-            let mut tmp = dir.temp()?;
-            for path in &parts {
-                // fsio-exempt: a write source, not a probe of the store.
-                let mut src = std::fs::File::open(path).map_err(io_to_storage_error)?;
-                std::io::copy(&mut src, &mut tmp).map_err(io_to_storage_error)?;
-            }
-            xattr_meta::set_metadata_xattr(tmp.path(), &meta_json)?;
-            durable_rename(tmp, &target, durability, ticket)
-        })
-        .await
-        .map_err(super::join_error)?
-    }
 
     // === Chunked write operations ===
 
-    #[instrument(skip(self, chunks, metadata))]
-    async fn put_passthrough_chunked(
+    // === Streaming operations ===
+
+    #[instrument(skip(self, target, body, metadata), fields(name = target.name()))]
+    async fn put_object(
         &self,
         bucket: &str,
         prefix: &str,
-        filename: &str,
-        chunks: &[Bytes],
+        target: StoredWrite<'_>,
+        body: PutBody<'_>,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        self.require_bucket_exists(bucket).await?;
-        let data_path = self.passthrough_path(bucket, prefix, filename)?;
-
-        let dir = self.ensure_dir(bucket, &data_path)?;
-
-        // Write chunks sequentially to a temp file, then fsync + rename.
-        // This avoids allocating a contiguous buffer for the entire object.
-        let target = data_path.clone();
-        let chunks: Vec<Bytes> = chunks.to_vec();
-        let num_chunks = chunks.len();
-        let meta_json = serde_json::to_vec(metadata)?;
-        let durability = Durability::for_object();
-
-        let (_gate, ticket) = write::commit_gate();
-        tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
-            let mut tmp = dir.temp()?;
-            for chunk in &chunks {
-                tmp.write_all(chunk).map_err(io_to_storage_error)?;
+        let (object, data) = match (target, body) {
+            // A delta is in memory (bounded by the object size limit).
+            (StoredWrite::Delta { name, .. }, body) => {
+                (StoredObject::Delta(name), body.into_bytes().await?)
             }
-            // Write xattr before rename — atomic metadata+data visibility.
-            xattr_meta::set_metadata_xattr(tmp.path(), &meta_json)?;
-            durable_rename(tmp, &target, durability, ticket)
-        })
+            (StoredWrite::Passthrough { name }, PutBody::Bytes(data)) => {
+                (StoredObject::Passthrough(name), data)
+            }
+            (StoredWrite::Passthrough { name }, PutBody::File { path, .. }) => {
+                return self
+                    .put_passthrough_from_file(bucket, prefix, name, path, metadata)
+                    .await;
+            }
+            (StoredWrite::Passthrough { name }, PutBody::Parts { paths, .. }) => {
+                return self
+                    .put_passthrough_from_parts(bucket, prefix, name, paths, metadata)
+                    .await;
+            }
+            (StoredWrite::Passthrough { name }, PutBody::Chunks(chunks)) => {
+                return self
+                    .put_passthrough_from_chunks(bucket, prefix, name, chunks, metadata)
+                    .await;
+            }
+        };
+        self.require_bucket_exists(bucket).await?;
+        let (path, label, filename) = self.object_path(bucket, prefix, object)?;
+        self.put_object_file(
+            bucket,
+            &path,
+            data,
+            metadata,
+            label,
+            prefix,
+            filename,
+            Durability::for_object(),
+        )
         .await
-        .map_err(super::join_error)??;
-
-        debug!(
-            "Wrote passthrough chunked ({} chunks) for {}/{}",
-            num_chunks, prefix, filename
-        );
-        Ok(())
     }
-
-    // === Streaming operations ===
 
     #[instrument(skip(self))]
     async fn delete_object(

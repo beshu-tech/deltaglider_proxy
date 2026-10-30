@@ -673,6 +673,7 @@ mod tests {
             ".put_passthrough_chunked(",
             ".put_passthrough_parts(",
             ".put_delta(",
+            ".put_object(",
             ".copy_within(",
             ".create_multipart_upload(",
             ".complete_multipart_upload(",

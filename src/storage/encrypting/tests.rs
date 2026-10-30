@@ -560,34 +560,6 @@ mod wrapper_tests {
             *self.metadata.lock().unwrap() = Some(m.clone());
             Ok(())
         }
-        async fn put_passthrough_file(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            source_path: &std::path::Path,
-            _: &FileMetadata,
-            _: SpoolBudget<'_>,
-        ) -> Result<(), StorageError> {
-            let free = self.probe_spool.as_ref().map_or(0, |s| s.free_mib());
-            self.file_puts
-                .lock()
-                .unwrap()
-                .push((source_path.to_path_buf(), free));
-            Ok(())
-        }
-        async fn put_passthrough(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            data: Bytes,
-            m: &FileMetadata,
-        ) -> Result<(), StorageError> {
-            *self.bytes.lock().unwrap() = data.to_vec();
-            *self.metadata.lock().unwrap() = Some(m.clone());
-            Ok(())
-        }
 
         // All other trait methods: not needed for these tests.
         async fn create_bucket(&self, _: &str) -> Result<(), StorageError> {
@@ -631,6 +603,31 @@ mod wrapper_tests {
             Err(cb_err())
         }
 
+        async fn put_object(
+            &self,
+            _: &str,
+            _: &str,
+            t: crate::storage::StoredWrite<'_>,
+            body: crate::storage::PutBody<'_>,
+            m: &FileMetadata,
+        ) -> Result<(), StorageError> {
+            if let crate::storage::StoredWrite::Delta { .. } = t {
+                return Err(cb_err());
+            }
+            if let crate::storage::PutBody::File { path, .. } = body {
+                let free = self.probe_spool.as_ref().map_or(0, |s| s.free_mib());
+                self.file_puts
+                    .lock()
+                    .unwrap()
+                    .push((path.to_path_buf(), free));
+                return Ok(());
+            }
+            let data = body.into_bytes().await?;
+            *self.bytes.lock().unwrap() = data.to_vec();
+            *self.metadata.lock().unwrap() = Some(m.clone());
+            Ok(())
+        }
+
         async fn head_object(
             &self,
             _: &str,
@@ -654,17 +651,6 @@ mod wrapper_tests {
         }
         async fn flush_pending(&self) -> Result<(), StorageError> {
             Ok(())
-        }
-        async fn put_delta(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: Bytes,
-            _: &FileMetadata,
-            _: &RefWriteProof,
-        ) -> Result<(), StorageError> {
-            Err(cb_err())
         }
         async fn scan_deltaspace(
             &self,

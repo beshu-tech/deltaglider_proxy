@@ -630,7 +630,7 @@ mod write_path_tests {
     use super::*;
     use crate::bucket_usage::BucketUsage;
     use crate::deltaglider::savings::SavingsTotals;
-    use crate::storage::{DynStorageBackend, FilesystemBackend, StorageBackend};
+    use crate::storage::{DynStorageBackend, FilesystemBackend, StorageBackendExt};
     use crate::types::FileMetadata;
     use std::time::Duration;
 

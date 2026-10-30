@@ -213,6 +213,19 @@ format, a request count, or who can make a proof.
   live on in `StorageBackendExt`. The encrypting wrapper forwards it
   unchecked, as the two deletes were. The unfenced-reference-delete
   question above stays open: this step kept every delete as it was.
+- Step 6: done (commit "one object put"). 57 → 53 methods.
+  `put_object(StoredWrite, PutBody)`; `StoredWrite::Delta` carries the
+  `RefWriteProof`, `PutBody` is `Bytes` / `File` / `Parts` / `Chunks`.
+  The five names live on in `StorageBackendExt`. The old trait defaults
+  (read a file, join parts or chunks, then the buffered put) are
+  `PutBody::into_bytes`: S3 uses it for parts and chunks, as before, and
+  the test doubles that never overrode the file/parts/chunk puts call it
+  first. A delta body is always in memory (no caller sends another
+  shape). Guards moved: `.put_object(` in the `COMMITS` list and the
+  engine's form-write list; `buffered_put_bodies_are_not_copied` also
+  scans `s3/mod.rs` and `traits.rs`; the witness guard needed no change
+  (`put_object` starts with `put_`; checked by removing the check: it
+  fails).
 - Found while doing step 2, kept as it was: the encrypting wrapper runs the
   witness check on a FENCED reference delete (`check_write_unless(.., true)`
   still calls `check_witness`), but never on an UNFENCED one (the old

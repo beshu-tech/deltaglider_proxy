@@ -5,7 +5,7 @@
 //! never pass for "not found" on a path that writes.
 
 use super::*;
-use crate::storage::ObjectVariant;
+use crate::storage::{ObjectVariant, PutBody, StoredWrite};
 
 /// The error an armed call returns.
 #[derive(Clone, Copy, Debug)]
@@ -420,6 +420,33 @@ impl StorageBackend for FaultyFs {
         self.inner.get_object(bucket, prefix, object).await
     }
 
+    async fn put_object(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        target: StoredWrite<'_>,
+        body: PutBody<'_>,
+        metadata: &FileMetadata,
+    ) -> Result<(), StorageError> {
+        match target {
+            StoredWrite::Delta { name, .. } => {
+                self.armed(FaultPoint::PutDelta, bucket, prefix, name)
+                    .await?;
+                self.inner
+                    .put_object(bucket, prefix, target, body, metadata)
+                    .await
+            }
+            StoredWrite::Passthrough { .. } => {
+                self.faults
+                    .passthrough_write(
+                        self.inner
+                            .put_object(bucket, prefix, target, body, metadata),
+                    )
+                    .await
+            }
+        }
+    }
+
     async fn head_object(
         &self,
         bucket: &str,
@@ -493,92 +520,6 @@ impl StorageBackend for FaultyFs {
         self.delete_object(bucket, prefix, filename, variant)
             .await?;
         Ok(true)
-    }
-
-    async fn put_delta(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        data: bytes::Bytes,
-        metadata: &FileMetadata,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), StorageError> {
-        self.armed(FaultPoint::PutDelta, bucket, prefix, filename)
-            .await?;
-        self.inner
-            .put_delta(bucket, prefix, filename, data, metadata, proof)
-            .await
-    }
-
-    async fn put_passthrough(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        data: bytes::Bytes,
-        metadata: &FileMetadata,
-    ) -> Result<(), StorageError> {
-        self.faults
-            .passthrough_write(
-                self.inner
-                    .put_passthrough(bucket, prefix, filename, data, metadata),
-            )
-            .await
-    }
-
-    async fn put_passthrough_file(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        source_path: &Path,
-        metadata: &FileMetadata,
-        _spool: crate::deltaglider::spool::SpoolBudget<'_>,
-    ) -> Result<(), StorageError> {
-        self.faults
-            .passthrough_write(self.inner.put_passthrough_file(
-                bucket,
-                prefix,
-                filename,
-                source_path,
-                metadata,
-                _spool,
-            ))
-            .await
-    }
-
-    async fn put_passthrough_parts(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        part_paths: &[PathBuf],
-        metadata: &FileMetadata,
-        _spool: crate::deltaglider::spool::SpoolBudget<'_>,
-    ) -> Result<(), StorageError> {
-        self.faults
-            .passthrough_write(
-                self.inner
-                    .put_passthrough_parts(bucket, prefix, filename, part_paths, metadata, _spool),
-            )
-            .await
-    }
-
-    async fn put_passthrough_chunked(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        chunks: &[Bytes],
-        metadata: &FileMetadata,
-    ) -> Result<(), StorageError> {
-        self.faults
-            .passthrough_write(
-                self.inner
-                    .put_passthrough_chunked(bucket, prefix, filename, chunks, metadata),
-            )
-            .await
     }
 
     async fn open_object(

@@ -2847,6 +2847,18 @@ mod multipart_abort_tests {
             }
         }
 
+        async fn put_object(
+            &self,
+            _: &str,
+            _: &str,
+            _: crate::storage::StoredWrite<'_>,
+            body: crate::storage::PutBody<'_>,
+            _: &FileMetadata,
+        ) -> Result<(), StorageError> {
+            body.into_bytes().await?;
+            Err(nope())
+        }
+
         // Source-object reads used by the streaming copy path.
         async fn head_object(
             &self,
@@ -2868,27 +2880,6 @@ mod multipart_abort_tests {
         }
         async fn flush_pending(&self) -> Result<(), StorageError> {
             Ok(())
-        }
-        async fn put_delta(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: bytes::Bytes,
-            _: &FileMetadata,
-            _proof: &crate::deltaglider::RefWriteProof,
-        ) -> Result<(), StorageError> {
-            Err(nope())
-        }
-        async fn put_passthrough(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: bytes::Bytes,
-            _: &FileMetadata,
-        ) -> Result<(), StorageError> {
-            Err(nope())
         }
         async fn open_object(
             &self,
@@ -3105,6 +3096,19 @@ mod multipart_abort_tests {
             self.0.delete_object(b, p, f, v).await
         }
 
+        // Whole bodies only, as before (the trait's old defaults).
+        async fn put_object(
+            &self,
+            b: &str,
+            p: &str,
+            t: crate::storage::StoredWrite<'_>,
+            body: crate::storage::PutBody<'_>,
+            m: &FileMetadata,
+        ) -> Result<(), StorageError> {
+            let body = crate::storage::PutBody::Bytes(body.into_bytes().await?);
+            self.0.put_object(b, p, t, body, m).await
+        }
+
         async fn head_object(
             &self,
             b: &str,
@@ -3119,27 +3123,6 @@ mod multipart_abort_tests {
         }
         async fn flush_pending(&self) -> Result<(), StorageError> {
             self.0.flush_pending().await
-        }
-        async fn put_delta(
-            &self,
-            b: &str,
-            p: &str,
-            f: &str,
-            d: bytes::Bytes,
-            m: &FileMetadata,
-            proof: &crate::deltaglider::RefWriteProof,
-        ) -> Result<(), StorageError> {
-            self.0.put_delta(b, p, f, d, m, proof).await
-        }
-        async fn put_passthrough(
-            &self,
-            b: &str,
-            p: &str,
-            f: &str,
-            d: bytes::Bytes,
-            m: &FileMetadata,
-        ) -> Result<(), StorageError> {
-            self.0.put_passthrough(b, p, f, d, m).await
         }
         async fn open_object(
             &self,

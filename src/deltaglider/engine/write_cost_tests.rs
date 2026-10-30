@@ -365,6 +365,8 @@ fn buffered_put_bodies_are_not_copied() {
         "src/deltaglider/engine/store.rs",
         "src/deltaglider/engine/conditional.rs",
         "src/storage/s3/objects.rs",
+        "src/storage/s3/mod.rs",
+        "src/storage/traits.rs",
     ] {
         let text = std::fs::read_to_string(file).unwrap();
         let lines = crate::source_scan::prod_lines(&text);

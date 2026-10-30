@@ -50,8 +50,8 @@ use super::io_to_storage_error;
 use super::list_size_cache::{ListedSize, ResolveListed};
 use super::traits::{
     BulkListing, ByteStream, DelegatedListResult, LiteScanResult, MultipartUpload, ObjectRead,
-    RangeRead, ReferenceSource, StorageBackend, StorageBackendExt, StorageError, StoredObject,
-    UploadedPart,
+    PutBody, RangeRead, ReferenceSource, StorageBackend, StorageBackendExt, StorageError,
+    StoredObject, StoredWrite, UploadedPart,
 };
 use crate::deltaglider::spool::SpoolBudget;
 use crate::types::FileMetadata;
@@ -1077,6 +1077,38 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         .map_err(|e| StorageError::Other(format!("encrypt-to-file task join: {e}")))?
     }
 
+    /// The chunks of a passthrough, sealed as they come, to the inner
+    /// chunked PUT.
+    async fn put_encrypted_chunks(
+        &self,
+        site: Arc<v2::SiteKey>,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        chunks: &[Bytes],
+        metadata: &FileMetadata,
+    ) -> Result<(), StorageError> {
+        let plain_len: u64 = chunks.iter().map(|c| c.len() as u64).sum();
+        let object = StoredObject::Passthrough(filename);
+        let (mut sealer, stored) =
+            self.seal_new(&site, bucket, prefix, object, metadata, plain_len)?;
+        let mut out: Vec<Bytes> = Vec::with_capacity(chunks.len() + 2);
+        out.push(Bytes::copy_from_slice(&sealer.header()));
+        for chunk in chunks {
+            let mut frames = Vec::with_capacity(chunk.len() + v2::FRAME_WIRE_LEN);
+            sealer.push(chunk, &mut frames)?;
+            if !frames.is_empty() {
+                out.push(Bytes::from(frames));
+            }
+        }
+        let mut last = Vec::with_capacity(v2::FRAME_WIRE_LEN);
+        sealer.finish(&mut last)?;
+        out.push(Bytes::from(last));
+        self.inner
+            .put_passthrough_chunked(bucket, prefix, filename, &out, &stored)
+            .await
+    }
+
     /// Encrypt the files `parts` into a spool file and store it as the
     /// passthrough object `filename`.
     #[allow(clippy::too_many_arguments)]
@@ -1372,114 +1404,78 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
             .await
     }
 
-    async fn put_delta(
+    /// A body in memory is sealed whole. A file or parts are encrypted
+    /// into a spool file (256 KiB reads, never the whole object; the
+    /// ciphertext file holds spool budget), chunks as they come (one 64
+    /// KiB window and one frame of working memory), then handed to the
+    /// inner backend.
+    async fn put_object(
         &self,
         bucket: &str,
         prefix: &str,
-        filename: &str,
-        data: bytes::Bytes,
-        metadata: &FileMetadata,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), StorageError> {
-        self.check_write(bucket).await?;
-        let (body, stored) = self.seal_bytes(
-            bucket,
-            prefix,
-            StoredObject::Delta(filename),
-            &data,
-            metadata,
-        )?;
-        self.inner
-            .put_delta(bucket, prefix, filename, body, &stored, proof)
-            .await
-    }
-
-    async fn put_passthrough(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        data: bytes::Bytes,
+        target: StoredWrite<'_>,
+        body: PutBody<'_>,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         self.check_write(bucket).await?;
-        let (body, stored) = self.seal_bytes(
-            bucket,
-            prefix,
-            StoredObject::Passthrough(filename),
-            &data,
-            metadata,
-        )?;
-        self.inner
-            .put_passthrough(bucket, prefix, filename, body, &stored)
-            .await
-    }
-
-    /// BOUNDED-MEMORY file store: encrypt the source file into a spool file
-    /// (256 KiB reads, never the whole object), then hand that file to the
-    /// inner backend. The ciphertext file holds spool budget.
-    async fn put_passthrough_file(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        source_path: &std::path::Path,
-        metadata: &FileMetadata,
-        spool: SpoolBudget<'_>,
-    ) -> Result<(), StorageError> {
-        self.check_write(bucket).await?;
-        let Some(site) = self.write_key(bucket)? else {
-            return self
-                .inner
-                .put_passthrough_file(
-                    bucket,
-                    prefix,
-                    filename,
-                    source_path,
-                    &without_markers(metadata),
-                    spool,
-                )
-                .await;
+        let name = match target {
+            StoredWrite::Delta { name, .. } => {
+                let data = body.into_bytes().await?;
+                let object = StoredObject::Delta(name);
+                let (body, stored) = self.seal_bytes(bucket, prefix, object, &data, metadata)?;
+                return self
+                    .inner
+                    .put_object(bucket, prefix, target, PutBody::Bytes(body), &stored)
+                    .await;
+            }
+            StoredWrite::Passthrough { name } => name,
         };
-        self.put_encrypted_files(
-            site,
-            bucket,
-            prefix,
-            filename,
-            &[source_path.to_path_buf()],
-            metadata,
-            spool,
-        )
-        .await
-    }
-
-    /// BOUNDED-MEMORY relayed-parts store: the ordered part files are
-    /// encrypted straight into one spool file (no joined plaintext copy).
-    async fn put_passthrough_parts(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        part_paths: &[std::path::PathBuf],
-        metadata: &FileMetadata,
-        spool: SpoolBudget<'_>,
-    ) -> Result<(), StorageError> {
-        self.check_write(bucket).await?;
-        let Some(site) = self.write_key(bucket)? else {
-            return self
-                .inner
-                .put_passthrough_parts(
-                    bucket,
-                    prefix,
-                    filename,
-                    part_paths,
-                    &without_markers(metadata),
-                    spool,
-                )
-                .await;
-        };
-        self.put_encrypted_files(site, bucket, prefix, filename, part_paths, metadata, spool)
-            .await
+        match body {
+            PutBody::Bytes(data) => {
+                let object = StoredObject::Passthrough(name);
+                let (body, stored) = self.seal_bytes(bucket, prefix, object, &data, metadata)?;
+                self.inner
+                    .put_object(bucket, prefix, target, PutBody::Bytes(body), &stored)
+                    .await
+            }
+            PutBody::File { path, spool } => {
+                let Some(site) = self.write_key(bucket)? else {
+                    let body = PutBody::File { path, spool };
+                    let plain = without_markers(metadata);
+                    return self
+                        .inner
+                        .put_object(bucket, prefix, target, body, &plain)
+                        .await;
+                };
+                let parts = [path.to_path_buf()];
+                self.put_encrypted_files(site, bucket, prefix, name, &parts, metadata, spool)
+                    .await
+            }
+            PutBody::Parts { paths, spool } => {
+                let Some(site) = self.write_key(bucket)? else {
+                    let body = PutBody::Parts { paths, spool };
+                    let plain = without_markers(metadata);
+                    return self
+                        .inner
+                        .put_object(bucket, prefix, target, body, &plain)
+                        .await;
+                };
+                self.put_encrypted_files(site, bucket, prefix, name, paths, metadata, spool)
+                    .await
+            }
+            PutBody::Chunks(chunks) => {
+                let Some(site) = self.write_key(bucket)? else {
+                    let body = PutBody::Chunks(chunks);
+                    let plain = without_markers(metadata);
+                    return self
+                        .inner
+                        .put_object(bucket, prefix, target, body, &plain)
+                        .await;
+                };
+                self.put_encrypted_chunks(site, bucket, prefix, name, chunks, metadata)
+                    .await
+            }
+        }
     }
 
     async fn file_put_spool_bytes(&self, bucket: &str, bytes: u64, parts: bool) -> u64 {
@@ -1489,50 +1485,6 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         // The ciphertext file.
         let wire = v2::stored_len(bytes).unwrap_or(u64::MAX);
         wire.saturating_add(self.inner.file_put_spool_bytes(bucket, wire, false).await)
-    }
-
-    /// The chunks are encrypted as they come (one 64 KiB window and one
-    /// frame of working memory) and handed to the inner chunked PUT.
-    async fn put_passthrough_chunked(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        chunks: &[Bytes],
-        metadata: &FileMetadata,
-    ) -> Result<(), StorageError> {
-        self.check_write(bucket).await?;
-        let Some(site) = self.write_key(bucket)? else {
-            return self
-                .inner
-                .put_passthrough_chunked(
-                    bucket,
-                    prefix,
-                    filename,
-                    chunks,
-                    &without_markers(metadata),
-                )
-                .await;
-        };
-        let plain_len: u64 = chunks.iter().map(|c| c.len() as u64).sum();
-        let object = StoredObject::Passthrough(filename);
-        let (mut sealer, stored) =
-            self.seal_new(&site, bucket, prefix, object, metadata, plain_len)?;
-        let mut out: Vec<Bytes> = Vec::with_capacity(chunks.len() + 2);
-        out.push(Bytes::copy_from_slice(&sealer.header()));
-        for chunk in chunks {
-            let mut frames = Vec::with_capacity(chunk.len() + v2::FRAME_WIRE_LEN);
-            sealer.push(chunk, &mut frames)?;
-            if !frames.is_empty() {
-                out.push(Bytes::from(frames));
-            }
-        }
-        let mut last = Vec::with_capacity(v2::FRAME_WIRE_LEN);
-        sealer.finish(&mut last)?;
-        out.push(Bytes::from(last));
-        self.inner
-            .put_passthrough_chunked(bucket, prefix, filename, &out, &stored)
-            .await
     }
 
     // ── Reads: open ──

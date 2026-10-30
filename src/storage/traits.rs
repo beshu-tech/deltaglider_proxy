@@ -457,6 +457,79 @@ pub enum RefWrite<'a> {
     Delete,
 }
 
+/// What [`StorageBackend::put_object`] stores: a delta (written under the
+/// deltaspace lock, so it needs the lock's proof) or a passthrough object.
+#[derive(Debug, Clone, Copy)]
+pub enum StoredWrite<'a> {
+    Delta {
+        name: &'a str,
+        proof: &'a crate::deltaglider::RefWriteProof,
+    },
+    Passthrough {
+        name: &'a str,
+    },
+}
+
+impl<'a> StoredWrite<'a> {
+    /// The object's file name in its deltaspace.
+    pub fn name(&self) -> &'a str {
+        match *self {
+            StoredWrite::Delta { name, .. } | StoredWrite::Passthrough { name } => name,
+        }
+    }
+}
+
+/// The body of a [`StorageBackend::put_object`].
+pub enum PutBody<'a> {
+    /// In memory. A write (and each retry of it) shares the caller's
+    /// buffer instead of copying it.
+    Bytes(Bytes),
+    /// A local file. `spool` is where the write puts any temp file of its
+    /// own (the encrypting wrapper's ciphertext); it never waits for
+    /// budget: the caller reserves up front with
+    /// [`StorageBackend::file_put_spool_bytes`].
+    File {
+        path: &'a Path,
+        spool: SpoolBudget<'a>,
+    },
+    /// Ordered relay part files, stored as one object. `spool`: as for
+    /// `File`.
+    Parts {
+        paths: &'a [PathBuf],
+        spool: SpoolBudget<'a>,
+    },
+    /// Pre-split chunks, stored without a contiguous buffer where the
+    /// backend can.
+    Chunks(&'a [Bytes]),
+}
+
+impl PutBody<'_> {
+    /// The whole body in memory: what a backend stores for a body shape
+    /// that it has no streaming write for. A `Bytes` body is not copied.
+    pub async fn into_bytes(self) -> Result<Bytes, StorageError> {
+        match self {
+            PutBody::Bytes(data) => Ok(data),
+            PutBody::File { path, .. } => Ok(Bytes::from(tokio::fs::read(path).await?)),
+            PutBody::Parts { paths, .. } => {
+                let mut assembled = Vec::new();
+                for path in paths {
+                    let part = tokio::fs::read(path).await?;
+                    assembled.extend_from_slice(&part);
+                }
+                Ok(Bytes::from(assembled))
+            }
+            PutBody::Chunks(chunks) => {
+                let total_len: usize = chunks.iter().map(|c| c.len()).sum();
+                let mut buf = Vec::with_capacity(total_len);
+                for chunk in chunks {
+                    buf.extend_from_slice(chunk);
+                }
+                Ok(Bytes::from(buf))
+            }
+        }
+    }
+}
+
 /// The message of a fenced reference write that lost its precondition.
 pub fn reference_fence_lost(bucket: &str, prefix: &str) -> StorageError {
     StorageError::Throttled(format!(
@@ -1005,80 +1078,26 @@ pub trait StorageBackend: Send + Sync {
         metadata: &FileMetadata,
     ) -> impl Future<Output = Result<CopyOutcome, StorageError>> + Send;
 
-    // === Delta file operations ===
+    // === Object writes ===
 
-    /// Store a delta file with its metadata
-    fn put_delta(
+    /// Store a delta or a passthrough object with its metadata, from
+    /// `body`. A backend without a streaming write for a body shape stores
+    /// [`PutBody::into_bytes`]. Callers use the names in
+    /// [`StorageBackendExt`]. No default: every wrapper must forward it
+    /// with its own transform.
+    fn put_object(
         &self,
         bucket: &str,
         prefix: &str,
-        filename: &str,
-        data: Bytes,
-        metadata: &FileMetadata,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send;
-
-    // === Passthrough file operations (stored as-is with original filename) ===
-
-    /// Store a passthrough (non-delta) file with its metadata
-    fn put_passthrough(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        data: Bytes,
+        target: StoredWrite<'_>,
+        body: PutBody<'_>,
         metadata: &FileMetadata,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
-    /// Store a passthrough file from an on-disk source path.
-    /// Default implementation reads the full file and delegates to `put_passthrough`.
-    ///
-    /// `spool` is where the write puts any temp file of its own (the
-    /// encrypting wrapper's ciphertext). It never waits for budget: the
-    /// caller reserves up front with [`Self::file_put_spool_bytes`].
-    fn put_passthrough_file(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        source_path: &Path,
-        metadata: &FileMetadata,
-        _spool: SpoolBudget<'_>,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send {
-        async move {
-            let data = tokio::fs::read(source_path).await?;
-            self.put_passthrough(bucket, prefix, filename, Bytes::from(data), metadata)
-                .await
-        }
-    }
-
-    /// Store a passthrough file from ordered relay part paths.
-    /// Default implementation materializes an intermediate file in-memory.
-    /// `spool`: as for [`Self::put_passthrough_file`].
-    fn put_passthrough_parts(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        part_paths: &[PathBuf],
-        metadata: &FileMetadata,
-        _spool: SpoolBudget<'_>,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send {
-        async move {
-            let mut assembled = Vec::new();
-            for path in part_paths {
-                let part = tokio::fs::read(path).await?;
-                assembled.extend_from_slice(&part);
-            }
-            self.put_passthrough(bucket, prefix, filename, Bytes::from(assembled), metadata)
-                .await
-        }
-    }
-
-    /// Spool bytes that `put_passthrough_file` (`parts = false`) or
-    /// `put_passthrough_parts` (`parts = true`) needs for its own temp files
-    /// when it stores `bytes` into `bucket`. The engine reserves this much
-    /// before it takes the deltaspace lock. Default: none.
+    /// Spool bytes that a `put_object` of a [`PutBody::File`] (`parts =
+    /// false`) or [`PutBody::Parts`] (`parts = true`) needs for its own
+    /// temp files when it stores `bytes` into `bucket`. The engine reserves
+    /// this much before it takes the deltaspace lock. Default: none.
     fn file_put_spool_bytes(
         &self,
         _bucket: &str,
@@ -1169,27 +1188,6 @@ pub trait StorageBackend: Send + Sync {
         start: u64,
         end: u64,
     ) -> impl Future<Output = Result<RangeRead, StorageError>> + Send;
-
-    /// Store a passthrough file from pre-split chunks without assembling into a contiguous buffer.
-    /// Default implementation collects chunks and delegates to `put_passthrough()`.
-    fn put_passthrough_chunked(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        chunks: &[Bytes],
-        metadata: &FileMetadata,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send {
-        async move {
-            let total_len: usize = chunks.iter().map(|c| c.len()).sum();
-            let mut buf = Vec::with_capacity(total_len);
-            for chunk in chunks {
-                buf.extend_from_slice(chunk);
-            }
-            self.put_passthrough(bucket, prefix, filename, Bytes::from(buf), metadata)
-                .await
-        }
-    }
 
     // === Multipart upload operations (Phase B: streaming large-object copy) ===
     //
@@ -1597,9 +1595,9 @@ pub trait StorageBackend: Send + Sync {
 
 /// The per-form names over the form-generic methods
 /// ([`StorageBackend::write_reference`], [`StorageBackend::head_object`],
-/// [`StorageBackend::get_object`], [`StorageBackend::delete_object`]). One
-/// implementation for every backend (the blanket impl below), so no wrapper
-/// forwards them.
+/// [`StorageBackend::get_object`], [`StorageBackend::delete_object`],
+/// [`StorageBackend::put_object`]). One implementation for every backend
+/// (the blanket impl below), so no wrapper forwards them.
 pub trait StorageBackendExt: StorageBackend {
     /// Delete a delta file and its metadata.
     fn delete_delta(
@@ -1648,6 +1646,95 @@ pub trait StorageBackendExt: StorageBackend {
         filename: &str,
     ) -> impl Future<Output = Result<Vec<u8>, StorageError>> + Send {
         self.get_object(bucket, prefix, StoredObject::Passthrough(filename))
+    }
+
+    /// Store a delta file with its metadata.
+    fn put_delta(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        data: Bytes,
+        metadata: &FileMetadata,
+        proof: &crate::deltaglider::RefWriteProof,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        async move {
+            let target = StoredWrite::Delta {
+                name: filename,
+                proof,
+            };
+            self.put_object(bucket, prefix, target, PutBody::Bytes(data), metadata)
+                .await
+        }
+    }
+
+    /// Store a passthrough (non-delta) file with its metadata.
+    fn put_passthrough(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        data: Bytes,
+        metadata: &FileMetadata,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        let target = StoredWrite::Passthrough { name: filename };
+        self.put_object(bucket, prefix, target, PutBody::Bytes(data), metadata)
+    }
+
+    /// Store a passthrough file from an on-disk source path.
+    fn put_passthrough_file(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        source_path: &Path,
+        metadata: &FileMetadata,
+        spool: SpoolBudget<'_>,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        async move {
+            let target = StoredWrite::Passthrough { name: filename };
+            let body = PutBody::File {
+                path: source_path,
+                spool,
+            };
+            self.put_object(bucket, prefix, target, body, metadata)
+                .await
+        }
+    }
+
+    /// Store a passthrough file from ordered relay part paths.
+    fn put_passthrough_parts(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        part_paths: &[PathBuf],
+        metadata: &FileMetadata,
+        spool: SpoolBudget<'_>,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        async move {
+            let target = StoredWrite::Passthrough { name: filename };
+            let body = PutBody::Parts {
+                paths: part_paths,
+                spool,
+            };
+            self.put_object(bucket, prefix, target, body, metadata)
+                .await
+        }
+    }
+
+    /// Store a passthrough file from pre-split chunks without assembling
+    /// them into a contiguous buffer.
+    fn put_passthrough_chunked(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        chunks: &[Bytes],
+        metadata: &FileMetadata,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        let target = StoredWrite::Passthrough { name: filename };
+        self.put_object(bucket, prefix, target, PutBody::Chunks(chunks), metadata)
     }
 
     /// Get reference file metadata.

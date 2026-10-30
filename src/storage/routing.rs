@@ -1213,18 +1213,6 @@ impl StorageBackend for RoutingBackend {
 
     // === Delta file operations ===
 
-    async fn put_delta(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        data: bytes::Bytes,
-        metadata: &FileMetadata,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), StorageError> {
-        route_existing!(self, bucket, put_delta, prefix, filename, data, metadata, proof)
-    }
-
     /// Inside one backend instance only: two buckets on two backends
     /// (or two definitions of one provider) cannot copy server-side.
     async fn copy_within(
@@ -1255,69 +1243,15 @@ impl StorageBackend for RoutingBackend {
 
     // === Passthrough file operations ===
 
-    async fn put_passthrough(
+    async fn put_object(
         &self,
         bucket: &str,
         prefix: &str,
-        filename: &str,
-        data: bytes::Bytes,
+        target: super::StoredWrite<'_>,
+        body: super::PutBody<'_>,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        route_existing!(
-            self,
-            bucket,
-            put_passthrough,
-            prefix,
-            filename,
-            data,
-            metadata
-        )
-    }
-
-    // Forward the FILE + PARTS sinks so a routed EncryptingBackend's streaming
-    // overrides are reached — the trait default `tokio::fs::read`s the whole
-    // object into RAM (O(object), no cap), which defeats the bounded-memory
-    // guarantee for the production multi-backend shape.
-    async fn put_passthrough_file(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        source_path: &std::path::Path,
-        metadata: &FileMetadata,
-        spool: crate::deltaglider::spool::SpoolBudget<'_>,
-    ) -> Result<(), StorageError> {
-        route_existing!(
-            self,
-            bucket,
-            put_passthrough_file,
-            prefix,
-            filename,
-            source_path,
-            metadata,
-            spool
-        )
-    }
-
-    async fn put_passthrough_parts(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        part_paths: &[std::path::PathBuf],
-        metadata: &FileMetadata,
-        spool: crate::deltaglider::spool::SpoolBudget<'_>,
-    ) -> Result<(), StorageError> {
-        route_existing!(
-            self,
-            bucket,
-            put_passthrough_parts,
-            prefix,
-            filename,
-            part_paths,
-            metadata,
-            spool
-        )
+        route_existing!(self, bucket, put_object, prefix, target, body, metadata)
     }
 
     async fn file_put_spool_bytes(&self, bucket: &str, bytes: u64, parts: bool) -> u64 {
@@ -1448,25 +1382,6 @@ impl StorageBackend for RoutingBackend {
         op: crate::storage::ClaimWrite<'_>,
     ) -> Result<crate::storage::ClaimOutcome, StorageError> {
         route_existing!(self, bucket, write_key_claim, op)
-    }
-
-    async fn put_passthrough_chunked(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        chunks: &[Bytes],
-        metadata: &FileMetadata,
-    ) -> Result<(), StorageError> {
-        route_existing!(
-            self,
-            bucket,
-            put_passthrough_chunked,
-            prefix,
-            filename,
-            chunks,
-            metadata
-        )
     }
 
     // === Multipart upload (Phase B) ===
@@ -1883,6 +1798,18 @@ mod tests {
             Ok(())
         }
 
+        async fn put_object(
+            &self,
+            _: &str,
+            _: &str,
+            _: crate::storage::StoredWrite<'_>,
+            body: crate::storage::PutBody<'_>,
+            _: &FileMetadata,
+        ) -> Result<(), StorageError> {
+            body.into_bytes().await?;
+            Ok(())
+        }
+
         async fn head_object(
             &self,
             _: &str,
@@ -1904,18 +1831,6 @@ mod tests {
         }
 
         async fn flush_pending(&self) -> Result<(), StorageError> {
-            Ok(())
-        }
-
-        async fn put_delta(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: bytes::Bytes,
-            _: &FileMetadata,
-            _proof: &crate::deltaglider::RefWriteProof,
-        ) -> Result<(), StorageError> {
             Ok(())
         }
 
@@ -1965,17 +1880,6 @@ mod tests {
             _: crate::storage::ClaimWrite<'_>,
         ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
             Ok(crate::storage::ClaimOutcome::Written)
-        }
-
-        async fn put_passthrough(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: bytes::Bytes,
-            _: &FileMetadata,
-        ) -> Result<(), StorageError> {
-            Ok(())
         }
 
         async fn get_passthrough_metadata_for_rewrite(

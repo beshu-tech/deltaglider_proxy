@@ -506,6 +506,7 @@ mod tests {
         ".put_passthrough_chunked(",
         ".put_passthrough_parts(",
         ".put_delta(",
+        ".put_object(",
         ".put_directory_marker(",
         ".complete_multipart_upload(",
         ".put_reference(",

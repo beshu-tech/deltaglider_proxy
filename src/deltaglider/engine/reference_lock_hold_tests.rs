@@ -573,6 +573,25 @@ impl crate::storage::StorageBackend for FencingFs {
         self.inner.delete_object(b, p, f, v).await
     }
 
+    // Whole bodies only, as before (the trait's old defaults).
+    async fn put_object(
+        &self,
+        b: &str,
+        p: &str,
+        t: crate::storage::StoredWrite<'_>,
+        body: crate::storage::PutBody<'_>,
+        m: &Meta,
+    ) -> Result<(), StorageError> {
+        let body = crate::storage::PutBody::Bytes(body.into_bytes().await?);
+        if matches!(t, crate::storage::StoredWrite::Delta { .. })
+            && self.peer_race_on_delta.swap(false, Ordering::SeqCst)
+        {
+            self.peer_race.store(true, Ordering::SeqCst);
+            self.maybe_peer_write(b, p).await;
+        }
+        self.inner.put_object(b, p, t, body, m).await
+    }
+
     async fn head_object(
         &self,
         b: &str,
@@ -663,31 +682,6 @@ impl crate::storage::StorageBackend for FencingFs {
         }
         self.bump(b, p);
         self.reference_fence(b, p).await
-    }
-    async fn put_delta(
-        &self,
-        b: &str,
-        p: &str,
-        f: &str,
-        d: bytes::Bytes,
-        m: &Meta,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), StorageError> {
-        if self.peer_race_on_delta.swap(false, Ordering::SeqCst) {
-            self.peer_race.store(true, Ordering::SeqCst);
-            self.maybe_peer_write(b, p).await;
-        }
-        self.inner.put_delta(b, p, f, d, m, proof).await
-    }
-    async fn put_passthrough(
-        &self,
-        b: &str,
-        p: &str,
-        f: &str,
-        d: bytes::Bytes,
-        m: &Meta,
-    ) -> Result<(), StorageError> {
-        self.inner.put_passthrough(b, p, f, d, m).await
     }
     async fn get_passthrough_metadata_for_rewrite(
         &self,

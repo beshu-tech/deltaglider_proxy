@@ -102,6 +102,18 @@ impl crate::storage::StorageBackend for NullInner {
         Ok(())
     }
 
+    async fn put_object(
+        &self,
+        _: &str,
+        _: &str,
+        _: crate::storage::StoredWrite<'_>,
+        body: crate::storage::PutBody<'_>,
+        _: &crate::types::FileMetadata,
+    ) -> Result<(), crate::storage::StorageError> {
+        body.into_bytes().await?;
+        Ok(())
+    }
+
     async fn head_object(
         &self,
         _: &str,
@@ -126,27 +138,6 @@ impl crate::storage::StorageBackend for NullInner {
         Err(crate::storage::StorageError::Other("null".into()))
     }
     async fn flush_pending(&self) -> Result<(), crate::storage::StorageError> {
-        Ok(())
-    }
-    async fn put_delta(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-        _: bytes::Bytes,
-        _: &crate::types::FileMetadata,
-        _proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), crate::storage::StorageError> {
-        Ok(())
-    }
-    async fn put_passthrough(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-        _: bytes::Bytes,
-        _: &crate::types::FileMetadata,
-    ) -> Result<(), crate::storage::StorageError> {
         Ok(())
     }
     async fn open_object(

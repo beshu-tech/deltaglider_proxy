@@ -56,8 +56,8 @@ use super::list_size_cache::{self, ListedSize, LogicalFacts, ResolveListed, Stor
 use super::listing_facts;
 use super::traits::{
     reference_fence_lost, same_stored_generation, BulkListing, CopyOutcome, DelegatedListResult,
-    LiteScanResult, MultipartUpload, ObjectAt, ObjectVariant, RefFence, RefWrite, StorageBackend,
-    StorageError, StoredObject, UploadedPart,
+    LiteScanResult, MultipartUpload, ObjectAt, ObjectVariant, PutBody, RefFence, RefWrite,
+    StorageBackend, StorageError, StoredObject, StoredWrite, UploadedPart,
 };
 use crate::config::BackendConfig;
 use crate::types::{FileMetadata, StorageInfo};
@@ -809,24 +809,42 @@ impl StorageBackend for S3Backend {
 
     // === Delta file operations ===
 
-    #[instrument(skip(self, data, metadata))]
-    async fn put_delta(
+    #[instrument(skip(self, target, body, metadata), fields(name = target.name()))]
+    async fn put_object(
         &self,
         bucket: &str,
         prefix: &str,
-        filename: &str,
-        data: Bytes,
+        target: StoredWrite<'_>,
+        body: PutBody<'_>,
         metadata: &FileMetadata,
-        proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
-        let key = self.delta_key(prefix, filename);
+        let (key, label) = match target {
+            StoredWrite::Delta { name, .. } => (self.delta_key(prefix, name), "delta"),
+            StoredWrite::Passthrough { name } => {
+                (self.passthrough_key(prefix, name), "passthrough")
+            }
+        };
+        let data = match (target, body) {
+            (StoredWrite::Passthrough { name }, PutBody::File { path, .. }) => {
+                self.put_object_file_with_metadata(bucket, &key, path, metadata)
+                    .await?;
+                debug!(
+                    "Stored passthrough from file for {}/{}/{} ({:?})",
+                    bucket, prefix, name, path
+                );
+                return Ok(());
+            }
+            // A delta, parts and chunks: one PUT of the whole body.
+            (_, body) => body.into_bytes().await?,
+        };
         self.put_object_with_metadata(bucket, &key, data.clone(), metadata)
             .await?;
         debug!(
-            "Stored delta for {}/{}/{} ({} bytes)",
+            "Stored {} for {}/{}/{} ({} bytes)",
+            label,
             bucket,
             prefix,
-            filename,
+            target.name(),
             data.len()
         );
         Ok(())
@@ -845,48 +863,6 @@ impl StorageBackend for S3Backend {
     }
 
     // === Passthrough file operations (stored with original filename) ===
-
-    #[instrument(skip(self, data, metadata))]
-    async fn put_passthrough(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        data: Bytes,
-        metadata: &FileMetadata,
-    ) -> Result<(), StorageError> {
-        let key = self.passthrough_key(prefix, filename);
-        self.put_object_with_metadata(bucket, &key, data.clone(), metadata)
-            .await?;
-        debug!(
-            "Stored passthrough for {}/{}/{} ({} bytes)",
-            bucket,
-            prefix,
-            filename,
-            data.len()
-        );
-        Ok(())
-    }
-
-    #[instrument(skip(self, metadata, _spool))]
-    async fn put_passthrough_file(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        source_path: &std::path::Path,
-        metadata: &FileMetadata,
-        _spool: crate::deltaglider::spool::SpoolBudget<'_>,
-    ) -> Result<(), StorageError> {
-        let key = self.passthrough_key(prefix, filename);
-        self.put_object_file_with_metadata(bucket, &key, source_path, metadata)
-            .await?;
-        debug!(
-            "Stored passthrough from file for {}/{}/{} ({:?})",
-            bucket, prefix, filename, source_path
-        );
-        Ok(())
-    }
 
     #[instrument(skip(self))]
     async fn delete_object(
