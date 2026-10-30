@@ -21,6 +21,11 @@ ignore = [
     # quick-xml <0.41 XML-parsing DoS (quadratic dup-attribute scan / unbounded
     # namespace allocation). Pulled transitively by s3s 0.14, which pins
     # quick-xml ^0.40 — cannot upgrade without an s3s bump (tracked separately).
+    # Mitigation (src/api/s3s_hooks.rs): s3s iterates attributes only on a
+    # `Grantee` tag, so the bodies of the ops that carry one are capped at
+    # 64 KiB (GRANT_XML_MAX_BODY_SIZE; worst tag parses in ~0.07 s) and every
+    # XML body at 4 MiB (S3S_XML_MAX_BODY_SIZE). s3s uses a plain `Reader`,
+    # never `NsReader`, so 0195 is not reachable.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
     # rustls-pemfile unmaintained (repo archived Aug 2025); thin wrapper pulled
