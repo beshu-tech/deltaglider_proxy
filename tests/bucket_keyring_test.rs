@@ -931,7 +931,7 @@ async fn native_sse_per_bucket_minio() {
     let up = client
         .create_multipart_upload()
         .bucket(kms)
-        .key("big.bin")
+        .key("big.dat")
         .send()
         .await
         .unwrap();
@@ -941,7 +941,7 @@ async fn native_sse_per_bucket_minio() {
         let p = client
             .upload_part()
             .bucket(kms)
-            .key("big.bin")
+            .key("big.dat")
             .upload_id(id)
             .part_number(n)
             .body(ByteStream::from(body))
@@ -958,7 +958,7 @@ async fn native_sse_per_bucket_minio() {
     client
         .complete_multipart_upload()
         .bucket(kms)
-        .key("big.bin")
+        .key("big.dat")
         .upload_id(id)
         .multipart_upload(
             aws_sdk_s3::types::CompletedMultipartUpload::builder()
@@ -968,10 +968,10 @@ async fn native_sse_per_bucket_minio() {
         .send()
         .await
         .unwrap();
-    assert_eq!(form(minio_sse(kms, "big.bin").await), kms_form);
+    assert_eq!(form(minio_sse(kms, "big.dat").await), kms_form);
     let mut want = part1;
     want.extend_from_slice(&part2);
-    assert_eq!(env.get(kms, "big.bin").await, want);
+    assert_eq!(env.get(kms, "big.dat").await, want);
 }
 
 // ── Scenario: audit and confirmed downgrade (issue #116 P3) ─────────────

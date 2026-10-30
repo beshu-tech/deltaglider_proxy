@@ -29,8 +29,8 @@ const MIB: usize = 1024 * 1024;
 ///
 /// The tests in this binary run in parallel against ONE backend and seed the
 /// same deterministic body (`big_passthrough_body` is a fixed xorshift
-/// stream, so every `big.bin` has the same ETag). On shared buckets a
-/// sibling's replication run can land `big.bin` in the destination first;
+/// stream, so every `big.dat` has the same ETag). On shared buckets a
+/// sibling's replication run can land `big.dat` in the destination first;
 /// this test's run then sees nothing newer to copy and reports 0 parts —
 /// which is exactly what a fast runner exposed. A unique pair per test keeps
 /// the assertions about this test's own run, and `cleanup` keeps a
@@ -183,7 +183,7 @@ async fn run_now_ok(server: &TestServer) -> Value {
     run
 }
 
-/// Seed one passthrough `.bin` into this test's source bucket.
+/// Seed one passthrough `.dat` into this test's source bucket.
 async fn seed_passthrough(server: &TestServer, b: &Buckets, key: &str, len: usize) -> Vec<u8> {
     let body = big_passthrough_body(len);
     let client = server.s3_client().await;
@@ -222,7 +222,7 @@ async fn memory_bounded_resident_part_bytes() {
         .build()
         .await;
 
-    seed_passthrough(&server, &b, "big.bin", obj_size).await;
+    seed_passthrough(&server, &b, "big.dat", obj_size).await;
     run_now_ok(&server).await;
 
     let m = metrics_snapshot(&server.endpoint()).await;
@@ -266,7 +266,7 @@ async fn part_count_matches_plan() {
         .build()
         .await;
 
-    seed_passthrough(&server, &b, "big.bin", obj_size).await;
+    seed_passthrough(&server, &b, "big.dat", obj_size).await;
     run_now_ok(&server).await;
 
     let expected = deltaglider_proxy::transfer_plan::plan_parts(obj_size as u64, part_size).len();
@@ -303,7 +303,7 @@ async fn inflight_parts_reach_concurrency() {
         .build()
         .await;
 
-    seed_passthrough(&server, &b, "big.bin", obj_size).await;
+    seed_passthrough(&server, &b, "big.dat", obj_size).await;
     run_now_ok(&server).await;
 
     let m = metrics_snapshot(&server.endpoint()).await;
@@ -340,7 +340,7 @@ async fn inflight_objects_overlap() {
 
     // Three objects so a transfers=2 batch must overlap at least two.
     for i in 0..3 {
-        seed_passthrough(&server, &b, &format!("obj-{i}.bin"), 8 * MIB).await;
+        seed_passthrough(&server, &b, &format!("obj-{i}.dat"), 8 * MIB).await;
     }
     run_now_ok(&server).await;
 
@@ -377,7 +377,7 @@ async fn per_part_resume_single_retry() {
         .build()
         .await;
 
-    let body = seed_passthrough(&server, &b, "big.bin", obj_size).await;
+    let body = seed_passthrough(&server, &b, "big.dat", obj_size).await;
     run_now_ok(&server).await;
 
     let m = metrics_snapshot(&server.endpoint()).await;
@@ -392,7 +392,7 @@ async fn per_part_resume_single_retry() {
     let got = client
         .get_object()
         .bucket(&b.dst)
-        .key("big.bin")
+        .key("big.dat")
         .send()
         .await
         .expect("dest present")
