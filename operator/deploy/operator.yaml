@@ -78,7 +78,7 @@ spec:
         runAsUser: 999
       containers:
         - name: operator
-          image: beshultd/deltaglider-operator:0.3.19
+          image: beshultd/deltaglider-operator:0.3.20
           securityContext:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
