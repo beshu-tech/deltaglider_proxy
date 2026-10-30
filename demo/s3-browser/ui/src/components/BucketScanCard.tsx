@@ -28,7 +28,7 @@
  *     N ago" line + "Re-scan" button.
  */
 
-import { useState, useEffect, useCallback } from 'react';
+import { useEffect, useCallback } from 'react';
 import { Button, Progress } from 'antd';
 import {
   PlayCircleOutlined,
@@ -37,13 +37,12 @@ import {
   ClockCircleOutlined,
 } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
-import { useVisiblePolling } from '../useVisiblePolling';
 import { formatBytes, relativeTime } from '../utils';
 import { summarizeScopeSavings } from '../savings';
 import { fmtNum } from './dashboard/chartDefaults';
-import { getAllBucketScans, type BucketScanResult } from '../adminApi';
+import type { BucketScanResult } from '../adminApi';
+import { useBucketScans, useInvalidateBucketScans, useScannableBuckets } from '../queries/bucketScans';
 import { useBucketScanQueue } from '../hooks/useBucketScanQueue';
-import { listBuckets } from '../s3client';
 
 interface Props {
   /**
@@ -112,46 +111,26 @@ function aggregate(results: Record<string, BucketScanResult>): {
   };
 }
 
+const NO_SCANS: Record<string, BucketScanResult> = {};
+const NO_BUCKETS: string[] = [];
+
 export default function BucketScanCard({ onRenderActions, scopeBucket }: Props) {
   const colors = useColors();
 
-  const [scans, setScans] = useState<Record<string, BucketScanResult>>({});
-  const [scansLoaded, setScansLoaded] = useState(false);
-  const [allBuckets, setAllBuckets] = useState<string[]>([]);
-
-  /** Hard-refresh the all-bucket cache (cheap — server-side disk read). */
-  const refreshAllScans = useCallback(async () => {
-    try {
-      const res = await getAllBucketScans();
-      setScans(res.buckets);
-    } catch {
-      // Non-fatal — leave whatever's already there.
-    } finally {
-      setScansLoaded(true);
-    }
-  }, []);
+  // Persisted totals (shared query, polled every 30 s for cross-tab
+  // settling) and the bucket list for the fan-out.
+  const scansQuery = useBucketScans();
+  const scans = scansQuery.data?.buckets ?? NO_SCANS;
+  const scansLoaded = scansQuery.status !== 'pending';
+  const allBuckets = useScannableBuckets().data ?? NO_BUCKETS;
 
   /**
    * Multi-bucket fan-out queue (shared with the analytics page). The
-   * head of the queue is the bucket whose live progress shows.
+   * head of the queue is the bucket whose live progress shows; a scan
+   * that ends refreshes the totals.
    */
-  const scan = useBucketScanQueue(refreshAllScans);
+  const scan = useBucketScanQueue(useInvalidateBucketScans());
   const { live: liveProgress, queue } = scan;
-
-  // Initial load: scans + bucket list (for the fan-out).
-  useEffect(() => {
-    refreshAllScans();
-    listBuckets()
-      .then((bs) => setAllBuckets(bs.filter((b) => !b.unavailable).map((b) => b.name)))
-      .catch(() => setAllBuckets([]));
-  }, [refreshAllScans]);
-
-  // Re-poll every 30s — covers the case where another tab kicked
-  // off a scan that completed in the background. SSE handles the
-  // live case for the tab that started a scan; this catches
-  // cross-tab settling. Routed through useVisiblePolling so a
-  // backgrounded tab stops wasting requests (Tier 3.3).
-  useVisiblePolling(refreshAllScans, 30_000);
 
   // ─── Actions ──────────────────────────────────────────────────────
 

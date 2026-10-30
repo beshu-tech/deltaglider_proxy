@@ -16,13 +16,13 @@
  * dashboard/README or the design notes in dashboard/Panel.tsx for
  * the grid semantics.
  */
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { Typography, Spin, Progress } from 'antd';
+import { useState, useEffect, useMemo, useRef } from 'react';
+import { Typography, Progress } from 'antd';
 import { useColors } from '../ThemeContext';
 import { cacheEntrySubtitle, formatBytes } from '../utils';
-import { fetchWithRelogin } from '../adminApi/core';
+import { usePrometheusMetrics } from '../queries/metrics';
+import { LoadingState } from './StatePlaceholders';
 import { cacheMissSeverity, serverErrorSeverity } from '../statusTone';
-import { useVisiblePolling } from '../useVisiblePolling';
 import AnalyticsSection from './AnalyticsSection';
 import BucketScanCard from './BucketScanCard';
 import { useAdminConfig } from '../queries/config';
@@ -165,10 +165,6 @@ interface Props {
 export default function MetricsPage({ search, proxyVersion }: Props) {
   const colors = useColors();
   const { navigate } = useNavigation();
-  const [metricsMap, setMetricsMap] = useState<Map<string, ParsedMetric>>(new Map());
-  const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [cadence, setCadence] = useState<RefreshCadence>('5s');
   const [history, setHistory] = useState<Snapshot[]>([]);
   // Action chrome for the BucketScanCard. The card itself decides
@@ -198,46 +194,44 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
   // mounted for backwards compatibility with external dashboards but
   // is intentionally unused inside the app.
 
-  const fetchMetrics = useCallback(async () => {
-    setRefreshing(true);
-    try {
-      const metricsRes = await fetchWithRelogin('/_/metrics', { credentials: 'include' });
-      if (!metricsRes.ok) throw new Error(`HTTP ${metricsRes.status}`);
-      const parsed = parsePrometheus(await metricsRes.text());
-      setMetricsMap(parsed);
-
-      const hits = val(parsed, 'deltaglider_cache_hits_total');
-      const misses = val(parsed, 'deltaglider_cache_misses_total');
-      const httpReqs = parsed.get('deltaglider_http_requests_total')?.samples.reduce((a, s) => a + s.value, 0) ?? 0;
-      const latencyHist = histStats(parsed, 'deltaglider_http_request_duration_seconds');
-
-      const snap: Snapshot = {
-        t: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-        cacheHits: prevRef.current ? Math.max(0, hits - prevRef.current.hits) : 0,
-        cacheMisses: prevRef.current ? Math.max(0, misses - prevRef.current.misses) : 0,
-        cacheUtil: val(parsed, 'deltaglider_cache_utilization_ratio') * 100,
-        httpTotal: prevRef.current ? Math.max(0, httpReqs - prevRef.current.http) : 0,
-        avgLatency: prevRef.current && latencyHist.count > prevRef.current.latencyCount
-          ? ((latencyHist.sum - prevRef.current.latencySum) / (latencyHist.count - prevRef.current.latencyCount)) * 1000
-          : 0,
-      };
-      prevRef.current = { hits, misses, http: httpReqs, latencySum: latencyHist.sum, latencyCount: latencyHist.count };
-      setHistory(prev => [...prev, snap].slice(-MAX_HISTORY));
-      setError(null);
-    } catch (e) {
-      setError(normalizeUiError(e, 'Failed to fetch'));
-    } finally { setLoading(false); setRefreshing(false); }
-  }, []);
-
-  useEffect(() => { fetchMetrics(); }, [fetchMetrics]);
   // Poll the (heavy) full /_/metrics text ONLY when it's actually on screen:
-  // the Monitoring view is active, cadence isn't off, AND the tab is visible.
-  // On the Analytics view or a backgrounded tab the Prometheus data isn't
-  // rendered, so scraping + parsing it every 5-30s is pure waste.
+  // the Monitoring view is active and cadence isn't off (react-query also
+  // pauses it in a background tab). On the Analytics view the Prometheus data
+  // isn't rendered, so scraping + parsing it every 5-30s is pure waste.
   const metricsPollActive = cadence !== 'off' && activeView === 'monitoring';
-  useVisiblePolling(fetchMetrics, cadence === '30s' ? 30_000 : 5_000, metricsPollActive);
+  const metrics = usePrometheusMetrics(metricsPollActive ? (cadence === '30s' ? 30_000 : 5_000) : false);
+  const metricsMap = useMemo(() => parsePrometheus(metrics.data ?? ''), [metrics.data]);
+  const loading = metrics.isPending;
+  const refreshing = metrics.isFetching;
+  const error = metrics.error ? normalizeUiError(metrics.error, 'Failed to fetch') : null;
+  const fetchMetrics = () => void metrics.refetch();
 
-  if (loading) return <div style={{ display: 'flex', justifyContent: 'center', padding: 64 }}><Spin description="Loading metrics..." /></div>;
+  // One history point per successful scrape (counters → per-interval deltas).
+  useEffect(() => {
+    if (!metrics.dataUpdatedAt) return;
+    const parsed = metricsMap;
+    const hits = val(parsed, 'deltaglider_cache_hits_total');
+    const misses = val(parsed, 'deltaglider_cache_misses_total');
+    const httpReqs = parsed.get('deltaglider_http_requests_total')?.samples.reduce((a, s) => a + s.value, 0) ?? 0;
+    const latencyHist = histStats(parsed, 'deltaglider_http_request_duration_seconds');
+
+    const snap: Snapshot = {
+      t: new Date(metrics.dataUpdatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+      cacheHits: prevRef.current ? Math.max(0, hits - prevRef.current.hits) : 0,
+      cacheMisses: prevRef.current ? Math.max(0, misses - prevRef.current.misses) : 0,
+      cacheUtil: val(parsed, 'deltaglider_cache_utilization_ratio') * 100,
+      httpTotal: prevRef.current ? Math.max(0, httpReqs - prevRef.current.http) : 0,
+      avgLatency: prevRef.current && latencyHist.count > prevRef.current.latencyCount
+        ? ((latencyHist.sum - prevRef.current.latencySum) / (latencyHist.count - prevRef.current.latencyCount)) * 1000
+        : 0,
+    };
+    prevRef.current = { hits, misses, http: httpReqs, latencySum: latencyHist.sum, latencyCount: latencyHist.count };
+    setHistory(prev => [...prev, snap].slice(-MAX_HISTORY));
+    // metricsMap is derived from the same scrape; dataUpdatedAt marks a new one.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [metrics.dataUpdatedAt]);
+
+  if (loading) return <LoadingState label="Loading metrics..." />;
 
   const m = metricsMap;
 

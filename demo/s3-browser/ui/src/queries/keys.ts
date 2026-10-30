@@ -70,6 +70,15 @@ export const qk = {
   },
   audit: (limit: number) => ['audit', limit] as const,
   logs: (level: string, target: string, q: string, limit: number) => ['logs', level, target, q, limit] as const,
+  /** The Prometheus scrape of `/_/metrics` (raw text). */
+  metrics: () => ['metrics'] as const,
+  deltaEfficiency: (bucket: string, minDeltas: number) => ['delta-efficiency', bucket, minDeltas] as const,
+  bucketScans: {
+    status: () => ['bucket-scans', 'status'] as const,
+    buckets: () => ['bucket-scans', 'buckets'] as const,
+    /** NOT under `bucket-usage`: a per-bucket usage refresh must not refetch every counter. */
+    usage: () => ['bucket-scans', 'usage'] as const,
+  },
   bucketUsage: (bucket: string) => ['bucket-usage', bucket] as const,
 
   // ── Jobs (replication / lifecycle / reencrypt / migrate) ────────

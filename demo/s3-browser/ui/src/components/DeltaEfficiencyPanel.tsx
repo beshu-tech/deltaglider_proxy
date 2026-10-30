@@ -18,8 +18,6 @@ import { ReloadOutlined, ThunderboltOutlined, CopyOutlined } from '@ant-design/i
 import { useColors } from '../ThemeContext';
 import { clamp, formatBytes } from '../utils';
 import {
-  fetchDeltaEfficiency,
-  triggerDeltaEfficiencyScan,
   verifyDeltaEfficiency,
   type DeltaEfficiencyResponse,
   type DeltaspaceEfficiencyReport,
@@ -31,7 +29,8 @@ import HoverHint from './HoverHint';
 import { contentColumn, CONTENT_WIDE } from './shared-styles';
 import { normalizeUiError } from '../errorHandling';
 import { useCopyToClipboard } from '../useCopyToClipboard';
-import { isSessionExpired } from '../errorHandling';
+import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
+import { useDeltaEfficiency, useTriggerDeltaEfficiencyScan } from '../queries/deltaEfficiency';
 
 /**
  * Per-row verification state, keyed by prefix. Stored at the
@@ -59,35 +58,19 @@ function efficiencyLabel(e: DeltaEfficiency): string {
   }
 }
 
-/**
- * Poll cadence on 202 Accepted. Optimized backend lands in ~3-5s for a
- * 141-prefix bucket, so 3s catches the answer in a single tick. Bumping
- * higher would slow the UX on the common case; lower would hammer the
- * server for no benefit.
- */
-const POLL_INTERVAL_MS = 3000;
-
-/**
- * Ceiling for the 202 → 200 polling loop. Sized for buckets with
- * thousands of deltaspaces; the optimized scanner lands inside this
- * window comfortably for any realistic bucket.
- */
-const SCAN_TIMEOUT_MS = 300_000;
-
 export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
   const colors = useColors();
   const bucketNames = useBucketNames();
   const [bucket, setBucket] = useState<string | undefined>(undefined);
   const [minDeltas, setMinDeltas] = useState<number>(3);
-  const [response, setResponse] = useState<DeltaEfficiencyResponse | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [scanning, setScanning] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  // Monotonic id stamped on each scan. A polling loop checks this
-  // against the latest id before publishing state, so a stale scan
-  // (e.g. bucket A still polling when the operator switches to bucket
-  // B) can't overwrite the newer scan's result. See runScan.
-  const scanIdRef = useRef(0);
+  // The scan the operator asked for. A scan belongs to the (bucket, minDeltas)
+  // it started with: a change of either drops it (and its poll), and the
+  // query key moves with them, so A's report never shows under B.
+  const [requested, setRequested] = useState<{ bucket: string; minDeltas: number } | null>(null);
+  const active = requested !== null && requested.bucket === bucket && requested.minDeltas === minDeltas;
+  const startedAt = useRef(0);
+  const scan = useDeltaEfficiency(bucket, minDeltas, { enabled: active, startedAt: () => startedAt.current });
+  const trigger = useTriggerDeltaEfficiencyScan();
 
   // Bucket names from the SHARED query cache (sorted) — no per-mount fetch of
   // /buckets that other panels already hold. Auto-select the first once loaded.
@@ -96,95 +79,29 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
     if (buckets.length > 0 && bucket === undefined) setBucket(buckets[0]);
   }, [buckets, bucket]);
 
-  // A scan belongs to the (bucket, minDeltas) it started with. On change —
-  // and on unmount — supersede any in-flight poll (it captured the old
-  // bucket and would otherwise publish A's report under B, or keep polling
-  // after unmount up to SCAN_TIMEOUT_MS) and clear the stale report.
-  useEffect(() => {
-    const ids = scanIdRef;
-    return () => {
-      ids.current += 1;
-      setResponse(null);
-      setLoading(false);
-      setScanning(false);
-      setError(null);
-    };
-  }, [bucket, minDeltas]);
+  const data = active && !trigger.isPending ? scan.data : undefined;
+  const response: DeltaEfficiencyResponse | null = data && !('scanning' in data) ? data : null;
+  const rawError = active && !trigger.isPending ? (trigger.error ?? scan.error) : null;
+  useSessionExpiredOn(rawError, onSessionExpired);
+  const error = rawError ? `Scan failed: ${normalizeUiError(rawError, String(rawError))}` : null;
+  const scanning = !rawError && !!data && 'scanning' in data;
+  const loading = active && (scan.isFetching || trigger.isPending);
 
   /**
-   * Server returns one of:
-   *   - 200 OK with the report (cached or fresh)
-   *   - 202 Accepted with `{scanning: true}` and a background scan
-   *     was just enqueued (or one was already running).
-   *
-   * On 202, poll the GET endpoint at `POLL_INTERVAL_MS` cadence until
-   * we get a 200, bounded by `SCAN_TIMEOUT_MS`.
+   * The first scan may answer from the server's 5-minute cache (200), or
+   * start a background scan (202) that the query polls. `forceRescan` POSTs
+   * a new scan first.
    */
-  const fetchOrPoll = async (
-    forceRescan: boolean,
-    scanId: number,
-  ): Promise<DeltaEfficiencyResponse | null> => {
-    if (!bucket) return null;
-    if (forceRescan) {
-      // Force a re-scan, then poll.
-      await triggerDeltaEfficiencyScan(bucket, minDeltas);
-    }
-    const startedAt = Date.now();
-    const deadline = startedAt + SCAN_TIMEOUT_MS;
-    // First call: if fresh-cached we'll get 200 immediately.
-    // If not, the server enqueues a scan and we get 202.
-    while (Date.now() < deadline) {
-      const r = await fetchDeltaEfficiency(bucket, minDeltas);
-      // A newer scan superseded us — stop polling and discard the
-      // result so it can't clobber the newer scan's state.
-      if (scanIdRef.current !== scanId) return null;
-      if ('scanning' in r && !r.scanning) {
-        // The last scan failed: the server starts no new scan for a GET,
-        // so polling again would only wait for the timeout.
-        throw new Error(r.error);
-      }
-      if ('scanning' in r) {
-        // Server is working on it. Wait briefly, then re-fetch.
-        setScanning(true);
-        await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
-        // Superseded (or unmounted) while sleeping — no further fetches.
-        if (scanIdRef.current !== scanId) return null;
-        continue;
-      }
-      setScanning(false);
-      return r;
-    }
-    throw new Error(
-      `Scan timed out after ${Math.round(SCAN_TIMEOUT_MS / 1000)}s — ` +
-        `try again or check server logs`,
-    );
-  };
-
-  const runScan = async (forceRescan = false) => {
+  const runScan = (forceRescan = false) => {
     if (!bucket) return;
-    // Stamp this scan. Any older in-flight poll loop will see a newer
-    // id and bail before publishing, so out-of-order completions can't
-    // overwrite the latest scan's result.
-    const scanId = ++scanIdRef.current;
-    setLoading(true);
-    setError(null);
-    if (forceRescan) setResponse(null);
-    try {
-      const r = await fetchOrPoll(forceRescan, scanId);
-      if (scanIdRef.current !== scanId) return;
-      if (r) setResponse(r);
-    } catch (e) {
-      if (scanIdRef.current !== scanId) return;
-      const msg = normalizeUiError(e, String(e));
-      if (isSessionExpired(e)) onSessionExpired?.();
-      setError(`Scan failed: ${msg}`);
-    } finally {
-      // Only the latest scan owns the shared loading/scanning flags;
-      // a superseded loop must not flip them off under the new scan.
-      if (scanIdRef.current === scanId) {
-        setLoading(false);
-        setScanning(false);
-      }
+    startedAt.current = Date.now();
+    const wasActive = active;
+    setRequested({ bucket, minDeltas });
+    if (forceRescan) {
+      trigger.reset();
+      trigger.mutate({ bucket, minDeltas });
+    } else if (wasActive) {
+      void scan.refetch();
     }
   };
 

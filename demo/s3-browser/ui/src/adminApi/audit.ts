@@ -8,7 +8,7 @@ import { adminJson } from './core';
  * in `src/audit.rs::AuditEntry` — keep this in sync if either side
  * adds fields.
  */
-export interface AuditEntry {
+interface AuditEntry {
   timestamp: string; // ISO-8601 UTC
   action: string;
   user: string;

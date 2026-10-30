@@ -9,7 +9,8 @@
  *   - Session savings time-series + Compression opportunities.
  *
  * Data path (post v0.10):
- *   - On mount, call `getAllBucketScans()` once. That returns every
+ *   - `useBucketScans()` (shared with BucketScanCard, polled every 30 s)
+ *     reads `getAllBucketScans()`. That returns every
  *     bucket the server has a cached scan for, loaded from
  *     `.deltaglider_scans/<bucket>.json` on disk — survives restarts.
  *     KPIs render IMMEDIATELY off this cache; no spinner unless
@@ -18,7 +19,7 @@
  *     we know which buckets have NO cache yet ("unscanned").
  *   - The user can click **Re-scan all** to walk every bucket
  *     sequentially via SSE. Each bucket streams progress; on `done`
- *     we re-pull `getAllBucketScans()` so the panels reflect the
+ *     we invalidate that query so the panels reflect the
  *     newly-persisted totals. The next bucket in the queue starts.
  *   - **Stop** cancels the bucket that's currently streaming. The
  *     queue is dropped. Whatever was already persisted stays
@@ -28,19 +29,13 @@
  * explicitly re-scans. The banner shows oldest + newest scan age so
  * staleness is never invisible.
  */
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { Button } from 'antd';
 import { CaretRightOutlined, ReloadOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
-import { useVisiblePolling } from '../useVisiblePolling';
-import { listBuckets } from '../s3client';
-import { getAllBucketUsage } from '../adminApi';
+import { useAllBucketUsage, useBucketScans, useInvalidateBucketScans, useScannableBuckets } from '../queries/bucketScans';
 import type { AdminConfig, BucketUsage } from '../adminApi';
-import {
-  getAllBucketScans,
-  type BucketScanResult,
-  type BucketScanProgress,
-} from '../adminApi';
+import type { BucketScanResult, BucketScanProgress } from '../adminApi';
 import { useBucketScanQueue } from '../hooks/useBucketScanQueue';
 import { formatBytes, relativeTime } from '../utils';
 import { monthlyCost, parseCostRate, summarizeScopeSavings } from '../savings';
@@ -77,6 +72,9 @@ interface Props {
 
 // COST_PRESETS now lives in HeroSavingsPanel.tsx (sole consumer).
 
+const NO_SCANS: Record<string, BucketScanResult> = {};
+const NO_BUCKETS: string[] = [];
+
 export default function AnalyticsSection({ config }: Props) {
   const colors = useColors();
 
@@ -91,14 +89,23 @@ export default function AnalyticsSection({ config }: Props) {
    *     fan-out. The head of the queue is what `liveProgress` is
    *     tracking; on `done` we shift it and start the next.
    */
-  const [scans, setScans] = useState<Record<string, BucketScanResult>>({});
-  const [scansLoaded, setScansLoaded] = useState(false);
-  const [allBuckets, setAllBuckets] = useState<string[]>([]);
+  // Persisted totals: the shared query, polled every 30 s for cross-tab
+  // settling; a failed read keeps what is on screen.
+  const scansQuery = useBucketScans();
+  const scans = scansQuery.data?.buckets ?? NO_SCANS;
+  const scansLoaded = scansQuery.status !== 'pending';
+  const bucketsQuery = useScannableBuckets();
+  const allBuckets = bucketsQuery.data ?? NO_BUCKETS;
   // O(1) running counters, keyed by bucket. Seeds the fleet rows instantly on
   // load so the dashboard shows real sizes without waiting for a scan; a live
   // scan still overrides while it runs, and a completed cached scan takes
   // precedence (it's the same ground truth the counter is reconciled against).
-  const [counters, setCounters] = useState<Record<string, BucketUsage>>({});
+  // One request for every bucket, once the list is in (best-effort; 403 → none).
+  const usageQuery = useAllBucketUsage(bucketsQuery.isSuccess);
+  const counters: Record<string, BucketUsage> = useMemo(() => {
+    const listed = new Set(allBuckets);
+    return Object.fromEntries((usageQuery.data ?? []).filter((u) => listed.has(u.bucket)).map((u) => [u.bucket, u]));
+  }, [usageQuery.data, allBuckets]);
   /**
    * Top-buckets sort key. Persisted to localStorage so the operator's
    * preference survives reloads — repeatedly re-picking "savings" each
@@ -122,67 +129,24 @@ export default function AnalyticsSection({ config }: Props) {
     writeStorage('dg-cost-per-gb', String(rate));
   };
 
-  /**
-   * Pull the persisted scan map from the server. Idempotent; cheap.
-   * Called on mount, on focus, every 30s (to catch cross-tab work),
-   * and after each bucket's scan finishes so the panels reflect the
-   * fresh per-bucket totals.
-   */
-  const refreshScans = useCallback(async () => {
-    try {
-      const res = await getAllBucketScans();
-      setScans(res.buckets);
-      return res.running ?? {};
-    } catch {
-      // Non-fatal: keep whatever's already on screen.
-      return {};
-    } finally {
-      setScansLoaded(true);
-    }
-  }, []);
-
   // The fan-out queue and the live progress of its head (shared with the
   // dashboard card). A finished scan refreshes the persisted map.
-  const scan = useBucketScanQueue(
-    useCallback(() => {
-      void refreshScans();
-    }, [refreshScans]),
-  );
+  const scan = useBucketScanQueue(useInvalidateBucketScans());
   const { live: liveProgress, queue, seed: seedQueue } = scan;
 
-  // Initial load: bucket list + persisted scans, in parallel.
-  //
   // RE-ATTACH on mount: scans run server-side and keep going even if the
-  // operator navigates away (this component unmounts). On return we read the
-  // server's `running` map and re-seed the fan-out queue with any in-flight
-  // buckets — the queue-follow effect then re-opens SSE and live progress
-  // resumes, instead of the dashboard showing nothing. This is the core fix for
-  // "scan lost on navigation".
+  // operator navigates away (this component unmounts). The first read after
+  // mount carries the server's `running` map; re-seed the fan-out queue with
+  // any in-flight buckets — the queue-follow effect then re-opens SSE and live
+  // progress resumes, instead of the dashboard showing nothing. This is the
+  // core fix for "scan lost on navigation".
+  const reattached = useRef(false);
   useEffect(() => {
-    refreshScans().then((running) => {
-      const inFlight = Object.keys(running);
-      if (inFlight.length > 0) seedQueue(inFlight);
-    });
-    listBuckets()
-      .then(bs => {
-        const names = bs.filter(b => !b.unavailable).map(b => b.name);
-        setAllBuckets(names);
-        // Seed instant O(1) sizes for every bucket, in one request
-        // (best-effort; 403 → skip).
-        const listed = new Set(names);
-        getAllBucketUsage()
-          .then(rows => {
-            if (!rows) return;
-            setCounters(Object.fromEntries(rows.filter(u => listed.has(u.bucket)).map(u => [u.bucket, u])));
-          })
-          .catch(() => {});
-      })
-      .catch(() => setAllBuckets([]));
-  }, [refreshScans, seedQueue]);
-
-  // Re-poll every 30s for cross-tab scan settling. Routed through
-  // useVisiblePolling so a backgrounded tab stops wasting requests (Tier 3.3).
-  useVisiblePolling(refreshScans, 30_000);
+    if (reattached.current || !scansQuery.isFetchedAfterMount) return;
+    reattached.current = true;
+    const inFlight = Object.keys(scansQuery.data?.running ?? {});
+    if (inFlight.length > 0) seedQueue(inFlight);
+  }, [scansQuery.isFetchedAfterMount, scansQuery.data, seedQueue]);
 
   /**
    * Default action: scan only the buckets that aren't yet cached.
