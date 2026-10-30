@@ -53,12 +53,7 @@
 //! - Phase 3d: group presets expanding to IAM policy documents.
 
 use crate::bucket_policy::BucketPolicyConfig;
-use crate::config::{
-    default_cache_size_mb, default_filtered_list_max_engine_pages, default_listen_addr,
-    default_log_level, default_max_delta_ratio, default_max_object_size,
-    default_max_passthrough_object_size, default_metadata_cache_mb, default_range_spool_ttl_secs,
-    BackendConfig, DefaultsVersion, NamedBackendConfig, TlsConfig,
-};
+use crate::config::{BackendConfig, DefaultsVersion, NamedBackendConfig, TlsConfig};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
@@ -1618,130 +1613,208 @@ fn is_backend_default(b: &BackendConfig) -> bool {
     b == &BackendConfig::default()
 }
 
-impl SectionedConfig {
-    /// Build a `SectionedConfig` from a flat [`Config`](crate::config::Config).
-    ///
-    /// This is the canonical exporter — called by `to_canonical_yaml`.
-    /// We deliberately keep default-valued `Option<T>` fields as `None`
-    /// so the serialized YAML omits them (cleaner GitOps diffs).
-    ///
-    /// # Shorthand exporting policy
-    ///
-    /// - **Bucket-level `public: true`** IS collapsed from
-    ///   `public_prefixes: [""]` when unambiguous. The shorthand is an
-    ///   exact 1:1 with the expanded form (exactly one prefix, exactly
-    ///   the empty string), so round-tripping is lossless and the GUI's
-    ///   "Public read" toggle maps directly to the YAML.
-    /// - **Storage-level `s3:` / `filesystem:`** are NOT collapsed.
-    ///   Reason: the expanded `backend: { type: S3, endpoint, region,
-    ///   force_path_style, ... }` form carries fields (`force_path_style`,
-    ///   named backends, etc.) that the shorthand can't express without
-    ///   ambiguity, and collapsing selectively would make the exporter
-    ///   non-deterministic. Operators who want the compact form should
-    ///   keep it in their GitOps source-of-truth file; the server's
-    ///   persisted artifact is explicit by contract.
-    ///
-    /// This asymmetry is intentional. Don't "fix" it by adding a
-    /// `collapse_backend_to_shorthand()` without a hard contract that
-    /// the collapse is lossless for ALL current and future backend
-    /// fields.
-    pub fn from_flat(flat: &crate::config::Config) -> Self {
-        Self {
-            defaults_version: flat.defaults_version,
-            // Only emit `admission:` when the operator actually
-            // authored blocks — keeps default-config exports empty.
-            admission: if flat.admission_blocks.is_empty() {
-                None
-            } else {
-                Some(AdmissionSection {
-                    blocks: flat.admission_blocks.clone(),
-                })
-            },
-            access: AccessSection {
-                iam_mode: flat.iam_mode,
-                authentication: flat.authentication.clone(),
-                access_key_id: flat.access_key_id.clone(),
-                secret_access_key: flat.secret_access_key.clone(),
-                iam_users: flat.iam_users.clone(),
-                iam_groups: flat.iam_groups.clone(),
-                auth_providers: flat.auth_providers.clone(),
-                group_mapping_rules: flat.group_mapping_rules.clone(),
-                // Not represented in the flat Config — the flat shape is
-                // operator-authored YAML; bindings only ride the full-IAM
-                // import path (document_level.rs parses the sectioned shape
-                // directly). from_flat therefore always projects them away.
-                external_identities: Vec::new(),
-            },
-            storage: StorageSection {
-                backend: flat.backend.clone(),
-                backend_encryption: flat.backend_encryption.clone(),
-                backends: flat.backends.clone(),
-                default_backend: flat.default_backend.clone(),
-                // Prefer the compact shorthand form (`public: true`) when
-                // the canonical expansion is unambiguous. Keeps GitOps
-                // diffs short and maps 1:1 to the GUI's bucket-settings
-                // "Public read" toggle.
-                buckets: flat
-                    .buckets
-                    .iter()
-                    .map(|(name, policy)| (name.clone(), policy.collapse_to_shorthand()))
-                    .collect(),
-                replication: flat.replication.clone(),
-                lifecycle: flat.lifecycle.clone(),
-                // Shorthand fields never appear in the canonical export —
-                // the expanded `backend:` carries the information instead.
-                // Future `collapse_backend_to_shorthand()` could emit
-                // these, but today we keep the exporter predictable.
-                s3: None,
-                filesystem: None,
-                region: None,
-                access_key_id: None,
-                secret_access_key: None,
-                force_path_style: None,
-            },
-            advanced: AdvancedSection {
-                // Emit only non-default values to keep the exported YAML
-                // minimal. Round-trip correctness is the invariant — the
-                // defaults round back through `Config::default()`.
-                listen_addr: some_if_nondefault(flat.listen_addr, default_listen_addr()),
-                max_delta_ratio: some_if_nondefault(
-                    flat.max_delta_ratio,
-                    default_max_delta_ratio(),
-                ),
-                max_object_size: some_if_nondefault(
-                    flat.max_object_size,
-                    default_max_object_size(),
-                ),
-                max_passthrough_object_size: some_if_nondefault(
-                    flat.max_passthrough_object_size,
-                    default_max_passthrough_object_size(),
-                ),
-                range_spool_ttl_secs: some_if_nondefault(
-                    flat.range_spool_ttl_secs,
-                    default_range_spool_ttl_secs(),
-                ),
-                cache_size_mb: some_if_nondefault(flat.cache_size_mb, default_cache_size_mb()),
-                metadata_cache_mb: some_if_nondefault(
-                    flat.metadata_cache_mb,
-                    default_metadata_cache_mb(),
-                ),
-                filtered_list_max_engine_pages: some_if_nondefault(
-                    flat.filtered_list_max_engine_pages,
-                    default_filtered_list_max_engine_pages(),
-                ),
-                codec_concurrency: flat.codec_concurrency,
-                blocking_threads: flat.blocking_threads,
-                log_level: some_if_nondefault_str(&flat.log_level, default_log_level()),
-                config_sync_bucket: flat.config_sync_bucket.clone(),
-                config_sync_object_key: flat.config_sync_object_key.clone(),
-                tls: flat.tls.clone(),
-                bootstrap_password_hash: flat.bootstrap_password_hash.clone(),
-                event_delivery: flat.event_delivery.clone(),
-                jobs: flat.jobs.clone(),
-            },
-        }
-    }
+/// THE field map between the flat [`Config`](crate::config::Config) and the
+/// four sections (docs/plan/config-model.md). Each flat field is named once,
+/// under its section. `same`: one type on both sides. `elided`: `T` flat,
+/// `Option<T>` sectioned, `None` when it equals `Config::default()`. The
+/// fields with their own rule (`admission_blocks`, `buckets`, the storage
+/// shorthands, `external_identities`, the runtime-only fields) are written
+/// in the body. Both projections destructure their input with no `..`, so
+/// a field missing here, on either side, does not compile.
+macro_rules! config_projection {
+    (
+        root: [$($root:ident),* $(,)?],
+        access: [$($acc:ident),* $(,)?],
+        storage: [$($sto:ident),* $(,)?],
+        advanced same: [$($adv:ident),* $(,)?],
+        advanced elided: [$($eli:ident),* $(,)?] $(,)?
+    ) => {
+        /// The root keys of the FLAT shape: any of them at the root makes a
+        /// document flat (`defaults` is shape-neutral, so it is not here).
+        pub(crate) const FLAT_ROOT_KEYS: &[&str] = &[
+            $(stringify!($acc),)*
+            $(stringify!($sto),)*
+            $(stringify!($adv),)*
+            $(stringify!($eli),)*
+            "buckets",
+            "admission_blocks",
+            "admin_password_hash", // serde alias of bootstrap_password_hash
+        ];
 
+        impl SectionedConfig {
+            /// Build a `SectionedConfig` from a flat [`Config`](crate::config::Config).
+            ///
+            /// This is the canonical exporter — called by `to_canonical_yaml`.
+            /// We deliberately keep default-valued `Option<T>` fields as `None`
+            /// so the serialized YAML omits them (cleaner GitOps diffs).
+            ///
+            /// # Shorthand exporting policy
+            ///
+            /// - **Bucket-level `public: true`** IS collapsed from
+            ///   `public_prefixes: [""]` when unambiguous. The shorthand is an
+            ///   exact 1:1 with the expanded form (exactly one prefix, exactly
+            ///   the empty string), so round-tripping is lossless and the GUI's
+            ///   "Public read" toggle maps directly to the YAML.
+            /// - **Storage-level `s3:` / `filesystem:`** are NOT collapsed.
+            ///   Reason: the expanded `backend: { type: S3, endpoint, region,
+            ///   force_path_style, ... }` form carries fields (`force_path_style`,
+            ///   named backends, etc.) that the shorthand can't express without
+            ///   ambiguity, and collapsing selectively would make the exporter
+            ///   non-deterministic. Operators who want the compact form should
+            ///   keep it in their GitOps source-of-truth file; the server's
+            ///   persisted artifact is explicit by contract.
+            ///
+            /// This asymmetry is intentional. Don't "fix" it by adding a
+            /// `collapse_backend_to_shorthand()` without a hard contract that
+            /// the collapse is lossless for ALL current and future backend
+            /// fields.
+            pub fn from_flat(flat: &crate::config::Config) -> Self {
+                let defaults = crate::config::Config::default();
+                let crate::config::Config {
+                    $($root,)*
+                    $($acc,)*
+                    $($sto,)*
+                    $($adv,)*
+                    $($eli,)*
+                    buckets,
+                    admission_blocks,
+                    env_refs: _,
+                    env_shadow: _,
+                    tuning: _,
+                } = flat.clone();
+                Self {
+                    $($root,)*
+                    // Only emit `admission:` when the operator actually
+                    // authored blocks — keeps default-config exports empty.
+                    admission: if admission_blocks.is_empty() {
+                        None
+                    } else {
+                        Some(AdmissionSection {
+                            blocks: admission_blocks,
+                        })
+                    },
+                    access: AccessSection {
+                        $($acc,)*
+                        // Not represented in the flat Config — the flat shape
+                        // is operator-authored YAML; bindings only ride the
+                        // full-IAM import path (document_level.rs parses the
+                        // sectioned shape directly).
+                        external_identities: Vec::new(),
+                    },
+                    storage: StorageSection {
+                        $($sto,)*
+                        // Prefer the compact shorthand form (`public: true`)
+                        // when the canonical expansion is unambiguous.
+                        buckets: buckets
+                            .into_iter()
+                            .map(|(name, policy)| (name, policy.collapse_to_shorthand()))
+                            .collect(),
+                        // Shorthand fields never appear in the canonical
+                        // export — the expanded `backend:` carries them.
+                        s3: None,
+                        filesystem: None,
+                        region: None,
+                        access_key_id: None,
+                        secret_access_key: None,
+                        force_path_style: None,
+                    },
+                    advanced: AdvancedSection {
+                        $($adv,)*
+                        $($eli: some_if_nondefault($eli, defaults.$eli),)*
+                    },
+                }
+            }
+
+            /// Internal: flat projection without any shorthand expansion. Used
+            /// by tests and by the exporter's round-trip verification where
+            /// shorthands have already been resolved.
+            fn into_flat_unchecked(self) -> crate::config::Config {
+                let defaults = crate::config::Config::default();
+                let SectionedConfig {
+                    $($root,)*
+                    admission,
+                    access: AccessSection {
+                        $($acc,)*
+                        // `into_flat` refuses a non-empty list (#71).
+                        external_identities: _,
+                    },
+                    storage: StorageSection {
+                        $($sto,)*
+                        buckets,
+                        // Expanded into `backend` by `StorageSection::normalize`.
+                        s3: _,
+                        filesystem: _,
+                        region: _,
+                        access_key_id: _,
+                        secret_access_key: _,
+                        force_path_style: _,
+                    },
+                    advanced: AdvancedSection {
+                        $($adv,)*
+                        $($eli,)*
+                    },
+                } = self;
+                crate::config::Config {
+                    $($root,)*
+                    $($acc,)*
+                    $($sto,)*
+                    $($adv,)*
+                    $($eli: $eli.unwrap_or(defaults.$eli),)*
+                    buckets,
+                    admission_blocks: admission.map(|s| s.blocks).unwrap_or_default(),
+                    env_refs: Default::default(),
+                    env_shadow: Default::default(),
+                    tuning: Default::default(),
+                }
+            }
+        }
+    };
+}
+
+config_projection! {
+    root: [defaults_version],
+    access: [
+        iam_mode,
+        authentication,
+        access_key_id,
+        secret_access_key,
+        iam_users,
+        iam_groups,
+        auth_providers,
+        group_mapping_rules,
+    ],
+    storage: [
+        backend,
+        backend_encryption,
+        backends,
+        default_backend,
+        replication,
+        lifecycle,
+    ],
+    advanced same: [
+        codec_concurrency,
+        blocking_threads,
+        config_sync_bucket,
+        config_sync_object_key,
+        tls,
+        bootstrap_password_hash,
+        event_delivery,
+        jobs,
+    ],
+    advanced elided: [
+        listen_addr,
+        max_delta_ratio,
+        max_object_size,
+        max_passthrough_object_size,
+        range_spool_ttl_secs,
+        cache_size_mb,
+        metadata_cache_mb,
+        filtered_list_max_engine_pages,
+        log_level,
+    ],
+}
+
+impl SectionedConfig {
     /// Collapse a `SectionedConfig` back into a flat [`Config`](crate::config::Config). The
     /// inverse of [`SectionedConfig::from_flat`].
     ///
@@ -1779,74 +1852,6 @@ impl SectionedConfig {
         }
         Ok(self.into_flat_unchecked())
     }
-
-    /// Internal: flat projection without any shorthand expansion. Used
-    /// by tests and by the exporter's round-trip verification where
-    /// shorthands have already been resolved.
-    fn into_flat_unchecked(self) -> crate::config::Config {
-        let defaults = crate::config::Config::default();
-        crate::config::Config {
-            defaults_version: self.defaults_version,
-            listen_addr: self.advanced.listen_addr.unwrap_or(defaults.listen_addr),
-            backend: self.storage.backend,
-            max_delta_ratio: self
-                .advanced
-                .max_delta_ratio
-                .unwrap_or(defaults.max_delta_ratio),
-            max_object_size: self
-                .advanced
-                .max_object_size
-                .unwrap_or(defaults.max_object_size),
-            max_passthrough_object_size: self
-                .advanced
-                .max_passthrough_object_size
-                .unwrap_or(defaults.max_passthrough_object_size),
-            range_spool_ttl_secs: self
-                .advanced
-                .range_spool_ttl_secs
-                .unwrap_or(defaults.range_spool_ttl_secs),
-            cache_size_mb: self
-                .advanced
-                .cache_size_mb
-                .unwrap_or(defaults.cache_size_mb),
-            metadata_cache_mb: self
-                .advanced
-                .metadata_cache_mb
-                .unwrap_or(defaults.metadata_cache_mb),
-            filtered_list_max_engine_pages: self
-                .advanced
-                .filtered_list_max_engine_pages
-                .unwrap_or(defaults.filtered_list_max_engine_pages),
-            authentication: self.access.authentication,
-            access_key_id: self.access.access_key_id,
-            secret_access_key: self.access.secret_access_key,
-            iam_mode: self.access.iam_mode,
-            iam_users: self.access.iam_users,
-            iam_groups: self.access.iam_groups,
-            auth_providers: self.access.auth_providers,
-            group_mapping_rules: self.access.group_mapping_rules,
-            env_refs: Default::default(),
-            env_shadow: Default::default(),
-            tuning: Default::default(),
-            bootstrap_password_hash: self.advanced.bootstrap_password_hash,
-            codec_concurrency: self.advanced.codec_concurrency,
-            blocking_threads: self.advanced.blocking_threads,
-            log_level: self.advanced.log_level.unwrap_or(defaults.log_level),
-            config_sync_bucket: self.advanced.config_sync_bucket,
-            config_sync_object_key: self.advanced.config_sync_object_key,
-            tls: self.advanced.tls,
-            event_delivery: self.advanced.event_delivery,
-            jobs: self.advanced.jobs,
-            buckets: self.storage.buckets,
-            backend_encryption: self.storage.backend_encryption,
-            backends: self.storage.backends,
-            default_backend: self.storage.default_backend,
-            replication: self.storage.replication,
-            lifecycle: self.storage.lifecycle,
-            admission_blocks: self.admission.map(|s| s.blocks).unwrap_or_default(),
-            // iam_mode already populated above from self.access.iam_mode.
-        }
-    }
 }
 
 /// Helper: return `Some(value)` unless it equals the default, in which
@@ -1856,14 +1861,6 @@ fn some_if_nondefault<T: PartialEq>(value: T, default: T) -> Option<T> {
         None
     } else {
         Some(value)
-    }
-}
-
-fn some_if_nondefault_str(value: &str, default: String) -> Option<String> {
-    if value == default {
-        None
-    } else {
-        Some(value.to_string())
     }
 }
 

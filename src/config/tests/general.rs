@@ -2428,7 +2428,7 @@ fn the_state_file_keeps_a_hash_that_only_the_config_file_carries() {
     ));
 }
 
-/// A root key missing from `FLAT_ONLY_KEYS` makes a mixed document fail with
+/// A root key missing from `FLAT_ROOT_KEYS` makes a mixed document fail with
 /// "unknown field" instead of the mixed-shape error that names both halves.
 #[test]
 fn flat_only_keys_cover_every_config_key() {
@@ -2437,7 +2437,7 @@ fn flat_only_keys_cover_every_config_key() {
     let missing: Vec<&str> = props
         .keys()
         .map(String::as_str)
-        .filter(|k| *k != "defaults" && !FLAT_ONLY_KEYS.contains(k))
+        .filter(|k| *k != "defaults" && !FLAT_ROOT_KEYS.contains(k))
         .collect();
-    assert!(missing.is_empty(), "add to FLAT_ONLY_KEYS: {missing:?}");
+    assert!(missing.is_empty(), "add to FLAT_ROOT_KEYS: {missing:?}");
 }
