@@ -5,7 +5,7 @@
 
 type SessionCheck = { valid: boolean; admin_gui: boolean };
 
-type SessionCapabilities = {
+export type SessionCapabilities = {
   /** Signed in through Admin (bootstrap, OAuth, or admin IAM login-as). */
   adminGui: boolean;
   /** Signed in with an access key on the connect screen — files only until Admin is opened. */

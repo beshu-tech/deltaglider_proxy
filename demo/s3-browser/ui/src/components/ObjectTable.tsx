@@ -36,36 +36,64 @@ const PAGE_SIZE_OPTIONS = [25, 50, 100, 250, 500] as const;
 const DEFAULT_PAGE_SIZE = 100;
 const PAGE_SIZE_STORAGE_KEY = 'dg-object-table-page-size';
 
-interface Props {
+/** The folder's rows and listing status. */
+interface ObjectTableListing {
   objects: S3Object[];
   folders: string[];
   prefix: string;
-  selected: S3Object | null;
-  onSelect: (obj: S3Object) => void;
-  onNavigate: (prefix: string) => void;
-  selectedKeys: Set<string>;
-  onToggleKey: (key: string) => void;
-  onToggleAll: () => void;
-  isMobile: boolean;
   isTruncated: boolean;
   /** When the rows after the first listing page were listed: the 60 s
    *  auto-refresh reads page 1 only. Null = the folder fits one page. */
   restListedAt?: number | null;
   refreshing: boolean;
   headCache: Record<string, { storageType?: string; storedSize?: number }>;
-  folderSizes: Record<string, FolderSizeState>;
+  /** Folders implied by writable prefixes only (never scanned). */
   virtualFolders: string[];
-  hasAdminSession: boolean;
-  onComputeSize: (prefix: string) => void;
-  onCancelSize: (prefix: string) => void;
-  onAutoPopulateSizes?: (currentPrefix: string, folderPrefixes: string[]) => void;
+}
+
+/** The inspected row and the checked rows. */
+interface ObjectTableSelection {
+  /** The object open in the inspector (highlighted row). */
+  inspected: S3Object | null;
+  selectedKeys: Set<string>;
+  onToggleKey: (key: string) => void;
+  onToggleAll: () => void;
+}
+
+/** Row activation: a click opens, a folder navigates, a double-click previews. */
+interface ObjectTableActions {
+  onSelect: (obj: S3Object) => void;
+  onNavigate: (prefix: string) => void;
   onPreview?: (obj: S3Object) => void;
-  /** rowKey of the keyboard-cursor row (arrow-key navigation), or null. */
-  cursorKey?: string | null;
-  /** Sync the keyboard cursor when a row is clicked. */
-  onCursorChange?: (key: string | null) => void;
+}
+
+/** The folder Size column (admin usage scanner). */
+export interface ObjectTableFolderSizes {
+  sizes: Record<string, FolderSizeState>;
+  /** An admin session may scan; otherwise the column shows a dash. */
+  canScan: boolean;
+  onCompute: (prefix: string) => void;
+  onCancel: (prefix: string) => void;
+  onAutoPopulate?: (currentPrefix: string, folderPrefixes: string[]) => void;
+}
+
+/** Keyboard cursor (useBrowserKeyboardNav). */
+export interface ObjectTableCursor {
+  /** rowKey of the cursor row, or null. */
+  key: string | null;
+  /** Sync the cursor when a row is clicked. */
+  onChange?: (key: string | null) => void;
   /** Reports the displayed (sorted) row order, so keyboard navigation walks it. */
   onRowOrderChange?: (keys: string[]) => void;
+}
+
+interface Props {
+  listing: ObjectTableListing;
+  selection: ObjectTableSelection;
+  actions: ObjectTableActions;
+  folderSizes: ObjectTableFolderSizes;
+  cursor?: ObjectTableCursor;
+  isMobile: boolean;
 }
 
 type RowData = BrowserRow;
@@ -164,31 +192,26 @@ function FolderSizeCell({
 }
 
 export default function ObjectTable({
-  objects,
-  folders,
-  prefix,
-  selected,
-  onSelect,
-  onNavigate,
-  selectedKeys,
-  onToggleKey,
-  onToggleAll,
+  listing,
+  selection,
+  actions,
+  folderSizes: sizeProps,
+  cursor,
   isMobile,
-  isTruncated,
-  restListedAt = null,
-  refreshing,
-  headCache,
-  folderSizes,
-  virtualFolders,
-  hasAdminSession,
-  onComputeSize,
-  onCancelSize,
-  onAutoPopulateSizes,
-  onPreview,
-  cursorKey = null,
-  onCursorChange,
-  onRowOrderChange,
 }: Props) {
+  const { objects, folders, prefix, isTruncated, restListedAt = null, refreshing, headCache, virtualFolders } = listing;
+  const { inspected: selected, selectedKeys, onToggleKey, onToggleAll } = selection;
+  const { onSelect, onNavigate, onPreview } = actions;
+  const {
+    sizes: folderSizes,
+    canScan: hasAdminSession,
+    onCompute: onComputeSize,
+    onCancel: onCancelSize,
+    onAutoPopulate: onAutoPopulateSizes,
+  } = sizeProps;
+  const cursorKey = cursor?.key ?? null;
+  const onCursorChange = cursor?.onChange;
+  const onRowOrderChange = cursor?.onRowOrderChange;
   const uid = useId();
   const { token } = theme.useToken();
   const { TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED, ACCENT_BLUE, ACCENT_AMBER, ACCENT_PURPLE, STORAGE_TYPE_COLORS, STORAGE_TYPE_DEFAULT } = useColors();

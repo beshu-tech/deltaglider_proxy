@@ -1,60 +1,45 @@
-import { useState, useEffect, useRef, useCallback, useMemo, lazy, Suspense } from 'react';
-import { Alert, Layout, Spin, Empty, Grid, Button, Progress, Space, message } from 'antd';
+import { useState, useEffect, useRef, useCallback, useMemo, type ReactNode } from 'react';
+import { Layout, Spin, Grid, message } from 'antd';
 import useS3Browser from './useS3Browser';
 import TopBar from './components/TopBar';
-import BulkActionBar from './components/BulkActionBar';
 import { useBucketMaintenance } from './queries/maintenance';
-import { browserBannerText, bucketWritesBlocked, phaseLabel, activePercent } from './maintenanceStatus';
+import { bucketWritesBlocked } from './maintenanceStatus';
 import Sidebar from './components/Sidebar';
-import ObjectTable from './components/ObjectTable';
 import InspectorPanel from './components/InspectorPanel';
 import ReloginModal from './components/ReloginModal';
 import FilePreview from './components/FilePreview';
 import DropZone from './components/DropZone';
-import UploadPage from './components/UploadPage';
 import ConnectPage, { type ConnectOutcome } from './components/ConnectPage';
-// Heavy admin/docs pages are lazy-loaded so the file-browser
-// shell doesn't pay for Monaco / mermaid / recharts on first paint.
-const AdminPage = lazy(() => import('./components/AdminPage'));
-const DocsPage = lazy(() => import('./components/DocsPage'));
 import FileBrowserSessionTip from './components/FileBrowserSessionTip';
 import AccountMenu from './components/AccountMenu';
-import DemoDataGenerator from './components/DemoDataGenerator';
 import ShortcutsHelp from './components/ShortcutsHelp';
+import { AdminScreen, DocsScreen } from './screens/LazyScreens';
+import UploadScreen from './screens/UploadScreen';
+import BrowserScreen from './screens/BrowserScreen';
 import { useGlobalShortcuts } from './useGlobalShortcuts';
 import { useBrowserKeyboardNav } from './useBrowserKeyboardNav';
+import { useFilePreview } from './browser/useFilePreview';
 import { getBucket, hasCredentials, disconnect, initFromSession, getCredentials } from './s3client';
 import { clearSessionCredentials } from './sessionApi';
 import { adminLogout, whoami, checkSession, resolveIamIdentity } from './adminApi';
 import type { WhoamiResponse } from './adminApi';
 import { deriveSessionCapabilities } from './sessionCapabilities';
+import { deriveBrowserCapabilities } from './browserCapabilities';
 import { useColors } from './ThemeContext';
 import useComputeSize from './useComputeSize';
 import { NavigationContext } from './NavigationContext';
 import { canRequestPrefixUsageScan, canUse, writablePrefixesForBucket } from './permissions';
 import { useUrlRouter } from './useUrlRouter';
 import { buildViewUrl, buildBrowserUrl, type View } from './urlState';
-import { useOverlayClose } from './hooks/useOverlayClose';
-import type { S3Object } from './types';
-import { parentPrefix } from './utils';
 import { writeStorage } from './safeStorage';
 import { pageTitle } from './pageTitle';
 import { headerForPath } from './components/adminNavigation';
 import { identitySummary } from './identitySummary';
-import DeleteJobsBanner from './components/DeleteJobsBanner';
 
 const { useBreakpoint } = Grid;
 
 /** Full-screen views hide the main sidebar and TopBar */
 const FULLSCREEN_VIEWS: Set<View> = new Set(['admin', 'docs']);
-
-// Shared Suspense fallback for lazy admin / docs page chunks.
-// Module-scope so we don't reallocate it on every render.
-const LAZY_FALLBACK = (
-  <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 48 }}>
-    <Spin size="large" />
-  </div>
-);
 
 export default function App() {
   const colors = useColors();
@@ -75,7 +60,6 @@ export default function App() {
   const [needsConnect, setNeedsConnect] = useState(true); // start true, resolved in useEffect
   const [sessionLoading, setSessionLoading] = useState(true);
   const [firstLoadDone, setFirstLoadDone] = useState(false);
-  const [previewObject, setPreviewObject] = useState<import('./types').S3Object | null>(null);
   const [identity, setIdentity] = useState<WhoamiResponse | null>(null);
   const [bucketCount, setBucketCount] = useState<number | null>(null);
   const [createBucketFocusSignal, setCreateBucketFocusSignal] = useState(0);
@@ -111,8 +95,7 @@ export default function App() {
   // working — only write affordances are disabled below.
   const bucketStatusQuery = useBucketMaintenance(view === 'browser' ? activeBucket || null : null);
   const bucketStatus = bucketStatusQuery.data;
-  const runningDeletes = bucketStatus?.deletes ?? [];
-  const bucketMaintenance = bucketStatus?.active ?? null;
+  const runningDeletes = useMemo(() => bucketStatus?.deletes ?? [], [bucketStatus]);
   // The server's write gate decides: a migration that is being cancelled
   // (or cleans up after the switch) no longer blocks writes, so Upload and
   // Delete come back while its row is still active.
@@ -144,39 +127,7 @@ export default function App() {
     active: view === 'browser',
   });
 
-  // --- FilePreview deep-link (?object=…&preview=1) ---
-  // Opening the preview pushes ?preview=1 alongside ?object=… so the overlay
-  // is deep-linkable, reload-safe, and Back closes it without over-navigating
-  // out of the folder.
-  const { markPushed: markPreviewPushed, closeOverlay: closePreviewOverlay } = useOverlayClose();
-
-  const openPreview = useCallback(
-    (obj: S3Object) => {
-      setPreviewObject(obj);
-      navigate(buildBrowserUrl({ ...browser, object: obj.key, preview: '1' }));
-      markPreviewPushed();
-    },
-    [browser, navigate, markPreviewPushed],
-  );
-
-  // Close: remove preview=1 but keep ?object=… so the inspector stays open.
-  const closePreview = useCallback(() => {
-    const key = previewObject?.key ?? browser.object;
-    closePreviewOverlay(buildBrowserUrl({ ...browser, object: key, preview: '' }), navigate);
-    setPreviewObject(null);
-  }, [browser, previewObject, navigate, closePreviewOverlay]);
-
-  // Sync preview state with the URL: open on direct-load with ?preview=1,
-  // close when Back / navigation removes the flag.
-  useEffect(() => {
-    if (browser.preview === '1' && browser.object && !previewObject) {
-      const obj = s3.objects.find((o) => o.key === browser.object);
-      if (obj) setPreviewObject(obj);
-    }
-    if (browser.preview !== '1' && previewObject) {
-      setPreviewObject(null);
-    }
-  }, [browser.preview, browser.object, previewObject, s3.objects]);
+  const { previewObject, openPreview, closePreview, clearPreview } = useFilePreview(browser, navigate, s3.objects);
 
   // App-wide shortcuts: ⌘/Ctrl+, → Settings, ⌘/Ctrl+/ → Docs, ? → help.
   // Disabled on the connect/login screen so we don't hijack keys there.
@@ -316,8 +267,8 @@ export default function App() {
   // root-to-root bucket switch would otherwise keep bucket A's sizes under B.
   useEffect(() => {
     cancelFolderSizes();
-    setPreviewObject(null);
-  }, [cancelFolderSizes, s3.prefix, browser.bucket]);
+    clearPreview();
+  }, [cancelFolderSizes, clearPreview, s3.prefix, browser.bucket]);
 
   // Tab title follows the view, the bucket and the admin page. Keep the
   // unsaved-edits "● " marker that useDirtyGlobalIndicators owns.
@@ -374,16 +325,7 @@ export default function App() {
     changeS3Bucket(newBucket);
   }, [changeS3Bucket]);
 
-  const isEmpty = s3.objects.length === 0 && s3.folders.length === 0;
-  // Empty only because "Show system files" is off (the folder holds .dg/ etc.).
-  const onlyHiddenEntries = isEmpty && !s3.searchQuery && !s3.showHidden && s3.allFolders.length > 0;
-  const hasBuckets = (bucketCount ?? 0) > 0;
-  const hasNoBuckets = bucketCount === 0;
-  const isRootBucketEmpty = hasBuckets && s3.prefix === '' && !s3.searchQuery && isEmpty && !s3.loading;
   const currentAccessKey = getCredentials().accessKeyId || undefined;
-  // A session can also belong to a non-admin external SSO user. Only
-  // show Settings after whoami resolves admin/open/bootstrap authority.
-  const canAdmin = identity?.mode === 'bootstrap' || identity?.mode === 'open' || identity?.user?.is_admin === true;
   // A running delete removes objects page by page: reload the listing each
   // time it reports progress, and once more when it ends.
   const deleteProgress = runningDeletes.map((j) => `${j.id}:${j.objects_done}`).join(',');
@@ -394,32 +336,32 @@ export default function App() {
     seenDeleteProgress.current = deleteProgress;
     reloadListing();
   }, [deleteProgress, reloadListing]);
-  const canCreateBucket = canUse(identity, 'admin');
-  const canWriteActivePrefix = Boolean(activeBucket) && !bucketBusy && canUse(identity, 'write', activeBucket, s3.prefix);
+
+  const inspectedKey = s3.inspectorObject?.key ?? null;
+  const caps = useMemo(
+    () =>
+      deriveBrowserCapabilities({
+        identity,
+        session: sessionCaps,
+        bucket: activeBucket,
+        prefix: s3.prefix,
+        bucketBusy,
+        writablePrefixes,
+        selectedKeys: s3.selectedKeys,
+        inspectedKey,
+      }),
+    [identity, sessionCaps, activeBucket, s3.prefix, bucketBusy, writablePrefixes, s3.selectedKeys, inspectedKey],
+  );
+  // A session can also belong to a non-admin external SSO user. Only
+  // show Settings after whoami resolves admin/open/bootstrap authority.
+  const { canAdmin, canCreateBucket, canUpload } = caps;
   // The upload page opens at the folder the user is in, even a read-only one:
   // it says so there and offers the writable prefixes (never a silent move).
   const uploadPrefix = s3.prefix;
-  const canUploadToActiveBucket = Boolean(activeBucket) && !bucketBusy && (canWriteActivePrefix || writablePrefixes.length > 0);
   const canWriteUploadPrefix = useCallback(
     (p: string) => canUse(identity, 'write', activeBucket, p),
     [identity, activeBucket],
   );
-  const selectedKeys = Array.from(s3.selectedKeys);
-  const canReadSelected = Boolean(activeBucket) && selectedKeys.length > 0 && selectedKeys.every((selectedKey) =>
-    selectedKey.startsWith('folder:')
-      ? canUse(identity, 'read', activeBucket, selectedKey.slice('folder:'.length))
-      : canUse(identity, 'read', activeBucket, selectedKey)
-  );
-  const canDeleteSelected = Boolean(activeBucket) && !bucketBusy && selectedKeys.length > 0 && selectedKeys.every((selectedKey) =>
-    selectedKey.startsWith('folder:')
-      ? canUse(identity, 'delete', activeBucket, selectedKey.slice('folder:'.length))
-      : canUse(identity, 'delete', activeBucket, selectedKey)
-  );
-  const canReadSelectedObject = Boolean(activeBucket && s3.inspectorObject) && canUse(identity, 'read', activeBucket, s3.inspectorObject?.key ?? '');
-  const canDeleteSelectedObject = Boolean(activeBucket && s3.inspectorObject) && canUse(identity, 'delete', activeBucket, s3.inspectorObject?.key ?? '');
-  const canCopyFromActiveBucket = canReadSelected && canWriteActivePrefix;
-  const canMoveFromActiveBucket = canCopyFromActiveBucket && canDeleteSelected;
-  const canReadActiveBucket = !activeBucket || canUse(identity, 'read', activeBucket, s3.prefix) || canUse(identity, 'list', activeBucket, s3.prefix);
   const who = identitySummary(identity, currentAccessKey);
   const openSettings = () => navigate(buildViewUrl('admin'));
   // Settings has ONE entry point per screen: the labelled TopBar button when
@@ -447,7 +389,7 @@ export default function App() {
     setCreateBucketFocusSignal((n) => n + 1);
   };
   const openUpload = () => {
-    if (!canUploadToActiveBucket) return;
+    if (!canUpload) return;
     // Capture the destination BEFORE the URL changes: navigating to /_/upload
     // resets browser.prefix (and so uploadPrefix) to '', which would seed the
     // upload view at bucket root instead of the folder the user is in.
@@ -460,13 +402,13 @@ export default function App() {
   // current folder so the user confirms/adjusts the destination before
   // committing — rather than silently uploading in place.
   const handleBrowserDrop = useCallback((files: File[]) => {
-    if (!canUploadToActiveBucket || files.length === 0) return;
+    if (!canUpload || files.length === 0) return;
     setDroppedFiles(files);
     // Same prefix capture as openUpload — see the comment there.
     setUploadSeedPrefix(uploadPrefix);
     navigate(buildViewUrl('upload'));
     setSiderOpen(false);
-  }, [canUploadToActiveBucket, uploadPrefix, navigate]);
+  }, [canUpload, uploadPrefix, navigate]);
 
   // Stable context value so consumers of `useNavigation()` (AdminPage,
   // Sidebar, TopBar) don't re-render on every App render. Previously
@@ -498,263 +440,79 @@ export default function App() {
     );
   }
 
-  const renderContent = () => {
-    if (view === 'admin') {
-      return (
-        <Suspense fallback={LAZY_FALLBACK}>
-          <AdminPage
-            onBack={navigateToBrowse}
-            onSessionExpired={navigateToBrowse}
-            subPath={subPath}
-            search={search}
-            accountMenu={accountMenu()}
-            canAdmin={canAdmin}
-            onShowShortcuts={showShortcuts}
-            proxyVersion={identity?.version}
-          />
-        </Suspense>
-      );
-    }
-
-    if (view === 'docs') {
-      return (
-        <Suspense fallback={LAZY_FALLBACK}>
-          <DocsPage onBack={navigateToBrowse} docId={subPath || undefined} accountMenu={accountMenu()} onShowShortcuts={showShortcuts} />
-        </Suspense>
-      );
-    }
-
-    if (view === 'upload') {
-      if (!canUploadToActiveBucket) {
-        return (
-          <Empty
-            description="You do not have permission to upload to this bucket."
-            style={{ padding: '64px 0' }}
-          />
-        );
-      }
-      return (
-        <UploadPage
-          prefix={uploadSeedPrefix ?? uploadPrefix}
-          canWrite={canWriteUploadPrefix}
-          writablePrefixes={writablePrefixes}
-          checkLimits={sessionCaps.canFetchFullAdminConfig}
-          initialFiles={droppedFiles}
-          onConsumeInitialFiles={() => setDroppedFiles([])}
-          onBack={navigateToBrowse}
-          onDone={() => s3.mutate()}
-          onFinish={(destPrefix) => {
-            if (activeBucket) {
-              navigate(buildBrowserUrl({ bucket: activeBucket, prefix: destPrefix }));
-            } else {
-              navigateToBrowse();
-            }
-          }}
-        />
-      );
-    }
-
-    return (
-      <>
-        {bucketMaintenance && (
-          <div
-            role="status"
-            data-writes-blocked={bucketBusy ? 'true' : 'false'}
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 14,
-              padding: '10px 16px',
-              // Amber while writes are refused; calm once they work again.
-              background: bucketBusy ? 'rgba(217, 119, 6, 0.10)' : 'rgba(37, 99, 235, 0.08)',
-              borderBottom: bucketBusy ? '1px solid rgba(217, 119, 6, 0.35)' : '1px solid rgba(37, 99, 235, 0.25)',
-            }}
-          >
-            <Spin size="small" />
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontSize: 13, fontWeight: 600 }}>
-                {browserBannerText(bucketMaintenance, bucketBusy)}
-              </div>
-              <Progress
-                aria-label="Bucket maintenance progress"
-                percent={activePercent(bucketMaintenance) ?? 100}
-                status="active"
-                showInfo={activePercent(bucketMaintenance) != null}
-                size="small"
-                strokeColor="#d97706"
-                style={{ margin: '4px 0 0', maxWidth: 420 }}
-              />
-            </div>
-            <span style={{ fontSize: 12, opacity: 0.75, whiteSpace: 'nowrap' }}>
-              {phaseLabel(bucketMaintenance)}
-            </span>
-          </div>
-        )}
-        <DeleteJobsBanner
-          jobs={runningDeletes}
-          // A job started without an IAM user (admin password, open access) says "admin".
-          me={identity?.user?.name ?? (canAdmin ? 'admin' : null)}
-          canCancel={(job) => canAdmin || (!!identity?.user && job.triggered_by === identity.user.name)}
-          onChanged={() => void bucketStatusQuery.refetch()}
-        />
-        {/* A running bulk action keeps the bar (and its progress) on screen
-            even when the selection empties: a delete's or move's batch reloads
-            the listing, and a folder change clears the selection. */}
-        {(s3.selectedKeys.size > 0 || s3.bulkRunning) && (
-          <BulkActionBar
-            selectedCount={s3.selectedKeys.size}
-            onDelete={canDeleteSelected && sessionCaps.canUseBulkActions ? s3.bulkDelete : undefined}
-            onCopy={canCopyFromActiveBucket && sessionCaps.canUseBulkActions ? s3.bulkCopy : undefined}
-            onMove={canMoveFromActiveBucket && sessionCaps.canUseBulkActions ? s3.bulkMove : undefined}
-            onDownloadZip={canReadSelected && sessionCaps.canUseBulkActions ? s3.downloadZip : undefined}
-            progress={s3.bulkProgress}
-            onCancel={s3.cancelBulk}
-            currentPrefix={s3.prefix}
-            selectionKeys={s3.selectedKeys}
-            onSessionExpired={handleSessionExpired}
-          />
-        )}
-
-        <div style={{ flex: 1, overflow: 'auto' }}>
-          {/* An unrefreshed FAULT always outranks the friendly empty state:
-              a failed listing must never render as "No objects yet — add
-              demo data" (the beshu-b2 incident: a bucket whose backend was
-              unreachable looked innocently empty). With stale rows on hand
-              we show them under a warning banner instead. */}
-          {s3.error && !isEmpty && (
-            <Alert
-              type="warning"
-              showIcon
-              banner
-              title="Showing a stale listing — the last refresh failed"
-              description={s3.error}
-              style={{ borderRadius: 0 }}
-            />
-          )}
-          {s3.loading && isEmpty ? (
-            <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', padding: '64px 0' }}>
-              <Spin description="Loading objects..." />
-            </div>
-          ) : s3.error && isEmpty ? (
-            <div style={{ maxWidth: 560, margin: '48px auto', padding: '0 16px' }}>
-              <Alert
-                type="error"
-                showIcon
-                title={
-                  /NoSuchBucket/i.test(s3.error)
-                    ? `Bucket '${activeBucket}' was not found on its storage backend`
-                    : /ServiceUnavailable|unavailable|503/i.test(s3.error)
-                      ? `Bucket '${activeBucket}' is currently unavailable`
-                      : 'Failed to load objects'
-                }
-                description={
-                  <Space orientation="vertical" size={8}>
-                    <span>{s3.error}</span>
-                    {/NoSuchBucket/i.test(s3.error) && (
-                      <span>
-                        The bucket exists in this proxy's configuration but not on the
-                        backend it routes to — check the bucket's backend under
-                        Settings → Storage → Buckets, or create it on that backend.
-                      </span>
-                    )}
-                    <Button size="small" onClick={s3.mutate}>
-                      Retry
-                    </Button>
-                  </Space>
-                }
-                style={{ borderRadius: 8 }}
-              />
-            </div>
-          ) : isEmpty ? (
-            <Empty
-              description={<span style={{ display: 'inline-block', maxWidth: 520 }}>{
-                s3.searchQuery
-                  ? `No results for "${s3.searchQuery}"`
-                  : hasNoBuckets
-                    ? 'Create a bucket before uploading objects or generating demo data.'
-                    : onlyHiddenEntries
-                      ? 'This folder holds only hidden system files. Turn on "Show system files" in the account menu to see them.'
-                      : s3.prefix
-                      // The proxy stores no folder markers: a folder exists
-                      // only while it holds files, so an empty listing here
-                      // is as likely a typo in the path as an empty folder.
-                      ? `Nothing is stored under ${activeBucket}/${s3.prefix}. A folder exists only while it holds files, so check the path for a typo${canUploadToActiveBucket ? ', or upload files to create it' : ''}.`
-                      : 'No objects yet. Upload files or generate demo data.'
-              }</span>}
-              style={{ padding: '64px 0' }}
-            >
-              {s3.prefix && !s3.searchQuery && (
-                <Space size={16} wrap style={{ justifyContent: 'center' }}>
-                  {canUploadToActiveBucket && (
-                    <Button type="primary" onClick={openUpload}>
-                      Upload files here
-                    </Button>
-                  )}
-                  <Button onClick={() => s3.navigate(parentPrefix(s3.prefix))}>
-                    {parentPrefix(s3.prefix) ? 'Go to the parent folder' : `Go to ${activeBucket}`}
-                  </Button>
-                </Space>
-              )}
-              {hasNoBuckets && (canCreateBucket || canAdmin) && (
-                <Space size={16} wrap style={{ justifyContent: 'center' }}>
-                  {canCreateBucket && (
-                    <Button type="link" onClick={requestCreateBucket} style={{ paddingInline: 0 }}>
-                      Create a bucket
-                    </Button>
-                  )}
-                  {/* A fresh proxy: the wizard sets backend, admin and a bucket in one go. */}
-                  {canAdmin && (
-                    <Button type="link" onClick={() => navigate(buildViewUrl('admin', 'setup'))} style={{ paddingInline: 0 }}>
-                      Run the setup wizard
-                    </Button>
-                  )}
-                </Space>
-              )}
-              {isRootBucketEmpty && canUploadToActiveBucket && (
-                <Space orientation="vertical" size={4} align="center">
-                  <DemoDataGenerator
-                    onDone={s3.mutate}
-                    variant="empty-state"
-                    label={`Add demo data to ${activeBucket}`}
-                  />
-                  <Button type="link" onClick={openUpload} style={{ paddingInline: 0 }}>
-                    Upload from computer
-                  </Button>
-                </Space>
-              )}
-            </Empty>
-          ) : (
-            <ObjectTable
-              objects={s3.objects}
-              folders={s3.folders}
-              prefix={s3.prefix}
-              selected={s3.inspectorObject}
-              onSelect={(obj) => s3.openInspector(obj.key)}
-              onNavigate={s3.navigate}
-              selectedKeys={s3.selectedKeys}
-              onToggleKey={s3.toggleKey}
-              onToggleAll={s3.toggleAll}
-              isMobile={isMobile}
-              isTruncated={s3.isTruncated}
-              restListedAt={s3.restListedAt}
-              refreshing={s3.refreshing}
-              headCache={s3.headCache}
-              folderSizes={folderSize.sizes}
-              virtualFolders={s3.virtualFolders}
-              hasAdminSession={hasAdminSession}
-              onComputeSize={computeFolderSize}
-              onCancelSize={folderSize.cancel}
-              onAutoPopulateSizes={hasAdminSession ? folderSize.autoPopulate : undefined}
-              onPreview={openPreview}
-              cursorKey={browserNav.cursorKey}
-              onCursorChange={browserNav.setCursorKey}
-              onRowOrderChange={browserNav.setRowOrder}
-            />
-          )}
-        </div>
-      </>
+  let content: ReactNode;
+  if (view === 'admin') {
+    content = (
+      <AdminScreen
+        onBack={navigateToBrowse}
+        onSessionExpired={navigateToBrowse}
+        subPath={subPath}
+        search={search}
+        accountMenu={accountMenu()}
+        canAdmin={canAdmin}
+        onShowShortcuts={showShortcuts}
+        proxyVersion={identity?.version}
+      />
     );
-  };
+  } else if (view === 'docs') {
+    content = (
+      <DocsScreen onBack={navigateToBrowse} docId={subPath || undefined} accountMenu={accountMenu()} onShowShortcuts={showShortcuts} />
+    );
+  } else if (view === 'upload') {
+    content = (
+      <UploadScreen
+        canUpload={canUpload}
+        prefix={uploadSeedPrefix ?? uploadPrefix}
+        canWrite={canWriteUploadPrefix}
+        writablePrefixes={writablePrefixes}
+        checkLimits={sessionCaps.canFetchFullAdminConfig}
+        initialFiles={droppedFiles}
+        onConsumeInitialFiles={() => setDroppedFiles([])}
+        onBack={navigateToBrowse}
+        onDone={() => s3.mutate()}
+        onFinish={(destPrefix) => {
+          if (activeBucket) {
+            navigate(buildBrowserUrl({ bucket: activeBucket, prefix: destPrefix }));
+          } else {
+            navigateToBrowse();
+          }
+        }}
+      />
+    );
+  } else {
+    content = (
+      <BrowserScreen
+        s3={s3}
+        bucket={activeBucket}
+        caps={caps}
+        identity={identity}
+        jobs={{
+          active: bucketStatus?.active ?? null,
+          deletes: runningDeletes,
+          writesBlocked: bucketBusy,
+          refetch: () => void bucketStatusQuery.refetch(),
+        }}
+        bucketCount={bucketCount}
+        isMobile={isMobile}
+        folderSizes={{
+          sizes: folderSize.sizes,
+          canScan: hasAdminSession,
+          onCompute: computeFolderSize,
+          onCancel: folderSize.cancel,
+          onAutoPopulate: hasAdminSession ? folderSize.autoPopulate : undefined,
+        }}
+        cursor={{
+          key: browserNav.cursorKey,
+          onChange: browserNav.setCursorKey,
+          onRowOrderChange: browserNav.setRowOrder,
+        }}
+        onPreview={openPreview}
+        onUpload={openUpload}
+        onCreateBucket={requestCreateBucket}
+        onSessionExpired={handleSessionExpired}
+      />
+    );
+  }
 
   return (
     <NavigationContext.Provider value={navValue}>
@@ -773,7 +531,7 @@ export default function App() {
             createBucketFocusSignal={createBucketFocusSignal}
             canCreateBucket={canCreateBucket}
             canDeleteBucket={(bucket) => canUse(identity, 'admin', bucket)}
-            canUpload={canUploadToActiveBucket}
+            canUpload={canUpload}
             canAdmin={canAdmin}
             includeBucketOrigins={sessionCaps.canLoadBucketOrigins}
             open={siderOpen}
@@ -793,7 +551,7 @@ export default function App() {
               isMobile={isMobile}
               onMenuClick={() => setSiderOpen(true)}
               onRefresh={s3.mutate}
-              canRefresh={canReadActiveBucket}
+              canRefresh={caps.canReadFolder}
               searchQuery={s3.searchQuery}
               onSearchChange={s3.setSearchQuery}
               refreshing={s3.refreshing}
@@ -812,7 +570,7 @@ export default function App() {
             {/* A plain div: AntD's Layout.Content is a second <main>. */}
             <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, position: 'relative' }}>
               <FileBrowserSessionTip visible={view === 'browser' && sessionCaps.signedInForFilesOnly} userKey={currentAccessKey ?? who.name} />
-              {renderContent()}
+              {content}
             </div>
           </main>
         </Layout>
@@ -824,8 +582,8 @@ export default function App() {
         onDeleted={s3.removeObject}
         onPreview={openPreview}
         isMobile={isMobile}
-        canDelete={canDeleteSelectedObject}
-        canRead={canReadSelectedObject}
+        canDelete={caps.canDeleteInspected}
+        canRead={caps.canReadInspected}
         hasAdminSession={sessionCaps.canFetchFullAdminConfig}
       />
 
@@ -840,7 +598,7 @@ export default function App() {
       {shortcutsOpen && (
         <ShortcutsHelp open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
       )}
-      {view === 'browser' && canWriteActivePrefix && <DropZone onDrop={handleBrowserDrop} prefix={s3.prefix} />}
+      {view === 'browser' && caps.canWriteFolder && <DropZone onDrop={handleBrowserDrop} prefix={s3.prefix} />}
     </Layout>
     </NavigationContext.Provider>
   );

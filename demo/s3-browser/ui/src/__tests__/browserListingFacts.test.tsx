@@ -80,25 +80,19 @@ function Harness({ prefix }: { prefix: string }) {
   cache = s3.headCache;
   return (
     <ObjectTable
-      objects={s3.objects}
-      folders={s3.folders}
-      prefix={s3.prefix}
-      selected={null}
-      onSelect={() => {}}
-      onNavigate={() => {}}
-      selectedKeys={s3.selectedKeys}
-      onToggleKey={() => {}}
-      onToggleAll={() => {}}
+      listing={{
+        objects: s3.objects,
+        folders: s3.folders,
+        prefix: s3.prefix,
+        isTruncated: false,
+        refreshing: false,
+        headCache: s3.headCache,
+        virtualFolders: [],
+      }}
+      selection={{ inspected: null, selectedKeys: s3.selectedKeys, onToggleKey: () => {}, onToggleAll: () => {} }}
+      actions={{ onSelect: () => {}, onNavigate: () => {} }}
+      folderSizes={{ sizes: {}, canScan: false, onCompute: () => {}, onCancel: () => {}, onAutoPopulate: () => {} }}
       isMobile={false}
-      isTruncated={false}
-      refreshing={false}
-      headCache={s3.headCache}
-      folderSizes={{}}
-      virtualFolders={[]}
-      hasAdminSession={false}
-      onComputeSize={() => {}}
-      onCancelSize={() => {}}
-      onAutoPopulateSizes={() => {}}
     />
   );
 }

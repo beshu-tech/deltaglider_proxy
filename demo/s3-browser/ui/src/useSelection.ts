@@ -1,9 +1,15 @@
 import { useState, useCallback } from 'react';
 import type { S3Object } from './types';
 
-/** Manages row selection state independently from data fetching. */
-export default function useSelection(objects: S3Object[], folders: string[]) {
-  const [selected, setSelected] = useState<S3Object | null>(null);
+/** Selection key of a folder row (object rows use the object key). */
+const folderKey = (f: string) => `folder:${f}`;
+
+/**
+ * Checked rows of the object browser, independent of data fetching. The
+ * caller passes the visible rows to `toggleAll` and the fresh listing to
+ * `reconcile`, so this hook can run before the listing hook.
+ */
+export default function useSelection() {
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
 
   const toggleKey = useCallback((key: string) => {
@@ -15,27 +21,17 @@ export default function useSelection(objects: S3Object[], folders: string[]) {
     });
   }, []);
 
-  const toggleAll = useCallback(() => {
+  const toggleAll = useCallback((objects: S3Object[], folders: string[]) => {
     setSelectedKeys((prev) => {
-      const allKeys = [
-        ...folders.map((f) => `folder:${f}`),
-        ...objects.map((o) => o.key),
-      ];
+      const allKeys = [...folders.map(folderKey), ...objects.map((o) => o.key)];
       return prev.size === allKeys.length ? new Set() : new Set(allKeys);
     });
-  }, [objects, folders]);
+  }, []);
 
-  /** Prune stale keys and selected object after data refresh. */
+  /** Prune stale keys after data refresh. */
   const reconcile = useCallback((freshObjects: S3Object[], freshFolders: string[]) => {
-    setSelected((prev) => {
-      if (!prev) return null;
-      return freshObjects.find((o) => o.key === prev.key) || null;
-    });
     setSelectedKeys((prev) => {
-      const validKeys = new Set([
-        ...freshObjects.map((o) => o.key),
-        ...freshFolders.map((f) => `folder:${f}`),
-      ]);
+      const validKeys = new Set([...freshObjects.map((o) => o.key), ...freshFolders.map(folderKey)]);
       const next = new Set<string>();
       for (const k of prev) {
         if (validKeys.has(k)) next.add(k);
@@ -45,17 +41,8 @@ export default function useSelection(objects: S3Object[], folders: string[]) {
   }, []);
 
   const clearSelection = useCallback(() => {
-    setSelected(null);
     setSelectedKeys(new Set());
   }, []);
 
-  return {
-    selected,
-    setSelected,
-    selectedKeys,
-    toggleKey,
-    toggleAll,
-    reconcile,
-    clearSelection,
-  };
+  return { selectedKeys, toggleKey, toggleAll, reconcile, clearSelection };
 }

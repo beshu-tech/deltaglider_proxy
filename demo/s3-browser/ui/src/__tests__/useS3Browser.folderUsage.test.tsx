@@ -29,25 +29,25 @@ function Harness({ freshArray = false }: { freshArray?: boolean }) {
   const folderSize = useComputeSize();
   return (
     <ObjectTable
-      objects={s3.objects}
-      folders={freshArray ? [...s3.folders] : s3.folders}
-      prefix={s3.prefix}
-      selected={null}
-      onSelect={() => {}}
-      onNavigate={() => {}}
-      selectedKeys={s3.selectedKeys}
-      onToggleKey={() => {}}
-      onToggleAll={() => {}}
+      listing={{
+        objects: s3.objects,
+        folders: freshArray ? [...s3.folders] : s3.folders,
+        prefix: s3.prefix,
+        isTruncated: false,
+        refreshing: false,
+        headCache: s3.headCache,
+        virtualFolders: [],
+      }}
+      selection={{ inspected: null, selectedKeys: s3.selectedKeys, onToggleKey: () => {}, onToggleAll: () => {} }}
+      actions={{ onSelect: () => {}, onNavigate: () => {} }}
+      folderSizes={{
+        sizes: folderSize.sizes,
+        canScan: true,
+        onCompute: () => {},
+        onCancel: () => {},
+        onAutoPopulate: folderSize.autoPopulate,
+      }}
       isMobile={false}
-      isTruncated={false}
-      refreshing={false}
-      headCache={s3.headCache}
-      folderSizes={folderSize.sizes}
-      virtualFolders={[]}
-      hasAdminSession
-      onComputeSize={() => {}}
-      onCancelSize={() => {}}
-      onAutoPopulateSizes={folderSize.autoPopulate}
     />
   );
 }

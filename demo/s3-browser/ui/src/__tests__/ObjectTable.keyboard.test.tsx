@@ -41,27 +41,20 @@ function Harness({ spies, extra }: { spies: Spies; extra?: React.ReactNode }) {
     <>
       {extra}
       <ObjectTable
-        objects={OBJECTS}
-        folders={FOLDERS}
-        prefix="builds/"
-        selected={null}
-        onSelect={spies.onSelect}
-        onNavigate={spies.navigate}
-        selectedKeys={new Set()}
-        onToggleKey={spies.onToggleKey}
-        onToggleAll={() => {}}
+        listing={{
+          objects: OBJECTS,
+          folders: FOLDERS,
+          prefix: 'builds/',
+          isTruncated: false,
+          refreshing: false,
+          headCache: {},
+          virtualFolders: [],
+        }}
+        selection={{ inspected: null, selectedKeys: new Set(), onToggleKey: spies.onToggleKey, onToggleAll: () => {} }}
+        actions={{ onSelect: spies.onSelect, onNavigate: spies.navigate }}
+        folderSizes={{ sizes: {}, canScan: false, onCompute: () => {}, onCancel: () => {} }}
+        cursor={{ key: nav.cursorKey, onChange: nav.setCursorKey, onRowOrderChange: nav.setRowOrder }}
         isMobile={false}
-        isTruncated={false}
-        refreshing={false}
-        headCache={{}}
-        folderSizes={{}}
-        virtualFolders={[]}
-        hasAdminSession={false}
-        onComputeSize={() => {}}
-        onCancelSize={() => {}}
-        cursorKey={nav.cursorKey}
-        onCursorChange={nav.setCursorKey}
-        onRowOrderChange={nav.setRowOrder}
       />
     </>
   );
