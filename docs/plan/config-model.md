@@ -198,3 +198,37 @@ Each step stops and is re-planned if it would change the canonical YAML
 export, a golden fixture, or `GET /config`.
 
 ## 7. Progress
+
+- Step 1: done (commit "one field map generates both projections").
+  `config_projection!` generates `from_flat`, `into_flat_unchecked` and
+  `FLAT_ROOT_KEYS`. Checked against the old functions (a throwaway test,
+  not kept) on the default, example and prod-shape configs and on a
+  config with every elided field set: equal in both directions, same
+  YAML. Removing a row is a compile error on both sides (verified).
+- Step 2: done (commit "the wizard config names only what it asks").
+- Step 3: done for the engine class (commit "every field has an
+  engine-rebuild class"). The restart class is not moved yet.
+  `config_sync_bucket` is read by the engine (reserved bucket) but is
+  classified restart, because a change needs a restart anyway.
+- Step 4: done (commit "one env table sets the scalar fields"). Each
+  `ENV_FIELD_BINDINGS` row carries its setter; `apply_env_overrides_with`
+  runs the table and keeps the block overrides, the bootstrap hash and
+  `RUST_LOG` as code. New test `every_bound_variable_writes_its_yaml_path`
+  checks that each row's YAML path is the field its setter writes (it
+  fails when a path names another field; verified). YAML-path literals
+  stay in `env_overrides.rs` (the UI test reads them).
+- Found, kept as it was: `applied_value` (the GUI's "from env" value)
+  parses `Unsigned` as `u64`, but the setter parses the field's own type
+  (`u32` for the replication fields). A value above `u32::MAX` shows as an
+  override in the GUI and is ignored by the apply, with a warning.
+
+Cost of one field after steps 1 to 4, for the `range_spool_ttl_secs`
+shape: `config/mod.rs` (field, default fn, `impl Default`),
+`config_sections.rs` (section field, one map row), `env_overrides.rs`
+(one row), `registry.rs`, `transition.rs` (one class row), the example
+YAML, the reference doc (2), the UI test, the changelog: 9 files, 13
+sites (was 10 files, 17 sites). The compiler now finds a missing map row
+and a missing class row; a test finds a wrong env path.
+
+Next: the restart class in the same declaration as step 3 (derive
+`RESTART_ONLY_YAML_PATHS`), then decide on generated GUI types.

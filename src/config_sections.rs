@@ -19,19 +19,17 @@
 //!
 //! # How it works
 //!
-//! The public [`Config`](crate::config::Config) deserializer uses a
-//! [`#[serde(untagged)]`] enum that tries the sectioned shape first and
-//! falls back to the historical flat shape. Both shapes produce the same
+//! `Config::from_yaml_str` classifies the root keys: sectioned, flat
+//! (`FLAT_ROOT_KEYS`), or mixed (an error). Both shapes produce the same
 //! in-memory `Config`. Serialization always emits the sectioned shape
-//! (via [`SectionedConfig::from_flat`] + `to_string`).
+//! (via [`SectionedConfig::from_flat`] + `to_string`). One field map
+//! (`config_projection!`) generates both projections.
 //!
 //! # Why not `#[serde(flatten)]`?
 //!
 //! The original plan suggested wrapping each section in a `#[serde(flatten)]`
 //! struct, but `flatten` only projects one wire shape onto one in-memory
-//! shape — it does not support "accept either flat OR sectioned YAML". The
-//! untagged-enum approach is the minimal amount of serde machinery that
-//! gets us BOTH shapes on read with a single in-memory target.
+//! shape — it does not support "accept either flat OR sectioned YAML".
 //!
 //! # Features layered on the section types
 //!
