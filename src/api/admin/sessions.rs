@@ -83,15 +83,35 @@ pub(crate) async fn revoke_identities_everywhere(
     state: &Arc<AdminState>,
     identities: &[String],
 ) -> RevokeOutcome {
-    let now = crate::event_outbox::current_unix_seconds();
+    revoke_identities_with(
+        &state.sessions,
+        state.config_db.as_deref(),
+        identities,
+        crate::event_outbox::current_unix_seconds(),
+        || super::push_config_sync_now(state),
+    )
+    .await
+}
+
+/// [`revoke_identities_everywhere`] with its three steps injected (unit seam).
+async fn revoke_identities_with<Fut>(
+    sessions: &crate::session::SessionStore,
+    config_db: Option<&tokio::sync::Mutex<crate::config_db::ConfigDb>>,
+    identities: &[String],
+    now: i64,
+    push: impl FnOnce() -> Fut,
+) -> RevokeOutcome
+where
+    Fut: std::future::Future<Output = super::SyncPush>,
+{
     let mut revoked_local = 0;
     for identity in identities {
-        revoked_local += state.sessions.revoke_by_identity(identity);
-        state.sessions.note_revocation(identity, now);
+        revoked_local += sessions.revoke_by_identity(identity);
+        sessions.note_revocation(identity, now);
     }
 
     let mut persisted = false;
-    if let Some(db) = state.config_db.as_ref() {
+    if let Some(db) = config_db {
         let db = db.lock().await;
         persisted = true;
         for identity in identities {
@@ -103,7 +123,7 @@ pub(crate) async fn revoke_identities_everywhere(
     }
 
     let (pushed, sync_reachable) = if persisted {
-        match super::push_config_sync_now(state).await {
+        match push().await {
             super::SyncPush::Uploaded => (true, true),
             // Failed pushes are queued (mark_needs_upload) — the poll flush
             // still delivers, so a convergence bound exists.
@@ -159,4 +179,111 @@ pub async fn revoke_user_sessions(
         "pushed": outcome.pushed,
         "propagation_bound_secs": propagation_bound_secs,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::admin::SyncPush;
+    use crate::config_db::ConfigDb;
+    use crate::session::{AuthMethod, SessionKind, SessionStore};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const KEY: &str = "AKIAREVOKED";
+
+    fn store_with_victim() -> (SessionStore, String, String) {
+        let store = SessionStore::new();
+        let victim = store.create_session(
+            None,
+            AuthMethod::IamLoginAs {
+                access_key_id: KEY.into(),
+            },
+            SessionKind::AdminGui,
+        );
+        let bystander = store.create_session(None, AuthMethod::Bootstrap, SessionKind::AdminGui);
+        assert!(store.validate(&victim, None));
+        (store, victim, bystander)
+    }
+
+    /// A config DB whose revocation write fails.
+    fn broken_db() -> tokio::sync::Mutex<ConfigDb> {
+        let db = ConfigDb::in_memory("test").unwrap();
+        db.conn
+            .execute_batch("DROP TABLE session_revocations")
+            .unwrap();
+        assert!(db.revoke_identity_sessions(KEY, 1).is_err());
+        tokio::sync::Mutex::new(db)
+    }
+
+    /// The local kill comes first: a failed DB write does not skip it, and
+    /// nothing is pushed for a revocation that is not durable.
+    #[tokio::test]
+    async fn a_failed_db_write_still_revokes_locally() {
+        let (store, victim, bystander) = store_with_victim();
+        let db = broken_db();
+        let pushed = AtomicBool::new(false);
+        // Ahead of the clock, so the epoch check below is deterministic.
+        let now = crate::event_outbox::current_unix_seconds() + 60;
+        let outcome = revoke_identities_with(&store, Some(&db), &[KEY.into()], now, || async {
+            pushed.store(true, Ordering::SeqCst);
+            SyncPush::Uploaded
+        })
+        .await;
+        // The in-memory epoch is set too: a session of the identity created
+        // up to `now` is refused.
+        let late = store.create_session(
+            None,
+            AuthMethod::IamLoginAs {
+                access_key_id: KEY.into(),
+            },
+            SessionKind::AdminGui,
+        );
+        assert!(
+            !store.validate(&late, None),
+            "the in-memory epoch refuses it"
+        );
+        assert_eq!(outcome.revoked_local, 1);
+        assert!(!outcome.persisted);
+        assert!(!outcome.pushed);
+        assert!(!outcome.sync_reachable);
+        assert!(!pushed.load(Ordering::SeqCst), "no push of a lost write");
+        assert!(
+            !store.validate(&victim, None),
+            "this node rejects the cookie"
+        );
+        assert!(store.admin_gui_auth_method(&victim, None).is_none());
+        assert!(store.validate(&bystander, None));
+    }
+
+    /// A failed push leaves the local kill and the durable epoch in place.
+    #[tokio::test]
+    async fn a_failed_push_keeps_the_local_and_durable_revocation() {
+        let (store, victim, _) = store_with_victim();
+        let db = tokio::sync::Mutex::new(ConfigDb::in_memory("test").unwrap());
+        let outcome = revoke_identities_with(&store, Some(&db), &[KEY.into()], 100, || async {
+            SyncPush::Failed("bucket down".into())
+        })
+        .await;
+        assert_eq!(outcome.revoked_local, 1);
+        assert!(outcome.persisted);
+        assert!(!outcome.pushed);
+        assert!(outcome.sync_reachable, "the poll flush still delivers");
+        assert!(!store.validate(&victim, None));
+        assert_eq!(
+            db.lock().await.session_revoked_since(KEY).unwrap(),
+            Some(100)
+        );
+    }
+
+    #[tokio::test]
+    async fn no_config_db_still_revokes_locally() {
+        let (store, victim, _) = store_with_victim();
+        let outcome = revoke_identities_with(&store, None, &[KEY.into()], 100, || async {
+            unreachable!("nothing to push without a config DB")
+        })
+        .await;
+        assert_eq!(outcome.revoked_local, 1);
+        assert!(!outcome.persisted);
+        assert!(!store.validate(&victim, None));
+    }
 }
