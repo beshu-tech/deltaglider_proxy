@@ -153,6 +153,23 @@ fn parse_policy_scope(credential: &str) -> Result<(&str, &str, &str), S3Error> {
     Ok((access_key, date, region))
 }
 
+/// The form's `x-amz-checksum-*` fields as headers, for
+/// `checksum::verify_body_checksum` (a form POST has no trailers).
+fn form_checksum_fields(fields_ci: &HashMap<String, String>) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for algorithm in crate::api::checksum::ChecksumAlgorithm::ALL {
+        let name = algorithm.header();
+        let Some(value) = lookup_form_field(fields_ci, name) else {
+            continue;
+        };
+        // A value that is not a header value cannot be base64 either.
+        let value = axum::http::HeaderValue::from_str(value)
+            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("!"));
+        out.insert(name, value);
+    }
+    out
+}
+
 fn lookup_form_field<'a>(fields_ci: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
     fields_ci
         .get(&name.to_ascii_lowercase())
@@ -801,6 +818,11 @@ pub async fn handle_form_post_upload(
         &format!("/{bucket}"),
     )?;
     ensure_bucket_exists(state, bucket).await?;
+    crate::api::checksum::verify_body_checksum(
+        &form_checksum_fields(&parsed.fields_ci),
+        None,
+        &parsed.file_data,
+    )?;
     let precondition = form_post_precondition(headers)?;
     // The same client write as PutObject: quota, the object's write lock,
     // the preconditions, the store (spooled when large), the event.
@@ -841,6 +863,36 @@ pub async fn handle_form_post_upload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A form's checksum field is checked like the PUT header.
+    #[test]
+    fn form_checksum_fields_feed_the_checksum_check() {
+        let check = |fields: &[(&str, &str)], body: &[u8]| {
+            let fields_ci: HashMap<String, String> = fields
+                .iter()
+                .map(|(k, v)| (k.to_ascii_lowercase(), v.to_string()))
+                .collect();
+            crate::api::checksum::verify_body_checksum(
+                &form_checksum_fields(&fields_ci),
+                None,
+                body,
+            )
+            .map_err(|e| S3Error::from(e).code())
+        };
+        assert_eq!(check(&[("key", "k")], b"hello"), Ok(()));
+        assert_eq!(
+            check(&[("X-Amz-Checksum-CRC32", "NhCmhg==")], b"hello"),
+            Ok(())
+        );
+        assert_eq!(
+            check(&[("x-amz-checksum-crc32", "NhCmhg==")], b"hellO"),
+            Err("BadDigest")
+        );
+        assert_eq!(
+            check(&[("x-amz-checksum-crc32", "bad\nvalue")], b"hello"),
+            Err("InvalidRequest")
+        );
+    }
 
     /// H18-adjacent: the form-POST write check must honor an IP-scoped Deny.
     /// Mirrors the exact decision the handler now makes (can_with_context with

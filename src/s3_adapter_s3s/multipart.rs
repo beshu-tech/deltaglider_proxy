@@ -44,14 +44,14 @@ pub(super) async fn upload_part(
     svc: &DeltaGliderS3Service,
     req: s3s::S3Request<s3s::dto::UploadPartInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::UploadPartOutput>> {
-    let chunked_headers = headers_if_still_aws_chunked(&req);
+    let body_ctx = BodyContext::of(&req);
     let input = req.input;
     // Cached briefly per bucket: one HeadBucket per upload, not per part.
     crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
     let max_object_size = svc.state.engine.load().max_object_size();
     // Review C9: the store's per-upload cap follows the live config.
     svc.state.multipart.set_max_object_size(max_object_size);
-    let data = collect_blob_limited(input.body, max_object_size, chunked_headers.as_ref()).await?;
+    let data = collect_blob_limited(input.body, max_object_size, &body_ctx).await?;
     validate_content_md5_s3s(input.content_md5.as_deref(), &data)?;
     let etag = svc.state.multipart.upload_part(
         &input.upload_id,

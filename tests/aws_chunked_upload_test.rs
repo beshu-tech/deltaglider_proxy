@@ -30,7 +30,21 @@
 
 use crate::common;
 
+use base64::Engine as _;
 use common::TestServer;
+use s3s::crypto::Checksum as _;
+
+fn b64(digest: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(digest)
+}
+
+/// The `x-amz-checksum-crc64nvme` trailer line of `payload`.
+fn crc64nvme_trailer(payload: &[u8]) -> String {
+    format!(
+        "x-amz-checksum-crc64nvme:{}",
+        b64(&s3s::crypto::Crc64Nvme::checksum(payload))
+    )
+}
 
 /// Build a STREAMING-UNSIGNED-PAYLOAD-TRAILER chunk-framed body:
 ///
@@ -152,7 +166,7 @@ async fn streaming_unsigned_payload_trailer_roundtrips_byte_exact() {
     // any off-by-one framing leak shows up immediately in the diff.
     let payload: Vec<u8> = (0..4096u32).map(|i| (i & 0xff) as u8).collect();
 
-    let wire = frame_unsigned_trailer(&payload, Some("x-amz-checksum-crc64nvme:xEkkN635Gbg="));
+    let wire = frame_unsigned_trailer(&payload, Some(&crc64nvme_trailer(&payload)));
     let retrieved = put_then_get(
         &server,
         &bucket,
@@ -229,7 +243,11 @@ async fn streaming_signed_payload_trailer_roundtrips_byte_exact() {
     let bucket = server.bucket().to_string();
 
     let payload: Vec<u8> = (0..1024u32).map(|i| (i & 0xff) as u8).collect();
-    let wire = frame_signed_trailer(&payload, "x-amz-checksum-sha256:dGVzdA==");
+    let trailer = format!(
+        "x-amz-checksum-sha256:{}",
+        b64(&s3s::crypto::Sha256::checksum(&payload))
+    );
+    let wire = frame_signed_trailer(&payload, &trailer);
 
     let retrieved = put_then_get(
         &server,
@@ -265,7 +283,7 @@ async fn production_corruption_pattern_is_fixed() {
     let size = 0xc107usize;
     let payload: Vec<u8> = (0..size).map(|i| ((i * 31) & 0xff) as u8).collect();
 
-    let wire = frame_unsigned_trailer(&payload, Some("x-amz-checksum-crc64nvme:xEkkN635Gbg="));
+    let wire = frame_unsigned_trailer(&payload, Some(&crc64nvme_trailer(&payload)));
 
     // Framed wire body must be exactly 52 bytes longer than the
     // payload: `<hex>\r\n` (6: `c107\r\n`) + `\r\n` after data (2) +
@@ -297,6 +315,36 @@ async fn production_corruption_pattern_is_fixed() {
     );
 }
 
+/// A trailer checksum that does not match the decoded body is refused
+/// with `BadDigest`, and nothing is stored.
+#[tokio::test]
+async fn unsigned_trailer_with_a_wrong_checksum_is_bad_digest() {
+    // Open access: the adapter de-frames this body itself (s3s does not).
+    let server = TestServer::builder().open_access().build().await;
+    let payload = b"payload-with-a-checksum".to_vec();
+    let wire = frame_unsigned_trailer(&payload, Some(&crc64nvme_trailer(b"other bytes")));
+    let url = format!("{}/{}/bad-trailer.bin", server.endpoint(), server.bucket());
+    let resp = server
+        .http()
+        .put(&url)
+        .header("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+        .header("x-amz-trailer", "x-amz-checksum-crc64nvme")
+        .header("x-amz-decoded-content-length", payload.len().to_string())
+        .header("content-length", wire.len().to_string())
+        .body(wire)
+        .send()
+        .await
+        .expect("PUT sends");
+    assert_eq!(resp.status(), 400);
+    assert!(resp
+        .text()
+        .await
+        .unwrap()
+        .contains("<Code>BadDigest</Code>"));
+    let get = server.http().get(&url).send().await.expect("GET sends");
+    assert_eq!(get.status(), 404, "a refused body must not be stored");
+}
+
 // ============================================================================
 // Review C1: the SAME framing through a server that verifies SigV4.
 //
@@ -310,7 +358,9 @@ async fn production_corruption_pattern_is_fixed() {
 
 mod signed {
     use super::common::TestServer;
+    use aws_sdk_s3::error::ProvideErrorMetadata as _;
     use hmac::{Hmac, Mac};
+    use s3s::crypto::Checksum as _;
     use sha2::{Digest, Sha256};
 
     const AK: &str = "chunk-ak";
@@ -355,24 +405,55 @@ mod signed {
         query: &[(&str, &str)],
         payload: &[u8],
     ) -> reqwest::Response {
+        signed_put(server, path, query, payload, None).await
+    }
+
+    /// A header-signed `STREAMING-UNSIGNED-PAYLOAD-TRAILER` PUT (the AWS SDK
+    /// default): s3s de-frames it and hands over the trailer.
+    async fn signed_trailer_put(
+        server: &TestServer,
+        path: &str,
+        query: &[(&str, &str)],
+        payload: &[u8],
+        trailer: (&str, &str),
+    ) -> reqwest::Response {
+        signed_put(server, path, query, payload, Some(trailer)).await
+    }
+
+    async fn signed_put(
+        server: &TestServer,
+        path: &str,
+        query: &[(&str, &str)],
+        payload: &[u8],
+        trailer: Option<(&str, &str)>,
+    ) -> reqwest::Response {
         let now = chrono::Utc::now();
         let ts = now.format("%Y%m%dT%H%M%SZ").to_string();
         let date = &ts[..8];
         let scope = format!("{date}/{REGION}/s3/aws4_request");
         let host = server.endpoint().trim_start_matches("http://").to_string();
-        let content_sha = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+        let content_sha = if trailer.is_some() {
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
+        } else {
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+        };
         let canonical_query = query
             .iter()
             .map(|(k, v)| format!("{}={}", uri_encode(k), uri_encode(v)))
             .collect::<Vec<_>>()
             .join("&");
-        let signed_headers =
-            "content-encoding;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length";
-        let canonical_headers = format!(
+        let mut signed_headers =
+            "content-encoding;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length"
+                .to_string();
+        let mut canonical_headers = format!(
             "content-encoding:aws-chunked\nhost:{host}\nx-amz-content-sha256:{content_sha}\n\
              x-amz-date:{ts}\nx-amz-decoded-content-length:{}\n",
             payload.len()
         );
+        if let Some((name, _)) = trailer {
+            signed_headers.push_str(";x-amz-trailer");
+            canonical_headers.push_str(&format!("x-amz-trailer:{name}\n"));
+        }
         let canonical_request = format!(
             "PUT\n{path}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{content_sha}"
         );
@@ -387,18 +468,25 @@ mod signed {
         // the previous signature (the chunk-signature chain).
         let mut body = Vec::new();
         let mut prev = seed.clone();
-        for chunk in [payload, &[][..]] {
-            let sts = format!(
-                "AWS4-HMAC-SHA256-PAYLOAD\n{ts}\n{scope}\n{prev}\n{EMPTY_SHA}\n{}",
-                sha_hex(chunk)
-            );
-            let sig = hex::encode(hmac(&key, sts.as_bytes()));
-            body.extend_from_slice(
-                format!("{:x};chunk-signature={sig}\r\n", chunk.len()).as_bytes(),
-            );
-            body.extend_from_slice(chunk);
-            body.extend_from_slice(b"\r\n");
-            prev = sig;
+        if let Some((name, value)) = trailer {
+            // Unsigned chunks, then the trailer block.
+            body.extend_from_slice(format!("{:x}\r\n", payload.len()).as_bytes());
+            body.extend_from_slice(payload);
+            body.extend_from_slice(format!("\r\n0\r\n{name}:{value}\r\n\r\n").as_bytes());
+        } else {
+            for chunk in [payload, &[][..]] {
+                let sts = format!(
+                    "AWS4-HMAC-SHA256-PAYLOAD\n{ts}\n{scope}\n{prev}\n{EMPTY_SHA}\n{}",
+                    sha_hex(chunk)
+                );
+                let sig = hex::encode(hmac(&key, sts.as_bytes()));
+                body.extend_from_slice(
+                    format!("{:x};chunk-signature={sig}\r\n", chunk.len()).as_bytes(),
+                );
+                body.extend_from_slice(chunk);
+                body.extend_from_slice(b"\r\n");
+                prev = sig;
+            }
         }
 
         let url = if canonical_query.is_empty() {
@@ -406,8 +494,11 @@ mod signed {
         } else {
             format!("{}{path}?{canonical_query}", server.endpoint())
         };
-        reqwest::Client::new()
-            .put(url)
+        let mut request = reqwest::Client::new().put(url);
+        if let Some((name, _)) = trailer {
+            request = request.header("x-amz-trailer", name);
+        }
+        request
             .header(
                 "authorization",
                 format!(
@@ -525,5 +616,113 @@ mod signed {
             .unwrap()
             .into_bytes();
         assert_eq!(got.as_ref(), payload.as_slice(), "no framing may leak");
+    }
+
+    async fn assert_bad_digest(resp: reqwest::Response) {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        assert_eq!(status, 400, "{text}");
+        assert!(text.contains("<Code>BadDigest</Code>"), "{text}");
+    }
+
+    /// The trailer s3s takes off a signed request's body is checked.
+    #[tokio::test]
+    async fn signed_trailer_checksum_is_verified() {
+        let server = authed_server().await;
+        let payload: Vec<u8> = (0..4000u32).map(|i| ((i * 11) & 0xff) as u8).collect();
+        let crc32c = super::b64(&s3s::crypto::Crc32c::checksum(&payload));
+        let name = "x-amz-checksum-crc32c";
+        let path = format!("/{}/trailer-ok.bin", server.bucket());
+        let resp = signed_trailer_put(&server, &path, &[], &payload, (name, &crc32c)).await;
+        let status = resp.status();
+        assert!(
+            status.is_success(),
+            "right trailer must succeed, got {status}: {:?}",
+            resp.text().await.ok()
+        );
+
+        let wrong = super::b64(&s3s::crypto::Crc32c::checksum(b"other"));
+        let path = format!("/{}/trailer-bad.bin", server.bucket());
+        assert_bad_digest(signed_trailer_put(&server, &path, &[], &payload, (name, &wrong)).await)
+            .await;
+        let s3 = server.s3_client().await;
+        let head = s3
+            .head_object()
+            .bucket(server.bucket())
+            .key("trailer-bad.bin")
+            .send()
+            .await;
+        assert!(head.is_err(), "a refused body must not be stored");
+
+        // UploadPart takes the same check.
+        let upload_id = s3
+            .create_multipart_upload()
+            .bucket(server.bucket())
+            .key("trailer-mpu.bin")
+            .send()
+            .await
+            .expect("create MPU")
+            .upload_id()
+            .unwrap()
+            .to_string();
+        let path = format!("/{}/trailer-mpu.bin", server.bucket());
+        let query = [("partNumber", "1"), ("uploadId", upload_id.as_str())];
+        assert_bad_digest(
+            signed_trailer_put(&server, &path, &query, &payload, (name, &wrong)).await,
+        )
+        .await;
+    }
+
+    /// The AWS SDK's `x-amz-checksum-*` request header is checked.
+    #[tokio::test]
+    async fn sdk_checksum_header_is_verified() {
+        let server = authed_server().await;
+        let s3 = server.s3_client().await;
+        let body = b"sdk body".to_vec();
+        let right = super::b64(&s3s::crypto::Sha256::checksum(&body));
+        s3.put_object()
+            .bucket(server.bucket())
+            .key("sdk-ok.txt")
+            .checksum_sha256(&right)
+            .body(body.clone().into())
+            .send()
+            .await
+            .expect("right checksum is accepted");
+
+        let wrong = super::b64(&s3s::crypto::Sha256::checksum(b"other"));
+        let err = s3
+            .put_object()
+            .bucket(server.bucket())
+            .key("sdk-bad.txt")
+            .checksum_sha256(&wrong)
+            .body(body.clone().into())
+            .send()
+            .await
+            .expect_err("wrong checksum is refused");
+        assert_eq!(err.into_service_error().code(), Some("BadDigest"));
+
+        let upload_id = s3
+            .create_multipart_upload()
+            .bucket(server.bucket())
+            .key("sdk-mpu.bin")
+            .send()
+            .await
+            .expect("create MPU")
+            .upload_id()
+            .unwrap()
+            .to_string();
+        let wrong_crc = super::b64(&s3s::crypto::Crc32::checksum(b"other"));
+        let err = s3
+            .upload_part()
+            .bucket(server.bucket())
+            .key("sdk-mpu.bin")
+            .upload_id(&upload_id)
+            .part_number(1)
+            .checksum_crc32(&wrong_crc)
+            .body(body.into())
+            .send()
+            .await
+            .expect_err("wrong part checksum is refused");
+        assert_eq!(err.into_service_error().code(), Some("BadDigest"));
     }
 }

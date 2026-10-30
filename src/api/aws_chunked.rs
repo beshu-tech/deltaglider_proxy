@@ -45,14 +45,8 @@
 //!
 //! When a trailer carries `x-amz-checksum-{crc32,crc32c,sha1,sha256,crc64nvme}`,
 //! the client expects the server to verify the checksum against the
-//! decoded body. Today we parse and log the trailer but do NOT verify —
-//! adding verification requires pulling in crc32c/crc64nvme crates and is
-//! a separate piece of work. The decoded body is still handed downstream
-//! unchanged, which is strictly better than the pre-fix behaviour (where
-//! the trailer bytes silently became part of the object). Tracked as a
-//! follow-up; tests below include a trailer-present case to lock the
-//! parsing behaviour so the follow-up can only add verification, not
-//! change the decoding shape.
+//! decoded body. [`decode_aws_chunked_with_trailers`] returns the trailers;
+//! the caller verifies them (`api::checksum::verify_body_checksum`).
 
 use axum::body::Bytes;
 use axum::http::HeaderMap;
@@ -115,6 +109,15 @@ pub fn get_decoded_content_length(headers: &HeaderMap) -> Option<usize> {
 /// authorised. Chunk-level signature verification is a separate piece
 /// of work and is not implemented here (nor in the pre-fix code).
 pub fn decode_aws_chunked(body: &Bytes, expected_length: Option<usize>) -> Option<Bytes> {
+    decode_aws_chunked_with_trailers(body, expected_length).map(|(decoded, _)| decoded)
+}
+
+/// [`decode_aws_chunked`], plus the trailer lines that parse as headers.
+pub fn decode_aws_chunked_with_trailers(
+    body: &Bytes,
+    expected_length: Option<usize>,
+) -> Option<(Bytes, HeaderMap)> {
+    let mut trailers = HeaderMap::new();
     // The decoded payload is never longer than the framed body, whatever the
     // client advertised in x-amz-decoded-content-length.
     let mut result = Vec::with_capacity(expected_length.unwrap_or(body.len()).min(body.len()));
@@ -150,7 +153,7 @@ pub fn decode_aws_chunked(body: &Bytes, expected_length: Option<usize>) -> Optio
             //   0;chunk-signature=...\r\n\r\n              (legacy signed)
             //   0\r\n x-amz-checksum-crc32:...\r\n\r\n     (unsigned+trailer)
             //   0;chunk-signature=...\r\n key:v\r\n ... \r\n   (signed+trailer)
-            consume_trailers(body, &mut pos)?;
+            consume_trailers(body, &mut pos, &mut trailers)?;
             break;
         }
 
@@ -197,7 +200,7 @@ pub fn decode_aws_chunked(body: &Bytes, expected_length: Option<usize>) -> Optio
         body.len()
     );
 
-    Some(Bytes::from(result))
+    Some((Bytes::from(result), trailers))
 }
 
 /// Consume zero or more trailer lines after a zero-size terminator
@@ -205,11 +208,9 @@ pub fn decode_aws_chunked(body: &Bytes, expected_length: Option<usize>) -> Optio
 /// the trailer section is well-formed, `None` if the input is
 /// truncated or malformed.
 ///
-/// We log each trailer we see — specifically the `x-amz-checksum-*`
-/// family — so operators can see that flexible-checksum uploads are
-/// arriving; verifying those checksums against the decoded body is
-/// tracked as a follow-up (see module doc).
-fn consume_trailers(body: &Bytes, pos: &mut usize) -> Option<()> {
+/// Each `name:value` line that is a valid header goes into `trailers`;
+/// other lines are skipped, as before.
+fn consume_trailers(body: &Bytes, pos: &mut usize, trailers: &mut HeaderMap) -> Option<()> {
     loop {
         let line_end = find_crlf(&body[*pos..])?;
         let line = &body[*pos..*pos + line_end];
@@ -221,13 +222,15 @@ fn consume_trailers(body: &Bytes, pos: &mut usize) -> Option<()> {
         }
 
         if let Ok(line_str) = std::str::from_utf8(line) {
-            if line_str.to_ascii_lowercase().starts_with("x-amz-checksum-") {
-                // Trailer checksum present but not yet verified — see
-                // module docs. Logged at debug (not warn) because this
-                // is the expected path for modern SDK uploads.
-                debug!("aws_chunked: received trailer checksum '{}'", line_str);
-            } else {
-                debug!("aws_chunked: received trailer line '{}'", line_str);
+            debug!("aws_chunked: received trailer line '{}'", line_str);
+            let parsed = line_str.split_once(':').and_then(|(name, value)| {
+                Some((
+                    axum::http::HeaderName::from_bytes(name.trim().as_bytes()).ok()?,
+                    axum::http::HeaderValue::from_str(value.trim()).ok()?,
+                ))
+            });
+            if let Some((name, value)) = parsed {
+                trailers.append(name, value);
             }
         }
     }
@@ -355,6 +358,18 @@ mod tests {
         );
         let result = decode_aws_chunked(&body, Some(11)).unwrap();
         assert_eq!(result.as_ref(), b"hello world");
+    }
+
+    #[test]
+    fn decode_returns_the_trailers() {
+        let body = Bytes::from(
+            "5\r\nhello\r\n0\r\nx-amz-checksum-crc32: NhCmhg==\r\nx-amz-trailer-signature:abc\r\nnot a header\r\n\r\n",
+        );
+        let (decoded, trailers) = decode_aws_chunked_with_trailers(&body, Some(5)).unwrap();
+        assert_eq!(decoded.as_ref(), b"hello");
+        assert_eq!(trailers["x-amz-checksum-crc32"], "NhCmhg==");
+        assert_eq!(trailers["x-amz-trailer-signature"], "abc");
+        assert_eq!(trailers.len(), 2);
     }
 
     #[test]

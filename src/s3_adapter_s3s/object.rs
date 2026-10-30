@@ -547,7 +547,7 @@ pub(super) async fn put_object(
     svc: &DeltaGliderS3Service,
     req: s3s::S3Request<s3s::dto::PutObjectInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::PutObjectOutput>> {
-    let chunked_headers = headers_if_still_aws_chunked(&req);
+    let body_ctx = BodyContext::of(&req);
     let s3s_verified_sha256 =
         s3s_verified_payload_sha256(&req.headers, &req.uri, req.credentials.is_some());
     let signed_payload_hash = req
@@ -565,12 +565,7 @@ pub(super) async fn put_object(
     // One HeadBucket per bucket per 5 seconds, not one per PUT.
     crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
 
-    let data = collect_blob_limited(
-        input.body,
-        engine.max_object_size(),
-        chunked_headers.as_ref(),
-    )
-    .await?;
+    let data = collect_blob_limited(input.body, engine.max_object_size(), &body_ctx).await?;
     // s3s verified the signed payload hash while the body streamed in: its
     // digest is the body's SHA-256. Otherwise a verifiable signed hash is
     // checked here, and an unsigned shape leaves the hashing to the engine.

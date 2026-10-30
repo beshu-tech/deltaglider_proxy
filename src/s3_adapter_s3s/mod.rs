@@ -397,10 +397,24 @@ fn s3s_decoded_aws_chunked(headers: &axum::http::HeaderMap, has_credentials: boo
             .is_some_and(|v| v.starts_with("AWS4-HMAC-SHA256 "))
 }
 
-/// The headers `collect_blob_limited` needs to decode aws-chunked framing,
-/// or `None` when s3s already decoded the body.
-fn headers_if_still_aws_chunked<T>(req: &s3s::S3Request<T>) -> Option<axum::http::HeaderMap> {
-    (!s3s_decoded_aws_chunked(&req.headers, req.credentials.is_some())).then(|| req.headers.clone())
+/// What `collect_blob_limited` needs from the request besides the body:
+/// the headers (aws-chunked framing, `x-amz-checksum-*`) and the trailers
+/// s3s took off a body it decoded. Taken before `req.input` moves.
+pub(super) struct BodyContext {
+    headers: axum::http::HeaderMap,
+    /// The body still carries aws-chunked framing (s3s did not decode it).
+    still_chunked: bool,
+    s3s_trailers: Option<s3s::TrailingHeaders>,
+}
+
+impl BodyContext {
+    pub(super) fn of<T>(req: &s3s::S3Request<T>) -> Self {
+        Self {
+            headers: req.headers.clone(),
+            still_chunked: !s3s_decoded_aws_chunked(&req.headers, req.credentials.is_some()),
+            s3s_trailers: req.trailing_headers.clone(),
+        }
+    }
 }
 
 /// The body SHA-256 that s3s verified for this request, or `None` when s3s
@@ -464,13 +478,30 @@ pub(crate) fn s3s_verified_payload_sha256(
     crate::deltaglider::KnownSha256::from_verified_hex(claimed)
 }
 
+/// THE collection of an object body (PutObject, UploadPart): bounded by
+/// `limit`, de-framed when s3s left aws-chunked framing, and checked
+/// against the client's `x-amz-checksum-*` header or trailer.
 async fn collect_blob_limited(
     body: Option<s3s::dto::StreamingBlob>,
     limit: u64,
-    headers: Option<&axum::http::HeaderMap>,
+    ctx: &BodyContext,
 ) -> s3s::S3Result<bytes::Bytes> {
+    let (body, own_trailers) = collect_and_unframe(body, limit, ctx).await?;
+    let s3s_trailers = ctx.s3s_trailers.as_ref().and_then(|t| t.read(Clone::clone));
+    let trailers = own_trailers.as_ref().or(s3s_trailers.as_ref());
+    crate::api::checksum::verify_body_checksum(&ctx.headers, trailers, &body)
+        .map_err(|e| s3s::S3Error::from(crate::api::S3Error::from(e)))?;
+    Ok(body)
+}
+
+/// The body bytes, and the trailers when this function removed the framing.
+async fn collect_and_unframe(
+    body: Option<s3s::dto::StreamingBlob>,
+    limit: u64,
+    ctx: &BodyContext,
+) -> s3s::S3Result<(bytes::Bytes, Option<axum::http::HeaderMap>)> {
     let Some(mut body) = body else {
-        return Ok(bytes::Bytes::new());
+        return Ok((bytes::Bytes::new(), None));
     };
     let mut out = Vec::new();
     while let Some(chunk) = body.next().await {
@@ -509,34 +540,33 @@ async fn collect_blob_limited(
         out.extend_from_slice(&chunk);
     }
     let body = bytes::Bytes::from(out);
-    if let Some(headers) = headers {
-        if crate::api::aws_chunked::is_aws_chunked(headers) {
-            let expected_len = crate::api::aws_chunked::get_decoded_content_length(headers);
-            if expected_len.is_some_and(|len| len as u64 > limit) {
-                return Err(s3s::s3_error!(EntityTooLarge));
-            }
-            // Require x-amz-decoded-content-length for chunked bodies: without it
-            // the decoder can only frame-check, and a body truncated at a chunk
-            // boundary (with a surviving/crafted 0\r\n\r\n terminator) would pass
-            // framing yet store short. AWS SDKs always send this header for
-            // streaming uploads, so requiring it rejects only malformed inputs.
-            if expected_len.is_none() {
-                return Err(s3s::s3_error!(
-                    InvalidArgument,
-                    "aws-chunked transfer encoding requires x-amz-decoded-content-length"
-                ));
-            }
-            return crate::api::aws_chunked::decode_aws_chunked(&body, expected_len).ok_or_else(
-                || {
-                    s3s::s3_error!(
-                        InvalidArgument,
-                        "Failed to decode AWS chunked transfer encoding"
-                    )
-                },
-            );
+    let headers = &ctx.headers;
+    if ctx.still_chunked && crate::api::aws_chunked::is_aws_chunked(headers) {
+        let expected_len = crate::api::aws_chunked::get_decoded_content_length(headers);
+        if expected_len.is_some_and(|len| len as u64 > limit) {
+            return Err(s3s::s3_error!(EntityTooLarge));
         }
+        // Require x-amz-decoded-content-length for chunked bodies: without it
+        // the decoder can only frame-check, and a body truncated at a chunk
+        // boundary (with a surviving/crafted 0\r\n\r\n terminator) would pass
+        // framing yet store short. AWS SDKs always send this header for
+        // streaming uploads, so requiring it rejects only malformed inputs.
+        if expected_len.is_none() {
+            return Err(s3s::s3_error!(
+                InvalidArgument,
+                "aws-chunked transfer encoding requires x-amz-decoded-content-length"
+            ));
+        }
+        return crate::api::aws_chunked::decode_aws_chunked_with_trailers(&body, expected_len)
+            .map(|(decoded, trailers)| (decoded, Some(trailers)))
+            .ok_or_else(|| {
+                s3s::s3_error!(
+                    InvalidArgument,
+                    "Failed to decode AWS chunked transfer encoding"
+                )
+            });
     }
-    Ok(body)
+    Ok((body, None))
 }
 
 /// A live HeadBucket. Only the HeadBucket verb uses it; every other verb

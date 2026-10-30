@@ -602,8 +602,102 @@ fn engine_error_maps_to_s3s_code() {
 #[tokio::test]
 async fn collect_blob_limited_rejects_oversize_body() {
     let blob = s3s::dto::StreamingBlob::from(s3s::Body::from(bytes::Bytes::from_static(b"abcd")));
-    let err = collect_blob_limited(Some(blob), 3, None).await.unwrap_err();
+    let ctx = body_ctx(&[], false);
+    let err = collect_blob_limited(Some(blob), 3, &ctx).await.unwrap_err();
     assert_eq!(err.code(), &s3s::S3ErrorCode::EntityTooLarge);
+}
+
+fn body_ctx(headers: &[(&'static str, &str)], still_chunked: bool) -> BodyContext {
+    let mut map = axum::http::HeaderMap::new();
+    for (k, v) in headers {
+        map.append(*k, v.parse().unwrap());
+    }
+    BodyContext {
+        headers: map,
+        still_chunked,
+        s3s_trailers: None,
+    }
+}
+
+async fn collect(body: &'static [u8], ctx: &BodyContext) -> s3s::S3Result<bytes::Bytes> {
+    let blob = s3s::dto::StreamingBlob::from(s3s::Body::from(bytes::Bytes::from_static(body)));
+    collect_blob_limited(Some(blob), 1 << 20, ctx).await
+}
+
+/// Every client object body is checked against its `x-amz-checksum-*`:
+/// an s3s verb reads `input.body` only through `collect_blob_limited`, the
+/// request path de-frames aws-chunked bodies only with the trailer-keeping
+/// decoder, and the form POST runs the same check.
+#[test]
+fn every_client_body_passes_the_checksum_check() {
+    use crate::source_scan::{files, prod_lines, read, rel};
+    let test_files = crate::source_scan::out_of_line_test_modules(&files("src", "rs"));
+    let mut offenders = Vec::new();
+    for path in files("src", "rs") {
+        let file = rel(&path);
+        if test_files.contains(&path) {
+            continue;
+        }
+        let text = read(&file);
+        for (n, line) in prod_lines(&text) {
+            let body_read = file.starts_with("src/s3_adapter_s3s/")
+                && line.contains("input.body")
+                && !line.contains("collect_blob_limited(input.body");
+            // The trailer-dropping decoder: its own module, the fuzz entry
+            // and the fake S3 backend only.
+            let trailer_drop = line.contains("decode_aws_chunked(")
+                && !matches!(
+                    file.as_str(),
+                    "src/api/aws_chunked.rs" | "src/fuzz_entry.rs" | "src/storage/fake_s3.rs"
+                );
+            if body_read || trailer_drop {
+                offenders.push(format!("{file}:{n}: {}", line.trim()));
+            }
+        }
+    }
+    assert!(offenders.is_empty(), "unchecked body: {offenders:#?}");
+    let form = crate::source_scan::prod_text(&read("src/api/handlers/form_post.rs"));
+    assert!(form.contains("checksum::verify_body_checksum("));
+}
+
+/// CRC32 of `hello` is 3610a686.
+#[tokio::test]
+async fn collect_blob_limited_checks_the_checksum_header() {
+    let right = body_ctx(&[("x-amz-checksum-crc32", "NhCmhg==")], false);
+    assert_eq!(collect(b"hello", &right).await.unwrap().as_ref(), b"hello");
+    let err = collect(b"hellO", &right).await.unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::BadDigest);
+    let malformed = body_ctx(&[("x-amz-checksum-crc32", "dGVzdA==AA")], false);
+    let err = collect(b"hello", &malformed).await.unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+}
+
+/// The trailer of a body this adapter de-frames is checked too.
+#[tokio::test]
+async fn collect_blob_limited_checks_the_chunked_trailer() {
+    let headers = [
+        ("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+        ("x-amz-decoded-content-length", "5"),
+        ("x-amz-trailer", "x-amz-checksum-crc32"),
+    ];
+    let ctx = body_ctx(&headers, true);
+    let right = collect(
+        b"5\r\nhello\r\n0\r\nx-amz-checksum-crc32:NhCmhg==\r\n\r\n",
+        &ctx,
+    )
+    .await;
+    assert_eq!(right.unwrap().as_ref(), b"hello");
+    let wrong = collect(
+        b"5\r\nhellO\r\n0\r\nx-amz-checksum-crc32:NhCmhg==\r\n\r\n",
+        &ctx,
+    )
+    .await;
+    assert_eq!(wrong.unwrap_err().code(), &s3s::S3ErrorCode::BadDigest);
+    let missing = collect(b"5\r\nhello\r\n0\r\n\r\n", &ctx).await;
+    assert_eq!(
+        missing.unwrap_err().code(),
+        &s3s::S3ErrorCode::InvalidRequest
+    );
 }
 
 #[test]
