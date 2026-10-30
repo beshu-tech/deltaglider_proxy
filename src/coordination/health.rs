@@ -1573,6 +1573,32 @@ mod review2_tests {
         }
     }
 
+    /// Whether a SigV4-signed request reaches `listener` within `wait`.
+    /// Other local software (a dev-server port scanner) may open unsigned
+    /// connections to any new port; only a signed request is the probe's.
+    async fn signed_request_arrives(
+        listener: tokio::net::TcpListener,
+        wait: std::time::Duration,
+    ) -> bool {
+        use tokio::io::AsyncReadExt;
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let Ok(Ok((mut conn, _))) = tokio::time::timeout_at(deadline, listener.accept()).await
+            else {
+                return false;
+            };
+            let mut head = vec![0u8; 8192];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(1), conn.read(&mut head))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(0);
+            if String::from_utf8_lossy(&head[..n]).contains("AWS4-HMAC-SHA256") {
+                return true;
+            }
+        }
+    }
+
     /// Review-2 (S18 incomplete): the pre-commit health probe (and every
     /// client built by `ConfigDbSync::build_client`: config sync, S3 leases,
     /// the reference lock, the capability probe) never runs the outbound-URL
@@ -1593,11 +1619,10 @@ mod review2_tests {
         let _restore = RestoreEnv(prev);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let accepted = tokio::spawn(async move {
-            tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
-                .await
-                .is_ok()
-        });
+        let accepted = tokio::spawn(signed_request_arrives(
+            listener,
+            std::time::Duration::from_secs(5),
+        ));
         let backend = BackendConfig::S3 {
             endpoint: Some(format!("http://127.0.0.1:{port}")),
             region: "us-east-1".into(),

@@ -307,3 +307,29 @@ pub fn prometheus_counter_has_labels(metrics: &str, name: &str, labels: &[&str])
             .unwrap_or(false)
     })
 }
+
+/// Whether a SigV4-signed request reaches `listener` within `wait`. Other
+/// local software (a dev-server port scanner) may open unsigned
+/// connections to any new port; only a signed request is the proxy's.
+pub async fn signed_request_arrives(
+    listener: tokio::net::TcpListener,
+    wait: std::time::Duration,
+) -> bool {
+    use tokio::io::AsyncReadExt;
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let Ok(Ok((mut conn, _))) = tokio::time::timeout_at(deadline, listener.accept()).await
+        else {
+            return false;
+        };
+        let mut head = vec![0u8; 8192];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), conn.read(&mut head))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(0);
+        if String::from_utf8_lossy(&head[..n]).contains("AWS4-HMAC-SHA256") {
+            return true;
+        }
+    }
+}

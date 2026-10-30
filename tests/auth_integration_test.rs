@@ -3309,11 +3309,10 @@ async fn production_defaults_refuse_a_loopback_backend() {
         .await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let accepted = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(3), listener.accept())
-            .await
-            .is_ok()
-    });
+    let accepted = tokio::spawn(common::signed_request_arrives(
+        listener,
+        Duration::from_secs(3),
+    ));
     let admin = admin_http_client(&server.endpoint()).await;
     let resp = admin
         .post(format!("{}/_/api/admin/backends", server.endpoint()))
