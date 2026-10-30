@@ -33,6 +33,10 @@ pub(crate) enum TransitionCtx<'a> {
         app: &'a AppState,
         /// Log line of the engine rebuild.
         context: &'a str,
+        /// The transition puts back the config that a failed persist
+        /// replaced: the encryption witness restores what the failed
+        /// change published instead of publishing.
+        restoring: bool,
     },
 }
 
@@ -281,9 +285,8 @@ pub(crate) async fn apply_config_transition(
         _ => Vec::new(),
     };
     let rollback = match &ctx {
-        TransitionCtx::Admin { restoring, .. } => *restoring,
-        TransitionCtx::Background { context, .. } => {
-            *context == crate::config_apply::ROLLBACK_CONTEXT
+        TransitionCtx::Admin { restoring, .. } | TransitionCtx::Background { restoring, .. } => {
+            *restoring
         }
     };
     if let Some(witness) = &ctx.app().encryption_witness {

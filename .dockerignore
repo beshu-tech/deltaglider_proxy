@@ -1,5 +1,9 @@
 # Rust build (rebuilt inside container)
 target/
+**/target/
+
+# Agent worktrees (each a full checkout with its own target/)
+.claude/
 
 # Node (rebuilt inside container)
 node_modules/

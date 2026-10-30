@@ -54,13 +54,13 @@ RUN ./scripts/check-bundle-fingerprints.sh demo/s3-browser/ui/dist Cargo.toml
 # Parallel jobs from the memory budget, not the CPU count: cargo alone starts
 # one rustc per CPU and a build container with a modest memory limit is killed
 # mid-build (scripts/cargo-jobs.sh has the measured per-job peaks).
-RUN CARGO_BUILD_JOBS="$(./scripts/cargo-jobs.sh)" cargo build --release
+RUN CARGO_BUILD_JOBS="$(./scripts/cargo-jobs.sh)" cargo build --release --locked
 
 # ── Runtime ──
 # Security notes:
 # - Runs as non-root user 'dg' (least privilege).
-# - Only ca-certificates, xdelta3, and curl are installed (minimal attack surface).
-#   curl is required for the HEALTHCHECK probe; no shell utilities beyond busybox.
+# - Only ca-certificates, curl, chrony/ntpstat and xdelta3 are installed.
+#   curl is required for the HEALTHCHECK probe.
 # - No secrets are embedded in the image — all credentials are provided at runtime
 #   via environment variables or mounted config files.
 #
@@ -90,12 +90,13 @@ LABEL org.opencontainers.image.title="DeltaGlider Proxy" \
 # `upgrade` takes the Debian security fixes that the base image does not
 # have yet: the published debian:bookworm-slim can lag them by weeks
 # (perl-base CVEs, October 2026), and a scanner reports them against us.
-# Use multiple retries + fallback to handle unreliable deb.debian.org.
-RUN (apt-get -o Acquire::Retries=5 update && apt-get upgrade -y --no-install-recommends \
+# Retries handle an unreliable deb.debian.org. A failure fails the build: an
+# image without curl is always unhealthy, and one without ca-certificates
+# cannot reach an HTTPS backend.
+RUN apt-get -o Acquire::Retries=5 update && apt-get upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends \
     ca-certificates curl ntpstat chrony \
-    && rm -rf /var/lib/apt/lists/*) \
-    || (echo "WARN: apt-get failed — continuing without curl (healthcheck will use wget fallback)" && apt-get clean)
+    && rm -rf /var/lib/apt/lists/*
 RUN groupadd --system dg && useradd --system --gid dg --no-create-home dg
 COPY --from=rust-build /app/target/release/deltaglider_proxy /usr/local/bin/
 COPY --from=rust-build /usr/bin/xdelta3 /usr/bin/xdelta3

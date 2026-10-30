@@ -103,8 +103,13 @@ impl Default for ListenerLimits {
     }
 }
 
+/// How long a graceful shutdown waits for the requests in flight, on both
+/// listeners. A slow download must not hold back the steps after `serve`
+/// (usage flush, event-outbox flush) until the orchestrator sends SIGKILL.
+pub const GRACEFUL_SHUTDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Serve `app` over plain HTTP on `listener` until `shutdown` resolves,
-/// then wait for the requests in flight.
+/// then wait for the requests in flight, up to [`GRACEFUL_SHUTDOWN_DEADLINE`].
 /// Middlewares see the peer address through `ConnectInfo<SocketAddr>`.
 pub async fn serve_plain<F>(
     listener: TcpListener,
@@ -119,7 +124,7 @@ where
     let on_shutdown = handle.clone();
     let stop = tokio::spawn(async move {
         shutdown.await;
-        on_shutdown.graceful_shutdown(None);
+        on_shutdown.graceful_shutdown(Some(GRACEFUL_SHUTDOWN_DEADLINE));
     });
     let mut server = axum_server::from_tcp(listener.into_std()?)
         .acceptor(Capped::new(NoDelayAcceptor::new(), limits))

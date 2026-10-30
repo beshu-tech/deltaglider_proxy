@@ -1205,7 +1205,8 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         let shutdown_handle = handle.clone();
         tokio::spawn(async move {
             shutdown_signal().await;
-            shutdown_handle.graceful_shutdown(Some(Duration::from_secs(10)));
+            shutdown_handle
+                .graceful_shutdown(Some(deltaglider_proxy::serve::GRACEFUL_SHUTDOWN_DEADLINE));
         });
 
         let listener = TcpListener::bind(&config.listen_addr).await?;

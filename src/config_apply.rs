@@ -89,10 +89,9 @@ pub fn install_engine(app: &AppState, engine: DynEngine, context: &str) {
     tracing::info!("{}", context);
 }
 
-/// The context of the transition that puts the old config back after a
-/// failed persist: a rollback, not a new change (the encryption witness
-/// restores what the failed change published instead of publishing).
-pub const ROLLBACK_CONTEXT: &str = "rollback after failed persist";
+/// Log line of the transition that puts the old config back after a
+/// failed persist.
+const ROLLBACK_CONTEXT: &str = "rollback after failed persist";
 
 #[derive(Clone)]
 pub struct ConfigMutator {
@@ -147,6 +146,7 @@ impl ConfigMutator {
         let ctx = || TransitionCtx::Background {
             app: &self.app,
             context,
+            restoring: false,
         };
         let mut cfg = self.config.write().await;
         let rollback = cfg.clone();
@@ -166,6 +166,7 @@ impl ConfigMutator {
                 let back = TransitionCtx::Background {
                     app: &self.app,
                     context: ROLLBACK_CONTEXT,
+                    restoring: true,
                 };
                 let restore_err = apply_config_transition(back, &mut cfg, rollback.clone())
                     .await

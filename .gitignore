@@ -42,9 +42,6 @@ docs/benchmark/*.tgz
 
 # Runtime data
 data/
-# Marketing ships pinned benchmark numbers (not secrets).
-!marketing/src/data/
-!marketing/src/data/**
 
 # Config (contains secrets/credentials). The .toml form is a pre-v1.4.1
 # leftover (TOML support removed) but may still hold secrets — keep ignored.
