@@ -307,45 +307,19 @@ pub fn run_init_inner(
         None
     };
 
-    // Build Config
+    // Only what the wizard asks; every other field keeps its default.
     let config = Config {
-        defaults_version: Default::default(),
         listen_addr,
         backend,
         max_delta_ratio,
         max_object_size: max_object_size_mb * 1024 * 1024,
-        max_passthrough_object_size: crate::config::default_max_passthrough_object_size(),
-        range_spool_ttl_secs: crate::config::default_range_spool_ttl_secs(),
         cache_size_mb,
-        metadata_cache_mb: 50,
-        filtered_list_max_engine_pages: crate::config::default_filtered_list_max_engine_pages(),
         authentication,
         access_key_id,
         secret_access_key,
-        bootstrap_password_hash: None,
-        codec_concurrency: None,
-        blocking_threads: None,
         log_level,
-        config_sync_bucket: None,
-        config_sync_object_key: None,
         tls,
-        buckets: std::collections::BTreeMap::new(),
-        backends: Vec::new(),
-        default_backend: None,
-        backend_encryption: crate::config::BackendEncryptionConfig::default(),
-        replication: crate::config_sections::ReplicationConfig::default(),
-        lifecycle: crate::config_sections::LifecycleConfig::default(),
-        event_delivery: crate::config_sections::EventDeliveryConfig::default(),
-        jobs: crate::config_sections::JobsConfig::default(),
-        admission_blocks: Vec::new(),
-        iam_mode: crate::config_sections::IamMode::default(),
-        iam_users: Vec::new(),
-        iam_groups: Vec::new(),
-        auth_providers: Vec::new(),
-        group_mapping_rules: Vec::new(),
-        env_refs: Default::default(),
-        env_shadow: Default::default(),
-        tuning: Default::default(),
+        ..Config::default()
     };
 
     // Show summary (canonical sectioned YAML — the only config format)
