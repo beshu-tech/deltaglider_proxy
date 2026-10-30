@@ -831,6 +831,7 @@ mod source_guards {
                 "docs/product/how-to/upgrade.md",
                 "beshultd/deltaglider_proxy:",
             ),
+            ("operator/README.md", "beshultd/deltaglider_proxy:"),
             ("DOCKERHUB.md", "| `"),
             (
                 "docs/product/tutorials/first-delta-savings.md",
@@ -873,18 +874,22 @@ mod source_guards {
             .trim_matches('"')
             .to_string();
         let minor = channel.rsplitn(2, '.').last().unwrap().to_string();
-        let dockerfile = crate::source_scan::read("Dockerfile");
-        let pins: Vec<&str> = dockerfile
-            .lines()
-            .filter_map(|l| l.trim().strip_prefix("FROM rust:"))
-            .collect();
-        assert!(!pins.is_empty(), "Dockerfile has no FROM rust: stage");
-        for pin in pins {
-            let version = pin.split('-').next().unwrap();
-            assert!(
-                version == channel || version == minor,
-                "Dockerfile pins rust:{pin}, rust-toolchain.toml pins {channel}: bump them together"
-            );
+        // The operator image builds with context operator/, where the root
+        // rust-toolchain.toml is not visible: its pin must follow too.
+        for path in ["Dockerfile", "operator/Dockerfile"] {
+            let dockerfile = crate::source_scan::read(path);
+            let pins: Vec<&str> = dockerfile
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("FROM rust:"))
+                .collect();
+            assert!(!pins.is_empty(), "{path} has no FROM rust: stage");
+            for pin in pins {
+                let version = pin.split('-').next().unwrap();
+                assert!(
+                    version == channel || version == minor,
+                    "{path} pins rust:{pin}, rust-toolchain.toml pins {channel}: bump them together"
+                );
+            }
         }
     }
 

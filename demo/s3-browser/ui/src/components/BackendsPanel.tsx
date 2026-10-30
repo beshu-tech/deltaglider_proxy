@@ -750,7 +750,9 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 try {
                   await updateAdminConfig({ max_delta_ratio: on ? 0.75 : 0 });
                   await refresh();
-                } catch { /* non-blocking: user sees the toggle revert */ }
+                } catch (e) {
+                  message.error(normalizeUiError(e, 'Failed to change delta compression'));
+                }
               }}
             />
             <div>

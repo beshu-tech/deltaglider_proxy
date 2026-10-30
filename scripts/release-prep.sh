@@ -192,9 +192,13 @@ CH_CUR="$(sed -nE 's/^version: *([0-9.]+).*/\1/p' "$CHART" | head -1)"
 CH_NEW="$(bump_patch "$CH_CUR")"
 [[ "$OP_NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$CH_NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
     || err "could not read the operator ($OP_CUR) or chart ($CH_CUR) version"
-stamp() { # file, awk program; atomic replace
+stamp() { # file, awk program; atomic replace. awk exits 0 when no line
+    # matches, so a stamp that changes nothing is an error.
     local f="$1" t; t="$(mktemp)"
-    awk -v proxy="$NEW_VERSION" -v op="$OP_NEW" -v chart="$CH_NEW" "$2" "$f" > "$t" && mv "$t" "$f"
+    awk -v proxy="$NEW_VERSION" -v op="$OP_NEW" -v chart="$CH_NEW" "$2" "$f" > "$t" \
+        || err "stamp of $f failed"
+    cmp -s "$t" "$f" && { rm -f "$t"; err "stamp of $f changed nothing"; }
+    mv "$t" "$f"
 }
 stamp "$OP_TOML" '/^version = "/ && !d { print "version = \"" op "\""; d = 1; next } { print }'
 stamp "$ROOT/operator/src/crd.rs" '{ sub(/beshultd\/deltaglider_proxy:[0-9]+\.[0-9]+\.[0-9]+/, "beshultd/deltaglider_proxy:" proxy); print }'

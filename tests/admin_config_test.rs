@@ -1490,14 +1490,12 @@ async fn test_update_config_accepts_case_insensitive_backend_type() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body: serde_json::Value = resp.json().await.unwrap();
-    let warnings = body["warnings"].as_array().unwrap();
+    // The switch itself is refused (an S3 backend with no endpoint), but
+    // for the S3 reason, not for the casing.
+    let body = resp.text().await.unwrap();
     assert!(
-        !warnings
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("Unknown backend type")),
-        "uppercase 'S3' must be accepted, got warnings: {warnings:?}"
+        !body.contains("Unknown backend type"),
+        "uppercase 'S3' must be accepted, got: {body}"
     );
 }
 

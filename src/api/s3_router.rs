@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use axum::{extract::DefaultBodyLimit, middleware, Router};
+use axum::{middleware, Router};
 use s3s::access::S3Access;
 use tower_http::trace::TraceLayer;
 
@@ -393,17 +393,11 @@ where
             .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
             .map(|ci| ci.0.ip());
 
-        // Consume the body, bounded by `max_object_size`. This is the
-        // authoritative cap for this path: `DefaultBodyLimit` only does an
-        // eager `Content-Length` check and is enforced lazily on read for
-        // chunked bodies, so a chunked/streamed `multipart/form-data` POST
-        // could otherwise slip past it. We therefore enforce the limit HERE
-        // explicitly — `to_bytes` aborts as soon as the collected body
-        // exceeds the limit, so a single oversized (or chunked) request can
-        // never buffer the whole body into memory. Double-enforcement with
-        // `DefaultBodyLimit` is harmless: whichever limit fires first wins.
+        // Consume the body, bounded by `max_object_size`: `to_bytes` aborts
+        // as soon as the collected body exceeds the limit, chunked or not.
         // Read the cap from the (hot-reloadable) engine so a runtime
-        // `max_object_size` change applies here too.
+        // `max_object_size` change applies here too. No S3 route uses an
+        // axum body extractor, so `DefaultBodyLimit` would bound nothing.
         let max_body = state.engine.load().max_object_size() as usize;
         let (parts, body) = request.into_parts();
         let body_bytes = match axum::body::to_bytes(body, max_body).await {
@@ -547,7 +541,6 @@ where
         )))
         .layer(axum::Extension(rate_limiter.clone()))
         .layer(axum::Extension(metrics.clone()))
-        .layer(DefaultBodyLimit::max(config.max_object_size as usize))
         // Inside the global cap: a request takes its backend's slot only
         // once it has a global one, and gives a full share back at once.
         .layer(middleware::from_fn_with_state(

@@ -30,10 +30,23 @@ pub async fn build_engine(app: &AppState, cfg: &Config) -> Result<DynEngine, Str
     // The new engine shares the encryption-policy slots of the running
     // one, so the runs that drain on the old engine follow the per-bucket
     // policy it publishes at install (issue #116 review D).
-    let policies = app.engine.load().encryption_policies();
-    let new_engine = DynEngine::new_sharing(cfg, Some(app.metrics.clone()), policies)
+    let running = app.engine.load();
+    let policies = running.encryption_policies();
+    // The sync client keeps the coordination bucket it started with until a
+    // restart, so a changed or cleared `config_sync_bucket` must not open
+    // that bucket to clients: the new engine reserves both.
+    let still_reserved: Vec<String> = running
+        .bucket_policy_registry()
+        .reserved_buckets()
+        .map(str::to_owned)
+        .collect();
+    drop(running);
+    let mut new_engine = DynEngine::new_sharing(cfg, Some(app.metrics.clone()), policies)
         .await
         .map_err(|e| e.to_string())?;
+    for bucket in &still_reserved {
+        new_engine = new_engine.with_reserved_bucket(bucket);
+    }
     // Re-attach the usage counter and cross-instance reference lock — a
     // rebuild must not drop either.
     Ok(new_engine

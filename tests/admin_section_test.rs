@@ -1567,7 +1567,7 @@ async fn bootstrap_credentials_are_removed_explicitly_and_never_leave_auth_off()
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let cfg: serde_json::Value = admin
         .get(format!("{ep}/_/api/admin/config"))
         .send()

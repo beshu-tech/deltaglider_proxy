@@ -138,14 +138,11 @@
   },
   "patch_transition_refused": {
     "body": {
-      "requires_restart": false,
-      "success": true,
-      "warnings": [
-        "Failed to apply config patch: this change leaves the proxy without authentication: no IAM user, no bootstrap SigV4 pair and no `authentication: none` would remain. Create an IAM user or set a bootstrap pair first. Pre-patch config restored."
-      ]
+      "error": "Failed to apply config patch (no state changed): this change leaves the proxy without authentication: no IAM user, no bootstrap SigV4 pair and no `authentication: none` would remain. Create an IAM user or set a bootstrap pair first",
+      "success": false
     },
     "etag": false,
-    "status": 200
+    "status": 422
   },
   "patch_warnings_restart": {
     "body": {

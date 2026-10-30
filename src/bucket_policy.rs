@@ -239,9 +239,11 @@ pub struct BucketPolicyRegistry {
     /// probe in `resolve_existing_named` — onto the protected mirror's storage,
     /// so it must be blocked even though no policy is keyed under that name.
     replication_target_real_names: std::collections::HashSet<String>,
-    /// Lowercased `config_sync_bucket`: reserved for the proxy's own sync
+    /// Lowercased coordination buckets: reserved for the proxy's own sync
     /// client (synced IAM DB, leases, locks). See [`Self::reserved_bucket_reason`].
-    reserved_bucket: Option<String>,
+    /// More than one only while a changed `config_sync_bucket` waits for a
+    /// restart: the running sync client still writes to the old one.
+    reserved_buckets: std::collections::BTreeSet<String>,
 }
 
 /// A bucket name admitted by [`BucketPolicyRegistry::client_bucket`]: not
@@ -284,21 +286,28 @@ impl serde::Serialize for ClientBucket {
 }
 
 impl BucketPolicyRegistry {
-    /// Reserve the coordination bucket (`config_sync_bucket`). Builder;
-    /// `None` or empty reserves nothing.
+    /// Reserve a coordination bucket (`config_sync_bucket`). Builder; adds
+    /// to the buckets already reserved. `None` or empty reserves nothing.
     pub fn with_reserved_bucket(mut self, bucket: Option<&str>) -> Self {
-        self.reserved_bucket = bucket
-            .map(str::trim)
-            .filter(|b| !b.is_empty())
-            .map(str::to_ascii_lowercase);
+        self.reserve_bucket(bucket);
         self
     }
 
-    /// Whether `bucket` is the reserved coordination bucket.
+    /// [`Self::with_reserved_bucket`] in place.
+    pub fn reserve_bucket(&mut self, bucket: Option<&str>) {
+        if let Some(b) = bucket.map(str::trim).filter(|b| !b.is_empty()) {
+            self.reserved_buckets.insert(b.to_ascii_lowercase());
+        }
+    }
+
+    /// The reserved coordination buckets, lowercased.
+    pub fn reserved_buckets(&self) -> impl Iterator<Item = &str> {
+        self.reserved_buckets.iter().map(String::as_str)
+    }
+
+    /// Whether `bucket` is a reserved coordination bucket.
     pub fn is_reserved(&self, bucket: &str) -> bool {
-        self.reserved_bucket
-            .as_deref()
-            .is_some_and(|r| r.eq_ignore_ascii_case(bucket))
+        self.reserved_buckets.contains(&bucket.to_ascii_lowercase())
     }
 
     /// THE admission of a bucket name that a client or admin request (or an
@@ -442,7 +451,7 @@ impl BucketPolicyRegistry {
             })
             .collect();
         Self {
-            reserved_bucket: None,
+            reserved_buckets: Default::default(),
             policies,
             default_compression: true,
             default_max_delta_ratio,
@@ -800,6 +809,9 @@ mod tests {
         let reason = reg.reserved_bucket_reason("dgp-sync").unwrap();
         assert!(reason.contains("config_sync_bucket"), "{reason}");
         assert!(reg.reserved_bucket_reason("releases").is_none());
+        // A changed bucket waiting for a restart: both stay reserved.
+        let both = reg.with_reserved_bucket(Some("dgp-sync-new"));
+        assert!(both.is_reserved("dgp-sync") && both.is_reserved("DGP-SYNC-NEW"));
     }
 
     // ── replication_target_only write gate (incl. the alias hole) ──

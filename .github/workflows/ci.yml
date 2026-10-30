@@ -52,9 +52,6 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Scrub stale workspace (drop .claude leftovers from prior runs)
-        shell: bash
-        run: rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Build demo UI
         run: cd demo/s3-browser/ui && npm ci && PROD=true npm run build
@@ -81,9 +78,6 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Scrub stale workspace (drop .claude leftovers from prior runs)
-        shell: bash
-        run: rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
         with:
@@ -111,13 +105,18 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Scrub stale workspace (drop .claude leftovers from prior runs)
-        shell: bash
-        run: |
-          rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Verify tests/*.rs map to CI --test flags
         run: ./scripts/check-integration-tests-in-ci.sh
+      # A committed gitlink (an agent worktree added by mistake) breaks
+      # checkout on every later run of a reused workspace.
+      - name: No gitlinks in the tree
+        run: |
+          if git ls-files -s | grep -q '^160000 '; then
+            git ls-files -s | grep '^160000 '
+            echo "::error::gitlink (submodule entry) committed — remove it with git rm --cached"
+            exit 1
+          fi
       - name: Memory-derived cargo parallelism truth table
         run: ./scripts/test-cargo-jobs.sh
 
@@ -127,10 +126,6 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Scrub stale workspace (drop .claude leftovers from prior runs)
-        shell: bash
-        run: |
-          rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Every .rs file must have SPDX-License-Identifier
         run: ./scripts/check-spdx-headers.sh
@@ -141,10 +136,6 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Scrub stale workspace (drop .claude leftovers from prior runs)
-        shell: bash
-        run: |
-          rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: No live secrets / secret artifacts in the tracked tree
         run: ./scripts/check-no-committed-secrets.sh
@@ -155,10 +146,6 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Scrub stale workspace (drop .claude leftovers from prior runs)
-        shell: bash
-        run: |
-          rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Forbid inline savings math outside the central modules
         run: ./scripts/check-savings-math.sh
@@ -175,10 +162,6 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Scrub stale workspace (drop .claude leftovers from prior runs)
-        shell: bash
-        run: |
-          rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: cargo fmt
         run: cargo fmt --all -- --check
@@ -196,10 +179,6 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Scrub stale workspace (drop .claude leftovers from prior runs)
-        shell: bash
-        run: |
-          rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
         with:
@@ -269,10 +248,6 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Scrub stale workspace (drop .claude leftovers from prior runs)
-        shell: bash
-        run: |
-          rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
         with:
@@ -415,10 +390,6 @@ jobs:
     # DGP_* var, so CI and a local run see the same child env, and tests
     # that opt into `production_security_defaults()` get the real defaults.
     steps:
-      - name: Scrub stale workspace (drop .claude leftovers from prior runs)
-        shell: bash
-        run: |
-          rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
         with:
@@ -479,10 +450,6 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Scrub stale workspace (drop .claude leftovers from prior runs)
-        shell: bash
-        run: |
-          rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
         with:
@@ -516,10 +483,6 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Scrub stale workspace (drop .claude leftovers from prior runs)
-        shell: bash
-        run: |
-          rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v6.0.0
         with:
@@ -570,10 +533,6 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Scrub stale workspace (drop .claude leftovers from prior runs)
-        shell: bash
-        run: |
-          rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install dependencies
         run: cd demo/s3-browser/ui && npm ci
@@ -611,10 +570,6 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Scrub stale workspace (drop .claude leftovers from prior runs)
-        shell: bash
-        run: |
-          rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       # ── Blocking: every .md under docs/product/ has a manifest entry
       #    (and vice versa) — the binary embeds that folder and serves it
@@ -692,10 +647,6 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Scrub stale workspace (drop .claude leftovers from prior runs)
-        shell: bash
-        run: |
-          rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v6.0.0
         with:

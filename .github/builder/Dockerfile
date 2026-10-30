@@ -62,12 +62,13 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 # link check) were previously `cargo install`ed from source on every CI run.
 # Bake them so the nightly coverage/supply-chain jobs and the docs job pay
 # zero install cost.
-RUN cargo install cargo-audit --locked \
-  && cargo install cargo-sbom --locked \
-  && cargo install cargo-llvm-cov --locked \
-  && cargo install cargo-deny --locked \
-  && cargo install lychee --locked \
-  && cargo install sccache --locked \
+# Versions are pinned so a rebuild of `:latest` changes no tool by surprise.
+RUN cargo install cargo-audit@0.22.2 --locked \
+  && cargo install cargo-sbom@0.10.0 --locked \
+  && cargo install cargo-llvm-cov@0.9.1 --locked \
+  && cargo install cargo-deny@0.20.2 --locked \
+  && cargo install lychee@0.24.2 --locked \
+  && cargo install sccache@0.19.0 --locked \
   && rm -rf "$CARGO_HOME"/registry "$CARGO_HOME"/git
 
 # ── MinIO client (mc) ──────────────────────────────────────────────

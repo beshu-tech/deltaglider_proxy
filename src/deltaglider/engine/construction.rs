@@ -623,14 +623,7 @@ pub(crate) fn effective_legacy_key_id(
 /// backend `eu-archive` and the "key loaded from file" log points
 /// back at the SAME env var name.
 fn env_name_for_backend(backend_name: &str) -> String {
-    if backend_name == "default" {
-        "DGP_ENCRYPTION_KEY".to_string()
-    } else {
-        format!(
-            "DGP_BACKEND_{}_ENCRYPTION_KEY",
-            crate::config::env_suffix_for_backend_name(backend_name)
-        )
-    }
+    crate::config::backend_encryption_env_names(backend_name).0
 }
 
 impl<S: StorageBackend> DeltaGliderEngine<S> {
@@ -687,6 +680,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         usage: Option<Arc<crate::bucket_usage::BucketUsage>>,
     ) -> Self {
         self.bucket_usage = usage;
+        self
+    }
+
+    /// Reserve one more coordination bucket (builder; see
+    /// [`crate::bucket_policy::BucketPolicyRegistry::with_reserved_bucket`]).
+    pub fn with_reserved_bucket(mut self, bucket: &str) -> Self {
+        self.bucket_policies.reserve_bucket(Some(bucket));
         self
     }
 

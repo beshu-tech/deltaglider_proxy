@@ -692,7 +692,7 @@ pub fn kms_key_id_problem(id: &str) -> Option<&'static str> {
 /// `DGP_SSE_KMS_KEY_ID` so single-backend deployments keep the short
 /// names operators are used to.
 ///
-/// Shared with `engine::env_name_for_backend` (the
+/// Used by `backend_encryption_env_names` (the
 /// `DGP_BACKEND_<NAME>_ENCRYPTION_KEY` formatter) so the char-mapping
 /// rules live in one place. Drift risk: an operator's env var no
 /// longer matches the named backend if the two functions diverge.
@@ -1161,6 +1161,51 @@ enum ConfigShape {
     },
 }
 
+/// The flat-shape-only root keys: any of them at the root disqualifies
+/// "sectioned". Every on-disk key of `Config` (test
+/// `flat_only_keys_cover_every_config_key`).
+const FLAT_ONLY_KEYS: &[&str] = &[
+    "listen_addr",
+    "backend",
+    "backends",
+    "default_backend",
+    "max_delta_ratio",
+    "max_object_size",
+    "max_passthrough_object_size",
+    "range_spool_ttl_secs",
+    "cache_size_mb",
+    "metadata_cache_mb",
+    "filtered_list_max_engine_pages",
+    "authentication",
+    "access_key_id",
+    "secret_access_key",
+    "bootstrap_password_hash",
+    "admin_password_hash", // legacy alias for bootstrap_password_hash
+    "codec_concurrency",
+    "blocking_threads",
+    "log_level",
+    "config_sync_bucket",
+    "config_sync_object_key",
+    "backend_encryption",
+    "tls",
+    "buckets",
+    "lifecycle",
+    "replication",
+    "event_delivery",
+    "jobs",
+    "iam_users",
+    "iam_groups",
+    "auth_providers",
+    "group_mapping_rules",
+    // Phase 3b.2.a: operator-authored admission blocks at the flat
+    // root. Both sectioned (`admission:`) and flat (`admission_blocks:`)
+    // forms exist for round-trip preservation; mixing them is
+    // operator error and the classifier catches it.
+    "admission_blocks",
+    // Phase 3c.1: IAM source-of-truth selector at the flat root.
+    "iam_mode",
+];
+
 /// Classify a parsed YAML document as sectioned (Phase 3+ canonical shape)
 /// vs. flat (legacy) vs. mixed (reject).
 ///
@@ -1177,41 +1222,6 @@ fn classify_shape(doc: &serde_yaml::Value) -> ConfigShape {
         return ConfigShape::Flat;
     };
     const SECTION_KEYS: &[&str] = &["admission", "access", "storage", "advanced"];
-    // Any flat-shape-only key at the root disqualifies "sectioned".
-    // Must include every public on-disk key of `Config`; additions need
-    // to show up here too or mixed-shape detection silently misses them.
-    const FLAT_ONLY_KEYS: &[&str] = &[
-        "listen_addr",
-        "backend",
-        "backends",
-        "default_backend",
-        "max_delta_ratio",
-        "max_object_size",
-        "cache_size_mb",
-        "metadata_cache_mb",
-        "filtered_list_max_engine_pages",
-        "authentication",
-        "access_key_id",
-        "secret_access_key",
-        "bootstrap_password_hash",
-        "admin_password_hash", // legacy alias for bootstrap_password_hash
-        "codec_concurrency",
-        "blocking_threads",
-        "log_level",
-        "config_sync_bucket",
-        "config_sync_object_key",
-        "backend_encryption",
-        "tls",
-        "buckets",
-        "lifecycle",
-        // Phase 3b.2.a: operator-authored admission blocks at the flat
-        // root. Both sectioned (`admission:`) and flat (`admission_blocks:`)
-        // forms exist for round-trip preservation; mixing them is
-        // operator error and the classifier catches it.
-        "admission_blocks",
-        // Phase 3c.1: IAM source-of-truth selector at the flat root.
-        "iam_mode",
-    ];
 
     let mut flat_keys = Vec::new();
     let mut section_keys = Vec::new();

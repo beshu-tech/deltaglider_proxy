@@ -457,10 +457,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `from_file(path).unwrap_or_else(load)` path quietly dropped env
     // overrides when the file parsed, which broke `DGP_BOOTSTRAP_PASSWORD`
     // specifically — documented in the revamp plan's risks table.)
-    // Quiet: `async_main` loads again and prints the warnings once.
+    // Quiet: `async_main` loads again and prints the warnings once. A bad
+    // `--config` falls back to defaults, never to another file: `async_main`
+    // then fails on that path with its own error.
     let pre_config = if let Some(ref path) = cli.config {
-        deltaglider_proxy::config::Config::load_from_path_quiet(path)
-            .unwrap_or_else(|_| deltaglider_proxy::config::Config::load_quiet())
+        deltaglider_proxy::config::Config::load_from_path_quiet(path).unwrap_or_default()
     } else {
         deltaglider_proxy::config::Config::load_quiet()
     };

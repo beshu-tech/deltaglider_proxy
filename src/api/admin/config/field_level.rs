@@ -614,9 +614,10 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
 /// (`super::write`) — the same one the section and document surfaces
 /// use — so hot-reload side effects never drift between them.
 ///
-/// The PATCH contract: a refused transition (a gate, the engine build, the
-/// auth decision) answers `success: true` with a warning and the pre-patch
-/// config kept, not a 5xx; a persist failure is a warning too.
+/// A refused change (a gate, the engine build, the auth decision) answers
+/// its status with `success: false`, as the section and document surfaces
+/// do; the pre-patch config stays. A persist failure is a warning: the
+/// runtime state is correct, only the file is stale.
 pub async fn update_config(
     State(state): State<Arc<AdminState>>,
     headers: axum::http::HeaderMap,
@@ -647,19 +648,19 @@ fn shape_patch(result: WriteResult) -> axum::response::Response {
     };
     match outcome {
         Outcome::Conflict { current } => super::version::conflict(&current, "config"),
-        Outcome::Rejected(r) if r.stage == Stage::Build => {
-            let body = serde_json::json!({ "success": false, "error": r.error });
-            write::respond(r.status, body, &refs, None)
-        }
         // The pipeline changes no runtime state on a refusal: the pre-patch
         // config stays.
         Outcome::Rejected(r) => {
-            let failed = format!(
-                "Failed to apply config patch: {}. Pre-patch config restored.",
+            let error = if r.stage == Stage::Build {
                 r.error
-            );
-            let w = *r.warnings;
-            reply([w.build, w.env, vec![failed]].concat(), false)
+            } else {
+                format!(
+                    "Failed to apply config patch (no state changed): {}",
+                    r.error
+                )
+            };
+            let body = serde_json::json!({ "success": false, "error": error });
+            write::respond(r.status, body, &refs, None)
         }
         Outcome::Applied {
             warnings: w,
