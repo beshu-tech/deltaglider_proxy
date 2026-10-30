@@ -1641,16 +1641,6 @@ impl Config {
         use env_shadow::slot;
         let mut applied = Vec::new();
 
-        if let Some(addr) = env("DGP_LISTEN_ADDR") {
-            match addr.parse() {
-                Ok(parsed) => {
-                    self.listen_addr = parsed;
-                    applied.push(slot(&["listen_addr"]));
-                }
-                Err(e) => eprintln!("Warning: ignoring invalid DGP_LISTEN_ADDR=\"{addr}\": {e}"),
-            }
-        }
-
         // The legacy singleton backend: an S3 activator replaces the WHOLE
         // block (unset members take their defaults), DGP_DATA_DIR replaces
         // it with a filesystem backend.
@@ -1672,66 +1662,22 @@ impl Config {
             applied.push(slot(&["backend"]));
         }
 
-        macro_rules! parsed {
-            ($var:literal, $ty:ty, $field:ident, $wrap:expr) => {
-                if let Some(v) = lookup_parse::<$ty>(env, $var) {
-                    self.$field = $wrap(v);
-                    applied.push(slot(&[stringify!($field)]));
-                }
+        // Every single-field variable: THE table in `env_overrides`.
+        for b in env_overrides::ENV_FIELD_BINDINGS {
+            let (Some(set), Some(path)) = (b.set, b.yaml_path) else {
+                continue;
             };
-        }
-        macro_rules! text {
-            ($var:literal, $field:ident, $wrap:expr) => {
-                if let Some(v) = env($var) {
-                    self.$field = $wrap(v);
-                    applied.push(slot(&[stringify!($field)]));
-                }
+            let Some(raw) = env(b.env) else {
+                continue;
             };
-        }
-        parsed!("DGP_MAX_DELTA_RATIO", f32, max_delta_ratio, |v| v);
-        parsed!("DGP_MAX_OBJECT_SIZE", u64, max_object_size, |v| v);
-        parsed!(
-            "DGP_MAX_PASSTHROUGH_OBJECT_SIZE",
-            u64,
-            max_passthrough_object_size,
-            |v| v
-        );
-        parsed!("DGP_RANGE_SPOOL_TTL_SECS", u64, range_spool_ttl_secs, |v| v);
-        parsed!("DGP_CACHE_MB", usize, cache_size_mb, |v| v);
-        parsed!("DGP_METADATA_CACHE_MB", usize, metadata_cache_mb, |v| v);
-        parsed!(
-            "DGP_FILTERED_LIST_MAX_ENGINE_PAGES",
-            usize,
-            filtered_list_max_engine_pages,
-            |v| v
-        );
-        parsed!("DGP_CODEC_CONCURRENCY", usize, codec_concurrency, Some);
-        parsed!("DGP_BLOCKING_THREADS", usize, blocking_threads, Some);
-
-        // Replication run concurrency: the worker reads these fields, so the
-        // override must land here (the worker clamps the value at use).
-        for (var, field, value) in [
-            (
-                "DGP_REPLICATION_TRANSFERS",
-                "transfers",
-                &mut self.replication.transfers,
-            ),
-            (
-                "DGP_UPLOAD_CONCURRENCY",
-                "upload_concurrency",
-                &mut self.replication.upload_concurrency,
-            ),
-        ] {
-            if let Some(v) = lookup_parse::<u32>(env, var) {
-                *value = v;
-                applied.push(slot(&["replication", field]));
+            if b.kind == env_overrides::EnvValueKind::NonBlankText && raw.trim().is_empty() {
+                continue;
+            }
+            match set(self, &raw) {
+                Ok(()) => applied.push(env_overrides::flat_slot(path)),
+                Err(e) => eprintln!("Warning: ignoring invalid {}=\"{raw}\": {e}", b.env),
             }
         }
-
-        // Authentication mode + proxy SigV4 credentials.
-        text!("DGP_AUTHENTICATION", authentication, Some);
-        text!("DGP_ACCESS_KEY_ID", access_key_id, Some);
-        text!("DGP_SECRET_ACCESS_KEY", secret_access_key, Some);
 
         // Admin GUI password hash
         if let Some(v) =
@@ -1744,17 +1690,11 @@ impl Config {
         // Log level (runtime operational). RUST_LOG sets the startup filter
         // above DGP_LOG_LEVEL (startup.rs::init_tracing), so it is the
         // effective level: the GUI shows it and an apply cannot replace it.
-        if let Some(v) = env(RUST_LOG).or_else(|| env("DGP_LOG_LEVEL")) {
+        if let Some(v) = env(RUST_LOG) {
             self.log_level = v;
-            applied.push(slot(&["log_level"]));
-        }
-
-        // Config DB S3 sync
-        text!("DGP_CONFIG_SYNC_BUCKET", config_sync_bucket, Some);
-        if let Some(key) = env("DGP_CONFIG_SYNC_KEY") {
-            if !key.trim().is_empty() {
-                self.config_sync_object_key = Some(key);
-                applied.push(slot(&["config_sync_object_key"]));
+            let log_slot = slot(&["log_level"]);
+            if !applied.contains(&log_slot) {
+                applied.push(log_slot);
             }
         }
 

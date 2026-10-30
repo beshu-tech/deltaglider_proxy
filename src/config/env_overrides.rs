@@ -47,6 +47,8 @@ pub struct EnvFieldBinding {
     pub yaml_path: Option<&'static str>,
     pub kind: EnvValueKind,
     pub secret: bool,
+    /// `None`: no `Config` field (a [`super::RuntimeTuning`] setting).
+    pub set: Option<FieldSetter>,
 }
 
 /// One member of a block that an activator variable replaces as a whole.
@@ -63,13 +65,32 @@ pub struct EnvBlockMember {
 pub const S3_ACTIVATORS: &[&str] = &["DGP_S3_ENDPOINT", "DGP_S3_REGION"];
 pub const TLS_FLAG: &str = "DGP_TLS_ENABLED";
 
-const fn bind(env: &'static str, yaml_path: &'static str, kind: EnvValueKind) -> EnvFieldBinding {
-    EnvFieldBinding {
-        env,
-        yaml_path: Some(yaml_path),
-        kind,
-        secret: false,
-    }
+/// Writes a raw env value into its flat `Config` field. `Err`: the value
+/// does not parse, and the override ignores it.
+pub type FieldSetter = fn(&mut Config, &str) -> Result<(), String>;
+
+/// One binding of THE env → field table: the GUI's YAML path and the
+/// setter that `apply_env_overrides_with` runs. The flat field is the YAML
+/// path without its section (`SectionedConfig::from_flat` keeps the names;
+/// test `every_bound_variable_writes_its_yaml_path`). The wrapper (`Some`)
+/// fills an `Option` field.
+macro_rules! bind {
+    ($env:literal, $path:literal, $kind:ident, $($field:ident).+) => {
+        bind!($env, $path, $kind, $($field).+, std::convert::identity)
+    };
+    ($env:literal, $path:literal, $kind:ident, $($field:ident).+, $wrap:path) => {
+        EnvFieldBinding {
+            env: $env,
+            yaml_path: Some($path),
+            kind: EnvValueKind::$kind,
+            secret: false,
+            set: Some(|cfg, raw| {
+                let value = raw.parse().map_err(|e| format!("{e}"))?;
+                cfg.$($field).+ = $wrap(value);
+                Ok(())
+            }),
+        }
+    };
 }
 
 const fn env_only(env: &'static str) -> EnvFieldBinding {
@@ -78,6 +99,7 @@ const fn env_only(env: &'static str) -> EnvFieldBinding {
         yaml_path: None,
         kind: EnvValueKind::Unsigned,
         secret: false,
+        set: None,
     }
 }
 
@@ -97,95 +119,123 @@ const fn member(
     }
 }
 
-/// Variables that control exactly one field.
+/// Variables that control exactly one field. THE env → field map:
+/// `apply_env_overrides_with` applies the bound ones from this table.
 pub const ENV_FIELD_BINDINGS: &[EnvFieldBinding] = &[
-    bind(
+    bind!(
         "DGP_LISTEN_ADDR",
         "advanced.listen_addr",
-        EnvValueKind::SocketAddr,
+        SocketAddr,
+        listen_addr
     ),
-    bind(
+    bind!(
         "DGP_MAX_DELTA_RATIO",
         "advanced.max_delta_ratio",
-        EnvValueKind::Float,
+        Float,
+        max_delta_ratio
     ),
-    bind(
+    bind!(
         "DGP_MAX_OBJECT_SIZE",
         "advanced.max_object_size",
-        EnvValueKind::Unsigned,
+        Unsigned,
+        max_object_size
     ),
-    bind(
+    bind!(
         "DGP_MAX_PASSTHROUGH_OBJECT_SIZE",
         "advanced.max_passthrough_object_size",
-        EnvValueKind::Unsigned,
+        Unsigned,
+        max_passthrough_object_size
     ),
-    bind(
+    bind!(
         "DGP_RANGE_SPOOL_TTL_SECS",
         "advanced.range_spool_ttl_secs",
-        EnvValueKind::Unsigned,
+        Unsigned,
+        range_spool_ttl_secs
     ),
-    bind(
+    bind!(
         "DGP_CACHE_MB",
         "advanced.cache_size_mb",
-        EnvValueKind::Unsigned,
+        Unsigned,
+        cache_size_mb
     ),
-    bind(
+    bind!(
         "DGP_METADATA_CACHE_MB",
         "advanced.metadata_cache_mb",
-        EnvValueKind::Unsigned,
+        Unsigned,
+        metadata_cache_mb
     ),
-    bind(
+    bind!(
         "DGP_FILTERED_LIST_MAX_ENGINE_PAGES",
         "advanced.filtered_list_max_engine_pages",
-        EnvValueKind::Unsigned,
+        Unsigned,
+        filtered_list_max_engine_pages
     ),
-    bind(
+    bind!(
         "DGP_CODEC_CONCURRENCY",
         "advanced.codec_concurrency",
-        EnvValueKind::Unsigned,
+        Unsigned,
+        codec_concurrency,
+        Some
     ),
-    bind(
+    bind!(
         "DGP_BLOCKING_THREADS",
         "advanced.blocking_threads",
-        EnvValueKind::Unsigned,
+        Unsigned,
+        blocking_threads,
+        Some
     ),
-    bind(
+    // Replication run concurrency: the worker reads these fields, so the
+    // override lands here (the worker clamps the value at use).
+    bind!(
         "DGP_REPLICATION_TRANSFERS",
         "storage.replication.transfers",
-        EnvValueKind::Unsigned,
+        Unsigned,
+        replication.transfers
     ),
-    bind(
+    bind!(
         "DGP_UPLOAD_CONCURRENCY",
         "storage.replication.upload_concurrency",
-        EnvValueKind::Unsigned,
+        Unsigned,
+        replication.upload_concurrency
     ),
-    bind("DGP_LOG_LEVEL", "advanced.log_level", EnvValueKind::Text),
-    bind(
+    // RUST_LOG beats it (`apply_env_overrides_with`).
+    bind!("DGP_LOG_LEVEL", "advanced.log_level", Text, log_level),
+    bind!(
         "DGP_CONFIG_SYNC_BUCKET",
         "advanced.config_sync_bucket",
-        EnvValueKind::Text,
+        Text,
+        config_sync_bucket,
+        Some
     ),
-    bind(
+    bind!(
         "DGP_CONFIG_SYNC_KEY",
         "advanced.config_sync_object_key",
-        EnvValueKind::NonBlankText,
+        NonBlankText,
+        config_sync_object_key,
+        Some
     ),
-    bind(
+    bind!(
         "DGP_AUTHENTICATION",
         "access.authentication",
-        EnvValueKind::Text,
+        Text,
+        authentication,
+        Some
     ),
-    bind(
+    bind!(
         "DGP_ACCESS_KEY_ID",
         "access.access_key_id",
-        EnvValueKind::Text,
+        Text,
+        access_key_id,
+        Some
     ),
     EnvFieldBinding {
         secret: true,
-        ..bind(
+        ..bind!(
             "DGP_SECRET_ACCESS_KEY",
             "access.secret_access_key",
-            EnvValueKind::Text,
+            Text,
+            secret_access_key,
+            Some
         )
     },
     env_only("DGP_REQUEST_TIMEOUT_SECS"),
@@ -194,6 +244,13 @@ pub const ENV_FIELD_BINDINGS: &[EnvFieldBinding] = &[
     env_only("DGP_MAX_CONNECTIONS"),
     env_only("DGP_MAX_MULTIPART_UPLOADS"),
 ];
+
+/// The flat `Config` slot of a bound YAML path: the path without its
+/// section.
+pub(super) fn flat_slot(yaml_path: &str) -> super::env_shadow::EnvSlot {
+    let keys: Vec<&str> = yaml_path.split('.').skip(1).collect();
+    super::env_shadow::slot(&keys)
+}
 
 /// The legacy singleton backend when an S3 activator is set: the WHOLE
 /// `storage.backend` block comes from the environment.
@@ -746,6 +803,49 @@ storage:
             }
         }
         names
+    }
+
+    /// The YAML path of a binding is the field its setter writes: the value
+    /// shows up there in the sectioned export, and the env shadow records
+    /// the flat slot that exists in the flat tree.
+    #[test]
+    fn every_bound_variable_writes_its_yaml_path() {
+        fn at<'a>(tree: &'a serde_yaml::Value, keys: &[&str]) -> Option<&'a serde_yaml::Value> {
+            keys.iter().try_fold(tree, |v, k| v.get(*k))
+        }
+        let sectioned = |c: &Config| {
+            serde_yaml::to_value(crate::config_sections::SectionedConfig::from_flat(c)).unwrap()
+        };
+        let base = sectioned(&Config::default());
+        let mut bound = 0;
+        for b in ENV_FIELD_BINDINGS {
+            let (Some(_), Some(path)) = (b.set, b.yaml_path) else {
+                continue;
+            };
+            let raw = match b.kind {
+                EnvValueKind::SocketAddr => "127.0.0.1:1",
+                EnvValueKind::Float => "0.3",
+                EnvValueKind::Unsigned => "7",
+                _ => "x-test",
+            };
+            let mut cfg = Config::default();
+            let slots = cfg.apply_env_overrides_with(&|n: &str| (n == b.env).then(|| raw.into()));
+            assert_eq!(slots, vec![flat_slot(path)], "{}", b.env);
+            let flat = serde_yaml::to_value(&cfg).unwrap();
+            let flat_keys: Vec<&str> = path.split('.').skip(1).collect();
+            assert!(at(&flat, &flat_keys).is_some(), "{}: no flat {path}", b.env);
+            let keys: Vec<&str> = path.split('.').collect();
+            let got = at(&sectioned(&cfg), &keys).cloned();
+            assert!(got.is_some(), "{} does not write {path}", b.env);
+            assert_ne!(
+                got.as_ref(),
+                at(&base, &keys),
+                "{} does not write {path}",
+                b.env
+            );
+            bound += 1;
+        }
+        assert_eq!(bound, 18);
     }
 
     /// Drift guard: a variable the overrides read must be shown to the GUI or
