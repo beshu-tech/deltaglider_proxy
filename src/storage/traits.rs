@@ -1018,14 +1018,6 @@ pub trait StorageBackend: Send + Sync {
         proof: &crate::deltaglider::RefWriteProof,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
-    /// Delete a delta file and its metadata
-    fn delete_delta(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send;
-
     // === Passthrough file operations (stored as-is with original filename) ===
 
     /// Store a passthrough (non-delta) file with its metadata
@@ -1096,12 +1088,15 @@ pub trait StorageBackend: Send + Sync {
         async move { 0 }
     }
 
-    /// Delete a passthrough (non-delta) file and its metadata
-    fn delete_passthrough(
+    /// Delete one variant of an object (a delta or a passthrough file)
+    /// and its metadata. Callers use the names in [`StorageBackendExt`].
+    /// No default: every wrapper must forward it.
+    fn delete_object(
         &self,
         bucket: &str,
         prefix: &str,
         filename: &str,
+        variant: ObjectVariant,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// The stored version (the backend's ETag) of one variant, for a later
@@ -1131,12 +1126,8 @@ pub trait StorageBackend: Send + Sync {
         _version: &str,
     ) -> impl Future<Output = Result<bool, StorageError>> + Send {
         async move {
-            match variant {
-                ObjectVariant::Delta => self.delete_delta(bucket, prefix, filename).await?,
-                ObjectVariant::Passthrough => {
-                    self.delete_passthrough(bucket, prefix, filename).await?
-                }
-            }
+            self.delete_object(bucket, prefix, filename, variant)
+                .await?;
             Ok(true)
         }
     }
@@ -1606,9 +1597,30 @@ pub trait StorageBackend: Send + Sync {
 
 /// The per-form names over the form-generic methods
 /// ([`StorageBackend::write_reference`], [`StorageBackend::head_object`],
-/// [`StorageBackend::get_object`]). One implementation for every backend
-/// (the blanket impl below), so no wrapper forwards them.
+/// [`StorageBackend::get_object`], [`StorageBackend::delete_object`]). One
+/// implementation for every backend (the blanket impl below), so no wrapper
+/// forwards them.
 pub trait StorageBackendExt: StorageBackend {
+    /// Delete a delta file and its metadata.
+    fn delete_delta(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        self.delete_object(bucket, prefix, filename, ObjectVariant::Delta)
+    }
+
+    /// Delete a passthrough (non-delta) file and its metadata.
+    fn delete_passthrough(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        self.delete_object(bucket, prefix, filename, ObjectVariant::Passthrough)
+    }
+
     /// Get the reference file for a deltaspace.
     fn get_reference(
         &self,

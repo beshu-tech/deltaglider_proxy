@@ -844,20 +844,6 @@ impl StorageBackend for S3Backend {
             .await
     }
 
-    #[instrument(skip(self))]
-    async fn delete_delta(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<(), StorageError> {
-        let key = self.delta_key(prefix, filename);
-        let at = self.delete_s3_object_dated(bucket, &key).await?;
-        self.facts_cleanup.enqueue(bucket, &key, at);
-        debug!("Deleted delta for {}/{}/{}", bucket, prefix, filename);
-        Ok(())
-    }
-
     // === Passthrough file operations (stored with original filename) ===
 
     #[instrument(skip(self, data, metadata))]
@@ -903,19 +889,24 @@ impl StorageBackend for S3Backend {
     }
 
     #[instrument(skip(self))]
-    async fn delete_passthrough(
+    async fn delete_object(
         &self,
         bucket: &str,
         prefix: &str,
         filename: &str,
+        variant: ObjectVariant,
     ) -> Result<(), StorageError> {
-        let key = self.passthrough_key(prefix, filename);
+        let key = self.variant_key(prefix, filename, variant);
         let at = self.delete_s3_object_dated(bucket, &key).await?;
         // A plain passthrough has facts too when its stored ETag is not the
         // logical one (a proxy-assembled multipart upload), and a ciphertext
-        // always: queue the cleanup for every passthrough delete.
+        // always: queue the cleanup for every delete.
         self.facts_cleanup.enqueue(bucket, &key, at);
-        debug!("Deleted passthrough for {}/{}/{}", bucket, prefix, filename);
+        let label = match variant {
+            ObjectVariant::Delta => "delta",
+            ObjectVariant::Passthrough => "passthrough",
+        };
+        debug!("Deleted {} for {}/{}/{}", label, bucket, prefix, filename);
         Ok(())
     }
 

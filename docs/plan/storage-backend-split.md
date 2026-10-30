@@ -208,6 +208,11 @@ format, a request count, or who can make a proof.
   `get_object(StoredObject)`; the three names live on in
   `StorageBackendExt`. `S3Backend`'s own `get_object` helper is now
   `get_object_bytes`. The encrypting guard also refuses `inner.get_object(`.
+- Step 5: done (commit "one object delete"). 58 → 57 methods.
+  `delete_object(.., ObjectVariant)`; `delete_delta` / `delete_passthrough`
+  live on in `StorageBackendExt`. The encrypting wrapper forwards it
+  unchecked, as the two deletes were. The unfenced-reference-delete
+  question above stays open: this step kept every delete as it was.
 - Found while doing step 2, kept as it was: the encrypting wrapper runs the
   witness check on a FENCED reference delete (`check_write_unless(.., true)`
   still calls `check_witness`), but never on an UNFENCED one (the old

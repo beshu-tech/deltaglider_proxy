@@ -563,6 +563,16 @@ impl crate::storage::StorageBackend for FencingFs {
         self.inner.get_object(b, p, o).await
     }
 
+    async fn delete_object(
+        &self,
+        b: &str,
+        p: &str,
+        f: &str,
+        v: crate::storage::ObjectVariant,
+    ) -> Result<(), StorageError> {
+        self.inner.delete_object(b, p, f, v).await
+    }
+
     async fn head_object(
         &self,
         b: &str,
@@ -669,9 +679,6 @@ impl crate::storage::StorageBackend for FencingFs {
         }
         self.inner.put_delta(b, p, f, d, m, proof).await
     }
-    async fn delete_delta(&self, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
-        self.inner.delete_delta(b, p, f).await
-    }
     async fn put_passthrough(
         &self,
         b: &str,
@@ -691,9 +698,6 @@ impl crate::storage::StorageBackend for FencingFs {
         self.inner
             .get_passthrough_metadata_for_rewrite(b, p, f)
             .await
-    }
-    async fn delete_passthrough(&self, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
-        self.inner.delete_passthrough(b, p, f).await
     }
     async fn open_object(
         &self,

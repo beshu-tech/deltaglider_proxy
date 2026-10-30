@@ -621,6 +621,16 @@ mod wrapper_tests {
             }
         }
 
+        async fn delete_object(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: crate::storage::ObjectVariant,
+        ) -> Result<(), StorageError> {
+            Err(cb_err())
+        }
+
         async fn head_object(
             &self,
             _: &str,
@@ -654,12 +664,6 @@ mod wrapper_tests {
             _: &FileMetadata,
             _: &RefWriteProof,
         ) -> Result<(), StorageError> {
-            Err(cb_err())
-        }
-        async fn delete_delta(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
-            Err(cb_err())
-        }
-        async fn delete_passthrough(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
             Err(cb_err())
         }
         async fn scan_deltaspace(

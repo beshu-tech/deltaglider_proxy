@@ -92,6 +92,16 @@ impl crate::storage::StorageBackend for NullInner {
         Ok(vec![])
     }
 
+    async fn delete_object(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: crate::storage::ObjectVariant,
+    ) -> Result<(), crate::storage::StorageError> {
+        Ok(())
+    }
+
     async fn head_object(
         &self,
         _: &str,
@@ -126,14 +136,6 @@ impl crate::storage::StorageBackend for NullInner {
         _: bytes::Bytes,
         _: &crate::types::FileMetadata,
         _proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), crate::storage::StorageError> {
-        Ok(())
-    }
-    async fn delete_delta(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
     ) -> Result<(), crate::storage::StorageError> {
         Ok(())
     }
@@ -193,14 +195,6 @@ impl crate::storage::StorageBackend for NullInner {
         _: crate::storage::ClaimWrite<'_>,
     ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
         Ok(crate::storage::ClaimOutcome::Written)
-    }
-    async fn delete_passthrough(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-    ) -> Result<(), crate::storage::StorageError> {
-        Ok(())
     }
     async fn scan_deltaspace(
         &self,

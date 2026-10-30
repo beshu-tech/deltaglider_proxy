@@ -1253,15 +1253,6 @@ impl StorageBackend for RoutingBackend {
             .await
     }
 
-    async fn delete_delta(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<(), StorageError> {
-        route_existing!(self, bucket, delete_delta, prefix, filename)
-    }
-
     // === Passthrough file operations ===
 
     async fn put_passthrough(
@@ -1367,15 +1358,6 @@ impl StorageBackend for RoutingBackend {
         )
     }
 
-    async fn delete_passthrough(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<(), StorageError> {
-        route_existing!(self, bucket, delete_passthrough, prefix, filename)
-    }
-
     async fn variant_version(
         &self,
         bucket: &str,
@@ -1384,6 +1366,16 @@ impl StorageBackend for RoutingBackend {
         variant: crate::storage::ObjectVariant,
     ) -> Result<Option<String>, StorageError> {
         route_existing!(self, bucket, variant_version, prefix, filename, variant)
+    }
+
+    async fn delete_object(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        variant: crate::storage::ObjectVariant,
+    ) -> Result<(), StorageError> {
+        route_existing!(self, bucket, delete_object, prefix, filename, variant)
     }
 
     async fn delete_variant_if(
@@ -1881,6 +1873,16 @@ mod tests {
             ))
         }
 
+        async fn delete_object(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: crate::storage::ObjectVariant,
+        ) -> Result<(), StorageError> {
+            Ok(())
+        }
+
         async fn head_object(
             &self,
             _: &str,
@@ -1914,10 +1916,6 @@ mod tests {
             _: &FileMetadata,
             _proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), StorageError> {
-            Ok(())
-        }
-
-        async fn delete_delta(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
             Ok(())
         }
 
@@ -1987,10 +1985,6 @@ mod tests {
             _: &str,
         ) -> Result<(FileMetadata, crate::storage::RewriteBasis), StorageError> {
             Err(StorageError::NotFound("object metadata".to_string()))
-        }
-
-        async fn delete_passthrough(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
-            Ok(())
         }
 
         async fn scan_deltaspace(

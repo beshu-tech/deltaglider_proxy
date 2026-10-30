@@ -456,6 +456,23 @@ impl StorageBackend for FaultyFs {
             .map(Some)
     }
 
+    async fn delete_object(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        variant: ObjectVariant,
+    ) -> Result<(), StorageError> {
+        let point = match variant {
+            ObjectVariant::Delta => FaultPoint::DeleteDelta,
+            ObjectVariant::Passthrough => FaultPoint::DeletePassthrough,
+        };
+        self.armed(point, bucket, prefix, filename).await?;
+        self.inner
+            .delete_object(bucket, prefix, filename, variant)
+            .await
+    }
+
     async fn delete_variant_if(
         &self,
         bucket: &str,
@@ -473,10 +490,8 @@ impl StorageBackend for FaultyFs {
                 Err(e) => return Err(e),
             }
         }
-        match variant {
-            ObjectVariant::Delta => self.delete_delta(bucket, prefix, filename).await?,
-            ObjectVariant::Passthrough => self.delete_passthrough(bucket, prefix, filename).await?,
-        }
+        self.delete_object(bucket, prefix, filename, variant)
+            .await?;
         Ok(true)
     }
 
@@ -494,17 +509,6 @@ impl StorageBackend for FaultyFs {
         self.inner
             .put_delta(bucket, prefix, filename, data, metadata, proof)
             .await
-    }
-
-    async fn delete_delta(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<(), StorageError> {
-        self.armed(FaultPoint::DeleteDelta, bucket, prefix, filename)
-            .await?;
-        self.inner.delete_delta(bucket, prefix, filename).await
     }
 
     async fn put_passthrough(
@@ -558,19 +562,6 @@ impl StorageBackend for FaultyFs {
                 self.inner
                     .put_passthrough_parts(bucket, prefix, filename, part_paths, metadata, _spool),
             )
-            .await
-    }
-
-    async fn delete_passthrough(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<(), StorageError> {
-        self.armed(FaultPoint::DeletePassthrough, bucket, prefix, filename)
-            .await?;
-        self.inner
-            .delete_passthrough(bucket, prefix, filename)
             .await
     }
 

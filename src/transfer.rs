@@ -2834,6 +2834,19 @@ mod multipart_abort_tests {
             Err(nope())
         }
 
+        async fn delete_object(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            v: crate::storage::ObjectVariant,
+        ) -> Result<(), StorageError> {
+            match v {
+                crate::storage::ObjectVariant::Delta => Ok(()),
+                crate::storage::ObjectVariant::Passthrough => Err(nope()),
+            }
+        }
+
         // Source-object reads used by the streaming copy path.
         async fn head_object(
             &self,
@@ -2867,9 +2880,6 @@ mod multipart_abort_tests {
         ) -> Result<(), StorageError> {
             Err(nope())
         }
-        async fn delete_delta(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
-            Ok(())
-        }
         async fn put_passthrough(
             &self,
             _: &str,
@@ -2878,9 +2888,6 @@ mod multipart_abort_tests {
             _: bytes::Bytes,
             _: &FileMetadata,
         ) -> Result<(), StorageError> {
-            Err(nope())
-        }
-        async fn delete_passthrough(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
             Err(nope())
         }
         async fn open_object(
@@ -3088,6 +3095,16 @@ mod multipart_abort_tests {
             self.0.get_object(b, p, o).await
         }
 
+        async fn delete_object(
+            &self,
+            b: &str,
+            p: &str,
+            f: &str,
+            v: crate::storage::ObjectVariant,
+        ) -> Result<(), StorageError> {
+            self.0.delete_object(b, p, f, v).await
+        }
+
         async fn head_object(
             &self,
             b: &str,
@@ -3114,9 +3131,6 @@ mod multipart_abort_tests {
         ) -> Result<(), StorageError> {
             self.0.put_delta(b, p, f, d, m, proof).await
         }
-        async fn delete_delta(&self, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
-            self.0.delete_delta(b, p, f).await
-        }
         async fn put_passthrough(
             &self,
             b: &str,
@@ -3126,9 +3140,6 @@ mod multipart_abort_tests {
             m: &FileMetadata,
         ) -> Result<(), StorageError> {
             self.0.put_passthrough(b, p, f, d, m).await
-        }
-        async fn delete_passthrough(&self, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
-            self.0.delete_passthrough(b, p, f).await
         }
         async fn open_object(
             &self,

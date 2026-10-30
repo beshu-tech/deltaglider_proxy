@@ -1527,23 +1527,6 @@ impl StorageBackend for FilesystemBackend {
         .await
     }
 
-    #[instrument(skip(self))]
-    async fn delete_delta(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<(), StorageError> {
-        self.delete_object_file(
-            &self.delta_path(bucket, prefix, filename)?,
-            &self.deltaspace_dir(bucket, "")?,
-            "delta",
-            prefix,
-            filename,
-        )
-        .await
-    }
-
     // === Passthrough operations (stored with original filename) ===
 
     #[instrument(skip(self, data, metadata))]
@@ -1630,23 +1613,6 @@ impl StorageBackend for FilesystemBackend {
         .map_err(super::join_error)?
     }
 
-    #[instrument(skip(self))]
-    async fn delete_passthrough(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<(), StorageError> {
-        self.delete_object_file(
-            &self.passthrough_path(bucket, prefix, filename)?,
-            &self.deltaspace_dir(bucket, "")?,
-            "passthrough",
-            prefix,
-            filename,
-        )
-        .await
-    }
-
     // === Chunked write operations ===
 
     #[instrument(skip(self, chunks, metadata))]
@@ -1692,6 +1658,31 @@ impl StorageBackend for FilesystemBackend {
     }
 
     // === Streaming operations ===
+
+    #[instrument(skip(self))]
+    async fn delete_object(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        variant: ObjectVariant,
+    ) -> Result<(), StorageError> {
+        let (path, label) = match variant {
+            ObjectVariant::Delta => (self.delta_path(bucket, prefix, filename)?, "delta"),
+            ObjectVariant::Passthrough => (
+                self.passthrough_path(bucket, prefix, filename)?,
+                "passthrough",
+            ),
+        };
+        self.delete_object_file(
+            &path,
+            &self.deltaspace_dir(bucket, "")?,
+            label,
+            prefix,
+            filename,
+        )
+        .await
+    }
 
     /// The metadata read (xattr, or the fallback of a file without it) and
     /// the file, opened once.

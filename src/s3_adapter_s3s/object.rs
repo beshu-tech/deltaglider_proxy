@@ -927,7 +927,7 @@ pub(super) fn get_object_output_from_metadata(
 mod delete_objects_tests {
     use super::*;
     use crate::deltaglider::store_deltas;
-    use crate::storage::{FakeS3, StorageBackend};
+    use crate::storage::{FakeS3, StorageBackend, StorageBackendExt};
 
     /// A service over a fake S3 with bucket `b` and an event outbox.
     async fn service() -> (DeltaGliderS3Service, Arc<FakeS3>) {

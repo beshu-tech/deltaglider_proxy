@@ -2022,12 +2022,16 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     ) -> Result<super::traits::RefFence, StorageError> {
         self.inner.reference_fence(b, p).await
     }
-    async fn delete_delta(&self, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
-        self.inner.delete_delta(b, p, f).await
+    async fn delete_object(
+        &self,
+        b: &str,
+        p: &str,
+        f: &str,
+        v: crate::storage::ObjectVariant,
+    ) -> Result<(), StorageError> {
+        self.inner.delete_object(b, p, f, v).await
     }
-    async fn delete_passthrough(&self, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
-        self.inner.delete_passthrough(b, p, f).await
-    }
+
     // The version is the stored object's: an overwrite changes it too.
     async fn variant_version(
         &self,
