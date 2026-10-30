@@ -28,6 +28,17 @@ export function isTypingTarget(target: EventTarget | null): boolean {
   return target.isContentEditable;
 }
 
+/** True when the key goes to a control that acts on Enter itself (a button,
+ *  a link, a menu item): a page-level Enter handler must leave it alone. */
+export function isActivatableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return (
+    target.closest(
+      'button, a[href], [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="checkbox"], [role="switch"]',
+    ) !== null
+  );
+}
+
 /**
  * True when any AntD overlay (modal, drawer, or open dropdown/select popup) is
  * mounted and visible. Those own the keyboard while open, so browser-level

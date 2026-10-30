@@ -14,6 +14,9 @@
 
 ### Fixed — Interface and website
 
+- The file browser's keyboard cursor had no visible style: the row styles named table rows, and the browser draws its list with `div` rows. The cursor row now has a ring, and hover and selection show again.
+- The file browser's list is a grid for screen readers: rows and cells have their roles, the sorted column says so, and Tab reaches the cursor row. When a row has the focus, the focus follows the arrow keys.
+- Enter on a focused button of the file browser presses the button. Before, with a cursor row, Enter opened that row instead.
 - The **Change Admin Password** button had a contrast of 2.89:1 in the light theme, and the **Download** button of the inspector was white on mint in the dark theme. Both use the theme's primary button now, and a lint rule refuses a hand-picked accent fill on a button.
 - The page no longer starts with `class="dark"` on `<html>` while the theme is light: the first paint sets `data-theme` with the same rule as the app.
 - The docs index showed `//api/admin/` for `/_/api/admin/*`, and page descriptions dropped the `_` of names such as `config_sync_bucket`. A summary now keeps the text of code spans.

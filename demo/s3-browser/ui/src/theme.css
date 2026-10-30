@@ -208,11 +208,15 @@ body {
   min-width: 0;
 }
 
-/* ───── Ant Design table overrides ───── */
-.ant-table-wrapper .ant-table-tbody > tr.ant-table-row:hover > td {
+/* ───── Ant Design table overrides ─────
+   Every body-row rule names both row shapes: <tr> > <td> of a normal table
+   and the <div class="ant-table-row"> > .ant-table-cell of a `virtual` one
+   (the object browser). Rules for <tr> only left the browser's hover,
+   selection and keyboard cursor without any style. */
+.ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row).ant-table-row:hover > :is(td, .ant-table-cell) {
   background: var(--table-row-hover) !important;
 }
-.ant-table-wrapper .ant-table-tbody > tr.ant-table-row-selected > td {
+.ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row).ant-table-row-selected > :is(td, .ant-table-cell) {
   background: var(--table-row-selected) !important;
 }
 
@@ -226,13 +230,13 @@ body {
 }
 
 /* Row hover accent bar */
-.ant-table-wrapper .ant-table-tbody > tr.ant-table-row {
+.ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row).ant-table-row {
   position: relative;
 }
-.ant-table-wrapper .ant-table-tbody > tr.ant-table-row > td:first-child {
+.ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row).ant-table-row > :is(td, .ant-table-cell):first-child {
   position: relative;
 }
-.ant-table-wrapper .ant-table-tbody > tr.ant-table-row > td:first-child::before {
+.ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row).ant-table-row > :is(td, .ant-table-cell):first-child::before {
   content: '';
   position: absolute;
   left: 0;
@@ -244,22 +248,19 @@ body {
   opacity: 0;
   transition: opacity 0.15s ease;
 }
-.ant-table-wrapper .ant-table-tbody > tr.ant-table-row:hover > td:first-child::before {
-  opacity: 1;
-}
-.ant-table-wrapper .ant-table-tbody > tr.ant-table-row-selected > td:first-child::before {
+.ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row):is(:hover, .ant-table-row-selected, .dg-row-cursor) > :is(td, .ant-table-cell):first-child::before {
   opacity: 1;
 }
 
-/* Keyboard-cursor row (arrow-key navigation): a clear focus ring + the
-   left accent bar, so the active row reads as "focused" distinct from the
-   click-selected row. */
-.ant-table-wrapper .ant-table-tbody > tr.dg-row-cursor > td {
+/* Keyboard-cursor row (arrow-key navigation): the hover background, the
+   left accent bar and a ring around the row, so the active row reads as
+   "focused", distinct from the click-selected row. */
+.ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row).dg-row-cursor > :is(td, .ant-table-cell) {
   background: var(--table-row-hover) !important;
-  box-shadow: inset 0 0 0 1px var(--focus-ring);
 }
-.ant-table-wrapper .ant-table-tbody > tr.dg-row-cursor > td:first-child::before {
-  opacity: 1;
+.ant-table-wrapper .ant-table-tbody-virtual .ant-table-row:is(.dg-row-cursor, :focus-visible) {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
 }
 
 /* ───── Accessibility: skip-to-content ───── */

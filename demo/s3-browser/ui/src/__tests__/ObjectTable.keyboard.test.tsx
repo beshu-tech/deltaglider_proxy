@@ -157,3 +157,42 @@ describe('mouse', () => {
     expect(spies.onSelect).not.toHaveBeenCalled();
   });
 });
+
+describe('assistive tech', () => {
+  test('the list is a grid of rows and cells, with one row in the tab order', async () => {
+    mount();
+    await screen.findByText('app-1.0.zip');
+    const grid = screen.getByRole('grid', { name: 'Objects in builds/' });
+    expect(grid).toHaveAttribute('aria-rowcount', '4');
+    expect(grid.querySelector('table')).toHaveAttribute('role', 'presentation');
+    expect(screen.getAllByRole('columnheader').map((h) => h.textContent)).toContain('Name');
+    const rows = document.querySelectorAll('.ant-table-row');
+    expect([...rows].map((r) => r.getAttribute('role'))).toEqual(['row', 'row', 'row']);
+    expect([...rows].map((r) => r.getAttribute('aria-rowindex'))).toEqual(['2', '3', '4']);
+    expect([...rows].map((r) => r.getAttribute('tabindex'))).toEqual(['0', '-1', '-1']);
+    expect(row('builds/app-1.0.zip').querySelectorAll('[role="gridcell"]').length).toBeGreaterThan(2);
+  });
+
+  test('a focused row moves the cursor, and the focus follows the arrows', async () => {
+    mount();
+    await screen.findByText('app-1.0.zip');
+    row('builds/app-1.0.zip').focus();
+    await waitFor(() => expect(cursorRow()).toBe('builds/app-1.0.zip'));
+    fireEvent.keyDown(document.activeElement!, { key: 'ArrowDown' });
+    await waitFor(() => expect(cursorRow()).toBe('builds/app-1.1.zip'));
+    await waitFor(() => expect(document.activeElement).toBe(row('builds/app-1.1.zip')));
+    expect(row('builds/app-1.1.zip')).toHaveAttribute('tabindex', '0');
+  });
+});
+
+test('Enter on a focused button presses it and does not open the cursor row', async () => {
+  const clicked = vi.fn();
+  const spies = mount(<button onClick={clicked}>Upload Files</button>);
+  await screen.findByText('app-1.0.zip');
+  fireEvent.keyDown(document, { key: 'End' });
+  await waitFor(() => expect(cursorRow()).toBe('builds/app-1.1.zip'));
+  const button = screen.getByRole('button', { name: 'Upload Files' });
+  button.focus();
+  fireEvent.keyDown(button, { key: 'Enter' });
+  expect(spies.openInspector).not.toHaveBeenCalled();
+});

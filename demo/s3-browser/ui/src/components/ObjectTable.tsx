@@ -1,5 +1,5 @@
 import type { CSSProperties } from 'react';
-import { useState, useEffect, useCallback, useRef, useMemo, useId } from 'react';
+import { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo, useId } from 'react';
 import { Table, Typography, Alert, Progress, Checkbox, theme, Button, Select } from 'antd';
 import { FolderOutlined, FileOutlined, LoadingOutlined, CalculatorOutlined, CloseCircleOutlined } from '@ant-design/icons';
 import type { S3Object } from '../types';
@@ -18,6 +18,39 @@ import StorageTypeTag from './StorageTypeTag';
 import { buildRows, sortRows, type BrowserRow, type SortColumn, type SortState } from '../browserNav';
 
 const { Text } = Typography;
+
+/** The header of a `virtual` table is a real <table>. Inside the grid its
+ *  implicit table/rowgroup roles would nest a second table, so it is
+ *  presentational; its <tr>/<th> carry explicit row/columnheader roles. */
+function PresentationTable(props: React.HTMLAttributes<HTMLTableElement>) {
+  return <table {...props} role="presentation" />;
+}
+const GRID_COMPONENTS = { header: { table: PresentationTable } };
+
+/** Grid roles on every cell, and `aria-sort` on the sorted header. */
+function withGridRoles<T>(columns: ColumnsType<T>, sort: SortState | null): ColumnsType<T> {
+  return columns.map((col) => {
+    const ownCell = col.onCell;
+    const ownHeader = col.onHeaderCell;
+    const sorted = sort && col.key === sort.column ? (sort.order === 'ascend' ? 'ascending' : 'descending') : undefined;
+    return {
+      ...col,
+      onCell: (record: T, index?: number) => ({ ...(ownCell?.(record, index) ?? {}), role: 'gridcell' }),
+      onHeaderCell: (c: Parameters<NonNullable<typeof ownHeader>>[0]) => ({
+        ...(ownHeader?.(c) ?? {}),
+        role: 'columnheader',
+        ...(sorted ? { 'aria-sort': sorted } : {}),
+      }),
+    };
+  }) as ColumnsType<T>;
+}
+
+/** The body row of `key` under `root`, if it is rendered (virtual rows
+ *  outside the viewport are not). */
+function rowElement(root: HTMLElement, key: string): HTMLElement | null {
+  const esc = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(key) : key.replace(/["\\]/g, '\\$&');
+  return root.querySelector<HTMLElement>(`.ant-table-row[data-row-key="${esc}"]`);
+}
 
 // Static (theme-independent) parts of the column-header title style. The
 // theme-dependent `color` is merged in at each use site.
@@ -367,9 +400,32 @@ export default function ObjectTable({
     // scrollTo({key}) instead of querySelector + scrollIntoView.
     const id = requestAnimationFrame(() => {
       tableRef.current?.scrollTo?.({ key: cursorKey });
+      // Roving focus: when a row has the focus, the focus follows the
+      // cursor, so a screen reader announces the row the arrows moved to.
+      const root = scrollContainerRef.current;
+      const active = document.activeElement;
+      if (root && active instanceof HTMLElement && active.classList.contains('ant-table-row') && root.contains(active)) {
+        requestAnimationFrame(() => rowElement(root, cursorKey)?.focus({ preventScroll: true }));
+      }
     });
     return () => cancelAnimationFrame(id);
   }, [cursorKey, cursorIndex, pageSize]);
+
+  // The grid root is AntD's `.ant-table` (the pager sits outside it, and a
+  // list is not allowed inside a grid). AntD offers no prop for its
+  // attributes, so they are set after each render.
+  const gridLabel = `Objects in ${prefix || 'the bucket root'}`;
+  useLayoutEffect(() => {
+    const root = scrollContainerRef.current?.querySelector('.ant-table');
+    if (!root) return;
+    root.setAttribute('role', 'grid');
+    root.setAttribute('aria-label', gridLabel);
+    root.setAttribute('aria-rowcount', String(totalItems + 1));
+    root.setAttribute('aria-multiselectable', 'true');
+  });
+  const pageStart = (currentPage - 1) * pageSize;
+  // The row that Tab reaches: the cursor, else the first row of the page.
+  const tabStopKey = cursorKey ?? dataSource[pageStart]?.key ?? null;
 
   const columns: ColumnsType<RowData> = [
     {
@@ -524,7 +580,9 @@ export default function ObjectTable({
         <Table<RowData>
           ref={tableRef}
           virtual
-          columns={withKeyboardSort(columns)}
+          columns={withGridRoles(withKeyboardSort(columns), sortState)}
+          components={GRID_COMPONENTS}
+          onHeaderRow={() => ({ role: 'row', 'aria-rowindex': 1 }) as React.HTMLAttributes<HTMLElement>}
           dataSource={dataSource}
           onChange={handleTableChange}
           rowKey="key"
@@ -555,7 +613,14 @@ export default function ObjectTable({
             if (record.key === cursorKey) classes.push('dg-row-cursor');
             return classes.join(' ');
           }}
-          onRow={(record) => ({
+          onRow={(record, index) => ({
+            role: 'row',
+            'aria-rowindex': pageStart + (index ?? 0) + 2,
+            'aria-selected': selectedKeys.has(record.key),
+            tabIndex: record.key === tabStopKey ? 0 : -1,
+            onFocus: (e: React.FocusEvent<HTMLElement>) => {
+              if (e.target === e.currentTarget && record.key !== cursorKey) onCursorChange?.(record.key);
+            },
             onClick: () => {
               onCursorChange?.(record.key);
               if (!record._isFolder) onSelect(record);

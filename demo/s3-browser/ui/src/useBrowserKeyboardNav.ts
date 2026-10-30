@@ -26,7 +26,7 @@
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useDocumentEvent } from './useDocumentEvent';
-import { isTypingTarget, anyOverlayOpen } from './keyboard';
+import { isTypingTarget, anyOverlayOpen, isActivatableTarget } from './keyboard';
 import { parentPrefix } from './utils';
 import { rowKeysFor, nextCursor, orderedRowKeys, sameKeyOrder } from './browserNav';
 import type { S3Object } from './types';
@@ -133,7 +133,8 @@ export function useBrowserKeyboardNav({
           break;
         case 'Enter':
         case 'ArrowRight':
-          if (cursorKey !== null) {
+          // Enter on a focused button or link presses it, never opens the row.
+          if (cursorKey !== null && !(e.key === 'Enter' && isActivatableTarget(e.target))) {
             e.preventDefault();
             openCursor();
           }
