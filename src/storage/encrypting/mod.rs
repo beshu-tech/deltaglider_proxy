@@ -50,7 +50,8 @@ use super::io_to_storage_error;
 use super::list_size_cache::{ListedSize, ResolveListed};
 use super::traits::{
     BulkListing, ByteStream, DelegatedListResult, LiteScanResult, MultipartUpload, ObjectRead,
-    RangeRead, ReferenceSource, StorageBackend, StorageError, StoredObject, UploadedPart,
+    RangeRead, ReferenceSource, StorageBackend, StorageBackendExt, StorageError, StoredObject,
+    UploadedPart,
 };
 use crate::deltaglider::spool::SpoolBudget;
 use crate::types::FileMetadata;
@@ -555,15 +556,7 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             heads.push((prefix.to_string(), object, key.to_string()));
         }
         for (prefix, object, key) in heads {
-            let raw = match object {
-                StoredObject::Reference => self.inner.get_reference_metadata(bucket, &prefix).await,
-                StoredObject::Delta(f) => self.inner.get_delta_metadata(bucket, &prefix, f).await,
-                StoredObject::Passthrough(f) => {
-                    self.inner
-                        .get_passthrough_metadata(bucket, &prefix, f)
-                        .await
-                }
-            };
+            let raw = self.inner.head_object(bucket, &prefix, object).await;
             // An object deleted since the listing is no evidence either way.
             let Ok(raw) = raw else { continue };
             if let Ok(Some(sealed)) = seal::sealed_of(&raw) {
@@ -1339,21 +1332,13 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         metadata: &FileMetadata,
     ) -> Result<super::traits::CopyOutcome, StorageError> {
         self.check_write(dst.bucket).await?;
-        use super::traits::{CopyOutcome, ObjectVariant};
+        use super::traits::CopyOutcome;
         let dst_site = self.write_key(dst.bucket)?;
-        let raw = match variant {
-            ObjectVariant::Delta => {
-                self.inner
-                    .get_delta_metadata(src.bucket, src.prefix, src.filename)
-                    .await?
-            }
-            ObjectVariant::Passthrough => {
-                self.inner
-                    .get_passthrough_metadata(src.bucket, src.prefix, src.filename)
-                    .await?
-            }
-        };
         let src_object = object_of(variant, src.filename);
+        let raw = self
+            .inner
+            .head_object(src.bucket, src.prefix, src_object)
+            .await?;
         let dst_object = object_of(variant, dst.filename);
         let stored = match (seal::sealed_of(&raw)?, dst_site) {
             (None, None) => {
@@ -1804,9 +1789,14 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
 
     // ── Metadata: present / re-seal ──
 
-    async fn get_reference_metadata(&self, b: &str, p: &str) -> Result<FileMetadata, StorageError> {
-        let raw = self.inner.get_reference_metadata(b, p).await?;
-        Ok(self.present_raw(b, p, StoredObject::Reference, &raw)?.meta)
+    async fn head_object(
+        &self,
+        b: &str,
+        p: &str,
+        object: StoredObject<'_>,
+    ) -> Result<FileMetadata, StorageError> {
+        let raw = self.inner.head_object(b, p, object).await?;
+        Ok(self.present_raw(b, p, object, &raw)?.meta)
     }
     async fn read_key_claim(&self, b: &str) -> Result<Option<super::KeyClaim>, StorageError> {
         self.inner.read_key_claim(b).await
@@ -1817,26 +1807,6 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         op: super::ClaimWrite<'_>,
     ) -> Result<super::ClaimOutcome, StorageError> {
         self.inner.write_key_claim(b, op).await
-    }
-    async fn get_delta_metadata(
-        &self,
-        b: &str,
-        p: &str,
-        f: &str,
-    ) -> Result<FileMetadata, StorageError> {
-        let raw = self.inner.get_delta_metadata(b, p, f).await?;
-        Ok(self.present_raw(b, p, StoredObject::Delta(f), &raw)?.meta)
-    }
-    async fn get_passthrough_metadata(
-        &self,
-        b: &str,
-        p: &str,
-        f: &str,
-    ) -> Result<FileMetadata, StorageError> {
-        let raw = self.inner.get_passthrough_metadata(b, p, f).await?;
-        Ok(self
-            .present_raw(b, p, StoredObject::Passthrough(f), &raw)?
-            .meta)
     }
     /// The presented metadata; the basis keeps the stored (raw) metadata,
     /// which the re-seal of the rewrite needs (its salt).

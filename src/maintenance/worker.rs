@@ -29,7 +29,7 @@
 //!
 //! [`needs_rewrite`]: super::needs_rewrite
 
-use crate::storage::StorageBackend;
+use crate::storage::{StorageBackend, StorageBackendExt};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;

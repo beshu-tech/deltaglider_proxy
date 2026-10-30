@@ -604,6 +604,17 @@ mod head_cost_tests {
         assert_eq!(fake.requests().len(), 2, "{:?}", fake.requests());
     }
 
+    /// Line `i` reads the metadata of one form: by its `StorageBackendExt`
+    /// name, or by `head_object` with `form` in the call.
+    fn reads_metadata(lines: &[(usize, &str)], i: usize, name: &str, form: &str) -> bool {
+        let line = lines[i].1;
+        line.contains(name)
+            || (line.contains(".head_object(")
+                && lines[i..lines.len().min(i + 4)]
+                    .iter()
+                    .any(|(_, l)| l.contains(form)))
+    }
+
     /// Both stored forms of an object are read together in one place
     /// (`resolve_stored_forms`): `delete.rs` kept its own copy of the
     /// parallel HEADs and the newest-wins rule.
@@ -612,13 +623,18 @@ mod head_cost_tests {
         let mut sites = Vec::new();
         for (file, text) in crate::source_scan::prod_sources("src/deltaglider/engine") {
             let lines = crate::source_scan::prod_lines(&text);
-            for (i, (n, line)) in lines.iter().enumerate() {
-                if !line.contains(".get_delta_metadata(") {
+            for (i, (n, _)) in lines.iter().enumerate() {
+                if !reads_metadata(&lines, i, ".get_delta_metadata(", "StoredObject::Delta") {
                     continue;
                 }
-                let both = lines[i.saturating_sub(6)..lines.len().min(i + 6)]
-                    .iter()
-                    .any(|(_, l)| l.contains(".get_passthrough_metadata("));
+                let both = (i.saturating_sub(6)..lines.len().min(i + 6)).any(|j| {
+                    reads_metadata(
+                        &lines,
+                        j,
+                        ".get_passthrough_metadata(",
+                        "StoredObject::Passthrough",
+                    )
+                });
                 if both {
                     sites.push((file.clone(), *n));
                 }
@@ -648,9 +664,14 @@ mod head_cost_tests {
                 if !line.contains(".has_reference(") && !line.contains(".reference_fence(") {
                     continue;
                 }
-                let then_reads = lines[i..lines.len().min(i + 15)]
-                    .iter()
-                    .any(|(_, l)| l.contains(".get_reference_metadata("));
+                let then_reads = (i..lines.len().min(i + 15)).any(|j| {
+                    reads_metadata(
+                        &lines,
+                        j,
+                        ".get_reference_metadata(",
+                        "StoredObject::Reference",
+                    )
+                });
                 if then_reads {
                     sites.push((file.clone(), *n));
                 }

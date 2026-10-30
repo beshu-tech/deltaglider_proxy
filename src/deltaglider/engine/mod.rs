@@ -9,7 +9,9 @@ use super::codec::{CodecError, DeltaCodec};
 use crate::config::{BackendConfig, Config};
 use crate::metadata_cache::MetadataCache;
 use crate::metrics::Metrics;
-use crate::storage::{FilesystemBackend, S3Backend, StorageBackend, StorageError};
+use crate::storage::{
+    FilesystemBackend, S3Backend, StorageBackend, StorageBackendExt, StorageError,
+};
 use crate::types::{FileMetadata, ObjectKey, StorageInfo, StoreResult};
 use bytes::Bytes;
 use dashmap::DashMap;

@@ -540,20 +540,6 @@ mod wrapper_tests {
         ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
             Ok(crate::storage::ClaimOutcome::Written)
         }
-        async fn get_passthrough_metadata(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-        ) -> Result<FileMetadata, StorageError> {
-            if self
-                .fail_meta_reads
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
-                return Err(StorageError::Throttled("transient".into()));
-            }
-            self.metadata.lock().unwrap().clone().ok_or_else(cb_err)
-        }
         async fn get_passthrough_metadata_for_rewrite(
             &self,
             b: &str,
@@ -629,17 +615,28 @@ mod wrapper_tests {
         async fn head_bucket(&self, _: &str) -> Result<bool, StorageError> {
             Err(cb_err())
         }
+        async fn head_object(
+            &self,
+            _: &str,
+            _: &str,
+            o: crate::storage::StoredObject<'_>,
+        ) -> Result<FileMetadata, StorageError> {
+            if !matches!(o, crate::storage::StoredObject::Passthrough(_)) {
+                return Err(cb_err());
+            }
+            if self
+                .fail_meta_reads
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(StorageError::Throttled("transient".into()));
+            }
+            self.metadata.lock().unwrap().clone().ok_or_else(cb_err)
+        }
+
         async fn has_reference(&self, _: &str, _: &str) -> Result<bool, StorageError> {
             Ok(false)
         }
         async fn get_reference(&self, _: &str, _: &str) -> Result<Vec<u8>, StorageError> {
-            Err(cb_err())
-        }
-        async fn get_reference_metadata(
-            &self,
-            _: &str,
-            _: &str,
-        ) -> Result<FileMetadata, StorageError> {
             Err(cb_err())
         }
         async fn flush_pending(&self) -> Result<(), StorageError> {
@@ -657,14 +654,6 @@ mod wrapper_tests {
             Err(cb_err())
         }
         async fn get_delta(&self, _: &str, _: &str, _: &str) -> Result<Vec<u8>, StorageError> {
-            Err(cb_err())
-        }
-        async fn get_delta_metadata(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-        ) -> Result<FileMetadata, StorageError> {
             Err(cb_err())
         }
         async fn delete_delta(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {

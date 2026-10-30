@@ -389,6 +389,15 @@ impl S3Backend {
         }
     }
 
+    /// The S3 key of one stored object.
+    fn object_key(&self, prefix: &str, object: StoredObject<'_>) -> String {
+        match object {
+            StoredObject::Reference => self.reference_key(prefix),
+            StoredObject::Delta(f) => self.delta_key(prefix, f),
+            StoredObject::Passthrough(f) => self.passthrough_key(prefix, f),
+        }
+    }
+
     /// Get the S3 key for a passthrough file (stored with original filename, no suffix)
     fn passthrough_key(&self, prefix: &str, filename: &str) -> String {
         Self::prefixed_key(prefix, filename)
@@ -645,12 +654,13 @@ impl StorageBackend for S3Backend {
     }
 
     #[instrument(skip(self))]
-    async fn get_reference_metadata(
+    async fn head_object(
         &self,
         bucket: &str,
         prefix: &str,
+        object: StoredObject<'_>,
     ) -> Result<FileMetadata, StorageError> {
-        let key = self.reference_key(prefix);
+        let key = self.object_key(prefix, object);
         self.get_object_metadata(bucket, &key).await
     }
 
@@ -841,17 +851,6 @@ impl StorageBackend for S3Backend {
     }
 
     #[instrument(skip(self))]
-    async fn get_delta_metadata(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<FileMetadata, StorageError> {
-        let key = self.delta_key(prefix, filename);
-        self.get_object_metadata(bucket, &key).await
-    }
-
-    #[instrument(skip(self))]
     async fn delete_delta(
         &self,
         bucket: &str,
@@ -918,17 +917,6 @@ impl StorageBackend for S3Backend {
     ) -> Result<Vec<u8>, StorageError> {
         let key = self.passthrough_key(prefix, filename);
         self.get_object(bucket, &key).await
-    }
-
-    #[instrument(skip(self))]
-    async fn get_passthrough_metadata(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<FileMetadata, StorageError> {
-        let key = self.passthrough_key(prefix, filename);
-        self.get_object_metadata(bucket, &key).await
     }
 
     #[instrument(skip(self))]
@@ -1024,11 +1012,7 @@ impl StorageBackend for S3Backend {
         prefix: &str,
         object: StoredObject<'_>,
     ) -> Result<super::ObjectRead, StorageError> {
-        let key = match object {
-            StoredObject::Reference => self.reference_key(prefix),
-            StoredObject::Delta(f) => self.delta_key(prefix, f),
-            StoredObject::Passthrough(f) => self.passthrough_key(prefix, f),
-        };
+        let key = self.object_key(prefix, object);
         let response = self
             .client
             .get_object()

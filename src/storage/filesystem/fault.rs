@@ -376,16 +376,6 @@ impl StorageBackend for FaultyFs {
             .await
     }
 
-    async fn get_reference_metadata(
-        &self,
-        bucket: &str,
-        prefix: &str,
-    ) -> Result<FileMetadata, StorageError> {
-        self.armed(FaultPoint::GetReferenceMetadata, bucket, prefix, "")
-            .await?;
-        self.inner.get_reference_metadata(bucket, prefix).await
-    }
-
     async fn reference_fence(&self, bucket: &str, prefix: &str) -> Result<RefFence, StorageError> {
         self.inner.reference_fence(bucket, prefix).await
     }
@@ -423,6 +413,21 @@ impl StorageBackend for FaultyFs {
         self.inner
             .write_reference_fenced(bucket, prefix, op, _fence, proof)
             .await
+    }
+
+    async fn head_object(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        object: StoredObject<'_>,
+    ) -> Result<FileMetadata, StorageError> {
+        let (point, filename) = match object {
+            StoredObject::Reference => (FaultPoint::GetReferenceMetadata, ""),
+            StoredObject::Delta(f) => (FaultPoint::GetDeltaMetadata, f),
+            StoredObject::Passthrough(f) => (FaultPoint::GetPassthroughMetadata, f),
+        };
+        self.armed(point, bucket, prefix, filename).await?;
+        self.inner.head_object(bucket, prefix, object).await
     }
 
     async fn has_reference(&self, bucket: &str, prefix: &str) -> Result<bool, StorageError> {
@@ -492,19 +497,6 @@ impl StorageBackend for FaultyFs {
             .await?;
         self.inner
             .put_delta(bucket, prefix, filename, data, metadata, proof)
-            .await
-    }
-
-    async fn get_delta_metadata(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<FileMetadata, StorageError> {
-        self.armed(FaultPoint::GetDeltaMetadata, bucket, prefix, filename)
-            .await?;
-        self.inner
-            .get_delta_metadata(bucket, prefix, filename)
             .await
     }
 
@@ -579,19 +571,6 @@ impl StorageBackend for FaultyFs {
                 self.inner
                     .put_passthrough_parts(bucket, prefix, filename, part_paths, metadata, _spool),
             )
-            .await
-    }
-
-    async fn get_passthrough_metadata(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<FileMetadata, StorageError> {
-        self.armed(FaultPoint::GetPassthroughMetadata, bucket, prefix, filename)
-            .await?;
-        self.inner
-            .get_passthrough_metadata(bucket, prefix, filename)
             .await
     }
 

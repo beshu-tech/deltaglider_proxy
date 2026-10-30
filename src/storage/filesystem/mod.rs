@@ -4,7 +4,7 @@
 
 use super::traits::{
     BulkListing, CopyOutcome, DelegatedListResult, ObjectAt, ObjectVariant, RefFence, RefWrite,
-    StorageBackend, StorageError, StoredObject,
+    StorageBackend, StorageBackendExt, StorageError, StoredObject,
 };
 use super::xattr_meta;
 use crate::types::FileMetadata;
@@ -1328,14 +1328,34 @@ impl StorageBackend for FilesystemBackend {
     }
 
     #[instrument(skip(self))]
-    async fn get_reference_metadata(
+    async fn head_object(
         &self,
         bucket: &str,
         prefix: &str,
+        object: StoredObject<'_>,
     ) -> Result<FileMetadata, StorageError> {
-        let path = self.reference_path(bucket, prefix)?;
-        // No xattr metadata: described from its stat.
-        Ok(Self::object_metadata(&path, "reference.bin").await?.0)
+        match object {
+            StoredObject::Reference => {
+                let path = self.reference_path(bucket, prefix)?;
+                // No xattr metadata: described from its stat.
+                Ok(Self::object_metadata(&path, "reference.bin").await?.0)
+            }
+            StoredObject::Delta(filename) => {
+                let path = self.delta_path(bucket, prefix, filename)?;
+                Ok(keyed(
+                    Self::object_metadata(&path, filename).await?,
+                    filename,
+                ))
+            }
+            StoredObject::Passthrough(filename) => {
+                let path = self.passthrough_path(bucket, prefix, filename)?;
+                // No xattr: an unmanaged file, described from its stat.
+                Ok(keyed(
+                    Self::object_metadata(&path, filename).await?,
+                    filename,
+                ))
+            }
+        }
     }
 
     /// Existence only: the filesystem backend is single-node, so it never
@@ -1503,20 +1523,6 @@ impl StorageBackend for FilesystemBackend {
     }
 
     #[instrument(skip(self))]
-    async fn get_delta_metadata(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<FileMetadata, StorageError> {
-        let path = self.delta_path(bucket, prefix, filename)?;
-        Ok(keyed(
-            Self::object_metadata(&path, filename).await?,
-            filename,
-        ))
-    }
-
-    #[instrument(skip(self))]
     async fn delete_delta(
         &self,
         bucket: &str,
@@ -1633,21 +1639,6 @@ impl StorageBackend for FilesystemBackend {
         })
         .await
         .map_err(super::join_error)?
-    }
-
-    #[instrument(skip(self))]
-    async fn get_passthrough_metadata(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<FileMetadata, StorageError> {
-        let path = self.passthrough_path(bucket, prefix, filename)?;
-        // No xattr: an unmanaged file, described from its stat.
-        Ok(keyed(
-            Self::object_metadata(&path, filename).await?,
-            filename,
-        ))
     }
 
     #[instrument(skip(self))]

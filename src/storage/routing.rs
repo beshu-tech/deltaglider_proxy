@@ -1137,12 +1137,13 @@ impl StorageBackend for RoutingBackend {
         route_existing!(self, bucket, get_reference_to_file, prefix, dest)
     }
 
-    async fn get_reference_metadata(
+    async fn head_object(
         &self,
         bucket: &str,
         prefix: &str,
+        object: super::StoredObject<'_>,
     ) -> Result<FileMetadata, StorageError> {
-        route_existing!(self, bucket, get_reference_metadata, prefix)
+        route_existing!(self, bucket, head_object, prefix, object)
     }
 
     async fn has_reference(&self, bucket: &str, prefix: &str) -> Result<bool, StorageError> {
@@ -1256,15 +1257,6 @@ impl StorageBackend for RoutingBackend {
             .await
     }
 
-    async fn get_delta_metadata(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<FileMetadata, StorageError> {
-        route_existing!(self, bucket, get_delta_metadata, prefix, filename)
-    }
-
     async fn delete_delta(
         &self,
         bucket: &str,
@@ -1352,15 +1344,6 @@ impl StorageBackend for RoutingBackend {
 
     async fn file_put_spool_bytes(&self, bucket: &str, bytes: u64, parts: bool) -> u64 {
         route_existing!(self, bucket, file_put_spool_bytes, bytes, parts)
-    }
-
-    async fn get_passthrough_metadata(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<FileMetadata, StorageError> {
-        route_existing!(self, bucket, get_passthrough_metadata, prefix, filename)
     }
 
     async fn get_passthrough_metadata_for_rewrite(
@@ -1899,12 +1882,20 @@ mod tests {
             Err(StorageError::NotFound("reference".to_string()))
         }
 
-        async fn get_reference_metadata(
+        async fn head_object(
             &self,
             _: &str,
             _: &str,
+            object: crate::storage::StoredObject<'_>,
         ) -> Result<FileMetadata, StorageError> {
-            Err(StorageError::NotFound("metadata".to_string()))
+            Err(StorageError::NotFound(
+                match object {
+                    crate::storage::StoredObject::Reference => "metadata",
+                    crate::storage::StoredObject::Delta(_) => "delta metadata",
+                    crate::storage::StoredObject::Passthrough(_) => "object metadata",
+                }
+                .to_string(),
+            ))
         }
 
         async fn has_reference(&self, _: &str, _: &str) -> Result<bool, StorageError> {
@@ -1929,15 +1920,6 @@ mod tests {
             _proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), StorageError> {
             Ok(())
-        }
-
-        async fn get_delta_metadata(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-        ) -> Result<FileMetadata, StorageError> {
-            Err(StorageError::NotFound("delta metadata".to_string()))
         }
 
         async fn delete_delta(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
@@ -2010,15 +1992,6 @@ mod tests {
             _: &FileMetadata,
         ) -> Result<(), StorageError> {
             Ok(())
-        }
-
-        async fn get_passthrough_metadata(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-        ) -> Result<FileMetadata, StorageError> {
-            Err(StorageError::NotFound("object metadata".to_string()))
         }
 
         async fn get_passthrough_metadata_for_rewrite(

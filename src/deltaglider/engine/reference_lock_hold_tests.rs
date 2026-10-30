@@ -557,9 +557,15 @@ impl crate::storage::StorageBackend for FencingFs {
     async fn get_reference(&self, b: &str, p: &str) -> Result<Vec<u8>, StorageError> {
         self.inner.get_reference(b, p).await
     }
-    async fn get_reference_metadata(&self, b: &str, p: &str) -> Result<Meta, StorageError> {
-        self.inner.get_reference_metadata(b, p).await
+    async fn head_object(
+        &self,
+        b: &str,
+        p: &str,
+        o: crate::storage::StoredObject<'_>,
+    ) -> Result<Meta, StorageError> {
+        self.inner.head_object(b, p, o).await
     }
+
     async fn has_reference(&self, b: &str, p: &str) -> Result<bool, StorageError> {
         self.inner.has_reference(b, p).await
     }
@@ -660,9 +666,6 @@ impl crate::storage::StorageBackend for FencingFs {
         }
         self.inner.put_delta(b, p, f, d, m, proof).await
     }
-    async fn get_delta_metadata(&self, b: &str, p: &str, f: &str) -> Result<Meta, StorageError> {
-        self.inner.get_delta_metadata(b, p, f).await
-    }
     async fn delete_delta(&self, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
         self.inner.delete_delta(b, p, f).await
     }
@@ -678,14 +681,6 @@ impl crate::storage::StorageBackend for FencingFs {
         m: &Meta,
     ) -> Result<(), StorageError> {
         self.inner.put_passthrough(b, p, f, d, m).await
-    }
-    async fn get_passthrough_metadata(
-        &self,
-        b: &str,
-        p: &str,
-        f: &str,
-    ) -> Result<Meta, StorageError> {
-        self.inner.get_passthrough_metadata(b, p, f).await
     }
     async fn get_passthrough_metadata_for_rewrite(
         &self,

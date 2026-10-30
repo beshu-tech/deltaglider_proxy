@@ -2803,15 +2803,6 @@ mod multipart_abort_tests {
             Ok(())
         }
 
-        // Source-object reads used by the streaming copy path.
-        async fn get_passthrough_metadata(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-        ) -> Result<FileMetadata, StorageError> {
-            Ok(self.src_meta.clone())
-        }
         async fn get_passthrough_metadata_for_rewrite(
             &self,
             _: &str,
@@ -2819,14 +2810,6 @@ mod multipart_abort_tests {
             _: &str,
         ) -> Result<(FileMetadata, crate::storage::RewriteBasis), StorageError> {
             Ok((self.src_meta.clone(), crate::storage::RewriteBasis::none()))
-        }
-        async fn get_delta_metadata(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-        ) -> Result<FileMetadata, StorageError> {
-            Err(StorageError::NotFound("no delta".into()))
         }
 
         // Required by the trait; irrelevant to these tests.
@@ -2845,13 +2828,22 @@ mod multipart_abort_tests {
         async fn get_reference(&self, _: &str, _: &str) -> Result<Vec<u8>, StorageError> {
             Err(nope())
         }
-        async fn get_reference_metadata(
+        // Source-object reads used by the streaming copy path.
+        async fn head_object(
             &self,
             _: &str,
             _: &str,
+            o: crate::storage::StoredObject<'_>,
         ) -> Result<FileMetadata, StorageError> {
-            Err(nope())
+            match o {
+                crate::storage::StoredObject::Reference => Err(nope()),
+                crate::storage::StoredObject::Delta(_) => {
+                    Err(StorageError::NotFound("no delta".into()))
+                }
+                crate::storage::StoredObject::Passthrough(_) => Ok(self.src_meta.clone()),
+            }
         }
+
         async fn has_reference(&self, _: &str, _: &str) -> Result<bool, StorageError> {
             Ok(false)
         }
@@ -3072,14 +3064,6 @@ mod multipart_abort_tests {
         ) -> Result<(), StorageError> {
             self.0.abort_multipart_upload(u, p, f).await
         }
-        async fn get_passthrough_metadata(
-            &self,
-            b: &str,
-            p: &str,
-            f: &str,
-        ) -> Result<FileMetadata, StorageError> {
-            self.0.get_passthrough_metadata(b, p, f).await
-        }
         async fn get_passthrough_metadata_for_rewrite(
             &self,
             b: &str,
@@ -3087,14 +3071,6 @@ mod multipart_abort_tests {
             f: &str,
         ) -> Result<(FileMetadata, crate::storage::RewriteBasis), StorageError> {
             self.0.get_passthrough_metadata_for_rewrite(b, p, f).await
-        }
-        async fn get_delta_metadata(
-            &self,
-            b: &str,
-            p: &str,
-            f: &str,
-        ) -> Result<FileMetadata, StorageError> {
-            self.0.get_delta_metadata(b, p, f).await
         }
         async fn create_bucket(&self, b: &str) -> Result<(), StorageError> {
             self.0.create_bucket(b).await
@@ -3111,13 +3087,15 @@ mod multipart_abort_tests {
         async fn get_reference(&self, b: &str, p: &str) -> Result<Vec<u8>, StorageError> {
             self.0.get_reference(b, p).await
         }
-        async fn get_reference_metadata(
+        async fn head_object(
             &self,
             b: &str,
             p: &str,
+            o: crate::storage::StoredObject<'_>,
         ) -> Result<FileMetadata, StorageError> {
-            self.0.get_reference_metadata(b, p).await
+            self.0.head_object(b, p, o).await
         }
+
         async fn has_reference(&self, b: &str, p: &str) -> Result<bool, StorageError> {
             self.0.has_reference(b, p).await
         }
@@ -3334,7 +3312,7 @@ mod request_count_tests {
     use crate::bucket_usage::BucketUsage;
     use crate::config::Config;
     use crate::deltaglider::DeltaGliderEngine;
-    use crate::storage::{DynStorageBackend, FakeS3, StorageBackend};
+    use crate::storage::{DynStorageBackend, FakeS3, StorageBackendExt};
 
     async fn engine_on(
         backend: crate::storage::S3Backend,

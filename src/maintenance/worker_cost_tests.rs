@@ -508,7 +508,7 @@ async fn backfill_asks_an_acl_less_backend_once() {
 /// rewrite fails (the job records it per object).
 #[tokio::test]
 async fn a_rewrite_is_fenced_on_the_jobs_read() {
-    use crate::storage::StorageBackend;
+    use crate::storage::{StorageBackend, StorageBackendExt};
     let (engine, fake) = counted_engine().await;
     store_foreign(&fake, 1);
     let storage = engine.storage();

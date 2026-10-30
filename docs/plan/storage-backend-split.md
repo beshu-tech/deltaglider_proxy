@@ -200,6 +200,10 @@ format, a request count, or who can make a proof.
 
 - Step 1: done (commit "drop the two metadata-less passthrough stream reads").
 - Step 2: done (commit "one unfenced reference write"). 67 → 62 methods.
+- Step 3: done (commit "one metadata read"). 62 → 60 methods.
+  `head_object(StoredObject)`; the three names live on in
+  `StorageBackendExt`. The engine guards in `metadata.rs` also match a
+  `head_object` call with the form in it.
 - Found while doing step 2, kept as it was: the encrypting wrapper runs the
   witness check on a FENCED reference delete (`check_write_unless(.., true)`
   still calls `check_witness`), but never on an UNFENCED one (the old

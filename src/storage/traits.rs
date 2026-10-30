@@ -51,7 +51,8 @@ pub enum ObjectVariant {
     Passthrough,
 }
 
-/// One stored object of a deltaspace, for [`StorageBackend::open_object`].
+/// One stored object of a deltaspace, for [`StorageBackend::open_object`]
+/// and [`StorageBackend::head_object`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoredObject<'a> {
     Reference,
@@ -877,7 +878,7 @@ pub trait StorageBackend: Send + Sync {
         proof: &crate::deltaglider::RefWriteProof,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
-    /// [`Self::get_passthrough_metadata`], and the [`RewriteBasis`] that a
+    /// [`StorageBackendExt::get_passthrough_metadata`], and the [`RewriteBasis`] that a
     /// later [`Self::put_passthrough_metadata`] of the same object takes
     /// instead of reading the object again. One request (S3: one HEAD).
     fn get_passthrough_metadata_for_rewrite(
@@ -919,11 +920,16 @@ pub trait StorageBackend: Send + Sync {
         }
     }
 
-    /// Get reference file metadata
-    fn get_reference_metadata(
+    /// The metadata of one stored object (S3: one HEAD; filesystem: the
+    /// xattr, or the file's stat). A missing object is `NotFound`. Callers
+    /// use the names in [`StorageBackendExt`]. No default: a wrapper that
+    /// forgot it would hand out the inner backend's metadata without its
+    /// own transform.
+    fn head_object(
         &self,
         bucket: &str,
         prefix: &str,
+        object: StoredObject<'_>,
     ) -> impl Future<Output = Result<FileMetadata, StorageError>> + Send;
 
     /// Check if a reference exists for this deltaspace.
@@ -1024,14 +1030,6 @@ pub trait StorageBackend: Send + Sync {
         proof: &crate::deltaglider::RefWriteProof,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
-    /// Get delta file metadata
-    fn get_delta_metadata(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> impl Future<Output = Result<FileMetadata, StorageError>> + Send;
-
     /// Delete a delta file and its metadata
     fn delete_delta(
         &self,
@@ -1117,14 +1115,6 @@ pub trait StorageBackend: Send + Sync {
     ) -> impl Future<Output = u64> + Send {
         async move { 0 }
     }
-
-    /// Get passthrough file metadata
-    fn get_passthrough_metadata(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> impl Future<Output = Result<FileMetadata, StorageError>> + Send;
 
     /// Delete a passthrough (non-delta) file and its metadata
     fn delete_passthrough(
@@ -1634,10 +1624,40 @@ pub trait StorageBackend: Send + Sync {
     }
 }
 
-/// The unfenced reference writes by name, over
-/// [`StorageBackend::write_reference`]. One implementation for every
-/// backend (the blanket impl below), so no wrapper forwards them.
+/// The per-form names over the form-generic methods
+/// ([`StorageBackend::write_reference`], [`StorageBackend::head_object`]).
+/// One implementation for every backend (the blanket impl below), so no
+/// wrapper forwards them.
 pub trait StorageBackendExt: StorageBackend {
+    /// Get reference file metadata.
+    fn get_reference_metadata(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> impl Future<Output = Result<FileMetadata, StorageError>> + Send {
+        self.head_object(bucket, prefix, StoredObject::Reference)
+    }
+
+    /// Get delta file metadata.
+    fn get_delta_metadata(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> impl Future<Output = Result<FileMetadata, StorageError>> + Send {
+        self.head_object(bucket, prefix, StoredObject::Delta(filename))
+    }
+
+    /// Get passthrough file metadata.
+    fn get_passthrough_metadata(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> impl Future<Output = Result<FileMetadata, StorageError>> + Send {
+        self.head_object(bucket, prefix, StoredObject::Passthrough(filename))
+    }
+
     /// Store a reference file with its metadata.
     fn put_reference(
         &self,

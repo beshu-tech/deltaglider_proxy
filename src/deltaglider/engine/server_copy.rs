@@ -99,7 +99,7 @@ mod tests {
     use crate::storage::{
         same_stored_generation, CopyOutcome, DynStorageBackend, EncryptingBackend,
         EncryptionConfig, EncryptionKey, FilesystemBackend, ObjectAt, ObjectVariant,
-        RoutingBackend, StorageBackend,
+        RoutingBackend, StorageBackend, StorageBackendExt,
     };
     use crate::types::FileMetadata;
     use std::collections::HashMap;

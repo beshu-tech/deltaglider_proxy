@@ -83,6 +83,15 @@ impl crate::storage::StorageBackend for NullInner {
     async fn head_bucket(&self, _: &str) -> Result<bool, crate::storage::StorageError> {
         Ok(true)
     }
+    async fn head_object(
+        &self,
+        _: &str,
+        _: &str,
+        _: crate::storage::StoredObject<'_>,
+    ) -> Result<crate::types::FileMetadata, crate::storage::StorageError> {
+        Err(crate::storage::StorageError::Other("null".into()))
+    }
+
     async fn has_reference(&self, _: &str, _: &str) -> Result<bool, StorageError> {
         Ok(false)
     }
@@ -92,13 +101,6 @@ impl crate::storage::StorageBackend for NullInner {
         _: &str,
     ) -> Result<Vec<u8>, crate::storage::StorageError> {
         Ok(vec![])
-    }
-    async fn get_reference_metadata(
-        &self,
-        _: &str,
-        _: &str,
-    ) -> Result<crate::types::FileMetadata, crate::storage::StorageError> {
-        Err(crate::storage::StorageError::Other("null".into()))
     }
     async fn get_passthrough_metadata_for_rewrite(
         &self,
@@ -132,14 +134,6 @@ impl crate::storage::StorageBackend for NullInner {
         _: &str,
     ) -> Result<Vec<u8>, crate::storage::StorageError> {
         Ok(vec![])
-    }
-    async fn get_delta_metadata(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-    ) -> Result<crate::types::FileMetadata, crate::storage::StorageError> {
-        Err(crate::storage::StorageError::Other("null".into()))
     }
     async fn delete_delta(
         &self,
@@ -213,14 +207,6 @@ impl crate::storage::StorageBackend for NullInner {
         _: crate::storage::ClaimWrite<'_>,
     ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
         Ok(crate::storage::ClaimOutcome::Written)
-    }
-    async fn get_passthrough_metadata(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-    ) -> Result<crate::types::FileMetadata, crate::storage::StorageError> {
-        Err(crate::storage::StorageError::Other("null".into()))
     }
     async fn delete_passthrough(
         &self,
