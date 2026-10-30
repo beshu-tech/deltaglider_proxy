@@ -12,13 +12,25 @@ use std::sync::Arc;
 /// encryption witness, issue #116 P3). Indexed by `(raw backend, real
 /// bucket)`; the bucket `*` stands for every bucket on the backend that has
 /// no entry of its own. Inactive (refuses nothing) on a single instance.
-#[derive(Default)]
 pub struct WitnessGate {
     state: ArcSwap<WitnessGateState>,
-    /// Unix ms of the last successful sync; 0 = never.
+    /// [`WitnessGate::now_ms`] of the last successful sync; [`NEVER`] = none.
     last_ok_ms: std::sync::atomic::AtomicI64,
     /// How long a sync verdict holds; 0 = gate inactive.
     ttl_ms: std::sync::atomic::AtomicI64,
+}
+
+/// `last_ok_ms` before the first successful sync.
+const NEVER: i64 = i64::MIN;
+
+impl Default for WitnessGate {
+    fn default() -> Self {
+        Self {
+            state: Default::default(),
+            last_ok_ms: std::sync::atomic::AtomicI64::new(NEVER),
+            ttl_ms: Default::default(),
+        }
+    }
 }
 
 /// What the witness decided at its last judgement.
@@ -35,14 +47,18 @@ pub struct WitnessGateState {
 /// The bucket name that stands for a backend's buckets with no entry.
 pub const WITNESS_BACKEND_DEFAULT: &str = "*";
 
-fn unix_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 impl WitnessGate {
+    /// Now, in ms on the monotonic clock of this process. Every age of a
+    /// verdict is judged on it: a wall-clock step (NTP, an operator) must
+    /// neither keep a stale verdict alive nor refuse a fresh one.
+    pub fn now_ms() -> i64 {
+        static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        EPOCH
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis() as i64
+    }
+
     /// Turn the gate on with a verdict lifetime of `ttl`. Until the first
     /// successful sync, every witnessed storage is refused (fail closed).
     pub fn activate(&self, ttl: std::time::Duration) {
@@ -58,11 +74,12 @@ impl WitnessGate {
 
     /// Record a successful sync (the verdict is fresh from now).
     pub fn synced(&self) {
-        self.synced_at(unix_ms());
+        self.synced_at(Self::now_ms());
     }
 
-    /// Record a successful sync that STARTED at `started_ms` (unix ms): the
-    /// verdict's age counts from there, so a slow sync does not stretch it.
+    /// Record a successful sync that STARTED at `started_ms` (a
+    /// [`Self::now_ms`] reading): the verdict's age counts from there, so a
+    /// slow sync does not stretch it.
     pub fn synced_at(&self, started_ms: i64) {
         self.last_ok_ms
             .store(started_ms, std::sync::atomic::Ordering::Relaxed);
@@ -85,6 +102,11 @@ impl WitnessGate {
 
     /// The refusal of a write to `bucket` on `backend`, if any.
     pub fn refusal(&self, backend: &str, bucket: &str) -> Option<String> {
+        self.refusal_at(backend, bucket, Self::now_ms())
+    }
+
+    /// [`Self::refusal`] at `now_ms` (a [`Self::now_ms`] reading).
+    fn refusal_at(&self, backend: &str, bucket: &str, now_ms: i64) -> Option<String> {
         use std::sync::atomic::Ordering;
         let ttl = self.ttl_ms.load(Ordering::Relaxed);
         if ttl == 0 {
@@ -99,15 +121,76 @@ impl WitnessGate {
             return Some(msg.clone());
         }
         let witnessed = witnessed_own || st.witnessed.contains(&key(WITNESS_BACKEND_DEFAULT));
-        let age = unix_ms() - self.last_ok_ms.load(Ordering::Relaxed);
-        (witnessed && age > ttl).then(|| {
+        let last_ok = self.last_ok_ms.load(Ordering::Relaxed);
+        let age = now_ms.saturating_sub(last_ok);
+        (witnessed && (last_ok == NEVER || age > ttl)).then(|| {
+            let since = if last_ok == NEVER {
+                "since this instance started".to_string()
+            } else {
+                format!("for {}s", age / 1000)
+            };
             format!(
                 "bucket '{bucket}' on backend '{backend}': this instance cannot confirm that \
                  its encryption of the bucket agrees with the other instances (no successful \
-                 check of the coordination bucket for {}s), so it refuses writes to the bucket \
-                 until a check succeeds. Reads keep working",
-                age / 1000
+                 check of the coordination bucket {since}), so it refuses writes to the bucket \
+                 until a check succeeds. Reads keep working"
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    const TTL: Duration = Duration::from_secs(2);
+
+    fn witnessed_gate() -> WitnessGate {
+        let gate = WitnessGate::default();
+        gate.activate(TTL);
+        let mut st = WitnessGateState::default();
+        st.witnessed
+            .insert(("local-disk".into(), WITNESS_BACKEND_DEFAULT.into()));
+        gate.set(st);
+        gate
+    }
+
+    /// Fail closed before the first sync, even while the monotonic clock is
+    /// still younger than the TTL (it starts near 0 with the process).
+    #[test]
+    fn never_synced_refuses_from_the_first_ms() {
+        let gate = witnessed_gate();
+        for now in [0, 1, 1_999, 10_000] {
+            let msg = gate.refusal_at("local-disk", "releases", now);
+            assert!(msg.is_some_and(|m| m.contains("since this instance started")));
+        }
+    }
+
+    #[test]
+    fn a_verdict_holds_for_the_ttl_from_the_sync_start() {
+        let gate = witnessed_gate();
+        gate.synced_at(5_000);
+        assert!(gate.refusal_at("local-disk", "releases", 5_000).is_none());
+        assert!(gate.refusal_at("local-disk", "releases", 7_000).is_none());
+        let msg = gate.refusal_at("local-disk", "releases", 7_001).unwrap();
+        assert!(msg.contains("for 2s"), "{msg}");
+        assert!(gate.refusal_at("other", "releases", 99_000).is_none());
+    }
+
+    /// The age is judged on the process's monotonic clock, never on the
+    /// wall clock: `now_ms` never goes back.
+    #[test]
+    fn now_ms_is_monotonic() {
+        let a = WitnessGate::now_ms();
+        std::thread::sleep(Duration::from_millis(5));
+        let b = WitnessGate::now_ms();
+        assert!(a >= 0 && b >= a + 5, "{a} {b}");
+    }
+
+    #[test]
+    fn an_inactive_gate_refuses_nothing() {
+        let gate = WitnessGate::default();
+        assert!(gate.refusal_at("local-disk", "releases", 0).is_none());
     }
 }

@@ -439,6 +439,8 @@ pub fn plan_publish(
     Ok(plan)
 }
 
+/// Wall time: only for the stamps written into the manifest. Ages are
+/// judged on [`WitnessGate::now_ms`].
 fn unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -714,7 +716,7 @@ impl EncryptionWitness {
     async fn sync_locked(&self, cfg: &Config) -> Result<(), String> {
         // The verdict holds from the START of the sync: a slow sync cannot
         // stretch the window in which a stale verdict lets writes through.
-        let started = unix_ms();
+        let started = WitnessGate::now_ms();
         let result = self.sync_inner(cfg).await;
         match &result {
             Ok(()) => self.gate.synced_at(started),
@@ -1200,12 +1202,12 @@ mod tests {
         let gate = WitnessGate::default();
         let cfg = with_key();
         EncryptionWitness::close_gate(&gate, &cfg, std::time::Duration::from_secs(1));
-        gate.synced_at(unix_ms() - 2_500); // a sync that took 2.5 s
+        gate.synced_at(WitnessGate::now_ms() - 2_500); // a sync that took 2.5 s
         assert!(
             gate.refusal("local-disk", "releases").is_some(),
             "older than 2 polls"
         );
-        gate.synced_at(unix_ms() - 500);
+        gate.synced_at(WitnessGate::now_ms() - 500);
         assert!(gate.refusal("local-disk", "releases").is_none());
     }
 
