@@ -9,9 +9,16 @@
 - Every encrypted object also names the fingerprint of its key in its sealed metadata and in its listing token. A proxy records the fingerprint of each object that it reads but cannot open. Before the first write to a bucket, and then every 10 minutes, it also checks a sample of the bucket: one listing page, the listing tokens of that page, and a HEAD request for up to 8 objects. The sample finds the buckets that an earlier release encrypted, which have no claim.
 - When the claim or an object names a key that the proxy does not have, every write to the bucket fails with `400 InvalidRequest`. The message names the fingerprint. Deletes still work. When you add the key to the configuration (also as `legacy_key`), the writes work at once. See [Buckets that another proxy encrypts](docs/product/reference/encryption.md#buckets-that-another-proxy-encrypts).
 
+### Changed — Upgrade notes for the key check
+
+- A bucket that holds objects of a key that the proxy no longer has (for example, a key that you removed from the configuration without a re-encrypt job) now refuses writes. Add the old key as `legacy_key`, or delete those objects.
+- Each bucket that the proxy writes costs a few more requests: a read of the key claim every minute (a proxy that writes plaintext) or every 10 minutes (a proxy that encrypts), and a sample of the bucket every 10 minutes (on S3, two LIST requests and up to 8 HEAD requests).
+- Keys under `.dg/facts/` are now refused for every client request, not only for uploads.
+- When proxies that share a bucket rotate their key, add the new key as a read-only key on every proxy first. See [Rotate a key on proxies that share a bucket](docs/product/reference/encryption.md#rotate-a-key-on-proxies-that-share-a-bucket).
+
 ### Changed — A read of an object whose key the proxy does not have answers 400
 
-- A GET or HEAD of an object that is encrypted with a key that the proxy does not have now fails with `400 InvalidRequest`, and the message names the fingerprint of the key. Before this release, the answer was `500 InternalError` without a cause, which SDKs retry. S3 answers in the same way when a client reads an SSE-C object without its key.
+- A GET or HEAD of an object that is encrypted with a key that the proxy does not have now fails with `400 InvalidRequest`, and the message names only the fingerprint label of the key (the log has the whole cause). Before this release, the answer was `500 InternalError` without a cause, which SDKs retry. S3 answers in the same way when a client reads an SSE-C object without its key.
 
 ## v2.0.19 — 2026-10-29
 

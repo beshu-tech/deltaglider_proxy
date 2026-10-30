@@ -153,6 +153,21 @@ impl ObjectKey {
     pub fn validate_object(&self) -> Result<(), KeyValidationError> {
         validate_key_path(&self.prefix, true)?;
         validate_key_path(&self.filename, false)?;
+        // The S3 backend keeps its listing facts and the bucket's key claim
+        // there (review C3; the key sentinel): no client request reads,
+        // writes or deletes them.
+        if self
+            .full_key()
+            .starts_with(crate::storage::listing_facts::FACTS_ROOT)
+        {
+            return Err(KeyValidationError(format!(
+                "Object key '{}' is refused: keys under '{}' are reserved, because the S3 \
+                 backend keeps its listing facts and the bucket's key claim there. See \
+                 {RESERVED_KEYS_DOC_URL}",
+                self.full_key(),
+                crate::storage::listing_facts::FACTS_ROOT
+            )));
+        }
         if self.is_directory_marker() {
             return Ok(());
         }
@@ -197,18 +212,6 @@ impl ObjectKey {
     /// cleanup. A single trailing `/` (folder marker) is unaffected.
     pub fn validate_ingest(&self) -> Result<(), KeyValidationError> {
         self.validate_object()?;
-        // The S3 backend keeps its listing facts there (review C3).
-        if self
-            .full_key()
-            .starts_with(crate::storage::listing_facts::FACTS_ROOT)
-        {
-            return Err(KeyValidationError(format!(
-                "Object key '{}' is refused: keys under '{}' are reserved, because the S3 \
-                 backend keeps its listing facts there. See {RESERVED_KEYS_DOC_URL}",
-                self.full_key(),
-                crate::storage::listing_facts::FACTS_ROOT
-            )));
-        }
         // `parse` strips leading `/` and puts no trailing `/` in the prefix, so
         // any empty segment is an internal `//` (including one just before the
         // filename: `a//x` has prefix `a/`).
@@ -969,10 +972,18 @@ mod tests {
     }
 
     #[test]
-    fn listing_facts_namespace_is_reserved_on_ingest() {
-        assert!(ObjectKey::parse("b", ".dg/facts/x!!1.e.1.2.e")
-            .validate_ingest()
-            .is_err());
+    /// The facts namespace (listing facts, the key claim) is reserved for
+    /// every client request, not only ingest: a client that could DELETE
+    /// `.dg/facts/!!key-claim` would unclaim the bucket.
+    fn listing_facts_namespace_is_reserved_for_every_request() {
+        for key in [
+            ".dg/facts/x!!1.e.1.2.e",
+            crate::storage::listing_facts::KEY_CLAIM_KEY,
+        ] {
+            let k = ObjectKey::parse("b", key);
+            assert!(k.validate_object().is_err(), "{key}");
+            assert!(k.validate_ingest().is_err(), "{key}");
+        }
         assert!(ObjectKey::parse("b", ".dg/other.txt")
             .validate_ingest()
             .is_ok());

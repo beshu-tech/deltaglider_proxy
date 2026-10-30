@@ -248,8 +248,6 @@ pub enum ClaimOutcome {
     Written,
     /// Another writer changed the claim first: read it again.
     Lost,
-    /// The backend keeps no claims (a test double).
-    NoStore,
 }
 
 /// One range read of a passthrough object
@@ -497,6 +495,18 @@ pub enum StorageError {
     #[error("S3 error: {0}")]
     AccessDenied(String),
 
+    /// A key that this proxy does not have (`storage/encrypting/sentinel.rs`):
+    /// the read of an object sealed with it (`write: false`), or a write to
+    /// a bucket that holds such objects. `key` is the key's public label
+    /// (`fp-<hex>`), the only part a client gets (`api::errors`); `detail`
+    /// is the operator's text, for the log.
+    #[error("Encryption error: {detail}")]
+    KeyNotHeld {
+        key: String,
+        write: bool,
+        detail: String,
+    },
+
     #[error("Bucket not found: {0}")]
     BucketNotFound(String),
 
@@ -605,6 +615,11 @@ impl StorageError {
             E::AccessDenied(s) => E::AccessDenied(s.clone()),
             E::BucketNotFound(s) => E::BucketNotFound(s.clone()),
             E::Encryption(s) => E::Encryption(s.clone()),
+            E::KeyNotHeld { key, write, detail } => E::KeyNotHeld {
+                key: key.clone(),
+                write: *write,
+                detail: detail.clone(),
+            },
             E::BucketNotEmpty(s) => E::BucketNotEmpty(s.clone()),
             E::Throttled(s) => E::Throttled(s.clone()),
             E::WritesRefused(s) => E::WritesRefused(s.clone()),
@@ -1443,23 +1458,21 @@ pub trait StorageBackend: Send + Sync {
 
     /// The key claim of `bucket` (`storage/encrypting/sentinel.rs`), or
     /// `None`. A raw backend keeps it where listings do not show it; the
-    /// encrypting wrapper asks its inner backend. The default keeps none.
+    /// encrypting wrapper asks its inner backend. No default: a wrapper
+    /// must forward it.
     fn read_key_claim(
         &self,
-        _bucket: &str,
-    ) -> impl Future<Output = Result<Option<KeyClaim>, StorageError>> + Send {
-        async { Ok(None) }
-    }
+        bucket: &str,
+    ) -> impl Future<Output = Result<Option<KeyClaim>, StorageError>> + Send;
 
     /// Write the key claim of `bucket` with the condition of `op`. A
     /// backend without conditional writes writes without the condition.
+    /// No default: a wrapper must forward it.
     fn write_key_claim(
         &self,
-        _bucket: &str,
-        _op: ClaimWrite<'_>,
-    ) -> impl Future<Output = Result<ClaimOutcome, StorageError>> + Send {
-        async { Ok(ClaimOutcome::NoStore) }
-    }
+        bucket: &str,
+        op: ClaimWrite<'_>,
+    ) -> impl Future<Output = Result<ClaimOutcome, StorageError>> + Send;
 
     /// A name for the STORAGE behind `bucket`: two bucket names that store
     /// into the same real bucket (policy aliases) get the same identity, so

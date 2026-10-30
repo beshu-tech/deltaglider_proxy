@@ -46,15 +46,20 @@ impl S3Backend {
         bucket: &str,
         op: ClaimWrite<'_>,
     ) -> Result<ClaimOutcome, StorageError> {
+        // The bucket's native SSE, as every other write: a bucket policy
+        // that requires it refuses a claim without it.
+        let native = self.native_encryption.for_bucket(bucket);
         let put = |fingerprint: &str| {
-            self.client
+            let request = self
+                .client
                 .put_object()
                 .bucket(bucket)
                 .key(KEY_CLAIM_KEY)
                 .content_type("text/plain")
                 .body(aws_sdk_s3::primitives::ByteStream::from(
                     fingerprint.as_bytes().to_vec(),
-                ))
+                ));
+            super::metadata::apply_native_encryption(request, &native)
         };
         let delete = || {
             self.client

@@ -1547,6 +1547,20 @@ impl StorageBackend for RoutingBackend {
             end
         )
     }
+    async fn read_key_claim(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<crate::storage::KeyClaim>, StorageError> {
+        route_existing!(self, bucket, read_key_claim)
+    }
+
+    async fn write_key_claim(
+        &self,
+        bucket: &str,
+        op: crate::storage::ClaimWrite<'_>,
+    ) -> Result<crate::storage::ClaimOutcome, StorageError> {
+        route_existing!(self, bucket, write_key_claim, op)
+    }
 
     async fn put_passthrough_chunked(
         &self,
@@ -2074,6 +2088,19 @@ mod tests {
             _: &str,
         ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
             Ok(Box::pin(futures::stream::empty()))
+        }
+        async fn read_key_claim(
+            &self,
+            _: &str,
+        ) -> Result<Option<crate::storage::KeyClaim>, crate::storage::StorageError> {
+            Ok(None)
+        }
+        async fn write_key_claim(
+            &self,
+            _: &str,
+            _: crate::storage::ClaimWrite<'_>,
+        ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
+            Ok(crate::storage::ClaimOutcome::Written)
         }
 
         async fn get_passthrough_stream_range(

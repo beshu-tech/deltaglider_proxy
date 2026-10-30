@@ -1125,6 +1125,19 @@ impl FilesystemBackend {
 /// The file of a bucket's key claim, in the bucket's directory.
 const KEY_CLAIM_FILE: &str = ".dg-key-claim";
 
+/// A synced private temp file holding `body`, for a claim write: unique
+/// per process and call.
+async fn claim_temp_file(dir: &Path, body: &str) -> std::io::Result<PathBuf> {
+    use tokio::io::AsyncWriteExt;
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!("{KEY_CLAIM_FILE}.{}.{n}.tmp", std::process::id()));
+    let mut f = fs::File::create(&tmp).await?;
+    f.write_all(body.as_bytes()).await?;
+    f.sync_all().await?;
+    Ok(tmp)
+}
+
 impl StorageBackend for FilesystemBackend {
     async fn flush_pending(&self) -> Result<(), StorageError> {
         tokio::task::spawn_blocking(flush_pending_fsync)
@@ -1999,9 +2012,11 @@ impl StorageBackend for FilesystemBackend {
         &self,
         bucket: &str,
     ) -> Result<Option<crate::storage::KeyClaim>, StorageError> {
-        match fs::read_to_string(self.bucket_dir(bucket).join(KEY_CLAIM_FILE)).await {
-            Ok(text) => {
-                let fingerprint = text.trim().to_string();
+        match fsio::read(&self.bucket_dir(bucket).join(KEY_CLAIM_FILE)).await {
+            Ok(bytes) => {
+                // A claim is a short label; anything longer is not one.
+                let text = String::from_utf8_lossy(&bytes);
+                let fingerprint = crate::security::str_prefix(&text, 64).trim().to_string();
                 Ok(Some(crate::storage::KeyClaim {
                     version: fingerprint.clone(),
                     fingerprint,
@@ -2023,51 +2038,57 @@ impl StorageBackend for FilesystemBackend {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
         let path = dir.join(KEY_CLAIM_FILE);
+        // A Replace or Remove compares the version and then writes: one at
+        // a time in this process. (Two processes on one directory can still
+        // interleave them; a Create cannot.)
+        static CLAIM_WRITES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _one = CLAIM_WRITES.lock().await;
         let current = self.read_key_claim(bucket).await?;
-        match op {
+        let version_is = |v: &str| current.as_ref().map(|c| c.version.as_str()) == Some(v);
+        let outcome = match op {
             ClaimWrite::Create(fp) => {
-                // `create_new` is the condition: one creator wins.
-                let created = fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-                    .await;
-                match created {
-                    Ok(mut f) => {
-                        use tokio::io::AsyncWriteExt;
-                        f.write_all(fp.as_bytes()).await?;
-                        f.sync_all().await?;
-                        Ok(ClaimOutcome::Written)
-                    }
+                // The claim appears whole or not at all: write a synced
+                // private file, then hard-link it into place. `link` fails
+                // when the claim exists, which is the condition (one
+                // creator wins).
+                let tmp = claim_temp_file(&dir, fp).await?;
+                let linked = fs::hard_link(&tmp, &path).await;
+                let _ = fsio::remove_file(&tmp).await;
+                match linked {
+                    Ok(()) => ClaimOutcome::Written,
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                        Ok(ClaimOutcome::Lost)
+                        return Ok(ClaimOutcome::Lost)
                     }
-                    Err(e) => Err(e.into()),
+                    Err(e) => return Err(e.into()),
                 }
             }
             ClaimWrite::Replace {
                 fingerprint,
                 version,
             } => {
-                if current.as_ref().map(|c| c.version.as_str()) != Some(version) {
+                if !version_is(version) {
                     return Ok(ClaimOutcome::Lost);
                 }
-                let tmp = dir.join(format!("{KEY_CLAIM_FILE}.{}", std::process::id()));
-                fs::write(&tmp, fingerprint.as_bytes()).await?;
+                let tmp = claim_temp_file(&dir, fingerprint).await?;
                 fs::rename(&tmp, &path).await?;
-                Ok(ClaimOutcome::Written)
+                ClaimOutcome::Written
             }
             ClaimWrite::Remove { version } => {
-                if current.as_ref().map(|c| c.version.as_str()) != Some(version) {
+                if !version_is(version) {
                     return Ok(ClaimOutcome::Lost);
                 }
                 match fsio::remove_file(&path).await {
-                    Ok(()) => Ok(ClaimOutcome::Written),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ClaimOutcome::Lost),
-                    Err(e) => Err(e.into()),
+                    Ok(()) => ClaimOutcome::Written,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(ClaimOutcome::Lost)
+                    }
+                    Err(e) => return Err(e.into()),
                 }
             }
-        }
+        };
+        // The new directory entry survives a crash.
+        fsio::open(&dir).await?.sync_all().await?;
+        Ok(outcome)
     }
 
     async fn total_size(&self, bucket: Option<&str>) -> Result<u64, StorageError> {

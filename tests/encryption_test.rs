@@ -362,7 +362,10 @@ async fn keyless_proxy_refuses_to_write(builder: common::TestServerBuilder, buck
         body.contains(common::key_fp_label(TEST_KEY).trim_start_matches("fp-")),
         "{body}"
     );
-    assert!(body.contains("reports/sealed.html"), "{body}");
+    assert!(
+        !body.contains("reports/sealed.html"),
+        "the client learns the key label only, not other objects: {body}"
+    );
 
     let head = http.head(url("reports/plain.html")).send().await.unwrap();
     assert_eq!(head.status(), 404, "the refused PUT wrote nothing");
@@ -378,16 +381,10 @@ async fn keyless_proxy_refuses_to_write(builder: common::TestServerBuilder, buck
     );
 }
 
-#[tokio::test]
-async fn a_proxy_without_the_key_refuses_to_write_an_encrypted_bucket() {
-    let builder = TestServer::builder()
-        .bucket(BUCKET)
-        .auth("ENCKEY", "ENCSECRET");
-    keyless_proxy_refuses_to_write(builder, BUCKET).await;
-}
-
-/// The same on S3, where the probe reads the key from the `!!2` listing
-/// token or a HEAD of the sealed object.
+/// On S3 the restarted proxy finds the owner's key claim (and the `!!2`
+/// listing token of the sealed object). The wrapper-level cases (sightings,
+/// rotation, removal, refuse mode, cost) are in
+/// `src/storage/encrypting/sentinel_tests.rs`.
 #[tokio::test]
 async fn a_proxy_without_the_key_refuses_to_write_an_encrypted_s3_bucket() {
     skip_unless_minio!();
@@ -500,6 +497,15 @@ async fn two_proxies_with_different_keys_never_both_write_one_bucket() {
         assert!(body.contains(fp.trim_start_matches("fp-")), "{body}");
     }
     assert_eq!(put_status(winner, &bucket, "more.bin").await.0, 200);
+
+    // No client request reaches the claim, so none can unclaim the bucket.
+    let claim = format!("{}/{bucket}/.dg/facts/!!key-claim", winner.endpoint());
+    for resp in [
+        winner.http().get(&claim).send().await.unwrap(),
+        winner.http().delete(&claim).send().await.unwrap(),
+    ] {
+        assert_eq!(resp.status(), 400, "{:?}", resp.text().await);
+    }
 
     // The claim is internal: it does not list, and it does not keep an
     // emptied bucket from being deleted.

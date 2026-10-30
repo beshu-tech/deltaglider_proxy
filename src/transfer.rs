@@ -2974,6 +2974,19 @@ mod multipart_abort_tests {
         ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
             Err(nope())
         }
+        async fn read_key_claim(
+            &self,
+            _: &str,
+        ) -> Result<Option<crate::storage::KeyClaim>, crate::storage::StorageError> {
+            Ok(None)
+        }
+        async fn write_key_claim(
+            &self,
+            _: &str,
+            _: crate::storage::ClaimWrite<'_>,
+        ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
+            Ok(crate::storage::ClaimOutcome::Written)
+        }
         async fn scan_deltaspace(
             &self,
             _: &str,
@@ -3261,6 +3274,19 @@ mod multipart_abort_tests {
             f: &str,
         ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
             self.0.get_passthrough_stream(b, p, f).await
+        }
+        async fn read_key_claim(
+            &self,
+            _: &str,
+        ) -> Result<Option<crate::storage::KeyClaim>, crate::storage::StorageError> {
+            Ok(None)
+        }
+        async fn write_key_claim(
+            &self,
+            _: &str,
+            _: crate::storage::ClaimWrite<'_>,
+        ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
+            Ok(crate::storage::ClaimOutcome::Written)
         }
         async fn scan_deltaspace(
             &self,

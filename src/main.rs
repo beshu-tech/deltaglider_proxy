@@ -875,9 +875,10 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         backend_health: backend_health.clone(),
         encryption_witness: encryption_witness.clone(),
     });
-    if encryption_witness.is_some() {
-        // The background writers (replication, lifecycle) ask the witness
-        // through the maintenance gate: a refused destination defers them.
+    // The background writers (replication, lifecycle) ask the encryption
+    // witness and the key sentinel through the maintenance gate: a refused
+    // destination defers them instead of failing object after object.
+    {
         let weak = Arc::downgrade(&state);
         maintenance_gate.set_write_refusal_probe(Arc::new(move |bucket: &str| {
             weak.upgrade()

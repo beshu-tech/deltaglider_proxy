@@ -212,7 +212,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// [`Self::resolve_stored_forms`] for a DELETE. A form that the read
-    /// rule refuses (`StorageError::Encryption`: its seal does not open, or
+    /// rule refuses (`StorageError::Encryption` or `KeyNotHeld`: its seal does not open, or
     /// it is plaintext where the bucket refuses plaintext) counts as present
     /// with unknown facts, and the refusal comes back with it: an object
     /// that cannot be read can still be deleted.
@@ -248,7 +248,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         );
         let mut refusal = None;
         let mut present = |read: Result<Option<FileMetadata>, StorageError>, form| match read {
-            Err(e @ StorageError::Encryption(_)) if refused_is_present => {
+            Err(e @ (StorageError::Encryption(_) | StorageError::KeyNotHeld { .. }))
+                if refused_is_present =>
+            {
                 refusal = Some(e);
                 Ok(Some(unopened_form(filename, form)))
             }

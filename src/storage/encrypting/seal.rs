@@ -298,15 +298,6 @@ pub fn refusal(at: &Location<'_>, raw: &FileMetadata) -> StorageError {
 /// which [`is_plaintext_refusal`] knows it.
 const PLAINTEXT_REFUSAL: &str = "is not encrypted, but the bucket encrypts";
 
-/// Does an encryption error name a key that this proxy does not have: the read of an
-/// object sealed with it, or the sentinel's refusal of a write to a bucket
-/// that holds such objects? The client gets a 400 that says so (like S3
-/// for an SSE-C object read without its key), not a retryable 500.
-/// Takes the message of a `StorageError::Encryption`.
-pub fn names_a_key_not_held(msg: &str) -> bool {
-    msg.contains(super::sentinel::KEY_NOT_HELD)
-}
-
 /// Is `e` the read rule's refusal of an unencrypted object in a bucket
 /// that encrypts (not a seal that fails to open)?
 pub fn is_plaintext_refusal(e: &StorageError) -> bool {
@@ -321,16 +312,19 @@ pub fn open<'r>(
     at: &Location<'_>,
     ring: &'r Keyring,
 ) -> Result<(SealedFacts, &'r RingEntry), StorageError> {
-    let entry = ring.get(&sealed.fp).ok_or_else(|| {
-        enc_err(format!(
-            "object in bucket '{}' was encrypted {} (key fp-{}). Add that key to this \
-             proxy's encryption config (legacy_key reads without writing), or read the object \
-             through the proxy that holds it",
-            at.bucket,
-            super::sentinel::KEY_NOT_HELD,
-            hex::encode(sealed.fp)
-        ))
-    })?;
+    let entry = ring
+        .get(&sealed.fp)
+        .ok_or_else(|| StorageError::KeyNotHeld {
+            key: super::sentinel::label(&sealed.fp),
+            write: false,
+            detail: format!(
+                "object in bucket '{}' was encrypted with a key that this proxy does not have \
+             (key {}). Add that key to this proxy's encryption config (legacy_key reads without \
+             writing), or read the object through the proxy that holds it",
+                at.bucket,
+                super::sentinel::label(&sealed.fp)
+            ),
+        })?;
     let facts = entry.site.object(sealed.salt).open(at, sealed)?;
     if facts.headers != client_headers(raw) {
         return Err(enc_err(format!(

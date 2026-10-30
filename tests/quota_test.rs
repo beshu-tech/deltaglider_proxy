@@ -20,18 +20,24 @@ async fn put_sized(server: &TestServer, key: &str, size: usize) -> Result<(), St
         .send()
         .await
         .map(|_| ())
-        .map_err(|e| format!("{}", e))
+        .map_err(|e| format!("{}", aws_sdk_s3::error::DisplayErrorContext(&e)))
 }
 
 /// Helper: delete a file.
 async fn delete(server: &TestServer, key: &str) {
     let client = server.s3_client().await;
-    let _ = client
+    client
         .delete_object()
         .bucket(server.bucket())
         .key(key)
         .send()
-        .await;
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "DELETE {key}: {}",
+                aws_sdk_s3::error::DisplayErrorContext(&e)
+            )
+        });
 }
 
 // ═══════════════════════════════════════════════════
@@ -214,6 +220,7 @@ async fn test_quota_delete_frees_space() {
     // Signal-driven poll until scanner refreshes and allows writes again.
     // Scanner cache TTL is 5 minutes, but get_or_scan re-triggers scan when stale.
     let mut freed = false;
+    let mut last_err = String::new();
     for _ in 0..30 {
         let baseline = common::get_usage_scan_version(&http, &endpoint).await;
         let _ = common::wait_usage_scan_refresh_bounded(
@@ -223,14 +230,17 @@ async fn test_quota_delete_frees_space() {
             std::time::Duration::from_millis(500),
         )
         .await;
-        if put_sized(&server, "after_delete.bin", 100).await.is_ok() {
-            freed = true;
-            break;
+        match put_sized(&server, "after_delete.bin", 100).await {
+            Ok(()) => {
+                freed = true;
+                break;
+            }
+            Err(e) => last_err = e,
         }
     }
     assert!(
         freed,
-        "PUT should succeed after deleting objects and scanner refresh"
+        "PUT should succeed after deleting objects and scanner refresh; last error: {last_err}"
     );
 }
 

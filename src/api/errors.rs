@@ -396,15 +396,13 @@ impl From<crate::storage::StorageError> for S3Error {
             {
                 S3Error::InvalidRequest(KEY_PATH_CONFLICT_FS.to_string())
             }
-            // A key that this proxy does not have (an object sealed with it,
-            // or a write to a bucket that holds such objects): a 400 that
-            // names the key fingerprint, like S3 for an SSE-C object read
-            // without its key. A retry cannot succeed.
-            crate::storage::StorageError::Encryption(msg)
-                if crate::storage::encrypting::seal::names_a_key_not_held(&msg) =>
-            {
-                tracing::error!("{msg}");
-                S3Error::InvalidRequest(msg)
+            // A key that this proxy does not have: a 400 that names only the
+            // key's public label, like S3 for an SSE-C object read without its
+            // key (a retry cannot succeed). The detail (real bucket, an
+            // example key, this proxy's key id) is for the log only.
+            crate::storage::StorageError::KeyNotHeld { key, write, detail } => {
+                tracing::error!("{detail}");
+                S3Error::InvalidRequest(key_not_held_message(&key, write))
             }
             crate::storage::StorageError::MetadataTooLarge(msg) => S3Error::MetadataTooLarge(msg),
             crate::storage::StorageError::InvalidRange(_) => S3Error::InvalidRange,
@@ -441,6 +439,19 @@ impl From<crate::storage::StorageError> for S3Error {
             }
             other => S3Error::InternalError(sanitise_for_client(&other)),
         }
+    }
+}
+
+/// The client's text of a [`crate::storage::StorageError::KeyNotHeld`]:
+/// the key's public label and what is refused, nothing else.
+pub(crate) fn key_not_held_message(key: &str, write: bool) -> String {
+    if write {
+        format!(
+            "This bucket holds objects that are encrypted with key {key}, which this proxy \
+             does not have, so the proxy refuses to write to it. Reads and deletes still work."
+        )
+    } else {
+        format!("This object is encrypted with key {key}, which this proxy does not have.")
     }
 }
 
@@ -654,6 +665,31 @@ mod tests {
 
     /// Every surface answers oversized metadata with the S3 code
     /// `MetadataTooLarge`; form POST and stored metadata answered
+    /// A key that this proxy does not have is a 400 InvalidRequest (a retry
+    /// cannot succeed; S3 answers the same for an SSE-C object read without
+    /// its key). The client gets the key's public label and nothing of the
+    /// operator's detail: not the real bucket behind an alias, not another
+    /// object's name, not this proxy's key id.
+    #[test]
+    fn a_key_not_held_is_a_400_that_names_only_the_key() {
+        for write in [false, true] {
+            let err: S3Error = crate::storage::StorageError::KeyNotHeld {
+                key: "fp-8748e64455ba2257".into(),
+                write,
+                detail: "bucket 'real-bucket' ... 'secret/payroll.pdf' ... 'k-id'".into(),
+            }
+            .into();
+            assert_eq!(err.code(), "InvalidRequest");
+            assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+            let xml = err.to_xml("id");
+            assert!(xml.contains("fp-8748e64455ba2257"), "{xml}");
+            for secret in ["real-bucket", "payroll", "k-id"] {
+                assert!(!xml.contains(secret), "{secret} leaked: {xml}");
+            }
+            assert_eq!(xml.contains("refuses to write"), write, "{xml}");
+        }
+    }
+
     /// `InvalidArgument` (s3surface-18).
     #[test]
     fn metadata_too_large_has_its_own_code() {

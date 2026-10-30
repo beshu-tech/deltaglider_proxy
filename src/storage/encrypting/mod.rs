@@ -27,6 +27,8 @@ mod format;
 pub(crate) mod seal;
 mod sentinel;
 #[cfg(test)]
+mod sentinel_tests;
+#[cfg(test)]
 mod tests;
 pub(crate) mod v2;
 mod witness;
@@ -41,7 +43,7 @@ pub use witness::{WitnessGate, WitnessGateState, WITNESS_BACKEND_DEFAULT};
 /// its v2 fingerprint (issue #120). It depends on the key alone, so the
 /// same key has the same id on every backend and a rename changes nothing.
 pub fn fingerprint_label(key: &EncryptionKey) -> String {
-    format!("fp-{}", hex::encode(v2::SiteKey::new(key).fingerprint()))
+    sentinel::label(&v2::SiteKey::new(key).fingerprint())
 }
 
 use super::io_to_storage_error;
@@ -364,62 +366,77 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         let Some(sentinel) = self.sentinel.as_ref().filter(|_| !delete) else {
             return Ok(());
         };
-        if sentinel.needs_probe(bucket) {
-            let _one = sentinel.probe_lock().await;
-            if sentinel.needs_probe(bucket) {
-                let found = match self.probe_keys(bucket).await {
+        let cfg = self.config.load_full();
+        // A bucket in `WriteMode::Refuse` stores nothing that a key could
+        // read or not: its content writes fail on their own, and a folder
+        // marker or a metadata rewrite keeps its old behaviour.
+        let Ok(site) = self.write_key(bucket) else {
+            return Ok(());
+        };
+        let write = site.as_ref().map(|s| s.fingerprint());
+        let held = |fp: &sentinel::Fingerprint| cfg.ring().get(fp).is_some();
+        let now = std::time::Instant::now;
+        let mut refusal = sentinel.refusal(bucket, now(), held);
+        if refusal.is_none()
+            && (sentinel.probe_due(bucket, now()) || sentinel.claim_due(bucket, now(), held, write))
+        {
+            let lock = sentinel.lock(bucket);
+            let _one = lock.lock().await;
+            if sentinel.probe_due(bucket, now()) {
+                let found = match self.probe_keys(bucket, cfg.ring()).await {
                     Ok(found) => Some(found),
                     Err(StorageError::BucketNotFound(_) | StorageError::NotFound(_)) => {
                         Some(Vec::new())
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "encryption: the key probe of bucket '{bucket}' failed, the write \
-                             goes ahead unchecked: {e}"
-                        );
+                        tracing::debug!("encryption: key probe of bucket '{bucket}': {e}");
                         None
                     }
                 };
-                sentinel.probed(bucket, found);
+                let failed = found.is_none();
+                if sentinel.probed(bucket, found, now()) {
+                    tracing::warn!(
+                        "encryption: the key probe of bucket '{bucket}' failed; writes go ahead \
+                         on the other evidence, and the probe is tried again in {}s",
+                        sentinel::FAILED_TTL.as_secs()
+                    );
+                } else if !failed {
+                    tracing::debug!("encryption: probed bucket '{bucket}'");
+                }
+            }
+            // The probe and the sightings first: a writer never claims a
+            // bucket that holds another key.
+            refusal = sentinel.refusal(bucket, now(), held);
+            if refusal.is_none() && sentinel.claim_due(bucket, now(), held, write) {
+                if let Err(e) = self.settle_claim(sentinel, bucket, held, write).await {
+                    if sentinel.claim_failed(bucket, now()) {
+                        tracing::warn!(
+                            "encryption: the key claim of bucket '{bucket}' could not be read or \
+                             written, writes go ahead on the other evidence and the claim is \
+                             tried again in {}s: {e}",
+                            sentinel::FAILED_TTL.as_secs()
+                        );
+                    }
+                }
+                refusal = sentinel.refusal(bucket, now(), held);
             }
         }
-        let cfg = self.config.load();
-        let site = self.write_key(bucket)?;
+        let Some(r) = refusal else {
+            return Ok(());
+        };
         let write_key = site.as_ref().map(|site| {
             cfg.ring()
                 .get(&site.fingerprint())
-                .map_or_else(|| fingerprint_hex(site), |e| e.id.clone())
+                .map_or_else(|| sentinel::label(&site.fingerprint()), |e| e.id.clone())
         });
-        let refuse = |msg: String| {
-            tracing::warn!("encryption: refused a write: {msg}");
-            Err(StorageError::Encryption(msg))
-        };
-        // The probe and the sightings first: a writer never claims a bucket
-        // that holds another key.
-        if let Some(msg) = sentinel.refusal(bucket, cfg.ring(), write_key.as_deref()) {
-            return refuse(msg);
-        }
-        let write_fp = site.as_ref().map(|s| s.fingerprint());
-        let held = |fp: &sentinel::Fingerprint| cfg.ring().get(fp).is_some();
-        if sentinel.claim_due(bucket, held, write_fp) {
-            let _one = sentinel.probe_lock().await;
-            if sentinel.claim_due(bucket, held, write_fp) {
-                if let Err(e) = self.settle_claim(sentinel, bucket, held, write_fp).await {
-                    tracing::warn!(
-                        "encryption: the key claim of bucket '{bucket}' could not be read or \
-                         written, the write goes ahead on the evidence it has: {e}"
-                    );
-                    sentinel.claim_failed(bucket);
-                }
-            }
-        }
-        match sentinel.refusal(bucket, cfg.ring(), write_key.as_deref()) {
-            Some(msg) => refuse(msg),
-            None => Ok(()),
-        }
+        Err(StorageError::KeyNotHeld {
+            key: sentinel::label(&r.fingerprint),
+            write: true,
+            detail: sentinel::refusal_detail(bucket, &r, write_key.as_deref()),
+        })
     }
 
-    /// Read the key claim of `bucket` and apply [`sentinel::claim_step`]:
+    /// Read the key claim of `bucket` and apply [`sentinel::claim_action`]:
     /// create, replace or remove it with a conditional write, and read it
     /// again when another writer changed it first.
     async fn settle_claim(
@@ -430,50 +447,41 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         write: Option<sentinel::Fingerprint>,
     ) -> Result<(), StorageError> {
         use super::{ClaimOutcome, ClaimWrite};
-        use sentinel::ClaimStep;
+        use sentinel::ClaimAction;
+        let write_label = write.as_ref().map(sentinel::label);
         for _ in 0..3 {
             let claim = self.inner.read_key_claim(bucket).await?;
-            let parsed = claim.as_ref().map(|c| {
-                (
-                    sentinel::parse_claim_label(&c.fingerprint),
-                    c.version.as_str(),
-                )
-            });
-            let (outcome, now_claimed) = match sentinel::claim_step(parsed, &held, write) {
-                ClaimStep::Keep | ClaimStep::Refuse(_) => {
-                    let fp = parsed.and_then(|(fp, _)| fp);
-                    sentinel.claim_seen(bucket, fp, fp.is_some() && fp == write);
+            let parsed = claim
+                .as_ref()
+                .map(|c| sentinel::parse_label(&c.fingerprint));
+            let version = claim.as_ref().map_or("", |c| c.version.as_str());
+            let now = std::time::Instant::now;
+            let (op, after) = match (sentinel::claim_action(parsed, &held, write), &write_label) {
+                (ClaimAction::Keep | ClaimAction::Refuse(_), _) => {
+                    let fp = parsed.flatten();
+                    sentinel.claim_seen(bucket, fp, fp.is_some() && fp == write, now());
                     return Ok(());
                 }
-                ClaimStep::Create(w) => {
-                    let label = sentinel::claim_label(&w);
-                    let op = ClaimWrite::Create(&label);
-                    (self.inner.write_key_claim(bucket, op).await?, Some(w))
-                }
-                ClaimStep::Replace(w, version) => {
-                    let label = sentinel::claim_label(&w);
-                    let op = ClaimWrite::Replace {
-                        fingerprint: &label,
-                        version: &version,
-                    };
-                    (self.inner.write_key_claim(bucket, op).await?, Some(w))
-                }
-                ClaimStep::Remove(version) => {
-                    let op = ClaimWrite::Remove { version: &version };
-                    (self.inner.write_key_claim(bucket, op).await?, None)
+                (ClaimAction::Create, Some(label)) => (ClaimWrite::Create(label), write),
+                (ClaimAction::Replace, Some(label)) => (
+                    ClaimWrite::Replace {
+                        fingerprint: label,
+                        version,
+                    },
+                    write,
+                ),
+                (ClaimAction::Remove, _) => (ClaimWrite::Remove { version }, None),
+                (ClaimAction::Create | ClaimAction::Replace, None) => {
+                    unreachable!("claim_action creates or replaces only for a write key")
                 }
             };
-            match outcome {
+            match self.inner.write_key_claim(bucket, op).await? {
                 ClaimOutcome::Written => {
                     tracing::info!(
                         "encryption: key claim of bucket '{bucket}' is now {}",
-                        now_claimed.map_or("none".to_string(), |fp| sentinel::claim_label(&fp))
+                        after.as_ref().map_or("none".to_string(), sentinel::label)
                     );
-                    sentinel.claim_seen(bucket, now_claimed, now_claimed.is_some());
-                    return Ok(());
-                }
-                ClaimOutcome::NoStore => {
-                    sentinel.claim_seen(bucket, None, true);
+                    sentinel.claim_seen(bucket, after, true, now());
                     return Ok(());
                 }
                 ClaimOutcome::Lost => continue,
@@ -485,45 +493,53 @@ impl<B: StorageBackend> EncryptingBackend<B> {
     }
 
     /// The fingerprints of the keys that sealed a sample of `bucket`, with
-    /// an object each: the listing tokens of one page from the root, then a
-    /// HEAD of a few baselines and objects spread over the page. Stops at
-    /// the first key that is not in the ring.
+    /// an object each: one bounded flat listing page from the root (whose
+    /// raw metadata already carries the seal on a filesystem), the listing
+    /// tokens of that page, then a HEAD of a few baselines and of objects
+    /// spread over the page. Stops at the first key that `ring` lacks. A
+    /// backend that cannot list a bounded page is not sampled.
     async fn probe_keys(
         &self,
         bucket: &str,
+        ring: &seal::Keyring,
     ) -> Result<Vec<(sentinel::Fingerprint, String)>, StorageError> {
-        let listing = self
+        let Some(page) = self
             .inner
-            .bulk_list_objects_with_baselines(bucket, "", None, Some(sentinel::PROBE_LIST))
-            .await?;
-        let ring = self.config.load().ring().clone();
+            .list_objects_delegated(bucket, "", None, sentinel::PROBE_LIST, None)
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
         let mut found = Vec::new();
         let foreign = |found: &[(sentinel::Fingerprint, String)]| {
             found.iter().any(|(fp, _)| ring.get(fp).is_none())
         };
-        let tokens = self.inner.listing_tokens(bucket, &listing.objects).await;
-        for ((key, _), token) in listing.objects.iter().zip(tokens) {
+        for (key, meta) in &page.objects {
+            if let Ok(Some(sealed)) = seal::sealed_of(meta) {
+                found.push((sealed.fp, key.clone()));
+            }
+        }
+        let tokens = self.inner.listing_tokens(bucket, &page.objects).await;
+        for ((key, _), token) in page.objects.iter().zip(tokens) {
             if let Some(fp) = token.and_then(|t| v2::token_fingerprint(&t.token)) {
                 found.push((fp, key.clone()));
             }
         }
-        if foreign(&found) {
+        if foreign(&found) || !found.is_empty() && page.objects.len() == found.len() {
             return Ok(found);
         }
         // Baselines first: one reference stands for its whole deltaspace.
-        let mut heads: Vec<(String, StoredObject<'_>, String)> = listing
-            .baselines
+        let mut heads: Vec<(String, StoredObject<'_>, String)> = page
+            .reference_prefixes
             .iter()
-            .map(|(key, _)| {
-                let prefix = key
-                    .strip_suffix("reference.bin")
-                    .unwrap_or_default()
-                    .trim_end_matches('/');
-                (prefix.to_string(), StoredObject::Reference, key.clone())
-            })
+            .flatten()
             .take(sentinel::PROBE_HEADS / 2)
+            .map(|prefix| {
+                let key = object_name(prefix, StoredObject::Reference);
+                (prefix.clone(), StoredObject::Reference, key)
+            })
             .collect();
-        let files: Vec<_> = listing
+        let files: Vec<_> = page
             .objects
             .iter()
             .filter(|(key, _)| !key.ends_with('/'))
@@ -604,11 +620,6 @@ fn stored_object_of<'a>(meta: &FileMetadata, name: &'a str) -> StoredObject<'a> 
     }
 }
 
-/// A folder marker: never sealed, always readable.
-fn fingerprint_hex(site: &v2::SiteKey) -> String {
-    format!("fp-{}", hex::encode(site.fingerprint()))
-}
-
 /// The key of a stored object, for a message.
 fn object_name(prefix: &str, object: StoredObject<'_>) -> String {
     let name = match object {
@@ -622,6 +633,7 @@ fn object_name(prefix: &str, object: StoredObject<'_>) -> String {
     }
 }
 
+/// A folder marker: never sealed, always readable.
 fn is_folder(object: StoredObject<'_>) -> bool {
     matches!(object, StoredObject::Passthrough(f) if f.is_empty() || f.ends_with('/'))
 }
@@ -870,7 +882,8 @@ impl<B: StorageBackend> EncryptingBackend<B> {
                 let cfg = self.config.load();
                 if let Some(sentinel) = &self.sentinel {
                     if cfg.ring().get(&sealed.fp).is_none() {
-                        sentinel.sighted(bucket, sealed.fp, &object_name(prefix, object));
+                        let at = object_name(prefix, object);
+                        sentinel.sighted(bucket, sealed.fp, &at, std::time::Instant::now());
                     }
                 }
                 let (facts, entry) = seal::open(raw, &sealed, &at, cfg.ring())?;
@@ -1783,6 +1796,16 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         let raw = self.inner.get_reference_metadata(b, p).await?;
         Ok(self.present_raw(b, p, StoredObject::Reference, &raw)?.meta)
     }
+    async fn read_key_claim(&self, b: &str) -> Result<Option<super::KeyClaim>, StorageError> {
+        self.inner.read_key_claim(b).await
+    }
+    async fn write_key_claim(
+        &self,
+        b: &str,
+        op: super::ClaimWrite<'_>,
+    ) -> Result<super::ClaimOutcome, StorageError> {
+        self.inner.write_key_claim(b, op).await
+    }
     async fn get_delta_metadata(
         &self,
         b: &str,
@@ -2035,6 +2058,12 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
                 if apply_listing_facts(meta, &t, &lf) {
                     *size = ListedSize::Cached;
                 }
+            } else if let (Some(sentinel), Some(fp)) =
+                (&self.sentinel, v2::token_fingerprint(&t.token))
+            {
+                if cfg.ring().get(&fp).is_none() {
+                    sentinel.sighted(b, fp, &t.stored_key, std::time::Instant::now());
+                }
             }
         }
         sizes
@@ -2049,7 +2078,12 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         self.inner.ensure_declared_bucket(b).await
     }
     async fn delete_bucket(&self, b: &str) -> Result<(), StorageError> {
-        self.inner.delete_bucket(b).await
+        self.inner.delete_bucket(b).await?;
+        // A new bucket of that name starts without the old one's evidence.
+        if let Some(sentinel) = &self.sentinel {
+            sentinel.forget(b);
+        }
+        Ok(())
     }
     async fn list_buckets(&self) -> Result<Vec<String>, StorageError> {
         self.inner.list_buckets().await
@@ -2118,11 +2152,18 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     async fn total_size(&self, b: Option<&str>) -> Result<u64, StorageError> {
         self.inner.total_size(b).await
     }
+    /// The witness, then the sentinel's cached verdict (no I/O): the
+    /// background writers defer instead of failing object after object.
     fn write_refusal(&self, bucket: &str) -> Option<String> {
-        match self.check_witness(bucket) {
-            Err(StorageError::WritesRefused(m)) => Some(m),
-            _ => None,
+        if let Err(StorageError::WritesRefused(m)) = self.check_witness(bucket) {
+            return Some(m);
         }
+        let sentinel = self.sentinel.as_ref()?;
+        let cfg = self.config.load();
+        let r = sentinel.refusal(bucket, std::time::Instant::now(), |fp| {
+            cfg.ring().get(fp).is_some()
+        })?;
+        Some(sentinel::refusal_detail(bucket, &r, None))
     }
     async fn put_directory_marker(&self, b: &str, k: &str) -> Result<(), StorageError> {
         self.check_write(b).await?;

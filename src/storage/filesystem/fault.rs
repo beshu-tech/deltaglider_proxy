@@ -47,6 +47,12 @@ pub(crate) enum FaultPoint {
     /// A delta write, before it writes: the writer holds its deltaspace
     /// lock and encoded against reference.bin.
     PutDelta,
+    /// The key is `"bucket//"`: the read of the bucket's key claim.
+    ReadKeyClaim,
+    /// The key is `"bucket//"`: a write of the bucket's key claim.
+    WriteKeyClaim,
+    /// The key is `"bucket/prefix/"`: a delegated listing page.
+    ListObjectsDelegated,
 }
 
 /// Work a test runs inside a storage call, before the call goes on: a
@@ -66,6 +72,8 @@ enum Arm {
 struct FaultState {
     armed: std::collections::HashMap<(FaultPoint, String), Arm>,
     fired: std::collections::HashMap<(FaultPoint, String), usize>,
+    /// Every call at each point and key, armed or not (cost tests).
+    calls: std::collections::HashMap<(FaultPoint, String), usize>,
     /// `Some`: each passthrough write waits this long before it writes,
     /// and the gauge counts the writes in flight.
     slow_passthrough: Option<std::time::Duration>,
@@ -143,10 +151,21 @@ impl Faults {
             .unwrap_or(0)
     }
 
+    /// How many calls reached `point` on `key`, armed or not.
+    pub(crate) fn calls(&self, point: FaultPoint, key: &str) -> usize {
+        let state = self.0.lock().unwrap();
+        state
+            .calls
+            .get(&(point, key.to_string()))
+            .copied()
+            .unwrap_or(0)
+    }
+
     async fn trip(&self, point: FaultPoint, key: String) -> Result<(), StorageError> {
         let arm = {
             let mut state = self.0.lock().unwrap();
             let k = (point, key);
+            *state.calls.entry(k.clone()).or_default() += 1;
             let Some(arm) = state.armed.get(&k).cloned() else {
                 return Ok(());
             };
@@ -700,6 +719,22 @@ impl StorageBackend for FaultyFs {
             .get_passthrough_stream_range(bucket, prefix, filename, start, end)
             .await
     }
+    async fn read_key_claim(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<crate::storage::KeyClaim>, crate::storage::StorageError> {
+        self.armed(FaultPoint::ReadKeyClaim, bucket, "", "").await?;
+        self.inner.read_key_claim(bucket).await
+    }
+    async fn write_key_claim(
+        &self,
+        bucket: &str,
+        op: crate::storage::ClaimWrite<'_>,
+    ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
+        self.armed(FaultPoint::WriteKeyClaim, bucket, "", "")
+            .await?;
+        self.inner.write_key_claim(bucket, op).await
+    }
 
     async fn scan_deltaspace(
         &self,
@@ -765,6 +800,8 @@ impl StorageBackend for FaultyFs {
         max_keys: u32,
         continuation_token: Option<&str>,
     ) -> Result<Option<DelegatedListResult>, StorageError> {
+        self.armed(FaultPoint::ListObjectsDelegated, bucket, prefix, "")
+            .await?;
         self.inner
             .list_objects_delegated(bucket, prefix, delimiter, max_keys, continuation_token)
             .await

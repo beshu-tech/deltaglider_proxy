@@ -755,6 +755,19 @@ impl crate::storage::StorageBackend for FencingFs {
     ) -> Result<BoxStream<'static, Result<bytes::Bytes, StorageError>>, StorageError> {
         self.inner.get_passthrough_stream(b, p, f).await
     }
+    async fn read_key_claim(
+        &self,
+        _: &str,
+    ) -> Result<Option<crate::storage::KeyClaim>, crate::storage::StorageError> {
+        Ok(None)
+    }
+    async fn write_key_claim(
+        &self,
+        _: &str,
+        _: crate::storage::ClaimWrite<'_>,
+    ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
+        Ok(crate::storage::ClaimOutcome::Written)
+    }
     async fn get_passthrough_stream_range(
         &self,
         b: &str,

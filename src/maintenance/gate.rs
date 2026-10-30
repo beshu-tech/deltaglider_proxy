@@ -130,7 +130,8 @@ impl MaintenanceGate {
         self.busy.load().contains_key(&bucket.to_ascii_lowercase())
     }
 
-    /// Install the encryption witness probe (boot, multi-instance only).
+    /// Install the write-refusal probe: the encryption witness and the key
+    /// sentinel (boot).
     pub fn set_write_refusal_probe(&self, probe: WriteRefusalProbe) {
         let _ = self.write_refusal.set(ProbeCell(probe));
     }
