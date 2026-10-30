@@ -111,28 +111,68 @@ pub(crate) struct TransitionReport {
 /// so this check enumerates the fields the engine actually reads and lets
 /// the caller skip the work when nothing relevant changed.
 ///
-/// Any field listed here must be tested for equality. Anything outside
-/// (listen_addr, log_level, SigV4 creds, bootstrap hash, tls config,
-/// config_sync_bucket, defaults_version) is engine-orthogonal.
+/// Every `Config` field is classified below, with no `..`: a new field does
+/// not compile until it is put in a class (docs/plan/config-model.md). The
+/// engine snapshots its fields at construction (engine/construction.rs), so
+/// an engine field missing from the first list is a silent no-op apply
+/// (reported applied:true, the running engine keeps the old value).
 pub(super) fn engine_affecting_fields_changed(
     old: &crate::config::Config,
     new: &crate::config::Config,
 ) -> bool {
-    old.backend != new.backend
-        || old.backend_encryption != new.backend_encryption
-        || old.backends != new.backends
-        || old.default_backend != new.default_backend
-        || old.buckets != new.buckets
-        || old.max_object_size != new.max_object_size
-        || old.cache_size_mb != new.cache_size_mb
-        || old.max_delta_ratio != new.max_delta_ratio
-        || old.metadata_cache_mb != new.metadata_cache_mb
-        // The engine snapshots these at construction (engine/construction.rs), so a
-        // change is a silent no-op without a rebuild (reported applied:true but
-        // the running engine keeps the old limit / codec parallelism).
-        || old.max_passthrough_object_size != new.max_passthrough_object_size
-        || old.codec_concurrency != new.codec_concurrency
-        || old.range_spool_ttl_secs != new.range_spool_ttl_secs
+    macro_rules! classify {
+        (engine: [$($e:ident),* $(,)?], other: [$($o:ident),* $(,)?] $(,)?) => {{
+            let crate::config::Config { $($e: _,)* $($o: _,)* } = old;
+            false $(|| old.$e != new.$e)*
+        }};
+    }
+    classify! {
+        engine: [
+            backend,
+            backend_encryption,
+            backends,
+            default_backend,
+            buckets,
+            max_object_size,
+            cache_size_mb,
+            max_delta_ratio,
+            metadata_cache_mb,
+            max_passthrough_object_size,
+            codec_concurrency,
+            range_spool_ttl_secs,
+        ],
+        other: [
+            defaults_version,
+            // Restart class (`requires_restart_warnings`). The engine reads
+            // config_sync_bucket too, but a change needs a restart anyway.
+            listen_addr,
+            blocking_threads,
+            tls,
+            config_sync_bucket,
+            // Read per request or by their own subsystem.
+            filtered_list_max_engine_pages,
+            authentication,
+            access_key_id,
+            secret_access_key,
+            bootstrap_password_hash,
+            log_level,
+            config_sync_object_key,
+            replication,
+            lifecycle,
+            event_delivery,
+            jobs,
+            admission_blocks,
+            iam_mode,
+            iam_users,
+            iam_groups,
+            auth_providers,
+            group_mapping_rules,
+            // Runtime-only. `tuning` is fixed for the process (env-only).
+            env_refs,
+            env_shadow,
+            tuning,
+        ],
+    }
 }
 
 /// Side effects of transitioning the runtime config from `**cfg` to `new_cfg`.
