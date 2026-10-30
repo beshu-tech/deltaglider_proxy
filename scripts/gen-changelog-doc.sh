@@ -95,7 +95,14 @@ HEADER
       if ($0 !~ /^## v/ && $0 ~ /[^[:space:]]/) nonblank = 1
     }
     END { flush() }
-  ' "$SRC"
+  ' "$SRC" | rebase_doc_links
+}
+
+# CHANGELOG.md links docs from the repo root (`docs/product/x.md`); the
+# generated page lives IN docs/product/, and both doc surfaces resolve a link
+# against the page's own folder, so drop the prefix.
+rebase_doc_links() {
+  sed 's#](docs/product/#](#g'
 }
 
 if [ "${1:-}" = "--check" ]; then

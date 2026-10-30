@@ -15,16 +15,16 @@ _Last updated: 2026-10-30_
 ### Security — A proxy does not write to a bucket that another proxy encrypts with a key that it does not have
 
 - Two proxies with separate configurations can store objects in one bucket of a backend. When one of them encrypts the bucket and the other does not have the key, the other proxy wrote its objects without encryption. The first proxy refused to read those objects, and the other proxy could not read the encrypted ones. The encryption witness did not help, because it works only between instances that share a `config_sync_bucket`.
-- A proxy that encrypts a bucket now claims the bucket for its key with one small internal object (`.dg/facts/!!key-claim`), which it creates with a conditional write. Two proxies with different keys cannot both claim one bucket, also when both start on an empty bucket at the same moment. A key rotation moves the claim to the new key, and a bucket that stops encrypting loses its claim. Listings do not show the claim, and DeleteBucket removes it. On a backend without conditional writes (Backblaze B2), two proxies that start on an empty bucket at the same moment can both write a claim. The other proxy then finds the claim at its next read, up to 10 minutes later. After a key rotation, a proxy that has only the old key can keep writing for up to 10 minutes. See [What the claim does not stop](docs/product/reference/encryption.md#what-the-claim-does-not-stop).
+- A proxy that encrypts a bucket now claims the bucket for its key with one small internal object (`.dg/facts/!!key-claim`), which it creates with a conditional write. Two proxies with different keys cannot both claim one bucket, also when both start on an empty bucket at the same moment. A key rotation moves the claim to the new key, and a bucket that stops encrypting loses its claim. Listings do not show the claim, and DeleteBucket removes it. On a backend without conditional writes (Backblaze B2), two proxies that start on an empty bucket at the same moment can both write a claim. The other proxy then finds the claim at its next read, up to 10 minutes later. After a key rotation, a proxy that has only the old key can keep writing for up to 10 minutes. See [What the claim does not stop](reference/encryption.md#what-the-claim-does-not-stop).
 - Every encrypted object also names the fingerprint of its key in its sealed metadata and in its listing token. A proxy records the fingerprint of each object that it reads but cannot open. Before the first write to a bucket, and then every 10 minutes, it also checks a sample of the bucket: one listing page, the listing tokens of that page, and a HEAD request for up to 8 objects. The sample finds the buckets that an earlier release encrypted, which have no claim.
-- When the claim or an object names a key that the proxy does not have, every write to the bucket fails with `400 InvalidRequest`. The message names the fingerprint. Deletes still work. When you add the key to the configuration (also as `legacy_key`), the writes work at once. See [Buckets that another proxy encrypts](docs/product/reference/encryption.md#buckets-that-another-proxy-encrypts).
+- When the claim or an object names a key that the proxy does not have, every write to the bucket fails with `400 InvalidRequest`. The message names the fingerprint. Deletes still work. When you add the key to the configuration (also as `legacy_key`), the writes work at once. See [Buckets that another proxy encrypts](reference/encryption.md#buckets-that-another-proxy-encrypts).
 
 ### Changed — Upgrade notes for the key check
 
 - A bucket that holds objects of a key that the proxy no longer has (for example, a key that you removed from the configuration without a re-encrypt job) now refuses writes. Add the old key as `legacy_key`, or delete those objects.
 - Each bucket that the proxy writes costs a few more requests: a read of the key claim every minute (a proxy that writes plaintext) or every 10 minutes (a proxy that encrypts), and a sample of the bucket every 10 minutes (on S3, two LIST requests and up to 8 HEAD requests).
 - Keys under `.dg/facts/` are now refused for every client request, not only for uploads.
-- When proxies that share a bucket rotate their key, add the new key as a read-only key on every proxy first. See [Rotate a key on proxies that share a bucket](docs/product/reference/encryption.md#rotate-a-key-on-proxies-that-share-a-bucket).
+- When proxies that share a bucket rotate their key, add the new key as a read-only key on every proxy first. See [Rotate a key on proxies that share a bucket](reference/encryption.md#rotate-a-key-on-proxies-that-share-a-bucket).
 
 ### Changed — A read of an object whose key the proxy does not have answers 400
 
@@ -240,7 +240,7 @@ The bucket list and the bucket card now show and change a bucket's own encryptio
 - The re-encrypt proposals, the Jobs picker and the migrate dialog decide per bucket: after a backend change, only the buckets whose effective encryption changed are preselected; a bucket's own key that moves with a migration needs no plaintext acknowledgement.
 - **Reset to defaults** keeps a bucket's own encryption block and its backend, and says so. The Backends card shows "Encryption: Default for N buckets · M buckets override".
 - The key dialog no longer says that DeltaGlider does not back up the key: a full backup carries a key that is in the config file, not a key that an environment variable supplies.
-- New how-to: [How to encrypt one bucket on a shared backend](docs/product/how-to/encrypt-one-bucket-on-a-shared-backend.md).
+- New how-to: [How to encrypt one bucket on a shared backend](how-to/encrypt-one-bucket-on-a-shared-backend.md).
 
 ### Added — The encryption witness keeps several instances in agreement
 
@@ -257,7 +257,7 @@ With `config_sync_bucket` set, the YAML is still per instance, so two instances 
 **Upgrade notes:**
 
 - Upgrade every instance before you add a bucket `encryption` block while `config_sync_bucket` is set: an older release ignores the witness.
-- This also changes clusters that use BACKEND-level encryption only, because each encrypting backend's `*` is witnessed. A backend key or mode changed by editing the file or an environment variable and restarting the instances is not published: after the restart, every instance with the new key refuses all writes to that backend until you run `deltaglider_proxy witness publish backend:<name>` once (or make the change with a config apply instead). An instance that starts while the sync bucket does not answer refuses writes to every encrypting backend until its first check succeeds. See [How to upgrade](docs/product/how-to/upgrade.md) and [How to run multiple instances](docs/product/how-to/run-multiple-instances.md).
+- This also changes clusters that use BACKEND-level encryption only, because each encrypting backend's `*` is witnessed. A backend key or mode changed by editing the file or an environment variable and restarting the instances is not published: after the restart, every instance with the new key refuses all writes to that backend until you run `deltaglider_proxy witness publish backend:<name>` once (or make the change with a config apply instead). An instance that starts while the sync bucket does not answer refuses writes to every encrypting backend until its first check succeeds. See [How to upgrade](how-to/upgrade.md) and [How to run multiple instances](how-to/run-multiple-instances.md).
 
 ### Added — Audit entries for a bucket's encryption
 
