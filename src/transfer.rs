@@ -2825,9 +2825,15 @@ mod multipart_abort_tests {
         async fn head_bucket(&self, _: &str) -> Result<bool, StorageError> {
             Err(nope())
         }
-        async fn get_reference(&self, _: &str, _: &str) -> Result<Vec<u8>, StorageError> {
+        async fn get_object(
+            &self,
+            _: &str,
+            _: &str,
+            _: crate::storage::StoredObject<'_>,
+        ) -> Result<Vec<u8>, StorageError> {
             Err(nope())
         }
+
         // Source-object reads used by the streaming copy path.
         async fn head_object(
             &self,
@@ -2850,9 +2856,6 @@ mod multipart_abort_tests {
         async fn flush_pending(&self) -> Result<(), StorageError> {
             Ok(())
         }
-        async fn get_delta(&self, _: &str, _: &str, _: &str) -> Result<Vec<u8>, StorageError> {
-            Err(nope())
-        }
         async fn put_delta(
             &self,
             _: &str,
@@ -2866,14 +2869,6 @@ mod multipart_abort_tests {
         }
         async fn delete_delta(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
             Ok(())
-        }
-        async fn get_passthrough(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-        ) -> Result<Vec<u8>, StorageError> {
-            Err(nope())
         }
         async fn put_passthrough(
             &self,
@@ -3084,9 +3079,15 @@ mod multipart_abort_tests {
         async fn head_bucket(&self, b: &str) -> Result<bool, StorageError> {
             self.0.head_bucket(b).await
         }
-        async fn get_reference(&self, b: &str, p: &str) -> Result<Vec<u8>, StorageError> {
-            self.0.get_reference(b, p).await
+        async fn get_object(
+            &self,
+            b: &str,
+            p: &str,
+            o: crate::storage::StoredObject<'_>,
+        ) -> Result<Vec<u8>, StorageError> {
+            self.0.get_object(b, p, o).await
         }
+
         async fn head_object(
             &self,
             b: &str,
@@ -3102,9 +3103,6 @@ mod multipart_abort_tests {
         async fn flush_pending(&self) -> Result<(), StorageError> {
             self.0.flush_pending().await
         }
-        async fn get_delta(&self, b: &str, p: &str, f: &str) -> Result<Vec<u8>, StorageError> {
-            self.0.get_delta(b, p, f).await
-        }
         async fn put_delta(
             &self,
             b: &str,
@@ -3118,14 +3116,6 @@ mod multipart_abort_tests {
         }
         async fn delete_delta(&self, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
             self.0.delete_delta(b, p, f).await
-        }
-        async fn get_passthrough(
-            &self,
-            b: &str,
-            p: &str,
-            f: &str,
-        ) -> Result<Vec<u8>, StorageError> {
-            self.0.get_passthrough(b, p, f).await
         }
         async fn put_passthrough(
             &self,

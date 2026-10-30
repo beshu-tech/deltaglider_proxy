@@ -588,14 +588,6 @@ mod wrapper_tests {
             *self.metadata.lock().unwrap() = Some(m.clone());
             Ok(())
         }
-        async fn get_passthrough(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-        ) -> Result<Vec<u8>, StorageError> {
-            Ok(self.bytes.lock().unwrap().clone())
-        }
 
         // All other trait methods: not needed for these tests.
         async fn create_bucket(&self, _: &str) -> Result<(), StorageError> {
@@ -615,6 +607,20 @@ mod wrapper_tests {
         async fn head_bucket(&self, _: &str) -> Result<bool, StorageError> {
             Err(cb_err())
         }
+        async fn get_object(
+            &self,
+            _: &str,
+            _: &str,
+            o: crate::storage::StoredObject<'_>,
+        ) -> Result<Vec<u8>, StorageError> {
+            match o {
+                crate::storage::StoredObject::Passthrough(_) => {
+                    Ok(self.bytes.lock().unwrap().clone())
+                }
+                _ => Err(cb_err()),
+            }
+        }
+
         async fn head_object(
             &self,
             _: &str,
@@ -636,9 +642,6 @@ mod wrapper_tests {
         async fn has_reference(&self, _: &str, _: &str) -> Result<bool, StorageError> {
             Ok(false)
         }
-        async fn get_reference(&self, _: &str, _: &str) -> Result<Vec<u8>, StorageError> {
-            Err(cb_err())
-        }
         async fn flush_pending(&self) -> Result<(), StorageError> {
             Ok(())
         }
@@ -651,9 +654,6 @@ mod wrapper_tests {
             _: &FileMetadata,
             _: &RefWriteProof,
         ) -> Result<(), StorageError> {
-            Err(cb_err())
-        }
-        async fn get_delta(&self, _: &str, _: &str, _: &str) -> Result<Vec<u8>, StorageError> {
             Err(cb_err())
         }
         async fn delete_delta(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
@@ -2552,8 +2552,8 @@ fn follow_up_reads_are_pinned_to_the_first_read() {
     let prod = crate::source_scan::prod_text(&text);
     let squashed: String = prod.split_whitespace().collect();
     assert!(
-        !squashed.contains("inner.get_passthrough("),
-        "encrypting/mod.rs calls inner.get_passthrough: use pinned_range"
+        !squashed.contains("inner.get_passthrough(") && !squashed.contains("inner.get_object("),
+        "encrypting/mod.rs reads the inner backend without metadata: use pinned_range"
     );
     // The plaintext follow-up goes through the pinned helper, which is
     // the one place that checks the version.

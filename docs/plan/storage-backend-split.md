@@ -204,6 +204,10 @@ format, a request count, or who can make a proof.
   `head_object(StoredObject)`; the three names live on in
   `StorageBackendExt`. The engine guards in `metadata.rs` also match a
   `head_object` call with the form in it.
+- Step 4: done (commit "one buffered read"). 60 → 58 methods.
+  `get_object(StoredObject)`; the three names live on in
+  `StorageBackendExt`. `S3Backend`'s own `get_object` helper is now
+  `get_object_bytes`. The encrypting guard also refuses `inner.get_object(`.
 - Found while doing step 2, kept as it was: the encrypting wrapper runs the
   witness check on a FENCED reference delete (`check_write_unless(.., true)`
   still calls `check_witness`), but never on an UNFENCED one (the old

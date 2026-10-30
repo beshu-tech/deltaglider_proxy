@@ -575,9 +575,14 @@ impl StorageBackend for S3Backend {
     }
 
     #[instrument(skip(self))]
-    async fn get_reference(&self, bucket: &str, prefix: &str) -> Result<Vec<u8>, StorageError> {
-        let key = self.reference_key(prefix);
-        self.get_object(bucket, &key).await
+    async fn get_object(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        object: StoredObject<'_>,
+    ) -> Result<Vec<u8>, StorageError> {
+        let key = self.object_key(prefix, object);
+        self.get_object_bytes(bucket, &key).await
     }
 
     async fn get_reference_to_file(
@@ -840,17 +845,6 @@ impl StorageBackend for S3Backend {
     }
 
     #[instrument(skip(self))]
-    async fn get_delta(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<Vec<u8>, StorageError> {
-        let key = self.delta_key(prefix, filename);
-        self.get_object(bucket, &key).await
-    }
-
-    #[instrument(skip(self))]
     async fn delete_delta(
         &self,
         bucket: &str,
@@ -906,17 +900,6 @@ impl StorageBackend for S3Backend {
             bucket, prefix, filename, source_path
         );
         Ok(())
-    }
-
-    #[instrument(skip(self))]
-    async fn get_passthrough(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<Vec<u8>, StorageError> {
-        let key = self.passthrough_key(prefix, filename);
-        self.get_object(bucket, &key).await
     }
 
     #[instrument(skip(self))]

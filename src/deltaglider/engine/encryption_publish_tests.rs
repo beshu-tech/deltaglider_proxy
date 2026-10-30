@@ -7,7 +7,7 @@
 use crate::api::handlers::AppState;
 use crate::config::Config;
 use crate::deltaglider::DynEngine;
-use crate::storage::{StorageBackend, StorageBackendExt};
+use crate::storage::StorageBackendExt;
 use std::collections::HashMap;
 
 const KB: &str = "2222222222222222222222222222222222222222222222222222222222222222";

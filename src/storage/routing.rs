@@ -1122,8 +1122,13 @@ impl StorageBackend for RoutingBackend {
 
     // === Reference file operations ===
 
-    async fn get_reference(&self, bucket: &str, prefix: &str) -> Result<Vec<u8>, StorageError> {
-        route_existing!(self, bucket, get_reference, prefix)
+    async fn get_object(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        object: super::StoredObject<'_>,
+    ) -> Result<Vec<u8>, StorageError> {
+        route_existing!(self, bucket, get_object, prefix, object)
     }
 
     async fn get_reference_to_file(
@@ -1208,15 +1213,6 @@ impl StorageBackend for RoutingBackend {
 
     // === Delta file operations ===
 
-    async fn get_delta(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<Vec<u8>, StorageError> {
-        route_existing!(self, bucket, get_delta, prefix, filename)
-    }
-
     async fn put_delta(
         &self,
         bucket: &str,
@@ -1267,15 +1263,6 @@ impl StorageBackend for RoutingBackend {
     }
 
     // === Passthrough file operations ===
-
-    async fn get_passthrough(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<Vec<u8>, StorageError> {
-        route_existing!(self, bucket, get_passthrough, prefix, filename)
-    }
 
     async fn put_passthrough(
         &self,
@@ -1878,8 +1865,20 @@ mod tests {
             Ok(self.buckets.lock().unwrap().contains(bucket))
         }
 
-        async fn get_reference(&self, _: &str, _: &str) -> Result<Vec<u8>, StorageError> {
-            Err(StorageError::NotFound("reference".to_string()))
+        async fn get_object(
+            &self,
+            _: &str,
+            _: &str,
+            object: crate::storage::StoredObject<'_>,
+        ) -> Result<Vec<u8>, StorageError> {
+            Err(StorageError::NotFound(
+                match object {
+                    crate::storage::StoredObject::Reference => "reference",
+                    crate::storage::StoredObject::Delta(_) => "delta",
+                    crate::storage::StoredObject::Passthrough(_) => "object",
+                }
+                .to_string(),
+            ))
         }
 
         async fn head_object(
@@ -1906,10 +1905,6 @@ mod tests {
             Ok(())
         }
 
-        async fn get_delta(&self, _: &str, _: &str, _: &str) -> Result<Vec<u8>, StorageError> {
-            Err(StorageError::NotFound("delta".to_string()))
-        }
-
         async fn put_delta(
             &self,
             _: &str,
@@ -1924,15 +1919,6 @@ mod tests {
 
         async fn delete_delta(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
             Ok(())
-        }
-
-        async fn get_passthrough(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-        ) -> Result<Vec<u8>, StorageError> {
-            Err(StorageError::NotFound("object".to_string()))
         }
 
         async fn open_object(

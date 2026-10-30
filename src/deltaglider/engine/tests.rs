@@ -83,6 +83,15 @@ impl crate::storage::StorageBackend for NullInner {
     async fn head_bucket(&self, _: &str) -> Result<bool, crate::storage::StorageError> {
         Ok(true)
     }
+    async fn get_object(
+        &self,
+        _: &str,
+        _: &str,
+        _: crate::storage::StoredObject<'_>,
+    ) -> Result<Vec<u8>, crate::storage::StorageError> {
+        Ok(vec![])
+    }
+
     async fn head_object(
         &self,
         _: &str,
@@ -94,13 +103,6 @@ impl crate::storage::StorageBackend for NullInner {
 
     async fn has_reference(&self, _: &str, _: &str) -> Result<bool, StorageError> {
         Ok(false)
-    }
-    async fn get_reference(
-        &self,
-        _: &str,
-        _: &str,
-    ) -> Result<Vec<u8>, crate::storage::StorageError> {
-        Ok(vec![])
     }
     async fn get_passthrough_metadata_for_rewrite(
         &self,
@@ -127,14 +129,6 @@ impl crate::storage::StorageBackend for NullInner {
     ) -> Result<(), crate::storage::StorageError> {
         Ok(())
     }
-    async fn get_delta(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-    ) -> Result<Vec<u8>, crate::storage::StorageError> {
-        Ok(vec![])
-    }
     async fn delete_delta(
         &self,
         _: &str,
@@ -152,14 +146,6 @@ impl crate::storage::StorageBackend for NullInner {
         _: &crate::types::FileMetadata,
     ) -> Result<(), crate::storage::StorageError> {
         Ok(())
-    }
-    async fn get_passthrough(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-    ) -> Result<Vec<u8>, crate::storage::StorageError> {
-        Ok(vec![])
     }
     async fn open_object(
         &self,

@@ -606,7 +606,7 @@ impl S3Backend {
     }
 
     /// Get an object from S3
-    pub(super) async fn get_object(
+    pub(super) async fn get_object_bytes(
         &self,
         bucket: &str,
         key: &str,

@@ -327,6 +327,27 @@ impl FilesystemBackend {
         })
     }
 
+    /// The file of one stored object, its label, and its name (as the
+    /// error and debug messages print them).
+    fn object_path<'o>(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        object: StoredObject<'o>,
+    ) -> Result<(PathBuf, &'static str, &'o str), StorageError> {
+        Ok(match object {
+            StoredObject::Reference => (
+                self.reference_path(bucket, prefix)?,
+                "reference",
+                "reference.bin",
+            ),
+            StoredObject::Delta(f) => (self.delta_path(bucket, prefix, f)?, "delta", f),
+            StoredObject::Passthrough(f) => {
+                (self.passthrough_path(bucket, prefix, f)?, "passthrough", f)
+            }
+        })
+    }
+
     /// Get the path for the reference file
     fn reference_path(&self, bucket: &str, prefix: &str) -> Result<PathBuf, StorageError> {
         Ok(self.deltaspace_dir(bucket, prefix)?.join("reference.bin"))
@@ -1249,14 +1270,14 @@ impl StorageBackend for FilesystemBackend {
     // format as delta and passthrough operations.
 
     #[instrument(skip(self))]
-    async fn get_reference(&self, bucket: &str, prefix: &str) -> Result<Vec<u8>, StorageError> {
-        self.get_object_file(
-            &self.reference_path(bucket, prefix)?,
-            "reference",
-            prefix,
-            "reference.bin",
-        )
-        .await
+    async fn get_object(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        object: StoredObject<'_>,
+    ) -> Result<Vec<u8>, StorageError> {
+        let (path, label, name) = self.object_path(bucket, prefix, object)?;
+        self.get_object_file(&path, label, prefix, name).await
     }
 
     async fn get_reference_to_file(
@@ -1482,22 +1503,6 @@ impl StorageBackend for FilesystemBackend {
 
     // === Delta operations ===
 
-    #[instrument(skip(self))]
-    async fn get_delta(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<Vec<u8>, StorageError> {
-        self.get_object_file(
-            &self.delta_path(bucket, prefix, filename)?,
-            "delta",
-            prefix,
-            filename,
-        )
-        .await
-    }
-
     #[instrument(skip(self, data, metadata))]
     async fn put_delta(
         &self,
@@ -1540,22 +1545,6 @@ impl StorageBackend for FilesystemBackend {
     }
 
     // === Passthrough operations (stored with original filename) ===
-
-    #[instrument(skip(self))]
-    async fn get_passthrough(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<Vec<u8>, StorageError> {
-        self.get_object_file(
-            &self.passthrough_path(bucket, prefix, filename)?,
-            "passthrough",
-            prefix,
-            filename,
-        )
-        .await
-    }
 
     #[instrument(skip(self, data, metadata))]
     async fn put_passthrough(
@@ -1713,17 +1702,7 @@ impl StorageBackend for FilesystemBackend {
         object: StoredObject<'_>,
     ) -> Result<super::ObjectRead, StorageError> {
         use futures::StreamExt;
-        let (path, label, name) = match object {
-            StoredObject::Reference => (
-                self.reference_path(bucket, prefix)?,
-                "reference",
-                "reference.bin",
-            ),
-            StoredObject::Delta(f) => (self.delta_path(bucket, prefix, f)?, "delta", f),
-            StoredObject::Passthrough(f) => {
-                (self.passthrough_path(bucket, prefix, f)?, "passthrough", f)
-            }
-        };
+        let (path, label, name) = self.object_path(bucket, prefix, object)?;
         let what = format!("{label}: {prefix}/{name}");
         let is_reference = matches!(object, StoredObject::Reference);
         let (file, meta) = Self::open_with_metadata(path, what, name, is_reference).await?;

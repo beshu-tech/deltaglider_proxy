@@ -337,10 +337,6 @@ impl StorageBackend for FaultyFs {
         self.inner.head_bucket(bucket).await
     }
 
-    async fn get_reference(&self, bucket: &str, prefix: &str) -> Result<Vec<u8>, StorageError> {
-        self.inner.get_reference(bucket, prefix).await
-    }
-
     async fn get_reference_to_file(
         &self,
         bucket: &str,
@@ -415,6 +411,15 @@ impl StorageBackend for FaultyFs {
             .await
     }
 
+    async fn get_object(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        object: StoredObject<'_>,
+    ) -> Result<Vec<u8>, StorageError> {
+        self.inner.get_object(bucket, prefix, object).await
+    }
+
     async fn head_object(
         &self,
         bucket: &str,
@@ -475,15 +480,6 @@ impl StorageBackend for FaultyFs {
         Ok(true)
     }
 
-    async fn get_delta(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<Vec<u8>, StorageError> {
-        self.inner.get_delta(bucket, prefix, filename).await
-    }
-
     async fn put_delta(
         &self,
         bucket: &str,
@@ -509,15 +505,6 @@ impl StorageBackend for FaultyFs {
         self.armed(FaultPoint::DeleteDelta, bucket, prefix, filename)
             .await?;
         self.inner.delete_delta(bucket, prefix, filename).await
-    }
-
-    async fn get_passthrough(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<Vec<u8>, StorageError> {
-        self.inner.get_passthrough(bucket, prefix, filename).await
     }
 
     async fn put_passthrough(

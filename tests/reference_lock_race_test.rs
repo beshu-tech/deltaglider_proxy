@@ -344,7 +344,9 @@ async fn minio_enforces_conditional_delete() {
 /// overwrite that write with a retryable error, and a current fence passes.
 #[tokio::test]
 async fn s3_reference_writes_are_fenced() {
-    use deltaglider_proxy::storage::{RefFence, RefWrite, S3Backend, StorageBackend, StorageError};
+    use deltaglider_proxy::storage::{
+        RefFence, RefWrite, S3Backend, StorageBackend, StorageBackendExt, StorageError,
+    };
     use deltaglider_proxy::types::FileMetadata;
     if !minio_available().await {
         eprintln!("Skipping s3_reference_writes_are_fenced: MinIO not available");

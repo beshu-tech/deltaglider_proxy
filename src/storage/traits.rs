@@ -688,20 +688,8 @@ pub async fn open_object_by_parts<B: StorageBackend + ?Sized>(
     prefix: &str,
     object: StoredObject<'_>,
 ) -> Result<ObjectRead, StorageError> {
-    let (data, metadata) = match object {
-        StoredObject::Reference => {
-            let meta = backend.get_reference_metadata(bucket, prefix).await?;
-            (backend.get_reference(bucket, prefix).await?, meta)
-        }
-        StoredObject::Delta(f) => {
-            let meta = backend.get_delta_metadata(bucket, prefix, f).await?;
-            (backend.get_delta(bucket, prefix, f).await?, meta)
-        }
-        StoredObject::Passthrough(f) => {
-            let meta = backend.get_passthrough_metadata(bucket, prefix, f).await?;
-            (backend.get_passthrough(bucket, prefix, f).await?, meta)
-        }
-    };
+    let metadata = backend.head_object(bucket, prefix, object).await?;
+    let data = backend.get_object(bucket, prefix, object).await?;
     Ok(ObjectRead {
         stored_total: data.len() as u64,
         stream: Box::pin(futures::stream::once(async move { Ok(Bytes::from(data)) })),
@@ -820,14 +808,20 @@ pub trait StorageBackend: Send + Sync {
     /// Check if a bucket exists
     fn head_bucket(&self, bucket: &str) -> impl Future<Output = Result<bool, StorageError>> + Send;
 
-    // === Reference file operations ===
+    // === Object reads ===
 
-    /// Get the reference file for a deltaspace
-    fn get_reference(
+    /// The bytes of one stored object, whole in memory. A missing object
+    /// is `NotFound`. Callers use the names in [`StorageBackendExt`]. No
+    /// default: a wrapper that forgot it would hand out the inner
+    /// backend's bytes without its own transform.
+    fn get_object(
         &self,
         bucket: &str,
         prefix: &str,
+        object: StoredObject<'_>,
     ) -> impl Future<Output = Result<Vec<u8>, StorageError>> + Send;
+
+    // === Reference file operations ===
 
     /// Materialise the reference file at `dest` as a seekable local file, WITHOUT
     /// heap-loading it — the streaming codec (`encode_from_reader` /
@@ -835,7 +829,7 @@ pub trait StorageBackend: Send + Sync {
     /// multi-GB reference must never be buffered in RAM (adversarial blocker 10).
     ///
     /// Returns the number of bytes written. The default impl falls back to
-    /// `get_reference` + write (fine for small references / backends that don't
+    /// `get_object` + write (fine for small references / backends that don't
     /// override); the filesystem backend hardlinks (near-zero) and the S3 backend
     /// streams the GET body to the file.
     fn get_reference_to_file(
@@ -845,7 +839,9 @@ pub trait StorageBackend: Send + Sync {
         dest: &std::path::Path,
     ) -> impl Future<Output = Result<u64, StorageError>> + Send {
         async move {
-            let data = self.get_reference(bucket, prefix).await?;
+            let data = self
+                .get_object(bucket, prefix, StoredObject::Reference)
+                .await?;
             tokio::fs::write(dest, &data).await?;
             Ok(data.len() as u64)
         }
@@ -1011,14 +1007,6 @@ pub trait StorageBackend: Send + Sync {
 
     // === Delta file operations ===
 
-    /// Get a delta file
-    fn get_delta(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> impl Future<Output = Result<Vec<u8>, StorageError>> + Send;
-
     /// Store a delta file with its metadata
     fn put_delta(
         &self,
@@ -1039,14 +1027,6 @@ pub trait StorageBackend: Send + Sync {
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     // === Passthrough file operations (stored as-is with original filename) ===
-
-    /// Get a passthrough (non-delta) file
-    fn get_passthrough(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> impl Future<Output = Result<Vec<u8>, StorageError>> + Send;
 
     /// Store a passthrough (non-delta) file with its metadata
     fn put_passthrough(
@@ -1625,10 +1605,39 @@ pub trait StorageBackend: Send + Sync {
 }
 
 /// The per-form names over the form-generic methods
-/// ([`StorageBackend::write_reference`], [`StorageBackend::head_object`]).
-/// One implementation for every backend (the blanket impl below), so no
-/// wrapper forwards them.
+/// ([`StorageBackend::write_reference`], [`StorageBackend::head_object`],
+/// [`StorageBackend::get_object`]). One implementation for every backend
+/// (the blanket impl below), so no wrapper forwards them.
 pub trait StorageBackendExt: StorageBackend {
+    /// Get the reference file for a deltaspace.
+    fn get_reference(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> impl Future<Output = Result<Vec<u8>, StorageError>> + Send {
+        self.get_object(bucket, prefix, StoredObject::Reference)
+    }
+
+    /// Get a delta file.
+    fn get_delta(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> impl Future<Output = Result<Vec<u8>, StorageError>> + Send {
+        self.get_object(bucket, prefix, StoredObject::Delta(filename))
+    }
+
+    /// Get a passthrough (non-delta) file.
+    fn get_passthrough(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> impl Future<Output = Result<Vec<u8>, StorageError>> + Send {
+        self.get_object(bucket, prefix, StoredObject::Passthrough(filename))
+    }
+
     /// Get reference file metadata.
     fn get_reference_metadata(
         &self,

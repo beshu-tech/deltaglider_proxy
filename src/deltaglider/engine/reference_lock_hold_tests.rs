@@ -554,9 +554,15 @@ impl crate::storage::StorageBackend for FencingFs {
     async fn head_bucket(&self, b: &str) -> Result<bool, StorageError> {
         self.inner.head_bucket(b).await
     }
-    async fn get_reference(&self, b: &str, p: &str) -> Result<Vec<u8>, StorageError> {
-        self.inner.get_reference(b, p).await
+    async fn get_object(
+        &self,
+        b: &str,
+        p: &str,
+        o: crate::storage::StoredObject<'_>,
+    ) -> Result<Vec<u8>, StorageError> {
+        self.inner.get_object(b, p, o).await
     }
+
     async fn head_object(
         &self,
         b: &str,
@@ -648,9 +654,6 @@ impl crate::storage::StorageBackend for FencingFs {
         self.bump(b, p);
         self.reference_fence(b, p).await
     }
-    async fn get_delta(&self, b: &str, p: &str, f: &str) -> Result<Vec<u8>, StorageError> {
-        self.inner.get_delta(b, p, f).await
-    }
     async fn put_delta(
         &self,
         b: &str,
@@ -668,9 +671,6 @@ impl crate::storage::StorageBackend for FencingFs {
     }
     async fn delete_delta(&self, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
         self.inner.delete_delta(b, p, f).await
-    }
-    async fn get_passthrough(&self, b: &str, p: &str, f: &str) -> Result<Vec<u8>, StorageError> {
-        self.inner.get_passthrough(b, p, f).await
     }
     async fn put_passthrough(
         &self,

@@ -1537,11 +1537,14 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
 
     // ── Reads: open ──
 
-    async fn get_reference(&self, bucket: &str, prefix: &str) -> Result<Vec<u8>, StorageError> {
-        let read = self
-            .open_object(bucket, prefix, StoredObject::Reference)
-            .await?;
-        collect_stream(read.stream).await
+    async fn get_object(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        object: StoredObject<'_>,
+    ) -> Result<Vec<u8>, StorageError> {
+        let ObjectRead { stream, .. } = self.open_object(bucket, prefix, object).await?;
+        collect_stream(stream).await
     }
 
     /// A plaintext reference passes through (the filesystem keeps its
@@ -1569,30 +1572,6 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         // end (final-frame flag), so the caller's write fails.
         let stream = open_body_stream(source.into_stream(), &body).await?;
         Ok(ReferenceSource::stream(stream, body.len, opened.meta))
-    }
-
-    async fn get_delta(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<Vec<u8>, StorageError> {
-        let ObjectRead { stream, .. } = self
-            .open_object(bucket, prefix, StoredObject::Delta(filename))
-            .await?;
-        collect_stream(stream).await
-    }
-
-    async fn get_passthrough(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<Vec<u8>, StorageError> {
-        let ObjectRead { stream, .. } = self
-            .open_object(bucket, prefix, StoredObject::Passthrough(filename))
-            .await?;
-        collect_stream(stream).await
     }
 
     /// The inner read carries the stored metadata and the stored size, so
