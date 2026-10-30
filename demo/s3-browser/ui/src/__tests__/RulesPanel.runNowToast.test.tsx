@@ -74,8 +74,8 @@ async function runNow() {
   const r = (await screen.findByText('expire-nightly-dumps')).closest('[role="row"]') as HTMLElement;
   await user.click(await within(r).findByRole('button', { name: 'Run now: expire-nightly-dumps' }));
   const dlg = await screen.findByRole('dialog');
-  const ok = await within(dlg).findByRole('button', { name: 'Run: delete 1 object' }, { timeout: 4000 });
-  await waitFor(() => expect(ok).toBeEnabled(), { timeout: 4000 });
+  const ok = await within(dlg).findByRole('button', { name: 'Run: delete 1 object' });
+  await waitFor(() => expect(ok).toBeEnabled());
   await user.click(ok);
 }
 

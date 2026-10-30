@@ -17,13 +17,17 @@ test('progress events cost O(1) each: 100k events over 5000 files stay fast', ()
   // (prev.map) and re-rendered every row, so 300 small files took minutes.
   const store = createUploadQueueStore<Item>();
   store.add(items(5000));
-  const t0 = performance.now();
+  // CPU time of this process, not wall-clock time: on a loaded host the
+  // wall clock also counts the time other processes run (3440 ms seen for
+  // about 100 ms of work). Vitest runs each test file in its own process.
+  const c0 = process.cpuUsage();
   for (let e = 0; e < 100_000; e++) {
     store.update(`f${e % 5000}`, (it) => ({ ...it, n: it.n + 1 }));
     // One snapshot (one React state update) per 50 events: a frame's worth.
     if (e % 50 === 49) store.snapshot();
   }
-  const ms = performance.now() - t0;
+  const cpu = process.cpuUsage(c0);
+  const ms = (cpu.user + cpu.system) / 1000;
   assert.equal(store.snapshot()[4999].n, 20);
   assert.ok(ms < 1000, `100k events took ${ms.toFixed(0)} ms`);
 });

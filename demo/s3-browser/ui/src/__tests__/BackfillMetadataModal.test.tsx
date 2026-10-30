@@ -50,17 +50,14 @@ test('after a partial start only the failed buckets stay checked', async () => {
   fireEvent.click(await screen.findByRole('checkbox', { name: 'releases' }));
   fireEvent.click(screen.getByRole('checkbox', { name: 'downloads' }));
   fireEvent.click(screen.getByRole('button', { name: /Start now \(2 buckets\)/ }));
-  await waitFor(() => expect(screen.getByRole('button', { name: /Start now \(1 bucket\)/ })).toBeInTheDocument(), { timeout: 5000 });
+  await waitFor(() => expect(screen.getByRole('button', { name: /Start now \(1 bucket\)/ })).toBeInTheDocument());
   expect(screen.getByRole('checkbox', { name: 'releases' })).not.toBeChecked();
   expect(screen.getByRole('checkbox', { name: 'downloads' })).toBeChecked();
   expect(onClose).not.toHaveBeenCalled();
   // A second Start sends only the failed bucket (once the first request
   // ended: a loading button ignores the click).
-  await waitFor(
-    () => expect(screen.getByRole('button', { name: /Start now \(1 bucket\)/ })).not.toHaveClass('ant-btn-loading'),
-    { timeout: 5000 },
-  );
+  await waitFor(() => expect(screen.getByRole('button', { name: /Start now \(1 bucket\)/ })).not.toHaveClass('ant-btn-loading'));
   fireEvent.click(screen.getByRole('button', { name: /Start now \(1 bucket\)/ }));
-  await waitFor(() => expect(http.callsTo('POST', START)).toHaveLength(2), { timeout: 5000 });
+  await waitFor(() => expect(http.callsTo('POST', START)).toHaveLength(2));
   expect(http.callsTo('POST', START)[1].body).toMatchObject({ buckets: ['downloads'] });
 });

@@ -14,6 +14,18 @@ export function testQueryClient(): QueryClient {
   });
 }
 
+/**
+ * How long every findBy* / waitFor waits (set in setup.ts). The budget is
+ * wall-clock time. A wait whose condition needs later tasks (React work
+ * after a dialog closes, a 1 s poll, a chain of mocked requests) gets
+ * those tasks late on a loaded host, and the library default of 1 s ran
+ * out (CreateBucketModal, firstRun.emptyState, the preview poll). A wait
+ * ends as soon as its condition holds, so a longer budget costs only a
+ * failing test. Tests do not set a shorter one of their own
+ * (asyncWaitBudget.test.ts).
+ */
+export const ASYNC_WAIT_MS = 5000;
+
 /** AntD theme without motion: jsdom never ends an animation. */
 export const NO_MOTION: ThemeConfig = { token: { motion: false } };
 

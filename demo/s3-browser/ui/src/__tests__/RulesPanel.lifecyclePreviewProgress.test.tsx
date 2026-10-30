@@ -84,7 +84,7 @@ test('while the proxy walks, the tab shows how many objects it scanned so far', 
   await openPreviewTab(userEvent.setup());
   expect(await screen.findByText('Scanning… 4,210 objects so far.')).toBeInTheDocument();
   // The counter advances: the tab reads it again while the walk runs.
-  expect(await screen.findByText('Scanning… 8,420 objects so far.', {}, { timeout: 3000 })).toBeInTheDocument();
+  expect(await screen.findByText('Scanning… 8,420 objects so far.')).toBeInTheDocument();
   await act(async () => release());
   await waitFor(() => expect(screen.queryByText(/^Scanning…/)).toBeNull());
   expect(screen.getByText('Nothing to do now: no scanned object matches the rule.')).toBeInTheDocument();

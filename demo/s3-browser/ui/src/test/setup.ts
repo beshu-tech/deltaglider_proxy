@@ -1,11 +1,13 @@
 // jsdom lacks the layout APIs AntD 6 calls on mount; stub them so components
 // render. The stubs report "no match / no size", which is what a test wants.
 import '@testing-library/jest-dom/vitest';
-import { act, cleanup } from '@testing-library/react';
+import { act, cleanup, configure } from '@testing-library/react';
 import { ConfigProvider, Modal, message, notification } from 'antd';
 import { createElement } from 'react';
-import { NO_MOTION } from './render';
+import { ASYNC_WAIT_MS, NO_MOTION } from './render';
 import { afterAll, afterEach, vi } from 'vitest';
+
+configure({ asyncUtilTimeout: ASYNC_WAIT_MS });
 
 // jsdom never fires animation/transition end, so AntD motion would leave
 // closed dialogs mounted and fire timers after the test. Static

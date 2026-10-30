@@ -222,5 +222,5 @@ test('a run-now ends with a toast that counts what it did', async () => {
   await user.click(within(jobRow()).getByRole('button', { name: 'Run now: expire-nightlies' }));
   const dialog = await screen.findByRole('dialog');
   await user.click(await within(dialog).findByRole('button', { name: 'Run: delete 2 objects' }));
-  expect(await screen.findByText('Lifecycle rule "expire-nightlies" finished: deleted 2.', {}, { timeout: 5000 })).toBeInTheDocument();
+  expect(await screen.findByText('Lifecycle rule "expire-nightlies" finished: deleted 2.')).toBeInTheDocument();
 });
