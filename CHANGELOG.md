@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.20 — 2026-10-30
+
 ### Security — A proxy does not write to a bucket that another proxy encrypts with a key that it does not have
 
 - Two proxies with separate configurations can store objects in one bucket of a backend. When one of them encrypts the bucket and the other does not have the key, the other proxy wrote its objects without encryption. The first proxy refused to read those objects, and the other proxy could not read the encrypted ones. The encryption witness did not help, because it works only between instances that share a `config_sync_bucket`.
