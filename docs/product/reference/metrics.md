@@ -248,6 +248,12 @@ Auth metrics stay at zero when SigV4 is disabled.
 
 `GET /_/api/admin/config/sync` shows the reason when the gauge is `0`.
 
+## Background tasks
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `deltaglider_background_task_panics_total` | Counter | `task` | Panics of a background task, such as `replication-scheduler`, `lifecycle-scheduler`, `event-dispatcher` or `session-cleanup`. The proxy logs each panic and starts the task again after a delay that grows from 1 second to 60 seconds. Any value above 0 is a bug to report |
+
 ## Label cardinality
 
 All label sets are bounded:

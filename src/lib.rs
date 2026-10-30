@@ -12,7 +12,7 @@
 pub mod admission;
 pub mod api;
 pub mod audit;
-pub(crate) mod background;
+pub mod background;
 pub mod bucket_policy;
 pub mod bucket_usage;
 pub mod cli;

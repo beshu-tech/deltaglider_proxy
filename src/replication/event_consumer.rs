@@ -276,34 +276,43 @@ pub fn spawn_event_consumer(
     // Per-rule leases go through the SAME lease the scheduler uses (S3 when a
     // coordination bucket is configured), so the consumer and a reconcile run
     // exclude each other across instances too.
-    tokio::spawn(async move {
-        info!(
-            "Replication event consumer started: instance_id={}",
-            instance_id
+    crate::background::spawn_supervised("replication-event-consumer", move || {
+        let (config, db, state, lease, instance_id) = (
+            config.clone(),
+            db.clone(),
+            state.clone(),
+            lease.clone(),
+            instance_id.clone(),
         );
-        let mut backoff = RuleBackoff::default();
-        loop {
-            let replication = { config.read().await.replication.clone() };
-            let tick = super::scheduler::scheduler_tick(&replication);
-            tokio::time::sleep(tick).await;
+        async move {
+            info!(
+                "Replication event consumer started: instance_id={}",
+                instance_id
+            );
+            let mut backoff = RuleBackoff::default();
+            loop {
+                let replication = { config.read().await.replication.clone() };
+                let tick = super::scheduler::scheduler_tick(&replication);
+                tokio::time::sleep(tick).await;
 
-            if !replication.enabled {
-                debug!("Event consumer skipped: replication disabled");
-                continue;
+                if !replication.enabled {
+                    debug!("Event consumer skipped: replication disabled");
+                    continue;
+                }
+                let engine = state.engine.load_full();
+                consumer_tick(
+                    &config,
+                    &db,
+                    &engine,
+                    &state.maintenance_gate,
+                    Some(&state.backend_health),
+                    &mut backoff,
+                    &replication,
+                    lease.as_ref(),
+                    &instance_id,
+                )
+                .await;
             }
-            let engine = state.engine.load_full();
-            consumer_tick(
-                &config,
-                &db,
-                &engine,
-                &state.maintenance_gate,
-                Some(&state.backend_health),
-                &mut backoff,
-                &replication,
-                lease.as_ref(),
-                &instance_id,
-            )
-            .await;
         }
     })
 }

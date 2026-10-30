@@ -31,20 +31,29 @@ pub fn spawn_scheduler(
     lease: Arc<DynCoordinationLease<'static>>,
 ) -> tokio::task::JoinHandle<()> {
     let instance_id = format!("scheduler:{}", uuid::Uuid::new_v4());
-    tokio::spawn(async move {
-        info!("Replication scheduler started: instance_id={}", instance_id);
-        loop {
-            let tick = {
-                let cfg = config.read().await;
-                scheduler_tick(&cfg.replication)
-            };
-            tokio::time::sleep(tick).await;
+    crate::background::spawn_supervised("replication-scheduler", move || {
+        let (config, db, state, lease, instance_id) = (
+            config.clone(),
+            db.clone(),
+            state.clone(),
+            lease.clone(),
+            instance_id.clone(),
+        );
+        async move {
+            info!("Replication scheduler started: instance_id={}", instance_id);
+            loop {
+                let tick = {
+                    let cfg = config.read().await;
+                    scheduler_tick(&cfg.replication)
+                };
+                tokio::time::sleep(tick).await;
 
-            let replication = { config.read().await.replication.clone() };
-            if replication.enabled {
-                run_due_rules(&replication, &config, &db, &state, &instance_id, &lease).await;
-            } else {
-                debug!("Replication scheduler skipped: global replication disabled");
+                let replication = { config.read().await.replication.clone() };
+                if replication.enabled {
+                    run_due_rules(&replication, &config, &db, &state, &instance_id, &lease).await;
+                } else {
+                    debug!("Replication scheduler skipped: global replication disabled");
+                }
             }
         }
     })

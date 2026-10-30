@@ -959,21 +959,24 @@ impl EncryptionWitness {
         if self.client.is_none() {
             return; // nothing to poll: applies keep judging
         }
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(interval);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            tick.tick().await; // the boot ran the first sync
-            loop {
-                tick.tick().await;
-                if crate::shutdown::is_shutting_down() {
-                    return;
-                }
-                let cfg = config.read().await.clone();
-                if let Err(e) = self.sync(&cfg).await {
-                    tracing::warn!(
-                        "encryption witness: sync failed ({e}); the last verdict holds for \
-                         two polls, then the witnessed buckets refuse writes"
-                    );
+        crate::background::spawn_supervised("encryption-witness-poller", move || {
+            let (this, config) = (self.clone(), config.clone());
+            async move {
+                let mut tick = tokio::time::interval(interval);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                tick.tick().await; // the boot ran the first sync
+                loop {
+                    tick.tick().await;
+                    if crate::shutdown::is_shutting_down() {
+                        return;
+                    }
+                    let cfg = config.read().await.clone();
+                    if let Err(e) = this.sync(&cfg).await {
+                        tracing::warn!(
+                            "encryption witness: sync failed ({e}); the last verdict holds for \
+                             two polls, then the witnessed buckets refuse writes"
+                        );
+                    }
                 }
             }
         });

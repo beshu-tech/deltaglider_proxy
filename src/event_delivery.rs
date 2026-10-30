@@ -638,32 +638,37 @@ pub fn spawn_dispatcher_with_client(
     client: Arc<DynEventDeliveryClient<'static>>,
 ) -> tokio::task::JoinHandle<()> {
     let claimant = format!("event-delivery:{}", uuid::Uuid::new_v4());
-    tokio::spawn(async move {
-        info!("Event outbox dispatcher started: claimant={}", claimant);
-        // Boot: does anything read the outbox? Until this runs, every
-        // append is kept (the gate starts open).
-        crate::event_outbox::init_readers(&db, &*config.read().await).await;
-        loop {
-            let tick = dispatcher_tick(&config.read().await.event_delivery);
-            tokio::time::sleep(tick).await;
-            // Read the config AFTER the sleep: a snapshot from before it could
-            // prune events written after delivery was turned on.
-            let cfg = { config.read().await.event_delivery.clone() };
-            if !cfg.is_active() {
-                // Delivery off: no dispatch, but still bound the outbox (X-ray
-                // H14, issue #92). See `prune_while_inactive`.
-                let replication_enabled = { config.read().await.replication.enabled };
-                prune_while_inactive(&db, &cfg, replication_enabled, current_unix_seconds()).await;
-                continue;
+    crate::background::spawn_supervised("event-dispatcher", move || {
+        let (config, db, client, claimant) =
+            (config.clone(), db.clone(), client.clone(), claimant.clone());
+        async move {
+            info!("Event outbox dispatcher started: claimant={}", claimant);
+            // Boot: does anything read the outbox? Until this runs, every
+            // append is kept (the gate starts open).
+            crate::event_outbox::init_readers(&db, &*config.read().await).await;
+            loop {
+                let tick = dispatcher_tick(&config.read().await.event_delivery);
+                tokio::time::sleep(tick).await;
+                // Read the config AFTER the sleep: a snapshot from before it
+                // could prune events written after delivery was turned on.
+                let cfg = { config.read().await.event_delivery.clone() };
+                if !cfg.is_active() {
+                    // Delivery off: no dispatch, but still bound the outbox
+                    // (X-ray H14, issue #92). See `prune_while_inactive`.
+                    let replication_enabled = { config.read().await.replication.enabled };
+                    prune_while_inactive(&db, &cfg, replication_enabled, current_unix_seconds())
+                        .await;
+                    continue;
+                }
+                dispatch_once(
+                    &db,
+                    client.as_ref(),
+                    &cfg,
+                    &claimant,
+                    current_unix_seconds(),
+                )
+                .await;
             }
-            dispatch_once(
-                &db,
-                client.as_ref(),
-                &cfg,
-                &claimant,
-                current_unix_seconds(),
-            )
-            .await;
         }
     })
 }

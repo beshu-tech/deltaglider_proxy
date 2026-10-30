@@ -3,6 +3,7 @@
 //! Server startup helpers — extracted from main.rs for file size.
 
 use deltaglider_proxy::api::handlers::AppState;
+use deltaglider_proxy::background::spawn_supervised;
 use deltaglider_proxy::config::{BackendConfig, Config};
 use deltaglider_proxy::config_db_sync::ConfigDbSync;
 use deltaglider_proxy::iam::{IamState, SharedIamState};
@@ -294,7 +295,7 @@ pub fn init_replay_cache(
     let replay_window_secs = tuning.replay_window_secs;
     // #86: the retain is an O(live-signatures) walk — up to 500k shards under
     // load (MAX_REPLAY_ENTRIES) — so it runs on the blocking pool.
-    spawn_periodic_blocking(Duration::from_secs(60), {
+    spawn_periodic_blocking("replay-cache-sweep", Duration::from_secs(60), {
         let cache = replay_cache.clone();
         move || {
             deltaglider_proxy::api::auth::expire_replay_cache(
@@ -316,7 +317,7 @@ pub fn spawn_cache_monitor(state: &Arc<AppState>, metrics: &Arc<Metrics>) {
     let prev_misses = Arc::new(AtomicU64::new(metrics.cache_misses_total.get()));
     let monitor_metrics = metrics.clone();
 
-    spawn_periodic(Duration::from_secs(60), move || {
+    spawn_periodic("cache-monitor", Duration::from_secs(60), move || {
         let engine = monitor_state.engine.load();
 
         // Check utilization
@@ -1704,46 +1705,54 @@ pub fn spawn_config_sync_poll(
     let sessions = sessions.clone();
     let db_key = db_key.clone();
 
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(300));
-        // Skip the immediate first tick (startup sync already ran)
-        tick.tick().await;
-        loop {
+    spawn_supervised("config-sync-poll", move || {
+        let sync = sync.clone();
+        let db_arc = db_arc.clone();
+        let iam = iam.clone();
+        let ext_auth = ext_auth.clone();
+        let sessions = sessions.clone();
+        let db_key = db_key.clone();
+        async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(300));
+            // Skip the immediate first tick (startup sync already ran)
             tick.tick().await;
-            match deltaglider_proxy::config_db_sync::pull_and_merge(
-                &sync,
-                &db_arc,
-                db_key.expose(),
-                &iam,
-                &ext_auth,
-                Some(&sessions),
-                "periodic poll",
-            )
-            .await
-            {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    tracing::debug!("Config DB S3 sync poll: no changes");
-                }
-                Err(e) => {
-                    warn!("Config DB S3 sync poll failed: {}", e);
-                }
-            }
-            // Flush an upload that exhausted its retries earlier — a parked
-            // revocation/mutation must not wait for the next admin action.
-            if sync.take_needs_upload() {
-                if let Err(e) = deltaglider_proxy::config_db_sync::upload_with_reconcile(
+            loop {
+                tick.tick().await;
+                match deltaglider_proxy::config_db_sync::pull_and_merge(
                     &sync,
                     &db_arc,
                     db_key.expose(),
                     &iam,
                     &ext_auth,
                     Some(&sessions),
-                    "poll flush",
+                    "periodic poll",
                 )
                 .await
                 {
-                    warn!("Config DB S3 sync poll: pending upload flush failed: {}", e);
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        tracing::debug!("Config DB S3 sync poll: no changes");
+                    }
+                    Err(e) => {
+                        warn!("Config DB S3 sync poll failed: {}", e);
+                    }
+                }
+                // Flush an upload that exhausted its retries earlier — a parked
+                // revocation/mutation must not wait for the next admin action.
+                if sync.take_needs_upload() {
+                    if let Err(e) = deltaglider_proxy::config_db_sync::upload_with_reconcile(
+                        &sync,
+                        &db_arc,
+                        db_key.expose(),
+                        &iam,
+                        &ext_auth,
+                        Some(&sessions),
+                        "poll flush",
+                    )
+                    .await
+                    {
+                        warn!("Config DB S3 sync poll: pending upload flush failed: {}", e);
+                    }
                 }
             }
         }
@@ -1783,12 +1792,22 @@ pub async fn init_tls(
 /// filesystem or walks a large collection belongs in
 /// [`spawn_periodic_blocking`] instead, or it stalls request handling
 /// for the duration of the tick's work (#86).
-pub fn spawn_periodic(interval: Duration, f: impl Fn() + Send + 'static) {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(interval);
-        loop {
-            tick.tick().await;
-            f();
+///
+/// Supervised: a panicking tick restarts the loop after a backoff.
+pub fn spawn_periodic(
+    name: &'static str,
+    interval: Duration,
+    f: impl Fn() + Send + Sync + 'static,
+) {
+    let f = Arc::new(f);
+    spawn_supervised(name, move || {
+        let f = Arc::clone(&f);
+        async move {
+            let mut tick = tokio::time::interval(interval);
+            loop {
+                tick.tick().await;
+                f();
+            }
         }
     });
 }
@@ -1804,15 +1823,25 @@ pub fn spawn_periodic(interval: Duration, f: impl Fn() + Send + 'static) {
 /// unwinds through `spawn_blocking` and is reported as a `JoinError`,
 /// after which the next tick still runs — no lock can be poisoned, so the
 /// sweep can never be permanently disabled by one bad tick.
-pub fn spawn_periodic_blocking(interval: Duration, f: impl Fn() + Send + Sync + 'static) {
-    let f = std::sync::Arc::new(f);
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(interval);
-        loop {
-            tick.tick().await;
-            let f = std::sync::Arc::clone(&f);
-            if let Err(e) = tokio::task::spawn_blocking(move || f()).await {
-                tracing::error!("periodic blocking task failed: {}", e);
+pub fn spawn_periodic_blocking(
+    name: &'static str,
+    interval: Duration,
+    f: impl Fn() + Send + Sync + 'static,
+) {
+    let f = Arc::new(f);
+    spawn_supervised(name, move || {
+        let f = Arc::clone(&f);
+        async move {
+            let mut tick = tokio::time::interval(interval);
+            loop {
+                tick.tick().await;
+                let f = Arc::clone(&f);
+                if let Err(e) = tokio::task::spawn_blocking(move || f()).await {
+                    deltaglider_proxy::background::BACKGROUND_TASK_PANICS
+                        .with_label_values(&[name])
+                        .inc();
+                    tracing::error!(task = name, "periodic blocking task failed: {}", e);
+                }
             }
         }
     });
@@ -2276,11 +2305,15 @@ mod tests {
         use std::sync::Arc as StdArc;
         let runs = StdArc::new(AtomicUsize::new(0));
         let r = StdArc::clone(&runs);
-        spawn_periodic_blocking(Duration::from_millis(10), move || {
-            if r.fetch_add(1, Ordering::SeqCst) == 0 {
-                panic!("first tick blows up");
-            }
-        });
+        spawn_periodic_blocking(
+            "test-periodic-blocking",
+            Duration::from_millis(10),
+            move || {
+                if r.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("first tick blows up");
+                }
+            },
+        );
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while runs.load(Ordering::SeqCst) < 3 && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;

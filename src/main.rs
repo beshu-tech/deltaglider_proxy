@@ -518,6 +518,7 @@ fn run_cli_async<F: std::future::Future<Output = i32>>(fut: F) -> i32 {
 async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // --- Logging ---
     let log_reload_handle = init_tracing(&cli);
+    deltaglider_proxy::background::install_panic_hook();
 
     // --- Configuration ---
     // Use `load_from_path` for explicit --config so env overrides still apply
@@ -616,9 +617,13 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref usage) = bucket_usage {
         let usage = Arc::clone(usage);
         let flush_interval_secs: u64 = env_parse_with_default("DGP_BUCKET_USAGE_FLUSH_SECS", 10);
-        spawn_periodic_blocking(Duration::from_secs(flush_interval_secs.max(1)), move || {
-            usage.flush_pending();
-        });
+        spawn_periodic_blocking(
+            "bucket-usage-flush",
+            Duration::from_secs(flush_interval_secs.max(1)),
+            move || {
+                usage.flush_pending();
+            },
+        );
     }
 
     // --- Engine ---
@@ -717,7 +722,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // #86: the sweep walks + removes relay dirs on the filesystem — run it
     // on the blocking pool, not inline on a worker.
-    spawn_periodic_blocking(multipart_sweep_interval, {
+    spawn_periodic_blocking("multipart-sweep", multipart_sweep_interval, {
         let mp = multipart.clone();
         let metrics = metrics.clone();
         move || {
@@ -763,7 +768,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Rate limiter & replay cache ---
     let rate_limiter = RateLimiter::default_auth();
-    spawn_periodic(Duration::from_secs(300), {
+    spawn_periodic("rate-limiter-cleanup", Duration::from_secs(300), {
         let rl = rate_limiter.clone();
         move || rl.cleanup_expired()
     });
@@ -803,7 +808,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let admin_password_hash = config.ensure_bootstrap_password_hash();
     let session_store =
         Arc::new(SessionStore::new().with_secure_cookies(config.tuning.secure_cookies));
-    spawn_periodic(Duration::from_secs(300), {
+    spawn_periodic("session-cleanup", Duration::from_secs(300), {
         let sessions = session_store.clone();
         move || sessions.cleanup_expired()
     });
@@ -1071,24 +1076,27 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             backend_health.clone(),
             shared_config.clone(),
         );
-        spawn_periodic(every, {
+        deltaglider_proxy::background::spawn_supervised("backend-health", {
             let health = backend_health.clone();
             let shared_config = shared_config.clone();
-            let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
             move || {
-                // A round with a hung backend can outlast the interval; never
-                // stack rounds.
-                if running.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                    return;
-                }
                 let health = health.clone();
                 let shared_config = shared_config.clone();
-                let running = running.clone();
-                tokio::spawn(async move {
-                    deltaglider_proxy::coordination::health::reprobe_all(&health, &shared_config)
+                async move {
+                    let mut tick = tokio::time::interval(every);
+                    // A round with a hung backend can outlast the interval:
+                    // rounds run one after another and missed ticks are
+                    // skipped, so rounds never stack.
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tick.tick().await;
+                        deltaglider_proxy::coordination::health::reprobe_all(
+                            &health,
+                            &shared_config,
+                        )
                         .await;
-                    running.store(false, std::sync::atomic::Ordering::Release);
-                });
+                    }
+                }
             }
         });
     }
@@ -1111,7 +1119,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         // Periodic cleanup for expired pending OAuth flows (every 60s)
-        spawn_periodic(Duration::from_secs(60), {
+        spawn_periodic("oauth-pending-cleanup", Duration::from_secs(60), {
             let mgr = manager.clone();
             move || mgr.cleanup_expired_pending()
         });

@@ -39,23 +39,32 @@ pub fn spawn_scheduler(
     state: Arc<AppState>,
 ) -> tokio::task::JoinHandle<()> {
     let instance_id = format!("lifecycle-scheduler:{}", uuid::Uuid::new_v4());
-    tokio::spawn(async move {
-        info!("Lifecycle scheduler started: instance_id={}", instance_id);
-        loop {
-            let tick = {
-                let cfg = config.read().await;
-                scheduler_tick(&cfg.lifecycle)
-            };
-            tokio::time::sleep(check_interval(tick)).await;
+    crate::background::spawn_supervised("lifecycle-scheduler", move || {
+        let (config, db, state, instance_id) = (
+            config.clone(),
+            db.clone(),
+            state.clone(),
+            instance_id.clone(),
+        );
+        async move {
+            info!("Lifecycle scheduler started: instance_id={}", instance_id);
+            loop {
+                let tick = {
+                    let cfg = config.read().await;
+                    scheduler_tick(&cfg.lifecycle)
+                };
+                tokio::time::sleep(check_interval(tick)).await;
 
-            let (lifecycle, lease) = {
-                let cfg = config.read().await;
-                (cfg.lifecycle.clone(), lease_timing(&cfg.jobs))
-            };
-            if lifecycle.enabled {
-                run_due_rules(&lifecycle, &config, lease, db.clone(), &state, &instance_id).await;
-            } else {
-                debug!("Lifecycle scheduler skipped: global lifecycle disabled");
+                let (lifecycle, lease) = {
+                    let cfg = config.read().await;
+                    (cfg.lifecycle.clone(), lease_timing(&cfg.jobs))
+                };
+                if lifecycle.enabled {
+                    run_due_rules(&lifecycle, &config, lease, db.clone(), &state, &instance_id)
+                        .await;
+                } else {
+                    debug!("Lifecycle scheduler skipped: global lifecycle disabled");
+                }
             }
         }
     })

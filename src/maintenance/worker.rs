@@ -120,24 +120,27 @@ pub fn spawn_worker(
     db: Arc<Mutex<JobsDb>>,
     deletes: super::delete::DeleteDeps,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        // One task: aborting the worker stops both lanes.
-        tokio::join!(
-            run_lane(
-                mutator.clone(),
-                db.clone(),
-                deletes.clone(),
-                Lane::Serial,
-                1
-            ),
-            run_lane(
-                mutator,
-                db,
-                deletes,
-                Lane::Delete,
-                super::delete::DELETE_PARALLEL,
-            ),
-        );
+    crate::background::spawn_supervised("maintenance-worker", move || {
+        let (mutator, db, deletes) = (mutator.clone(), db.clone(), deletes.clone());
+        async move {
+            // One task: aborting the worker stops both lanes.
+            tokio::join!(
+                run_lane(
+                    mutator.clone(),
+                    db.clone(),
+                    deletes.clone(),
+                    Lane::Serial,
+                    1
+                ),
+                run_lane(
+                    mutator,
+                    db,
+                    deletes,
+                    Lane::Delete,
+                    super::delete::DELETE_PARALLEL,
+                ),
+            );
+        }
     })
 }
 
