@@ -186,8 +186,8 @@ async fn test_data_encrypted_on_disk() {
 /// With no key the wrapper's keyring is empty, so `seal::open` cannot find
 /// the key that the object's `dg-sealed` fingerprint names and returns
 /// `StorageError::Encryption` ("... was encrypted with a key that this
-/// backend does not have ..."). The S3 handler surfaces that as 500: the
-/// client never sees raw ciphertext.
+/// proxy does not have ..."). The S3 handler surfaces that as 400
+/// InvalidRequest: the client never sees raw ciphertext.
 #[tokio::test]
 async fn test_disable_key_then_read_encrypted_object_errors_not_corrupts() {
     let mut server = encrypted_builder().build().await;
@@ -319,6 +319,84 @@ async fn test_disable_key_then_read_encrypted_object_errors_not_corrupts() {
         .await
         .unwrap();
     assert!(after.contents().is_empty(), "{:?}", after.contents());
+}
+
+/// Two proxies over one bucket (the report behind the key sentinel): one
+/// encrypts it, the other has no key. The keyless proxy must not write the
+/// bucket, because the encrypting proxy refuses every object that it does
+/// not seal. A restart without the encryption block is that second proxy.
+/// Its PUT answers 400 InvalidRequest that names the key fingerprint and an
+/// object; nothing is written, and a DELETE still works.
+async fn keyless_proxy_refuses_to_write(builder: common::TestServerBuilder, bucket: &str) {
+    let mut server = builder.encryption_key(TEST_KEY).build().await;
+    let http = server.http();
+    let url = |key: &str| format!("{}/{bucket}/{key}", server.endpoint());
+    let sealed = http
+        .put(url("reports/sealed.html"))
+        .body("written encrypted")
+        .send()
+        .await
+        .unwrap();
+    assert!(sealed.status().is_success(), "{}", sealed.status());
+    // The second proxy: no encryption block at all (a proxy whose mode is
+    // aes256-gcm-proxy without a key refuses every write anyway).
+    let yaml = std::fs::read_to_string(server.config_path()).unwrap();
+    let keyless = yaml.replace("backend_encryption:\n  mode: aes256-gcm-proxy\n", "");
+    assert_ne!(yaml, keyless, "the generated config changed its shape");
+    std::fs::write(server.config_path(), keyless).unwrap();
+    server.respawn_without_encryption_key().await;
+
+    let http = server.http();
+    let url = |key: &str| format!("{}/{bucket}/{key}", server.endpoint());
+    let put = http
+        .put(url("reports/plain.html"))
+        .body("would land unencrypted")
+        .send()
+        .await
+        .unwrap();
+    let status = put.status();
+    let body = put.text().await.unwrap();
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("<Code>InvalidRequest</Code>"), "{body}");
+    assert!(
+        body.contains(common::key_fp_label(TEST_KEY).trim_start_matches("fp-")),
+        "{body}"
+    );
+    assert!(body.contains("reports/sealed.html"), "{body}");
+
+    let head = http.head(url("reports/plain.html")).send().await.unwrap();
+    assert_eq!(head.status(), 404, "the refused PUT wrote nothing");
+    let delete = http
+        .delete(url("reports/sealed.html"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        delete.status().is_success(),
+        "a DELETE is not refused: {}",
+        delete.status()
+    );
+}
+
+#[tokio::test]
+async fn a_proxy_without_the_key_refuses_to_write_an_encrypted_bucket() {
+    let builder = TestServer::builder()
+        .bucket(BUCKET)
+        .auth("ENCKEY", "ENCSECRET");
+    keyless_proxy_refuses_to_write(builder, BUCKET).await;
+}
+
+/// The same on S3, where the probe reads the key from the `!!2` listing
+/// token or a HEAD of the sealed object.
+#[tokio::test]
+async fn a_proxy_without_the_key_refuses_to_write_an_encrypted_s3_bucket() {
+    skip_unless_minio!();
+    let bucket = common::unique_bucket("sentinel");
+    let builder = TestServer::builder()
+        .bucket(&bucket)
+        .auth("ENCKEY", "ENCSECRET")
+        .s3_endpoint(&common::minio_endpoint_url());
+    keyless_proxy_refuses_to_write(builder, &bucket).await;
 }
 
 #[tokio::test]
@@ -1075,26 +1153,33 @@ async fn test_section_put_key_rotation_surfaces_fingerprint_diff() {
     );
 }
 
-/// A GET that cannot decrypt because the backend does not have the key that
-/// the object's seal fingerprint names logs the precise cause at ERROR (never the key). The
-/// sanitised 500 used to log it under a target outside the log filter, so
-/// the operator saw only "Internal server error".
+/// A GET that cannot decrypt because the proxy does not have the key that
+/// the object's seal fingerprint names answers 400 InvalidRequest that
+/// names the key fingerprint (like S3 for an SSE-C object read without its
+/// key: a retry cannot succeed), and logs the cause at ERROR (never the
+/// key). It used to be a sanitised 500 InternalError, which SDKs retry and
+/// which said nothing about the key.
 #[tokio::test]
-async fn a_key_mismatch_on_get_logs_its_cause() {
+async fn a_key_mismatch_on_get_names_the_key_and_logs_its_cause() {
     let mut server = encrypted_builder().build().await;
     put_object(&server, "mismatch.bin", b"written under TEST_KEY").await;
     server
         .respawn_with_env(&[("DGP_ENCRYPTION_KEY", OTHER_KEY)])
         .await;
 
-    // One raw request: an SDK would retry the 500 and log it again.
     let get = server
         .http()
         .get(format!("{}/{BUCKET}/mismatch.bin", server.endpoint()))
         .send()
         .await
         .unwrap();
-    assert_eq!(get.status(), 500, "the GET must fail under the other key");
+    assert_eq!(get.status(), 400, "the GET must fail under the other key");
+    let body = get.text().await.unwrap();
+    assert!(body.contains("<Code>InvalidRequest</Code>"), "{body}");
+    assert!(
+        body.contains(common::key_fp_label(TEST_KEY).trim_start_matches("fp-")),
+        "the client learns which key the object needs: {body}"
+    );
 
     let admin = common::admin_http_client(&server.endpoint()).await;
     let logs: serde_json::Value = admin
@@ -1110,7 +1195,7 @@ async fn a_key_mismatch_on_get_logs_its_cause() {
         .unwrap();
     let text = logs.to_string();
     // Format v2 (#120): the object names its key by fingerprint only.
-    let cause = "was encrypted with a key that this backend does not have";
+    let cause = "was encrypted with a key that this proxy does not have";
     assert!(
         text.contains(cause),
         "no ERROR line names the key mismatch: {text}"
@@ -1120,10 +1205,9 @@ async fn a_key_mismatch_on_get_logs_its_cause() {
         text.contains(fp.trim_start_matches("fp-")),
         "the ERROR line names the fingerprint of the object's key: {text}"
     );
-    // One request, one ERROR line: the cause. A second line that repeats
-    // only the sanitised client text is noise.
+    // One request, one ERROR line: the cause.
     let errors = logs["entries"].as_array().expect("a log list");
-    assert_eq!(errors.len(), 1, "one ERROR line per 500: {text}");
+    assert_eq!(errors.len(), 1, "one ERROR line per refused GET: {text}");
     assert!(errors[0].to_string().contains(cause));
     assert!(
         !text.contains(TEST_KEY) && !text.contains(OTHER_KEY),

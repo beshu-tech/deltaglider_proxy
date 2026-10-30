@@ -397,9 +397,138 @@ fn every_write_method_checks_the_witness() {
         };
         let body_start = wrapper[at..].find("{\n").map(|i| at + i).unwrap();
         let first = wrapper[body_start + 2..].lines().next().unwrap_or("");
-        if !first.contains("self.check_witness(") {
+        if !first.contains("self.check_write(") && !first.contains("self.check_write_unless(") {
             missing.push(format!("{name}: first line is `{}`", first.trim()));
         }
     }
     assert!(missing.is_empty(), "{missing:?}");
+}
+
+/// A one-byte passthrough write of `name` at the root of `bucket`.
+async fn put_x<S: StorageBackend>(s: &S, bucket: &str, name: &str) -> Result<(), StorageError> {
+    s.put_passthrough(
+        bucket,
+        "",
+        name,
+        bytes::Bytes::from_static(b"x"),
+        &meta(name, 1),
+    )
+    .await
+}
+
+/// Two proxies over one stored bucket (the report that led to the
+/// sentinel): proxy A encrypts `releases`, proxy B has no key. B's probe
+/// finds A's seal before B's first write and refuses it, with the key's
+/// fingerprint and an object; B still deletes. Once B has A's key as a
+/// read-only keyring entry, B writes again.
+#[tokio::test]
+async fn a_keyless_proxy_refuses_to_write_a_bucket_that_another_proxy_encrypts() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = EncryptingBackend::new(
+        FilesystemBackend::new(dir.path().to_path_buf())
+            .await
+            .unwrap(),
+        Arc::new(ArcSwap::new(Arc::new(two_keys()))),
+    );
+    a.create_bucket("releases").await.unwrap();
+    a.create_bucket("downloads").await.unwrap();
+    a.put_passthrough(
+        "releases",
+        "fw",
+        "app.zip",
+        bytes::Bytes::from_static(b"sealed by a"),
+        &meta("app.zip", 11),
+    )
+    .await
+    .unwrap();
+
+    let b_cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig::default())));
+    let b = EncryptingBackend::new(
+        FilesystemBackend::new(dir.path().to_path_buf())
+            .await
+            .unwrap(),
+        b_cfg.clone(),
+    )
+    .with_sentinel(Arc::new(KeySentinel::default()));
+    let put = |bucket: &'static str, name: &'static str| put_x(&b, bucket, name);
+
+    let err = put("releases", "plain.txt").await.unwrap_err();
+    let msg = err.to_string();
+    let fp = hex::encode(v2::SiteKey::new(&key(0xaa)).fingerprint());
+    assert!(msg.contains(&fp), "{msg}");
+    assert!(msg.contains("fw/app.zip"), "{msg}");
+    assert!(seal::names_a_key_not_held(&msg), "{msg}");
+    assert!(
+        b.get_passthrough_metadata("releases", "", "plain.txt")
+            .await
+            .is_err(),
+        "nothing was written"
+    );
+    // Every write shape is refused, also a folder marker.
+    assert!(b.put_directory_marker("releases", "dir/").await.is_err());
+    // A bucket without sealed objects is written in plaintext as before.
+    put("downloads", "plain.txt").await.unwrap();
+    // A delete is not a write the sentinel stops.
+    b.delete_passthrough("releases", "fw", "app.zip")
+        .await
+        .unwrap();
+    a.put_passthrough(
+        "releases",
+        "fw",
+        "app.zip",
+        bytes::Bytes::from_static(b"sealed by a"),
+        &meta("app.zip", 11),
+    )
+    .await
+    .unwrap();
+
+    // A's key as a read-only entry of B's ring: B reads A's objects, and
+    // writes again (the verdict follows the ring at once).
+    b_cfg.store(Arc::new(EncryptionConfig {
+        keyring: HashMap::from([("from-a".to_string(), key(0xaa))]),
+        ..Default::default()
+    }));
+    put("releases", "plain.txt").await.unwrap();
+}
+
+/// A read of a sealed object is a sighting: a bucket whose probe sample
+/// held no seal is refused once a read meets one.
+#[tokio::test]
+async fn a_read_of_a_foreign_seal_refuses_later_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = EncryptingBackend::new(
+        FilesystemBackend::new(dir.path().to_path_buf())
+            .await
+            .unwrap(),
+        Arc::new(ArcSwap::new(Arc::new(two_keys()))),
+    );
+    a.create_bucket("releases").await.unwrap();
+    let b = EncryptingBackend::new(
+        FilesystemBackend::new(dir.path().to_path_buf())
+            .await
+            .unwrap(),
+        Arc::new(ArcSwap::new(Arc::new(EncryptionConfig::default()))),
+    )
+    .with_sentinel(Arc::new(KeySentinel::default()));
+    let put_b = |name: &'static str| put_x(&b, "releases", name);
+    // The probe of an empty bucket finds nothing: the write goes ahead.
+    put_b("first.txt").await.unwrap();
+    a.put_passthrough(
+        "releases",
+        "",
+        "sealed.bin",
+        bytes::Bytes::from_static(b"sealed by a"),
+        &meta("sealed.bin", 11),
+    )
+    .await
+    .unwrap();
+    // Within the probe's TTL, only a sighting can tell.
+    put_b("second.txt").await.unwrap();
+    let read = b
+        .get_passthrough_metadata("releases", "", "sealed.bin")
+        .await
+        .unwrap_err();
+    assert!(seal::names_a_key_not_held(&read.to_string()), "{read}");
+    let err = put_b("third.txt").await.unwrap_err();
+    assert!(err.to_string().contains("sealed.bin"), "{err}");
 }

@@ -285,7 +285,8 @@ pub fn refusal(at: &Location<'_>, raw: &FileMetadata) -> StorageError {
     } else {
         enc_err(format!(
             "object '{what}' in bucket '{}' {PLAINTEXT_REFUSAL}: the proxy refuses it, because \
-             a writer with access to the backend could have planted it. Set \
+             a writer with access to the backend could have planted it (for example \
+             another proxy that does not have the bucket's key). Set \
              encryption.plaintext_reads: serve while a re-encrypt job converts the bucket's \
              history",
             at.bucket
@@ -296,6 +297,15 @@ pub fn refusal(at: &Location<'_>, raw: &FileMetadata) -> StorageError {
 /// The words of the refusal of an unencrypted object ([`refusal`]), by
 /// which [`is_plaintext_refusal`] knows it.
 const PLAINTEXT_REFUSAL: &str = "is not encrypted, but the bucket encrypts";
+
+/// Does an encryption error name a key that this proxy does not have: the read of an
+/// object sealed with it, or the sentinel's refusal of a write to a bucket
+/// that holds such objects? The client gets a 400 that says so (like S3
+/// for an SSE-C object read without its key), not a retryable 500.
+/// Takes the message of a `StorageError::Encryption`.
+pub fn names_a_key_not_held(msg: &str) -> bool {
+    msg.contains(super::sentinel::KEY_NOT_HELD)
+}
 
 /// Is `e` the read rule's refusal of an unencrypted object in a bucket
 /// that encrypts (not a seal that fails to open)?
@@ -313,9 +323,11 @@ pub fn open<'r>(
 ) -> Result<(SealedFacts, &'r RingEntry), StorageError> {
     let entry = ring.get(&sealed.fp).ok_or_else(|| {
         enc_err(format!(
-            "object in bucket '{}' was encrypted with a key that this backend does not have \
-             (fingerprint {}). Add that key as legacy_key, or restore it",
+            "object in bucket '{}' was encrypted {} (key fp-{}). Add that key to this \
+             proxy's encryption config (legacy_key reads without writing), or read the object \
+             through the proxy that holds it",
             at.bucket,
+            super::sentinel::KEY_NOT_HELD,
             hex::encode(sealed.fp)
         ))
     })?;

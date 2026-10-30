@@ -369,14 +369,14 @@ SSE-KMS / SSE-S3 objects carry no DG framing. AWS applies its own encryption wra
 
 The read path applies one rule to every object in a bucket:
 
-- **An object with sealed metadata.** The proxy finds the key by the fingerprint in the seal, opens the seal at the location of the object, checks the digest of the clear headers, checks the header of the body, and then decrypts and authenticates each frame. Any failure is `500 InternalError`, and the log names the cause.
+- **An object with sealed metadata.** The proxy finds the key by the fingerprint in the seal, opens the seal at the location of the object, checks the digest of the clear headers, checks the header of the body, and then decrypts and authenticates each frame. When the proxy does not have the key that the fingerprint names, the read fails with `400 InvalidRequest`, and the message names the fingerprint (for example `key fp-8748e64455ba2257`). S3 answers in the same way when a client reads an SSE-C object without its key: a retry cannot succeed. Every other failure is `500 InternalError`, and the log names the cause.
 - **An object without sealed metadata, but with `dg-encrypted`.** The proxy refuses it. The object was written by another release, or its metadata was edited.
 - **An object without any marker in a bucket that encrypts.** The proxy refuses it, unless the bucket has `plaintext_reads: serve` (see the next section).
 - **An object without any marker in a bucket that stores plaintext.** The proxy serves it as it is. The read path also checks the first bytes of the body: a body that starts with a `DGE` magic and a digit is proxy-encrypted, so its metadata was stripped, and the read fails instead of serving ciphertext as plaintext.
 - **A folder marker** (an empty object whose key ends in `/`) always reads, because the proxy never encrypts it.
 - `dg-encrypted-native: sse-kms` (or `sse-s3`): no proxy-side decryption; AWS returns plaintext.
 
-A refused or failed read is always `500 InternalError`, never corrupt data and never `404 NoSuchKey`. The proxy never treats a refused delta reference as missing, because a missing reference makes the next upload create a new baseline over it.
+A refused or failed read is always an error (`400 InvalidRequest` for a key that the proxy does not have, else `500 InternalError`), never corrupt data and never `404 NoSuchKey`. The proxy never treats a refused delta reference as missing, because a missing reference makes the next upload create a new baseline over it.
 
 The rule applies to the requests that return the facts or the bytes of one object: GET, HEAD, a copy and a range read. A listing does not apply it. A listing shows a refused object with the size and the name that the backend stores in clear, and logs a warning, so that one refused object does not fail the listing of its whole folder, nor the re-encrypt and migrate jobs that page through the folder. A DELETE request removes a refused object, because a DELETE needs only the kind of the stored object, which the stored key shows. A conditional DELETE (`If-Match`) of a refused object fails, because the proxy cannot compare the ETag of an object whose facts it refuses.
 
@@ -422,6 +422,26 @@ A bucket that no backend lists yet needs no confirmation, because it holds no ob
 ### Copies outside the proxy
 
 The sealed metadata names the real bucket, the folder and the name of the object. A copy that the backend makes on its own therefore does not open at its new location: an `rclone` copy into another bucket, a restore of a backup under another bucket name, or a key that you move by hand. The proxy refuses such a copy, with a message that the sealed metadata failed authentication. This release has no setting that reads an object at another location. To move encrypted objects, copy them through the proxy (`CopyObject`, replication, the migrate job, or a lifecycle transition): the proxy then writes new sealed metadata for the destination. A backup of the backend restores readable objects only under the same bucket names and keys.
+
+### Buckets that another proxy encrypts
+
+Two proxies with separate configurations can store objects in one bucket of a backend. For example, a second proxy has the credentials of `hetzner-fsn1` and writes to `db-archive`, which the first proxy encrypts. When the second proxy does not have the key of `db-archive`, it cannot read the encrypted objects, and the first proxy refuses every object that the second proxy writes (see [Plaintext objects in a bucket that encrypts](#plaintext-objects-in-a-bucket-that-encrypts)). The encryption witness does not help here, because it works only between instances that share a `config_sync_bucket`.
+
+Each encrypted object therefore tells the proxy that the bucket is encrypted. The sealed metadata of each object, and the listing token of each object on an S3 backend, start with the fingerprint of the key. The fingerprint identifies the key but does not reveal it. A proxy does not write to a bucket that holds an object whose key it does not have. The proxy finds such objects in two ways:
+
+- **Reads.** Every GET, HEAD, listing with metadata and delta upload reads the sealed metadata of an object. When the proxy does not have the key of that object, it records the fingerprint for the bucket. This costs no extra request.
+- **A sample before the first write.** Before the first write to a bucket, and then every 10 minutes, the proxy lists the first 200 keys of the bucket. It reads the listing tokens of those keys (on S3, one more LIST request of `.dg/facts/`), and sends a HEAD request for up to 8 objects: the delta references first, and then objects from the whole list. The sample stops at the first key that the proxy does not have.
+
+When the bucket holds such an object, every write to the bucket fails with `400 InvalidRequest`, and nothing is written. The writes are PUT, multipart uploads, copies into the bucket, metadata rewrites and folder markers. The message names the bucket, the fingerprint and an object, for example:
+
+> bucket 'db-archive' holds objects that were encrypted with a key that this proxy does not have (key fp-8748e64455ba2257, for example 'nightly/2026-10-14.dump'). This proxy would write without proxy encryption, and the proxy that holds that key could not read the result, so it refuses the write. Add that key to this proxy's encryption config of the bucket, or send the writes through the proxy that holds it. Reads and deletes still work
+
+The rule is the same for a proxy that encrypts with another key, because the first proxy cannot read those objects either. A DELETE request is not refused, so that the second proxy can remove the objects that it wrote. The proxy compares the fingerprints with its current keys at every write. When you add the key to the configuration, the writes work at once. A key in `legacy_key` or in the keyring counts, so a key rotation or a change to native SSE does not refuse writes. A fingerprint that the proxy does not see again for one hour stops counting, so a bucket whose encrypted objects were deleted becomes writable again. When the sample fails (for example, the credentials cannot list the bucket), the proxy logs a warning, lets the write go ahead, and tries the sample again after one minute.
+
+There are two ways to let a second proxy write to the bucket:
+
+- **Send the writes through the proxy that holds the key.** Create an IAM user on the first proxy, with permissions on the folders that the other team needs, and let their clients send requests for the bucket to the first proxy. The key then stays on one proxy, and the IAM permissions of the first proxy limit what the other team can read and write.
+- **Give the second proxy the same key** for the bucket. The sealed metadata names the real bucket, the folder and the name of the object, but not the name of the backend or of a bucket alias, so both proxies read each other's objects. A proxy with the key can read every object of the bucket, so do this only for a proxy that you trust with all of it. The two proxies also do not share their locks, so do not let both of them store delta-compressed objects in the same folder.
 
 ### The `legacy_key` shim
 

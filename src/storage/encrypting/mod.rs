@@ -25,6 +25,7 @@
 mod bucket_tests;
 mod format;
 pub(crate) mod seal;
+mod sentinel;
 #[cfg(test)]
 mod tests;
 pub(crate) mod v2;
@@ -33,6 +34,7 @@ mod witness;
 pub use seal::{ENCRYPTION_MARKER_KEYS, PRESENTED_MARKER_VALUE};
 
 pub use format::*;
+pub use sentinel::KeySentinel;
 pub use witness::{WitnessGate, WitnessGateState, WITNESS_BACKEND_DEFAULT};
 
 /// The id of a key that the config does not name: `fp-` and the hex of
@@ -179,12 +181,24 @@ pub struct EncryptionPolicies {
     slots: parking_lot::Mutex<std::collections::HashMap<String, Arc<ArcSwap<EncryptionConfig>>>>,
     /// The witness gate that every wrapper of the lineage consults.
     witness: Arc<WitnessGate>,
+    /// The foreign-key sentinel of each slot (same keys as `slots`).
+    sentinels: parking_lot::Mutex<std::collections::HashMap<String, Arc<KeySentinel>>>,
 }
 
 impl EncryptionPolicies {
     /// The witness gate of every engine that shares these slots.
     pub fn witness_gate(&self) -> Arc<WitnessGate> {
         self.witness.clone()
+    }
+
+    /// The foreign-key sentinel of slot `key`: an engine rebuild keeps the
+    /// evidence of the raw backend that it does not change.
+    pub fn sentinel(&self, key: &str) -> Arc<KeySentinel> {
+        self.sentinels
+            .lock()
+            .entry(key.to_string())
+            .or_default()
+            .clone()
     }
 
     /// The slot of `key` and remember `cfg` for [`Self::publish`]. A new
@@ -214,6 +228,9 @@ impl EncryptionPolicies {
             slot.store(cfg.clone());
         }
         self.slots
+            .lock()
+            .retain(|k, _| published.iter().any(|(p, _, _)| p == k));
+        self.sentinels
             .lock()
             .retain(|k, _| published.iter().any(|(p, _, _)| p == k));
     }
@@ -294,6 +311,8 @@ pub struct EncryptingBackend<B: StorageBackend> {
     config: Arc<ArcSwap<EncryptionConfig>>,
     /// The raw backend's name and the witness gate (multi-instance).
     witness: Option<(String, Arc<WitnessGate>)>,
+    /// The foreign-key sentinel (`sentinel.rs`); `None` = no check.
+    sentinel: Option<Arc<KeySentinel>>,
 }
 
 impl<B: StorageBackend> EncryptingBackend<B> {
@@ -302,7 +321,15 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             inner,
             config,
             witness: None,
+            sentinel: None,
         }
+    }
+
+    /// Refuse writes to a bucket that holds objects sealed with a key that
+    /// this backend does not have (`sentinel.rs`).
+    pub fn with_sentinel(mut self, sentinel: Arc<KeySentinel>) -> Self {
+        self.sentinel = Some(sentinel);
+        self
     }
 
     /// THE witness check (issue #116 P3): a node whose encryption of this
@@ -320,6 +347,132 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             Some(msg) => Err(StorageError::WritesRefused(msg)),
             None => Ok(()),
         }
+    }
+
+    /// THE write check: the witness, then the foreign-key sentinel. Every
+    /// mutating method calls it first (source guard
+    /// `every_write_method_checks_the_witness`).
+    async fn check_write(&self, bucket: &str) -> Result<(), StorageError> {
+        self.check_write_unless(bucket, false).await
+    }
+
+    /// [`Self::check_write`]; `delete`: the write only removes an object,
+    /// which the sentinel allows (the proxy must stay able to remove what
+    /// it wrote by mistake).
+    async fn check_write_unless(&self, bucket: &str, delete: bool) -> Result<(), StorageError> {
+        self.check_witness(bucket)?;
+        let Some(sentinel) = self.sentinel.as_ref().filter(|_| !delete) else {
+            return Ok(());
+        };
+        if sentinel.needs_probe(bucket) {
+            let _one = sentinel.probe_lock().await;
+            if sentinel.needs_probe(bucket) {
+                let found = match self.probe_keys(bucket).await {
+                    Ok(found) => Some(found),
+                    Err(StorageError::BucketNotFound(_) | StorageError::NotFound(_)) => {
+                        Some(Vec::new())
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "encryption: the key probe of bucket '{bucket}' failed, the write \
+                             goes ahead unchecked: {e}"
+                        );
+                        None
+                    }
+                };
+                sentinel.probed(bucket, found);
+            }
+        }
+        let cfg = self.config.load();
+        let write_key = self.write_key(bucket)?.map(|site| {
+            cfg.ring()
+                .get(&site.fingerprint())
+                .map_or_else(|| fingerprint_hex(&site), |e| e.id.clone())
+        });
+        match sentinel.refusal(bucket, cfg.ring(), write_key.as_deref()) {
+            Some(msg) => {
+                tracing::warn!("encryption: refused a write: {msg}");
+                Err(StorageError::Encryption(msg))
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// The fingerprints of the keys that sealed a sample of `bucket`, with
+    /// an object each: the listing tokens of one page from the root, then a
+    /// HEAD of a few baselines and objects spread over the page. Stops at
+    /// the first key that is not in the ring.
+    async fn probe_keys(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<(sentinel::Fingerprint, String)>, StorageError> {
+        let listing = self
+            .inner
+            .bulk_list_objects_with_baselines(bucket, "", None, Some(sentinel::PROBE_LIST))
+            .await?;
+        let ring = self.config.load().ring().clone();
+        let mut found = Vec::new();
+        let foreign = |found: &[(sentinel::Fingerprint, String)]| {
+            found.iter().any(|(fp, _)| ring.get(fp).is_none())
+        };
+        let tokens = self.inner.listing_tokens(bucket, &listing.objects).await;
+        for ((key, _), token) in listing.objects.iter().zip(tokens) {
+            if let Some(fp) = token.and_then(|t| v2::token_fingerprint(&t.token)) {
+                found.push((fp, key.clone()));
+            }
+        }
+        if foreign(&found) {
+            return Ok(found);
+        }
+        // Baselines first: one reference stands for its whole deltaspace.
+        let mut heads: Vec<(String, StoredObject<'_>, String)> = listing
+            .baselines
+            .iter()
+            .map(|(key, _)| {
+                let prefix = key
+                    .strip_suffix("reference.bin")
+                    .unwrap_or_default()
+                    .trim_end_matches('/');
+                (prefix.to_string(), StoredObject::Reference, key.clone())
+            })
+            .take(sentinel::PROBE_HEADS / 2)
+            .collect();
+        let files: Vec<_> = listing
+            .objects
+            .iter()
+            .filter(|(key, _)| !key.ends_with('/'))
+            .collect();
+        let room = sentinel::PROBE_HEADS - heads.len();
+        let step = files.len().div_ceil(room.max(1)).max(1);
+        for (key, meta) in files.iter().step_by(step).take(room) {
+            let (prefix, name) = key.rsplit_once('/').unwrap_or(("", key.as_str()));
+            let object = if meta.is_delta() {
+                StoredObject::Delta(name)
+            } else {
+                StoredObject::Passthrough(name)
+            };
+            heads.push((prefix.to_string(), object, key.to_string()));
+        }
+        for (prefix, object, key) in heads {
+            let raw = match object {
+                StoredObject::Reference => self.inner.get_reference_metadata(bucket, &prefix).await,
+                StoredObject::Delta(f) => self.inner.get_delta_metadata(bucket, &prefix, f).await,
+                StoredObject::Passthrough(f) => {
+                    self.inner
+                        .get_passthrough_metadata(bucket, &prefix, f)
+                        .await
+                }
+            };
+            // An object deleted since the listing is no evidence either way.
+            let Ok(raw) = raw else { continue };
+            if let Ok(Some(sealed)) = seal::sealed_of(&raw) {
+                found.push((sealed.fp, key));
+                if foreign(&found) {
+                    break;
+                }
+            }
+        }
+        Ok(found)
     }
 
     /// Refuse the writes that the witness gate names for raw backend `name`.
@@ -366,6 +519,23 @@ fn stored_object_of<'a>(meta: &FileMetadata, name: &'a str) -> StoredObject<'a> 
 }
 
 /// A folder marker: never sealed, always readable.
+fn fingerprint_hex(site: &v2::SiteKey) -> String {
+    format!("fp-{}", hex::encode(site.fingerprint()))
+}
+
+/// The key of a stored object, for a message.
+fn object_name(prefix: &str, object: StoredObject<'_>) -> String {
+    let name = match object {
+        StoredObject::Reference => "reference.bin",
+        StoredObject::Delta(f) | StoredObject::Passthrough(f) => f,
+    };
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}/{name}")
+    }
+}
+
 fn is_folder(object: StoredObject<'_>) -> bool {
     matches!(object, StoredObject::Passthrough(f) if f.is_empty() || f.ends_with('/'))
 }
@@ -612,6 +782,11 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         match seal::sealed_of(raw)? {
             Some(sealed) => {
                 let cfg = self.config.load();
+                if let Some(sentinel) = &self.sentinel {
+                    if cfg.ring().get(&sealed.fp).is_none() {
+                        sentinel.sighted(bucket, sealed.fp, &object_name(prefix, object));
+                    }
+                }
                 let (facts, entry) = seal::open(raw, &sealed, &at, cfg.ring())?;
                 Ok(Opened {
                     meta: seal::present(raw, &facts, &entry.id),
@@ -1003,7 +1178,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         metadata: &FileMetadata,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
-        self.check_witness(bucket)?;
+        self.check_write(bucket).await?;
         let (body, stored) =
             self.seal_bytes(bucket, prefix, StoredObject::Reference, &data, metadata)?;
         self.inner
@@ -1026,7 +1201,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         source: &FileMetadata,
         metadata: &FileMetadata,
     ) -> Result<super::traits::CopyOutcome, StorageError> {
-        self.check_witness(dst.bucket)?;
+        self.check_write(dst.bucket).await?;
         use super::traits::{CopyOutcome, ObjectVariant};
         let dst_site = self.write_key(dst.bucket)?;
         let raw = match variant {
@@ -1084,7 +1259,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         metadata: &FileMetadata,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
-        self.check_witness(bucket)?;
+        self.check_write(bucket).await?;
         let (body, stored) = self.seal_bytes(
             bucket,
             prefix,
@@ -1105,7 +1280,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         data: bytes::Bytes,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        self.check_witness(bucket)?;
+        self.check_write(bucket).await?;
         let (body, stored) = self.seal_bytes(
             bucket,
             prefix,
@@ -1130,7 +1305,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         metadata: &FileMetadata,
         spool: SpoolBudget<'_>,
     ) -> Result<(), StorageError> {
-        self.check_witness(bucket)?;
+        self.check_write(bucket).await?;
         let Some(site) = self.write_key(bucket)? else {
             return self
                 .inner
@@ -1167,7 +1342,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         metadata: &FileMetadata,
         spool: SpoolBudget<'_>,
     ) -> Result<(), StorageError> {
-        self.check_witness(bucket)?;
+        self.check_write(bucket).await?;
         let Some(site) = self.write_key(bucket)? else {
             return self
                 .inner
@@ -1204,7 +1379,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         chunks: &[Bytes],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        self.check_witness(bucket)?;
+        self.check_write(bucket).await?;
         let Some(site) = self.write_key(bucket)? else {
             return self
                 .inner
@@ -1358,7 +1533,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         filename: &str,
         metadata: &FileMetadata,
     ) -> Result<MultipartUpload, StorageError> {
-        self.check_witness(bucket)?;
+        self.check_write(bucket).await?;
         // A refused write names its cause, not "multipart unsupported".
         self.write_key(bucket)?;
         if !self.writes_plaintext(bucket) {
@@ -1379,7 +1554,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         part_number: i32,
         data: Bytes,
     ) -> Result<UploadedPart, StorageError> {
-        self.check_witness(&upload.bucket)?;
+        self.check_write(&upload.bucket).await?;
         self.inner
             .upload_part(upload, prefix, filename, part_number, data)
             .await
@@ -1394,7 +1569,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         assembled: &[Bytes],
         metadata: &FileMetadata,
     ) -> Result<String, StorageError> {
-        self.check_witness(&upload.bucket)?;
+        self.check_write(&upload.bucket).await?;
         // The bucket's write policy NOW (a config apply can change it
         // between create and complete). A bucket that encrypts never stores
         // the parts as plaintext: buffered parts are encrypted like any
@@ -1570,7 +1745,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         m: &FileMetadata,
         basis: &super::RewriteBasis,
     ) -> Result<(), StorageError> {
-        self.check_witness(b)?;
+        self.check_write(b).await?;
         // The body is not rewritten: the stored object's seal decides. A
         // caller's earlier read gives the stored metadata without a HEAD.
         let raw = match &basis.stored {
@@ -1589,7 +1764,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         m: &FileMetadata,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
-        self.check_witness(b)?;
+        self.check_write(b).await?;
         let raw = self.inner.get_reference_metadata(b, p).await?;
         let stored = self.reseal(b, p, StoredObject::Reference, m, &raw)?;
         self.inner
@@ -1619,7 +1794,8 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         fence: &super::traits::RefFence,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<super::traits::RefFence, StorageError> {
-        self.check_witness(b)?;
+        self.check_write_unless(b, matches!(op, super::traits::RefWrite::Delete))
+            .await?;
         use super::traits::RefWrite;
         match op {
             RefWrite::Put { data, metadata } => {
@@ -1863,7 +2039,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         }
     }
     async fn put_directory_marker(&self, b: &str, k: &str) -> Result<(), StorageError> {
-        self.check_witness(b)?;
+        self.check_write(b).await?;
         self.inner.put_directory_marker(b, k).await
     }
 }

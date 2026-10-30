@@ -396,6 +396,16 @@ impl From<crate::storage::StorageError> for S3Error {
             {
                 S3Error::InvalidRequest(KEY_PATH_CONFLICT_FS.to_string())
             }
+            // A key that this proxy does not have (an object sealed with it,
+            // or a write to a bucket that holds such objects): a 400 that
+            // names the key fingerprint, like S3 for an SSE-C object read
+            // without its key. A retry cannot succeed.
+            crate::storage::StorageError::Encryption(msg)
+                if crate::storage::encrypting::seal::names_a_key_not_held(&msg) =>
+            {
+                tracing::error!("{msg}");
+                S3Error::InvalidRequest(msg)
+            }
             crate::storage::StorageError::MetadataTooLarge(msg) => S3Error::MetadataTooLarge(msg),
             crate::storage::StorageError::InvalidRange(_) => S3Error::InvalidRange,
             crate::storage::StorageError::BucketNotFound(b) => S3Error::NoSuchBucket(b),

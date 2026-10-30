@@ -74,11 +74,8 @@ impl DynEngine {
                 &mut KeyIdCollisionCheck::new(),
             )?;
             refuse_native_overrides_off_s3("default", &config.backend, &on("default"))?;
-            let slot = policies.slot(
-                &policy_slot_key("default", &config.backend, &config.backend_encryption),
-                cfg,
-                &mut published,
-            );
+            let slot_key = policy_slot_key("default", &config.backend, &config.backend_encryption);
+            let slot = policies.slot(&slot_key, cfg, &mut published);
             let raw = build_raw_backend_native(
                 "default",
                 &config.backend,
@@ -87,7 +84,8 @@ impl DynEngine {
             .await?;
             DynStorageBackend::new_box(
                 crate::storage::EncryptingBackend::new(raw, slot)
-                    .with_witness("default", policies.witness_gate()),
+                    .with_witness("default", policies.witness_gate())
+                    .with_sentinel(policies.sentinel(&slot_key)),
             )
         } else {
             // Multi-backend routing. Each named entry is constructed
@@ -104,11 +102,8 @@ impl DynEngine {
                     &mut kid_collisions,
                 )?;
                 refuse_native_overrides_off_s3(&named.name, &named.backend, &on(&named.name))?;
-                let slot = policies.slot(
-                    &policy_slot_key(&named.name, &named.backend, &named.encryption),
-                    cfg,
-                    &mut published,
-                );
+                let slot_key = policy_slot_key(&named.name, &named.backend, &named.encryption);
+                let slot = policies.slot(&slot_key, cfg, &mut published);
                 let raw = build_raw_backend_native(
                     &named.name,
                     &named.backend,
@@ -117,7 +112,8 @@ impl DynEngine {
                 .await?;
                 let wrapped = DynStorageBackend::new_box(
                     crate::storage::EncryptingBackend::new(raw, slot)
-                        .with_witness(&named.name, policies.witness_gate()),
+                        .with_witness(&named.name, policies.witness_gate())
+                        .with_sentinel(policies.sentinel(&slot_key)),
                 );
                 backends.insert(named.name.clone(), Arc::new(wrapped));
             }

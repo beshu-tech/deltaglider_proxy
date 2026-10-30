@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Security — A proxy does not write to a bucket that another proxy encrypts with a key that it does not have
+
+- Two proxies with separate configurations can store objects in one bucket of a backend. When one of them encrypts the bucket and the other does not have the key, the other proxy wrote its objects without encryption. The first proxy refused to read those objects, and the other proxy could not read the encrypted ones. The encryption witness did not help, because it works only between instances that share a `config_sync_bucket`.
+- Every encrypted object names the fingerprint of its key in its sealed metadata and in its listing token. A proxy now records the fingerprint of each object that it reads but cannot open. Before the first write to a bucket, and then every 10 minutes, it also checks a sample of the bucket: one listing page, the listing tokens of that page, and a HEAD request for up to 8 objects. When the bucket holds an object whose key the proxy does not have, every write to the bucket fails with `400 InvalidRequest`. The message names the fingerprint and an object. Deletes still work. When you add the key to the configuration (also as `legacy_key`), the writes work at once. See [Buckets that another proxy encrypts](docs/product/reference/encryption.md#buckets-that-another-proxy-encrypts).
+
+### Changed — A read of an object whose key the proxy does not have answers 400
+
+- A GET or HEAD of an object that is encrypted with a key that the proxy does not have now fails with `400 InvalidRequest`, and the message names the fingerprint of the key. Before this release, the answer was `500 InternalError` without a cause, which SDKs retry. S3 answers in the same way when a client reads an SSE-C object without its key.
+
 ## v2.0.19 — 2026-10-29
 
 ### Security — Dependency updates
