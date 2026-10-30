@@ -16,7 +16,7 @@ use axum::{
 use serde::Deserialize;
 use std::sync::Arc;
 
-use super::{audit_log, AdminError, AdminState, JsonError};
+use super::{audit_log, AdminError, AdminState};
 
 /// GET /api/admin/sessions — list live (non-expired) sessions, redacted.
 pub async fn list_sessions(
@@ -43,7 +43,7 @@ pub async fn revoke_session(
     State(state): State<Arc<AdminState>>,
     Path(id): Path<String>,
     headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, AdminError<JsonError>> {
+) -> Result<Json<serde_json::Value>, AdminError> {
     if let Some(own) = super::auth::extract_session_token(&headers) {
         if state.sessions.session_id_matches(&own, &id) {
             return Err(AdminError::invalid("use logout to end your own session"));
@@ -151,7 +151,7 @@ pub async fn revoke_user_sessions(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     AdminJson(req): AdminJson<RevokeUserRequest>,
-) -> Result<Json<serde_json::Value>, AdminError<JsonError>> {
+) -> Result<Json<serde_json::Value>, AdminError> {
     let Some(identity) = req.identity.or(req.access_key_id) else {
         return Err(AdminError::invalid(
             "identity (or access_key_id) is required",

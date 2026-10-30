@@ -51,7 +51,7 @@ use std::sync::Arc;
 use crate::config::{BackendConfig, Config};
 
 use super::users::rebuild_iam_index;
-use super::{audit_log, trigger_config_sync, AdminError, AdminState, Scrubbed};
+use super::{audit_log, trigger_config_sync, AdminError, AdminState};
 
 #[derive(Serialize)]
 struct ImportErrorBody {
@@ -253,8 +253,8 @@ fn import_fail(
 /// A failed IAM restore as the import's error. A refusal (4xx: a lockout,
 /// a bootstrap-key collision) carries its reason, so the operator reads
 /// why; a server error carries only the status text (its detail is
-/// logged, as [`Scrubbed`] does).
-fn restore_iam_failure(e: AdminError<Scrubbed>, context: &str) -> BackupImportError {
+/// logged, as every scrubbed [`AdminError`] is).
+fn restore_iam_failure(e: AdminError, context: &str) -> BackupImportError {
     let status = e.status_code();
     let detail = if status.is_client_error() {
         e.message().to_string()
@@ -459,7 +459,7 @@ struct SecretsStorage {
 
 /// Build the IamBackup struct from current DB state. Used by both
 /// the JSON and zip export paths.
-async fn build_iam_backup(state: &Arc<AdminState>) -> Result<IamBackup, AdminError<Scrubbed>> {
+async fn build_iam_backup(state: &Arc<AdminState>) -> Result<IamBackup, AdminError> {
     let db = state
         .config_db
         .as_ref()
@@ -519,7 +519,7 @@ pub async fn export_backup(
     State(state): State<Arc<AdminState>>,
     AdminQuery(q): AdminQuery<ExportQuery>,
     headers: axum::http::HeaderMap,
-) -> Result<Response, AdminError<Scrubbed>> {
+) -> Result<Response, AdminError> {
     let iam = build_iam_backup(&state).await?;
 
     let format = q.format.as_deref().unwrap_or("zip");
@@ -553,7 +553,7 @@ pub async fn export_backup(
 async fn export_zip(
     state: &Arc<AdminState>,
     iam: &IamBackup,
-) -> Result<(Bytes, String), AdminError<Scrubbed>> {
+) -> Result<(Bytes, String), AdminError> {
     // We hold the read lock for the entire inspection of config so
     // a concurrent apply can't tear the YAML + secrets harvest apart.
     let cfg = state.config.read().await;
@@ -1456,7 +1456,7 @@ async fn import_zip_full_backup(
             .as_ref()
             .is_some_and(|s| !s.oauth_client_secrets.is_empty());
     if oauth_secrets && state.config_db.is_none() {
-        let e = AdminError::<super::error::Text>::no_config_db();
+        let e = AdminError::no_config_db();
         return Err(import_fail(
             e.status_code(),
             "apply_secrets",
@@ -1986,7 +1986,7 @@ async fn import_backup_iam(
     backup: IamBackup,
     mode: IamRestoreMode,
     restoring: bool,
-) -> Result<Json<ImportResult>, AdminError<Scrubbed>> {
+) -> Result<Json<ImportResult>, AdminError> {
     let db = state
         .config_db
         .as_ref()
@@ -2061,8 +2061,8 @@ mod tests {
     /// detail in the log.
     #[test]
     fn a_refused_restore_names_its_reason_and_a_500_does_not() {
-        use super::{restore_iam_failure, AdminError, Scrubbed};
-        let refused = AdminError::<Scrubbed>::conflict("the restore leaves no credential");
+        use super::{restore_iam_failure, AdminError};
+        let refused = AdminError::conflict("the restore leaves no credential");
         let e = restore_iam_failure(refused, "legacy JSON backup");
         assert_eq!(
             e.detail.as_deref(),

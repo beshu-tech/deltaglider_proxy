@@ -47,7 +47,7 @@ use crate::rate_limiter::RateLimiter;
 use crate::session::SessionStore;
 use crate::usage_scanner::UsageScanner;
 
-pub use error::{AdminError, CodedJson, ErrorBody, JsonError, Scrubbed, Text};
+pub use error::AdminError;
 
 // Re-export everything so external code doesn't need import changes.
 pub use audit::{get_audit, get_encryption_witness, publish_encryption_witness};
@@ -253,10 +253,10 @@ pub(crate) async fn push_config_sync_now(state: &Arc<AdminState>) -> SyncPush {
 /// database, the leases and the locks, so no admin job, scan or bulk
 /// operation may read or rewrite it. Admin endpoints bypass the S3 request
 /// gate; `AdminBucket::admit` and this are their one way to a bucket name.
-pub(crate) fn admit_bucket<B: ErrorBody>(
+pub(crate) fn admit_bucket(
     state: &AdminState,
     bucket: &str,
-) -> Result<crate::bucket_policy::ClientBucket, AdminError<B>> {
+) -> Result<crate::bucket_policy::ClientBucket, AdminError> {
     state
         .s3_state
         .engine
@@ -284,10 +284,7 @@ pub async fn run_to_completion(
     }
     match crate::audit::spawn_in_request_scope(next.run(req)).await {
         Ok(response) => response,
-        Err(e) => {
-            tracing::error!("admin request task failed: {e}");
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
+        Err(e) => AdminError::internal(format!("admin request task failed: {e}")).into_response(),
     }
 }
 
@@ -333,7 +330,7 @@ pub(crate) fn trigger_config_sync(state: &Arc<AdminState>) {
 /// ```ignore
 /// pub async fn list_providers(
 ///     State(state): State<Arc<AdminState>>,
-/// ) -> Result<impl IntoResponse, AdminError<Scrubbed>> {
+/// ) -> Result<impl IntoResponse, AdminError> {
 ///     let providers = with_config_db(&state, "load auth providers", |db| {
 ///         db.load_auth_providers()
 ///     })
@@ -341,13 +338,12 @@ pub(crate) fn trigger_config_sync(state: &Arc<AdminState>) {
 ///     Ok(Json(providers))
 /// }
 /// ```
-pub(crate) async fn with_config_db<T, B, F>(
+pub(crate) async fn with_config_db<T, F>(
     state: &Arc<AdminState>,
     op_label: &str,
     f: F,
-) -> Result<T, AdminError<B>>
+) -> Result<T, AdminError>
 where
-    B: ErrorBody,
     F: FnOnce(&ConfigDb) -> Result<T, crate::config_db::ConfigDbError>,
 {
     let db = state
@@ -367,13 +363,12 @@ where
 }
 
 /// [`with_config_db`] for the node-local jobs DB.
-pub(crate) async fn with_jobs_db<T, B, F>(
+pub(crate) async fn with_jobs_db<T, F>(
     state: &Arc<AdminState>,
     op_label: &str,
     f: F,
-) -> Result<T, AdminError<B>>
+) -> Result<T, AdminError>
 where
-    B: ErrorBody,
     F: FnOnce(&JobsDb) -> Result<T, crate::config_db::ConfigDbError>,
 {
     let db = state.jobs_db.as_ref().ok_or_else(AdminError::no_jobs_db)?;

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Changed — One error body for the admin API
+
+- An admin API error now always has the JSON body `{"error": <code>, "message": <text>}`. Before, an error had one of four bodies: plain text, `{"error": <text>}`, `{"error": <code>, "message": <text>}`, or an empty body for a server error. The `error` field now holds a stable machine code (for example `not_found`, `conflict` or `invalid_request`), and the text is in `message`. The codes that clients already matched on, such as `iam_declarative`, `admin_session_required` and `invalid_path`, stay in `error`. A script that showed `error` as the reason must now show `message`. See [Errors](docs/product/reference/admin-api.md#errors).
+- A server error never sends the text of the underlying failure. The body is `{"error": "internal", "message": …}` with a generic message, and the detail goes to the server log. Before, some endpoints sent database or storage error text.
+- The config write endpoints keep their own bodies (`{success: false, error}`, `{ok: false, error}`, `{applied: false, error}`), and `error` still holds the text there.
+
 ## v2.0.20 — 2026-10-30
 
 ### Security — A proxy does not write to a bucket that another proxy encrypts with a key that it does not have

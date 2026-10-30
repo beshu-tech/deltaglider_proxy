@@ -20,7 +20,7 @@
 //!   included) so non-admin browser users see busy state + progress; the
 //!   response carries only status/phase/counts — no config detail.
 
-use super::{AdminError, AdminState, Scrubbed};
+use super::{AdminError, AdminState};
 use crate::api::admin::extract::AdminJson;
 use crate::maintenance::migrate::{pick_transient_key, MigrateParams, MigrateTarget};
 use crate::maintenance::store::{current_unix_seconds, CancelOutcome, MaintenanceJob};
@@ -336,7 +336,7 @@ pub async fn start_migrate(
         ));
     }
     super::path_guard::check_bucket(&bucket).map_err(AdminError::invalid)?;
-    let bucket = super::admit_bucket::<super::Text>(&state, &bucket)?.into_string();
+    let bucket = super::admit_bucket(&state, &bucket)?.into_string();
     let db = state.jobs_db.as_ref().ok_or_else(AdminError::no_jobs_db)?;
 
     // The bucket must actually exist (the old handler skipped this check).
@@ -596,7 +596,7 @@ pub async fn bucket_status(
     connect_info: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     headers: axum::http::HeaderMap,
     Path(bucket): Path<super::path_guard::AdminBucket>,
-) -> Result<Json<serde_json::Value>, AdminError<Scrubbed>> {
+) -> Result<Json<serde_json::Value>, AdminError> {
     let bucket = bucket.admit(&state)?;
     // Session-light, but bucket-scoped: only a principal that may list the
     // bucket learns its maintenance state (403, as the S3 LIST answers).

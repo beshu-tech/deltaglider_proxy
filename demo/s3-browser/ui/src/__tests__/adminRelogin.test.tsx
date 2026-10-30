@@ -40,7 +40,7 @@ test('a 401 on a CRUD mutation asks to sign in, then sends the same request agai
 
 test('a 403 admin_session_required is an expired session too; the JSON body is re-sent', async () => {
   let puts = 0;
-  http.on('PUT', '/_/api/admin/users/4', () => (++puts === 1 ? json({ error: 'admin_session_required' }, 403) : json({ id: 4 })));
+  http.on('PUT', '/_/api/admin/users/4', () => (++puts === 1 ? json({ error: 'admin_session_required', message: 'sign in as an admin' }, 403) : json({ id: 4 })));
   renderWithQuery(<ReloginModal />);
   let done: Promise<unknown> = Promise.resolve();
   act(() => { done = adminJson('/api/admin/users/4', { method: 'PUT', body: { name: 'dana' } }); });

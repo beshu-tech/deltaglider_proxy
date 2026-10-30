@@ -17,7 +17,7 @@ use crate::iam::{Group, IamIndex, IamState, IamUser};
 use crate::rate_limiter;
 use crate::session::{AuthMethod, S3SessionCredentials, SessionKind, SessionStore};
 
-use super::{audit_log, AdminError, AdminState, JsonError, Scrubbed};
+use super::{audit_log, AdminError, AdminState};
 
 /// Marker type inserted by [`require_admin_gui_session`] into request extensions.
 /// Handlers that must never run under a browser-lift session take
@@ -297,8 +297,9 @@ pub struct OpenBrowserConnectRequest {
     bucket: String,
 }
 
-/// Error of a credential handler: a plain status, or a lockout (429 with
-/// `Retry-After` and a JSON reason, see [`crate::rate_limiter::Blocked`]).
+/// Error of a credential handler: a status (the admin error body with a
+/// fixed message, which says nothing about which check failed), or a
+/// lockout (429 with `Retry-After`, see [`crate::rate_limiter::Blocked`]).
 pub enum AuthReject {
     Status(StatusCode),
     Blocked(crate::rate_limiter::Blocked),
@@ -319,7 +320,7 @@ impl From<crate::rate_limiter::Blocked> for AuthReject {
 impl IntoResponse for AuthReject {
     fn into_response(self) -> axum::response::Response {
         match self {
-            Self::Status(s) => s.into_response(),
+            Self::Status(s) => super::AdminError::status(s, "access denied").into_response(),
             Self::Blocked(b) => b.into_response(),
         }
     }
@@ -1193,14 +1194,18 @@ pub async fn open_browser_connect(
 }
 
 /// 401 `{"error": "unauthorized"}`: no live session; the UI signs in again.
-fn unauthorized() -> AdminError<JsonError> {
-    AdminError::status(StatusCode::UNAUTHORIZED, "unauthorized")
+fn unauthorized() -> AdminError {
+    AdminError::status(StatusCode::UNAUTHORIZED, "sign in to use the admin API")
 }
 
 /// 403 `{"error": "admin_session_required"}`: a live session of the wrong
 /// kind (a browser-only session on an admin route).
-fn admin_session_required() -> AdminError<JsonError> {
-    AdminError::forbidden("admin_session_required")
+fn admin_session_required() -> AdminError {
+    AdminError::coded(
+        "admin_session_required",
+        StatusCode::FORBIDDEN,
+        "this session can use only the object browser; sign in as an admin to use the admin API",
+    )
 }
 
 /// Middleware: validate session for protected admin routes.
@@ -1210,7 +1215,7 @@ pub async fn require_session(
     headers: HeaderMap,
     request: axum::extract::Request,
     next: axum::middleware::Next,
-) -> Result<Response, AdminError<JsonError>> {
+) -> Result<Response, AdminError> {
     let peer_ip = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -1274,7 +1279,7 @@ pub async fn require_admin_gui_session(
     headers: HeaderMap,
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
-) -> Result<Response, AdminError<JsonError>> {
+) -> Result<Response, AdminError> {
     let peer_ip = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -1334,7 +1339,7 @@ pub async fn require_bulk_session(
     headers: HeaderMap,
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
-) -> Result<Response, AdminError<JsonError>> {
+) -> Result<Response, AdminError> {
     let peer_ip = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -1532,7 +1537,7 @@ pub async fn get_s3_session_creds(
     State(state): State<Arc<AdminState>>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
-) -> Result<Response, AdminError<Scrubbed>> {
+) -> Result<Response, AdminError> {
     let token = extract_session_token(&headers)
         .ok_or_else(|| AdminError::status(StatusCode::UNAUTHORIZED, "no session"))?;
     let client_ip = request_client_ip(&headers, connect_info.as_ref());
@@ -1560,7 +1565,7 @@ pub async fn set_s3_session_creds(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     AdminJson(creds): AdminJson<S3SessionCredentials>,
-) -> Result<StatusCode, AdminError<Scrubbed>> {
+) -> Result<StatusCode, AdminError> {
     let token = extract_session_token(&headers)
         .ok_or_else(|| AdminError::status(StatusCode::UNAUTHORIZED, "no session"))?;
     state.sessions.set_s3_creds(&token, creds);
@@ -1571,7 +1576,7 @@ pub async fn set_s3_session_creds(
 pub async fn clear_s3_session_creds(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
-) -> Result<StatusCode, AdminError<Scrubbed>> {
+) -> Result<StatusCode, AdminError> {
     let token = extract_session_token(&headers)
         .ok_or_else(|| AdminError::status(StatusCode::UNAUTHORIZED, "no session"))?;
     state.sessions.clear_s3_creds(&token);

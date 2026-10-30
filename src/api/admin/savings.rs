@@ -40,7 +40,7 @@
 
 use super::path_guard::{AdminBucket, AdminObjectPath};
 use crate::api::admin::extract::AdminQuery;
-use crate::api::admin::{AdminError, JsonError};
+use crate::api::admin::AdminError;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -212,7 +212,7 @@ impl Default for SavingsCache {
 pub async fn get_savings(
     State(state): State<Arc<crate::api::admin::AdminState>>,
     AdminQuery(q): AdminQuery<SavingsQuery>,
-) -> Result<Json<SavingsResponse>, AdminError<JsonError>> {
+) -> Result<Json<SavingsResponse>, AdminError> {
     // `AdminBucket` refuses an empty name at extraction (400
     // `invalid_bucket`), so the bucket is never empty here.
     let bucket = q.bucket.admit(&state)?;

@@ -1,5 +1,5 @@
 // Admin API client core: shared fetch glue + cross-cutting types.
-import { ApiError, isSessionExpired, normalizeUiError, throwApiError } from '../errorHandling';
+import { ApiError, isSessionExpired, normalizeUiError, parseErrorBody, throwApiError } from '../errorHandling';
 import { loginFailureMessage, retryAfterSeconds } from '../loginError';
 import type { EnvOverride } from '../envOverrides';
 import { BASE as APP_BASE } from '../urlState';
@@ -138,10 +138,10 @@ export async function signInRequest(
 
 /** The sign-in failure sentence for a non-2xx sign-in response. */
 export async function loginFailureFromResponse(res: Response): Promise<string> {
-  const data = (await res.json().catch(() => ({}))) as { error?: unknown; retry_after_secs?: unknown };
+  const data = (await res.json().catch(() => ({}))) as { retry_after_secs?: unknown };
   return loginFailureMessage({
     status: res.status,
-    error: typeof data.error === 'string' ? data.error : undefined,
+    error: parseErrorBody(data).message,
     retryAfterSecs: retryAfterSeconds(res.headers.get('retry-after'), data),
   });
 }

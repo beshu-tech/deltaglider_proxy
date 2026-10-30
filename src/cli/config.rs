@@ -387,6 +387,18 @@ async fn admin_login(opts: &AdminClientOpts) -> Result<reqwest::Client, CliError
     }
 }
 
+/// Pure: the text of an admin error body. The admin error type sends
+/// `{error: <code>, message: <text>}`; `/config/apply` sends
+/// `{applied: false, error: <text>}`.
+fn admin_error_text(body: &serde_json::Value) -> Option<&str> {
+    let text = |k: &str| {
+        body.get(k)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+    };
+    text("message").or_else(|| text("error"))
+}
+
 /// CLI-side error shape. Converted to exit codes + messages by the
 /// dispatcher so the public API (exit codes) stays stable regardless
 /// of internal refactoring.
@@ -567,10 +579,7 @@ async fn apply_async(
         .unwrap_or(false);
 
     if !status.is_success() || !applied {
-        let error = body
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("(no error message)");
+        let error = admin_error_text(&body).unwrap_or("(no error message)");
         return Err(CliError::Rejected(format!("{status}: {error}")));
     }
 
@@ -650,7 +659,7 @@ async fn witness_publish_async(
     }
     let error = serde_json::from_str::<serde_json::Value>(&text)
         .ok()
-        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+        .and_then(|v| admin_error_text(&v).map(str::to_string))
         .unwrap_or(text);
     if status.is_server_error() {
         return Err(CliError::Http(format!("{status}: {error}")));
@@ -729,6 +738,21 @@ async fn admission_trace_async(args: TraceArgs, opts: AdminClientOpts) -> Result
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn admin_error_text_prefers_the_message() {
+        use serde_json::json;
+        let t = |v: serde_json::Value| super::admin_error_text(&v).map(str::to_string);
+        assert_eq!(
+            t(json!({"error": "unauthorized", "message": "sign in"})),
+            Some("sign in".into())
+        );
+        assert_eq!(
+            t(json!({"applied": false, "error": "refused"})),
+            Some("refused".into())
+        );
+        assert_eq!(t(json!({"ok": false})), None);
+    }
+
     use super::*;
 
     #[test]

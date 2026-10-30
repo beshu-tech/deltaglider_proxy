@@ -223,7 +223,10 @@ async fn oidc_login_against_a_private_idp_with_a_private_ca() {
     assert_eq!(r.status(), 422);
     let body: Value = r.json().await.unwrap();
     assert!(
-        body["error"].as_str().unwrap_or("").contains("allow_local"),
+        body["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("allow_local"),
         "{body}"
     );
 

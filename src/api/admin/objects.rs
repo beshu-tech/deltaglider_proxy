@@ -1597,7 +1597,7 @@ pub async fn download_zip(
         super::path_guard::check_bucket(b)
             .and_then(|()| super::path_guard::check_object_path(k))
             .map_err(AdminError::invalid)?;
-        super::admit_bucket::<super::Text>(&state, b)?;
+        super::admit_bucket(&state, b)?;
     }
     if parsed.len() > MAX_BULK_OBJECTS {
         return Err(AdminError::invalid(format!(

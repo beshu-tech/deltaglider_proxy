@@ -15,7 +15,7 @@ use axum::{
 use serde::Deserialize;
 use std::sync::Arc;
 
-use super::{AdminError, AdminState, JsonError};
+use super::{AdminError, AdminState};
 
 #[derive(Deserialize)]
 pub struct ScanUsageRequest {
@@ -34,7 +34,7 @@ pub async fn scan_usage(
     State(state): State<Arc<AdminState>>,
     AdminJson(req): AdminJson<ScanUsageRequest>,
 ) -> axum::response::Response {
-    let bucket = match req.bucket.admit::<JsonError>(&state) {
+    let bucket = match req.bucket.admit(&state) {
         Ok(b) => b,
         Err(e) => return e.into_response(),
     };
@@ -64,7 +64,7 @@ pub async fn scan_usage(
 pub async fn migrate_legacy(
     State(state): State<Arc<AdminState>>,
     AdminJson(req): AdminJson<MigrateRequest>,
-) -> Result<Json<serde_json::Value>, AdminError<JsonError>> {
+) -> Result<Json<serde_json::Value>, AdminError> {
     let bucket = req.bucket.admit(&state)?;
     let engine = state.s3_state.engine.load();
     let (migrated, skipped, errors) = engine
@@ -89,7 +89,7 @@ pub async fn get_usage(
     State(state): State<Arc<AdminState>>,
     AdminQuery(q): AdminQuery<UsageQuery>,
 ) -> impl IntoResponse {
-    let bucket = match q.bucket.admit::<JsonError>(&state) {
+    let bucket = match q.bucket.admit(&state) {
         Ok(b) => b,
         Err(e) => return e.into_response(),
     };
@@ -148,7 +148,7 @@ fn usage_json(bucket: &str, row: Option<crate::bucket_usage::BucketUsageRow>) ->
 pub async fn get_bucket_usage(
     State(state): State<Arc<AdminState>>,
     Path(bucket): Path<AdminBucket>,
-) -> Result<Json<serde_json::Value>, AdminError<JsonError>> {
+) -> Result<Json<serde_json::Value>, AdminError> {
     let bucket = bucket.admit(&state)?;
     let Some(usage) = state.s3_state.bucket_usage.as_ref() else {
         return Ok(Json(
@@ -165,7 +165,7 @@ pub async fn get_bucket_usage(
 /// one answer (the analytics dashboard), instead of one request per bucket.
 pub async fn get_all_bucket_usage(
     State(state): State<Arc<AdminState>>,
-) -> Result<Json<serde_json::Value>, AdminError<JsonError>> {
+) -> Result<Json<serde_json::Value>, AdminError> {
     all_usage_json(&state.s3_state)
         .map(Json)
         .map_err(AdminError::internal)
@@ -203,7 +203,7 @@ fn all_usage_json(s3_state: &crate::api::handlers::AppState) -> Result<serde_jso
 pub async fn refresh_bucket_usage(
     State(state): State<Arc<AdminState>>,
     AdminQuery(q): AdminQuery<UsageQuery>,
-) -> Result<Json<serde_json::Value>, AdminError<JsonError>> {
+) -> Result<Json<serde_json::Value>, AdminError> {
     let bucket = q.bucket.admit(&state)?;
     if state.s3_state.bucket_usage.is_none() {
         return Ok(Json(

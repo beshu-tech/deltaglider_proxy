@@ -1558,7 +1558,7 @@ async fn bootstrap_credentials_are_removed_explicitly_and_never_leave_auth_off()
     let r = remove().send().await.unwrap();
     assert_eq!(r.status(), StatusCode::CONFLICT);
     let body: serde_json::Value = r.json().await.unwrap();
-    assert!(body["error"].as_str().unwrap().contains("IAM"), "{body}");
+    assert!(body["message"].as_str().unwrap().contains("IAM"), "{body}");
 
     // "Clear both fields" through the field-level PATCH is refused too.
     let r = admin

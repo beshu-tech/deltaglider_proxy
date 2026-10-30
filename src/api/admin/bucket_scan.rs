@@ -665,7 +665,7 @@ pub async fn get_scan_status(
 ) -> axum::response::Response {
     let scanner = &state.bucket_scanner;
     if let Some(bucket) = q.bucket {
-        let bucket = match bucket.admit::<super::JsonError>(&state) {
+        let bucket = match bucket.admit(&state) {
             Ok(b) => b,
             Err(e) => return e.into_response(),
         };
@@ -702,7 +702,7 @@ pub async fn get_scan_status(
 pub async fn post_scan_start(
     State(state): State<Arc<AdminState>>,
     AdminQuery(q): AdminQuery<BucketQuery>,
-) -> Result<Json<ScanProgress>, super::AdminError<super::JsonError>> {
+) -> Result<Json<ScanProgress>, super::AdminError> {
     let bucket = q.bucket.admit(&state)?;
     let rx = state
         .bucket_scanner
@@ -715,7 +715,7 @@ pub async fn post_scan_start(
 pub async fn post_scan_stop(
     State(state): State<Arc<AdminState>>,
     AdminQuery(q): AdminQuery<BucketQuery>,
-) -> Result<Json<serde_json::Value>, super::AdminError<super::JsonError>> {
+) -> Result<Json<serde_json::Value>, super::AdminError> {
     let bucket = q.bucket.admit(&state)?;
     let cancelled = state.bucket_scanner.cancel(&bucket);
     Ok(Json(serde_json::json!({ "cancelled": cancelled })))
@@ -726,7 +726,7 @@ pub async fn post_scan_stop(
 pub async fn delete_scan(
     State(state): State<Arc<AdminState>>,
     AdminQuery(q): AdminQuery<BucketQuery>,
-) -> Result<Json<serde_json::Value>, super::AdminError<super::JsonError>> {
+) -> Result<Json<serde_json::Value>, super::AdminError> {
     let bucket = q.bucket.admit(&state)?;
     let forgotten = state.bucket_scanner.forget(&bucket);
     Ok(Json(serde_json::json!({ "forgotten": forgotten })))
@@ -743,10 +743,7 @@ pub async fn get_scan_stream(
     State(state): State<Arc<AdminState>>,
     Extension(session): Extension<super::auth::AdminSessionCheck>,
     AdminQuery(q): AdminQuery<BucketQuery>,
-) -> Result<
-    Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>,
-    super::AdminError<super::JsonError>,
-> {
+) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, super::AdminError> {
     // Opening the stream STARTS a scan: the coordination bucket is refused
     // like POST scan/start (review B3).
     let bucket = q.bucket.admit(&state)?;

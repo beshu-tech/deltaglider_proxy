@@ -18,7 +18,7 @@ use axum::http::request::Parts;
 use axum::http::StatusCode;
 use serde::de::DeserializeOwned;
 
-use super::{AdminError, CodedJson};
+use super::AdminError;
 
 /// JSON body extractor: `axum::Json` with a JSON error body.
 pub struct AdminJson<T>(pub T);
@@ -27,7 +27,7 @@ pub struct AdminJson<T>(pub T);
 pub struct AdminQuery<T>(pub T);
 
 /// The rejection of both extractors.
-pub type AdminInputRejection = AdminError<CodedJson>;
+pub type AdminInputRejection = AdminError;
 
 /// Pure: the error code for an input-rule message. The path-guard rules
 /// (`path_guard::check_*`) start their messages with these phrases.

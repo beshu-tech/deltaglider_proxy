@@ -15,17 +15,20 @@ async function thrown(status: number, body: string, contentType = 'application/j
   throw new Error('throwApiError must throw');
 }
 
-test('the decision rides on the HTTP status, not the message text', async () => {
-  assert.equal(isSessionExpired(await thrown(401, '{"error":"unauthorized"}')), true);
+const body = (code: string, message: string) => JSON.stringify({ error: code, message });
+
+test('the decision rides on the HTTP status and the code, not the message text', async () => {
+  assert.equal(isSessionExpired(await thrown(401, body('unauthorized', 'sign in to use the admin API'))), true);
   // A message that merely CONTAINS "401" (a user id, a request id) is not expiry.
-  assert.equal(isSessionExpired(await thrown(404, '{"error":"user 4015 not found"}')), false);
-  assert.equal(isSessionExpired(await thrown(500, '{"error":"backend 401 unreachable"}')), false);
+  assert.equal(isSessionExpired(await thrown(404, body('not_found', 'user 4015 not found'))), false);
+  assert.equal(isSessionExpired(await thrown(503, body('unavailable', 'backend 401 unreachable'))), false);
   // "session" in the text of a non-auth failure must not log the user out.
-  assert.equal(isSessionExpired(await thrown(500, '{"error":"session store full"}')), false);
+  assert.equal(isSessionExpired(await thrown(409, body('conflict', 'session store full'))), false);
   // A browser-lift session on an admin route needs an admin sign-in.
-  assert.equal(isSessionExpired(await thrown(403, '{"error":"admin_session_required"}')), true);
-  // A plain permission denial is not expiry.
-  assert.equal(isSessionExpired(await thrown(403, '{"error":"access denied"}')), false);
+  assert.equal(isSessionExpired(await thrown(403, body('admin_session_required', 'sign in as an admin'))), true);
+  // A plain permission denial is not expiry, also when its text names the code.
+  assert.equal(isSessionExpired(await thrown(403, body('forbidden', 'access denied'))), false);
+  assert.equal(isSessionExpired(await thrown(403, body('forbidden', 'admin_session_required'))), false);
   // Non-API errors never count, whatever their text.
   assert.equal(isSessionExpired(new Error('failed (401)')), false);
   assert.equal(isSessionExpired('401'), false);
@@ -33,9 +36,9 @@ test('the decision rides on the HTTP status, not the message text', async () => 
 });
 
 test('the thrown message keeps its operator-facing shape', async () => {
-  const e = await thrown(401, '{"error":"unauthorized"}');
+  const e = await thrown(401, body('unauthorized', 'sign in to use the admin API'));
   assert.ok(e instanceof Error);
-  assert.equal(e.message, 'Load users failed (401): unauthorized');
+  assert.equal(e.message, 'Load users failed (401) [unauthorized]: sign in to use the admin API');
   assert.ok(e instanceof ApiError);
   assert.equal(e.status, 401);
 });
@@ -53,9 +56,35 @@ test('{error: <code>, message: <text>} keeps the code separate from the message'
     shaped.message,
     'Load users failed (400) [invalid_path]: dest_prefix: invalid path "../x/": \'.\' and \'..\' segments are not allowed',
   );
-  // A lone `error` still is the message (and the detail isSessionExpired reads).
-  const denial = (await thrown(403, '{"error":"admin_session_required"}')) as ApiError;
-  assert.equal(denial.detail, 'admin_session_required');
+  assert.equal(shaped.detail, 'dest_prefix: invalid path "../x/": \'.\' and \'..\' segments are not allowed');
+  // A lone `error` (the config write surfaces: `{ok: false, error}`) is the text.
+  const refusal = (await thrown(409, '{"ok":false,"error":"the section changed"}')) as ApiError;
+  assert.equal(refusal.code, undefined);
+  assert.equal(refusal.detail, 'the section changed');
+  assert.equal(refusal.message, 'Load users failed (409): the section changed');
+});
+
+test('a body that is not the admin JSON shape falls back to its text or the status hint', async () => {
+  // A reverse proxy in front of the proxy answers in HTML or plain text.
+  const html = (await thrown(502, '<html><body>Bad Gateway</body></html>', 'text/html')) as ApiError;
+  assert.equal(html.status, 502);
+  assert.equal(html.code, undefined);
+  assert.match(html.message, /^Load users failed \(502\): <html><body>Bad Gateway<\/body><\/html>$/);
+  const empty = (await thrown(504, '', 'text/plain')) as ApiError;
+  assert.match(empty.message, /Load users failed \(504\): Gateway timeout \(504\)/);
+  const tooLarge = (await thrown(413, '', 'text/html')) as ApiError;
+  assert.match(tooLarge.message, /Payload too large/);
+  // JSON without a string `error`/`message` keeps its own text.
+  const odd = (await thrown(400, '{"error":{"nested":true}}')) as ApiError;
+  assert.equal(odd.detail, '{"error":{"nested":true}}');
+  // An S3 XML error is never read as JSON (the unit project has no
+  // DOMParser, so its text stands in for <Message>).
+  const xml = (await thrown(
+    403,
+    '<?xml version="1.0"?><Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>',
+    'application/xml',
+  )) as ApiError;
+  assert.match(xml.detail ?? '', /Access Denied/);
 });
 
 test('source guard: no component classifies expiry on message text', async () => {
@@ -103,9 +132,9 @@ test('checkSession: "not valid" only for a real answer or an expired session', a
   assert.deepEqual(await core.checkSession(), { valid: true, admin_gui: true });
   stubFetch(200, { valid: false, admin_gui: false });
   assert.deepEqual(await core.checkSession(), { valid: false, admin_gui: false });
-  stubFetch(401, { error: 'unauthorized' });
+  stubFetch(401, { error: 'unauthorized', message: 'sign in' });
   assert.deepEqual(await core.checkSession(), { valid: false, admin_gui: false });
-  stubFetch(403, { error: 'admin_session_required' });
+  stubFetch(403, { error: 'admin_session_required', message: 'sign in as an admin' });
   assert.deepEqual(await core.checkSession(), { valid: false, admin_gui: false });
   // A gateway blip or a dropped connection is NOT "your session expired".
   for (const status of [500, 502, 503, 'network' as const]) {

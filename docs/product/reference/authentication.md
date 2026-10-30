@@ -193,7 +193,7 @@ The proxy answers `403 AccessDenied` to every S3 request to the coordination buc
 
 The S3 lockout counts only a request whose signature the proxy checked and refused. A request without credentials, with a malformed `Authorization` header, or with an unknown access key does not count, so anonymous traffic behind a shared load-balancer address cannot lock that address out.
 
-Admin-API errors are JSON, not XML: IAM mutations in declarative mode return `403 { "error": "iam_declarative" }`; admin endpoints without an AdminGui session return `403 { "error": "admin_session_required" }`. A locked-out admin sign-in (password, IAM keys, browser connect) answers `429` with `Retry-After` and `{ "error": "too_many_attempts", "message": "… Try again in N min.", "retry_after_secs": N }`. The single sign-on authorize and callback pages answer `429` with `Retry-After` and an error page that names the wait.
+Admin-API errors are JSON, not XML (see [Errors](admin-api.md#errors) for the body): IAM mutations in declarative mode return `403 { "error": "iam_declarative" }`; admin endpoints without an AdminGui session return `403 { "error": "admin_session_required" }`. A locked-out admin sign-in (password, IAM keys, browser connect) answers `429` with `Retry-After` and `{ "error": "too_many_attempts", "message": "… Try again in N min.", "retry_after_secs": N }`. The single sign-on authorize and callback pages answer `429` with `Retry-After` and an error page that names the wait.
 
 ## Related
 

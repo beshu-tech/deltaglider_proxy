@@ -108,6 +108,11 @@ pub async fn publish_encryption_witness(
             })),
         )),
         Err(PublishError::Refused(r)) => Err(super::AdminError::invalid(r.to_string())),
-        Err(PublishError::Failed(e)) => Err(super::AdminError::unavailable(e)),
+        Err(PublishError::Failed(e)) => {
+            tracing::warn!("encryption witness publish failed: {e}");
+            Err(super::AdminError::unavailable(
+                "the coordination bucket did not answer; the server log has the details",
+            ))
+        }
     }
 }

@@ -1,5 +1,5 @@
 // === Whoami / Login-as ===
-import { ApiError } from '../errorHandling';
+import { ApiError, parseErrorBody } from '../errorHandling';
 import { adminFetch, loginFailureFromResponse, safeJson, signInRequest } from './core';
 import type { IamPermission } from './users';
 
@@ -110,8 +110,7 @@ export async function browserSessionConnect(req: {
   if (res.status === 429) return { ok: false, error: await loginFailureFromResponse(res) };
   let error = 'Could not create browser session';
   try {
-    const data = (await res.json()) as { error?: string };
-    if (data?.error) error = data.error;
+    error = parseErrorBody(await res.json()).message ?? error;
   } catch {
     /* keep generic */
   }
@@ -133,8 +132,7 @@ export async function openBrowserConnect(req: {
   if (res.status === 429) return { ok: false, error: await loginFailureFromResponse(res) };
   let error = 'Could not start open browser session';
   try {
-    const data = (await res.json()) as { error?: string };
-    if (data?.error) error = data.error;
+    error = parseErrorBody(await res.json()).message ?? error;
   } catch {
     /* keep generic */
   }

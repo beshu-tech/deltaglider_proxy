@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::iam::{normalize_permissions, validate_permissions, Group, Permission};
 
 use super::users::rebuild_iam_index;
-use super::{audit_log, next_copy_name, trigger_config_sync, AdminError, AdminState, Scrubbed};
+use super::{audit_log, next_copy_name, trigger_config_sync, AdminError, AdminState};
 
 #[derive(Deserialize)]
 pub struct CreateGroupRequest {
@@ -48,7 +48,7 @@ pub struct AddGroupMemberRequest {
 /// GET /api/admin/groups — list all groups.
 pub async fn list_groups(
     State(state): State<Arc<AdminState>>,
-) -> Result<Json<Vec<Group>>, AdminError<Scrubbed>> {
+) -> Result<Json<Vec<Group>>, AdminError> {
     let db = match state.config_db.as_ref() {
         Some(db) => db,
         None => return Ok(Json(vec![])),
@@ -65,7 +65,7 @@ pub async fn create_group(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     AdminJson(body): AdminJson<CreateGroupRequest>,
-) -> Result<(StatusCode, Json<Group>), AdminError<Scrubbed>> {
+) -> Result<(StatusCode, Json<Group>), AdminError> {
     let db = state
         .config_db
         .as_ref()
@@ -138,7 +138,7 @@ pub async fn clone_group(
     axum::extract::Path(group_id): axum::extract::Path<i64>,
     headers: HeaderMap,
     body: Option<Json<CloneGroupRequest>>,
-) -> Result<(StatusCode, Json<Group>), AdminError<Scrubbed>> {
+) -> Result<(StatusCode, Json<Group>), AdminError> {
     let db = state
         .config_db
         .as_ref()
@@ -188,7 +188,7 @@ pub async fn update_group(
     axum::extract::Path(group_id): axum::extract::Path<i64>,
     headers: HeaderMap,
     AdminJson(body): AdminJson<UpdateGroupRequest>,
-) -> Result<Json<Group>, AdminError<Scrubbed>> {
+) -> Result<Json<Group>, AdminError> {
     let db = state
         .config_db
         .as_ref()
@@ -244,7 +244,7 @@ pub async fn delete_group(
     State(state): State<Arc<AdminState>>,
     axum::extract::Path(group_id): axum::extract::Path<i64>,
     headers: HeaderMap,
-) -> Result<StatusCode, AdminError<Scrubbed>> {
+) -> Result<StatusCode, AdminError> {
     let db = state
         .config_db
         .as_ref()
@@ -270,7 +270,7 @@ pub async fn add_group_member(
     axum::extract::Path(group_id): axum::extract::Path<i64>,
     headers: HeaderMap,
     AdminJson(body): AdminJson<AddGroupMemberRequest>,
-) -> Result<StatusCode, AdminError<Scrubbed>> {
+) -> Result<StatusCode, AdminError> {
     let db = state
         .config_db
         .as_ref()
@@ -305,7 +305,7 @@ pub async fn remove_group_member(
     State(state): State<Arc<AdminState>>,
     axum::extract::Path((group_id, user_id)): axum::extract::Path<(i64, i64)>,
     headers: HeaderMap,
-) -> Result<StatusCode, AdminError<Scrubbed>> {
+) -> Result<StatusCode, AdminError> {
     let db = state
         .config_db
         .as_ref()

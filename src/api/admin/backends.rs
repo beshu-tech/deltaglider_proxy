@@ -298,7 +298,7 @@ pub async fn create_bucket_on_backend(
     if bucket.is_empty() {
         return Err(AdminError::invalid("Bucket name cannot be empty"));
     }
-    let bucket = super::admit_bucket::<super::Text>(&state, &bucket)?.into_string();
+    let bucket = super::admit_bucket(&state, &bucket)?.into_string();
     let backend_name = body.backend_name.trim().to_string();
     if backend_name.is_empty() {
         return Err(AdminError::invalid("backend_name cannot be empty"));

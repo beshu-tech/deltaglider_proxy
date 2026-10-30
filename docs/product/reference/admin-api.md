@@ -6,11 +6,48 @@ The admin UI and GitOps integrations talk to this surface. All mutation routes r
 
 A browser marks each request with a `Sec-Fetch-Site` header, and it adds an `Origin` header to cross-origin requests. The proxy refuses, with `403 cross_origin_request`, every `POST`, `PUT`, `PATCH` or `DELETE` under `/_/` that such a header marks as coming from another origin. The session cookie is `SameSite=Strict`, but that attribute does not stop a page on a sibling subdomain, because such a page belongs to the same site. A client that sends neither header, such as `curl` or `config apply`, is not a browser page, so the check lets it through. Development mode (`DGP_CORS_PERMISSIVE=true`) turns the check off.
 
-A request body or query string that the proxy cannot accept gets `400` with a JSON body `{"error": <code>, "message": <text>}`. The message names the field and the rule that the value breaks, for example `dest_prefix: invalid path "../x/": '.' and '..' segments are not allowed`. The code is `invalid_path` for an object key or prefix with a `.` or `..` segment, a leading `/` or a NUL character, `invalid_bucket` for a bucket name that breaks the S3 naming rules, and `invalid_request` for every other bad input, such as a missing field or a body that is not valid JSON. A body sent without the `application/json` content type gets `415` with the same JSON shape.
-
-An endpoint that needs the encrypted config DB (for example IAM users, groups, external auth, backup and declarative IAM) answers `503` with the message `config DB not available` when the instance has no config DB open. An endpoint that needs the jobs DB (the event log and the job actions) answers `503` with the message `jobs DB not available` when the instance has no jobs DB open. That is the case when the config DB key does not open the config DB, see [Config database key](authentication.md#config-database-key).
-
 This page documents only the admin endpoints. The S3-compatible API lives under `/`, and the AWS S3 documentation describes it.
+
+## Errors
+
+When an admin request fails, the response body is JSON with the content type `application/json` and two fields:
+
+```json
+{"error": "not_found", "message": "rule \"nightly\" not found"}
+```
+
+The `error` field holds a stable machine code, and the `message` field holds a sentence for a person to read. A script should decide on the HTTP status and on `error`, and it should show `message` without parsing it, because the wording of a message can change between releases. The `error` field holds the code and not the text because clients already matched on codes such as `iam_declarative` and `admin_session_required` in that field.
+
+Most errors carry the code of their status:
+
+| Status | `error` |
+|---|---|
+| `400` | `invalid_request` |
+| `401` | `unauthorized` |
+| `403` | `forbidden` |
+| `404` | `not_found` |
+| `409` | `conflict` |
+| `412` | `precondition_failed` |
+| `413` | `payload_too_large` |
+| `415` | `unsupported_media_type` |
+| `422` | `unprocessable` |
+| `429` | `rate_limited` |
+| `503` | `unavailable` |
+| any other `5xx` | `internal` |
+
+Some refusals carry a more specific code, so that a client can tell them apart from other errors with the same status: `invalid_path` and `invalid_bucket` (see below), `cross_origin_request` (`403`), `iam_declarative` (`403`), `admin_session_required` (`403`, a file-browser session on an admin route), and `too_many_attempts` (`429`, a sign-in lockout; this body also carries `retry_after_secs`).
+
+A server error never sends the text of the underlying failure, because that text can hold internal details such as database errors or file paths. The proxy writes the detail to its log, and the response is `{"error": "internal", "message": "internal server error; the server log has the details"}` with the original status. A few server errors carry a message that the proxy writes for the operator instead of the generic one. A `503` with the code `unavailable` says what is unavailable, for example `config DB not available` or a backend that the health check closed. A `500` can say what failed and what state it left, for example that a rule delete could not be saved to the config file and that nothing changed. These messages never quote the underlying error.
+
+Some endpoints answer with a body of their own, which the sections below describe. The config write endpoints answer a refusal with `{success: false, error}` (`PUT /_/api/admin/config` and the backend endpoints), `{ok: false, error}` (the section endpoints, validate and `PUT /_/api/admin/password`) or `{applied: false, error}` (`POST /_/api/admin/config/apply`). In those bodies, `error` holds the text of the refusal and there is no `message` field. A backup import answers a failed stage with `{error, stage, context, detail}`, and `POST /_/api/admin/config/sync-now` answers with `{downloaded, status}`. A request that never reaches the proxy can fail with a body that a reverse proxy wrote, for example an HTML page with `413`, `502` or `504`.
+
+### Bad input
+
+A request body or query string that the proxy cannot accept gets `400` with the error body. The message names the field and the rule that the value breaks, for example `dest_prefix: invalid path "../x/": '.' and '..' segments are not allowed`. The code is `invalid_path` for an object key or prefix with a `.` or `..` segment, a leading `/` or a NUL character, `invalid_bucket` for a bucket name that breaks the S3 naming rules, and `invalid_request` for every other bad input, such as a missing field or a body that is not valid JSON. A body sent without the `application/json` content type gets `415` with the same JSON shape.
+
+### Unavailable databases
+
+An endpoint that needs the encrypted config DB (for example IAM users, groups, external auth, backup and declarative IAM) answers `503 unavailable` with the message `config DB not available` when the instance has no config DB open. An endpoint that needs the jobs DB (the event log and the job actions) answers `503 unavailable` with the message `jobs DB not available` when the instance has no jobs DB open. That is the case when the config DB key does not open the config DB, see [Config database key](authentication.md#config-database-key).
 
 ## Authentication and session
 
@@ -138,7 +175,7 @@ A change of a bucket's encryption is a storage-section update (`PUT /_/api/admin
 
 ## IAM (gated by `iam_mode`)
 
-`POST`/`PUT`/`DELETE` return `403 { "error": "iam_declarative" }` when `access.iam_mode: declarative`. Reads stay open for diagnostics.
+`POST`/`PUT`/`DELETE` return `403` with `{"error": "iam_declarative", "message": <text>}` when `access.iam_mode: declarative`. Reads stay open for diagnostics.
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -158,7 +195,7 @@ A change of a bucket's encryption is a storage-section update (`PUT /_/api/admin
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` / `POST` | `/_/api/admin/ext-auth/providers` | List / create (`422` with `{error}` when the issuer URL or `extra_config` is invalid) |
+| `GET` / `POST` | `/_/api/admin/ext-auth/providers` | List / create (`422 unprocessable` when the issuer URL or `extra_config` is invalid; the message names the problem) |
 | `PUT` / `DELETE` | `/_/api/admin/ext-auth/providers/:id` | Update / delete |
 | `POST` | `/_/api/admin/ext-auth/providers/:id/test` | Test a saved provider: fetch its `.well-known` discovery document (not gated) |
 | `POST` | `/_/api/admin/ext-auth/providers/test` | Test a provider that is not saved yet; the body is the provider form (not gated) |

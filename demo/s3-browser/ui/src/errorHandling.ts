@@ -1,9 +1,20 @@
-type JsonErrorShape = {
-  error?: string;
-  message?: string;
-  code?: string;
-  details?: string;
-};
+/**
+ * An admin JSON error body. The admin error type always sends
+ * `{error: <code>, message: <text>}`. The config write surfaces
+ * (`{ok|success|applied: false, error}`) and the backup import send the
+ * text in `error` and no `message`.
+ */
+type JsonErrorBody = { error?: unknown; message?: unknown };
+
+/** Pure: the code and the text of an admin JSON error body. */
+export function parseErrorBody(data: unknown): { code?: string; message?: string } {
+  if (!data || typeof data !== 'object') return {};
+  const { error, message } = data as JsonErrorBody;
+  const err = typeof error === 'string' && error ? error : undefined;
+  const msg = typeof message === 'string' && message ? message : undefined;
+  if (msg) return { code: err, message: msg };
+  return { message: err };
+}
 
 function statusHint(status: number): string {
   switch (status) {
@@ -63,16 +74,8 @@ async function readResponseBodyMessage(res: Response): Promise<{ code?: string; 
 
   if (ct.includes('application/json')) {
     try {
-      const data = JSON.parse(body) as JsonErrorShape;
-      // `{error: <code>, message: <text>}`: the text is the message and the
-      // short `error` is the code. A lone `error` stays the message.
-      if (data.error && data.message) {
-        return { code: data.code || data.error, message: data.message };
-      }
-      return {
-        code: data.code,
-        message: data.error || data.message || data.details || trimOneLine(body),
-      };
+      const parsed = parseErrorBody(JSON.parse(body));
+      return { code: parsed.code, message: parsed.message || trimOneLine(body) };
     } catch {
       return { message: trimOneLine(body) };
     }
@@ -97,7 +100,7 @@ async function readResponseBodyMessage(res: Response): Promise<{ code?: string; 
 export class ApiError extends Error {
   readonly status: number;
   readonly code?: string;
-  /** The server's error string (JSON `error`/`message`), when it sent one. */
+  /** The server's error text (JSON `message`, or a lone `error`), when it sent one. */
   readonly detail?: string;
 
   constructor(message: string, status: number, code?: string, detail?: string) {
@@ -127,11 +130,11 @@ export async function throwApiError(res: Response, context: string): Promise<nev
 /**
  * THE rule for "send the user back to sign-in": a 401, or a 403 whose body is
  * `admin_session_required` (a browser-only session on an admin route).
- * Decided on the status and the server's error string, never on message text.
+ * Decided on the status and the error code, never on message text.
  */
 export function isSessionExpired(err: unknown): boolean {
   if (!(err instanceof ApiError)) return false;
-  return err.status === 401 || (err.status === 403 && err.detail === 'admin_session_required');
+  return err.status === 401 || (err.status === 403 && err.code === 'admin_session_required');
 }
 
 function stringifyUnknown(err: unknown): string {

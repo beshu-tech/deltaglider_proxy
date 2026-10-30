@@ -2,32 +2,26 @@
 
 //! The admin API's error type.
 //!
-//! An [`AdminError`] is a status and a message. The body shape is a type
-//! parameter, because the admin API answers errors in three shapes and a
-//! client sees the shape of the handler it calls:
+//! An [`AdminError`] is a status, a stable machine code and a message. It
+//! has one body, `{"error": <code>, "message": <text>}`, with
+//! `Content-Type: application/json`.
 //!
-//! - [`Text`] (default): `text/plain` body with the message — the shape of
-//!   the former `(StatusCode, String)` handlers.
-//! - [`Scrubbed`]: a client error (4xx) is `{"error": <message>}`, so the
-//!   UI shows why the request was refused; a server error (5xx) is the
-//!   status only, and the message goes to the log, not to the client.
-//!   (It replaces the former `Bare`, which sent an empty body also for a
-//!   4xx: the validation text never reached the UI.)
+//! `error` carries the code, not the text: the codes that clients match
+//! on (`iam_declarative`, `admin_session_required`, `csrf_rejected`,
+//! `invalid_path`, ...) were already in `error`, and a client that shows
+//! only `error` still shows a stable word. The text is in `message`.
 //!
-//! No shape sends an empty body for a 4xx
-//! (`no_shape_sends_an_empty_client_error`).
-//! - [`JsonError`]: `{"error": <message>}` — the former
-//!   `(StatusCode, Json(json!({"error": ..})))` handlers.
-//! - [`CodedJson`]: `{"error": <code>, "message": <message>}` — a machine
-//!   code plus the human text (CSRF refusal, declarative-IAM gate, bad
-//!   request input). Built with [`AdminError::coded`].
+//! A server error (5xx) never sends its text: the detail goes to the log,
+//! and the body is `{"error": "internal", "message": <generic>}`. Two
+//! constructors take a message written for the client instead:
+//! [`AdminError::unavailable`] (a backend that the health check closed, no
+//! config DB) and [`AdminError::internal_explained`] (what failed and what
+//! state it left; the detail still goes to the log only).
 //!
 //! `From<ConfigDbError>` is the one mapping of a config-DB error to a
 //! status (missing row and FOREIGN KEY failure 404, UNIQUE violation 409,
 //! the rest 500), so a handler forwards a DB error with `?` and cannot pick
 //! a status by hand.
-
-use std::marker::PhantomData;
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -35,74 +29,71 @@ use axum::response::{IntoResponse, Response};
 use crate::config_db::ConfigDbError;
 use crate::storage::StorageError;
 
-/// How an [`AdminError`] renders its body.
-pub trait ErrorBody {
-    fn render(status: StatusCode, code: &'static str, message: String) -> Response;
-}
+/// The code of every scrubbed server error.
+pub(crate) const INTERNAL_CODE: &str = "internal";
 
-/// `text/plain` body with the message.
-pub struct Text;
-/// 4xx: `{"error": <message>}`; 5xx: status only, message logged.
-pub struct Scrubbed;
-/// `{"error": <message>}`.
-pub struct JsonError;
-/// `{"error": <code>, "message": <message>}`.
-pub struct CodedJson;
+/// The message of every scrubbed server error.
+pub(crate) const INTERNAL_MESSAGE: &str = "internal server error; the server log has the details";
 
-impl ErrorBody for Text {
-    fn render(status: StatusCode, _code: &'static str, message: String) -> Response {
-        (status, message).into_response()
+/// Pure: the code of an error built without one.
+pub(crate) fn code_for_status(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST => "invalid_request",
+        StatusCode::UNAUTHORIZED => "unauthorized",
+        StatusCode::FORBIDDEN => "forbidden",
+        StatusCode::NOT_FOUND => "not_found",
+        StatusCode::METHOD_NOT_ALLOWED => "method_not_allowed",
+        StatusCode::CONFLICT => "conflict",
+        StatusCode::GONE => "gone",
+        StatusCode::PRECONDITION_FAILED => "precondition_failed",
+        StatusCode::PAYLOAD_TOO_LARGE => "payload_too_large",
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => "unsupported_media_type",
+        StatusCode::UNPROCESSABLE_ENTITY => "unprocessable",
+        StatusCode::PRECONDITION_REQUIRED => "precondition_required",
+        StatusCode::TOO_MANY_REQUESTS => "rate_limited",
+        StatusCode::SERVICE_UNAVAILABLE => "unavailable",
+        s if s.is_server_error() => INTERNAL_CODE,
+        _ => "invalid_request",
     }
 }
 
-impl ErrorBody for Scrubbed {
-    fn render(status: StatusCode, code: &'static str, message: String) -> Response {
-        if status.is_server_error() {
-            tracing::warn!("admin API {status}: {message}");
-            return status.into_response();
-        }
-        JsonError::render(status, code, message)
-    }
-}
-
-impl ErrorBody for JsonError {
-    fn render(status: StatusCode, _code: &'static str, message: String) -> Response {
-        (status, axum::Json(serde_json::json!({ "error": message }))).into_response()
-    }
-}
-
-impl ErrorBody for CodedJson {
-    fn render(status: StatusCode, code: &'static str, message: String) -> Response {
-        (
-            status,
-            axum::Json(serde_json::json!({ "error": code, "message": message })),
-        )
-            .into_response()
-    }
-}
-
-/// An admin API error; see the module docs for the body shapes.
-pub struct AdminError<B: ErrorBody = Text> {
+/// An admin API error; see the module docs for the body.
+pub struct AdminError {
     status: StatusCode,
-    /// The machine code; only [`CodedJson`] renders it.
     code: &'static str,
     message: String,
-    body: PhantomData<B>,
+    /// A 5xx whose message is written for the client
+    /// ([`AdminError::unavailable`]). Every other 5xx is scrubbed.
+    public: bool,
 }
 
-impl<B: ErrorBody> AdminError<B> {
-    /// Any status. Prefer the named constructors below.
+impl AdminError {
+    /// Any status, with the code of the status. Prefer the named
+    /// constructors below. The message of a 5xx goes to the log only.
     pub(crate) fn status(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,
-            code: GENERIC_CODE,
+            code: code_for_status(status),
             message: message.into(),
-            body: PhantomData,
+            public: false,
         }
     }
 
-    /// 404.
-    pub(crate) fn not_found(message: impl Into<String>) -> Self {
+    /// A specific machine code, for a refusal that a client tells apart
+    /// from the other errors of its status.
+    pub(crate) fn coded(
+        code: &'static str,
+        status: StatusCode,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            code,
+            ..Self::status(status, message)
+        }
+    }
+
+    /// 404 (public: the binary answers an unmatched admin path with it).
+    pub fn not_found(message: impl Into<String>) -> Self {
         Self::status(StatusCode::NOT_FOUND, message)
     }
 
@@ -121,14 +112,33 @@ impl<B: ErrorBody> AdminError<B> {
         Self::status(StatusCode::FORBIDDEN, message)
     }
 
-    /// 500.
-    pub(crate) fn internal(message: impl Into<String>) -> Self {
-        Self::status(StatusCode::INTERNAL_SERVER_ERROR, message)
+    /// 500. The detail goes to the log; the client gets [`INTERNAL_MESSAGE`].
+    pub(crate) fn internal(detail: impl Into<String>) -> Self {
+        Self::status(StatusCode::INTERNAL_SERVER_ERROR, detail)
     }
 
-    /// 503.
+    /// 500 with a message written for the client (what failed and what
+    /// state it left); `detail` goes to the log only.
+    pub(crate) fn internal_explained(
+        message: impl Into<String>,
+        detail: impl std::fmt::Display,
+    ) -> Self {
+        let message = message.into();
+        tracing::warn!("admin API 500: {message}: {detail}");
+        Self {
+            public: true,
+            ..Self::internal(message)
+        }
+    }
+
+    /// 503 with a message that the client reads. Write it for the
+    /// operator; never pass the text of a dependency's error (log it and
+    /// use [`AdminError::internal`]).
     pub(crate) fn unavailable(message: impl Into<String>) -> Self {
-        Self::status(StatusCode::SERVICE_UNAVAILABLE, message)
+        Self {
+            public: true,
+            ..Self::status(StatusCode::SERVICE_UNAVAILABLE, message)
+        }
     }
 
     /// 503 "config DB not available": the answer of a handler that needs
@@ -145,30 +155,33 @@ impl<B: ErrorBody> AdminError<B> {
         self.status
     }
 
+    /// The message, also of a scrubbed 5xx (for the log, and for callers
+    /// that wrap the error in their own body).
     pub(crate) fn message(&self) -> &str {
         &self.message
     }
-}
 
-/// The code of an error built without one (a `?` on a DB or storage
-/// error into a [`CodedJson`] handler).
-const GENERIC_CODE: &str = "error";
+    /// The machine code that the client receives.
+    #[cfg(test)]
+    pub(crate) fn code(&self) -> &'static str {
+        self.wire().0
+    }
 
-impl AdminError<CodedJson> {
-    /// `{"error": code, "message": message}` with `status`.
-    pub(crate) fn coded(
-        code: &'static str,
-        status: StatusCode,
-        message: impl Into<String>,
-    ) -> Self {
-        Self {
-            code,
-            ..Self::status(status, message)
+    fn scrubbed(&self) -> bool {
+        self.status.is_server_error() && !self.public
+    }
+
+    /// Pure: the `(code, message)` that the client receives.
+    fn wire(&self) -> (&'static str, &str) {
+        if self.scrubbed() {
+            (INTERNAL_CODE, INTERNAL_MESSAGE)
+        } else {
+            (self.code, &self.message)
         }
     }
 }
 
-impl<B: ErrorBody> std::fmt::Debug for AdminError<B> {
+impl std::fmt::Debug for AdminError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AdminError")
             .field("status", &self.status)
@@ -178,19 +191,27 @@ impl<B: ErrorBody> std::fmt::Debug for AdminError<B> {
     }
 }
 
-impl<B: ErrorBody> std::fmt::Display for AdminError<B> {
+impl std::fmt::Display for AdminError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.status, self.message)
     }
 }
 
-impl<B: ErrorBody> IntoResponse for AdminError<B> {
+impl IntoResponse for AdminError {
     fn into_response(self) -> Response {
-        B::render(self.status, self.code, self.message)
+        if self.scrubbed() {
+            tracing::warn!("admin API {}: {}", self.status, self.message);
+        }
+        let (code, message) = self.wire();
+        (
+            self.status,
+            axum::Json(serde_json::json!({ "error": code, "message": message })),
+        )
+            .into_response()
     }
 }
 
-impl<B: ErrorBody> From<ConfigDbError> for AdminError<B> {
+impl From<ConfigDbError> for AdminError {
     fn from(e: ConfigDbError) -> Self {
         let status = db_error_status(&e);
         Self::status(status, db_error_message(status, &e))
@@ -199,7 +220,7 @@ impl<B: ErrorBody> From<ConfigDbError> for AdminError<B> {
 
 /// Pure: the message of a config-DB error. A SQLite failure that is the
 /// caller's (404, 409) is said in words, because the client shows it; the
-/// rest keeps the error's own text.
+/// rest keeps the error's own text (a 500, so only the log sees it).
 fn db_error_message(status: StatusCode, e: &ConfigDbError) -> String {
     match (status, e) {
         (StatusCode::CONFLICT, ConfigDbError::Sqlite(rusqlite::Error::SqliteFailure(_, msg))) => {
@@ -216,8 +237,8 @@ fn db_error_message(status: StatusCode, e: &ConfigDbError) -> String {
     }
 }
 
-/// A storage failure is the server's 500, with the error text.
-impl<B: ErrorBody> From<StorageError> for AdminError<B> {
+/// A storage failure is the server's 500; its text goes to the log.
+impl From<StorageError> for AdminError {
     fn from(e: StorageError) -> Self {
         Self::internal(e.to_string())
     }
@@ -250,7 +271,7 @@ fn db_error_status(e: &ConfigDbError) -> StatusCode {
 mod tests {
     use super::*;
 
-    async fn parts(r: Response) -> (StatusCode, Option<String>, Vec<u8>) {
+    async fn parts(r: Response) -> (StatusCode, Option<String>, serde_json::Value) {
         let status = r.status();
         let ct = r
             .headers()
@@ -258,129 +279,109 @@ mod tests {
             .map(|v| v.to_str().unwrap().to_string());
         let body = axum::body::to_bytes(r.into_body(), usize::MAX)
             .await
-            .unwrap()
-            .to_vec();
-        (status, ct, body)
+            .unwrap();
+        (status, ct, serde_json::from_slice(&body).unwrap())
     }
 
-    /// Each shape answers byte for byte what the legacy return type did:
-    /// status, content type and body.
+    const CLIENT_ERRORS: [StatusCode; 9] = [
+        StatusCode::BAD_REQUEST,
+        StatusCode::UNAUTHORIZED,
+        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
+        StatusCode::CONFLICT,
+        StatusCode::PRECONDITION_FAILED,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        StatusCode::TOO_MANY_REQUESTS,
+    ];
+
+    /// Guard: every client error (4xx) is the one JSON body with a code
+    /// and its message, so the UI can show why the request was refused.
     #[tokio::test]
-    async fn shapes_render_like_the_legacy_return_types() {
-        for status in [
-            StatusCode::BAD_REQUEST,
-            StatusCode::NOT_FOUND,
-            StatusCode::CONFLICT,
-            StatusCode::SERVICE_UNAVAILABLE,
-        ] {
-            let msg = "rule \"x\" not found".to_string();
+    async fn every_client_error_carries_its_code_and_message() {
+        for status in CLIENT_ERRORS {
+            let r = AdminError::status(status, "invalid permissions: x").into_response();
+            let (st, ct, body) = parts(r).await;
+            assert_eq!(st, status);
+            assert_eq!(ct.as_deref(), Some("application/json"));
             assert_eq!(
-                parts(AdminError::<Text>::status(status, msg.clone()).into_response()).await,
-                parts((status, msg.clone()).into_response()).await,
+                body,
+                serde_json::json!({
+                    "error": code_for_status(status),
+                    "message": "invalid permissions: x",
+                }),
+                "{status}"
             );
-            if status.is_client_error() {
-                assert_eq!(
-                    parts(AdminError::<Scrubbed>::status(status, msg.clone()).into_response())
-                        .await,
-                    parts(AdminError::<JsonError>::status(status, msg.clone()).into_response())
-                        .await,
-                    "a Scrubbed client error carries its message as JSON"
-                );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_coded_error_sends_its_code() {
+        let e = AdminError::coded("iam_declarative", StatusCode::FORBIDDEN, "edit the YAML");
+        assert_eq!(
+            parts(e.into_response()).await.2,
+            serde_json::json!({ "error": "iam_declarative", "message": "edit the YAML" })
+        );
+    }
+
+    /// A server error keeps its detail off the wire, whatever built it.
+    #[tokio::test]
+    async fn server_errors_send_no_detail() {
+        let detail = "sqlite: disk I/O at /var/x";
+        let scrubbed = serde_json::json!({ "error": "internal", "message": INTERNAL_MESSAGE });
+        for e in [
+            AdminError::internal(detail),
+            AdminError::status(StatusCode::SERVICE_UNAVAILABLE, detail),
+            AdminError::status(StatusCode::BAD_GATEWAY, detail),
+            AdminError::coded("x", StatusCode::INTERNAL_SERVER_ERROR, detail),
+            ConfigDbError::Other(detail.into()).into(),
+            StorageError::Other(detail.into()).into(),
+        ] {
+            let status = e.status_code();
+            let (st, _, body) = parts(e.into_response()).await;
+            assert_eq!(st, status);
+            assert_eq!(body, scrubbed);
+        }
+    }
+
+    /// The two 5xx constructors whose message the client reads.
+    #[tokio::test]
+    async fn written_server_messages_reach_the_client() {
+        let (st, _, body) = parts(AdminError::no_jobs_db().into_response()).await;
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body,
+            serde_json::json!({ "error": "unavailable", "message": "jobs DB not available" })
+        );
+        let e = AdminError::internal_explained("not saved (no change)", "EACCES /etc/x.yaml");
+        let (st, _, body) = parts(e.into_response()).await;
+        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body,
+            serde_json::json!({ "error": "internal", "message": "not saved (no change)" })
+        );
+    }
+
+    #[test]
+    fn every_status_has_a_snake_case_code() {
+        for n in 400u16..600 {
+            let Ok(status) = StatusCode::from_u16(n) else {
+                continue;
+            };
+            let code = code_for_status(status);
+            assert!(
+                !code.is_empty() && code.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{status}: {code:?}"
+            );
+            if status.is_server_error() && status != StatusCode::SERVICE_UNAVAILABLE {
+                assert_eq!(code, INTERNAL_CODE);
             }
-            assert_eq!(
-                parts(AdminError::<JsonError>::status(status, msg.clone()).into_response()).await,
-                parts(
-                    (
-                        status,
-                        axum::Json(serde_json::json!({ "error": msg.clone() }))
-                    )
-                        .into_response()
-                )
-                .await,
-            );
-        }
-    }
-
-    /// A Scrubbed server error keeps its detail off the wire.
-    #[tokio::test]
-    async fn scrubbed_server_errors_send_no_detail() {
-        for status in [
-            StatusCode::INTERNAL_SERVER_ERROR,
-            StatusCode::SERVICE_UNAVAILABLE,
-        ] {
-            let r = AdminError::<Scrubbed>::status(status, "sqlite: disk I/O at /var/x")
-                .into_response();
-            assert_eq!(parts(r).await, parts(status.into_response()).await);
-        }
-    }
-
-    /// Guard: every body shape carries the message of a client error
-    /// (4xx), so the UI can show why the request was refused. A shape that
-    /// sends an empty 4xx body fails here.
-    #[tokio::test]
-    async fn no_shape_sends_an_empty_client_error() {
-        async fn body_of<B: ErrorBody>(status: StatusCode) -> String {
-            let r = AdminError::<B>::status(status, "invalid permissions: x").into_response();
-            String::from_utf8(parts(r).await.2).unwrap()
-        }
-        for status in [
-            StatusCode::BAD_REQUEST,
-            StatusCode::UNAUTHORIZED,
-            StatusCode::FORBIDDEN,
-            StatusCode::NOT_FOUND,
-            StatusCode::CONFLICT,
-            StatusCode::UNPROCESSABLE_ENTITY,
-        ] {
-            for body in [
-                body_of::<Text>(status).await,
-                body_of::<Scrubbed>(status).await,
-                body_of::<JsonError>(status).await,
-                body_of::<CodedJson>(status).await,
-            ] {
-                assert!(
-                    body.contains("invalid permissions: x"),
-                    "{status}: body without the message: {body:?}"
-                );
-            }
-        }
-        // A new shape must join the list above.
-        let shapes = crate::source_scan::prod_sources("src")
-            .into_iter()
-            .map(|(_, text)| {
-                text.lines()
-                    .filter(|l| l.starts_with("impl ErrorBody for "))
-                    .count()
-            })
-            .sum::<usize>();
-        assert_eq!(shapes, 4, "add the new ErrorBody shape to this guard");
-    }
-
-    /// `CodedJson` answers what the hand-built `{error, message}` bodies
-    /// (CSRF, declarative gate, extractor rejection) did.
-    #[tokio::test]
-    async fn coded_json_renders_like_the_hand_built_bodies() {
-        for status in [StatusCode::BAD_REQUEST, StatusCode::FORBIDDEN] {
-            let e = AdminError::coded("iam_declarative", status, "edit the YAML");
-            assert_eq!(
-                parts(e.into_response()).await,
-                parts(
-                    (
-                        status,
-                        axum::Json(serde_json::json!({
-                            "error": "iam_declarative",
-                            "message": "edit the YAML",
-                        }))
-                    )
-                        .into_response()
-                )
-                .await,
-            );
         }
     }
 
     #[test]
     fn named_constructors_pick_their_status() {
-        type E = AdminError<Text>;
+        type E = AdminError;
         assert_eq!(E::not_found("").status_code(), StatusCode::NOT_FOUND);
         assert_eq!(E::conflict("").status_code(), StatusCode::CONFLICT);
         assert_eq!(E::invalid("").status_code(), StatusCode::BAD_REQUEST);
@@ -422,8 +423,8 @@ mod tests {
         );
     }
 
-    /// `?` on a DB error keeps the legacy `db_error_reply` answer: the
-    /// mapped status and the error's Display text.
+    /// `?` on a DB error keeps the mapped status and the error's text (a
+    /// 500 sends it to the log only).
     #[test]
     fn db_error_converts_to_its_status_and_text() {
         let e: AdminError = ConfigDbError::NotFound("provider 9".into()).into();
@@ -443,9 +444,10 @@ mod tests {
         );
         let e: AdminError = ConfigDbError::Sqlite(unique).into();
         assert_eq!(
-            (e.status_code(), e.message()),
+            (e.status_code(), e.code(), e.message()),
             (
                 StatusCode::CONFLICT,
+                "conflict",
                 "the name is already in use (UNIQUE constraint failed: groups.name)"
             )
         );
@@ -453,8 +455,9 @@ mod tests {
 
     #[test]
     fn storage_error_converts_to_a_500_with_its_text() {
-        let e: AdminError<JsonError> = StorageError::NotFound("k".into()).into();
+        let e: AdminError = StorageError::NotFound("k".into()).into();
         assert_eq!(e.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(e.code(), INTERNAL_CODE);
         assert_eq!(e.message(), StorageError::NotFound("k".into()).to_string());
     }
 

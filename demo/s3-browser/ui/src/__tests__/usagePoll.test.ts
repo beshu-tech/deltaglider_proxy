@@ -59,7 +59,7 @@ test('non-retryable errors stop at once', () => {
   const expired = usagePollStep(1, { error: new ApiError('Unauthorized', 401) });
   assert.deepEqual(expired, { kind: 'fail', error: 'Session expired — sign in again' });
   assert.equal(
-    kind(usagePollStep(1, { error: new ApiError('Forbidden', 403, undefined, 'admin_session_required') })),
+    kind(usagePollStep(1, { error: new ApiError('Forbidden', 403, 'admin_session_required', 'sign in as an admin') })),
     'fail',
   );
   assert.deepEqual(usagePollStep(1, { error: new ApiError('Bad bucket', 400) }), { kind: 'fail', error: 'Bad bucket' });

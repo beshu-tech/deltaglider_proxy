@@ -1237,7 +1237,10 @@ async fn delete_rule(
                 )
                 .await
                 .map_err(|e| {
-                    AdminError::unavailable(format!("could not take the rule lease: {e}"))
+                    tracing::warn!("rule '{name}' delete: could not take the rule lease: {e}");
+                    AdminError::unavailable(
+                        "could not take the rule lease; the server log has the details",
+                    )
                 })?;
                 if !held {
                     return Err(AdminError::conflict(format!(
@@ -1374,9 +1377,10 @@ async fn delete_rule_locked(
     match applied {
         Ok(_) => Ok(()),
         Err(HeldRefusal::Edit(e)) => Err(e),
-        Err(HeldRefusal::Persist { path, error }) => Err(AdminError::internal(format!(
-            "rule delete FAILED to persist to {path} (rolled back, no change): {error}"
-        ))),
+        Err(HeldRefusal::Persist { path, error }) => Err(AdminError::internal_explained(
+            "the rule delete could not be saved to the config file (rolled back, no change)",
+            format_args!("persist to {path}: {error}"),
+        )),
         Err(HeldRefusal::Pipeline(InternalRefusal::Invalid { status, error })) => {
             Err(AdminError::status(status, error))
         }

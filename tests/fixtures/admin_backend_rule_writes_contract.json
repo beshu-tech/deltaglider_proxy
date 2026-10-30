@@ -54,7 +54,10 @@
     "status": 409
   },
   "bucket_create_fails": {
-    "body": "Storage error: IO error: File exists (os error 17)",
+    "body": {
+      "error": "invalid_request",
+      "message": "Storage error: IO error: File exists (os error 17)"
+    },
     "status": 400
   },
   "bucket_create_ok": {
@@ -66,7 +69,10 @@
     "status": 200
   },
   "bucket_create_unknown_backend": {
-    "body": "Unknown backend 'ghost'",
+    "body": {
+      "error": "invalid_request",
+      "message": "Unknown backend 'ghost'"
+    },
     "status": 400
   },
   "rule_delete_lifecycle_ok": {
@@ -74,7 +80,10 @@
     "status": 204
   },
   "rule_delete_replication_missing": {
-    "body": "job not found",
+    "body": {
+      "error": "not_found",
+      "message": "job not found"
+    },
     "status": 404
   },
   "rule_delete_replication_ok": {

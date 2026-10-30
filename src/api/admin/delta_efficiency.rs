@@ -45,7 +45,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, warn};
 
-use super::{AdminError, AdminState, JsonError};
+use super::{AdminError, AdminState};
 use crate::api::handlers::AppState;
 use crate::types::{FileMetadata, StorageInfo};
 
@@ -579,7 +579,7 @@ pub async fn get_delta_efficiency(
     State(state): State<Arc<AdminState>>,
     AdminQuery(q): AdminQuery<EfficiencyQuery>,
 ) -> impl IntoResponse {
-    let bucket = match q.bucket.admit::<JsonError>(&state) {
+    let bucket = match q.bucket.admit(&state) {
         Ok(b) => b,
         Err(e) => return e.into_response(),
     };
@@ -647,7 +647,7 @@ pub async fn post_delta_efficiency_scan(
     State(state): State<Arc<AdminState>>,
     AdminJson(req): AdminJson<EfficiencyScanRequest>,
 ) -> axum::response::Response {
-    let bucket = match req.bucket.admit::<JsonError>(&state) {
+    let bucket = match req.bucket.admit(&state) {
         Ok(b) => b,
         Err(e) => return e.into_response(),
     };
@@ -732,7 +732,7 @@ pub struct VerifyRequest {
 pub async fn verify_delta_efficiency(
     State(state): State<Arc<AdminState>>,
     AdminJson(req): AdminJson<VerifyRequest>,
-) -> Result<Json<VerifyResponse>, AdminError<JsonError>> {
+) -> Result<Json<VerifyResponse>, AdminError> {
     let bucket = req.bucket.admit(&state)?;
     let engine = state.s3_state.engine.load_full();
     let scan = engine

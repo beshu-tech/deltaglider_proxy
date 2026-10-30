@@ -210,10 +210,9 @@ pub async fn run_now(
         Vec::new(),
     );
     if let Some(why) = check.gated() {
-        return Err(AdminError::status(
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("{why} — run the rule again when the backend recovers"),
-        ));
+        return Err(AdminError::unavailable(format!(
+            "{why} — run the rule again when the backend recovers"
+        )));
     }
 
     let Some(guard) = lifecycle::try_acquire_rule(&rule.name) else {

@@ -768,9 +768,12 @@ async fn rule_delete_that_cannot_persist_changes_nothing() {
         return;
     }
     assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+    assert_eq!(v["error"], "internal", "{v}");
+    let message = v["message"].as_str().unwrap();
+    assert!(message.contains("rolled back, no change"), "{v}");
     assert!(
-        v.as_str().unwrap().contains("rolled back, no change"),
-        "{v}"
+        !message.contains(&dir.display().to_string()),
+        "no path: {v}"
     );
     let jobs: Value = admin
         .get(format!("{ep}/_/api/admin/jobs"))
@@ -975,14 +978,14 @@ async fn groups_crud_members_clone_and_errors() {
     assert_eq!(code, StatusCode::BAD_REQUEST, "invalid action: {v}");
     // The refusal carries its reason, so the UI can show it.
     assert!(
-        v["error"]
+        v["message"]
             .as_str()
             .is_some_and(|e| e.starts_with("invalid permissions:")),
         "the 400 names the bad permission: {v}"
     );
     let (code, v) = json_of(create(json!({ "name": "" })).await.unwrap()).await;
     assert_eq!(code, StatusCode::BAD_REQUEST, "an empty group name: {v}");
-    assert_eq!(v["error"], "group name cannot be blank", "{v}");
+    assert_eq!(v["message"], "group name cannot be blank", "{v}");
 
     // Update.
     let put = |id: i64, body: Value| {
@@ -1281,7 +1284,7 @@ async fn users_rotate_clone_delete_and_empty_name() {
         )
         .await;
         assert_eq!(code, StatusCode::BAD_REQUEST, "user name {name:?}");
-        assert_eq!(v["error"], reason, "the 400 carries its reason: {v}");
+        assert_eq!(v["message"], reason, "the 400 carries its reason: {v}");
     }
     let policies: Value = admin
         .get(format!("{ep}/_/api/admin/policies"))
@@ -2089,8 +2092,8 @@ async fn a_provider_type_other_than_oidc_is_refused() {
 
 // ── Error body shapes ───────────────────────────────────────────────────
 
-/// What a client reads from an admin error: the SPA shows the JSON
-/// `error`, else the text body, else a hint for the bare status.
+/// What a client reads from an admin error. Every admin error is JSON
+/// `{error: <code>, message}`; the other variants catch a regression.
 #[derive(Debug, PartialEq)]
 enum ErrorBody {
     /// Status only: no body and no content type.
@@ -2123,16 +2126,15 @@ async fn error_body(resp: reqwest::Response) -> (StatusCode, ErrorBody) {
 }
 
 /// One error of each admin module, pinned by status, content type and
-/// body: a change to a handler's error type must not change what a client
-/// reads.
+/// body: every module answers the one admin error body.
 #[tokio::test]
 async fn admin_error_bodies_keep_their_shape() {
     let server = TestServer::filesystem().await;
     let ep = server.endpoint();
     let admin = admin_http_client(&ep).await;
     let api = |p: &str| format!("{ep}/_/api/admin{p}");
-    let text = |s: &str| ErrorBody::Text(s.to_string());
-    let err = |s: &str| ErrorBody::Json(json!({ "error": s }));
+    let err =
+        |code: &str, message: &str| ErrorBody::Json(json!({ "error": code, "message": message }));
 
     // Set-up for the conflict cases.
     for _ in 0..2 {
@@ -2145,21 +2147,22 @@ async fn admin_error_bodies_keep_their_shape() {
     }
 
     let cases: Vec<(&str, reqwest::RequestBuilder, StatusCode, ErrorBody)> = vec![
-        // groups / users / external auth: a client error carries its
-        // reason as JSON (an empty body left the UI with a generic hint).
         (
             "group duplicate",
             admin
                 .post(api("/groups"))
                 .json(&json!({ "name": "shape-dup" })),
             StatusCode::CONFLICT,
-            err("the name is already in use (UNIQUE constraint failed: groups.name)"),
+            err(
+                "conflict",
+                "the name is already in use (UNIQUE constraint failed: groups.name)",
+            ),
         ),
         (
             "group blank name",
             admin.post(api("/groups")).json(&json!({ "name": "" })),
             StatusCode::BAD_REQUEST,
-            err("group name cannot be blank"),
+            err("invalid_request", "group name cannot be blank"),
         ),
         (
             "user missing",
@@ -2167,7 +2170,7 @@ async fn admin_error_bodies_keep_their_shape() {
                 .put(api("/users/999999"))
                 .json(&json!({ "name": "x" })),
             StatusCode::NOT_FOUND,
-            err("not found"),
+            err("not_found", "not found"),
         ),
         (
             "user reserved name",
@@ -2175,63 +2178,61 @@ async fn admin_error_bodies_keep_their_shape() {
                 .post(api("/users"))
                 .json(&json!({ "name": "$x", "permissions": [] })),
             StatusCode::BAD_REQUEST,
-            err("user name cannot start with '$'"),
+            err("invalid_request", "user name cannot start with '$'"),
         ),
         (
             "mapping missing",
             admin.delete(api("/ext-auth/mappings/999999")),
             StatusCode::NOT_FOUND,
-            err("Not found: Mapping rule ID 999999"),
+            err("not_found", "Not found: Mapping rule ID 999999"),
         ),
         (
             "provider test missing",
             admin.post(api("/ext-auth/providers/999999/test")),
             StatusCode::NOT_FOUND,
-            err("Not found: Auth provider ID 999999"),
+            err("not_found", "Not found: Auth provider ID 999999"),
         ),
-        // event outbox: text.
         (
             "outbox bad status",
             admin.get(api("/event-outbox?status=bogus")),
             StatusCode::BAD_REQUEST,
-            text("unknown outbox status: bogus"),
+            err("invalid_request", "unknown outbox status: bogus"),
         ),
         (
             "outbox requeue missing",
             admin.post(api("/event-outbox/999999/requeue")),
             StatusCode::CONFLICT,
-            text("event is not failed or does not exist"),
+            err("conflict", "event is not failed or does not exist"),
         ),
-        // jobs / replication / lifecycle / maintenance: text.
         (
             "job id unknown",
             admin.post(api("/jobs/nope:x/pause")),
             StatusCode::NOT_FOUND,
-            text("job not found"),
+            err("not_found", "job not found"),
         ),
         (
             "job action unknown",
             admin.post(api("/jobs/replication:x/bogus")),
             StatusCode::NOT_FOUND,
-            text("unknown action 'bogus'"),
+            err("not_found", "unknown action 'bogus'"),
         ),
         (
             "replication rule missing",
             admin.post(api("/jobs/replication:missing/pause")),
             StatusCode::NOT_FOUND,
-            text("rule not found"),
+            err("not_found", "rule not found"),
         ),
         (
             "lifecycle rule missing",
             admin.post(api("/jobs/lifecycle:missing/run-now")),
             StatusCode::NOT_FOUND,
-            text("rule not found"),
+            err("not_found", "rule not found"),
         ),
         (
             "maintenance runs of a bad id",
             admin.get(api("/jobs/maintenance:abc/runs")),
             StatusCode::NOT_FOUND,
-            text("job not found"),
+            err("not_found", "job not found"),
         ),
         (
             "reencrypt without buckets",
@@ -2239,14 +2240,13 @@ async fn admin_error_bodies_keep_their_shape() {
                 .post(api("/jobs/reencrypt"))
                 .json(&json!({ "buckets": [] })),
             StatusCode::BAD_REQUEST,
-            text("no buckets given"),
+            err("invalid_request", "no buckets given"),
         ),
-        // backends / objects: text.
         (
             "backend missing",
             admin.post(api("/backends/nope/probe")),
             StatusCode::NOT_FOUND,
-            text("no backend named 'nope'"),
+            err("not_found", "no backend named 'nope'"),
         ),
         (
             "copy without items",
@@ -2254,20 +2254,19 @@ async fn admin_error_bodies_keep_their_shape() {
                 "source_bucket": "src", "dest_bucket": "dst", "items": []
             })),
             StatusCode::BAD_REQUEST,
-            text("no items to copy"),
+            err("invalid_request", "no items to copy"),
         ),
-        // sessions / savings / scanner: JSON.
         (
             "revoke-user without identity",
             admin.post(api("/sessions/revoke-user")).json(&json!({})),
             StatusCode::BAD_REQUEST,
-            ErrorBody::Json(json!({ "error": "identity (or access_key_id) is required" })),
+            err("invalid_request", "identity (or access_key_id) is required"),
         ),
         (
             "session missing",
             admin.delete(api("/sessions/nope")),
             StatusCode::NOT_FOUND,
-            ErrorBody::Json(json!({ "error": "no such session" })),
+            err("not_found", "no such session"),
         ),
     ];
     let mut wrong = Vec::new();
@@ -2281,7 +2280,7 @@ async fn admin_error_bodies_keep_their_shape() {
 }
 
 /// The session gates' error bodies: the SPA signs in again on a 401, or a
-/// 403 whose JSON `error` is `admin_session_required`.
+/// 403 whose code is `admin_session_required`.
 #[tokio::test]
 async fn session_gate_error_bodies_keep_their_shape() {
     let server = TestServer::filesystem().await;
@@ -2295,7 +2294,12 @@ async fn session_gate_error_bodies_keep_their_shape() {
         json!([{ "actions": ["read", "list"], "resources": ["*"] }]),
     )
     .await;
-    let unauthorized = || ErrorBody::Json(json!({ "error": "unauthorized" }));
+    let unauthorized = || {
+        ErrorBody::Json(json!({
+            "error": "unauthorized",
+            "message": "sign in to use the admin API",
+        }))
+    };
 
     let anon = reqwest::Client::builder().no_proxy().build().unwrap();
     for (what, req) in [
@@ -2331,7 +2335,10 @@ async fn session_gate_error_bodies_keep_their_shape() {
         got,
         (
             StatusCode::FORBIDDEN,
-            ErrorBody::Json(json!({ "error": "admin_session_required" }))
+            ErrorBody::Json(json!({
+                "error": "admin_session_required",
+                "message": "this session can use only the object browser; sign in as an admin to use the admin API",
+            }))
         )
     );
     let cleared = lift
@@ -2351,7 +2358,10 @@ async fn session_gate_error_bodies_keep_their_shape() {
         got,
         (
             StatusCode::NOT_FOUND,
-            ErrorBody::Json(json!({ "error": "no S3 credentials in this session" }))
+            ErrorBody::Json(json!({
+                "error": "not_found",
+                "message": "no S3 credentials in this session",
+            }))
         )
     );
 }

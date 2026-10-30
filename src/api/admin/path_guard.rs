@@ -22,10 +22,10 @@ pub struct AdminBucket(String);
 impl AdminBucket {
     /// Admit the bucket for this request: `403` for the coordination
     /// bucket, which no admin request may read or write.
-    pub(crate) fn admit<B: super::ErrorBody>(
+    pub(crate) fn admit(
         self,
         state: &super::AdminState,
-    ) -> Result<crate::bucket_policy::ClientBucket, super::AdminError<B>> {
+    ) -> Result<crate::bucket_policy::ClientBucket, super::AdminError> {
         super::admit_bucket(state, &self.0)
     }
 }

@@ -51,6 +51,8 @@ export type ImportIamMode = 'replace' | 'merge';
 
 interface ImportBackupErrorBody {
   error?: string;
+  /** The admin error body (`{error: <code>, message}`) of a refusal before the import. */
+  message?: string;
   stage?: string;
   context?: string;
   detail?: string;
@@ -64,6 +66,7 @@ export class ImportBackupError extends Error {
 
   constructor(status: number, response?: ImportBackupErrorBody, rawBody?: string) {
     const detail =
+      response?.message ||
       response?.error ||
       [response?.stage, response?.context, response?.detail].filter(Boolean).join(': ') ||
       rawBody ||

@@ -674,14 +674,13 @@ async fn static_or_fallback(Path(path): Path<String>) -> impl IntoResponse {
     }
 }
 
-/// JSON 404 for an unmatched admin/API path, any method. Never `index.html`,
-/// so API clients and scanners get an honest answer instead of a 200 HTML
-/// page; `no-store` so nothing in front caches it.
+/// The admin error 404 for an unmatched admin/API path, any method. Never
+/// `index.html`, so API clients and scanners get an honest answer instead
+/// of a 200 HTML page; `no-store` so nothing in front caches it.
 async fn api_not_found() -> Response {
     (
-        StatusCode::NOT_FOUND,
         [(header::CACHE_CONTROL, "no-store")],
-        Json(serde_json::json!({ "error": "not_found" })),
+        admin::AdminError::not_found("no admin API route matches this path"),
     )
         .into_response()
 }
