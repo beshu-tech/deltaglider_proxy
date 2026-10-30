@@ -154,6 +154,11 @@ export function ReadOnlyValue({ children, muted = false, testId }: { children: R
         borderRadius: 6,
         padding: '5px 11px',
         wordBreak: 'break-all',
+        // As wide as the value (a short value is not a full-width bar),
+        // never wider than the column.
+        display: 'inline-block',
+        minWidth: 180,
+        maxWidth: '100%',
       }}
     >
       {children}

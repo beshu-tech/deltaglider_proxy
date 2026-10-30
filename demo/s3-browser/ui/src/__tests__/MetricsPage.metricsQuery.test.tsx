@@ -59,3 +59,17 @@ test('scrapes every 5 s by default, and on Refresh now', async () => {
   await user.click(screen.getByRole('button', { name: 'Refresh now' }));
   await waitFor(() => expect(scrapes()).toHaveLength(3));
 });
+
+// UX harvest C34: "1 hits · 0 misses" and a "100.0 %" hit rate next to
+// "Too few lookups to judge the cache".
+test('too few cache lookups show no hit rate, in correct plurals', async () => {
+  http.on('GET', '/_/metrics', text([
+    'deltaglider_cache_hits_total 1',
+    'deltaglider_cache_misses_total 0',
+    '',
+  ].join('\n')));
+  renderWithQuery(<MetricsPage />);
+  expect(await screen.findByText('1 hit · 0 misses')).toBeInTheDocument();
+  expect(screen.getByText('Too few lookups to judge the cache yet')).toBeInTheDocument();
+  expect(screen.queryByText('100.0%')).toBeNull();
+});

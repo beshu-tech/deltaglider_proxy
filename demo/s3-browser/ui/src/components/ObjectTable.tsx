@@ -1,6 +1,6 @@
-import type { CSSProperties } from 'react';
+import type { CSSProperties, ReactNode } from 'react';
 import { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo, useId } from 'react';
-import { Table, Typography, Alert, Progress, Checkbox, theme, Button, Select } from 'antd';
+import { Table, Typography, Alert, Progress, Checkbox, theme, Button, Select, Tag } from 'antd';
 import { FolderOutlined, FileOutlined, LoadingOutlined, CalculatorOutlined, CloseCircleOutlined } from '@ant-design/icons';
 import type { S3Object } from '../types';
 import { formatBytes, relativeTime } from '../utils';
@@ -15,6 +15,8 @@ import { canRequestPrefixUsageScan, isVirtualFolderPrefix } from '../permissions
 import { usePersistedPageSize } from '../usePersistedPageSize';
 import { describeVisibleRange } from '../paginationLabels';
 import StorageTypeTag from './StorageTypeTag';
+import MiddleEllipsis from '../browser/MiddleEllipsis';
+import { storageChip } from '../deltaSummary';
 import { buildRows, sortRows, type BrowserRow, type SortColumn, type SortState } from '../browserNav';
 import { useIsNarrow } from '../useIsNarrow';
 
@@ -86,7 +88,7 @@ interface ObjectTableListing {
    *  auto-refresh reads page 1 only. Null = the folder fits one page. */
   restListedAt?: number | null;
   refreshing: boolean;
-  headCache: Record<string, { storageType?: string; storedSize?: number }>;
+  headCache: Record<string, { storageType?: string; storedSize?: number; isBaseline?: boolean }>;
   /** Folders implied by writable prefixes only (never scanned). */
   virtualFolders: string[];
 }
@@ -134,6 +136,12 @@ interface Props {
   folderSizes: ObjectTableFolderSizes;
   cursor?: ObjectTableCursor;
   isMobile: boolean;
+  /** Free space (px) kept under the rows: a floating bar sits there instead
+   *  of over the last row. */
+  reserveBottom?: number;
+  /** Shown in the footer after the range text (the bucket totals on a
+   *  narrow window, where the header has no room for them). */
+  footerExtra?: ReactNode;
 }
 
 type RowData = BrowserRow;
@@ -161,6 +169,9 @@ function FolderSizeCell({
   onCancelSize: (prefix: string) => void;
 }) {
   const { TEXT_SECONDARY, TEXT_MUTED } = useColors();
+  // While a scan runs the cell is a spinner; pointing at it (or focusing it)
+  // turns the spinner into the cancel icon. Both at once read as noise.
+  const [cancelShown, setCancelShown] = useState(false);
 
   if (isVirtual) {
     return (
@@ -182,15 +193,19 @@ function FolderSizeCell({
   if (sizeState?.loading) {
     return (
       <Button
-        title={sizeState.progress ? formatBytes(sizeState.progress.totalSize) + ' across ' + sizeState.progress.totalFiles.toLocaleString() + ' files so far...' : 'Starting...'}
+        title={`${sizeState.progress ? `${formatBytes(sizeState.progress.totalSize)} across ${sizeState.progress.totalFiles.toLocaleString()} files so far` : 'Counting'}. Click to stop.`}
+        aria-label="Stop counting the folder size"
         type="text"
         size="small"
-        icon={<CloseCircleOutlined />}
+        icon={cancelShown ? <CloseCircleOutlined /> : <LoadingOutlined />}
+        onMouseEnter={() => setCancelShown(true)}
+        onMouseLeave={() => setCancelShown(false)}
+        onFocus={() => setCancelShown(true)}
+        onBlur={() => setCancelShown(false)}
         onClick={(e) => { e.stopPropagation(); onCancelSize(folderPrefix); }}
         style={{ ...MONO_CELL_STYLE, fontSize: 11, color: TEXT_SECONDARY, padding: '0 4px', height: 'auto' }}
       >
-        <LoadingOutlined style={{ marginRight: 4 }} />
-        {sizeState.progress ? formatBytes(sizeState.progress.totalSize) : '...'}
+        {sizeState.progress ? formatBytes(sizeState.progress.totalSize) : null}
       </Button>
     );
   }
@@ -238,6 +253,8 @@ export default function ObjectTable({
   folderSizes: sizeProps,
   cursor,
   isMobile,
+  reserveBottom = 0,
+  footerExtra,
 }: Props) {
   const { objects, folders, prefix, isTruncated, restListedAt = null, refreshing, headCache, virtualFolders } = listing;
   const { inspected: selected, selectedKeys, onToggleKey, onToggleAll } = selection;
@@ -359,7 +376,7 @@ export default function ObjectTable({
     const el = scrollContainerRef.current;
     if (!el) return;
     // 39 thead + 48 pagination (when shown) + 44 status bar + 9 breathing room.
-    const CHROME_BELOW = multiPage ? 140 : 92;
+    const CHROME_BELOW = (multiPage ? 140 : 92) + reserveBottom;
     const measure = () => {
       // Clamp a negative top (window resized while the page is scrolled) so
       // the height stays viewport-bounded instead of growing by the scroll.
@@ -377,7 +394,7 @@ export default function ObjectTable({
       window.removeEventListener('resize', measure);
       ro.disconnect();
     };
-  }, [multiPage]);
+  }, [multiPage, reserveBottom]);
 
   function fileIconColor(name: string): string {
     const ext = name.split('.').pop()?.toLowerCase() || '';
@@ -485,10 +502,10 @@ export default function ObjectTable({
               className="btn-reset"
               title={record.name}
               onClick={() => guardedNavigate(record.key.replace('folder:', ''))}
-              style={{ fontWeight: 500, color: TEXT_PRIMARY, gap: 8, fontFamily: "var(--font-ui)" }}
+              style={{ fontWeight: 500, color: TEXT_PRIMARY, gap: 8, fontFamily: "var(--font-ui)", maxWidth: '100%', minWidth: 0 }}
             >
-              <FolderOutlined aria-hidden="true" style={{ color: ACCENT_BLUE, fontSize: 15 }} />
-              {record.name}
+              <FolderOutlined aria-hidden="true" style={{ color: ACCENT_BLUE, fontSize: 15, flexShrink: 0 }} />
+              <MiddleEllipsis text={record.name} title={false} />
               {isVirtualFolderPrefix(record.key.replace('folder:', ''), virtualFolders) ? (
                 <sup
                   title="Virtual folder from your permissions. It will become a real folder after upload."
@@ -502,11 +519,14 @@ export default function ObjectTable({
         }
         return (
           <span data-testid={`object-row-${record.name}`} title={record.name} style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-            <FileOutlined aria-hidden="true" style={{ color: fileIconColor(record.name), fontSize: 14 }} />
+            <FileOutlined aria-hidden="true" style={{ color: fileIconColor(record.name), fontSize: 14, flexShrink: 0 }} />
             <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, flex: 1, cursor: 'pointer' }}>
-              <span style={{ fontFamily: "var(--font-mono)", fontSize: 13, color: TEXT_PRIMARY, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {record.name}
-              </span>
+              {/* Cut in the middle: versions of one file differ at the end. */}
+              <MiddleEllipsis
+                text={record.name}
+                title={false}
+                style={{ fontFamily: "var(--font-mono)", fontSize: 13, color: TEXT_PRIMARY }}
+              />
               {sizeSubline && (
                 <span data-testid="object-size-subline" style={{ fontSize: 11, color: TEXT_MUTED, fontFamily: 'var(--font-ui)', lineHeight: 1.3 }}>
                   {formatBytes(record.size)}
@@ -547,7 +567,8 @@ export default function ObjectTable({
     {
       title: () => <span style={{ ...COL_HEADER_STYLE, color: TEXT_MUTED }}>Modified</span>,
       key: 'modified',
-      width: 200,
+      // "12 min ago" fits; the freed width goes to the name.
+      width: 130,
       responsive: ['lg'] as const,
       sorter: true,
       sortOrder: sortOrderFor('modified'),
@@ -570,10 +591,26 @@ export default function ObjectTable({
       responsive: ['sm'] as const,
       render: (_: unknown, record: RowData) => {
         if (record._isFolder) return null;
-        // From the listing; a row without facts shows the neutral tag.
+        // From the listing; a row without facts shows the neutral tag. The
+        // folder's baseline is "Baseline", as the inspector calls it.
+        const facts = headCache[record.key];
+        const chip = storageChip(facts?.storageType, Boolean(facts?.isBaseline));
+        if (chip.label === 'Baseline') {
+          return (
+            <Tag
+              title={chip.title}
+              style={{
+                background: 'transparent', border: `1px solid ${token.colorBorder}`, color: TEXT_MUTED,
+                borderRadius: 6, fontFamily: 'var(--font-mono)', fontSize: 11, fontWeight: 500,
+              }}
+            >
+              {chip.label}
+            </Tag>
+          );
+        }
         return (
           <StorageTypeTag
-            storageType={headCache[record.key]?.storageType}
+            storageType={facts?.storageType}
             colors={STORAGE_TYPE_COLORS}
             fallback={STORAGE_TYPE_DEFAULT}
           />
@@ -660,6 +697,7 @@ export default function ObjectTable({
             },
           })}
         />
+        {reserveBottom > 0 && <div aria-hidden="true" style={{ height: reserveBottom }} />}
       </div>
 
       {isTruncated && (
@@ -691,7 +729,8 @@ export default function ObjectTable({
           flexShrink: 0,
         }}
       >
-        <div role="status" aria-live="polite" style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+        <div role="status" aria-live="polite" style={{ minWidth: 0 }}>
           <Text style={{ fontSize: 12, color: TEXT_MUTED, fontFamily: 'var(--font-ui)', fontVariantNumeric: 'tabular-nums' }}>
             {describeVisibleRange(totalItems, currentPage, pageSize)}
             {restListedAt !== null && (
@@ -700,6 +739,8 @@ export default function ObjectTable({
               </span>
             )}
           </Text>
+        </div>
+        {footerExtra}
         </div>
         {/* The page size matters only when a folder can fill a page. */}
         {totalItems > PAGE_SIZE_OPTIONS[0] && (

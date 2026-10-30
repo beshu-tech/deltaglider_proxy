@@ -27,7 +27,7 @@
  * API).
  */
 import { useEffect, useMemo, useState } from 'react';
-import { useForm, Controller } from 'react-hook-form';
+import { useForm, useController, Controller } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import {
   Modal,
@@ -121,6 +121,8 @@ export default function AdmissionBlockEditorModal({
     defaultValues: defaults,
     mode: 'onChange',
   });
+
+  const { field: nameField } = useController({ control, name: 'name' });
 
   // Re-seed when the modal reopens with a different initial block.
   useEffect(() => {
@@ -228,27 +230,18 @@ export default function AdmissionBlockEditorModal({
         label="Name"
         yamlPath="admission.blocks[].name"
         helpText="A unique name. Letters, digits, and the characters _ : . - only."
+        error={errors.name?.message}
         style={FIELD_GAP}
       >
-        <Controller
-          control={control}
-          name="name"
-          render={({ field }) => (
-            <Input
-              placeholder="e.g. deny-known-bad-ips"
-              status={errors.name ? 'error' : undefined}
-              value={field.value ?? ''}
-              onChange={(e) => field.onChange(e.target.value)}
-              onBlur={field.onBlur}
-              ref={field.ref}
-            />
-          )}
+        {/* The Input is FormField's direct child, so it gets the label, the
+            error's aria-describedby, aria-invalid and the red border. */}
+        <Input
+          placeholder="e.g. deny-known-bad-ips"
+          value={nameField.value ?? ''}
+          onChange={(e) => nameField.onChange(e.target.value)}
+          onBlur={nameField.onBlur}
+          ref={nameField.ref}
         />
-        {errors.name && (
-          <Text type="danger" style={{ fontSize: 12 }}>
-            {errors.name.message}
-          </Text>
-        )}
       </FormField>
 
       {/* Match: every condition in one card. Empty = matches everything. */}
@@ -480,3 +473,4 @@ export default function AdmissionBlockEditorModal({
     </Modal>
   );
 }
+

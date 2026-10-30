@@ -23,18 +23,24 @@
  * "Off" on an encrypting backend asks for a confirmation before it sends
  * the downgrade header.
  *
- * "Create and open settings" (admin only) creates the bucket the same way,
- * then opens its card on the Buckets page: compression, quota, public
- * access and the rest of its settings.
+ * "Create and configure…" (admin only, a link beside the one primary
+ * Create) creates the bucket the same way, then opens its card on the
+ * Buckets page: compression, quota, public access and the rest.
+ *
+ * The buttons stay enabled; Create checks the form and says what is
+ * missing under the field (a disabled button gave no reason). A name that
+ * already exists is an error under the name, never a "created" toast.
  */
 import { useEffect, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Alert, Button, Modal, Input, Radio, Select, Typography, message } from 'antd';
+import { Button, Modal, Input, Radio, Select, Typography, message } from 'antd';
 import type { InputRef } from 'antd';
 import { createBucket } from '../s3client';
 import { getBackends, getBucketEncryptionPreview } from '../adminApi';
 import type { BackendInfo } from '../adminApi';
-import { normalizeUiError } from '../errorHandling';
+import { ApiError } from '../errorHandling';
+import { plainError, type PlainError } from '../adminApi';
+import PlainErrorAlert from './PlainErrorAlert';
 import { bucketNameError } from '../bucketName';
 import { encryptionWord } from '../backendFacts';
 import { describeBucketEncryption, modeWord, newBucketEncryptionBlock, type NewBucketEncryption } from '../bucketEncryption';
@@ -72,7 +78,11 @@ export default function CreateBucketModal({
   const [messageApi, contextHolder] = message.useMessage();
   const [encChoice, setEncChoice] = useState<NewBucketEncryption['kind']>('same');
   const [keyValue, setKeyValue] = useState<BucketKeyValue | null>(null);
-  const [createError, setCreateError] = useState<string | null>(null);
+  const [createError, setCreateError] = useState<PlainError | null>(null);
+  // Create was clicked: the form now shows what is missing.
+  const [tried, setTried] = useState(false);
+  // The name the server (or the bucket list) said exists.
+  const [takenName, setTakenName] = useState<string | null>(null);
   const { navigate } = useNavigation();
 
   // Focus the name field shortly after opening.
@@ -124,7 +134,17 @@ export default function CreateBucketModal({
   const choice: NewBucketEncryption['kind'] =
     (encChoice === 'bucket-key' && !offerKey) || (encChoice === 'off' && !offerOff) ? 'same' : encChoice;
   const keyNotReady = choice === 'bucket-key' && !keyValue?.ready;
-  const createDisabled = !name.trim() || nameError !== null || (showPicker && !selectedBackend) || keyNotReady;
+  const emptyName = !trimmedName;
+  const nameMessage =
+    takenName !== null && takenName === trimmedName
+      ? `A bucket named ${trimmedName} already exists. Choose another name.`
+      : emptyName
+        ? tried
+          ? 'Enter a bucket name.'
+          : null
+        : nameError;
+  const backendMissing = showPicker && !selectedBackend;
+  const formInvalid = emptyName || nameError !== null || backendMissing || keyNotReady || nameMessage !== null;
 
   const reset = () => {
     setName('');
@@ -132,13 +152,20 @@ export default function CreateBucketModal({
     setEncChoice('same');
     setKeyValue(null);
     setCreateError(null);
+    setTried(false);
+    setTakenName(null);
   };
 
   /** `openSettings`: after the create, open the bucket's settings card. */
   const handleCreate = async (openSettings = false) => {
     const trimmed = name.trim();
     // A second Enter while the first create runs must not send another.
-    if (creating || !trimmed || keyNotReady) return;
+    if (creating) return;
+    setTried(true);
+    if (formInvalid) {
+      inputRef.current?.focus();
+      return;
+    }
     const enc: NewBucketEncryption =
       choice === 'bucket-key' && keyValue ? { kind: 'bucket-key', key: keyValue.key, keyId: keyValue.keyId } : { kind: choice === 'off' ? 'off' : 'same' };
     const encryption = newBucketEncryptionBlock(enc);
@@ -172,9 +199,18 @@ export default function CreateBucketModal({
       onCreated(trimmed);
       if (openSettings) navigate(bucketSettingsUrl(trimmed));
     } catch (e: unknown) {
-      const msg = normalizeUiError(e, "Unknown error");
-      if (encryption) setCreateError(`The bucket was not created: ${msg}`);
-      else messageApi.error(`Failed to create bucket: ${msg}`);
+      // An existing name: S3 says BucketAlreadyOwnedByYou / -Exists, the
+      // admin route answers 409.
+      if (
+        e instanceof ApiError &&
+        (e.status === 409 || e.code === 'BucketAlreadyOwnedByYou' || e.code === 'BucketAlreadyExists')
+      ) {
+        setTakenName(trimmed);
+        inputRef.current?.focus();
+      } else {
+        const why = plainError(e, 'The proxy did not create the bucket.');
+        setCreateError({ text: `The bucket was not created. ${why.text}`, details: why.details });
+      }
     } finally {
       setCreating(false);
     }
@@ -189,17 +225,24 @@ export default function CreateBucketModal({
         okText="Create"
         onOk={() => void handleCreate()}
         confirmLoading={creating}
-        okButtonProps={{ disabled: createDisabled }}
         footer={(_, { OkBtn, CancelBtn }) => (
-          <>
-            <CancelBtn />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
             {canAdmin && (
-              <Button disabled={createDisabled || creating} onClick={() => void handleCreate(true)}>
-                Create and open settings
+              <Button
+                type="link"
+                style={{ paddingInline: 0, marginRight: 'auto' }}
+                disabled={creating}
+                title="Create the bucket, then open its settings: quota, compression, public access"
+                onClick={() => void handleCreate(true)}
+              >
+                Create and configure…
               </Button>
             )}
-            <OkBtn />
-          </>
+            <span style={{ marginLeft: 'auto', display: 'inline-flex', gap: 8 }}>
+              <CancelBtn />
+              <OkBtn />
+            </span>
+          </div>
         )}
         onCancel={() => {
           if (creating) return;
@@ -216,14 +259,18 @@ export default function CreateBucketModal({
           value={name}
           // Keep what the user typed and say what is wrong: a silent rewrite
           // ("My_Bucket" → "mybucket") creates a bucket nobody asked for.
-          onChange={(e) => setName(e.target.value)}
-          onPressEnter={() => { if (!creating && !nameError && !keyNotReady) void handleCreate(); }}
-          status={nameError ? 'error' : undefined}
+          onChange={(e) => {
+            setName(e.target.value);
+            setCreateError(null);
+          }}
+          onPressEnter={() => void handleCreate()}
+          status={nameMessage ? 'error' : undefined}
+          aria-invalid={nameMessage ? true : undefined}
           style={{ fontFamily: 'var(--font-mono)' }}
         />
-        {nameError && (
+        {nameMessage && (
           <Text role="alert" type="danger" style={{ display: 'block', marginTop: 6, fontSize: 12 }}>
-            {nameError}
+            {nameMessage}
           </Text>
         )}
         {showPicker && (
@@ -247,9 +294,15 @@ export default function CreateBucketModal({
               )}
               showSearch={{ optionFilterProp: 'label' }}
               placeholder="Choose backend"
+              status={tried && backendMissing ? 'error' : undefined}
               style={{ width: '100%' }}
               size="middle"
             />
+            {tried && backendMissing && (
+              <Text role="alert" type="danger" style={{ display: 'block', marginTop: 6, fontSize: 12 }}>
+                Choose a backend.
+              </Text>
+            )}
             <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 6 }}>
               Created on the selected backend. Changing it later requires migrating data.
             </Text>
@@ -279,6 +332,11 @@ export default function CreateBucketModal({
                 <BucketKeySetup bucket={name.trim()} backend={preview.backend} onChange={setKeyValue} />
               </div>
             )}
+            {tried && keyNotReady && name.trim() && !nameError && (
+              <Text role="alert" type="danger" style={{ display: 'block', marginTop: 6, fontSize: 12 }}>
+                Confirm that you saved the key: type its last 6 characters.
+              </Text>
+            )}
             {choice === 'bucket-key' && (!name.trim() || nameError) && (
               <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 6 }}>
                 Type the bucket name first: the key id starts with it.
@@ -291,9 +349,7 @@ export default function CreateBucketModal({
             )}
           </div>
         )}
-        {createError && (
-          <Alert type="error" showIcon style={{ marginTop: 12, borderRadius: 6, fontSize: 12 }} title={createError} />
-        )}
+        {createError && <PlainErrorAlert error={createError} style={{ marginTop: 12 }} />}
       </Modal>
     </>
   );

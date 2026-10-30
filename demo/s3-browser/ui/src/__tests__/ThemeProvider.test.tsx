@@ -43,3 +43,21 @@ test('no saved theme + a dark system → dark; a toggle is saved', () => {
   expect(screen.getByRole('button')).toHaveTextContent('light');
   expect(readStorage('dg-theme')).toBe('light');
 });
+
+// UX harvest C27: the flip painted in two steps (AntD tokens first, the CSS
+// variables and the faded row backgrounds later).
+test('a toggle turns transitions off until the new theme is painted', () => {
+  prefer(false);
+  const frames: FrameRequestCallback[] = [];
+  vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb) => frames.push(cb));
+  render(<ThemeProvider><Probe /></ThemeProvider>);
+  const root = document.documentElement;
+  expect(root.classList.contains('dg-theme-switching')).toBe(false);
+  act(() => screen.getByRole('button').click());
+  expect(root.getAttribute('data-theme')).toBe('dark');
+  expect(root.classList.contains('dg-theme-switching')).toBe(true);
+  act(() => frames.shift()!(0));
+  expect(root.classList.contains('dg-theme-switching')).toBe(true);
+  act(() => frames.shift()!(0));
+  expect(root.classList.contains('dg-theme-switching')).toBe(false);
+});

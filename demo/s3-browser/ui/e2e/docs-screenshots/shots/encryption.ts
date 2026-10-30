@@ -369,7 +369,7 @@ export const BUCKET_ENCRYPTION_SHOTS: Shot[] = [
   {
     id: 'bucket-encryption-chip',
     route: '/_/admin/storage/buckets',
-    alt: 'The Buckets page; a box marks the chip Encrypted · bucket key db-archive-2026-10 of db-archive, and the downloads row shows Not encrypted.',
+    alt: 'The Buckets page; a box marks the chip Encrypted · bucket key db-archive-2026-10 of db-archive. The downloads row has no encryption chip, because it stores plaintext as its backend does.',
     setup: async (page) => {
       await exampleOrigins(page, () => true);
       await page.getByText('Encrypted · bucket key db-archive-2026-10').waitFor();

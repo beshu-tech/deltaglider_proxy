@@ -93,6 +93,8 @@ export default function AdminSidebar({ activePath, onNavigate }: Props) {
       <div key={entry.path}>
         <button
           onClick={() => onNavigate(entry.path)}
+          // Full-width row in a scrolling nav: an outside ring is clipped.
+          className="dg-focus-inset"
           aria-current={isActive ? 'page' : undefined}
           style={{
             display: 'flex',

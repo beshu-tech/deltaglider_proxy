@@ -60,3 +60,31 @@ test('a passthrough object on a compressing bucket says it is stored whole', asy
   expect(await screen.findByText(/Stored whole/)).toBeInTheDocument();
   expect(screen.queryByText(/compression is off/i)).not.toBeInTheDocument();
 });
+
+// UX harvest C31: a double-click on an object with no preview opened the
+// drawer and closed it again at once. The drawer now stays open.
+test('the second click of a double-click keeps the drawer open for an object with no preview', async () => {
+  const onClose = vi.fn();
+  const onPreview = vi.fn();
+  const zip = { key: 'builds/app-v1.zip', size: 5, lastModified: '2026-01-01T00:00:00Z' } as S3Object;
+  renderWithQuery(
+    <InspectorPanel object={zip} onClose={onClose} onDeleted={() => {}} onPreview={onPreview} hasAdminSession={false} />,
+  );
+  await screen.findByText('app-v1.zip');
+  fireEvent.click(document.querySelector('.ant-drawer-mask')!, { detail: 2 });
+  expect(onClose).not.toHaveBeenCalled();
+  expect(onPreview).not.toHaveBeenCalled();
+});
+
+// UX harvest C11: Tab from the last control stopped once on <body> before
+// the focus lock pulled it back. Tab now wraps inside the drawer.
+test('Tab from the last control goes to the first one, Shift+Tab back', async () => {
+  setup();
+  const close = await screen.findByRole('button', { name: 'Close inspector' });
+  const del = screen.getByRole('button', { name: /Delete object/ });
+  del.focus();
+  expect(fireEvent.keyDown(del, { key: 'Tab' })).toBe(false); // default prevented
+  expect(document.activeElement).toBe(close);
+  fireEvent.keyDown(close, { key: 'Tab', shiftKey: true });
+  expect(document.activeElement).toBe(del);
+});

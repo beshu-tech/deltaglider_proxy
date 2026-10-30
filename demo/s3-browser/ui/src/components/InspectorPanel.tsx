@@ -1,9 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Drawer, Button, Modal, message, Tag, Skeleton, Input, Spin } from 'antd';
+import { Drawer, Button, Modal, message, Tag, Skeleton, Input, Spin, theme } from 'antd';
 import { DownloadOutlined, DeleteOutlined, LinkOutlined, FileOutlined, CloseOutlined, CheckCircleFilled, CheckOutlined, CopyOutlined, LoadingOutlined, EyeOutlined } from '@ant-design/icons';
 import { deleteObject, getDownloadUrl, getPresignedUrl, getObjectUrl, headObject, getBucket } from '../s3client';
 import { GlobalOutlined } from '@ant-design/icons';
-import { formatBytes, getFileName, downloadFromUrl } from '../utils';
+import { formatBytes, getFileName, downloadFromUrl, relativeTime } from '../utils';
 import { normalizeUiError } from '../errorHandling';
 import { useRestoreFocus } from '../hooks/useRestoreFocus';
 import { isBaselineObject, summarizeObjectSavings } from '../savings';
@@ -28,6 +28,37 @@ const SHARE_DURATIONS = [
   { label: '24 hours', seconds: 86400 },
   { label: '7 days', seconds: 7 * 24 * 3600 - 1 },
 ];
+
+/** Long keys wrap after a `/`, `.`, `_` or `-`, not inside a word. */
+function withBreakHints(text: string): React.ReactNode[] {
+  // Each piece ends with its separator (no lookbehind: Safari < 16.4).
+  const parts = text.match(/[^/._-]*[/._-]|[^/._-]+$/g) ?? [text];
+  return parts.flatMap((part, i) => (i === 0 ? [part] : [<wbr key={i} />, part]));
+}
+
+/** The elements that Tab reaches inside `root`, in DOM order. */
+const TABBABLE = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/**
+ * Tab from the last control goes to the first one, Shift+Tab from the first
+ * to the last. The drawer's focus lock only pulls focus back after it left
+ * the page, so every round stopped once on <body> (UX harvest C11).
+ */
+function wrapTab(e: React.KeyboardEvent<HTMLElement>) {
+  if (e.key !== 'Tab') return;
+  const list = Array.from(e.currentTarget.querySelectorAll<HTMLElement>(TABBABLE))
+    .filter((el) => !el.closest('[aria-hidden="true"]'));
+  if (list.length === 0) return;
+  const first = list[0];
+  const last = list[list.length - 1];
+  if (!e.shiftKey && document.activeElement === last) {
+    e.preventDefault();
+    first.focus();
+  } else if (e.shiftKey && document.activeElement === first) {
+    e.preventDefault();
+    last.focus();
+  }
+}
 
 /** Centered vertical stack used by every loading/result modal body. */
 const MODAL_CENTER_STACK = { display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 16 } as const;
@@ -90,12 +121,12 @@ function InspectorSection({ title, children }: { title: string; children: React.
 }
 
 /** Key-value row for inspector metadata. Defined at module level to avoid React reconciliation issues. */
-function InfoRow({ label, value }: { label: string; value: string }) {
+function InfoRow({ label, value, title }: { label: string; value: string; title?: string }) {
   const { BG_SIDEBAR, TEXT_MUTED, TEXT_PRIMARY } = useColors();
   return (
     <div style={{ padding: '8px 12px', background: BG_SIDEBAR, borderRadius: 8, marginBottom: 4 }}>
       <div style={{ fontSize: 11, color: TEXT_MUTED, marginBottom: 2, fontFamily: "var(--font-ui)", fontWeight: 500 }}>{label}</div>
-      <div style={{ fontSize: 13, color: TEXT_PRIMARY, wordBreak: 'break-all', fontFamily: "var(--font-mono)" }}>{value}</div>
+      <div title={title} style={{ fontSize: 13, color: TEXT_PRIMARY, overflowWrap: 'anywhere', fontFamily: "var(--font-mono)" }}>{withBreakHints(value)}</div>
     </div>
   );
 }
@@ -118,6 +149,10 @@ function ShareDurationButton({
   textPrimary: string;
   bgSidebar: string;
 }) {
+  // The AntD primary of the theme, the same as Download beside it: the raw
+  // accent was a brighter teal in the dark theme and read as hovered.
+  const { token } = theme.useToken();
+  const primary = { background: token.colorPrimary, color: token.colorTextLightSolid };
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -135,8 +170,7 @@ function ShareDurationButton({
           alignItems: 'center',
           justifyContent: 'center',
           gap: 6,
-          background: accentBlue,
-          color: '#fff',
+          ...primary,
           border: 'none',
           borderRadius: '10px 0 0 10px',
           fontWeight: 600,
@@ -159,10 +193,9 @@ function ShareDurationButton({
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
-          background: accentBlue,
-          color: '#fff',
+          ...primary,
           border: 'none',
-          borderLeft: '1px solid rgba(255,255,255,0.25)',
+          borderLeft: `1px solid ${token.colorBgContainer}55`,
           borderRadius: '0 10px 10px 0',
           cursor: 'pointer',
           fontSize: 10,
@@ -256,7 +289,7 @@ export default function InspectorPanel({
 
   // Modal state for download / share operations (must be declared before early return)
   const [modalState, setModalState] = useState<
-    | { mode: 'share'; phase: 'loading' | 'ready' | 'error'; url?: string; error?: string }
+    | { mode: 'share'; phase: 'loading' | 'ready' | 'error'; url?: string; error?: string; expiresAt?: number }
     | null
   >(null);
   const [shareDuration, setShareDuration] = useState<number | null>(null);
@@ -369,9 +402,11 @@ export default function InspectorPanel({
   // A double-click on a file row: the first click opens this drawer, so the
   // second click lands on its mask (event.detail 2). Treat it as the row's
   // double-click and open the preview instead of closing.
+  // An object with no preview keeps the drawer open: the double-click shows
+  // its details instead of opening and closing the drawer in one gesture.
   const handleDrawerClose = (e: { type: string; detail?: number }) => {
-    if (e.type === 'click' && (e.detail ?? 0) >= 2 && canReadObject && onPreview && getPreviewMode(object.key)) {
-      onPreview(object);
+    if (e.type === 'click' && (e.detail ?? 0) >= 2) {
+      if (canReadObject && onPreview && getPreviewMode(object.key)) onPreview(object);
       return;
     }
     onClose();
@@ -409,6 +444,9 @@ export default function InspectorPanel({
     savedBytesText: formatBytes(savedBytes),
   });
   const baselineHeadline = headline.kind === 'baseline';
+  const showSizeBars = !baselineHeadline
+    && effectiveStored != null
+    && formatBytes(effectiveStored) !== formatBytes(originalSize);
   // The baseline is neither a saving nor a delta: neutral colours, not the
   // success green and the Delta palette.
   const neutralChip = { bg: 'transparent', border: BORDER, text: TEXT_MUTED };
@@ -475,8 +513,10 @@ export default function InspectorPanel({
 
   const handleCopyLink = async (expiresInSeconds?: number) => {
     const reqKey = object.key;
+    const seconds = expiresInSeconds ?? SHARE_DURATIONS[2].seconds;
+    const expiresAt = Date.now() + seconds * 1000;
     setModalState({ mode: 'share', phase: 'loading' });
-    setShareDuration(expiresInSeconds ?? SHARE_DURATIONS[2].seconds);
+    setShareDuration(seconds);
     try {
       let url: string;
       try {
@@ -490,7 +530,7 @@ export default function InspectorPanel({
       }
       // Stale-commit guard: don't surface A's URL after the user moved to B.
       if (latestKeyRef.current !== reqKey) return;
-      setModalState({ mode: 'share', phase: 'ready', url });
+      setModalState({ mode: 'share', phase: 'ready', url, expiresAt });
     } catch (e) {
       if (latestKeyRef.current !== reqKey) return;
       setModalState({ mode: 'share', phase: 'error', error: String(e) });
@@ -521,7 +561,7 @@ export default function InspectorPanel({
           header: { display: 'none' },
         }}
       >
-        <div className="animate-slide-in" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+        <div className="animate-slide-in" onKeyDown={wrapTab} style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
           {/* Header */}
           <div style={{
             padding: '16px 20px',
@@ -544,11 +584,11 @@ export default function InspectorPanel({
               <FileOutlined aria-hidden="true" style={{ fontSize: 20, color: ACCENT_BLUE }} />
             </div>
             <div style={{ flex: 1, minWidth: 0 }}>
-              <h2 style={{ fontSize: 15, fontWeight: 600, color: TEXT_PRIMARY, wordBreak: 'break-all', margin: 0, fontFamily: "var(--font-ui)" }}>
-                {fileName}
+              <h2 style={{ fontSize: 15, fontWeight: 600, color: TEXT_PRIMARY, overflowWrap: 'anywhere', margin: 0, fontFamily: "var(--font-ui)" }}>
+                {withBreakHints(fileName)}
               </h2>
-              <div style={{ fontSize: 11, color: TEXT_MUTED, marginTop: 2, wordBreak: 'break-all', fontFamily: "var(--font-mono)" }}>
-                {object.key}
+              <div style={{ fontSize: 11, color: TEXT_MUTED, marginTop: 2, overflowWrap: 'anywhere', fontFamily: "var(--font-mono)" }}>
+                {withBreakHints(object.key)}
               </div>
             </div>
             <Button
@@ -628,7 +668,7 @@ export default function InspectorPanel({
 
             {/* STORAGE STATS */}
             {bucketPolicyLoading ? (
-              <InspectorSection title="Storage stats">
+              <InspectorSection title="Storage">
                 <div style={{
                   background: BG_SIDEBAR, borderRadius: 10, padding: '24px 16px',
                   display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8,
@@ -640,7 +680,7 @@ export default function InspectorPanel({
                 </div>
               </InspectorSection>
             ) : compressionEnabled ? (
-              <InspectorSection title="Storage stats">
+              <InspectorSection title="Storage">
                 {headLoading && Object.keys(headers).length === 0 && storedSize == null ? (
                   /* Spin only while the HEAD is in flight AND we have nothing
                    * renderable yet. If the listing's facts already seeded a
@@ -676,7 +716,10 @@ export default function InspectorPanel({
                     <div style={{ fontSize: baselineHeadline ? 12 : 11, color: TEXT_MUTED, marginBottom: 12, fontFamily: baselineHeadline ? 'var(--font-ui)' : 'var(--font-mono)' }}>
                       {headline.detail}
                     </div>
-                    {/* Visual comparison bar */}
+                    {/* Visual comparison bars: only when the two sizes differ on
+                        screen. The baseline is the file plus a near-empty delta,
+                        so its "Stored" read one rounding step over "Original". */}
+                    {showSizeBars ? (<>
                     <div style={{ marginBottom: 10 }}>
                       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
                         <div style={{ fontSize: 11, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>Original</div>
@@ -703,6 +746,12 @@ export default function InspectorPanel({
                         }} />
                       </div>
                     </div>
+                    </>) : (
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 10 }}>
+                        <div style={{ fontSize: 11, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>Size</div>
+                        <div style={{ fontSize: 12, fontWeight: 600, color: TEXT_PRIMARY, fontFamily: "var(--font-mono)" }}>{formatBytes(originalSize)}</div>
+                      </div>
+                    )}
                     <Tag style={{
                       background: storageTypeColor.bg,
                       border: `1px solid ${storageTypeColor.border}`,
@@ -757,9 +806,13 @@ export default function InspectorPanel({
 
             {/* OBJECT INFO */}
             <InspectorSection title="Object info">
+              {/* Relative, like the table, and the exact time beside it. */}
               <InfoRow
                 label="Last modified"
-                value={object.lastModified ? new Date(object.lastModified).toLocaleString() : '--'}
+                value={object.lastModified
+                  ? `${relativeTime(object.lastModified)} · ${new Date(object.lastModified).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'medium' })}`
+                  : '—'}
+                title={object.lastModified ? new Date(object.lastModified).toISOString() : undefined}
               />
             </InspectorSection>
 
@@ -873,12 +926,17 @@ export default function InspectorPanel({
                   </div>
                   <div style={{ fontSize: 12, color: TEXT_MUTED, marginBottom: 12, fontFamily: "var(--font-ui)" }}>
                     Expires in {SHARE_DURATIONS.find(d => d.seconds === shareDuration)?.label ?? 'unknown'}
+                    {modalState.expiresAt != null && (
+                      <>, on {new Date(modalState.expiresAt).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}</>
+                    )}
                   </div>
+                  {/* The whole link is visible (expiry and signature
+                      included); a very long one scrolls inside the box. */}
                   <Input.TextArea
                     aria-label="Share URL"
                     value={modalState.url}
                     readOnly
-                    autoSize={{ minRows: 2, maxRows: 4 }}
+                    autoSize={{ minRows: 2, maxRows: 14 }}
                     style={{
                       fontFamily: "var(--font-mono)",
                       fontSize: 12,

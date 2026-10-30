@@ -27,8 +27,6 @@ import {
   computeRate,
   jobWalkProgress,
   jobStrategyMix,
-  planRuleDeleteSync,
-  editorAfterDiscard,
   stepPendingReverify,
   runNowMessage,
   jobsPollInterval,
@@ -506,34 +504,6 @@ test('jobStrategyMix', () => {
   }
 });
 
-test('planRuleDeleteSync (deleted rule must not resurrect as a draft)', () => {
-  const rules = [withRuleUid({ name: 'keep' }), withRuleUid({ name: 'gone' })];
-  // Clean editor → re-fetch server truth (value AND baseline lose the rule).
-  assert.deepEqual(planRuleDeleteSync(false, rules, rules, 'gone'), { action: 'refresh' });
-  // Dirty editor → filter the rule out of the value; the other edits stay.
-  const plan = planRuleDeleteSync(true, rules, rules, 'gone');
-  assert.equal(plan.action, 'filter');
-  assert.deepEqual(plan.action === 'filter' ? plan.rules : null, [rules[0]]);
-  // Regression: after the delete, the server list no longer has the rule.
-  // Without the sync the editor still carries it and mergeDraftRules shows it
-  // as a DRAFT, which the next Apply re-creates.
-  const server = [row({ id: 'replication:keep', name: 'keep' })];
-  const none = { rules: [], baseline: [] };
-  const stale = mergeDraftRules(server, { rules, baseline: rules }, none);
-  assert.ok(stale.some((d) => d.draft && d.row.name === 'gone'), 'stale editor resurrects the rule');
-  const synced = mergeDraftRules(server, { rules: plan.action === 'filter' ? plan.rules : rules, baseline: rules }, none);
-  assert.equal(synced.some((d) => d.row.name === 'gone'), false, 'synced editor drops the rule');
-  // Deleting a rule the editor does not have is a no-op filter.
-  const noop = planRuleDeleteSync(true, rules, rules, 'other');
-  assert.deepEqual(noop.action === 'filter' ? noop.rules : null, rules);
-  // A draft that only has the deleted name stays, and so does a rename of
-  // the deleted rule: only the saved rule under its saved name goes.
-  const draft = withRuleUid({ name: 'gone' });
-  const renamed = { ...rules[1], name: 'gone-eu' };
-  const kept = planRuleDeleteSync(true, [rules[0], renamed, draft], rules, 'gone');
-  assert.deepEqual(kept.action === 'filter' ? kept.rules : null, [rules[0], renamed, draft]);
-});
-
 test('rule identity: the editor matches a rule to its saved twin by uid, never by name', () => {
   const nightly = withRuleUid({ name: 'nightly', source: { bucket: 'releases' } });
   const saved = [nightly];
@@ -593,13 +563,6 @@ test('ruleIdsChangedByApply / savedRulesChangedByApply', () => {
   assert.deepEqual(savedRulesChangedByApply(rules, saved), ['b', 'c']);
   // A deleted rule; a new rule that takes a saved name is not that rule.
   assert.deepEqual(savedRulesChangedByApply([withRuleUid({ name: 'a', bucket: 'x' }), b, c], saved), ['a']);
-});
-
-test('editorAfterDiscard: after a dirty delete the baseline still holds it', () => {
-  // Discard after a dirty delete: the baseline still holds the deleted rule, so
-  // a plain discard would bring it back — refresh from the server instead.
-  assert.equal(editorAfterDiscard(false), 'discard');
-  assert.equal(editorAfterDiscard(true), 'refresh');
 });
 
 test('stepPendingReverify (run-now → verify after the run settles)', () => {

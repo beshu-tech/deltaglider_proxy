@@ -210,8 +210,12 @@ export function useObjectListing({
   // HEAD per row. A row the listing has no facts for gets an empty entry, so
   // the table shows the neutral tag instead of waiting for facts.
   const headCache = useMemo(() => {
-    const cache: Record<string, { storageType?: string; storedSize?: number }> = {};
-    for (const o of objects) cache[o.key] = { storageType: o.storageType, storedSize: o.storedSize };
+    const cache: Record<string, { storageType?: string; storedSize?: number; isBaseline?: boolean }> = {};
+    for (const o of objects) {
+      // `isBaseline`: the listing marks the folder's baseline, so the table
+      // chip says "Baseline" as the inspector does (UX harvest C4).
+      cache[o.key] = { storageType: o.storageType, storedSize: o.storedSize, isBaseline: o.isBaseline };
+    }
     return cache;
   }, [objects]);
 

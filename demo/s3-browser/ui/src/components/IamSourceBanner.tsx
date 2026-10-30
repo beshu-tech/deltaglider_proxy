@@ -61,6 +61,8 @@ export default function IamSourceBanner({ iamMode, loadError, resource }: Props)
             {' '}
             <a
               href={systemHref}
+              // Underlined: inside running text a link must not differ by colour only (axe link-in-text-block).
+              style={{ textDecoration: 'underline' }}
               onClick={(e) => {
                 if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
                 e.preventDefault();

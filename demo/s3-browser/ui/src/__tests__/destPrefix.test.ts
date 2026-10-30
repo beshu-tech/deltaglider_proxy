@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'vitest';
-import { normalizeDestPrefix, destinationIsSource, keyPathError } from '../components/destPrefix';
+import { normalizeDestPrefix, destinationIsSource, keyPathError, initialDestPrefix } from '../components/destPrefix';
 
 test('normalizeDestPrefix: truth table (from the bug report)', () => {
   assert.equal(normalizeDestPrefix('foo//bar'), 'foo/bar'); // THE regression: internal // collapsed
@@ -87,4 +87,14 @@ test('keyPathError: "." / ".." segments never reach a request', () => {
   for (const ok of ['', 'a', 'a/b/', 'releases/v1.2.3/', '..a/', 'a../b', '.hidden/', 'a/.../b', 'a//b']) {
     assert.equal(keyPathError(ok), null, `allowed: ${JSON.stringify(ok)}`);
   }
+});
+
+// UX harvest C33: the picker no longer opens in its own blocked state.
+test('initialDestPrefix: the browsed folder, else its parent, never the source', () => {
+  // Selection in qa-many/, browsing qa-many/: the parent (bucket root).
+  assert.equal(initialDestPrefix('releases', ['qa-many/a.txt'], 'qa-many/'), '');
+  assert.equal(initialDestPrefix('releases', ['a/b/x.zip'], 'a/b/'), 'a');
+  // A selection that is not in the browsed folder keeps it.
+  assert.equal(initialDestPrefix('releases', ['folder:qa-many/'], 'qa-many/'), 'qa-many');
+  assert.equal(destinationIsSource('releases', ['a/b/x.zip'], 'releases', initialDestPrefix('releases', ['a/b/x.zip'], 'a/b/')), false);
 });

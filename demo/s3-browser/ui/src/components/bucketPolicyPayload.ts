@@ -31,6 +31,7 @@
  * policy".
  */
 import type { AdminConfig } from '../adminApi';
+import { bytesFromGib } from '../savings';
 
 /** A public-prefix entry carrying a stable synthetic id so the
  *  prefix list keys by identity, not array index. */
@@ -216,6 +217,29 @@ export function policyToRow(
     encryption: (p as { encryption?: Record<string, unknown> | null }).encryption ?? null,
     unmodeled: unmodeledFields(p),
   };
+}
+
+
+/** The largest quota the field accepts: 1 PiB in GiB. A larger number is a
+ *  typo (an extra digit), not a plan. */
+const MAX_QUOTA_GIB = 1024 * 1024;
+
+/**
+ * Pure: the text of the Quota field (GiB) as `quota_bytes`. Empty = no
+ * quota (null). Anything else must be a number above 0 and at most
+ * `MAX_QUOTA_GIB`: AntD's number field turned "-5" and "abc" into 0, a
+ * quota that refuses every upload (UX harvest C20).
+ */
+export function parseQuotaGib(text: string): { ok: true; bytes: number | null } | { ok: false; error: string } {
+  const t = text.trim().replace(/,/g, '');
+  if (!t) return { ok: true, bytes: null };
+  if (!/^(\d+(\.\d*)?|\.\d+)$/.test(t)) {
+    return { ok: false, error: 'Enter a number of GiB, such as 50 or 0.5, or leave it empty for no quota.' };
+  }
+  const gib = Number(t);
+  if (!(gib > 0) || bytesFromGib(gib) < 1) return { ok: false, error: 'Enter a size above 0, or leave it empty for no quota.' };
+  if (gib > MAX_QUOTA_GIB) return { ok: false, error: 'Enter at most 1048576 GiB (1 PiB).' };
+  return { ok: true, bytes: bytesFromGib(gib) };
 }
 
 /** A typed file extension in the server's form: trimmed, lowercase, no

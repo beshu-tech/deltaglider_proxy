@@ -18,7 +18,7 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { S3Object, ListResult, BucketInfo } from './types';
 import { codePointCompare, detectDefaultEndpoint, numericCompare } from './utils';
 import { createBucketOnBackend, getBucketOrigins } from './adminApi';
-import { normalizeS3Error, requestIdSuffix } from './errorHandling';
+import { ApiError, normalizeS3Error, requestIdSuffix } from './errorHandling';
 import { queryClient } from './queries/client';
 import { qk } from './queries/keys';
 import {
@@ -208,13 +208,16 @@ const MAX_LIST_PAGES = 10; // ~10,000 objects max
 interface ListFacts {
   storageType?: string;
   storedSize?: number;
+  /** The delta is its folder's baseline (`x-amz-meta-dg-baseline: true`). */
+  isBaseline?: boolean;
 }
 
 /**
  * The storage facts of each `<Contents>` of a `metadata=true` ListObjectsV2
  * body, by key. The proxy lists them in `<UserMetadata>` with the names
  * HeadObject uses: `x-amz-meta-dg-note` (the storage type) and, for a delta,
- * `x-amz-meta-dg-delta-size` (the stored size). An entry without them (a
+ * `x-amz-meta-dg-delta-size` (the stored size); the folder's baseline delta
+ * also lists `x-amz-meta-dg-baseline: true`. An entry without them (a
  * facts miss, an anonymous reader) is absent from the map.
  */
 export function parseListFacts(xml: string): Map<string, ListFacts> {
@@ -233,7 +236,9 @@ export function parseListFacts(xml: string): Map<string, ListFacts> {
     const storageType = meta['x-amz-meta-dg-note'] || undefined;
     if (!storageType) continue;
     const size = meta['x-amz-meta-dg-delta-size'];
-    facts.set(key, { storageType, storedSize: size ? parseInt(size, 10) : undefined });
+    const fact: ListFacts = { storageType, storedSize: size ? parseInt(size, 10) : undefined };
+    if (meta['x-amz-meta-dg-baseline'] === 'true') fact.isBaseline = true;
+    facts.set(key, fact);
   }
   return facts;
 }
@@ -329,6 +334,7 @@ export async function listObjects(prefix = '', maxPages = MAX_LIST_PAGES): Promi
         etag: o.ETag || '',
         storageType: listed?.storageType,
         storedSize: listed?.storedSize,
+        isBaseline: listed?.isBaseline,
         headers: {},
       });
     }
@@ -855,9 +861,17 @@ export async function createBucket(
   opts?: Parameters<typeof createBucketOnBackend>[2],
 ): Promise<void> {
   if (backendName) {
+    // The admin route refuses an existing name itself (409).
     await createBucketOnBackend(name, backendName, opts);
     invalidateListBucketsCache();
     return;
+  }
+  // S3 CreateBucket answers 200 for a bucket the caller already owns (the
+  // us-east-1 rule, and what the proxy does): the UI then said "created"
+  // for a typo of an existing name (UX harvest C54). Ask first.
+  const listed = await sendCommand<ListBucketsCommandOutput>(new ListBucketsCommand({}), 'List buckets');
+  if ((listed.Buckets ?? []).some((b) => b.Name === name)) {
+    throw new ApiError(`A bucket named ${name} already exists.`, 409, 'BucketAlreadyOwnedByYou', `A bucket named ${name} already exists.`);
   }
   await sendCommand(new CreateBucketCommand({ Bucket: name }), `Create bucket ${name}`);
   invalidateListBucketsCache();

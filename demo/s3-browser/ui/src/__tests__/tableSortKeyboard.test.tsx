@@ -43,9 +43,21 @@ test('Enter still sorts once (AntD handles it; the helper adds nothing)', () => 
   expect(onChange).toHaveBeenCalledTimes(1);
 });
 
-test('theme.css draws an inset focus ring on sortable headers', () => {
+test('theme.css draws the focus ring inside table header cells', () => {
   const css = readFileSync(join(__dirname, '../theme.css'), 'utf8');
-  expect(css).toMatch(/th\.ant-table-column-has-sorters:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--focus-ring\)[^}]*outline-offset:\s*-2px/);
+  expect(css).toMatch(/\.ant-table-thead > tr > th:focus-visible,[^{]*\{[^}]*outline-offset:\s*calc\(-1 \* var\(--focus-ring-width\)\)/);
+});
+
+// UX harvest C19: four ring styles on one page. One rule draws the ring;
+// the others only move it inside the element.
+test('theme.css has one focus ring style', () => {
+  const css = readFileSync(join(__dirname, '../theme.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  const rules = [...css.matchAll(/([^{}]*:focus-visible[^{}]*)\{([^}]*)\}/g)];
+  const rings = rules.filter(([, , body]) => /(^|[;\s])outline\s*:/.test(body));
+  expect(rings.length).toBeGreaterThan(0);
+  for (const [, selector, body] of rings) {
+    expect(body, selector.trim()).toMatch(/outline:\s*var\(--focus-ring-width\) solid var\(--focus-ring[,)]/);
+  }
 });
 
 test('every component with a sortable column wraps its columns in withKeyboardSort', () => {

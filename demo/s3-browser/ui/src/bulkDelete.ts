@@ -63,11 +63,12 @@ export interface DeleteJobOutcome {
 }
 
 /** The message after a delete was started, or not. */
-export function deleteJobMessage(o: DeleteJobOutcome): { type: 'success' | 'info'; text: string } {
+export function deleteJobMessage(o: DeleteJobOutcome): { type: 'info'; text: string } {
   if (o.cancelled) return { type: 'info', text: 'Delete cancelled. Nothing was deleted.' };
   if (o.total === 0 || o.jobId === undefined) return { type: 'info', text: 'Nothing to delete.' };
+  // A started job is progress, not a result: never the success green.
   return {
-    type: 'success',
+    type: 'info',
     text: `Deleting ${count(o.total)} ${noun(o.total, 'object')} on the server. You can close this tab: the bucket shows the progress.`,
   };
 }

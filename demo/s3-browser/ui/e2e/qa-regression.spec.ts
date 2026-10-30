@@ -192,6 +192,7 @@ async function uploadViaUi(
     await input.fill(dest);
   }
   await page.locator('input[type=file]').first().setInputFiles(files);
+  await page.getByRole('button', { name: /Upload \d+ files? to / }).click();
   await expect(page.getByText('Upload complete')).toBeVisible({ timeout: 60_000 });
   await page.getByRole('button', { name: /Done — / }).click();
 }
@@ -390,8 +391,10 @@ test('3. bulk copy, move, ZIP, delete; refusals for move-into-source and path es
   await page.getByRole('button', { name: 'Upload files' }).click();
   await page.getByRole('combobox', { name: /Destination path prefix/ }).fill('../up-escape/');
   await expect(page.getByRole('alert').filter({ hasText: 'cannot be "." or ".."' })).toBeVisible();
-  await expect(page.getByRole('button', { name: /Select files/ })).toBeDisabled();
   await page.locator('input[type=file]').first().setInputFiles({ name: 'esc.txt', mimeType: 'text/plain', buffer: Buffer.from('x') });
+  // The file is staged, but the Upload button stays disabled while the
+  // destination is invalid.
+  await expect(page.getByRole('button', { name: /Upload 1 file to / })).toBeDisabled();
   await expect(page.getByRole('list', { name: 'Upload queue' })).toHaveCount(0);
   // "New folder" refuses '..' too.
   await page.getByRole('combobox', { name: /Destination path prefix/ }).fill('');

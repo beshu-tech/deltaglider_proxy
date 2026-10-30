@@ -19,7 +19,7 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { Typography, Progress } from 'antd';
 import { useColors } from '../ThemeContext';
-import { cacheEntrySubtitle, formatBytes } from '../utils';
+import { cacheEntrySubtitle, formatBytes, noun } from '../utils';
 import { usePrometheusMetrics } from '../queries/metrics';
 import { LoadingState } from './StatePlaceholders';
 import { CONTENT_WIDE, contentColumn } from './shared-styles';
@@ -382,11 +382,11 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
                 <ResponsiveContainer width="100%" height="100%">
                   <AreaChart data={history} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
                     <XAxis dataKey="t" tick={axisTickStyle(colors, true)} axisLine={false} tickLine={false} minTickGap={40} />
-                    <YAxis yAxisId="left" tick={axisTickStyle(colors)} axisLine={false} tickLine={false} width={40} />
+                    <YAxis yAxisId="left" tick={axisTickStyle(colors)} axisLine={false} tickLine={false} width={40} allowDecimals={false} />
                     <YAxis yAxisId="right" orientation="right" tick={axisTickStyle(colors)} axisLine={false} tickLine={false} width={40} />
                     <RTooltip {...tt} />
-                    <Area yAxisId="left" type="monotone" dataKey="httpTotal" stroke={CHART_PALETTE[1]} fill={`${CHART_PALETTE[1]}33`} strokeWidth={2} name="Requests" />
-                    <Area yAxisId="right" type="monotone" dataKey="avgLatency" stroke={CHART_PALETTE[3]} fill={`${CHART_PALETTE[3]}22`} strokeWidth={2} name="Avg latency (ms)" />
+                    <Area yAxisId="left" type="stepAfter" dataKey="httpTotal" stroke={CHART_PALETTE[1]} fill={`${CHART_PALETTE[1]}33`} strokeWidth={2} name="Requests" />
+                    <Area yAxisId="right" type="stepAfter" dataKey="avgLatency" stroke={CHART_PALETTE[3]} fill={`${CHART_PALETTE[3]}22`} strokeWidth={2} name="Avg latency (ms)" />
                   </AreaChart>
                 </ResponsiveContainer>
               </div>
@@ -453,18 +453,20 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
           </Panel>
           <Panel
             title="Cache hit rate"
-            subtitle={`${fmtNum(cacheHits)} hits · ${fmtNum(cacheMisses)} misses`}
+            subtitle={`${fmtNum(cacheHits)} ${noun(cacheHits, 'hit')} · ${fmtNum(cacheMisses)} ${noun(cacheMisses, 'miss', 'misses')}`}
             colSpan={4}
             accent={cacheSeverity === 'bad' ? 'red' : cacheSeverity === 'warn' ? 'amber' : undefined}
           >
             <StatValue
-              value={cacheTotal > 0 ? fmtPct(1 - cacheMissRate) : '—'}
+              // A rate of 1 or 2 lookups ("100.0 %") is noise: no figure
+              // until there are enough lookups to judge the cache.
+              value={cacheSeverity === 'neutral' ? '—' : fmtPct(1 - cacheMissRate)}
               tone={cacheSeverity}
               hint={
                 cacheTotal === 0
                   ? 'No cache lookups yet'
                   : cacheSeverity === 'neutral'
-                  ? 'Too few lookups yet to judge the cache'
+                  ? 'Too few lookups to judge the cache yet'
                   : cacheSeverity === 'bad'
                     ? 'More than half of lookups miss — cache undersized'
                     : 'Each miss forces a full backend read'
@@ -494,8 +496,8 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
                     <XAxis dataKey="t" tick={axisTickStyle(colors, true)} axisLine={false} tickLine={false} minTickGap={60} />
                     <YAxis tick={axisTickStyle(colors)} axisLine={false} tickLine={false} width={40} allowDecimals={false} />
                     <RTooltip {...tt} />
-                    <Area type="monotone" dataKey="cacheHits" stackId="1" stroke={CHART_PALETTE[0]} fill={`${CHART_PALETTE[0]}55`} strokeWidth={2} name="Hits" />
-                    <Area type="monotone" dataKey="cacheMisses" stackId="1" stroke={CHART_PALETTE[4]} fill={`${CHART_PALETTE[4]}55`} strokeWidth={2} name="Misses" />
+                    <Area type="stepAfter" dataKey="cacheHits" stackId="1" stroke={CHART_PALETTE[0]} fill={`${CHART_PALETTE[0]}55`} strokeWidth={2} name="Hits" />
+                    <Area type="stepAfter" dataKey="cacheMisses" stackId="1" stroke={CHART_PALETTE[4]} fill={`${CHART_PALETTE[4]}55`} strokeWidth={2} name="Misses" />
                   </AreaChart>
                 </ResponsiveContainer>
               </div>

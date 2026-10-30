@@ -5,6 +5,8 @@ import FormField from './FormField';
 import { AdvancedDisclosure } from './ruleEditorFields';
 import RuleFilterFields from './RuleFilterFields';
 import { ruleFolderPrefix } from '../ruleFilterPreview';
+import { replicationRuleFieldErrors } from './jobs/humanDuration';
+import { useErrorGate } from './jobs/useErrorGate';
 
 const { Text } = Typography;
 
@@ -26,6 +28,8 @@ export default function ReplicationRuleFields({
   onChange: (patch: Partial<ReplicationRuleConfig>) => void;
   onRename: (nextName: string) => void;
 }) {
+  const fieldErrors = replicationRuleFieldErrors(rule);
+  const gate = useErrorGate();
   return (
     <div>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 14 }}>
@@ -87,14 +91,16 @@ export default function ReplicationRuleFields({
         inputRadius={inputRadius}
       />
 
-      <AdvancedDisclosure title="Advanced rule behavior" hint="Interval, batch size, conflicts, delete replication">
+      <AdvancedDisclosure title="Advanced rule behavior" hint="Interval, batch size, conflicts, delete replication" hasError={!!fieldErrors.interval}>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 14 }}>
           <FormField
             label="Interval"
             yamlPath="storage.replication.rules[].interval"
             helpText="How often the full reconcile sweep runs for this rule. Events replicate changes as they happen; the sweep catches anything an event missed. A duration such as 6h or 24h (the default). The minimum is 30s."
+            error={gate.show('interval') ? fieldErrors.interval : undefined}
           >
             <Input
+              {...gate.props('interval')}
               value={rule.interval}
               onChange={(e) => onChange({ interval: e.target.value })}
               style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}

@@ -223,7 +223,9 @@ code, kbd, pre, samp, .ant-typography code {
 .ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row).ant-table-row:hover > :is(td, .ant-table-cell) {
   background: var(--table-row-hover) !important;
 }
-.ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row).ant-table-row-selected > :is(td, .ant-table-cell) {
+/* Selected = AntD's class (the inspector row) or `aria-selected` (a row
+   ticked in a grid, e.g. the object browser's checkboxes). */
+.ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row):is(.ant-table-row-selected, [aria-selected='true']) > :is(td, .ant-table-cell) {
   background: var(--table-row-selected) !important;
 }
 
@@ -255,7 +257,7 @@ code, kbd, pre, samp, .ant-typography code {
   opacity: 0;
   transition: opacity 0.15s ease;
 }
-.ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row):is(:hover, .ant-table-row-selected, .dg-row-cursor) > :is(td, .ant-table-cell):first-child::before {
+.ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row):is(:hover, .ant-table-row-selected, [aria-selected='true'], .dg-row-cursor) > :is(td, .ant-table-cell):first-child::before {
   opacity: 1;
 }
 
@@ -265,9 +267,9 @@ code, kbd, pre, samp, .ant-typography code {
 .ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row).dg-row-cursor > :is(td, .ant-table-cell) {
   background: var(--table-row-hover) !important;
 }
-.ant-table-wrapper .ant-table-tbody-virtual .ant-table-row:is(.dg-row-cursor, :focus-visible) {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: -2px;
+.ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row).dg-row-cursor {
+  outline: var(--focus-ring-width) solid var(--focus-ring);
+  outline-offset: calc(-1 * var(--focus-ring-width));
 }
 
 /* ───── Accessibility: skip-to-content ───── */
@@ -305,18 +307,37 @@ code, kbd, pre, samp, .ant-typography code {
   box-shadow: 0 4px 12px rgba(45, 212, 191, 0.3);
 }
 
-/* ───── Accessibility: visible focus indicators ───── */
-*:focus-visible {
-  outline: 2px solid var(--focus-ring, #2dd4bf);
-  outline-offset: 2px;
+/* ───── Accessibility: ONE focus ring for the whole app ─────
+   2 px of --focus-ring, 2 px outside the element. `!important` because AntD
+   draws its own (3 px colorPrimaryBorder, or currentColor on text buttons)
+   with a higher specificity; a second focus-visible rule elsewhere is a
+   regression. Exceptions: text fields keep AntD's border + glow (Chrome
+   matches them :focus-visible on every click, so a ring would double the
+   cue), and [tabindex='-1'] elements are focused by script (the main
+   region, a dialog body), not by Tab. */
+:root {
+  --focus-ring-width: 2px;
+  --focus-ring-offset: 2px;
 }
-
-/* Sortable table headers: the outside ring (2px offset) is clipped by the
-   table container and painted over by the next header cell, so draw it
-   inside the cell. */
-.ant-table-wrapper .ant-table-thead > tr > th.ant-table-column-has-sorters:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: -2px;
+:focus-visible:not(input, textarea, select, [tabindex='-1']) {
+  outline: var(--focus-ring-width) solid var(--focus-ring, #2dd4bf) !important;
+  outline-offset: var(--focus-ring-offset) !important;
+}
+/* AntD checkbox, radio: the focused element is a hidden <input>; the ring
+   goes on the box that is drawn next to it. */
+:is(.ant-checkbox-input, .ant-radio-input):focus-visible + :is(.ant-checkbox-inner, .ant-radio-inner) {
+  outline: var(--focus-ring-width) solid var(--focus-ring) !important;
+  outline-offset: var(--focus-ring-offset) !important;
+}
+/* The same ring drawn INSIDE the element, where an outside ring is clipped
+   by a scroll container or painted over by a neighbour: table header cells,
+   table rows, full-width sidebar rows and the sidebar resize handle. */
+.ant-table-wrapper .ant-table-thead > tr > th:focus-visible,
+.ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row):focus-visible,
+.dg-focus-inset:focus-visible,
+.dg-record-row:focus-visible,
+.dg-sidebar-resize-handle:focus-visible {
+  outline-offset: calc(-1 * var(--focus-ring-width)) !important;
 }
 
 /* ───── Semantic button reset ───── */
@@ -329,9 +350,28 @@ code, kbd, pre, samp, .ant-typography code {
   font-family: 'Manrope', sans-serif;
 }
 .btn-reset:focus-visible {
-  outline: 2px solid var(--focus-ring, #2dd4bf);
-  outline-offset: 2px;
   border-radius: 6px;
+}
+
+/* ───── Theme flip: one paint ─────
+   ThemeProvider sets this class on <html> for the two frames of a theme
+   change, so no background or colour fades in after the rest (C27). AntD
+   motion classes (*-enter / *-leave / *-appear) keep their transitions:
+   rc-motion waits for their end event. */
+.dg-theme-switching *:not([class*="-enter"], [class*="-leave"], [class*="-appear"]),
+.dg-theme-switching *:not([class*="-enter"], [class*="-leave"], [class*="-appear"])::before,
+.dg-theme-switching *:not([class*="-enter"], [class*="-leave"], [class*="-appear"])::after {
+  transition: none !important;
+}
+
+/* ───── Toasts: below the 52 px header ─────
+   AntD's default (8 px) put every toast on the breadcrumb, the bucket stats
+   and drawer titles (C6). Set here, once, because the message hooks
+   (`message.useMessage`) ignore `message.config`; AntD reads the offset from
+   this variable on the list element. */
+.ant-message.ant-message-top,
+.ant-notification:is(.ant-notification-top, .ant-notification-topLeft, .ant-notification-topRight) {
+  --notification-top: 64px !important;
 }
 
 /* ───── Browser sidebar: resize handle + backend groups ───── */
@@ -360,9 +400,6 @@ code, kbd, pre, samp, .ant-typography code {
 .dg-sidebar-resize-handle:focus-visible::after,
 .dg-col-resizing .dg-sidebar-resize-handle::after {
   background: var(--focus-ring);
-}
-.dg-sidebar-resize-handle:focus-visible {
-  outline: none;
 }
 /* During a drag: one cursor everywhere, no text selection, and no width
    transition on the sider (it would lag behind the pointer). */
@@ -566,10 +603,6 @@ code, kbd, pre, samp, .ant-typography code {
 [data-theme="light"] .account-menu-item:hover {
   background: rgba(13, 148, 136, 0.16);
 }
-.account-menu-item:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 2px;
-}
 
 .account-menu-section {
   margin: 10px 0 6px;
@@ -647,10 +680,6 @@ code, kbd, pre, samp, .ant-typography code {
 }
 [data-theme="light"] .account-menu-trigger:hover {
   border-color: rgba(13, 148, 136, 0.35);
-}
-.account-menu-trigger:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 2px;
 }
 .account-menu-trigger {
   display: flex;

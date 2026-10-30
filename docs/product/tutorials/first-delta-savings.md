@@ -74,10 +74,10 @@ Now back in the browser:
 When the upload finishes, navigate back into the bucket and open the `firmware/widget-3000/` folder. You should see one row:
 
 ```
-fw-1.4.0.tar    5.0 MB    just now    Delta
+fw-1.4.0.tar    5.0 MB    just now    Baseline
 ```
 
-This first upload became the folder's *reference baseline*. The baseline is one full copy, and the proxy stores every future version as a tiny diff against it. (The row reads **Delta** because the proxy records even the first file that way. Its diff against itself is trivially small.) The visible savings start with the *second* upload.
+This first upload became the folder's *reference baseline*. The baseline is one full copy, and the proxy stores every future version as a tiny diff against it. The proxy also stores the first file as a diff against the baseline, and that diff is almost empty, because the two are the same bytes. The row reads **Baseline** because the file and the baseline have the same SHA-256. The visible savings start with the *second* upload.
 
 ## Step 4: make v1.4.1 and upload it from the command line
 
@@ -114,11 +114,11 @@ Nothing about that command knew that compression was happening, because the prox
 Back in the browser, refresh the `firmware/widget-3000/` folder. There are two rows now, and the new one is different:
 
 ```
-fw-1.4.0.tar    5.0 MB    2 minutes ago    Delta
+fw-1.4.0.tar    5.0 MB    2 minutes ago    Baseline
 fw-1.4.1.tar    5.0 MB    just now         Delta
 ```
 
-Both rows are tagged **Delta**, because the proxy stores every version as a diff against the folder's reference baseline.
+The new row is tagged **Delta**, because the proxy stores it as a diff against the folder's reference baseline, which is `fw-1.4.0.tar`.
 
 Click the `fw-1.4.1.tar` row. An inspector drawer slides in from the right with the object's details, and near the top is the number we came for, in the **Savings** panel:
 

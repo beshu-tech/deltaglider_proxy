@@ -6,6 +6,8 @@ import {
   ArrowLeftOutlined,
   DeleteOutlined,
   CheckCircleFilled,
+  CloseOutlined,
+  PlusOutlined,
 } from '@ant-design/icons';
 import { getBucket } from '../s3client';
 import { formatBytes } from '../utils';
@@ -46,13 +48,48 @@ function normalizeDestination(dest: string): string {
 const ALWAYS = () => true;
 const NO_PREFIXES: string[] = [];
 
+/** The staged list shows this many rows; the rest are counted. */
+const STAGED_ROWS_SHOWN = 200;
+
+/** "Space saved" for a session that saved nothing. */
+const NOTHING_SAVED = 'None';
+
+/** The saving as the stats card shows it: a 0.0 % in a percent box read like a fault. */
+function savedText(pct: number): string {
+  const text = `${pct.toFixed(1)}%`;
+  return text === '0.0%' ? NOTHING_SAVED : text;
+}
+
+/** The path a file gets under the destination (a folder pick keeps its tree). */
+function stagedPath(file: File): string {
+  return (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
+}
+
+/** One staged file, however often it is picked or dropped. */
+function stagedId(file: File): string {
+  return `${stagedPath(file)}\u0000${file.size}\u0000${file.lastModified}`;
+}
+
+/** `prev` plus the files of `added` that are not in it yet. */
+function mergeStaged(prev: File[], added: File[]): File[] {
+  const seen = new Set(prev.map(stagedId));
+  const next = [...prev];
+  for (const f of added) {
+    const id = stagedId(f);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    next.push(f);
+  }
+  return next;
+}
+
 export default function UploadPage({
   prefix, onBack, onDone, initialFiles, onConsumeInitialFiles, onFinish,
   canWrite = ALWAYS, writablePrefixes = NO_PREFIXES, checkLimits = false,
 }: Props) {
   const {
     BG_BASE, BG_ELEVATED, BORDER, TEXT_PRIMARY,
-    TEXT_SECONDARY, TEXT_MUTED, ACCENT_BLUE, ACCENT_GREEN, ACCENT_RED, ACCENT_PURPLE, ACCENT_AMBER,
+    TEXT_SECONDARY, TEXT_MUTED, ACCENT_BLUE, ACCENT_GREEN, ACCENT_RED, ACCENT_AMBER,
   } = useColors();
   const [destination, setDestination] = useState(prefix);
   const [dragging, setDragging] = useState(false);
@@ -63,10 +100,9 @@ export default function UploadPage({
   const pageDropRef = useRef<HTMLDivElement>(null);
 
   const bucket = getBucket();
-  // Files staged from a drop (Finder→browser OR onto this page's drop zone),
-  // awaiting the user's confirmation of the destination before they enter the
-  // upload queue. Only the explicit "Select files/folder" buttons commit
-  // immediately — a deliberate pick made while looking at the destination.
+  // Every file the user adds (a drop onto the browser or this page, or the
+  // "Select files/folder" pickers) is staged here first. Nothing uploads
+  // until the user sets the folder, reviews the list and presses Upload.
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
   const {
     queue,
@@ -104,14 +140,14 @@ export default function UploadPage({
   // page says why at once instead of after the bytes went out.
   const limits = useUploadLimits(bucket, checkLimits);
   const [refused, setRefused] = useState<{ file: File; reason: string }[]>([]);
-  const addFilesIfValid = (files: FileList | File[]) => {
-    if (destError) return;
-    const check = precheckUpload(Array.from(files), limits);
-    setRefused(check.refused);
-    if (check.accepted.length > 0) addFiles(check.accepted);
+  const stageFiles = (files: FileList | File[]) => {
+    const added = Array.from(files);
+    if (added.length > 0) setPendingFiles((prev) => mergeStaged(prev, added));
   };
+  const unstage = (file: File) => setPendingFiles((prev) => prev.filter((f) => f !== file));
 
   const pendingCheck = precheckUpload(pendingFiles, limits);
+  const pendingBytes = pendingFiles.reduce((sum, f) => sum + f.size, 0);
   const commitPending = () => {
     if (pendingCheck.accepted.length === 0 || destError) return;
     addFiles(pendingCheck.accepted);
@@ -171,12 +207,10 @@ export default function UploadPage({
       setDragging(false);
       if (!e.dataTransfer) return;
       // Stage dropped files (don't upload yet) so the destination can be
-      // confirmed — consistent with a Finder→browser drop. Dropped FOLDERS
-      // are walked into their real files (sync call required, see
-      // droppedFiles.ts). The explicit "Select files/folder" buttons commit
-      // immediately instead.
+      // confirmed, the same as a pick. Dropped FOLDERS are walked into their
+      // real files (sync call required, see droppedFiles.ts).
       collectDroppedFiles(e.dataTransfer).then((dropped) => {
-        if (dropped.length > 0) setPendingFiles((prev) => [...prev, ...dropped]);
+        if (dropped.length > 0) setPendingFiles((prev) => mergeStaged(prev, dropped));
       });
     };
 
@@ -225,7 +259,7 @@ export default function UploadPage({
         Upload to {bucket}
       </Title>
       <Text style={{ color: TEXT_SECONDARY, fontSize: 13, display: 'block', marginBottom: 24, fontFamily: "var(--font-ui)" }}>
-        Drag and drop files, or select files and folders to upload. Archives, disk images, binaries and model files are stored as deltas when a new version is close to an older one; other files are stored whole.
+        Add files or folders, set the destination folder, then press Upload. Archives, disk images, binaries and model files are stored as deltas when a new version is close to an older one; other files are stored whole.
       </Text>
 
       {/* Upload destination — the clear, editable target path. */}
@@ -320,9 +354,10 @@ export default function UploadPage({
         </div>
       )}
 
-      {/* Pending dropped files — confirm the destination before they upload. */}
+      {/* Staged files: nothing uploads until the user presses Upload. */}
       {pendingFiles.length > 0 && (
-        <div
+        <section
+          aria-label="Files to upload"
           style={{
             marginBottom: 24,
             padding: 16,
@@ -331,14 +366,64 @@ export default function UploadPage({
             border: `1px solid ${ACCENT_BLUE}`,
           }}
         >
-          <Text style={{ display: 'block', fontSize: 14, color: TEXT_PRIMARY, fontFamily: 'var(--font-ui)', fontWeight: 600, marginBottom: 4 }}>
-            {pendingFiles.length} file{pendingFiles.length !== 1 ? 's' : ''} ready to upload
-          </Text>
+          <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', marginBottom: 4 }}>
+            <Text style={{ fontSize: 14, color: TEXT_PRIMARY, fontFamily: 'var(--font-ui)', fontWeight: 600 }}>
+              {pendingFiles.length} file{pendingFiles.length !== 1 ? 's' : ''} ready to upload · {formatBytes(pendingBytes)}
+            </Text>
+            <Space size={4} wrap>
+              <Button type="text" size="small" icon={<PlusOutlined />} onClick={() => fileInputRef.current?.click()} style={{ color: TEXT_SECONDARY, fontSize: 12 }}>
+                Add files
+              </Button>
+              <Button type="text" size="small" icon={<FolderAddOutlined />} onClick={() => folderInputRef.current?.click()} style={{ color: TEXT_SECONDARY, fontSize: 12 }}>
+                Add folder
+              </Button>
+              <Button type="text" size="small" icon={<DeleteOutlined />} onClick={() => setPendingFiles([])} style={{ color: TEXT_SECONDARY, fontSize: 12 }}>
+                Clear list
+              </Button>
+            </Space>
+          </div>
           <Text style={{ display: 'block', fontSize: 12, color: TEXT_SECONDARY, fontFamily: 'var(--font-ui)', marginBottom: 12 }}>
-            Check the destination above, then start the upload. {pendingFiles.slice(0, 3).map((f) => f.name).join(', ')}
-            {pendingFiles.length > 3 ? `, +${pendingFiles.length - 3} more` : ''}
+            Nothing is uploaded yet. Set the destination folder above, check the list, then press Upload.
           </Text>
-          <Space>
+          <ul
+            aria-label="Staged files"
+            style={{
+              listStyle: 'none', margin: '0 0 12px', padding: 0, maxHeight: 240, overflow: 'auto',
+              borderRadius: 8, border: `1px solid ${BORDER}`, background: BG_ELEVATED,
+            }}
+          >
+            {pendingFiles.slice(0, STAGED_ROWS_SHOWN).map((f) => {
+              const path = stagedPath(f);
+              return (
+                <li
+                  key={stagedId(f)}
+                  style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 4px 4px 12px', borderTop: `1px solid ${BORDER}`, marginTop: -1 }}
+                >
+                  <span title={path} style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'var(--font-mono)', fontSize: 12, color: TEXT_PRIMARY }}>
+                    {path}
+                  </span>
+                  <span style={{ flexShrink: 0, fontFamily: 'var(--font-mono)', fontSize: 12, color: TEXT_MUTED, fontVariantNumeric: 'tabular-nums' }}>
+                    {formatBytes(f.size)}
+                  </span>
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<CloseOutlined />}
+                    aria-label={`Remove ${path} from the list`}
+                    title="Remove from the list"
+                    onClick={() => unstage(f)}
+                    style={{ color: TEXT_MUTED, flexShrink: 0 }}
+                  />
+                </li>
+              );
+            })}
+            {pendingFiles.length > STAGED_ROWS_SHOWN && (
+              <li style={{ padding: '6px 12px', fontSize: 12, color: TEXT_MUTED, fontFamily: 'var(--font-ui)', borderTop: `1px solid ${BORDER}` }}>
+                And {(pendingFiles.length - STAGED_ROWS_SHOWN).toLocaleString()} more files
+              </li>
+            )}
+          </ul>
+          <Space wrap>
             <Button
               type="primary"
               size="large"
@@ -349,15 +434,13 @@ export default function UploadPage({
             >
               Upload {pendingCheck.accepted.length} file{pendingCheck.accepted.length !== 1 ? 's' : ''} to {destLabel}
             </Button>
-            <Button
-              size="large"
-              onClick={() => setPendingFiles([])}
-              style={{ background: BG_ELEVATED, borderColor: BORDER, color: TEXT_SECONDARY, borderRadius: 8 }}
-            >
-              Cancel
-            </Button>
+            {destError !== null && (
+              <Text style={{ fontSize: 12, color: ACCENT_RED, fontFamily: 'var(--font-ui)' }}>
+                Fix the destination folder to upload.
+              </Text>
+            )}
           </Space>
-        </div>
+        </section>
       )}
 
       {/* New folder modal */}
@@ -397,16 +480,17 @@ export default function UploadPage({
       {queue.length > 0 && (
       <div style={{ marginBottom: 24 }}>
         <Text style={{ fontSize: 11, fontWeight: 600, color: TEXT_MUTED, textTransform: 'uppercase', letterSpacing: 1, display: 'block', marginBottom: 12, fontFamily: "var(--font-ui)" }}>
-          Upload Session Statistics
+          Upload session
         </Text>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 12 }} role="status" aria-live="polite">
           {[
-            { label: 'Files uploaded', value: String(stats.uploaded), color: ACCENT_BLUE },
-            { label: 'Original size', value: formatBytes(stats.originalSize), color: ACCENT_PURPLE },
+            // Plain numbers in one colour: only a real saving is green.
+            { label: 'Files uploaded', value: String(stats.uploaded), color: TEXT_PRIMARY },
+            { label: 'Original size', value: formatBytes(stats.originalSize), color: TEXT_PRIMARY },
             {
               label: 'Stored',
               value: stats.storedSize === null ? '—' : formatBytes(stats.storedSize),
-              color: ACCENT_GREEN,
+              color: TEXT_PRIMARY,
               hint: stats.storedSize === null
                 ? 'Reading the stored size of each uploaded file'
                 : stats.baselineCount > 0
@@ -415,9 +499,13 @@ export default function UploadPage({
             },
             {
               label: 'Space saved',
-              value: stats.savingsPct === null ? '—' : `${stats.savingsPct.toFixed(1)}%`,
-              color: stats.savingsPct !== null && stats.savingsPct > 0 ? ACCENT_GREEN : TEXT_MUTED,
-              hint: stats.savingsPct === null ? 'Reading the stored size of each uploaded file' : undefined,
+              value: stats.savingsPct === null ? '—' : savedText(stats.savingsPct),
+              color: stats.savingsPct !== null && savedText(stats.savingsPct) !== NOTHING_SAVED ? ACCENT_GREEN : TEXT_MUTED,
+              hint: stats.savingsPct === null
+                ? 'Reading the stored size of each uploaded file'
+                : savedText(stats.savingsPct) === NOTHING_SAVED
+                  ? 'The files are stored whole: no space is saved yet.'
+                  : undefined,
             },
             { label: 'Active uploads', value: String(activeCount), color: activeCount > 0 ? ACCENT_BLUE : TEXT_MUTED },
           ].map((stat) => (
@@ -472,14 +560,13 @@ export default function UploadPage({
           <Text style={{ fontSize: 15, color: TEXT_PRIMARY, fontFamily: "var(--font-ui)", fontWeight: 500 }}>Drag and drop files here</Text>
         </div>
         <div style={{ marginBottom: 20 }}>
-          <Text style={{ fontSize: 12, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>or use the buttons below to select files</Text>
+          <Text style={{ fontSize: 12, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>or select files. You check the list before the upload starts.</Text>
         </div>
         <Space size={12} onClick={(e) => e.stopPropagation()}>
           <Button
             type="primary"
             icon={<CloudUploadOutlined />}
             onClick={() => fileInputRef.current?.click()}
-            disabled={destError !== null}
             style={{ borderRadius: 8 }}
           >
             Select files
@@ -487,7 +574,6 @@ export default function UploadPage({
           <Button
             icon={<FolderAddOutlined />}
             onClick={() => folderInputRef.current?.click()}
-            disabled={destError !== null}
             style={{ background: BG_ELEVATED, borderColor: BORDER, color: TEXT_SECONDARY, borderRadius: 8 }}
           >
             Select folder
@@ -504,7 +590,7 @@ export default function UploadPage({
         style={{ display: 'none' }}
         aria-hidden="true"
         onChange={(e) => {
-          if (e.target.files?.length) addFilesIfValid(e.target.files);
+          if (e.target.files?.length) stageFiles(e.target.files);
           e.target.value = '';
         }}
       />
@@ -516,7 +602,7 @@ export default function UploadPage({
         style={{ display: 'none' }}
         aria-hidden="true"
         onChange={(e) => {
-          if (e.target.files?.length) addFilesIfValid(e.target.files);
+          if (e.target.files?.length) stageFiles(e.target.files);
           e.target.value = '';
         }}
       />
@@ -587,7 +673,7 @@ export default function UploadPage({
         <div style={{ marginBottom: 24 }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
             <Text style={{ fontSize: 11, fontWeight: 600, color: TEXT_MUTED, textTransform: 'uppercase', letterSpacing: 1, fontFamily: "var(--font-ui)" }}>
-              Upload Queue ({queue.length})
+              Upload queue ({queue.length})
             </Text>
             <Space size={4}>
               {/* The big drop-zone box is hidden once files are in context;

@@ -195,17 +195,45 @@ export default function BucketsPanel({ onSessionExpired, search }: Props) {
   const globalCompressionOn = globalRatio > 0;
   const defaultDeltaExtensions = cfg?.delta_extensions_default ?? [];
 
+  // Fields whose text cannot be staged (a quota of "abc"), by card key. The
+  // dirty bar counts them and refuses to apply; Discard clears them (the
+  // cards remount with the staged values).
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+  const fieldErrorCount = Object.keys(fieldErrors).length;
+  const fieldErrorFor = useCallback(
+    (key: string) => (error: string | null) =>
+      setFieldErrors((cur) => {
+        if ((cur[key] ?? null) === error) return cur;
+        const next = { ...cur };
+        if (error) next[key] = error;
+        else delete next[key];
+        return next;
+      }),
+    [],
+  );
+  const [cardEpoch, setCardEpoch] = useState(0);
+  const discardAll = () => {
+    discard();
+    setFieldErrors({});
+    setCardEpoch((n) => n + 1);
+  };
+
   // Guarded apply: client-side validation first, then the editor's
   // validate → ApplyDialog → PUT flow (which re-derives the same body via
   // `toPayload`, keeping the validate/PUT body byte-identical).
   const runApply = useCallback(async () => {
+    const firstFieldError = Object.entries(fieldErrors)[0];
+    if (firstFieldError) {
+      message.error(`Fix the field marked in red first. ${firstFieldError[1]}`);
+      return;
+    }
     const res = buildBucketPayload(rows, baselineNamesRef.current, unmodeledNamesRef.current);
     if (!res.ok) {
       message.error(res.error);
       return;
     }
     await editorRunApply();
-  }, [rows, editorRunApply]);
+  }, [rows, editorRunApply, fieldErrors]);
 
   useApplyHandler('storage/buckets', runApply, dirty);
 
@@ -393,8 +421,9 @@ export default function BucketsPanel({ onSessionExpired, search }: Props) {
             const key = `real:${name}`;
             return (
               <BucketCard
-                key={key}
+                key={`${key}:${cardEpoch}`}
                 name={name}
+                onFieldError={fieldErrorFor(key)}
                 row={row}
                 real
                 expanded={expandedKey === key}
@@ -437,8 +466,9 @@ export default function BucketsPanel({ onSessionExpired, search }: Props) {
 
           {orphanRows.map((row) => (
             <BucketCard
-              key={row._id}
+              key={`${row._id}:${cardEpoch}`}
               name={row.name}
+              onFieldError={fieldErrorFor(row._id)}
               row={row}
               real={false}
               expanded={expandedKey === row._id}
@@ -464,17 +494,21 @@ export default function BucketsPanel({ onSessionExpired, search }: Props) {
           ))}
 
         </div>
+
+        {/* The bar belongs to the bucket list, so it sticks to the bottom of
+            THIS card: it floats over the list while the list scrolls, and
+            settles under the last bucket, never over the next card's title
+            (UX harvest C5: a viewport-fixed bar hid "Object size limit"). */}
+        <StickyDirtyBar
+          visible={dirty}
+          applying={applying}
+          errorCount={fieldErrorCount}
+          onDiscard={discardAll}
+          onApply={() => void runApply()}
+        />
       </div>
 
       <ObjectSizeLimitCard onSessionExpired={onSessionExpired} />
-
-      <StickyDirtyBar
-        visible={dirty}
-        applying={applying}
-        onDiscard={discard}
-        onApply={() => void runApply()}
-        floating
-      />
 
       <ReencryptProposalModal
         open={reencrypt !== null}

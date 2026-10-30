@@ -16,7 +16,7 @@ import { LockOutlined, RightOutlined } from '@ant-design/icons';
 import type { AdminConfig } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import { numericCompare } from '../utils';
-import { ActionBadge } from './AdmissionBlockList';
+import { RuleRowText } from './AdmissionBlockList';
 
 const { Text } = Typography;
 
@@ -79,9 +79,10 @@ export default function SynthesizedBlocksPreview({
             background: BG_CARD,
             borderRadius: 8,
             padding: '8px 10px',
-            display: 'grid',
-            gridTemplateColumns: 'auto 1fr auto auto',
-            gap: 12,
+            display: 'flex',
+            flexWrap: 'wrap',
+            columnGap: 12,
+            rowGap: 4,
             alignItems: 'center',
             // No opacity: it faded the tag text to 2.5:1. The lock icon
             // marks the row read-only.
@@ -91,35 +92,10 @@ export default function SynthesizedBlocksPreview({
           <span title="Read-only: edit it in the bucket settings" style={{ display: 'inline-flex' }}>
             <LockOutlined style={{ color: TEXT_MUTED, fontSize: 14 }} />
           </span>
-          <div style={{ minWidth: 0 }}>
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-              <Text
-                style={{
-                  fontFamily: 'var(--font-mono)',
-                  color: TEXT_MUTED,
-                }}
-              >
-                {row.name}
-              </Text>
-              <ActionBadge action="allow-anonymous" />
-            </div>
-            <Text
-              type="secondary"
-              style={{
-                fontSize: 12,
-                display: 'block',
-                whiteSpace: 'nowrap',
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-              }}
-            >
-              bucket: {row.bucket} · prefixes:{' '}
-              {row.prefixes
-                .map((p) => (p === '' ? '(entire bucket)' : p))
-                .join(', ')}
-            </Text>
-          </div>
-          <span />
+          <RuleRowText name={row.name} readOnly action="allow-anonymous">
+            bucket: {row.bucket} · prefixes:{' '}
+            {row.prefixes.map((p) => (p === '' ? '(entire bucket)' : p)).join(', ')}
+          </RuleRowText>
           <button
             title="Edit this bucket's public prefixes"
             onClick={() => onEditInStorage(row.bucket)}

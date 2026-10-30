@@ -10,6 +10,12 @@ import { type DeleteJobOutcome, type DeletePlanSummary, bulkDeleteConfirm, delet
 import { type BulkTransferOutcome, bulkTransferOutcomeMessage } from '../bulkTransfer';
 import { confirmDeletePlan } from './confirmDelete';
 import { pluralize } from '../utils';
+import { useIsNarrow } from '../useIsNarrow';
+
+/** Below this width the action buttons show their icon only (with a title):
+ *  "N selected · Copy · Move · ZIP · Delete" did not fit a phone, and the
+ *  clipped one was Delete. */
+const ICON_ONLY_BELOW = 480;
 
 interface Props {
   selectedCount: number;
@@ -44,6 +50,9 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
   const [modal, setModal] = useState<'copy' | 'move' | null>(null);
   const [operating, setOperating] = useState(false);
   const [downloading, setDownloading] = useState(false);
+  const iconOnly = useIsNarrow(ICON_ONLY_BELOW);
+  /** The visible label of an action button: none on a phone (the title says it). */
+  const labelOf = (text: string) => (iconOnly ? undefined : text);
 
   // Back closes the destination picker; closing it any other way pops the entry.
   const closeModal = useCallback(() => setModal(null), []);
@@ -85,8 +94,10 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
   const handleDelete = async () => {
     if (!onDelete) return;
     try {
-      const { type, text } = deleteJobMessage(await onDelete((plan) => confirmDeletePlan(bulkDeleteConfirm(plan))));
-      message[type](text);
+      // A started job is progress, not a result: an info toast, never the
+      // success green (the objects are still being deleted).
+      const { text } = deleteJobMessage(await onDelete((plan) => confirmDeletePlan(bulkDeleteConfirm(plan))));
+      message.info(text);
     } catch (e) {
       if (isSessionExpired(e) && onSessionExpired) onSessionExpired();
       else message.error(normalizeUiError(e, 'Delete failed'));
@@ -112,8 +123,8 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
         style={{
           position: 'absolute', left: '50%', bottom: 56, transform: 'translateX(-50%)',
           zIndex: 20, maxWidth: 'calc(100% - 32px)',
-          display: 'flex', alignItems: 'center', gap: 8,
-          padding: '8px 12px 8px 16px',
+          display: 'flex', alignItems: 'center', gap: iconOnly ? 6 : 8,
+          padding: iconOnly ? '8px 10px' : '8px 12px 8px 16px',
           border: `1px solid ${colors.BORDER}`, borderRadius: 10,
           background: colors.BG_ELEVATED,
           boxShadow: '0 8px 28px rgba(0, 0, 0, 0.35)',
@@ -149,7 +160,7 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
           </>
         ) : (
           <>
-            <span style={{ ...statusStyle, marginRight: 8 }}>
+            <span style={{ ...statusStyle, marginRight: iconOnly ? 0 : 8 }}>
               {selectedCount} selected
               {hint ? (
                 <span style={{ display: 'block', marginTop: 4, fontSize: 12, color: colors.TEXT_MUTED }}>
@@ -164,8 +175,9 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
                 onClick={() => setModal('copy')}
                 disabled={busy}
                 aria-label={`Copy ${selected}`}
+                title={`Copy ${selected}`}
               >
-                Copy
+                {labelOf('Copy')}
               </Button>
             )}
             {onMove && (
@@ -175,8 +187,9 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
                 onClick={() => setModal('move')}
                 disabled={busy}
                 aria-label={`Move ${selected}`}
+                title={`Move ${selected}`}
               >
-                Move
+                {labelOf('Move')}
               </Button>
             )}
             {onDownloadZip && (
@@ -187,8 +200,9 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
                 loading={downloading}
                 disabled={busy}
                 aria-label={`Download ${selected} as ZIP`}
+                title={`Download ${selected} as ZIP`}
               >
-                ZIP
+                {labelOf('ZIP')}
               </Button>
             )}
             {onDelete && (
@@ -201,8 +215,9 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
                 onClick={() => void handleDelete()}
                 disabled={busy}
                 aria-label={`Delete ${selected}`}
+                title={`Delete ${selected}`}
               >
-                Delete
+                {labelOf('Delete')}
               </Button>
             )}
           </>

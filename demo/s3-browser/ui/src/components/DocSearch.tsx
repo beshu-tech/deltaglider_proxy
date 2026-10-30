@@ -110,7 +110,7 @@ export default function DocSearch({ docs, onSelect }: Props) {
             <CloseCircleFilled aria-hidden="true" style={{ color: colors.TEXT_FAINT, fontSize: 12 }} />
           </button>
         ) : (
-          <span style={{ fontSize: 10, color: colors.TEXT_FAINT, fontFamily: 'var(--font-mono)' }}>
+          <span style={{ fontSize: 11, color: colors.TEXT_SECONDARY, fontFamily: 'var(--font-mono)' }}>
             {navigator.platform?.includes('Mac') ? '⌘K' : 'Ctrl+K'}
           </span>
         )}

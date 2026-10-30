@@ -1,7 +1,7 @@
-// The GUI user-name rule matches the server's (user_name_error in
+// The GUI user and group name rule matches the server's (iam_name_error in
 // src/api/admin/users.rs, which has the same truth table).
 import { expect, test } from 'vitest';
-import { userNameError } from '../userName';
+import { iamNameError } from '../userName';
 
 test.each([
   'ci-uploader',
@@ -12,7 +12,7 @@ test.each([
   'X',
   'a'.repeat(64),
 ])('%s is valid', (name) => {
-  expect(userNameError(name)).toBeNull();
+  expect(iamNameError(name)).toBeNull();
 });
 
 test.each([
@@ -26,5 +26,5 @@ test.each([
   ['..', /cannot be \. or \.\./],
   ['a'.repeat(65), /64 characters or fewer/],
 ])('%j is refused', (name, why) => {
-  expect(userNameError(name)).toMatch(why);
+  expect(iamNameError(name)).toMatch(why);
 });

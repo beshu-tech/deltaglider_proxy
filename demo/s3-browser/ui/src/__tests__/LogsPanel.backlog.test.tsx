@@ -71,7 +71,7 @@ test('tail lines prepend; a refetched backlog replaces them', async () => {
   http.on('GET', LOGS, () => json({ entries: backlog, limit: 2000 }));
   const user = userEvent.setup();
   renderWithQuery(<LogsPanel />);
-  await screen.findByText('1 lines');
+  await screen.findByText('1 line');
   await user.click(screen.getByRole('switch'));
   await waitFor(() => expect(tail.push).not.toBeNull());
   act(() => tail.push!(line('live')));
@@ -82,4 +82,14 @@ test('tail lines prepend; a refetched backlog replaces them', async () => {
   await user.click(screen.getByRole('button', { name: /Refresh/ }));
   // 3, not 4: the tail line is in the new backlog.
   expect(await screen.findByText('3 lines')).toBeInTheDocument();
+});
+
+// UX harvest C57: a search with no match showed an empty grey box only.
+test('a search with no match says so', async () => {
+  http.on('GET', LOGS, (req) => json({ entries: req.path.includes('q=') ? [] : [line('a')], limit: 2000 }));
+  const user = userEvent.setup();
+  renderWithQuery(<LogsPanel />);
+  expect(await screen.findByText('1 line')).toBeInTheDocument();
+  await user.type(screen.getByRole('textbox', { name: 'Search message and fields' }), 'zzzz-nomatch');
+  expect(await screen.findByText('No log line matches "zzzz-nomatch"')).toBeInTheDocument();
 });

@@ -25,5 +25,25 @@ test('a failed connection test shows its error', async () => {
   await user.type(screen.getByLabelText('Secret access key'), 'secret');
   await user.click(screen.getByRole('button', { name: /Test connection/ }));
   expect(await screen.findByText(/upstream exploded/)).toBeInTheDocument();
-  expect(screen.getByRole('button', { name: /Next/ })).toBeDisabled();
+  // C46: Next stays usable; a click says why the step is not done and stays.
+  await user.click(screen.getByRole('button', { name: /Next/ }));
+  expect(await screen.findByText('Test the connection. Next needs a test that passes.')).toBeInTheDocument();
+  expect(screen.getByText('Step 2 of 5')).toBeInTheDocument();
+});
+
+// C46: the admin step's Next marks the missing fields instead of being grey.
+test('Next on an empty admin step marks each missing field', async () => {
+  const user = userEvent.setup();
+  renderWithQuery(<SetupWizard onComplete={() => {}} onCancel={() => {}} />);
+  await user.click(await screen.findByRole('button', { name: /Next/ }));
+  await user.type(screen.getByRole('textbox', { name: 'Data directory' }), '/var/lib/deltaglider');
+  await user.click(screen.getByRole('button', { name: /Next/ }));
+  expect(await screen.findByText('Step 3 of 5')).toBeInTheDocument();
+  const next = screen.getByRole('button', { name: /Next/ });
+  expect(next).toBeEnabled();
+  await user.click(next);
+  expect(await screen.findByText('Enter an access key ID.')).toBeInTheDocument();
+  expect(screen.getByText('Enter a secret access key.')).toBeInTheDocument();
+  expect(screen.getByRole('textbox', { name: 'Access key ID' })).toHaveAttribute('aria-invalid', 'true');
+  expect(screen.getByText('Step 3 of 5')).toBeInTheDocument();
 });

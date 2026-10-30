@@ -32,3 +32,12 @@ test('a document apply that did not persist says the change is lost at restart',
     await screen.findByText(/Applied to the running proxy, but the config file is read-only, so this change is lost at the next restart\. Export the YAML and update your deployment\./),
   ).toBeInTheDocument();
 });
+
+// C8: the modal opens with focus in the YAML box, not on the close button.
+test.each(['import', 'export'] as const)('the %s modal focuses the YAML box on open', async (mode) => {
+  const http = mockFetch();
+  http.on('GET', '/_/api/admin/config/export', new Response('storage: {}\n', { status: 200, headers: { 'content-type': 'text/yaml' } }));
+  renderWithQuery(<YamlImportExportModal open mode={mode} onClose={() => {}} />);
+  const box = await screen.findByRole('textbox', { name: mode === 'import' ? 'YAML to import' : 'Exported YAML' });
+  await vi.waitFor(() => expect(document.activeElement).toBe(box));
+});

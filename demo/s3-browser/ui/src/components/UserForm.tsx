@@ -1,7 +1,7 @@
 import { useState, useId } from 'react';
 import { Input, Switch, Button, Alert, Space, Divider, Typography } from 'antd';
 import { ThunderboltOutlined, CheckCircleFilled, MinusCircleFilled, CrownFilled } from '@ant-design/icons';
-import type { IamUser, CreateUserRequest, UpdateUserRequest } from '../adminApi';
+import type { IamUser, IamPermission, CreateUserRequest, UpdateUserRequest } from '../adminApi';
 import { useCreateUser, useUpdateUser, useDeleteUser, useRotateUserKeys } from '../queries/users';
 import { useCannedPolicies } from '../queries/cannedPolicies';
 import { useGroups } from '../queries/groups';
@@ -24,7 +24,7 @@ import { confirmDialog } from '../confirmDialog';
 import { generateId, generateSecret } from '../credentialGeneration';
 import { ApiError, normalizeUiError } from '../errorHandling';
 import { IAM_DIRTY_KEYS, useDirtyFlag, useFormBaseline } from '../useDirtyFlag';
-import { USER_NAME_HELP, userNameError } from '../userName';
+import { IAM_NAME_HELP, iamNameError, serverNameErrorText } from '../userName';
 import { firstUserSwitchText } from '../firstUser';
 import { useApplyHandler } from '../useDirtySection';
 
@@ -76,7 +76,7 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
   const [accessKeyId, setAccessKeyId] = useState(() => user?.access_key_id ?? '');
   const [secretKey, setSecretKey] = useState('');
   const [enabled, setEnabled] = useState(() => user?.enabled ?? true);
-  const [permissions, setPermissions] = useState<PermissionRow[]>(() =>
+  const [initialPermissions] = useState<PermissionRow[]>(() =>
     user
       ? permissionsToRows(user.permissions)
       // Least privilege by default: a user saved without touching this
@@ -85,6 +85,7 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
       // by accident. The presets above one-click to broader access.
       : [{ _uiId: freshPermissionRowId(), effect: 'Allow', actions: ['read', 'list'], resources: ['*'] }],
   );
+  const [permissions, setPermissions] = useState<PermissionRow[]>(initialPermissions);
   const [saving, setSavingState] = useState(false);
   const [deleting, setDeletingState] = useState(false);
   const [error, setError] = useState('');
@@ -119,7 +120,7 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
   // A name that is not changed stays valid: an OAuth user keeps the display
   // name its identity provider gave it (the server accepts it unchanged).
   const nameChanged = !isEdit || name.trim() !== user.name;
-  const nameRuleError = nameChanged ? userNameError(name.trim()) : null;
+  const nameRuleError = nameChanged ? iamNameError(name.trim()) : null;
   const nameError = (showFieldErrors ? nameRuleError : null) ?? serverNameError;
 
   const handleSave = async () => {
@@ -171,7 +172,8 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
     } catch (e) {
       // The server's name rule (400 "user name …") belongs on the field.
       const detail = e instanceof ApiError && e.status === 400 ? e.detail ?? '' : '';
-      if (/^user name /i.test(detail)) setServerNameError(`${detail.charAt(0).toUpperCase()}${detail.slice(1)}.`);
+      const fieldError = serverNameErrorText('user', detail);
+      if (fieldError) setServerNameError(fieldError);
       else setError(normalizeUiError(e, 'Operation failed'));
     } finally {
       setSaving(false);
@@ -191,6 +193,21 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
     }
   };
 
+  const presets = cannedPolicies.length > 0 ? cannedPolicies : Object.entries(FALLBACK_PRESETS).map(([name, perms]) => ({
+    name,
+    description: '',
+    permissions: perms.map(p => ({ id: 0, effect: p.effect, actions: p.actions, resources: p.resources.map(s => s.trim()).filter(Boolean) })),
+  }));
+  // A preset asks before it replaces rules only when the rules hold work the
+  // click would lose: not the default rule a new form starts with, and not
+  // another preset (or no rules at all).
+  const permissionsHandMade = (() => {
+    const current = samePermissions(rowsToPermissions(permissions));
+    if (current([])) return false;
+    if (!isEdit && current(rowsToPermissions(initialPermissions))) return false;
+    return !presets.some(p => current(rowsToPermissions(permissionsToRows(p.permissions))));
+  })();
+
   const hasKeyChanges = isEdit && (
     (accessKeyId.trim() && accessKeyId.trim() !== user?.access_key_id) ||
     secretKey.trim().length > 0
@@ -199,7 +216,7 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
   // One entry point for the Save button and ⌘S: key changes need a confirm
   // because the new secret is shown only once.
   const submit = async () => {
-    if (!isEdit && firstUser && !userNameError(name.trim()) && !(await confirmDialog({
+    if (!isEdit && firstUser && !iamNameError(name.trim()) && !(await confirmDialog({
       title: 'Switch sign-in to IAM users?',
       content: `This is the first IAM user. ${firstUserSwitchText(firstUser.bootstrapAccessKey)}`,
       okText: 'Create user and switch',
@@ -268,7 +285,7 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
 
       <FormField
         label="Name"
-        helpText={readOnly ? undefined : USER_NAME_HELP}
+        helpText={readOnly ? undefined : IAM_NAME_HELP}
         error={nameError ?? undefined}
         style={{ marginBottom: 20 }}
       >
@@ -335,18 +352,13 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
       {/* Presets as compact pill buttons (hidden in read-only — nothing to apply). */}
       {!readOnly && (
         <div style={{ marginBottom: 12, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-          {(cannedPolicies.length > 0 ? cannedPolicies : Object.entries(FALLBACK_PRESETS).map(([name, perms]) => ({
-            name,
-            description: '',
-            permissions: perms.map(p => ({ id: 0, effect: p.effect, actions: p.actions, resources: p.resources.map(s => s.trim()).filter(Boolean) })),
-          }))).map(policy => {
+          {presets.map(policy => {
             return (
                 <PillButton
                   key={policy.name}
                   title={policy.description || `Replace the permissions with the "${policy.name}" preset`}
                   onClick={async () => {
-                    const hasExisting = permissions.some(r => r.actions.length > 0 || r.resources.some(res => res.trim() !== ''));
-                    if (hasExisting && !(await confirmDialog({ title: `Replace the permissions with "${policy.name}"?`, okText: 'Replace' }))) return;
+                    if (permissionsHandMade && !(await confirmDialog({ title: `Replace the permissions with "${policy.name}"?`, okText: 'Replace' }))) return;
                     setPermissions(permissionsToRows(policy.permissions));
                   }}
                 >
@@ -402,4 +414,15 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
       )}
     </div>
   );
+}
+
+/**
+ * `samePermissions(a)(b)`: the two rule lists grant the same thing (effect,
+ * actions, resources and conditions of each rule, in order; ids ignored).
+ */
+function samePermissions(a: IamPermission[]) {
+  const key = (rules: IamPermission[]) =>
+    JSON.stringify(rules.map(r => [r.effect ?? 'Allow', [...r.actions].sort(), [...r.resources].sort(), r.conditions ?? null]));
+  const mine = key(a);
+  return (b: IamPermission[]) => key(b) === mine;
 }

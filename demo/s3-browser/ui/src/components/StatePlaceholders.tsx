@@ -13,7 +13,7 @@
  * SectionHeader's 17 and FormField's 13.5), hint at FormField's 12.5 muted.
  */
 import type { ReactNode } from 'react';
-import { Spin } from 'antd';
+import { Skeleton, Spin } from 'antd';
 import { useColors } from '../ThemeContext';
 
 /**
@@ -51,6 +51,18 @@ export function LoadingState({ label }: { label?: string }) {
   );
 }
 
+/**
+ * Grey text bars where figures will appear: for a tile or card whose data is
+ * still loading. Without it a tile showed its zero / empty copy ("0 buckets
+ * ready to scan", "No buckets yet") for a moment before the real figures.
+ */
+export function SkeletonState({ rows = 3, label = 'Loading' }: { rows?: number; label?: string }) {
+  return (
+    <div role="status" aria-busy="true" aria-label={label} style={{ flex: 1, padding: 14 }}>
+      <Skeleton active title={false} paragraph={{ rows }} />
+    </div>
+  );
+}
 
 /**
  * Centered empty state: optional muted icon, title, optional hint sentence,

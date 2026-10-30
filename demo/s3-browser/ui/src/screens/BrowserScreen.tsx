@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react';
 import { Alert } from 'antd';
 import type { WhoamiResponse } from '../adminApi';
 import type { BrowserCapabilities } from '../browserCapabilities';
@@ -7,6 +8,9 @@ import ObjectTable, { type ObjectTableCursor, type ObjectTableFolderSizes } from
 import type { MaintenanceJobView } from '../maintenanceStatus';
 import type { S3Object } from '../types';
 import type { S3Browser } from '../useS3Browser';
+import BucketUsageChip from '../components/BucketUsageChip';
+import { BULK_BAR_RESERVE, HEADER_STATS_MIN_VIEWPORT } from '../browser/layout';
+import { useIsNarrow } from '../useIsNarrow';
 import BucketMaintenanceBanner from './BucketMaintenanceBanner';
 import ListingPlaceholder from './ListingPlaceholder';
 
@@ -57,6 +61,18 @@ export default function BrowserScreen({
 }: Props) {
   const isEmpty = s3.objects.length === 0 && s3.folders.length === 0;
   const { canAdmin } = caps;
+  const barShown = s3.selectedKeys.size > 0 || s3.bulkRunning;
+  // On a narrow window the header has room for the savings chip only: the
+  // bucket totals move to the listing's footer (TopBar hides them there).
+  const statsInFooter = useIsNarrow(HEADER_STATS_MIN_VIEWPORT) && !isMobile;
+  // The folder last seen with rows. An empty listing of THAT folder means
+  // the user emptied it (a delete or a move), not a mistyped path.
+  const location = `${bucket}\u0000${s3.prefix}`;
+  const [filledLocation, setFilledLocation] = useState<string | null>(null);
+  useEffect(() => {
+    if (!isEmpty) setFilledLocation(location);
+  }, [isEmpty, location]);
+  const emptied = isEmpty && filledLocation === location;
   return (
     <>
       {jobs.active && <BucketMaintenanceBanner job={jobs.active} writesBlocked={jobs.writesBlocked} />}
@@ -70,7 +86,7 @@ export default function BrowserScreen({
       {/* A running bulk action keeps the bar (and its progress) on screen
           even when the selection empties: a delete's or move's batch reloads
           the listing, and a folder change clears the selection. */}
-      {(s3.selectedKeys.size > 0 || s3.bulkRunning) && (
+      {barShown && (
         <BulkActionBar
           selectedCount={s3.selectedKeys.size}
           onDelete={caps.bulk.delete ? s3.bulkDelete : undefined}
@@ -106,6 +122,7 @@ export default function BrowserScreen({
             loading={s3.loading}
             error={s3.error}
             onlyHiddenEntries={!s3.searchQuery && !s3.showHidden && s3.allFolders.length > 0}
+            emptied={emptied}
             bucketCount={bucketCount}
             canUpload={caps.canUpload}
             canCreateBucket={caps.canCreateBucket}
@@ -137,6 +154,8 @@ export default function BrowserScreen({
             folderSizes={folderSizes}
             cursor={cursor}
             isMobile={isMobile}
+            reserveBottom={barShown ? BULK_BAR_RESERVE : 0}
+            footerExtra={statsInFooter && bucket ? <BucketUsageChip bucket={bucket} canAdmin={canAdmin} inFolder={!!s3.prefix} /> : undefined}
           />
         )}
       </div>

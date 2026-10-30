@@ -120,7 +120,9 @@ test('a bucket key from the bucket card: ciphertext at rest, re-encrypt, rotate'
   await page.goto('/_/admin/storage/buckets');
   // The row's name is its visible text: the bucket name, then the chips.
   const row = page.getByRole('button', { name: new RegExp(`^${BUCKET} `), expanded: false });
-  await expect(row).toContainText('Not encrypted', { timeout: 30_000 });
+  // A bucket that stores plaintext like its backend shows no encryption chip.
+  await expect(row).toBeVisible({ timeout: 30_000 });
+  await expect(row).not.toContainText('Encrypted');
   await row.click();
   const group = page.getByTestId('bucket-encryption-group');
   await expect(group).toBeVisible();

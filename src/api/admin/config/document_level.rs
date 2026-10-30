@@ -255,7 +255,7 @@ fn parse_and_validate_yaml(
         crate::config::Config::validate_document(&yaml).map_err(|refusal| {
             scrub(match refusal {
                 R::Empty => EMPTY_DOCUMENT.to_string(),
-                R::Parse(e) => format!("YAML parse error: {}", e),
+                R::Parse(e) => parse_refusal_text(&yaml, &e),
                 R::LogFilter(filter) => format!(
                     "invalid log_level filter '{filter}': expected a tracing-subscriber \
                      EnvFilter (e.g. 'info', 'deltaglider_proxy=debug')"
@@ -268,6 +268,122 @@ fn parse_and_validate_yaml(
     // The rule gates need the RUNNING config (a new defect vs. a standing
     // one): the write pipeline runs them.
     Ok((cfg, warnings.into_iter().map(scrub).collect()))
+}
+
+/// The plain-English sentence for a document the loader refuses (C63).
+/// A value of the wrong type names its YAML path and the value it got
+/// (`storage.buckets.releases.quota_bytes must be a whole number (got
+/// "notanumber")`), not serde's "invalid type: string …, expected u64". A
+/// refusal this does not know keeps its own text without the old double
+/// "YAML parse error: Parse error:" prefix. The raw text goes to the log.
+fn parse_refusal_text(yaml: &str, error: &crate::config::ConfigError) -> String {
+    let raw = match error {
+        crate::config::ConfigError::Parse(m) => m.clone(),
+        other => other.to_string(),
+    };
+    tracing::debug!("config document refused: {raw}");
+    let doc: serde_yaml::Value = match serde_yaml::from_str(yaml) {
+        Ok(doc) => doc,
+        Err(e) => return format!("The text is not valid YAML: {e}."),
+    };
+    if let Some((path, inner)) = failing_value_path(doc) {
+        // Use the path only when it is the same refusal (the loader reads
+        // `!envref` values more leniently than this second pass).
+        if raw.starts_with(&inner) {
+            if let Some(sentence) = describe_value_error(&path, &inner) {
+                return sentence;
+            }
+        }
+    }
+    format!("The config cannot be read: {raw}")
+}
+
+/// The YAML path and the serde message of the first value the config types
+/// refuse, or `None` when they accept the document.
+fn failing_value_path(doc: serde_yaml::Value) -> Option<(String, String)> {
+    let sectioned = doc.as_mapping().is_some_and(|m| {
+        ["admission", "access", "storage", "advanced"]
+            .iter()
+            .any(|k| m.contains_key(*k))
+    });
+    let err = if sectioned {
+        serde_path_to_error::deserialize::<_, crate::config_sections::SectionedConfig>(doc).err()?
+    } else {
+        serde_path_to_error::deserialize::<_, crate::config::Config>(doc).err()?
+    };
+    Some((err.path().to_string(), err.inner().to_string()))
+}
+
+/// One sentence for a serde type/value error at `path`, or `None` for a
+/// message shape this does not know.
+fn describe_value_error(path: &str, msg: &str) -> Option<String> {
+    let at = |p: &str| {
+        if p.is_empty() || p == "." {
+            "The document".to_string()
+        } else {
+            p.to_string()
+        }
+    };
+    let ticked = |s: &str| s.trim_matches('`').to_string();
+    if let Some(rest) = msg.strip_prefix("unknown field ") {
+        let field = ticked(rest.split(',').next().unwrap_or(rest));
+        // The path of an unknown key already ends at the key itself.
+        let full = if path.ends_with(&field) {
+            path.to_string()
+        } else if path.is_empty() || path == "." {
+            field.clone()
+        } else {
+            format!("{path}.{field}")
+        };
+        return Some(format!(
+            "{full} is not a known setting. Check the spelling and the section it is in."
+        ));
+    }
+    if let Some(rest) = msg.strip_prefix("missing field ") {
+        return Some(format!("{} needs the setting {}.", at(path), ticked(rest)));
+    }
+    if let Some(rest) = msg.strip_prefix("unknown variant ") {
+        let (got, expected) = rest.split_once(", expected ")?;
+        let options = expected.trim_start_matches("one of ").replace('`', "");
+        return Some(format!(
+            "{} must be one of {options} (got {}).",
+            at(path),
+            ticked(got)
+        ));
+    }
+    let (got, expected) = msg
+        .strip_prefix("invalid type: ")
+        .or_else(|| msg.strip_prefix("invalid value: "))?
+        .split_once(", expected ")?;
+    let want = match expected {
+        "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16" | "i32" | "i64" | "i128"
+        | "isize" => "a whole number".to_string(),
+        "f32" | "f64" => "a number".to_string(),
+        "a boolean" => "true or false".to_string(),
+        "a string" | "a borrowed string" => "text".to_string(),
+        "a sequence" => "a list".to_string(),
+        e if e.starts_with("struct ") || e.starts_with("a map") => {
+            "a mapping of settings".to_string()
+        }
+        e => e.replace('`', ""),
+    };
+    let got = if let Some(s) = got.strip_prefix("string ") {
+        s.to_string()
+    } else if let Some((_, v)) = got.split_once(' ').filter(|(k, _)| {
+        ["integer", "floating", "boolean"]
+            .iter()
+            .any(|t| k.starts_with(t))
+    }) {
+        ticked(v.trim_start_matches("point "))
+    } else {
+        match got {
+            "sequence" => "a list".to_string(),
+            "map" => "a mapping".to_string(),
+            "unit value" => "nothing".to_string(),
+            other => other.to_string(),
+        }
+    };
+    Some(format!("{} must be {want} (got {got}).", at(path)))
 }
 
 const EMPTY_DOCUMENT: &str = "empty YAML body: apply requires a full canonical config document. \
@@ -1102,6 +1218,32 @@ mod tests {
         )
         .expect_err("fatal config must not validate");
         assert!(err.contains("undefined backend 'hetzner-fsn1'"), "{err}");
+    }
+
+    /// C63: a refused value names its YAML path in plain English.
+    #[test]
+    fn parse_refusals_read_as_plain_english() {
+        let no_env = ScrubMap::new();
+        let cases: &[(&str, &str)] = &[
+            (
+                "storage:\n  buckets:\n    releases:\n      quota_bytes: notanumber\n",
+                "storage.buckets.releases.quota_bytes must be a whole number (got \"notanumber\").",
+            ),
+            (
+                "advanced:\n  max_delta_ratio: [1]\n",
+                "advanced.max_delta_ratio must be a number (got a list).",
+            ),
+            (
+                "advanced:\n  no_such_field: 1\n",
+                "advanced.no_such_field is not a known setting.",
+            ),
+            ("advanced: [unclosed\n", "The text is not valid YAML: "),
+        ];
+        for (yaml, want) in cases {
+            let got = parse_and_validate_yaml(yaml, &no_env).unwrap_err();
+            assert!(got.starts_with(want), "{yaml:?}\n got: {got}\nwant: {want}");
+            assert!(!got.contains("Parse error"), "{got}");
+        }
     }
 
     /// `config lint` and `/config/validate` run the same validation step:

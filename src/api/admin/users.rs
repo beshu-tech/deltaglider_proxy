@@ -47,34 +47,44 @@ fn default_copy_group_memberships() -> bool {
     true
 }
 
-/// Longest user name the admin API accepts (the AWS IAM limit).
+/// Longest user or group name the admin API accepts (the AWS IAM user-name
+/// limit).
 pub(crate) const USER_NAME_MAX_LEN: usize = 64;
 
-/// THE user-name rule of the admin API (create, rename, clone): 1 to 64
-/// characters, each a letter, a digit or one of `+ = , . @ _ -` (the AWS IAM
-/// user-name set), and not `.` or `..` (a path segment in `${iam:username}`).
-/// The GUI checks the same rule (`userNameError` in
+/// THE IAM name rule of the admin API, for user AND group names (create,
+/// rename, clone): 1 to 64 characters, each a letter, a digit or one of
+/// `+ = , . @ _ -` (the AWS IAM user-name set), and not `.` or `..` (a path
+/// segment in `${iam:username}`). `kind` ("user" / "group") starts the
+/// sentence. The GUI checks the same rule (`iamNameError` in
 /// `demo/s3-browser/ui/src/userName.ts`). OAuth auto-provisioning,
 /// declarative YAML and backup restore do not go through it, so a name made
 /// there before stays valid; a rename only has to pass it when it changes
 /// the name.
-pub(crate) fn user_name_error(name: &str) -> Option<&'static str> {
-    if crate::iam::types::is_blank_principal_name(name) {
-        return Some("user name cannot be blank");
-    }
-    if crate::iam::types::is_reserved_principal_name(name) {
-        return Some("user name cannot start with '$'");
-    }
-    if name.chars().count() > USER_NAME_MAX_LEN {
-        return Some("user name is longer than 64 characters");
-    }
-    if !name.chars().all(is_user_name_char) {
-        return Some("user name can contain only letters, digits and the characters + = , . @ _ -");
-    }
-    if matches!(name, "." | "..") {
-        return Some("user name cannot be '.' or '..'");
-    }
-    None
+fn iam_name_error(kind: &str, name: &str) -> Option<String> {
+    let why = if crate::iam::types::is_blank_principal_name(name) {
+        "name cannot be blank"
+    } else if crate::iam::types::is_reserved_principal_name(name) {
+        "name cannot start with '$'"
+    } else if name.chars().count() > USER_NAME_MAX_LEN {
+        "name is longer than 64 characters"
+    } else if !name.chars().all(is_user_name_char) {
+        "name can contain only letters, digits and the characters + = , . @ _ -"
+    } else if matches!(name, "." | "..") {
+        "name cannot be '.' or '..'"
+    } else {
+        return None;
+    };
+    Some(format!("{kind} {why}"))
+}
+
+/// [`iam_name_error`] for a user name.
+pub(crate) fn user_name_error(name: &str) -> Option<String> {
+    iam_name_error("user", name)
+}
+
+/// [`iam_name_error`] for a group name.
+pub(crate) fn group_name_error(name: &str) -> Option<String> {
+    iam_name_error("group", name)
 }
 
 fn is_user_name_char(c: char) -> bool {
@@ -83,21 +93,35 @@ fn is_user_name_char(c: char) -> bool {
 
 /// 400 with the rule's sentence unless `name` passes [`user_name_error`].
 fn check_user_name(name: &str) -> Result<(), AdminError> {
-    match user_name_error(name) {
+    check_name(user_name_error(name), name)
+}
+
+/// 400 with the rule's sentence unless `name` passes [`group_name_error`].
+pub(crate) fn check_group_name(name: &str) -> Result<(), AdminError> {
+    check_name(group_name_error(name), name)
+}
+
+fn check_name(error: Option<String>, name: &str) -> Result<(), AdminError> {
+    match error {
         None => Ok(()),
         Some(msg) => {
-            tracing::warn!("Invalid user name {:?}: {}", name, msg);
+            tracing::warn!("Invalid IAM name {:?}: {}", name, msg);
             Err(AdminError::invalid(msg))
         }
     }
 }
 
-/// The name a clone gets when the request names none: `<base>-copy`, then
-/// `<base>-copy2`, ... — the first that no user has. A source name made
-/// before the rule (an OAuth display name such as "Jane Doe") has each
-/// character outside the rule replaced by `-`, so the result always passes
-/// [`user_name_error`].
-fn next_user_copy_name(base: &str, existing: impl IntoIterator<Item = String>) -> String {
+/// The name a user or group clone gets when the request names none:
+/// `<base>-copy`, then `<base>-copy2`, ... — the first that `existing` does
+/// not hold. A source name made before the rule (an OAuth display name such
+/// as "Jane Doe") has each character outside the rule replaced by `-`, and
+/// one with no valid character becomes `kind`, so the result always passes
+/// [`iam_name_error`].
+pub(crate) fn next_iam_copy_name(
+    kind: &str,
+    base: &str,
+    existing: impl IntoIterator<Item = String>,
+) -> String {
     let existing: std::collections::HashSet<String> = existing.into_iter().collect();
     let mut stem: String = base
         .chars()
@@ -105,7 +129,7 @@ fn next_user_copy_name(base: &str, existing: impl IntoIterator<Item = String>) -
         .collect();
     let stem_trimmed = stem.trim_matches('-').to_string();
     stem = if stem_trimmed.is_empty() {
-        "user".to_string()
+        kind.to_string()
     } else {
         stem_trimmed
     };
@@ -386,7 +410,7 @@ pub async fn clone_user(
                 .unwrap_or_default()
                 .into_iter()
                 .map(|u| u.name);
-            next_user_copy_name(&source.name, names)
+            next_iam_copy_name("user", &source.name, names)
         });
 
     check_user_name(&name)?;
@@ -704,9 +728,16 @@ mod tests {
             assert!(got.starts_with(want), "{bad:?}: {got}");
         }
         assert_eq!(
-            user_name_error("."),
+            user_name_error(".").as_deref(),
             Some("user name cannot be '.' or '..'")
         );
+        assert_eq!(
+            group_name_error("qa group with spaces!").as_deref(),
+            Some("group name can contain only letters, digits and the characters + = , . @ _ -")
+        );
+        for ok in ["Engineering", "admins", "backup-group", "home-readers"] {
+            assert_eq!(group_name_error(ok), None, "{ok:?} is a valid group name");
+        }
     }
 
     proptest::proptest! {
@@ -718,21 +749,31 @@ mod tests {
                 proptest::prop_assert!(!name.is_empty() && name.len() <= USER_NAME_MAX_LEN);
                 proptest::prop_assert!(name.chars().all(is_user_name_char));
             }
-            let copy = next_user_copy_name(&name, [format!("{name}-copy")]);
+            let copy = next_iam_copy_name("user", &name, [format!("{name}-copy")]);
             proptest::prop_assert_eq!(user_name_error(&copy), None, "{:?} -> {:?}", name, copy);
         }
     }
 
     #[test]
     fn copy_names_skip_taken_ones_and_fix_old_names() {
-        assert_eq!(next_user_copy_name("dana", Vec::new()), "dana-copy");
+        assert_eq!(next_iam_copy_name("user", "dana", Vec::new()), "dana-copy");
         assert_eq!(
-            next_user_copy_name("dana", vec!["dana-copy".into(), "dana-copy2".into()]),
+            next_iam_copy_name(
+                "user",
+                "dana",
+                vec!["dana-copy".into(), "dana-copy2".into()]
+            ),
             "dana-copy3"
         );
-        assert_eq!(next_user_copy_name("Jane Doe", Vec::new()), "Jane-Doe-copy");
-        assert_eq!(next_user_copy_name("!!", Vec::new()), "user-copy");
-        assert_eq!(next_user_copy_name(&"a".repeat(64), Vec::new()).len(), 64);
+        assert_eq!(
+            next_iam_copy_name("user", "Jane Doe", Vec::new()),
+            "Jane-Doe-copy"
+        );
+        assert_eq!(next_iam_copy_name("user", "!!", Vec::new()), "user-copy");
+        assert_eq!(
+            next_iam_copy_name("user", &"a".repeat(64), Vec::new()).len(),
+            64
+        );
     }
 
     fn legacy_state() -> SharedIamState {

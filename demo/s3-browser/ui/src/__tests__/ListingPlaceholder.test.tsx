@@ -67,3 +67,11 @@ test('a search with no hits says so', () => {
   expect(screen.getByText('No objects or folders in releases/builds/ match "zzz".')).toBeInTheDocument();
   expect(screen.queryByRole('button', { name: 'Go to the parent folder' })).toBeNull();
 });
+
+// UX harvest C18: a folder the user just emptied is not a mistyped path.
+test('a folder emptied by the user says so, without the typo hint', () => {
+  mount({ prefix: 'qa-copied/', emptied: true });
+  expect(screen.getByText('releases/qa-copied/ is now empty.')).toBeInTheDocument();
+  expect(screen.queryByText(/typo/)).toBeNull();
+  expect(screen.getByRole('button', { name: 'Go to releases' })).toBeInTheDocument();
+});

@@ -909,39 +909,6 @@ export function mergeDraftRules(
 }
 
 /**
- * How to bring a rule editor in line after the server deleted one of its
- * rules. Without this the editor still carries the rule, mergeDraftRules
- * shows it as a DRAFT, and the next Apply re-creates it.
- * - clean editor → re-fetch (value AND baseline lose the rule);
- * - dirty editor → drop the rule from the value only, keeping the other
- *   edits. The baseline still holds it, so a later discard must refresh
- *   (see `editorAfterDiscard`).
- */
-export function planRuleDeleteSync<T extends NamedRule>(
-  dirty: boolean,
-  rules: T[],
-  baseline: readonly T[],
-  name: string,
-): { action: 'refresh' } | { action: 'filter'; rules: T[] } {
-  if (!dirty) return { action: 'refresh' };
-  // Drop the rule that IS the deleted one (by uid, still under that name):
-  // a draft that only has the same name stays, and so does a rename of the
-  // deleted rule (the operator's new rule).
-  const idx = findEditorRule(name, rules, baseline);
-  if (idx < 0 || rules[idx].name !== name) return { action: 'filter', rules };
-  return { action: 'filter', rules: rules.filter((_, i) => i !== idx) };
-}
-
-/**
- * Discard for a rule editor. `baselineStale` = a rule was deleted on the
- * server while the editor was dirty: its baseline still holds that rule, so a
- * plain discard would resurrect it — re-fetch server truth instead.
- */
-export function editorAfterDiscard(baselineStale: boolean): 'discard' | 'refresh' {
-  return baselineStale ? 'refresh' : 'discard';
-}
-
-/**
  * "Run now → re-verify" waits for the run to settle: the verify endpoint 409s
  * while the replication run holds its lease, and run-now returns 202 at once.
  * Fed each jobs-list sample of `replication:<rule>`; `start` is true on the

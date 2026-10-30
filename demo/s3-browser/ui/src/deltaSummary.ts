@@ -77,14 +77,33 @@ export function objectStorageHeadline(o: {
       kind: 'baseline',
       title: 'Stored whole',
       detail: "Reference for this folder's deltas",
-      chip: 'Baseline',
+      chip: storageChip('delta', true).label,
     };
   }
-  const type = o.storageType || 'Original';
   return {
     kind: 'savings',
     title: `${o.savingsPct.toFixed(1)}%`,
     detail: `${o.savedBytesText} saved`,
-    chip: type === 'passthrough' ? 'Original' : type.charAt(0).toUpperCase() + type.slice(1),
+    chip: storageChip(o.storageType || 'passthrough', false).label,
   };
+}
+
+/**
+ * THE storage chip of one object, for the object table and the inspector:
+ * "Baseline" (neutral: the folder's reference, stored whole), "Delta",
+ * "Original" (stored whole, not delta-eligible) or "—" (not known). The
+ * table showed "Delta" for a file the inspector called "Baseline".
+ */
+export function storageChip(storageType: string | undefined, isBaseline: boolean): {
+  label: string;
+  /** `neutral` = not a storage-type colour (baseline, unknown). */
+  tone: 'neutral' | 'type';
+  title?: string;
+} {
+  if (!storageType) return { label: '—', tone: 'neutral', title: 'Storage type not known' };
+  if (storageType === 'delta' && isBaseline) {
+    return { label: 'Baseline', tone: 'neutral', title: "Stored whole: the reference for this folder's deltas" };
+  }
+  if (storageType === 'passthrough') return { label: 'Original', tone: 'type' };
+  return { label: storageType.charAt(0).toUpperCase() + storageType.slice(1), tone: 'type' };
 }

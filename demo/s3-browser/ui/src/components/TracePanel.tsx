@@ -91,8 +91,20 @@ export default function TracePanel({ onSessionExpired }: Props) {
   const [result, setResult] = useState<TraceResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const { copy } = useCopyToClipboard();
+  // The server reads any string as a path ("not-a-path" became the bucket
+  // "not-a-path" and the answer "continue"), so a bad path is refused here,
+  // before a result that looks like an answer (UX harvest C61).
+  const [submitted, setSubmitted] = useState(false);
+  const pathError = tracePathError(path);
+  const shownPathError = submitted || path.trim() !== '' ? pathError : undefined;
 
   const run = async () => {
+    setSubmitted(true);
+    if (pathError) {
+      setResult(null);
+      setError(null);
+      return;
+    }
     setRunning(true);
     setError(null);
     setResult(null);
@@ -143,6 +155,7 @@ export default function TracePanel({ onSessionExpired }: Props) {
             helpText="The full request path, starting with /. The first segment is the bucket and the rest is the object key. Leave the key empty for a bucket-level request."
             examples={['/releases/builds/v1.zip', '/docs/readme.md', '/api/']}
             onExampleClick={(v) => setPath(String(v))}
+            error={shownPathError}
           >
             <Input
               value={path}
@@ -371,6 +384,15 @@ function DecisionSummary({ result }: { result: TraceResponse }) {
       )}
     </div>
   );
+}
+
+/** Why `path` cannot be traced, or undefined when it can. */
+function tracePathError(path: string): string | undefined {
+  const p = path.trim();
+  if (!p) return 'Enter a path, for example /releases/builds/v1.zip.';
+  if (!p.startsWith('/')) return 'The path must start with /.';
+  if (/\s/.test(p)) return 'The path must not contain spaces. Encode a space as %20.';
+  return undefined;
 }
 
 function ReasonPath({ result }: { result: TraceResponse }) {

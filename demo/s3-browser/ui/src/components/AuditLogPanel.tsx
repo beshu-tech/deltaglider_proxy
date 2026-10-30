@@ -186,7 +186,7 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
           <code style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: colors.TEXT_MUTED }}>
             DGP_AUDIT_RING_SIZE
           </code>
-          ). A restart clears them. Showing {entries.length} {entries.length === 1 ? 'entry' : 'entries'}.
+          ). A restart clears them.
         </span>
       </div>
 
@@ -224,7 +224,10 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
           </Text>
         </Space>
         <Text type="secondary" style={{ fontSize: 12 }}>
-          {filtered.length} of {entries.length} shown
+          {/* The one count on the page (the banner repeated it). */}
+          {filter.trim()
+            ? `${filtered.length} of ${entries.length} shown`
+            : `${entries.length} ${entries.length === 1 ? 'entry' : 'entries'}`}
         </Text>
       </Space>
 

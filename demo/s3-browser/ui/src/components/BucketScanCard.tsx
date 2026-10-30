@@ -43,6 +43,7 @@ import { fmtNum } from './dashboard/chartDefaults';
 import type { BucketScanResult } from '../adminApi';
 import { useBucketScans, useInvalidateBucketScans, useScannableBuckets } from '../queries/bucketScans';
 import { useBucketScanQueue } from '../hooks/useBucketScanQueue';
+import { SkeletonState } from './StatePlaceholders';
 
 interface Props {
   /**
@@ -122,7 +123,9 @@ export default function BucketScanCard({ onRenderActions, scopeBucket }: Props) 
   const scansQuery = useBucketScans();
   const scans = scansQuery.data?.buckets ?? NO_SCANS;
   const scansLoaded = scansQuery.status !== 'pending';
-  const allBuckets = useScannableBuckets().data ?? NO_BUCKETS;
+  const bucketsQuery = useScannableBuckets();
+  const allBuckets = bucketsQuery.data ?? NO_BUCKETS;
+  const bucketsLoaded = bucketsQuery.status !== 'pending';
 
   /**
    * Multi-bucket fan-out queue (shared with the analytics page). The
@@ -271,6 +274,12 @@ export default function BucketScanCard({ onRenderActions, scopeBucket }: Props) 
         </div>
       </div>
     );
+  }
+
+  // Before the scans and the bucket list are in, a skeleton: the idle copy
+  // read "0 buckets ready to scan" for a moment (UX harvest C52).
+  if (!scansLoaded || !bucketsLoaded) {
+    return <SkeletonState label="Loading scans" />;
   }
 
   // 2. Done state — at least one bucket has a cached result.

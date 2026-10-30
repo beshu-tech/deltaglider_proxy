@@ -140,9 +140,13 @@ function SortableRow({ block, onEdit, onDelete }: RowProps) {
     background: BG_CARD,
     borderRadius: 8,
     padding: '8px 10px',
-    display: 'grid',
-    gridTemplateColumns: 'auto 1fr auto auto auto',
-    gap: 12,
+    // Flex with wrap, not a fixed grid: the text block keeps at least
+    // RULE_TEXT_MIN_WIDTH, so on a phone the buttons move under it instead
+    // of squeezing the rule name into a 60 px column.
+    display: 'flex',
+    flexWrap: 'wrap',
+    columnGap: 12,
+    rowGap: 4,
     alignItems: 'center',
     opacity: isDragging ? 0.4 : 1,
   };
@@ -167,29 +171,9 @@ function SortableRow({ block, onEdit, onDelete }: RowProps) {
       </button>
 
       {/* Name + match summary */}
-      <div style={{ minWidth: 0 }}>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          <Text strong style={{ fontFamily: 'var(--font-mono)' }}>
-            {block.name}
-          </Text>
-          <ActionBadge action={block.action} />
-        </div>
-        <Text
-          type="secondary"
-          style={{
-            fontSize: 12,
-            display: 'block',
-            whiteSpace: 'nowrap',
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-          }}
-        >
-          {matchSummary(block.match)}
-        </Text>
-      </div>
-
-      {/* Spacer */}
-      <span />
+      <RuleRowText name={block.name} action={block.action}>
+        {matchSummary(block.match)}
+      </RuleRowText>
 
       {/* Edit */}
       <Button
@@ -223,12 +207,55 @@ function SortableRow({ block, onEdit, onDelete }: RowProps) {
   );
 }
 
+/** The narrowest the text block of a rule row gets before its buttons wrap. */
+const RULE_TEXT_MIN_WIDTH = 200;
+
+/**
+ * The text block of a rule row: the name and the action tag on one line
+ * (the tag wraps under a long name), the summary under them in full —
+ * the facts the row exists to show, so they wrap instead of being cut.
+ * It grows to fill the row and keeps RULE_TEXT_MIN_WIDTH, so the row's
+ * buttons wrap under it on a narrow screen. The public-access rows
+ * (SynthesizedBlocksPreview) use it too.
+ */
+export function RuleRowText({
+  name,
+  readOnly = false,
+  action,
+  children,
+}: {
+  name: string;
+  /** A rule the page cannot edit: the name is muted, not bold. */
+  readOnly?: boolean;
+  action: AdmissionBlock['action'];
+  children: React.ReactNode;
+}) {
+  const { TEXT_MUTED } = useColors();
+  return (
+    <div style={{ flex: `1 1 ${RULE_TEXT_MIN_WIDTH}px`, minWidth: 0 }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', columnGap: 8, rowGap: 2, alignItems: 'center' }}>
+        {/* Monospace, broken only where it must (a very long name). */}
+        <Text
+          strong={!readOnly}
+          style={{ fontFamily: 'var(--font-mono)', overflowWrap: 'anywhere', ...(readOnly ? { color: TEXT_MUTED } : {}) }}
+        >
+          {name}
+        </Text>
+        <ActionBadge action={action} />
+      </div>
+      <Text type="secondary" style={{ fontSize: 12, display: 'block', overflowWrap: 'anywhere' }}>
+        {children}
+      </Text>
+    </div>
+  );
+}
+
 /**
  * The action of a rule as a tag. The AntD preset colours put light green
  * text on a green tint (2.5:1); the theme accents reach 4.5:1 on light and
  * dark surfaces, so the text uses them and only the tint stays pale.
  */
-export function ActionBadge({ action }: { action: AdmissionBlock['action'] }) {
+function ActionBadge({ action }: { action: AdmissionBlock['action'] }) {
   const colors = useColors();
   const kind = actionKind(action);
   const colour: Record<string, string> = {

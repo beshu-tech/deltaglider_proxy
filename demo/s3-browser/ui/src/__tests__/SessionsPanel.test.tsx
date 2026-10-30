@@ -102,15 +102,38 @@ test('revoke-user sends the identity after confirmation and refetches', async ()
 });
 
 test('revoke-user warns when the revocation was not persisted', async () => {
-  http.on('GET', LIST, json({ sessions: [] }));
+  http.on('GET', LIST, json({ sessions: [session('s-bb', 'backup-bot')] }));
   http.on('POST', REVOKE_USER, json({
     revoked: 1, revoked_local: 1, persisted: false, pushed: false, propagation_bound_secs: null,
   }));
   const user = userEvent.setup();
   renderWithQuery(<SessionsPanel />);
-  await screen.findByText('0 live sessions');
+  await screen.findByText('1 live session');
   await user.type(screen.getByRole('textbox', { name: 'Sign out every session of an identity' }), 'backup-bot');
   await user.click(screen.getByRole('button', { name: 'Revoke key' }));
   await user.click(within(await lastDialog()).getByRole('button', { name: 'Sign out all sessions' }));
   expect(await screen.findByText(/could NOT be persisted/)).toBeInTheDocument();
+});
+
+// C39: an identity that no listed session uses is said so before anything is sent.
+test('revoke-user of an unknown identity says no live session here uses it', async () => {
+  http.on('GET', LIST, json({ sessions: [session('s-ci', 'ci-uploader')] }));
+  const user = userEvent.setup();
+  renderWithQuery(<SessionsPanel />);
+  await screen.findByText('1 live session');
+  await user.type(screen.getByRole('textbox', { name: 'Sign out every session of an identity' }), 'nonexistent-key');
+  await user.click(screen.getByRole('button', { name: 'Revoke key' }));
+  const dialog = await lastDialog();
+  expect(dialog).toHaveTextContent('No live session on this instance uses "nonexistent-key"');
+  await user.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+  expect(http.callsTo('POST', REVOKE_USER)).toHaveLength(0);
+});
+
+// C40: an Identity column that is empty on every row is not shown.
+test('the identity column shows only when a session has an identity', async () => {
+  http.on('GET', LIST, json({ sessions: [session('s-boot', null)] }));
+  renderWithQuery(<SessionsPanel />);
+  await screen.findByText('1 live session');
+  expect(screen.queryByRole('columnheader', { name: 'Identity' })).toBeNull();
+  expect(screen.getByRole('columnheader', { name: 'Age' })).toBeInTheDocument();
 });

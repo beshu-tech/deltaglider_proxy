@@ -12,11 +12,11 @@
  * a copyable s3:// URI rather than performed here, since that's a
  * destructive operation we don't want one-click.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { Typography, Button, Tag, Alert, Space, Select, InputNumber, Spin } from 'antd';
 import { ReloadOutlined, ThunderboltOutlined, CopyOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
-import { clamp, formatBytes } from '../utils';
+import { clamp, formatBytes, noun } from '../utils';
 import {
   verifyDeltaEfficiency,
   type DeltaEfficiencyResponse,
@@ -139,7 +139,7 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
       </Paragraph>
 
       <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'flex-end', gap: 16, marginBottom: 16 }}>
-        <div>
+        <div style={FIELD_STACK}>
           <FormLabel text="Bucket" htmlFor="delta-efficiency-bucket" />
           <Select
             id="delta-efficiency-bucket"
@@ -151,7 +151,7 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
             showSearch
           />
         </div>
-        <div>
+        <div style={FIELD_STACK}>
           <HoverHint hint="Skip folders with fewer than this many compressed files. Smaller folders do not give enough signal for a verdict.">
             <span>
               <FormLabel text="Minimum deltas per folder" htmlFor="delta-efficiency-min-deltas" />
@@ -210,11 +210,11 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
       {response && summary && (
         <>
           {response.reports.length === 0 ? (
-            <Alert
-              type="success"
-              title="No compression scopes met the reporting threshold"
-              description={`No prefix in '${response.bucket}' has at least ${response.min_deltas} deltas. Try a lower minimum, or select a different bucket.`}
-              showIcon
+            // Nothing to report is not a success: a neutral empty state.
+            <EmptyState
+              icon={<ThunderboltOutlined />}
+              title="No folder to report"
+              hint={`No folder in ${response.bucket} has ${response.min_deltas} or more ${noun(response.min_deltas, 'delta')}. Lower the minimum or select a different bucket.`}
             />
           ) : (
             <EfficiencyDashboard
@@ -228,6 +228,10 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
     </div>
   );
 }
+
+/** Label above its control at every width: inline, the hover-hint label
+ *  sat on the input's line on a phone. */
+const FIELD_STACK: CSSProperties = { display: 'flex', flexDirection: 'column', alignItems: 'flex-start' };
 
 /* ────────────────────────────────────────────────────────────────
    EfficiencyDashboard — reimagined display.
@@ -423,11 +427,11 @@ function HeroHeadline({
   const colors = useColors();
   const allHealthy = actionable === 0;
   const headlineText = allHealthy
-    ? 'All prefixes are compressing well.'
-    : `${actionable} of ${totalReported.toLocaleString()} prefixes need re-baselining`;
+    ? 'Every folder compresses well.'
+    : `${actionable} of ${totalReported.toLocaleString()} ${noun(totalReported, 'folder')} ${actionable === 1 ? 'needs' : 'need'} a new reference`;
   const subText = allHealthy
-    ? `Scanned ${totalReported.toLocaleString()} scope(s) with ≥${minDeltas} deltas. No regression found.`
-    : `≈ ${formatBytes(totalRecoverableBytes)} stored as bad-reference deltas. Re-upload the listed prefixes to recover.`;
+    ? `Scanned ${totalReported.toLocaleString()} ${noun(totalReported, 'folder')} with ${minDeltas} or more deltas. None compresses poorly.`
+    : `≈ ${formatBytes(totalRecoverableBytes)} stored as bad-reference deltas. Re-upload the listed folders to recover them.`;
 
   return (
     <div
@@ -590,7 +594,7 @@ function RankedRatioRows({
       <Alert
         type="info"
         showIcon
-        title="No prefixes match the current filter."
+        title="No folder matches the current filter."
       />
     );
   }
@@ -930,8 +934,8 @@ function VerifiedStoredVsOriginal({ verified }: { verified: VerifyDeltaEfficienc
           </div>
           <div style={{ marginTop: 4, color: savedColor }}>
             {positive
-              ? `DG is saving ${formatBytes(verified.true_savings_bytes)} on this prefix.`
-              : `DG is costing ${formatBytes(-verified.true_savings_bytes)} extra on this prefix — you'd be better off without it.`}
+              ? `DG is saving ${formatBytes(verified.true_savings_bytes)} in this folder.`
+              : `DG is costing ${formatBytes(-verified.true_savings_bytes)} extra in this folder: it would be smaller without delta compression.`}
           </div>
         </>
       }

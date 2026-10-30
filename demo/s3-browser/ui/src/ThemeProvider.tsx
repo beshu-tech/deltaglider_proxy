@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { darkColors, lightColors, ThemeContext } from './ThemeContext';
 import { readStorage, writeStorage } from './safeStorage';
 
 const DARK_QUERY = '(prefers-color-scheme: dark)';
+/** On `<html>` for the two frames of a theme flip (theme.css turns transitions off). */
+const THEME_SWITCHING_CLASS = 'dg-theme-switching';
 
 function systemPrefersDark(): boolean {
   return typeof window !== 'undefined' && typeof window.matchMedia === 'function'
@@ -37,8 +39,28 @@ export default function ThemeProvider({ children }: { children: ReactNode }) {
   }, []);
   const colors = isDark ? darkColors : lightColors;
 
-  useEffect(() => {
-    document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
+  // One paint for the whole flip. AntD injects its new tokens during render;
+  // a plain effect set `data-theme` (our CSS variables) after the paint, and
+  // the per-element background transitions faded the rest in later, so a
+  // frame showed a dark table header over light rows. A layout effect runs
+  // before the paint, and `dg-theme-switching` turns transitions off until
+  // the new colours are on screen.
+  const firstRun = useRef(true);
+  useLayoutEffect(() => {
+    const root = document.documentElement;
+    root.setAttribute('data-theme', isDark ? 'dark' : 'light');
+    if (firstRun.current) {
+      firstRun.current = false;
+      return;
+    }
+    root.classList.add(THEME_SWITCHING_CLASS);
+    let frame = requestAnimationFrame(() => {
+      frame = requestAnimationFrame(() => root.classList.remove(THEME_SWITCHING_CLASS));
+    });
+    return () => {
+      cancelAnimationFrame(frame);
+      root.classList.remove(THEME_SWITCHING_CLASS);
+    };
   }, [isDark]);
 
   const value = useMemo(() => ({ isDark, toggleTheme, colors }), [isDark, toggleTheme, colors]);

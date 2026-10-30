@@ -43,6 +43,23 @@
 - The dashboard cards share one style and one grid. System logs expand a row on click. Unknown docs addresses and unknown admin pages show a clear message.
 - Labels and buttons use sentence case, and the browser says "objects" for objects.
 
+### Changed — Interface, third pass
+
+- The upload page no longer uploads when you pick or drop files. The files go into a list that you can review, and **Upload N files to …** sends them. Before, the upload started before you could set the folder.
+- **Remove rule…** of a replication or lifecycle rule is now a staged change like every other rule edit: **Review & apply** removes the rule, and **Keep this rule** or **Discard** undoes it. A new lifecycle rule starts enabled.
+- Group names follow the same rule as user names, in the GUI and on the server (`400 invalid_request`). A duplicated group is named `<name>-copy`.
+- A filesystem-backend LIST with `metadata=true` marks the reference baseline of a folder with `x-amz-meta-dg-baseline: true`, and the file browser shows it as **Baseline**. An S3-backend LIST does not send this fact yet.
+
+### Fixed — Interface, third pass
+
+- Creating a bucket with the name of an existing bucket said that the bucket was created. It now says that the name is taken.
+- Durations, the bucket quota and the request rule tester check the value on the field and refuse to stage an invalid value. Before, `-5` and `abc` became a quota of 0, and an invalid rule opened a review that said both "Validation failed" and "No changes detected".
+- Backend errors and YAML import errors are plain sentences. YAML import names the setting and the value that it got.
+- Long object names are cut in the middle, so the end of the name (often the version) stays visible.
+- A link to a bucket that does not exist says so, instead of opening another bucket.
+- One focus ring for the whole interface. Toasts no longer cover the header. The theme switch repaints in one step.
+- Pages show placeholders while data loads, instead of zeros.
+
 ### Changed — One error body for the admin API
 
 - An admin API error now always has the JSON body `{"error": <code>, "message": <text>}`. Before, an error had one of four bodies: plain text, `{"error": <text>}`, `{"error": <code>, "message": <text>}`, or an empty body for a server error. The `error` field now holds a stable machine code (for example `not_found`, `conflict` or `invalid_request`), and the text is in `message`. The codes that clients already matched on, such as `iam_declarative`, `admin_session_required` and `invalid_path`, stay in `error`. A script that showed `error` as the reason must now show `message`. See [Errors](docs/product/reference/admin-api.md#errors).

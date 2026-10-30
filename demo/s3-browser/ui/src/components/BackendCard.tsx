@@ -11,7 +11,7 @@
  * `.dg-backend-card`), not the viewport: the admin sidebar takes a varying
  * share of the screen.
  */
-import type { ReactNode } from 'react';
+import { Fragment, type ReactNode } from 'react';
 import { CloudOutlined, DatabaseOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import type { BackendFact } from '../backendSummary';
@@ -37,6 +37,23 @@ interface Props {
   /** The "⋯" menu: the card's top-right corner at every width. */
   menu?: ReactNode;
   children?: ReactNode;
+}
+
+/** A path or URL that may wrap only after a "/" (a line break inside a
+ *  folder name read as two names). `overflow-wrap: anywhere` on the cell
+ *  still breaks a single name that is wider than the column. */
+function breakAtSlashes(value: string): ReactNode {
+  const parts = value.split('/');
+  return parts.map((part, i) => (
+    <Fragment key={i}>
+      {part}
+      {i < parts.length - 1 && (
+        <>
+          /<wbr />
+        </>
+      )}
+    </Fragment>
+  ));
 }
 
 function Pill({ pill }: { pill: BackendPill }) {
@@ -136,7 +153,7 @@ export default function BackendCard({ name, filesystem, kind, highlighted, pills
                   fontSize: f.mono ? 12 : 13,
                 }}
               >
-                {f.value}
+                {f.mono ? breakAtSlashes(f.value) : f.value}
               </dd>
             </div>
           ))}

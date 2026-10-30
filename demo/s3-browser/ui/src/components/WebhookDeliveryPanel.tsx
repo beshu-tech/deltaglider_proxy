@@ -37,7 +37,6 @@ import { DELIVERY_STATE, deliveryStateOf } from '../adminApi';
 import { useEventOutboxSummary } from '../queries/eventOutbox';
 import { useCardStyles, contentColumn, CONTENT_WIDE } from './shared-styles';
 import { LoadingState } from './StatePlaceholders';
-import { useColors } from '../ThemeContext';
 import { useIsNarrow } from '../useIsNarrow';
 import { useSectionEditor } from '../useSectionEditor';
 import { useNavigation } from '../NavigationContext';
@@ -110,53 +109,11 @@ function PanelShell({ children }: { children: React.ReactNode }) {
   );
 }
 
-/** A labeled section divider: a hairline rule with a centered uppercase label,
- *  marking the visual transition from generic config to the connector zone. */
-function ConnectorDivider({ label }: { label: string }) {
-  const c = useColors();
-  return (
-    <div
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: 12,
-        margin: '4px 2px',
-        userSelect: 'none',
-      }}
-    >
-      <div style={{ flex: 1, height: 1, background: c.BORDER }} />
-      <span
-        style={{
-          fontSize: 11,
-          fontWeight: 700,
-          letterSpacing: 1,
-          textTransform: 'uppercase',
-          color: c.TEXT_MUTED,
-          whiteSpace: 'nowrap',
-        }}
-      >
-        {label}
-      </span>
-      <div style={{ flex: 1, height: 1, background: c.BORDER }} />
-    </div>
-  );
-}
-
 export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
   const { cardStyle, inputRadius } = useCardStyles();
-  const colors = useColors();
   const nav = useNavigation();
   // Below ~900px the Slack two-column (config + preview) split stacks vertically.
   const isNarrow = useIsNarrow(900);
-
-  // The connector ("destination") card is visually set apart from the generic
-  // config above it: a teal accent on the left edge + a faintly tinted surface,
-  // so the eye reads "this is where events go" as a distinct zone.
-  const connectorCardStyle: React.CSSProperties = {
-    ...cardStyle,
-    borderLeft: `3px solid ${colors.ACCENT_BLUE}`,
-    background: `linear-gradient(${colors.BG_CARD}, ${colors.BG_CARD}) padding-box`,
-  };
 
   // Per-instance row-id counter (no module global) — only used for React keys
   // within this panel instance.
@@ -420,12 +377,10 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
         </div>
       </div>
 
-      {/* ── 2. DESTINATION ZONE — labeled divider sets the connector apart ── */}
-      <ConnectorDivider label={form.format === 'slack' ? 'Slack destination' : 'Webhook destination'} />
-
-      {/* The connector card carries an accent left-border so it reads as a
-          distinct "where does it go" zone, separate from the generic config. */}
-      <div style={connectorCardStyle}>
+      {/* ── 2. Destination: a normal card whose own title names it (a divider
+          label above it said the same, and an accent border made it look
+          selected). */}
+      <div style={cardStyle}>
         {form.format === 'raw' ? (
           <>
             <SectionHeader

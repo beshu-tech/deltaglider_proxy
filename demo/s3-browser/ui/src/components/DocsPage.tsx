@@ -180,9 +180,23 @@ function readHeadings(root: HTMLElement): TocItem[] {
   return items;
 }
 
+/** A code token in a heading has no break point: wider than the column it
+ *  was cut at the edge. It ends in an ellipsis instead; the link's title
+ *  holds the full heading. Prose still wraps. */
+const TOC_CODE_STYLE: React.CSSProperties = {
+  display: 'inline-block',
+  maxWidth: '100%',
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+  verticalAlign: 'bottom',
+};
+
 function TocLabel({ parts }: { parts: TocItem['parts'] }) {
-  return <>{parts.map((p, i) => (p.code ? <code key={i}>{p.text}</code> : <span key={i}>{p.text}</span>))}</>;
+  return <>{parts.map((p, i) => (p.code ? <code key={i} style={TOC_CODE_STYLE}>{p.text}</code> : <span key={i}>{p.text}</span>))}</>;
 }
+
+const tocTitle = (parts: TocItem['parts']) => parts.map((p) => p.text).join('');
 
 /** A fenced code block with a copy button (the website has the same). */
 function CodeBlock({ children, ...props }: React.HTMLAttributes<HTMLPreElement>) {
@@ -439,6 +453,7 @@ export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }
       key={h.id}
       href={`#${h.id}`}
       className={`${h.level === 3 ? 'toc-h3' : ''} ${activeHeading === h.id ? 'active' : ''}`}
+      title={tocTitle(h.parts)}
       onClick={(e) => { e.preventDefault(); scrollToHeading(h.id); }}
     >
       <TocLabel parts={h.parts} />
@@ -456,6 +471,7 @@ export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }
             key={h.id}
             href={`#${h.id}`}
             className={h.level === 3 ? 'toc-h3' : undefined}
+            title={tocTitle(h.parts)}
             onClick={(e) => { e.preventDefault(); scrollToHeading(h.id); }}
           >
             <TocLabel parts={h.parts} />

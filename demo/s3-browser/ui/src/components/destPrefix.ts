@@ -69,3 +69,16 @@ export function keyPathError(path: string): string | null {
   }
   return null;
 }
+
+/**
+ * The path the copy/move picker opens with: the browsed folder, unless the
+ * selection already lives there (the picker then opened in its own blocked
+ * state, "already in this folder", with the button disabled). Then its
+ * parent folder; at the bucket root, an empty path for the user to fill in.
+ */
+export function initialDestPrefix(sourceBucket: string, selectionKeys: Iterable<string>, currentPrefix: string): string {
+  const keys = [...selectionKeys];
+  const current = normalizeDestPrefix(currentPrefix);
+  if (!destinationIsSource(sourceBucket, keys, sourceBucket, current)) return current;
+  return current.includes('/') ? current.slice(0, current.lastIndexOf('/')) : '';
+}

@@ -62,18 +62,21 @@ export const OBSERVABILITY_SHOTS: Shot[] = [
     setup: async (page) => {
       // Sizes come from the usage scan: scan every bucket, then wait until
       // the page says so (the text before the click can already read 4 of 4
-      // from the cache of an earlier capture).
-      await page.getByRole('button', { name: /Re-scan all/ }).click();
+      // from the cache of an earlier capture). While a bucket has no scan,
+      // the hero offers "Scan all buckets" or "Scan N more buckets"; the
+      // bucket list offers "Re-scan all" once a scan exists.
+      const scanMissing = page.getByRole('button', { name: /Scan all buckets|Scan \d+ more buckets?/ });
+      if (await scanMissing.isVisible()) await scanMissing.click();
+      else await page.getByRole('button', { name: /Re-scan all/ }).click();
       // Done twice, 2 s apart: a replicated object can mark a bucket stale
       // again right after its scan.
       const scanned = async () => {
         const t = await page.locator('body').innerText();
-        return /4 of 4 scanned/.test(t) && !/\d+ buckets? not scanned|Scan missing/.test(t);
+        return /4 of 4 scanned/.test(t) && !/buckets? (is|are) not scanned/.test(t);
       };
       await expect
         .poll(async () => {
-          const missing = page.getByRole('button', { name: /Scan missing/ });
-          if (await missing.isVisible()) await missing.click({ timeout: 1000 }).catch(() => undefined);
+          if (await scanMissing.isVisible()) await scanMissing.click({ timeout: 1000 }).catch(() => undefined);
           return (await scanned()) && (await page.waitForTimeout(2000), await scanned());
         }, { timeout: 60_000 })
         .toBe(true);

@@ -23,6 +23,7 @@ import type { SectionApplyResponse, SectionName } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import { BORDER_RADIUS } from './overlayStyles';
 import { expandDiff } from '../applyDiff';
+import { plainError } from '../adminApi';
 
 const { Text } = Typography;
 
@@ -62,6 +63,10 @@ export default function ApplyDialog({
   const diffRows = expandDiff(Object.entries(sectionDiff));
   // A diff that the server computed and found empty: nothing to apply.
   const noChanges = diff != null && diffRows.length === 0;
+  // A refused body has no plan and no diff worth reading (the server sends
+  // an empty one): the dialog shows the reason only (UX harvest C21).
+  const refused = !ok;
+  const reason = refused ? plainError(error || '', 'The proxy refused this change.') : null;
 
   return (
     <Modal
@@ -83,138 +88,157 @@ export default function ApplyDialog({
       footer={
         <Space>
           <Button onClick={onCancel} disabled={loading}>
-            Cancel
+            {refused ? 'Back to the form' : 'Cancel'}
           </Button>
-          <Button
-            data-testid="apply-dialog-confirm"
-            aria-label="Apply and persist changes"
-            type="primary"
-            onClick={onApply}
-            disabled={!ok || loading || noChanges}
-            loading={loading}
-            icon={<CheckCircleOutlined />}
-          >
-            Apply and Persist
-          </Button>
+          {!refused && (
+            <Button
+              data-testid="apply-dialog-confirm"
+              aria-label="Apply and persist changes"
+              type="primary"
+              onClick={onApply}
+              disabled={loading || noChanges}
+              loading={loading}
+              icon={<CheckCircleOutlined />}
+            >
+              Apply and Persist
+            </Button>
+          )}
         </Space>
       }
     >
-      {/* Top-level error: validation refused the section body */}
-      {!ok && error && (
+      {/* Validation refused the section body: the reason, and nothing else. */}
+      {reason && (
         <Alert
           type="error"
           showIcon
           icon={<WarningOutlined />}
-          title="Validation failed"
-          description={<LinkifiedText text={error} />}
-          style={{ marginBottom: 12 }}
-        />
-      )}
-
-      {/* Warnings this change introduces (semi-blocking — operator must
-          read, but Apply still available). Same contract as the field-level
-          PATCH. */}
-      {warnings.length > 0 && (
-        <Alert
-          type="warning"
-          showIcon
-          title={
-            warnings.length === 1 ? '1 warning from this change' : `${warnings.length} warnings from this change`
-          }
-          description={<WarningList items={warnings} />}
-          style={{ marginBottom: 12 }}
-        />
-      )}
-
-      {/* Warnings the current config already had. Folded away so that they
-          do not hide the warnings that matter for this change. */}
-      {existingWarnings.length > 0 && (
-        <details data-testid="apply-dialog-existing-warnings" style={{ marginBottom: 12, color: TEXT_MUTED }}>
-          <summary style={{ cursor: 'pointer', fontSize: 13 }}>
-            {existingWarnings.length === 1
-              ? '1 warning that already existed before this change'
-              : `${existingWarnings.length} warnings that already existed before this change`}
-          </summary>
-          <div style={{ marginTop: 6 }}>
-            <WarningList items={existingWarnings} />
-          </div>
-        </details>
-      )}
-
-      {summary && (
-        <div style={{ marginBottom: 12 }}>
-          {summary}
-        </div>
-      )}
-
-      {/* Diff — the star of the dialog. An empty diff disables Apply. */}
-      <div
-        style={{
-          background: BG_CARD,
-          border: `1px solid ${BORDER}`,
-          borderRadius: BORDER_RADIUS.md,
-          padding: 12,
-          marginBottom: 12,
-        }}
-      >
-        <div
-          style={{
-            color: TEXT_MUTED,
-            fontSize: 11,
-            fontWeight: 600,
-            letterSpacing: 0.5,
-            textTransform: 'uppercase',
-            marginBottom: 8,
-          }}
-        >
-          Changes ({diffRows.length})
-        </div>
-        {diffRows.length === 0 ? (
-          <Text type="secondary">No changes detected: there is nothing to apply.</Text>
-        ) : (
-          <div style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
-            {diffRows.map((line) => (
-              <div key={`${line.kind}:${line.path}`} style={{ marginBottom: 10, wordBreak: 'break-word' }}>
-                <div style={{ color: TEXT, fontWeight: 600, marginBottom: 2 }}>
-                  {line.path}
-                  {line.kind !== 'changed' && (
-                    <Text type="secondary" style={{ fontWeight: 400, marginLeft: 8 }}>
-                      {line.kind === 'added' ? 'new' : 'removed'}
-                    </Text>
-                  )}
-                </div>
-                {line.kind !== 'added' && (
-                  <div style={{ color: ACCENT_RED, opacity: 0.9 }}>
-                    -&nbsp;{formatValue(line.before, line.kind === 'removed')}
-                  </div>
-                )}
-                {line.kind !== 'removed' && (
-                  <div style={{ color: ACCENT_GREEN, opacity: 0.9 }}>
-                    +&nbsp;{formatValue(line.after, line.kind === 'added')}
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {/* Restart-required banner — last so it's the last thing the
-          operator reads before hitting Apply. */}
-      {requires_restart && (
-        <Alert
-          type="info"
-          showIcon
-          icon={<SyncOutlined />}
-          title="Restart required"
+          data-testid="apply-dialog-refused"
+          title="This change cannot be applied"
           description={
             <>
-              These changes take effect only after a restart of the proxy. Restart it when the window is safe.
-              {restartReasons.length > 0 && <WarningList items={restartReasons} />}
+              <LinkifiedText text={reason.text} />
+              <div style={{ marginTop: 4 }}>Fix it in the form, then review again. Nothing was changed.</div>
+              {reason.details && (
+                <details style={{ marginTop: 6 }}>
+                  <summary style={{ cursor: 'pointer', fontSize: 12 }}>Details</summary>
+                  <code style={{ display: 'block', marginTop: 4, fontSize: 11, overflowWrap: 'anywhere' }}>{reason.details}</code>
+                </details>
+              )}
             </>
           }
           style={{ marginBottom: 0 }}
         />
+      )}
+
+      {!refused && (
+        <>
+
+          {/* Warnings this change introduces (semi-blocking — operator must
+              read, but Apply still available). Same contract as the field-level
+              PATCH. */}
+          {warnings.length > 0 && (
+            <Alert
+              type="warning"
+              showIcon
+              title={
+                warnings.length === 1 ? '1 warning from this change' : `${warnings.length} warnings from this change`
+              }
+              description={<WarningList items={warnings} />}
+              style={{ marginBottom: 12 }}
+            />
+          )}
+
+          {/* Warnings the current config already had. Folded away so that they
+              do not hide the warnings that matter for this change. */}
+          {existingWarnings.length > 0 && (
+            <details data-testid="apply-dialog-existing-warnings" style={{ marginBottom: 12, color: TEXT_MUTED }}>
+              <summary style={{ cursor: 'pointer', fontSize: 13 }}>
+                {existingWarnings.length === 1
+                  ? '1 warning that already existed before this change'
+                  : `${existingWarnings.length} warnings that already existed before this change`}
+              </summary>
+              <div style={{ marginTop: 6 }}>
+                <WarningList items={existingWarnings} />
+              </div>
+            </details>
+          )}
+
+          {summary && (
+            <div style={{ marginBottom: 12 }}>
+              {summary}
+            </div>
+          )}
+
+          {/* Diff — the star of the dialog. An empty diff disables Apply. */}
+          <div
+            style={{
+              background: BG_CARD,
+              border: `1px solid ${BORDER}`,
+              borderRadius: BORDER_RADIUS.md,
+              padding: 12,
+              marginBottom: 12,
+            }}
+          >
+            <div
+              style={{
+                color: TEXT_MUTED,
+                fontSize: 11,
+                fontWeight: 600,
+                letterSpacing: 0.5,
+                textTransform: 'uppercase',
+                marginBottom: 8,
+              }}
+            >
+              Changes ({diffRows.length})
+            </div>
+            {diffRows.length === 0 ? (
+              <Text type="secondary">No changes detected: there is nothing to apply.</Text>
+            ) : (
+              <div style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+                {diffRows.map((line) => (
+                  <div key={`${line.kind}:${line.path}`} style={{ marginBottom: 10, wordBreak: 'break-word' }}>
+                    <div style={{ color: TEXT, fontWeight: 600, marginBottom: 2 }}>
+                      {line.path}
+                      {line.kind !== 'changed' && (
+                        <Text type="secondary" style={{ fontWeight: 400, marginLeft: 8 }}>
+                          {line.kind === 'added' ? 'new' : 'removed'}
+                        </Text>
+                      )}
+                    </div>
+                    {line.kind !== 'added' && (
+                      <div style={{ color: ACCENT_RED, opacity: 0.9 }}>
+                        -&nbsp;{formatValue(line.before, line.kind === 'removed')}
+                      </div>
+                    )}
+                    {line.kind !== 'removed' && (
+                      <div style={{ color: ACCENT_GREEN, opacity: 0.9 }}>
+                        +&nbsp;{formatValue(line.after, line.kind === 'added')}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Restart-required banner — last so it's the last thing the
+              operator reads before hitting Apply. */}
+          {requires_restart && (
+            <Alert
+              type="info"
+              showIcon
+              icon={<SyncOutlined />}
+              title="Restart required"
+              description={
+                <>
+                  These changes take effect only after a restart of the proxy. Restart it when the window is safe.
+                  {restartReasons.length > 0 && <WarningList items={restartReasons} />}
+                </>
+              }
+              style={{ marginBottom: 0 }}
+            />
+          )}
+        </>
       )}
     </Modal>
   );

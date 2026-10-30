@@ -17,6 +17,7 @@ interface Entry {
   key: string;
   note?: string;
   deltaSize?: number;
+  baseline?: boolean;
 }
 
 const escapeXml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -29,6 +30,7 @@ function listXml(prefix: string, entries: Entry[], next?: string): string {
           ? `<Items><Key>x-amz-meta-dg-delta-size</Key><Value>${e.deltaSize}</Value></Items>`
           : '',
         e.note ? `<Items><Key>x-amz-meta-dg-note</Key><Value>${e.note}</Value></Items>` : '',
+        e.baseline ? '<Items><Key>x-amz-meta-dg-baseline</Key><Value>true</Value></Items>' : '',
       ].join('');
       return `<Contents><Key>${escapeXml(e.key)}</Key><LastModified>2026-10-01T00:00:00.000Z</LastModified>`
         + `<ETag>"abc"</ETag><Size>100</Size><StorageClass>STANDARD</StorageClass>`
@@ -50,7 +52,7 @@ let http: ReturnType<typeof mockFetch>;
 /** The listing of each folder, by prefix; a page token selects a later page. */
 let folders: Record<string, string[]>;
 /** The facts the table renders from, as the hook last handed them over. */
-let cache: Record<string, { storageType?: string; storedSize?: number }> = {};
+let cache: Record<string, { storageType?: string; storedSize?: number; isBaseline?: boolean }> = {};
 
 const lists = () => http.calls.filter((c) => c.method === 'GET' && /^\/releases\/?\?/.test(c.path));
 const heads = () => http.calls.filter((c) => c.method === 'HEAD');
@@ -166,4 +168,24 @@ test('parseListFacts reads the facts of each Contents, not the Items keys', () =
   expect([...facts.keys()]).toEqual(['r&d/a.zip', 'b.bin']);
   expect(facts.get('r&d/a.zip')).toEqual({ storageType: 'delta', storedSize: 42 });
   expect(facts.get('b.bin')).toEqual({ storageType: 'passthrough', storedSize: undefined });
+});
+
+test('the listing marks the baseline delta, and the row facts carry it to the table', async () => {
+  const facts = parseListFacts(listXml('', [
+    { key: 'v1.zip', note: 'delta', deltaSize: 9, baseline: true },
+    { key: 'v2.zip', note: 'delta', deltaSize: 7 },
+  ]));
+  expect(facts.get('v1.zip')).toEqual({ storageType: 'delta', storedSize: 9, isBaseline: true });
+  expect(facts.get('v2.zip')?.isBaseline).toBeUndefined();
+
+  folders['r/'] = [listXml('r/', [
+    { key: 'r/v1.zip', note: 'delta', deltaSize: 9, baseline: true },
+    { key: 'r/v2.zip', note: 'delta', deltaSize: 7 },
+  ])];
+  renderWithQuery(<Harness prefix="r/" />);
+  await waitFor(() => expect(Object.keys(cache)).toHaveLength(2));
+  // The table's chip reads these facts (storageChip: "Baseline" vs "Delta").
+  expect(cache['r/v1.zip']).toEqual({ storageType: 'delta', storedSize: 9, isBaseline: true });
+  expect(cache['r/v2.zip'].isBaseline).toBeUndefined();
+  expect(heads()).toHaveLength(0);
 });

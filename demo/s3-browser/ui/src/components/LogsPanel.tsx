@@ -22,7 +22,8 @@ import { Typography, Input, Button, Tag, Select, Space, Switch } from 'antd';
 import { ReloadOutlined, SearchOutlined } from '@ant-design/icons';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useColors } from '../ThemeContext';
-import { relativeTime } from '../utils';
+import { noun, relativeTime } from '../utils';
+import { EmptyState } from './StatePlaceholders';
 import { streamLogs, type LogEntry, type LogFilters } from '../adminApi';
 import { useLogBacklog } from '../queries/logs';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
@@ -216,7 +217,7 @@ export default function LogsPanel({ onSessionExpired }: Props) {
           <Switch id="logs-follow" checked={follow} onChange={setFollow} />
           <label htmlFor="logs-follow"><Text type="secondary">Follow</Text></label>
         </Space>
-        <Text type="secondary">{entries.length} lines</Text>
+        <Text type="secondary">{entries.length} {noun(entries.length, 'line')}</Text>
       </Space>
 
       {error && <Text type="danger">{error}</Text>}
@@ -233,6 +234,13 @@ export default function LogsPanel({ onSessionExpired }: Props) {
           fontSize: 12,
         }}
       >
+        {/* A filter with no match left only an empty box (UX harvest C57). */}
+        {entries.length === 0 && backlog.isSuccess && (
+          <EmptyState
+            icon={<SearchOutlined />}
+            {...emptyLogCopy(debouncedQ, debouncedTarget, level)}
+          />
+        )}
         <div style={{ height: rowVirtualizer.getTotalSize(), position: 'relative', width: '100%' }}>
           {rowVirtualizer.getVirtualItems().map((vi) => {
             const e = entries[vi.index];
@@ -313,4 +321,19 @@ export default function LogsPanel({ onSessionExpired }: Props) {
       </div>
     </div>
   );
+}
+
+/** The empty-list copy: what was asked for, and what to change. */
+function emptyLogCopy(q: string, target: string, level: string | undefined): { title: string; hint: string } {
+  if (!q && !target && !level) {
+    return { title: 'No log lines yet', hint: 'Lines appear here as the proxy writes them.' };
+  }
+  const parts = ['No log line'];
+  if (q) parts.push(`matches "${q}"`);
+  if (target) parts.push(`from "${target}"`);
+  if (level) parts.push('at this level');
+  return {
+    title: parts.join(' '),
+    hint: 'Change the filters to see more lines. The proxy keeps only the most recent lines in memory.',
+  };
 }

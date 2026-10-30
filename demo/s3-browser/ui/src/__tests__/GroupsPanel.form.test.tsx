@@ -33,3 +33,25 @@ test('with no groups the page shows one empty state, not two', async () => {
   expect(await screen.findByText('Create the first group')).toBeInTheDocument();
   expect(screen.queryByText(/No groups/)).toBeNull();
 });
+
+// C1: group names follow THE IAM name rule, like user names.
+test('a name with spaces is refused on the field with the user-name rule', async () => {
+  const user = userEvent.setup();
+  renderWithQuery(<GroupsPanel />);
+  await user.click(await screen.findByRole('button', { name: /new/i }));
+  await user.type(screen.getByRole('textbox', { name: 'Name' }), 'qa group with spaces!');
+  await user.click(screen.getByRole('button', { name: 'Create group' }));
+  expect(await screen.findByRole('alert')).toHaveTextContent('Remove the spaces. Use letters, digits and + = , . @ _ - only.');
+  expect(http.callsTo('POST', '/_/api/admin/groups')).toHaveLength(0);
+});
+
+test('the server name refusal shows on the field', async () => {
+  http.on('POST', '/_/api/admin/groups', json({ error: 'invalid_request', message: 'group name cannot start with \'$\'' }, 400));
+  const user = userEvent.setup();
+  renderWithQuery(<GroupsPanel />);
+  await user.click(await screen.findByRole('button', { name: /new/i }));
+  await user.type(screen.getByRole('textbox', { name: 'Name' }), 'developers');
+  await user.click(screen.getByRole('button', { name: 'Create group' }));
+  expect(await screen.findByRole('alert')).toHaveTextContent("Group name cannot start with '$'.");
+  expect(screen.getByRole('textbox', { name: 'Name' })).toHaveAttribute('aria-invalid', 'true');
+});

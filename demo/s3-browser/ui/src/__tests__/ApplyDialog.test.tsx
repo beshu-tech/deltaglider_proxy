@@ -90,13 +90,35 @@ describe('ok response', () => {
   });
 });
 
-test('ok:false shows the validation error and disables Apply', async () => {
-  const { onApply } = renderDialog({ ok: false, error: 'cache_size_mb must be > 0' });
-  expect(screen.getByText('Validation failed')).toBeInTheDocument();
-  expect(screen.getByText('cache_size_mb must be > 0')).toBeInTheDocument();
-  expect(applyButton()).toBeDisabled();
-  await userEvent.setup().click(applyButton());
-  expect(onApply).not.toHaveBeenCalled();
+/**
+ * UX harvest C21: a refused body showed "Validation failed", a plan, and
+ * "Changes (0) — nothing to apply" at once. Now the dialog shows the
+ * reason only, in plain words, and offers no Apply.
+ */
+test('ok:false shows only the reason: no plan, no diff, no Apply', async () => {
+  const { onCancel } = renderDialog({
+    ok: false,
+    error: "lifecycle rule 'qa-lc-rule' expire_after=notaduration invalid: expected number at 0",
+    diff: { advanced: {} },
+    warnings: ['a warning'],
+  });
+  const refused = screen.getByTestId('apply-dialog-refused');
+  expect(refused).toHaveTextContent('This change cannot be applied');
+  expect(refused).toHaveTextContent(
+    '"notaduration" is not a valid duration for expire after of rule qa-lc-rule. Use a duration such as 30d, 12h or 90m.',
+  );
+  expect(screen.queryByText(/Changes \(/)).not.toBeInTheDocument();
+  expect(screen.queryByText(/nothing to apply/)).not.toBeInTheDocument();
+  expect(screen.queryByText('Human summary')).not.toBeInTheDocument();
+  expect(screen.queryByText('a warning')).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Apply and persist changes' })).not.toBeInTheDocument();
+  await userEvent.setup().click(screen.getByRole('button', { name: 'Back to the form' }));
+  expect(onCancel).toHaveBeenCalledTimes(1);
+});
+
+test('ok:false with an unknown error shows it as a sentence', () => {
+  renderDialog({ ok: false, error: 'cache_size_mb must be > 0' });
+  expect(screen.getByTestId('apply-dialog-refused')).toHaveTextContent('cache_size_mb must be > 0.');
 });
 
 test('new warnings show open; existing warnings fold into a closed <details>', () => {

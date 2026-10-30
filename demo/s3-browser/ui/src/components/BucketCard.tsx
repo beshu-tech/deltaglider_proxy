@@ -23,7 +23,7 @@
  * for pre-provisioning drafts).
  */
 import { bucketNameError } from '../bucketName';
-import { Children, isValidElement, useState, useId } from 'react';
+import { Children, isValidElement, useEffect, useState, useId } from 'react';
 import type { ReactNode } from 'react';
 import { useIsNarrow } from '../useIsNarrow';
 import { CAPABILITY_DOC_URL, docsUrlToInAppHref } from '../linkifyDocUrl';
@@ -36,7 +36,7 @@ import { useColors } from '../ThemeContext';
 import SimpleAutoComplete from './SimpleAutoComplete';
 import { formRow } from './ruleEditorHelpers';
 import type { BucketPolicyRow, PrefixEntry } from './bucketPolicyPayload';
-import { DEFAULT_ROW_FIELDS, freshId, hasOwnEncryption, isAllDefaultRow, normalizeExtension, resetRowFields } from './bucketPolicyPayload';
+import { DEFAULT_ROW_FIELDS, freshId, hasOwnEncryption, isAllDefaultRow, normalizeExtension, parseQuotaGib, resetRowFields } from './bucketPolicyPayload';
 import PrefixListEditor from './PrefixListEditor';
 import MigrateBucketModal from './MigrateBucketModal';
 import type { JobRow } from '../jobsView';
@@ -46,7 +46,7 @@ import { useBucketMaintenance } from '../queries/maintenance';
 import { bucketWritesBlocked } from '../maintenanceStatus';
 import { cancelConfirmText } from '../jobsView';
 import { formatBytesIec } from '../utils';
-import { bytesFromGib, gibFromBytes } from '../savings';
+import { gibFromBytes } from '../savings';
 import { activateOnKey } from '../keyboard';
 import { confirmDialog } from '../confirmDialog';
 import { useNavigation } from '../NavigationContext';
@@ -109,6 +109,9 @@ interface CardProps {
   /** The encryption witness (several instances) refuses writes to this
    *  bucket on this instance: its encryption differs from the cluster's. */
   witnessRefused?: boolean;
+  /** A field of the card has a value that cannot be staged (the parent
+   *  counts it, and the dirty bar refuses to apply). Null = fixed. */
+  onFieldError?: (error: string | null) => void;
 }
 
 /** Small status chip used in the collapsed row. Sentence case, never an
@@ -190,6 +193,7 @@ export default function BucketCard({
   onReencrypt,
   witnessRefused = false,
   rules = [],
+  onFieldError,
 }: CardProps) {
   const uid = useId();
   const colors = useColors();
@@ -211,6 +215,37 @@ export default function BucketCard({
   const isPublic = eff.publicMode !== 'none';
   const publicPrefixCount = eff.public_prefixes.filter((p) => p.value.trim()).length;
   const hasOverrides = row !== null && !isAllDefaultRow(row);
+
+  // The Quota field keeps what the user typed while it is not a valid quota
+  // (the staged value stays the last valid one, and the error says why);
+  // a valid text is staged at once and the field shows the staged value.
+  const [quotaDraft, setQuotaDraft] = useState<string | null>(null);
+  const quotaText = quotaDraft ?? (eff.quota_bytes != null ? String(gibFromBytes(eff.quota_bytes)) : '');
+  const quotaParsed = quotaDraft === null ? null : parseQuotaGib(quotaDraft);
+  const quotaError = quotaParsed && !quotaParsed.ok ? quotaParsed.error : null;
+  const onQuotaText = (text: string) => {
+    const parsed = parseQuotaGib(text);
+    setQuotaDraft(text);
+    if (parsed.ok && parsed.bytes !== eff.quota_bytes) onPatch({ quota_bytes: parsed.bytes });
+  };
+  // A removed card takes its error with it.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => () => onFieldError?.(null), []);
+  useEffect(() => {
+    onFieldError?.(quotaError);
+    // Report changes of the error only; the callback is a fresh closure.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [quotaError]);
+  // A staged value that changes under a valid draft (Discard, Reset to
+  // defaults, a rebase) wins over the text.
+  const stagedQuota = eff.quota_bytes;
+  useEffect(() => {
+    setQuotaDraft((cur) => {
+      if (cur === null) return cur;
+      const parsed = parseQuotaGib(cur);
+      return parsed.ok && parsed.bytes !== stagedQuota ? null : cur;
+    });
+  }, [stagedQuota]);
 
   const cardBorder = isPublic ? `${colors.ACCENT_AMBER}66` : colors.BORDER;
   const cardBg = isPublic ? `${colors.ACCENT_AMBER}0a` : colors.BG_ELEVATED;
@@ -309,7 +344,17 @@ export default function BucketCard({
       </Chip>
     )
   );
-  if (real) {
+  // Plaintext inherited from a plaintext backend is the default state of
+  // every bucket: a "Not encrypted" chip on every row said nothing (UX
+  // harvest C42). The chip shows when the bucket is encrypted, when it
+  // differs from its backend, or when the proxy does not know.
+  const encryptionIsPlainDefault =
+    !!effectiveEncryption &&
+    !effectiveEncryption.encrypts &&
+    effectiveEncryption.source === 'backend' &&
+    effectiveEncryption.mode === 'none' &&
+    !effectiveEncryption.legacy_key_id;
+  if (real && !encryptionIsPlainDefault) {
     chips.push(
       <Chip
         key="enc"
@@ -501,13 +546,21 @@ export default function BucketCard({
             )}
           </span>
         ) : (
+          // A long name is cut with an ellipsis inside the card (it ran past
+          // the card edge on a phone); the full name is in the title.
           <Text
+            title={name}
             style={{
               fontFamily: 'var(--font-mono)',
               fontSize: 13,
               fontWeight: 600,
               color: colors.TEXT_PRIMARY,
-              flexShrink: 0,
+              flex: '0 1 auto',
+              minWidth: 0,
+              maxWidth: 'calc(100% - 24px)',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
             }}
           >
             {name}
@@ -932,17 +985,26 @@ export default function BucketCard({
                       <Text id={`${uid}-quota`} style={{ fontSize: 12, color: colors.TEXT_MUTED, width: 150 }}>
                         Quota
                       </Text>
-                      <InputNumber
-                        aria-labelledby={`${uid}-quota`}
-                        value={eff.quota_bytes != null ? gibFromBytes(eff.quota_bytes) : undefined}
-                        onChange={(v) => onPatch({ quota_bytes: v != null ? bytesFromGib(v) : null })}
-                        min={0}
-                        step={0.1}
-                        placeholder="Unlimited"
-                        style={{ width: 170, ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 11 }}
-                        size="small"
-                        suffix="GiB"
-                      />
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}>
+                        <Input
+                          aria-labelledby={`${uid}-quota`}
+                          aria-invalid={quotaError ? true : undefined}
+                          aria-describedby={quotaError ? `${uid}-quota-error` : undefined}
+                          status={quotaError ? 'error' : undefined}
+                          inputMode="decimal"
+                          value={quotaText}
+                          onChange={(e) => onQuotaText(e.target.value)}
+                          placeholder="No quota"
+                          style={{ width: 170, ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 11 }}
+                          size="small"
+                          suffix="GiB"
+                        />
+                        {quotaError && (
+                          <Text id={`${uid}-quota-error`} role="alert" type="danger" style={{ fontSize: 12 }}>
+                            {quotaError}
+                          </Text>
+                        )}
+                      </div>
                     </div>
                   </div>
                 ),

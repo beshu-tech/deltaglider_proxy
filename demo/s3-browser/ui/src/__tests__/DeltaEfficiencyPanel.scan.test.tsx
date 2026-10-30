@@ -61,7 +61,7 @@ test('a 202 polls every 3 s until the report lands', async () => {
   await act(() => vi.advanceTimersByTimeAsync(3100));
   await waitFor(() => expect(gets()).toHaveLength(2));
   await act(() => vi.advanceTimersByTimeAsync(3100));
-  expect(await screen.findByText('1 of 1 prefixes need re-baselining')).toBeInTheDocument();
+  expect(await screen.findByText('1 of 1 folder needs a new reference')).toBeInTheDocument();
   expect(screen.queryByText('Scan running on the server, polling…')).toBeNull();
   // The report ends the polling.
   await act(() => vi.advanceTimersByTimeAsync(10_000));
@@ -73,7 +73,7 @@ test('an empty report says no scope met the threshold', async () => {
   const user = userEvent.setup();
   renderWithQuery(<DeltaEfficiencyPanel />);
   await clickScan(user);
-  expect(await screen.findByText('No compression scopes met the reporting threshold')).toBeInTheDocument();
+  expect(await screen.findByText('No folder to report')).toBeInTheDocument();
 });
 
 test('a changed bucket drops the report', async () => {
@@ -81,10 +81,10 @@ test('a changed bucket drops the report', async () => {
   const user = userEvent.setup();
   renderWithQuery(<DeltaEfficiencyPanel />);
   await clickScan(user);
-  await screen.findByText('No compression scopes met the reporting threshold');
+  await screen.findByText('No folder to report');
   await user.click(screen.getByRole('combobox', { name: 'Bucket' }));
   await user.click(await screen.findByTitle('releases'));
-  await waitFor(() => expect(screen.queryByText('No compression scopes met the reporting threshold')).toBeNull());
+  await waitFor(() => expect(screen.queryByText('No folder to report')).toBeNull());
   expect(gets()).toHaveLength(1);
 });
 
@@ -98,11 +98,11 @@ test('Re-scan POSTs a new scan, then reads its result', async () => {
   const user = userEvent.setup();
   renderWithQuery(<DeltaEfficiencyPanel />);
   await clickScan(user);
-  await screen.findByText('No compression scopes met the reporting threshold');
+  await screen.findByText('No folder to report');
   await user.click(screen.getByRole('button', { name: /Re-scan/ }));
   await waitFor(() => expect(http.callsTo('POST', POST)).toHaveLength(1));
   expect(http.callsTo('POST', POST)[0].body).toEqual({ bucket: 'db-archive', min_deltas: 3 });
-  expect(await screen.findByText('1 of 1 prefixes need re-baselining')).toBeInTheDocument();
+  expect(await screen.findByText('1 of 1 folder needs a new reference')).toBeInTheDocument();
   expect(gets()).toHaveLength(2);
 });
 

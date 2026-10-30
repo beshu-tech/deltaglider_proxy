@@ -14,7 +14,6 @@ import UserForm from './UserForm';
 import CredentialsModal from './CredentialsModal';
 import IamSourceBanner from './IamSourceBanner';
 import { EmptyState } from './StatePlaceholders';
-import { firstUserSwitchText } from '../firstUser';
 import { normalizeUiError } from '../errorHandling';
 import { useNavigation } from '../NavigationContext';
 import { buildViewUrl, parseAdminQuery } from '../urlState';
@@ -31,6 +30,9 @@ interface UsersPanelProps {
   search?: string;
 }
 
+/** The credentials dialog of the first IAM user (the switch is explained before the create). */
+const FIRST_USER_CREATED_NOTE = 'You now sign in with an access key.';
+
 export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigateToGroup, search }: UsersPanelProps) {
   const colors = useColors();
   const qc = useQueryClient();
@@ -44,8 +46,8 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
   const [creating, setCreating] = useState(false);
   const [filterText, setFilterText] = useState('');
   // `firstSwitch`: this create was the first IAM user, so the dialog also
-  // says that sign-in changed (and names the bootstrap key it kept).
-  const [newCreds, setNewCreds] = useState<{ ak: string; sk: string; firstSwitch?: { bootstrapAccessKey?: string } } | null>(null);
+  // says in one line that sign-in changed.
+  const [newCreds, setNewCreds] = useState<{ ak: string; sk: string; firstSwitch?: boolean } | null>(null);
 
   // IAM mode banner: tells the operator where user state lives (DB in
   // `gui` mode vs YAML in `declarative`). Snapshot once via TanStack
@@ -123,7 +125,7 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
   };
 
   const handleCreated = async (ak: string, sk: string) => {
-    const firstSwitch = isFirstUser ? { bootstrapAccessKey } : undefined;
+    const firstSwitch = isFirstUser;
     // Refetch synchronously to capture the new user's ID, then select it.
     const result = await qc.fetchQuery({ queryKey: qk.users.list(), queryFn: getUsers });
     const newUser = result.find(u => u.access_key_id === ak);
@@ -169,7 +171,8 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
           accessKey={newCreds.ak}
           secretKey={newCreds.sk}
           title="User created: save these credentials"
-          note={newCreds.firstSwitch ? firstUserSwitchText(newCreds.firstSwitch.bootstrapAccessKey) : undefined}
+          // The create confirm explained the switch a moment ago: one line here.
+          note={newCreds.firstSwitch ? FIRST_USER_CREATED_NOTE : undefined}
           onClose={() => setNewCreds(null)}
         />
       )}

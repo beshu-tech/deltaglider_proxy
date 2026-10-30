@@ -21,7 +21,8 @@
  * textarea. Split into two files only if the flows diverge further.
  */
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { TextAreaRef } from 'antd/es/input/TextArea';
 import { LinkifiedText } from './LinkifiedText';
 import { Alert, Button, Modal, Space, Typography, Tag, Input } from 'antd';
 import { CopyOutlined, CheckOutlined, UploadOutlined, DownloadOutlined } from '@ant-design/icons';
@@ -58,6 +59,7 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
   const { copy, copied } = useCopyToClipboard();
   const [validated, setValidated] = useState(false);
   const [applyResult, setApplyResult] = useState<ConfigApplyResponse | null>(null);
+  const textAreaRef = useRef<TextAreaRef>(null);
 
   // Reset state whenever the modal opens or the mode changes.
   useEffect(() => {
@@ -157,6 +159,12 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
       mask={{ closable: false }}
       footer={null}
       destroyOnHidden
+      // Focus the YAML box, not the close button: no focus ring in the corner
+      // on open; import can paste at once, export can select at once.
+      afterOpenChange={(isOpen) => {
+        if (!isOpen) return;
+        textAreaRef.current?.resizableTextArea?.textArea.focus({ preventScroll: true, focusVisible: false } as FocusOptions);
+      }}
     >
       {mode === 'export' && (
         <Space orientation="vertical" size="small" style={{ width: '100%' }}>
@@ -171,6 +179,7 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
           </Paragraph>
           {error && <Alert type="error" title={error} showIcon />}
           <Input.TextArea
+            ref={textAreaRef}
             aria-label="Exported YAML"
             value={yaml}
             readOnly
@@ -212,6 +221,7 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
           </Paragraph>
 
           <Input.TextArea
+            ref={textAreaRef}
             aria-label="YAML to import"
             value={yaml}
             onChange={(e) => {

@@ -33,27 +33,43 @@ export function isConfigDbLocked(info: WhoamiResponse): boolean {
   return info.lock_state === 'locked' || info.config_db_mismatch === true;
 }
 
-export async function whoami(): Promise<WhoamiResponse> {
+/**
+ * True for a request the caller cancelled (its AbortSignal fired). That is
+ * not a failure: nothing is logged, the caller has moved on.
+ */
+function isAbort(err: unknown, signal?: AbortSignal): boolean {
+  return signal?.aborted === true || (err instanceof DOMException && err.name === 'AbortError');
+}
+
+/**
+ * The identity of this browser session. `signal` cancels it (a view that
+ * goes away before the answer comes): a cancelled request logs nothing.
+ */
+export async function whoami(signal?: AbortSignal): Promise<WhoamiResponse> {
   try {
-    const res = await adminFetch('/api/whoami');
+    const res = await adminFetch('/api/whoami', 'GET', undefined, undefined, undefined, signal);
     if (!res.ok) return { mode: 'bootstrap', user: null };
     return await safeJson(res);
   } catch (err) {
-    console.warn('whoami request failed:', err);
+    if (!isAbort(err, signal)) console.warn('whoami request failed:', err);
     return { mode: 'bootstrap', user: null };
   }
 }
 
-export async function resolveIamIdentity(accessKeyId: string, secretAccessKey: string): Promise<WhoamiResponse | null> {
+export async function resolveIamIdentity(
+  accessKeyId: string,
+  secretAccessKey: string,
+  signal?: AbortSignal,
+): Promise<WhoamiResponse | null> {
   try {
     const res = await adminFetch('/api/iam/identity', 'POST', {
       access_key_id: accessKeyId,
       secret_access_key: secretAccessKey,
-    });
+    }, undefined, undefined, signal);
     if (!res.ok) return null;
     return await safeJson(res);
   } catch (err) {
-    console.warn('IAM identity resolve failed:', err);
+    if (!isAbort(err, signal)) console.warn('IAM identity resolve failed:', err);
     return null;
   }
 }

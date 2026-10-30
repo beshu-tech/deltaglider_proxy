@@ -176,9 +176,18 @@ describe('copy / move destination', () => {
     return { user, dialog, path, ok };
   }
 
-  test('starts at the browsed folder, which is the source: confirm is refused', async () => {
+  // UX harvest C33: the browsed folder IS the source here, so the picker
+  // starts at its parent instead of opening in its own blocked state.
+  test('starts at the parent when the browsed folder is the source: confirm is allowed', async () => {
     const { dialog, path, ok } = await openPicker('Copy', vi.fn());
-    expect(path).toHaveValue('builds');
+    expect(path).toHaveValue('');
+    expect(within(dialog).queryByText(/already in this folder/)).toBeNull();
+    expect(ok).toBeEnabled();
+  });
+
+  test('typing the source folder back is refused', async () => {
+    const { user, dialog, path, ok } = await openPicker('Copy', vi.fn());
+    await user.type(path, 'builds');
     expect(within(dialog).getByText(/already in this folder/)).toBeInTheDocument();
     expect(ok).toBeDisabled();
   });

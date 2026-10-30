@@ -15,12 +15,25 @@ import { useColors } from '../ThemeContext';
 /**
  * Collapsible HTML5 `<details>` block. The summary is the title in sentence
  * case (13px, 600), with an optional `hint` as a muted second line that says
- * what is inside, so the reader knows before opening it.
+ * what is inside, so the reader knows before opening it. `hasError`: a
+ * field inside has a validation error, so the block opens and says so (an
+ * error inside a closed block is an error nobody sees).
  */
-export function AdvancedDisclosure({ title, hint, children }: { title: string; hint?: string; children: ReactNode }) {
-  const { BORDER, TEXT_PRIMARY, TEXT_MUTED } = useColors();
+export function AdvancedDisclosure({
+  title,
+  hint,
+  hasError = false,
+  children,
+}: {
+  title: string;
+  hint?: string;
+  hasError?: boolean;
+  children: ReactNode;
+}) {
+  const { BORDER, TEXT_PRIMARY, TEXT_MUTED, ACCENT_RED } = useColors();
   return (
     <details
+      open={hasError || undefined}
       style={{
         marginTop: 16,
         borderTop: `1px solid ${BORDER}`,
@@ -37,6 +50,7 @@ export function AdvancedDisclosure({ title, hint, children }: { title: string; h
         }}
       >
         <span>{title}</span>
+        {hasError && <span style={{ marginLeft: 8, fontWeight: 400, color: ACCENT_RED }}>· a field needs a fix</span>}
         {hint && (
           <span style={{ display: 'block', marginLeft: 16, fontSize: 12, fontWeight: 400, color: TEXT_MUTED }}>
             {hint}

@@ -53,12 +53,24 @@ export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?:
   const revokeUser = async () => {
     const key = revokeKey.trim();
     if (!key) return;
-    if (!(await confirmDialog({
-      title: `Sign out every session of "${key}"?`,
-      content: 'This ends the sessions on every instance. If this is your own identity, you are signed out too. Use it after you rotate a compromised key.',
-      okText: 'Sign out all sessions',
-      danger: true,
-    }))) return;
+    // Say what the click does: the sessions it ends here, or that none here
+    // uses the identity (the sign-out still reaches the other instances,
+    // where this list cannot look).
+    const here = rows.filter((r) => r.identity === key).length;
+    const confirmed = here > 0
+      ? await confirmDialog({
+          title: `Sign out ${here === 1 ? 'the session' : `all ${here} sessions`} of "${key}"?`,
+          content: 'This ends the sessions on every instance. If this is your own identity, you are signed out too. Use it after you rotate a compromised key.',
+          okText: 'Sign out all sessions',
+          danger: true,
+        })
+      : await confirmDialog({
+          title: `No live session on this instance uses "${key}"`,
+          content: 'Check the access key ID. If you run more than one instance, a session of this identity can still be live on another one: sign-out also ends those.',
+          okText: 'Sign out on other instances',
+          cancelText: 'Cancel',
+        });
+    if (!confirmed) return;
     try {
       setBusy('user');
       const res = await revokeUserMutation.mutateAsync(key);
@@ -103,9 +115,14 @@ export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?:
         </Space>
       ),
     },
-    { title: 'Identity', dataIndex: 'identity', key: 'identity', render: (v: string | null) => v ?? <Text type="secondary">—</Text> },
+    // A column that is "—" on every row (bootstrap-password sessions have no
+    // identity) says nothing: it shows only when one row has an identity.
+    ...(rows.some((r) => r.identity)
+      ? [{ title: 'Identity', dataIndex: 'identity', key: 'identity', render: (v: string | null) => v ?? <Text type="secondary">—</Text> }]
+      : []),
     { title: 'IP', dataIndex: 'ip', key: 'ip', responsive: ['md' as const], render: (v: string | null) => v ?? <Text type="secondary">—</Text> },
-    { title: 'Age', dataIndex: 'age_secs', key: 'age', responsive: ['md' as const], render: (v: number) => formatDuration(v) },
+    // Age stays on a phone: it tells an old session from a fresh one.
+    { title: 'Age', dataIndex: 'age_secs', key: 'age', render: (v: number) => formatDuration(v) },
     {
       title: 'Actions',
       key: 'action',

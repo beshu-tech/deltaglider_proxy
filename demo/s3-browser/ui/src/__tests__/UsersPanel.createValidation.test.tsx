@@ -91,7 +91,9 @@ test('the first user asks before it switches sign-in, and the credentials dialog
   expect(http.callsTo('POST', '/_/api/admin/users')).toHaveLength(0);
   await user.click(within(confirm).getByRole('button', { name: 'Create user and switch' }));
   const creds = await screen.findByRole('dialog', { name: /save these credentials/i });
-  expect(creds).toHaveTextContent(/legacy-admin/);
+  // C64: the confirm explained the switch; the credentials dialog says it in one line.
+  expect(creds).toHaveTextContent('You now sign in with an access key.');
+  expect(creds).not.toHaveTextContent(/legacy-admin/);
 });
 
 test('a later user does not ask about the switch', async () => {
@@ -101,7 +103,19 @@ test('a later user does not ask about the switch', async () => {
   await user.type(screen.getByRole('textbox', { name: 'Name' }), 'ci-uploader');
   await user.click(screen.getByRole('button', { name: 'Create user' }));
   const creds = await screen.findByRole('dialog', { name: /save these credentials/i });
-  expect(creds).not.toHaveTextContent(/legacy-admin/);
+  expect(creds).not.toHaveTextContent(/legacy-admin|You now sign in/);
+});
+
+// C62: a preset on an untouched new-user form replaces the default rule at once.
+test('a preset on a new form, or after another preset, applies without a confirm', async () => {
+  const user = userEvent.setup();
+  renderWithQuery(<UsersPanel />);
+  await user.click(await screen.findByRole('button', { name: /new/i }));
+  await user.click(screen.getByRole('button', { name: 'Read/Write/Delete' }));
+  await user.click(screen.getByRole('button', { name: 'Read Only' }));
+  expect(screen.queryByRole('dialog')).toBeNull();
+  await user.click(screen.getByRole('button', { name: 'Full Access (admin)' }));
+  expect(screen.queryByRole('dialog')).toBeNull();
 });
 
 test('with no users the page shows one empty state, not two', async () => {

@@ -74,6 +74,8 @@ export function useBulkActions({ selectedKeys, clearSelection, refresh, mutate }
         confirm?: (items: ExpandedItem[]) => Promise<boolean>;
         /** Reload the listing after each batch: the sources leave the page as the run goes on. */
         reloadPerBatch: boolean;
+        /** The buckets whose size and object count the run changes. */
+        buckets: string[];
       },
     ): Promise<O> => {
       const ctl = new AbortController();
@@ -120,10 +122,15 @@ export function useBulkActions({ selectedKeys, clearSelection, refresh, mutate }
         setBulkProgress(null);
         // Once for the whole run (a failed batch may have done part of its
         // work): the listing and the savings chip, not after each batch.
-        if (total > 0) mutate();
+        // The header's bucket totals of every bucket the run wrote to, also
+        // a copy's destination bucket, which no listing here reloads.
+        if (total > 0) {
+          mutate();
+          for (const b of new Set(run.buckets)) void queryClient.invalidateQueries({ queryKey: qk.bucketUsage(b) });
+        }
       }
     },
-    [clearSelection, refresh, mutate],
+    [clearSelection, refresh, mutate, queryClient],
   );
 
   /**
@@ -158,6 +165,7 @@ export function useBulkActions({ selectedKeys, clearSelection, refresh, mutate }
         },
         cancelledWhileListing: () => ({ total: 0, cancelled: true, failed: 0 }),
         reloadPerBatch: false,
+        buckets: [bucket],
       });
     },
     [runBulk, expandSelected, selectedKeys, queryClient],
@@ -212,6 +220,7 @@ export function useBulkActions({ selectedKeys, clearSelection, refresh, mutate }
           cancelled: true,
         }),
         reloadPerBatch: action === 'move',
+        buckets: [sourceBucket, destBucket],
       });
     },
     [runBulk, expandSelected],

@@ -2165,6 +2165,17 @@ async fn admin_error_bodies_keep_their_shape() {
             err("invalid_request", "group name cannot be blank"),
         ),
         (
+            "group name with a space",
+            admin
+                .post(api("/groups"))
+                .json(&json!({ "name": "qa group with spaces!" })),
+            StatusCode::BAD_REQUEST,
+            err(
+                "invalid_request",
+                "group name can contain only letters, digits and the characters + = , . @ _ -",
+            ),
+        ),
+        (
             "user missing",
             admin
                 .put(api("/users/999999"))

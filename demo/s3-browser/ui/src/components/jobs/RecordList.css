@@ -69,12 +69,6 @@
    not per-cell squares with gutters between them. */
 .dg-record-row[data-clickable] { cursor: pointer; }
 .dg-record-row[data-clickable]:hover { background: var(--rl-hover); }
-.dg-record-row:focus-visible {
-  outline: 2px solid var(--rl-text-muted);
-  outline-offset: -2px;
-  border-radius: 6px;
-}
-
 .dg-record-empty {
   padding: 32px 16px;
   text-align: center;

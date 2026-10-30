@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use crate::iam::{normalize_permissions, validate_permissions, Group, Permission};
 
-use super::users::rebuild_iam_index;
-use super::{audit_log, next_copy_name, trigger_config_sync, AdminError, AdminState};
+use super::users::{check_group_name, group_name_error, next_iam_copy_name, rebuild_iam_index};
+use super::{audit_log, trigger_config_sync, AdminError, AdminState};
 
 #[derive(Deserialize)]
 pub struct CreateGroupRequest {
@@ -72,10 +72,7 @@ pub async fn create_group(
         .ok_or_else(AdminError::no_config_db)?;
     let db = db.lock().await;
 
-    if crate::iam::types::is_blank_principal_name(&body.name) {
-        tracing::warn!("Group name cannot be blank");
-        return Err(AdminError::invalid("group name cannot be blank"));
-    }
+    check_group_name(&body.name)?;
     let mut perms = body.permissions.clone();
     normalize_permissions(&mut perms);
     if let Err(msg) = validate_permissions(&perms) {
@@ -159,8 +156,9 @@ pub async fn clone_group(
             // lightweight name-only query rather than load_groups()'s per-group
             // permission/member fan-out.
             let names = db.load_group_names().unwrap_or_default().into_iter();
-            next_copy_name(&source.name, names)
+            next_iam_copy_name("group", &source.name, names)
         });
+    check_group_name(&name)?;
     let copy_members = body.map(|b| b.copy_members).unwrap_or(false);
 
     let group = db
@@ -195,14 +193,14 @@ pub async fn update_group(
         .ok_or_else(AdminError::no_config_db)?;
     let db = db.lock().await;
 
-    // Refuse a RENAME to a blank name; a row that already has one (created
-    // before names were checked) stays editable.
+    // Refuse a RENAME to a name outside the rule. A row that already carries
+    // one (created before names were checked, or by declarative YAML) stays
+    // editable: the GUI always sends the current name back.
     if let Some(name) = body.name.as_deref() {
-        if crate::iam::types::is_blank_principal_name(name) {
+        if group_name_error(name).is_some() {
             let current = db.get_group_by_id(group_id)?;
             if current.name != name {
-                tracing::warn!("Group name cannot be blank");
-                return Err(AdminError::invalid("group name cannot be blank"));
+                check_group_name(name)?;
             }
         }
     }

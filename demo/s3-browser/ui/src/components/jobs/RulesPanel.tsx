@@ -19,6 +19,7 @@ import {
   PlusOutlined,
   StopOutlined,
   ThunderboltOutlined,
+  UndoOutlined,
 } from '@ant-design/icons';
 import { useQueryClient } from '@tanstack/react-query';
 import type {
@@ -33,7 +34,6 @@ import type { JobAction, JobDisplayRow, JobRow, JobWatch } from '../../jobsView'
 import {
   availableActions,
   editedRuleIds,
-  editorAfterDiscard,
   editorRuleJobId,
   findEditorRule,
   ruleIdsChangedByApply,
@@ -49,7 +49,6 @@ import {
   lifecycleRunNowBlock,
   nextRunText,
   deferredText,
-  planRuleDeleteSync,
   liveCopySummary,
   rowMeterInput,
   runEndedMessage,
@@ -101,6 +100,13 @@ import { LifecycleApplySummary } from '../LifecycleSummary';
 import { normalizeUiError } from '../../errorHandling';
 import FormField from '../FormField';
 import { runsUrl } from './runsLink';
+import {
+  durationError,
+  firstRuleFieldError,
+  lifecycleRuleFieldErrors,
+  replicationRuleFieldErrors,
+} from './humanDuration';
+import { useErrorGate } from './useErrorGate';
 
 const { Text } = Typography;
 
@@ -116,7 +122,7 @@ interface RulesConfig<R> {
 type PayloadResult = { ok: true; body: StorageSectionBody } | { ok: false; error: string };
 
 /** What differs between the replication page and the lifecycle page. */
-interface RuleKindSpec<C extends RulesConfig<R>, R extends { name: string }> {
+interface RuleKindSpec<C extends RulesConfig<R>, R extends { name: string; enabled: boolean }> {
   kind: RuleKind;
   /** The admin path of the page. */
   path: string;
@@ -124,6 +130,8 @@ interface RuleKindSpec<C extends RulesConfig<R>, R extends { name: string }> {
   normalize: (body: StorageSectionBody) => C;
   build: (value: C) => PayloadResult;
   emptyRule: (existing: R[]) => R;
+  /** The duration errors of one rule, by field (shown in the drawer). */
+  fieldErrors: (rule: R) => Partial<Record<string, string>>;
   /** The editor value inside a pending PUT body. */
   pending: (body: StorageSectionBody | null) => C | undefined;
   applySummary: (value: C) => ReactNode;
@@ -143,6 +151,8 @@ interface RuleKindSpec<C extends RulesConfig<R>, R extends { name: string }> {
     tickPath: string;
     tickHelp: string;
     tickPlaceholder: string;
+    /** The server's minimum of the tick. */
+    tickMin: { seconds: number; text: string };
   };
 }
 
@@ -153,6 +163,7 @@ const REPLICATION_SPEC: RuleKindSpec<ReplicationConfig, ReplicationRuleConfig> =
   normalize: (body) => normalizeReplication(body.replication),
   build: buildReplicationPayload,
   emptyRule: emptyReplicationRule,
+  fieldErrors: replicationRuleFieldErrors,
   pending: (body) => body?.replication,
   applySummary: (value) => <ReplicationApplySummary replication={value} />,
   drawer: (editor) => ({ replication: editor }),
@@ -167,6 +178,7 @@ const REPLICATION_SPEC: RuleKindSpec<ReplicationConfig, ReplicationRuleConfig> =
     tickPath: 'storage.replication.tick_interval',
     tickHelp: 'How often the scheduler looks for a rule whose interval has passed. A duration such as 30s or 1m. The minimum is 5s.',
     tickPlaceholder: '30s',
+    tickMin: { seconds: 5, text: '5s' },
   },
 };
 
@@ -176,7 +188,10 @@ const LIFECYCLE_SPEC: RuleKindSpec<LifecycleConfig, LifecycleRuleConfig> = {
   initial: DEFAULT_LIFECYCLE,
   normalize: (body) => normalizeLifecycle(body.lifecycle),
   build: buildLifecyclePayload,
-  emptyRule: emptyLifecycleRule,
+  // A new rule is on: a user who writes a rule expects it to run. Whether
+  // the scheduler runs it is the page switch, and the page says so.
+  emptyRule: (existing) => ({ ...emptyLifecycleRule(existing), enabled: true }),
+  fieldErrors: lifecycleRuleFieldErrors,
   pending: (body) => body?.lifecycle,
   applySummary: (value) => <LifecycleApplySummary lifecycle={value} />,
   drawer: (editor) => ({ lifecycle: editor }),
@@ -192,6 +207,7 @@ const LIFECYCLE_SPEC: RuleKindSpec<LifecycleConfig, LifecycleRuleConfig> = {
     tickHelp:
       'A rule runs this long after its last run ended. A new rule first runs this long after you apply it, so you can preview it first. A duration such as 30m, 1h or 1d. The minimum is 1m.',
     tickPlaceholder: '1h',
+    tickMin: { seconds: 60, text: '1m' },
   },
 };
 
@@ -227,18 +243,25 @@ const ACTION_META: Record<
     danger: true,
     done: 'Kill requested — the running sweep aborts in-flight',
   },
-  delete: { label: 'Delete', icon: <DeleteOutlined />, danger: true, done: 'Rule deleted' },
+  delete: { label: 'Remove rule', icon: <DeleteOutlined />, danger: true },
 };
 
-/** Destructive row actions: shown in the row's "⋯" menu, not as buttons. */
+/**
+ * Destructive row actions: shown in the row's "⋯" menu, not as buttons.
+ * Delete is a STAGED edit like every other rule change (UX harvest C22):
+ * the row shows "removing", the dirty bar appears, and Review & apply
+ * removes the rule (the apply also drops its run history). Kill acts at
+ * once: it stops a run, not a definition.
+ */
 type MenuAction = 'kill' | 'delete';
 const MENU_ACTIONS: readonly JobAction[] = ['kill', 'delete'] satisfies MenuAction[];
 /** The confirmation each menu action asks before it runs. */
 const MENU_CONFIRM: Record<MenuAction, (row: JobRow) => RowActionConfirm> = {
   delete: (row) => ({
-    title: `Delete rule "${row.name}"?`,
-    content: 'This removes the rule from the configuration and clears its run history.',
-    okText: 'Delete rule',
+    title: `Remove rule "${row.name}"?`,
+    content:
+      'The rule is removed, with its run history, when you review and apply. Until then it keeps running, and Discard keeps it.',
+    okText: 'Remove rule',
   }),
   // Kill aborts in-flight work mid-object.
   kill: (row) => ({
@@ -296,7 +319,7 @@ function LastRunCell({ row, schedulerOn }: { row: JobRow; schedulerOn: boolean }
   );
 }
 
-function RulesPanel<C extends RulesConfig<R>, R extends { name: string }>({
+function RulesPanel<C extends RulesConfig<R>, R extends { name: string; enabled: boolean }>({
   spec,
   onSessionExpired,
   search,
@@ -399,25 +422,34 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string }>({
     [serverRows],
   );
 
-  // True after a rule was deleted on the server while the editor was dirty:
-  // the rule was filtered out of the value, but the baseline still holds it,
-  // so Discard must re-fetch instead of reverting to the baseline.
-  const baselineStale = useRef(false);
-
-  // A rule deleted on the server leaves the editor: refresh a clean editor;
-  // drop it from a dirty one (the other unsaved edits stay).
-  const syncEditorAfterDelete = (row: JobRow) => {
-    // The Verify tab's cached parity result belongs to the deleted rule: a
-    // new rule with the same name must not show it.
-    if (row.kind === 'replication') qc.removeQueries({ queryKey: qk.jobs.verify(row.name) });
-    const plan = planRuleDeleteSync(ed.isDirty, ed.value.rules, ed.baseline.rules, row.name);
-    if (plan.action === 'refresh') {
-      void ed.refresh();
-    } else {
-      const keep = new Set(plan.rules.map(ruleUid));
-      ed.setValue((cur) => ({ ...cur, rules: cur.rules.filter((r) => keep.has(ruleUid(r))) }));
-      baselineStale.current = true;
+  // Stage the removal of a saved rule: it leaves the editor value, so the
+  // list shows it as "removing" and Apply deletes it. The other unsaved
+  // edits stay.
+  const stageRemove = (row: Pick<JobRow, 'id' | 'name'>) => {
+    ed.setValue((cur) => ({ ...cur, rules: cur.rules.filter((r) => r.name !== row.name) }));
+    if (drawerJobId === row.id) handleDrawerClose();
+    messageApi.info(`Rule ${row.name} is staged for removal. Review and apply to remove it.`);
+  };
+  // A saved rule that the edits remove (Remove rule, or a rename). Not the
+  // same as the row's `pendingDelete`: before the section loads, every
+  // server row lacks an editor twin.
+  const stagedForRemoval = (name: string) =>
+    !ed.loading && ed.baseline.rules.some((r) => r.name === name) && !ed.value.rules.some((r) => r.name === name);
+  // Undo a staged removal: the saved rule comes back at its saved place.
+  const keepRule = (row: Pick<JobRow, 'name'>) => {
+    const saved = ed.baseline.rules.find((r) => r.name === row.name);
+    if (!saved) return;
+    // A rename shows the old name as "removing" too: its edits live on
+    // under the new name, and a second copy of the rule would clash.
+    if (ed.value.rules.some((r) => ruleUid(r) === ruleUid(saved))) {
+      messageApi.info(`Rule ${row.name} is renamed in your edits. Rename it back, or discard the edits.`);
+      return;
     }
+    ed.setValue((cur) => {
+      if (cur.rules.some((r) => r.name === row.name)) return cur;
+      const at = Math.min(ed.baseline.rules.indexOf(saved), cur.rules.length);
+      return { ...cur, rules: [...cur.rules.slice(0, at), saved, ...cur.rules.slice(at)] };
+    });
   };
 
   // Clone a rule into a new draft and open it, so the operator points it at
@@ -447,14 +479,7 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string }>({
     if (drawerJobId === row.id) handleDrawerClose();
   };
 
-  const discardEditor = () => {
-    if (editorAfterDiscard(baselineStale.current) === 'refresh') {
-      baselineStale.current = false;
-      void ed.refresh();
-    } else {
-      ed.discard();
-    }
-  };
+  const discardEditor = () => ed.discard();
 
   // Rules with unapplied edits (and drafts): only THESE block Run now /
   // Preview and show the "edited" marker.
@@ -463,14 +488,27 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string }>({
     [kind, ed.value.rules, ed.baseline.rules],
   );
 
+  // A wrong duration is refused here, with the rule and the field named:
+  // the server's answer was a parser message in the review dialog.
+  const tickGate = useErrorGate();
+  const tickError = durationError(ed.value.tick_interval, { min: spec.settings.tickMin });
+  const ruleFieldError = firstRuleFieldError(ed.value.rules, spec.fieldErrors);
+  const errorCount =
+    (tickError ? 1 : 0) +
+    ed.value.rules.filter((r) => Object.values(spec.fieldErrors(r)).some(Boolean)).length;
   const startApply = useCallback(async () => {
+    const fieldError = tickError ? `${spec.settings.tickLabel}: ${tickError}` : ruleFieldError;
+    if (fieldError) {
+      messageApi.error(fieldError);
+      return;
+    }
     const r = spec.build(ed.value);
     if (!r.ok) {
       messageApi.error(r.error);
       return;
     }
     await ed.runApply();
-  }, [spec, ed, messageApi]);
+  }, [spec, ed, messageApi, tickError, ruleFieldError]);
   useApplyHandler(spec.path, startApply, ed.isDirty);
 
   const confirmApply = useCallback(async () => {
@@ -478,15 +516,18 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string }>({
     // changes, and the rules whose runs the scheduler starts within a second.
     const staleVerify = kind === 'replication' ? savedRulesChangedByApply(ed.value.rules, ed.baseline.rules) : [];
     const changed = ruleIdsChangedByApply(kind, ed.value.rules, ed.baseline.rules);
+    const waitsOnScheduler =
+      kind === 'lifecycle' && !ed.value.enabled && ed.value.rules.some((r) => r.enabled);
     if (await ed.confirmApply()) {
-      // A successful apply re-fetches the section: the baseline is fresh.
-      baselineStale.current = false;
+      if (waitsOnScheduler) {
+        messageApi.warning(`Applied. The rules do not run until “${spec.settings.switchLabel}” is on.`, 8);
+      }
       watchJobs(changed);
       // A deleted, renamed or changed rule's parity result is not the new rule's.
       for (const name of staleVerify) qc.removeQueries({ queryKey: qk.jobs.verify(name) });
     }
     qc.invalidateQueries({ queryKey: qk.jobs.list() });
-  }, [kind, ed, qc, watchJobs]);
+  }, [kind, ed, qc, watchJobs, messageApi, spec.settings.switchLabel]);
 
   // ── Display rows: server rows + drafts/pending-deletes overlay. ──
   const displayRows: JobDisplayRow[] = useMemo(() => {
@@ -619,12 +660,6 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string }>({
       }
       // Resume and Run now make the server start a run a moment later.
       if (action === 'run-now' || action === 'resume') watchJobs([row.id], action === 'run-now');
-      // A deleted rule no longer exists — close its drawer, and drop it from
-      // the editor, or it comes back as a draft that the next Apply re-creates.
-      if (action === 'delete') {
-        if (drawerJobId === row.id) handleDrawerClose();
-        syncEditorAfterDelete(row);
-      }
       // Refresh the list AND this rule's runs/failures tables — a resume or
       // run-now starts a new run that the open drawer's tabs must show.
       qc.invalidateQueries({ queryKey: qk.jobs.list() });
@@ -675,7 +710,16 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string }>({
               edited
             </Tag>
           )}
-          {d.pendingDelete && <Tag color="error" style={{ margin: 0, flexShrink: 0 }}>removing</Tag>}
+          {/* Not while the section loads: then no server row has an editor twin yet. */}
+          {d.pendingDelete && !ed.loading && (
+            <Tag
+              color="error"
+              style={{ margin: 0, flexShrink: 0 }}
+              title="Staged for removal: Review & apply removes this rule. Discard, or Keep this rule in the ⋯ menu, keeps it."
+            >
+              removing
+            </Tag>
+          )}
         </div>
       ),
     },
@@ -802,6 +846,9 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string }>({
                   (d.row.enabled === false || d.row.paused === true);
                 const label = oneOff ? 'Run once' : ACTION_META[a].label;
                 const blocked =
+                  (stagedForRemoval(d.row.name) && (a === 'run-now' || a === 'preview')
+                    ? 'This rule is staged for removal. Keep the rule or discard the edits first.'
+                    : null) ??
                   draftBlocksAction(a, d.row, edited) ??
                   // The SAVED master switch decides (unknown while it loads:
                   // do not block on the default).
@@ -834,16 +881,19 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string }>({
               label={`More actions for ${d.row.name}`}
               loading={MENU_ACTIONS.some((a) => actionBusy === `${d.row.id}:${a}`)}
               actions={[
-                cloneRuleAction(d.row, cloneRuleRow),
+                ...(stagedForRemoval(d.row.name)
+                  ? [{ key: 'keep', icon: <UndoOutlined />, label: 'Keep this rule', onSelect: () => keepRule(d.row) }]
+                  : [cloneRuleAction(d.row, cloneRuleRow)]),
                 ...availableActions(d.row)
-                  .filter((a) => MENU_ACTIONS.includes(a))
+                  .filter((a) => MENU_ACTIONS.includes(a) && !(a === 'delete' && stagedForRemoval(d.row.name)))
                   .map((a) => ({
                     key: a,
                     danger: true as const,
                     icon: ACTION_META[a].icon,
                     label: `${ACTION_META[a].label}…`,
                     confirm: MENU_CONFIRM[a as MenuAction](d.row),
-                    onSelect: () => runAction(d.row, a),
+                    // Remove is staged in the editor; Kill goes to the server.
+                    onSelect: () => (a === 'delete' ? stageRemove(d.row) : runAction(d.row, a)),
                   })),
               ]}
             />
@@ -861,6 +911,12 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string }>({
   }
 
   const st = spec.settings;
+  // A lifecycle rule runs only while the page switch is on (off by
+  // default): say so where the switch is, while enabled rules wait on it.
+  const schedulerOffNote =
+    kind === 'lifecycle' && !ed.loading && !ed.value.enabled && ed.value.rules.some((r) => r.enabled)
+      ? `No lifecycle rule runs while “${st.switchLabel}” is off. Turn it on, then review and apply.`
+      : null;
   // The list's empty state carries the "New rule" button; a failed list has
   // no empty state, so the header keeps it then.
   const showHeader = displayRows.length > 0 || !!jobsQuery.error;
@@ -887,6 +943,7 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string }>({
             <StickyDirtyBar
               visible
               applying={ed.applying}
+              errorCount={errorCount}
               onDiscard={discardEditor}
               onApply={() => void startApply()}
               inline
@@ -927,13 +984,24 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string }>({
             onChange={(enabled) => ed.setValue((cur) => ({ ...cur, enabled }))}
           />
         </FormField>
+        {schedulerOffNote && (
+          <Alert
+            type="warning"
+            showIcon
+            data-testid="rules-scheduler-off"
+            style={{ marginTop: 8, borderRadius: 8 }}
+            title={schedulerOffNote}
+          />
+        )}
         <FormField
           label={st.tickLabel}
           yamlPath={st.tickPath}
           helpText={st.tickHelp}
+          error={tickGate.show('tick') && !ed.loading ? (tickError ?? undefined) : undefined}
           style={{ marginTop: 12, marginBottom: 0, maxWidth: 360 }}
         >
           <Input
+            {...tickGate.props('tick')}
             value={ed.value.tick_interval}
             disabled={ed.loading}
             placeholder={st.tickPlaceholder}
@@ -973,6 +1041,7 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string }>({
       <StickyDirtyBar
         visible={ed.isDirty && !drawerJobId}
         applying={ed.applying}
+        errorCount={errorCount}
         onDiscard={discardEditor}
         onApply={() => void startApply()}
         floating

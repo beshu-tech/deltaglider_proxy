@@ -5,6 +5,8 @@ export interface S3Object {
   etag: string;
   storageType?: string;
   storedSize?: number;
+  /** The listing marks this delta as its folder's baseline (`x-amz-meta-dg-baseline`). */
+  isBaseline?: boolean;
   /** All response headers from HEAD, for metadata display */
   headers: Record<string, string>;
 }

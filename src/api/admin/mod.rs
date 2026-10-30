@@ -404,17 +404,6 @@ pub(crate) fn named_target(name: Option<&str>, id: i64) -> String {
     }
 }
 
-pub(crate) fn next_copy_name(base: &str, existing: impl IntoIterator<Item = String>) -> String {
-    let existing: std::collections::HashSet<String> = existing.into_iter().collect();
-    for n in 1.. {
-        let candidate = format!("{base} (copy{n})");
-        if !existing.contains(&candidate) {
-            return candidate;
-        }
-    }
-    unreachable!("unbounded copy-name search should always return")
-}
-
 /// Common password validation for both admin API and CLI.
 /// Returns `Ok(())` if valid, `Err(message)` if invalid.
 pub fn validate_password(password: &str) -> Result<(), &'static str> {
@@ -455,20 +444,4 @@ pub fn validate_password(password: &str) -> Result<(), &'static str> {
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::next_copy_name;
-
-    #[test]
-    fn next_copy_name_skips_existing_suffixes() {
-        let existing = vec![
-            "reader".to_string(),
-            "reader (copy1)".to_string(),
-            "reader (copy2)".to_string(),
-        ];
-
-        assert_eq!(next_copy_name("reader", existing), "reader (copy3)");
-    }
 }

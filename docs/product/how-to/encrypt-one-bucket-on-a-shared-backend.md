@@ -141,9 +141,9 @@ A proxy with its own configuration, which shares no sync bucket with these insta
 
 ## Verify
 
-1. On **Storage → Buckets**, check the encryption chip of each row. `db-archive` shows **Encrypted · bucket key db-archive-2026-10**, and `downloads` shows **Not encrypted**. A bucket that takes the encryption of an encrypting backend shows **Encrypted · from hetzner-fsn1**.
+1. On **Storage → Buckets**, check the encryption chip of each row. `db-archive` shows **Encrypted · bucket key db-archive-2026-10**. The `downloads` row has no encryption chip, because a bucket that stores plaintext like its backend shows no chip. A bucket that takes the encryption of an encrypting backend shows **Encrypted · from hetzner-fsn1**.
 
-   ![The Buckets page; a box marks the chip Encrypted · bucket key db-archive-2026-10 of db-archive, and the downloads row shows Not encrypted.](/_/screenshots/bucket-encryption-chip.webp)
+   ![The Buckets page; a box marks the chip Encrypted · bucket key db-archive-2026-10 of db-archive. The downloads row has no encryption chip, because it stores plaintext as its backend does.](/_/screenshots/bucket-encryption-chip.webp)
 
 2. The admin API reports the same answer for each bucket (see [the admin API reference](../reference/admin-api.md)):
 

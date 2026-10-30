@@ -4,7 +4,7 @@ import { WarningOutlined } from '@ant-design/icons';
 import { listBuckets, getBucket } from '../s3client';
 import { useColors } from '../ThemeContext';
 import { pluralize } from '../utils';
-import { normalizeDestPrefix, destinationIsSource, keyPathError } from './destPrefix';
+import { normalizeDestPrefix, destinationIsSource, keyPathError, initialDestPrefix } from './destPrefix';
 
 const { Text } = Typography;
 
@@ -41,17 +41,26 @@ export default function DestinationPickerModal({ open, mode, itemCount, onConfir
   const [sourceBucket, setSourceBucket] = useState(getBucket());
   const [destBucket, setDestBucket] = useState(getBucket());
   const [destPrefix, setDestPrefix] = useState('');
+  // Until the user changes the destination, a destination that is the
+  // source gets a prompt, not the "already in this folder" alert.
+  const [edited, setEdited] = useState(false);
 
+  // The keys at the moment the picker opens: the effect must not reset the
+  // path when the selection object changes identity.
+  const keysText = [...selectionKeys].join('\n');
   useEffect(() => {
     if (open) {
       listBuckets().then(bs => setBuckets(bs.filter(b => !b.unavailable).map(b => b.name))).catch(() => {});
-      setSourceBucket(getBucket());
-      setDestBucket(getBucket());
-      // Start from the folder being browsed, not the bucket root: copies and
-      // moves usually go next to, or below, where the user already is.
-      setDestPrefix(normalizeDestPrefix(currentPrefix));
+      const bucket = getBucket();
+      setSourceBucket(bucket);
+      setDestBucket(bucket);
+      setEdited(false);
+      // Start from the folder being browsed (copies usually go next to, or
+      // below, where the user already is), or its parent when the
+      // selection lives there: the picker never opens blocked.
+      setDestPrefix(initialDestPrefix(bucket, keysText ? keysText.split('\n') : [], currentPrefix));
     }
-  }, [open, currentPrefix]);
+  }, [open, currentPrefix, keysText]);
 
   const clean = normalizeDestPrefix(destPrefix);
   const preview = `${destBucket}/${clean ? clean + '/' : ''}`;
@@ -77,7 +86,7 @@ export default function DestinationPickerModal({ open, mode, itemCount, onConfir
         <Select
           aria-labelledby="dest-picker-bucket"
           value={destBucket}
-          onChange={setDestBucket}
+          onChange={(b) => { setDestBucket(b); setEdited(true); }}
           options={buckets.map(b => ({ value: b, label: b }))}
           placeholder="Select bucket"
           style={{ width: '100%' }}
@@ -90,7 +99,7 @@ export default function DestinationPickerModal({ open, mode, itemCount, onConfir
         <Input
           aria-labelledby="dest-picker-path"
           value={destPrefix}
-          onChange={e => setDestPrefix(e.target.value)}
+          onChange={e => { setDestPrefix(e.target.value); setEdited(true); }}
           placeholder="/ (bucket root)"
           style={{ fontFamily: 'var(--font-mono)', fontSize: 13 }}
           autoFocus
@@ -118,7 +127,9 @@ export default function DestinationPickerModal({ open, mode, itemCount, onConfir
         <Alert
           type="info"
           showIcon
-          title={`The selected objects are already in this folder. Choose another folder or bucket to ${mode} them.`}
+          title={edited
+            ? `The selected objects are already in this folder. Choose another folder or bucket to ${mode} them.`
+            : `Type the folder or choose the bucket to ${mode} the selected objects to.`}
           style={{ borderRadius: 8, marginBottom: mode === 'move' ? 12 : 0 }}
         />
       )}

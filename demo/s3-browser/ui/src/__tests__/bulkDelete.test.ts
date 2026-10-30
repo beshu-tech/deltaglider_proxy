@@ -8,7 +8,7 @@ import { bulkDeleteConfirm, deleteJobMessage } from '../bulkDelete';
 
 test('the message after the start, a cancel, or an empty selection', () => {
   assert.deepEqual(deleteJobMessage({ total: 12_346, cancelled: false, failed: 0, jobId: 7 }), {
-    type: 'success',
+    type: 'info',
     text: 'Deleting 12,346 objects on the server. You can close this tab: the bucket shows the progress.',
   });
   assert.deepEqual(deleteJobMessage({ total: 0, cancelled: true, failed: 0 }), {

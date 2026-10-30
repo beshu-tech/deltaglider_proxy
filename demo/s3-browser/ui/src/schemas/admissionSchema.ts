@@ -47,38 +47,37 @@ const admissionMatchSchema = z
     source_ip: z
       .string()
       .trim()
-      .min(1, 'IP must not be empty')
+      .min(1, 'Enter an IP address or a CIDR range.')
       .max(64)
       .optional(),
     source_ip_list: z
-      .array(z.string().trim().min(1, 'entry must not be empty').max(64))
+      .array(z.string().trim().min(1, 'Remove the empty source IP entry.').max(64))
       .max(4096, 'Enter at most 4096 source IPs.')
       .optional(),
     bucket: z
       .string()
       .trim()
-      .min(1, 'bucket name must not be empty')
+      .min(1, 'Enter a bucket name.')
       .max(128)
       .optional(),
     path_glob: z
       .string()
       .trim()
-      .min(1, 'path_glob must not be empty')
+      .min(1, 'Enter a path pattern.')
       .max(1024)
       .optional(),
     authenticated: z.boolean().optional(),
     config_flag: z
       .string()
       .trim()
-      .min(1, 'config_flag must not be empty')
+      .min(1, 'Enter a config flag.')
       .max(128)
       .optional(),
   })
   .refine(
     (m) => !(m.source_ip && m.source_ip_list && m.source_ip_list.length > 0),
     {
-      message:
-        'source_ip and source_ip_list cannot both be set; pick one form',
+      message: 'Use one source IP or a source IP list, not both.',
       path: ['source_ip_list'],
     }
   );
@@ -88,8 +87,8 @@ const admissionRejectSchema = z.object({
   status: z
     .number()
     .int()
-    .min(400, 'reject status must be 4xx or 5xx')
-    .max(599, 'reject status must be 4xx or 5xx'),
+    .min(400, 'Use a status code from 400 to 599.')
+    .max(599, 'Use a status code from 400 to 599.'),
   message: z.string().max(4096).optional(),
 });
 
@@ -109,12 +108,9 @@ export const admissionBlockSchema = z.object({
   name: z
     .string()
     .trim()
-    .min(1, 'name is required')
-    .max(128, 'name must be at most 128 characters')
-    .regex(
-      NAME_PATTERN,
-      'name may only contain letters, digits, and the characters _ : . -'
-    )
+    .min(1, 'Enter a name.')
+    .max(128, 'Use 128 characters or fewer.')
+    .regex(NAME_PATTERN, 'Use letters, digits and _ : . - only.')
     .refine((n) => !n.startsWith(RESERVED_NAME_PREFIX), {
       message:
         'Names starting with "public-prefix:" are reserved for public-access rules.',

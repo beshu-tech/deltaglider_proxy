@@ -41,6 +41,7 @@ test('open auth: bucket, upload, list, admin login, sign out, reconnect, object 
     mimeType: 'text/plain',
     buffer: Buffer.from('deltaglider e2e payload\n'),
   });
+  await page.getByRole('button', { name: /Upload \d+ files? to / }).click();
 
   // Upload completes near-instantly for a tiny file; the page swaps the
   // "Back to browse" button for the success panel's single Done action.

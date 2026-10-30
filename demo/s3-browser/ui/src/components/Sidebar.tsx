@@ -22,6 +22,7 @@ import {
 import type { BucketInfo } from '../types';
 import { useColors } from '../ThemeContext';
 import BucketEncryptionIcon from './BucketEncryptionIcon';
+import MiddleEllipsis from '../browser/MiddleEllipsis';
 import BucketPublicIcon from './BucketPublicIcon';
 import SidebarResizeHandle from './SidebarResizeHandle';
 import { describeBackend } from '../bucketBackend';
@@ -73,6 +74,10 @@ interface Props {
   onUploadClick: () => void;
   onBucketChange: (bucket: string) => void;
   onBucketsChanged?: (count: number) => void;
+  /** The listed bucket names, after every listing. When set, a linked
+   *  bucket that is not in the list stays at its URL: the caller shows it
+   *  as missing instead of the sidebar switching to another bucket. */
+  onBucketNamesChanged?: (names: string[]) => void;
   createBucketFocusSignal?: number;
   canCreateBucket: boolean;
   canDeleteBucket: (bucket: string) => boolean;
@@ -91,6 +96,7 @@ export default function Sidebar({
   onUploadClick,
   onBucketChange,
   onBucketsChanged,
+  onBucketNamesChanged,
   createBucketFocusSignal = 0,
   canCreateBucket,
   canDeleteBucket,
@@ -144,8 +150,13 @@ export default function Sidebar({
         setLoadError(null);
         setBuckets(list);
         onBucketsChanged?.(list.length);
+        onBucketNamesChanged?.(list.map((b) => b.name));
         const requested = getBucket();
-        if (list.length > 0 && !list.some((b) => b.name === requested)) {
+        // A linked bucket that is not listed stays at its URL when the
+        // caller shows it as missing; switching to another bucket in
+        // silence made the link look like it worked.
+        const callerShowsMissing = Boolean(requested && onBucketNamesChanged);
+        if (list.length > 0 && !callerShowsMissing && !list.some((b) => b.name === requested)) {
           // Never auto-select an unavailable placeholder — it would drive the
           // object pane at a dead backend.
           const firstLive = list.find((b) => !b.unavailable) ?? list[0];
@@ -174,7 +185,7 @@ export default function Sidebar({
     return () => {
       cancelled = true;
     };
-  }, [onBucketChange, onBucketsChanged, includeBucketOrigins, reloadSignal, messageApi]);
+  }, [onBucketChange, onBucketsChanged, onBucketNamesChanged, includeBucketOrigins, reloadSignal, messageApi]);
 
   useEffect(() => {
     if (createBucketFocusSignal <= 0) return;
@@ -191,6 +202,7 @@ export default function Sidebar({
       const updated = await listBuckets({ includeOrigins: includeBucketOrigins });
       setBuckets(updated);
       onBucketsChanged?.(updated.length);
+      onBucketNamesChanged?.(updated.map((b) => b.name));
     } catch {
       /* refresh failure is non-fatal — the bucket was created */
     }
@@ -215,6 +227,7 @@ export default function Sidebar({
     const updated = await listBuckets({ includeOrigins: includeBucketOrigins });
     setBuckets(updated);
     onBucketsChanged?.(updated.length);
+    onBucketNamesChanged?.(updated.map((b) => b.name));
     if (getBucket() === name && updated.length > 0) {
       setBucket(updated[0].name);
       onBucketChange(updated[0].name);
@@ -393,18 +406,17 @@ export default function Sidebar({
             if (!isCurrent) e.currentTarget.style.background = 'transparent';
           }}
         >
-          <span style={{
-            lineHeight: '20px',
-            fontFamily: "var(--font-mono)",
-            fontSize: 13,
-            fontWeight: isActive ? 600 : 400,
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
-            minWidth: 0,
-          }}>
-            {b.name}
-          </span>
+          {/* Cut in the middle: buckets often differ only at the end (-prod, -dr). */}
+          <MiddleEllipsis
+            text={b.name}
+            title={false}
+            style={{
+              lineHeight: '20px',
+              fontFamily: "var(--font-mono)",
+              fontSize: 13,
+              fontWeight: isActive ? 600 : 400,
+            }}
+          />
           <BucketPublicIcon bucket={b.name} canAdmin={canAdmin} />
           <BucketEncryptionIcon origin={b.backend} />
           {isUnavailable && (

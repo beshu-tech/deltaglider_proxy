@@ -2,7 +2,7 @@
   "doc_apply_400": {
     "body": {
       "applied": false,
-      "error": "YAML parse error: Parse error: did not find expected ',' or ']' at line 2 column 1, while parsing a flow sequence at line 1 column 11",
+      "error": "The text is not valid YAML: did not find expected ',' or ']' at line 2 column 1, while parsing a flow sequence at line 1 column 11.",
       "persisted": false,
       "requires_restart": false
     },

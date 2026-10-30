@@ -78,7 +78,9 @@ test('lifecycle: create a rule, preview count = confirmed count = deleted count'
   await name.fill(RULE);
   await drawer.getByPlaceholder('prod-artifacts').fill(BUCKET);
   await drawer.getByPlaceholder('builds/releases/').fill('logs/');
-  await drawer.getByRole('switch').first().click();
+  // A new rule starts enabled; turn it on only if it is off.
+  const enabled = drawer.getByRole('switch').first();
+  if ((await enabled.getAttribute('aria-checked')) !== 'true') await enabled.click();
   await page.keyboard.press('Escape');
   // While the drawer is open its footer carries the apply bar; the page bar
   // returns once the drawer has closed.

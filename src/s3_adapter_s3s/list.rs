@@ -461,11 +461,34 @@ pub(super) fn list_metadata_map(
     if !reader.sees_delta_facts() {
         return std::collections::HashMap::new();
     }
-    response_metadata_map(meta, reader)
+    let full = response_metadata_map(meta, reader);
+    let baseline = is_baseline_delta(&full);
+    let mut listed: std::collections::HashMap<String, String> = full
         .into_iter()
         .filter(|(k, _)| k == mk::NOTE || k == mk::DELTA_SIZE)
         .map(|(k, v)| (format!("{}{k}", mk::AMZ_META_PREFIX), v))
-        .collect()
+        .collect();
+    if baseline {
+        listed.insert(
+            format!("{}{}", mk::AMZ_META_PREFIX, mk::BASELINE),
+            "true".to_string(),
+        );
+    }
+    listed
+}
+
+/// Whether the HEAD metadata `map` is of the delta whose bytes ARE its
+/// folder's reference baseline: the object's SHA-256 equals the SHA-256 of
+/// the reference it is a delta against. The baseline PUT writes its body as
+/// reference.bin and then a delta of the body against itself, so the two
+/// hashes are equal. A later object with the same bytes matches too: its
+/// bytes are the baseline as well.
+pub(super) fn is_baseline_delta(map: &std::collections::HashMap<String, String>) -> bool {
+    use crate::types::meta_keys as mk;
+    match (map.get(mk::FILE_SHA256), map.get(mk::REF_SHA256)) {
+        (Some(file), Some(reference)) => !file.is_empty() && file == reference,
+        _ => false,
+    }
 }
 
 pub(super) fn list_objects_v2_output_from_page(

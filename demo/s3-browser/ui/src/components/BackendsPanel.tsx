@@ -7,7 +7,9 @@ import { Button, Input, Radio, Switch, Typography, Space, Alert, Spin, message }
 import { PlusOutlined, DeleteOutlined, DatabaseOutlined, CheckCircleOutlined, ApiOutlined } from '@ant-design/icons';
 import type { BackendEncryptionMode, BackendHealthEntry, BackendInfo, ConfirmHeaders, CreateBackendRequest } from '../adminApi';
 import { confirmDialog } from '../confirmDialog';
-import { createBackend, deleteBackend, probeBackend, testS3Connection, updateAdminConfig, getSectionVersioned } from '../adminApi';
+import { backendHealthSentence, createBackend, deleteBackend, plainError, probeBackend, testS3Connection, updateAdminConfig, getSectionVersioned } from '../adminApi';
+import type { PlainError } from '../adminApi';
+import PlainErrorAlert from './PlainErrorAlert';
 import { applySection, persistFailureText, sectionApplyErrorText } from '../applySection';
 import { useAdminConfig } from '../queries/config';
 import { useBackends, useBucketOrigins } from '../queries/backends';
@@ -34,7 +36,6 @@ import {
   type StorageSectionBackends,
 } from '../backendEncryptionPayload';
 import MaskedSecretInput from './MaskedSecretInput';
-import { normalizeUiError } from '../errorHandling';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
 import { isSessionExpired } from '../errorHandling';
 import { ABSOLUTE_PATH_ERROR, isAbsolutePath } from '../utils';
@@ -45,16 +46,7 @@ const { Text } = Typography;
 
 /** Plain-language one-liner for a health verdict (badge + Test result). */
 function healthLabel(h: BackendHealthEntry): string {
-  switch (h.status) {
-    case 'healthy':
-      return 'Connected';
-    case 'auth-rejected':
-      return `Credentials rejected (${h.detail}) — check access key / secret`;
-    case 'unreachable':
-      return `Endpoint unreachable (${h.detail})`;
-    case 'erroring':
-      return `Backend erroring (${h.detail})`;
-  }
+  return h.status === 'healthy' ? 'Connected' : backendHealthSentence(h.status, h.detail);
 }
 
 /** The status pills after a backend's name: default and health. The
@@ -142,7 +134,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   useSessionExpiredOn(loadError, onSessionExpired);
   const error =
     loadError && !isSessionExpired(loadError)
-      ? normalizeUiError(loadError, 'Failed to load backends')
+      ? plainError(loadError, 'The proxy did not send the backends.').text
       : null;
 
   // New backend form
@@ -162,7 +154,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   const [saveResult, setSaveResult] = useState<{ ok: boolean; message: string } | null>(null);
   // Create errors render inside the form, next to the button that caused them;
   // the page-top Alert is out of view when the form is open.
-  const [formError, setFormError] = useState<string | null>(null);
+  const [formError, setFormError] = useState<PlainError | null>(null);
   const pathInvalid = formType === 'filesystem' && !isAbsolutePath(formPath);
   // Set by the first Create click: from then on, empty required fields say
   // so on the field itself (a disabled Create button said nothing).
@@ -209,7 +201,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
       // failing uploads) is the worse failure mode.
       if (formType === 's3') {
         if (!formAccessKey || !formSecretKey) {
-          setFormError('An S3 backend needs an access key ID and a secret access key.');
+          setFormError({ text: 'An S3 backend needs an access key ID and a secret access key.' });
           return;
         }
         const probe = await testS3Connection({
@@ -220,7 +212,8 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
           secret_access_key: req.secret_access_key,
         });
         if (!probe.success) {
-          setFormError(`Connection test failed, so the backend was not created: ${probe.error || 'unknown error'}`);
+          const why = plainError(probe.error || '', 'The connection test failed.');
+          setFormError({ text: `${why.text} The backend was not created.`, details: why.details });
           return;
         }
       }
@@ -257,10 +250,10 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
             ?.scrollIntoView({ behavior: 'smooth', block: 'center' });
         });
       } else {
-        setFormError(result.error || 'Failed to create backend');
+        setFormError(plainError(result.error || '', 'The proxy did not create the backend.'));
       }
     } catch (e) {
-      setFormError(normalizeUiError(e, "Network error"));
+      setFormError(plainError(e, 'The proxy did not create the backend.'));
     } finally {
       setSaving(false);
     }
@@ -295,10 +288,10 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
         message.success(`Backend "${name}" removed`);
         await refresh();
       } else {
-        setSaveResult({ ok: false, message: result.error || 'Failed to delete' });
+        setSaveResult({ ok: false, message: plainError(result.error || '', 'The proxy did not remove the backend.').text });
       }
     } catch (e) {
-      setSaveResult({ ok: false, message: normalizeUiError(e, "Network error") });
+      setSaveResult({ ok: false, message: plainError(e, 'The proxy did not remove the backend.').text });
     }
   };
 
@@ -318,7 +311,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
       });
       qc.invalidateQueries({ queryKey: qk.backends.list() });
     } catch (e) {
-      setTestResult({ name: b.name, ok: false, message: normalizeUiError(e, 'Probe failed') });
+      setTestResult({ name: b.name, ok: false, message: plainError(e, 'The connection test failed.').text });
     } finally {
       setTestingBackend(null);
     }
@@ -727,7 +720,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
               <label htmlFor="backend-set-default" style={{ fontSize: 13, fontFamily: 'var(--font-ui)' }}>Set as default backend</label>
             </div>
             {formError && (
-              <Alert type="error" showIcon title={formError} style={{ marginTop: 16, borderRadius: 8 }} />
+              <PlainErrorAlert error={formError} style={{ marginTop: 16 }} />
             )}
             <div style={{ marginTop: 16, display: 'flex', gap: 8 }}>
               <Button data-testid="backend-create" type="primary" icon={<CheckCircleOutlined />} onClick={handleCreate} loading={saving} style={{ borderRadius: 8, fontWeight: 600 }}>
@@ -758,7 +751,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                   await updateAdminConfig({ max_delta_ratio: on ? 0.75 : 0 });
                   await refresh();
                 } catch (e) {
-                  message.error(normalizeUiError(e, 'Failed to change delta compression'));
+                  message.error(plainError(e, 'The proxy did not change delta compression.').text);
                 }
               }}
             />

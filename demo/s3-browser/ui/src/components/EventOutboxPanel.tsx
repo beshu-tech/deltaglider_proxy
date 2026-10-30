@@ -410,7 +410,8 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
         </Text>
       </div>
 
-      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+      {/* A grid, not a wrapping row: four counters on a phone wrapped 3 + 1. */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8 }}>
         <CountPill label="Pending" value={counts.pending} colour="default" active={status === 'pending'} onClick={() => { setStatus('pending'); setPage(1); }} />
         <CountPill label="In progress" value={counts.in_progress} colour={countTone(counts.in_progress, 'processing')} active={status === 'in_progress'} onClick={() => { setStatus('in_progress'); setPage(1); }} />
         <CountPill label="Failed" value={counts.failed} colour={countTone(counts.failed, 'error')} active={status === 'failed'} onClick={() => { setStatus('failed'); setPage(1); }} />
@@ -487,19 +488,25 @@ function CountPill({
   active?: boolean;
   onClick?: () => void;
 }) {
+  // Theme tokens: the CSS variables used before (--border, --card-bg,
+  // --accent-blue) are not defined, so the pills had no border or fill.
+  const { ACCENT_BLUE, BORDER, BG_CARD } = useColors();
   return (
     <button
       type="button"
       onClick={onClick}
+      aria-pressed={active}
       style={{
-        display: 'inline-flex',
+        display: 'flex',
         alignItems: 'center',
+        justifyContent: 'space-between',
         gap: 6,
-        border: `1px solid ${active ? 'var(--accent-blue)' : 'var(--border)'}`,
+        border: `1px solid ${active ? ACCENT_BLUE : BORDER}`,
         borderRadius: 999,
         padding: '5px 9px',
-        background: active ? 'rgba(72, 160, 255, 0.12)' : 'var(--card-bg)',
+        background: active ? `${ACCENT_BLUE}1f` : BG_CARD,
         cursor: 'pointer',
+        fontFamily: 'var(--font-ui)',
       }}
     >
       <Text type="secondary" style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.4 }}>{label}</Text>

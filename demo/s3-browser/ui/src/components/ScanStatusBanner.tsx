@@ -4,6 +4,7 @@ import { useColors } from '../ThemeContext';
 import { formatBytes, relativeTime, noun } from '../utils';
 import { fmtNum } from './dashboard/chartDefaults';
 import type { BucketScanProgress } from '../adminApi';
+import { scanCallToAction } from '../scanQueue';
 
 interface ScanStatusBannerProps {
   colors: ReturnType<typeof useColors>;
@@ -32,7 +33,7 @@ interface ScanStatusBannerProps {
  * contract with the user:
  *   - On first paint they see "Cache: N of M buckets · oldest
  *     scanned X ago". No ghosting, no spinner.
- *   - Click Re-scan all → banner switches to a live progress row with
+ *   - Click a scan action → banner switches to a live progress row with
  *     bucket name, objects scanned, bytes seen, Stop.
  *   - The KPIs and panels below update LIVE per SSE frame so you can
  *     watch the totals tick up rather than wait for the whole bucket
@@ -86,7 +87,7 @@ export default function ScanStatusBanner({
           </>
         ) : cachedCount === 0 ? (
           <span>
-            No scans yet. Click <strong>Run full scan</strong> — results persist on disk and survive restarts.
+            No scans yet. Click <strong>{scanCallToAction(unscannedCount, bucketCount)}</strong>. The results are kept on disk and survive a restart.
           </span>
         ) : (
           <>
@@ -123,15 +124,10 @@ export default function ScanStatusBanner({
         </Button>
       ) : (
         /*
-          Two affordances side-by-side:
-          - **Scan missing (N)** is the primary action when any
-            bucket is uncached. Doing a full re-scan in that case
-            would waste 30+ minutes redoing the 1.4 TB beshu bucket
-            just to learn the same number we already have.
-          - **Re-scan all** is the explicit "I want fresh numbers
-            everywhere" — surfaced as a smaller secondary button.
-          When everything is already cached, "Scan missing" hides
-          and only "Re-scan all" remains as the primary.
+          The labels of the analytics page: "Scan all buckets" / "Scan N
+          more buckets" while some bucket has no scan (a full re-scan then
+          redoes buckets whose numbers are known), and "Re-scan all" only
+          once a scan exists.
         */
         <div style={{ display: 'flex', gap: 6 }}>
           {unscannedCount > 0 && (
@@ -142,31 +138,21 @@ export default function ScanStatusBanner({
               onClick={onScanMissing}
               disabled={allBucketsCount === 0 || !scansLoaded}
             >
-              Scan missing ({unscannedCount})
+              {scanCallToAction(unscannedCount, bucketCount)}
             </Button>
           )}
-          <Button
-            size="small"
-            type={unscannedCount === 0 ? 'primary' : 'default'}
-            icon={
-              cachedCount === 0 ? (
-                <PlayCircleOutlined />
-              ) : (
-                <ReloadOutlined />
-              )
-            }
-            onClick={onRescanAll}
-            disabled={allBucketsCount === 0 || !scansLoaded}
-            title={
-              unscannedCount > 0
-                ? 'Force a fresh scan of every bucket, including ones already cached. Expensive — only do this if you suspect data drift.'
-                : undefined
-            }
-          >
-            {cachedCount === 0
-              ? 'Run full scan'
-              : `Re-scan all (${allBucketsCount})`}
-          </Button>
+          {cachedCount > 0 && (
+            <Button
+              size="small"
+              type={unscannedCount === 0 ? 'primary' : 'default'}
+              icon={<ReloadOutlined />}
+              onClick={onRescanAll}
+              disabled={allBucketsCount === 0 || !scansLoaded}
+              title="Scan every bucket again"
+            >
+              Re-scan all
+            </Button>
+          )}
         </div>
       )}
     </div>

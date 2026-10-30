@@ -7,6 +7,8 @@ import RuleFilterFields from './RuleFilterFields';
 import { ruleFolderPrefix } from '../ruleFilterPreview';
 import { actionKind } from './lifecyclePayload';
 import { ruleGlobError } from './jobs/lifecycleText';
+import { lifecycleRuleFieldErrors } from './jobs/humanDuration';
+import { useErrorGate } from './jobs/useErrorGate';
 
 const { Text } = Typography;
 
@@ -58,6 +60,9 @@ export default function RuleEditor({
   };
 
   const includeError = ruleGlobError(rule.name, rule.include_globs);
+  const fieldErrors = lifecycleRuleFieldErrors(rule);
+  const gate = useErrorGate();
+  const errorOf = (key: keyof typeof fieldErrors) => (gate.show(key) ? (fieldErrors[key] ?? undefined) : undefined);
   const excludeError = ruleGlobError(rule.name, rule.exclude_globs);
 
   return (
@@ -99,8 +104,10 @@ export default function RuleEditor({
             label="Expire after"
             yamlPath="storage.lifecycle.rules[].expire_after"
             helpText="Objects whose creation time is older than this age become candidates. The proxy stamps the creation time when it stores an object. For an object that was written without the proxy (a restore, a copy straight to the disk or the backend), it uses the file's modification time instead. A duration such as 12h, 30d or 90d."
+            error={errorOf('expire_after')}
           >
             <Input
+              {...gate.props('expire_after')}
               value={rule.expire_after || ''}
               onChange={(e) => onChange({ expire_after: e.target.value })}
               placeholder="30d"
@@ -192,8 +199,10 @@ export default function RuleEditor({
               label="Ignore objects younger than"
               yamlPath="storage.lifecycle.rules[].action.qualify.min_age"
               helpText="A duration such as 1h. The rule ignores objects younger than this, because they can still be uploading. Leave it empty for no age filter."
+              error={errorOf('min_age')}
             >
               <Input
+                {...gate.props('min_age')}
                 value={retainAction.qualify?.min_age || ''}
                 onChange={(e) => updateQualify({ min_age: e.target.value || undefined })}
                 placeholder="1h"
@@ -201,13 +210,15 @@ export default function RuleEditor({
               />
             </FormField>
           </div>
-          <AdvancedDisclosure title="Delete-side guard" hint="Never delete objects younger than an age">
+          <AdvancedDisclosure title="Delete-side guard" hint="Never delete objects younger than an age" hasError={!!fieldErrors.protect_younger_than}>
             <FormField
               label="Don't delete anything younger than"
               yamlPath="storage.lifecycle.rules[].action.protect_younger_than"
               helpText="A duration such as 1h. This run does not delete a selected object that is younger than this. The filters above are different: they remove objects from the count. Most rules leave this empty."
+              error={errorOf('protect_younger_than')}
             >
               <Input
+                {...gate.props('protect_younger_than')}
                 value={retainAction.protect_younger_than || ''}
                 onChange={(e) => updateRetain({ protect_younger_than: e.target.value || undefined })}
                 placeholder="7d"

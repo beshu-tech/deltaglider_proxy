@@ -904,6 +904,35 @@ fn list_metadata_is_the_storage_facts_of_the_head() {
     assert!(list_metadata_map(&meta, Reader::Anonymous).is_empty());
 }
 
+/// `metadata=true`: a delta whose SHA-256 equals its reference's is the
+/// folder's baseline and lists `dg-baseline: true`; any other delta, and a
+/// delta with no hashes, does not.
+#[test]
+fn list_metadata_marks_the_baseline_delta() {
+    let mut meta = meta_at_subsecond();
+    let delta = |ref_sha256: &str| crate::types::StorageInfo::Delta {
+        ref_path: "reference.bin".into(),
+        ref_sha256: ref_sha256.into(),
+        delta_size: 9,
+        delta_cmd: String::new(),
+    };
+    meta.file_sha256 = "ab".repeat(32);
+    meta.storage_info = delta(&"ab".repeat(32));
+    let list = list_metadata_map(&meta, Reader::Authenticated);
+    assert_eq!(list["x-amz-meta-dg-baseline"], "true");
+    assert!(list_metadata_map(&meta, Reader::Anonymous).is_empty());
+    assert!(list_metadata_map(&meta, Reader::OutsideFolder).is_empty());
+
+    meta.storage_info = delta(&"cd".repeat(32));
+    let list = list_metadata_map(&meta, Reader::Authenticated);
+    assert!(!list.contains_key("x-amz-meta-dg-baseline"));
+
+    meta.file_sha256 = String::new();
+    meta.storage_info = delta("");
+    let list = list_metadata_map(&meta, Reader::Authenticated);
+    assert!(!list.contains_key("x-amz-meta-dg-baseline"));
+}
+
 #[test]
 fn client_max_keys_keeps_zero_and_refuses_a_negative_value() {
     let ok = |v| client_max_keys(v).unwrap();

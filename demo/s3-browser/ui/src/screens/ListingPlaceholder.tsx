@@ -14,6 +14,8 @@ interface Props {
   error: string | null;
   /** Empty only because "Show system files" is off (the folder holds .dg/ etc.). */
   onlyHiddenEntries: boolean;
+  /** The folder had rows a moment ago: the user emptied it (a delete or a move). */
+  emptied?: boolean;
   /** null until the sidebar has listed the buckets. */
   bucketCount: number | null;
   canUpload: boolean;
@@ -38,6 +40,7 @@ export default function ListingPlaceholder({
   loading,
   error,
   onlyHiddenEntries,
+  emptied = false,
   bucketCount,
   canUpload,
   canCreateBucket,
@@ -110,6 +113,8 @@ export default function ListingPlaceholder({
             ? 'Create a bucket before uploading objects or generating demo data.'
             : onlyHiddenEntries
               ? 'This folder holds only hidden system files. Turn on "Show system files" in the account menu to see them.'
+              : emptied
+              ? `${prefix ? `${bucket}/${prefix}` : bucket} is now empty.`
               : prefix
               // The proxy stores no folder markers: a folder exists
               // only while it holds files, so an empty listing here

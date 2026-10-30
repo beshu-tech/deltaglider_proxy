@@ -101,7 +101,7 @@ The dialog **Credentials updated: save them now** shows the new secret once. The
 
 If a client cannot accept a short period of `403` responses while you roll out the new secret, overlap two credentials instead:
 
-1. Click **Duplicate user with fresh credentials** (the copy icon) on the row of the user. The copy gets fresh keys, the same permissions, and the same groups, and the dialog shows its secret once. The admin API does the same with `POST /_/api/admin/users/:id/clone`.
+1. Click **Duplicate user with fresh credentials** (the copy icon) on the row of the user. The copy gets the name `<name>-copy` (`ci-uploader-copy`), fresh keys, the same permissions, and the same groups, and the dialog shows its secret once. When that name is in use, the copy gets `<name>-copy2`, then `<name>-copy3`, and so on. The admin API does the same with `POST /_/api/admin/users/:id/clone`.
 
    ![The list of users; the box marks the Duplicate user with fresh credentials button on the ci-uploader row.](/_/screenshots/iam-users-duplicate.webp)
 
@@ -115,12 +115,14 @@ Put rules that several users share on a group, and do not copy them onto each us
 In the admin UI:
 
 1. In the sidebar, open **Access → Groups** (`/_/admin/access/groups`), and click **New**.
-2. In **Name**, type `Engineering`. A **Description** is optional.
+2. In **Name**, type `Engineering`. A group name follows the same rule as a user name: 1 to 64 characters, each a letter, a digit, or one of `+ = , . @ _ -`. A **Description** is optional.
 3. Under **Permissions**, type `releases/*` under **WHERE**, and turn on **List** and **Read** under **CAN DO**.
 4. Under **Members**, tick `dana` and `backup-bot`.
 5. Click **Create group**.
 
    ![The form of a new Engineering group; callout 1 marks the New button, callout 2 the Name field, callout 3 the rule that allows List and Read on releases/*, callout 4 the members dana and backup-bot, and callout 5 the Create group button.](/_/screenshots/iam-groups-new-form.webp)
+
+To start a group from an existing one, click **Duplicate group** (the copy icon) on its row. The copy gets the name `<name>-copy` and the same rules. When the group has members, the page asks whether the copy gets them too: click **Copy members** or **No members**.
 
 Members get the rules of the group in addition to their direct rules, and a Deny from either source wins. The user form of `dana` then lists `Engineering` under **Groups & Inherited Access**, next to the effective permissions. If you use SSO, mapping rules can add people to `Engineering` automatically when they sign in. See [How to set up OAuth/OIDC single sign-on](set-up-sso.md).
 

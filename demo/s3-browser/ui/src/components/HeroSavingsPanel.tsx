@@ -48,6 +48,7 @@ import { monthlyCost } from '../savings';
 import { useFixedOverlayPosition } from '../useFixedOverlayPosition';
 import { readStorage, writeStorage } from '../safeStorage';
 import { activateOnKey } from '../keyboard';
+import { scanCallToAction } from '../scanQueue';
 
 /** Cost rate presets. */
 const COST_PRESETS = [
@@ -782,8 +783,8 @@ function HeroInner({
             {unscannedCount === 1 ? 'is' : 'are'} not scanned. Their sizes come from the live usage
             counters, so these figures are an estimate. A scan gives the exact figures.
           </span>
-          <Button size="small" onClick={onScanMissing}>
-            Scan {unscannedCount} {noun(unscannedCount, 'bucket')}
+          <Button size="small" type="primary" onClick={onScanMissing} disabled={liveScanning}>
+            {scanCallToAction(unscannedCount, bucketCount)}
           </Button>
         </div>
       )}
@@ -861,7 +862,7 @@ function EmptyHero({
               boxShadow: `0 2px 12px ${colors.GLOW_GREEN}`,
             }}
           >
-            Scan {n} bucket{n === 1 ? '' : 's'}
+            {scanCallToAction(n, bucketCount)}
           </button>
         )}
       </div>

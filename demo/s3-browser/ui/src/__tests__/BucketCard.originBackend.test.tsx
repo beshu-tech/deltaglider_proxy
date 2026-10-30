@@ -52,5 +52,12 @@ test('a bucket on a non-default backend without a route names that backend and i
 test('a bucket on the default backend keeps the default label', () => {
   renderCard('local-disk', eff({ backend: 'local-disk' }));
   expect(screen.getByText('Default backend · local-disk')).toBeInTheDocument();
-  expect(screen.getByText('Not encrypted')).toBeInTheDocument();
+  // Plaintext inherited from a plaintext backend is every bucket's default:
+  // no chip for it (UX harvest C42).
+  expect(screen.queryByText(/Not encrypted/)).toBeNull();
+});
+
+test('a bucket that is plaintext on an encrypting backend keeps its chip', () => {
+  renderCard('hetzner-fsn1', eff({ backend: 'hetzner-fsn1', source: 'bucket' }));
+  expect(screen.getByText(/^Not encrypted/)).toBeInTheDocument();
 });

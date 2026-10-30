@@ -13,6 +13,7 @@
  *  - a start that fails moves to the next bucket, with a notice.
  */
 import type { BucketScanProgress } from './adminApi/bucketScan';
+import { noun } from './utils';
 
 export interface ScanQueueState {
   /** The buckets still to scan; the head is the one that runs. */
@@ -69,4 +70,14 @@ export function scanQueueReducer(state: ScanQueueState, event: ScanQueueEvent): 
     case 'stopOne':
       return { ...state, queue: state.queue.filter((b) => b !== event.bucket) };
   }
+}
+
+/**
+ * THE call to action that scans the buckets with no scan yet: "Scan all
+ * buckets" when none has one, else "Scan N more buckets". "Re-scan all" is a
+ * separate action, offered only once a scan exists.
+ */
+export function scanCallToAction(unscanned: number, total: number): string {
+  if (unscanned >= total) return total === 1 ? 'Scan the bucket' : 'Scan all buckets';
+  return `Scan ${unscanned} more ${noun(unscanned, 'bucket')}`;
 }

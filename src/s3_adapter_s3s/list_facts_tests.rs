@@ -68,15 +68,30 @@ async fn listed(engine: &Arc<DynEngine>, metadata: bool) -> Vec<(String, FileMet
 /// The storage facts of the HEAD of `key`, as the LIST names them.
 async fn head_facts(engine: &DynEngine, key: &str) -> std::collections::HashMap<String, String> {
     let meta = engine.head("b", key).await.unwrap();
-    response_metadata_map(&meta, Reader::Authenticated)
+    let head = response_metadata_map(&meta, Reader::Authenticated);
+    // The HEAD's two hashes say whether this is the baseline; the LIST says
+    // so with `dg-baseline`.
+    let baseline = matches!(
+        (head.get("dg-file-sha256"), head.get("dg-ref-sha256")),
+        (Some(f), Some(r)) if !f.is_empty() && f == r
+    );
+    let mut facts: std::collections::HashMap<String, String> = head
         .into_iter()
         .filter(|(k, _)| k == "dg-note" || k == "dg-delta-size")
         .map(|(k, v)| (format!("x-amz-meta-{k}"), v))
-        .collect()
+        .collect();
+    if baseline {
+        facts.insert("x-amz-meta-dg-baseline".into(), "true".into());
+    }
+    facts
 }
 
 /// Every listed entry: its listed facts, size and ETag equal the HEAD's.
-async fn assert_list_matches_head(engine: &Arc<DynEngine>, label: &str) {
+/// `lists_baseline`: the backend's listing carries the two SHA-256s that
+/// mark the baseline. The S3 listing facts (listing tokens, facts objects)
+/// hold only the logical size and ETag, so an S3 LIST does not mark it; the
+/// HEAD (inspector) still does.
+async fn assert_list_matches_head(engine: &Arc<DynEngine>, label: &str, lists_baseline: bool) {
     let objects = listed(engine, true).await;
     let keys: Vec<&str> = objects.iter().map(|(k, _)| k.as_str()).collect();
     assert_eq!(
@@ -93,13 +108,24 @@ async fn assert_list_matches_head(engine: &Arc<DynEngine>, label: &str) {
     );
     for (key, meta) in &objects {
         let list = list_metadata_map(meta, Reader::Authenticated);
-        assert_eq!(list, head_facts(engine, key).await, "{label}: {key}");
+        let mut head = head_facts(engine, key).await;
+        if !lists_baseline {
+            head.remove("x-amz-meta-dg-baseline");
+        }
+        assert_eq!(list, head, "{label}: {key}");
         let head = engine.head("b", key).await.unwrap();
         assert_eq!(meta.file_size, head.file_size, "{label}: {key} size");
         assert_eq!(meta.etag(), head.etag(), "{label}: {key} etag");
         assert!(
             !list.contains_key("x-amz-meta-foo"),
             "{label}: user metadata"
+        );
+        // The first delta of the folder wrote the baseline: only it is
+        // listed as the baseline (UX harvest C4).
+        assert_eq!(
+            list.get("x-amz-meta-dg-baseline").map(String::as_str),
+            (lists_baseline && key == "rel/build-000.zip").then_some("true"),
+            "{label}: {key} baseline"
         );
     }
 }
@@ -113,7 +139,7 @@ async fn listed_storage_facts_equal_the_head_on_the_filesystem() {
             .unwrap();
         let engine = if enc { encrypted(fs) } else { plain(fs) };
         fill(&engine).await;
-        assert_list_matches_head(&engine, &format!("fs enc={enc}")).await;
+        assert_list_matches_head(&engine, &format!("fs enc={enc}"), true).await;
     }
 }
 
@@ -169,7 +195,7 @@ async fn listed_storage_facts_equal_the_head_on_s3_with_no_head() {
                 heads.len() <= max && heads.iter().all(|r| r.ends_with(".delta")),
                 "s3 enc={enc} {label}: {heads:?}"
             );
-            assert_list_matches_head(engine, &format!("s3 enc={enc} {label}")).await;
+            assert_list_matches_head(engine, &format!("s3 enc={enc} {label}"), false).await;
         }
     }
 }

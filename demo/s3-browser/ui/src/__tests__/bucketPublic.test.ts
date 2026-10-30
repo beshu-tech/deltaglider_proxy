@@ -1,7 +1,7 @@
 /** src/bucketPublic.ts: the public marker of the browser (B53). */
 import assert from 'node:assert/strict';
 import { test } from 'vitest';
-import { publicScope, publicScopeText } from '../bucketPublic';
+import { publicMarkerAt, publicScope, publicScopeText } from '../bucketPublic';
 
 const cfg = (p: Record<string, { public?: boolean; public_prefixes?: string[] }>) => ({ bucket_policies: p });
 
@@ -18,4 +18,15 @@ test('some prefixes, none, or unknown config', () => {
   assert.equal(publicScope(cfg({}), 'releases'), null);
   assert.equal(publicScope(undefined, 'releases'), null);
   assert.match(publicScopeText({ whole: false, prefixes: ['pub/', 'docs/'] }), /under pub\/, docs\//);
+});
+
+// UX harvest C26: the header marker describes the folder, not the bucket.
+test('publicMarkerAt: public folder, private folder, parent of a public folder, bucket root', () => {
+  const scope = { whole: false as const, prefixes: ['builds/'] };
+  assert.equal(publicMarkerAt(scope, '')?.label, 'Partly public');
+  assert.equal(publicMarkerAt(scope, 'builds/')?.label, 'Public folder');
+  assert.equal(publicMarkerAt(scope, 'builds/v2/')?.label, 'Public folder');
+  assert.equal(publicMarkerAt(scope, 'qa-many/'), null);
+  assert.equal(publicMarkerAt({ whole: false, prefixes: ['a/b/'] }, 'a/')?.label, 'Partly public');
+  assert.equal(publicMarkerAt({ whole: true }, 'qa-many/')?.label, 'Public');
 });

@@ -21,11 +21,56 @@ test('an invalid name is kept and explained, not rewritten', async () => {
   await user.type(input, 'My_Bucket');
   expect(input).toHaveValue('My_Bucket');
   expect(screen.getByRole('alert')).toHaveTextContent('Use only lowercase letters, digits, dots and hyphens.');
-  expect(screen.getByRole('button', { name: 'Create' })).toBeDisabled();
+  // Create stays enabled and refuses the invalid name.
+  await user.click(screen.getByRole('button', { name: 'Create' }));
+  expect(createBucket).not.toHaveBeenCalled();
   await user.clear(input);
   await user.type(input, 'my-bucket');
   expect(screen.queryByRole('alert')).not.toBeInTheDocument();
-  expect(screen.getByRole('button', { name: 'Create' })).toBeEnabled();
+});
+
+/**
+ * UX harvest C25: Create and "Create and open settings" were two equal,
+ * disabled buttons with no reason. Now ONE primary Create, a link for
+ * the settings path, and a click on an empty form says what is missing.
+ */
+test('an empty form says what is missing instead of a disabled button', async () => {
+  vi.mocked(createBucket).mockReset();
+  const user = userEvent.setup();
+  renderWithQuery(<CreateBucketModal open canAdmin={false} onClose={() => {}} onCreated={() => {}} />);
+  await screen.findByLabelText('Bucket name');
+  const create = screen.getByRole('button', { name: 'Create' });
+  expect(create).toBeEnabled();
+  await user.click(create);
+  expect(screen.getByRole('alert')).toHaveTextContent('Enter a bucket name.');
+  expect(createBucket).not.toHaveBeenCalled();
+});
+
+/**
+ * UX harvest C54: a create of an existing name ("releases") said "Bucket
+ * releases created". `createBucket` refuses it (409); the dialog stays
+ * open and says so under the name.
+ */
+test('an existing name is an error under the name, not a success', async () => {
+  const { ApiError } = await import('../errorHandling');
+  vi.mocked(createBucket).mockReset().mockRejectedValue(
+    new ApiError('A bucket named releases already exists.', 409, 'BucketAlreadyOwnedByYou'),
+  );
+  const onCreated = vi.fn();
+  const onClose = vi.fn();
+  const user = userEvent.setup();
+  renderWithQuery(<CreateBucketModal open canAdmin={false} onClose={onClose} onCreated={onCreated} />);
+  const input = await screen.findByLabelText('Bucket name');
+  await user.type(input, 'releases');
+  await user.click(screen.getByRole('button', { name: 'Create' }));
+  expect(await screen.findByRole('alert')).toHaveTextContent('A bucket named releases already exists. Choose another name.');
+  expect(input).toHaveAttribute('aria-invalid', 'true');
+  expect(onCreated).not.toHaveBeenCalled();
+  expect(onClose).not.toHaveBeenCalled();
+  expect(screen.queryByText(/created/)).not.toBeInTheDocument();
+  // A new name clears the error.
+  await user.type(input, '-2');
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument();
 });
 
 /**
@@ -80,10 +125,15 @@ describe('encryption of a new bucket', () => {
     await user.type(await screen.findByLabelText('Bucket name'), 'db-archive');
     await user.click(await screen.findByText('Encrypt with a bucket key'));
     const create = screen.getByRole('button', { name: 'Create' });
-    expect(create).toBeDisabled();
+    // Before the key is confirmed, Create says what is missing.
+    await user.click(create);
+    expect(await screen.findByText('Confirm that you saved the key: type its last 6 characters.')).toBeInTheDocument();
+    expect(createBucket).not.toHaveBeenCalled();
     const key = (screen.getByLabelText('Generated key') as HTMLTextAreaElement).value;
     await user.type(screen.getByLabelText('Last 6 characters of the key'), key.slice(-6));
-    await waitFor(() => expect(create).toBeEnabled());
+    await waitFor(() =>
+      expect(screen.queryByText('Confirm that you saved the key: type its last 6 characters.')).not.toBeInTheDocument(),
+    );
     await user.click(create);
     await waitFor(() => expect(createBucket).toHaveBeenCalledTimes(1));
     const [bucket, target, opts] = vi.mocked(createBucket).mock.calls[0];
@@ -142,13 +192,13 @@ describe('encryption of a new bucket', () => {
     await user.type(input, '{Enter}');
     await user.type(input, '{Enter}');
     expect(createBucket).toHaveBeenCalledTimes(1);
-    finish(new Error("bucket 'db-archive' already exists"));
-    expect(await screen.findByText(/The bucket was not created: .*already exists/)).toBeInTheDocument();
+    finish(new Error('backend hetzner-fsn1 is not reachable'));
+    expect(await screen.findByText('The bucket was not created. Backend hetzner-fsn1 is not reachable.')).toBeInTheDocument();
   });
 });
 
 /**
- * "Create and open settings": an admin creates the bucket and lands on its
+ * "Create and configure…": an admin creates the bucket and lands on its
  * card on the Buckets page (the full form). A non-admin never sees it.
  */
 describe('create and open settings', () => {
@@ -157,7 +207,7 @@ describe('create and open settings', () => {
   test('a non-admin sees no such button', async () => {
     renderWithQuery(<CreateBucketModal open canAdmin={false} onClose={() => {}} onCreated={() => {}} />);
     await screen.findByLabelText('Bucket name');
-    expect(screen.queryByRole('button', { name: 'Create and open settings' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Create and configure…' })).toBeNull();
   });
 
   test('an admin creates the bucket, then opens its settings', async () => {
@@ -174,8 +224,7 @@ describe('create and open settings', () => {
         <CreateBucketModal open canAdmin onClose={() => {}} onCreated={onCreated} />
       </NavigationContext.Provider>,
     );
-    const button = screen.getByRole('button', { name: 'Create and open settings' });
-    expect(button).toBeDisabled();
+    const button = screen.getByRole('button', { name: 'Create and configure…' });
     await user.type(await screen.findByLabelText('Bucket name'), 'releases');
     await user.click(button);
     await waitFor(() => expect(navigate).toHaveBeenCalledWith('/_/admin/storage/buckets?bucket=releases'));

@@ -42,6 +42,10 @@ pub mod meta_keys {
     pub const REF_SHA256: &str = "dg-ref-sha256";
     pub const DELTA_SIZE: &str = "dg-delta-size";
     pub const DELTA_CMD: &str = "dg-delta-cmd";
+    /// LIST only (`metadata=true`), never stored: `true` on the delta whose
+    /// bytes are its folder's reference baseline (file SHA-256 = reference
+    /// SHA-256). HEAD readers derive the same fact from the two hashes.
+    pub const BASELINE: &str = "dg-baseline";
 
     /// S3 response header prefix for user-defined metadata.
     pub const AMZ_META_PREFIX: &str = "x-amz-meta-";

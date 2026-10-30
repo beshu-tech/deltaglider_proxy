@@ -20,9 +20,9 @@ async function openBucket(page: Page, name: string): Promise<void> {
 
 /** Open the Advanced disclosure of the open bucket card (it stays open when a setting in it is in use). */
 async function openAdvanced(page: Page): Promise<void> {
-  const cutoff = page.getByRole('spinbutton', { name: 'Quota' });
-  if (!(await cutoff.isVisible())) await page.getByText(/^Advanced/).click();
-  await cutoff.waitFor();
+  const quota = page.getByRole('textbox', { name: 'Quota' });
+  if (!(await quota.isVisible())) await page.getByText(/^Advanced/).click();
+  await quota.waitFor();
 }
 
 /** The Backend select inside the open bucket card. */
@@ -245,16 +245,16 @@ const BUCKET_POLICY_SHOTS: Shot[] = [
     setup: async (page) => {
       await openBucket(page, 'db-archive');
       await openAdvanced(page);
-      await page.getByRole('spinbutton', { name: 'Quota' }).fill('500');
+      await page.getByRole('textbox', { name: 'Quota' }).fill('500');
       await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
       await page.evaluate(() => window.scrollTo(0, 0));
     },
     annotations: [
       { target: bucketRow('db-archive'), kind: 'callout', label: '1' },
       { target: { text: /^Advanced/ }, kind: 'callout', label: '2', side: 'right' },
-      // Box the whole InputNumber, not the inner <input>: a callout to the
-      // right of the input covered the GiB suffix.
-      { target: { css: '.ant-input-number:has(input[placeholder="Unlimited"])' }, kind: 'box', label: '3', side: 'right' },
+      // Box the whole input with its GiB suffix, not the inner <input>: a
+      // callout to the right of the input covered the suffix.
+      { target: { css: '.ant-input-affix-wrapper:has(input[placeholder="No quota"])' }, kind: 'box', label: '3', side: 'right' },
     ],
   },
   {

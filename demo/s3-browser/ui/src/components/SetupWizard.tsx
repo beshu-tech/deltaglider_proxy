@@ -233,7 +233,16 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
     isAbsolutePath,
   );
 
+  // Next is always enabled: a click on an incomplete step marks what is
+  // missing on the step's fields instead of a silent grey button.
+  const [showStepErrors, setShowStepErrors] = useState(false);
+  useEffect(() => setShowStepErrors(false), [step]);
+
   const next = () => {
+    if (!canAdvance) {
+      setShowStepErrors(true);
+      return;
+    }
     const ns = Math.min(step + 1, MAX_STEP);
     setStep(ns);
     // Push (not replace) so browser Back walks through wizard steps
@@ -314,6 +323,7 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
             testing={testing}
             testResult={testResult}
             onTest={runTest}
+            showErrors={showStepErrors}
             cardStyle={cardStyle}
             inputRadius={inputRadius}
           />
@@ -324,6 +334,7 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
             env={envControl}
             state={state}
             update={update}
+            showErrors={showStepErrors}
             cardStyle={cardStyle}
             inputRadius={inputRadius}
           />
@@ -490,7 +501,6 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
             type="primary"
             icon={<ArrowRightOutlined />}
             onClick={next}
-            disabled={!canAdvance}
           >
             Next
           </Button>
@@ -594,6 +604,7 @@ function ConfigureBackendStep({
   testing,
   testResult,
   onTest,
+  showErrors,
   cardStyle,
   inputRadius,
 }: {
@@ -603,10 +614,15 @@ function ConfigureBackendStep({
   testing: boolean;
   testResult: TestS3Response | null;
   onTest: () => void;
+  /** Next was clicked on this incomplete step: mark what is missing. */
+  showErrors: boolean;
   cardStyle: React.CSSProperties;
   inputRadius: { borderRadius: number };
 }) {
   if (state.backendKind === 'filesystem') {
+    const pathError = !state.fsPath.trim()
+      ? (showErrors ? 'Enter the data directory.' : undefined)
+      : !isAbsolutePath(state.fsPath) ? ABSOLUTE_PATH_ERROR : undefined;
     return (
       <div style={cardStyle}>
         <h3 style={{ margin: 0, fontFamily: 'var(--font-ui)', fontSize: 18 }}>
@@ -623,20 +639,14 @@ function ConfigureBackendStep({
           helpText="Must be writable by the proxy user."
           examples={['/var/lib/deltaglider', '/mnt/fast-nvme/dgp']}
           onExampleClick={(v) => update({ fsPath: String(v) })}
+          error={pathError}
         >
           <Input
-            aria-label="Data directory"
             value={state.fsPath}
             onChange={(e) => update({ fsPath: e.target.value })}
             placeholder="/var/lib/deltaglider"
-            status={state.fsPath.trim() && !isAbsolutePath(state.fsPath) ? 'error' : undefined}
             style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }}
           />
-          {state.fsPath.trim() && !isAbsolutePath(state.fsPath) && (
-            <Text type="danger" style={{ fontSize: 12, display: 'block', marginTop: 4 }}>
-              {ABSOLUTE_PATH_ERROR}
-            </Text>
-          )}
         </FormField>
       </div>
     );
@@ -729,6 +739,13 @@ function ConfigureBackendStep({
         Test connection
       </Button>
       )}
+      {showErrors && env.backendKind === null && !testResult?.success && (
+        <Text type="danger" role="alert" style={{ fontSize: 12, display: 'block', marginTop: 8 }}>
+          {!state.s3AccessKey || !state.s3SecretKey
+            ? 'Fill in the access key ID and the secret access key, then test the connection.'
+            : 'Test the connection. Next needs a test that passes.'}
+        </Text>
+      )}
       {testResult && env.backendKind === null && (
         <Alert
           type={testResult.success ? 'success' : 'error'}
@@ -754,18 +771,34 @@ function CreateAdminStep({
   env,
   state,
   update,
+  showErrors,
   cardStyle,
   inputRadius,
 }: {
   env: SetupEnvControl;
   state: WizardState;
   update: (patch: Partial<WizardState>) => void;
+  /** Next was clicked on this incomplete step: mark what is missing. */
+  showErrors: boolean;
   cardStyle: React.CSSProperties;
   inputRadius: { borderRadius: number };
 }) {
-  const passwordsMatch =
-    state.adminSecretKey.length === 0 ||
-    state.adminSecretKey === state.adminSecretKeyConfirm;
+  // The same rule as setupStepComplete (step 2), one sentence per field.
+  const keyId = state.adminAccessKeyId.trim();
+  const keyIdError = env.adminAccessKeyId || !showErrors
+    ? undefined
+    : !keyId ? 'Enter an access key ID.' : keyId.length < 4 ? 'Use 4 or more characters.' : undefined;
+  const secretError = env.adminSecretKey || !showErrors
+    ? undefined
+    : !state.adminSecretKey ? 'Enter a secret access key.'
+    : state.adminSecretKey.length < 12 ? 'Use at least 12 characters.' : undefined;
+  // A mismatch shows as soon as the second field has text; an empty second
+  // field only after Next.
+  const confirmError = env.adminSecretKey || !state.adminSecretKey
+    ? undefined
+    : state.adminSecretKeyConfirm
+      ? (state.adminSecretKeyConfirm !== state.adminSecretKey ? 'The two secret access keys are not the same.' : undefined)
+      : (showErrors ? 'Enter the secret access key again.' : undefined);
   return (
     <div style={cardStyle}>
       <h3 style={{ margin: 0, fontFamily: 'var(--font-ui)', fontSize: 18 }}>
@@ -783,6 +816,7 @@ function CreateAdminStep({
         helpText={env.adminAccessKeyId ? undefined : '4+ characters. Convention: uppercase, starts with AKIA.'}
         examples={['AKIAADMINDEVELOPER01', 'AKIAMYDGPSITEADMIN']}
         onExampleClick={(v) => update({ adminAccessKeyId: String(v) })}
+        error={keyIdError}
       >
         <Input
           value={state.adminAccessKeyId}
@@ -799,6 +833,7 @@ function CreateAdminStep({
             ? undefined
             : "At least 12 characters. Use a password manager; you won't see this again after Save."
         }
+        error={secretError}
       >
         <Input.Password
           value={state.adminSecretKey}
@@ -808,19 +843,13 @@ function CreateAdminStep({
         />
       </FormField>
       {!env.adminSecretKey && (
-      <FormField label="Confirm secret access key" helpText="Paste it again to catch typos.">
+      <FormField label="Confirm secret access key" helpText="Paste it again to catch typos." error={confirmError}>
         <Input.Password
           value={state.adminSecretKeyConfirm}
           onChange={(e) => update({ adminSecretKeyConfirm: e.target.value })}
           autoComplete="new-password"
-          status={!passwordsMatch ? 'error' : undefined}
           style={{ ...inputRadius }}
         />
-        {!passwordsMatch && (
-          <Text type="danger" style={{ fontSize: 12 }}>
-            Secret keys don't match.
-          </Text>
-        )}
       </FormField>
       )}
     </div>

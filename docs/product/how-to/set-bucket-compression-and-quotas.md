@@ -4,6 +4,8 @@ This guide shows you how to turn delta compression off for a bucket, how to make
 
 The example turns compression off for `downloads`, keeps only good deltas in `releases`, and caps `db-archive` at 500 GiB.
 
+To set these options on a new bucket, click **Create bucket**, type the name, and click **Create and configure…** instead of **Create**. The dialog creates the bucket and then opens its row on the Buckets page, so you can continue with the steps below. **Create and configure…** shows only to an admin.
+
 ## 1. Turn compression off for a bucket
 
 A bucket that holds content that does not delta (images, video, binaries that are unique on every upload) gains nothing from xdelta3. When compression is off, the proxy stores every object in the bucket as-is and skips the xdelta3 CPU cost.
@@ -80,7 +82,7 @@ In the admin UI:
 
 1. On **Storage → Buckets**, click the `db-archive` row to open it.
 2. Click **Advanced** inside the row.
-3. Type `500` in **Quota**. The field counts in GiB (1 GiB is 1024³ bytes), and an empty field means no quota.
+3. Type `500` in **Quota**. The field counts in GiB (1 GiB is 1024³ bytes), and accepts a decimal size such as `0.5`. An empty field, which shows **No quota**, means that the bucket has no quota. When the value is not a size above 0, or is above 1048576 GiB (1 PiB), the field shows the reason under it, and the page does not stage the change.
 
    ![The db-archive bucket is open with its Advanced settings; callout 1 marks the db-archive row, callout 2 marks Advanced, and callout 3 marks Quota, set to 500 GiB.](/_/screenshots/bucket-quota.webp)
 

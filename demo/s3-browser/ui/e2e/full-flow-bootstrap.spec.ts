@@ -43,6 +43,7 @@ test('bootstrap auth: sign in, bucket, upload, list, admin, sign out, sign in, o
     mimeType: 'text/plain',
     buffer: Buffer.from('deltaglider e2e payload\n'),
   });
+  await page.getByRole('button', { name: /Upload \d+ files? to / }).click();
   await expect(page.getByText('Upload complete')).toBeVisible({ timeout: 60_000 });
   await page.getByRole('button', { name: /Done — / }).click();
   await expect(page.getByText(uploadName)).toBeVisible({ timeout: 60_000 });

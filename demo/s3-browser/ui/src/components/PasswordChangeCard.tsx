@@ -5,6 +5,7 @@ import { changeAdminPassword } from '../adminApi';
 import { normalizeUiError } from '../errorHandling';
 import { useCardStyles } from './shared-styles';
 import SectionHeader from './SectionHeader';
+import FormField from './FormField';
 import { CodeTokenText } from './CodeTokenText';
 import { useColors } from '../ThemeContext';
 
@@ -18,8 +19,22 @@ export default function PasswordChangeCard() {
   const [newPassword, setNewPassword] = useState('');
   const [changing, setChanging] = useState(false);
   const [result, setResult] = useState<{ ok: boolean; error?: string } | null>(null);
+  // The button is always usable; a click checks the fields and marks the
+  // empty or short one (the same rule as the server: 12 to 128 characters).
+  // After the first click the errors follow each keystroke.
+  const [showFieldErrors, setShowFieldErrors] = useState(false);
+  const currentError = !currentPassword ? 'Enter the current password.' : undefined;
+  const newError = !newPassword
+    ? 'Enter a new password.'
+    : newPassword.length < 12
+      ? 'Use at least 12 characters.'
+      : newPassword.length > 128
+        ? 'Use 128 characters or fewer.'
+        : undefined;
 
   const handleSubmit = async () => {
+    setShowFieldErrors(true);
+    if (currentError || newError) return;
     setChanging(true);
     setResult(null);
     try {
@@ -28,6 +43,7 @@ export default function PasswordChangeCard() {
       if (res.ok) {
         setCurrentPassword('');
         setNewPassword('');
+        setShowFieldErrors(false);
       }
     } catch (e) {
       setResult({ ok: false, error: normalizeUiError(e, 'The password change failed') });
@@ -71,22 +87,26 @@ export default function PasswordChangeCard() {
         />
 
         <input type="text" autoComplete="username" defaultValue="admin" aria-hidden="true" style={{ display: 'none' }} />
-        <Input.Password
-          aria-label="Current admin password"
-          placeholder="Current admin password"
-          value={currentPassword}
-          onChange={(e) => setCurrentPassword(e.target.value)}
-          autoComplete="current-password"
-          style={inputRadius}
-        />
-        <Input.Password
-          aria-label="New admin password"
-          placeholder="New admin password"
-          value={newPassword}
-          onChange={(e) => setNewPassword(e.target.value)}
-          autoComplete="new-password"
-          style={inputRadius}
-        />
+        <FormField label="Current admin password" error={showFieldErrors ? currentError : undefined}>
+          <Input.Password
+            value={currentPassword}
+            onChange={(e) => setCurrentPassword(e.target.value)}
+            autoComplete="current-password"
+            style={inputRadius}
+          />
+        </FormField>
+        <FormField
+          label="New admin password"
+          helpText="12 to 128 characters."
+          error={showFieldErrors ? newError : undefined}
+        >
+          <Input.Password
+            value={newPassword}
+            onChange={(e) => setNewPassword(e.target.value)}
+            autoComplete="new-password"
+            style={inputRadius}
+          />
+        </FormField>
 
         {result && (
           <Alert
@@ -101,8 +121,6 @@ export default function PasswordChangeCard() {
           htmlType="submit"
           type="primary"
           loading={changing}
-          disabled={!currentPassword || !newPassword}
-          block
           style={{ ...inputRadius, fontFamily: "var(--font-ui)", fontWeight: 600 }}
         >
           Change admin password

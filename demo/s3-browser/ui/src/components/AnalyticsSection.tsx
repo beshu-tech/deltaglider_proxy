@@ -31,7 +31,7 @@
  */
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { Button } from 'antd';
-import { CaretRightOutlined, ReloadOutlined } from '@ant-design/icons';
+import { ReloadOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import { useAllBucketUsage, useBucketScans, useInvalidateBucketScans, useScannableBuckets } from '../queries/bucketScans';
 import type { AdminConfig, BucketUsage } from '../adminApi';
@@ -96,6 +96,9 @@ export default function AnalyticsSection({ config }: Props) {
   const scansLoaded = scansQuery.status !== 'pending';
   const bucketsQuery = useScannableBuckets();
   const allBuckets = bucketsQuery.data ?? NO_BUCKETS;
+  // Until both are in, the panels show a skeleton: the empty hero and
+  // "No buckets yet" flashed before the data (UX harvest C52).
+  const dataReady = scansLoaded && bucketsQuery.status !== 'pending';
   // O(1) running counters, keyed by bucket. Seeds the fleet rows instantly on
   // load so the dashboard shows real sizes without waiting for a scan; a live
   // scan still overrides while it runs, and a completed cached scan takes
@@ -372,12 +375,13 @@ export default function AnalyticsSection({ config }: Props) {
       <Panel
         title="Total savings"
         subtitle={
-          unscannedCount > 0 && totalOriginal > 0
+          dataReady && unscannedCount > 0 && totalOriginal > 0
             ? 'Estimate until every bucket is scanned'
             : undefined
         }
         colSpan={12}
         rowSpan={3}
+        loading={!dataReady}
       >
         <HeroSavingsPanel
           totalOriginal={totalOriginal}
@@ -403,16 +407,17 @@ export default function AnalyticsSection({ config }: Props) {
       {/* ── Row 2: THE bucket list ───────────────────────────────
           One full-width list replaces the old fleet view + Top-5
           table (which showed the same rows twice). Scan plumbing
-          (coverage subline, sort, Scan missing / Re-scan all) lives
+          (coverage subline, sort, Re-scan all) lives
           in this panel's header.
       */}
       <Panel
         title="Buckets"
         subtitle={
-          bucketRows.length > 0
+          dataReady && bucketRows.length > 0
             ? `${coverageSubtitle} · sorted by ${SORT_LABELS[topBucketsSort]}`
             : undefined
         }
+        loading={!dataReady}
         colSpan={12}
         rowSpan={(bucketRows.length <= 3 ? 1 : bucketRows.length <= 7 ? 2 : 3) as 1 | 2 | 3}
         empty={
@@ -424,33 +429,26 @@ export default function AnalyticsSection({ config }: Props) {
             : undefined
         }
         actions={
-          bucketRows.length > 0 ? (
+          dataReady && bucketRows.length > 0 ? (
             <>
               <TopBucketsSortSelect
                 value={topBucketsSort}
                 onChange={setTopBucketsSort}
               />
-              {unscannedCount > 0 && (
+              {/* One scan action per state: while a bucket has no scan the
+                  hero owns the call to action ("Scan all buckets" / "Scan N
+                  more buckets"); "Re-scan all" appears once a scan exists. */}
+              {cachedRows.length > 0 && (
                 <Button
                   size="small"
-                  type="primary"
-                  icon={<CaretRightOutlined />}
-                  onClick={handleScanMissing}
+                  icon={<ReloadOutlined />}
+                  onClick={handleRescanAll}
                   disabled={!scansLoaded || isScanning}
-                  title={`Scan the ${unscannedCount} bucket${unscannedCount === 1 ? '' : 's'} with no cached scan`}
+                  title="Scan every bucket again"
                 >
-                  Scan missing ({unscannedCount})
+                  Re-scan all
                 </Button>
               )}
-              <Button
-                size="small"
-                icon={<ReloadOutlined />}
-                onClick={handleRescanAll}
-                disabled={!scansLoaded || isScanning}
-                title="Re-scan every bucket"
-              >
-                Re-scan all
-              </Button>
             </>
           ) : undefined
         }

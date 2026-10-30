@@ -297,6 +297,7 @@ test('the upload page sends 300 tiny files in under a minute', async ({ page }) 
     buffer: Buffer.from(`file ${i}`),
   }));
   await page.locator('input[type=file]').first().setInputFiles(files);
+  await page.getByRole('button', { name: /Upload \d+ files? to / }).click();
   // Each PUT takes about 10 ms on the server. Today the page re-renders the
   // whole queue on every progress event and spends about 1.7 s per file, so
   // 300 files take about 9 minutes.
@@ -316,6 +317,7 @@ test('the upload page sends 1000 tiny files with a bounded heap', async ({ page 
   }));
   const t0 = Date.now();
   await page.locator('input[type=file]').first().setInputFiles(files);
+  await page.getByRole('button', { name: /Upload \d+ files? to / }).click();
   await expect(page.getByText('Upload complete')).toBeVisible({ timeout: 180_000 });
   const secs = (Date.now() - t0) / 1000;
   // Only the rows in view are in the DOM (the list is virtualised).

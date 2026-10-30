@@ -14,7 +14,8 @@ import { permissionsToRows, rowsToPermissions, freshPermissionRowId, type Permis
 import { groupPermissionSummary, filterItems } from '../masterDetailFilter';
 import MasterDetailPanel from './MasterDetailPanel';
 import IamSourceBanner from './IamSourceBanner';
-import { normalizeUiError } from '../errorHandling';
+import { ApiError, normalizeUiError } from '../errorHandling';
+import { IAM_NAME_HELP, iamNameError, serverNameErrorText } from '../userName';
 import { useNavigation } from '../NavigationContext';
 import { buildViewUrl, parseAdminQuery } from '../urlState';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
@@ -319,8 +320,14 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
   const [deleting, setDeletingState] = useState(false);
   const [error, setError] = useState('');
   // The name error shows after the first submit, then follows each keystroke.
+  // The rule is THE IAM name rule (the same as for users, and the server's).
+  // A name that is not changed stays valid: a group from declarative YAML or
+  // from before the rule keeps its name (the server accepts it unchanged).
   const [showFieldErrors, setShowFieldErrors] = useState(false);
-  const nameError = showFieldErrors && !name.trim() ? 'Enter a name.' : undefined;
+  const [serverNameError, setServerNameError] = useState<string | null>(null);
+  const nameChanged = !isEdit || name.trim() !== group.name;
+  const nameRuleError = nameChanged ? iamNameError(name.trim()) : null;
+  const nameError = (showFieldErrors ? nameRuleError : null) ?? serverNameError ?? undefined;
 
   const setSaving = (v: boolean) => { setSavingState(v); onSavingChange?.(v); };
   const setDeleting = (v: boolean) => { setDeletingState(v); onSavingChange?.(v); };
@@ -333,9 +340,10 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
 
   const handleSave = async () => {
     setShowFieldErrors(true);
-    if (!name.trim()) return;
+    if (nameRuleError) return;
     setSaving(true);
     setError('');
+    setServerNameError(null);
     try {
       if (isEdit) {
         await updateGroupMutation.mutateAsync({
@@ -385,7 +393,11 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
       }
       onSaved();
     } catch (e) {
-      setError(normalizeUiError(e, "Operation failed"));
+      // The server's name rule (400 "group name …") belongs on the field.
+      const detail = e instanceof ApiError && e.status === 400 ? e.detail ?? '' : '';
+      const fieldError = serverNameErrorText('group', detail);
+      if (fieldError) setServerNameError(fieldError);
+      else setError(normalizeUiError(e, "Operation failed"));
     } finally {
       setSaving(false);
     }
@@ -424,8 +436,8 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
 
       {error && <Alert type="error" title={error} showIcon closable={{ onClose: () => setError('') }} style={{ marginBottom: 16, borderRadius: 8 }} />}
 
-      <FormField label="Name" error={nameError} style={{ marginBottom: 20 }}>
-        <Input data-testid="group-name" value={name} onChange={e => setName(e.target.value)} placeholder="e.g. developers" disabled={readOnly} style={{ ...inputRadius }} />
+      <FormField label="Name" helpText={readOnly ? undefined : IAM_NAME_HELP} error={nameError} style={{ marginBottom: 20 }}>
+        <Input data-testid="group-name" autoFocus={!isEdit} value={name} onChange={e => { setName(e.target.value); setServerNameError(null); }} placeholder="e.g. developers" disabled={readOnly} style={{ ...inputRadius }} />
       </FormField>
 
       <FormField label="Description" style={{ marginBottom: 20 }}>

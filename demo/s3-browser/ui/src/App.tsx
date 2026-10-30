@@ -16,6 +16,7 @@ import ShortcutsHelp from './components/ShortcutsHelp';
 import { AdminScreen, DocsScreen } from './screens/LazyScreens';
 import UploadScreen from './screens/UploadScreen';
 import BrowserScreen from './screens/BrowserScreen';
+import MissingBucketScreen from './screens/MissingBucketScreen';
 import { useGlobalShortcuts } from './useGlobalShortcuts';
 import { useBrowserKeyboardNav } from './useBrowserKeyboardNav';
 import { useFilePreview } from './browser/useFilePreview';
@@ -62,6 +63,9 @@ export default function App() {
   const [firstLoadDone, setFirstLoadDone] = useState(false);
   const [identity, setIdentity] = useState<WhoamiResponse | null>(null);
   const [bucketCount, setBucketCount] = useState<number | null>(null);
+  // The sidebar's bucket names (null until listed): a linked bucket that is
+  // not among them shows "No bucket named …" at its own URL.
+  const [bucketNames, setBucketNames] = useState<string[] | null>(null);
   const [createBucketFocusSignal, setCreateBucketFocusSignal] = useState(0);
   // Files dropped onto the browser (from Finder) are staged here and the Upload
   // view is opened so the user can confirm/adjust the destination prefix before
@@ -115,6 +119,8 @@ export default function App() {
     () => writablePrefixesForBucket(identity, activeBucket),
     [identity, activeBucket],
   );
+  const bucketMissing =
+    view === 'browser' && !!browser.bucket && bucketNames !== null && bucketNames.length > 0 && !bucketNames.includes(browser.bucket);
   const s3 = useS3Browser({
     writablePrefixes,
     adminSession: hasAdminSession,
@@ -123,8 +129,9 @@ export default function App() {
     q: browser.q,
     object: browser.object,
     navigateUrl: navigate,
-    // Settings, Upload and the docs keep the hook mounted: it lists nothing there.
-    active: view === 'browser',
+    // Settings, Upload and the docs keep the hook mounted: it lists nothing
+    // there, nor for a linked bucket that does not exist.
+    active: view === 'browser' && !bucketMissing,
   });
 
   const { previewObject, openPreview, closePreview, clearPreview } = useFilePreview(browser, navigate, s3.objects);
@@ -232,25 +239,28 @@ export default function App() {
   // and fetch identity. Runs AFTER React commits the needsConnect state.
   useEffect(() => {
     if (!needsConnect && !sessionLoading) {
-      let cancelled = false;
+      // A re-run or unmount aborts the requests in flight: a stale answer
+      // never sets the identity, and no request outlives its effect.
+      const controller = new AbortController();
+      const { signal } = controller;
       reconnectS3();
       (async () => {
-        const nextIdentity = await whoami();
+        const nextIdentity = await whoami(signal);
+        if (signal.aborted) return;
         if (nextIdentity.mode === 'iam' && !nextIdentity.user) {
           const creds = getCredentials();
           if (creds.accessKeyId && creds.secretAccessKey) {
-            const resolved = await resolveIamIdentity(creds.accessKeyId, creds.secretAccessKey);
+            const resolved = await resolveIamIdentity(creds.accessKeyId, creds.secretAccessKey, signal);
+            if (signal.aborted) return;
             if (resolved) {
-              if (!cancelled) setIdentity(resolved);
+              setIdentity(resolved);
               return;
             }
           }
         }
-        if (!cancelled) setIdentity(nextIdentity);
+        setIdentity(nextIdentity);
       })();
-      return () => {
-        cancelled = true;
-      };
+      return () => controller.abort();
     } else if (needsConnect) {
       setIdentity(null);
       setSessionValid(false);
@@ -479,6 +489,10 @@ export default function App() {
         }}
       />
     );
+  } else if (bucketMissing) {
+    content = (
+      <MissingBucketScreen bucket={browser.bucket} buckets={bucketNames ?? []} onOpenBucket={handleBucketChange} />
+    );
   } else {
     content = (
       <BrowserScreen
@@ -528,6 +542,7 @@ export default function App() {
             onUploadClick={openUpload}
             onBucketChange={handleBucketChange}
             onBucketsChanged={setBucketCount}
+            onBucketNamesChanged={setBucketNames}
             createBucketFocusSignal={createBucketFocusSignal}
             canCreateBucket={canCreateBucket}
             canDeleteBucket={(bucket) => canUse(identity, 'admin', bucket)}

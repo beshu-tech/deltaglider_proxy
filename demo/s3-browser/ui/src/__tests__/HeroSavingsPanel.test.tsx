@@ -70,7 +70,14 @@ test('the figures are labelled an estimate while a bucket is not scanned', () =>
   renderHero(4);
   expect(screen.getByText('Estimated saving')).toBeInTheDocument();
   expect(screen.getByText(/4 of 4 buckets are not scanned/)).toBeInTheDocument();
-  expect(screen.getByRole('button', { name: 'Scan 4 buckets' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Scan all buckets' })).toBeInTheDocument();
+});
+
+// UX harvest C12: the hero is the one scan call to action; with some
+// buckets scanned it names only the rest.
+test('the call to action names only the buckets with no scan', () => {
+  renderHero(2);
+  expect(screen.getByRole('button', { name: 'Scan 2 more buckets' })).toBeInTheDocument();
 });
 
 test('the figures are not an estimate when every bucket is scanned', () => {

@@ -13,8 +13,7 @@
  */
 import { useEffect, useRef } from 'react';
 import type { ReactNode } from 'react';
-import { Spin } from 'antd';
-import { EmptyState } from '../StatePlaceholders';
+import { EmptyState, SkeletonState } from '../StatePlaceholders';
 import { useColors } from '../../ThemeContext';
 import type { ColorTokens } from '../../ThemeContext';
 
@@ -37,7 +36,7 @@ interface Props {
    *  attention (bad / warn), never for "all good": a stripe on a healthy tile
    *  reads as "selected" or "alert". */
   accent?: PanelAccent;
-  /** Shows a spinner/skeleton in place of body. */
+  /** Shows a skeleton in place of the body, never placeholder figures. */
   loading?: boolean;
   /** When truthy, body is replaced with an empty-state message. */
   empty?: { title: string; hint?: string };
@@ -104,7 +103,7 @@ export default function Panel({
         />
       )}
       <PanelHeader title={title} subtitle={subtitle} actions={actions} colors={colors} />
-      <PanelBody loading={loading} empty={empty} colors={colors}>
+      <PanelBody loading={loading} empty={empty}>
         {children}
       </PanelBody>
     </div>
@@ -174,7 +173,9 @@ function PanelHeader({
         )}
       </div>
       {actions && (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', flexShrink: 0 }}>
+        // `flexShrink: 0` sized the toolbar to its content, so on a phone it
+        // ran past the card edge instead of wrapping its own buttons.
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', flex: '0 1 auto', minWidth: 0, maxWidth: '100%' }}>
           {actions}
         </div>
       )}
@@ -185,12 +186,10 @@ function PanelHeader({
 function PanelBody({
   loading,
   empty,
-  colors,
   children,
 }: {
   loading?: boolean;
   empty?: { title: string; hint?: string };
-  colors: ColorTokens;
   children: ReactNode;
 }) {
   // ResponsiveContainer from Recharts requires the body to have a
@@ -209,22 +208,7 @@ function PanelBody({
   }, []);
 
   if (loading) {
-    return (
-      <div
-        style={{
-          flex: 1,
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          padding: 16,
-          color: colors.TEXT_MUTED,
-          fontSize: 12,
-        }}
-      >
-        <Spin size="small" style={{ marginRight: 8 }} />
-        Loading…
-      </div>
-    );
+    return <SkeletonState />;
   }
 
   if (empty) {

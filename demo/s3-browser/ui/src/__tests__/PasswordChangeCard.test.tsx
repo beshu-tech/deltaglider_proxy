@@ -14,8 +14,8 @@ afterEach(() => vi.unstubAllGlobals());
 
 async function submit() {
   const user = userEvent.setup();
-  await user.type(screen.getByLabelText('Current admin password'), 'old');
-  await user.type(screen.getByLabelText('New admin password'), 'new');
+  await user.type(screen.getByLabelText('Current admin password'), 'old-password-1');
+  await user.type(screen.getByLabelText('New admin password'), 'new-password-12');
   await user.click(screen.getByRole('button', { name: /Change admin password/ }));
 }
 
@@ -32,4 +32,19 @@ test('a failure without a result body shows the error too', async () => {
   renderWithQuery(<PasswordChangeCard />);
   await submit();
   expect(await screen.findByText(/gateway down/)).toBeTruthy();
+});
+
+// C9: the button is enabled; a click on empty fields marks them and sends nothing.
+test('a click with empty or short fields shows inline errors and sends nothing', async () => {
+  const user = userEvent.setup();
+  renderWithQuery(<PasswordChangeCard />);
+  const button = screen.getByRole('button', { name: /Change admin password/ });
+  expect(button).toBeEnabled();
+  await user.click(button);
+  expect(await screen.findByText('Enter the current password.')).toBeTruthy();
+  expect(screen.getByText('Enter a new password.')).toBeTruthy();
+  expect(screen.getByLabelText('Current admin password')).toHaveAttribute('aria-invalid', 'true');
+  await user.type(screen.getByLabelText('New admin password'), 'short');
+  expect(screen.getByText('Use at least 12 characters.')).toBeTruthy();
+  expect(http.callsTo('PUT', '/_/api/admin/password')).toHaveLength(0);
 });

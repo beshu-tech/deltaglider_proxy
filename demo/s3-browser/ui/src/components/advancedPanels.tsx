@@ -31,7 +31,7 @@ import {
   ControlOutlined,
   SyncOutlined,
 } from '@ant-design/icons';
-import { useAdminConfig } from '../queries/config';
+import { useAdminConfig, useEnvOverride } from '../queries/config';
 import { useColors } from '../ThemeContext';
 import { useCardStyles } from './shared-styles';
 import { useSectionEditor } from '../useSectionEditor';
@@ -585,6 +585,8 @@ export function LoggingPanel({ onSessionExpired }: PanelProps) {
     },
   };
 
+  const logLevelFromEnv = useEnvOverride('advanced.log_level') !== null;
+
   const gate = loadGate(subset);
   if (gate) return gate;
 
@@ -597,7 +599,13 @@ export function LoggingPanel({ onSessionExpired }: PanelProps) {
         <SectionHeader
           icon={<ControlOutlined />}
           title="Log level"
-          description="tracing-subscriber EnvFilter string. Hot-reloadable: changes take effect on the next request after Apply."
+          // An env-owned level is read-only (FormField says where to change
+          // it), so the "after Apply" promise is only true without one.
+          description={
+            logLevelFromEnv
+              ? 'A tracing-subscriber EnvFilter string.'
+              : 'A tracing-subscriber EnvFilter string. A change takes effect on the next request after Apply, with no restart.'
+          }
         />
         <FormField label="Level" yamlPath="advanced.log_level" style={{ marginBottom: 0 }}>
           <Radio.Group

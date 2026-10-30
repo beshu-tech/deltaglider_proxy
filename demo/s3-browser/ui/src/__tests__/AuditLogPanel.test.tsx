@@ -27,7 +27,9 @@ test('lists the entries and filters them client-side', async () => {
   http.on('GET', AUDIT, json({ entries: [entry('login', 'dana'), entry('delete_object', 'ci-uploader', 'releases')] }));
   const user = userEvent.setup();
   renderWithQuery(<AuditLogPanel />);
-  expect(await screen.findByText('2 of 2 shown')).toBeInTheDocument();
+  // UX harvest C41: the count is stated once.
+  expect(await screen.findByText('2 entries')).toBeInTheDocument();
+  expect(screen.queryByText(/Showing 2/)).toBeNull();
   expect(http.callsTo('GET', AUDIT)[0].path).toBe('/_/api/admin/audit?limit=500');
   await user.type(screen.getByRole('textbox', { name: 'Filter audit entries' }), 'releases');
   expect(screen.getByText('1 of 2 shown')).toBeInTheDocument();
@@ -59,7 +61,7 @@ test('auto-refresh polls every 3 s only while switched on', async () => {
   http.on('GET', AUDIT, json({ entries: [entry('login', 'dana')] }));
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
   renderWithQuery(<AuditLogPanel />);
-  await screen.findByText('1 of 1 shown');
+  await screen.findByText('1 entry');
   await act(() => vi.advanceTimersByTimeAsync(7000));
   expect(http.callsTo('GET', AUDIT)).toHaveLength(1);
   await user.click(screen.getByRole('switch', { name: 'Auto-refresh every 3 seconds' }));

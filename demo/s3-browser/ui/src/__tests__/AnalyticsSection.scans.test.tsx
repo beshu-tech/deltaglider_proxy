@@ -65,3 +65,21 @@ test('a scan still running on the server is followed again', async () => {
   renderWithQuery(<AnalyticsSection config={null} />);
   await waitFor(() => expect(sse.subscribed).toEqual(['db-archive']));
 });
+
+// UX harvest C12: "Scan 3 buckets", "Scan missing (3)" and "Re-scan all"
+// were three buttons for one walk.
+test('with no scan, the page offers one scan action', async () => {
+  http.on('GET', STATUS, json({ buckets: {}, running: {} }));
+  renderWithQuery(<AnalyticsSection config={null} />);
+  await screen.findByText(/0 of 3 scanned/);
+  expect(screen.queryByRole('button', { name: /Re-scan all/ })).toBeNull();
+  expect(screen.queryByRole('button', { name: /Scan missing/ })).toBeNull();
+});
+
+test('once a scan exists, the bucket list offers Re-scan all', async () => {
+  http.on('GET', STATUS, json({ buckets: { releases: result('releases') }, running: {} }));
+  renderWithQuery(<AnalyticsSection config={null} />);
+  await screen.findByText(/1 of 3 scanned/);
+  expect(screen.getByRole('button', { name: /Re-scan all/ })).toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: /Scan missing/ })).toBeNull();
+});

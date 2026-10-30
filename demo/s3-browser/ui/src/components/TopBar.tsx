@@ -13,10 +13,7 @@ import { useColors, useTheme } from '../ThemeContext';
 import { useDocumentEvent } from '../useDocumentEvent';
 import { isTypingTarget, anyOverlayOpen } from '../keyboard';
 import { useIsNarrow } from '../useIsNarrow';
-
-/** Below this viewport width the savings chip no longer fits next to the
- *  breadcrumb and the bucket-size pill (the 250px sidebar takes the rest). */
-const SAVINGS_CHIP_MIN_VIEWPORT = 1200;
+import { HEADER_STATS_MIN_VIEWPORT } from '../browser/layout';
 
 const { Header } = Layout;
 
@@ -103,7 +100,9 @@ export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuCli
   // or Back): a filtered list with no visible search box looked like missing
   // files.
   const [searchOpen, setSearchOpen] = useState(() => !!searchQuery);
-  const hideSavingsChip = useIsNarrow(SAVINGS_CHIP_MIN_VIEWPORT);
+  // Narrow window: the bucket totals move to the listing's footer
+  // (BrowserScreen), and the savings chip keeps its place here.
+  const statsInFooter = useIsNarrow(HEADER_STATS_MIN_VIEWPORT);
   const inputRef = useRef<InputRef>(null);
   useEffect(() => {
     if (searchQuery) setSearchOpen(true);
@@ -138,6 +137,8 @@ export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuCli
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'space-between',
+        // The stats never run into the icon group.
+        gap: isMobile ? 8 : 24,
         padding: isMobile ? '0 12px' : '0 20px',
         height: 52,
         lineHeight: '52px',
@@ -171,9 +172,9 @@ export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuCli
               />
             ) : (
               <>
-                {bucket && <BucketPublicIcon bucket={bucket} canAdmin={canAdmin} label />}
-                {bucket && <BucketUsageChip bucket={bucket} canAdmin={canAdmin} inFolder={!!prefix} />}
-                {!hideSavingsChip && <DeltaSavingsChip summary={deltaSummary} />}
+                {bucket && <BucketPublicIcon bucket={bucket} canAdmin={canAdmin} prefix={prefix} label />}
+                {bucket && !statsInFooter && <BucketUsageChip bucket={bucket} canAdmin={canAdmin} inFolder={!!prefix} />}
+                <DeltaSavingsChip summary={deltaSummary} />
               </>
             )}
           </>

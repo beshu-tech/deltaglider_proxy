@@ -106,3 +106,18 @@ test('Run full scan starts the first bucket; its end refreshes the totals', asyn
   await waitFor(() => expect(http.callsTo('GET', STATUS)).toHaveLength(2));
   expect(await screen.findByText('77')).toBeInTheDocument();
 });
+
+// UX harvest C52: "0 buckets ready to scan" showed before the data arrived.
+test('a skeleton, not zero figures, until the scans are read', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  http.on('GET', STATUS, async () => {
+    await gate;
+    return json({ buckets: {}, running: {} });
+  });
+  renderWithQuery(<BucketScanCard />);
+  expect(await screen.findByRole('status', { name: 'Loading scans' })).toBeInTheDocument();
+  expect(screen.queryByText(/ready to scan/)).toBeNull();
+  release();
+  expect(await screen.findByText('3 buckets ready to scan')).toBeInTheDocument();
+});
