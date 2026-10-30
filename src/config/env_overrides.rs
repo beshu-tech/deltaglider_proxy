@@ -431,7 +431,16 @@ pub fn env_overrides(cfg: &Config, env: EnvLookup) -> Vec<EnvOverride> {
         });
     }
     for b in ENV_FIELD_BINDINGS {
-        if let Some(value) = env(b.env).and_then(|raw| applied_value(b.kind, &raw)) {
+        // A bound variable is an override only when its setter, the one the
+        // apply runs, accepts the value (a `u32` field refuses a `u64`).
+        let applies = |raw: &str| match b.set {
+            Some(set) => set(&mut cfg.clone(), raw).is_ok(),
+            None => true,
+        };
+        if let Some(value) = env(b.env)
+            .filter(|raw| applies(raw))
+            .and_then(|raw| applied_value(b.kind, &raw))
+        {
             out.push(EnvOverride {
                 env: b.env.to_string(),
                 yaml_path: b.yaml_path.map(str::to_string),
@@ -609,6 +618,17 @@ storage:
         assert_eq!(o.value.as_deref(), Some("info"));
         let out = run(&[("DGP_LOG_LEVEL", "warn")]);
         assert_eq!(at(&out, "advanced.log_level").unwrap().env, "DGP_LOG_LEVEL");
+    }
+
+    /// The apply ignores a value its field cannot hold; the GUI must not
+    /// show that field as set from env.
+    #[test]
+    fn a_value_the_field_cannot_hold_is_not_an_override() {
+        let too_big = (u64::from(u32::MAX) + 1).to_string();
+        let out = run(&[("DGP_REPLICATION_TRANSFERS", too_big.as_str())]);
+        assert!(at(&out, "storage.replication.transfers").is_none());
+        let out = run(&[("DGP_REPLICATION_TRANSFERS", "8")]);
+        assert!(at(&out, "storage.replication.transfers").is_some());
     }
 
     #[test]
