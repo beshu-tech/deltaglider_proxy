@@ -577,25 +577,6 @@ fn the_get_verb_opens_the_object_with_its_metadata() {
     );
 }
 
-/// THE rule of the engine's reads: the bytes of an object are read with
-/// the metadata of the same response (`open_object`,
-/// `open_passthrough_range`), and that metadata is what the GET serves.
-/// The metadata-less reads (`get_passthrough_stream`,
-/// `get_passthrough_stream_range`) paired an earlier read's ETag with the
-/// bytes of a version that a write put in between.
-#[test]
-fn the_engine_reads_bytes_with_their_metadata() {
-    let text = std::fs::read_to_string("src/deltaglider/engine/retrieve.rs").unwrap();
-    let prod = crate::source_scan::prod_text(&text);
-    let squashed: String = prod.split_whitespace().collect();
-    for bare in [".get_passthrough_stream(", ".get_passthrough_stream_range("] {
-        assert!(
-            !squashed.contains(bare),
-            "retrieve.rs calls {bare}: use open_object / open_passthrough_range"
-        );
-    }
-}
-
 /// Routing: the two parallel reads of a cold GET share one bucket
 /// resolution (one HeadBucket), as do concurrent GETs.
 #[tokio::test]

@@ -286,9 +286,10 @@ pub struct ObjectRead {
     pub stored_total: u64,
 }
 
-/// `open_passthrough_range` from the metadata read, then the range read,
-/// for a test double. Its stored total is the metadata's stored size: exact
-/// for a double that stores the bytes it is given and the size of those.
+/// `open_passthrough_range` from the metadata read, then the whole data
+/// read, sliced: for a test double. Its stored total is the metadata's
+/// stored size: exact for a double that stores the bytes it is given and
+/// the size of those.
 pub async fn open_passthrough_range_by_parts<B: StorageBackend + ?Sized>(
     backend: &B,
     bucket: &str,
@@ -300,12 +301,12 @@ pub async fn open_passthrough_range_by_parts<B: StorageBackend + ?Sized>(
     let metadata = backend
         .get_passthrough_metadata(bucket, prefix, filename)
         .await?;
-    let (stream, len) = backend
-        .get_passthrough_stream_range(bucket, prefix, filename, start, end)
-        .await?;
+    let data = backend.get_passthrough(bucket, prefix, filename).await?;
+    let (start, end) = clamp_range(start, end, data.len() as u64)?;
+    let range = Bytes::from(data).slice(start as usize..=end as usize);
     Ok(RangeRead {
-        stream,
-        len,
+        len: range.len() as u64,
+        stream: Box::pin(futures::stream::once(async move { Ok(range) })),
         stored_total: metadata.stored_size(),
         metadata,
     })
@@ -696,15 +697,13 @@ pub async fn unfenced_reference_write<B: StorageBackend + ?Sized>(
 }
 
 /// `open_object` from two reads: the metadata read, then the data read. For
-/// a test double whose data read does not carry the metadata. The data is
-/// collected to measure its stored size.
+/// a test double whose data read does not carry the metadata.
 pub async fn open_object_by_parts<B: StorageBackend + ?Sized>(
     backend: &B,
     bucket: &str,
     prefix: &str,
     object: StoredObject<'_>,
 ) -> Result<ObjectRead, StorageError> {
-    use futures::TryStreamExt;
     let (data, metadata) = match object {
         StoredObject::Reference => {
             let meta = backend.get_reference_metadata(bucket, prefix).await?;
@@ -716,12 +715,7 @@ pub async fn open_object_by_parts<B: StorageBackend + ?Sized>(
         }
         StoredObject::Passthrough(f) => {
             let meta = backend.get_passthrough_metadata(bucket, prefix, f).await?;
-            let chunks: Vec<Bytes> = backend
-                .get_passthrough_stream(bucket, prefix, f)
-                .await?
-                .try_collect()
-                .await?;
-            (chunks.concat(), meta)
+            (backend.get_passthrough(bucket, prefix, f).await?, meta)
         }
     };
     Ok(ObjectRead {
@@ -734,7 +728,7 @@ pub async fn open_object_by_parts<B: StorageBackend + ?Sized>(
 /// Pure: clamp an inclusive byte range `start..=end` to an object of `len`
 /// bytes. A range that starts at or past the end, or with `start > end`, is
 /// [`StorageError::InvalidRange`]; an `end` past the object is clamped.
-/// Every `get_passthrough_stream_range` resolves its range through it.
+/// Every `open_passthrough_range` resolves its range through it.
 pub fn clamp_range(start: u64, end: u64, len: u64) -> Result<(u64, u64), StorageError> {
     let clamped = end.min(len.saturating_sub(1));
     if len == 0 || start > clamped {
@@ -1229,26 +1223,15 @@ pub trait StorageBackend: Send + Sync {
 
     // === Streaming operations ===
 
-    /// Stream a passthrough file's contents without buffering the entire file in
-    /// memory. REQUIRED (no default) — a buffering default would silently defeat
-    /// the memory bound for large objects on a backend that forgot to override
-    /// it. The type system enforces every backend provides a real streaming read
-    /// (this used to be a buffering default guarded by a grep conformance test).
-    fn get_passthrough_stream(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> impl Future<Output = Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError>> + Send;
-
     /// Stream one stored object together with the metadata stored with it,
     /// both from ONE read of the backend (S3: the GET response's headers;
     /// filesystem: the file and its xattr). The metadata is the raw stored
     /// one, markers included, so the encrypting wrapper decides
     /// encrypted-or-plaintext from it and sends no separate HEAD
-    /// (storage-7). A missing object is `NotFound`. No default: a wrapper
-    /// that forgot it would read the object through the inner backend
-    /// without its own transform.
+    /// (storage-7). A missing object is `NotFound`. The stream never
+    /// buffers a passthrough object whole (the memory bound of large GETs).
+    /// No default: a wrapper that forgot it would read the object through
+    /// the inner backend without its own transform.
     fn open_object(
         &self,
         bucket: &str,
@@ -1262,8 +1245,11 @@ pub trait StorageBackend: Send + Sync {
     /// its length, the metadata and the stored object's total size
     /// ([`RangeRead`]; no default for it). An `end` past the object is clamped; a
     /// `start` at or past it is [`StorageError::InvalidRange`]; a missing
-    /// object is `NotFound`. No default: a wrapper that forgot it would
-    /// read the inner backend's bytes without its own transform.
+    /// object is `NotFound`. `len` is never 0. A backend without native
+    /// range reads reads the object and slices it; it never buffers more
+    /// than the range promises (the E2 invariant). No default: a wrapper
+    /// that forgot it would read the inner backend's bytes without its own
+    /// transform.
     fn open_passthrough_range(
         &self,
         bucket: &str,
@@ -1272,30 +1258,6 @@ pub trait StorageBackend: Send + Sync {
         start: u64,
         end: u64,
     ) -> impl Future<Output = Result<RangeRead, StorageError>> + Send;
-
-    /// Stream a byte range of a passthrough file without buffering the entire
-    /// object. REQUIRED (no default) — same memory-bound rationale as
-    /// [`get_passthrough_stream`](Self::get_passthrough_stream): a buffering
-    /// fallback would fetch the whole object first, defeating the bound a ranged
-    /// GET promises (the E2 invariant). Backends with native range reads (S3,
-    /// filesystem, the EncryptingBackend chunked wrapper) implement it directly;
-    /// a backend with no native range support must still provide an explicit
-    /// (even if full-stream) impl so the choice is VISIBLE, not silently inherited.
-    ///
-    /// Returns `(stream, content_length)` where `content_length` is the exact
-    /// number of bytes in the range (never 0: an empty range is
-    /// [`StorageError::InvalidRange`]). There is no "not a range" answer: a
-    /// backend that cannot read a range must read the object and slice it.
-    fn get_passthrough_stream_range(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        start: u64,
-        end: u64, // inclusive
-    ) -> impl Future<
-        Output = Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError>,
-    > + Send;
 
     /// Store a passthrough file from pre-split chunks without assembling into a contiguous buffer.
     /// Default implementation collects chunks and delegates to `put_passthrough()`.

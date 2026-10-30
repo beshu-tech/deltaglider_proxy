@@ -9,7 +9,6 @@ use super::traits::{
 use super::xattr_meta;
 use crate::types::FileMetadata;
 use bytes::Bytes;
-use futures::stream::BoxStream;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -1732,28 +1731,6 @@ impl StorageBackend for FilesystemBackend {
 
     // === Streaming operations ===
 
-    #[instrument(skip(self))]
-    async fn get_passthrough_stream(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
-        use futures::StreamExt;
-
-        let data_path = self.passthrough_path(bucket, prefix, filename)?;
-        let file = fsio::open(&data_path)
-            .await
-            .map_err(|e| fsio::storage_error(e, || format!("passthrough: {prefix}/{filename}")))?;
-        let reader_stream = ReaderStream::new(file);
-        let stream = reader_stream.map(|result| result.map_err(StorageError::Io));
-        debug!(
-            "Opened passthrough file stream for {}/{}/{}",
-            bucket, prefix, filename
-        );
-        Ok(Box::pin(stream))
-    }
-
     /// The metadata read (xattr, or the fallback of a file without it) and
     /// the file, opened once.
     async fn open_object(
@@ -1827,35 +1804,6 @@ impl StorageBackend for FilesystemBackend {
         objects: &[(String, FileMetadata)],
     ) -> Vec<Option<crate::storage::ListedToken>> {
         vec![None; objects.len()]
-    }
-
-    #[instrument(skip(self))]
-    async fn get_passthrough_stream_range(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        start: u64,
-        end: u64,
-    ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError> {
-        use futures::StreamExt;
-        use tokio::io::{AsyncReadExt, AsyncSeekExt};
-
-        let data_path = self.passthrough_path(bucket, prefix, filename)?;
-        let mut file = fsio::open(&data_path)
-            .await
-            .map_err(|e| fsio::storage_error(e, || format!("passthrough: {prefix}/{filename}")))?;
-        let (start, end) = super::clamp_range(start, end, file.metadata().await?.len())?;
-        file.seek(std::io::SeekFrom::Start(start)).await?;
-        let range_len = end - start + 1;
-        let limited = file.take(range_len);
-        let reader_stream = ReaderStream::new(limited);
-        let stream = reader_stream.map(|result| result.map_err(StorageError::Io));
-        debug!(
-            "Opened passthrough range stream for {}/{}/{} (bytes {}-{})",
-            bucket, prefix, filename, start, end
-        );
-        Ok((Box::pin(stream), range_len))
     }
 
     // === Scanning operations ===

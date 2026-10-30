@@ -2513,8 +2513,8 @@ mod body_resume_tests {
     async fn a_range_read_resumes_inside_its_range() {
         let obj = object();
         let (ep, fake) = start(obj.clone(), vec![Send::Drop(10_000)]).await;
-        let (stream, len) = backend(&ep)
-            .get_passthrough_stream_range("b", "v", "a.bin", 1_000, 99_999)
+        let crate::storage::RangeRead { stream, len, .. } = backend(&ep)
+            .open_passthrough_range("b", "v", "a.bin", 1_000, 99_999)
             .await
             .unwrap();
         assert_eq!(len, 99_000);

@@ -155,9 +155,9 @@ async fn a_retired_bucket_key_still_reads_from_the_keyring() {
     r.put("db-archive", "new", b"plain").await.unwrap();
     assert_eq!(r.stamp("db-archive", "new").await, None);
     // A range read takes the keyed path for this bucket.
-    let (stream, len) = r
+    let crate::storage::RangeRead { stream, len, .. } = r
         .wrapper
-        .get_passthrough_stream_range("db-archive", "", "old", 0, 2)
+        .open_passthrough_range("db-archive", "", "old", 0, 2)
         .await
         .unwrap();
     use futures::StreamExt;
@@ -194,9 +194,7 @@ async fn a_bucket_override_decides_whether_plaintext_is_served() {
             (
                 w.get_passthrough(b, "", "plain").await.is_ok(),
                 w.get_passthrough_metadata(b, "", "plain").await.is_ok(),
-                w.get_passthrough_stream_range(b, "", "plain", 0, 0)
-                    .await
-                    .is_ok(),
+                w.open_passthrough_range(b, "", "plain", 0, 0).await.is_ok(),
             )
         };
         let s = backend_serves;

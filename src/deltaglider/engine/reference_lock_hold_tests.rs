@@ -483,7 +483,6 @@ async fn review2_lost_lock_during_reclaim_does_not_fail_the_delete() {
 
 use crate::storage::{RefFence, RefWrite};
 use crate::types::FileMetadata as Meta;
-use futures::stream::BoxStream;
 
 /// A filesystem backend with S3-style conditional reference writes: a
 /// version per reference plays the ETag. `peer_race` makes a peer write
@@ -747,14 +746,6 @@ impl crate::storage::StorageBackend for FencingFs {
     ) -> Vec<Option<crate::storage::ListedToken>> {
         vec![None; objects.len()]
     }
-    async fn get_passthrough_stream(
-        &self,
-        b: &str,
-        p: &str,
-        f: &str,
-    ) -> Result<BoxStream<'static, Result<bytes::Bytes, StorageError>>, StorageError> {
-        self.inner.get_passthrough_stream(b, p, f).await
-    }
     async fn read_key_claim(
         &self,
         _: &str,
@@ -767,18 +758,6 @@ impl crate::storage::StorageBackend for FencingFs {
         _: crate::storage::ClaimWrite<'_>,
     ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
         Ok(crate::storage::ClaimOutcome::Written)
-    }
-    async fn get_passthrough_stream_range(
-        &self,
-        b: &str,
-        p: &str,
-        f: &str,
-        start: u64,
-        end: u64,
-    ) -> Result<(BoxStream<'static, Result<bytes::Bytes, StorageError>>, u64), StorageError> {
-        self.inner
-            .get_passthrough_stream_range(b, p, f, start, end)
-            .await
     }
     async fn scan_deltaspace(&self, b: &str, p: &str) -> Result<Vec<Meta>, StorageError> {
         self.inner.scan_deltaspace(b, p).await

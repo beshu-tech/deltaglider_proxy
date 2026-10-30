@@ -56,7 +56,6 @@ use crate::deltaglider::spool::SpoolBudget;
 use crate::types::FileMetadata;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use futures::stream::BoxStream;
 use std::sync::Arc;
 
 /// Drop the at-rest encryption markers (and the seal) from an object's
@@ -1572,18 +1571,6 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         collect_stream(stream).await
     }
 
-    async fn get_passthrough_stream(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
-        let ObjectRead { stream, .. } = self
-            .open_object(bucket, prefix, StoredObject::Passthrough(filename))
-            .await?;
-        Ok(stream)
-    }
-
     /// The inner read carries the stored metadata and the stored size, so
     /// the read rule needs no HEAD of its own, and a sealed object of the
     /// wrong stored size fails before the first byte. References and deltas
@@ -1731,20 +1718,6 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     /// facts, an S3 lite list does not.
     fn lite_list_carries_logical_facts(&self, bucket: &str) -> bool {
         self.inner.lite_list_carries_logical_facts(bucket)
-    }
-
-    async fn get_passthrough_stream_range(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        start: u64,
-        end: u64,
-    ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError> {
-        let read = self
-            .open_passthrough_range(bucket, prefix, filename, start, end)
-            .await?;
-        Ok((read.stream, read.len))
     }
 
     /// Without any key, objects here are plaintext: the inner backend's one

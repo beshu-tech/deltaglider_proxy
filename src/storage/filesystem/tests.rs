@@ -1293,15 +1293,15 @@ mod backend_tests {
             .unwrap();
         for (start, end) in [(20, 25), (10, 10), (8, 2)] {
             let res = backend
-                .get_passthrough_stream_range("bucket", "p", "o.bin", start, end)
+                .open_passthrough_range("bucket", "p", "o.bin", start, end)
                 .await;
             assert!(
                 matches!(res, Err(StorageError::InvalidRange(_))),
                 "({start},{end}) must be InvalidRange"
             );
         }
-        let (stream, len) = backend
-            .get_passthrough_stream_range("bucket", "p", "o.bin", 5, 100)
+        let crate::storage::RangeRead { stream, len, .. } = backend
+            .open_passthrough_range("bucket", "p", "o.bin", 5, 100)
             .await
             .unwrap();
         let body: Vec<u8> = stream.map(|c| c.unwrap().to_vec()).concat().await;
@@ -1434,7 +1434,10 @@ async fn a_stat_error_never_reads_as_absent() {
         fs.get_passthrough("b", "d", "k").await,
         Err(StorageError::Io(_))
     ));
-    assert!(fs.get_passthrough_stream("b", "d", "k").await.is_err());
+    assert!(fs
+        .open_object("b", "d", StoredObject::Passthrough("k"))
+        .await
+        .is_err());
     // The metadata read goes through the same rule: an error, not absent.
     assert!(matches!(
         fs.get_passthrough_metadata("b", "d", "k").await,

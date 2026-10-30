@@ -215,15 +215,15 @@ mod wrapper_tests {
         r.put("p", "o.bin", b"0123456789").await;
         for (start, end) in [(20, 25), (10, 10), (8, 2), (70_000, 70_010)] {
             let res =
-                r.w.get_passthrough_stream_range("b", "p", "o.bin", start, end)
+                r.w.open_passthrough_range("b", "p", "o.bin", start, end)
                     .await;
             assert!(
                 matches!(res, Err(StorageError::InvalidRange(_))),
                 "({start},{end}) must be InvalidRange"
             );
         }
-        let (stream, len) =
-            r.w.get_passthrough_stream_range("b", "p", "o.bin", 5, 100)
+        let crate::storage::RangeRead { stream, len, .. } =
+            r.w.open_passthrough_range("b", "p", "o.bin", 5, 100)
                 .await
                 .unwrap();
         assert_eq!(
@@ -471,19 +471,6 @@ mod wrapper_tests {
         ) -> Result<crate::storage::RefFence, StorageError> {
             crate::storage::unfenced_reference_write(self, b, p, op, proof).await
         }
-        async fn get_passthrough_stream_range(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            start: u64,
-            end: u64,
-        ) -> Result<(ByteStream, u64), StorageError> {
-            self.ranges_requested.lock().unwrap().push((start, end));
-            let slice = self.slice(start, end)?;
-            let len = slice.len() as u64;
-            Ok((once(slice), len))
-        }
         async fn open_object(
             &self,
             b: &str,
@@ -542,14 +529,6 @@ mod wrapper_tests {
             _: crate::storage::ClaimWrite<'_>,
         ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
             Ok(crate::storage::ClaimOutcome::Written)
-        }
-        async fn get_passthrough_stream(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-        ) -> Result<ByteStream, StorageError> {
-            Ok(once(self.bytes.lock().unwrap().clone()))
         }
         async fn get_passthrough_metadata(
             &self,
@@ -779,8 +758,8 @@ mod wrapper_tests {
     async fn a_range_read_is_one_read_of_the_covering_frames() {
         let (w, data) = counting(keyed(key(1), "kid-1"), key(1), 10 * F).await;
         let (start, end) = (7 * F as u64 + 100, 8 * F as u64 + 500);
-        let (stream, len) = w
-            .get_passthrough_stream_range("b", "p", "test.bin", start, end)
+        let crate::storage::RangeRead { stream, len, .. } = w
+            .open_passthrough_range("b", "p", "test.bin", start, end)
             .await
             .unwrap();
         assert_eq!(len, end - start + 1);
@@ -804,8 +783,8 @@ mod wrapper_tests {
         let size = 64 * F;
         let (w, data) = counting(keyed(key(1), "kid-1"), key(1), size).await;
         let (start, end) = (size as u64 - 100, size as u64 - 1);
-        let (stream, len) = w
-            .get_passthrough_stream_range("b", "p", "test.bin", start, end)
+        let crate::storage::RangeRead { stream, len, .. } = w
+            .open_passthrough_range("b", "p", "test.bin", start, end)
             .await
             .unwrap();
         assert_eq!(len, 100);
@@ -2209,9 +2188,11 @@ mod read_request_tests {
             .await
             .unwrap();
             fake.clear();
-            let got = collect(w.get_passthrough_stream("b", "p", "a.bin").await.unwrap())
+            let read = w
+                .open_object("b", "p", StoredObject::Passthrough("a.bin"))
                 .await
                 .unwrap();
+            let got = collect(read.stream).await.unwrap();
             assert_eq!(got, body, "key: {}", key.is_some());
             assert!(one_get(&fake), "{:?}", fake.requests());
             fake.clear();
@@ -2267,8 +2248,8 @@ mod read_request_tests {
             assert_eq!(m.file_size, body.len() as u64);
             assert!(one_get(&fake), "open {start}-{end}: {:?}", reads(&fake));
             fake.clear();
-            let (stream, len) = w
-                .get_passthrough_stream_range("b", "p", "a.bin", start, end)
+            let crate::storage::RangeRead { stream, len, .. } = w
+                .open_passthrough_range("b", "p", "a.bin", start, end)
                 .await
                 .unwrap();
             assert_eq!(
@@ -2598,15 +2579,10 @@ fn follow_up_reads_are_pinned_to_the_first_read() {
     let text = std::fs::read_to_string("src/storage/encrypting/mod.rs").unwrap();
     let prod = crate::source_scan::prod_text(&text);
     let squashed: String = prod.split_whitespace().collect();
-    for bare in [
-        "inner.get_passthrough_stream_range(",
-        "inner.get_passthrough(",
-    ] {
-        assert!(
-            !squashed.contains(bare),
-            "encrypting/mod.rs calls {bare}: use pinned_range"
-        );
-    }
+    assert!(
+        !squashed.contains("inner.get_passthrough("),
+        "encrypting/mod.rs calls inner.get_passthrough: use pinned_range"
+    );
     // The plaintext follow-up goes through the pinned helper, which is
     // the one place that checks the version.
     let helper = squashed
@@ -2647,34 +2623,17 @@ mod range_matrix_tests {
         name: &str,
         start: u64,
         end: u64,
-        open: bool,
     ) -> String {
-        let r = if open {
-            match w.open_passthrough_range("b", "p", name, start, end).await {
-                Ok(r) => Ok((r.stream, r.len, Some(r.metadata))),
-                Err(e) => Err(e),
-            }
-        } else {
-            match w
-                .get_passthrough_stream_range("b", "p", name, start, end)
-                .await
-            {
-                Ok((s, len)) => Ok((s, len, None)),
-                Err(e) => Err(e),
-            }
-        };
-        match r {
-            Ok((s, len, m)) => match collect(s).await {
+        match w.open_passthrough_range("b", "p", name, start, end).await {
+            Ok(r) => match collect(r.stream).await {
                 Ok(body) => {
-                    let md = m
-                        .map(|m| format!("size={} etag={}", m.file_size, m.etag()))
-                        .unwrap_or_default();
                     format!(
-                        "OK len={} bodylen={} body_md5={} {}",
-                        len,
+                        "OK len={} bodylen={} body_md5={} size={} etag={}",
+                        r.len,
                         body.len(),
                         md5_hex(&body),
-                        md
+                        r.metadata.file_size,
+                        r.metadata.etag()
                     )
                 }
                 Err(e) => format!("STREAM-ERR {e}"),
@@ -2759,11 +2718,8 @@ mod range_matrix_tests {
                     ranges.push((size.saturating_sub(n), last));
                 }
             }
-            for (i, (s, e)) in ranges.into_iter().enumerate() {
-                // `get_passthrough_stream_range` is `open_passthrough_range`
-                // without the metadata: the ranges alternate the two.
-                let open = i % 2 == 0;
-                let twin = outcome(&unkeyed, "plain", s, e, open).await;
+            for (s, e) in ranges {
+                let twin = outcome(&unkeyed, "plain", s, e).await;
                 for name in [
                     "plain",
                     "chunked",
@@ -2773,10 +2729,10 @@ mod range_matrix_tests {
                     "prev-chunked",
                     "prev-buffered",
                 ] {
-                    let got = outcome(&reader, name, s, e, open).await;
+                    let got = outcome(&reader, name, s, e).await;
                     if got != twin {
                         mismatches.push(format!(
-                            "size={size} range={s}-{e} open={open} {name}: twin=[{twin}] got=[{got}]"
+                            "size={size} range={s}-{e} {name}: twin=[{twin}] got=[{got}]"
                         ));
                     }
                 }

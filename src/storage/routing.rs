@@ -13,7 +13,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures::stream::BoxStream;
 use tracing::warn;
 
 use super::list_size_cache::{ListedSize, ResolveListed};
@@ -1484,15 +1483,6 @@ impl StorageBackend for RoutingBackend {
 
     // === Streaming operations ===
 
-    async fn get_passthrough_stream(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
-        route_existing!(self, bucket, get_passthrough_stream, prefix, filename)
-    }
-
     async fn open_object(
         &self,
         bucket: &str,
@@ -1529,24 +1519,6 @@ impl StorageBackend for RoutingBackend {
         route_existing!(self, bucket, listing_tokens, objects)
     }
 
-    async fn get_passthrough_stream_range(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        start: u64,
-        end: u64,
-    ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError> {
-        route_existing!(
-            self,
-            bucket,
-            get_passthrough_stream_range,
-            prefix,
-            filename,
-            start,
-            end
-        )
-    }
     async fn read_key_claim(
         &self,
         bucket: &str,
@@ -2081,14 +2053,6 @@ mod tests {
         ) -> Vec<Option<crate::storage::ListedToken>> {
             vec![None; objects.len()]
         }
-        async fn get_passthrough_stream(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-        ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
-            Ok(Box::pin(futures::stream::empty()))
-        }
         async fn read_key_claim(
             &self,
             _: &str,
@@ -2101,20 +2065,6 @@ mod tests {
             _: crate::storage::ClaimWrite<'_>,
         ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
             Ok(crate::storage::ClaimOutcome::Written)
-        }
-
-        async fn get_passthrough_stream_range(
-            &self,
-            bucket: &str,
-            prefix: &str,
-            filename: &str,
-            _: u64,
-            _: u64,
-        ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError> {
-            let stream = self
-                .get_passthrough_stream(bucket, prefix, filename)
-                .await?;
-            Ok((stream, 0))
         }
 
         async fn put_passthrough(

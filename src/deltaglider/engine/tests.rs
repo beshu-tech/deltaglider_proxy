@@ -219,17 +219,6 @@ impl crate::storage::StorageBackend for NullInner {
     ) -> Vec<Option<crate::storage::ListedToken>> {
         vec![None; objects.len()]
     }
-    async fn get_passthrough_stream(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-    ) -> Result<
-        futures::stream::BoxStream<'static, Result<bytes::Bytes, crate::storage::StorageError>>,
-        crate::storage::StorageError,
-    > {
-        Ok(Box::pin(futures::stream::empty()))
-    }
     async fn read_key_claim(
         &self,
         _: &str,
@@ -242,22 +231,6 @@ impl crate::storage::StorageBackend for NullInner {
         _: crate::storage::ClaimWrite<'_>,
     ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
         Ok(crate::storage::ClaimOutcome::Written)
-    }
-    async fn get_passthrough_stream_range(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-        _: u64,
-        _: u64,
-    ) -> Result<
-        (
-            futures::stream::BoxStream<'static, Result<bytes::Bytes, crate::storage::StorageError>>,
-            u64,
-        ),
-        crate::storage::StorageError,
-    > {
-        Ok((Box::pin(futures::stream::empty()), 0))
     }
     async fn get_passthrough_metadata(
         &self,

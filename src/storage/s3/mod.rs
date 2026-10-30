@@ -1043,28 +1043,6 @@ impl StorageBackend for S3Backend {
 
     // === Streaming operations ===
 
-    #[instrument(skip(self))]
-    async fn get_passthrough_stream(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
-        let key = self.passthrough_key(prefix, filename);
-        let response = self
-            .client
-            .get_object()
-            .bucket(bucket)
-            .key(&key)
-            .send()
-            .await
-            .map_err(|e| self.classify_get(bucket, &key, &e))?;
-
-        debug!("S3 GET stream {}/{}", bucket, key);
-
-        Ok(self.body_stream(bucket, &key, response))
-    }
-
     /// One GET: the body, and the metadata from the response's own headers.
     async fn open_object(
         &self,
@@ -1137,20 +1115,6 @@ impl StorageBackend for S3Backend {
             metadata: meta,
             stored_total: total,
         })
-    }
-
-    #[instrument(skip(self))]
-    async fn get_passthrough_stream_range(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        start: u64,
-        end: u64,
-    ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError> {
-        let key = self.passthrough_key(prefix, filename);
-        let (response, len, _) = self.ranged_get(bucket, &key, start, end).await?;
-        Ok((self.body_stream(bucket, &key, response), len))
     }
 
     // === Multipart upload (Phase B native streaming copy) ===

@@ -661,17 +661,6 @@ impl StorageBackend for FaultyFs {
             .await
     }
 
-    async fn get_passthrough_stream(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
-        self.inner
-            .get_passthrough_stream(bucket, prefix, filename)
-            .await
-    }
-
     async fn open_object(
         &self,
         bucket: &str,
@@ -707,18 +696,6 @@ impl StorageBackend for FaultyFs {
         self.inner.listing_tokens(b, objects).await
     }
 
-    async fn get_passthrough_stream_range(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
-        start: u64,
-        end: u64,
-    ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError> {
-        self.inner
-            .get_passthrough_stream_range(bucket, prefix, filename, start, end)
-            .await
-    }
     async fn read_key_claim(
         &self,
         bucket: &str,

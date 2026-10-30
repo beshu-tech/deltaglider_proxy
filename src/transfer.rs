@@ -2657,7 +2657,6 @@ mod multipart_abort_tests {
     use crate::storage::{MultipartUpload, StorageBackend, StorageError, UploadedPart};
     use crate::types::FileMetadata;
     use bytes::Bytes;
-    use futures::stream::BoxStream;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -2666,7 +2665,6 @@ mod multipart_abort_tests {
     /// native multipart destination, and records every abort. Failure modes
     /// are toggled per test.
     struct AbortSpy {
-        src_bytes: Vec<u8>,
         src_meta: FileMetadata,
         fail_part: AtomicBool,
         slow_parts: AtomicBool,
@@ -2684,7 +2682,6 @@ mod multipart_abort_tests {
                 Some("application/octet-stream".to_string()),
             );
             Self {
-                src_bytes,
                 src_meta: meta,
                 fail_part: AtomicBool::new(false),
                 slow_parts: AtomicBool::new(false),
@@ -2820,22 +2817,6 @@ mod multipart_abort_tests {
         ) -> Result<FileMetadata, StorageError> {
             Err(StorageError::NotFound("no delta".into()))
         }
-        async fn get_passthrough_stream_range(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            start: u64,
-            end: u64,
-        ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError> {
-            let end = std::cmp::min(end, self.src_bytes.len() as u64 - 1);
-            let slice = self.src_bytes[start as usize..=end as usize].to_vec();
-            let len = slice.len() as u64;
-            Ok((
-                Box::pin(futures::stream::once(async move { Ok(Bytes::from(slice)) })),
-                len,
-            ))
-        }
 
         // Required by the trait; irrelevant to these tests.
         async fn create_bucket(&self, _: &str) -> Result<(), StorageError> {
@@ -2965,14 +2946,6 @@ mod multipart_abort_tests {
             objects: &[(String, crate::types::FileMetadata)],
         ) -> Vec<Option<crate::storage::ListedToken>> {
             vec![None; objects.len()]
-        }
-        async fn get_passthrough_stream(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-        ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
-            Err(nope())
         }
         async fn read_key_claim(
             &self,
@@ -3130,16 +3103,6 @@ mod multipart_abort_tests {
         ) -> Result<FileMetadata, StorageError> {
             self.0.get_delta_metadata(b, p, f).await
         }
-        async fn get_passthrough_stream_range(
-            &self,
-            b: &str,
-            p: &str,
-            f: &str,
-            s: u64,
-            e: u64,
-        ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError> {
-            self.0.get_passthrough_stream_range(b, p, f, s, e).await
-        }
         async fn create_bucket(&self, b: &str) -> Result<(), StorageError> {
             self.0.create_bucket(b).await
         }
@@ -3266,14 +3229,6 @@ mod multipart_abort_tests {
             objects: &[(String, crate::types::FileMetadata)],
         ) -> Vec<Option<crate::storage::ListedToken>> {
             self.0.listing_tokens(b, objects).await
-        }
-        async fn get_passthrough_stream(
-            &self,
-            b: &str,
-            p: &str,
-            f: &str,
-        ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
-            self.0.get_passthrough_stream(b, p, f).await
         }
         async fn read_key_claim(
             &self,
